@@ -39,10 +39,10 @@ each widget then needs its own permission:
   permission as `GET /api/v1/ca/issued` ([PKI](server-admin.md)), and are withheld from a
   confined caller in the same way. A caller who can see a count but does not hold
   `Security:Read` sees the count, and a click shows "the certificate list needs Security:Read"
-  in the drill panel. The withholding covers the drill and the **filtered** form of
-  `GET /api/v1/ca/issued` / `list_issued_certs` only: the unfiltered `GET /api/v1/ca/issued`
-  is unchanged and still returns every Yuzu-issued certificate to any `Security:Read` holder,
-  a confined one included (owner decision; the same rows, without the dashboard's windows).
+  in the drill panel. The withholding covers the drill, both forms of
+  `GET /api/v1/ca/issued` / `list_issued_certs` (filtered and unfiltered) and the list in the
+  Settings certificate panel: the unfiltered inventory returns the same per-agent rows, so a
+  confined caller gets the same refusal there and sees a note in the panel instead of the list.
 
 A widget whose permission you do not hold is drawn as a card that says "not available to this
 account (`Inventory:Read` required)", not as an error.
@@ -425,7 +425,7 @@ permissions, through REST and MCP.
 | `GET /api/v1/crypto/dashboard/layout` | Your own layout (`widgets`, `is_default`, `version`, `preserved_unknown`). Authentication only; refused to service-scoped tokens. The dashboard page answers such a token, or an MCP token whose tier does not allow the read, with the default layout, read-only, and never reads or shows the minting operator's saved layout. |
 | `PUT /api/v1/crypto/dashboard/layout` | Replace your own layout: body `{"widgets":[ids], "expected_version": n}`, at most 64 catalogue ids, no repeats; `expected_version` names the version you read (omit it only for a first save). A stale version, or none while a layout is stored, is `409`. Same-site browser writes only; audited `crypto.dashboard.layout.update`. |
 | `GET /api/v1/crypto/ca/stats` | Every Yuzu-issued count against one `as_of`. `Inventory:Read`, withheld from a confined caller (`403`). |
-| `GET /api/v1/ca/issued?kind=...` | The Yuzu-issued certificates behind one count: `kind` (required in this form), `days`, `week`, `bucket`, `as_of`, `limit` (1 to 500, default 100), `cursor` (the previous page's `next_cursor`; no `offset`). `Security:Read`, withheld from a confined caller. Without any of `kind`, `days`, `week`, `bucket`, `as_of` or `cursor` the route lists certificates exactly as before, `offset` paging included (see [PKI](server-admin.md)). That unfiltered list is unchanged by this feature and still returns every row to any `Security:Read` holder, a confined one included: only the filtered form is withheld from a confined caller. |
+| `GET /api/v1/ca/issued?kind=...` | The Yuzu-issued certificates behind one count: `kind` (required in this form), `days`, `week`, `bucket`, `as_of`, `limit` (1 to 500, default 100), `cursor` (the previous page's `next_cursor`; no `offset`). `Security:Read`, withheld from a confined caller. Without any of `kind`, `days`, `week`, `bucket`, `as_of` or `cursor` the route lists the inventory with `offset` paging (see [PKI](server-admin.md)). That unfiltered list is held to the same rules: it is withheld from a confined caller (`403`, no permission named), it is audited `crypto.ca.certificates.view`, and it answers `503` when the confinement check cannot be made. |
 
 `version` and `ecosystem` are matched **exactly**, and a parameter that is present but empty is
 the exact empty value (some rows genuinely carry no version or no ecosystem); an absent parameter
@@ -451,7 +451,7 @@ Full parameters, response shapes and error tables are in [rest-api.md](rest-api.
 | `list_crypto_widgets` | `GET /api/v1/crypto/widgets` | No args. |
 | `get_crypto_dashboard_layout` / `set_crypto_dashboard_layout` | `GET` / `PUT /api/v1/crypto/dashboard/layout` | The calling principal's own layout; `set` takes `widgets` and optional `expected_version`. |
 | `get_crypto_ca_stats` | `GET /api/v1/crypto/ca/stats` | No args. |
-| `list_issued_certs` | `GET /api/v1/ca/issued` | With any of `kind`, `days`, `week`, `bucket`, `as_of` or `cursor` it lists the certificates behind one count, paged by `next_cursor`; without them it answers as before (`offset` paging). |
+| `list_issued_certs` | `GET /api/v1/ca/issued` | With any of `kind`, `days`, `week`, `bucket`, `as_of` or `cursor` it lists the certificates behind one count, paged by `next_cursor`; without them it lists the inventory with `offset` paging, under the same confinement refusal and the same audit. |
 
 The published ecosystems are the closed list the software catalogue tools use: `""`, `rpm`,
 `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`,
@@ -476,7 +476,7 @@ data, permission or other operator is touched).
   the kind's set, a `days`, `week` or `bucket` on a kind that does not take it, a `limit` outside
   1 to 500, any `offset`, a malformed, edited or other-filter `cursor`, or an `as_of` outside the
   accepted range (measured on the database clock) is refused (`400` on REST, invalid-params on
-  MCP), with a message naming the parameter. The unfiltered form keeps its old behaviour: REST and MCP clamp `limit` to 1 to 1000.
+  MCP), with a message naming the parameter. The unfiltered form keeps its parameter handling: REST and MCP clamp `limit` to 1 to 1000.
 - **Layouts.** `get_crypto_dashboard_layout` returns `version`; pass it as `expected_version` to
   `set_crypto_dashboard_layout` so a save is refused when the layout changed meanwhile (a
   non-retryable invalid-params error: read again, then save). `expected_version` `0` means "only
@@ -569,7 +569,7 @@ Every read that serves data is written to the audit log (see [audit-log.md](audi
 | `crypto.libraries.devices` | A page of one family's devices is served (REST route and the drill). The MCP tool writes `mcp.list_crypto_library_devices`. |
 | `crypto.cbom.export` | A CBOM is exported (REST route). The MCP tool writes `mcp.export_crypto_cbom`. Same detail key set as the summary (`rows` is the number of families), plus ` serial=<urn:uuid:...> [ecosystem=<filter>] components=<n>` (the `ecosystem` key only when that filter was given) on the success row, tying the audit row to the exact document handed out. |
 | `crypto.ca.stats.view` | The Yuzu-issued counts are served (`GET /api/v1/crypto/ca/stats`, the dashboard, a single Yuzu-issued card, and the MCP tool `get_crypto_ca_stats` under the same verb). Target `Inventory` / `yuzu_ca`; detail `cid=.. ws=crypto_widget_windows_v1 as_of=<epoch>`, plus `widgets=<n>` on the dashboard row. A confined caller's refusal is a `denied` row with `withheld=confined`. |
-| `crypto.ca.certificates.view` | A page of Yuzu-issued certificates behind one count is served: `GET /api/v1/ca/issued` **with filter parameters**, the drill with every Load more page, and `list_issued_certs` with filter arguments, under the same verb. Target `Security` / `kind=<k>[ days=<n>][ week=<YYYY-Www>][ bucket=<b>]`; detail adds `as_of` (with `pinned` when the caller supplied it or the page continues a cursor), `rows`, `page=first` or `page=continuation`, and `total`. A confined caller's refusal is a `denied` row with `withheld=confined`. The unfiltered `GET /api/v1/ca/issued` and `list_issued_certs` stay unaudited, as before. `issued_by` names who caused the issuance: `agent:<id>` for an enrolment, `operator:<username>` for a certificate an operator issued, or `system:default-certs` for the server's own bootstrap certificates, so the list can carry operator usernames (personal data) to every `Security:Read` holder, as the unfiltered list always has. |
+| `crypto.ca.certificates.view` | A page of Yuzu-issued certificates behind one count is served: `GET /api/v1/ca/issued` (filtered or not), the drill with every Load more page, and `list_issued_certs` (filtered or not), under the same verb. Target `Security` / `kind=<k>[ days=<n>][ week=<YYYY-Www>][ bucket=<b>]`; detail adds `as_of` (with `pinned` when the caller supplied it or the page continues a cursor), `rows`, `page=first` or `page=continuation`, and `total`. A confined caller's refusal is a `denied` row with `withheld=confined`. The unfiltered `GET /api/v1/ca/issued` and `list_issued_certs` write the same verb with target `Security` / `inventory` and detail `inventory rows=<n> limit=<n> offset=<n> has_more=<true|false>`, and a refused confined caller gets the same `denied` row. The Settings certificate panel is not audited. `issued_by` names who caused the issuance: `agent:<id>` for an enrolment, `operator:<username>` for a certificate an operator issued, or `system:default-certs` for the server's own bootstrap certificates, so the list can carry operator usernames (personal data) to every unconfined `Security:Read` holder, as the unfiltered list always has. |
 | `crypto.dashboard.layout.update` | You save a layout (`PUT /api/v1/crypto/dashboard/layout`, the dashboard buttons, or `set_crypto_dashboard_layout`). An `attempted` row is written first and the layout is not changed if it cannot be; then `success` (with the new `version=`) or `failure` (with `outcome=conflict`, `corrupt`, `degraded`, `unknown` or `invalid`). Target `CryptoDashboard` / your user name; detail `widgets=<n>`, plus `expected_version=<n>` when sent. A service-scoped token's attempt is a `denied` row. |
 | `crypto.dashboard.layout.access_denied` | A service-scoped API token tried to read a layout (`GET /api/v1/crypto/dashboard/layout`); written as `denied`. |
 

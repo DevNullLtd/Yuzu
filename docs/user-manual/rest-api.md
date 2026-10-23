@@ -2326,6 +2326,17 @@ Query params `limit` (1–1000, default 200) and `offset` (default 0). The full
 certificate PEM and enrollment reference are intentionally omitted. `503` if
 the CA store is unavailable.
 
+The inventory is fleet-wide data about every enrolled agent (subject, SAN), so it is
+held to the same rules as the filtered list below. A caller whose view of the fleet is
+confined (management-group confinement) is refused `403` with no `permission` named, and
+the refusal is written as a `denied` `crypto.ca.certificates.view` row. A served page is
+written as a `success` row (target `inventory`, detail `inventory rows=<n> limit=<n>
+offset=<n> has_more=<bool>`), set-and-proceed: if the row cannot be written the page is
+still served, with `Sec-Audit-Failed: true` and `audit_persisted: false` in the body. The
+confinement check failing is `503` + `retry_after_ms: 5000` (`access check unavailable`),
+and a server built without it is `503` with no `retry_after_ms`
+(`certificate list unavailable`).
+
 `meta.has_more` is `true` when more rows exist beyond the current page; when it is,
 `meta.next_offset` carries the `offset` to pass for the next page. Iterate until
 `has_more` is `false` (do **not** infer end-of-list from `count < limit`).
@@ -2433,8 +2444,8 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 the walk's `as_of`, so every page is measured against the same time and starts strictly after
 that certificate: a certificate revoked between pages never makes the walk skip another (an
 offset would). `next_cursor` is `null` on the last page. Order: expiring soonest first, expired and revoked most recent first, the
-rest newest-issued first. Every filtered call is audited `crypto.ca.certificates.view`
-(set-and-proceed: `audit_persisted: false` in the body and `Sec-Audit-Failed: true` when the row
+rest newest-issued first. Every filtered call is audited `crypto.ca.certificates.view`, as
+is every unfiltered call (set-and-proceed: `audit_persisted: false` in the body and `Sec-Audit-Failed: true` when the row
 is lost; a confined refusal is a `denied` row). Errors: `400` (each malformed parameter, named),
 `401`, `403` (no `Security:Read`, or a confined caller), `503` + `retry_after_ms: 5000` (`Yuzu CA
 read degraded`, `crypto read capacity in use; retry`, or `access check unavailable`; never an

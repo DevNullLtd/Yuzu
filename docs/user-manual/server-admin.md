@@ -3116,7 +3116,9 @@ than *Current*.
 When the server runs its built-in CA, **Settings → Certificates and secrets**
 (or **Settings → Internal CA** on the Settings page) lists the newest 500
 issued certificates; for an older one, find its serial with
-`GET /api/v1/ca/issued?offset=` and revoke it with `POST /api/v1/ca/revoke`. To revoke one (e.g. a decommissioned or compromised agent):
+`GET /api/v1/ca/issued?offset=` and revoke it with `POST /api/v1/ca/revoke`. A caller whose
+view of the fleet is confined (management-group confinement) sees a note in place of the list,
+in the panel and on that route alike. To revoke one (e.g. a decommissioned or compromised agent):
 
 1. Find the agent's row in the inventory (match on **Subject** = `agent_id` or
    the **Serial**).

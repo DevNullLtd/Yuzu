@@ -2,6 +2,17 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: a confined operator is refused the unfiltered issued-certificate list
+
+**What changed.** `GET /api/v1/ca/issued` without a filter parameter, the MCP tool `list_issued_certs` without filter arguments, and the list in the Settings certificate panel now apply the confinement check the filtered form already used. A caller whose view of the fleet is confined (management-group confinement) gets `403` (MCP: permission denied) with no permission named, and the panel shows a note in place of the list. If the check cannot be made the answer is `503` with `retry_after_ms: 5000`. Both forms of the route and the tool are now audited `crypto.ca.certificates.view` with target `inventory`, set-and-proceed.
+
+**Who is affected.** A confined operator or agentic worker that holds `Security:Read` (the seeded Viewer role does) and listed the CA inventory, and anyone who relied on that call being unaudited.
+
+**What to check.**
+
+- A confined caller that needs the inventory must be given an unconfined view, or use an unconfined account.
+- A SIEM rule or report that counts `crypto.ca.certificates.view` rows now sees one per inventory page as well as one per filtered page.
+
 ## Behaviour change: the Windows agent installer passes the enrollment token by file
 
 **What changed.** The Windows agent installer no longer puts the enrollment token on the
@@ -782,10 +793,10 @@ devices.
   by MCP `list_issued_certs` with the same arguments. A filtered list pages by **keyset cursor**
   (`next_cursor`, `null` on the last page), never by `offset` (refused with a filter), so a
   certificate revoked between pages never shifts another out of the walk; a pinned `as_of` is
-  checked against the database clock. Without those parameters both behave exactly as before,
-  `offset` paging included, and the unfiltered list still returns every row to any
-  `Security:Read` holder. Filtered calls are audited `crypto.ca.certificates.view`; unfiltered
-  calls are still not audited.
+  checked against the database clock. Without those parameters both list the inventory with
+  `offset` paging, as before. Both forms are withheld from a confined caller and audited
+  `crypto.ca.certificates.view`; the unfiltered list used to return every row to a confined
+  `Security:Read` holder and was not audited.
 - **New REST routes and MCP tools.** `GET /api/v1/crypto/widgets`, `GET`/`PUT
   /api/v1/crypto/dashboard/layout` and `GET /api/v1/crypto/ca/stats`; MCP `list_crypto_widgets`,
   `get_crypto_dashboard_layout`, `set_crypto_dashboard_layout` (annotated destructive: it
