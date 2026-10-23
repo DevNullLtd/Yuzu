@@ -624,6 +624,29 @@ TEST_CASE("registry write: no WOW64 view flag is passed and a literal Wow6432Nod
     CHECK_FALSE(key_exists(HKEY_LOCAL_MACHINE, "SOFTWARE\\Wow6432Node\\" + scratch_name() + "-wow-plain"));
 }
 
+TEST_CASE("registry write: a non-ASCII key and value name reach the registry as UTF-16 text",
+          "[registry][windows][write]") {
+    // The plugin converts ASCII names through a stack buffer and every other name through the full UTF-8 to
+    // UTF-16 conversion. A name with a two-byte UTF-8 character must land as ONE UTF-16 code unit, not as two
+    // widened bytes.
+    Plugin p;
+    if (!p.ok()) { skip_or_fail("registry.dll not found"); return; }
+    ScratchTree cleanup{HKEY_CURRENT_USER, "Software\\" + scratch_name()};
+    const std::string key = "Software\\" + scratch_name() + "\\caf\xC3\xA9";
+    const auto out = p.run("set_value", {{"hive", "HKCU"}, {"key", key}, {"name", "n\xC3\xA9"}, {"type", "REG_DWORD"}, {"value", "7"}});
+    CHECK(out.rc == 0);
+    CHECK(out.has("status|ok"));
+    yuzu::win::RegKey k;
+    const std::wstring wkey = L"Software\\" + widen(scratch_name()) + L"\\caf\u00e9";
+    REQUIRE(RegOpenKeyExW(HKEY_CURRENT_USER, wkey.c_str(), 0, KEY_QUERY_VALUE, k.put()) == ERROR_SUCCESS);
+    DWORD type = 0, got = 4;
+    std::uint8_t data[4] = {};
+    REQUIRE(RegQueryValueExW(k.get(), L"n\u00e9", nullptr, &type, data, &got) == ERROR_SUCCESS);
+    CHECK(type == REG_DWORD);
+    CHECK(got == 4);
+    CHECK(data[0] == 7);
+}
+
 #else // !_WIN32
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -768,29 +791,6 @@ TEST_CASE("registry plugin: off Windows a read answers the sentinel with rc 0 an
         REQUIRE(rows.size() == 1);
         CHECK(rows[0] == "error|unknown action: get_vaule");
     }
-}
-
-TEST_CASE("registry write: a non-ASCII key and value name reach the registry as UTF-16 text",
-          "[registry][windows][write]") {
-    // The plugin converts ASCII names through a stack buffer and every other name through the full UTF-8 to
-    // UTF-16 conversion. A name with a two-byte UTF-8 character must land as ONE UTF-16 code unit, not as two
-    // widened bytes.
-    Plugin p;
-    if (!p.ok()) { skip_or_fail("registry.dll not found"); return; }
-    ScratchTree cleanup{HKEY_CURRENT_USER, "Software\\" + scratch_name()};
-    const std::string key = "Software\\" + scratch_name() + "\\caf\xC3\xA9";
-    const auto out = p.run("set_value", {{"hive", "HKCU"}, {"key", key}, {"name", "n\xC3\xA9"}, {"type", "REG_DWORD"}, {"value", "7"}});
-    CHECK(out.rc == 0);
-    CHECK(out.has("status|ok"));
-    yuzu::win::RegKey k;
-    const std::wstring wkey = L"Software\\" + widen(scratch_name()) + L"\\caf\u00e9";
-    REQUIRE(RegOpenKeyExW(HKEY_CURRENT_USER, wkey.c_str(), 0, KEY_QUERY_VALUE, k.put()) == ERROR_SUCCESS);
-    DWORD type = 0, got = 4;
-    std::uint8_t data[4] = {};
-    REQUIRE(RegQueryValueExW(k.get(), L"n\u00e9", nullptr, &type, data, &got) == ERROR_SUCCESS);
-    CHECK(type == REG_DWORD);
-    CHECK(got == 4);
-    CHECK(data[0] == 7);
 }
 
 #endif // _WIN32

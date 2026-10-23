@@ -69,7 +69,9 @@ struct Node {
 /// (the walk always passes REG_OPTION_OPEN_LINK), while `open_path` resolves a whole path the way
 /// RegOpenKeyExW does -- an intermediate link is FOLLOWED to its target, a link at the leaf is opened as the
 /// link object -- and `final_name` is the canonical name of the object the handle is bound to. A plain key may
-/// carry a VALUE named SymbolicLinkValue; the probe cannot tell that from a link.
+/// carry a VALUE named SymbolicLinkValue; the probe cannot tell that from a link. A relative open or create from
+/// a handle whose key has BECOME a link (a test hook completes it) is followed to the link's target, so the
+/// walk's check-to-use race is expressible.
 class FakeRegistry final : public RegistryWriter {
 public:
     static constexpr Handle kRoot = 1;
@@ -154,11 +156,11 @@ public:
         log.push_back(ev);
         long rc = 0;
         if (const auto inj = take(ev)) rc = *inj;
-        const auto p = node(parent);
         NodeP child;
         if (rc == 0) {
-            if (!p || p->deleted) rc = 1018;
-            else if (const auto it = p->subkeys.find(std::string{name}); it == p->subkeys.end()) rc = 2;
+            const auto base = children_of(node(parent));
+            if (base.rc != 0) rc = base.rc;
+            else if (const auto it = base.node->subkeys.find(std::string{name}); it == base.node->subkeys.end()) rc = 2;
             else if (it->second->deny_open) rc = 5;
             else child = it->second;
         }
@@ -207,10 +209,14 @@ public:
         if (before) before(ev);
         long rc = 0;
         if (const auto inj = take(ev)) rc = *inj;
-        const auto p = node(parent);
-        if (rc == 0 && (!p || p->deleted)) rc = 1018;
-        if (rc == 0 && p->deny_create) rc = 5;
+        Resolved base;
         if (rc == 0) {
+            base = children_of(node(parent));
+            rc = base.rc;
+        }
+        if (rc == 0 && base.node->deny_create) rc = 5;
+        if (rc == 0) {
+            const auto p = base.node;
             const auto it = p->subkeys.find(std::string{name});
             if (it == p->subkeys.end()) {
                 auto n = std::make_shared<Node>();
@@ -324,6 +330,15 @@ private:
             cur = child;
         }
         return {0, cur};
+    }
+    /// The node whose children a relative open or create from the handle bound to `p` sees. A key that has
+    /// become a link (completed after the handle was opened) is FOLLOWED to its target, the way the kernel
+    /// parses a name below a link object; a dangling link is not-found. Any other node is its own.
+    Resolved children_of(const NodeP& p) const {
+        if (!p || p->deleted) return {1018, nullptr};
+        if (!p->is_link) return {0, p};
+        if (p->link_target.empty()) return {2, nullptr};
+        return resolve(root, p->link_target, false, 1);
     }
     long do_query(Handle key_h, std::string_view name, std::size_t cap, QueryResult& out) {
         const auto n = node(key_h);
@@ -569,13 +584,13 @@ TEST_CASE("registry core: check-to-use -- a component swapped for a link after t
     FakeRegistry reg;
     const NodeP original_b = reg.key("A\\B");
     reg.key("Elsewhere\\Target");
-    int probes = 0;
-    // The walk probes A then B; the fast open probes only the leaf B. The instant B has been probed plain --
-    // the check is finished, the use has not started -- B's tree entry becomes a link, exactly the swap a
-    // path-based mutation would follow.
-    const int leaf_probe = fast ? 1 : 2;
+    int captures = 0;
+    // Both opens finish their checks before the previous-value capture (the walk's probes and kernel-name test,
+    // the fast open's name compare and leaf probe). The instant the capture has been read -- the check is
+    // finished, the use has not started -- B's tree entry becomes a link, exactly the swap a path-based
+    // mutation would follow.
     reg.after = [&](const std::string& ev) {
-        if (ev == "query_value:SymbolicLinkValue" && ++probes == leaf_probe) {
+        if (ev == "query_value:V" && ++captures == 1) {
             auto link = std::make_shared<Node>();
             link->is_link = true;
             link->link_target = "Elsewhere\\Target";
@@ -596,6 +611,146 @@ TEST_CASE("registry core: check-to-use -- a component swapped for a link after t
     CHECK(std::none_of(set_pos, reg.log.end(), [](const std::string& l) {
         return l.rfind("open_sub", 0) == 0 || l.rfind("open_path", 0) == 0 || l.rfind("create_sub", 0) == 0;
     }));
+}
+
+// The walk's last test (open_checked / leaf_name_check): the leaf handle's kernel name must be the first
+// component's name plus the remaining requested components. These run the WALK (fast_eligible false) because the
+// probes it makes cannot see a link completed, or a component moved, AFTER the probe. Every REFUSAL assertion
+// below is a mutant sentinel: with the check dropped (or a failed name read accepted) the write lands on the
+// object the handle follows -- the decoy, or the parked key -- and the case turns red.
+TEST_CASE("registry core: the walk refuses a leaf whose kernel name is not the requested path",
+          "[registry][core][walk_identity]") {
+    SECTION("a component completed into a link after its probe: the next relative open follows it to the decoy") {
+        for (const int which : {1, 2}) { // 1: the first component A, 2: the intermediate component B
+            INFO("component " << which);
+            FakeRegistry reg;
+            const NodeP a = reg.key("A");
+            const NodeP b = reg.key("A\\B");
+            reg.key("A\\B\\C");
+            reg.put("Decoy\\B\\C", "Marker", kRegDword, dword(0xDEC0));
+            int probes = 0;
+            // The walk probes A, B, C in turn. A link is made in two steps (the key, then its SymbolicLinkValue),
+            // so the probe of component `which` saw a plain key and the value lands right after it.
+            reg.after = [&](const std::string& ev) {
+                if (ev == "query_value:SymbolicLinkValue" && ++probes == which) {
+                    const NodeP n = which == 1 ? a : b;
+                    n->is_link = true;
+                    n->link_target = which == 1 ? "Decoy" : "Decoy\\B";
+                }
+            };
+            const auto o = set_value_verified(reg, FakeRegistry::kRoot, "A\\B\\C", "V", kRegDword, dword(7), false);
+            CHECK(o.result == "refused");
+            CHECK(o.reason == "key_is_link");
+            CHECK_FALSE(o.mutated);
+            CHECK(reg.calls("set_value") == 0); // nothing was written anywhere
+            CHECK(reg.get("Decoy\\B\\C", "V") == nullptr);
+            REQUIRE(reg.get("Decoy\\B\\C", "Marker") != nullptr);
+            CHECK(reg.get("Decoy\\B\\C", "Marker")->data == dword(0xDEC0));
+            CHECK(reg.get("A\\B\\C", "V") == nullptr);
+            CHECK(reg.method_calls("final_name") == 2); // the first component's name and the leaf's
+        }
+    }
+    SECTION("a component moved by a rename after its probe: the handle follows the object, not the path") {
+        // NtRenameKey moves the object a handle is bound to without touching the handle. The real B goes to
+        // A\Parked and a prepared link to the decoy takes its name; the walk's handle still opens C beneath the
+        // moved object, and only its kernel name (A\Parked\C, not A\B\C) shows it.
+        FakeRegistry reg;
+        const NodeP a = reg.key("A");
+        reg.put("A\\B\\C", "Marker", kRegDword, dword(0xD0));
+        reg.put("Decoy", "Marker", kRegDword, dword(0xDEC0));
+        int probes = 0;
+        reg.after = [&](const std::string& ev) {
+            if (ev == "query_value:SymbolicLinkValue" && ++probes == 2) {
+                a->subkeys["Parked"] = a->subkeys["B"];
+                auto link = std::make_shared<Node>();
+                link->is_link = true;
+                link->link_target = "Decoy";
+                a->subkeys["B"] = link;
+            }
+        };
+        const auto o = set_value_verified(reg, FakeRegistry::kRoot, "A\\B\\C", "V", kRegDword, dword(7), false);
+        CHECK(o.result == "refused");
+        CHECK(o.reason == "key_is_link");
+        CHECK(reg.calls("set_value") == 0);
+        CHECK(reg.get("A\\Parked\\C", "V") == nullptr);
+        CHECK(reg.get("A\\Parked\\C", "Marker")->data == dword(0xD0));
+        CHECK(reg.get("Decoy", "V") == nullptr);
+    }
+    SECTION("the create path: the parent completed into a link just before create_sub") {
+        FakeRegistry reg;
+        const NodeP top = reg.key("Top");
+        reg.put("Decoy", "Marker", kRegDword, dword(0xDEC0));
+        reg.before = [&](const std::string& ev) {
+            if (ev == "create_sub:A") {
+                top->is_link = true;
+                top->link_target = "Decoy";
+            }
+        };
+        const auto o = set_value_verified(reg, FakeRegistry::kRoot, "Top\\A\\B", "V", kRegDword, dword(7), false);
+        CHECK(o.reason == "key_is_link");
+        CHECK(o.result == "failed"); // A and B were created beneath the decoy before the name could be read
+        CHECK(o.created == 2);
+        CHECK(reg.calls("set_value") == 0); // but the value is not written
+        CHECK(reg.get("Decoy\\A\\B", "V") == nullptr);
+        CHECK(reg.get("Decoy", "Marker")->data == dword(0xDEC0));
+    }
+    SECTION("a legitimate walk is accepted, case variants and a leaf link for delete_key included") {
+        FakeRegistry reg;
+        reg.put("Software\\Acme\\Deep", "V", kRegDword, dword(1));
+        reg.link("Software\\L", "Software\\Acme");
+        for (const std::string request : {"Software\\Acme\\Deep", "SOFTWARE\\acme\\DEEP", "software\\ACME\\deep"}) {
+            INFO(request);
+            const Opened o = open_checked(reg, FakeRegistry::kRoot, request, kKeySetValue, false);
+            CHECK(o.error.empty());
+            CHECK_FALSE(o.fast);
+            CHECK(o.leaf.get() != 0);
+        }
+        const Opened link = open_checked(reg, FakeRegistry::kRoot, "software\\l", kKeySetValue, false, true);
+        CHECK(link.error.empty()); // the link object itself: its own name is the requested one
+    }
+}
+
+TEST_CASE("registry core: leaf_name_check compares the kernel names with an ASCII-only fold",
+          "[registry][core][walk_identity]") {
+    FakeRegistry reg;
+    reg.key("Soft\\Caf\xC3\xA9");
+    Handle h = 0;
+    REQUIRE(reg.open_path(FakeRegistry::kRoot, "Soft\\Caf\xC3\xA9", kKeyQueryValue, h) == 0);
+    const Owned leaf{reg, h};
+    const std::string first = "\\REGISTRY\\MACHINE\\Soft";
+    CHECK(leaf_name_check(reg, h, first, split_key("Soft\\Caf\xC3\xA9")).empty());
+    CHECK(leaf_name_check(reg, h, first, split_key("SOFT\\CAF\xC3\xA9")).empty()); // A-Z fold; the first part is the kernel's
+    // A difference outside ASCII is a different name to this compare: refused (README caveat 1), never accepted.
+    CHECK(leaf_name_check(reg, h, first, split_key("Soft\\Caf\xC3\x89")) == "key_is_link");
+    CHECK(leaf_name_check(reg, h, first, split_key("Soft\\Other")) == "key_is_link");
+    CHECK(leaf_name_check(reg, h, first, split_key("Soft")) == "key_is_link"); // a shorter requested path
+    reg.inject["final_name"] = 5;
+    CHECK(leaf_name_check(reg, h, first, split_key("Soft\\Caf\xC3\xA9")) == "access_denied");
+}
+
+TEST_CASE("registry core: a walk whose handle cannot be named refuses and holds nothing", "[registry][core][walk_identity]") {
+    SECTION("the first component's name cannot be read: refused before any probe") {
+        FakeRegistry reg;
+        reg.key("A\\B");
+        reg.inject["final_name"] = 5;
+        const auto o = set_value_verified(reg, FakeRegistry::kRoot, "A\\B", "V", kRegDword, dword(1), false);
+        CHECK(o.result == "refused");
+        CHECK(o.reason == "access_denied");
+        CHECK(reg.method_calls("query_value") == 0);
+        CHECK(reg.calls("set_value") == 0);
+    }
+    SECTION("the leaf's name cannot be read: refused, the unexpected code keeps its number") {
+        FakeRegistry reg;
+        reg.key("A\\B");
+        reg.after = [&](const std::string& ev) { // the first probe is after the first name read
+            if (ev == "query_value:SymbolicLinkValue" && reg.inject.empty()) reg.inject["final_name"] = 1450;
+        };
+        const auto o = set_value_verified(reg, FakeRegistry::kRoot, "A\\B", "V", kRegDword, dword(1), false);
+        CHECK(o.result == "refused");
+        CHECK(o.reason == "win32:1450");
+        CHECK(reg.calls("set_value") == 0);
+        CHECK(reg.get("A\\B", "V") == nullptr);
+    }
 }
 
 TEST_CASE("registry core: a missing suffix is created component-wise from the checked handle",
@@ -1434,6 +1589,11 @@ TEST_CASE("registry core: fast set_value issues a fixed number of seam calls at 
                 CHECK(reg.method_calls("create_sub") == 0);
                 CHECK(reg.method_calls("open_path") == 1);
                 CHECK(reg.method_calls("final_name") == 1);
+            } else {
+                // The walk's name test costs two final_name calls whatever the depth: the first component's and the
+                // leaf's (a depth-1 path reads the same handle twice).
+                CHECK(reg.method_calls("open_path") == 0);
+                CHECK(reg.method_calls("final_name") == 2);
             }
         }
     }
@@ -1484,7 +1644,7 @@ TEST_CASE("registry core: the walk is taken only for a missing key a name mismat
         const auto o = set_value_verified(reg, FakeRegistry::kRoot, "Software\\Acme", "V", kRegDword, dword(2), false);
         REQUIRE(o.ok());
         CHECK(reg.method_calls("open_path") == 0);
-        CHECK(reg.method_calls("final_name") == 0);
+        CHECK(reg.method_calls("final_name") == 2); // the walk's own name test, none from the fast open
         CHECK(reg.method_calls("root_name") == 0);
         CHECK(reg.method_calls("open_sub") == 2); // Software, then Acme
     }
@@ -1495,6 +1655,7 @@ TEST_CASE("registry core: the walk is taken only for a missing key a name mismat
         REQUIRE(o.ok());
         CHECK(reg.method_calls("root_name") == 1);
         CHECK(reg.method_calls("open_path") == 0);
+        CHECK(reg.method_calls("final_name") == 2); // the walk names its own handles; the root needs no name
         CHECK(reg.method_calls("open_sub") == 2);
     }
     SECTION("an empty component is refused by the walk before any call") {

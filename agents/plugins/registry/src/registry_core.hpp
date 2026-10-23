@@ -12,7 +12,13 @@
  *
  *  - the WALK (the reference, and the only path that produces a verdict token or creates a key): the path
  *    component by component, each opened from the previous HANDLE with REG_OPTION_OPEN_LINK and probed for
- *    `SymbolicLinkValue` (a hit refuses `key_is_link`).
+ *    `SymbolicLinkValue` (a hit refuses `key_is_link`). The probes alone leave a window: a link is made in two
+ *    steps (the key, then its `SymbolicLinkValue`), so one completed after its probe is followed by the next
+ *    relative open, and a component renamed away leaves the handle bound to the object at its new name. The
+ *    walk therefore ends on the fast open's own test: the canonical name of the leaf handle has to equal the
+ *    canonical name of the FIRST component's handle (read right after that open, before its probe) plus the
+ *    remaining requested components, ASCII case-insensitively, else `key_is_link`; a name that cannot be read
+ *    refuses with its win32 token. One derivation serves every hive, HKCU and HKCR included.
  *  - the FAST open (open_fast; HKLM and HKU only): ONE open_path of the whole path with REG_OPTION_OPEN_LINK,
  *    then final_name -- the kernel's canonical name of the object the handle is bound to -- is compared
  *    with `<root kernel name>\<requested path>` (ASCII case-insensitively, every other byte exactly) and the
@@ -32,7 +38,13 @@
  *       key_is_link on any successful query whatever the value's type, so the walk refuses, the fast open
  *       accepts.
  * A decoy on the LEAF is refused on both paths (the same probe). A non-ASCII case variant, a failed or
- * overflowing final_name and a failed root_name all fall back to the walk. No handle outlives one command.
+ * overflowing final_name and a failed root_name all fall back to the walk (which refuses the non-ASCII variant
+ * after the first component, its own name test using the same ASCII-only fold). No handle outlives one command.
+ *
+ * The walk's ACCEPT carries the same kind of guarantee (see its bullet): the leaf handle's kernel name is the
+ * first component's name plus the remaining requested components, so a link completed after its probe, or a
+ * component moved by a rename, refuses `key_is_link` instead of landing the write on the object it now reaches.
+ * A same-path substitution (a plain key recreated at the requested name) is not a redirect and stays out of scope.
  */
 
 #include <algorithm>
@@ -223,8 +235,8 @@ struct Opened {
 };
 
 /// Equal byte for byte except that A-Z fold to a-z: a strict subset of the kernel's case folding, so it never
-/// equates two names the kernel keeps distinct. A name that differs only in non-ASCII case compares unequal
-/// and the caller takes the walk.
+/// equates two names the kernel keeps distinct. A name that differs only in non-ASCII case compares unequal:
+/// the fast open declines and the walk's own name test (leaf_name_check) refuses it.
 [[nodiscard]] inline bool names_equal_ascii_ci(std::string_view a, std::string_view b) {
     const auto fold = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; };
     return std::equal(a.begin(), a.end(), b.begin(), b.end(), [&](char x, char y) { return fold(x) == fold(y); });
@@ -257,6 +269,22 @@ struct Opened {
     return out;
 }
 
+/// The walk's last test (see the file banner): "" when the canonical name of the leaf handle equals `first_name`
+/// (the canonical name of the first component's handle) plus the remaining requested components, ASCII
+/// case-insensitively; key_is_link when it does not (a link resolved mid-walk, or a component moved); win32:<n> /
+/// access_denied when the leaf's name cannot be read (a handle that cannot be identified is never accepted).
+[[nodiscard]] inline std::string leaf_name_check(RegistryWriter& reg, Handle leaf, std::string_view first_name,
+                                                 const std::vector<std::string_view>& parts) {
+    std::string actual;
+    if (const long rc = reg.final_name(leaf, actual); rc != kErrorSuccess) return rc_token(rc, Missing::key);
+    std::string expected{first_name};
+    for (std::size_t i = 1; i < parts.size(); ++i) {
+        expected += '\\';
+        expected += parts[i];
+    }
+    return names_equal_ascii_ci(expected, actual) ? std::string{} : std::string{kTokKeyIsLink};
+}
+
 /// See the file banner. `leaf_access` always gains KEY_QUERY_VALUE (the link probe needs it).
 /// `leaf_may_be_link` (delete_key only): the handle opened with REG_OPTION_OPEN_LINK IS the link object,
 /// so NtDeleteKey on it removes the link, never its target. A creating op refuses a component missing
@@ -278,6 +306,15 @@ struct Opened {
     const std::uint32_t inter_access = kKeyQueryValue | (create ? kKeyCreateSubKey : 0);
     Owned cur{reg};
     Handle parent = root;
+    std::string first_name; // the canonical name of the first component's handle, read right after its open
+    // Hands the leaf over only when its kernel name is the requested path (leaf_name_check); `cur` closes it otherwise.
+    const auto hand_over = [&]() -> Opened {
+        if (auto why = leaf_name_check(reg, cur.get(), first_name, parts); !why.empty())
+            out.error = std::move(why);
+        else
+            out.leaf = std::move(cur);
+        return std::move(out);
+    };
     for (std::size_t i = 0; i < parts.size(); ++i) {
         const bool last = i + 1 == parts.size();
         Handle next = 0;
@@ -313,14 +350,18 @@ struct Opened {
                 cur = std::move(made_h); // closes the previous (checked) parent after the child exists
                 parent = cur.get();
             }
-            out.leaf = std::move(cur);
-            return out;
+            return hand_over();
         }
         if (rc != kErrorSuccess) {
             out.error = rc_token(rc, Missing::key);
             return out;
         }
         Owned opened{reg, next};
+        if (i == 0) // before the probe: no later swap can move what this names
+            if (const long nrc = reg.final_name(next, first_name); nrc != kErrorSuccess) {
+                out.error = rc_token(nrc, Missing::key);
+                return out;
+            }
         if (!(last && leaf_may_be_link)) {
             if (auto link = probe_link(reg, next); !link.empty()) {
                 out.error = std::move(link);
@@ -330,8 +371,7 @@ struct Opened {
         cur = std::move(opened); // closes the previous parent
         parent = cur.get();
     }
-    out.leaf = std::move(cur);
-    return out;
+    return hand_over();
 }
 
 // ── previous-value capture ───────────────────────────────────────────────
