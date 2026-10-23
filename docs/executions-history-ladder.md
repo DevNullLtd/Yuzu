@@ -269,10 +269,11 @@ is sticky), so that text is reduced again for a Forensics execution before it re
 `running` frame therefore cannot republish a pre-upgrade raw value. An unwired tracker (a test harness only; production
 boot refuses an unwired plugin set) publishes the text as stored. The durable event outbox (24 hours; other replicas re-publish its rows onto their own stream) is
 not reduced on read, so text written by a replica that predates the change can reach another
-replica's stream until it expires. The live `output` event stream publishes no
-Forensics-tier row; for a Forensics-tier action it carries one constant notice row in place of the Console's
-"Waiting for results..." placeholder ("Forensics output is not shown live. Open the execution results."), and
-nothing at all when the plugin set is unwired or the frame carries no output.
+replica's stream until it expires. The live `output` event stream publishes nothing for a
+Forensics-tier frame: no row and no notice, because a notice would itself be an event every subscriber of the
+shared stream could see. It likewise publishes nothing when the plugin set is unwired or the frame carries no
+output. The dashboard Console therefore stays on "Waiting for results..." for such an action; read the rows
+through the execution results (Executions page), which apply the tier.
 
 **Audit.** A read that serves at least one Forensics-tier row writes one `response.forensics.read`
 row (`forensics_rows=<n> plugins=<names> surface=<s>`), on the row-returning surfaces only; see
