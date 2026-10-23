@@ -1,6 +1,11 @@
 #include "rate_limiter.hpp"
 
+#include "rest_a4_envelope_http.hpp"
+
+#include <httplib.h>
+
 #include <algorithm>
+#include <cstdint>
 
 namespace yuzu::server {
 
@@ -49,6 +54,17 @@ void RateLimiter::purge_stale() {
 size_t RateLimiter::bucket_count() const {
     std::lock_guard lock(mu_);
     return buckets_.size();
+}
+
+void write_rate_limited_response(httplib::Response& res) {
+    res.status = 429;
+    res.set_header("Retry-After", "1");
+    // The A4 envelope: `correlation_id` is the one carried in `X-Correlation-Id` (minted here
+    // when no upstream gate set it), and `retry_after_ms` agrees with the `Retry-After` header.
+    res.set_content(detail::error_json_a4(429, "rate limit exceeded",
+                                          detail::ensure_correlation_id(res),
+                                          std::int64_t{1000}, {}),
+                    "application/json");
 }
 
 } // namespace yuzu::server
