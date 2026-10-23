@@ -770,6 +770,19 @@ MUTATIONS = [
 
 # --- positive cases: must stay clean -----------------------------------------------------------
 
+# The step-up stage is wired into the server (the branch that adds `run_pre_request_stage(` has
+# merged). Three positives below insert tokens that the real file already carries once, and the
+# gate (checks 8 and 9) allows each of them exactly once, so on a wired tree they normalise the
+# existing occurrence first; a second pre_request registration is no longer harmless there and
+# moves to the mutation rows. On a tree without the stage the original insertions apply as-is.
+STEP_UP_WIRED = "run_pre_request_stage(" in SERVER_CPP.read_text(encoding="utf-8")
+
+
+def without_clear_step_up_pass(src):
+    """`src` minus any statement line `[detail::]clear_step_up_pass();` (comments untouched)."""
+    return re.sub(r"^[ \t]*(?:detail::)?clear_step_up_pass\(\);[ \t]*\n", "", src, flags=re.M)
+
+
 def p_second_pre_request_handler_registration(s):
     return insert_before(s, PRE_ROUTING,
                          "web_server_->set_pre_request_handler([](const httplib::Request&, "
@@ -787,14 +800,19 @@ def p_literals_and_comments_with_tokens(s):
 
 
 def p_optional_clear_step_up_pass_at_top(s):
-    return insert_after(s, TOP_RESET, "clear_step_up_pass();\n")
+    return insert_after(without_clear_step_up_pass(s), TOP_RESET, "clear_step_up_pass();\n")
 
 
 def p_qualified_clear_step_up_pass_at_top(s):
-    return insert_after(s, TOP_RESET, "detail::clear_step_up_pass();\n")
+    return insert_after(without_clear_step_up_pass(s), TOP_RESET,
+                        "detail::clear_step_up_pass();\n")
 
 
 def p_stage_inside_pre_request_handler(s):
+    if "run_pre_request_stage(" in s:
+        # Already wired: the single occurrence is the pinned one; vary its spelling instead.
+        assert s.count("detail::run_pre_request_stage(") == 1, "stage spelling changed (stale)"
+        return s.replace("detail::run_pre_request_stage(", "run_pre_request_stage(", 1)
     at = lambda_open_brace(s, PRE_REQUEST)
     return s[:at + 1] + "\nrun_pre_request_stage(req, res, kNone);\n" + s[at + 1:]
 
@@ -851,7 +869,6 @@ for _pre in PREFIXES:
 
 
 POSITIVES = [
-    ("second pre_request handler registration", p_second_pre_request_handler_registration),
     ("literals and comments carrying pinned tokens", p_literals_and_comments_with_tokens),
     ("optional clear_step_up_pass at the top", p_optional_clear_step_up_pass_at_top),
     ("qualified clear_step_up_pass at the top", p_qualified_clear_step_up_pass_at_top),
@@ -866,6 +883,14 @@ POSITIVES = [
     ("prefixed raw string carrying the gate text", p_prefixed_raw_string),
 ] + PREFIX_POSITIVES
 
+if STEP_UP_WIRED:
+    MUTATIONS.append(("second pre_request handler registration (the stage is wired)",
+                      p_second_pre_request_handler_registration,
+                      "set_pre_request_handler( is not registered exactly once"))
+else:
+    POSITIVES.insert(0, ("second pre_request handler registration",
+                         p_second_pre_request_handler_registration))
+
 
 # Rows that must also fail on the COMPLETE file: file-level counts and registrations, the include,
 # the step-up registration elsewhere in the file, the audit-sink declaration far from the lambda,
@@ -879,6 +904,7 @@ FULL_FILE_ROWS = {
     "raw-string splice desync", "splice through a form feed",
     "u8 char desync at the top of the lambda", "#define Handled Unhandled",
     "registration receiver swapped to another server", "registration inside a runtime if block",
+    "second pre_request handler registration (the stage is wired)",
 }
 FULL_FILE_POSITIVES = {
     "macro that names nothing the lambda uses", "digit separators at the top of the lambda",

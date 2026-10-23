@@ -3,7 +3,8 @@
 Status: **PR 1 + PR 2 + PR 3 of 3 shipped (v0.13+), plus the at-rest
 encryption follow-up SHIPPED (2026-07-16)** — self-service
 enrollment, login challenge, recovery codes (PR 1); step-up on 11
-high-risk REST + Settings surfaces (PR 2); OIDC `amr` short-circuit plus
+high-risk REST + Settings surfaces (PR 2; since extended to 36 mutating
+routes, 36 enforced at one chokepoint, see "Step-up chokepoint" below); OIDC `amr` short-circuit plus
 enforcement modes (`admin-only` / `required`) with login-time enrollment
 bootstrap (PR 3). The MFA ladder is complete. `mfa_totp_secret` at-rest
 encryption landed as part of the `AuthDB`/`ScimStore` ADR-0006 Postgres
@@ -362,6 +363,28 @@ has nothing to evaluate. Guardian rule **delete** took its place in the
 high-risk set during PR 2 governance (removing a remediation rule is as
 destructive as updating one), keeping the count at eleven.
 
+### Step-up chokepoint (update)
+
+The eleven-site count above describes PR 2. The gated set has since grown
+(engine-principal, RBAC assignment and enforcement toggle, password reset,
+unlock, Guardian guard update / delete, MFA recovery-code regeneration and
+MFA disable, and others) to 39 mutating routes, 36 enforced by one
+chokepoint and three, the JIT-elevation routes, by their own stricter
+handler gate. Other mutating routes (73 REST rows are still
+`kPendingRuling`) and all MCP tools are not MFA-step-up gated in this
+release. The decision no longer lives only in each handler:
+`step_up_policy.hpp`'s `kStepUpPolicy` classifies every mutating route by its
+exact `(method, registered pattern)`, and the pre-request stage
+(`run_pre_request_stage` in `step_up_wiring.hpp`, installed by `server.cpp`)
+evaluates it before any handler runs. The gate's decision tree is unchanged;
+only where it is invoked, the order relative to the handler's authorization
+and its own CSRF copy (step-up first; for a cookie session the server-wide
+same-site gate in pre-routing answers a cross-site write before the step-up
+check), the `403` for an engine principal, and the
+fail-closed `503` for an unwired authentication store (any caller) or an
+unreadable one (local sessions) are new. The full description is in
+`docs/auth-architecture.md` "MFA step-up chokepoint".
+
 ---
 
 ## Enforcement modes (PR 3 — shipped)
@@ -554,7 +577,7 @@ Every transition writes to `AuditStore` via `AuthRoutes::audit_log`
 |---|---|
 | `mfa.enroll.initiated` | `POST /api/settings/mfa/init` — secret generated |
 | `mfa.enroll.required` | `POST /login` blocked an un-enrolled login under enforcement and issued an enrollment-pending token (PR 3) |
-| `mfa.enroll.verified` | `POST /api/settings/mfa/verify` or `POST /login/mfa/enroll` — first code accepted |
+| `mfa.enroll.verified` | `POST /api/settings/mfa/verify` or `POST /login/mfa/enroll`: first code accepted. A Settings confirm also stamps a step-up proof on the confirming session; the detail is `step_up_proof=stamped`, or `step_up_proof=not_stamped` when the session could not be stamped (bearer principal, absent or mismatched cookie, or a store failure) |
 | `mfa.enroll.failed` | First code rejected (Settings or login bootstrap); or, detail `credential_changed` (#5342 F4), an enrolment write — Settings init/verify, the `POST /login` bootstrap init, or `POST /login/mfa/enroll` — found the account's password changed since its credential anchor was established (nothing revealed, written or enrolled) |
 | `mfa.enroll.race` | Result `ok` — a concurrent verify already resolved enrollment; the benign loser, kept out of the `mfa.enroll.failed` bad-code population (#3777, CC7.2) |
 | `mfa.disabled` | `POST /api/settings/mfa/disable` (`ok` + `sessions_ended=<n>`; `ok` + `no verified factor to clear` when an unfinished enrolment was cancelled and no session ended; `partial` + `sessions_ended=failed` when the factor was cleared but its sessions were not ended; `error` + `disable failed (sessions_ended=<n>\|failed)` when the clear failed on an account that had a verified factor, or `disable failed` on one that had none; `error` + `blocked: mfa_enforcement=<mode>` when the self-target guard fires) |
@@ -565,7 +588,16 @@ Every transition writes to `AuditStore` via `AuthRoutes::audit_log`
 | `mfa.recovery_code.used` | `POST /login/mfa` accepted a recovery code |
 
 PR 2 adds `mfa.step_up.required`, `mfa.step_up.passed`,
-`mfa.step_up.failed`. PR 3 adds `mfa.enroll.required` and routes
+`mfa.step_up.failed`. A `mfa.step_up.required` row is always `result=error`;
+one written by the step-up chokepoint has the detail
+`user=<name> age_secs=<n> window_secs=<n> cid=<id> stage=pre_authz` for a
+stale or absent proof (`age_secs=-1` with no proof) and
+`user=<name> reason=<token> cid=<id> stage=pre_authz` for every other refusal
+(an unusable authentication store is `reason=auth_store_unwired`); the gate
+applied inside the JIT-elevation handlers writes the same fields without
+`cid=` or `stage=`. A proof is also granted by a Settings enrolment confirm,
+which writes no `mfa.step_up.passed` row: its evidence is the
+`step_up_proof=stamped` (or `not_stamped`) detail of `mfa.enroll.verified`. PR 3 adds `mfa.enroll.required` and routes
 `mfa.enroll.verified` / `mfa.enroll.failed` through the new
 `POST /login/mfa/enroll` bootstrap endpoint as well as Settings.
 
@@ -700,3 +732,58 @@ regress:
    gate. The seeded timestamp is a wall-clock (`system_clock`) instant and must
    keep its future-dated-proof fail-closed handling (#5), and `/login/mfa/stepup`
    must keep rejecting OIDC callers.
+
+9. **There is one step-up table, and it fails closed.** The set of routes that
+   need a fresh MFA proof is `kStepUpPolicy` in `step_up_policy.hpp`, evaluated
+   once per request by the chokepoint in the pre-request stage
+   (`run_pre_request_stage` in `step_up_wiring.hpp`, installed by `server.cpp`).
+   Regressions to guard against: (a) a second list of gated routes, or a new
+   per-handler `step_up_fn` call used as the only enforcement for a route (a
+   handler can forget it; the table cannot be bypassed by omission); (b) a
+   `kRequired` route that passes when the authentication store is unwired
+   (a null `AuthDB`), or that passes a local session whose enrollment read
+   failed with a store/decrypt error, instead of answering `503` (token and
+   OIDC callers never read the store, so only the null-store case reaches
+   them, and it must still be `503`); (c) `render_step_up_refusal` given a
+   default surface (the REST envelope is wrong for a non-REST caller); (d)
+   caching a verdict across requests (the `confirm` routes must re-evaluate on
+   an idempotent re-serve); (e) a mutating route registered with no table row
+   (a build-time self-check fails the build on a malformed table, the
+   compiled and source-scan coverage tests fail the test run on a missing row,
+   and boot refuses to serve an unclassified route registered through
+   `HttplibRouteSink`); (f) an engine principal that reaches a `kRequired`
+   handler or a store read instead of the `403` (`kEngineDenied`, reason
+   `engine_principal_denied`) at the chokepoint, once the engine's credential has
+   resolved (during a database outage pre-routing authentication cannot resolve it, and the
+   request is answered `401` `unauthorized` before the chokepoint runs; the denial itself never
+   reads the MFA store). The order is: after the pre-routing
+   gates, a null auth store answers `503` for every caller class first, then an engine is `403` with no
+   store read, ahead of the window-disabled hatch, which in turn precedes the
+   SAML denial and the store read (so a window of 0 or less lets SAML through);
+   (g) a gated request authorised by a principal other than the one the check passed:
+   the binding removed while handlers still resolve more than once. One principal per request: once the central check passes a gated request,
+   every `AuthRoutes::resolve_session` call for that request yields the same principal or
+   none, and a pass is honoured only for the principal that earned it. The principal is
+   identified by the principal class exactly, plus a fingerprint of principal kind, auth
+   source and username. The binding is armed with the pass and kept until the end of the
+   request, even after the pass is spent: `resolve_session` applies it on every credential
+   path (cookie, Bearer, `X-Yuzu-Token`) through `detail::step_up_binding_admits`, and a
+   resolution that would land on another principal returns no session, so the route answers
+   its ordinary no-session response (usually `401`; approve and reject answer `503` with
+   `retry_after_ms` 5000 when the change falls between the handler's two resolutions). The few direct validators that do not go through
+   `resolve_session` (the elevation routes, the login and SSO callbacks, the MFA enrolment
+   confirm, the SCIM bearer, stream revalidation) do not authorise a gated handler; a source
+   scan pins that list. The stash and the binding are thread-local: a resolution made on
+   another thread is unbound (admitted, as for any non-gated request), and no `kRequired`
+   route resolves off the worker thread today. The in-handler `step_up_fn` reuses the central
+   verdict only through the per-request pass: a handler session that differs refuses the
+   pass, spends it, and is evaluated afresh, which is the path that answers an engine
+   principal `403` with a wired store. A fingerprint that cannot be computed fails closed:
+   the chokepoint answers `503` (reached only after the decision passes, so an engine or a
+   SAML session still gets its `403`), and consume and the binding check refuse. The identity
+   omits the role, the proof timestamps, `mcp_tier` and `token_scope_service`; that is
+   sufficient because one request resolves one cookie session record, or a token session
+   that the decision exempts (both `api_token` and `mcp_token`) before it reads role, scope
+   or proof. Chokepoint PR 2: the pass and the in-handler calls may be deleted once handlers
+   consume the centrally resolved session or the repeated resolves are removed (#6200); the
+   binding stays until then, and ideally then carries the resolved session itself.

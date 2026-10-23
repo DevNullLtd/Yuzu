@@ -612,9 +612,9 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   local account or OIDC single sign-on, and the request must carry that session cookie. An API token or an MCP
   token is refused with `403` and an A4 error envelope, however much it is permitted to do
   elsewhere.
-- **An enrolled MFA factor and a fresh proof (#6079).** Approve and reject do not use the generic
-  step-up check that token creation and role changes use, because that check passes an account that
-  has no factor to ask for. The server instead requires the reviewer's own session to show a
+- **An enrolled MFA factor and a fresh proof (#6079).** Approve and reject are covered by the central
+  step-up check that token creation and role changes use, but that check passes an account that
+  has no factor to ask for, and a disabled window switches it off. The server therefore also requires the reviewer's own session to show a
   second-factor proof made within the approver window (the window is `--mfa-step-up-window-secs`
   when that is between 1 and 300, and 300 when it is `0`, negative or above 300, so 300 seconds is a
   ceiling and a lower setting shortens it; it does not depend on `--mfa-enforcement`; the age is measured on the
@@ -667,7 +667,7 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   follow-up. Until then, do not rely on the reviewer check as proof that two different humans were involved
   where users can hold more than one identity.
 - **Not a SAML session.** MFA step-up is not available for SAML sessions (#4935), so a user who
-  signed in through SAML is refused with `403` whatever `--mfa-step-up-window-secs` is set to (before
+  signed in through SAML is refused with `403` whatever `--mfa-step-up-window-secs` is set to (with step-up on, the central check's generic `403` answers first; with it off, the approver rule's `saml_mfa_unsupported`; before
   #6079, setting it to `0` admitted a SAML approver; it no longer does). Approvers who use SAML cannot
   approve until they sign in with a local account or OIDC.
   **A deployment where every approver signs in through SAML has no working approver path** until
@@ -702,10 +702,12 @@ with a signed-in session.
   submission, so an aged approved request keeps showing `approved` until then although it can no
   longer be used (tracked in #6098).
 
-**If the dialog says you do not have permission.** For an approver refusal (`approver_assurance_required:<reason>`, whether a class or an MFA refusal) the Approvals dialog shows the refusal's own remediation text, which names the next step. For any other `403` it shows the generic "You do not have permission" text, and the response's own message names the cause. The causes, in the order the server checks them: you lack `Approval:Approve`; the
-request carried no same-site `Origin` or `Referer` (for example a reverse proxy rewrites `Host` and the
-public address is not listed in `--csrf-trusted-origin`); you signed in through SAML; your account has no
-enrolled MFA factor; your account has been deleted or deactivated; or your single sign-on login carried no MFA claim. The Approve and Reject buttons are a
+**If the dialog says you do not have permission.** For an approver refusal (`approver_assurance_required:<reason>`, whether a class or an MFA refusal) the Approvals dialog shows the refusal's own remediation text, which names the next step. For any other `403` it shows the generic "You do not have permission" text, and the response's own message names the cause. The causes, in the order the server checks them: the request carried no same-site
+`Origin` or `Referer` (for example a reverse proxy rewrites `Host` and the public address is not
+listed in `--csrf-trusted-origin`; the server-wide same-site check answers this first, before any
+step-up); you signed in through SAML while step-up is on (the central step-up check, before the
+route handler); then, in the handler, you lack `Approval:Approve`; your account has no
+enrolled MFA factor; your account has been deleted or deactivated; your single sign-on login carried no MFA claim; or you signed in through SAML with step-up switched off (`--mfa-step-up-window-secs=0`), which the approver rule still refuses. The Approve and Reject buttons are a
 render hint only: an unenrolled or SAML session is shown them and the route still refuses it. The Approvals tab on Instructions has no dialog: on a `403` it shows the same remediation text in a toast for an approver refusal and the server's message for any other `403`, "Your session expired; sign in again." on a plain `401`, and the same code prompt
 as the Approvals page on a step-up `401`, then repeats the decision once after a correct code.
 

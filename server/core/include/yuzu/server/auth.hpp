@@ -926,7 +926,8 @@ public:
                              std::int64_t elevated_until_ms, std::int64_t elevation_issued_ms,
                              std::int64_t now_ms);
 
-    /// Look up a session by cookie token.
+    /// Look up a session by cookie token. An empty token (no cookie) and an over-long one
+    /// never match; both return nullopt before any cache or store access.
     std::optional<Session> validate_session(const std::string& token) const;
 
     /// Authoritative read of `token`'s durable MFA proof for the approver freshness gate

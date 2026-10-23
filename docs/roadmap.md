@@ -1499,7 +1499,7 @@ Server-side resource registry for versioned binary blobs:
 ### Issue 13.1: 2FA for Instruction Approval (TOTP)
 **Capability:** new | **Scope:** Server | **Status:** Done (TOTP + MFA step-up landed generally; wired to approval approve/reject by #6061 and #6079, which require an interactive session and an enrolled factor with a fresh proof)
 
-TOTP (`totp.{hpp,cpp}`) and a general step-up MFA framework (`mfa_step_up.{hpp,cpp}`) shipped as part of the auth-and-authz workstream — `require_mfa_step_up` gates the generic high-risk endpoints (`auth_routes.cpp`). Approval approve/reject are now covered too, by their own stricter rule (#6061, #6079): an interactive session plus an enrolled MFA factor with a fresh proof (`require_enrolled_fresh_mfa`), with the code entered at the step-up prompt rather than as a `totp_code` field on the request. Original sketch:
+TOTP (`totp.{hpp,cpp}`) and a general step-up MFA framework (`mfa_step_up.{hpp,cpp}`) shipped as part of the auth-and-authz workstream - the step-up check is enforced centrally on 36 named REST/dashboard routes (the three JIT-elevation routes keep their own handler gate) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`, and MCP tools are not step-up gated. Approval approve/reject are among those routes and are covered by a stricter rule on top of it (#6061, #6079): an interactive session plus an enrolled MFA factor with a fresh proof (`require_enrolled_fresh_mfa`), with the code entered at the step-up prompt rather than as a `totp_code` field on the request. Original sketch:
 
 TOTP (RFC 6238) second factor on instruction approval:
 - Per-user TOTP secret stored encrypted in auth store

@@ -100,6 +100,14 @@ struct Harness {
         return s;
     }()};
 
+    /// Generic step-up stub (the shared `StepUpFn`, which consumes the central check's pass).
+    /// It runs BEFORE the approver gate; a refusal writes the 401 and ends the request.
+    bool step_up_ok{true};
+    bool wire_step_up{true};
+    std::vector<std::string> step_up_labels;
+    /// Order witness: audit-row count at the moment step-up ran.
+    std::vector<size_t> audits_at_step_up;
+
     /// Approver MFA gate stub (`require_enrolled_fresh_mfa` has its own tests; the [pg] cases
     /// below drive the real one): the outcome the closure returns. kChallengeWritten also
     /// writes a 401 envelope, as the real gate does. Default is an enrolled caller passing.
@@ -148,6 +156,20 @@ struct Harness {
                 throw std::runtime_error("audit sink down");
             return audit_succeeds;
         };
+        if (wire_step_up) {
+            deps.step_up_fn = [this](const httplib::Request&, httplib::Response& res,
+                                     const auth::Session&, const std::string& label) {
+                step_up_labels.push_back(label);
+                audits_at_step_up.push_back(audits.size());
+                if (!step_up_ok) {
+                    res.status = 401;
+                    res.set_content(R"({"error":{"code":401,"message":"MFA step-up required"}})",
+                                    "application/json");
+                    return false;
+                }
+                return true;
+            };
+        }
         if (mfa_fn_override) {
             deps.approver_mfa_fn = mfa_fn_override;
         } else if (wire_mfa) {
@@ -810,6 +832,59 @@ TEST_CASE("approval_routes: an unwired approver_mfa_fn fails closed (503), never
         CHECK(res->status == 503);
     }
     CHECK(h.audits.empty());
+    auto row = mgr->get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "pending");
+}
+
+TEST_CASE("approval_routes: an unwired step_up_fn fails closed (503), never skips the freshness "
+          "requirement",
+          "[server][routes][approval_routes][pg]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    auto id = mgr->submit("def-nostepup", "submitter1", "ostype = 'windows'", "",
+                          ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.wire_step_up = false;
+    h.wire();
+
+    auto res = h.sink.Post("/api/approvals/" + *id + "/approve", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(h.audits.empty());
+    CHECK(h.mfa_labels.empty()); // the approver gate was never reached
+    auto row = mgr->get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "pending");
+}
+
+TEST_CASE("approval_routes: a generic step-up refusal ends the request before the approver gate "
+          "and leaves the ticket pending",
+          "[server][routes][approval_routes][approver_mfa][pg]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    auto id = mgr->submit("def-stepup-first", "submitter1", "ostype = 'windows'", "",
+                          ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.step_up_ok = false;
+    h.wire();
+
+    for (const char* verb : {"approve", "reject"}) {
+        auto res = h.sink.Post("/api/approvals/" + *id + "/" + verb, "{}");
+        REQUIRE(res);
+        CHECK(res->status == 401);
+    }
+    CHECK(h.mfa_labels.empty());
+    CHECK(h.audits.empty());
+    // The label pin in test_step_up_route_inventory.cpp reads the call sites lexically; the
+    // runtime labels must be the ones kStepUpPolicy carries for the two approval rows.
+    REQUIRE(h.step_up_labels.size() == 2);
+    CHECK(h.step_up_labels[0] == "POST /api/approvals/{id}/approve");
+    CHECK(h.step_up_labels[1] == "POST /api/approvals/{id}/reject");
     auto row = mgr->get(*id);
     REQUIRE(row.has_value());
     CHECK(row->status == "pending");
@@ -1836,7 +1911,9 @@ TEST_CASE("approval_routes: wiring -- server.cpp passes approver_mfa_fn and csrf
     REQUIRE(end != std::string::npos);
     const std::string block = src.substr(call, end - call);
     CHECK(block.find(".approver_mfa_fn = approver_mfa_fn") != std::string::npos);
-    CHECK(block.find(".step_up_fn") == std::string::npos); // the bearer-exempt gate is not the one
+    // Both gates are wired: the generic one consumes the central check's pass, the approver
+    // one refuses what it lets through. Dropping either is a fail-closed 503 on every approval.
+    CHECK(block.find(".step_up_fn = step_up_fn") != std::string::npos);
     CHECK(block.find(".csrf_trusted_origins = cfg_.csrf_trusted_origins") != std::string::npos);
     CHECK(block.find(".perm_fn = perm_fn") != std::string::npos);
     CHECK(block.find(".resolve_session_fn = resolve_session_fn") != std::string::npos);

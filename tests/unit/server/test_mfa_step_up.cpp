@@ -370,7 +370,9 @@ TEST_CASE_METHOD(StepUpFixture,
     CHECK(audits[0].action == "mfa.step_up.required");
     CHECK(audits[0].result == "error");
     CHECK(audits[0].detail.find("mfa_status_unavailable") != std::string::npos);
-    CHECK(audits[0].detail.find("fail-closed") != std::string::npos);
+    // The reason token stands alone: no "(fail-closed)" parenthetical (audit grammar, docs).
+    CHECK(audits[0].detail.find("reason=mfa_status_unavailable") != std::string::npos);
+    CHECK(audits[0].detail.find("fail-closed") == std::string::npos);
 }
 
 TEST_CASE_METHOD(StepUpFixture,
