@@ -3,28 +3,39 @@
 // real consumer and asserts the exact observable output, with an ordinary-plugin control so a
 // filter that silenced everything would fail too.
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <map>
 #include <stdexcept>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include <grpcpp/grpcpp.h>
+#include <nlohmann/json.hpp>
+
 #include "agent.grpc.pb.h"
 #include "agent_registry.hpp"
 #include "agent_service_impl.hpp"
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
+#include "analytics_event_store.hpp"
 #include "execution_tracker.hpp"
 #include "forensics_error_detail.hpp"
+#include "notification_store.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "preflight_parse.hpp"
 #include "response_store.hpp"
 #include "result_set_members.hpp"
+#include "test_analytics_pg_helper.hpp"
+#include "test_auth_db_pg_helper.hpp"
 #include "test_forensics_tier_fixture.hpp"
+#include "test_offload_target_store_pg_helper.hpp"
 #include "test_tracker_scope.hpp"
+#include "test_webhook_store_pg_helper.hpp"
 #include "../test_helpers.hpp"
 #include <libpq-fe.h>
 #include <yuzu/metrics.hpp>
@@ -325,6 +336,242 @@ TEST_CASE("tracker error_detail: rows written before the sanitiser are reduced o
         REQUIRE(got->has_value());
         CHECK((*got)->last_error_detail == "forensics_error");
     }
+}
+
+// -- A3: the failure text in the server's other derived sinks -------------------------------------
+//
+// The tracker is one reader of a terminal frame's failure text. The notification store (read at
+// Infrastructure:Read), the analytics event and the webhook / offload payload are the others; each
+// is observed here on BOTH ingest paths (the gateway-proxied one and the direct Subscribe stream),
+// with an ordinary plugin as the control so a sanitiser that blanked everything would fail too.
+
+namespace {
+
+yuzu::test::PgTestTemplate leaks_notif_tpl{"notifstore", [](const std::string& dsn) {
+                                               yuzu::server::pg::PgPool pool{
+                                                   {.conninfo = dsn, .size = 1}};
+                                               NotificationStore store{pool};
+                                               if (!store.is_open())
+                                                   throw std::runtime_error(
+                                                       "notification template: store failed to "
+                                                       "migrate");
+                                           }};
+
+constexpr const char* kDirectAgent = "agent-direct";
+constexpr const char* kGatewayAgent = "agent-gateway";
+
+/// What each sink holds after one failed command.
+struct SinkView {
+    std::vector<std::string> notifications;    ///< messages of the "Execution Failed" rows
+    std::vector<std::string> analytics_errors; ///< `error_message` of command.completed events
+    std::vector<std::string> webhook_payloads;
+    std::vector<std::string> offload_payloads;
+};
+
+/// A real AgentServiceImpl behind a loopback gRPC server with all four derived sinks wired to real
+/// stores. MEMBER ORDER IS LOAD-BEARING: the stores are declared first so they outlive the service,
+/// and the destructor body detaches them before anything is destroyed.
+struct SinkHarness {
+    yuzu::test::WebhookStorePg webhooks;
+    yuzu::test::OffloadTargetStorePg offloads;
+    yuzu::test::AuthDbPgShared auth_db;
+    yuzu::server::pg::PgPool notif_pool;
+    yuzu::server::pg::PgPool analytics_pool;
+    NotificationStore notifications;
+    std::shared_ptr<AnalyticsEventStore> analytics;
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    AgentServiceImpl svc{registry, bus, /*require_client_identity=*/false, auth_mgr, auto_approve,
+                         metrics, /*gateway_mode=*/false};
+    std::unique_ptr<grpc::Server> server;
+    std::unique_ptr<apb::AgentService::Stub> stub;
+    int port = 0;
+    int64_t wh_id = 0;
+    int64_t off_id = 0;
+
+    SinkHarness(const std::string& notif_dsn, const std::string& analytics_dsn, bool wire_set)
+        : notif_pool({.conninfo = notif_dsn, .size = 4}),
+          analytics_pool({.conninfo = analytics_dsn, .size = 4}), notifications(notif_pool),
+          analytics(std::make_shared<AnalyticsEventStore>(analytics_pool)) {
+        REQUIRE(notifications.is_open());
+        REQUIRE(analytics->is_open());
+        auth_mgr.set_auth_db(auth_db.get());
+        if (wire_set)
+            svc.set_forensics_plugin_set(&test::forensics_plugin_set());
+        svc.set_notification_store(&notifications);
+        svc.set_analytics_store(analytics);
+        svc.set_webhook_store(webhooks.get());
+        svc.set_offload_target_store(offloads.get());
+        const auto wh =
+            webhooks->create_webhook("http://127.0.0.1:1/hook", "execution.completed", "");
+        REQUIRE(wh.has_value());
+        wh_id = *wh;
+        // batch_size 2 so the single event buffers deterministically until flush_all().
+        const auto off = offloads->create_target("t1", "http://127.0.0.1:1/off",
+                                                 OffloadAuthType::None, "", "execution.completed",
+                                                 /*batch_size=*/2);
+        REQUIRE(off.has_value());
+        off_id = *off;
+
+        grpc::ServerBuilder builder;
+        builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+        builder.RegisterService(&svc);
+        server = builder.BuildAndStart();
+        REQUIRE(server != nullptr);
+        stub = apb::AgentService::NewStub(grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
+                                                              grpc::InsecureChannelCredentials()));
+    }
+    ~SinkHarness() {
+        if (server)
+            server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(5));
+        svc.set_notification_store(nullptr);
+        svc.set_analytics_store({});
+        svc.set_webhook_store(nullptr);
+        svc.set_offload_target_store(nullptr);
+        webhooks->quiesce(std::chrono::seconds(5));
+        offloads->quiesce(std::chrono::seconds(5));
+    }
+    SinkHarness(const SinkHarness&) = delete;
+    SinkHarness& operator=(const SinkHarness&) = delete;
+
+    /// The gateway-proxied ingest path.
+    void ingest_gateway(const apb::CommandResponse& frame) {
+        svc.process_gateway_response(kGatewayAgent, frame);
+    }
+
+    /// The direct ingest path: a real Register + Subscribe stream carrying `frame`.
+    void ingest_direct(const apb::CommandResponse& frame) {
+        const auto deadline = [] {
+            return std::chrono::system_clock::now() + std::chrono::seconds(20);
+        };
+        auto token = auth_mgr.create_enrollment_token("forensics-sinks", 0, std::chrono::hours(1),
+                                                      "test-admin");
+        REQUIRE(token.has_value());
+        apb::RegisterRequest reg;
+        reg.mutable_info()->set_agent_id(kDirectAgent);
+        reg.mutable_info()->set_hostname("host");
+        reg.mutable_info()->mutable_platform()->set_os("windows");
+        reg.mutable_info()->mutable_platform()->set_arch("x86_64");
+        reg.set_enrollment_token(token->raw_token);
+        apb::RegisterResponse reg_resp;
+        grpc::ClientContext reg_ctx;
+        reg_ctx.set_deadline(deadline());
+        REQUIRE(stub->Register(&reg_ctx, reg, &reg_resp).ok());
+        REQUIRE(reg_resp.accepted());
+
+        grpc::ClientContext ctx;
+        ctx.set_deadline(deadline());
+        ctx.AddMetadata(std::string{AgentServiceImpl::kSessionMetadataKey}, reg_resp.session_id());
+        auto stream = stub->Subscribe(&ctx);
+        REQUIRE(stream != nullptr);
+        REQUIRE(stream->Write(frame));
+        REQUIRE(stream->WritesDone());
+        apb::CommandRequest unused;
+        while (stream->Read(&unused)) {}
+        CHECK(stream->Finish().ok()); // the handler read the frame before it returned
+    }
+
+    /// Settles the delivery pools and reads every sink. Call once: it closes both pools.
+    SinkView observe() {
+        offloads->flush_all();
+        REQUIRE(offloads->quiesce(std::chrono::seconds(5)));
+        REQUIRE(webhooks->quiesce(std::chrono::seconds(5)));
+        SinkView v;
+        for (const auto& n : notifications.list_all())
+            if (n.title == "Execution Failed")
+                v.notifications.push_back(n.message);
+        const auto events = analytics->query_recent(50);
+        REQUIRE(events.has_value());
+        for (const auto& e : *events)
+            if (e.event_type == "command.completed" && e.payload.contains("error_message"))
+                v.analytics_errors.push_back(e.payload["error_message"].get<std::string>());
+        for (const auto& d : webhooks->get_deliveries(wh_id))
+            v.webhook_payloads.push_back(d.payload);
+        for (const auto& d : offloads->get_deliveries(off_id))
+            v.offload_payloads.push_back(d.payload);
+        return v;
+    }
+};
+
+/// What every sink must hold after the failure of `command_id` on `agent`.
+void check_sinks(const SinkView& v, const std::string& command_id, const std::string& agent,
+                 const std::string& expected) {
+    REQUIRE(v.notifications.size() == 1);
+    CHECK(v.notifications[0] ==
+          "Command " + command_id + " on agent " + agent + " failed: " + expected);
+    REQUIRE(v.analytics_errors.size() == 1);
+    CHECK(v.analytics_errors[0] == expected);
+    REQUIRE(v.webhook_payloads.size() == 1);
+    const auto wh = nlohmann::json::parse(v.webhook_payloads[0]);
+    CHECK(wh.at("error").get<std::string>() == expected);
+    CHECK(wh.at("status") == "error");
+    CHECK(wh.at("exit_code") == 3); // the status and exit code are untouched
+    REQUIRE(v.offload_payloads.size() == 1);
+    // The offload batch is {"events": [<the same event payloads>]}.
+    const auto off = nlohmann::json::parse(v.offload_payloads[0]);
+    REQUIRE(off.at("events").is_array());
+    REQUIRE(off.at("events").size() == 1);
+    CHECK(off.at("events")[0].at("error").get<std::string>() == expected);
+}
+
+} // namespace
+
+TEST_CASE("terminal failure text: every derived sink carries only a bounded token for a "
+          "Forensics-tier plugin",
+          "[pg][server][forensics_tier][security]") {
+    const bool direct = GENERATE(false, true);
+    INFO((direct ? "direct Subscribe path" : "gateway path"));
+    YUZU_REQUIRE_PG_DB_TPL(ndb, leaks_notif_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(adb, yuzu::test::analytics_pg_template);
+    SinkHarness h(ndb.dsn(), adb.dsn(), /*wire_set=*/true);
+    const std::string agent = direct ? kDirectAgent : kGatewayAgent;
+    const auto ingest = [&](const apb::CommandResponse& f) {
+        if (direct)
+            h.ingest_direct(f);
+        else
+            h.ingest_gateway(f);
+    };
+
+    SECTION("free text from a Forensics plugin, in any ASCII case, is reduced in all four sinks") {
+        const std::string id = "BROWSER_INVENTORY-0e1";
+        ingest(failure_frame(id, kFreeText));
+        const auto v = h.observe();
+        check_sinks(v, id, agent, "forensics_error");
+        for (const auto& s : v.notifications)
+            CHECK(s.find("marker-4990") == std::string::npos);
+        for (const auto& s : v.offload_payloads)
+            CHECK(s.find("marker-4990") == std::string::npos);
+        for (const auto& s : v.webhook_payloads)
+            CHECK(s.find("marker-4990") == std::string::npos);
+    }
+    SECTION("a token-shaped failure from a Forensics plugin is preserved in all four sinks") {
+        const std::string id = std::string{test::kForensicsPlugin} + "-0e2";
+        ingest(failure_frame(id, kToken));
+        check_sinks(h.observe(), id, agent, kToken);
+    }
+    SECTION("an ordinary plugin keeps its full failure text in all four sinks (control)") {
+        const std::string id = std::string{test::kOrdinaryPlugin} + "-0e3";
+        ingest(failure_frame(id, kFreeText));
+        check_sinks(h.observe(), id, agent, kFreeText);
+    }
+}
+
+TEST_CASE("terminal failure text: an unwired plugin set sanitises every plugin in every sink",
+          "[pg][server][forensics_tier][security]") {
+    const bool direct = GENERATE(false, true);
+    INFO((direct ? "direct Subscribe path" : "gateway path"));
+    YUZU_REQUIRE_PG_DB_TPL(ndb, leaks_notif_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(adb, yuzu::test::analytics_pg_template);
+    SinkHarness h(ndb.dsn(), adb.dsn(), /*wire_set=*/false);
+    const std::string id = std::string{test::kOrdinaryPlugin} + "-0e4";
+    if (direct)
+        h.ingest_direct(failure_frame(id, kFreeText));
+    else
+        h.ingest_gateway(failure_frame(id, kFreeText));
+    check_sinks(h.observe(), id, direct ? kDirectAgent : kGatewayAgent, "forensics_error");
 }
 
 // -- A5: the result-set materialiser's content-membership read ------------------------------------

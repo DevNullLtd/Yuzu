@@ -692,6 +692,18 @@ private:
     void notify_exec_tracker(const std::string& command_id, const std::string& agent_id,
                              const pb::CommandResponse& resp);
 
+    /// #4990: the failure text of a terminal frame in the form the server's own derived sinks may
+    /// carry: the execution tracker (and through it the drawer, the event stream and the outbox),
+    /// the notification store, the analytics event, and the webhook / offload payload. Those sinks
+    /// are read below the Forensics tier of the plugin's own rows, so a Forensics-tier plugin keeps
+    /// only a bounded failure token (`sanitize_forensics_error_detail`); an unwired plugin set
+    /// cannot tell the plugins apart and sanitises every plugin's message. Any other plugin keeps
+    /// its full text. Empty when the frame carries no error. Each ingest path calls this ONCE per
+    /// response and feeds the one value to every sink; a new sink of the failure text takes it
+    /// from there, never from `resp.error().message()` directly.
+    [[nodiscard]] std::string failure_text_for_sinks(const std::string& command_id,
+                                                     const pb::CommandResponse& resp) const;
+
     /// Persists the `registry.write` audit rows one stored output frame owes (see
     /// plugin_result_audit.hpp for the binding). Called at every site that stores an
     /// output-carrying frame, immediately before `notify_exec_tracker`, so the row exists before the

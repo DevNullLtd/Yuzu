@@ -1621,6 +1621,11 @@ grpc::Status AgentServiceImpl::Subscribe(
                          ::yuzu::log_id_token(resp.command_id()), static_cast<int>(resp.status()),
                          resp.exit_code());
 
+            // #4990: the failure text every derived sink below (analytics event, notification,
+            // webhook / offload payload) may carry; computed once. The stored response row keeps
+            // the raw message: it is a row of the plugin itself and is read through the tier filter.
+            const std::string sink_error = failure_text_for_sinks(resp.command_id(), resp);
+
             // Store completion response
             if (response_store_) {
                 auto plugin_name = extract_plugin(resp.command_id());
@@ -1708,7 +1713,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                                                                               : Severity::kError;
                 ae.payload = {{"status", status_str}, {"exit_code", resp.exit_code()}};
                 if (resp.has_error()) {
-                    ae.payload["error_message"] = resp.error().message();
+                    ae.payload["error_message"] = sink_error;
                 }
                 analytics_store->emit(std::move(ae));
             }
@@ -1716,7 +1721,7 @@ grpc::Status AgentServiceImpl::Subscribe(
             // Create notification on execution failure
             if (resp.status() != pb::CommandResponse::SUCCESS && notification_store_ &&
                 notification_store_->is_open()) {
-                std::string err_msg = resp.has_error() ? resp.error().message() : "unknown";
+                std::string err_msg = resp.has_error() ? sink_error : "unknown";
                 notification_store_->create("error", "Execution Failed",
                                             "Command " + resp.command_id() + " on agent " +
                                                 agent_id + " failed: " + err_msg);
@@ -1733,7 +1738,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                                              {"status", status_str},
                                              {"exit_code", resp.exit_code()}};
                 if (resp.has_error()) {
-                    wh_payload["error"] = resp.error().message();
+                    wh_payload["error"] = sink_error;
                 }
                 const auto body = wh_payload.dump();
                 if (webhook_store_ && webhook_store_->is_open()) {
@@ -1952,6 +1957,9 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                      ::yuzu::log_id_token(resp.command_id()), static_cast<int>(resp.status()),
                      resp.exit_code());
 
+        // #4990: see the Subscribe twin; one value for every derived sink below.
+        const std::string sink_error = failure_text_for_sinks(resp.command_id(), resp);
+
         if (response_store_) {
             auto gw_plugin = extract_plugin(resp.command_id());
             std::string err_detail;
@@ -2019,14 +2027,14 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                                                                           : Severity::kError;
             ae.payload = {{"status", status_str}, {"exit_code", resp.exit_code()}};
             if (resp.has_error()) {
-                ae.payload["error_message"] = resp.error().message();
+                ae.payload["error_message"] = sink_error;
             }
             analytics_store->emit(std::move(ae));
         }
 
         if (resp.status() != pb::CommandResponse::SUCCESS && notification_store_ &&
             notification_store_->is_open()) {
-            std::string err_msg = resp.has_error() ? resp.error().message() : "unknown";
+            std::string err_msg = resp.has_error() ? sink_error : "unknown";
             notification_store_->create("error", "Execution Failed",
                                         "Command " + resp.command_id() + " on agent " + agent_id +
                                             " failed: " + err_msg);
@@ -2040,7 +2048,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                                          {"status", status_str},
                                          {"exit_code", resp.exit_code()}};
             if (resp.has_error()) {
-                wh_payload["error"] = resp.error().message();
+                wh_payload["error"] = sink_error;
             }
             const auto body = wh_payload.dump();
             if (webhook_store_ && webhook_store_->is_open()) {
@@ -2121,6 +2129,16 @@ std::string AgentServiceImpl::render_row(const std::string& agent_name, const st
     }
     html += "</div></td></tr>";
     return html;
+}
+
+std::string AgentServiceImpl::failure_text_for_sinks(const std::string& command_id,
+                                                     const pb::CommandResponse& resp) const {
+    if (!resp.has_error())
+        return {};
+    std::string text = resp.error().message();
+    if (!forensics_plugins_ || forensics_plugins_->contains(extract_plugin(command_id)))
+        text = sanitize_forensics_error_detail(text);
+    return text;
 }
 
 void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
@@ -2264,15 +2282,9 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     // sdk/include/yuzu/plugin.h's YuzuResultStatus), so no separate mapping
     // table is needed to avoid drift; 0 in both is PLUGIN_RESULT_UNDECLARED.
     s.plugin_result_status = static_cast<int>(resp.plugin_result_status());
-    if (resp.has_error()) {
-        s.error_detail = resp.error().message();
-        // #4990: this value is shown at the Execution:Read tier (drawer, execution status, event
-        // stream and outbox), below the Forensics tier of the plugin's own rows. A Forensics-tier
-        // plugin keeps only a bounded failure token; an unwired set cannot tell the plugins apart,
-        // so it sanitises every plugin's message.
-        if (!forensics_plugins_ || forensics_plugins_->contains(extract_plugin(command_id)))
-            s.error_detail = sanitize_forensics_error_detail(s.error_detail);
-    }
+    // #4990: shown at the Execution:Read tier (drawer, execution status, event stream and outbox),
+    // below the Forensics tier of the plugin's own rows; see failure_text_for_sinks.
+    s.error_detail = failure_text_for_sinks(command_id, resp);
     switch (resp.status()) {
     case pb::CommandResponse::RUNNING:
         s.status = "running";
