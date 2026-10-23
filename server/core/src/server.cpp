@@ -149,6 +149,7 @@
 #include "quarantine_store.hpp"
 #include "quarantine_containment_reconciler.hpp" // #3425: reconnect re-application
 #include "result_set_matcher.hpp"
+#include "result_set_members.hpp" // #4990
 #include "result_set_store.hpp"
 #include "result_sets_ui.hpp"
 #include "scope_yaml.hpp"
@@ -17917,26 +17918,17 @@ private:
                             // empty matcher = SUCCESS responders; tar_rows_ge
                             // = SUCCESS with ≥N rows; column/op/value = a
                             // matching output row (PR-D, design §3.3).
+                            // #4990: the read excludes the Forensics plugins (see
+                            // result_set_members.hpp); a degraded read skips this set for this
+                            // tick rather than risk a false-empty membership (ADR-0039) - it
+                            // retries on the next 2s tick.
                             std::vector<std::string> members;
-                            std::unordered_set<std::string> seen;
                             if (response_store_) {
-                                // #4990: internal consumer. Membership only (agent ids), owner-scoped
-                                // by the pending row; no response body leaves the server here.
-                                auto rows = response_store_->query_by_execution(
-                                    p.source_execution_id,
-                                    ResponseTierFilter::unrestricted_internal_consumer());
-                                if (!rows) {
-                                    // Degraded read: skip materializing THIS pending set
-                                    // this tick rather than risk a false-empty membership
-                                    // (ADR-0039) — it retries on the next 2s tick.
+                                auto found =
+                                    result_set_members(*response_store_, forensics_plugins(), p);
+                                if (!found)
                                     continue;
-                                }
-                                for (const auto& r : *rows) {
-                                    if (!rs_matcher::response_matches(p.matcher, r.status, r.output))
-                                        continue;
-                                    if (seen.insert(r.agent_id).second)
-                                        members.push_back(r.agent_id);
-                                }
+                                members = std::move(*found);
                             }
                             if (result_set_store_->materialize(p.id, members)) {
                                 metrics_

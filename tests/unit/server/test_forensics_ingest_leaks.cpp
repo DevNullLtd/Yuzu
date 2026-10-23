@@ -20,6 +20,8 @@
 #include "forensics_error_detail.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "response_store.hpp"
+#include "result_set_members.hpp"
 #include "test_forensics_tier_fixture.hpp"
 #include "test_tracker_scope.hpp"
 #include "../test_helpers.hpp"
@@ -321,5 +323,84 @@ TEST_CASE("tracker error_detail: rows written before the sanitiser are reduced o
         REQUIRE(got.has_value());
         REQUIRE(got->has_value());
         CHECK((*got)->last_error_detail == "forensics_error");
+    }
+}
+
+// -- A5: the result-set materialiser's content-membership read ------------------------------------
+
+namespace {
+
+yuzu::test::PgTestTemplate leaks_responsestore_tpl{
+    "responsestore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        ResponseStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("responsestore template: store failed to migrate");
+    }};
+
+void put_source_row(ResponseStore& store, const std::string& execution_id,
+                    const std::string& agent_id, const std::string& plugin,
+                    const std::string& output) {
+    StoredResponse r;
+    r.instruction_id = plugin + "-1";
+    r.execution_id = execution_id;
+    r.agent_id = agent_id;
+    r.plugin = plugin;
+    r.status = 1;
+    r.output = output;
+    r.timestamp = 100;
+    store.store(r);
+}
+
+constexpr const char* kHit =
+    R"({"columns":[{"name":"hostname","type":"string"}],"rows":[{"hostname":"marker-4990-member"}]})";
+constexpr const char* kContentMatcher =
+    R"({"column":"hostname","op":"eq","value":"marker-4990-member"})";
+
+} // namespace
+
+TEST_CASE("result-set materialiser: membership is never derived from a Forensics plugin's rows",
+          "[pg][server][forensics_tier][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leaks_responsestore_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store{pool};
+    REQUIRE(store.is_open());
+    put_source_row(store, "exec-ordinary", "agent-1", test::kOrdinaryPlugin, kHit);
+    put_source_row(store, "exec-ordinary", "agent-2", test::kOrdinaryPlugin,
+                   R"({"columns":[{"name":"hostname","type":"string"}],"rows":[{"hostname":"other"}]})");
+    put_source_row(store, "exec-forensic", "agent-1", test::kForensicsPlugin, kHit);
+    put_source_row(store, "exec-forensic", "agent-3", test::kForensicsPlugin, kHit);
+
+    const auto pending = [](const std::string& source, const std::string& matcher) {
+        PendingSet p;
+        p.id = "rs-" + source;
+        p.owner_principal = "alice";
+        p.source_kind = "instruction_result";
+        p.source_execution_id = source;
+        p.matcher = matcher;
+        return p;
+    };
+    const auto& set = test::forensics_plugin_set();
+
+    SECTION("control: an ordinary source matches by content (and by the default matcher)") {
+        auto content = result_set_members(store, &set, pending("exec-ordinary", kContentMatcher));
+        REQUIRE(content.has_value());
+        CHECK(*content == std::vector<std::string>{"agent-1"});
+        auto dflt = result_set_members(store, &set, pending("exec-ordinary", ""));
+        REQUIRE(dflt.has_value());
+        CHECK(dflt->size() == 2);
+    }
+    SECTION("a Forensics source yields no content-derived and no default membership") {
+        auto content = result_set_members(store, &set, pending("exec-forensic", kContentMatcher));
+        REQUIRE(content.has_value());
+        CHECK(content->empty());
+        auto dflt = result_set_members(store, &set, pending("exec-forensic", ""));
+        REQUIRE(dflt.has_value());
+        CHECK(dflt->empty());
+    }
+    SECTION("an unwired plugin set refuses every row, ordinary sources included") {
+        auto content = result_set_members(store, nullptr, pending("exec-ordinary", kContentMatcher));
+        REQUIRE(content.has_value());
+        CHECK(content->empty());
     }
 }
