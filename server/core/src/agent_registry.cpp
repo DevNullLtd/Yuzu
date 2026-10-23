@@ -2226,7 +2226,8 @@ AgentRegistry::evaluate_scope_for_agent(const std::string& agent_id,
 
 const std::vector<ScopeKindInfo>& scope_kind_catalog() {
     static const std::vector<ScopeKindInfo> catalog = {
-        {"from_result_set:<id>", "from_result_set:<id>", "from_result_set:rs_01H8X3ZQK7YB2",
+        {"from_result_set:<id>", "from_result_set:<id>",
+         "from_result_set:rs_019a3c5e7b20123456789abcdef",
          "Owner-checked membership of a previously-saved result set (composable "
          "scope, docs/scope-walking-design.md). A set the caller does not own, "
          "or that no longer exists, aborts the whole dispatch (#4981 PR-1) — it "

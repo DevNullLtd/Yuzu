@@ -13500,9 +13500,10 @@ private:
             // claimed one), and this is the ONLY call to
             // refresh_dynamic_membership: the helper returns early once the
             // group exists, so a skipped refresh here leaves the group
-            // without those members until the group is deleted and
-            // re-created. There is no dedicated
-            // recovery runbook for this; a degraded tag store is a
+            // without those members until an operator adds them with
+            // POST /api/v1/management-groups/{id}/members, or the group is
+            // deleted and re-created. There is no dedicated recovery
+            // runbook for this; a degraded tag store is a
             // `TagStore::agents_with_tag` failure, diagnosed the same way as
             // any other store-degrade log line.
             if (tag_store_) {

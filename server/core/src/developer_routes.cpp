@@ -28,8 +28,10 @@ void send_html(httplib::Response& res, const std::string& html) {
     res.set_content(html, "text/html; charset=utf-8");
 }
 
-/// The route catalogue parses a ~340 KB compiled-in document, so parse it once:
-/// the document cannot change while the process runs. Filtering happens on the
+/// The route catalogue parses the compiled-in default OpenAPI document, about 648 KB
+/// (measured as compact JSON of the literal without the guides, before ecosystem
+/// token expansion; it grows as operations are added), so parse it once: the
+/// document cannot change while the process runs. Filtering happens on the
 /// parsed rows in render_routes_table.
 const json& routes_doc() {
     static const json doc = json::parse(build_routes_catalog(openapi_spec_json()).json, nullptr,
