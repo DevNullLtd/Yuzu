@@ -3142,29 +3142,42 @@ tests:
             value: 1
 
   # ── YuzuCertInventoryReportsRejected ─────────────────────────────────────
-  # CASE - a sustained rising rejected counter fires after the 30m hold; a flat one does not.
+  # CASE - ONE device refused ONCE fires (increase over a day, no hold), carrying its reason.
   - interval: 1m
-    name: cert inventory rejected - sustained rejections fire, a flat series stays quiet
+    name: cert inventory rejected - a single refusal fires, with its reason label
     input_series:
       - series: 'yuzu_server_cert_inventory_ingest_total{job="yuzu",instance="s1",result="rejected",reason="unknown_version"}'
-        values: "0+1x50"
+        values: "0x10 1x60"
       - series: 'yuzu_server_cert_inventory_ingest_total{job="yuzu",instance="s1",result="stored",reason="none"}'
-        values: "0+5x50"
+        values: "0+5x70"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuCertInventoryReportsRejected", alertstate="firing"}'
-        eval_time: 45m
+        eval_time: 15m
         exp_samples:
-          - labels: 'ALERTS{alertname="YuzuCertInventoryReportsRejected", alertstate="firing", severity="warning"}'
+          - labels: 'ALERTS{alertname="YuzuCertInventoryReportsRejected", alertstate="firing", severity="warning", result="rejected", reason="unknown_version"}'
             value: 1
-      - expr: 'ALERTS{alertname="YuzuCertInventoryReportsRejected", alertstate="firing"}'
-        eval_time: 10m
-        exp_samples: []
 
+  # CASE - a budget_exceeded freeze fires through the second arm.
   - interval: 1m
-    name: cert inventory rejected - a flat zero rejected series stays quiet
+    name: cert inventory rejected - budget_exceeded fires too
+    input_series:
+      - series: 'yuzu_server_cert_inventory_ingest_total{job="yuzu",instance="s1",result="error",reason="budget_exceeded"}'
+        values: "0x10 1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCertInventoryReportsRejected", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCertInventoryReportsRejected", alertstate="firing", severity="warning", result="error", reason="budget_exceeded"}'
+            value: 1
+
+  # CASE - a flat zero series, and an unrelated store_error, stay quiet.
+  - interval: 1m
+    name: cert inventory rejected - flat rejected and plain store errors stay quiet
     input_series:
       - series: 'yuzu_server_cert_inventory_ingest_total{job="yuzu",instance="s1",result="rejected",reason="bad_header"}'
-        values: "0x50"
+        values: "0x70"
+      - series: 'yuzu_server_cert_inventory_ingest_total{job="yuzu",instance="s1",result="error",reason="store_error"}'
+        values: "0+1x70"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuCertInventoryReportsRejected", alertstate="firing"}'
         eval_time: 45m

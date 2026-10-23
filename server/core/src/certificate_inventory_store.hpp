@@ -36,13 +36,14 @@
 /// out is the decommission tombstone, which is a separate, later change.
 ///
 /// FAILURE POSTURE (ADR-0012 §1). Ingest is fail-soft (a transient outage returns `kError`; the
-/// seam nacks and the agent resends next cycle). `delete_agent` returns true only when the
+/// seam answers the agent (a full report is asked to resend; a hash-only report is acknowledged and retries next interval)). `delete_agent` returns true only when the
 /// transaction committed, so the decommission cascade records a rolled-back erasure as Failed.
 /// This PR ships no read surface; a store that failed to open is visible on `/readyz`.
 ///
 /// Registered in the agent-decommission cascade (`AgentDecommissionStores::certificate_inventory`,
 /// the eighth store).
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -67,10 +68,6 @@ namespace yuzu::server {
 /// change the key, or a rolling upgrade would run two keys for one agent). Ingest (full and
 /// hash-skip), `delete_agent` and the future retention prune ALL use this one constant.
 inline constexpr std::string_view kCertInventoryAgentLockPrefix = "cert_inventory:";
-
-/// md5(path) as lowercase hex: the key `cert_location` uses for a path. The ingest de-duplicates
-/// on this, so the dedupe and the primary key can never disagree.
-[[nodiscard]] std::string cert_path_key(std::string_view path);
 
 /// The store's migration array (schema `certificate_inventory_store`), for the D13 schema lint.
 [[nodiscard]] const std::vector<pg::PgMigration>& certificate_inventory_migrations();
@@ -217,8 +214,20 @@ public:
         ingest_budget_ = std::move(f);
     }
 
+    /// TEST SEAMS: `after_facts` runs inside ingest_full once the fact rows are written;
+    /// `child_hash` replaces the child-set digest function (an empty result is an error).
+    void set_test_hook_after_facts(std::function<void()> hook) {
+        test_hook_after_facts_ = std::move(hook);
+    }
+    void set_test_child_hash(std::function<std::string(std::string_view)> f) {
+        child_hash_ = std::move(f);
+    }
+
 private:
     pg::PgPool& pool_;
+    std::atomic<int> active_full_{0};
+    std::function<void()> test_hook_after_facts_;
+    std::function<std::string(std::string_view)> child_hash_;
     yuzu::MetricsRegistry* metrics_{nullptr};
     std::function<std::chrono::steady_clock::duration(std::size_t)> ingest_budget_;
     bool open_{false};

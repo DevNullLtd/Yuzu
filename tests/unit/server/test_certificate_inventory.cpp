@@ -1013,6 +1013,21 @@ TEST_CASE("CertificateInventoryStore: delete_agent erases every table for the ag
 }
 
 namespace {
+// Joins its thread on scope exit (also on an early REQUIRE/CHECK exit), so a failing assertion can
+// never reach std::terminate or leave a thread running against destroyed locals. Declare it AFTER
+// every object its thread captures. (std::thread, not jthread: Apple libc++ at the project floor
+// has no jthread.)
+struct ThreadGuard {
+    std::thread t;
+    ThreadGuard() = default;
+    ThreadGuard(const ThreadGuard&) = delete;
+    ThreadGuard& operator=(const ThreadGuard&) = delete;
+    ~ThreadGuard() { join(); }
+    void join() {
+        if (t.joinable())
+            t.join();
+    }
+};
 // Every table's row count for the agent, as one comparable tuple.
 std::vector<std::int64_t> shape(CertificateInventoryStore& s, const std::string& a) {
     const auto r = s.row_counts(a);
@@ -1039,9 +1054,9 @@ TEST_CASE("CertificateInventoryStore: an ingest racing delete_agent ends as one 
         std::atomic<bool> delete_done{false};
         std::atomic<bool> delete_done_at_hook_return{true};
         bool delete_ok = false;
-        std::jthread deleter;
+        ThreadGuard deleter; // declared after everything its thread captures
         store.set_test_hook_after_lock([&] {
-            deleter = std::jthread([&] {
+            deleter.t = std::thread([&] {
                 CertificateInventoryStore other{pool}; // a second connection
                 delete_ok = other.delete_agent("agent-1");
                 delete_done = true;
@@ -1064,12 +1079,12 @@ TEST_CASE("CertificateInventoryStore: an ingest racing delete_agent ends as one 
         std::atomic<bool> ingest_done{false};
         std::atomic<bool> deferred_ack_nacked{false};
         std::atomic<bool> ingest_done_at_hook_return{false};
-        std::jthread reporter;
         CertificateInventoryStore other{pool};
         yuzu::MetricsRegistry m;
         cert_ingest_metric::register_metrics(m);
+        ThreadGuard reporter;
         store.set_test_hook_after_erase([&] {
-            reporter = std::jthread([&] {
+            reporter.t = std::thread([&] {
                 deferred_ack_nacked = nacked(ingest(other, "agent-1", full_report(b), &m));
                 ingest_done = true;
             });
@@ -1343,8 +1358,16 @@ TEST_CASE("CertificateInventoryStore: concurrent reports for one agent never par
 
     HeldAgentLock held(pool, "agent-1"); // another replica's report is mid-flight
     constexpr int kN = 12;               // more than the shared pool's size (4)
-    std::vector<std::jthread> ts;
     std::atomic<int> full_nacked{0}, hash_nacked{0};
+    std::vector<std::thread> ts;
+    struct Joiner {
+        std::vector<std::thread>& v;
+        ~Joiner() {
+            for (auto& t : v)
+                if (t.joinable())
+                    t.join();
+        }
+    } joiner{ts};
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < kN; ++i)
         ts.emplace_back([&, i] {
@@ -1564,14 +1587,57 @@ TEST_CASE("CertificateInventoryStore: a child-only change (SAN set) is never ski
     CHECK(store.row_counts("agent-1")->cert_eku == 1);
 }
 
-TEST_CASE("cert path key: the dedupe key is md5(path), identical to the table's generated column",
+TEST_CASE("cert path key: the key is md5(path) computed by Postgres, never by the application",
           "[certinv][pg]") {
     CERT_SHARED(store, pool);
     const std::string path = "/etc/ssl/certs/\xC3\xA9.pem";
     ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {cert(1, {{"S", path}})})));
+    CHECK(scalar(pool, "SELECT path_md5 = md5(path) FROM certificate_inventory_store.cert_location") ==
+          "t");
     CHECK(scalar(pool, "SELECT path_md5 FROM certificate_inventory_store.cert_location") ==
-          cert_path_key(path));
-    CHECK(cert_path_key("") == "d41d8cd98f00b204e9800998ecf8427e");
+          scalar(pool, "SELECT md5($1)", {path}));
+}
+
+TEST_CASE("cert ingest: a child-digest failure is an error, never an empty digest",
+          "[certinv][pg]") {
+    CERT_SHARED(store, pool);
+    yuzu::MetricsRegistry m;
+    cert_ingest_metric::register_metrics(m);
+    store.set_test_child_hash([](std::string_view) { return std::string{}; }); // digest unavailable
+    CHECK(nacked(ingest(store, "agent-1",
+                        full_report(blob(store_rec("S", "ok"), {cert(1, {{"S", ""}})})), &m)));
+    CHECK(metric_count(m, "error", "store_error") == 1);
+    CHECK(store.row_counts("agent-1")->agent_state == 0); // nothing written
+}
+
+TEST_CASE("cert ingest: a budget overrun AFTER the facts phase is still budget_exceeded, rolled "
+          "back, with no resend",
+          "[certinv][pg]") {
+    CERT_SHARED(store, pool);
+    Cert c = cert(1, {{"S", ""}});
+    c.sans = {{"dns", "a"}};
+    c.ekus = {"1.3.6.1.5.5.7.3.1"};
+    const auto b = blob(store_rec("S", "ok"), {c});
+    yuzu::MetricsRegistry m;
+    cert_ingest_metric::register_metrics(m);
+    store.set_test_ingest_budget([](std::size_t) { return std::chrono::milliseconds(800); });
+    // The facts are written inside the budget, then time runs out before the children.
+    store.set_test_hook_after_facts([] { std::this_thread::sleep_for(std::chrono::milliseconds(1200)); });
+    const auto ack = ingest(store, "agent-1", full_report(b), &m);
+    CHECK_FALSE(nacked(ack));
+    CHECK(metric_count(m, "error", "budget_exceeded") == 1);
+    CHECK(metric_count(m, "error", "store_error") == 0);
+    CHECK(store.row_counts("agent-1")->agent_state == 0);
+    CHECK(store.row_counts("agent-1")->cert_fact == 0); // the facts were rolled back too
+}
+
+TEST_CASE("cert ingest: two different paths folded by the md5 key are one row, not an error",
+          "[certinv][pg]") {
+    CERT_SHARED(store, pool);
+    // Same (store, sha256) with two distinct paths is two rows; identical paths are one.
+    ingest(store, "agent-1",
+           full_report(blob(store_rec("S", "ok"), {cert(1, {{"S", "/a"}, {"S", "/b"}, {"S", "/a"}})})));
+    CHECK(store.row_counts("agent-1")->cert_location == 2);
 }
 
 TEST_CASE("CertificateInventoryStore: delete_agent gives up on a held lock and is counted",
