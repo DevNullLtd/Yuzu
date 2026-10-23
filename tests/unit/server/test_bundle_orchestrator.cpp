@@ -9,12 +9,14 @@
 #include "bundle_service.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
+#include "test_forensics_tier_fixture.hpp" // #4990
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -76,9 +78,20 @@ BundleOrchestrator::AuditSink null_audit() {
               const std::string&) {};
 }
 
+// A caller holding a global Forensics:Read (every row visible) and one holding none.
+ResponseTierFilter open_tier() {
+    return ResponseTierFilter::exclude(yuzu::server::test::forensics_plugin_set(), std::nullopt);
+}
+ResponseTierFilter non_holder_tier() {
+    return ResponseTierFilter::exclude(yuzu::server::test::forensics_plugin_set(),
+                                       yuzu::server::authz::deny_all());
+}
+
 void put_response(ResponseStore& store, const std::string& correlation,
-                  const std::string& command_id, int status, const std::string& output) {
+                  const std::string& command_id, int status, const std::string& output,
+                  const std::string& plugin = {}) {
     StoredResponse r;
+    r.plugin = plugin;
     r.execution_id = correlation;  // stamped with the bundle correlation id
     r.instruction_id = command_id; // == the dispatched command_id
     r.agent_id = "agent-1";
@@ -239,7 +252,7 @@ TEST_CASE("orchestrator collate groups responses in request order", "[pg][bundle
     auto res = orch.dispatch("agent-1", two_steps(), "alice", null_audit());
 
     // Before any response: not complete.
-    auto a0 = orch.collate(res.correlation_id, "alice", /*is_admin=*/false);
+    auto a0 = orch.collate(res.correlation_id, "alice", /*is_admin=*/false, open_tier());
     REQUIRE(a0.has_value());
     CHECK_FALSE(a0->complete);
     CHECK(a0->received == 0);
@@ -248,7 +261,7 @@ TEST_CASE("orchestrator collate groups responses in request order", "[pg][bundle
     put_response(store, "bundle-abc", "cmd-os_info-os_name", 1, "os_name|Win");
     put_response(store, "bundle-abc", "cmd-os_info-uptime", 1, "up 3d");
 
-    auto a1 = orch.collate(res.correlation_id, "alice", false);
+    auto a1 = orch.collate(res.correlation_id, "alice", false, open_tier());
     REQUIRE(a1.has_value());
     CHECK(a1->complete);
     CHECK(a1->received == 2);
@@ -269,7 +282,7 @@ TEST_CASE("orchestrator: a step that reached no agent is dispatch-failed (termin
     BundleOrchestrator orch(fd.fn(), &store, fixed_id("abc"));
 
     auto res = orch.dispatch("agent-1", two_steps(), "alice", null_audit());
-    auto a = orch.collate(res.correlation_id, "alice", false);
+    auto a = orch.collate(res.correlation_id, "alice", false, open_tier());
     REQUIRE(a.has_value());
     CHECK(a->complete); // dispatch-failed steps are terminal, don't hold it open
     CHECK(a->received == 0);
@@ -288,11 +301,11 @@ TEST_CASE("orchestrator collate enforces ownership (IDOR guard)", "[pg][bundle][
     auto res = orch.dispatch("agent-1", two_steps(), "alice", null_audit());
 
     // Wrong principal, not admin → nullopt (indistinguishable from not-found).
-    CHECK_FALSE(orch.collate(res.correlation_id, "mallory", /*is_admin=*/false).has_value());
+    CHECK_FALSE(orch.collate(res.correlation_id, "mallory", /*is_admin=*/false, open_tier()).has_value());
     // Admin override is allowed.
-    CHECK(orch.collate(res.correlation_id, "mallory", /*is_admin=*/true).has_value());
+    CHECK(orch.collate(res.correlation_id, "mallory", /*is_admin=*/true, open_tier()).has_value());
     // Owner is allowed.
-    CHECK(orch.collate(res.correlation_id, "alice", false).has_value());
+    CHECK(orch.collate(res.correlation_id, "alice", false, open_tier()).has_value());
 }
 
 TEST_CASE("orchestrator collate of an unknown correlation id is nullopt", "[pg][bundle][orchestrator]") {
@@ -302,7 +315,7 @@ TEST_CASE("orchestrator collate of an unknown correlation id is nullopt", "[pg][
     ResponseStore store(pool);
     REQUIRE(store.is_open());
     BundleOrchestrator orch(fd.fn(), &store, fixed_id("abc"));
-    auto agg = orch.collate("bundle-nope", "alice", false);
+    auto agg = orch.collate("bundle-nope", "alice", false, open_tier());
     CHECK_FALSE(agg.has_value());
     CHECK(agg.error() == CollateError::kNotFoundOrDenied);
 }
@@ -322,7 +335,7 @@ TEST_CASE("orchestrator collate distinguishes a degraded store read from not-fou
     BundleOrchestrator orch(fd.fn(), &bad_store, fixed_id("abc"));
 
     auto res = orch.dispatch("agent-1", two_steps(), "alice", null_audit());
-    auto agg = orch.collate(res.correlation_id, "alice", /*is_admin=*/false);
+    auto agg = orch.collate(res.correlation_id, "alice", /*is_admin=*/false, open_tier());
     CHECK_FALSE(agg.has_value());
     CHECK(agg.error() == CollateError::kDegraded); // NOT kNotFoundOrDenied
 }
@@ -335,7 +348,7 @@ TEST_CASE("orchestrator collate with an unwired response store is a degrade not 
     FakeDispatch fd;
     BundleOrchestrator orch(fd.fn(), /*response_store=*/nullptr, fixed_id("abc"));
     auto res = orch.dispatch("agent-1", two_steps(), "alice", null_audit());
-    auto agg = orch.collate(res.correlation_id, "alice", /*is_admin=*/false);
+    auto agg = orch.collate(res.correlation_id, "alice", /*is_admin=*/false, open_tier());
     CHECK_FALSE(agg.has_value());
     CHECK(agg.error() == CollateError::kDegraded);
 }
@@ -369,7 +382,7 @@ TEST_CASE("orchestrator: a throwing dispatch step is isolated, manifest still st
     BundleOrchestrator::DispatchResult res;
     REQUIRE_NOTHROW(res = orch.dispatch("agent-1", *specs, "alice", null_audit()));
 
-    auto agg = orch.collate(res.correlation_id, "alice", /*is_admin=*/false);
+    auto agg = orch.collate(res.correlation_id, "alice", /*is_admin=*/false, open_tier());
     REQUIRE(agg.has_value()); // not orphaned
     REQUIRE(agg->steps.size() == 3);
     CHECK(agg->steps[1].state == BundleStepState::DispatchFailed); // the throwing step
@@ -395,12 +408,12 @@ TEST_CASE("orchestrator: a single boundary poll does not self-evict; polling sli
     // CH-3: first/only poll exactly at created_at + ttl + 1 still serves it
     // (collate finds BEFORE sweeping).
     clock = 1000 + ttl + 1;
-    CHECK(orch.collate(res.correlation_id, "alice", false).has_value());
+    CHECK(orch.collate(res.correlation_id, "alice", false, open_tier()).has_value());
 
     // CH-4: that poll slid the window — a poll within ttl of the LAST poll works,
     // even though it is far past the original created_at.
     clock += ttl;
-    CHECK(orch.collate(res.correlation_id, "alice", false).has_value());
+    CHECK(orch.collate(res.correlation_id, "alice", false, open_tier()).has_value());
 }
 
 TEST_CASE("orchestrator: an abandoned (un-polled) bundle is eventually swept",
@@ -423,7 +436,7 @@ TEST_CASE("orchestrator: an abandoned (un-polled) bundle is eventually swept",
     // a fresh dispatch triggers the sweep that drops it.
     clock = 1000 + ttl + 31000;
     orch.dispatch("agent-1", two_steps(), "alice", null_audit());
-    CHECK_FALSE(orch.collate(abandoned.correlation_id, "alice", false).has_value());
+    CHECK_FALSE(orch.collate(abandoned.correlation_id, "alice", false, open_tier()).has_value());
 }
 
 TEST_CASE("orchestrator: an empty principal can never collate (sec-M2/CH-7)",
@@ -436,9 +449,9 @@ TEST_CASE("orchestrator: an empty principal can never collate (sec-M2/CH-7)",
     BundleOrchestrator orch(fd.fn(), &store, fixed_id("abc"));
     auto res = orch.dispatch("agent-1", two_steps(), /*principal=*/"", null_audit());
     // Even the (empty) dispatcher cannot collate — empty principal never owns.
-    CHECK_FALSE(orch.collate(res.correlation_id, "", /*is_admin=*/false).has_value());
+    CHECK_FALSE(orch.collate(res.correlation_id, "", /*is_admin=*/false, open_tier()).has_value());
     // Admin break-glass still works.
-    CHECK(orch.collate(res.correlation_id, "", /*is_admin=*/true).has_value());
+    CHECK(orch.collate(res.correlation_id, "", /*is_admin=*/true, open_tier()).has_value());
 }
 
 TEST_CASE("orchestrator: cap eviction drops the oldest manifest (QE-S3)",
@@ -458,7 +471,48 @@ TEST_CASE("orchestrator: cap eviction drops the oldest manifest (QE-S3)",
     auto a = orch.dispatch("agent-1", two_steps(), "alice", null_audit());
     auto b = orch.dispatch("agent-1", two_steps(), "alice", null_audit());
     auto c = orch.dispatch("agent-1", two_steps(), "alice", null_audit()); // cap → evict oldest (a)
-    CHECK_FALSE(orch.collate(a.correlation_id, "alice", false).has_value());
-    CHECK(orch.collate(b.correlation_id, "alice", false).has_value());
-    CHECK(orch.collate(c.correlation_id, "alice", false).has_value());
+    CHECK_FALSE(orch.collate(a.correlation_id, "alice", false, open_tier()).has_value());
+    CHECK(orch.collate(b.correlation_id, "alice", false, open_tier()).has_value());
+    CHECK(orch.collate(c.correlation_id, "alice", false, open_tier()).has_value());
+}
+
+TEST_CASE("orchestrator collate: a Forensics step's output is the caller's Forensics tier, not the "
+          "dispatcher's (#4990)",
+          "[pg][bundle][orchestrator][forensics_tier]") {
+    FakeDispatch fd;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    BundleOrchestrator orch(fd.fn(), &store, fixed_id("abc"));
+
+    const std::string forensic = yuzu::server::test::kForensicsPlugin;
+    auto steps = validate_bundle_steps(
+        R"([{"plugin":"browser_inventory","action":"profiles"},{"plugin":"os_info","action":"uptime"}])");
+    REQUIRE(steps.has_value());
+    auto res = orch.dispatch("agent-1", *steps, "alice", null_audit());
+    put_response(store, "bundle-abc", "cmd-browser_inventory-profiles", 1, "marker-4990-bundle",
+                 forensic);
+    put_response(store, "bundle-abc", "cmd-os_info-uptime", 1, "up 3d", "os_info");
+
+    SECTION("a non-holder: the Forensics step has no output, the ordinary step is unchanged") {
+        auto agg = orch.collate(res.correlation_id, "alice", /*is_admin=*/true, non_holder_tier());
+        REQUIRE(agg.has_value());
+        REQUIRE(agg->steps.size() == 2);
+        CHECK(agg->steps[0].output.empty());
+        CHECK(agg->steps[1].output == "up 3d");
+        CHECK(agg->received == 1);
+    }
+    SECTION("a holder sees both") {
+        auto agg = orch.collate(res.correlation_id, "alice", false, open_tier());
+        REQUIRE(agg.has_value());
+        CHECK(agg->steps[0].output == "marker-4990-bundle");
+        CHECK(agg->steps[1].output == "up 3d");
+    }
+    SECTION("an unwired plugin set refuses every row") {
+        auto agg = orch.collate(res.correlation_id, "alice", false,
+                                ResponseTierFilter::refuse_unwired());
+        REQUIRE(agg.has_value());
+        CHECK(agg->received == 0);
+    }
 }

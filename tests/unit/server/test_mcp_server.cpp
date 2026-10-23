@@ -23106,6 +23106,52 @@ TEST_CASE("MCP get_bundle_result collates the responses in request order", "[pg]
     CHECK(bundle_structured(get) == p);
 }
 
+TEST_CASE("MCP get_bundle_result: a Forensics step's output follows the caller's Forensics tier "
+          "(#4990)",
+          "[pg][mcp][bundle][forensics_tier]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start_with_dispatch(fake_bundle_dispatch());
+
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":84,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-1","steps":[{"plugin":"browser_inventory","action":"profiles"},{"plugin":"os_info","action":"uptime"}]}}})");
+    auto exec_id = bundle_payload(disp)["bundle_id"].get<std::string>();
+    auto inject = [&](const std::string& cmd, const std::string& out, const std::string& plugin) {
+        yuzu::server::StoredResponse r;
+        r.execution_id = exec_id;
+        r.instruction_id = cmd;
+        r.agent_id = "agent-1";
+        r.plugin = plugin;
+        r.status = 1;
+        r.output = out;
+        r.timestamp = 100;
+        store.store(r);
+    };
+    inject("cmd-browser_inventory-profiles", "marker-4990-mcp-bundle",
+           yuzu::server::test::kForensicsPlugin);
+    inject("cmd-os_info-uptime", "up 3d", "os_info");
+    const std::string get_call =
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":85,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        exec_id + R"("}}})";
+
+    ts.forensics_for_test.viewer();
+    auto hidden = bundle_payload(ts.call(get_call));
+    CHECK(hidden["steps"][0]["output"] == "");
+    CHECK(hidden["steps"][1]["output"] == "up 3d");
+    CHECK(hidden["received"] == 1);
+
+    ts.forensics_for_test.admin();
+    auto shown = bundle_payload(ts.call(get_call));
+    CHECK(shown["steps"][0]["output"] == "marker-4990-mcp-bundle");
+    CHECK(shown["steps"][1]["output"] == "up 3d");
+}
+
 TEST_CASE("MCP get_bundle_result: #3344 retry_after_ms present only while complete=false",
           "[pg][mcp][bundle]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

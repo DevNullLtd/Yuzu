@@ -17,6 +17,7 @@
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include "rest_api_v1.hpp"
+#include "test_forensics_tier_fixture.hpp" // #4990
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -63,6 +64,8 @@ struct BundleHarness {
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
 
+    /// #4990: the caller's Forensics visibility for the collate read (admin by default).
+    yuzu::server::test::ForensicsCaller forensics;
     std::vector<DispatchCall> calls;
     std::vector<AuditRow> audits;
     std::string principal = "alice";
@@ -136,6 +139,7 @@ struct BundleHarness {
             };
         }
 
+        yuzu::server::test::wire_forensics(api, forensics);
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
                             /*quarantine_store=*/nullptr, store.is_open() ? &store : nullptr,
@@ -177,8 +181,9 @@ struct BundleHarness {
     }
 
     void put_response(const std::string& correlation, const std::string& command_id, int st,
-                      const std::string& output) {
+                      const std::string& output, const std::string& plugin = {}) {
         StoredResponse r;
+        r.plugin = plugin;
         r.execution_id = correlation;
         r.instruction_id = command_id;
         r.agent_id = "agent-1";
@@ -567,4 +572,38 @@ TEST_CASE("POST /api/v1/bundles: a body nested past the depth limit is rejected 
     h.post("/api/v1/bundles", body, status);
     CHECK(status == 400);
     CHECK(h.calls.empty()); // never reached command_dispatch_fn
+}
+
+TEST_CASE("GET /api/v1/bundles/{id}: a Forensics step's output follows the caller's Forensics tier "
+          "(#4990)",
+          "[pg][bundle][rest][forensics_tier]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
+    int status = 0;
+    auto disp = h.post(
+        "/api/v1/bundles",
+        R"({"agent_id":"agent-1","steps":[{"plugin":"browser_inventory","action":"profiles"},{"plugin":"os_info","action":"uptime"}]})",
+        status);
+    REQUIRE(status == 202);
+    auto exec_id = disp["data"]["bundle_id"].get<std::string>();
+    h.put_response(exec_id, "cmd-browser_inventory-profiles", 1, "marker-4990-rest-bundle",
+                   yuzu::server::test::kForensicsPlugin);
+    h.put_response(exec_id, "cmd-os_info-uptime", 1, "up 3d", "os_info");
+
+    SECTION("a dispatcher without Forensics:Read: the Forensics step shows no output") {
+        h.forensics.viewer();
+        auto a = h.get("/api/v1/bundles/" + exec_id, status);
+        REQUIRE(status == 200);
+        CHECK(a["data"]["steps"][0]["output"] == "");
+        CHECK(a["data"]["steps"][1]["output"] == "up 3d");
+        CHECK(a["data"]["received"] == 1);
+    }
+    SECTION("a holder sees the output") {
+        h.forensics.admin();
+        auto a = h.get("/api/v1/bundles/" + exec_id, status);
+        REQUIRE(status == 200);
+        CHECK(a["data"]["steps"][0]["output"] == "marker-4990-rest-bundle");
+        CHECK(a["data"]["steps"][1]["output"] == "up 3d");
+    }
 }

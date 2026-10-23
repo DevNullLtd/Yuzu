@@ -3529,8 +3529,8 @@ void RestApiV1::register_routes(
 
     // GET /api/v1/bundles/{id} — collate (poll). Server-grouped result.
     sink.Get(R"(/api/v1/bundles/(bundle-[a-f0-9]+))",
-             [auth_fn, perm_fn, audit_fn, bundle_orch](const httplib::Request& req,
-                                                       httplib::Response& res) {
+             [auth_fn, perm_fn, audit_fn, bundle_orch, forensics_plugins,
+              forensics_visibility_fn](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Response", "Read"))
                      return;
                  if (!bundle_orch) {
@@ -3543,7 +3543,9 @@ void RestApiV1::register_routes(
                  const bool is_admin =
                      session && auth::effective_role(*session) == auth::Role::admin; // JIT elevation
                  const auto id = req.matches[1].str();
-                 auto agg = bundle_orch->collate(id, principal, is_admin);
+                 // #4990: the caller's own Forensics visibility, resolved on this request.
+                 const auto tier = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
+                 auto agg = bundle_orch->collate(id, principal, is_admin, tier);
                  if (!agg) {
                      // #2691 (Doomgoose finding #3): kDegraded is a real store
                      // read failure on a bundle that WAS found and owned — a

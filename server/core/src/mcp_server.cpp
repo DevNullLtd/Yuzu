@@ -21641,7 +21641,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const bool is_admin = session->role == auth::Role::admin;
-                auto agg = bundle_orch->collate(bundle_id, session->username, is_admin);
+                // #4990: the caller's own Forensics visibility, resolved on this request.
+                const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                auto agg = bundle_orch->collate(bundle_id, session->username, is_admin, tier);
                 if (!agg) {
                     // #2691 (Doomgoose finding #3): kDegraded is a real store
                     // read failure on a bundle that WAS found and owned — a
