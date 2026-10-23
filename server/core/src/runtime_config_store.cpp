@@ -38,9 +38,11 @@ struct KeySpec {
 };
 
 // One row per allowed key, and every row names its write class explicitly: the generic
-// PUT /api/config/{key} (config_routes.cpp) applies the class, and a key whose own settings route
-// is administrator-only must not be weaker here. test_runtime_config_secret_redaction.cpp pins
-// every key's class, so a new row without a deliberate class fails there.
+// PUT /api/config/{key} (config_routes.cpp) applies the class. General means Infrastructure:Write
+// suffices; a key that a Settings route writes must NOT be General (test_config_routes.cpp scans
+// for that). Other keys are classified by maintainer ruling on sensitivity, recorded on the row.
+// test_runtime_config_secret_redaction.cpp pins every key's class, so a new row without a
+// deliberate class fails there.
 constexpr ConfigWriteClass kGeneral = ConfigWriteClass::General;
 constexpr ConfigWriteClass kAdmin = ConfigWriteClass::AdminRoute;
 constexpr ConfigWriteClass kOidc = ConfigWriteClass::AdminRouteInteractiveOnly;
@@ -48,8 +50,12 @@ constexpr ConfigWriteClass kOidc = ConfigWriteClass::AdminRouteInteractiveOnly;
 constexpr KeySpec kKeySpecs[] = {
     {"heartbeat_timeout", kGeneral},       // seconds before marking agent offline
     {"response_retention_days", kGeneral}, // days to keep instruction responses
-    // days to keep audit events. Administrator-only by maintainer ruling: it sets the audit
-    // retention floor, and the generic PUT is its only writer (no Settings route).
+    // days to keep audit events. Administrator-only by maintainer ruling because it is the
+    // stored audit-retention setting (audit evidence), not because a PUT changes the window
+    // applied today: AuditStore copies the window at construction, so a stored value is not
+    // enforced (#483). It has no Settings route; the generic PUT is its only writer.
+    // response_retention_days and guardian_event_retention_days are the same stored-only shape
+    // but operational data, deliberately General for now.
     {"audit_retention_days", kAdmin},
     {"guardian_event_retention_days", kGeneral}, // days to keep guaranteed-state events
     {"auto_approve_enabled", kGeneral},          // "true" or "false"

@@ -837,7 +837,9 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   `audit_retention_days` applies one caller rule. For the first six it is the rule of the
   Settings routes that also write them; `audit_retention_days` has no Settings route
   (the generic PUT is its only writer) and is in the class by maintainer ruling, because
-  it sets how long audit events are kept (the SOC 2 audit retention floor). The Settings
+  it is the stored audit-retention setting (reported by `GET /api/config`, evidence-bearing,
+  and the lever that will govern enforcement once #483 lands); the stored value is not
+  enforced today, the enforced window being `--audit-retention-days` plus a restart. The Settings
   routes are behind `require_admin`; the generic route uses the same predicate: `authz::admin_gate_verdict` (`admin_gate.hpp`) refuses a
   service-scoped token and an MCP-tier token whatever the creator's role, and otherwise
   requires the EFFECTIVE role to be `admin`. That role is the account's own (legacy)

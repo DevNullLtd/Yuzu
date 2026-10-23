@@ -138,14 +138,17 @@ class SecretCodec;
 namespace yuzu::server {
 
 /// Who may write an allowed key through the generic PUT /api/config/{key}. The route already
-/// requires Infrastructure:Write; a class other than General adds the caller-identity rule of
-/// the key's own settings route, so the generic route is never the weaker way to the same key.
+/// requires Infrastructure:Write; a class other than General adds a caller rule on top. The rule
+/// is always decided by the class here (through `authz::admin_gate_verdict`), never by consulting
+/// a Settings route, so the generic route is never the weaker way to a key a Settings route
+/// guards (a test scans the Settings routes for exactly that).
 enum class ConfigWriteClass : std::uint8_t {
     /// Infrastructure:Write is enough.
     General,
-    /// The key's settings route is `require_admin`: refused for a service-scoped token, an
-    /// MCP-tier token, and a caller whose effective role is not admin
-    /// (`authz::admin_gate_verdict`).
+    /// Refused for a service-scoped token, an MCP-tier token, and a caller whose effective role
+    /// is not admin (`authz::admin_gate_verdict`). Used for keys a `require_admin` Settings
+    /// route also writes, and for `audit_retention_days`, which has no Settings route and is
+    /// classified here by maintainer ruling.
     AdminRoute,
     /// Sign-in provider keys: the caller's OWN role must be admin, so a JIT elevation, an
     /// MCP-tier token and a service-scoped token are all refused.
