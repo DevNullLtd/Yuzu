@@ -545,16 +545,23 @@ std::string wrapper_panel_body(CaStore* ca_store, bool pki_view, const PanelAcce
 
 /// The success reply of a wrapper (revoke / import-chain). An unconfined caller sees the result
 /// in the re-rendered inventory (the Revoked pill, the Trust mode badge), byte-identical to
-/// before. A caller whose inventory is withheld has nothing in the panel that shows the
-/// mutation, so the reply carries an explicit confirmation (banner + success toast) that does
-/// not depend on the inventory. `prefix` is any code-authored banner that goes first.
+/// before. Any other caller has nothing on screen that shows the mutation (the inventory is
+/// withheld, or the whole panel is, for a caller holding Security:Delete or Security:Write but
+/// not Security:Read), so the reply carries an explicit confirmation (banner + success toast)
+/// that does not depend on the inventory. `confirmation` is a code-authored constant that
+/// discloses nothing a caller who submitted the request did not already know; the banner adds a
+/// pointer to the inventory note only when that note is on the page, and the toast (which has no
+/// "below") never does. `prefix` is any code-authored banner that goes first.
 std::string wrapper_success_body(httplib::Response& res, CaStore* ca_store, bool pki_view,
                                  const PanelAccess& access, std::string_view confirmation,
                                  std::string prefix = {}) {
-    if (access.may_view && access.inventory_note) {
+    if (!access.may_view || access.inventory_note) {
         set_toast(res, std::string(confirmation), "success");
+        std::string banner(confirmation);
+        if (access.may_view)
+            banner += " The issued-certificate inventory is not shown (see the note below).";
         prefix += "<div class=\"alert alert-success\" style=\"margin-bottom:0.75rem\">" +
-                  html_escape(std::string(confirmation)) + "</div>";
+                  html_escape(banner) + "</div>";
     }
     return prefix + wrapper_panel_body(ca_store, pki_view, access);
 }
@@ -1463,8 +1470,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
         if (!rv.audit_ok)
             res.set_header("Sec-Audit-Failed", "true");
         res.set_content(wrapper_success_body(res, ca_store, pki_view, access,
-                                             "Certificate revoked. The issued-certificate "
-                                             "inventory is not shown (see the note below)."),
+                                             "Certificate revoked."),
                         "text/html; charset=utf-8");
     });
 
@@ -1606,8 +1612,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                   res.set_content(wrapper_success_body(
                                       res, ca_store, pki_view, access,
                                       "Signed chain imported: this CA is now subordinate to the "
-                                      "imported enterprise root. The issued-certificate inventory "
-                                      "is not shown (see the note below).",
+                                      "imported enterprise root.",
                                       std::move(body)),
                                   "text/html; charset=utf-8");
               });

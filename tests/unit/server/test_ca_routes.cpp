@@ -2033,7 +2033,7 @@ const std::unordered_map<std::string, std::string> kSameOrigin = {{"Host", "yuzu
 
 } // namespace
 
-TEST_CASE("ca_routes: revoke wrapper without Security:Read returns only the banner",
+TEST_CASE("ca_routes: revoke wrapper without Security:Read confirms the revoke and never shows the panel",
           "[ca_routes][pki][security][pg]") {
     for (const char* view : {"", "&view=pki"}) {
         Harness h;
@@ -2051,18 +2051,31 @@ TEST_CASE("ca_routes: revoke wrapper without Security:Read returns only the bann
         CHECK(bad->body.find("Invalid certificate serial.") != std::string::npos);
         CHECK_FALSE(bad->get_header_value("HX-Trigger").empty());
         check_no_inventory(bad->body);
+        CHECK(bad->body.find("alert-success") == std::string::npos); // an error is not confirmed
+        CHECK_THAT(bad->get_header_value("HX-Trigger"),
+                   Catch::Matchers::ContainsSubstring("\"level\":\"error\""));
 
-        // Success path: still revokes (Delete is held), reply is not the panel.
+        // Success path: still revokes (Delete is held), reply is not the panel, but the
+        // mutation is confirmed (banner + success toast) so the caller is not left guessing.
         auto ok = h.sink.dispatch("POST", "/api/settings/ca/revoke?serial_hex=DEAD" + v, "",
                                   "application/x-www-form-urlencoded", kSameOrigin);
         REQUIRE(ok);
         CHECK(ok->status == 200);
         CHECK(h.store->is_revoked("DEAD"));
         check_no_inventory(ok->body);
+        CHECK(ok->body.find("alert-success") != std::string::npos);
+        CHECK(ok->body.find("Certificate revoked.") != std::string::npos);
+        CHECK(ok->body.find("not shown to this account") != std::string::npos);
+        CHECK(ok->body.find("see the note below") == std::string::npos);
+        CHECK_THAT(ok->get_header_value("HX-Trigger"),
+                   Catch::Matchers::ContainsSubstring("\"level\":\"success\""));
+        CHECK_THAT(ok->get_header_value("HX-Trigger"),
+                   Catch::Matchers::ContainsSubstring("Certificate revoked."));
+        CHECK(ok->get_header_value("HX-Trigger").find("below") == std::string::npos);
     }
 }
 
-TEST_CASE("ca_routes: import wrapper without Security:Read gets a plain note, never the inventory",
+TEST_CASE("ca_routes: import wrapper without Security:Read confirms the import, never the inventory",
           "[ca_routes][pki][subordinate][security][pg]") {
     for (const char* view : {"", "&view=pki"}) {
         Harness h;
@@ -2088,6 +2101,13 @@ TEST_CASE("ca_routes: import wrapper without Security:Read gets a plain note, ne
         CHECK(ok->status == 200);
         CHECK(h.import_calls == 1);
         check_no_inventory(ok->body);
+        CHECK(ok->body.find("alert-success") != std::string::npos);
+        CHECK(ok->body.find("Signed chain imported") != std::string::npos);
+        CHECK(ok->body.find("not shown to this account") != std::string::npos);
+        CHECK(ok->body.find("see the note below") == std::string::npos);
+        CHECK_THAT(ok->get_header_value("HX-Trigger"),
+                   Catch::Matchers::ContainsSubstring("\"level\":\"success\""));
+        CHECK(ok->get_header_value("HX-Trigger").find("below") == std::string::npos);
     }
 }
 
@@ -2523,7 +2543,8 @@ TEST_CASE("ca_routes: a degraded or unwired caller's wrappers confirm success wi
     }
 }
 
-TEST_CASE("ca_routes: a wrapper caller without Security:Read gets a plain note, never an empty body",
+TEST_CASE("ca_routes: a wrapper caller without Security:Read gets a confirmation and a plain note, "
+          "never an empty body",
           "[ca_routes][pki][security][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
@@ -2536,6 +2557,7 @@ TEST_CASE("ca_routes: a wrapper caller without Security:Read gets a plain note, 
     CHECK(ok->status == 200);
     CHECK(h.store->is_revoked("DEAD"));
     CHECK(ok->body.find("not shown to this account") != std::string::npos);
+    CHECK(ok->body.find("Certificate revoked.") != std::string::npos);
     check_no_inventory(ok->body);
     h.import_outcome = CaRoutes::ImportOutcome::Ok;
     auto imp = h.sink.dispatch("POST",
@@ -2543,6 +2565,7 @@ TEST_CASE("ca_routes: a wrapper caller without Security:Read gets a plain note, 
                                "application/x-www-form-urlencoded", kSameOrigin);
     REQUIRE(imp);
     CHECK(imp->body.find("not shown to this account") != std::string::npos);
+    CHECK(imp->body.find("Signed chain imported") != std::string::npos);
     check_no_inventory(imp->body);
 }
 
