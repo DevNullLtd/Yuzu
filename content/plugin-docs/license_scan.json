@@ -52,7 +52,7 @@
   "caveats": [
     "**Linux legs are declared CONSTRAINED, not SUPPORTED, by deliberate decision.** `pkg_metadata` is a declared-licence classification only (no lapse detection); `entitlement_certs`' authoritative expiry still depends on the `openssl` CLI being present. Not a regression — the migration off `popen` to the bounded argv runner is what made the demotion visible, not what caused the gap.",
     "**A binary macOS Info.plist is never decoded.** `bplist00` bundles fall back to the bundle name with an empty version, deliberately, because parsing binary plists without a Mac to verify against was ruled too risky to ship.",
-    "**Per-user Windows probes are never a primary surface.** A missing `SeBackup`/`SeRestore` privilege or a hive-unload failure degrades the `per_user_hives` probe status honestly but never blocks `list` or the daily-sync cycle — per-user licence state is additive, not authoritative.",
+    "**Per-user Windows probes are never a primary surface.** A missing `SeBackup`/`SeRestore` privilege, a refused hive file (the default offline guard, related issue #5291 -- aggregate reason `hive_file_refused`, per-profile sid + specific token logged at `warn`), or a hive-unload failure degrades the `per_user_hives` probe status honestly but never blocks `list` or the daily-sync cycle — per-user licence state is additive, not authoritative.",
     "**`ent|` entitlement records are explicitly out of scope.** FlexLM seat counts and KMS activation counts are PR2 scope (ADR-0024 D12); do not add seat-count emission here without that decision being revisited.",
     "**An `rpm` execution failure — not absence — falls through to `dpkg-query`.** A stray/leftover `rpm` binary with an uninitialized database (seen live on a self-hosted CI runner) failed every query while `dpkg-query` worked fine as the host's real package manager; only rpm's *absence* is treated as \"try the next tool\" the same way, execution failure is now handled identically rather than reported as a terminal error. A truncated capture (`output_truncated`) is kept as a distinct, honest failure mode, never folded into a silent partial success."
   ],
@@ -78,7 +78,7 @@
   "privileges": [
     {
       "grant": "**None.** Machine-scope surfaces need only the agent account's existing registry-read access. The per-user offline-hive fallback rides `SeBackupPrivilege` + `SeRestorePrivilege`, already held by the agent account for `tar.*`/certificate-store writes — no new privilege is introduced.",
-      "if_refused": "`slp_wmi` (authoritative) errors block the daily-sync cycle; `per_user_hives` degrades to `privilege_missing`/`hive_unload_failed`/`profile_list_unreadable` without blocking `list`, since per-user hives are never a primary surface",
+      "if_refused": "`slp_wmi` (authoritative) errors block the daily-sync cycle; `per_user_hives` degrades to `privilege_missing`/`hive_file_refused`/`hive_unload_failed`/`profile_list_truncated` without blocking `list`, since per-user hives are never a primary surface -- `hive_file_refused` is the aggregate reason when the default offline hive-file guard (related issue #5291) refuses any profile's hive; the per-profile sid and the guard's specific token go to the agent log at `warn`, never into the row itself",
       "measured": "2026-09-07, bare-metal, as `SYSTEM`",
       "os": "Windows",
       "runs_as": "agent service account (LocalSystem today, #1442)"
