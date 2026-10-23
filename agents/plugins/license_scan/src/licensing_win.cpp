@@ -55,6 +55,8 @@
 
 #include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681, R17)
 
+#include <spdlog/spdlog.h>
+
 // Shared per-user profile/hive ladder (#2771). This file's own copy of the
 // ProfileList walk, the privilege enable and the hive mount was the reference
 // the shared version was ported FROM; it now consumes it instead, which also
@@ -423,6 +425,7 @@ void run_per_user_surfaces(std::vector<LicRecord>& records, std::vector<ProbeOut
     std::size_t file_rows = 0;
     bool hive_unload_failed = false; // any profile's RegUnLoadKeyW failed
     bool privilege_missing = false;  // some profile NEEDED an offline mount and could not
+    bool hive_file_refused = false;  // the default offline guard refused some profile's hive file
 
     for (const auto& profile : profiles) {
         // ── registry hive: loaded HKU\<SID> FIRST, offline NTUSER.DAT as the
@@ -443,6 +446,11 @@ void run_per_user_surfaces(std::vector<LicRecord>& records, std::vector<ProbeOut
             hive_unload_failed = true;
         if (status == yuzu::win::HiveAccessStatus::privilege_missing)
             privilege_missing = true;
+        if (status == yuzu::win::HiveAccessStatus::file_refused) {
+            hive_file_refused = true;
+            spdlog::warn("license_scan: hive file refused for profile sid {} ({})", profile.sid,
+                         report.refusal);
+        }
         // A per-profile load failure (hive corrupt/locked) is still not a
         // surface failure: per-user hives are never a primary surface
         // (ADR-0024 D3/R15) — the profile is skipped, the cycle proceeds.
@@ -462,29 +470,14 @@ void run_per_user_surfaces(std::vector<LicRecord>& records, std::vector<ProbeOut
     // privilege_missing even when every profile was live-loaded and no
     // offline mount was ever needed. Now it reflects a profile that actually
     // required the fallback and could not get it.
-    if (privilege_missing) {
-        // R15: hardened installs that strip SeBackup/SeRestore surface here
-        // through the live `surfaces` diagnostics. Loaded hives were still
-        // probed (their records ride `list` regardless); offline NTUSER.DAT
-        // hives were unreadable, so availability is honestly degraded.
-        outcomes.push_back({"per_user_hives", false, hive_rows, "privilege_missing"});
-    } else if (hive_unload_failed) {
-        // A RegUnLoadKeyW failure (exotic — the ladder closes every HKEY into
-        // the hive before unloading) leaves that profile's NTUSER.DAT mounted
-        // and locked. The rows probed are still valid (they ride `list`
-        // regardless), but the condition must be visible: ok=false + rows,
-        // the privilege_missing precedent. Never a silent leak of a
-        // system-wide mount. Non-cycle-blocking — per-user hives are never a
-        // primary surface (sync source, ADR-0024 D3/R15).
-        outcomes.push_back({"per_user_hives", false, hive_rows, "hive_unload_failed"});
-    } else if (truncated) {
-        // New with the shared ladder, which caps the walk at kMaxProfiles
-        // where this file's own enumerate_profiles was unbounded. Reported
-        // rather than silently returning a short list.
-        outcomes.push_back({"per_user_hives", false, hive_rows, "profile_list_truncated"});
-    } else {
-        outcomes.push_back({"per_user_hives", true, hive_rows, {}});
-    }
+    // Precedence (per_user_hives_outcome, licensing_parsers.hpp): privilege_missing >
+    // hive_file_refused > hive_unload_failed > profile_list_truncated > ok. Rows probed before
+    // any one profile degraded are carried on every branch (they ride `list` regardless) --
+    // per-user hives are never a primary surface (sync source, ADR-0024 D3/R15). The aggregate
+    // reason names only `hive_file_refused`; the per-profile sid + specific token already went to
+    // the agent log above.
+    outcomes.push_back(per_user_hives_outcome(privilege_missing, hive_file_refused,
+                                              hive_unload_failed, truncated, hive_rows));
     outcomes.push_back({"per_user_files", true, file_rows, {}});
 }
 

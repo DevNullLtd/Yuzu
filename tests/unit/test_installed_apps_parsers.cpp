@@ -777,3 +777,33 @@ TEST_CASE("report_hive_read_failed: zero is silent; a failure is a trailing warn
     CHECK(some.lines[0] == "warning|hive_read_failed: 2 profile(s) had an unreadable Uninstall key; "
                            "their per-user apps may be under-listed");
 }
+
+TEST_CASE("report_hive_file_refused: declares status + writes exactly one warning row carrying "
+          "the sid and token",
+          "[installed_apps]") {
+    RecCtx ctx;
+    report_hive_file_refused(ctx, "S-1-5-21-1-2-3-1001", "hive_owner_unexpected");
+    CHECK(ctx.status_calls == 1);
+    CHECK(ctx.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(ctx.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(ctx.provenance == kDegradedProvenance);
+    REQUIRE(ctx.lines.size() == 1);
+    CHECK(ctx.lines[0] ==
+          "warning|hive_file_refused: profile sid S-1-5-21-1-2-3-1001 hive refused "
+          "(hive_owner_unexpected); its per-user apps are not listed");
+}
+
+TEST_CASE("report_hive_file_refused: a sid or token carrying a pipe or a newline cannot forge a "
+          "column or a row",
+          "[installed_apps]") {
+    RecCtx ctx;
+    report_hive_file_refused(ctx, "S-1-5|evil\nrow", "tok|en\r");
+    REQUIRE(ctx.lines.size() == 1);
+    // The fixed text has one '|' (after "warning"); every other pipe is escaped and no CR/LF
+    // survives in the row.
+    CHECK(ctx.lines[0].find('\n') == std::string::npos);
+    CHECK(ctx.lines[0].find('\r') == std::string::npos);
+    CHECK(ctx.lines[0] ==
+          "warning|hive_file_refused: profile sid S-1-5\\|evil row hive refused (tok\\|en ); its "
+          "per-user apps are not listed");
+}

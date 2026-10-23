@@ -360,6 +360,36 @@ separately.
 
 ## Upgrade Notes
 
+### vNEXT — the offline user-hive file check is now the default for autoruns, installed_apps, license_scan, registry and tar (related issue #5291; breaking for fleets with non-standard profile roots)
+
+**What changed.** Agent plugins that mount a logged-out Windows profile's `NTUSER.DAT` offline (to
+read its `HKEY_USERS` hive without a live session) have always run a file-level check against that
+hive — the path must not cross a UNC/non-fixed-drive or a reparse-point ancestor, and the file
+itself must be a regular file owned by the profile, LocalSystem or Administrators. Before this
+change only one plugin (`privacy_permissions`) opted into that check; the other five production
+callers (`autoruns`, `installed_apps`, `license_scan`, `registry`, and TAR's mapped-drive-history
+collector) mounted with no check at all. The check is now the default for all of them.
+
+**Who this affects.** A profile hive that fails the check — most commonly an FSLogix, UWP-container
+or other non-persistent-image profile root, or any profile directory not owned by its own
+user/LocalSystem/Administrators — now surfaces as a named, unreadable-source row instead of being
+silently mounted and read: `autoruns list`/`catalog` and `installed_apps list_per_user` name the
+specific refusal reason per profile; `license_scan list` reports the aggregate reason
+`hive_file_refused` on its `per_user_hives` probe status (the specific per-profile reason goes to
+the agent log only); `registry` answers its existing hive-file-refused error (unchanged wording,
+no reason suffix); TAR's mapped-drive history retries an affected profile individually, up to 7
+attempts over 24 h apart, before giving up on that profile. A fleet with many such profiles (e.g. a
+VDI/FSLogix rollout) may see these constraint rows appear for a noticeable fraction of devices
+right after upgrading.
+
+**What to do.** No action is required — this is a fail-closed tightening of an existing check's
+reach, not a new restriction with a workaround; a profile that reads fine today under the new
+default was never at risk from it. Automation that treats one of the five affected plugins'
+previously-silent success as a guarantee (a script that only checks for a non-empty `list` row
+count, a SIEM rule that alerts only on an explicit error) should instead treat a
+`hive_*`/`hive_file_refused`/hive-file-refused row the same way it already treats any other
+named per-profile constraint from these plugins (`not_found`, `privilege_missing`, `mount_failed`)
+— none of these are new categories of outcome, only a more specific one for this particular cause.
 ### vNEXT - MFA step-up is checked once, before the route's own checks; the server refuses to start with an unclassified mutating route (breaking order of checks)
 
 **What changed.** A fresh MFA proof is required on 36 named high-risk routes for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`; un-enrolled accounts and API-token and MCP-token callers pass, and engine principals are denied. Other mutating routes and all MCP tools are not MFA-step-up gated in this release. The check now runs in the request pipeline before the route's own authorization and its own same-site copy (and after the server-wide same-site check, which answers a cross-site cookie write `403` first), so a session with a stale or missing proof receives the `401` step-up envelope instead of the route's `403`; engine principals receive `403` on every one of the 36 routes regardless of grants (once their credential resolves and the pre-routing gates and the unwired-store `503` below have been ruled out; during a database outage the credential cannot be resolved and the request is answered `401` `unauthorized` instead), audited as `mfa.step_up.required` instead of the per-route handler denial row; and `POST /api/settings/mfa/recovery-codes` and `POST /api/settings/mfa/disable` are newly gated. A server with no wired authentication store answers `503` on these routes, and an unreadable store answers `503` to local sessions. Full list of behaviour changes: [Upgrading](upgrading.md) ("Breaking: MFA step-up is checked once").
@@ -2500,19 +2530,20 @@ New CLI flags (all optional):
   (the secure default) — browser-based MCP clients must be allowlisted
   explicitly. Non-browser clients (which send no `Origin`) need no configuration.
 
-### vNEXT — DEX per-application sampling (`procperf`) is a new opt-in telemetry category
+### vNEXT — DEX per-application sampling (`procperf`) is a new telemetry category
 
 This release adds per-application resource sampling (top-N processes by CPU and
-working set, by image name) to the TAR edge warehouse. **It is off by default**
-(`procperf_enabled=false`) and collects nothing until an operator opts in — it
-is a distinct, usage-class telemetry category subject to works-council / DPA
-review, separate from the device-level performance sampling (`perf_enabled`,
+working set, by image name) to the TAR edge warehouse. **Superseded: it is now
+on by default** (`procperf_enabled=true` on every agent, including a one-time
+reset of any stored `false` at the tar.db schema v8 upgrade — see
+[Upgrading](upgrading.md)); this release originally shipped it off. It is a
+distinct telemetry category, separate from the device-level performance sampling (`perf_enabled`,
 on by default, no per-app identity) that shipped in the prior release **on
 Windows** — on Linux, device-level sampling starts automatically **on upgrade
 to this release** (see the upgrade checklist in the user manual's
 [Upgrading](upgrading.md) page and the TAR manual's upgrade note; opt out per
 host with `perf_enabled=false`). To
-enable per-app sampling, set `procperf_enabled=true` via a TAR `configure`
+disable per-app sampling, set `procperf_enabled=false` via a TAR `configure`
 instruction (fleet-wide or per-device). The data is image names only (no
 command lines), 7-day raw / 31-day hourly retention, and is captured in the
 Workstream E data inventory in `docs/enterprise-readiness-soc2-first-customer.md`.

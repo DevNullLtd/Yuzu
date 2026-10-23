@@ -244,7 +244,7 @@ inline constexpr std::array<CommandCapability, 45> kPluginActionCatalogueA{{
     // rollup/sql/compatibility) only observe the host and record/report —
     // ReadOnly/None/Read under `Infrastructure`, per DispatchClass's own
     // "collects and reports only" definition. query/export/sql can surface
-    // opt-in PII sources (mapdrive usernames, dns-visited-domains, arp) via
+    // PII sources (mapdrive usernames, dns-visited-domains, arp) via
     // a type filter or raw SQL — Medium, not the Read floor of Low.
     // configure changes plugin behaviour (retention/intervals/redaction) —
     // Mutating/Reversible/Write. rollup performs routine retention
@@ -265,7 +265,7 @@ inline constexpr std::array<CommandCapability, 45> kPluginActionCatalogueA{{
         .execute_gate = ExecuteGate::None,
     },
     {
-        // Medium, not the Read floor: a type filter can return opt-in PII
+        // Medium, not the Read floor: a type filter can return PII
         // sources (arp/dns/mapdrive) alongside the default event union.
         .plugin = "tar",
         .action = "query",
@@ -375,7 +375,7 @@ inline constexpr std::array<CommandCapability, 45> kPluginActionCatalogueA{{
     {
         // Medium, not the Read floor: validate_and_translate_sql is
         // SELECT-only (rejects INSERT/UPDATE/DELETE/DROP/etc.) but an
-        // operator-authored SELECT can reach the same opt-in PII tables
+        // operator-authored SELECT can reach the same PII tables
         // query/export gate behind a type filter.
         .plugin = "tar",
         .action = "sql",

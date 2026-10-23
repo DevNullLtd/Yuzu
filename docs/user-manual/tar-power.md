@@ -10,20 +10,16 @@ different enough from every other TAR source to need its own explanation.
 
 ## It ships default-on
 
-Every other opt-in TAR source (`software`, `ARP`, `DNS`, `mapdrive`, `netconn`)
-defaults to **off** because it is either high-volume, behaviorally sensitive,
-or both. `power` is the deliberate exception: sleep/wake and AC-source events are
-low-volume and directly useful for baseline device-health and
-battery/charging-posture investigations from day one. `power` (and its
-sibling `removable`) therefore ship **enabled by default** — set
+Like every TAR capture source, `power` ships **enabled by default** — set
 `power_enabled=false` to opt out on a host where this is not wanted.
+Sleep/wake and AC-source events are low-volume and directly useful for
+baseline device-health and battery/charging-posture investigations from day one.
 
 Default-on is **not** a finding that these events are privacy-neutral. The
 *timing* of sleep/wake and AC transitions is a presence and working-hours
 proxy, exactly as connectivity history is, so the same works-council posture
-as `netconn` applies in full. Under the Wave 6 ruling
-(`docs/tar-implementer.md`) that posture attaches to the **lookback control**
-rather than to the enable flag: set `power_lookback_seconds=0` for
+as `netconn` applies in full. Because every TAR source ships enabled, that posture
+attaches to the **lookback control** rather than to the enable flag: set `power_lookback_seconds=0` for
 forward-only collection on a host where a retrospective read of the OS's
 retained power log is not lawful. Because the obligation now lands at
 *upgrade* rather than at an operator's opt-in, it is a stronger duty to

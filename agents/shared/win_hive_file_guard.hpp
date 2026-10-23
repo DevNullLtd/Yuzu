@@ -2,8 +2,9 @@
 
 /**
  * win_hive_file_guard.hpp -- the offline-hive FILE guard behind an injectable seam, meant for any
- * plugin that mounts a profile's NTUSER.DAT as SYSTEM. Today only privacy_permissions supplies an
- * OfflineHiveFileCheck; every other with_user_hive caller passes none and is unguarded.
+ * plugin that mounts a profile's NTUSER.DAT as SYSTEM. It is the default for every with_user_hive
+ * caller (win_profiles.hpp); privacy_permissions is the one consumer that still supplies its own
+ * OfflineHiveFileCheck, because it needs a deadline the shared default does not have.
  *
  * windows.h-free by design. The Win32 shell (win_hive_file_probe.hpp's Win32HiveFileProbe) answers
  * one question per probe call -- an attribute word, a leaf's facts from its own handle, a directory
@@ -13,8 +14,9 @@
  * tests/unit/test_privacy_permissions_win_walk.cpp. The pure decision block it routes through
  * (HiveFileFacts, the tokens, classify_hive_file) lives in this header too.
  *
- * The guard is OPT-IN per with_user_hive call (the OfflineHiveFileCheck argument); making it the
- * default for every with_user_hive consumer is tracked in #5291.
+ * The guard is the DEFAULT for every with_user_hive call (related issue #5291); the opt-out is
+ * win_profiles.hpp's `kOfflineHiveFileUnguarded`, which a caller passes explicitly and names the
+ * reason for at the call site.
  *
  * The deadline is INJECTED (`expired`), so the guard's API depends on neither a run's retention
  * budget nor any plugin's row model.
