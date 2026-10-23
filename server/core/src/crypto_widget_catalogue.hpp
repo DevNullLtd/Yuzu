@@ -203,9 +203,10 @@ struct MergedLayout {
 
 // ── Availability (drawing only, never a grant) ───────────────────────────────
 
-/// A caller's standing for one gate: kAvailable; kRefused (no grant); kConfined (a
-/// kFleetWideOnly widget and the caller's view is confined); kDegraded (the access check
-/// itself could not be completed - a store behind it could not be read).
+/// A caller's standing for one gate: kAvailable; kRefused (the check answered 403: no grant,
+/// or a read failure partway through the check, which the answer cannot tell apart);
+/// kConfined (a kFleetWideOnly widget and the caller's view is confined); kDegraded (the
+/// check answered 503: it could not be completed because a store behind it could not be read).
 enum class Access { kAvailable, kRefused, kConfined, kDegraded };
 [[nodiscard]] std::string_view access_name(Access a);
 

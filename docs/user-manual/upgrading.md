@@ -4,7 +4,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 ## Behaviour change: a confined operator is refused the unfiltered issued-certificate list
 
-**What changed.** `GET /api/v1/ca/issued` without a filter parameter, the MCP tool `list_issued_certs` without filter arguments, and the list in the Settings certificate panel now apply the confinement check the filtered form already used. A caller whose view of the fleet is confined (management-group confinement) gets `403` (MCP: permission denied) with no permission named, and the panel shows a note in place of the list. If the check cannot be made the answer is `503` with `retry_after_ms: 5000`. Both forms of the route and the tool are now audited `crypto.ca.certificates.view` with target `inventory`, set-and-proceed.
+**What changed.** `GET /api/v1/ca/issued` without a filter parameter, the MCP tool `list_issued_certs` without filter arguments, and the list in the Settings certificate panel now apply the confinement check the filtered form already used. A caller whose view of the fleet is confined (management-group confinement) gets `403` (MCP: permission denied) with no permission named, and the panel shows a note in place of the list. If the check reports itself unavailable the answer is `503` with `retry_after_ms: 5000`. A read failure partway through the check reads as no Inventory grant and is not treated as confined. Both forms of the route and the tool are now audited `crypto.ca.certificates.view` with target `inventory`, set-and-proceed.
 
 **Who is affected.** A confined operator or agentic worker that holds `Security:Read` (the seeded Viewer role does) and listed the CA inventory, and anyone who relied on that call being unaudited.
 

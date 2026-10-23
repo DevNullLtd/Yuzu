@@ -2333,9 +2333,9 @@ the refusal is written as a `denied` `crypto.ca.certificates.view` row. A served
 written as a `success` row (target `inventory`, detail `inventory rows=<n> limit=<n>
 offset=<n> has_more=<bool>`), set-and-proceed: if the row cannot be written the page is
 still served, with `Sec-Audit-Failed: true` and `audit_persisted: false` in the body. The
-confinement check failing is `503` + `retry_after_ms: 5000` (`access check unavailable`),
+confinement check reporting itself unavailable is `503` + `retry_after_ms: 5000` (`access check unavailable`),
 and a server built without it is `503` with no `retry_after_ms`
-(`certificate list unavailable`).
+(`certificate list unavailable`). A read failure partway through the check reads as no Inventory grant, which is not a confined view, so that caller is served the list.
 
 `meta.has_more` is `true` when more rows exist beyond the current page; when it is,
 `meta.next_offset` carries the `offset` to pass for the next page. Iterate until
