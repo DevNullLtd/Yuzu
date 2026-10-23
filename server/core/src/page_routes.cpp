@@ -307,7 +307,10 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     // spec route itself is unaudited). The page carries the same Infrastructure:Read gate as
     // that route and shows no more than it returns, so a denied operator gets the 403 here
     // rather than a shell whose only fetch would fail. No nav entry. The signed-out redirect
-    // below is the same landing-page redirect the pre-routing gate and the sibling pages use.
+    // below is home_ui::sign_in_location, the same one the pre-routing gate and the other
+    // pages registered in this file use; with no nav entry it resolves to plain /home. Pages
+    // registered in other files (device, DEX, network, access tokens, compliance) redirect to
+    // a literal /login instead, which forwards to the same landing page.
     sink.Get("/swagger", [deps](const httplib::Request& req, httplib::Response& res) {
         auto session = deps.auth_fn(req, res);
         if (!session) {

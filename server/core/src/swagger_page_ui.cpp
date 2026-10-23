@@ -110,9 +110,9 @@ extern const char* const kSwaggerBody = R"SWG(
 <div class="sw-page">
   <header class="page-header"><div>
     <h1>API reference</h1>
-    <div class="subtitle">Every REST v1 operation this server documents, read live from <code>/api/v1/openapi.json</code>. The same document is available to agentic workers over MCP as <code>yuzu://openapi</code>. Each group opens with a guide to what it is for, who may call it and what to watch for.</div>
+    <div class="subtitle">Every REST v1 operation this server documents, read live from <code>/api/v1/openapi.json</code>. Agentic workers can read the same document over MCP as <code>yuzu://openapi</code>, without the group guides this page adds. Each group opens with a guide to what it is for, who may call it and what to watch for.</div>
   </div></header>
-  <div id="sw-root" class="mut">Loading the API description...</div>
+  <div id="sw-root" class="mut"><noscript>The API reference needs JavaScript. Turn it on for this site, then reload the page.</noscript></div>
 </div>
 <div id="toast-container" class="toast-container"></div>
 <script>
@@ -141,12 +141,16 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
   function mono(text) { return h('span', 'mono', [text]); }
 
   function refName(r) { return r.split('/').pop(); }
+  // Own keys only: a schema named "constructor" or "toString" must not resolve to Object.prototype.
+  function schemaOf(n) {
+    var sc = spec.components && spec.components.schemas;
+    return (sc && Object.prototype.hasOwnProperty.call(sc, n) && sc[n]) || {};
+  }
   function deref(s, seen) {
     if (!s || !s.$ref) return s || {};
     var n = refName(s.$ref);
     if (seen && seen.indexOf(n) >= 0) return { type: 'object', description: '(recursive: ' + n + ')' };
-    var t = spec.components && spec.components.schemas && spec.components.schemas[n];
-    return t || {};
+    return schemaOf(n);
   }
   function label(s) {
     if (!s) return 'any';
@@ -160,23 +164,30 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
   function successSchema(op) {
     var found = false, r = op.responses || {};
     Object.keys(r).forEach(function (c) {
-      if (/^2/.test(c) && r[c].content) {
+      if (/^2/.test(c) && r[c] && r[c].content) {
         Object.keys(r[c].content).forEach(function (m) { if (r[c].content[m].schema) found = true; });
       }
     });
     return found;
   }
 
-  // Schema -> table rows. depth/seen guard against recursion.
-  function schemaRows(s, depth, seen, req, out, indent) {
+  // Breadth budget for one schema block. The depth cap below bounds a chain, not a wide spec
+  // edit, and a wide acyclic schema multiplies per level. Measured on the compiled-in
+  // document: the largest block has 97 rows, so this cap is about twenty times that.
+  var MAX_ROWS = 2000;
+
+  // Schema -> table rows. depth/seen guard against recursion; budget bounds the row count.
+  function schemaRows(s, depth, seen, req, out, indent, budget) {
     var base = s.allOf && s.allOf.length === 1 && !s.properties ? s.allOf[0] : s;
     var n = base.$ref ? refName(base.$ref) : null;
     var d = deref(base, seen);
     var nseen = n ? (seen || []).concat([n]) : seen;
-    if (d.type === 'array' && d.items) { return schemaRows(d.items, depth, nseen, req, out, indent); }
+    if (d.type === 'array' && d.items) { return schemaRows(d.items, depth, nseen, req, out, indent, budget); }
     var props = d.properties || {};
     var required = d.required || [];
     Object.keys(props).forEach(function (k) {
+      if (budget.rows >= MAX_ROWS) { budget.skipped++; return; }
+      budget.rows++;
       var p = props[k], pd = deref(p, nseen);
       var tr = h('tr', '', [
         h('td', 'sw-name', [h('span', 'sw-indent', [new Array(indent + 1).join('   ')]), mono(k)]),
@@ -188,24 +199,41 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
       var inner = p.items ? p.items : p;
       var innerD = deref(inner, nseen);
       if (depth < 5 && (innerD.properties || (innerD.allOf && innerD.allOf.length === 1))) {
-        schemaRows(inner, depth + 1, nseen, false, out, indent + 1);
+        schemaRows(inner, depth + 1, nseen, false, out, indent + 1, budget);
       }
     });
     return out;
   }
-  function schemaBlock(s) {
-    var d = deref(s.allOf && s.allOf.length === 1 ? s.allOf[0] : s);
+  // seen carries the schema names already open above this block, so a schema that reaches
+  // itself through oneOf/anyOf stops at a note instead of recursing forever.
+  function schemaBlock(s, seen, budget) {
+    if (budget) return schemaBlockIn(s, seen || [], budget);
+    budget = { rows: 0, skipped: 0 };
+    var blk = schemaBlockIn(s, seen || [], budget);
+    if (budget.skipped) blk.appendChild(h('div', 'sw-untyped', ['Truncated: at least ' + budget.skipped + ' more fields or options are not shown.']));
+    return blk;
+  }
+  function schemaBlockIn(s, seen, budget) {
+    var inner = s.allOf && s.allOf.length === 1 ? s.allOf[0] : s;
+    var n = inner.$ref ? refName(inner.$ref) : null;
+    if (n && seen.indexOf(n) >= 0) return h('div', 'sw-untyped', ['(recursive: ' + n + ')']);
+    var nseen = n ? seen.concat([n]) : seen;
+    var d = deref(inner);
     var alts = d.oneOf || d.anyOf;
     if (alts && alts.length) {
       var akids = [h('div', 'sw-schema-head', [pill(d.oneOf ? 'one of' : 'any of', 'info mono'), d.description ? h('span', 'mut', [d.description]) : null])];
       // Properties declared beside the alternatives apply to every option; show them first.
-      var shared = d.properties ? schemaRows(s, 0, [], false, [], 0) : [];
+      var shared = d.properties ? schemaRows(s, 0, seen, false, [], 0, budget) : [];
       if (shared.length) akids.push(tableWrap(shared));
-      alts.forEach(function (a, i) { akids.push(h('div', 'sw-alt', [h('h3', '', ['Option ' + (i + 1)]), schemaBlock(a)])); });
+      alts.forEach(function (a, i) {
+        if (budget.rows >= MAX_ROWS) { budget.skipped++; return; }
+        budget.rows++;
+        akids.push(h('div', 'sw-alt', [h('h3', '', ['Option ' + (i + 1)]), schemaBlockIn(a, nseen, budget)]));
+      });
       return h('div', '', akids);
     }
     var head = h('div', 'sw-schema-head', [pill(label(s), 'info mono'), d.description ? h('span', 'mut', [d.description]) : null]);
-    var rows = schemaRows(s, 0, [], false, [], 0);
+    var rows = schemaRows(s, 0, seen, false, [], 0, budget);
     if (!rows.length) return h('div', '', [head]);
     return h('div', '', [head, tableWrap(rows)]);
   }
@@ -238,6 +266,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
   }
 
   function responseBlock(code, r) {
+    r = r || {};
     var cls = /^2/.test(code) ? 'ok' : /^4/.test(code) ? 'warn' : /^5/.test(code) ? 'bad' : 'idle';
     var kids = [h('div', 'sw-resp-head', [pill(code, cls + ' mono'), h('span', 'sw-desc', [r.description || ''])])];
     if (r.headers) {
@@ -281,8 +310,12 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
 
 
   // ---- group guides (spec.tags[].x-yuzu-guide) ----
-  var guides = {};
-  var SKIP_MODEL = { ApiMeta: 1, ApiPagination: 1, A4ErrorEnvelope: 1, ApiEnvelope: 1 };
+  // Name-keyed maps have no prototype, so a tag or schema named "constructor" or "__proto__"
+  // is an ordinary key.
+  function dict() { return Object.create(null); }
+  var guides = dict();
+  var SKIP_MODEL = dict();
+  ['ApiMeta', 'ApiPagination', 'A4ErrorEnvelope', 'ApiEnvelope'].forEach(function (n) { SKIP_MODEL[n] = 1; });
   function collectRefs(node, acc) {
     if (!node || typeof node !== 'object') return;
     if (Array.isArray(node)) { node.forEach(function (n) { collectRefs(n, acc); }); return; }
@@ -290,14 +323,14 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
     Object.keys(node).forEach(function (k) { collectRefs(node[k], acc); });
   }
   function modelNames(list) {
-    var seen = {}, queue = {}, order = [];
+    var seen = dict(), queue = dict(), order = [];
     list.forEach(function (o) { collectRefs(o.op.responses, queue); collectRefs(o.op.requestBody, queue); });
     var names = Object.keys(queue);
     while (names.length && order.length < 60) {
       var n = names.shift();
       if (seen[n] || SKIP_MODEL[n]) continue;
       seen[n] = 1; order.push(n);
-      var sub = {}; collectRefs(spec.components.schemas[n], sub);
+      var sub = dict(); collectRefs(schemaOf(n), sub);
       Object.keys(sub).forEach(function (m) { if (!seen[m]) names.push(m); });
     }
     return order;
@@ -321,9 +354,15 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
       var wrap = h('div', 'sw-model', [btn]);
       btn.addEventListener('click', function () {
         var open = btn.getAttribute('aria-expanded') !== 'true';
+        // Build first, then flip the state, so a schema that cannot be drawn never leaves a
+        // Hide button above an empty body.
+        if (open && !body) {
+          try { body = schemaBlock({ $ref: '#/components/schemas/' + n }); }
+          catch (e) { body = h('div', 'sw-error', ['These fields could not be shown.']); }
+          wrap.appendChild(body);
+        }
         btn.setAttribute('aria-expanded', open ? 'true' : 'false');
         btn.lastChild.textContent = open ? 'Hide fields' : 'Show fields';
-        if (open && !body) { body = schemaBlock({ $ref: '#/components/schemas/' + n }); wrap.appendChild(body); }
         if (body) body.hidden = !open;
       });
       kids.push(wrap);
@@ -359,16 +398,22 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
   }
 
   function build() {
-    ops = []; tags = []; guides = {}; st = { q: '', method: '', tag: '', typed: '' };
-    (spec.tags || []).forEach(function (t) {
+    ops = []; tags = []; guides = dict(); st = { q: '', method: '', tag: '', typed: '' };
+    // A malformed entry (a null tag, a guide that is not an object, a null path item) is
+    // skipped, not allowed to take the whole page down.
+    function isObj(x) { return !!x && typeof x === 'object' && !Array.isArray(x); }
+    (Array.isArray(spec.tags) ? spec.tags : []).forEach(function (t) {
+      if (!isObj(t) || typeof t.name !== 'string') return;
       var g = t['x-yuzu-guide'];
-      if (g) { g.summary = t.description || ''; guides[t.name] = g; }
+      if (isObj(g)) { g.summary = t.description || ''; guides[t.name] = g; }
     });
-    Object.keys(spec.paths).forEach(function (p) {
+    var paths = isObj(spec.paths) ? spec.paths : {};
+    Object.keys(paths).forEach(function (p) {
+      if (!isObj(paths[p])) return;
       METHODS.forEach(function (m) {
-        var op = spec.paths[p][m];
-        if (!op) return;
-        var t = (op.tags && op.tags[0]) || 'Untagged';
+        var op = paths[p][m];
+        if (!isObj(op)) return;
+        var t = (Array.isArray(op.tags) && typeof op.tags[0] === 'string' && op.tags[0]) || 'Untagged';
         ops.push({ method: m, path: p, op: op, tag: t, typed: successSchema(op), unavail: op['x-yuzu-unavailable'] || '', key: m.toUpperCase() + ' ' + p });
       });
     });
@@ -386,7 +431,7 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
     var summary = h('div', 'sw-chips', [
       h('span', 'chip', ['Operations', h('b', '', [String(ops.length)])]),
       h('span', 'chip', ['Groups', h('b', '', [String(tags.length)])]),
-      h('span', 'chip', ['Typed responses', h('b', '', [typed + ' (' + Math.round(100 * typed / ops.length) + '%)'])]),
+      h('span', 'chip', ['Typed responses', h('b', '', [typed + ' (' + (ops.length ? Math.round(100 * typed / ops.length) : 0) + '%)'])]),
       unavailable ? h('span', 'chip', ['Unavailable', h('b', '', [String(unavailable)])]) : null,
       h('span', 'chip', ['Auth', h('b', '', ['Bearer token, X-Yuzu-Token, or session cookie'])])
     ]);
@@ -394,7 +439,7 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
 
     var toc = h('nav', 'sw-toc', [h('div', 'sw-toc-h', ['Groups'])]);
     var main = h('div', 'sw-main', []);
-    var panels = {}, tocLinks = {};
+    var panels = dict(), tocLinks = dict();
     tags.forEach(function (t) {
       var id = 'g-' + t.replace(/[^A-Za-z0-9]+/g, '-');
       var list = h('div', 'sw-ops', []);
@@ -458,7 +503,7 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
     });
 
     function apply() {
-      var needle = st.q.toLowerCase(), shown = 0, per = {};
+      var needle = st.q.toLowerCase(), shown = 0, per = dict();
       ops.forEach(function (o) {
         var ok = (!st.method || o.method === st.method) && (!st.tag || o.tag === st.tag) &&
           (!st.typed || (st.typed === 'typed') === o.typed) &&
@@ -496,9 +541,10 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
     ops.forEach(function (o) { if (o.key === hash) { o.toggle(true); o.el.scrollIntoView(); } });
   }
 
-  function fail(msg, status, cid) {
+  function fail(msg, status, cid, hint) {
     root.textContent = '';
     var box = h('div', 'sw-error', [h('div', '', [msg])]);
+    if (hint) box.appendChild(h('div', 'mut', [hint]));
     if (status === 401) box.appendChild(h('div', 'mut', ['Your session may have ended. Sign in again, then reload this page.']));
     if (status === 403) box.appendChild(h('div', 'mut', ['Your account needs the Infrastructure:Read permission to read the API description.']));
     if (cid) box.appendChild(h('div', 'mut mono', ['Correlation id: ' + cid]));
@@ -507,6 +553,20 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
     retry.addEventListener('click', load);
     box.appendChild(retry);
     root.appendChild(box);
+  }
+  // An error whose text is safe to show. Anything else that reaches the catch below (a
+  // SyntaxError from a non-JSON body, a TypeError from a bad spec) is logged to the console and
+  // replaced by a fixed message, so the operator never reads "Unexpected token '<'".
+  function problem(msg, extra) {
+    var e = new Error(msg);
+    e.friendly = true;
+    if (extra) Object.keys(extra).forEach(function (k) { e[k] = extra[k]; });
+    return e;
+  }
+  // The A4 body carries the correlation id; the X-Correlation-Id header is the fallback for a
+  // failure whose body is not JSON (a proxy page, for example).
+  function headerCid(r) {
+    try { return (r.headers && r.headers.get('X-Correlation-Id')) || ''; } catch (e) { return ''; }
   }
   function load() {
     root.textContent = 'Loading the API description...';
@@ -517,19 +577,30 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
     fetch(SPEC_URL, opts)
       .then(function (r) {
         // The timer stays armed until the body is read, so a stalled body also reaches Retry.
-        if (r.ok) return r.json();
+        if (r.ok) {
+          return r.json().catch(function (x) {
+            if (x && x.name === 'AbortError') throw x;
+            throw problem('The server answered, but not with an API description.',
+              { hint: 'Your session may have expired. Sign in again, then reload this page.', cid: headerCid(r), raw: x });
+          });
+        }
         return r.json().then(function (j) { return j; }, function () { return null; }).then(function (j) {
-          var e = new Error('The API description could not be loaded (HTTP ' + r.status + ').');
-          e.status = r.status;
-          e.cid = j && j.error && j.error.correlation_id;
-          throw e;
+          throw problem('The API description could not be loaded (HTTP ' + r.status + ').',
+            { status: r.status, cid: (j && j.error && j.error.correlation_id) || headerCid(r) });
         });
+      }, function (x) {
+        if (x && x.name === 'AbortError') throw x;
+        throw problem('The API description could not be reached. Check the network connection, then retry.', { raw: x });
       })
-      .then(function (j) { clearTimeout(timer); spec = j; build(); })
+      .then(function (j) {
+        clearTimeout(timer); spec = j;
+        try { build(); } catch (x) { throw problem('The API description was loaded but could not be shown.', { raw: x }); }
+      })
       .catch(function (e) {
         clearTimeout(timer);
-        var msg = e && e.name === 'AbortError' ? 'The API description took too long to load.' : (e && e.message ? e.message : 'The API description could not be loaded.');
-        fail(msg, e && e.status, e && e.cid);
+        try { console.error('API reference page:', e && e.raw ? e.raw : e); } catch (x) { /* no console */ }
+        var msg = e && e.name === 'AbortError' ? 'The API description took too long to load.' : (e && e.friendly ? e.message : 'The API description could not be loaded.');
+        fail(msg, e && e.status, e && e.cid, e && e.hint);
       });
   }
   load();
