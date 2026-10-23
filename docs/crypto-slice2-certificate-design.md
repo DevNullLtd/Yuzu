@@ -1909,6 +1909,15 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
    before this ruling; option (b) adds a server half to 2a-2a's successor and an agent half to
    2a-2e.
 
+9. **D13 counts at fleet scale** (raised by 2a-3, measured 2026-10-23). Computed from raw rows
+   in one statement, the counts finish inside the 10 s read bound only up to about 1.3M
+   certificates in scope (about 7 µs per certificate; 13.5 s for 2M on a laptop Postgres). The
+   capacity target is 30–60M. Above the limit the counts answer 503 with a retry hint, never a
+   partial figure. The owner chooses: a stored rollup keyed to its `as_of` (which needs an
+   amendment to D13 condition 3, "never stored"), a longer bound with its own read slot, or an
+   asynchronous count job. 2a-3 ships the read-time counts with the limit stated; the chosen fix is
+   its own PR.
+
 ## How this could ship wrong
 
 1. **A failed or kept store reads as current.** Kept rows shown without their store status, or a
