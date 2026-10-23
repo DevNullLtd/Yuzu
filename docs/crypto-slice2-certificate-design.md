@@ -864,7 +864,7 @@ fleet-wide or confined scope. A degraded read is a 503 with a retry hint, never 
 | `crypto.certificates.view` | per-certificate read | REST: **fail closed**. Dashboard and MCP: set-and-proceed |
 | `crypto.certificates.summary` | raw-value summary | as above |
 | `crypto.certificates.counts` | D13 counts | as above |
-| `crypto.cbom.export` | CBOM (extends #6143's verb, with a `halves=` detail) | as above, when the certificate half is included |
+| `crypto.cbom.export` | CBOM (extends #6143's verb; the detail gains `certificates=included certificate_components=<n>` or `certificates=omitted:<reason>`) | set-and-proceed for the library half on every surface; the certificate half writes its own `crypto.certificates.view` row (`via=cbom`) and is omitted, named in `halves_omitted`, when that row cannot be stored (Decisions item 10) |
 | `crypto.revocation_source.list` / `.view` | source list and detail | as above (Proposed) |
 | `crypto.revocation_source.register` / `.update` / `.remove` / `.reset_high_water` | mutations | **fail closed** on every surface |
 | `crypto.certificates.tombstone_purge` | decommission-tombstone purge | **fail closed** on every surface |
