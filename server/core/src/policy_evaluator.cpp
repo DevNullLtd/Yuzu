@@ -904,7 +904,7 @@ void PolicyEvaluator::collect_ready() {
         // served by the compliance routes and MCP to readers below the Forensics tier. So this
         // read EXCLUDES the Forensics plugins outright (`deny_all()`): a Forensics check yields no
         // row and scores `unknown`, never a verdict from, or a stored copy of, Forensics output.
-        // A separate follow-up tracks the dispatch-side authorisation of policy checks.
+        // A separate follow-up (#6065) tracks the dispatch-side authorization of policy checks.
         const auto tier = d_.forensics_plugins
                               ? ResponseTierFilter::exclude(*d_.forensics_plugins, authz::deny_all())
                               : ResponseTierFilter::refuse_unwired();

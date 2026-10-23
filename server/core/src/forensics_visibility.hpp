@@ -122,8 +122,10 @@ void seed_forensics_tier_metrics(yuzu::MetricsRegistry& metrics);
 /// Step 2 skips caller classes the global probe treats specially because their authority is not
 /// "the minting user's grants": using the owner's scoped grants for them would widen them.
 /// Known limit: `require_permission`'s RBAC branch answers a degraded `check_permission` with a 403,
-/// not a 503, so a degrade that hits only step 1 and not step 2 classifies as Denied; the
-/// `yuzu_server_rbac_read_degrade_total` series is the signal for that case.
+/// not a 503, so for a caller other than an engine principal a degrade that hits only step 1 and
+/// not step 2 classifies as Denied; the `yuzu_server_rbac_read_degrade_total` series is the signal
+/// for that case. (An engine principal alone answers 503 when the RBAC store is not open, which is
+/// Unknown(RbacUnavailable); a query-level degrade is a 403, Denied, for every caller class.)
 [[nodiscard]] ForensicsVisibility resolve_forensics_visible(const ForensicsVisibilityDeps& deps,
                                                             const httplib::Request& req);
 
