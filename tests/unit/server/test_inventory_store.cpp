@@ -143,7 +143,8 @@ TEST_CASE("InventoryStore degrades (not empty) on a broken pool", "[inventory]")
     CHECK(!typed.has_value());
     CHECK(typed.error() == yuzu::server::InventoryReadError::kDegraded);
     CHECK_FALSE(store.delete_agent("a"));       // ingest/delete: fail-soft, false, no crash
-    CHECK_FALSE(store.delete_source("app_usage")); // same, keyed on plugin instead of agent
+    CHECK(!store.purge_typed_sources_batch(yuzu::server::kTypedInventorySources, 10));
+    CHECK(!store.drain_typed_sources(10).has_value());
     store.upsert("a", "p", "{}", 1);            // fail-soft: does not throw
 }
 
@@ -297,26 +298,60 @@ TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][
     }
 }
 
-TEST_CASE("InventoryStore delete_source erases one plugin across all agents, leaves others intact",
+TEST_CASE("InventoryStore purge_typed_sources_batch deletes only typed rows, bounded and idempotent",
           "[pg][inventory]") {
     INVENTORY_SHARED(store, pool);
 
-    store.upsert("agent-1", "app_usage", R"({"n":1})", 1000);
-    store.upsert("agent-2", "app_usage", R"({"n":2})", 1000);
-    store.upsert("agent-1", "hardware_info", R"({"n":3})", 1000);
-    REQUIRE(raw_row_count(pool, "app_usage") == 2);
+    for (int i = 0; i < 5; ++i)
+        store.upsert("agent-" + std::to_string(i), "app_usage", R"({"n":1})", 1000);
+    store.upsert("agent-0", "certificate_inventory", R"({"n":2})", 1000);
+    store.upsert("agent-0", "hardware_info", R"({"n":3})", 1000);
+    REQUIRE(raw_row_count(pool, "app_usage") == 5);
 
-    CHECK(store.delete_source("app_usage"));
+    const auto typed = yuzu::server::kTypedInventorySources;
 
-    // Counted in SQL: the reads exclude app_usage (a typed source) whether or not
-    // the purge ran, so only a raw count proves the rows are gone.
-    CHECK(raw_row_count(pool, "app_usage") == 0);
-    CHECK(raw_row_count(pool, "hardware_info") == 1);
-
-    CHECK_FALSE(store.delete_source("")); // empty-name guard
-
-    // Idempotent: a 0-row delete of an already-purged source still commits.
-    CHECK(store.delete_source("app_usage"));
+    SECTION("a batch never exceeds max_rows") {
+        auto n = store.purge_typed_sources_batch(typed, 4);
+        REQUIRE(n.has_value());
+        CHECK(*n == 4);
+        CHECK(raw_row_count(pool, "app_usage") + raw_row_count(pool, "certificate_inventory") == 2);
+    }
+    SECTION("looping drains everything typed and leaves generic rows") {
+        std::int64_t total = 0;
+        for (int guard = 0; guard < 10; ++guard) {
+            auto n = store.purge_typed_sources_batch(typed, 4);
+            REQUIRE(n.has_value());
+            if (*n == 0)
+                break;
+            total += *n;
+        }
+        CHECK(total == 6);
+        CHECK(raw_row_count(pool, "app_usage") == 0);
+        CHECK(raw_row_count(pool, "certificate_inventory") == 0);
+        CHECK(raw_row_count(pool, "hardware_info") == 1);
+        // Idempotent: nothing left is a successful 0, not a failure.
+        auto again = store.purge_typed_sources_batch(typed, 4);
+        REQUIRE(again.has_value());
+        CHECK(*again == 0);
+    }
+    SECTION("empty input and a non-positive bound are no-ops") {
+        CHECK(store.purge_typed_sources_batch({}, 10) == std::optional<std::int64_t>{0});
+        CHECK(store.purge_typed_sources_batch(typed, 0) == std::optional<std::int64_t>{0});
+        CHECK(raw_row_count(pool, "app_usage") == 5);
+    }
+    SECTION("drain_typed_sources drains a multi-batch backlog and reports the total") {
+        auto n = store.drain_typed_sources(2); // 6 rows -> 3 batches
+        REQUIRE(n.has_value());
+        CHECK(*n == 6);
+        CHECK(raw_row_count(pool, "app_usage") == 0);
+        CHECK(raw_row_count(pool, "hardware_info") == 1);
+    }
+    SECTION("drain_typed_sources stops between batches when asked") {
+        auto n = store.drain_typed_sources(2, [] { return true; });
+        REQUIRE(n.has_value());
+        CHECK(*n == 0);
+        CHECK(raw_row_count(pool, "app_usage") == 5);
+    }
 }
 
 TEST_CASE("InventoryStore reads never return a typed source's stray row (ADR-0070 D12)",

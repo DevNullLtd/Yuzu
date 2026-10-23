@@ -942,6 +942,9 @@ ingest is failing. Four further series sharpen the picture:
   `YuzuGenericInventoryPersistenceDropped` warns only after a non-`stale` reason's rate
   remains non-zero for 15 minutes, avoiding alerts for a single self-healing report or
   expected clock-step stale suppression.
+- `yuzu_inventory_typed_purge_rows_total` (counter) — stray typed-source rows removed from the
+  generic store by the background boot purge. Non-zero only after an upgrade or rollback that
+  left such rows; the pass runs once per boot and then stops, so a flat counter is normal.
 - `yuzu_inventory_query_truncated_total` (counter) — generic-store reads that hit their
   row cap or 8 MiB aggregate payload cap. A non-zero rate on the result-set
   producer path pairs with 503s from

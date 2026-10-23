@@ -161,6 +161,11 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     {"result_set_store.counts", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
      "read-only gauge refresh"},
 
+    // ---- typed_purge_thread_ (one-shot at boot) ----
+    {"inventory_store.purge_typed_sources", "typed_purge_thread_", BackgroundJobClass::ReplicaSafe,
+     "idempotent bounded DELETE (ctid-batched) of rows that must not exist (typed sources); no clock "
+     "cutoff, so a concurrent purge on another replica only finds fewer rows"},
+
     // ---- app_perf_rollup_thread_ (1h tick) ----
     {"app_perf_rollup.roll_window", "app_perf_rollup_thread_", BackgroundJobClass::ReplicaSafe,
      "idempotent upsert (ON CONFLICT (app_name,version,day) DO UPDATE)"},

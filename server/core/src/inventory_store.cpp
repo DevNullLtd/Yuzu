@@ -530,33 +530,71 @@ bool InventoryStore::delete_agent(const std::string& agent_id) {
     return true;
 }
 
-// ── Delete source (all agents, one plugin) ───────────────────────────────────
+// ── Bounded purge of typed-source rows ───────────────────────────────────────
 
-bool InventoryStore::delete_source(std::string_view plugin_name) {
-    // Empty-name guard, mirroring delete_agent's empty-id guard: never run a
-    // `DELETE ... WHERE plugin = ''` (a footgun, never a fleet wipe).
-    if (plugin_name.empty())
-        return false;
+std::optional<std::int64_t>
+InventoryStore::purge_typed_sources_batch(std::span<const std::string_view> sources,
+                                          int max_rows) {
+    if (sources.empty() || max_rows <= 0)
+        return std::int64_t{0};
     if (!open_) {
-        spdlog::debug("InventoryStore: delete_source skipped for plugin={}, store not open",
-                      plugin_name);
-        return false;
+        spdlog::debug("InventoryStore: purge_typed_sources_batch skipped, store not open");
+        return std::nullopt;
     }
+    // The names are plain identifiers (kTypedInventorySources), so no element needs
+    // array-literal quoting; an empty name is skipped so it can never match a row.
+    std::string param = "{";
+    for (const auto name : sources) {
+        if (name.empty())
+            continue;
+        if (param.size() > 1)
+            param += ',';
+        param += name;
+    }
+    param += '}';
+    if (param.size() == 2)
+        return std::int64_t{0};
+
     auto lease = pool_.try_acquire_for(kIngestAcquireTimeout);
     if (!lease) {
-        spdlog::debug("InventoryStore: delete_source skipped for plugin={}, no connection ({})",
-                      plugin_name, pool_.last_error());
-        return false;
+        spdlog::debug("InventoryStore: purge_typed_sources_batch skipped, no connection ({})",
+                      pool_.last_error());
+        return std::nullopt;
     }
+    // ctid-bounded: the inner SELECT picks at most max_rows physical rows through
+    // inventory_data_plugin_idx, so one statement never deletes (or locks) an
+    // unbounded set. No clock cutoff, so the clock-guarded-retention apparatus does
+    // not apply: these rows must not exist at all.
     pg::PgResult res = pg::exec_params(
-        lease.get(), "DELETE FROM inventory_store.inventory_data WHERE plugin = $1",
-        std::vector<std::string>{std::string(plugin_name)});
+        lease.get(),
+        "DELETE FROM inventory_store.inventory_data WHERE ctid IN ("
+        "SELECT ctid FROM inventory_store.inventory_data "
+        "WHERE plugin = ANY($1::text[]) LIMIT $2::int)",
+        std::vector<std::string>{param, std::to_string(max_rows)});
     if (res.status() != PGRES_COMMAND_OK) {
-        spdlog::debug("InventoryStore: delete_source failed for plugin={}: {}", plugin_name,
+        spdlog::debug("InventoryStore: purge_typed_sources_batch failed: {}",
                       PQerrorMessage(lease.get()));
-        return false;
+        return std::nullopt;
     }
-    return true;
+    return affected_rows(res);
+}
+
+std::optional<std::int64_t>
+InventoryStore::drain_typed_sources(int batch_rows, const std::function<bool()>& should_stop) {
+    std::int64_t total = 0;
+    for (;;) {
+        if (should_stop && should_stop())
+            return total;
+        const auto n = purge_typed_sources_batch(kTypedInventorySources, batch_rows);
+        if (!n)
+            return std::nullopt;
+        if (*n == 0)
+            return total;
+        total += *n;
+        if (metrics_)
+            metrics_->counter("yuzu_inventory_typed_purge_rows_total")
+                .increment(static_cast<double>(*n));
+    }
 }
 
 // ── Count (authoritative read) ───────────────────────────────────────────────

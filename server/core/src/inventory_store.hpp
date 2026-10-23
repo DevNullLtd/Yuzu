@@ -55,8 +55,11 @@
 
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu {
@@ -185,17 +188,24 @@ public:
     /// cannot report a false "erased".
     [[nodiscard]] bool delete_agent(const std::string& agent_id);
 
-    /// Delete every row for one plugin (source), across ALL agents. Mirrors
-    /// `delete_agent`'s lease/txn idiom exactly, keyed on `plugin` instead of
-    /// `agent_id`. Defence-in-depth (ADR-0016 §5) for the boot-time typed-
-    /// source purge (server.cpp): a typed source's rows never belong in this
-    /// generic store — the gateway skip (`is_typed_inventory_source`) and the
-    /// read filter on every read are the controls; this is hygiene that
-    /// reclaims rows a newer-agent/older-server window left here. Returns false on a
-    /// closed store, a lease/lock timeout, or a SQL failure (never throws) —
-    /// callers must not treat a false return as fatal (never set
-    /// `startup_failed_` on it).
-    [[nodiscard]] bool delete_source(std::string_view plugin_name);
+    /// Delete at most `max_rows` rows belonging to any of `sources` (across ALL
+    /// agents) in ONE bounded statement; the caller loops until it returns 0. This is
+    /// the hygiene sweep for a typed source's stray rows (ADR-0016 §5 / ADR-0070 D12):
+    /// the read filter and the gateway skip are the controls, this only reclaims the
+    /// space. Returns the rows deleted (0 = nothing left, or empty input), or
+    /// `std::nullopt` on a closed store, a lease timeout or a SQL failure (never
+    /// throws) -- a caller must not treat nullopt as fatal.
+    [[nodiscard]] std::optional<std::int64_t>
+    purge_typed_sources_batch(std::span<const std::string_view> sources, int max_rows);
+
+    /// The background pass: loops `purge_typed_sources_batch` over every
+    /// `kTypedInventorySources` name, `batch_rows` at a time, until a batch deletes
+    /// nothing (or `should_stop()` turns true, checked between batches). Counts each
+    /// batch into `yuzu_inventory_typed_purge_rows_total`. Returns the total deleted
+    /// this call, or `std::nullopt` when a batch failed (the rows already deleted are
+    /// still counted; the pass is not retried this boot).
+    [[nodiscard]] std::optional<std::int64_t>
+    drain_typed_sources(int batch_rows, const std::function<bool()>& should_stop = {});
 
     /// Count inventory records, typed sources excluded. AUTHORITATIVE read: `std::nullopt` on a
     /// store/pool/query degrade, NEVER a silent zero.

@@ -7757,21 +7757,30 @@ public:
                 // Defence-in-depth purge (adjudication P1): a typed source's rows
                 // never belong in the generic store — is_typed_inventory_source is
                 // the PRIMARY control (the gateway ProxyInventory generic-blob loop
-                // skips these sources outright); this sweep is hygiene for a
-                // newer-agent/older-server window where a typed blob landed here
-                // before the exclusion took effect (or before a source was
-                // promoted to typed at all). Never fails closed on a purge miss —
-                // the exclusion and the read filter, not the purge, are what a caller
-                // must rely on.
+                // skips these sources outright) and the read filter makes any stray
+                // row unreadable (ADR-0070 D12); this sweep is hygiene that reclaims
+                // the space. It runs in the BACKGROUND, bounded and batched, and is
+                // never awaited before serving: boot no longer blocks on an unbounded
+                // DELETE per source. Started at every boot, drains until no typed
+                // row remains, then stops for this boot. A failure is logged and
+                // non-fatal (never sets startup_failed_). It is a delete with no clock
+                // cutoff, so the clock-guarded-retention apparatus does not apply.
                 // Iterates kTypedInventorySources, the one list the gateway skip and
                 // the read filter also use; never a second hand-written list here.
-                for (const std::string_view s : kTypedInventorySources) {
-                    if (!inventory_store_->delete_source(s))
-                        spdlog::warn("[PG] Boot purge: InventoryStore::delete_source(\"{}\") "
-                                     "reported failure (non-fatal — hygiene sweep, not a startup "
-                                     "gate)",
-                                     s);
-                }
+                typed_purge_thread_ = std::thread([this]() {
+                    YUZU_ASSERT_BACKGROUND_JOB("inventory_store.purge_typed_sources"); // WS-10 ReplicaSafe
+                    constexpr int kTypedPurgeBatchRows = 5000;
+                    const auto n = inventory_store_->drain_typed_sources(
+                        kTypedPurgeBatchRows,
+                        [this] { return stop_requested_.load(std::memory_order_acquire); });
+                    if (n)
+                        spdlog::info("[PG] Typed-source purge finished: {} stray row(s) removed "
+                                     "from the generic inventory store",
+                                     *n);
+                    else
+                        spdlog::warn("[PG] Typed-source purge failed (non-fatal — hygiene sweep, "
+                                     "not a startup gate; stray rows are unreadable regardless)");
+                });
             }
         }
 
@@ -10560,6 +10569,12 @@ public:
         // execution_tracker_, response_store_ — must stop before teardown)
         if (result_set_maint_thread_.joinable()) {
             result_set_maint_thread_.join();
+        }
+
+        // Join the one-shot typed-source purge (borrows inventory_store_; checks
+        // stop_requested_ between batches, so this returns promptly)
+        if (typed_purge_thread_.joinable()) {
+            typed_purge_thread_.join();
         }
 
         // Join the insecure-TLS reminder thread (issue #79)
@@ -23530,6 +23545,7 @@ private:
     std::thread preflight_runner_thread_; // joined before stores in stop()
     std::thread schedule_tick_thread_;    // drives ScheduleRunner (#1191); joined before stores
     std::thread result_set_maint_thread_;
+    std::thread typed_purge_thread_; // one-shot boot pass over inventory_store_; joined before stores
 
     // WS-3 (ADR-2002 §3/§6/§10): the fenced leader elector + its election loop.
     // The elector owns a dedicated coordination connection (NOT pg_pool_), so it
