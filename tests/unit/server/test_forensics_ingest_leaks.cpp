@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <memory>
 #include <string>
@@ -303,9 +304,20 @@ TEST_CASE("tracker error_detail: rows written before the sanitiser are reduced o
     const auto upper = make_failed("BROWSER_INVENTORY-0b", true, kFreeText);
     const auto token = make_failed(std::string{test::kForensicsPlugin} + "-0c", true, kToken);
     const auto ordinary = make_failed(std::string{test::kOrdinaryPlugin} + "-0d", true, kFreeText);
+    // No command_execution mapping at all: what a row older than the 24 h mapping window looks like.
+    const auto unmapped = make_failed(std::string{test::kForensicsPlugin} + "-0e", false, kFreeText);
 
-    SECTION("unwired tracker returns the stored text (harness behaviour)") {
+    SECTION("an UNWIRED tracker's read scrub fails OPEN: it returns the stored text") {
+        // Characterised, not endorsed: the READ side is open when no plugin set is wired, while the
+        // WRITE side (notify_exec_tracker, see the unwired test above) sanitises every plugin.
+        // Production cannot reach the open state: boot refuses an empty set and the wiring is
+        // pinned lexically (tests/test_forensics_tier_wiring_lexical.py, row `tracker-set`).
         CHECK(tracker.get_agent_statuses(forensic)[0].error_detail == kFreeText);
+        CHECK(tracker.get_agent_statuses_for_executions({forensic}).at(forensic)[0].error_detail ==
+              kFreeText);
+        const auto got = tracker.get_execution(forensic);
+        REQUIRE(got.has_value());
+        CHECK(got->last_error_detail == kFreeText);
     }
 
     tracker.set_forensics_plugin_set(&test::forensics_plugin_set());
@@ -320,6 +332,19 @@ TEST_CASE("tracker error_detail: rows written before the sanitiser are reduced o
         CHECK(batch.at(upper)[0].error_detail == "forensics_error");
         CHECK(batch.at(token)[0].error_detail == kToken);
         CHECK(batch.at(ordinary)[0].error_detail == kFreeText);
+    }
+    SECTION("a row whose command mapping is gone keeps its stored text (the disclosed 24 h residual)") {
+        // The scrub is keyed on the command_execution mapping, which is reaped after 24 h; older
+        // rows are outside it. The write-time sanitiser covers every row written since the fix, so
+        // this only concerns pre-upgrade rows. Pinned so the residual stays a decision.
+        CHECK(tracker.get_agent_statuses(unmapped)[0].error_detail == kFreeText);
+        CHECK(tracker.get_agent_statuses_for_executions({unmapped}).at(unmapped)[0].error_detail ==
+              kFreeText);
+        const auto got = tracker.get_execution(unmapped);
+        REQUIRE(got.has_value());
+        CHECK(got->last_error_detail == kFreeText);
+        // The mapped Forensics row beside it is still reduced.
+        CHECK(tracker.get_agent_statuses(forensic)[0].error_detail == "forensics_error");
     }
     SECTION("get_execution (the unchecked accessor) reduces the execution-level text too") {
         const auto f = tracker.get_execution(forensic);
@@ -459,6 +484,11 @@ struct SinkHarness {
 
     /// The direct ingest path: a real Register + Subscribe stream carrying `frame`.
     void ingest_direct(const apb::CommandResponse& frame) {
+        ingest_direct_frames({frame});
+    }
+
+    /// Same, for several frames on ONE stream (the agent registers once).
+    void ingest_direct_frames(const std::vector<apb::CommandResponse>& frames) {
         const auto deadline = [] {
             return std::chrono::system_clock::now() + std::chrono::seconds(20);
         };
@@ -482,11 +512,12 @@ struct SinkHarness {
         ctx.AddMetadata(std::string{AgentServiceImpl::kSessionMetadataKey}, reg_resp.session_id());
         auto stream = stub->Subscribe(&ctx);
         REQUIRE(stream != nullptr);
-        REQUIRE(stream->Write(frame));
+        for (const auto& frame : frames)
+            REQUIRE(stream->Write(frame));
         REQUIRE(stream->WritesDone());
         apb::CommandRequest unused;
         while (stream->Read(&unused)) {}
-        CHECK(stream->Finish().ok()); // the handler read the frame before it returned
+        CHECK(stream->Finish().ok()); // the handler read every frame before it returned
     }
 
     /// Settles the delivery pools and reads every sink. Call once: it closes both pools.
@@ -587,6 +618,48 @@ TEST_CASE("terminal failure text: an unwired plugin set sanitises every plugin i
     else
         h.ingest_gateway(failure_frame(id, kFreeText));
     check_sinks(h.observe(), id, direct ? kDirectAgent : kGatewayAgent, "forensics_error");
+}
+
+// The live output bus through the DIRECT Subscribe stream: the same helper the gateway path uses
+// (publish_output_rows), reached from the other ingest branch.
+TEST_CASE("live output bus: the direct Subscribe path publishes no Forensics-tier row either",
+          "[pg][server][forensics_tier][security]") {
+    const bool wired = GENERATE(true, false);
+    INFO((wired ? "plugin set wired" : "plugin set unwired"));
+    YUZU_REQUIRE_PG_DB_TPL(ndb, leaks_notif_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(adb, yuzu::test::analytics_pg_template);
+    SinkHarness h(ndb.dsn(), adb.dsn(), wired);
+    std::mutex mu;
+    std::vector<SseEvent> seen;
+    const auto sub = h.bus.subscribe([&](const SseEvent& e) {
+        std::lock_guard lock(mu);
+        seen.push_back(e);
+    });
+    constexpr const char* kForensicRow = "marker-4990-forensics-row";
+    h.ingest_direct_frames({running_frame(std::string{test::kOrdinaryPlugin} + "-0f1", kMarker),
+                            running_frame(std::string{test::kForensicsPlugin} + "-0f2", kForensicRow),
+                            running_frame("BROWSER_INVENTORY-0f3", kForensicRow)});
+    h.bus.unsubscribe(sub);
+    std::size_t ordinary = 0, forensic = 0, output_events = 0;
+    {
+        std::lock_guard lock(mu);
+        for (const auto& e : seen) {
+            if (e.event_type == "output")
+                ++output_events;
+            if (e.data.find(kMarker) != std::string::npos)
+                ++ordinary;
+            if (e.data.find(kForensicRow) != std::string::npos)
+                ++forensic;
+        }
+    }
+    CHECK(forensic == 0); // never published, in either case, wired or not
+    if (wired) {
+        CHECK(ordinary == 1); // control: the ordinary plugin's row reaches the bus
+        CHECK(output_events == 1);
+    } else {
+        CHECK(ordinary == 0); // an unwired set publishes no output row at all
+        CHECK(output_events == 0);
+    }
 }
 
 // -- A5: the result-set materialiser's content-membership read ------------------------------------
