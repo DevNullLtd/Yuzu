@@ -83,6 +83,11 @@ TEST_CASE("route inventory: registrations are keyed by server and de-duplicated"
 TEST_CASE("route inventory: forget drops one server and an unknown server reads empty",
           "[routeinv]") {
     httplib::Server svr;
+    // A new server may reuse a destroyed one's address (route_inventory.hpp, `forget`), and other
+    // test files (test_health_routes.cpp, test_settings_routes_ota_audit.cpp) register on a stack
+    // server without forgetting it, so clear whatever a previous owner of this address left
+    // behind before counting. Without it this REQUIRE intermittently read `5 == 1` in CI.
+    RouteInventory::instance().forget(&svr);
     HttplibRouteSink sink(svr);
     sink.Post("/yuzu_test_forget", kNoop);
     REQUIRE(RouteInventory::instance().routes_for(&svr).size() == 1);
