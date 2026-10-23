@@ -1095,7 +1095,7 @@ TEST_CASE("AuthDB::mfa_disable_report reports the pre-image of the clear itself 
     MfaSettingsHarness h;
     // Provisional secret only: nothing verified, so the report is false.
     REQUIRE(h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt).has_value());
-    auto provisional = h.auth_db->mfa_disable_report("admin");
+    auto provisional = h.auth_db->mfa_disable_report("admin", std::nullopt);
     REQUIRE(provisional.has_value());
     CHECK_FALSE(*provisional);
 
@@ -1107,7 +1107,7 @@ TEST_CASE("AuthDB::mfa_disable_report reports the pre-image of the clear itself 
     std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
     REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
-    auto verified = h.auth_db->mfa_disable_report("admin");
+    auto verified = h.auth_db->mfa_disable_report("admin", std::nullopt);
     REQUIRE(verified.has_value());
     CHECK(*verified);
     auto status = h.auth_db->mfa_status("admin");
@@ -1116,10 +1116,10 @@ TEST_CASE("AuthDB::mfa_disable_report reports the pre-image of the clear itself 
 
     // Already cleared: false (idempotent). An unknown account matches no row and reports true,
     // so a caller deciding whether to end sessions fails safe.
-    auto again = h.auth_db->mfa_disable_report("admin");
+    auto again = h.auth_db->mfa_disable_report("admin", std::nullopt);
     REQUIRE(again.has_value());
     CHECK_FALSE(*again);
-    auto unknown = h.auth_db->mfa_disable_report("nobody");
+    auto unknown = h.auth_db->mfa_disable_report("nobody", std::nullopt);
     REQUIRE(unknown.has_value());
     CHECK(*unknown);
 }

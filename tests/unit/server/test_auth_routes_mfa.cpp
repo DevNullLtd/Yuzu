@@ -542,7 +542,7 @@ TEST_CASE("POST /login/mfa with valid recovery code emits mfa.recovery_code.used
     // is consumed inside enroll_mfa via mfa_verify_enrollment which
     // returned them, but we discarded the return — regenerate gives a
     // clean batch we own).
-    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin");
+    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
     REQUIRE(codes.has_value());
     REQUIRE_FALSE(codes->empty());
     auto recovery = codes->front();
@@ -583,7 +583,7 @@ TEST_CASE("POST /login/mfa recovery-code path still audits mfa.recovery_code.use
           "[pg][mfa][routes][auth_routes]") {
     AuthRoutesHarness h;
     h.enroll_mfa("admin");
-    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin");
+    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
     REQUIRE(codes.has_value());
     REQUIRE_FALSE(codes->empty());
     auto recovery = codes->front();
@@ -691,7 +691,7 @@ TEST_CASE("POST /login/mfa strict shape gate routes non-6-digit to recovery path
           "[pg][mfa][routes][auth_routes]") {
     AuthRoutesHarness h;
     h.enroll_mfa("admin");
-    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin");
+    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
     REQUIRE(codes.has_value());
 
     auto step1 = h.sink.Post("/login",
@@ -827,7 +827,7 @@ TEST_CASE(
     "[pg][mfa][stepup][routes]") {
     AuthRoutesHarness h;
     auto secret = h.enroll_mfa("admin");
-    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin");
+    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
     REQUIRE(codes.has_value());
     REQUIRE_FALSE(codes->empty());
     auto recovery = codes->front();

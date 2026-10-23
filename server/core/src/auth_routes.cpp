@@ -2934,7 +2934,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         if (is_totp) {
             auto r = db->mfa_verify_login_code(entry.username, code);
             if (r) {
-                matched = *r;
+                matched = r->ok;
             } else if (is_store_unavailable(r.error())) {
                 // ★ SECURITY (architect BLOCK): a decrypt/store failure must
                 // NEVER be treated as "wrong code" — that would silently
@@ -2949,7 +2949,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
         } else {
             auto r = db->mfa_consume_recovery_code(entry.username, code);
-            if (r && *r) {
+            if (r && r->ok) {
                 matched = true;
                 used_recovery = true;
             } else if (!r && is_store_unavailable(r.error())) {
@@ -3188,7 +3188,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             // password can never complete.
             auto r = db->mfa_verify_enrollment(entry.username, code, entry.hash_hex);
             if (r) {
-                recovery_codes = std::move(*r);
+                recovery_codes = std::move(r->recovery_codes);
                 verified = true;
             } else if (r.error() == AuthDBError::CredentialChanged) {
                 credential_changed = true;
@@ -3520,7 +3520,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         if (is_totp) {
             auto r = db->mfa_verify_login_code(session->username, code);
             if (r) {
-                matched = *r;
+                matched = r->ok;
             } else if (is_store_unavailable(r.error())) {
                 // ★ SECURITY (architect BLOCK): never collapse a decrypt/
                 // store failure into "wrong code" — no session mutation
@@ -3530,7 +3530,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
         } else {
             auto r = db->mfa_consume_recovery_code(session->username, code);
-            if (r && *r) {
+            if (r && r->ok) {
                 matched = true;
                 used_recovery = true;
             } else if (!r && is_store_unavailable(r.error())) {

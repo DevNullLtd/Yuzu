@@ -93,7 +93,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_verify_enrollment with valid code enrolls and 
 
     auto recovery = db->mfa_verify_enrollment("alice", code, std::nullopt);
     REQUIRE(recovery.has_value());
-    REQUIRE(recovery->size() == 10);
+    REQUIRE(recovery->recovery_codes.size() == 10);
 
     auto s = db->mfa_status("alice");
     REQUIRE(s.has_value());
@@ -153,7 +153,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code replay-protected", "[pg][mfa
     // Same code in the same step is rejected on login (replay).
     auto replay = db->mfa_verify_login_code("alice", code);
     REQUIRE(replay.has_value());
-    REQUIRE_FALSE(*replay);
+    REQUIRE_FALSE(replay->ok);
 }
 
 TEST_CASE_METHOD(MfaFixture,
@@ -179,11 +179,11 @@ TEST_CASE_METHOD(MfaFixture,
 
     auto first = db->mfa_verify_login_code("alice", future_code);
     REQUIRE(first.has_value());
-    REQUIRE(*first);
+    REQUIRE(first->ok);
 
     auto replay = db->mfa_verify_login_code("alice", future_code);
     REQUIRE(replay.has_value());
-    REQUIRE_FALSE(*replay);
+    REQUIRE_FALSE(replay->ok);
 }
 
 TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code rejects garbage", "[pg][mfa][store]") {
@@ -194,11 +194,11 @@ TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code rejects garbage", "[pg][mfa]
 
     auto r = db->mfa_verify_login_code("alice", "");
     REQUIRE(r.has_value());
-    REQUIRE_FALSE(*r);
+    REQUIRE_FALSE(r->ok);
 
     auto r2 = db->mfa_verify_login_code("alice", "abcdef");
     REQUIRE(r2.has_value());
-    REQUIRE_FALSE(*r2);
+    REQUIRE_FALSE(r2->ok);
 }
 
 TEST_CASE_METHOD(MfaFixture, "recovery codes are single-use", "[pg][mfa][store][recovery]") {
@@ -208,16 +208,16 @@ TEST_CASE_METHOD(MfaFixture, "recovery codes are single-use", "[pg][mfa][store][
     auto recovery_res = db->mfa_verify_enrollment("alice", code, std::nullopt);
     REQUIRE(recovery_res.has_value());
 
-    const auto& codes = *recovery_res;
+    const auto& codes = recovery_res->recovery_codes;
     REQUIRE_FALSE(codes.empty());
 
     auto first = db->mfa_consume_recovery_code("alice", codes.front());
     REQUIRE(first.has_value());
-    REQUIRE(*first);
+    REQUIRE(first->ok);
 
     auto replay = db->mfa_consume_recovery_code("alice", codes.front());
     REQUIRE(replay.has_value());
-    REQUIRE_FALSE(*replay);
+    REQUIRE_FALSE(replay->ok);
 
     auto s = db->mfa_status("alice");
     REQUIRE(s->recovery_codes_remaining == 9);
@@ -229,7 +229,7 @@ TEST_CASE_METHOD(MfaFixture, "recovery codes normalise separator and case",
     auto code = code_for_now(init->secret_base32);
     auto recovery_res = db->mfa_verify_enrollment("alice", code, std::nullopt);
     REQUIRE(recovery_res.has_value());
-    auto orig = recovery_res->front(); // shape "XXXXX-XXXXX"
+    auto orig = recovery_res->recovery_codes.front(); // shape "XXXXX-XXXXX"
 
     // Strip the dash; should still match the same stored row.
     std::string no_dash;
@@ -239,16 +239,16 @@ TEST_CASE_METHOD(MfaFixture, "recovery codes normalise separator and case",
 
     auto stripped = db->mfa_consume_recovery_code("alice", no_dash);
     REQUIRE(stripped.has_value());
-    REQUIRE(*stripped);
+    REQUIRE(stripped->ok);
 
     // Lowercased should also have matched if we hadn't already consumed.
-    auto next = recovery_res->at(1);
+    auto next = recovery_res->recovery_codes.at(1);
     std::string lower;
     for (char c : next)
         lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     auto matched = db->mfa_consume_recovery_code("alice", lower);
     REQUIRE(matched.has_value());
-    REQUIRE(*matched);
+    REQUIRE(matched->ok);
 }
 
 TEST_CASE_METHOD(MfaFixture, "regenerate replaces all codes", "[pg][mfa][store][recovery]") {
@@ -257,19 +257,19 @@ TEST_CASE_METHOD(MfaFixture, "regenerate replaces all codes", "[pg][mfa][store][
     auto first_set = db->mfa_verify_enrollment("alice", code, std::nullopt);
     REQUIRE(first_set.has_value());
 
-    auto second_set = db->mfa_regenerate_recovery_codes("alice");
+    auto second_set = db->mfa_regenerate_recovery_codes("alice", std::nullopt);
     REQUIRE(second_set.has_value());
     REQUIRE(second_set->size() == 10);
 
     // Old codes no longer valid.
-    auto stale = db->mfa_consume_recovery_code("alice", first_set->front());
+    auto stale = db->mfa_consume_recovery_code("alice", first_set->recovery_codes.front());
     REQUIRE(stale.has_value());
-    REQUIRE_FALSE(*stale);
+    REQUIRE_FALSE(stale->ok);
 
     // New ones are.
     auto fresh = db->mfa_consume_recovery_code("alice", second_set->front());
     REQUIRE(fresh.has_value());
-    REQUIRE(*fresh);
+    REQUIRE(fresh->ok);
 }
 
 TEST_CASE_METHOD(MfaFixture, "disable clears secret and recovery codes", "[pg][mfa][store]") {
@@ -305,7 +305,7 @@ TEST_CASE_METHOD(MfaFixture, "verify_login_code on disabled user always fails", 
 
     auto r = db->mfa_verify_login_code("alice", code);
     REQUIRE(r.has_value());
-    REQUIRE_FALSE(*r);
+    REQUIRE_FALSE(r->ok);
 }
 
 // Quality SHOULD (governance hardening round): mfa_init_enrollment's fresh-

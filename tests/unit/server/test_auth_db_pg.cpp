@@ -385,7 +385,7 @@ TEST_CASE("AuthDB::mfa_verify_enrollment binds to the proven credential (Credent
     // The proven credential still stored → enrols.
     auto ok = h.db.mfa_verify_enrollment("bind", code, std::string("h0"));
     REQUIRE(ok.has_value());
-    CHECK(ok->size() == 10);
+    CHECK(ok->recovery_codes.size() == 10);
     CHECK(h.db.mfa_status("bind")->enrolled);
 }
 
@@ -516,7 +516,7 @@ TEST_CASE("AuthDB::mfa_verify_enrollment with no expected hash anchors to the ha
                               "UPDATE auth.users SET password_hash = 'h1' WHERE username = 'sett2'")};
             REQUIRE(u.ok());
         }
-        std::optional<std::expected<std::vector<std::string>, AuthDBError>> during;
+        std::optional<std::expected<AuthDB::MfaEnrolment, AuthDBError>> during;
         {
             std::jthread verifier(
                 [&] { during = h.db.mfa_verify_enrollment("sett2", code, std::nullopt); });
@@ -1579,10 +1579,10 @@ TEST_CASE("AuthDB migrates v1 -> v2: clean enrollment/pending shape + import_met
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AuthDB adb{pool, codec};
-    REQUIRE(adb.is_open()); // the v2 step applied
+    REQUIRE(adb.is_open()); // the v2 and v3 steps applied
 
     PgConn conn = connect(db.dsn());
-    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "2");
+    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "3");
 
     // v1 dead shapes gone, clean shape present (no `is_used`, has `max_uses`/`token_id`).
     CHECK(scalar(conn.get(), "SELECT count(*) FROM auth.enrollment_tokens") == "0");
@@ -1628,17 +1628,25 @@ TEST_CASE("AuthDB recovery codes regenerate + single-use consume", "[pg][auth_db
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("rec", "h", "s", yuzu::server::auth::Role::user).has_value());
+    // #6079: a recovery code is redeemable only by an ENROLLED account (the consume locks the
+    // users row with `mfa_enrolled_at IS NOT NULL`), so these fixtures enrol the account.
+    {
+        auto init = h.db.mfa_init_enrollment("rec", "Yuzu", std::nullopt);
+        REQUIRE(init.has_value());
+        REQUIRE(h.db.mfa_verify_enrollment("rec", totp_for(init->secret_base32), std::nullopt)
+                    .has_value());
+    }
 
-    auto codes = h.db.mfa_regenerate_recovery_codes("rec");
+    auto codes = h.db.mfa_regenerate_recovery_codes("rec", std::nullopt);
     REQUIRE(codes.has_value());
     REQUIRE(codes->size() == 10);
 
     const auto& one = (*codes)[0];
-    CHECK(h.db.mfa_consume_recovery_code("rec", one).value());
+    CHECK(h.db.mfa_consume_recovery_code("rec", one).value().ok);
     // Single-use: consuming again fails.
-    CHECK_FALSE(h.db.mfa_consume_recovery_code("rec", one).value());
+    CHECK_FALSE(h.db.mfa_consume_recovery_code("rec", one).value().ok);
     // A never-issued code fails cleanly (not an error).
-    CHECK_FALSE(h.db.mfa_consume_recovery_code("rec", "ZZZZZ-ZZZZZ").value());
+    CHECK_FALSE(h.db.mfa_consume_recovery_code("rec", "ZZZZZ-ZZZZZ").value().ok);
 }
 
 // ── #3779: concurrent recovery-code regenerate must serialize ───────────────
@@ -1658,6 +1666,14 @@ TEST_CASE("AuthDB MFA: concurrent recovery-code regenerate persists exactly one 
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()}; // pool size 4 — enough for two concurrent regenerates
     REQUIRE(h.db.upsert_user("regenrace", "h", "s", yuzu::server::auth::Role::user).has_value());
+    // #6079: a recovery code is redeemable only by an ENROLLED account (the consume locks the
+    // users row with `mfa_enrolled_at IS NOT NULL`), so these fixtures enrol the account.
+    {
+        auto init = h.db.mfa_init_enrollment("regenrace", "Yuzu", std::nullopt);
+        REQUIRE(init.has_value());
+        REQUIRE(h.db.mfa_verify_enrollment("regenrace", totp_for(init->secret_base32), std::nullopt)
+                    .has_value());
+    }
 
     std::atomic<int> ok{0};
     std::atomic<int> err{0};
@@ -1667,7 +1683,7 @@ TEST_CASE("AuthDB MFA: concurrent recovery-code regenerate persists exactly one 
         while (!go.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
-        auto r = h.db.mfa_regenerate_recovery_codes("regenrace");
+        auto r = h.db.mfa_regenerate_recovery_codes("regenrace", std::nullopt);
         if (r.has_value()) {
             *slot = *r;
             ok.fetch_add(1, std::memory_order_relaxed);
@@ -1697,8 +1713,8 @@ TEST_CASE("AuthDB MFA: concurrent recovery-code regenerate persists exactly one 
     // (its first code consumes), the other is cleanly dead (its first code does
     // not) — deterministic regardless of which thread committed last. Pre-fix,
     // ALL 20 rows are present so both would consume (this CHECK would fail).
-    const bool v1_live = h.db.mfa_consume_recovery_code("regenrace", v1[0]).value();
-    const bool v2_live = h.db.mfa_consume_recovery_code("regenrace", v2[0]).value();
+    const bool v1_live = h.db.mfa_consume_recovery_code("regenrace", v1[0]).value().ok;
+    const bool v2_live = h.db.mfa_consume_recovery_code("regenrace", v2[0]).value().ok;
     CHECK(v1_live != v2_live);
 
     // The consume above spent one code from the live set → 9 remain.
@@ -1713,7 +1729,7 @@ TEST_CASE("AuthDB MFA: regenerate for a nonexistent user returns UserNotFound",
           "[pg][auth_db][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
-    auto r = h.db.mfa_regenerate_recovery_codes("nobody");
+    auto r = h.db.mfa_regenerate_recovery_codes("nobody", std::nullopt);
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error() == AuthDBError::UserNotFound);
 }
@@ -1728,10 +1744,11 @@ TEST_CASE("AuthDB MFA: regenerate refuses a deactivated account (no live codes)"
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("gone", "h", "s", yuzu::server::auth::Role::user).has_value());
-    REQUIRE(h.db.mfa_regenerate_recovery_codes("gone").has_value()); // seed a live set
+    REQUIRE(
+        h.db.mfa_regenerate_recovery_codes("gone", std::nullopt).has_value()); // seed a live set
     REQUIRE(h.db.remove_user("gone").has_value());                   // deactivate
 
-    auto r = h.db.mfa_regenerate_recovery_codes("gone");
+    auto r = h.db.mfa_regenerate_recovery_codes("gone", std::nullopt);
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error() == AuthDBError::UserNotFound);
     // mfa_status on a deactivated account also returns UserNotFound — there is no
@@ -1776,7 +1793,7 @@ TEST_CASE("AuthDB MFA enroll -> verify round trip is envelope-encrypted end to e
 
     auto verify = h.db.mfa_verify_enrollment("mfauser", code, std::nullopt);
     REQUIRE(verify.has_value());
-    CHECK(verify->size() == 10);
+    CHECK(verify->recovery_codes.size() == 10);
 
     // Enrolling twice is rejected.
     auto redo = h.db.mfa_init_enrollment("mfauser", "Yuzu", std::nullopt);
@@ -1793,12 +1810,12 @@ TEST_CASE("AuthDB MFA enroll -> verify round trip is envelope-encrypted end to e
     auto code2 = yuzu::server::mfa::generate(secret_view, counter + 1);
     auto login = h.db.mfa_verify_login_code("mfauser", code2);
     REQUIRE(login.has_value());
-    CHECK(*login == true);
+    CHECK(login->ok);
 
     // A wrong code is a clean `false`, not an error.
     auto wrong = h.db.mfa_verify_login_code("mfauser", "000000");
     REQUIRE(wrong.has_value());
-    CHECK(*wrong == false);
+    CHECK_FALSE(wrong->ok);
 
     REQUIRE(h.db.mfa_disable("mfauser").has_value());
     auto after_disable = h.db.mfa_status("mfauser");
@@ -1948,7 +1965,7 @@ TEST_CASE("AuthDB MFA: concurrent enrollment verify enrolls exactly once, no orp
         }
         auto r = h.db.mfa_verify_enrollment("enrollrace", code, std::nullopt);
         if (r.has_value()) {
-            *slot = *r;
+            *slot = r->recovery_codes;
             ok.fetch_add(1, std::memory_order_relaxed);
         } else if (r.error() == AuthDBError::MfaAlreadyEnrolled) {
             already.fetch_add(1, std::memory_order_relaxed);
@@ -1977,7 +1994,7 @@ TEST_CASE("AuthDB MFA: concurrent enrollment verify enrolls exactly once, no orp
     REQUIRE(status.has_value());
     CHECK(status->enrolled);
     CHECK(status->recovery_codes_remaining == 10);
-    CHECK(h.db.mfa_consume_recovery_code("enrollrace", winner[0]).value());
+    CHECK(h.db.mfa_consume_recovery_code("enrollrace", winner[0]).value().ok);
 }
 
 // ── #3762: white-box coverage of the enrollment guard's WHERE predicate ─────
@@ -2282,7 +2299,7 @@ TEST_CASE("AuthDB MFA: disable then re-enroll succeeds — the guard does not we
             sv, yuzu::server::mfa::current_counter(std::chrono::system_clock::now()));
         auto verify = h.db.mfa_verify_enrollment("reenroll", code, std::nullopt);
         REQUIRE(verify.has_value());
-        CHECK(verify->size() == 10);
+        CHECK(verify->recovery_codes.size() == 10);
     };
 
     enroll_once();
@@ -2341,7 +2358,7 @@ TEST_CASE("AuthDB MFA: concurrent submission of one valid code succeeds exactly 
         auto r = h.db.mfa_verify_login_code("racer", login_code);
         if (!r.has_value())
             errored.fetch_add(1, std::memory_order_relaxed);
-        else if (*r)
+        else if (r->ok)
             ok.fetch_add(1, std::memory_order_relaxed);
         else
             rejected.fetch_add(1, std::memory_order_relaxed);
@@ -2361,7 +2378,7 @@ TEST_CASE("AuthDB MFA: concurrent submission of one valid code succeeds exactly 
     // And the code stays burned for any later attempt.
     auto replay = h.db.mfa_verify_login_code("racer", login_code);
     REQUIRE(replay.has_value());
-    CHECK(*replay == false);
+    CHECK_FALSE(replay->ok);
 }
 
 // ── #2399: white-box coverage of the monotonic guard's WHERE predicate ──────
@@ -2655,7 +2672,7 @@ TEST_CASE("AuthDB MFA: a genuinely NOT-enrolled user still verifies as a plain f
 
     auto login = h.db.mfa_verify_login_code("noenroll", "123456");
     REQUIRE(login.has_value());
-    CHECK(*login == false);
+    CHECK_FALSE(login->ok);
 }
 
 TEST_CASE("AuthDB MFA fail-closed: mfa_init_enrollment never mints a fresh secret over a "
@@ -2865,6 +2882,751 @@ TEST_CASE("AuthDB::mfa_disable_report pre-image is false when a concurrent disab
     REQUIRE(report.has_value());
     REQUIRE(report->has_value());
     CHECK_FALSE(**report); // nothing left to clear: the other disable already did
+}
+
+// ── #6079: database-owned MFA factor generation (auth v3) ────────────────────
+//
+// The generation is advanced by a row trigger on EVERY change of `mfa_enrolled_at`, whichever
+// binary issued the write, so "which factor is enrolled right now" cannot be forged by a repeated
+// or skewed enrolment timestamp. The three verifiers return the generation read under the row lock
+// plus the DATABASE instant captured by the statement that loaded the secret (or the recovery
+// candidates), before any cryptographic check, and publish success only after COMMIT.
+
+namespace {
+
+// The pinned trigger function body, copied from auth_db.cpp's kUsersMfaFactorGenBody on purpose:
+// the validation compares prosrc byte for byte, so a change to the production text must fail here
+// and be re-pinned deliberately.
+constexpr const char* kBindingFnBody =
+    "\nBEGIN\n"
+    "  IF NEW.mfa_enrolled_at IS DISTINCT FROM OLD.mfa_enrolled_at THEN\n"
+    "    NEW.mfa_factor_gen := OLD.mfa_factor_gen + 1;\n"
+    "  ELSE\n"
+    "    NEW.mfa_factor_gen := OLD.mfa_factor_gen;\n"
+    "  END IF;\n"
+    "  RETURN NEW;\n"
+    "END\n";
+
+void run_sql(PGconn* c, const std::string& stmt) {
+    PgResult r{PQexec(c, stmt.c_str())};
+    INFO(stmt << " -> " << PQerrorMessage(c));
+    REQUIRE(r.ok());
+}
+
+std::int64_t gen_of(PGconn* c, const std::string& user) {
+    return std::stoll(
+        scalar(c, "SELECT mfa_factor_gen FROM auth.users WHERE username = $1", {user}));
+}
+
+std::int64_t counter_of(PGconn* c, const std::string& user) {
+    return std::stoll(
+        scalar(c, "SELECT mfa_last_counter FROM auth.users WHERE username = $1", {user}));
+}
+
+std::string code_ids(PGconn* c, const std::string& user) {
+    return scalar(c,
+                  "SELECT COALESCE(string_agg(id::text, ',' ORDER BY id), '') "
+                  "FROM auth.mfa_recovery_codes WHERE username = $1",
+                  {user});
+}
+
+std::string code_for(const std::string& secret_b32, bool next_step) {
+    auto raw = yuzu::server::mfa::base32_decode(secret_b32);
+    REQUIRE(raw.has_value());
+    auto counter = yuzu::server::mfa::current_counter(std::chrono::system_clock::now());
+    if (next_step)
+        counter += 1;
+    return yuzu::server::mfa::generate(
+        std::string_view(reinterpret_cast<const char*>(raw->data()), raw->size()), counter);
+}
+
+struct Enrolled {
+    AuthDB::MfaEnrolment result;
+    std::string secret_b32;
+};
+
+Enrolled enroll_full(AuthDB& db, const std::string& user) {
+    auto init = db.mfa_init_enrollment(user, "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto e = db.mfa_verify_enrollment(user, code_for(init->secret_base32, false), std::nullopt);
+    REQUIRE(e.has_value());
+    return Enrolled{std::move(*e), init->secret_base32};
+}
+
+// A store built over a FRESH, un-initialised codec on the same database: exactly the boot path
+// (migrations + the trigger validation) with no secret to decrypt.
+bool second_store_opens(const std::string& dsn) {
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    AuthDB second{pool, codec, /*cleanup_interval_secs=*/0};
+    return second.is_open();
+}
+
+constexpr const char* kRestoreTriggerSql =
+    "ALTER TABLE auth.users ENABLE ALWAYS TRIGGER users_mfa_factor_gen";
+
+// A deferred constraint trigger that raises at COMMIT: the COMMIT itself fails after every
+// statement succeeded (the idiom of test_auth_password.cpp's "COMMIT itself fails" case).
+void install_commit_failer(PGconn* c, const std::string& table, const std::string& event) {
+    run_sql(c, "CREATE OR REPLACE FUNCTION public.yuzu_test_fail_commit() RETURNS trigger LANGUAGE "
+               "plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced commit failure'; END $$");
+    run_sql(c, "CREATE CONSTRAINT TRIGGER yuzu_test_fail_commit AFTER " + event + " ON " + table +
+                   " DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION "
+                   "public.yuzu_test_fail_commit()");
+}
+
+void remove_commit_failer(PGconn* c, const std::string& table) {
+    run_sql(c, "DROP TRIGGER yuzu_test_fail_commit ON " + table);
+}
+
+} // namespace
+
+TEST_CASE("AuthDB migrates v2 -> v3: enrolled accounts seed at generation 1, the trigger is ENABLE "
+          "ALWAYS",
+          "[pg][auth_db][migration][mfa_binding]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    {
+        yuzu::test::TempDir keys;
+        FileKeyProvider provider(keys.path);
+        SecretCodec codec(provider);
+        PgConn conn = connect(db.dsn());
+        REQUIRE(codec.init(conn.get()).has_value());
+        AuthDB first{pool, codec, 0};
+        REQUIRE(first.is_open());
+    }
+    PgConn conn = connect(db.dsn());
+    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "3");
+
+    // Rewind to the v2 shape: no column, no trigger, schema_meta at 2.
+    run_sql(conn.get(), "DROP TRIGGER users_mfa_factor_gen ON auth.users");
+    run_sql(conn.get(), "DROP FUNCTION auth.users_mfa_factor_gen()");
+    run_sql(conn.get(), "ALTER TABLE auth.users DROP COLUMN mfa_factor_gen");
+    run_sql(conn.get(), "UPDATE public.schema_meta SET version = 2 WHERE store = 'auth'");
+    run_sql(conn.get(), "INSERT INTO auth.users (username, mfa_enrolled_at) VALUES "
+                        "('seed_enrolled', now()), ('seed_never', NULL)");
+
+    CHECK(second_store_opens(db.dsn())); // applies v3
+    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "3");
+    // The seed ran BEFORE the trigger existed: created first, the trigger would have overridden
+    // it to 0 (the instant is unchanged, so it takes the ELSE arm).
+    CHECK(gen_of(conn.get(), "seed_enrolled") == 1);
+    CHECK(gen_of(conn.get(), "seed_never") == 0);
+    CHECK(scalar(conn.get(),
+                 "SELECT tgenabled FROM pg_trigger WHERE tgname = 'users_mfa_factor_gen' "
+                 "AND tgrelid = 'auth.users'::regclass") == "A");
+    // Re-opening is a no-op migration and the trigger stays in force.
+    CHECK(second_store_opens(db.dsn()));
+    CHECK(gen_of(conn.get(), "seed_enrolled") == 1);
+}
+
+TEST_CASE("AuthDB factor generation advances on every change of mfa_enrolled_at, whoever writes it",
+          "[pg][auth_db][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("g1", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    // Never enrolled, and a provisional secret: generation 0 (mfa_init is not a factor change).
+    CHECK(h.db.mfa_status("g1")->factor_gen == 0);
+    REQUIRE(h.db.mfa_init_enrollment("g1", "Yuzu", std::nullopt).has_value());
+    CHECK(gen_of(h.conn.get(), "g1") == 0);
+    REQUIRE(h.db.mfa_disable("g1").has_value());
+    CHECK(gen_of(h.conn.get(), "g1") == 0); // NULL -> NULL is not a change
+
+    auto f1 = enroll_full(h.db, "g1");
+    CHECK(f1.result.factor_gen == 1);
+    CHECK(h.db.mfa_status("g1")->factor_gen == 1);
+    const std::string f1_instant =
+        scalar(h.conn.get(), "SELECT mfa_enrolled_at::text FROM auth.users WHERE username = 'g1'");
+
+    // Not bumped: a login counter advance, a recovery-code regeneration, a lockout counter.
+    auto login = h.db.mfa_verify_login_code("g1", code_for(f1.secret_b32, true));
+    REQUIRE(login.has_value());
+    CHECK(login->ok);
+    CHECK(login->factor_gen == 1);
+    REQUIRE(h.db.mfa_regenerate_recovery_codes("g1", std::nullopt).has_value());
+    CHECK(gen_of(h.conn.get(), "g1") == 1);
+
+    REQUIRE(h.db.mfa_disable("g1").has_value()); // clear: 1 -> 2, readable while un-enrolled
+    CHECK(h.db.mfa_status("g1")->factor_gen == 2);
+    CHECK_FALSE(h.db.mfa_status("g1")->enrolled);
+    auto f2 = enroll_full(h.db, "g1"); // 3
+    CHECK(f2.result.factor_gen == 3);
+
+    // THE repeated-timestamp case: put F1's exact enrolment instant back. The timestamp alone
+    // would read "F1 is enrolled again"; the generation reads 4, which no earlier proof carries.
+    run_sql(h.conn.get(), "UPDATE auth.users SET mfa_enrolled_at = '" + f1_instant +
+                              "'::timestamptz WHERE username = 'g1'");
+    CHECK(scalar(h.conn.get(),
+                 "SELECT mfa_enrolled_at::text FROM auth.users WHERE username = 'g1'") ==
+          f1_instant);
+    CHECK(gen_of(h.conn.get(), "g1") == f2.result.factor_gen + 1);
+    CHECK(gen_of(h.conn.get(), "g1") != f1.result.factor_gen);
+
+    // A direct write of the generation column is overridden; one that also changes the instant
+    // advances by exactly one; a no-op write of the instant does not advance.
+    run_sql(h.conn.get(), "UPDATE auth.users SET mfa_factor_gen = 999 WHERE username = 'g1'");
+    CHECK(gen_of(h.conn.get(), "g1") == 4);
+    run_sql(h.conn.get(), "UPDATE auth.users SET mfa_factor_gen = 999, mfa_enrolled_at = now() "
+                          "WHERE username = 'g1'");
+    CHECK(gen_of(h.conn.get(), "g1") == 5);
+    run_sql(h.conn.get(),
+            "UPDATE auth.users SET mfa_enrolled_at = mfa_enrolled_at WHERE username = 'g1'");
+    CHECK(gen_of(h.conn.get(), "g1") == 5);
+
+    // Two changes of one row in one transaction stay distinct (strict OLD + 1).
+    run_sql(h.conn.get(), "BEGIN");
+    run_sql(h.conn.get(), "UPDATE auth.users SET mfa_enrolled_at = now() - interval '1 day' "
+                          "WHERE username = 'g1'");
+    run_sql(h.conn.get(), "UPDATE auth.users SET mfa_enrolled_at = now() WHERE username = 'g1'");
+    run_sql(h.conn.get(), "COMMIT");
+    CHECK(gen_of(h.conn.get(), "g1") == 7);
+
+    // Soft delete clears the enrolment: a change.
+    REQUIRE(h.db.remove_user("g1").has_value());
+    CHECK(gen_of(h.conn.get(), "g1") == 8);
+}
+
+TEST_CASE("AuthDB::mfa_status carries the database clock and reports the binding as enforced",
+          "[pg][auth_db][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("s1", "h", "s", yuzu::server::auth::Role::user).has_value());
+    const std::int64_t lo = db_now_ms(h.conn.get());
+    auto st = h.db.mfa_status("s1");
+    const std::int64_t hi = db_now_ms(h.conn.get());
+    REQUIRE(st.has_value());
+    CHECK(st->db_now_ms >= lo);
+    CHECK(st->db_now_ms <= hi);
+    CHECK(st->binding_enforced);
+    CHECK(st->factor_gen == 0);
+    CHECK(st->enrolled_at_ms == 0); // still present alongside the new fields until C6
+}
+
+TEST_CASE("AuthDB verifiers return the generation and an instant captured BEFORE the check",
+          "[pg][auth_db][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("v1", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    SECTION("enrolment: the instant is the load, not the write, and the pause is counted") {
+        auto init = h.db.mfa_init_enrollment("v1", "Yuzu", std::nullopt);
+        REQUIRE(init.has_value());
+        const std::string code = code_for(init->secret_base32, false);
+        std::int64_t hook_now = 0;
+        h.db.set_enrolment_pre_txn_hook_for_test([&] {
+            // The pause between the TOTP check and the transaction. 25 ms forces a later
+            // millisecond than the load so the strict comparisons below can discriminate.
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            hook_now = db_now_ms(h.conn.get());
+        });
+        const std::int64_t lo = db_now_ms(h.conn.get());
+        auto e = h.db.mfa_verify_enrollment("v1", code, std::nullopt);
+        h.db.set_enrolment_pre_txn_hook_for_test(nullptr);
+        REQUIRE(e.has_value());
+        CHECK(e->factor_gen == 1);
+        CHECK(e->verified_ms >= lo);
+        CHECK(e->verified_ms <= hook_now);
+        const std::int64_t enrolled_ms = h.db.mfa_status("v1")->enrolled_at_ms;
+        CHECK(e->verified_ms < enrolled_ms); // captured before the pause, so before the UPDATE
+        CHECK(e->recovery_codes.size() == 10);
+    }
+
+    SECTION("enrolment: a secret rotated in the pause is refused by the identity guard") {
+        auto init = h.db.mfa_init_enrollment("v1", "Yuzu", std::nullopt);
+        REQUIRE(init.has_value());
+        const std::string code = code_for(init->secret_base32, false);
+        h.db.set_enrolment_pre_txn_hook_for_test([&] {
+            REQUIRE(h.db.mfa_disable("v1").has_value());
+            REQUIRE(h.db.mfa_init_enrollment("v1", "Yuzu", std::nullopt).has_value());
+        });
+        auto e = h.db.mfa_verify_enrollment("v1", code, std::nullopt);
+        h.db.set_enrolment_pre_txn_hook_for_test(nullptr);
+        REQUIRE_FALSE(e.has_value());
+        CHECK(e.error() == AuthDBError::WriteFailed);
+        CHECK_FALSE(h.db.mfa_status("v1")->enrolled);
+        CHECK(code_ids(h.conn.get(), "v1").empty());
+    }
+
+    SECTION("login code") {
+        auto f = enroll_full(h.db, "v1");
+        const std::int64_t lo = db_now_ms(h.conn.get());
+        auto v = h.db.mfa_verify_login_code("v1", code_for(f.secret_b32, true));
+        const std::int64_t hi = db_now_ms(h.conn.get());
+        REQUIRE(v.has_value());
+        CHECK(v->ok);
+        CHECK(v->factor_gen == f.result.factor_gen);
+        CHECK(v->verified_ms >= lo);
+        CHECK(v->verified_ms <= hi);
+        // A definitive "no" carries zeros.
+        auto replay = h.db.mfa_verify_login_code("v1", code_for(f.secret_b32, true));
+        REQUIRE(replay.has_value());
+        CHECK_FALSE(replay->ok);
+        CHECK(replay->factor_gen == 0);
+        CHECK(replay->verified_ms == 0);
+    }
+
+    SECTION("recovery code") {
+        auto f = enroll_full(h.db, "v1");
+        const std::int64_t lo = db_now_ms(h.conn.get());
+        auto v = h.db.mfa_consume_recovery_code("v1", f.result.recovery_codes[0]);
+        const std::int64_t hi = db_now_ms(h.conn.get());
+        REQUIRE(v.has_value());
+        CHECK(v->ok);
+        CHECK(v->factor_gen == f.result.factor_gen);
+        CHECK(v->verified_ms >= lo);
+        CHECK(v->verified_ms <= hi);
+        // The instant precedes the consume's own write.
+        CHECK(v->verified_ms <=
+              std::stoll(scalar(h.conn.get(),
+                                "SELECT (extract(epoch from max(consumed_at))*1000)::bigint "
+                                "FROM auth.mfa_recovery_codes WHERE username = 'v1'")));
+        auto again = h.db.mfa_consume_recovery_code("v1", f.result.recovery_codes[0]);
+        REQUIRE(again.has_value());
+        CHECK_FALSE(again->ok);
+        CHECK(again->verified_ms == 0);
+    }
+}
+
+TEST_CASE("AuthDB verifiers publish success only after COMMIT (a failing COMMIT is WriteFailed, "
+          "and a genuine rollback leaves the code valid)",
+          "[pg][auth_db][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("c1", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    SECTION("login verifier") {
+        auto f = enroll_full(h.db, "c1");
+        const std::string code = code_for(f.secret_b32, true);
+        const auto before = counter_of(h.conn.get(), "c1");
+        install_commit_failer(h.conn.get(), "auth.users", "UPDATE");
+        auto v = h.db.mfa_verify_login_code("c1", code);
+        REQUIRE_FALSE(v.has_value()); // red on dev: it returned a bare `true` ignoring `committed`
+        CHECK(v.error() == AuthDBError::WriteFailed);
+        CHECK(yuzu::server::is_store_unavailable(v.error()));
+        CHECK(counter_of(h.conn.get(), "c1") == before);
+        remove_commit_failer(h.conn.get(), "auth.users");
+        auto retry = h.db.mfa_verify_login_code("c1", code); // the rollback left it valid
+        REQUIRE(retry.has_value());
+        CHECK(retry->ok);
+    }
+
+    SECTION("recovery consume") {
+        auto f = enroll_full(h.db, "c1");
+        install_commit_failer(h.conn.get(), "auth.mfa_recovery_codes", "UPDATE");
+        auto v = h.db.mfa_consume_recovery_code("c1", f.result.recovery_codes[0]);
+        REQUIRE_FALSE(v.has_value());
+        CHECK(v.error() == AuthDBError::WriteFailed);
+        CHECK(scalar(h.conn.get(),
+                     "SELECT count(*) FROM auth.mfa_recovery_codes WHERE username = 'c1' "
+                     "AND consumed_at IS NOT NULL") == "0");
+        remove_commit_failer(h.conn.get(), "auth.mfa_recovery_codes");
+        auto retry = h.db.mfa_consume_recovery_code("c1", f.result.recovery_codes[0]);
+        REQUIRE(retry.has_value());
+        CHECK(retry->ok);
+    }
+
+    SECTION("enrolment") {
+        auto init = h.db.mfa_init_enrollment("c1", "Yuzu", std::nullopt);
+        REQUIRE(init.has_value());
+        const std::string code = code_for(init->secret_base32, false);
+        install_commit_failer(h.conn.get(), "auth.mfa_recovery_codes", "INSERT");
+        auto e = h.db.mfa_verify_enrollment("c1", code, std::nullopt);
+        REQUIRE_FALSE(e.has_value());
+        CHECK(e.error() == AuthDBError::WriteFailed);
+        CHECK_FALSE(h.db.mfa_status("c1")->enrolled);
+        CHECK(code_ids(h.conn.get(), "c1").empty());
+        remove_commit_failer(h.conn.get(), "auth.mfa_recovery_codes");
+        auto retry = h.db.mfa_verify_enrollment("c1", code, std::nullopt);
+        REQUIRE(retry.has_value());
+        CHECK(retry->factor_gen == 1);
+    }
+}
+
+TEST_CASE("AuthDB verifiers: a COMMIT whose acknowledgement is lost publishes nothing and "
+          "restores nothing",
+          "[pg][auth_db][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("a1", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    SECTION("recovery consume") {
+        auto f = enroll_full(h.db, "a1");
+        h.db.set_commit_ack_lost_for_test(true);
+        auto v = h.db.mfa_consume_recovery_code("a1", f.result.recovery_codes[0]);
+        h.db.set_commit_ack_lost_for_test(false);
+        REQUIRE_FALSE(v.has_value());
+        CHECK(v.error() == AuthDBError::WriteFailed);
+        // The commit really happened: the code stays consumed, nothing restores it.
+        CHECK(scalar(h.conn.get(),
+                     "SELECT count(*) FROM auth.mfa_recovery_codes WHERE username = 'a1' "
+                     "AND consumed_at IS NOT NULL") == "1");
+        auto retry = h.db.mfa_consume_recovery_code("a1", f.result.recovery_codes[0]);
+        REQUIRE(retry.has_value());
+        CHECK_FALSE(retry->ok); // refused as a replay (the route answers 401); no proof row
+        auto next = h.db.mfa_consume_recovery_code("a1", f.result.recovery_codes[1]);
+        REQUIRE(next.has_value());
+        CHECK(next->ok);
+    }
+
+    SECTION("login verifier") {
+        auto f = enroll_full(h.db, "a1");
+        const std::string code = code_for(f.secret_b32, true);
+        const auto before = counter_of(h.conn.get(), "a1");
+        h.db.set_commit_ack_lost_for_test(true);
+        auto v = h.db.mfa_verify_login_code("a1", code);
+        h.db.set_commit_ack_lost_for_test(false);
+        REQUIRE_FALSE(v.has_value());
+        CHECK(v.error() == AuthDBError::WriteFailed);
+        CHECK(counter_of(h.conn.get(), "a1") > before); // the advance persisted
+        auto retry = h.db.mfa_verify_login_code("a1", code);
+        REQUIRE(retry.has_value());
+        CHECK_FALSE(retry->ok); // refused as a replay
+    }
+
+    SECTION("enrolment: the codes of an enrolment the caller cannot confirm are not revealed") {
+        auto init = h.db.mfa_init_enrollment("a1", "Yuzu", std::nullopt);
+        REQUIRE(init.has_value());
+        const std::string code = code_for(init->secret_base32, false);
+        h.db.set_commit_ack_lost_for_test(true);
+        auto e = h.db.mfa_verify_enrollment("a1", code, std::nullopt);
+        h.db.set_commit_ack_lost_for_test(false);
+        REQUIRE_FALSE(e.has_value());
+        CHECK(e.error() == AuthDBError::WriteFailed);
+        CHECK(h.db.mfa_status("a1")->enrolled); // it really committed
+        auto retry = h.db.mfa_verify_enrollment("a1", code, std::nullopt);
+        REQUIRE_FALSE(retry.has_value());
+        CHECK(retry.error() == AuthDBError::MfaAlreadyEnrolled);
+    }
+}
+
+TEST_CASE("AuthDB recovery consume takes the users row lock first, bounded, and fails closed",
+          "[pg][auth_db][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("r1", "h", "s", yuzu::server::auth::Role::user).has_value());
+    auto f = enroll_full(h.db, "r1");
+
+    SECTION("a held users-row lock times out as QueryFailed and the code stays intact") {
+        PgConn locker = connect(db.dsn());
+        run_sql(locker.get(), "BEGIN");
+        run_sql(locker.get(), "SELECT 1 FROM auth.users WHERE username = 'r1' FOR UPDATE");
+        std::optional<std::expected<AuthDB::MfaVerification, AuthDBError>> res;
+        {
+            std::jthread t(
+                [&] { res = h.db.mfa_consume_recovery_code("r1", f.result.recovery_codes[0]); });
+            CHECK(yuzu::test::wait_for_pg_lock_waiter(db.dsn(), "%WITH u AS MATERIALIZED%"));
+        } // joins after the bounded lock wait expires
+        run_sql(locker.get(), "ROLLBACK");
+        REQUIRE(res.has_value());
+        REQUIRE_FALSE(res->has_value());
+        CHECK(res->error() == AuthDBError::QueryFailed);
+        CHECK(yuzu::server::is_store_unavailable(res->error())); // 503, never a burned attempt
+        auto retry = h.db.mfa_consume_recovery_code("r1", f.result.recovery_codes[0]);
+        REQUIRE(retry.has_value());
+        CHECK(retry->ok);
+    }
+
+    SECTION("an account cleared between the scan and the lock consumes nothing") {
+        // The codes survive (a direct clear, as a partial failure elsewhere would leave them).
+        run_sql(h.conn.get(), "UPDATE auth.users SET mfa_enrolled_at = NULL WHERE username = 'r1'");
+        auto v = h.db.mfa_consume_recovery_code("r1", f.result.recovery_codes[0]);
+        REQUIRE(v.has_value());
+        CHECK_FALSE(v->ok);
+        CHECK(scalar(h.conn.get(),
+                     "SELECT count(*) FROM auth.mfa_recovery_codes WHERE username = 'r1' "
+                     "AND consumed_at IS NOT NULL") == "0");
+    }
+
+    SECTION("a regeneration landing between the scan and the consume consumes nothing") {
+        PgConn locker = connect(db.dsn());
+        run_sql(locker.get(), "BEGIN");
+        run_sql(locker.get(), "SELECT 1 FROM auth.users WHERE username = 'r1' FOR UPDATE");
+        std::optional<std::expected<AuthDB::MfaVerification, AuthDBError>> res;
+        {
+            std::jthread t(
+                [&] { res = h.db.mfa_consume_recovery_code("r1", f.result.recovery_codes[0]); });
+            // The scan has run and matched; the consume is now queued on the users row.
+            CHECK(yuzu::test::wait_for_pg_lock_waiter(db.dsn(), "%WITH u AS MATERIALIZED%"));
+            run_sql(locker.get(), "DELETE FROM auth.mfa_recovery_codes WHERE username = 'r1'");
+            run_sql(locker.get(), "COMMIT");
+        }
+        REQUIRE(res.has_value());
+        REQUIRE(res->has_value());
+        CHECK_FALSE((*res)->ok);
+    }
+
+    SECTION("two consumes of one code on two connections: exactly one wins") {
+        std::atomic<bool> go{false};
+        std::atomic<int> wins{0};
+        std::atomic<int> losses{0};
+        std::atomic<int> errors{0};
+        std::atomic<std::int64_t> gen_seen{-1};
+        auto fire = [&] {
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            auto r = h.db.mfa_consume_recovery_code("r1", f.result.recovery_codes[0]);
+            if (!r.has_value())
+                errors.fetch_add(1);
+            else if (r->ok) {
+                wins.fetch_add(1);
+                gen_seen.store(r->factor_gen);
+            } else
+                losses.fetch_add(1);
+        };
+        std::thread t1(fire);
+        std::thread t2(fire);
+        go.store(true, std::memory_order_release);
+        t1.join();
+        t2.join();
+        CHECK(wins.load() == 1);
+        CHECK(losses.load() == 1);
+        CHECK(errors.load() == 0);
+        CHECK(gen_seen.load() == h.db.mfa_status("r1")->factor_gen);
+    }
+}
+
+TEST_CASE(
+    "AuthDB factor mutations compare the admitted generation under the row lock (FactorChanged)",
+    "[pg][auth_db][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    CHECK_FALSE(yuzu::server::is_store_unavailable(AuthDBError::FactorChanged));
+    REQUIRE(h.db.upsert_user("m1", "h", "s", yuzu::server::auth::Role::user).has_value());
+    auto f = enroll_full(h.db, "m1");
+    const std::int64_t g = f.result.factor_gen;
+    const std::string ids = code_ids(h.conn.get(), "m1");
+    REQUIRE_FALSE(ids.empty());
+
+    // Regeneration admitted at a stale generation writes nothing at all.
+    auto stale = h.db.mfa_regenerate_recovery_codes("m1", g - 1);
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(stale.error() == AuthDBError::FactorChanged);
+    CHECK(code_ids(h.conn.get(), "m1") == ids);
+
+    // Disable admitted at a stale generation clears nothing and leaves the codes.
+    auto no_clear = h.db.mfa_disable_report("m1", g - 1);
+    REQUIRE_FALSE(no_clear.has_value());
+    CHECK(no_clear.error() == AuthDBError::FactorChanged);
+    CHECK(h.db.mfa_status("m1")->enrolled);
+    CHECK(code_ids(h.conn.get(), "m1") == ids);
+
+    // At the admitted generation both proceed; with nullopt they behave exactly as before.
+    auto regen = h.db.mfa_regenerate_recovery_codes("m1", g);
+    REQUIRE(regen.has_value());
+    CHECK(regen->size() == 10);
+    CHECK(code_ids(h.conn.get(), "m1") != ids);
+    REQUIRE(h.db.mfa_regenerate_recovery_codes("m1", std::nullopt).has_value());
+    auto cleared = h.db.mfa_disable_report("m1", g);
+    REQUIRE(cleared.has_value());
+    CHECK(*cleared); // it was enrolled
+    CHECK_FALSE(h.db.mfa_status("m1")->enrolled);
+
+    // The provisional cancel: admitted UN-ENROLLED at generation g+1, then an enrolment lands in
+    // between (g+2): the cancel is refused and must not strip a factor that did not exist at the
+    // gate.
+    const std::int64_t admitted = h.db.mfa_status("m1")->factor_gen;
+    CHECK(admitted == g + 1);
+    auto f2 = enroll_full(h.db, "m1");
+    CHECK(f2.result.factor_gen == admitted + 1);
+    auto refused = h.db.mfa_disable_report("m1", admitted);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == AuthDBError::FactorChanged);
+    CHECK(h.db.mfa_status("m1")->enrolled);
+    CHECK(code_ids(h.conn.get(), "m1") != "");
+
+    // Cancelling a provisional enrolment at the matching generation works and reports false.
+    REQUIRE(h.db.mfa_disable("m1").has_value());
+    const std::int64_t now_gen = h.db.mfa_status("m1")->factor_gen;
+    REQUIRE(h.db.mfa_init_enrollment("m1", "Yuzu", std::nullopt).has_value());
+    auto cancel = h.db.mfa_disable_report("m1", now_gen);
+    REQUIRE(cancel.has_value());
+    CHECK_FALSE(*cancel);
+    CHECK(read_secret_hex(h.conn.get(), "m1").empty());
+
+    // An unknown account keeps the fail-safe answers.
+    auto unknown_disable = h.db.mfa_disable_report("nobody", 5);
+    REQUIRE(unknown_disable.has_value());
+    CHECK(*unknown_disable);
+    auto unknown_regen = h.db.mfa_regenerate_recovery_codes("nobody", 5);
+    REQUIRE_FALSE(unknown_regen.has_value());
+    CHECK(unknown_regen.error() == AuthDBError::UserNotFound);
+}
+
+TEST_CASE("AuthDB::recheck_role_locked hands the factor generation read under the row lock to the "
+          "callback",
+          "[pg][auth_db][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("rg", "h0", "s", yuzu::server::auth::Role::user).has_value());
+    std::int64_t seen = -1;
+    REQUIRE(h.db.recheck_role_locked(
+                    "rg",
+                    [&](yuzu::server::auth::Role, const std::string& hash, std::int64_t gen) {
+                        seen = gen;
+                        CHECK(hash == "h0");
+                    })
+                .has_value());
+    CHECK(seen == 0);
+    auto f = enroll_full(h.db, "rg");
+    REQUIRE(h.db.recheck_role_locked("rg", [&](yuzu::server::auth::Role, const std::string&,
+                                               std::int64_t gen) { seen = gen; })
+                .has_value());
+    CHECK(seen == f.result.factor_gen);
+    // The two-argument form still compiles and runs against the same row.
+    int calls = 0;
+    REQUIRE(h.db.recheck_role_locked("rg",
+                                     [&](yuzu::server::auth::Role, const std::string&) { ++calls; })
+                .has_value());
+    CHECK(calls == 1);
+}
+
+TEST_CASE("AuthDB refuses to open when the generation trigger is not in force",
+          "[pg][auth_db][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(second_store_opens(db.dsn())); // baseline: the migrated store opens
+
+    struct Tamper {
+        const char* name;
+        std::string apply;
+        std::string restore;
+    };
+    const std::string recreate_fn =
+        std::string(
+            "CREATE OR REPLACE FUNCTION auth.users_mfa_factor_gen() RETURNS trigger LANGUAGE "
+            "plpgsql AS $$") +
+        kBindingFnBody + "$$";
+    const std::string recreate_trigger =
+        "CREATE TRIGGER users_mfa_factor_gen BEFORE UPDATE OF mfa_enrolled_at, mfa_factor_gen ON "
+        "auth.users FOR EACH ROW EXECUTE FUNCTION auth.users_mfa_factor_gen()";
+    const std::vector<Tamper> tampers = {
+        {"dropped", "DROP TRIGGER users_mfa_factor_gen ON auth.users",
+         recreate_trigger + "; " + kRestoreTriggerSql},
+        {"disabled", "ALTER TABLE auth.users DISABLE TRIGGER users_mfa_factor_gen",
+         kRestoreTriggerSql},
+        {"replica only", "ALTER TABLE auth.users ENABLE REPLICA TRIGGER users_mfa_factor_gen",
+         kRestoreTriggerSql},
+        {"origin only (the default, skipped under replica)",
+         "ALTER TABLE auth.users ENABLE TRIGGER users_mfa_factor_gen", kRestoreTriggerSql},
+        {"function body replaced",
+         "CREATE OR REPLACE FUNCTION auth.users_mfa_factor_gen() RETURNS trigger LANGUAGE plpgsql "
+         "AS "
+         "$$ BEGIN RETURN NEW; END $$",
+         recreate_fn},
+        {"WHEN clause narrows the firing",
+         "DROP TRIGGER users_mfa_factor_gen ON auth.users; CREATE TRIGGER users_mfa_factor_gen "
+         "BEFORE "
+         "UPDATE OF mfa_enrolled_at, mfa_factor_gen ON auth.users FOR EACH ROW WHEN "
+         "(OLD.is_active) "
+         "EXECUTE FUNCTION auth.users_mfa_factor_gen(); " +
+             std::string(kRestoreTriggerSql),
+         "DROP TRIGGER users_mfa_factor_gen ON auth.users; " + recreate_trigger + "; " +
+             kRestoreTriggerSql},
+        {"no longer covers the instant column",
+         "DROP TRIGGER users_mfa_factor_gen ON auth.users; CREATE TRIGGER users_mfa_factor_gen "
+         "BEFORE "
+         "UPDATE OF mfa_factor_gen ON auth.users FOR EACH ROW EXECUTE FUNCTION "
+         "auth.users_mfa_factor_gen(); " +
+             std::string(kRestoreTriggerSql),
+         "DROP TRIGGER users_mfa_factor_gen ON auth.users; " + recreate_trigger + "; " +
+             kRestoreTriggerSql},
+    };
+    for (const auto& t : tampers) {
+        INFO("tamper: " << t.name);
+        run_sql(conn.get(), t.apply);
+        CHECK_FALSE(second_store_opens(db.dsn()));
+        run_sql(conn.get(), t.restore);
+        CHECK(second_store_opens(db.dsn()));
+    }
+}
+
+TEST_CASE("AuthDB trigger validation is sticky once it observes tampering",
+          "[pg][auth_db][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    h.db.set_binding_validation_memo_for_test(std::chrono::milliseconds(0)); // validate every read
+    REQUIRE(h.db.upsert_user("t1", "h", "s", yuzu::server::auth::Role::user).has_value());
+    CHECK(h.db.mfa_status("t1")->binding_enforced);
+
+    run_sql(h.conn.get(), "ALTER TABLE auth.users DISABLE TRIGGER users_mfa_factor_gen");
+    auto seen = h.db.mfa_status("t1");
+    REQUIRE(seen.has_value()); // logins and proving keep working; only the binding is withdrawn
+    CHECK_FALSE(seen->binding_enforced);
+
+    // Re-enabling does not re-admit: changes made while it was off are not reconstructable.
+    run_sql(h.conn.get(), kRestoreTriggerSql);
+    CHECK_FALSE(h.db.mfa_status("t1")->binding_enforced);
+    CHECK_FALSE(h.db.mfa_status("t1")->binding_enforced);
+
+    // A new instance runs the boot check afresh and is the gate back in.
+    PgPool pool2{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::test::TempDir keys2;
+    FileKeyProvider provider2(keys2.path);
+    SecretCodec codec2(provider2);
+    AuthDB fresh{pool2, codec2, 0};
+    REQUIRE(fresh.is_open());
+    CHECK(fresh.mfa_status("t1")->binding_enforced);
+}
+
+TEST_CASE("AuthDB trigger validation cannot see a disable that ends before the next validation",
+          "[pg][auth_db][mfa_binding][known-limitation]") {
+    // Documented limit, asserted so the docs cannot overclaim: validation is request-driven and
+    // looks at the catalog as it is NOW. A disable, a factor change and a re-enable that complete
+    // between two validations pass the next one, and the generation did not move for the change
+    // made in the window. The trust boundary is the database role.
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    h.db.set_binding_validation_memo_for_test(std::chrono::milliseconds(0));
+    REQUIRE(h.db.upsert_user("k1", "h", "s", yuzu::server::auth::Role::user).has_value());
+    auto f = enroll_full(h.db, "k1");
+    REQUIRE(h.db.mfa_status("k1")->binding_enforced);
+
+    run_sql(h.conn.get(), "ALTER TABLE auth.users DISABLE TRIGGER users_mfa_factor_gen");
+    run_sql(h.conn.get(), "UPDATE auth.users SET mfa_enrolled_at = NULL WHERE username = 'k1'");
+    run_sql(h.conn.get(), "UPDATE auth.users SET mfa_enrolled_at = now() WHERE username = 'k1'");
+    run_sql(h.conn.get(), kRestoreTriggerSql);
+
+    auto st = h.db.mfa_status("k1");
+    REQUIRE(st.has_value());
+    CHECK(st->binding_enforced);
+    CHECK(st->factor_gen == f.result.factor_gen); // the generation did not move
+}
+
+TEST_CASE("AuthDB generation trigger fires under session_replication_role = replica; an origin "
+          "trigger does not",
+          "[pg][auth_db][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("rp", "h", "s", yuzu::server::auth::Role::user).has_value());
+    {
+        PgResult probe{PQexec(h.conn.get(), "SET session_replication_role = replica")};
+        if (!probe.ok()) {
+            SKIP("test role is not a superuser: session_replication_role is not settable");
+        }
+    }
+    // Negative control: a default ('O') trigger on a scratch table is skipped under replica.
+    run_sql(h.conn.get(), "RESET session_replication_role");
+    run_sql(h.conn.get(),
+            "CREATE TABLE public.yuzu_test_ctrl (id int PRIMARY KEY, v int NOT NULL)");
+    run_sql(h.conn.get(), "INSERT INTO public.yuzu_test_ctrl VALUES (1, 0)");
+    run_sql(h.conn.get(),
+            "CREATE FUNCTION public.yuzu_test_ctrl_fn() RETURNS trigger LANGUAGE plpgsql "
+            "AS $$ BEGIN NEW.v := OLD.v + 100; RETURN NEW; END $$");
+    run_sql(h.conn.get(),
+            "CREATE TRIGGER yuzu_test_ctrl_trg BEFORE UPDATE ON public.yuzu_test_ctrl "
+            "FOR EACH ROW EXECUTE FUNCTION public.yuzu_test_ctrl_fn()");
+    run_sql(h.conn.get(), "SET session_replication_role = replica");
+    run_sql(h.conn.get(), "UPDATE public.yuzu_test_ctrl SET v = 7 WHERE id = 1");
+    run_sql(h.conn.get(), "UPDATE auth.users SET mfa_enrolled_at = now() WHERE username = 'rp'");
+    const auto ctrl = scalar(h.conn.get(), "SELECT v FROM public.yuzu_test_ctrl WHERE id = 1");
+    const auto gen = gen_of(h.conn.get(), "rp");
+    run_sql(h.conn.get(), "RESET session_replication_role");
+    CHECK(ctrl == "7"); // the origin trigger did NOT fire under replica
+    CHECK(gen == 1);    // the ENABLE ALWAYS generation trigger DID
 }
 
 #endif // YUZU_TEST_ENABLE_PG

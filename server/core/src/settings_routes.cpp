@@ -6993,7 +6993,7 @@ void SettingsRoutes::register_routes(
                   audit_fn_(req, "mfa.recovery_codes.generated", "ok", "User",
                             session->username, "10 codes issued");
                   set_no_store(res);
-                  res.set_content(render_mfa_fragment(*session, {}, {}, *codes_res),
+                  res.set_content(render_mfa_fragment(*session, {}, {}, codes_res->recovery_codes),
                                   "text/html; charset=utf-8");
               });
 
@@ -7024,7 +7024,8 @@ void SettingsRoutes::register_routes(
                                       "text/html; charset=utf-8");
                       return;
                   }
-                  auto codes = db->mfa_regenerate_recovery_codes(session->username);
+                  auto codes = db->mfa_regenerate_recovery_codes(
+                      session->username, /*expected_factor_gen=*/std::nullopt);
                   if (!codes) {
                       audit_fn_(req, "mfa.recovery_codes.generated", "error", "User",
                                 session->username, "regeneration failed");
@@ -7140,7 +7141,8 @@ void SettingsRoutes::register_routes(
                   // The pre-image comes from the clear's own row lock, so it cannot miss an
                   // enrolment verified in between. A failed clear leaves it unknown, which counts
                   // as enrolled: the fail-safe is to end sessions.
-                  auto r = db->mfa_disable_report(session->username);
+                  auto r = db->mfa_disable_report(session->username,
+                                                  /*expected_factor_gen=*/std::nullopt);
                   if (!r) {
                       // The clear may have committed with its acknowledgement lost, so the
                       // sessions end anyway (#6079).

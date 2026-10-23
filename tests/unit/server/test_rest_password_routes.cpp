@@ -1151,7 +1151,7 @@ TEST_CASE("password routes: a Settings MFA verify queued behind a reset is Crede
     REQUIRE(init.has_value());
     const auto code = totp_now(init->secret_base32);
 
-    std::optional<std::expected<std::vector<std::string>, AuthDBError>> during;
+    std::optional<std::expected<AuthDB::MfaEnrolment, AuthDBError>> during;
     std::atomic<bool> fired{false};
     bool waiter_seen = false;
     std::jthread racer; // joined on every exit path
@@ -1847,7 +1847,7 @@ TEST_CASE("password routes: a same-account recovery-code sign-in during an audit
     auto codes =
         h.db->mfa_verify_enrollment("vic", totp_now(init->secret_base32, -1), std::nullopt);
     REQUIRE(codes.has_value());
-    REQUIRE_FALSE(codes->empty());
+    REQUIRE_FALSE(codes->recovery_codes.empty());
     const auto h0 = h.stored_hash("vic");
     const auto prior = h.auth_mgr.create_local_session_for_test("vic", Role::user, true);
     REQUIRE_FALSE(prior.empty());
@@ -1873,9 +1873,9 @@ TEST_CASE("password routes: a same-account recovery-code sign-in during an audit
     {
         std::jthread tv([&] { resV = h.reset("vic", kNew); }); // joined on every exit path
         owner_waiting = yuzu::test::wait_for_pg_lock_waiter(h.db.dsn(), "%INSERT INTO audit_store%");
-        step2 = h.sink.Post("/login/mfa",
-                            "mfa_pending_token=" + pending + "&code=" + codes->front(),
-                            "application/x-www-form-urlencoded");
+        step2 = h.sink.Post(
+            "/login/mfa", "mfa_pending_token=" + pending + "&code=" + codes->recovery_codes.front(),
+            "application/x-www-form-urlencoded");
         tv.join();
     }
     CHECK(run("ROLLBACK"));

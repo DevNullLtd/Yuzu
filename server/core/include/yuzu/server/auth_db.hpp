@@ -139,6 +139,11 @@ enum class AuthDBError : std::uint8_t {
     /// a password reset also wipes the provisional secret, and that refusal must
     /// win.
     MfaEnrollmentCancelled,
+    /// #6079: a factor mutation (`mfa_regenerate_recovery_codes`, `mfa_disable_report`) was
+    /// admitted at one factor generation and found the account at another under the `auth.users`
+    /// row lock, so nothing was written. A business outcome, NOT a store fault
+    /// (`is_store_unavailable` is false): the caller refuses (409) and the operator re-proves.
+    FactorChanged,
 };
 
 /// True iff `e` reflects the AuthDB store itself being unavailable (PG
@@ -492,6 +497,14 @@ public:
         const std::string& username,
         const std::function<void(auth::Role, const std::string& password_hash)>& under_row_lock);
 
+    /// #6079: as above, and `under_row_lock` also receives the account's `mfa_factor_gen` read
+    /// under the same row lock, so a mint can deny when the factor it verified against has since
+    /// been replaced. The two-argument form adapts onto this one.
+    std::expected<void, AuthDBError>
+    recheck_role_locked(const std::string& username,
+                        const std::function<void(auth::Role, const std::string& password_hash,
+                                                 std::int64_t factor_gen)>& under_row_lock);
+
     /// Set/clear the per-user JIT-elevation eligibility flag (SOC 2 CC6.3/CC6.6):
     /// who may activate a time-boxed admin elevation via POST /api/v1/elevate,
     /// distinct from holding standing admin. Admin-managed. Single
@@ -717,6 +730,42 @@ public:
         /// the Postgres `now()` that stamped the enrolment (the same clock domain
         /// as `session_store.sessions.mfa_verified_ms`). 0 == not enrolled.
         std::int64_t enrolled_at_ms{0};
+        /// #6079: the account's factor generation (`auth.users.mfa_factor_gen`), read in the same
+        /// statement as the rest of the row. Database-owned: a row trigger advances it on EVERY
+        /// change of `mfa_enrolled_at`, whichever binary issued the write, so it is a monotonic
+        /// stand-in for "which factor is enrolled right now" that a repeated or skewed enrolment
+        /// timestamp cannot forge. Read for an un-enrolled account too (0 for one never enrolled,
+        /// g for one cleared g times): a factor-credential gate carries it to the mutation.
+        std::int64_t factor_gen{0};
+        /// The database clock (`now()`, epoch milliseconds) at this read: the same clock domain as
+        /// `session_store.sessions.mfa_verified_ms`. Never the replica's own clock.
+        std::int64_t db_now_ms{0};
+        /// False once the generation trigger has been observed missing, disabled, replica-only, or
+        /// with an altered body (validated at boot and behind a 60 s memo). STICKY until restart:
+        /// generation changes made while the trigger was not firing are not reconstructable, so a
+        /// re-enable must not silently re-admit. A gate that compares generations MUST answer
+        /// store-unavailable while this is false.
+        bool binding_enforced{true};
+    };
+
+    /// #6079: the result of a TOTP or recovery-code verification, with the factor generation read
+    /// under the `auth.users` row lock and the DATABASE instant captured by the statement that
+    /// loaded the secret (or the recovery candidates), BEFORE any cryptographic check. Every pause
+    /// after that instant, inside or outside a transaction, therefore counts as proof age.
+    /// `ok == false` carries zeros. `ok == true` is published only after COMMIT.
+    struct MfaVerification {
+        bool ok{false};
+        std::int64_t factor_gen{0};
+        std::int64_t verified_ms{0};
+    };
+
+    /// #6079: the result of completing an enrolment: the one-time recovery codes, the generation
+    /// the enrolment UPDATE produced (post-trigger), and the instant captured by the statement
+    /// that loaded the provisional secret, before the TOTP check.
+    struct MfaEnrolment {
+        std::vector<std::string> recovery_codes;
+        std::int64_t factor_gen{0};
+        std::int64_t verified_ms{0};
     };
 
     struct MfaEnrollmentInit {
@@ -785,7 +834,11 @@ public:
     /// change committed while its UPDATE waited on the credential change's row
     /// lock is refused too. A 0-row result on an active, un-enrolled row whose
     /// hash differs from the anchor is `CredentialChanged`.
-    std::expected<std::vector<std::string>, AuthDBError>
+    ///
+    /// #6079: returns the codes together with the generation the enrolment UPDATE produced and the
+    /// instant captured by the statement that loaded the provisional secret (before the TOTP
+    /// check). The codes are returned only when the enrolment committed.
+    std::expected<MfaEnrolment, AuthDBError>
     mfa_verify_enrollment(const std::string& username, std::string_view code,
                           const std::optional<std::string>& expected_password_hash_hex);
 
@@ -799,8 +852,14 @@ public:
     /// SecretCodec/KEK outage silently lock every MFA-enrolled user out
     /// indistinguishably from a bad code, instead of surfacing the real
     /// (retryable) fault.
-    std::expected<bool, AuthDBError> mfa_verify_login_code(const std::string& username,
-                                                          std::string_view code);
+    ///
+    /// #6079: the result carries the factor generation read under the row lock and the database
+    /// instant of the transaction that loaded the secret. `ok` is published ONLY after COMMIT: a
+    /// commit that fails, or whose acknowledgement is lost, is `unexpected(WriteFailed)` (503, no
+    /// proof). After a lost acknowledgement the counter advance has persisted, so the same code is
+    /// refused as a replay on retry: fail closed either way.
+    std::expected<MfaVerification, AuthDBError> mfa_verify_login_code(const std::string& username,
+                                                                      std::string_view code);
 
     /// Consume a single recovery code for login or step-up. Returns true
     /// if the code matched an unconsumed row (and that row is now
@@ -808,8 +867,17 @@ public:
     /// recovery codes / is not enrolled). Recovery codes are PBKDF2-hashed,
     /// not envelope-encrypted (verify-only, ADR-0010 — no SecretCodec
     /// involvement, no SecretUnavailable outcome here).
-    std::expected<bool, AuthDBError> mfa_consume_recovery_code(const std::string& username,
-                                                               std::string_view raw_code);
+    ///
+    /// #6079: the consume runs in a bounded transaction that takes the `auth.users` row lock
+    /// (FOR UPDATE) BEFORE the code row, the same order regeneration, enrolment and disable use,
+    /// and returns the factor generation read under it. The instant is captured by the statement
+    /// that loaded the candidates, before the PBKDF2 scan, so no hashing runs under the row lock.
+    /// `ok` is published only after COMMIT; after a lost acknowledgement the code stays consumed
+    /// (nothing is restored) and a retry of the same code is refused as a replay. A lock timeout is
+    /// `QueryFailed` (503, never a burned attempt). Zero rows (a concurrent winner, a regeneration
+    /// that deleted the candidate, an account cleared between the scan and the lock) is `ok=false`.
+    std::expected<MfaVerification, AuthDBError>
+    mfa_consume_recovery_code(const std::string& username, std::string_view raw_code);
 
     /// Wipe the user's existing recovery codes and issue 10 fresh ones.
     /// Returns the raw codes for one-time display. Serialized on the
@@ -819,8 +887,15 @@ public:
     /// matching storage (#3779). Returns `UserNotFound` when no ACTIVE user row
     /// matches (a deactivated account never receives fresh codes);
     /// `QueryFailed`/`WriteFailed` on a store outage (fail-closed 503).
+    ///
+    /// #6079: `expected_factor_gen` (REQUIRED, no default, so every caller decides) is the factor
+    /// generation a gate ADMITTED this request at. When engaged it is compared against
+    /// `auth.users.mfa_factor_gen` under the same row lock, before the DELETE: a different value
+    /// is `FactorChanged` and nothing is written (the committed code set is untouched). Break-glass
+    /// and test callers with no gate pass `std::nullopt`.
     std::expected<std::vector<std::string>, AuthDBError>
-    mfa_regenerate_recovery_codes(const std::string& username);
+    mfa_regenerate_recovery_codes(const std::string& username,
+                                  std::optional<std::int64_t> expected_factor_gen);
 
     /// Disable MFA for a user. Clears the secret column, stamps
     /// mfa_disabled_at, and deletes all recovery codes. Idempotent on
@@ -830,7 +905,32 @@ public:
     /// `mfa_disable`, reporting whether the account had a verified factor at the moment of the
     /// clear (the pre-image of the same row lock, #6079). `true` also when no active row matched,
     /// so a caller deciding whether to end the account's sessions fails safe.
-    [[nodiscard]] std::expected<bool, AuthDBError> mfa_disable_report(const std::string& username);
+    ///
+    /// #6079: `expected_factor_gen` (REQUIRED, no default) is the generation a gate admitted this
+    /// request at, compared inside the clearing statement itself under the row lock. A different
+    /// value on an active row is `FactorChanged` with nothing cleared and the recovery codes
+    /// untouched. This is the atomic "still at the admitted generation" condition for BOTH the
+    /// enrolled clear and the provisional cancel: an account admitted un-enrolled at generation g
+    /// and enrolled in between reads g+1 and is refused. `mfa_disable` passes `std::nullopt`.
+    [[nodiscard]] std::expected<bool, AuthDBError>
+    mfa_disable_report(const std::string& username,
+                       std::optional<std::int64_t> expected_factor_gen);
+
+    // ── Test seams (#6079) ───────────────────────────────────────────────
+    // Production never calls these.
+
+    /// Treat a COMMIT that really happened as unacknowledged by the three verifiers: the call
+    /// returns `unexpected(WriteFailed)` and publishes nothing, exactly as a lost acknowledgement
+    /// would. The write itself persists (counter advanced / code consumed / account enrolled).
+    void set_commit_ack_lost_for_test(bool lost) noexcept;
+
+    /// Runs between `mfa_verify_enrollment`'s cryptographic check and its transaction, so a test
+    /// can pause there and read the database clock or rotate the provisional secret.
+    void set_enrolment_pre_txn_hook_for_test(std::function<void()> hook);
+
+    /// Overrides the 60 s memo `mfa_status` uses between re-validations of the generation
+    /// trigger (0 re-validates on every call). Never shortens a failure: the flag is sticky.
+    void set_binding_validation_memo_for_test(std::chrono::milliseconds memo) noexcept;
 
     // ── Enrollment tokens + pending agents (WS-6 slice 6.2, ADR-2002 §8) ─────
     //
