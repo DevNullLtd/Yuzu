@@ -738,6 +738,10 @@ TEST_CASE("capability catalogue: every Forensics-securable plugin is in the resp
         }
     }
     CHECK(forensics_rows > 0);
+    // The row count is pinned too: a new Forensics ACTION on an existing plugin changes no plugin
+    // name, so the set below would not notice it, but it widens what the tier's audit and error
+    // handling must cover. Update this number in the same change that adds the row.
+    CHECK(forensics_rows == 10);
 
     // A NEW Forensics plugin must be acknowledged HERE (and in test_response_tier_filter.cpp):
     // its stored rows become Forensics-tier on every operator read, which is a user-visible
