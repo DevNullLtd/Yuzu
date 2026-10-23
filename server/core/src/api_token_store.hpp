@@ -369,9 +369,13 @@ public:
     ///                per-reveal audit + step-up re-validation that gates a
     ///                replay happen at the ROUTE layer, not here. Once the
     ///                grace window lapses (or the cache entry is gone),
-    ///                rejected — the caller falls back to the compromise
-    ///                runbook (principal-level revoke) or an explicit
-    ///                re-mint, never an indefinite retry.
+    ///                rejected — the caller resolves the stuck pair by
+    ///                revoking the SUCCESSOR credential (the surviving
+    ///                predecessor then becomes a standalone credential via
+    ///                resolve_rotation_pair_after_revoke) and rotating
+    ///                again, never an indefinite retry. Principal-level
+    ///                revoke is terminal: it is the compromise runbook,
+    ///                not the stuck-pair remedy.
     ///   >2 active -> defensive rejection; this function's own 1-active arm
     ///                is the only mint path it drives, so this state means a
     ///                credential was minted outside `rotate_engine_credential`
@@ -1280,8 +1284,9 @@ private:
     // Raw secret cache for the rotation grace window, keyed by
     // `rotation_group`. RAM-only, process-local — the raw value is NEVER
     // persisted (same one-time-reveal contract as `create_token`), and a
-    // process restart forfeits re-serve (acceptable per §7: the caller falls
-    // back to an explicit re-mint or the compromise runbook). `raw` reveal
+    // process restart forfeits re-serve (acceptable per §7: the caller revokes
+    // the successor credential and rotates again; principal-level revoke is
+    // terminal and is the compromise runbook, not the remedy). `raw` reveal
     // is refused (by `try_reserve`, on lookup) once older than
     // `kRotationGraceSecs`, and the plaintext itself is actively scrubbed
     // (`yuzu::secure_zero`, not just left unreachable) by

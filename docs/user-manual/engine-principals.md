@@ -394,11 +394,14 @@ What `ok:true` means, and what it does not:
   writes an `engine_principal.audit.no_admin` audit row
   (`violations=N scope=all|active`, then up to ten detected
   `principal_id:reason` pairs), and those rows are the evidence the control
-  operated. The Tokens page runs the check on every load, so it writes rows by
-  itself. A success row whose write was dropped is signalled only by
-  `Sec-Audit-Failed` on REST (the MCP tool gives no signal), so "a period with
-  no rows" is evidence the check did not run only where those writes are
-  monitored. The grants, the roles and the role permissions are three separate
+  operated. The Tokens page also runs the check incidentally, in the browser,
+  whenever a viewer who holds `AuditLog:Read` loads the principals panel; that
+  is not a schedule and not a control (other viewers see a note that the check
+  needs `AuditLog:Read`, and a deployment nobody opens in a browser never
+  triggers it). A success row whose write was dropped is signalled only by
+  `Sec-Audit-Failed` on REST (the MCP tool gives no signal). A period with no
+  rows is therefore not evidence that the check ran or that it passed; absence
+  of rows shows only that nobody ran it. The grants, the roles and the role permissions are three separate
   reads, not one snapshot: a role granted or edited between them is picked up by
   the next run. Run it after every role assignment to an engine principal
   and periodically as part of a machine-identity access review.

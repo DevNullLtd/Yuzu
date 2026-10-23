@@ -261,9 +261,10 @@ separate reads (grants, roles, role permissions), not one snapshot. The cadence 
 the operator's, and the `engine_principal.audit.no_admin` run rows (`violations=N
 scope=all|active`, then up to ten detected principals) are the evidence the
 control operated. A dropped success-row write is signalled only by
-`Sec-Audit-Failed` on REST (the MCP tool gives no signal), and the Tokens page
-runs the check on every load, so a period with no rows is evidence the check did
-not run only where those writes are monitored. A machine-identity
+`Sec-Audit-Failed` on REST (the MCP tool gives no signal). The Tokens page also
+runs the check incidentally, in the browser, when a viewer holding `AuditLog:Read`
+loads the principals panel; that is not a schedule and not a control, so a
+period with no rows is not evidence that the check ran or that it passed. A machine-identity
 access review must therefore include the engine grants and a no-admin run. The
 route and its MCP twin fail closed when a read cannot be answered, so a degraded
 store is never reported as clean. Risk to be recorded in the risk register: a custom wildcard role on a

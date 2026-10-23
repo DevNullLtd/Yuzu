@@ -600,8 +600,11 @@ for non-HTTP writers is unaffected).
      audited secret-disclosure event**, not folded into one "rotation
      succeeded" row. Once the grace window lapses, a `rotate` call against
      an unconfirmed successor errors rather than re-serving — the caller
-     must fall back to the compromise runbook (principal-level revoke) or
-     an explicit re-mint, not an indefinite retry loop. The
+     must resolve the stuck pair by revoking the SUCCESSOR credential
+     (`DELETE /api/v1/tokens/{token_id}`, admin) and rotating again from the
+     sole remaining credential, not by an indefinite retry loop. Revoking the
+     principal itself is terminal and is the compromise runbook, not the
+     stuck-pair remedy. The
      one-time-reveal contract's "once" means once per grace-bounded
      rotation attempt, never once per rotation lifetime and never
      unboundedly;
