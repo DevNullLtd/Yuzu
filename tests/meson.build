@@ -4040,6 +4040,24 @@ test('split interlock tripwire selftest',
   timeout: 30,
 )
 
+# #4990: stored-response reads and the Forensics tier. The tripwire pins the exact set of
+# ResponseStore read methods (each must take a ResponseTierFilter) and the exact set of
+# unrestricted_internal_consumer() call sites; the self-test proves it fails on each mutation. Both
+# also run in .github/workflows/docs-lint.yml on every PR; registered here for local `meson test
+# --suite docs` parity with the sibling python doc-tests.
+test('response store read tripwire',
+  _python3_test,
+  args: [files('test_response_store_read_tripwire.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('response store read tripwire selftest',
+  _python3_test,
+  args: [files('test_response_store_read_tripwire_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Personal-data commit guard (scripts/ci/check-personal-data.py) and its
 # self-test. Both also run in .github/workflows/docs-lint.yml on every PR.
 test('personal data guard',

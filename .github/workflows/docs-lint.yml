@@ -78,6 +78,17 @@ jobs:
       - name: Split interlock tripwire self-test
         run: python3 tests/test_split_interlock_tripwire_selftest.py
 
+      # #4990: stored-response reads and the Forensics tier. The exact set of ResponseStore read
+      # methods (each must take a ResponseTierFilter) and the exact set of
+      # unrestricted_internal_consumer() call sites are frozen in the tripwire; a new read or a new
+      # internal-consumer site fails until it is classified in a reviewed change. The self-test runs
+      # the checks against mutated sources and proves each mutation is caught.
+      - name: Response store read tripwire (#4990)
+        run: python3 -I tests/test_response_store_read_tripwire.py
+
+      - name: Response store read tripwire self-test (#4990)
+        run: python3 -I tests/test_response_store_read_tripwire_selftest.py
+
       # Personal-data guard: no real home paths, SIDs, tailnet IPs, MACs, private
       # keys, consumer e-mail or tracked session artifacts in this PUBLIC repo.
       # Pre-existing hits live in scripts/ci/personal-data-baseline.json (counts
