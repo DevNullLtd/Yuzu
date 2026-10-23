@@ -334,7 +334,7 @@ std::int64_t today_utc_midnight() {
     return (now / 86400) * 86400;
 }
 
-// Populate one agent across all seven stores. `tag` distinguishes the target
+// Populate one agent across all eight stores. `tag` distinguishes the target
 // agent from the bystander so the assertions can prove agent-scoping.
 void seed_agent(const std::string& agent_id, yuzu::server::InventoryStore& inv,
                 yuzu::server::SoftwareInventoryStore& soft,

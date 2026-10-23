@@ -16,17 +16,18 @@
 ///
 /// CLOCK. Every `*_at` / `*_seen` column is a TIMESTAMPTZ authored by the DATABASE clock
 /// (never the replica's, never the agent's: #1685, ADR-0016 clock-skew rule). One value is
-/// read per transaction, after the per-agent lock, and is forced strictly above the agent's
-/// previous `last_full_at`, so a report that took the lock second never stamps an earlier
-/// time than the one that took it first. Certificate validity columns come from the
+/// read per transaction, after the per-agent lock, from the plain DB clock. No ordering against a
+/// previous report is assumed (a DB clock step or restore must not latch anything): the ok-store
+/// sweep removes locations whose `full_report_at` DIFFERS from this report's value. Certificate validity columns come from the
 /// certificate itself and are stored unclamped.
 ///
 /// SCHEMA LINT. No column is named after a D13 rule id or window field, or
 /// `days_remaining` (ADR-0070 D13 "Mechanical checks"). `certificate_inventory_migrations()`
-/// is exported so `test_certificate_inventory_store.cpp` can walk the migration array.
+/// is exported so `test_certificate_inventory.cpp` can walk the migration array.
 ///
 /// PER-AGENT SERIALISATION. Ingest (full and hash-skip) and `delete_agent` take the SAME
-/// `pg_advisory_xact_lock(hashtextextended('cert_inventory:' || agent_id, 0))` first, so a
+/// `pg_advisory_xact_lock(hashtextextended(kCertInventoryAgentLockPrefix || agent_id, 0))` first (ingest
+/// TRIES it and answers kBusy rather than parking a pooled connection), so a
 /// decommission cannot interleave with an ingest's transaction. The retention
 /// prune (PR 2a-2d) must take it too.
 ///
@@ -57,7 +58,13 @@ struct PgMigration;
 
 namespace yuzu::server {
 
-/// The store's migration array (schema `cert_inventory`), for the D13 schema lint.
+/// The per-agent advisory-lock key prefix: the lock key is hashtextextended(prefix || agent_id, 0).
+/// A STABLE constant, deliberately independent of the schema name (renaming the schema must never
+/// change the key, or a rolling upgrade would run two keys for one agent). Ingest (full and
+/// hash-skip), `delete_agent` and the future retention prune ALL use this one constant.
+inline constexpr std::string_view kCertInventoryAgentLockPrefix = "cert_inventory:";
+
+/// The store's migration array (schema `certificate_inventory_store`), for the D13 schema lint.
 [[nodiscard]] const std::vector<pg::PgMigration>& certificate_inventory_migrations();
 
 /// Closed store-status vocabulary (design "Store status"). `not_observed` is server-side only.
@@ -133,6 +140,7 @@ enum class CertIngestOutcome {
     kStored,         ///< full report applied
     kTouched,        ///< hash-skip matched; freshness advanced
     kNeedFull,       ///< cold cache or hash mismatch: the agent must resend in full
+    kBusy,           ///< another report for this agent holds the lock: nothing written, retry
     kError,          ///< pool/SQL failure (transient)
 };
 
@@ -146,7 +154,7 @@ struct CertIngestResult {
 
 class CertificateInventoryStore {
 public:
-    /// Borrows the shared pool and runs the `cert_inventory` migration on a pinned lease.
+    /// Borrows the shared pool and runs the `certificate_inventory_store` migration on a pinned lease.
     /// `is_open()` is false if the lease was empty or the migration failed (the server fails
     /// closed before reaching here).
     explicit CertificateInventoryStore(pg::PgPool& pool);

@@ -622,6 +622,25 @@ spent or expired.
 **How to fix.** Pass an explicit `0` for `max_uses` and/or `ttl_hours` to keep the old
 unlimited/no-expiry behaviour, or size them to the rollout window and the number of machines.
 
+## Behaviour change: a new Postgres schema for the fleet certificate inventory, and an eighth decommission store
+
+The server now creates the Postgres schema `certificate_inventory_store` at boot (seven tables, no
+data until a certificate-collecting agent reports). The server's database role needs `CREATE` on the
+database, as for every other store; if the schema cannot be created the server refuses to start
+(fail-closed, ADR-0007) and `/readyz` shows `certificate_inventory_store` until it opens.
+
+`DELETE /api/v1/sle/agents/{id}` now fans out across **eight** stores: the response's `stores` map
+gains a `certificate_inventory` key and `deleted` reaches 8 when every store is configured. During a
+rolling upgrade a replica that has not been upgraded runs the old cascade and returns `200` without
+that key; it did not erase certificate rows. Re-issue the DELETE once every replica is upgraded (the
+same advice as for the presence row, #5682). Erasure is not durable yet: a still-running agent
+repopulates its rows on its next report until the decommission tombstone ships in a later change.
+
+**Rolling back** leaves the `certificate_inventory_store` schema in the database; it is harmless to
+the older binary and is not read. Plan capacity before agents start reporting: DER is optional and
+bounded at 1 MiB per device, so a large fleet is storage- and WAL-heavy (see
+[Server administration](server-admin.md#fleet-certificate-inventory-storage)).
+
 ## Behaviour change: generic inventory reads never return a typed source's rows
 
 **What changed.** The generic inventory store's reads (`query_inventory`, `get_agent_inventory`, `list_inventory_tables` and their REST twins, `POST /api/v1/inventory/evaluate`, and the inventory-query result-set source) no longer return rows for the typed daily-sync sources: `installed_software`, `app_perf`, `device_ci`, `software_licensing`, `app_usage`, and the reserved `certificate_inventory`. Those sources have their own stores and gates. Before this change, a typed source's blob that reached the generic store through an older server's gateway path could be read there under `Infrastructure:Read` or `Inventory:Read` until the next boot purge removed it. That window is now closed on every server at this release or later (see the per-server note below). The gateway also drops a `certificate_inventory` blob, a source no agent sends yet, instead of storing it generically.

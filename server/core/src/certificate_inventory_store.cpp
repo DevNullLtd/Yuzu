@@ -23,7 +23,7 @@ namespace yuzu::server {
 
 namespace {
 
-constexpr const char* kStoreName = "cert_inventory";
+constexpr const char* kStoreName = "certificate_inventory_store";
 
 // The ingest path runs on the gRPC thread (direct ReportInventory / gateway ProxyInventory), so
 // it gives up fast on a saturated pool: best-effort, the agent resends next cycle.
@@ -81,20 +81,24 @@ const std::string& fact_upsert_sql() {
         std::string cols = "agent_id";
         std::string sel = "$1";
         std::string rec;
-        std::string upd;
+        std::string upd, cur, exc;
         for (const auto& c : kFactCols) {
             cols += std::string(", ") + c.name;
             sel += std::string(", t.") + c.name;
             if (!rec.empty())
                 rec += ", ";
             rec += std::string(c.name) + " " + c.type;
-            if (std::string_view(c.name) != "sha256")
+            if (std::string_view(c.name) != "sha256") {
                 upd += std::string(upd.empty() ? "" : ", ") + c.name + " = EXCLUDED." + c.name;
+                cur += std::string(cur.empty() ? "" : ", ") + "cert_fact." + c.name;
+                exc += std::string(exc.empty() ? "" : ", ") + "EXCLUDED." + c.name;
+            }
         }
-        return "INSERT INTO cert_inventory.cert_fact (" + cols + ", server_parsed) SELECT " + sel +
+        return "INSERT INTO certificate_inventory_store.cert_fact (" + cols + ", server_parsed) SELECT " + sel +
                ", false FROM jsonb_to_recordset($2::jsonb) AS t(" + rec +
                ") ON CONFLICT (agent_id, sha256) DO UPDATE SET " + upd +
-               ", server_parsed = false";
+               ", server_parsed = false WHERE (" + cur + ", cert_fact.server_parsed) IS DISTINCT FROM (" +
+               exc + ", false) RETURNING sha256";
     }();
     return sql;
 }
@@ -185,11 +189,14 @@ const std::vector<pg::PgMigration>& build_migrations() {
          "  store_id        TEXT NOT NULL,"
          "  user_ref        TEXT NOT NULL DEFAULT '',"
          "  path            TEXT NOT NULL DEFAULT '',"
+         // The key is on md5(path), not the path: a btree index row over ~2.7 KB is an error, and
+         // a path is attacker-influenced text. The path itself is still stored in full.
+         "  path_md5        TEXT GENERATED ALWAYS AS (md5(path)) STORED,"
          "  sha256          TEXT NOT NULL,"
          "  first_seen      TIMESTAMPTZ NOT NULL,"
          "  last_seen       TIMESTAMPTZ NOT NULL,"
          "  full_report_at  TIMESTAMPTZ NOT NULL,"
-         "  PRIMARY KEY (agent_id, store_id, user_ref, path, sha256),"
+         "  PRIMARY KEY (agent_id, store_id, user_ref, path_md5, sha256),"
          "  FOREIGN KEY (agent_id, sha256) REFERENCES cert_fact (agent_id, sha256)"
          "    ON DELETE CASCADE);"
          "CREATE INDEX cert_location_fact_idx ON cert_location (agent_id, sha256);"
@@ -222,16 +229,35 @@ const std::vector<pg::PgMigration>& build_migrations() {
     return kMigrations;
 }
 
+// Per-agent serialisation. The prefix is the shared constant in the header (stable, independent of
+// the schema name). Ingest TRIES the lock: a report that cannot get it must not park a pooled
+// connection (many concurrent reports for one agent would otherwise starve the shared pool), so it
+// is answered "busy" and retried by the agent. delete_agent, an operator action, waits.
 constexpr const char* kLockSql =
-    "SELECT pg_advisory_xact_lock(hashtextextended('cert_inventory:' || $1, 0))";
+    "SELECT pg_advisory_xact_lock(hashtextextended($2::text || $1::text, 0))";
+constexpr const char* kTryLockSql =
+    "SELECT pg_try_advisory_xact_lock(hashtextextended($2::text || $1::text, 0))";
 
-// One transaction timestamp from the DATABASE clock, strictly above the agent's previous
-// last_full_at so the stale-location sweep (`full_report_at < T`) can never miss a row from a
-// report that took the lock first but carried a later clock reading.
-constexpr const char* kTimeSql =
-    "SELECT GREATEST(clock_timestamp(), COALESCE((SELECT last_full_at FROM "
-    "cert_inventory.agent_state WHERE agent_id = $1), '-infinity'::timestamptz) + "
-    "interval '1 microsecond')::text";
+// One transaction timestamp from the plain DATABASE clock. No ordering against a previous report
+// is assumed: the ok-store sweep compares for DIFFERENCE from this value (every location this
+// report carries is stamped exactly T), so a DB clock step or restore cannot freeze sweeps.
+constexpr const char* kTimeSql = "SELECT clock_timestamp()::text";
+
+// Upper bound on one ingest transaction's statements (checked between chunks): a transaction that
+// keeps a pooled connection past this gives it back and the agent retries.
+constexpr std::chrono::seconds kIngestTxnBudget{8};
+thread_local std::chrono::steady_clock::time_point t_txn_deadline{};
+
+bool take_lock(PGconn* c, const std::string& id, bool blocking, bool& got) {
+    pg::PgResult r = pg::exec_params(c, blocking ? kLockSql : kTryLockSql,
+                                     std::vector<std::string>{id, std::string(kCertInventoryAgentLockPrefix)});
+    if (!r.ok() && r.status() != PGRES_TUPLES_OK)
+        return false;
+    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1)
+        return false;
+    got = blocking || std::string_view(PQgetvalue(r.get(), 0, 0)) == "t";
+    return true;
+}
 
 bool cmd_ok(const pg::PgResult& r) { return r.status() == PGRES_COMMAND_OK; }
 bool tup_ok(const pg::PgResult& r) { return r.status() == PGRES_TUPLES_OK; }
@@ -293,6 +319,8 @@ template <typename Row, typename MakeParams>
 bool for_each_chunk(PGconn* c, const char* sql, const std::vector<Row>& rows,
                     MakeParams&& make_params) {
     for (std::size_t i = 0; i < rows.size(); i += kChunkRows) {
+        if (std::chrono::steady_clock::now() > t_txn_deadline)
+            return false; // over the transaction budget: roll back, the agent retries
         const auto end = std::min(rows.size(), i + kChunkRows);
         pg::PgResult r = pg::exec_params(c, sql, make_params(i, end));
         if (!cmd_ok(r))
@@ -360,19 +388,25 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
             facts.push_back(&f);
 
     const bool committed = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
-        if (!tup_ok(pg::exec_params(c, kLockSql, std::vector<std::string>{id})))
+        t_txn_deadline = std::chrono::steady_clock::now() + kIngestTxnBudget;
+        bool got = false;
+        if (!take_lock(c, id, /*blocking=*/false, got))
             return false;
+        if (!got) {
+            result.outcome = CertIngestOutcome::kBusy; // another report for this agent is running
+            return true;
+        }
         if (test_hook_after_lock_)
             test_hook_after_lock_();
 
-        pg::PgResult tr = pg::exec_params(c, kTimeSql, std::vector<std::string>{id});
+        pg::PgResult tr = pg::exec_params(c, kTimeSql, std::vector<std::string>{});
         if (!tup_ok(tr) || PQntuples(tr.get()) != 1)
             return false;
         const std::string T = PQgetvalue(tr.get(), 0, 0);
 
         pg::PgResult as = pg::exec_params(
             c,
-            "INSERT INTO cert_inventory.agent_state "
+            "INSERT INTO certificate_inventory_store.agent_state "
             "(agent_id, content_hash, blob_version, first_seen, last_seen, last_full_at) "
             "VALUES ($1, $2, $3, $4::timestamptz, $4::timestamptz, $4::timestamptz) "
             "ON CONFLICT (agent_id) DO UPDATE SET content_hash = EXCLUDED.content_hash, "
@@ -383,17 +417,31 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
             return false;
 
         // Facts and their children first (cert_location references cert_fact).
-        if (!for_each_chunk(c, fact_upsert_sql().c_str(), facts, [&](std::size_t b, std::size_t e) {
-                Json arr = Json::array();
-                for (std::size_t i = b; i < e; ++i)
-                    arr.push_back(fact_json(*facts[i]));
-                return std::vector<std::string>{id, arr.dump()};
-            }))
-            return false;
+        // An unchanged fact is not rewritten (IS DISTINCT FROM guard): RETURNING names only the
+        // facts that were inserted or changed, and only those get their children rewritten.
+        std::set<std::string> changed;
+        for (std::size_t i = 0; i < facts.size(); i += kChunkRows) {
+            if (std::chrono::steady_clock::now() > t_txn_deadline)
+                return false;
+            const auto e = std::min(facts.size(), i + kChunkRows);
+            Json arr = Json::array();
+            for (std::size_t k = i; k < e; ++k)
+                arr.push_back(fact_json(*facts[k]));
+            pg::PgResult fr =
+                pg::exec_params(c, fact_upsert_sql().c_str(), std::vector<std::string>{id, arr.dump()});
+            if (!tup_ok(fr))
+                return false;
+            for (int r = 0; r < PQntuples(fr.get()); ++r)
+                changed.insert(PQgetvalue(fr.get(), r, 0));
+        }
+        std::vector<const CertFactRow*> child_facts;
+        for (const auto* f : facts)
+            if (changed.contains(f->sha256))
+                child_facts.push_back(f);
         {
             std::vector<std::string_view> shas;
-            shas.reserve(facts.size());
-            for (const auto* f : facts)
+            shas.reserve(child_facts.size());
+            for (const auto* f : child_facts)
                 shas.emplace_back(f->sha256);
             for (std::size_t i = 0; i < shas.size(); i += kChunkRows) {
                 const auto e = std::min(shas.size(), i + kChunkRows);
@@ -401,7 +449,7 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
                     std::vector<std::string_view>(shas.begin() + static_cast<long>(i),
                                                   shas.begin() + static_cast<long>(e)));
                 for (const char* t : {"cert_san", "cert_eku", "cert_cdp"}) {
-                    const std::string sql = std::string("DELETE FROM cert_inventory.") + t +
+                    const std::string sql = std::string("DELETE FROM certificate_inventory_store.") + t +
                                             " WHERE agent_id = $1 AND sha256 = ANY($2::text[])";
                     if (!cmd_ok(pg::exec_params(c, sql.c_str(), std::vector<std::string>{id, arr})))
                         return false;
@@ -416,7 +464,7 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
         std::vector<SanRow> san_rows;
         std::vector<std::pair<const std::string*, std::pair<int, const std::string*>>> eku_rows,
             cdp_rows;
-        for (const auto* f : facts) {
+        for (const auto* f : child_facts) {
             for (std::size_t i = 0; i < f->sans.size(); ++i)
                 san_rows.push_back({&f->sha256, static_cast<int>(i), &f->sans[i]});
             for (std::size_t i = 0; i < f->ekus.size(); ++i)
@@ -426,7 +474,7 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
         }
         if (!for_each_chunk(
                 c,
-                "INSERT INTO cert_inventory.cert_san (agent_id, sha256, ord, san_type, value) "
+                "INSERT INTO certificate_inventory_store.cert_san (agent_id, sha256, ord, san_type, value) "
                 "SELECT $1, t.sha256, t.ord, t.san_type, t.value FROM "
                 "jsonb_to_recordset($2::jsonb) AS t(sha256 text, ord int, san_type text, "
                 "value text)",
@@ -441,7 +489,7 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
                 }))
             return false;
         if (!for_each_chunk(c,
-                            "INSERT INTO cert_inventory.cert_eku (agent_id, sha256, ord, oid) "
+                            "INSERT INTO certificate_inventory_store.cert_eku (agent_id, sha256, ord, oid) "
                             "SELECT $1, t.sha256, t.ord, t.oid FROM jsonb_to_recordset($2::jsonb) "
                             "AS t(sha256 text, ord int, oid text)",
                             eku_rows, [&](std::size_t b, std::size_t e) {
@@ -454,7 +502,7 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
                             }))
             return false;
         if (!for_each_chunk(c,
-                            "INSERT INTO cert_inventory.cert_cdp (agent_id, sha256, ord, uri) "
+                            "INSERT INTO certificate_inventory_store.cert_cdp (agent_id, sha256, ord, uri) "
                             "SELECT $1, t.sha256, t.ord, t.uri FROM jsonb_to_recordset($2::jsonb) "
                             "AS t(sha256 text, ord int, uri text)",
                             cdp_rows, [&](std::size_t b, std::size_t e) {
@@ -471,12 +519,12 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
         // report did not carry), `absent` removes all, `constrained` keeps the rest.
         if (!for_each_chunk(
                 c,
-                "INSERT INTO cert_inventory.cert_location (agent_id, store_id, user_ref, path, "
+                "INSERT INTO certificate_inventory_store.cert_location (agent_id, store_id, user_ref, path, "
                 "sha256, first_seen, last_seen, full_report_at) "
                 "SELECT $1, t.store_id, '', t.path, t.sha256, $3::timestamptz, $3::timestamptz, "
                 "$3::timestamptz FROM jsonb_to_recordset($2::jsonb) AS t(store_id text, "
                 "path text, sha256 text) "
-                "ON CONFLICT (agent_id, store_id, user_ref, path, sha256) DO UPDATE SET "
+                "ON CONFLICT (agent_id, store_id, user_ref, path_md5, sha256) DO UPDATE SET "
                 "  last_seen = EXCLUDED.last_seen, full_report_at = EXCLUDED.full_report_at",
                 locs, [&](std::size_t b, std::size_t e) {
                     Json arr = Json::array();
@@ -492,14 +540,14 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
             if (s->status == cert_status::kOk) {
                 if (!cmd_ok(pg::exec_params(
                         c,
-                        "DELETE FROM cert_inventory.cert_location WHERE agent_id = $1 AND "
-                        "store_id = $2 AND user_ref = '' AND full_report_at < $3::timestamptz",
+                        "DELETE FROM certificate_inventory_store.cert_location WHERE agent_id = $1 AND "
+                        "store_id = $2 AND user_ref = '' AND full_report_at IS DISTINCT FROM $3::timestamptz",
                         std::vector<std::string>{id, s->store_id, T})))
                     return false;
             } else if (s->status == cert_status::kAbsent) {
                 if (!cmd_ok(pg::exec_params(
                         c,
-                        "DELETE FROM cert_inventory.cert_location WHERE agent_id = $1 AND "
+                        "DELETE FROM certificate_inventory_store.cert_location WHERE agent_id = $1 AND "
                         "store_id = $2 AND user_ref = ''",
                         std::vector<std::string>{id, s->store_id})))
                     return false;
@@ -508,7 +556,7 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
                 s->status == cert_status::kOk || s->status == cert_status::kAbsent;
             if (!cmd_ok(pg::exec_params(
                     c,
-                    "INSERT INTO cert_inventory.store_state (agent_id, store_id, user_ref, scope, "
+                    "INSERT INTO certificate_inventory_store.store_state (agent_id, store_id, user_ref, scope, "
                     "status, reason, observed_at, status_at, cert_count) "
                     "VALUES ($1, $2, '', $3, $4, $5, CASE WHEN $6::boolean THEN $7::timestamptz "
                     "END, $7::timestamptz, 0) "
@@ -516,7 +564,7 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
                     "  scope = EXCLUDED.scope, status = EXCLUDED.status, "
                     "  reason = EXCLUDED.reason, "
                     "  observed_at = COALESCE(EXCLUDED.observed_at, "
-                    "    cert_inventory.store_state.observed_at), "
+                    "    certificate_inventory_store.store_state.observed_at), "
                     "  status_at = EXCLUDED.status_at",
                     std::vector<std::string>{id, s->store_id, s->scope, s->status, s->reason,
                                              observed ? "true" : "false", T})))
@@ -531,7 +579,7 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
                 names.emplace_back(s->store_id);
             if (!cmd_ok(pg::exec_params(
                     c,
-                    "UPDATE cert_inventory.store_state SET status = 'not_observed', "
+                    "UPDATE certificate_inventory_store.store_state SET status = 'not_observed', "
                     "reason = 'missing_from_report' WHERE agent_id = $1 AND "
                     "store_id <> ALL($2::text[]) AND status <> 'not_observed'",
                     std::vector<std::string>{id, pg::to_text_array(names)})))
@@ -542,15 +590,15 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
         // per-store distinct-certificate counts are recomputed.
         if (!cmd_ok(pg::exec_params(
                 c,
-                "DELETE FROM cert_inventory.cert_fact f WHERE f.agent_id = $1 AND NOT EXISTS "
-                "(SELECT 1 FROM cert_inventory.cert_location l WHERE l.agent_id = f.agent_id AND "
+                "DELETE FROM certificate_inventory_store.cert_fact f WHERE f.agent_id = $1 AND NOT EXISTS "
+                "(SELECT 1 FROM certificate_inventory_store.cert_location l WHERE l.agent_id = f.agent_id AND "
                 "l.sha256 = f.sha256)",
                 std::vector<std::string>{id})))
             return false;
         if (!cmd_ok(pg::exec_params(
                 c,
-                "UPDATE cert_inventory.store_state s SET cert_count = (SELECT count(DISTINCT "
-                "l.sha256) FROM cert_inventory.cert_location l WHERE l.agent_id = s.agent_id AND "
+                "UPDATE certificate_inventory_store.store_state s SET cert_count = (SELECT count(DISTINCT "
+                "l.sha256) FROM certificate_inventory_store.cert_location l WHERE l.agent_id = s.agent_id AND "
                 "l.store_id = s.store_id AND l.user_ref = s.user_ref)::int "
                 "WHERE s.agent_id = $1 AND s.status IN ('ok', 'absent', 'constrained')",
                 std::vector<std::string>{id})))
@@ -574,12 +622,18 @@ CertIngestResult CertificateInventoryStore::ingest_touch(std::string_view agent_
     const std::string id{agent_id};
 
     const bool committed = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
-        if (!tup_ok(pg::exec_params(c, kLockSql, std::vector<std::string>{id})))
+        t_txn_deadline = std::chrono::steady_clock::now() + kIngestTxnBudget;
+        bool got = false;
+        if (!take_lock(c, id, /*blocking=*/false, got))
             return false;
+        if (!got) {
+            result.outcome = CertIngestOutcome::kBusy;
+            return true;
+        }
         if (test_hook_after_lock_)
             test_hook_after_lock_();
         pg::PgResult st = pg::exec_params(
-            c, "SELECT content_hash FROM cert_inventory.agent_state WHERE agent_id = $1",
+            c, "SELECT content_hash FROM certificate_inventory_store.agent_state WHERE agent_id = $1",
             std::vector<std::string>{id});
         if (!tup_ok(st))
             return false;
@@ -593,7 +647,7 @@ CertIngestResult CertificateInventoryStore::ingest_touch(std::string_view agent_
             result.need_full_cause = CertNeedFullCause::kHashMismatch;
             return true;
         }
-        pg::PgResult tr = pg::exec_params(c, kTimeSql, std::vector<std::string>{id});
+        pg::PgResult tr = pg::exec_params(c, kTimeSql, std::vector<std::string>{});
         if (!tup_ok(tr) || PQntuples(tr.get()) != 1)
             return false;
         const std::string T = PQgetvalue(tr.get(), 0, 0);
@@ -601,21 +655,21 @@ CertIngestResult CertificateInventoryStore::ingest_touch(std::string_view agent_
         // equals agent_state.last_full_at; kept, unreported locations are not refreshed.
         if (!cmd_ok(pg::exec_params(
                 c,
-                "UPDATE cert_inventory.cert_location l SET last_seen = $2::timestamptz FROM "
-                "cert_inventory.agent_state a WHERE a.agent_id = $1 AND l.agent_id = a.agent_id "
+                "UPDATE certificate_inventory_store.cert_location l SET last_seen = $2::timestamptz FROM "
+                "certificate_inventory_store.agent_state a WHERE a.agent_id = $1 AND l.agent_id = a.agent_id "
                 "AND l.full_report_at = a.last_full_at",
                 std::vector<std::string>{id, T})))
             return false;
         if (!cmd_ok(pg::exec_params(
                 c,
-                "UPDATE cert_inventory.store_state SET status_at = $2::timestamptz, "
+                "UPDATE certificate_inventory_store.store_state SET status_at = $2::timestamptz, "
                 "observed_at = CASE WHEN status IN ('ok', 'absent') THEN $2::timestamptz "
                 "ELSE observed_at END WHERE agent_id = $1 AND status <> 'not_observed'",
                 std::vector<std::string>{id, T})))
             return false;
         if (!cmd_ok(pg::exec_params(
                 c,
-                "UPDATE cert_inventory.agent_state SET last_seen = $2::timestamptz "
+                "UPDATE certificate_inventory_store.agent_state SET last_seen = $2::timestamptz "
                 "WHERE agent_id = $1",
                 std::vector<std::string>{id, T})))
             return false;
@@ -643,12 +697,13 @@ bool CertificateInventoryStore::delete_agent(std::string_view agent_id) {
     // either commits first (and is erased here) or runs after the erase and re-creates its rows
     // from its own report; either way the result is one whole state, never partial rows.
     const bool committed = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
-        if (!tup_ok(pg::exec_params(c, kLockSql, std::vector<std::string>{id})))
+        bool got = false;
+        if (!take_lock(c, id, /*blocking=*/true, got))
             return false;
         for (const char* t : {"cert_san", "cert_eku", "cert_cdp", "cert_location", "cert_fact",
                               "store_state", "agent_state"}) {
             const std::string sql =
-                std::string("DELETE FROM cert_inventory.") + t + " WHERE agent_id = $1";
+                std::string("DELETE FROM certificate_inventory_store.") + t + " WHERE agent_id = $1";
             if (!cmd_ok(pg::exec_params(c, sql.c_str(), std::vector<std::string>{id})))
                 return false;
         }
@@ -681,7 +736,7 @@ CertificateInventoryStore::row_counts(std::string_view agent_id) {
     }};
     for (const auto& [name, member] : tables) {
         const std::string sql =
-            std::string("SELECT count(*) FROM cert_inventory.") + name + " WHERE agent_id = $1";
+            std::string("SELECT count(*) FROM certificate_inventory_store.") + name + " WHERE agent_id = $1";
         pg::PgResult r =
             pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{std::string(agent_id)});
         if (!tup_ok(r) || PQntuples(r.get()) != 1)
