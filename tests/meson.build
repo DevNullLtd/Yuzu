@@ -2177,6 +2177,12 @@ if build_server
   # filter edit: B 4783 -> 4493, C 1139 -> 1429 (+290 = the four tags), D 24, A
   # 786; the non-pg total (6732) is unchanged, no case lost or duplicated.
   # D's priority drops 48 -> 10 (now the lightest; A 20, C 45, B 50 stay distinct).
+  # 2026-10-23 (dev merge): dev's step-up route-inventory test brought one case that still runs
+  # two std::regex passes over the source tree ('kRequired labels equal the in-handler step_up_fn
+  # labels', test_step_up_route_inventory.cpp): 19.7 s of D's 25.2 s alone on braga (macOS debug,
+  # --durations=yes, one process). All four non-pg shards run together: A 17.4 s, D 29.0 s, C 38.4 s,
+  # B 46.0 s, so D is still not the floor; the case is left as it is and the 5.6 s above is no
+  # longer D's total.
   # Windows MSVC debug (kingsley, 2026-10-22, one process per shard run back to
   # back, one sample): A 67.0 s, B 142.2 s, C 91.1 s, D 0.55 s; the four moved tags
   # alone: [oidc] 61.5 s, [retention] 8.2 s, [readyz] 4.5 s, [tls] 5.9 s (so
