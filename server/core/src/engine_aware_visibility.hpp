@@ -11,11 +11,15 @@
 // with RBAC on it follows the ordinary grant evaluation. A NEW username-keyed resolver must take the
 // same fact (`authz::is_engine_principal_name`).
 //
-// ONE enforcement snapshot per decision: two `rbac_enforcement_in_effect` reads could disagree
-// across a concurrent toggle and let an engine fall through both branches to the full fleet.
+// Each resolver makes ONE enforcement read of its own: two `rbac_enforcement_in_effect` reads could
+// disagree across a concurrent toggle and let an engine fall through both branches to the full fleet.
+// `ManagementGroupStore::get_visible_agents` consults its own RBAC probe on top of that read, so for a
+// HUMAN the two can differ across a toggle (unchanged from before this header existed); an engine
+// stays empty on both reads, because `get_visible_agents` refuses the `engine:` prefix in its
+// legacy-open branch.
 //
 // Return conventions (ADR-0033 §1): `std::nullopt` = unfiltered (whole fleet); a present-EMPTY set
-// = deny-all. A degraded store narrows to empty, never to `nullopt`.
+// = deny-all. A degraded or absent store narrows to empty, never to `nullopt`.
 
 #include "authz_model.hpp"
 #include "management_group_store.hpp"

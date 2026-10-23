@@ -40,6 +40,9 @@ struct VisRig {
     std::string group;
 
     VisRig() {
+        // Production wiring (server.cpp): the management-group store consults the same enforcement
+        // predicate, so the header, the probe and the store's engine guard compose as they do live.
+        mgmt.set_rbac_enabled_probe([this]() { return rbac_enforcement_in_effect(&rbac); });
         rbac.set_rbac_enabled(true);
         REQUIRE(rbac.create_role({"InfraReader6204", "", false, 0}).has_value());
         REQUIRE(rbac.set_permission({"InfraReader6204", "Infrastructure", "Read", "allow"})
