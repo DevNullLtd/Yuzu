@@ -2005,7 +2005,9 @@ public:
         // Installed-software inventory observability (ADR-0016; #1664/#1675).
         metrics_.describe("yuzu_inventory_ingest_total",
                           "Inventory-report ingest outcomes by source and outcome "
-                          "(stored/touched/need_full/error/dropped/rejected/rejected_depth)",
+                          "(stored/touched/need_full/error/dropped/rejected/rejected_depth; deferred = "
+                          "a report skipped because another report for the same agent held its "
+                          "lock, certificate_inventory only - not a failure)",
                           "counter");
         cert_ingest_metric::register_metrics(metrics_); // slice-2 PR 2a-2a
         metrics_.describe("yuzu_inventory_ingest_duration_seconds",
@@ -7862,6 +7864,7 @@ public:
                               "be created/opened)");
                 startup_failed_ = true;
             } else {
+                certificate_inventory_store_->set_metrics(&metrics_);
                 agent_service_.set_certificate_inventory_store(certificate_inventory_store_.get());
                 if (gateway_service_)
                     gateway_service_->set_certificate_inventory_store(

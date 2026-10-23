@@ -845,6 +845,16 @@ void cert_ingest_metric::register_metrics(::yuzu::MetricsRegistry& metrics) {
                         {{"result", std::string(result)}, {"reason", std::string(reason)}});
 }
 
+void cert_ingest_metric::count_exception(::yuzu::MetricsRegistry* metrics) {
+    if (!metrics)
+        return;
+    metrics
+        ->counter(std::string(kName), {{"result", "error"}, {"reason", "exception"}})
+        .increment();
+    metrics->counter("yuzu_inventory_ingest_total", {{"source", kSource}, {"outcome", "error"}})
+        .increment();
+}
+
 void ingest_certificate_inventory_report(CertificateInventoryStore& store,
                                          const std::string& agent_id, const pb::InventoryReport& report,
                                          pb::InventoryAck& ack, ::yuzu::MetricsRegistry* metrics) {
@@ -857,11 +867,16 @@ void ingest_certificate_inventory_report(CertificateInventoryStore& store,
             ->counter(std::string(cert_ingest_metric::kName),
                       {{"result", std::string(result)}, {"reason", std::string(reason)}})
             .increment();
+        // Map onto the generic family's EXISTING vocabulary so the shipped alerts and runbooks
+        // mean what they say: an over-cap/unknown/malformed blob is `dropped` (the over-cap
+        // blob alert), only a >64-source report is `rejected` (the report-rejected alert), and
+        // a bad claim is `need_full` like the siblings' mismatch. `deferred` is this source's
+        // own (described in server.cpp); it is a busy-lock deferral, not a failure.
         const char* outcome = result == "stored"      ? "stored"
                               : result == "touched"   ? "touched"
                               : result == "need_full" ? "need_full"
-                              : result == "rejected"  ? "rejected"
                               : result == "deferred"  ? "deferred"
+                              : result == "rejected"  ? (reason == "too_many_sources" ? "rejected" : "dropped")
                                                       : "error";
         metrics
             ->counter("yuzu_inventory_ingest_total",
@@ -912,6 +927,11 @@ void ingest_certificate_inventory_report(CertificateInventoryStore& store,
             need_full();
             emit("need_full", r.need_full_cause == CertNeedFullCause::kCold ? "cold"
                                                                             : "hash_mismatch");
+            return;
+        case CertIngestOutcome::kBudgetExceeded:
+            // Terminal ack: the same report would exceed again at once; the agent's next
+            // interval starts cold (hash-only -> need_full -> one resend per interval).
+            emit("error", "budget_exceeded");
             return;
         case CertIngestOutcome::kBusy:
             if (!hash_only)

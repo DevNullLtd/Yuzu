@@ -1960,11 +1960,13 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
                                                 *response, metrics_);
         } catch (const std::exception& ex) {
             response->add_need_full("certificate_inventory");
+            cert_ingest_metric::count_exception(metrics_);
             spdlog::warn("[gateway] ProxyInventory: certificate_inventory ingest threw for "
                          "agent={} — nacked: {}",
                          agent_id, ex.what());
         } catch (...) {
             response->add_need_full("certificate_inventory");
+            cert_ingest_metric::count_exception(metrics_);
             spdlog::warn("[gateway] ProxyInventory: certificate_inventory ingest threw (unknown) "
                          "for agent={} — nacked",
                          agent_id);

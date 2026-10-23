@@ -3141,6 +3141,35 @@ tests:
           - labels: 'ALERTS{alertname="YuzuInventoryGenericBlobRejectedDepth", alertstate="firing", severity="warning"}'
             value: 1
 
+  # ── YuzuCertInventoryReportsRejected ─────────────────────────────────────
+  # CASE - a sustained rising rejected counter fires after the 30m hold; a flat one does not.
+  - interval: 1m
+    name: cert inventory rejected - sustained rejections fire, a flat series stays quiet
+    input_series:
+      - series: 'yuzu_server_cert_inventory_ingest_total{job="yuzu",instance="s1",result="rejected",reason="unknown_version"}'
+        values: "0+1x50"
+      - series: 'yuzu_server_cert_inventory_ingest_total{job="yuzu",instance="s1",result="stored",reason="none"}'
+        values: "0+5x50"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCertInventoryReportsRejected", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCertInventoryReportsRejected", alertstate="firing", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCertInventoryReportsRejected", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+
+  - interval: 1m
+    name: cert inventory rejected - a flat zero rejected series stays quiet
+    input_series:
+      - series: 'yuzu_server_cert_inventory_ingest_total{job="yuzu",instance="s1",result="rejected",reason="bad_header"}'
+        values: "0x50"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCertInventoryReportsRejected", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples: []
+
   # CASE - a flat/absent counter stays quiet: RED against dropping the `> 0`
   # (an `>= 0` form would spuriously fire the instant this series is scraped
   # at all - unlike yuzu_guardian_push_rule_excluded_total, this series has

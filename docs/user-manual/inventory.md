@@ -1172,12 +1172,34 @@ points. It never lands in the generic inventory store, on either path.
 - **Refusals, never truncation.** A record over a cap (64 stores, 10,000 distinct
   certificates, 2,000 certificates per store, 64 SANs of 256 bytes, 32 EKUs, 8 CRL
   distribution points of 512 bytes, 1,024-byte DNs, 16 KiB DER and 1 MiB of DER per
-  blob, 3 MiB per blob) is refused. A refused or malformed record makes the store it
-  belongs to read `constrained` with reason `parse_error`, keeps that store's rows, and
-  the blob is still acknowledged. A record that cannot be tied to a store constrains the
-  whole report. An unparseable header or an unknown major version nacks the blob.
+  blob, 3 MiB per blob) is refused, never truncated. A refused or malformed record makes
+  the store it belongs to read `constrained` (reason `row_cap` for a size cap,
+  `parse_error` for a defect), keeps that store's rows, and the blob is still
+  acknowledged. A record that cannot be tied to a store constrains the whole report.
   Invalid UTF-8 is replaced with U+FFFD and the field is named in the certificate's
-  `constrained_fields`.
+  `constrained_fields` (a `?` for is_ca, path_len or self_signed is named
+  `unknown:<field>`). A DER that does not hash to its certificate is dropped and the
+  certificate marked `der_hash_mismatch`. No private key material is ever stored; the
+  optional public DER and key-association metadata are.
+- **A refused device freezes.** A whole blob that is over 3 MiB, has an unknown major
+  version, an unparseable header, more than 64 stores or 10,000 certificates, or arrives
+  with more than 64 sources is **rejected**: acknowledged without asking for a resend (the
+  same bytes would be refused again), nothing is written, and the device's stored
+  inventory stops changing. Its next daily cycle is cold (hash-only, then a full resend)
+  and is refused again, so this repeats once per interval until the agent is fixed. It is
+  visible only as `yuzu_server_cert_inventory_ingest_total{result="rejected",reason}` (the
+  `YuzuCertInventoryReportsRejected` alert) and a warn log naming the agent. To diagnose,
+  find the agent in the warn line `blob from agent=... refused`, then check its agent
+  version against the server's (unknown major version) and its store count. A
+  transaction that runs past its time budget (scaled with the report size) is rolled
+  back, counted as `error`/`budget_exceeded`, and is likewise acknowledged and retried
+  next interval.
+- **Busy device.** Reports for one device are serialised. A report that finds another
+  for the same device in flight is counted `deferred`/`agent_busy`; a full report is asked
+  to resend, and a hash-only report just retries next cycle. A hash-only claim must be
+  exactly 64 lowercase hex characters (an empty or malformed claim is answered with a
+  resend request, counted `need_full`/`bad_claim`). Consumers of a device's `status_at`
+  must tolerate one missed interval.
 - **Erasure.** Erasing a device (`DELETE /api/v1/sle/agents/{id}`) removes its
   certificate rows in one transaction. Erasure does not unenrol the device, so a
   still-running agent re-creates its rows on its next report.

@@ -3831,6 +3831,27 @@ groups:
             signals a malformed/abusive/corrupted agent — check the agent version and the
             warn-level "carries too many sources" server logs for the agent_id.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuCertInventoryReportsRejected
+        # certificate_inventory: result="rejected" is a whole report refused (over 3 MiB, unknown
+        # major version, bad header, over 64 stores / 10,000 certificates, >64 sources). It is
+        # acknowledged WITHOUT a resend and writes nothing, so the device's stored inventory
+        # freezes and nothing else shows it. Sustained = a device (or a fleet after an agent
+        # upgrade ahead of the server) is stuck.
+        expr: |
+          sum(rate(yuzu_server_cert_inventory_ingest_total{result="rejected"}[15m])) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Certificate inventory reports being rejected"
+          description: >-
+            yuzu_server_cert_inventory_ingest_total{result="rejected"} has been non-zero for
+            30m. The rejected devices' certificate inventory is frozen (acknowledged, not
+            stored, not resent). By reason label: unknown_version = an agent newer than the
+            server (upgrade the server first); bad_header / over_cap / blob_too_large = a
+            malformed or oversize report - find the agent in the warn log line
+            "certificate_inventory: blob from agent=... refused".
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryGenericBlobRejectedDepth
         # json-dump-depth-guard fix: outcome=rejected_depth is a SEPARATE outcome
         # from outcome=rejected above (whole-report source-cap) - it fires once
