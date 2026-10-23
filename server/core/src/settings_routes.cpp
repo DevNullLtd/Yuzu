@@ -14,7 +14,6 @@
 #include <cstdio>
 #include <format>
 
-#include "auth_routes.hpp" // AuthRoutes::extract_session_cookie (keep the caller session on MFA disable)
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
 #include "enrolment_render.hpp" // enrolment token / pending / auto-approve fragment markup (pure)
@@ -6936,23 +6935,28 @@ void SettingsRoutes::register_routes(
                                       "text/html; charset=utf-8");
                       return;
                   }
-                  // End the account's OTHER sessions (#6079): one may hold an MFA proof made
-                  // under the factor just cleared. The session the user is acting from stays.
-                  const auto others = auth_mgr_->invalidate_other_user_sessions(
-                      session->username, AuthRoutes::extract_session_cookie(req));
-                  audit_fn_(req, "mfa.disabled", "ok", "User", session->username,
-                            std::format("other_sessions_ended={}{}", others.count,
-                                        others.db_persisted ? "" : " (durable delete failed)"));
-                  if (!others.db_persisted) {
-                      res.set_content(render_mfa_fragment(
-                                          *session, {}, {}, {}, {},
-                                          "MFA disabled, but your other sessions could not be "
-                                          "ended. Sign out everywhere from your account page."),
-                                      "text/html; charset=utf-8");
+                  // End EVERY session of the account, the caller's included (#6079): any of them
+                  // may hold an MFA proof made under the factor just cleared. The user signs in
+                  // again; a kept session would be a surviving proof we could not tell apart.
+                  const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
+                  if (!ended.db_persisted) {
+                      audit_fn_(req, "mfa.disabled", "partial", "User", session->username,
+                                "sessions_ended=failed");
+                      res.set_content(
+                          render_mfa_fragment(
+                              *session, {}, {}, {}, {},
+                              "MFA was disabled, but the account's sessions could not be ended. "
+                              "Try again; if this persists, ask an administrator to end them."),
+                          "text/html; charset=utf-8");
                       return;
                   }
-                  res.set_content(render_mfa_fragment(*session),
-                                  "text/html; charset=utf-8");
+                  audit_fn_(req, "mfa.disabled", "ok", "User", session->username,
+                            std::format("sessions_ended={}", ended.count));
+                  // Same exit as logout: drop the cookie and send the browser to the landing page.
+                  res.set_header("Set-Cookie",
+                                 "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+                  res.set_header("HX-Redirect", "/home");
+                  res.set_content("", "text/plain");
               });
 }
 

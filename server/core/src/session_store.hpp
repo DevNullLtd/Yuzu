@@ -179,12 +179,6 @@ public:
     /// change). Returns the number removed.
     [[nodiscard]] std::expected<int, Error> invalidate_user(const std::string& username);
 
-    /// Delete every session for a username EXCEPT the one with `keep_token_hash`
-    /// (disabling a factor from Settings, #6079). Bumps the generation in the same txn.
-    /// Returns the number removed.
-    [[nodiscard]] std::expected<int, Error>
-    invalidate_user_except(const std::string& username, const std::string& keep_token_hash);
-
     /// Grant/extend elevation, authored in the DB clock domain: the store stamps
     /// `elevation_issued_ms = now()` and `elevated_until_ms = LEAST(now() +
     /// elevation_duration_ms, expires_at_ms)` — the "never past absolute expiry"
