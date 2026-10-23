@@ -40,8 +40,9 @@ class ChainError(Exception):
     pass
 
 
-def segments(src: bytes):
-    """Returns [(1-based start line, byte length)] for each raw-string segment of the chain."""
+def spans(src: bytes):
+    """Returns [(1-based start line, body start, body end)] for each raw-string segment of the
+    chain; the body is src[start:end] without the R"json( and )json" delimiters."""
     m = CHAIN_START.search(src)
     if not m:
         raise ChainError(
@@ -72,7 +73,7 @@ def segments(src: bytes):
             if end < 0:
                 raise ChainError("unterminated raw string in the OpenAPI literal chain")
             line = src.count(b"\n", 0, pos) + 1
-            out.append((line, end - body_start))
+            out.append((line, body_start, end))
             pos = end + len(CLOSE)
         elif src[pos : pos + 1] == b")":
             return out
@@ -82,6 +83,17 @@ def segments(src: bytes):
                 f"line {line}: the OpenAPI literal chain holds something other than "
                 'R"json(...)json" segments; this gate (and check-api-parity.py) expect only those'
             )
+
+
+def segments(src: bytes):
+    """Returns [(1-based start line, byte length)] for each raw-string segment of the chain."""
+    return [(line, end - start) for line, start, end in spans(src)]
+
+
+def chain_text(src: bytes) -> bytes:
+    """The chain joined as the compiler joins it: the OpenAPI template before
+    expand_ecosystem_tokens() substitutes its three @@ECOSYSTEM_*@@ tokens."""
+    return b"".join(src[start:end] for _line, start, end in spans(src))
 
 
 def problems(src: bytes, ceiling: int = CEILING, minimum: int = MIN_SEGMENTS):

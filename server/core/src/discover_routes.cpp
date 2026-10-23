@@ -426,7 +426,8 @@ DiscoveryDoc build_routes_catalog(const std::string& openapi_json) {
          "generated from the live route table. A route that exists but was never "
          "documented in the OpenAPI spec will be under-reported here too. Per-route "
          "RBAC requirement is embedded in each entry's free-text 'description' "
-         "(no structured field yet)."},
+         "(no structured field yet). An entry with an 'unavailable' field is documented "
+         "but not registered on this server: skip it, do not call it."},
         {"count", routes_arr.size()},
         {"routes", std::move(routes_arr)},
     };

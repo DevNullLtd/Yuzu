@@ -1069,7 +1069,9 @@ TEST_CASE("discover.routes: the real catalog marks the same operations as the do
                 in_document.insert("/api/v1" + path + " " + method);
         }
     }
-    REQUIRE(in_document.size() == 14);
+    // The set itself is pinned in test_openapi_spec_completeness.cpp (kExpected); this case only
+    // ties the catalogue to whatever the document marks.
+    REQUIRE_FALSE(in_document.empty());
 
     const auto doc = nlohmann::json::parse(
         yuzu::server::build_routes_catalog(yuzu::server::openapi_spec_json()).json);

@@ -715,14 +715,17 @@ TEST_CASE("openapi_spec_json(): every ecosystem parameter and the pipe-list are 
     // The route handler and discover_routes bind this by reference: it must be one stable object.
     CHECK(&yuzu::server::openapi_spec_json() == &yuzu::server::openapi_spec_json());
     // openapi_spec_json() is the lean copy openapi_strip_guides() builds once and trims with
-    // shrink_to_fit(), so its capacity must sit within a small slack of its size. This pins that
-    // derivation.
-    CHECK(yuzu::server::openapi_spec_json().capacity() - raw.size() < 4096);
+    // shrink_to_fit(). The standard makes that call a non-binding request, so these two pins
+    // are deliberately coarse: they catch a string that kept a doubled buffer (capacity near
+    // twice the size, which is what a missed trim or a reallocation leaves) and nothing finer.
+    // libstdc++ and libc++ trim to the byte; an STL that rounds up (MSVC's allocation
+    // granularity) must still pass, so the bound is half the size, not a byte count.
+    CHECK(yuzu::server::openapi_spec_json().capacity() - raw.size() < raw.size() / 2);
     // The guides-included document is the expansion's own string, served as built, so its capacity
     // pins the reserve of the very expand_ecosystem_tokens() that builds the document (the
-    // function the test below exercises on a synthetic template).
+    // function the test below exercises on a synthetic template, where the exact bound holds).
     const auto& built = yuzu::server::openapi_spec_with_guides_json();
-    CHECK(built.capacity() - built.size() < 64);
+    CHECK(built.capacity() - built.size() < built.size() / 2);
 }
 
 TEST_CASE("expand_ecosystem_tokens(): the output is allocated once at its final size",
@@ -858,27 +861,6 @@ std::set<std::pair<std::string, std::string>> registered_routes(bool wire_unavai
 }
 
 } // namespace
-
-TEST_CASE("openapi_spec_json(): every operation has a unique and well-formed operationId",
-          "[openapi][structure]") {
-    const json spec = json::parse(yuzu::server::openapi_spec_json());
-    const auto ops = all_operations(spec);
-    REQUIRE(ops.size() > 100);
-
-    static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
-    std::map<std::string, std::string> seen; // operationId -> first operation using it
-    for (const auto& o : ops) {
-        INFO(o.where());
-        REQUIRE(o.op.contains("operationId"));
-        REQUIRE(o.op["operationId"].is_string());
-        const auto id = o.op["operationId"].get<std::string>();
-        INFO("operationId " << id);
-        CHECK(std::regex_match(id, kShape));
-        const auto [it, fresh] = seen.emplace(id, o.where());
-        if (!fresh)
-            FAIL_CHECK("operationId " << id << " is also used by " << it->second);
-    }
-}
 
 TEST_CASE("openapi_spec_json(): x-yuzu-unavailable marks exactly the operations that wiring "
           "a store adds",
@@ -1068,6 +1050,93 @@ TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matchin
         CHECK(denied->get_header_value("ETag").empty());
         CHECK(denied->body.find("\"openapi\"") == std::string::npos);
     }
+
+    SECTION("the comparison is exact: a weak validator, a list or * is a full 200") {
+        // The server compares the header to its one ETag as a string. It does not parse the
+        // If-None-Match grammar, so each of these revalidates by refetching. That is documented
+        // (rest-api.md, the spec text); a proxy that weakens or merges validators costs the
+        // 304 saving, never correctness.
+        for (const std::string& inm :
+             {"W/" + lean_etag, lean_etag + ", \"0000000000000000\"",
+              "\"0000000000000000\", " + lean_etag, std::string("*")}) {
+            INFO("If-None-Match: " << inm);
+            auto r = sink.Get(lean_path, {{"If-None-Match", inm}});
+            REQUIRE(r);
+            CHECK(r->status == 200);
+            CHECK(r->body == lean->body);
+            CHECK(r->get_header_value("ETag") == lean_etag);
+        }
+    }
+
+    SECTION("an unauthenticated caller is refused before the validator, even with the right one") {
+        // Production's perm_fn answers 401 for a request with no session; the gate must run
+        // first, so the right ETag never becomes a 304 that confirms what the document is.
+        RestApiV1 api2;
+        yuzu::server::test::TestRouteSink sink2;
+        RestApiV1::PermFn no_session = [](const httplib::Request&, httplib::Response& res,
+                                          const std::string&, const std::string&) {
+            res.status = 401;
+            res.set_content(R"({"error":{"code":401,"message":"unauthorized"}})", "application/json");
+            return false;
+        };
+        api2.register_routes(sink2, admin_auth_fn(), no_session, ok_audit_fn(),
+                             /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr,
+                             /*token_store=*/nullptr, /*quarantine_store=*/nullptr,
+                             /*response_store=*/nullptr, /*instruction_store=*/nullptr,
+                             /*execution_tracker=*/nullptr, /*schedule_engine=*/nullptr,
+                             /*approval_manager=*/nullptr, /*tag_store=*/nullptr,
+                             /*audit_store=*/nullptr);
+        auto r = sink2.Get(lean_path, {{"If-None-Match", lean_etag}});
+        REQUIRE(r);
+        CHECK(r->status == 401);
+        CHECK(r->get_header_value("ETag").empty());
+        CHECK(r->body.find("\"openapi\"") == std::string::npos);
+    }
+
+    SECTION("guides is read as exactly true or 1, and the first value wins") {
+        // Anything else, in any case or spelling, is the default (lean) form with a 200: the
+        // server does not say which form it chose beyond the ETag and the body.
+        for (const char* q : {"true", "1"}) {
+            INFO("guides=" << q);
+            auto r = sink.Get(std::string(lean_path) + "?guides=" + q);
+            REQUIRE(r);
+            CHECK(r->body == full->body);
+            CHECK(r->get_header_value("ETag") == full_etag);
+        }
+        for (const char* q : {"TRUE", "True", "yes", "on", "false", "0", ""}) {
+            INFO("guides=" << q);
+            auto r = sink.Get(std::string(lean_path) + "?guides=" + q);
+            REQUIRE(r);
+            CHECK(r->status == 200);
+            CHECK(r->body == lean->body);
+            CHECK(r->get_header_value("ETag") == lean_etag);
+        }
+        auto first_true = sink.Get(lean_path + "?guides=true&guides=no");
+        REQUIRE(first_true);
+        CHECK(first_true->body == full->body);
+        auto first_no = sink.Get(lean_path + "?guides=no&guides=true");
+        REQUIRE(first_no);
+        CHECK(first_no->body == lean->body);
+    }
+}
+
+TEST_CASE("content_etag(): known vectors", "[openapi][etag]") {
+    // FNV-1a 64 over the bytes, with the offset constant 1469598103934665603. That constant is
+    // the standard offset basis (14695981039346656037) with its last digit dropped, a
+    // transcription slip carried by every copy of this function. It is kept on purpose:
+    // correcting it would change every ETag the server has handed out, once. These vectors pin
+    // the value so the slip is neither "fixed" nor changed by accident, and so the shared
+    // implementation and the production handlers cannot drift together unnoticed.
+    CHECK(yuzu::server::content_etag("") == "\"14650fb0739d0383\"");
+    CHECK(yuzu::server::content_etag("a") == "\"44bd8ad473cd9906\"");
+    CHECK(yuzu::server::content_etag("yuzu") == "\"ea31ac803c5388dc\"");
+    // A leading zero is kept: the digest is always sixteen hex digits.
+    CHECK(yuzu::server::content_etag(R"({"openapi":"3.0.3"})") == "\"0aecba309589115d\"");
+    // All 256 byte values: a byte above 0x7f is folded in unsigned, not sign-extended.
+    std::string all_bytes;
+    for (int c = 0; c < 256; ++c)
+        all_bytes.push_back(static_cast<char>(c));
+    CHECK(yuzu::server::content_etag(all_bytes) == "\"16d173bdfcdae583\"");
 }
 
 TEST_CASE("openapi_strip_guides(): removes the guides and keeps everything else",
@@ -1207,23 +1276,47 @@ std::set<std::string> key_set(const json& obj) {
 
 } // namespace
 
-TEST_CASE("openapi documents: every operation has a unique operationId in both forms",
+TEST_CASE("openapi documents: every operation has a unique, well-formed and pinned operationId in "
+          "both forms",
           "[openapi][structure]") {
+    // The operationId is the method name an OpenAPI client generator derives (upgrading.md says
+    // so), so renaming one is a breaking change for every generated client. The checksum below
+    // fails on ANY change to the set of ids: a rename, an addition or a removal.
+    //
+    // To update it after an intended change: run this test, copy the checksum the failure
+    // prints into kOperationIdChecksum, and state the rename in the operationId note of
+    // docs/user-manual/upgrading.md and in the change's changelog fragment. The count is
+    // derived from the document (it is the number of operations); the one hand-kept number
+    // for it lives in the typed-response test's exclusion list, not here.
+    static const std::string kOperationIdChecksum = "\"9cd34cf0860aa379\"";
+    static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
         const json spec = json::parse(document_text(with_guides));
         const auto ops = all_operations(spec);
-        // Adding or removing an operation changes this count on purpose.
-        CHECK(ops.size() == 259);
-        std::set<std::string> ids;
+        REQUIRE(ops.size() > 100);
+        std::map<std::string, std::string> seen; // operationId -> first operation using it
         for (const auto& o : ops) {
             INFO(o.where());
             REQUIRE(o.op.contains("operationId"));
             REQUIRE(o.op["operationId"].is_string());
-            CHECK_FALSE(o.op["operationId"].get<std::string>().empty());
-            ids.insert(o.op["operationId"].get<std::string>());
+            const auto id = o.op["operationId"].get<std::string>();
+            INFO("operationId " << id);
+            CHECK(std::regex_match(id, kShape));
+            const auto [it, fresh] = seen.emplace(id, o.where());
+            if (!fresh)
+                FAIL_CHECK("operationId " << id << " is also used by " << it->second);
         }
-        CHECK(ids.size() == ops.size());
+        CHECK(seen.size() == ops.size());
+        // std::map iterates in key order, so the joined text is the sorted list of ids.
+        std::string joined;
+        for (const auto& [id, where] : seen) {
+            joined += id;
+            joined += '\n';
+        }
+        INFO("sorted operationIds hash to " << yuzu::server::content_etag(joined)
+             << " (update kOperationIdChecksum, and see the comment above it)");
+        CHECK(yuzu::server::content_etag(joined) == kOperationIdChecksum);
     }
 }
 
@@ -1246,7 +1339,6 @@ TEST_CASE("openapi documents: x-yuzu-unavailable marks exactly the pinned operat
         "post /software-deployments/{id}/rollback",
         "post /software-deployments/{id}/cancel",
     };
-    REQUIRE(kExpected.size() == 14);
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
         const json spec = json::parse(document_text(with_guides));
@@ -1297,7 +1389,9 @@ TEST_CASE("openapi documents: all but two operations declare a typed success res
                 untyped.insert(o.where());
         }
         CHECK(untyped == kUntyped);
-        CHECK(typed == 257);
+        // Every other operation is typed: the count follows from the document and the
+        // exclusion list, so it is not a second hand-kept literal.
+        CHECK(typed == all_operations(spec).size() - kUntyped.size());
     }
 }
 

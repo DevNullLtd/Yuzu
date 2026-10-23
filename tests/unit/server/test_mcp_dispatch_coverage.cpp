@@ -588,7 +588,9 @@ TEST_CASE("MCP registry tools: every record carries the A5 machine-checkable con
     // than by whichever PR first added this test. An exemption must still be short: once the
     // description is brought up to the floor the entry fails below and must be deleted, so the
     // list can only shrink.
-    const std::set<std::string> kShortDescriptionBackfill{"discover_routes"};
+    // Now empty: discover_routes left it when its description gained the sentence telling an
+    // agent to skip a route that carries `unavailable`, which took it past the floor.
+    const std::set<std::string> kShortDescriptionBackfill{};
     CHECK(kShortDescriptionBackfill.size() <= 1); // a new short description is fixed, not listed
     for (const auto& name : kShortDescriptionBackfill) {
         INFO("backfill entry " << name);

@@ -151,6 +151,13 @@ std::string render_routes_table(const json& doc, std::string_view q_raw) {
              esc(str_of(r, "path")) + "</div>";
         if (const auto s = str_of(r, "summary"); !s.empty())
             h += "<div class=\"hint\">" + esc(s) + "</div>";
+        // An operation the document lists but this build does not register carries a
+        // marker string (build_routes_catalog passes x-yuzu-unavailable through). Keep the
+        // row, as /swagger and the discover routes do, but say it is not served so the
+        // page does not present it as callable.
+        if (const auto u = str_of(r, "unavailable"); !u.empty())
+            h += "<div class=\"hint\"><span class=\"pill warn\">unavailable</span> " + esc(u) +
+                 "</div>";
         h += "</td><td>";
         if (r.contains("tags") && r["tags"].is_array())
             for (const auto& t : r["tags"])

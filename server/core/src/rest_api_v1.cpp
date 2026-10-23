@@ -2696,7 +2696,9 @@ OpenApiStripResult openapi_strip_guides(const std::string& full) {
         if (tag.is_object())
             tag.erase("x-yuzu-guide");
     std::string out = doc.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
-    out.shrink_to_fit(); // sized exactly: one stable string for the process lifetime
+    // A request, not a guarantee: the standard lets shrink_to_fit() keep spare capacity. The
+    // string is built once and lives for the process lifetime, so the worst case is some slack.
+    out.shrink_to_fit();
     return {std::move(out), /*fell_back=*/false};
 }
 

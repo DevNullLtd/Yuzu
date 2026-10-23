@@ -11,6 +11,12 @@
 // The page is assembled from named pieces so each raw literal can be measured against
 // MSVC's 16,380-byte C2026 cap (docs/cpp-conventions.md); test_swagger_page.cpp keeps
 // every piece under 15,000 bytes.
+//
+// The kSwagger* pieces have external linkage on purpose, like kHelpHtml: there is no header for
+// them, test_swagger_page.cpp declares them extern to measure each piece, and page_routes.cpp
+// declares kSwaggerPageHtml the same way. They are link-namespace names, not an API: nothing
+// else should read them, and a new piece must be added to that test's list. kSwaggerPageHtml
+// points into shell::bake()'s static storage, which lives for the process.
 
 #include "app_shell.hpp"
 
@@ -98,7 +104,8 @@ extern const char* const kSwaggerCss = R"SWG(.sw-page{padding:22px 28px 36px;dis
 .sw-unavail{display:flex;gap:10px;align-items:baseline;margin-top:12px;padding:8px 12px;border:1px solid color-mix(in srgb,var(--warn) 50%,var(--line2));border-radius:var(--rad-ctl);background:var(--mds-color-bg-warning-tinted);color:var(--ink2)}
 .sw-unavail .pill{flex:none}
 .sw-alt{margin-top:6px;padding-left:10px;border-left:2px solid var(--line)}
-.sw-error .btn{margin-top:10px})SWG";
+.sw-error .btn{margin-top:10px}
+.sw-sr{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0})SWG";
 
 // End of <style>, the shell marker, the page header and the opening <script>.
 extern const char* const kSwaggerBody = R"SWG(
@@ -112,6 +119,7 @@ extern const char* const kSwaggerBody = R"SWG(
     <h1>API reference</h1>
     <div class="subtitle">Every REST v1 operation this server documents, read live from <code>/api/v1/openapi.json</code>. Agentic workers can read the same document over MCP as <code>yuzu://openapi</code>, without the group guides this page adds. Each group opens with a guide to what it is for, who may call it and what to watch for.</div>
   </div></header>
+  <div id="sw-status" class="sw-sr" role="status" aria-live="polite"></div>
   <div id="sw-root" class="mut"><noscript>The API reference needs JavaScript. Turn it on for this site, then reload the page.</noscript></div>
 </div>
 <div id="toast-container" class="toast-container"></div>
@@ -126,6 +134,10 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
   var MPILL = { get: 'ok', post: 'info', put: 'warn', patch: 'warn', 'delete': 'bad' };
   var spec = null, ops = [], tags = [], st = { q: '', method: '', tag: '', typed: '' };
   var root = document.getElementById('sw-root');
+  // A polite live region that outlives every re-render of #sw-root, so a screen reader hears
+  // that the page is loading, or why it failed. Text nodes only, like the rest of the page.
+  var live = document.getElementById('sw-status');
+  function say(t) { if (live) live.textContent = t; }
 
   // DOM helper: strings become text nodes, never markup (spec text contains "<plugin>").
   function h(tag, cls, kids) {
@@ -426,7 +438,7 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
     var msel = h('select', 'sw-ctl', [h('option', '', ['All methods'])].concat(METHODS.map(function (m) { return h('option', '', [m.toUpperCase()]); }))); msel.id = 'sw-m'; msel.setAttribute('aria-label', 'Method');
     var tsel = h('select', 'sw-ctl', [h('option', '', ['All groups'])].concat(tags.map(function (t) { return h('option', '', [t]); }))); tsel.id = 'sw-t'; tsel.setAttribute('aria-label', 'Group');
     var ysel = h('select', 'sw-ctl', ['Any response schema', 'Typed response', 'Untyped response'].map(function (t) { return h('option', '', [t]); })); ysel.id = 'sw-y'; ysel.setAttribute('aria-label', 'Response schema');
-    var count = h('span', 'mut', ['']);
+    var count = h('span', 'mut', ['']); count.setAttribute('role', 'status'); count.setAttribute('aria-live', 'polite');
 
     var summary = h('div', 'sw-chips', [
       h('span', 'chip', ['Operations', h('b', '', [String(ops.length)])]),
@@ -530,6 +542,7 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
     ysel.addEventListener('change', function () { st.typed = ['', 'typed', 'untyped'][ysel.selectedIndex]; apply(); });
 
     root.textContent = '';
+    say('');
     root.appendChild(summary);
     root.appendChild(bar);
     root.appendChild(h('div', 'sw-grid', [toc, main]));
@@ -544,10 +557,13 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
   function fail(msg, status, cid, hint) {
     root.textContent = '';
     var box = h('div', 'sw-error', [h('div', '', [msg])]);
-    if (hint) box.appendChild(h('div', 'mut', [hint]));
-    if (status === 401) box.appendChild(h('div', 'mut', ['Your session may have ended. Sign in again, then reload this page.']));
-    if (status === 403) box.appendChild(h('div', 'mut', ['Your account needs the Infrastructure:Read permission to read the API description.']));
-    if (cid) box.appendChild(h('div', 'mut mono', ['Correlation id: ' + cid]));
+    var said = [msg];
+    function note(t, cls) { box.appendChild(h('div', cls, [t])); said.push(t); }
+    if (hint) note(hint, 'mut');
+    if (status === 401) note('Your session may have ended. Sign in again, then reload this page.', 'mut');
+    if (status === 403) note('Your account needs the Infrastructure:Read permission to read the API description.', 'mut');
+    if (cid) note('Correlation id: ' + cid, 'mut mono');
+    say(said.join(' '));
     var retry = h('button', 'btn btn-sm', ['Retry']);
     retry.type = 'button';
     retry.addEventListener('click', load);
@@ -570,6 +586,7 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
   }
   function load() {
     root.textContent = 'Loading the API description...';
+    say('Loading the API description...');
     var ctl = typeof AbortController === 'function' ? new AbortController() : null;
     var timer = setTimeout(function () { if (ctl) ctl.abort(); }, 30000);
     var opts = { credentials: 'same-origin', headers: { Accept: 'application/json' } };

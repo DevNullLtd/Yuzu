@@ -11,7 +11,10 @@ page down, deep links, the v2 route's curl path, and the failure view (status-aw
 correlation id, Retry that fetches again). It also feeds hostile specs: schemas that reach themselves,
 a schema that throws, very wide schemas (the row budget), malformed entries, tags named after
 Object.prototype keys, and every failure shape (non-JSON 200, bodyless 502, network down, a null
-document), which must show a fixed message and never the raw JavaScript error.
+document), which must show a fixed message and never the raw JavaScript error. It drives the search box and
+the method / group / response-schema selects (rows hidden, counts, the empty view, the typed and
+untyped pills, the summary chips, the live regions) and runs the renderer once over the real
+document, the OpenAPI literal of rest_api_v1.cpp (the text openapi_spec_with_guides_json() serves).
 
 Skips cleanly (exit 77) when `node` is not on PATH, unless YUZU_REQUIRE_NODE=1 is set, in which
 case a missing node fails (exit 1). docs-lint.yml sets it on a hosted image that ships node, so
@@ -24,8 +27,17 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
-SRC = pathlib.Path(__file__).resolve().parents[1] / "server/core/src/swagger_page_ui.cpp"
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SRC = ROOT / "server/core/src/swagger_page_ui.cpp"
+SPEC_SRC = ROOT / "server/core/src/rest_api_v1.cpp"
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import test_openapi_literal_segments as literal  # noqa: E402  (the one lexer of the literal chain)
+
+# The inner subprocess limit stays under the meson timeout (60 s) so a hang reports itself
+# instead of being killed by the harness with no output.
+NODE_TIMEOUT = 45
 
 DRIVER = r"""
 const js = require('fs').readFileSync(0, 'utf8');
@@ -54,7 +66,8 @@ class E {
 const scrolled = [];
 const root = new E('div'); root.id = 'sw-root';
 globalThis.window = globalThis;
-globalThis.document = { getElementById: i => (i === 'sw-root' ? root : null), createElement: t => new E(t),
+const live = new E('div'); live.id = 'sw-status';
+globalThis.document = { getElementById: i => (i === 'sw-root' ? root : i === 'sw-status' ? live : null), createElement: t => new E(t),
   createTextNode: t => { const e = new E('#text'); e._t = String(t); return e; } };
 globalThis.location = { origin: 'https://yuzu.test', hash: '' };
 globalThis.history = { replaceState: (a, b, h) => { globalThis.location.hash = h; } };
@@ -259,6 +272,104 @@ const out = {};
   out.f_empty_panels = root.byTag('section').length;
   out.f_empty_text = root.textContent;
   out.console_errors = consoleErrors.length;
+
+  // ---- the live regions: loading and failure are announced, the success view is not ----
+  queue.push({ status: 503 }); location.hash = ''; (0, eval)(js);
+  out.live_loading = live.textContent;             // before the fetch settles
+  await settle();
+  out.live_error = live.textContent;
+  out.live_attrs = (document.getElementById('sw-status') === live);
+  await reload({ status: 403, body: { error: { correlation_id: 'req-live' } } });
+  out.live_403 = live.textContent;
+  await reload({ status: 200, body: spec });
+  out.live_cleared = live.textContent;
+
+  // ---- search and filter: events on the controls, rows hidden, counts, pills, chips ----
+  const rc = (extra) => ({ '200': Object.assign({ description: 'ok' }, extra || {}) });
+  const t200 = { content: { 'application/json': { schema: { type: 'object' } } } };
+  const specF = {
+    openapi: '3.0.3', info: { title: 't', version: '1' },
+    tags: [{ name: 'Alpha', description: 'a' }, { name: 'Beta', description: 'b' }],
+    paths: {
+      '/t1': { get: { summary: 'typed one', tags: ['Alpha'], responses: rc(t200) } },
+      '/t2': { post: { summary: 'typed two', tags: ['Alpha'], responses: rc(t200) } },
+      '/u1': { get: { summary: 'untyped one', tags: ['Beta'], responses: rc() } },
+      // A schema on an error response only: the success response is still untyped.
+      '/e1': { get: { summary: 'error schema', tags: ['Beta'], responses: Object.assign(rc(), { '404': t200 }) } },
+      '/x1': { delete: { summary: 'unserved', tags: ['Beta'], 'x-yuzu-unavailable': 'Not served.', responses: rc() } },
+      '/d1': { put: { summary: 'plain', description: 'Needle-Desc here', tags: ['Beta'], responses: rc() } }
+    }
+  };
+  await reload({ status: 200, body: specF });
+  const q = root.byTag('input')[0];
+  const [msel, tsel, ysel] = root.byTag('select');
+  const countEl = () => root.all(c => c.getAttribute('aria-live') === 'polite')[0];
+  const emptyEl = () => root.byClass('sw-empty')[0];
+  const rowsF = () => root.byClass('sw-op');
+  const keyOf = r => r.byClass('pill')[0].textContent + ' ' + pathOf(r);
+  const shown = () => rowsF().filter(r => !r.hidden).map(keyOf).sort();
+  const act = (el, type, mutate) => { mutate(); el.fire(type); };
+  const setQ = v => act(q, 'input', () => { q.value = v; });
+  const setSel = (el, i) => act(el, 'change', () => { el.selectedIndex = i; });
+  const reset = () => { setQ(''); setSel(msel, 0); setSel(tsel, 0); setSel(ysel, 0); };
+  out.f_all_shown = shown().length;
+  out.f_count0 = countEl().textContent;
+  out.f_count_live = countEl().getAttribute('role') + '/' + countEl().getAttribute('aria-live');
+  out.f_empty0 = emptyEl().hidden;
+  out.f_pills = rowsF().map(r => pathOf(r) + '=' + r.byClass('pill').slice(-1)[0].textContent).sort();
+  out.f_chips = root.byClass('chip').map(c => c.textContent);
+  setSel(ysel, 1); out.f_typed = shown(); out.f_typed_count = countEl().textContent;
+  setSel(ysel, 2); out.f_untyped = shown(); out.f_untyped_count = countEl().textContent;
+  reset();
+  setSel(msel, 1); out.f_get = shown();                       // GET
+  setSel(msel, 5); out.f_delete = shown(); out.f_delete_count = countEl().textContent;   // DELETE
+  reset();
+  setSel(tsel, 1); out.f_alpha = shown();
+  out.f_beta_panel_hidden = root.byTag('section').filter(p => p.byTag('h2')[0].textContent === 'Beta')[0].hidden;
+  out.f_alpha_sub = root.byTag('section').filter(p => p.byTag('h2')[0].textContent === 'Alpha')[0].byClass('sub')[0].textContent;
+  reset();
+  setQ('NEEDLE-desc'); out.f_search_desc = shown();           // matches the description, case-insensitively
+  setQ('typed'); out.f_search_summary = shown();              // matches "typed one", "typed two", "untyped one"
+  setSel(ysel, 1); out.f_search_and_typed = shown();          // narrowed again by the typed filter
+  reset();
+  setQ('no-such-operation'); out.f_none = shown().length; out.f_none_count = countEl().textContent;
+  out.f_none_empty = emptyEl().hidden; out.f_none_panels = root.byTag('section').filter(p => !p.hidden).length;
+  setQ(''); out.f_back_empty = emptyEl().hidden; out.f_back_shown = shown().length;
+
+  // ---- the real document: every operation drawn, every pill and filter agreeing with it ----
+  const real = JSON.parse(require('fs').readFileSync(process.argv[2], 'utf8'));
+  const M = ['get', 'post', 'put', 'patch', 'delete'];
+  const expect = []; Object.keys(real.paths).forEach(p => M.forEach(m => { const op = real.paths[p][m]; if (op && typeof op === 'object') {
+    const typedOp = Object.keys(op.responses || {}).some(c => /^2/.test(c) && op.responses[c] && op.responses[c].content &&
+      Object.keys(op.responses[c].content).some(mt => op.responses[c].content[mt].schema));
+    expect.push({ k: m.toUpperCase() + ' ' + p, typed: typedOp, unavail: !!op['x-yuzu-unavailable'] }); } }));
+  consoleErrors.length = 0;
+  await reload({ status: 200, body: real });
+  const rr = root.byClass('sw-op');
+  out.r_expect = expect.length; out.r_rows = rr.length;
+  out.r_expect_typed = expect.filter(e => e.typed && !e.unavail).length;
+  out.r_expect_untyped = expect.filter(e => !e.typed && !e.unavail).length;
+  out.r_expect_unavail = expect.filter(e => e.unavail).length;
+  const lastPill = r => r.byClass('pill').slice(-1)[0].textContent;
+  out.r_typed = rr.filter(r => lastPill(r) === 'typed').length;
+  out.r_untyped = rr.filter(r => lastPill(r) === 'untyped').length;
+  out.r_unavail = rr.filter(r => lastPill(r) === 'unavailable').length;
+  const rq = root.byTag('input')[0], [rm, rt, ry] = root.byTag('select');
+  const rcount = () => root.all(c => c.getAttribute('aria-live') === 'polite')[0].textContent;
+  out.r_count0 = rcount();
+  ry.selectedIndex = 1; ry.fire('change');
+  out.r_filter_typed = root.byClass('sw-op').filter(r => !r.hidden).length; out.r_expect_filter_typed = expect.filter(e => e.typed).length;
+  ry.selectedIndex = 2; ry.fire('change');
+  out.r_filter_untyped = root.byClass('sw-op').filter(r => !r.hidden).length; out.r_expect_filter_untyped = expect.filter(e => !e.typed).length;
+  ry.selectedIndex = 0; ry.fire('change');
+  rm.selectedIndex = 5; rm.fire('change');
+  out.r_filter_delete = root.byClass('sw-op').filter(r => !r.hidden).length; out.r_expect_delete = expect.filter(e => e.k.startsWith('DELETE ')).length;
+  rm.selectedIndex = 0; rm.fire('change');
+  out.r_panels = root.byTag('section').length;
+  out.r_expect_panels = new Set(Object.keys(real.paths).flatMap(p => M.map(m => real.paths[p][m]).filter(o => o && typeof o === 'object').map(o => (o.tags && o.tags[0]) || 'Untagged'))).size;
+  out.r_console_errors = consoleErrors.length;
+  out.r_guides = root.byClass('sw-gbtn').length;
+  out.r_expect_guides = (real.tags || []).filter(t => t['x-yuzu-guide']).length;
   console.log(JSON.stringify(out));
 })().catch(e => { console.log(JSON.stringify({ crash: String(e && e.stack || e) })); process.exit(1); });
 """
@@ -273,6 +384,20 @@ def extract_js():
             raise SystemExit("cannot find %s in %s" % (name, SRC))
         parts.append(m.group(1))
     return "".join(parts)
+
+
+def real_spec():
+    """The document openapi_spec_with_guides_json() serves: the literal chain of
+    rest_api_v1.cpp with its three ecosystem tokens substituted (here by stand-in names; the
+    renderer only reads the structure)."""
+    text = literal.chain_text(SPEC_SRC.read_bytes()).decode("utf-8")
+    text = (text.replace('"@@ECOSYSTEM_ENUM@@"', '"eco-a", "eco-b"')
+                .replace('"@@ECOSYSTEM_ENUM_OR_EMPTY@@"', '"", "eco-a", "eco-b"')
+                .replace("@@ECOSYSTEM_LIST@@", "eco-a|eco-b"))
+    doc = json.loads(text)
+    if len(doc.get("paths", {})) < 100:
+        raise ValueError("only %d paths in the literal: the chain was probably cut" % len(doc.get("paths", {})))
+    return doc
 
 
 def main():
@@ -295,7 +420,22 @@ def main():
     # The driver reads the script from stdin and evaluates it. Bytes both ways, UTF-8 explicitly:
     # the page script contains U+00A0 characters, which a locale codec such as cp1252 would
     # mangle in transit.
-    proc = subprocess.run([node, "-e", DRIVER], input=js.encode("utf-8"), capture_output=True, timeout=120)
+    try:
+        real = real_spec()
+    except (literal.ChainError, ValueError) as e:
+        print("FAIL")
+        print("  - cannot read the real OpenAPI document from rest_api_v1.cpp: %s" % e)
+        return 1
+    # The driver (16 KB) and the real document (about 1 MB) go to node as files, not as
+    # `node -e <source>`: a command line has a length limit on Windows, and a .cmd shim on PATH
+    # would be re-parsed by cmd.exe. The prefix keeps the name inside the Defender exclusion.
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_swagger_") as tmp:
+        driver = pathlib.Path(tmp) / "driver.js"
+        spec_file = pathlib.Path(tmp) / "openapi_with_guides.json"
+        driver.write_text(DRIVER, encoding="utf-8")
+        spec_file.write_text(json.dumps(real), encoding="utf-8")
+        proc = subprocess.run([node, str(driver), str(spec_file)], input=js.encode("utf-8"),
+                              capture_output=True, timeout=NODE_TIMEOUT)
     stdout = proc.stdout.decode("utf-8")
     stderr = proc.stderr.decode("utf-8", "replace")
     if proc.returncode != 0:
@@ -368,6 +508,48 @@ def main():
           "a build failure must be a fixed message with Retry: %r" % out["f_null_doc"])
     check(out["console_errors"] == 5, "each failure must be logged to the console for diagnosis, got %r" % out["console_errors"])
     check(out["f_empty_panels"] == 0 and "Operations" in out["f_empty_text"], "an empty but valid document must render without error")
+    # Live regions: a persistent polite region says that the page is loading or why it failed.
+    check(out["live_loading"] == "Loading the API description...", "loading must be announced: %r" % out["live_loading"])
+    check("HTTP 503" in out["live_error"] and out["live_attrs"], "a failure must be announced: %r" % out["live_error"])
+    check("HTTP 403" in out["live_403"] and "Infrastructure:Read" in out["live_403"] and "req-live" in out["live_403"],
+          "the announced failure must carry the status, the permission and the id: %r" % out["live_403"])
+    check(out["live_cleared"] == "", "the loading/failure announcement must clear once the page is drawn: %r" % out["live_cleared"])
+    # Search and filters.
+    check(out["f_all_shown"] == 6 and out["f_count0"] == "6 of 6 operations" and out["f_empty0"] is True,
+          "all six operations shown at first, with a count and no empty view: %r %r" % (out["f_all_shown"], out["f_count0"]))
+    check(out["f_count_live"] == "status/polite", "the filter count must be a polite live region: %r" % out["f_count_live"])
+    check(out["f_pills"] == ["/d1=untyped", "/e1=untyped", "/t1=typed", "/t2=typed", "/u1=untyped", "/x1=unavailable"],
+          "each row's pill: typed only for a 2xx schema, unavailable over both: %r" % out["f_pills"])
+    check(any(c == "Typed responses2 (33%)" for c in out["f_chips"]) and any(c == "Unavailable1" for c in out["f_chips"])
+          and any(c == "Operations6" for c in out["f_chips"]), "summary chips must count 6 / 2 typed (33%%) / 1 unavailable: %r" % out["f_chips"])
+    check(out["f_typed"] == ["GET /t1", "POST /t2"] and out["f_typed_count"] == "2 of 6 operations",
+          "the typed filter must keep only typed rows: %r %r" % (out["f_typed"], out["f_typed_count"]))
+    check(out["f_untyped"] == ["DELETE /x1", "GET /e1", "GET /u1", "PUT /d1"] and out["f_untyped_count"] == "4 of 6 operations",
+          "the untyped filter must keep the other four (an error-response schema is not typed): %r" % out["f_untyped"])
+    check(out["f_get"] == ["GET /e1", "GET /t1", "GET /u1"], "the GET filter: %r" % out["f_get"])
+    check(out["f_delete"] == ["DELETE /x1"] and out["f_delete_count"] == "1 of 6 operations", "the DELETE filter: %r" % out["f_delete"])
+    check(out["f_alpha"] == ["GET /t1", "POST /t2"] and out["f_beta_panel_hidden"] is True and out["f_alpha_sub"] == "2 of 2 operations",
+          "the group filter must hide the other group's panel: %r" % out["f_alpha"])
+    check(out["f_search_desc"] == ["PUT /d1"], "search must match descriptions, ignoring case: %r" % out["f_search_desc"])
+    check(out["f_search_summary"] == ["GET /t1", "GET /u1", "POST /t2"], "search must match summaries: %r" % out["f_search_summary"])
+    check(out["f_search_and_typed"] == ["GET /t1", "POST /t2"], "search and the typed filter must combine: %r" % out["f_search_and_typed"])
+    check(out["f_none"] == 0 and out["f_none_count"] == "0 of 6 operations" and out["f_none_empty"] is False and out["f_none_panels"] == 0,
+          "a search that matches nothing must show the empty view and no panels: %r" % out["f_none_count"])
+    check(out["f_back_empty"] is True and out["f_back_shown"] == 6, "clearing the search must bring every row back")
+    # The real document.
+    check(out["r_expect"] > 200 and out["r_rows"] == out["r_expect"], "one row per real operation: %r of %r" % (out["r_rows"], out["r_expect"]))
+    check(out["r_typed"] == out["r_expect_typed"] and out["r_untyped"] == out["r_expect_untyped"] and out["r_unavail"] == out["r_expect_unavail"],
+          "typed/untyped/unavailable pills over the real document: %r/%r/%r expected %r/%r/%r" % (
+              out["r_typed"], out["r_untyped"], out["r_unavail"], out["r_expect_typed"], out["r_expect_untyped"], out["r_expect_unavail"]))
+    check(out["r_count0"] == "%d of %d operations" % (out["r_expect"], out["r_expect"]), "the real document's count: %r" % out["r_count0"])
+    check(out["r_filter_typed"] == out["r_expect_filter_typed"] and out["r_filter_untyped"] == out["r_expect_filter_untyped"]
+          and out["r_filter_typed"] + out["r_filter_untyped"] == out["r_expect"],
+          "typed + untyped filters must partition the real operations: %r + %r" % (out["r_filter_typed"], out["r_filter_untyped"]))
+    check(out["r_filter_delete"] == out["r_expect_delete"] and out["r_filter_delete"] > 0, "the DELETE filter over the real document: %r" % out["r_filter_delete"])
+    check(out["r_panels"] == out["r_expect_panels"] and out["r_guides"] == out["r_expect_guides"] and out["r_guides"] > 0,
+          "one panel per group and a Guide button for every group that has one: %r/%r guides %r/%r" % (
+              out["r_panels"], out["r_expect_panels"], out["r_guides"], out["r_expect_guides"]))
+    check(out["r_console_errors"] == 0, "the real document must draw without a console error: %r" % out["r_console_errors"])
     if errors:
         print("FAIL")
         for e in errors:
