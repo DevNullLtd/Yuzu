@@ -246,14 +246,27 @@ TEST_CASE("writer: a bad dry_run is refused with a denied row and no store call"
 TEST_CASE("writer: no If-Match is 428 with a denied row and no store call",
           "[dex][score_policy_writer]") {
     World w;
-    const auto r = w.put(std::nullopt, doc_with_excellent(95.0));
-    CHECK(r.status == St::IfMatchMissing);
-    CHECK(r.message.find("If-Match") != std::string::npos);
-    REQUIRE(w.rows.size() == 1);
-    CHECK(w.rows[0].verb == "dex.score_policy.update");
-    CHECK(w.rows[0].result == "denied");
-    CHECK(w.rows[0].detail["reason"] == "if_match_missing");
-    CHECK(w.cas_calls == 0);
+    SECTION("PUT") {
+        const auto r = w.put(std::nullopt, doc_with_excellent(95.0));
+        CHECK(r.status == St::IfMatchMissing);
+        CHECK(r.message.find("If-Match") != std::string::npos);
+        REQUIRE(w.rows.size() == 1);
+        CHECK(w.rows[0].verb == "dex.score_policy.update");
+        CHECK(w.rows[0].result == "denied");
+        CHECK(w.rows[0].detail["reason"] == "if_match_missing");
+        CHECK(w.cas_calls == 0);
+    }
+    // DELETE shares the refusal but stamps its own verb on the row.
+    SECTION("DELETE") {
+        const auto r = w.del(std::nullopt);
+        CHECK(r.status == St::IfMatchMissing);
+        CHECK(r.message.find("If-Match") != std::string::npos);
+        REQUIRE(w.rows.size() == 1);
+        CHECK(w.rows[0].verb == "dex.score_policy.reset");
+        CHECK(w.rows[0].result == "denied");
+        CHECK(w.rows[0].detail["reason"] == "if_match_missing");
+        CHECK(w.car_calls == 0);
+    }
 }
 
 TEST_CASE("writer: a malformed If-Match is 400 and is recorded neutralised",
