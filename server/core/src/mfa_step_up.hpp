@@ -128,8 +128,11 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
 /// proof no older than `approver_step_up_window(configured_window_secs)`. Unlike
 /// `require_mfa_step_up` there is no `window_secs <= 0` escape hatch, no bearer
 /// exemption, no pass for an un-enrolled account and no enforcement-dependent OIDC
-/// pass. A local proof stamped before the current enrolment (the factor was cleared
-/// and re-enrolled since) does not count.
+/// pass. A local proof must belong to the factor enrolled now: a proof bound to a factor
+/// generation is judged by equality with the account's current generation
+/// (`judge_local_mfa_binding`; a mismatch is a 401 with `reason=proof_factor_mismatch`, an
+/// unreadable read or an unenforced binding trigger a 503). Transitional: a proof with no
+/// generation keeps the instant rule (stamped before the current enrolment does not count).
 ///
 /// The ceiling is hard and measured on the database clock. `durable` is the caller's
 /// authoritative read of the session's stored proof (`AuthManager::read_durable_mfa_proof`):

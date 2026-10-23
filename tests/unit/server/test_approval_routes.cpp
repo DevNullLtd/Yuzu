@@ -1919,6 +1919,12 @@ TEST_CASE("approval integration: the gate agrees with a session minted and re-st
         REQUIRE(stale);
         CHECK(stale->status == 401);
         CHECK(g.status_of(next) == "pending");
+        // The proof was bound to the old factor at mint; the re-enrolment advanced the
+        // generation, so it is refused as a mismatch (not by comparing instants).
+        bool mismatch = false;
+        for (const auto& a : g.h.audits)
+            mismatch |= a.detail.find("reason=proof_factor_mismatch") != std::string::npos;
+        CHECK(mismatch);
     }
 
     // ...and re-proving through the store's own stamp (database now()) clears it.
@@ -1931,6 +1937,104 @@ TEST_CASE("approval integration: the gate agrees with a session minted and re-st
     REQUIRE(again);
     CHECK(again->status == 200);
     CHECK(g.status_of(next) == "approved");
+}
+
+TEST_CASE("approval integration: a bound proof decides by generation equality, a mismatch is a "
+          "401 and the ticket stays pending (I13)",
+          "[server][routes][approval_routes][pg][approver_mfa]") {
+    RealGate g;
+    // alice re-enrols NOW: a proof verified before that moment would predate the enrolment by
+    // instant, but is bound to the generation that is current.
+    g.sql("UPDATE auth.users SET mfa_enrolled_at = now() WHERE username = $1", "alice");
+    const auto status = g.authdb->mfa_status("alice");
+    REQUIRE(status.has_value());
+    REQUIRE(status->factor_gen >= 2);
+    const auto now_ms =
+        std::chrono::duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    const auto bound = [&](std::int64_t gen) {
+        return auth::DurableMfaProof{auth::DurableMfaProof::Source::kRow, now_ms - 10'000, now_ms,
+                                     gen};
+    };
+    REQUIRE(bound(0).mfa_verified_ms < status->enrolled_at_ms);
+
+    g.h.session = g.session("alice", "local", auth::Role::admin, milliseconds(10'000));
+    g.durable = bound(status->factor_gen - 1);
+    {
+        auto res = g.decide("approve", g.id);
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(body(res->body)["meta"]["mfa_step_up_required"] == true);
+        CHECK(g.status_of(g.id) == "pending");
+        CHECK(g.audit_rows("attempted") == 0);
+        bool mismatch = false;
+        for (const auto& a : g.h.audits)
+            mismatch |= a.detail.find("reason=proof_factor_mismatch") != std::string::npos;
+        CHECK(mismatch);
+    }
+    g.durable = bound(status->factor_gen);
+    auto ok = g.decide("approve", g.id);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(g.status_of(g.id) == "approved");
+
+    // The same instant with no generation is the transitional instant rule: it predates.
+    const auto next = g.submit();
+    g.durable = bound(0);
+    auto old_rule = g.decide("approve", next);
+    REQUIRE(old_rule);
+    CHECK(old_rule->status == 401);
+    CHECK(g.status_of(next) == "pending");
+}
+
+// Enrol-then-approve (the user-visible flow the intermediate commits must keep working): a
+// user who has just enrolled can decide at once, both with the transitional UNBOUND stamp
+// (instant after the enrolment, old rule) and with a BOUND stamp whose instant was captured
+// before the enrolment (equality).
+TEST_CASE("approval integration: enrol then approve at once passes for an unbound and a bound "
+          "stamp (I14)",
+          "[server][routes][approval_routes][pg][approver_mfa]") {
+    RealGate g;
+    yuzu::server::SessionStore store{g.authdb.pool()};
+    REQUIRE(store.is_open());
+    auth::AuthManager mgr;
+    mgr.set_auth_db(g.authdb.get());
+    mgr.set_session_store(&store);
+
+    g.add_user("dave", auth::Role::user);
+    for (const bool bound : {false, true}) {
+        INFO(std::string(bound ? "bound" : "unbound") + " stamp");
+        const auto user = bound ? std::string("erin") : std::string("dave");
+        if (bound)
+            g.add_user(user, auth::Role::user);
+        // Password-only session first (no proof), then the enrolment, then the step-up stamp.
+        const auto token = mgr.create_local_session_for_test(user, auth::Role::user, false);
+        REQUIRE_FALSE(token.empty());
+        g.enroll(user);
+        const auto st = g.authdb->mfa_status(user);
+        REQUIRE(st.has_value());
+        REQUIRE(st->enrolled);
+        if (bound) {
+            // Verified 2 s BEFORE the enrolment instant, bound to the generation it produced.
+            REQUIRE(mgr.mark_session_mfa_verified(
+                token, yuzu::server::LocalMfaProof{st->factor_gen, st->enrolled_at_ms - 2'000}));
+        } else {
+            REQUIRE(mgr.mark_session_mfa_verified(token));
+        }
+        auto live = mgr.validate_session(token);
+        REQUIRE(live.has_value());
+        g.h.session = live;
+        g.durable = mgr.read_durable_mfa_proof(token, user);
+        REQUIRE(g.durable->source == auth::DurableMfaProof::Source::kRow);
+        CHECK((g.durable->mfa_factor_gen > 0) == bound);
+        if (bound)
+            CHECK(g.durable->mfa_verified_ms < st->enrolled_at_ms);
+
+        const auto ticket = g.submit();
+        auto res = g.decide("approve", ticket);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(g.status_of(ticket) == "approved");
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -36,6 +36,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -1134,6 +1135,375 @@ TEST_CASE_METHOD(ApproverFixture,
         REQUIRE(audits.size() == 1);
         CHECK(audits[0].detail.find("reason=") == std::string::npos);
     }
+}
+
+// ── judge_local_mfa_binding / durable_proof_age (#6079): the shared pure judgements ─────────
+
+namespace {
+
+using Source = auth::DurableMfaProof::Source;
+
+constexpr auth::DurableMfaProof proof_row(std::int64_t verified_ms, std::int64_t db_now_ms,
+                                          std::int64_t gen) {
+    return {Source::kRow, verified_ms, db_now_ms, gen};
+}
+
+} // namespace
+
+TEST_CASE("judge_local_mfa_binding: every arm, its reason token and its precedence",
+          "[mfa][stepup][approver][judge]") {
+    // kBound: equality is the only way in, and a bound verdict carries no refusal token.
+    {
+        const auto j = judge_local_mfa_binding(proof_row(1'000, 2'000, 7), 7, true);
+        CHECK(j.kind == LocalMfaBinding::kBound);
+        CHECK(j.reason.empty());
+        CHECK(judge_local_mfa_binding(proof_row(1, 2, 1), 1, true).kind == LocalMfaBinding::kBound);
+    }
+    // kMismatch: neither a lower nor a higher generation is "close enough", and an unreadable
+    // current generation never matches a bound proof.
+    for (const std::int64_t current : {6, 8, 100, 0, -1}) {
+        INFO("current=" << current);
+        const auto j = judge_local_mfa_binding(proof_row(1'000, 2'000, 7), current, true);
+        CHECK(j.kind == LocalMfaBinding::kMismatch);
+        CHECK(j.reason == "proof_factor_mismatch");
+    }
+    // kUnbound: a proof with no generation, whatever the account's generation is.
+    for (const std::int64_t gen : {0, -1}) {
+        INFO("gen=" << gen);
+        for (const std::int64_t current : {0, 1, 7}) {
+            const auto j = judge_local_mfa_binding(proof_row(1'000, 2'000, gen), current, true);
+            CHECK(j.kind == LocalMfaBinding::kUnbound);
+            CHECK(j.reason == "proof_factor_unbound");
+        }
+    }
+    // kNoProof: an absent row, or a row that carries no proof instant (even one still holding a
+    // generation: a binding without a proof is no proof).
+    {
+        const auto absent = judge_local_mfa_binding({Source::kAbsent, 0, 2'000, 0}, 7, true);
+        CHECK(absent.kind == LocalMfaBinding::kNoProof);
+        CHECK(absent.reason == "mfa_proof_missing");
+        CHECK(judge_local_mfa_binding(proof_row(0, 2'000, 7), 7, true).kind ==
+              LocalMfaBinding::kNoProof);
+        CHECK(judge_local_mfa_binding(proof_row(-5, 2'000, 7), 7, true).kind ==
+              LocalMfaBinding::kNoProof);
+        // A stray proof on an absent row is still absent.
+        CHECK(judge_local_mfa_binding({Source::kAbsent, 1'000, 2'000, 7}, 7, true).kind ==
+              LocalMfaBinding::kNoProof);
+    }
+    // kUnavailable: a degraded read (the zero value), or a row whose database clock is unusable.
+    {
+        const auto zero = judge_local_mfa_binding(auth::DurableMfaProof{}, 7, true);
+        CHECK(zero.kind == LocalMfaBinding::kUnavailable);
+        CHECK(zero.reason == "mfa_proof_unavailable");
+        CHECK(judge_local_mfa_binding(proof_row(1'000, 0, 7), 7, true).kind ==
+              LocalMfaBinding::kUnavailable);
+        CHECK(judge_local_mfa_binding(proof_row(1'000, -1, 7), 7, true).kind ==
+              LocalMfaBinding::kUnavailable);
+        // An absent row with no clock is NOT unavailable: it names no clock to distrust.
+        CHECK(judge_local_mfa_binding({Source::kAbsent, 0, 0, 0}, 7, true).kind ==
+              LocalMfaBinding::kNoProof);
+    }
+    // kUnenforced: the trigger is not observed in force, so even a perfect proof is undecidable.
+    {
+        const auto j = judge_local_mfa_binding(proof_row(1'000, 2'000, 7), 7, false);
+        CHECK(j.kind == LocalMfaBinding::kUnenforced);
+        CHECK(j.reason == "mfa_binding_unenforced");
+    }
+    // Precedence: undecidable (unavailable, then unenforced) before any statement about the proof.
+    CHECK(judge_local_mfa_binding(auth::DurableMfaProof{}, 7, false).kind ==
+          LocalMfaBinding::kUnavailable);
+    CHECK(judge_local_mfa_binding({Source::kAbsent, 0, 2'000, 0}, 7, false).kind ==
+          LocalMfaBinding::kUnenforced);
+    CHECK(judge_local_mfa_binding(proof_row(1'000, 2'000, 0), 7, false).kind ==
+          LocalMfaBinding::kUnenforced);
+    CHECK(judge_local_mfa_binding(proof_row(1'000, 2'000, 3), 7, false).kind ==
+          LocalMfaBinding::kUnenforced);
+    // The two-argument shape is usable at compile time (pure, no I/O).
+    static_assert(judge_local_mfa_binding(proof_row(1'000, 2'000, 2), 2, true).kind ==
+                  LocalMfaBinding::kBound);
+    static_assert(judge_local_mfa_binding(auth::DurableMfaProof{}, 2, true).kind ==
+                  LocalMfaBinding::kUnavailable);
+}
+
+TEST_CASE("durable_proof_age: fresh iff the age on the database clock lies in [0, window]",
+          "[mfa][stepup][approver][judge]") {
+    constexpr long long kWindow = 300'000;
+    // Boundaries: the same millisecond is age 0, exactly the window is fresh, one more is not.
+    {
+        const auto zero = durable_proof_age(proof_row(5'000, 5'000, 1), kWindow);
+        CHECK(zero.fresh);
+        CHECK(zero.age_secs == 0);
+        const auto edge = durable_proof_age(proof_row(5'000, 5'000 + kWindow, 1), kWindow);
+        CHECK(edge.fresh);
+        CHECK(edge.age_secs == 300);
+        const auto over = durable_proof_age(proof_row(5'000, 5'000 + kWindow + 1, 1), kWindow);
+        CHECK_FALSE(over.fresh);
+        CHECK(over.age_secs == 300); // the age is still reported, floored to whole seconds
+    }
+    // Whole seconds are floored, never rounded up.
+    CHECK(durable_proof_age(proof_row(1'000, 1'999, 1), kWindow).age_secs == 0);
+    CHECK(durable_proof_age(proof_row(1'000, 2'000, 1), kWindow).age_secs == 1);
+    CHECK(durable_proof_age(proof_row(1'000, 450'999, 1), kWindow).age_secs == 449);
+    // A zero window admits only an age of exactly zero.
+    CHECK(durable_proof_age(proof_row(5'000, 5'000, 1), 0).fresh);
+    CHECK_FALSE(durable_proof_age(proof_row(5'000, 5'001, 1), 0).fresh);
+    // Future-dated (a proof instant later than the database clock): never fresh, no age.
+    {
+        const auto future = durable_proof_age(proof_row(5'001, 5'000, 1), kWindow);
+        CHECK_FALSE(future.fresh);
+        CHECK(future.age_secs == -1);
+    }
+    // No usable row, no proof, or no usable clock: not fresh, no age. The generation plays no part.
+    for (const auto& d :
+         {auth::DurableMfaProof{}, auth::DurableMfaProof{Source::kAbsent, 5'000, 6'000, 1},
+          proof_row(0, 6'000, 1), proof_row(-1, 6'000, 1), proof_row(5'000, 0, 1),
+          proof_row(5'000, -1, 1)}) {
+        const auto a = durable_proof_age(d, kWindow);
+        CHECK_FALSE(a.fresh);
+        CHECK(a.age_secs == -1);
+    }
+    CHECK(durable_proof_age(proof_row(5'000, 6'000, 0), kWindow).fresh); // unbound is still timely
+    static_assert(durable_proof_age(proof_row(1, 2, 1), 10).fresh);
+    static_assert(!durable_proof_age(proof_row(1, 20, 1), 10).fresh);
+}
+
+// ── the approver gate's binding decision over a real AuthDB (#6079) ──────────────────────────
+//
+// alice / carol are enrolled and backdated an hour (ApproverFixture); every durable row here is
+// hand-built so the generation, the proof instant and the database clock are each controlled.
+
+namespace {
+
+struct BindingFixture : ApproverFixture {
+    /// The account's CURRENT generation, as the gate's own probe reads it.
+    std::int64_t gen_of(const std::string& user) {
+        return probe_mfa_factor(make_session(user, "local", system_clock::now()), *db).factor_gen;
+    }
+    /// A durable row `age_ms` old on a database clock reading "now" (+5 ms, as `durable_row_for`).
+    static auth::DurableMfaProof durable_aged(long long age_ms, std::int64_t gen) {
+        const auto now =
+            std::chrono::duration_cast<milliseconds>(system_clock::now().time_since_epoch())
+                .count() +
+            5;
+        return {Source::kRow, now - age_ms, now, gen};
+    }
+    void exec_plain(const char* statement) {
+        auto lease = db.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(lease.get(), statement, std::vector<std::string>{});
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    static bool detail_has(const AuditCapture& a, const char* what) {
+        return a.detail.find(what) != std::string::npos;
+    }
+};
+
+} // namespace
+
+TEST_CASE_METHOD(BindingFixture,
+                 "probe_mfa_factor: an enrolled local probe carries the generation, "
+                 "the database clock and the enforcement flag",
+                 "[pg][mfa][stepup][approver][probe][binding]") {
+    const auto before = probe_mfa_factor(make_session("alice", "local", system_clock::now()), *db);
+    REQUIRE(before.state == MfaFactorState::kEnrolledLocal);
+    CHECK(before.factor_gen >= 1);
+    CHECK(before.binding_enforced);
+    const auto wall_ms =
+        std::chrono::duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    CHECK(before.db_now_ms > 0);
+    CHECK(std::llabs(before.db_now_ms - wall_ms) < 60'000); // same clock domain, never the cache's
+
+    // Every change of the enrolment instant advances the generation by exactly one.
+    backdate_enrolment("alice", seconds(7200));
+    const auto after = probe_mfa_factor(make_session("alice", "local", system_clock::now()), *db);
+    CHECK(after.factor_gen == before.factor_gen + 1);
+
+    // Every non-enrolled-local state carries none of it.
+    for (const auto& p : {probe_mfa_factor(make_session("bob", "local"), *db),
+                          probe_mfa_factor(make_session("alice", "oidc", system_clock::now()), *db),
+                          probe_mfa_factor(make_session("alice", "saml", system_clock::now()), *db),
+                          probe_mfa_factor(make_session("alice", "api_token"), *db)}) {
+        CHECK(p.factor_gen == 0);
+        CHECK(p.db_now_ms == 0);
+    }
+}
+
+TEST_CASE_METHOD(BindingFixture,
+                 "require_enrolled_fresh_mfa: a bound proof is decided by generation "
+                 "equality, even when its instant precedes the enrolment",
+                 "[pg][mfa][stepup][approver][binding]") {
+    // alice re-enrols NOW: the enrolment instant is a moment ago and the proof was verified 10 s
+    // before it (the shape a verifier produces: the instant is captured BEFORE the enrolment
+    // UPDATE). Under the instant rule this is refused; under the generation it is the one factor.
+    sql("UPDATE auth.users SET mfa_enrolled_at = now() WHERE username = $1", "alice");
+    const auto g = gen_of("alice");
+    REQUIRE(g >= 2);
+    const auto enrolled_at = probe_mfa_factor(make_session("alice", "local"), *db).enrolled_at_ms;
+    const auto bound = durable_aged(10'000, g);
+    REQUIRE(bound.mfa_verified_ms < enrolled_at); // the premise: the instant precedes enrolment
+
+    const auto cached = make_session("alice", "local", system_clock::now());
+    {
+        auto r = run(cached, 300, nullptr, bound);
+        CHECK(r.outcome.kind == Kind::kPass);
+        check_untouched(r);
+        CHECK(audits.empty());
+    }
+    // Control: the SAME instant with no generation is the old instant rule, and it refuses.
+    {
+        auto r = run(cached, 300, nullptr, durable_aged(10'000, 0));
+        CHECK(r.outcome.kind == Kind::kChallengeWritten);
+        REQUIRE(audits.size() == 1);
+        CHECK(detail_has(audits[0], "reason=proof_predates_enrolment"));
+    }
+    // Equality does not excuse the window: a bound proof past the ceiling is still stale, and
+    // a stale proof is not a mismatch (no reason token).
+    audits.clear();
+    {
+        auto r = run(cached, 300, nullptr, durable_aged(400'000, g));
+        CHECK(r.outcome.kind == Kind::kChallengeWritten);
+        CHECK(r.res.status == 401);
+        REQUIRE(audits.size() == 1);
+        CHECK_FALSE(detail_has(audits[0], "reason="));
+        CHECK(detail_has(audits[0], "age_secs=400"));
+    }
+}
+
+TEST_CASE_METHOD(BindingFixture,
+                 "require_enrolled_fresh_mfa: a proof bound to another generation "
+                 "is a 401 proof_factor_mismatch, fresh or not",
+                 "[pg][mfa][stepup][approver][binding]") {
+    backdate_enrolment("alice", seconds(7200)); // gen >= 3, so g - 1 and g - 2 are real generations
+    backdate_enrolment("alice", seconds(3600));
+    const auto g = gen_of("alice");
+    REQUIRE(g >= 3);
+    const auto cached = make_session("alice", "local", system_clock::now());
+    for (const std::int64_t other : {g - 1, g - 2, g + 1, g + 1000}) {
+        INFO("proof gen=" << other << " current=" << g);
+        audits.clear();
+        auto r = run(cached, 300, nullptr, durable_aged(5'000, other));
+        CHECK(r.outcome.kind == Kind::kChallengeWritten);
+        CHECK(r.outcome.factor == MfaFactorState::kEnrolledLocal);
+        CHECK(r.res.status == 401);
+        auto body = nlohmann::json::parse(r.res.body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK(body["meta"]["mfa_step_up_required"] == true);
+        CHECK(body["meta"]["challenge_url"] == "/login/mfa/stepup");
+        REQUIRE(audits.size() == 1);
+        CHECK(audits[0].action == "mfa.step_up.required");
+        CHECK(detail_has(audits[0], "reason=proof_factor_mismatch"));
+    }
+    // The mismatch is decided before freshness: a mismatched AND stale proof names the factor.
+    audits.clear();
+    {
+        auto r = run(cached, 300, nullptr, durable_aged(400'000, g - 1));
+        CHECK(r.outcome.kind == Kind::kChallengeWritten);
+        REQUIRE(audits.size() == 1);
+        CHECK(detail_has(audits[0], "reason=proof_factor_mismatch"));
+    }
+    // And the matching generation passes (the control that the case above is not vacuous).
+    audits.clear();
+    CHECK(run(cached, 300, nullptr, durable_aged(5'000, g)).outcome.kind == Kind::kPass);
+    CHECK(audits.empty());
+}
+
+TEST_CASE_METHOD(BindingFixture,
+                 "require_enrolled_fresh_mfa: an unbound proof keeps the instant rule "
+                 "(transitional)",
+                 "[pg][mfa][stepup][approver][binding]") {
+    // bob enrols NOW, so the enrolment instant is a few ms ago and the boundary is exact.
+    enroll("bob");
+    const auto probe = probe_mfa_factor(make_session("bob", "local"), *db);
+    REQUIRE(probe.state == MfaFactorState::kEnrolledLocal);
+    const auto at = [&](std::int64_t verified_ms) -> auth::DurableMfaProof {
+        return {Source::kRow, verified_ms, probe.enrolled_at_ms + 60'000, 0};
+    };
+    const auto cached = make_session("bob", "local", system_clock::now());
+    // After the enrolment (or at the same millisecond): passes.
+    CHECK(run(cached, 300, nullptr, at(probe.enrolled_at_ms)).outcome.kind == Kind::kPass);
+    CHECK(run(cached, 300, nullptr, at(probe.enrolled_at_ms + 1)).outcome.kind == Kind::kPass);
+    // One millisecond before: refused, naming the old reason.
+    audits.clear();
+    {
+        auto r = run(cached, 300, nullptr, at(probe.enrolled_at_ms - 1));
+        CHECK(r.outcome.kind == Kind::kChallengeWritten);
+        CHECK(r.res.status == 401);
+        REQUIRE(audits.size() == 1);
+        CHECK(detail_has(audits[0], "reason=proof_predates_enrolment"));
+    }
+    // A negative generation is as unbound as zero.
+    CHECK(
+        run(cached, 300, nullptr,
+            auth::DurableMfaProof{Source::kRow, probe.enrolled_at_ms, probe.enrolled_at_ms + 1, -3})
+            .outcome.kind == Kind::kPass);
+}
+
+TEST_CASE_METHOD(BindingFixture,
+                 "require_enrolled_fresh_mfa: a row with no proof, or a binding with "
+                 "no instant, is a plain challenge with no reason",
+                 "[pg][mfa][stepup][approver][binding]") {
+    const auto g = gen_of("alice");
+    const auto cached = make_session("alice", "local", system_clock::now());
+    const auto now = durable_aged(0, g).db_now_ms;
+    for (const auto& d : {auth::DurableMfaProof{Source::kRow, 0, now, g},
+                          auth::DurableMfaProof{Source::kRow, 0, now, 0},
+                          auth::DurableMfaProof{Source::kAbsent, 0, now, 0}}) {
+        audits.clear();
+        auto r = run(cached, 300, nullptr, d);
+        CHECK(r.outcome.kind == Kind::kChallengeWritten);
+        CHECK(r.res.status == 401);
+        REQUIRE(audits.size() == 1);
+        CHECK_FALSE(detail_has(audits[0], "reason="));
+    }
+}
+
+TEST_CASE_METHOD(BindingFixture,
+                 "require_enrolled_fresh_mfa: a row with no usable database clock "
+                 "is a 503, never a decision",
+                 "[pg][mfa][stepup][approver][binding]") {
+    const auto g = gen_of("alice");
+    const auto cached = make_session("alice", "local", system_clock::now());
+    for (const std::int64_t gen : {g, std::int64_t{0}}) {
+        INFO("gen=" << gen);
+        yuzu::MetricsRegistry metrics;
+        auto d = durable_aged(1'000, gen);
+        d.db_now_ms = 0;
+        auto r = run(cached, 300, &metrics, d);
+        CHECK(r.outcome.kind == Kind::kStoreUnavailable);
+        CHECK(r.outcome.factor == MfaFactorState::kStoreUnavailable);
+        check_untouched(r);
+        CHECK(audits.empty());
+        CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}})
+                  .value() == 1.0);
+    }
+}
+
+TEST_CASE_METHOD(BindingFixture,
+                 "require_enrolled_fresh_mfa: an unenforced generation trigger is a "
+                 "503 for a local proof, bound or not, and leaves SSO alone",
+                 "[pg][mfa][stepup][approver][binding]") {
+    const auto g = gen_of("alice");
+    const auto cached = make_session("alice", "local", system_clock::now());
+    REQUIRE(run(cached, 300, nullptr, durable_aged(5'000, g)).outcome.kind == Kind::kPass);
+
+    db->set_binding_validation_memo_for_test(std::chrono::milliseconds(0)); // validate every read
+    exec_plain("DROP TRIGGER users_mfa_factor_gen ON auth.users");
+
+    for (const std::int64_t gen : {g, std::int64_t{0}}) {
+        INFO("proof gen=" << gen);
+        yuzu::MetricsRegistry metrics;
+        auto r = run(cached, 300, &metrics, durable_aged(5'000, gen));
+        CHECK(r.outcome.kind == Kind::kStoreUnavailable);
+        check_untouched(r);
+        CHECK(audits.empty());
+        CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}})
+                  .value() == 1.0);
+    }
+    // The flag is the read's own: the probe reports it.
+    CHECK_FALSE(probe_mfa_factor(cached, *db).binding_enforced);
+    // An SSO proof never reads the generation, so it is not held hostage by the local trigger.
+    CHECK(run(with_wall_proof(*this, "oidc:x#y", "oidc", seconds(10))).outcome.kind == Kind::kPass);
 }
 
 TEST_CASE("ApproverMfaOutcome: a value-initialised outcome refuses (R20)",

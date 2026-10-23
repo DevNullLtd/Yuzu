@@ -10,6 +10,8 @@
 #include <httplib.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <string>
 #include <string_view>
 
 namespace yuzu::server {
@@ -97,36 +99,39 @@ void write_step_up_challenge(const httplib::Request& req, httplib::Response& res
 
 MfaFactorProbe probe_mfa_factor(const auth::Session& session, AuthDB& auth_db) {
     if (session.auth_source == "saml")
-        return {MfaFactorState::kSamlUnsupported, 0};
+        return {MfaFactorState::kSamlUnsupported};
     if (session.auth_source == "oidc") {
         // An SSO identity has no local `users` row to consult; its only evidence is the
         // `amr`-seeded proof /auth/callback stamped on the session.
         const bool has_proof = session.steady_mfa_verified.time_since_epoch().count() != 0;
-        return {has_proof ? MfaFactorState::kIdpAttested : MfaFactorState::kNoIdpProof, 0};
+        return {has_proof ? MfaFactorState::kIdpAttested : MfaFactorState::kNoIdpProof};
     }
     if (session.auth_source != "local")
-        return {MfaFactorState::kNotInteractive, 0};
+        return {MfaFactorState::kNotInteractive};
 
     auto status = auth_db.mfa_status(session.username);
     if (!status) {
         if (is_store_unavailable(status.error()))
-            return {MfaFactorState::kStoreUnavailable, 0};
+            return {MfaFactorState::kStoreUnavailable};
         // mfa_status reads active rows only: a deactivated or deleted account (or a name that
         // is not a valid username) is a different remedy from "not enrolled", so it gets its
         // own state. Still a refusal; never a pass.
         if (status.error() == AuthDBError::UserNotFound ||
             status.error() == AuthDBError::InvalidUsername)
-            return {MfaFactorState::kAccountUnavailable, 0};
-        return {MfaFactorState::kNotEnrolled, 0};
+            return {MfaFactorState::kAccountUnavailable};
+        return {MfaFactorState::kNotEnrolled};
     }
     if (!status->enrolled)
-        return {MfaFactorState::kNotEnrolled, 0};
+        return {MfaFactorState::kNotEnrolled};
     // `enrolled` implies a non-NULL enrolment instant, which reads back as a positive epoch
-    // ms. A non-positive value would silently skip the pre-enrolment proof check in
-    // require_enrolled_fresh_mfa, so it is treated as an unreadable row (fail closed).
-    if (status->enrolled_at_ms <= 0)
-        return {MfaFactorState::kStoreUnavailable, 0};
-    return {MfaFactorState::kEnrolledLocal, status->enrolled_at_ms};
+    // ms, and a database-owned generation of at least 1 (the trigger advances it on every
+    // enrolment). A non-positive value of either is an unreadable row (fail closed): the
+    // first would silently skip the pre-enrolment proof check, the second would make the
+    // binding comparison vacuous.
+    if (status->enrolled_at_ms <= 0 || status->factor_gen <= 0)
+        return {MfaFactorState::kStoreUnavailable};
+    return {MfaFactorState::kEnrolledLocal, status->enrolled_at_ms, status->factor_gen,
+            status->db_now_ms, status->binding_enforced};
 }
 
 ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httplib::Response& res,
@@ -233,18 +238,44 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
         }
     }
 
-    // A local proof stamped before the CURRENT enrolment was made under a factor that has
-    // since been cleared (disable / reset) or replaced; it says nothing about this one.
-    // Equal passes: both instants are authored by the same database clock at ms resolution.
-    const bool predates = probe.state == MfaFactorState::kEnrolledLocal && has_proof &&
-                          proof_ms < probe.enrolled_at_ms;
+    // A local proof is judged against the factor that is enrolled NOW. A proof bound to a
+    // generation (gen > 0) is decided by generation equality (judge_local_mfa_binding), which
+    // no timestamp can forge or skew: a repeated or forward-skewed enrolment instant moves
+    // nothing, a cleared and re-enrolled factor has a new generation. A proof with NO
+    // generation (a legacy row, a row the rebind guard unbound, or a stamp written before the
+    // routes carry the binding) keeps the instant rule for now: stamped before the CURRENT
+    // enrolment means it was made under a factor since cleared or replaced. Equal passes: both
+    // instants are authored by the same database clock at ms resolution. TRANSITIONAL: the
+    // instant rule goes when every stamp site carries a generation; an unbound proof is then a
+    // challenge.
+    std::string refusal_detail;
+    if (probe.state == MfaFactorState::kEnrolledLocal) {
+        const auto judgement =
+            judge_local_mfa_binding(durable, probe.factor_gen, probe.binding_enforced);
+        switch (judgement.kind) {
+        case LocalMfaBinding::kUnavailable:
+            return store_unavailable("durable mfa proof");
+        case LocalMfaBinding::kUnenforced:
+            return store_unavailable("mfa factor binding");
+        case LocalMfaBinding::kMismatch:
+            refusal_detail = "reason=";
+            refusal_detail += judgement.reason;
+            break;
+        case LocalMfaBinding::kUnbound:
+            if (has_proof && proof_ms < probe.enrolled_at_ms)
+                refusal_detail = "reason=proof_predates_enrolment";
+            break;
+        case LocalMfaBinding::kNoProof:
+        case LocalMfaBinding::kBound:
+            break;
+        }
+    }
 
-    if (within_window && !predates)
+    if (within_window && refusal_detail.empty())
         return {Kind::kPass, probe.state};
 
-    detail::write_step_up_challenge(
-        req, res, session, session.auth_source == "oidc", audit_fn, action_label, age_secs,
-        window_secs, predates ? "reason=proof_predates_enrolment" : std::string_view{});
+    detail::write_step_up_challenge(req, res, session, session.auth_source == "oidc", audit_fn,
+                                    action_label, age_secs, window_secs, refusal_detail);
     return {Kind::kChallengeWritten, probe.state};
 }
 
