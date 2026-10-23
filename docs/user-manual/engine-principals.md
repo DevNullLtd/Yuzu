@@ -401,7 +401,7 @@ What `ok:true` means, and what it does not:
   triggers it). A success row whose write was dropped is signalled only by
   `Sec-Audit-Failed` on REST (the MCP tool gives no signal). A period with no
   rows is therefore not evidence that the check ran or that it passed; absence
-  of rows shows only that nobody ran it. The grants, the roles and the role permissions are three separate
+  of rows shows at most that no recorded run exists. The grants, the roles and the role permissions are three separate
   reads, not one snapshot: a role granted or edited between them is picked up by
   the next run. Run it after every role assignment to an engine principal
   and periodically as part of a machine-identity access review.
