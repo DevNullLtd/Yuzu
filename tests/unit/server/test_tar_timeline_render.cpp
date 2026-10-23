@@ -1864,8 +1864,9 @@ TEST_CASE("tar timeline css: one .tl- block, tokens only, no text on a filled hi
     const auto iend = css.find("/* -- end Timeline page interaction states", istart);
     REQUIRE(iend != std::string::npos);
     const std::string ib = css.substr(istart, iend - istart);
+    // touch-action: pan-y keeps vertical page scroll on touch while the scrub owns the horizontal drag.
     for (const char* needle : {".tl-ctl .btn.play[aria-pressed=\"true\"]", ".tl-det.busy", ".tl.scrubbing .tl-body",
-                               ".tl-body:focus-visible", "var(--hl)"})
+                               ".tl-body:focus-visible", ".tl-body { touch-action: pan-y; }", "var(--hl)"})
         contains(ib, needle);
     for (const char* banned : {"#", "gradient", "url(", "@import"})
         CHECK(count_of(ib, banned) == 0);
@@ -1929,4 +1930,26 @@ TEST_CASE("tar timeline page contract: the window, the moment and the links are 
     const auto hs = render_timeline_selected(h, "P2", W0 + 3300, links_full());
     contains(hs, "data-ref=\"" + escaped("a\"><x>") + "\"");
     lacks(hs, "<x>");
+}
+
+// yuzu-tar-timeline.js repeats two renderer facts as literals (its playheadLeft and edgeClass); the
+// node test pins the same strings, so a change on either side fails one of the two suites.
+TEST_CASE("tar timeline page contract: the playhead position and the chip edge thresholds",
+          "[tar][timeline]") {
+    auto m = with_lane(lane("l", "process", "p"));
+    m.moment_ts = W0 + 1800; // 50% of the one-hour window
+    const auto mid = render_timeline_lanes(m);
+    contains(mid, "style=\"left:calc(var(--gut) + (100% - var(--gut)) * 0.50000)\"><b>");
+    contains(mid, "style=\"left:calc(var(--gut) + (100% - var(--gut)) * 0.50000 + 1px)\"");
+    // fraction of the window -> chip class: past 90% it hangs left ("e"), before 5% right ("s")
+    struct Edge {
+        std::int64_t at;
+        const char* cls;
+    };
+    for (const auto& e : {Edge{W0 + 3276, " class=\"e\""}, Edge{W0 + 3240, ""}, Edge{W0 + 144, " class=\"s\""},
+                          Edge{W0 + 180, ""}}) {
+        m.moment_ts = e.at;
+        INFO("moment at " << (e.at - W0) << " s of 3600");
+        contains(render_timeline_lanes(m), std::string("\"><b") + e.cls + ">");
+    }
 }

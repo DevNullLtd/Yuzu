@@ -12,10 +12,18 @@ Rules under test:
   - every committed time change (pointer release, key, range change, nav link, block click)
     requests the moment panel, and the selected panel too while an item is selected;
   - a failed panel reports the HTTP status, a rejected fetch says the server was not reached,
-    an aborted (superseded) one writes nothing, and a failed poll inside the run slot is shown;
-  - playback moves the line by speed x elapsed time, commits at most once a second, and stops
-    at the window end, on Pause, on any manual move, on a failed panel, when the tab is hidden
-    and when the instance is replaced.
+    an aborted (superseded) one writes nothing, and a failed, unreachable or timed-out poll
+    inside the run slot is shown;
+  - every panel request carries HX-Request; a 401 or a redirect ends the session once: playback
+    stops, both panels are aborted, nothing else is written and /login is assigned once;
+  - a held key moves the line on every repeat but requests at most once a second (one immediate,
+    one trailing with the newest time, none at all at the window edge); a request in flight is
+    never answered with another one from the timer;
+  - playback moves the line by speed x elapsed time, commits at most once a second and only once
+    the previous answer is in, and stops at the window end, on Pause, on any manual move, on a
+    failed panel, when the tab is hidden and when the instance is replaced;
+  - a scrub that cannot capture the pointer, is cancelled or loses its button never sticks, and
+    Play cannot start during one; a modified or middle click on a link is left to the browser.
 
 Skips (77) when `node` is not on PATH. Stdlib only.
 """
@@ -47,6 +55,11 @@ const ok = (c, msg) => { if (!c) fails.push(msg); };
      'keyStep leaves other keys alone');
   eq([tl.step(100, 110), tl.page(100, 110)], [1, 1], 'step is at least one second on a 10 s window');
   eq([tl.step(0, 3600), tl.page(0, 3600)], [18, 360], 'step and page scale with the window');
+
+  eq(['150', '0', '999999999999999', '007'].map(tl.epochAttr), [150, 0, 999999999999999, 7], 'epochAttr: plain digits');
+  eq(['0x10', '1e3', '', null, undefined, ' 150', '150 ', '-5', '1.5', '+5', '1234567890123456'].map(tl.epochAttr)
+       .map((v) => (Number.isNaN(v) ? 'NaN' : v)),
+     Array(11).fill('NaN'), 'epochAttr: hex, exponent, empty, missing, spaces, signs, decimals and 16 digits are NaN');
 
   eq([tl.validWindow(100, 200), tl.validWindow(0, 200), tl.validWindow(200, 100), tl.validWindow(100, 100),
       tl.validWindow(NaN, 200), tl.validWindow('100', 200), tl.validWindow(100, 200.5)],
@@ -141,6 +154,7 @@ class El {
   setAttribute(k, v) { if (k === 'class') this.className = v; else this.attrs[k] = String(v); }
   getAttribute(k) { if (k === 'class') return this.classes.size ? this.className : null;
                     return k in this.attrs ? this.attrs[k] : null; }
+  removeAttribute(k) { delete this.attrs[k]; }
   appendChild(c) { c.parent = this; this.children.push(c); return c; }
   after(n) { const p = this.parent, i = p.children.indexOf(this); n.parent = p; p.children.splice(i + 1, 0, n); }
   addEventListener(t, f) { (this.listeners[t] = this.listeners[t] || []).push(f); }
@@ -207,7 +221,7 @@ function makeTl(o) {
     e.attrs['data-ts'] = String(b.ts); body.appendChild(e); return e; });
   const fut = new El('div'); fut.classes.add('tl-fut'); root.appendChild(fut);
   let ph = null, chip = null;
-  if (o.ph) { ph = new El('div'); ph.classes.add('tl-ph'); ph.attrs['data-ts'] = String(o.ts); chip = new El('b'); ph.appendChild(chip); root.appendChild(ph); }
+  if (o.ph) { ph = new El('div'); ph.classes.add('tl-ph'); if (o.ts !== null) ph.attrs['data-ts'] = String(o.ts); chip = new El('b'); ph.appendChild(chip); root.appendChild(ph); }
   return { root, head, g, body, fut, ph, chip, buttons };
 }
 function show(ctx, o) {
@@ -222,7 +236,13 @@ const ok200 = (f, html) => f.resolve({ status: 200, ok: true, text: () => Promis
 const status = (f, s) => f.resolve({ status: s, ok: false, text: () => Promise.resolve('x') });
 const MOM = '/fragments/tar/timeline/moment?id=agent-1&at=';
 const SEL = '/fragments/tar/timeline/selected?id=agent-1&ref=';
-const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k }, init || {}));
+// Answer every request still waiting (the settled ones and the superseded ones ignore a second answer).
+const settle = async (ctx) => { for (const f of ctx.fetches) ok200(f, '<i>ok</i>'); await flush(); };
+// A key as a person taps it and a click as a person makes it: a second after the last commit,
+// so each one commits at once. keyRaw is a key with no time passing (a held key's repeat).
+const keyRaw = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k }, init || {}));
+const key = (ctx, k, init) => { ctx.clockNow += 1000; return keyRaw(ctx, k, init); };
+const tap = (ctx, el, init) => { ctx.clockNow += 1000; return fire(el, 'click', init); };
 
 (async () => {
   // ---- bind, once, from its own instance
@@ -236,18 +256,29 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
     eq(t.fut.style.left, 'calc(var(--gut) + (100% - var(--gut)) * 0.50000 + 1px)', 'future shade position');
     eq([t.chip.textContent, c.clock.textContent], ['1970-01-01T00:02:30Z', '1970-01-01T00:02:30Z'], 'chip and clock');
     eq(t.body.getAttribute('tabindex'), '0', 'body is focusable');
+    eq([t.body.getAttribute('role'), t.body.getAttribute('aria-label')],
+       ['group', 'Timeline. Arrow, Page, Home and End keys move the moment.'], 'the focus stop is named');
+    const rg = t.root.querySelector('.tl-scrub');
+    eq([rg.getAttribute('aria-label'), rg.getAttribute('aria-valuetext')], ['Time, in seconds', '1970-01-01T00:02:30Z'],
+       'the range is named and reads the moment as a time');
     eq([c.play.disabled, c.speed.disabled, c.note.textContent], [false, false, ''], 'playback is available');
     fire(c.body, 'htmx:afterSettle', { target: t.body });
     eq([urls(c).length, t.root.querySelectorAll('.tl-scrub').length], [1, 1], 'a repeated settle is a no-op');
     key(c, 'ArrowRight');
     eq(urls(c)[1], MOM + '151', 'ArrowRight steps one second on a 100 s window and commits');
+    eq(rg.getAttribute('aria-valuetext'), '1970-01-01T00:02:31Z', 'the range reads the new moment');
     fire(c.body, 'htmx:afterSettle', { target: c.body });
     eq([urls(c).length, t.root.querySelectorAll('.tl-scrub').length], [2, 1], 'an unrelated settle neither resets t nor requests');
     key(c, 'End'); eq([t.chip.className, t.root.querySelector('.tl-scrub').value], ['e', '200'], 'End: chip hangs left, range follows');
     key(c, 'Home'); eq(t.chip.className, 's', 'Home: chip edge class');
     const e = key(c, 'x'); eq([e.defaultPrevented, urls(c).length], [false, 4], 'another key is left alone');
     ok(key(c, 'ArrowLeft').defaultPrevented, 'a handled key is prevented');
-    ok(!key(c, 'ArrowLeft', { ctrlKey: true }).defaultPrevented, 'a modified key is left to the browser');
+    eq(urls(c).length, 4, 'a key at the window edge changes nothing and requests nothing');
+    for (const m of [{ ctrlKey: true }, { altKey: true }, { metaKey: true }])
+      ok(!key(c, 'ArrowRight', m).defaultPrevented, 'a modified key is left to the browser: ' + Object.keys(m)[0]);
+    eq(urls(c).length, 4, 'and requests nothing');
+    ok(!fire(c.run, 'keydown', { key: 'ArrowRight' }).defaultPrevented, 'a key outside the timeline is left alone');
+    eq(urls(c).length, 4, 'and requests nothing either');
 
     const fresh = show(c, { from: 1000, to: 2000, ts: 1200 });
     eq(urls(c)[urls(c).length - 1], MOM + '1200', 'a new instance rebinds from its own moment');
@@ -261,23 +292,50 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
     eq([c.play.disabled, c.speed.disabled, c.note.textContent], [true, true, 'Play is not available: this window is not valid.'], 'invalid window: honest note');
     const c2 = build(); show(c2, { ph: false });
     eq(urls(c2).length, 0, 'a valid window with no playhead is not bound');
+    const c3 = build(); const t3 = show(c3, { ts: null });
+    eq([urls(c3).length, t3.root.querySelectorAll('.tl-scrub').length, c3.play.disabled, c3.note.textContent],
+       [0, 0, true, 'Play is not available: this window is not valid.'], 'a playhead with no data-ts is not bound at 0');
+    for (const bad of [{ from: '0x10', to: 200 }, { from: 100, to: '2e2' }, { ts: '1e2' }, { ts: ' 150' }, { ts: '' }, { ts: '-5' }]) {
+      const d = build(); const td = show(d, bad);
+      eq([JSON.stringify(bad), urls(d).length, td.root.querySelectorAll('.tl-scrub').length], [JSON.stringify(bad), 0, 0],
+         'markup numbers that are not plain digits bind nothing');
+    }
   }
 
   // ---- nav link, in-flight abort
   {
     const c = build(); show(c);
     const a = new El('a'); a.attrs.href = '/x'; a.attrs['data-ts'] = '120'; c.moment.appendChild(a);
-    const e = fire(a, 'click', {});
+    const e = tap(c, a, {});
     eq([e.defaultPrevented, urls(c)[1]], [true, MOM + '120'], 'nav link commits at its time and does not navigate');
     eq(c.fetches[0].signal.aborted, true, 'the superseded moment request is aborted');
     const dis = new El('button'); c.moment.appendChild(dis);
     fire(dis, 'click', {}); eq(urls(c).length, 2, 'a disabled nav button does nothing');
   }
 
+  // ---- modified and middle clicks on a link are the browser's, not ours
+  {
+    const c = build(); const t = show(c);
+    const a = new El('a'); a.attrs['data-ts'] = '120'; c.moment.appendChild(a);
+    const lk = new El('a'); lk.attrs['data-ref'] = 'p2'; lk.attrs['data-ts'] = '129'; c.selected.appendChild(lk);
+    tap(c, t.buttons[0], {}); await settle(c);
+    fire(c.play, 'click', {});
+    const n = urls(c).length;
+    for (const init of [{ ctrlKey: true }, { metaKey: true }, { shiftKey: true }, { altKey: true }, { button: 1 }]) {
+      for (const el of [a, lk]) {
+        c.clockNow += 1000;
+        const e = fire(el, 'click', init);
+        eq([JSON.stringify(init), el === a ? 'nav' : 'linked', e.defaultPrevented, urls(c).length, c.play.attrs['aria-pressed'], c.intervals.size],
+           [JSON.stringify(init), el === a ? 'nav' : 'linked', false, n, 'true', 1], 'a modified or middle click is left alone and playback keeps running');
+      }
+    }
+    ok(tap(c, a, {}).defaultPrevented, 'a plain click on the same link is still ours');
+  }
+
   // ---- item click, selected panel follows
   {
     const c = build(); const t = show(c);
-    fire(t.buttons[0], 'click', {});
+    tap(c, t.buttons[0], {});
     eq(urls(c).slice(1), [MOM + '130', SEL + 'p1&at=130'], 'a block click requests both panels');
     eq([t.buttons[0].classes.has('on'), t.buttons[1].classes.has('on')], [true, false], 'the clicked block is marked');
     key(c, 'ArrowLeft');
@@ -286,7 +344,7 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
     const e = fire(lk, 'click', {});
     eq([e.defaultPrevented, urls(c).slice(5)], [true, [SEL + 'p2&at=129']], 'a linked item changes the selection, not the time');
     eq([t.buttons[0].classes.has('on'), t.buttons[1].classes.has('on')], [false, true], 'the mark follows the selection');
-    fire(t.buttons[2], 'click', {});
+    tap(c, t.buttons[2], {});
     eq(urls(c).slice(6), [MOM + '180'], 'a block with no item id requests the moment panel only');
     key(c, 'ArrowLeft');
     eq(urls(c).slice(7), [MOM + '179'], 'and clears the selection');
@@ -295,22 +353,30 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
   // ---- no selection puts the shell's prompt back: on a count-block click and on a rebind
   {
     const c = build(); const t = show(c);
-    fire(t.buttons[0], 'click', {});                   // p1 at 130
+    tap(c, t.buttons[0], {});                          // p1 at 130
     ok200(c.fetches[2], '<b>p1 at 130</b>'); await flush();
     eq([c.selected.innerHTML, c.selected.children.length], ['<b>p1 at 130</b>', 0], 'a selected response replaces the prompt');
-    fire(t.buttons[2], 'click', {});                   // a count block: no item id
+    tap(c, t.buttons[2], {});                          // a count block: no item id
     eq([c.selected.children[0] === c.prompt, c.selected.children.length, c.selected.innerHTML], [true, 1, ''],
        'a click with no item puts the prompt node back');
     key(c, 'ArrowRight');
     eq(urls(c).slice(3), [MOM + '180', MOM + '181'], 'and no selected panel is requested any more');
-    fire(t.buttons[1], 'click', {});                   // p2 at 170, selected request in flight
-    fire(t.buttons[2], 'click', {});
+    tap(c, t.buttons[1], {});                          // p2 at 170, selected request in flight
+    tap(c, t.buttons[2], {});
     eq([c.fetches[6].signal.aborted, c.selected.children[0] === c.prompt], [true, true], 'an in-flight selected request is aborted and the prompt is back');
     ok200(c.fetches[6], '<i>late</i>'); await flush();
     eq([c.selected.children[0] === c.prompt, c.selected.innerHTML], [true, ''], 'its late answer writes nothing');
-    fire(t.buttons[0], 'click', {});                   // p1 again
+    tap(c, t.buttons[0], {});                          // p1 again
+    status(c.fetches[c.fetches.length - 1], 500); await flush();
+    eq([c.selected.textContent, c.selected.getAttribute('role')], ['Could not load this panel (HTTP 500).', 'alert'],
+       'a failed selected panel is announced');
+    tap(c, t.buttons[0], {});
     ok200(c.fetches[c.fetches.length - 1], '<b>p1 again</b>'); await flush();
-    eq(c.selected.innerHTML, '<b>p1 again</b>', 'the second selection lands');
+    eq([c.selected.innerHTML, c.selected.getAttribute('role')], ['<b>p1 again</b>', null], 'the next selection lands and stops being an alert');
+    tap(c, t.buttons[1], {}); status(c.fetches[c.fetches.length - 1], 500); await flush();
+    eq(c.selected.getAttribute('role'), 'alert', 'a failed selection is an alert again');
+    tap(c, t.buttons[2], {});
+    eq([c.selected.children[0] === c.prompt, c.selected.getAttribute('role')], [true, null], 'the prompt put back is not an alert');
     show(c, { from: 1000, to: 1050, ts: 1010 });
     eq([c.selected.children[0] === c.prompt, c.selected.innerHTML], [true, ''], 'a rebind clears the previous instance\'s selection');
   }
@@ -352,6 +418,49 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
     eq([urls(c).length, c.clock.textContent], [2, '1970-01-01T00:02:00Z'], 'range input moves the line only');
     fire(r, 'change', {});
     eq(urls(c)[2], MOM + '120', 'range change commits');
+    fire(t.body, 'pointerdown', { clientX: 100, pointerId: 7, button: 2 });
+    fire(t.body, 'pointerdown', { clientX: 780, pointerId: 7, button: 2 });
+    eq(t.root.classes.has('scrubbing'), false, 'a press with another button is not a scrub');
+  }
+
+  // ---- a scrub never sticks and never races Play
+  {
+    const c = build(); const t = show(c);
+    t.body.setPointerCapture = () => { throw new Error('NotFoundError'); };
+    fire(t.body, 'pointerdown', { clientX: 780, pointerId: 7 });
+    eq(t.root.classes.has('scrubbing'), false, 'a refused pointer capture starts no scrub');
+    fire(t.body, 'pointermove', { clientX: 1280 });
+    eq([t.chip.textContent, urls(c).length], ['1970-01-01T00:02:30Z', 1], 'and the line does not follow the pointer');
+    fire(t.body, 'pointerup', {});
+    eq(urls(c).length, 1, 'nor does a release commit');
+  }
+  {
+    const c = build(); const t = show(c);
+    fire(t.body, 'pointerdown', { clientX: 780, pointerId: 1 });
+    fire(t.body, 'pointermove', { clientX: 1280, buttons: 1 });
+    eq(t.chip.textContent, '1970-01-01T00:03:20Z', 'a drag with a button down follows the pointer');
+    fire(t.body, 'pointercancel', {});
+    eq([t.root.classes.has('scrubbing'), t.chip.textContent, c.clock.textContent, t.root.querySelector('.tl-scrub').value, urls(c).length],
+       [false, '1970-01-01T00:02:30Z', '1970-01-01T00:02:30Z', '150', 1], 'pointercancel puts the line back at the committed time and requests nothing');
+    fire(t.body, 'pointermove', { clientX: 300, buttons: 1 });
+    eq(t.chip.textContent, '1970-01-01T00:02:30Z', 'and the drag is over');
+  }
+  {
+    const c = build(); const t = show(c);
+    fire(t.body, 'pointerdown', { clientX: 780, pointerId: 1 });
+    fire(t.body, 'pointermove', { clientX: 100, buttons: 1 });
+    eq(t.chip.textContent, '1970-01-01T00:01:40Z', 'a drag into the label gutter holds the line at the window start');
+    fire(t.body, 'pointermove', { clientX: 1280, buttons: 0 });
+    eq([t.root.classes.has('scrubbing'), urls(c)[1]], [false, MOM + '100'], 'a move with every button up is the release: the scrub ends and commits where the line was');
+  }
+  {
+    const c = build(); const t = show(c);
+    fire(t.body, 'pointerdown', { clientX: 780, pointerId: 1 });
+    fire(c.play, 'click', {});
+    eq([c.play.attrs['aria-pressed'], c.intervals.size], ['false', 0], 'Play during a scrub starts nothing');
+    fire(t.body, 'pointerup', {});
+    fire(c.play, 'click', {});
+    eq(c.play.attrs['aria-pressed'], 'true', 'and works once the scrub is over');
   }
 
   // ---- failures
@@ -359,6 +468,7 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
     const c = build(); show(c);
     status(c.fetches[0], 403); await flush();
     eq([c.moment.textContent, c.moment.innerHTML, c.moment.classes.has('busy')], ['Could not load this panel (HTTP 403).', '', false], 'non-2xx: status in text, never markup');
+    eq(c.moment.getAttribute('role'), 'alert', 'the failure copy is announced');
     key(c, 'ArrowRight');
     c.fetches[1].reject(new Error('net')); await flush();
     eq(c.moment.textContent, 'Could not reach the server.', 'rejected fetch');
@@ -367,6 +477,7 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
     eq([c.moment.textContent, c.moment.classes.has('busy')], ['Could not reach the server.', true], 'an aborted request writes nothing and the slot stays busy');
     ok200(c.fetches[3], '<b>ok</b>'); await flush();
     eq([c.moment.innerHTML, c.moment.classes.has('busy')], ['<b>ok</b>', false], 'the replacement lands and clears busy');
+    eq(c.moment.getAttribute('role'), null, 'a landed panel is not an alert');
     key(c, 'ArrowRight'); fire(c.play, 'click', {});
     eq(c.play.attrs['aria-pressed'], 'true', '401 case: playback is running when the answer arrives');
     status(c.fetches[4], 401); await flush();
@@ -376,9 +487,62 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
     const inner = new El('div'); c.run.children[0].appendChild(inner);
     fire(inner, 'htmx:responseError', { detail: { xhr: { status: 500 } } });
     eq([c.run.textContent, c.run.children.length], ['Could not load the record (HTTP 500).', 0], 'a failed poll inside the run slot is reported there');
+    // The same message twice proves nothing: leave a sentinel, bind a fresh instance with playback
+    // running, then send errors from outside the run slot.
+    c.run.textContent = 'sentinel';
+    show(c); fire(c.play, 'click', {});
     const other = new El('div'); c.body.appendChild(other);
-    fire(other, 'htmx:responseError', { detail: { xhr: { status: 500 } } });
-    eq(c.run.textContent, 'Could not load the record (HTTP 500).', 'an error elsewhere is ignored');
+    for (const ev of ['htmx:responseError', 'htmx:sendError', 'htmx:timeout'])
+      fire(other, ev, { detail: { xhr: { status: 500 } } });
+    eq([c.run.textContent, c.run.children.length, c.play.attrs['aria-pressed'], c.intervals.size], ['sentinel', 1, 'true', 1],
+       'an error outside the run slot changes nothing and leaves the bound instance playing');
+  }
+
+  // ---- the run slot: refused, never reached, timed out
+  for (const [ev, code, want] of [['htmx:responseError', 502, 'Could not load the record (HTTP 502).'],
+                                  ['htmx:sendError', 0, 'Could not reach the server.'],
+                                  ['htmx:timeout', 0, 'Could not reach the server.']]) {
+    const c = build(); show(c); fire(c.play, 'click', {});
+    fire(c.run.children[0], ev, { detail: { xhr: { status: code } } });
+    eq([ev, c.run.textContent, c.play.attrs['aria-pressed'], c.intervals.size, c.play.disabled], [ev, want, 'false', 0, true],
+       ev + ' in the run slot is said, and playback and the controls stop');
+  }
+
+  // ---- signed out: one path, once
+  {
+    const c = build(); const t = show(c);
+    tap(c, t.buttons[0], {});                     // moment and selected requests in flight
+    ok(c.fetches.every((f) => f.opts.headers['HX-Request'] === 'true' && f.opts.headers.Accept === 'text/html'),
+       'every panel request says HX-Request');
+    eq(c.fetches.length, 3, 'a block click with an item makes both requests');
+    status(c.fetches[1], 401); status(c.fetches[2], 401); await flush();
+    eq(c.assigned, ['/login'], 'two 401s send the browser to sign in once');
+    eq([c.moment.classes.has('busy'), c.selected.classes.has('busy'), c.moment.textContent, c.selected.textContent], [false, false, '', ''],
+       'and write no error copy');
+    const n = c.fetches.length;
+    key(c, 'ArrowRight'); tap(c, t.buttons[1], {});
+    eq(c.fetches.length, n, 'a signed-out page makes no further requests');
+  }
+  {
+    const c = build(); const t = show(c);
+    tap(c, t.buttons[0], {});
+    fire(c.play, 'click', {});
+    status(c.fetches[1], 401); await flush();
+    ok200(c.fetches[2], '<i>late</i>'); await flush();
+    eq([c.selected.innerHTML, c.moment.innerHTML, c.assigned, c.play.attrs['aria-pressed'], c.intervals.size],
+       ['', '', ['/login'], 'false', 0], 'a late 200 on the other panel after a 401 writes nothing, and nothing keeps running');
+  }
+  {
+    const c = build(); const t = show(c);
+    tap(c, t.buttons[0], {});
+    status(c.fetches[2], 401); await flush();       // the selected panel is told first
+    ok200(c.fetches[1], '<i>late</i>'); await flush();
+    eq([c.moment.innerHTML, c.selected.innerHTML, c.assigned], ['', '', ['/login']], 'and the same the other way round');
+  }
+  {
+    const c = build(); show(c);
+    c.fetches[0].resolve({ status: 200, ok: true, redirected: true, text: () => Promise.resolve('<h1>landing page</h1>') }); await flush();
+    eq([c.moment.innerHTML, c.assigned], ['', ['/login']], 'a redirected answer is the sign-in page, not a panel');
   }
 
   // ---- a superseded response that still arrives is dropped
@@ -414,32 +578,47 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
   // ---- playback: pace, throttle, coalesce
   {
     const c = build(); const t = show(c);
+    await settle(c);
     fire(c.play, 'click', {});
     eq([c.play.attrs['aria-pressed'], c.play.textContent, c.intervals.size, [...c.intervals.values()][0].ms], ['true', 'Pause', 1, 250], 'Play starts one timer');
     c.tick(); c.tick(); c.tick();
     eq([urls(c).length, t.chip.textContent], [1, '1970-01-01T00:02:30Z'], 'three ticks: the line moves, nothing is requested');
     c.tick();
     eq(urls(c).slice(1), [MOM + '151'], 'the fourth tick (one second) commits once');
-    for (let i = 0; i < 8; i++) c.tick();
+    const second = async () => { for (let i = 0; i < 4; i++) c.tick(); await settle(c); };
+    await settle(c); await second(); await second();
     eq(urls(c).slice(2), [MOM + '152', MOM + '153'], 'two more seconds: two more requests, one a second');
-    eq(c.fetches[urls(c).length - 2].signal.aborted, true, 'an in-flight request is aborted by the next commit (latest wins)');
     fire(c.speed, 'click', {});
     eq(c.speed.textContent, 'Speed 10x', 'speed cycles 1x to 10x');
-    c.tick(); c.tick(); c.tick(); c.tick();
+    await second();
     eq(urls(c).length, 5, 'at 10x the next second is still one request');
     eq(urls(c)[4], MOM + '163', 'and carries the latest t (153 + 4 ticks of 2.5 s)');
     fire(c.speed, 'click', {}); eq(c.speed.textContent, 'Speed 60x', '10x to 60x');
     fire(c.speed, 'click', {}); eq(c.speed.textContent, 'Speed 1x', '60x back to 1x');
   }
 
+  // ---- playback never answers an unanswered request with another one
+  {
+    const c = build(); show(c);                    // the bind request never settles
+    fire(c.play, 'click', {});
+    for (let i = 0; i < 8; i++) c.tick();
+    eq([c.fetches.length, c.fetches[0].signal.aborted], [1, false], 'two seconds of playback over a slow answer: no second request, nothing aborted');
+    eq(c.intervals.size, 1, 'and the line keeps playing');
+    await settle(c);                               // positive control: the answer lands
+    c.tick();
+    eq(urls(c).slice(1), [MOM + '152'], 'the next tick after the answer commits the latest time');
+  }
+
   // ---- playback with an item selected: both panels are requested together at each second
   {
     const c = build(); const t = show(c);
-    fire(t.buttons[0], 'click', {});    // p1 at 130
+    tap(c, t.buttons[0], {});           // p1 at 130
+    await settle(c);
     fire(c.play, 'click', {});
     for (let i = 0; i < 4; i++) c.tick();
     eq(urls(c).slice(1), [MOM + '130', SEL + 'p1&at=130', MOM + '131', SEL + 'p1&at=131'],
        'one second of playback refreshes the moment and the selected panel at the same t');
+    await settle(c);
     for (let i = 0; i < 4; i++) c.tick();
     eq(urls(c).slice(5), [MOM + '132', SEL + 'p1&at=132'], 'and the next second does the same');
   }
@@ -454,6 +633,7 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
     fire(c.play, 'click', {});        // Pause
     eq([c.play.attrs['aria-pressed'], c.play.textContent, c.intervals.size], ['false', 'Play', 0], 'Pause stops the timer');
     eq([urls(c)[1], t.chip.textContent], [MOM + '152', '1970-01-01T00:02:32Z'], 'Pause commits the whole second it stopped on');
+    await settle(c);
     fire(c.play, 'click', {});        // Play again
     c.tick(); c.tick(); c.tick(); c.tick();
     eq(urls(c)[2], MOM + '162', 'Play resumes from the paused moment (152 + 10 s in one second)');
@@ -475,8 +655,8 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
   {
     const manual = {
       'key': (c) => key(c, 'ArrowRight'),
-      'block click': (c) => fire(c.t.buttons[0], 'click', {}),
-      'nav link': (c) => { const a = new El('a'); a.attrs['data-ts'] = '120'; c.moment.appendChild(a); fire(a, 'click', {}); },
+      'block click': (c) => tap(c, c.t.buttons[0], {}),
+      'nav link': (c) => { const a = new El('a'); a.attrs['data-ts'] = '120'; c.moment.appendChild(a); tap(c, a, {}); },
       'pointer scrub': (c) => fire(c.t.body, 'pointerdown', { clientX: 780, pointerId: 1 }),
       'range input': (c) => { const r = c.t.root.querySelector('.tl-scrub'); r.value = '120'; fire(r, 'input', {}); },
       'linked item': (c) => { const a = new El('a'); a.attrs['data-ref'] = 'p2'; a.attrs['data-ts'] = '150'; c.selected.appendChild(a); fire(a, 'click', {}); },
@@ -489,6 +669,55 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
     const c = build(); show(c); fire(c.play, 'click', {});
     key(c, 'ArrowRight');
     eq(urls(c).length, 2, 'a manual key while playing is one request, not a playback request as well');
+  }
+
+  // ---- a held key: every repeat moves the line, the panels follow at most once a second
+  {
+    const c = build(); const t = show(c);
+    tap(c, t.buttons[0], {});                        // p1 at 130: both panels in use
+    await settle(c);
+    c.clockNow += 1000;
+    const base = c.fetches.length;
+    for (let i = 1; i <= 30; i++) {                  // 30 repeats in 0.96 s; the interval fires every 250 ms
+      c.clockNow += 32;
+      ok(keyRaw(c, 'ArrowRight').defaultPrevented, 'repeat ' + i + ' is ours');
+      if (i % 8 === 0) c.tick(0);
+    }
+    eq(t.chip.textContent, '1970-01-01T00:02:40Z', 'the line followed all 30 repeats');
+    eq(urls(c).slice(base), [MOM + '131', SEL + 'p1&at=131'], 'the first repeat requested at once, the other 29 did not');
+    eq(c.intervals.size, 1, 'a commit is owed to the one timer');
+    await settle(c);
+    c.tick(250);
+    eq(urls(c).slice(base + 2), [MOM + '160', SEL + 'p1&at=160'], 'the trailing commit carries the newest time, for both panels');
+    eq(c.intervals.size, 0, 'and the timer is gone once nothing is owed');
+    c.tick(5000);
+    eq(urls(c).length, base + 4, 'exactly two requests per panel for the whole burst');
+  }
+  {
+    const c = build(); show(c);
+    key(c, 'End');                                   // 200: the window edge
+    const base = urls(c).length;
+    for (let i = 0; i < 30; i++) ok(keyRaw(c, 'End').defaultPrevented, 'a held End is still our key');
+    for (let i = 0; i < 30; i++) keyRaw(c, 'ArrowRight');
+    eq([urls(c).length, c.intervals.size], [base, 0], 'a held key at the window edge requests nothing and leaves no timer');
+  }
+  {
+    const c = build(); show(c); await settle(c);
+    fire(c.play, 'click', {}); c.tick();            // playing, 250 ms after the last commit
+    keyRaw(c, 'ArrowRight');
+    eq([c.play.attrs['aria-pressed'], urls(c).length, c.intervals.size], ['false', 1, 1],
+       'a key inside the second stops playback and moves the line; its commit is owed to the timer');
+    c.tick(); c.tick();
+    eq(urls(c).length, 1, 'not before the second is up');
+    c.tick();
+    eq([urls(c).slice(1), c.intervals.size], [[MOM + '151'], 0], 'then it is made once, and the timer goes');
+    const d = build(); show(d);                      // a request in flight: the owed commit waits for its answer
+    d.clockNow += 1000; keyRaw(d, 'ArrowRight');     // immediate, and unanswered
+    d.clockNow += 100; keyRaw(d, 'ArrowRight');      // owed
+    for (let i = 0; i < 8; i++) d.tick();
+    eq([d.fetches.length, d.fetches[1].signal.aborted], [2, false], 'an owed commit never aborts an unanswered request');
+    await settle(d); d.tick();
+    eq(urls(d).slice(2), [MOM + '152'], 'it is made on the first tick after the answer');
   }
   {
     const c = build(); show(c); fire(c.speed, 'click', {}); fire(c.play, 'click', {}); c.tick();   // 10x: 152.5
@@ -513,9 +742,20 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
   }
   {
     const c = build(); show(c); fire(c.speed, 'click', {}); fire(c.play, 'click', {}); c.tick();
+    for (const f of c.doc.listeners.visibilitychange) f({});
+    eq([c.play.attrs['aria-pressed'], c.intervals.size], ['true', 1], 'a visibility change to visible leaves playback alone');
     c.doc.hidden = true;
     for (const f of c.doc.listeners.visibilitychange) f({});
     eq([c.play.attrs['aria-pressed'], c.intervals.size, urls(c)[1]], ['false', 0, MOM + '152'], 'a hidden tab stops playback and keeps the panels honest');
+  }
+  {
+    const c = build(); show(c);
+    fire(c.play, 'click', {}); fire(c.play, 'click', {});
+    eq(urls(c).length, 1, 'Pause at the time already shown requests nothing');
+    key(c, 'ArrowRight');                            // the bind request is superseded
+    status(c.fetches[0], 500); await flush();
+    eq([c.moment.textContent, c.moment.classes.has('busy'), c.moment.getAttribute('role')], ['', true, null],
+       'a superseded failure says nothing');
   }
   {
     const c = build(); show(c); fire(c.play, 'click', {}); c.tick();

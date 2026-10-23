@@ -1204,6 +1204,7 @@ td .sub { display: block; overflow: hidden; text-overflow: ellipsis; color: var(
 
 /* -- Timeline page interaction states: yuzu-tar-timeline.js toggles these; tokens only -- */
 .tl-body:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.tl-body { touch-action: pan-y; }
 .tl.scrubbing .tl-body { cursor: grabbing; }
 .tl.scrubbing .tl-b, .tl.scrubbing .tl-t, .tl.scrubbing .tl-c, .tl.scrubbing .tl-k, .tl.scrubbing .tl-d { pointer-events: none; }
 .tl-det.busy { opacity: .6; }

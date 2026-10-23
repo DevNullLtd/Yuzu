@@ -15,8 +15,16 @@
  * Every committed time change (pointer release, key, range change, nav link, block click,
  * playback step) goes through commit(): it requests the moment panel and, when an item is
  * selected, the selected panel at the same time. Playback only advances the line through the
- * window already shown; it is throttled to one commit a second and stops on any manual move,
- * a failed panel request, a hidden tab, the window end, or an unbind.
+ * window already shown; it stops on any manual move, a failed panel request, a hidden tab, the
+ * window end, or an unbind.
+ *
+ * Request rate: a key, nav link or block click moves the line at once, but commits straight away
+ * only when the last commit is a second old; inside that second it marks a commit owed and the
+ * ONE interval (shared with playback) makes it, with the newest time, once the second is up. The
+ * interval never commits while the moment request is still in flight (a slow fragment is not
+ * answered with an abort per tick) and is cleared when playback is off and nothing is owed.
+ * A 401 or a redirect from a panel request means the session ended: one path stops everything
+ * and goes to /login once.
  *
  * Pure helpers are exported (module.exports) for the node test; the DOM shell takes its
  * environment (document, fetch, clock, timers) as a parameter so the test never sleeps.
@@ -35,6 +43,9 @@
     speeds: SPEEDS,
 
     clamp: function (t, from, to) { return Math.min(Math.max(t, from), to); },
+
+    // An epoch-seconds attribute: plain digits only (no hex, exponent, sign or space), else NaN.
+    epochAttr: function (s) { return /^\d{1,15}$/.test(s) ? Number(s) : NaN; },
 
     validWindow: function (from, to) {
       return Number.isSafeInteger(from) && Number.isSafeInteger(to) && from > 0 && to > from;
@@ -120,7 +131,9 @@
     var st = null;          // the bound run instance, or null
     var speed = 1;
     var playing = false, timer = null, lastTick = 0, lastCommit = -Infinity;
+    var pending = false;    // a manual time change whose panel request is owed to the timer
     var scrubbing = false;
+    var ended = false;      // the session ended: no more requests from this page
 
     function abortSlot(slot) {
       if (slot.ctl) {
@@ -135,6 +148,7 @@
       abortSlot(selected);
       if (selected.el && selectedIdle) {
         selected.el.textContent = '';
+        selected.el.removeAttribute('role');
         selected.el.appendChild(selectedIdle);
       }
     }
@@ -142,23 +156,38 @@
     function fail(slot, ctl, msg) {
       if (slot.ctl !== ctl) return;
       slot.el.textContent = msg;
+      slot.el.setAttribute('role', 'alert'); // only the failure copy is announced, never a routine refresh
       stopPlayback(false);
+    }
+
+    // A 401, or a redirect to the landing page, on a panel request: stop everything, sign in once.
+    function sessionEnded() {
+      if (ended) return;
+      ended = true;
+      pending = false;
+      stopPlayback(false);
+      releaseTimer();
+      abortSlot(moment);
+      abortSlot(selected);
+      env.location.assign('/login');
     }
 
     // The ONE way a panel is refreshed: fetch a page-given relative URL, newest request wins.
     function request(slot, url) {
-      if (!slot.el || !url) return;
+      if (ended || !slot.el || !url) return;
       if (slot.ctl) slot.ctl.abort();
       var ctl = new env.AbortController();
       slot.ctl = ctl;
       slot.el.classList.add('busy');
-      env.fetch(url, { credentials: 'same-origin', headers: { Accept: 'text/html' }, signal: ctl.signal })
+      // HX-Request makes the server answer a signed-out request with 401, not a redirect to a page.
+      env.fetch(url, { credentials: 'same-origin', headers: { Accept: 'text/html', 'HX-Request': 'true' }, signal: ctl.signal })
         .then(function (res) {
-          // Stop first: no flush (it would request again, and 401 again) and no timer left firing.
-          if (res.status === 401) { stopPlayback(false); env.location.assign('/login'); return null; }
+          if (res.status === 401 || res.redirected) { sessionEnded(); return null; }
           if (!res.ok) { fail(slot, ctl, 'Could not load this panel (HTTP ' + res.status + ').'); return null; }
           return res.text().then(function (html) {
-            if (slot.ctl === ctl) slot.el.innerHTML = html;
+            if (slot.ctl !== ctl) return;
+            slot.el.innerHTML = html;
+            slot.el.removeAttribute('role');
           });
         })
         .catch(function () {
@@ -191,59 +220,85 @@
       st.range.value = String(Math.floor(v));
       st.range.setAttribute('aria-valuetext', iso);
       if (clockEl) clockEl.textContent = iso;
+      if (copyBtn) copyBtn.textContent = copyIdle; // "Link copied" is about a moment the line has left
     }
 
     function commit(t) {
       if (!st) return;
       setT(t);
+      pending = false;
       lastCommit = env.now();
       st.committed = Math.floor(st.t);
-      if (copyBtn) copyBtn.textContent = copyIdle; // "Link copied" is about the moment that has just moved on
       request(moment, tl.momentUrl(run.getAttribute('data-moment-url') || '', st.t));
       if (st.ref) request(selected, tl.selectedUrl(run.getAttribute('data-selected-url') || '', st.ref, st.t));
+      releaseTimer();
     }
 
-    // A time change the operator made: playback yields to it.
+    // The one interval: playback steps and owed manual commits share it.
+    function ensureTimer() {
+      if (timer !== null) return;
+      timer = env.setInterval(tick, TICK_MS);
+    }
+
+    function releaseTimer() {
+      if (timer === null || playing || pending) return;
+      env.clearInterval(timer);
+      timer = null;
+    }
+
+    // A time change the operator made: playback yields to it and the line moves now. The panels
+    // follow at once when the last commit is a second old; otherwise the commit is owed and the
+    // timer makes it with the newest time (a held key repeats far faster than a second).
     function manualCommit(t) {
       stopPlayback(false);
-      commit(t);
+      if (tl.throttleDue(lastCommit, env.now())) { commit(t); return; }
+      setT(t);
+      pending = true;
+      ensureTimer();
     }
 
     // flush: commit the exact stop time once (outside the throttle) so the panels agree with the line.
     function stopPlayback(flush) {
       if (!playing) return;
       playing = false;
-      env.clearInterval(timer);
-      timer = null;
       playBtn.setAttribute('aria-pressed', 'false');
       playBtn.textContent = 'Play';
-      if (!st) return;
-      setT(Math.floor(st.t));
-      if (flush && st.committed !== st.t) commit(st.t);
+      if (st) {
+        setT(Math.floor(st.t));
+        if (flush && st.committed !== st.t) commit(st.t);
+      }
+      releaseTimer();
     }
 
     function tick() {
       if (!st) return;
       var n = env.now(), dt = n - lastTick;
       lastTick = n;
-      var r = tl.nextPlayhead(st.t, speed, dt, st.from, st.to);
-      setT(r.t);
-      if (r.done) { stopPlayback(true); return; }
-      if (tl.throttleDue(lastCommit, n)) commit(r.t);
+      if (playing) {
+        var r = tl.nextPlayhead(st.t, speed, dt, st.from, st.to);
+        setT(r.t);
+        if (r.done) { stopPlayback(true); return; }
+      }
+      // Commit when owed, a second after the last one, and only once the previous answer is in.
+      var owed = pending || (playing && Math.floor(st.t) !== st.committed);
+      if (owed && !scrubbing && !moment.ctl && tl.throttleDue(lastCommit, n)) commit(st.t);
+      releaseTimer();
     }
 
     function startPlayback() {
-      if (!st || playing || !tl.playbackAllowed(st.from, st.to)) return;
+      if (!st || playing || scrubbing || !tl.playbackAllowed(st.from, st.to)) return;
       if (st.t >= st.to) commit(st.from); // at the end: start over from the window start
       playing = true;
       lastTick = env.now();
-      timer = env.setInterval(tick, TICK_MS);
+      ensureTimer();
       playBtn.setAttribute('aria-pressed', 'true');
       playBtn.textContent = 'Pause';
     }
 
     function unbind() {
+      pending = false;
       stopPlayback(false);
+      releaseTimer();
       abortSlot(moment);
       clearSelection();
       st = null;
@@ -266,9 +321,9 @@
       unbind();
       root.setAttribute('data-tl-bound', '1');
       var body = root.querySelector('.tl-body'), ph = root.querySelector('.tl-ph');
-      var from = body ? Number(body.getAttribute('data-from')) : NaN;
-      var to = body ? Number(body.getAttribute('data-to')) : NaN;
-      var t0 = ph ? Number(ph.getAttribute('data-ts')) : NaN;
+      var from = body ? tl.epochAttr(body.getAttribute('data-from')) : NaN;
+      var to = body ? tl.epochAttr(body.getAttribute('data-to')) : NaN;
+      var t0 = ph ? tl.epochAttr(ph.getAttribute('data-ts')) : NaN;
       if (!ph || !tl.validWindow(from, to) || !isFinite(t0)) {
         // The server's own banner says the window is not valid: no controls, no requests.
         setPlayAvailability(false, 'Play is not available: this window is not valid.');
@@ -284,6 +339,8 @@
       var head = root.querySelector('.tl-head');
       if (head) head.after(range); else root.appendChild(range);
       body.setAttribute('tabindex', '0');
+      body.setAttribute('role', 'group');
+      body.setAttribute('aria-label', 'Timeline. Arrow, Page, Home and End keys move the moment.');
       st = {
         root: root, body: body, ph: ph, range: range, from: from, to: to, t: t0, ref: null,
         chip: ph.querySelector('b'), fut: root.querySelector('.tl-fut'), committed: null
@@ -305,32 +362,41 @@
       if (!e.target.closest('.tl-body') || e.target.closest('button[data-ts]')) return;
       var t = pointerTs(e);
       if (t === null) return;
+      // A refused capture (the pointer is already gone) means no scrub: never a stuck one.
+      try { st.body.setPointerCapture(e.pointerId); } catch (x) { return; }
       stopPlayback(false);
       scrubbing = true;
       st.root.classList.add('scrubbing');
-      if (st.body.setPointerCapture) st.body.setPointerCapture(e.pointerId);
       setT(t);
+    }
+
+    function endScrub(release) {
+      if (!scrubbing || !st) return;
+      scrubbing = false;
+      st.root.classList.remove('scrubbing');
+      if (release) commit(st.t); else setT(st.committed); // a cancelled drag goes back, it commits nothing
     }
 
     function onPointerMove(e) {
       if (!scrubbing || !st) return;
+      // Every button is up: the release happened where no pointerup reaches us.
+      if (typeof e.buttons === 'number' && e.buttons === 0) { endScrub(true); return; }
       var t = pointerTs(e);
       setT(t === null ? st.from : t);
     }
 
-    function onPointerEnd() {
-      if (!scrubbing || !st) return;
-      scrubbing = false;
-      st.root.classList.remove('scrubbing');
-      commit(st.t);
-    }
+    function onPointerEnd() { endScrub(true); }
+    function onPointerCancel() { endScrub(false); }
+
+    // Only a plain left click is ours; a modified or middle click keeps the browser's own meaning of a link.
+    function plainClick(e) { return e.button === 0 && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey; }
 
     function onClick(e) {
       if (!st) return;
       var b = e.target.closest('button[data-ts]');
       if (!b) return;
-      var ts = Number(b.getAttribute('data-ts'));
-      if (!isFinite(ts)) return;
+      var ts = tl.epochAttr(b.getAttribute('data-ts'));
+      if (isNaN(ts)) return;
       st.ref = b.getAttribute('data-ref') || null;
       markOn(st.ref);
       if (st.ref === null) clearSelection();
@@ -361,7 +427,7 @@
       run.addEventListener('pointerdown', onPointerDown);
       run.addEventListener('pointermove', onPointerMove);
       run.addEventListener('pointerup', onPointerEnd);
-      run.addEventListener('pointercancel', onPointerEnd);
+      run.addEventListener('pointercancel', onPointerCancel);
       run.addEventListener('click', onClick);
       run.addEventListener('input', function (e) {
         if (!st || e.target !== st.range) return;
@@ -376,19 +442,20 @@
         var n = tl.keyStep(e.key, st.t, st.from, st.to);
         if (n === null) return;
         e.preventDefault();
+        if (n === st.t) return; // already there (a held key at the window edge): nothing to request
         manualCommit(n);
       });
       if (moment.el) moment.el.addEventListener('click', function (e) {
         var a = e.target.closest('a[data-ts]');
-        if (!a || !st) return;
-        var ts = Number(a.getAttribute('data-ts'));
-        if (!isFinite(ts)) return;
+        if (!a || !st || !plainClick(e)) return;
+        var ts = tl.epochAttr(a.getAttribute('data-ts'));
+        if (isNaN(ts)) return;
         e.preventDefault();
         manualCommit(ts);
       });
       if (selected.el) selected.el.addEventListener('click', function (e) {
         var a = e.target.closest('a[data-ref]');
-        if (!a || !st) return;
+        if (!a || !st || !plainClick(e)) return;
         e.preventDefault();
         st.ref = a.getAttribute('data-ref');
         markOn(st.ref);
@@ -409,11 +476,14 @@
       });
       doc.body.addEventListener('htmx:afterSettle', bind);
       // The run slot, or the self-replacing poll inside it (its target is its own element).
-      doc.body.addEventListener('htmx:responseError', function (e) {
-        if (!e.target || !e.target.closest || !e.target.closest('#tl-run')) return;
-        var status = e.detail && e.detail.xhr ? e.detail.xhr.status : 0;
-        unbind();
-        run.textContent = 'Could not load the record (HTTP ' + status + ').';
+      // A refused answer, a request that never reached the server, or one that timed out.
+      ['htmx:responseError', 'htmx:sendError', 'htmx:timeout'].forEach(function (name) {
+        doc.body.addEventListener(name, function (e) {
+          if (!e.target || !e.target.closest || !e.target.closest('#tl-run')) return;
+          var status = e.detail && e.detail.xhr ? e.detail.xhr.status : 0;
+          unbind();
+          run.textContent = status ? 'Could not load the record (HTTP ' + status + ').' : 'Could not reach the server.';
+        });
       });
       bind();
     }
@@ -437,7 +507,7 @@
     AbortController: window.AbortController,
     location: window.location,
     navigator: window.navigator,
-    now: Date.now,
+    now: function () { return window.performance.now(); }, // monotonic: a clock step never silences playback
     setInterval: window.setInterval.bind(window),
     clearInterval: window.clearInterval.bind(window)
   }).start();

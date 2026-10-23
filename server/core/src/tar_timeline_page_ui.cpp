@@ -41,9 +41,9 @@ constexpr std::string_view kPage = R"HTM(<!DOCTYPE html>
       <div class="tl-clk"><b id="tl-clock">—</b><span>UTC</span></div>
       <div class="cg">
         <button class="btn play" id="tl-play" type="button" aria-pressed="false" disabled>Play</button>
-        <button class="btn" id="tl-speed" type="button" aria-label="Playback speed" disabled>Speed 1x</button>
+        <button class="btn" id="tl-speed" type="button" disabled>Speed 1x</button>
       </div>
-      <span class="lbl">Drag the yellow line, click the timeline, or use the arrow, Home, End and Page keys. Times are UTC. Play moves the yellow line through the record already loaded; it does not show live data.</span>
+      <span class="lbl">Drag the moment line, click the timeline, or use the arrow, Home, End and Page keys. Times are UTC. Play moves the moment line through the record already loaded; it does not show live data.</span>
       <span class="lbl" id="tl-play-note" role="status"></span>
     </div>
     <div id="tl-run" data-moment-url="/fragments/tar/timeline/moment?id={{ID}}" data-selected-url="/fragments/tar/timeline/selected?id={{ID}}" hx-get="/fragments/tar/timeline/run?id={{ID}}{{AT}}" hx-trigger="load" hx-swap="innerHTML">

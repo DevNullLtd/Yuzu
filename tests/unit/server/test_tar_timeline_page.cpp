@@ -15,7 +15,6 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <string>
-#include <vector>
 
 namespace yuzu::server {
 extern const std::string kYuzuTarTimelineJs;
@@ -58,11 +57,16 @@ TEST_CASE("tar timeline page: one shell block, Posture / TAR / Timeline, one CSS
     REQUIRE(b != std::string::npos);
     REQUIRE(e != std::string::npos);
     CHECK(e - b > 1000);
-    CHECK(shell::breadcrumb_trail({.active_key = "tar", .title = "Timeline"}) ==
-          std::vector<std::string>{"Posture", "TAR", "Timeline"});
+    // The rendered chrome, not the helper that builds it: Posture / TAR / Timeline, TAR lit.
+    CHECK_THAT(html, ContainsSubstring("<nav class=\"shell-crumb\" aria-label=\"Breadcrumb\"><span>Posture</span>"
+                                       "<span class=\"shell-sep\">/</span><span>TAR</span>"
+                                       "<span class=\"shell-sep\">/</span><b>Timeline</b></nav>"));
+    CHECK_THAT(html, ContainsSubstring("<a class=\"shell-nav on\" href=\"/tar\" aria-current=\"page\">"));
     CHECK(count_of(html, "<link rel=\"stylesheet\" href=\"/static/yuzu.css\">") == 1);
     CHECK(count_of(html, "<script src=\"/static/htmx.js\"></script>") == 1);
     CHECK(count_of(html, "<script src=\"/static/yuzu-tar-timeline.js\" defer></script>") == 1);
+    // Exactly two scripts of the page's own, both external: no inline script beside them.
+    CHECK(count_of(page_only(html), "<script") == 2);
     // The page's own markup carries no CSS and no inline handler.
     const std::string own = page_only(html);
     CHECK(count_of(own, "<style") == 0);
@@ -115,10 +119,15 @@ TEST_CASE("tar timeline page: playback controls and honest copy", "[tar][timelin
     CHECK_THAT(html, ContainsSubstring(
         "<button class=\"btn play\" id=\"tl-play\" type=\"button\" aria-pressed=\"false\" disabled>Play</button>"));
     CHECK_THAT(html, ContainsSubstring(
-        "<button class=\"btn\" id=\"tl-speed\" type=\"button\" aria-label=\"Playback speed\" disabled>Speed 1x</button>"));
+        "<button class=\"btn\" id=\"tl-speed\" type=\"button\" disabled>Speed 1x</button>"));
+    // The button's own text names it (a label that differs from the text would hide the speed).
+    CHECK_THAT(html, !ContainsSubstring("aria-label=\"Playback speed\""));
     CHECK_THAT(html, ContainsSubstring("id=\"tl-play-note\""));
     CHECK_THAT(html, ContainsSubstring(
-        "Play moves the yellow line through the record already loaded; it does not show live data."));
+        "Play moves the moment line through the record already loaded; it does not show live data."));
+    CHECK_THAT(html, ContainsSubstring("Drag the moment line, click the timeline,"));
+    // The line is not yellow in every colour scheme.
+    CHECK_THAT(page_only(html), !ContainsSubstring("yellow"));
     // No Slow pill, incident controls, story, user or fleet text on this page.
     const std::string own = page_only(html);
     for (const char* banned : {"Slow", "incident", "Story", "signed in", "fleet", "hx-on"}) {
@@ -132,7 +141,8 @@ TEST_CASE("tar timeline script: pinned tokens present", "[tar][timeline][js]") {
          {"'use strict'", "typeof module", "module.exports", "typeof document === 'undefined'", "fetch(",
           "credentials: 'same-origin'", "AbortController", "setPointerCapture", "data-tl-bound", "data-ts",
           "data-from", "data-ref", "location.origin", "calc(var(--gut) + (100% - var(--gut)) * ",
-          "aria-pressed", "visibilitychange", "htmx:afterSettle", "htmx:responseError"}) {
+          "aria-pressed", "visibilitychange", "htmx:afterSettle", "htmx:responseError", "htmx:sendError",
+          "htmx:timeout", "'HX-Request': 'true'", "res.redirected", "assign('/login')", "performance.now()"}) {
         INFO(want);
         CHECK_THAT(js(), ContainsSubstring(want));
     }

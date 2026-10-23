@@ -323,16 +323,18 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
         sink.Get("/tar/timeline", [deps](const httplib::Request& req, httplib::Response& res) {
             auto session = deps.auth_fn(req, res);
             if (!session) {
-                res.set_redirect(home_ui::sign_in_location(req.path));
+                // /tar/timeline is not in the nav, so ask for its family screen by route: the
+                // landing page then says "Sign in to open TAR".
+                res.set_redirect(home_ui::sign_in_location("/tar"));
                 return;
             }
+            res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
             const std::string id = req.get_param_value("id");
             if (id.empty()) {
                 res.status = 400;
                 res.set_content("missing id", "text/plain; charset=utf-8");
                 return;
             }
-            res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
             res.set_content(render_tar_timeline_page(id, req.get_param_value("at")),
                             "text/html; charset=utf-8");
         });

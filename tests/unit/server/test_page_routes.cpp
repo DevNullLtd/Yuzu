@@ -609,7 +609,9 @@ TEST_CASE("page_routes: the timeline page needs a session and an id",
     auto anon = h.sink.Get("/tar/timeline?id=x");
     REQUIRE(anon);
     CHECK(anon->status == 302);
-    CHECK(anon->get_header_value("Location").starts_with("/home"));
+    // /tar/timeline is not in the nav: the redirect names its family screen, so the landing page
+    // says "Sign in to open TAR".
+    CHECK(anon->get_header_value("Location") == "/home?next=tar");
 
     Harness a;
     a.tar_timeline_ui = true;
@@ -620,6 +622,7 @@ TEST_CASE("page_routes: the timeline page needs a session and an id",
         REQUIRE(r);
         CHECK(r->status == 400);
         CHECK(r->body == "missing id");
+        CHECK(r->get_header_value("Cache-Control").find("no-cache") != std::string::npos);
     }
 }
 

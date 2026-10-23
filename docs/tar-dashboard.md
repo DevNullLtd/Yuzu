@@ -339,8 +339,8 @@ separate work; this section records the contract it must meet.
 
 ### 5.8 Timeline page (hidden until the timeline fragments land)
 
-`GET /tar/timeline?id=<agent_id>[&at=<epoch seconds>]` is the page that hosts the 5.7
-renderers, with `static/yuzu-tar-timeline.js` beside it. Both routes are registered only
+`GET /tar/timeline?id=<agent_id>[&at=<epoch seconds>]` is the page that will host the
+5.7 renderers, with `static/yuzu-tar-timeline.js` beside it. Both routes are registered only
 when `kTarTimelineUi` (`tar_timeline_page_ui.hpp`, copied into `page::Deps::tar_timeline_ui`)
 is true. It ships false: the paths do not exist, nothing links to them, and nothing is
 operator-visible. A signed-out request is redirected to sign in; a missing `id` is a 400.
@@ -351,13 +351,14 @@ operator-visible. A signed-out request is redirected to sign in; a missing `id` 
   with `data-moment-url` and `data-selected-url` naming the other two fragments),
   `#tl-moment`, `#tl-selected`, the UTC clock, Play and Speed, and Copy link to this
   moment. The id is percent-encoded then HTML-escaped; `at` is used only when it is
-  digits.
+  1 to 19 digits.
 - **What the fragments must carry.** The script reads numbers, never guesses them:
   `.tl-body[data-from][data-to]` (the window), `.tl-ph[data-ts]` (the resolved moment,
   emitted only for a valid window, which is the script's bind signal), moment-panel
-  Previous/Next anchors `a[data-ts]`, block buttons `button[data-ts][data-ref]`, and the
-  selected panel's linked-item anchors `a[data-ref][data-ts]`. The renderers emit all of
-  these. The run fragment is expected to poll its own result with `hx-target="this"` (as
+  Previous/Next anchors `a[data-ts]`, block buttons `button[data-ts]` (with a `data-ref`
+  when the block is one item), and the selected panel's linked-item anchors
+  `a[data-ref][data-ts]`. Every number is plain digits (at most 15): `0x10`, `1e3` or a
+  missing `data-ts` makes the window invalid. The renderers emit all of these. The run fragment is expected to poll its own result with `hx-target="this"` (as
   the process tree does); a failed load or poll anywhere inside `#tl-run` is reported
   in the run slot with the HTTP status.
 - **What the script does.** It binds once per run instance (a repeated or unrelated
@@ -368,20 +369,40 @@ operator-visible. A signed-out request is redirected to sign in; a missing `id` 
   the same time; the newest request per panel wins and a superseded one is aborted. The
   panels show whatever the server returns, including offline, not-readable and capped
   states; a non-2xx is "Could not load this panel (HTTP n)." and an unreachable server
-  "Could not reach the server.".
+  "Could not reach the server." (failures are announced as alerts, a landed panel is not).
+  Every panel request sends `HX-Request: true`, so the server answers a signed-out one with
+  401; a 401 or a redirected answer ends the session once: playback stops, both panel
+  requests are aborted and the browser goes to `/login`. A load inside `#tl-run` that is
+  refused, never reaches the server or times out is reported in the run slot.
 - **Playback.** Play/Pause and a 1x / 10x / 60x speed move the moment line through the
   window already loaded; they do not show live data. Each step advances the line by
   speed times elapsed time, clamped to the window; a stalled timer (a throttled or
   suspended tab) counts at most one second of elapsed time per step, so the line never
   leaps. It stops at the window end (no loop),
   on Pause, on any manual move, on a failed panel request, when the tab is hidden and
-  when the run instance is replaced. Panel requests during playback are throttled to one
-  a second (the newest time wins); stopping on Pause, the window end or a hidden tab
-  commits the exact stop time once so the panels agree with the line. Play is disabled
+  when the run instance is replaced. Panel requests, during playback and for a held key
+  alike, are limited to one a second (the newest time wins) and wait for the previous
+  answer; stopping on Pause, the window end or a hidden tab commits the exact stop time
+  once so the panels agree with the line. A click on a linked item in the Selected panel
+  stops playback; Play at the window end restarts from the window start. Play is disabled
   with a note when the window is a day or longer or not valid.
 
-The fragments themselves, their permissions and audit are separate work; this section
-records the contract they must meet.
+The fragments themselves, their permissions and audit are separate work. What the page
+assumes of them:
+
+- Requests are `run?id[&at]`, `moment?id&at` and `selected?id&ref&at` under
+  `/fragments/tar/timeline/`: stateless, keyed by `id`, no token. The run poll ends at its
+  result. `at` parses fail-closed (digits only, no overflow, `at=0` invalid), `ref` has a
+  bounded length, and responses carry `Cache-Control: no-store`.
+- Per-device authorization is theirs: `require_scoped_permission`, the same posture as the
+  TAR SQL frame (5.5). One usage-class audit verb through `emit_behavioral_audit`, emitted
+  once per run open (not per moment or selected request), with an explicit choice of
+  fail-closed or proceed.
+- An A5 / ADR-1005 parity exception row (issue and revisit date) lands before the flag flips.
+- The renderers' default `href`s are not page deep links; the script intercepts them.
+- Keyboard and ARIA limits: the arrow, Page, Home and End keys move the line while the
+  timeline has focus; the range reads the moment as a UTC time; failures are announced,
+  routine refreshes are not. No accessibility conformance is claimed.
 
 ---
 
