@@ -324,6 +324,20 @@ yuzu_estate_js_embed = custom_target(
   ],
 )
 
+# TAR timeline page (hidden; /static/yuzu-tar-timeline.js). Symbol: kYuzuTarTimelineJs.
+yuzu_tar_timeline_js_embed = custom_target(
+  'yuzu_tar_timeline_js_bundle',
+  input: 'static/yuzu-tar-timeline.js',
+  output: 'yuzu_tar_timeline_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuTarTimelineJs',
+  ],
+)
+
 # Hardware record "Tags and properties" lens controls. Symbol: kYuzuDeviceDataJs.
 yuzu_device_data_js_embed = custom_target(
   'yuzu_device_data_js_bundle',
@@ -583,6 +597,7 @@ yuzu_server_core_lib = static_library(
    yuzu_groups_js_embed,
    yuzu_system_js_embed,
    yuzu_developer_js_embed,
+   yuzu_tar_timeline_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
@@ -694,6 +709,7 @@ yuzu_server_core_lib = static_library(
     'src/home_routes.cpp', # Dashboard: GET /fragments/dashboard/summary over injected seams
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
+    'src/tar_timeline_page_ui.cpp', # hidden TAR timeline page shell (flag-gated route)
     'src/result_sets_ui.cpp',
     'src/result_set_extras_render.cpp',
     'src/approvals_page_render.cpp', # Operate O1: the Approvals page's pure list renderer
