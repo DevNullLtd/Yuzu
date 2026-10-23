@@ -72,7 +72,6 @@ const ok = (c, msg) => { if (!c) fails.push(msg); };
   eq(tl.isoUtc(1e15), '—', 'isoUtc: out of range is a dash');
 
   eq(tl.momentUrl('/f/moment?id=agent-1', 150), '/f/moment?id=agent-1&at=150', 'momentUrl appends');
-  eq(tl.momentUrl('/f/moment', 150), '/f/moment?at=150', 'momentUrl starts the query when there is none');
   eq(tl.momentUrl('/f/moment?id=a', 150.9), '/f/moment?id=a&at=150', 'momentUrl floors');
   eq(tl.selectedUrl('/f/sel?id=a', 'a&b=c#d', 5), '/f/sel?id=a&ref=a%26b%3Dc%23d&at=5',
      'selectedUrl encodes the ref');
@@ -91,7 +90,7 @@ const ok = (c, msg) => { if (!c) fails.push(msg); };
   eq(tl.nextPlayhead(150, 1, -500, 100, 200), { t: 150, done: false }, 'nextPlayhead: no time travel');
   eq(tl.nextPlayhead(150, 1, 600000, 100, 200), { t: 151, done: false }, 'nextPlayhead: a stall does not jump');
   eq(tl.nextPlayhead(200, 1, 0, 100, 200).done, true, 'nextPlayhead: at the end is done');
-  eq([tl.throttleDue(null, 5), tl.throttleDue(1000, 1999), tl.throttleDue(1000, 2000), tl.throttleDue(1000, 5000)],
+  eq([tl.throttleDue(-Infinity, 5), tl.throttleDue(1000, 1999), tl.throttleDue(1000, 2000), tl.throttleDue(1000, 5000)],
      [true, false, true, true], 'throttleDue');
 }
 
@@ -130,7 +129,8 @@ class El {
     this.listeners = {}; this.style = {}; this._text = ''; this.innerHTML = ''; this.rect = { left: 0, width: 0 };
     this.disabled = false; this.value = ''; this.captured = [];
     this.classList = { add: (c) => this.classes.add(c), remove: (c) => this.classes.delete(c),
-                       contains: (c) => this.classes.has(c) };
+                       contains: (c) => this.classes.has(c),
+                       toggle: (c, f) => (f ? this.classes.add(c) : this.classes.delete(c)) };
   }
   get className() { return [...this.classes].join(' '); }
   set className(v) { this.classes = new Set(String(v).split(/\s+/).filter(Boolean)); }
@@ -169,7 +169,7 @@ function build(o) {
     addEventListener(t, f) { (this.listeners[t] = this.listeners[t] || []).push(f); },
     getElementById(id) { const f = (n) => { for (const c of n.children) { if (c.attrs.id === id) return c; const r = f(c); if (r) return r; } return null; }; return f(body); } };
   const mk = (tag, id, parent) => { const e = new El(tag); if (id) e.attrs.id = id; (parent || body).appendChild(e); return e; };
-  const ctx = { doc, body, fetches: [], assigned: [], clip: [], clockNow: 1000000, intervals: new Map(), nextH: 1, timeouts: [] };
+  const ctx = { doc, body, fetches: [], assigned: [], clip: [], clockNow: 1000000, intervals: new Map(), nextH: 1 };
   ctx.copy = mk('button', 'tl-copy'); ctx.copy.textContent = 'Copy link to this moment';
   ctx.clock = mk('b', 'tl-clock');
   ctx.play = mk('button', 'tl-play'); ctx.play.disabled = true; ctx.play.attrs['aria-pressed'] = 'false'; ctx.play.textContent = 'Play';
@@ -187,9 +187,7 @@ function build(o) {
     navigator: { clipboard: { writeText: (t) => { ctx.clip.push(t); return o && o.clipFail ? Promise.reject(new Error('no')) : Promise.resolve(); } } },
     now: () => ctx.clockNow,
     setInterval: (f, ms) => { const h = ctx.nextH++; ctx.intervals.set(h, { f, ms }); return h; },
-    clearInterval: (h) => { ctx.intervals.delete(h); },
-    setTimeout: (f, ms) => { const h = ctx.nextH++; ctx.timeouts.push({ h, f, ms }); return h; },
-    clearTimeout: (h) => { ctx.timeouts = ctx.timeouts.filter((t) => t.h !== h); } };
+    clearInterval: (h) => { ctx.intervals.delete(h); } };
   ctx.tick = (ms) => { ctx.clockNow += (ms === undefined ? 250 : ms); for (const { f } of [...ctx.intervals.values()]) f(); };
   tl.shell(env).start();
   return ctx;
@@ -353,8 +351,6 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
     key(c, 'ArrowRight');
     fire(c.copy, 'click', {}); await flush();
     eq([c.clip, c.copy.textContent], [['https://yuzu.test/tar/timeline?id=agent-1&at=151'], 'Link copied'], 'copy link is absolute and keeps only id');
-    eq(c.timeouts.length, 1, 'one label timer');
-    c.timeouts[0].f(); eq(c.copy.textContent, 'Copy link to this moment', 'label restores');
     const d = build({ clipFail: true }); show(d);
     fire(d.copy, 'click', {}); await flush();
     eq(d.copy.textContent, 'Could not copy', 'copy failure is said');

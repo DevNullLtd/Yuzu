@@ -127,13 +127,6 @@ TEST_CASE("tar timeline page: playback controls and honest copy", "[tar][timelin
     }
 }
 
-TEST_CASE("tar timeline page: every template piece is under the MSVC literal cap",
-          "[tar][timeline][page]") {
-    for (const auto part : tar_timeline_page_parts())
-        CHECK(part.size() < 16000);
-    CHECK(tar_timeline_page_parts().size() >= 2);
-}
-
 TEST_CASE("tar timeline script: pinned tokens present", "[tar][timeline][js]") {
     for (const char* want :
          {"'use strict'", "typeof module", "module.exports", "typeof document === 'undefined'", "fetch(",
@@ -159,10 +152,10 @@ TEST_CASE("tar timeline script: one markup sink, no eval, storage, console or ab
 
 TEST_CASE("tar timeline script: playback is bounded by named limits, not open-ended timers",
           "[tar][timeline][js]") {
-    // One playback interval; the only other timer is the copy label.
+    // One playback interval and no other timer.
     CHECK(count_of(js(), "env.setInterval(") == 1);
     CHECK(count_of(js(), "env.clearInterval(") == 1);
-    CHECK(count_of(js(), "env.setTimeout(") == 1);
+    CHECK(count_of(js(), "env.setTimeout(") == 0);
     CHECK(count_of(js(), "requestAnimationFrame") == 0);
     CHECK_THAT(js(), ContainsSubstring("THROTTLE_MS = 1000"));
 }

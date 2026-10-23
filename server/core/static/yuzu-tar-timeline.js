@@ -81,16 +81,9 @@
       return new Date(Math.floor(t) * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
     },
 
-    withParams: function (base, obj) {
-      var out = base, sep = base.indexOf('?') < 0 ? '?' : '&';
-      Object.keys(obj).forEach(function (k) {
-        out += sep + k + '=' + encodeURIComponent(String(obj[k]));
-        sep = '&';
-      });
-      return out;
-    },
-    momentUrl: function (base, t) { return tl.withParams(base, { at: Math.floor(t) }); },
-    selectedUrl: function (base, ref, t) { return tl.withParams(base, { ref: ref, at: Math.floor(t) }); },
+    // The page-given bases always carry `?id=`, so these only append.
+    momentUrl: function (base, t) { return base + '&at=' + Math.floor(t); },
+    selectedUrl: function (base, ref, t) { return base + '&ref=' + encodeURIComponent(ref) + '&at=' + Math.floor(t); },
 
     // Root-relative link to this page at moment t; only `id` is kept from the current query.
     pageLink: function (pathname, search, t) {
@@ -112,13 +105,11 @@
       var n = tl.clamp(t + speed * dt / 1000, from, to);
       return { t: n, done: n >= to };
     },
-    throttleDue: function (lastCommitMs, nowMs) {
-      return lastCommitMs === null || lastCommitMs === undefined || nowMs - lastCommitMs >= THROTTLE_MS;
-    }
+    throttleDue: function (lastCommitMs, nowMs) { return nowMs - lastCommitMs >= THROTTLE_MS; }
   };
 
   // The DOM shell. env = { document, fetch, AbortController, location, navigator, now,
-  // setInterval, clearInterval, setTimeout, clearTimeout }.
+  // setInterval, clearInterval }.
   tl.shell = function (env) {
     var doc = env.document;
     var run, clockEl, playBtn, speedBtn, noteEl, copyBtn;
@@ -126,9 +117,8 @@
     var selected = { el: null, ctl: null };
     var st = null;          // the bound run instance, or null
     var speed = 1;
-    var playing = false, timer = null, lastTick = 0, lastCommit = null;
+    var playing = false, timer = null, lastTick = 0, lastCommit = -Infinity;
     var scrubbing = false;
-    var copyTimer = null;
 
     function abortSlot(slot) {
       if (slot.ctl) {
@@ -249,11 +239,9 @@
     }
 
     function markOn(ref) {
-      var bs = st.root.querySelectorAll('button[data-ref]');
-      for (var i = 0; i < bs.length; i++) {
-        if (ref !== null && bs[i].getAttribute('data-ref') === ref) bs[i].classList.add('on');
-        else bs[i].classList.remove('on');
-      }
+      st.root.querySelectorAll('button[data-ref]').forEach(function (b) {
+        b.classList.toggle('on', ref !== null && b.getAttribute('data-ref') === ref);
+      });
     }
 
     // Binds a run instance once. Anything else (an unrelated or repeated settle) is a no-op.
@@ -337,12 +325,7 @@
 
     function onCopy() {
       var link = env.location.origin + tl.pageLink(env.location.pathname, env.location.search, st ? st.t : null);
-      var label = 'Copy link to this moment';
-      function say(text) {
-        copyBtn.textContent = text;
-        if (copyTimer !== null) env.clearTimeout(copyTimer);
-        copyTimer = env.setTimeout(function () { copyBtn.textContent = label; copyTimer = null; }, 2200);
-      }
+      function say(text) { copyBtn.textContent = text; }
       if (!env.navigator || !env.navigator.clipboard) { say('Could not copy'); return; }
       env.navigator.clipboard.writeText(link).then(function () { say('Link copied'); },
                                                    function () { say('Could not copy'); });
@@ -430,16 +413,15 @@
   if (typeof module !== 'undefined' && module.exports) module.exports = tl;
   if (typeof document === 'undefined') return;
 
+  // fetch and the timers throw on a detached `this`, so they are bound to window.
   tl.shell({
     document: document,
-    fetch: function (u, o) { return window.fetch(u, o); },
+    fetch: window.fetch.bind(window),
     AbortController: window.AbortController,
     location: window.location,
     navigator: window.navigator,
-    now: function () { return Date.now(); },
-    setInterval: function (f, ms) { return window.setInterval(f, ms); },
-    clearInterval: function (h) { window.clearInterval(h); },
-    setTimeout: function (f, ms) { return window.setTimeout(f, ms); },
-    clearTimeout: function (h) { window.clearTimeout(h); }
+    now: Date.now,
+    setInterval: window.setInterval.bind(window),
+    clearInterval: window.clearInterval.bind(window)
   }).start();
 })();

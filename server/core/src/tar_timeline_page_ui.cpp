@@ -7,15 +7,11 @@
 #include "app_shell.hpp"
 #include "web_utils.hpp"
 
-#include <array>
-
 namespace yuzu::server {
 
 namespace {
 
-// Two literals, each far under the MSVC C2026 16380-character cap; kept apart so the cap is a
-// per-piece pin in the tests.
-constexpr std::string_view kHead = R"HTM(<!DOCTYPE html>
+constexpr std::string_view kPage = R"HTM(<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -28,9 +24,7 @@ constexpr std::string_view kHead = R"HTM(<!DOCTYPE html>
 </head>
 <body>
 <!--yuzu:shell--><!--/yuzu:shell-->
-)HTM";
-
-constexpr std::string_view kBody = R"HTM(<main class="page">
+<main class="page">
   <header class="page-header">
     <div>
       <h1>Timeline</h1>
@@ -75,16 +69,12 @@ constexpr std::string_view kBody = R"HTM(<main class="page">
 </html>
 )HTM";
 
-constexpr std::array<std::string_view, 2> kParts{kHead, kBody};
+static_assert(kPage.size() < 15000,
+              "MSVC C2026: keep every raw string literal under the 16,380-byte cap");
 
 // The shell is rendered into the template once, on first use.
 const std::string& baked_page() {
-    static const std::string page = [] {
-        std::string tmpl;
-        for (const auto p : kParts)
-            tmpl += p;
-        return std::string{shell::bake(tmpl.c_str(), {.active_key = "tar", .title = "Timeline"})};
-    }();
+    static const std::string page{shell::bake(kPage.data(), {.active_key = "tar", .title = "Timeline"})};
     return page;
 }
 
@@ -110,7 +100,5 @@ std::string render_tar_timeline_page(std::string_view agent_id, std::string_view
     replace_all(html, "{{ID}}", html_escape(url_query_value(agent_id)));
     return html;
 }
-
-std::span<const std::string_view> tar_timeline_page_parts() { return kParts; }
 
 } // namespace yuzu::server

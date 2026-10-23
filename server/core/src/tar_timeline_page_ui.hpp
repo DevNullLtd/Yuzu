@@ -6,7 +6,6 @@
 /// the record and static/yuzu-tar-timeline.js moves the moment line. Design:
 /// docs/tar-dashboard.md section 5.8.
 
-#include <span>
 #include <string>
 #include <string_view>
 
@@ -21,8 +20,5 @@ inline constexpr bool kTarTimelineUi = false;
 /// The page for one device. `agent_id` is percent-encoded then HTML-escaped wherever it
 /// lands; `at` is the opening moment and is used only when it is 1 to 19 ASCII digits.
 [[nodiscard]] std::string render_tar_timeline_page(std::string_view agent_id, std::string_view at);
-
-/// The raw template pieces, for the per-literal size pin (MSVC caps one literal at 16380).
-[[nodiscard]] std::span<const std::string_view> tar_timeline_page_parts();
 
 } // namespace yuzu::server

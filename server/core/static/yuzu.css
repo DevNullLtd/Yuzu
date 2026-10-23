@@ -1207,6 +1207,6 @@ td .sub { display: block; overflow: hidden; text-overflow: ellipsis; color: var(
 .tl.scrubbing .tl-body { cursor: grabbing; }
 .tl.scrubbing .tl-b, .tl.scrubbing .tl-t, .tl.scrubbing .tl-c, .tl.scrubbing .tl-k, .tl.scrubbing .tl-d { pointer-events: none; }
 .tl-det.busy { opacity: .6; }
-.tl-det > .tl-empty, .tl-det > p.tl-empty { padding: 12px 16px; margin: 0; }
+.tl-det > .tl-empty { padding: 12px 16px; margin: 0; }
 .tl-ctl .btn.play[aria-pressed="true"] { border-color: var(--hl); background: color-mix(in srgb, var(--hl) 22%, transparent); }
 /* -- end Timeline page interaction states -- */
