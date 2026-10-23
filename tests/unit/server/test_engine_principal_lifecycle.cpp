@@ -1452,6 +1452,71 @@ TEST_CASE("Engine-principal REST: a role granting every pair but one is not repo
     }
 }
 
+TEST_CASE("Engine-principal REST: a stuck rotation pair is recovered by revoking the SUCCESSOR "
+          "through DELETE /api/v1/tokens/{id}, then rotating from the sole credential",
+          "[pg][rest][engine_principal][rotation][recovery]") {
+    // The documented recovery (docs/user-manual/engine-principals.md, "If the secret is lost"):
+    // the successor's secret is gone, so the pair cannot be confirmed. Revoke the SUCCESSOR with
+    // the per-credential route (never the principal, which is terminal), after which the
+    // predecessor must survive as a standalone credential and rotate again from there.
+    RestEngineHarness h;
+    auto [pid, raw1] = h.create_and_mint("rotation-recovery");
+    (void)raw1;
+
+    auto r1 = h.rotate(pid);
+    REQUIRE(r1);
+    REQUIRE(r1->status == 200);
+    const auto successor_id = nlohmann::json::parse(r1->body)["data"]["token_id"].get<std::string>();
+    REQUIRE(!successor_id.empty());
+
+    // Stuck: once the grace window lapses the pair cannot be re-served (same advanced-`now`
+    // technique as the lapsed-grace case above), and both credentials are still active.
+    auto lapsed =
+        h.token_store->rotate_engine_credential(pid, 86400, now_epoch() + 10 * 60, "alice");
+    REQUIRE_FALSE(lapsed.has_value());
+    CHECK(lapsed.error().find("grace window elapsed") != std::string::npos);
+
+    std::string predecessor_id;
+    {
+        const auto active = h.token_store->list_active_for_principal(pid);
+        REQUIRE(active.size() == 2);
+        for (const auto& t : active) {
+            CHECK(!t.rotation_group.empty());
+            if (t.token_id != successor_id)
+                predecessor_id = t.token_id;
+        }
+        REQUIRE(!predecessor_id.empty());
+    }
+
+    // Recovery step 2: revoke the successor as an effective administrator.
+    h.session_role = auth::Role::admin;
+    auto del = h.sink.dispatch("DELETE", "/api/v1/tokens/" + successor_id, "");
+    REQUIRE(del);
+    CHECK(del->status == 200);
+    CHECK(nlohmann::json::parse(del->body)["data"]["revoked"].get<bool>() == true);
+
+    // The predecessor survives as the SOLE credential, resolved to a standalone row (no
+    // rotation stamp left for the sweep to act on), and was not revoked to zero credentials.
+    {
+        const auto active = h.token_store->list_active_for_principal(pid);
+        REQUIRE(active.size() == 1);
+        CHECK(active[0].token_id == predecessor_id);
+        CHECK(active[0].rotation_group.empty());
+        CHECK(active[0].supersedes_token_id.empty());
+        CHECK(active[0].overlap_expires_at == 0);
+    }
+
+    // Recovery step 3: rotating from the sole credential succeeds with a fresh secret.
+    auto r2 = h.rotate(pid);
+    REQUIRE(r2);
+    REQUIRE(r2->status == 200);
+    const auto data = nlohmann::json::parse(r2->body)["data"];
+    CHECK(!data["token"].get<std::string>().empty());
+    CHECK(data["token_id"].get<std::string>() != successor_id);
+    CHECK(data["token_id"].get<std::string>() != predecessor_id);
+    CHECK(h.token_store->list_active_for_principal(pid).size() == 2);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // DELETE kills both identity + credentials.
 // ═══════════════════════════════════════════════════════════════════════════
