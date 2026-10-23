@@ -3123,9 +3123,10 @@ the root and CRL downloads and the import form. A confined `Security:Delete` hol
 revoke a serial it already knows through `POST /api/v1/ca/revoke`, but cannot list serials: use
 an unconfined account, or read revoked serials from the CRL (`/api/v1/ca/crl`). The panel's
 reply to a revoke or an import is never blank for such a caller: it shows the panel with a note
-where the list would be, plus a confirmation banner after a success (a caller without
-`Security:Read` gets the plain note instead of the panel, with the same confirmation banner and
-success toast after a success). To
+where the list would be, plus a confirmation banner and a success toast after a success; the
+banner adds that the issued-certificate inventory is not shown (see the note below). A caller
+without `Security:Read` gets the plain note instead of the panel, and after a success the same
+confirmation banner and toast, without that sentence about the inventory. To
 revoke one (e.g. a decommissioned or compromised agent):
 
 1. Find the agent's row in the inventory (match on **Subject** = `agent_id` or
