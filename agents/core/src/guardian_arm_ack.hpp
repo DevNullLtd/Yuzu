@@ -158,7 +158,7 @@ public:
     ///
     /// #5547: starts an application for an authoritative full_sync push (Application::full_sync
     /// is true). The only OBLIGATION it carries is the unattributed legacy debt:
-    /// `inherited_latch = old.inherited_latch || old.latched_failure` (Ruling 22 (b); it is
+    /// `inherited_latch = old.inherited_latch || old.latched_failure` (spark flip gate AC-11 (3); it is
     /// discharged by discharge_inherited_latch() once a full sync completes cleanly, never
     /// here). Every per-rule outcome is dropped: a full sync re-arms its named rules and
     /// detaches the rest. It also copies boot_claims (claim IDENTITY only, never an
@@ -179,7 +179,7 @@ public:
     /// (old.inherited_latch || old.latched_failure; the new application's own
     /// latched_failure starts false) and boot_claims (identity only). NOT carried:
     /// resolved_armed, applied, resolved_statuses_for_test, and wedge_suppress_count, which
-    /// restarts at 0 (Ruling 22 (c): alternating applications give no per-wedge elapsed-time
+    /// restarts at 0 (AC-11 (4): alternating applications give no per-wedge elapsed-time
     /// bound). If one id sits in more than one of the old application's sets (a drain that
     /// threw between its insert and its erase leaves that shape), exactly one source is
     /// carried, in the order sync_failed_ids, failed_ids, failed_receipts, pending.
@@ -212,15 +212,18 @@ public:
     void add_pending(std::string rule_id, GuardianSparkRuntime::ArmReceipt receipt,
                      bool boot_origin = false);
 
-    /// #5547 (Ruling 22 (a)): record that `rule_id` failed SYNCHRONOUSLY in the current
-    /// application (admission refusal, a put_rule failure or throw for that rule) so the
-    /// failure survives a replacing delta that omits the rule and holds can_advance()
-    /// false. `boot_origin` tags it as a boot-application failure (ruling (d)). Unlike
-    /// latch_failure() this MAY THROW (set insertion); a caller that must not throw wraps it
-    /// and falls back to latch_failure(). A no-op if there is no current application.
+    /// #5547 (spark flip gate AC-11): record that `rule_id` failed SYNCHRONOUSLY in the current
+    /// application (its arm attempt returned Failed, or its reconcile threw) so the failure
+    /// survives a replacing delta that omits the rule and holds can_advance() false. A
+    /// put_rule failure is NOT recorded here: it names a rule, but apply_rules() latches the
+    /// whole application (latch_failure()) and returns early, so that failure is inherited by
+    /// every later application and discharged only by a clean full_sync. `boot_origin` tags it
+    /// as a boot-application failure (AC-13). Unlike latch_failure() this MAY THROW (set
+    /// insertion); a caller that must not throw wraps it and falls back to latch_failure().
+    /// A no-op if there is no current application.
     void note_sync_failure(const std::string& rule_id, bool boot_origin);
 
-    /// #5547 (Ruling 22 (b), Dave 2026-10-22): clears ONLY the inherited, unattributed
+    /// #5547 (spark flip gate AC-11 (3)): clears ONLY the inherited, unattributed
     /// legacy debt (Application::inherited_latch). Called by apply_rules() at the tail of a
     /// full_sync push whose synchronous phases all succeeded - NOT when a full sync merely
     /// begins. It never touches latched_failure, sync_failed_ids or any per-rule outcome of
@@ -422,7 +425,10 @@ public:
     /// (Reapply). Reapply when there is no current application; when generation,
     /// content_id or full_sync differ; when either content_id is not a real 64-hex
     /// SHA-256 digest (a sentinel is never trusted as a match, even against an
-    /// identical sentinel); when the application latched a failure; when any
+    /// identical sentinel); when the application latched a failure or inherited an
+    /// unattributed latch from an earlier application (#5547); when it carries a
+    /// drained non-wedge failure (failed_ids) or a synchronous per-rule failure
+    /// (sync_failed_ids), each of which is owed a real re-apply; when any
     /// counted failure has no retained outstanding-wedge receipt (a genuine
     /// non-wedge failure, drained or not); and when nothing is outstanding at all
     /// (an application with no pending receipts and no outstanding wedge - this
@@ -524,8 +530,8 @@ private:
         /// account of an outstanding wedge for THIS application. Bounded by
         /// kWedgeSuppressMaxDecisions (the safety valve); incremented only on that
         /// branch; reset by every begin_*() overload and retire() (this struct is
-        /// replaced, and begin_delta_application() deliberately does NOT carry it - Ruling
-        /// 22 (c)), never by a drain or a sibling's recovery.
+        /// replaced, and begin_delta_application() deliberately does NOT carry it - AC-11
+        /// (4)), never by a drain or a sibling's recovery.
         std::size_t wedge_suppress_count{0};
         /// #5547: rule ids whose arm resolved to a counted failure that is NOT a retained
         /// outstanding wedge (Failed, CongestionExpired, Withdrawn, Stopped, a Wedged
@@ -545,7 +551,9 @@ private:
         /// same boot claim by a later application. Holding the receipt keeps the claim alive,
         /// so its address cannot be reused by a different claim. An entry is dropped when
         /// add_pending() sees a different claim for the rule, and otherwise lives until
-        /// retire().
+        /// retire() or the ledger's destruction: both begin_*_application() overloads copy
+        /// it, so a boot-Accepted rule that a later full push removes keeps its claim alive
+        /// until then (bounded by the number of boot-Accepted rules, memory only).
         std::map<std::string, GuardianSparkRuntime::ArmReceipt> boot_claims;
         /// #5547: unattributed legacy debt inherited from earlier applications
         /// (old.inherited_latch || old.latched_failure), distinct from latched_failure,

@@ -1039,7 +1039,9 @@ std::expected<void, std::string> GuardianEngine::start_local() {
     // Contract: if this begin_*_application() throws there is no boot application, so the late
     // variant is invisible (late receipts are dropped by add_pending) and recording a
     // synchronous failure is a no-op (its rule identity is lost); the synchronous flag
-    // boot_unresolved_ is still set by the synchronous variants.
+    // boot_unresolved_ is still set by the synchronous variants. With no identity to carry, the
+    // first later clean push, even an unrelated delta, clears that flag while the rule stays
+    // unarmed: a known, unfixed residual (spark flip gate AC-13).
     //
     // Production order, and what the test fixture now covers: agent.cpp calls
     // wire_spark_engine() BEFORE start_local(), so a real boot CAN re-arm via Spark here and
@@ -1819,11 +1821,12 @@ void GuardianEngine::journal_maintenance_tick() {
             // boot_app_open_ was set and carries the tag across a replacing delta that omits
             // the rule, so the failure surfaces here even after boot_app_open_ was cleared).
             // boot_app_open_ itself is NOT widened to "the application that carries a boot
-            // entry": a rule the replacing push NAMES and that then fails is an ordinary held
-            // push and must never report 0. NOT latched here (unlike the synchronous variants):
-            // a drained wedge stays retained and recoverable, and a late success adopted by
-            // the drain's recovery scan clears resolved_failed and lets the clear below fire
-            // with no push at all.
+            // entry": a rule the replacing push NAMES and that then fails with a fresh claim is
+            // an ordinary held push and does not report 0, whereas a named rule that re-observes
+            // its unchanged boot claim keeps its boot tag (add_pending()) and does. NOT latched
+            // here (unlike the synchronous variants): a drained wedge stays retained and
+            // recoverable, and a late success adopted by the drain's recovery scan clears
+            // resolved_failed and lets the clear below fire with no push at all.
             if (boot_app_open_ || boot_origin_failed)
                 boot_unresolved_ = true;
         }
@@ -2664,8 +2667,8 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // unwind guard declared where it was published. Anything that unwinds from here on (the
     // generation persist, the log line) no longer leaves an incomplete application behind.
     incomplete_application.committed = true;
-    // #5547 (Ruling 22 (b)): a full_sync whose synchronous phases ALL succeeded is the
-    // authoritative repair of the unattributed debt earlier applications handed down
+    // #5547 (spark flip gate AC-11 (3)): a full_sync whose synchronous phases ALL succeeded is
+    // the authoritative repair of the unattributed debt earlier applications handed down
     // (inherited_latch), so it is discharged here. ORDER IS LOAD-BEARING: after set_applied() and
     // BEFORE `clean` is computed below. Computed after, the repairing full_sync would judge itself
     // unclean (can_advance() reads inherited_latch), leave the boot flag set, not advance the
@@ -2747,8 +2750,8 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // and put_rule early returns above all leave the counters alone.
         // #5547: and only a FULL_SYNC counts. The catch-up the server sends for a boot failure is
         // always a full_sync (the heartbeat reconcile re-pushes full_sync=true), whereas a delta
-        // now carries the boot debt (a delta that omits the failed rule is unclean by
-        // construction), so counting it would let a stream of unrelated operator deltas keep
+        // now carries the boot debt (a delta that omits the failed rule is unclean, except when
+        // the boot application could not be opened, see start_local()), so counting it would let a stream of unrelated operator deltas keep
         // extending the holdoff and postpone the real catch-up indefinitely. The whole update is
         // gated, not only the increment: a delta also leaves the existing holdoff untouched. A pending Spark arm
         // also lands here (!can_advance()); the tick clears the flag, and the counters, once it
@@ -2964,7 +2967,7 @@ bool GuardianEngine::boot_rearm_unresolved() const {
 void GuardianEngine::note_boot_rearm_failure_locked(const std::string& rule_id) noexcept {
     boot_unresolved_ = true;
     arm_failures_.fetch_add(1, std::memory_order_relaxed);
-    // #5547 (Ruling 22 (d)): the failure is recorded AGAINST ITS RULE, tagged boot-origin,
+    // #5547 (spark flip gate AC-13): the failure is recorded AGAINST ITS RULE, tagged boot-origin,
     // instead of as the application-wide latch. Its effect on this application is the same
     // (note_sync_failure() makes can_advance() false, the predicate the tick's clear reads; see
     // start_local()'s boot-application comment; decide_retry() returns Reapply on the boot

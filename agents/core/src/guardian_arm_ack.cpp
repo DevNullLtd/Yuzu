@@ -202,7 +202,7 @@ void GuardianArmAckLedger::begin_delta_application(
         next->boot_claims = old.boot_claims;
         next->inherited_latch = old.inherited_latch || old.latched_failure;
         // latched_failure stays false: this application has raised nothing yet.
-        // wedge_suppress_count stays 0 (Ruling 22 (c)).
+        // wedge_suppress_count stays 0 (AC-11 (4)).
     }
     if (begin_fault_hook_)
         begin_fault_hook_(BeginFaultSite::BeforePublish);

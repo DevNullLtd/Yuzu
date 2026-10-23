@@ -1457,7 +1457,7 @@ TEST_CASE("#5513 live (prefer_spark=false): a catch-up whose generation persist 
 TEST_CASE("#5547 live (prefer_spark=false): boot debt is not cleared by an unrelated empty delta, "
           "only by a clean full_sync",
           "[spark][guardian][reconcile][boot][5513][5547]") {
-    // Ruling 22 (d): an unrelated delta must not clear boot_unresolved_. The boot re-arm failure
+    // AC-13 (flip gate): an unrelated delta must not clear boot_unresolved_. The boot re-arm failure
     // is recorded against r1 (tagged boot-origin; the application-wide latch is only the
     // allocation-failure fallback), and the omitting empty delta carries that record, so the
     // delta's application is not clean and the flag, and the reported generation 0, stay. A
@@ -1579,7 +1579,7 @@ TEST_CASE("#5547: a push naming a rule id twice is rejected with no state change
 TEST_CASE("#5547 live (prefer_spark=false): a synchronous boot failure keeps its rule identity "
           "across unrelated deltas, and only a push naming the rule that arms it cleanly clears it",
           "[spark][guardian][reconcile][boot][5513][5547]") {
-    // Ruling 22 (d). The boot failure is recorded against r1 (tagged boot-origin), not as an
+    // AC-13 (flip gate). The boot failure is recorded against r1 (tagged boot-origin), not as an
     // application-wide latch. Unrelated deltas carry it (the flag, the reported 0 and the #5513
     // back-off counters all stay), and a delta naming r1 that arms it cleanly drops exactly that
     // entry: the gap is closed, so the flag clears in that call. Under the previous rule-less
@@ -2046,7 +2046,7 @@ TEST_CASE("#5513 dormant (prefer_spark=true): a persistently failing rule holds 
     // asynchronously (drained), and BOTH hold, so the case never depends on which. Each iteration
     // drains to quiescence BEFORE re-arming the single-shot (an arm still in flight would consume
     // it, the flake the boot_inert refusal loop in this file documents). Mutation: a clear fired
-    // by begin_application or by a Reapply flips the reported value to kGen5513 mid-loop.
+    // by begin_*_application or by a Reapply flips the reported value to kGen5513 mid-loop.
     using namespace std::chrono_literals;
     BootRig5513 r;
     r.seed(true, true, {make_service_rule("r1")}, kGen5513);
@@ -2490,7 +2490,7 @@ TEST_CASE("#5513 dormant (prefer_spark=true): a rejected push leaves a set flag 
           "application untouched, and the next clean push clears it",
           "[spark][guardian][reconcile][boot][5513][dormant]") {
     // Flag already set by the synchronous boot throw. The #4665 reject returns before
-    // begin_application(), so nothing about the boot state may change. Mutation: clearing the
+    // begin_*_application(), so nothing about the boot state may change. Mutation: clearing the
     // flag (or the boot application's ledger state) on a rejected push.
     BootRig5513 r;
     const std::vector<gpb::GuaranteedStateRule> rules = {make_service_rule("r2", true, "SvcB")};
@@ -3007,7 +3007,7 @@ TEST_CASE("GuardianEngine::arm_stats(): prefer_spark_=true, Available, not stopp
     // is unreachable through it. Uses the file's own documented PRODUCTION wire order
     // instead (wire_spark_engine() before start_local() - see "a production-order
     // restart..." above) and stops BEFORE calling start_local(), so ack_ledger_ has
-    // never had begin_application() called on it at all.
+    // never had begin_*_application() called on it at all.
     auto opened = KvStore::open(unique_kv_path());
     REQUIRE(opened.has_value());
     KvStore kv{std::move(*opened)};

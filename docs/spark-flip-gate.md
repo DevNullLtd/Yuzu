@@ -1314,7 +1314,10 @@ flip, with a red-first test each:
     delta names is covered by the new application and is not carried; a full_sync carries no
     per-rule outcome (it re-arms its named rules and detaches the rest).
     What this does and does not do:
-    (1) It holds the generation and keeps the rule counted; it does not re-attempt the omitted
+    (1) It holds the generation. A carried pending arm, wedge or drained failure also stays
+    counted in `arm_failed` (Spark path only); a carried synchronous failure (`sync_failed_ids`)
+    and the application-wide latch hold the generation but are not counted there
+    (`arm_stats()` reads `resolved_failed` only). It does not re-attempt the omitted
     rule (a repeat of the delta processes only the rules it names). A carried failure forces
     a Reapply before the wedge loop, so a co-held genuine wedge is not Suppressed (the same as
     any ordinary failure, AC-12).
@@ -1326,15 +1329,22 @@ flip, with a red-first test each:
     hold lasts until an operator sends a full_sync or the generation moves. Baseline deploy and
     delete DO bump it and push a fleet-wide full_sync (`guardian_routes.cpp`, the
     `bump_policy_generation()` calls followed by `push_fn_("", true)`). A delta-only hold is
-    therefore visible on the agent (`arm_failed`, the held application) but not self-repairing.
-    (3) Ruling 22 (b) is LIVE at `prefer_spark_=false`: the application-wide latch raised by a
+    therefore not self-repairing, and its visibility is limited: on the Spark path an arm
+    failure or wedge shows in `arm_failed`, but a carried synchronous failure is not counted
+    there and `prefer_spark_=false` emits no arm pair, so the signals at the default are the
+    reported generation not advancing (only while a pushed generation is newer than the held
+    one) and the agent log line of the original failure. The `apply_rules ok` line of a later
+    delta counts only that push's failures (`failed=`), not the carried hold.
+    (3) The inherited latch is LIVE at `prefer_spark_=false`: the application-wide latch raised by a
     failure with no rule id (a full_sync's rule-key sweep, key delete or teardown failure, a
     put_rule failure, an unwind) is carried as `inherited_latch` into every later application and
     is discharged only at the tail of a full_sync whose synchronous phases all succeeded. Before
-    #5547 the next operator delta forgot it and the generation was acknowledged. Governance must
-    not file this as dormant.
-    (4) Ruling 22 (c): the suppress budget restarts at 0 on every replacement, delta or full, so
-    alternating deltas and full pushes give no per-wedge elapsed-time bound on a hold.
+    #5547 the next operator delta forgot it and the generation was acknowledged. The discharge
+    shows a clean synchronous tail: withdrawals were issued and queued, which is not the same as
+    each backend `disarm()` having completed (the ledger does not track Disarm claims).
+    (4) The suppress budget restarts at 0 on every replacement, delta or full (as it did before
+    #5547), so with a carried hold alternating deltas and full pushes give no per-wedge
+    elapsed-time bound.
     (5) The carried set is bounded by the distinct rule ids pushed since the last full_sync (a
     cardinality bound, not a work or memory cap: each replacement copies it under the engine lock).
     (6) Option A for AC-15 (decided 2026-10-22): a wedge that was adopted or settled before the
@@ -1367,9 +1377,11 @@ flip, with a red-first test each:
     `yuzu.guardian_boot_rearm_unresolved` until a push applies cleanly, so the server's
     existing reconcile catches it up, and the persisted generation is never rewritten. A
     full push that omits or disables the failed rule clears the flag too, because it is a clean
-    application. A delta that omits the failed rule does not (#5547): the boot failure is recorded against its rule, tagged
-    boot-origin, and carried, so the flag and the reported 0 stay; a delta that names the rule and
-    arms it cleanly clears it (AC-11, FU-12). The evidence is the `[5513]`
+    application. A delta that omits the failed rule does not (#5547), except when the boot
+    application could not be opened (see the residual below): the boot failure is recorded
+    against its rule, tagged boot-origin, and carried, so the flag and the reported 0 stay; a
+    delta that names the rule clears it only when it arms the rule cleanly and nothing else is
+    still unresolved or inherited (AC-11, FU-12). The evidence is the `[5513]`
     and `[boot_rearm]` tests in `test_guardian_engine.cpp`,
     `test_guardian_engine_spark_reconcile.cpp` (its `wire_first` fixture flag and
     `BootRig5513` run the production boot order) and `test_guardian_journal_heartbeat.cpp`,
@@ -1392,7 +1404,8 @@ flip, with a red-first test each:
     with the persisted generation equal to the server's current generation. Only a full_sync
     catch-up counts toward the back-off, and only a full_sync updates the holdoff (#5547): the
     server's catch-up is always a full_sync, whereas a delta that omits the failed rule now
-    carries the boot failure and so is always unclean, and counting it would let a stream of
+    carries the boot failure and so is unclean (except when the boot application could not be
+    opened, see the residual below), and counting it would let a stream of
     unrelated operator deltas keep extending the holdoff. It is NOT
     closed for: an agent whose persisted generation is behind the server's (or is 0), which
     keeps being re-pushed at the server's 25 s limit because the held-back report is still
@@ -1415,9 +1428,14 @@ flip, with a red-first test each:
     also fires for a boot-origin entry carried into a later application; an
     `apply_rules` throw after `begin_*_application()` and before the tail is latched on
     unwind by a guard (it no longer leaves the new application unlatched for the tick's
-    clear). One dormant-Spark residual remains: a boot `begin_full_application()` throw
-    leaves no boot application, so late boot receipts are not tracked and a synchronous boot
-    failure loses its rule identity (the synchronous flag is still set, and reports 0). An acknowledgment persisted by the old waiver is not revoked.
+    clear). One residual remains: a boot `begin_full_application()` throw (an allocation
+    failure) leaves no boot application, so late boot receipts are not tracked (the Spark-only
+    part, dormant while `prefer_spark_` is false) and a synchronous boot failure loses its rule
+    identity. The synchronous flag is still set and reports 0, but with no identity to carry,
+    the first later clean push, even an unrelated delta, clears it while the rule stays
+    unarmed. This is known and unfixed, and its synchronous variant is LIVE at
+    `prefer_spark_=false`, not dormant (it needs a boot re-arm failure as well, so the
+    legacy-path exposure is limited to where a legacy guard actually arms, see above). An acknowledgment persisted by the old waiver is not revoked.
   - (AC-14) **Content identity (#5512).** Before the #4415 PR, a re-observation of a wedged
     claim matched `rule_id` and spec only (the content-identity bug): a wedged rule edited
     without changing its spec (its expected value, for example) was re-observed, not rebuilt,
@@ -1599,7 +1617,7 @@ flip, with a red-first test each:
     (`spark_mechanism.hpp`); (7) an identical arm that sits behind a retained, queued disarm is
     re-observed rather than driven, so it waits at worst about 5 s (`redrive_retained_disarms`);
     the 10 s bound the engine case `(CH-5)` pins is the `release_hang` bound, and it pins that
-    the arm is driven, not that the redrive is what drives it. The keep-set (`full_sync_ids`) is now built
+    the arm is driven, not that the redrive is what drives it. The keep-set (`push_ids`) is now built
     before the first rule is persisted
     rather than inside the rule loop; the baseline (`45f727420`) already inserted into the same
     `std::set` after `begin_application()` with no catch, so this moves that existing exposure

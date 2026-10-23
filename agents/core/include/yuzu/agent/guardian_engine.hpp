@@ -444,8 +444,9 @@ public:
     /// only, never per event.
     [[nodiscard]] GuardianHealthStats spark_claim_health_stats() const;
     /// #5404 (P2): throws caught by the ack-bookkeeping maintenance firewall - the heartbeat
-    /// thread's ack drain / generation advance in journal_maintenance_tick, and the content-id
-    /// hash and begin_*_application preamble in apply_rules. A throw that recurs every tick
+    /// thread's ack drain / generation advance in journal_maintenance_tick, and in apply_rules the
+    /// content-id hash, the push-rule id indexing (the duplicate-id pre-scan) and the
+    /// begin_*_application preamble. A throw that recurs every tick
     /// repeats the skip of that tick's remaining ack drain. Lock-free; zero is steady state.
     [[nodiscard]] std::uint64_t ack_maint_exceptions() const noexcept {
         return ack_maint_exceptions_.load(std::memory_order_relaxed);

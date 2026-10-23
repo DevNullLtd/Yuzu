@@ -823,20 +823,24 @@ acknowledge while the omitted wedged claim had no owning application).
 delta does not name: pending receipts, retained wedges, drained failures
 (`failed_ids`) and synchronous failures (`sync_failed_ids`), each with its boot-origin tag.
 A rule the delta names is not carried, and a full push carries none of them. What the
-carry guarantees and what it does not: it holds the generation and keeps the rule counted
-(`arm_failed`); it does not re-attempt the omitted rule, because a repeat of the delta
+carry guarantees and what it does not: it holds the generation; a carried pending arm, wedge
+or drained failure also stays counted in `arm_failed` (Spark path only), whereas a carried
+synchronous failure and the application-wide latch hold the generation without being counted
+there (`arm_stats()` reads `resolved_failed` only), and `prefer_spark_=false` emits no arm
+pair; it does not re-attempt the omitted rule, because a repeat of the delta
 processes only the rules it names, and the server's heartbeat reconcile re-pushes a full
 push only while the agent reports a generation behind the server's. The REST and MCP
 pushes do not bump the generation (`server.cpp`, the comments in the push lambda that read,
 never bump, the generation), so a delta applied at the generation the agent already holds
 is not followed by an automatic full push: the hold lasts until a full push or a later
 generation (baseline deploy and delete do bump it and send a fleet-wide full push,
-`guardian_routes.cpp`). The suppress budget restarts on every replacement (Ruling 22 (c)).
+`guardian_routes.cpp`). The suppress budget restarts on every replacement (flip gate AC-11 (4); as before #5547).
 The unattributed legacy debt (the application-wide latch from a full push's rule-key
 sweep, key delete or teardown failure, or a put_rule failure) is carried as
 `inherited_latch` and discharged only at the tail of a full push whose synchronous phases
-all succeeded; this is live at `prefer_spark_=false`, where before the next operator delta
-forgot it. Known costs: the carried set is bounded by the distinct rule ids pushed since
+all succeeded (a clean synchronous tail shows that withdrawals were issued and queued, not
+that each backend disarm completed; the ledger does not track Disarm claims); this is live at
+`prefer_spark_=false`, where before the next operator delta forgot it. Known costs: the carried set is bounded by the distinct rule ids pushed since
 the last full push (a cardinality bound, not a work or memory cap; each replacement copies
 it under the engine lock); the carried AC-15 shape (a wedge adopted or settled before the
 agent retained it) is counted as an ordinary failure and persists until a full push or a
@@ -849,7 +853,9 @@ agent restart gap (the boot
 Application opens at the loaded acknowledged generation with an empty `content_id`;
 a failed boot re-arm, formerly never retried, is resolved by #5513: the agent reports
 generation 0 (intermittently, with an agent-side back-off between failed catch-ups) with the
-`yuzu.guardian_boot_rearm_unresolved` tag until a push applies cleanly; a legacy guard that returns false at arm is the boot-path analogue of #2797's
+`yuzu.guardian_boot_rearm_unresolved` tag until a push applies cleanly (an unrelated delta
+does not clear it since #5547, except when the boot application could not be opened, the
+known residual in flip gate AC-13); a legacy guard that returns false at arm is the boot-path analogue of #2797's
 `apply_rules` defect and stays uncovered); a content-identity gap (before #4415 an
 identical re-observation matched `rule_id` and spec only, #5512; since then it also requires
 identical content, and changed content over a wedge queues a follower, flip gate AC-14); a wedge that is adopted or
@@ -1137,7 +1143,9 @@ design is mentioned it is named as the earlier design.
   hold and clears on a genuine recovery (PR-5d's existing mechanism, unchanged). Note
   the claim-scoped #5403/#5404 age and deadline gauges do NOT dip on a forced
   Reapply (they are scoped to the claim/runtime); only `yuzu.guardian_arm_pending` and
-  `yuzu.guardian_arm_failed` are Application-scoped and reset on one.
+  `yuzu.guardian_arm_failed` are Application-scoped and reset on one. Since #5547 a forced
+  Reapply that is a delta no longer resets the entries of the rules it omits (they are carried);
+  a full push resets them.
 - **The drain-time linearization gap is removed, not relocated.** Under the waiver an
   eligibility read taken at the heartbeat drain authorized an acknowledgment, so a
   completion landing between that read and `persist_generation_locked()` (a late
