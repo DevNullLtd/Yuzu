@@ -16,12 +16,12 @@
 // file that defines its own copy next to these gets an ambiguous-call error, so extend the
 // helper instead. answer_unwired answers a non-retryable kInternalError by design and has no
 // retry hint. scripts/ci/check-mcp-retry-hints.py scans this header whenever it is new or
-// changed, but only for the guard shape `auto x = call(); if (!x) { ... a4_error(...) ... }`
-// with no retry_after_ms in the code of the guard body (a tripwire, not a proof). It flags
-// nothing today: answer_unwired has no such guard, so it needs no marker, and the line comment
-// inside it exempts nothing. A new helper that adds that guard shape with a retryable error
-// must pass retry_after_ms, or carry `// retry-hint-exempt: <reason>` inside the guard body;
-// a transient fault needs its own a4_error call with a retry hint.
+// changed, for a store or query fault guard whose error response carries no retry hint
+// (a tripwire, not a proof; the script's docstring names the exact shape, which is not
+// spelled out here because the scan reads comments too). It flags nothing today:
+// answer_unwired has no such guard, so it needs no marker. A new helper that adds a retryable
+// fault guard must pass retry_after_ms on its error call, or carry the script's exempt
+// comment inside the guard body; a transient fault needs its own a4_error call with a hint.
 
 #include "mcp_jsonrpc.hpp"       // kInternalError
 #include "mcp_tool_deps.hpp"     // ToolDeps::audit_fn
