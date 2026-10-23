@@ -1096,7 +1096,7 @@ flip, with a red-first test each:
     only) and then filtered per agent by `build_agent_push` on the LIVE row (`enabled`,
     `os_target`, `scope_expr`). So DISABLING the rule, or narrowing its scope or OS target,
     flows with the next automatic re-push (a rule update bumps the policy generation), while
-    removing a MEMBER from the Baseline is staged until a Re-deploy, a fleet-wide full push
+    removing a MEMBER from the Baseline is staged until a Re-deploy, a full push to the agents connected to that server
     that needs `GuaranteedState:Push`. REST push refuses a service-scoped token
     (`deny_fleet_wide_service_scoped`) and an interactive session must clear the MFA
     step-up check (`step_up_fn`, which skips API-token principals); MCP `push_guardian_rules`
@@ -1327,8 +1327,8 @@ flip, with a red-first test each:
     push lambda around "do not bump the generation" and "Read (never bump)"), so a delta applied
     at the generation the agent already holds is not followed by an automatic full_sync, and the
     hold lasts until an operator sends a full_sync or the generation moves. Baseline deploy and
-    delete of a DEPLOYED Baseline DO bump it and push a fleet-wide full_sync (`guardian_routes.cpp`,
-    the `bump_policy_generation()` calls followed by `push_fn_("", true)`); a deploy retries the hold (a wedged rule stays held until its hung call returns, or another exit in this criterion applies: a full push that drops it, an edit that changes its watch target, or an agent restart, each with the conditions stated there; AC-1), but a delete is not a repair: it withdraws every Guard no other deployed Baseline
+    delete of a DEPLOYED Baseline DO bump it and push a full_sync to the agents connected to that server (`guardian_routes.cpp`,
+    the `bump_policy_generation()` calls followed by `push_fn_("", true)`); a deploy retries the hold (a wedged rule stays held until its hung call returns, or another exit in AC-1 applies: a full push that drops it, an edit that changes its watch target, or an agent restart, each with the conditions stated in AC-1), but a delete is not a repair: it withdraws every Guard no other deployed Baseline
     delivers, so the hold on such a rule ends because the rule is no longer pushed. A delta-only hold is
     therefore not self-repairing, and its visibility is limited: on the Spark path an arm
     failure or wedge shows in `arm_failed`, but a carried synchronous failure is not counted
