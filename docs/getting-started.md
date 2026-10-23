@@ -30,6 +30,8 @@ Here are the key concepts you will use in this tutorial:
 
 - **InstructionSet** -- A permission boundary that groups related definitions together and declares which roles can author, execute, and approve the definitions it contains.
 
+Every REST route used below is described in the API reference at `http://localhost:8080/swagger`, which lists each operation with its parameters, bodies and responses and opens each group with a guide. It needs the `Infrastructure:Read` permission (with RBAC switched off, any signed-in account passes), has no menu entry, and is linked from Settings > Developer and API, which only administrators can open.
+
 Let's build all of this up, one step at a time.
 
 ---

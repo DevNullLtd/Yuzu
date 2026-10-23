@@ -154,7 +154,8 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
   the *specific* credential you no longer trust via
   `DELETE /api/v1/tokens/{token_id}` (never
   `DELETE /api/v1/engine-principals/{id}` — see step 4's callout below for
-  why). That call needs the administrator role: a caller without it gets
+  why). That call needs the administrator role (or a JIT-elevated session, which
+  counts for this route): a caller without either gets
   `404 token not found`, the same answer as for an unknown id, and only the
   audit log records the denial.
 
@@ -218,12 +219,12 @@ on it, then rotate again once you're down to one active credential.
 lost and the ~120-second re-serve window has passed, the secret cannot be shown
 again and `confirm` cannot be used (it needs the raw secret). The way out is an
 administrator call, and nothing else will do it: sign in as a user who holds the
-`admin` role (the same MFA step-up as other token revokes applies), read
+`admin` role or has an active JIT elevation (the same MFA step-up as other token revokes applies), read
 `GET /api/v1/engine-principals/{id}`, and pick the entry in `active_credentials`
 with `last_used_at` of `0` and `overlap_expires_at` of `0` (the successor; the
 predecessor carries the non-zero `overlap_expires_at`). Then call
-`DELETE /api/v1/tokens/{token_id}` with that `token_id`. A user who does not hold
-the admin role gets `404` for a token it does not own. Rotate again afterwards.
+`DELETE /api/v1/tokens/{token_id}` with that `token_id`. A user who holds neither
+the admin role nor an active elevation gets `404` for a token it does not own. Rotate again afterwards.
 Until then the predecessor keeps working, and the sweep will not retire it
 because the successor was never used.
 
