@@ -5445,8 +5445,10 @@ void RestApiV1::register_routes(
             if (!active_before) {
                 res.status = 503;
                 res.set_header("Retry-After", "2");
-                res.set_content(detail::a4_error(res, "could not confirm the principal has no "
-                                                      "active credential; retry"),
+                res.set_content(detail::a4_error(res,
+                                                 "could not confirm the principal has no "
+                                                 "active credential; retry",
+                                                 detail::A4ErrorOpts{.retry_after_ms = 2000}),
                                 "application/json");
                 (void)detail::emit_behavioral_audit(
                     audit_fn, req, res, "engine_principal.credential.mint", "failure",
@@ -5518,6 +5520,44 @@ void RestApiV1::register_routes(
                     "EnginePrincipal", principal_id, result.error());
                 return;
             }
+            // create_token returns only the raw secret; look up the freshly
+            // minted row (the newest active credential) for its token_id so a
+            // pure-REST caller can correlate the credential it just minted
+            // without a follow-up GET — mirrors the MCP mint_engine_credential
+            // twin's correlation logic (mcp_server.cpp).
+            //
+            // The read is the CHECKED twin, taken BEFORE the mint audit: the
+            // plain accessor collapses a lease timeout or query failure into
+            // an empty vector, which would deliver the secret with token_id ''.
+            // create_token above has already committed, so a failed read-back
+            // fails CLOSED: 503, secret withheld, audit 'partial' (a credential
+            // exists, so never 'failure'). Unlike rotate there is no grace-window
+            // re-serve for a mint and a second mint is a 409, so the recovery is
+            // to rotate the credential (no Retry-After: a retry of the mint cannot help).
+            std::string minted_token_id;
+            int64_t minted_created_at = -1;
+            auto active_after = token_store->list_active_for_principal_checked(principal_id);
+            if (!active_after) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "the credential was minted but could not be read back; "
+                                          "the secret was withheld. The credential exists but is "
+                                          "unusable: rotate it to obtain a secret, do not retry "
+                                          "the mint"),
+                    "application/json");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.mint", "partial",
+                    "EnginePrincipal", principal_id,
+                    "credential minted but its secret could not be read back for delivery: " +
+                        active_after.error());
+                return;
+            }
+            for (const auto& t : *active_after) {
+                if (t.created_at > minted_created_at) {
+                    minted_created_at = t.created_at;
+                    minted_token_id = t.token_id;
+                }
+            }
             // #2466/#2406: fail closed — the credential was minted, but an
             // unrecorded mint must not return the one-time secret. On a dropped
             // audit the secret is discarded (never placed in the 503 body). The
@@ -5538,19 +5578,6 @@ void RestApiV1::register_routes(
                 return;
             }
             res.status = 201;
-            // create_token returns only the raw secret; look up the freshly
-            // minted row (the newest active credential) for its token_id so a
-            // pure-REST caller can correlate the credential it just minted
-            // without a follow-up GET — mirrors the MCP mint_engine_credential
-            // twin's correlation logic (mcp_server.cpp).
-            std::string minted_token_id;
-            int64_t minted_created_at = -1;
-            for (const auto& t : token_store->list_active_for_principal(principal_id)) {
-                if (t.created_at > minted_created_at) {
-                    minted_created_at = t.created_at;
-                    minted_token_id = t.token_id;
-                }
-            }
             // G5 (secret hygiene): the response body carries a raw one-time
             // credential — never let a browser cache, a shared/corporate
             // proxy, or a back-button history entry retain it.
@@ -5650,14 +5677,17 @@ void RestApiV1::register_routes(
                 res.status = 503;
                 res.set_header("Retry-After", "2");
                 res.set_content(
-                    detail::a4_error(res, "rotation succeeded but the successor could not be "
-                                          "read back; the secret was withheld. Rotate again "
-                                          "within about two minutes to re-serve it"),
+                    detail::a4_error(res,
+                                     "rotation succeeded but the successor could not be "
+                                     "read back; the secret was withheld. Rotate again "
+                                     "within about two minutes to re-serve it",
+                                     detail::A4ErrorOpts{.retry_after_ms = 2000}),
                     "application/json");
                 (void)detail::emit_behavioral_audit(
                     audit_fn, req, res, "engine_principal.credential.rotate", "partial",
                     "EnginePrincipal", principal_id,
-                    "successor minted but its secret could not be read back for delivery: " +
+                    "a successor exists (newly minted or re-served) but its secret could not be "
+                    "read back for delivery: " +
                         active_after.error());
                 return;
             }
@@ -5671,6 +5701,31 @@ void RestApiV1::register_routes(
                     successor_overlap_expires_at = t.overlap_expires_at;
                     break;
                 }
+            }
+            // The read ANSWERED but no active credential links back to a
+            // predecessor: the successor was revoked, or the rotation confirmed,
+            // between the commit above and this read. The secret in `result`
+            // belongs to a credential that is no longer a pending successor, and
+            // handing it out with token_id '' gives confirm nothing to pin. Same
+            // posture as a failed read: 503, secret withheld, 'partial', no
+            // reveal row. A retry is safe: it re-serves inside the grace window
+            // or rotates from whatever credential remains.
+            if (successor_token_id.empty()) {
+                res.status = 503;
+                res.set_header("Retry-After", "2");
+                res.set_content(
+                    detail::a4_error(res,
+                                     "rotation succeeded but no pending successor credential was "
+                                     "found; the secret was withheld. Check the principal's "
+                                     "credentials and rotate again",
+                                     detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                    "application/json");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.rotate", "partial",
+                    "EnginePrincipal", principal_id,
+                    "rotation committed but no active credential links to a predecessor on "
+                    "read-back (revoked or confirmed out of band); secret withheld");
+                return;
             }
             // #2466/#2406: fail closed — the reveal IS this route's success audit
             // (see the comment above the route registration), so a dropped

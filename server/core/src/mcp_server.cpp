@@ -8700,8 +8700,16 @@ McpServer::HandlerFn McpServer::build_handler(
                             if (!engine_credential_store_ || !engine_credential_store_->is_open())
                                 return std::unexpected(
                                     "engine credential store unavailable; retry");
-                            const auto active =
-                                engine_credential_store_->list_active_for_principal(rot_principal_id);
+                            // CHECKED read: a read that cannot answer is "could not verify", not
+                            // an empty active set. (An empty VALUE still lands on kNoneActive
+                            // below and is denied the same way: the ticket is never consumed.)
+                            const auto active_checked =
+                                engine_credential_store_->list_active_for_principal_checked(
+                                    rot_principal_id);
+                            if (!active_checked)
+                                return std::unexpected(
+                                    "engine credential store could not be read; retry");
+                            const auto& active = *active_checked;
                             using yuzu::server::detail::classify_confirm_state;
                             using yuzu::server::detail::pair_matches_pin;
                             using yuzu::server::detail::RotationConfirmState;
@@ -26694,7 +26702,28 @@ McpServer::HandlerFn McpServer::build_handler(
                 // credential. Distinct from the concurrent-mint race #2281
                 // addresses (a lost-response retry is sequential, and this
                 // synchronous check closes it).
-                if (!engine_credential_store_->list_active_for_principal(principal_id).empty()) {
+                //
+                // The read is the CHECKED twin: the plain accessor collapses a pool-lease
+                // timeout or query failure into an empty vector, which would read as "no
+                // credential yet" and let a retry mint the second live secret this check
+                // exists to prevent. A read that cannot answer fails closed (retryable,
+                // nothing minted), like the REST twin's 503 + Retry-After: 2.
+                auto active_before =
+                    engine_credential_store_->list_active_for_principal_checked(principal_id);
+                if (!active_before) {
+                    const bool check_audit_ok =
+                        audit_fn(req, "engine_principal.credential.mint", "failure",
+                                 "EnginePrincipal", principal_id, active_before.error());
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "could not confirm the principal has no active credential; retry",
+                                 "retry the request",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs, {},
+                                 check_audit_ok),
+                        "application/json");
+                    return;
+                }
+                if (!active_before->empty()) {
                     res.set_content(
                         error_response(id, kInvalidParams,
                                        "engine principal already has an active credential; use "
@@ -26724,10 +26753,32 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // create_token returns only the raw secret; look up the freshly
                 // minted row (the newest active credential) for its token_id.
+                //
+                // CHECKED read, taken before the success audit. create_token has already
+                // committed, so a failed read-back withholds the secret (a credential exists
+                // that no one holds): audit 'partial' (never 'failure'), and the remedy is to
+                // rotate it. No retry hint: a retry of the mint is refused as a second mint.
                 ApiToken newest;
                 bool found_newest = false;
-                for (const auto& t :
-                    engine_credential_store_->list_active_for_principal(principal_id)) {
+                auto active_after =
+                    engine_credential_store_->list_active_for_principal_checked(principal_id);
+                if (!active_after) {
+                    const bool partial_audit_ok = audit_fn(
+                        req, "engine_principal.credential.mint", "partial", "EnginePrincipal",
+                        principal_id,
+                        "credential minted but its secret could not be read back for delivery: " +
+                            active_after.error());
+                    res.set_content(
+                        a4_error(503,
+                                 "the credential was minted but could not be read back; the "
+                                 "one-time secret was withheld. The credential exists but is "
+                                 "unusable: rotate it to obtain a secret",
+                                 "rotate the credential; do not retry the mint",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, partial_audit_ok),
+                        "application/json");
+                    return;
+                }
+                for (const auto& t : *active_after) {
                     if (!found_newest || t.created_at > newest.created_at) {
                         newest = t;
                         found_newest = true;
@@ -26850,18 +26901,54 @@ McpServer::HandlerFn McpServer::build_handler(
                 // second-resolution, so a same-second mint→rotate ties and the
                 // newest-scan could return the predecessor's id, which would
                 // break the #2384 confirm token_id pin.
+                //
+                // CHECKED read, taken before the reveal audit (REST parity). The rotation
+                // has already committed, so a successor and its live secret exist; a read
+                // that cannot answer, or that finds no linked successor (revoked or
+                // confirmed out of band in between), fails CLOSED: retryable, secret
+                // withheld, audit 'partial' (never 'failure', a credential exists) and no
+                // reveal row, since no secret left the server. The store cached the secret
+                // for the grace window, so the same operator's retry on this replica
+                // re-serves it.
                 ApiToken successor;
                 bool found_successor = false;
-                for (const auto& t :
-                    engine_credential_store_->list_active_for_principal(principal_id)) {
-                    // At most one active row links (the store clears
-                    // supersedes_token_id at cutover, revoke-resolution, and
-                    // sweep), so first match is THE successor.
-                    if (!t.supersedes_token_id.empty()) {
-                        successor = t;
-                        found_successor = true;
-                        break;
+                auto active_after =
+                    engine_credential_store_->list_active_for_principal_checked(principal_id);
+                if (active_after) {
+                    for (const auto& t : *active_after) {
+                        // At most one active row links (the store clears
+                        // supersedes_token_id at cutover, revoke-resolution, and
+                        // sweep), so first match is THE successor.
+                        if (!t.supersedes_token_id.empty()) {
+                            successor = t;
+                            found_successor = true;
+                            break;
+                        }
                     }
+                }
+                if (!found_successor) {
+                    const std::string why =
+                        active_after
+                            ? "rotation committed but no active credential links to a "
+                              "predecessor on read-back (revoked or confirmed out of band); "
+                              "secret withheld"
+                            : "a successor exists (newly minted or re-served) but its secret "
+                              "could not be read back for delivery: " +
+                                  active_after.error();
+                    const bool partial_audit_ok =
+                        audit_fn(req, "engine_principal.credential.rotate", "partial",
+                                 "EnginePrincipal", principal_id, why);
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "rotation succeeded but the successor could not be read back; "
+                                 "the one-time secret was withheld. Rotate again within about "
+                                 "two minutes to re-serve it",
+                                 "retry the rotation within about two minutes (same operator, "
+                                 "same server replica)",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs,
+                                 /*cid_override=*/{}, partial_audit_ok),
+                        "application/json");
+                    return;
                 }
                 // §7: every reveal — the original successor mint OR a within-grace-
                 // window replay — is its own independently audited disclosure event

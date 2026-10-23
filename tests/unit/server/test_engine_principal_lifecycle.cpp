@@ -857,6 +857,11 @@ TEST_CASE("Engine-principal REST: mint fails closed with 503 when the active-cre
         REQUIRE(!h.audit_log.empty());
         CHECK(h.audit_log.back().action == "engine_principal.credential.mint");
         CHECK(h.audit_log.back().result == "failure");
+        // The checked read's own string, not the generic create_token one ("database
+        // unavailable - try again"): this pins that the 503 came from the guard read.
+        CHECK(h.audit_log.back().detail == "pool lease timed out");
+        // A4: the retry hint is machine metadata in the body, not only a header.
+        CHECK(nlohmann::json::parse(res->body)["error"]["retry_after_ms"].get<int>() == 2000);
     }
 
     // Nothing was minted while the read could not answer ...
@@ -893,6 +898,8 @@ TEST_CASE("Engine-principal REST: rotate withholds the secret with 503 and a par
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Retry-After") == "2");
     CHECK(res->body.find("\"token\"") == std::string::npos);
+    CHECK(res->body.find("token_id") == std::string::npos); // nothing to pin was disclosed
+    CHECK(nlohmann::json::parse(res->body)["error"]["retry_after_ms"].get<int>() == 2000);
 
     // The audit row matches the database: a successor exists, so the outcome
     // is partial and no reveal was recorded.
@@ -915,6 +922,126 @@ TEST_CASE("Engine-principal REST: rotate withholds the secret with 503 and a par
     CHECK(!data["token_id"].get<std::string>().empty());
     CHECK(h.audit_log.back().action == "engine_principal.credential.reveal");
     CHECK(h.audit_log.back().result == "success");
+
+    // The re-served token_id is the NEWER active row (the one that links back to the
+    // predecessor), and the retry minted nothing: the pair is still exactly two.
+    const auto active = h.token_store->list_active_for_principal(pid);
+    REQUIRE(active.size() == 2);
+    std::string linked;
+    for (const auto& t : active)
+        if (!t.supersedes_token_id.empty())
+            linked = t.token_id;
+    CHECK(data["token_id"].get<std::string>() == linked);
+}
+
+TEST_CASE("Engine-principal REST: mint withholds the secret with 503 and a partial audit when "
+          "the read-back after the insert cannot answer, and rotate recovers a usable secret",
+          "[pg][rest][engine_principal][mint][degraded]") {
+    RestEngineHarness h;
+    auto cres = h.create("mint-readback-degraded");
+    REQUIRE(cres);
+    REQUIRE(cres->status == 201);
+    auto pid = nlohmann::json::parse(cres->body)["data"]["principal_id"].get<std::string>();
+
+    // create_token has no post-insert test seam, so a DEFERRED constraint trigger renames a
+    // column at COMMIT of the mint's own INSERT: the credential commits and the read-back's
+    // SELECT then fails. The shared clone is put back by the guard even if an assertion below
+    // aborts the case: trigger and function dropped, column renamed back.
+    auto run_ddl = [](const char* sql) {
+        auto lease = yuzu::test::detail::api_token_shared_bundle().pool->acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    };
+    struct Restore {
+        ~Restore() noexcept {
+            try {
+                auto lease = yuzu::test::detail::api_token_shared_bundle().pool->try_acquire_for(
+                    std::chrono::milliseconds(4000));
+                if (!lease)
+                    return;
+                for (const char* sql :
+                     {"DROP TRIGGER IF EXISTS mint_readback_sabotage ON api_token_store.api_tokens",
+                      "DROP FUNCTION IF EXISTS api_token_store.mint_readback_sabotage()"})
+                    (void)yuzu::server::pg::exec_params(lease.get(), sql,
+                                                        std::vector<std::string>{});
+                // Fails harmlessly when the column was never renamed (or already put back).
+                (void)yuzu::server::pg::exec_params(
+                    lease.get(),
+                    "ALTER TABLE api_token_store.api_tokens RENAME COLUMN mint_readback_gone "
+                    "TO name",
+                    std::vector<std::string>{});
+            } catch (...) {
+            }
+        }
+    } restore;
+    run_ddl("CREATE FUNCTION api_token_store.mint_readback_sabotage() RETURNS trigger LANGUAGE "
+            "plpgsql AS $$ BEGIN EXECUTE 'ALTER TABLE api_token_store.api_tokens RENAME COLUMN "
+            "name TO mint_readback_gone'; RETURN NULL; END $$");
+    run_ddl("CREATE CONSTRAINT TRIGGER mint_readback_sabotage AFTER INSERT ON "
+            "api_token_store.api_tokens DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE "
+            "FUNCTION api_token_store.mint_readback_sabotage()");
+    auto res = h.mint(pid);
+    run_ddl("DROP TRIGGER mint_readback_sabotage ON api_token_store.api_tokens");
+
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("\"token\"") == std::string::npos);
+    CHECK(res->get_header_value("Retry-After").empty()); // retrying the mint cannot help
+    REQUIRE(!h.audit_log.empty());
+    CHECK(h.audit_log.back().action == "engine_principal.credential.mint");
+    CHECK(h.audit_log.back().result == "partial");
+    for (const auto& a : h.audit_log)
+        CHECK_FALSE((a.action == "engine_principal.credential.mint" && a.result == "success"));
+
+    // Put the schema back, then check the database agrees with the audit row: the credential
+    // exists, a second mint is refused, and rotating the sole credential yields a secret.
+    {
+        auto lease = yuzu::test::detail::api_token_shared_bundle().pool->acquire();
+        REQUIRE(lease);
+        auto undo = yuzu::server::pg::exec_params(
+            lease.get(),
+            "ALTER TABLE api_token_store.api_tokens RENAME COLUMN mint_readback_gone TO name",
+            std::vector<std::string>{});
+        REQUIRE(undo.status() == PGRES_COMMAND_OK);
+    }
+    CHECK(h.token_store->list_active_for_principal(pid).size() == 1);
+    auto again = h.mint(pid);
+    REQUIRE(again);
+    CHECK(again->status == 409);
+    auto rot = h.rotate(pid);
+    REQUIRE(rot);
+    REQUIRE(rot->status == 200);
+    CHECK(!nlohmann::json::parse(rot->body)["data"]["token"].get<std::string>().empty());
+}
+
+TEST_CASE("Engine-principal REST: rotate withholds the secret with 503 and a partial audit when "
+          "the successor was revoked between the commit and the read-back",
+          "[pg][rest][engine_principal][rotation][degraded]") {
+    RestEngineHarness h;
+    auto [pid, raw1] = h.create_and_mint("rotate-successor-gone");
+    (void)raw1;
+
+    // The read ANSWERS, but no active credential links to a predecessor any more: it used
+    // to hand the secret out with token_id "" and a reveal row for a revoked credential.
+    h.token_store->test_hook_before_store_rotation_raw_ = [&] {
+        for (const auto& t : h.token_store->list_active_for_principal(pid))
+            if (!t.supersedes_token_id.empty())
+                REQUIRE(h.token_store->revoke_token(t.token_id).has_value());
+    };
+    auto res = h.rotate(pid);
+    h.token_store->test_hook_before_store_rotation_raw_ = nullptr;
+
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(res->body.find("\"token\"") == std::string::npos);
+    REQUIRE(!h.audit_log.empty());
+    CHECK(h.audit_log.back().action == "engine_principal.credential.rotate");
+    CHECK(h.audit_log.back().result == "partial");
+    for (const auto& a : h.audit_log)
+        CHECK(a.action != "engine_principal.credential.reveal");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

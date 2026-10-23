@@ -3366,6 +3366,208 @@ TEST_CASE("MCP #3937: rotate_engine_credential fails CLOSED and withholds the se
     CHECK(store.list_active_for_principal(principal).size() == 2);
 }
 
+// The MCP engine-credential twins read the token store through the CHECKED accessor, like the
+// REST routes: a read that cannot answer must never read as "no credential yet" (mint) or
+// "no successor" (rotate). The degraded read is produced the way the REST cases do: hold every
+// lease of the store's own pool, or poison the schema inside the mint's own transaction.
+namespace {
+using McpTokenLeases = std::vector<decltype(std::declval<yuzu::server::pg::PgPool&>().acquire())>;
+McpTokenLeases hold_all_leases(yuzu::server::pg::PgPool& pool) {
+    McpTokenLeases held;
+    for (std::size_t i = 0; i < pool.size(); ++i) {
+        held.push_back(pool.acquire());
+        REQUIRE(held.back());
+    }
+    return held;
+}
+} // namespace
+
+TEST_CASE("MCP mint_engine_credential: fails CLOSED with a retry hint and mints nothing when "
+          "the active-credential guard cannot read",
+          "[mcp][pg][engine_principal][mint][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    const std::string principal = "engine:mcp-mint-degraded";
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+    const std::string call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"mint_engine_credential","arguments":{"principal_id":"engine:mcp-mint-degraded","ttl_days":90}}})";
+
+    {
+        auto held = hold_all_leases(pool);
+        auto r = ts.call(call);
+        REQUIRE(r);
+        auto body = nlohmann::json::parse(r->body);
+        REQUIRE(body.contains("error"));
+        REQUIRE_FALSE(body.contains("result"));
+        CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+              mcp::kMcpStoreFaultShortRetryMs);
+        CHECK(r->body.find("raw_token") == std::string::npos);
+    }
+    // The checked read's own string reached the audit row, so this 503 is the guard's.
+    REQUIRE(!ts.audit_log.empty());
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "engine_principal.credential.mint|failure") == 1);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "engine_principal.credential.mint|success") == 0);
+    // Nothing was minted while the read could not answer, and the retry mints exactly one.
+    CHECK(store.list_active_for_principal(principal).empty());
+    auto retry = ts.call(call);
+    REQUIRE(retry);
+    CHECK(retry->body.find("raw_token") != std::string::npos);
+    CHECK(store.list_active_for_principal(principal).size() == 1);
+}
+
+TEST_CASE("MCP mint_engine_credential: withholds the secret with a partial audit when the "
+          "read-back after the insert cannot answer",
+          "[mcp][pg][engine_principal][mint][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    // create_token has no post-insert test seam, so a DEFERRED constraint trigger renames a
+    // column at COMMIT of the mint's own INSERT: the credential commits, and the read-back's
+    // SELECT then fails. Dedicated database, dropped with the test.
+    for (const char* sql :
+         {"CREATE FUNCTION api_token_store.mcp_mint_sabotage() RETURNS trigger LANGUAGE plpgsql AS "
+          "$$ BEGIN EXECUTE 'ALTER TABLE api_token_store.api_tokens RENAME COLUMN name TO "
+          "mcp_mint_gone'; RETURN NULL; END $$",
+          "CREATE CONSTRAINT TRIGGER mcp_mint_sabotage AFTER INSERT ON api_token_store.api_tokens "
+          "DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION "
+          "api_token_store.mcp_mint_sabotage()"}) {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+    auto r = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"mint_engine_credential","arguments":{"principal_id":"engine:mcp-mint-partial","ttl_days":90}}})");
+
+    REQUIRE(r);
+    auto body = nlohmann::json::parse(r->body);
+    REQUIRE(body.contains("error"));
+    REQUIRE_FALSE(body.contains("result"));
+    CHECK(r->body.find("raw_token") == std::string::npos);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "engine_principal.credential.mint|partial") == 1);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "engine_principal.credential.mint|success") == 0);
+}
+
+TEST_CASE("MCP rotate_engine_credential: withholds the secret with a retry hint and a partial "
+          "audit when the successor read-back cannot answer, and a retry re-serves it",
+          "[mcp][pg][engine_principal][rotation][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    const std::string principal = "engine:mcp-rotate-degraded";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+    const std::string call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"rotate_engine_credential","arguments":{"principal_id":"engine:mcp-rotate-degraded"}}})";
+
+    McpTokenLeases held;
+    // Fires after the rotation commits and before the store caches the secret, so the
+    // successor exists when the tool's own read-back runs dry.
+    store.test_hook_before_store_rotation_raw_ = [&] { held = hold_all_leases(pool); };
+    auto r = ts.call(call);
+    store.test_hook_before_store_rotation_raw_ = nullptr;
+    held.clear();
+
+    REQUIRE(r);
+    auto body = nlohmann::json::parse(r->body);
+    REQUIRE(body.contains("error"));
+    REQUIRE_FALSE(body.contains("result"));
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultShortRetryMs);
+    CHECK(r->body.find("raw_token") == std::string::npos);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "engine_principal.credential.rotate|partial") == 1);
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "engine_principal.credential.reveal|success");
+    CHECK(store.list_active_for_principal(principal).size() == 2);
+
+    // The same operator's retry inside the grace window re-serves the secret with a usable
+    // token_id: the newer active row, and no third credential.
+    auto retry = ts.call(call);
+    REQUIRE(retry);
+    auto rbody = nlohmann::json::parse(retry->body);
+    REQUIRE(rbody.contains("result"));
+    auto data = nlohmann::json::parse(rbody["result"]["content"][0]["text"].get<std::string>());
+    CHECK(!data["raw_token"].get<std::string>().empty());
+    std::string linked;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            linked = t.token_id;
+    CHECK(data["token_id"].get<std::string>() == linked);
+    CHECK(store.list_active_for_principal(principal).size() == 2);
+}
+
+TEST_CASE("MCP rotate_engine_credential: withholds the secret when the successor was revoked "
+          "between the commit and the read-back",
+          "[mcp][pg][engine_principal][rotation][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    const std::string principal = "engine:mcp-rotate-gone";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+    store.test_hook_before_store_rotation_raw_ = [&] {
+        for (const auto& t : store.list_active_for_principal(principal))
+            if (!t.supersedes_token_id.empty())
+                REQUIRE(store.revoke_token(t.token_id).has_value());
+    };
+    auto r = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"rotate_engine_credential","arguments":{"principal_id":"engine:mcp-rotate-gone"}}})");
+    store.test_hook_before_store_rotation_raw_ = nullptr;
+
+    REQUIRE(r);
+    auto body = nlohmann::json::parse(r->body);
+    REQUIRE(body.contains("error"));
+    REQUIRE_FALSE(body.contains("result"));
+    CHECK(r->body.find("raw_token") == std::string::npos);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "engine_principal.credential.rotate|partial") == 1);
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "engine_principal.credential.reveal|success");
+}
+
 TEST_CASE("MCP #3937: confirm_engine_rotation fails CLOSED on a dropped audit (rotation still "
           "committed)",
           "[mcp][pg][engine_principal][audit_failclose]") {
