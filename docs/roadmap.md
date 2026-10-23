@@ -164,7 +164,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 12.11 | [#282](https://github.com/Tr3kkR/Yuzu/issues/282) | Application Whitelisting | Open |
 | | 12.12 | [#283](https://github.com/Tr3kkR/Yuzu/issues/283) | Inventory Replication (Delta Sync) | **Done** (NOT_PLANNED, 2026-07-14, delivered differently: ADR-0016's hash-skip conditional sync, `sync_scheduler.hpp`) |
 | | 12.13 | [#284](https://github.com/Tr3kkR/Yuzu/issues/284) | Binary Resource Distribution | Open |
-| **13** | 13.1 | [#285](https://github.com/Tr3kkR/Yuzu/issues/285) | 2FA for Instruction Approval (TOTP) | Done (TOTP/MFA step-up shipped generally; wired to approve/reject by #6061 and #6079, see body note) |
+| **13** | 13.1 | [#285](https://github.com/Tr3kkR/Yuzu/issues/285) | 2FA for Instruction Approval (TOTP) | Open (stale — TOTP/MFA step-up shipped generally and is wired to approve/reject by #6061 and #6079; close this issue when #6079 merges, see body note) |
 | | 13.2 | [#286](https://github.com/Tr3kkR/Yuzu/issues/286) | Composable Instruction Chains | **Done** (NOT_PLANNED, 2026-07-14, delivered: `workflow_engine.cpp` `foreach_source` step field + step interpolation) |
 | | 13.3 | [#287](https://github.com/Tr3kkR/Yuzu/issues/287) | Process / Sync Logging UI | Open |
 | | 13.4 | [#288](https://github.com/Tr3kkR/Yuzu/issues/288) | Dashboard Branding | Open |
@@ -1497,9 +1497,9 @@ Server-side resource registry for versioned binary blobs:
 *Close remaining security gaps and improve operational UX.*
 
 ### Issue 13.1: 2FA for Instruction Approval (TOTP)
-**Capability:** new | **Scope:** Server | **Status:** Done (TOTP + MFA step-up landed generally; wired to approval approve/reject by #6061 and #6079, which require an interactive session and an enrolled factor with a fresh proof)
+**Capability:** new | **Scope:** Server | **Status:** Open (stale: TOTP + MFA step-up landed generally and gates instruction approve and reject, and #6061 and #6079 require an interactive session and an enrolled factor with a fresh proof; the `totp_code` parameter this issue asked for is not wired, the code is entered at the step-up prompt)
 
-TOTP (`totp.{hpp,cpp}`) and a general step-up MFA framework (`mfa_step_up.{hpp,cpp}`) shipped as part of the auth-and-authz workstream - the step-up check is enforced centrally on 36 named REST/dashboard routes (the three JIT-elevation routes keep their own handler gate) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`, and MCP tools are not step-up gated. Approval approve/reject are among those routes and are covered by a stricter rule on top of it (#6061, #6079): an interactive session plus an enrolled MFA factor with a fresh proof (`require_enrolled_fresh_mfa`), with the code entered at the step-up prompt rather than as a `totp_code` field on the request. Original sketch:
+TOTP (`totp.{hpp,cpp}`) and a general step-up MFA framework (`mfa_step_up.{hpp,cpp}`) shipped as part of the auth-and-authz workstream - the step-up check is enforced centrally on 36 named REST/dashboard routes (the three JIT-elevation routes keep their own handler gate) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`, and MCP tools are not step-up gated. MFA step-up now gates `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject` among those routes. This issue's specific ask, a `totp_code` request parameter on instruction approval, is not wired; the step-up check reads the session's MFA proof instead. Original sketch:
 
 TOTP (RFC 6238) second factor on instruction approval:
 - Per-user TOTP secret stored encrypted in auth store
@@ -2231,8 +2231,9 @@ before acting on any "open" / "in progress" claim:
 6. **Phase 11** — Consumer model & SDKs (platform extensibility, parallelizable with 12). 11.1 closed
    NOT_PLANNED with no delivery (its auth/token substance was absorbed into ADR-1005 engine principals,
    but the issue's own scope was never built); 11.2–11.4 not started.
-7. **Phase 13** — Remaining security hardening & polish: 13.3 (monitoring UI), 13.4 (branding).
-   13.1 (2FA on approval, wired to approve/reject by #6061 and #6079), 13.2 and 13.5 already shipped.
+7. **Phase 13** — Remaining security hardening & polish: 13.1 (2FA on approval — stale, general MFA
+   step-up exists but isn't wired to approval), 13.3 (monitoring UI), 13.4 (branding). 13.2 and 13.5
+   already shipped.
 8. **Phase 14** — Remaining scale items: 14.1 (P2P content), 14.2 (multi-gateway), 14.4–14.5
    (additional connectors — nominally depend on the now-deferred Phase 9). 14.3 Partial (Closed —
    not planned; the sharding design was obsoleted by the Postgres substrate — see the Index row);

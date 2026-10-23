@@ -358,7 +358,9 @@ So:
   the next request rebuilds each session from its row. The same holds for a
   crash or a failover to another replica.
 - A row is removed only by an explicit revoke (sign-out, or the REST calls
-  below, which delete by token or by username) or by the reaper once the
+  below, which delete by token or by username), by clearing the account's MFA
+  factor (`yuzu-server --mfa-reset`, or Disable in Settings; see
+  [Emergency MFA disable](#emergency-mfa-disable-break-glass)), or by the reaper once the
   session passes its absolute lifetime (8 hours). An idle-timed-out session
   is refused on every replica, but its row stays until the reaper removes it.
 
@@ -682,8 +684,10 @@ deletes the account's durable sessions (`SessionStore::invalidate_user`), which
 bumps the session generation so every replica drops its cached copy on its next
 refresh; the account is signed out everywhere. The number of sessions deleted is
 recorded as `sessions_ended=<n>` at the end of the audit row's `detail`
-(`... (os_identity=<account>, sessions_ended=<n>)`); the command's stdout line is
-unchanged. If ending the sessions fails, the factor is already cleared: the
+(`... (os_identity=<account>, sessions_ended=<n>)`); `<n>` counts every durable
+session row deleted for the account, rows that had already expired but were not yet
+reaped included, so it is not a count of sessions that were still usable. The
+command's stdout line is unchanged. If ending the sessions fails, the factor is already cleared: the
 command exits non-zero with `error: MFA cleared but the account's sessions were
 not ended`; the server log carries `--mfa-reset: MFA cleared for '<name>' but ending its
 sessions failed (<cause>). End them now with DELETE /api/v1/sessions?username=<name> and
@@ -698,8 +702,17 @@ control**: after the clear the page shows the not-enrolled view, and the Disable
 exists only in the enrolled view. If the clear itself fails on an account that had a
 verified factor, the sessions are still ended (the clear may have committed with its
 acknowledgement lost) and the audit row is `mfa.disabled` with `result=error` and
-`disable failed (sessions_ended=<n>|failed)`. Cancelling an enrolment that was never
-verified ends no session (`result=ok`, `no verified factor to clear`). Neither path
+`disable failed (sessions_ended=<n>|failed)`; the user is signed out when the delete
+succeeded, and when the delete failed too the page says "Could not confirm MFA was
+disabled, and the account's sessions could not be ended. Its state is unknown: ask an
+administrator to check it and end the sessions." (check the account's enrolment state
+and end its sessions as below). Cancelling an enrolment that was never
+verified ends no session (`result=ok`, `no verified factor to clear`). The Settings
+audit row is written after the changes and its write is best effort: if the audit
+store cannot be written the request still completes and only a server WARN line records
+it. The factor clear and the session delete are two separate database commits, so a
+process kill between them leaves the factor cleared, the sessions live and no audit
+row. Neither path
 ends API tokens: an administrator revokes a token with
 `DELETE /api/v1/tokens/{token_id}` (the global administrator role may revoke any
 token; the owner lists token ids with `GET /api/v1/tokens`).
@@ -718,7 +731,7 @@ account has no enrolled factor skip the step-up. So a sole administrator who has
 cleared their own factor can run it with their own session or an API token, and a
 sole-administrator lockout where no administrator session or token is left is covered
 by re-running `--mfa-reset` (before the user enrols again) or, if no `yuzu-server`
-binary is available, by the two statements under
+binary is available, by the single transaction under
 [Fallback: direct SQL](#fallback-direct-sql). Treat `db_persisted: false` in the
 response as a failed delete and call it again.
 
@@ -764,7 +777,14 @@ record the manual deletion in your change-management system. The query is read-o
 **Detective control.** Because the CLI exits without serving, it emits no
 Prometheus metric — the audit row is the only signal. Alert on
 `mfa.reset.breakglass` in `audit_events`; an unexpected one is an
-authentication-downgrade event and should page on-call.
+authentication-downgrade event and should page on-call. Also alert on `mfa.disabled`
+rows with `result=partial` or a `detail` containing `sessions_ended=failed`, and on
+`mfa.reset.breakglass` rows containing `sessions_ended=failed`: each is an account whose
+second factor is cleared and whose sessions may still be live. A database fault that fails
+the session delete can fail the audit write too, and a process kill between the two commits
+leaves no row at all; if `YuzuAuditPersistFailures` fired or
+`yuzu_auth_session_store_degrade_total{op="invalidate_user"}` rose in the same minutes, treat a
+missing row as unknown and end the sessions of any account that disabled MFA then.
 
 It is safe to run while the server is up: the one-shot opens its own pool and
 does not talk to the running process.
@@ -788,32 +808,20 @@ UPDATE auth.users
        mfa_last_counter = 0
  WHERE username = 'alice';
 DELETE FROM auth.mfa_recovery_codes WHERE username = 'alice';
-COMMIT;
-SQL
-```
-
-The two statements run in one transaction on purpose, as `--mfa-reset` does
-(`AuthDB::mfa_disable`): an interruption between them must never leave the secret
-cleared with the old recovery codes still valid. `ON_ERROR_STOP` makes `psql` stop
-and exit non-zero if a statement fails, so a failed `UPDATE` cannot turn the
-`COMMIT` into a silent rollback with exit status 0.
-
-This clears the factor only. It ends **no session**, and a session made under the
-old factor may hold an MFA proof from it. End the account's sessions in the same
-sitting, either with `DELETE /api/v1/sessions?username=alice` (needs
-`UserManagement:Write`; see "Ending the sessions by hand" above for who can call it
-and when it asks for a step-up) or, in a lockout where no administrator session or
-token is left, with the same statements the server runs:
-
-```bash
-psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" <<'SQL'
-BEGIN;
 DELETE FROM session_store.sessions WHERE username = 'alice';
 INSERT INTO session_store.session_meta (key, value) VALUES ('write_generation', '1')
 ON CONFLICT (key) DO UPDATE SET value = (session_store.session_meta.value::bigint + 1)::text;
 COMMIT;
 SQL
 ```
+
+These run in ONE transaction on purpose. Unlike the server's own two commits (the
+factor clear, then the session delete), an interruption cannot leave the factor
+cleared with the sessions live, or the secret cleared with the old recovery codes
+still valid. `ON_ERROR_STOP` makes `psql` stop and exit non-zero if a statement
+fails, so a failed statement cannot turn the `COMMIT` into a silent rollback with
+exit status 0. A session made under the old factor may hold an MFA proof from it,
+which is why the session delete is part of the same transaction.
 
 The generation bump is required for the same reason as in
 [Sessions are durable](#sessions-are-durable). API tokens are not touched. Run the
@@ -1334,7 +1342,13 @@ read failure the store does not classify as unavailable is answered `401` instea
 with the same `mfa_status_unavailable` reason and a remediation that says the
 authentication store is unavailable; it is counted as `refused`, not
 `unavailable`, so the alert below does not see it. A `503` is never a pass: the
-gated route stays closed until the cause is fixed.
+gated route stays closed until the cause is fixed. Approve and reject add their own
+check after this one. An approver whose stored session proof cannot be read, or a local
+approver whose MFA state cannot be read at that check (the window is `0` or less, or the
+fault falls between the two reads), can still receive a `503` from that check (A4 envelope with `retry_after_ms`,
+counted `route="approval"` on `yuzu_auth_secret_unavailable_total`, audit
+`approval.approve` or `approval.reject` with `result=error` and `detail`
+`approver_assurance:mfa_store_unavailable`).
 
 **The alert is slow by design.** `YuzuStepUpGateUnavailable` fires when the
 `unavailable` outcome counts at least **3** refusals in a 10-minute window for one
@@ -1494,8 +1508,9 @@ authentication store or reset the affected account. Know its limits:
   elevation still asks for a fresh proof and still fails if the store cannot be
   read.
 - **SAML sessions pass too.** The window check precedes the SAML denial, so while
-  the window is `0` or less a SAML session reaches all 36 routes instead of
-  getting its `403`.
+  the window is `0` or less a SAML session reaches the 36 central routes instead of
+  getting its `403`, except approve and reject (`POST /api/approvals/{id}/approve` and
+  `/reject`), which keep their own gate whatever this value is (next bullet).
 - **Approval approve and reject keep a gate of their own.** The approver gate
   (#6079) ignores this flag: an approver still needs an enrolled factor and a
   proof no older than 300 s on the database clock, a SAML session is still refused

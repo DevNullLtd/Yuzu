@@ -904,9 +904,9 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
 
 - an **interactive cookie session** (local or OIDC); API-token and MCP bearer sessions are refused
   with a typed `403` (A4 envelope);
-- an **enrolled MFA factor with a fresh proof** (#6079). Approve and reject no longer use the generic
-  `require_mfa_step_up` gate that the other step-up endpoints share, because that gate can only ask
-  for a factor the account has and so passes an unenrolled caller. They use
+- an **enrolled MFA factor with a fresh proof** (#6079). The central step-up check (see
+  "Two layers, one proof" below) runs first on these routes, as on the other step-up endpoints, but it can only ask
+  for a factor the account has and so passes an unenrolled caller. On top of it the handler runs
   `require_enrolled_fresh_mfa` (`mfa_step_up.{hpp,cpp}`), which first probes the factor of the
   **session's own identity** (never a namesake row that happens to share a username) and refuses
   before any proof is judged:
@@ -919,9 +919,15 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
     It does **not** mean a second factor was presented again at approval time, and any single MFA-method
     `amr` value the gate accepts counts. Real re-authentication (`auth_time` with `max_age`) is a named
     follow-up. An OIDC session with no MFA `amr` proof (no MFA `amr`, or `iat` missing or not positive,
-    so no proof was seeded at sign-in) is refused `403` `mfa_proof_missing`; a proof that is present but
-    older than the window is the step-up `401` with `challenge_url=/auth/oidc/start`;
-  - a **SAML** session is refused `saml_mfa_unsupported` (#4935), in every configuration;
+    so no proof was seeded at sign-in) is refused `403` `mfa_proof_missing` by the approver rule; a proof that is present but
+    older than the window is the step-up `401` with `challenge_url=/auth/oidc/start`. With the step-up window
+    above `0` and `--mfa-enforcement` protecting the role (`required`, or `admin-only` for an administrator), the
+    central check answers a session with no `amr` proof first, with that same `401` and no ticket row, so an
+    identity provider that never asserts an MFA `amr` loops through re-sign-in instead of seeing
+    `mfa_proof_missing`;
+  - a **SAML** session is refused (#4935), in every configuration, with `saml_mfa_unsupported` from the approver rule;
+    with the window above `0` the central check answers it first with its generic `403`, and the typed refusal
+    appears only with `--mfa-step-up-window-secs=0`;
   - a **local** session whose `auth.users` row is deleted, deactivated or has an invalid username is
     refused `account_unavailable` (a different remedy from "not enrolled"; the refusal never passes);
   - any other non-local session is refused as non-interactive.
@@ -935,10 +941,16 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   monotonic anchor, so the cached check alone is not a ceiling; the replica's own `system_clock` is never the authority.
   A degraded read is `503`; a missing or future-dated proof is a step-up `401` for a local session (an SSO session with no usable cached proof is refused earlier, `mfa_proof_missing`). With no SessionStore attached (a wiring fault: a serving process always has one) the
   gate answers `503` and nothing is decided; the replica's wall clock never stands in for the database clock.
-  A refusal for an unenrolled or proof-less caller is a `403` (`approver_assurance_required:mfa_not_enrolled`,
-  `mfa_proof_missing`, `saml_mfa_unsupported`, `account_unavailable`), not a step-up prompt; a stale or pre-enrolment proof is
-  the usual step-up `401`; an unreadable MFA store is a `503` with `retry_after_ms` and
-  `yuzu_auth_secret_unavailable_total{route="approval"}`. Break-glass accounts get no exemption: they
+  Once the central check has passed (or with the window at `0`), a refusal for an unenrolled or proof-less caller is a `403`
+  (`approver_assurance_required:mfa_not_enrolled`, `mfa_proof_missing`, `saml_mfa_unsupported`,
+  `account_unavailable`), not a step-up prompt; a stale or pre-enrolment proof is the step-up `401`; and when the
+  approver rule's own read fails (an unreadable stored proof, or an MFA-store fault at its own read) the answer is a
+  `503` with `retry_after_ms` and `yuzu_auth_secret_unavailable_total{route="approval"}`. With the window above `0`
+  the central check answers first for a SAML session (generic `403`), for a stale proof (`401`, normally: the central
+  and approver windows are both 300 by default, so the ticket-specific `approver_assurance:mfa_proof_stale` row exists
+  only in the band of about a second between the central whole-second test and the approver millisecond ceiling, for
+  `proof_predates_enrolment`, or when the configured window exceeds 300) and for an unreadable local MFA store (`503`
+  without `retry_after_ms`, counted `route="mfa_stepup"`). Break-glass accounts get no exemption: they
   are enrolled by validation and are judged like any local account;
 - a **human principal**, never an engine principal;
 - a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`). The comparison is
@@ -958,8 +970,9 @@ Consequences, each deliberate:
   step-up envelope before the handler's own `403`s, and an engine principal receives `403`
   `engine_principal_denied` (audited as `mfa.step_up.required`) in place of the handler's approver-class
   refusal. The central check passes an API-token or MCP-token session (it has no MFA factor), so the
-  handler's refusal of those sessions is unchanged. The handler keeps its own step-up call, which only
-  consumes the central pass and evaluates nothing again.
+  handler's refusal of those sessions is unchanged. The handler keeps its own step-up call, which consumes the central pass
+  and normally evaluates nothing again (it evaluates afresh when no pass was consumed, for example when the
+  central check is switched off with `--mfa-step-up-window-secs=0`), and then applies the approver rule on top.
 - **MCP can never approve.** The refusal is unconditional on the MCP transport, which runs no MFA step-up: the two MCP tools always
   return the typed refusal, for a bearer token and for a cookie session that reaches `/mcp/v1/` alike. This is an exception recorded in ADR-1005's exception ledger (entry 2026-10-18, "human review
   is a human-session act"; legacy REST rows `exception:#6061 revisit:2027-01-18`). The tools remain registered; listing pending approvals via MCP is unchanged. The MCP
@@ -988,7 +1001,11 @@ Consequences, each deliberate:
   in `AuthRoutes::require_permission` requires the `admin` role for `Approval:Approve`, so a non-admin
   is refused `403` "admin role required" before the MFA gate, and the enrolment paths achieve nothing
   until enforcement is turned on.
-- **Sessions ended on every factor clear (API tokens are not).** `yuzu-server --mfa-reset` deletes the account's durable
+- **Sessions ended when the CLI or Settings clears a factor (API tokens are not; the two steps are not atomic).** The
+  factor clear and the session delete are two separate database commits, so a failed delete or a process kill
+  between them leaves the factor cleared and the sessions live (a kill leaves no audit row), and the direct-SQL
+  fallback in the recovery runbook, which clears the factor in one transaction, is written to end the sessions in that
+  same transaction. `yuzu-server --mfa-reset` deletes the account's durable
   sessions in the same one-shot (`SessionStore::invalidate_user`, which bumps the generation so every
   replica drops its cached copy), and exits non-zero if that fails; the audit row records
   `sessions_ended` either way. Disabling MFA from Settings (`mfa_disable`) deletes EVERY session of the account, the caller's
@@ -996,12 +1013,18 @@ Consequences, each deliberate:
   browser to `/home`; the audit row records `sessions_ended=<n>`, or result `partial` with
   `sessions_ended=failed` when the durable delete failed (the factor stays cleared and the page has no retry
   control: the Disable form exists only in the enrolled view, so an administrator ends the sessions with
-  `DELETE /api/v1/sessions?username=<name>` or `--mfa-reset`). When the clear itself fails on an account that had a
-  verified factor (a failed status read counts as had one) the sessions are still ended, because the clear may
-  have committed with its acknowledgement lost (audit `error`, `disable failed (sessions_ended=<n>|failed)`);
+  `DELETE /api/v1/sessions?username=<name>` or `--mfa-reset`). When the clear itself fails the sessions are still ended (the had-a-verified-factor pre-image is
+  read from the clear's own row lock by `AuthDB::mfa_disable_report`, so an enrolment verified in between cannot be
+  missed, and a failed clear leaves it unknown, which counts as a verified factor), because the clear may
+  have committed with its acknowledgement lost (audit `error`, `disable failed (sessions_ended=<n>|failed)`; the user
+  is signed out when the delete succeeded, and when it also failed the page says the state is unknown and asks an
+  administrator to check the account and end its sessions);
   cancelling an enrolment that was never verified ends none (audit `ok`, `no verified factor to clear`). The row is
   written through the session-bound audit writer, so the actor's principal, role and session are recorded even
-  though that session was just deleted. Neither path ends API tokens. These are the only two production callers of
+  though that session was just deleted; that write is best effort (a failed write is a server WARN line only, the
+  request still completes), whereas `--mfa-reset` verifies the audit store is writable before it clears anything.
+  `sessions_ended` counts the durable session rows deleted, expired rows the reaper has not yet removed included.
+  Neither path ends API tokens. These are the only two production callers of
   `mfa_disable`. The proof-versus-enrolment comparison above remains the second line: it assumes the
   database primary clock does not step backward (ADR-2002 section 4 treats database clock integrity as
   a security dependency; the shipped control is the `YuzuSessionReapClockAnomaly` alert, which fires only when a
@@ -1999,8 +2022,9 @@ row). This means:
 - `--mfa-enforcement=optional` — same: the SAML-specific exit fires before
   enforcement mode is consulted.
 
-A SAML user cannot approve or reject approval tickets in any configuration
-(`approver_assurance_required:saml_mfa_unsupported`; see "Approver assurance" above).
+A SAML user cannot approve or reject approval tickets in any configuration (the generic `403` above
+with the window above `0`, `approver_assurance_required:saml_mfa_unsupported` with it at `0`; see "Approver
+assurance" above).
 
 **Recommendation:** Use `--mfa-enforcement=optional` or `--mfa-enforcement=admin-only`
 when SAML is in use, and configure your IdP to enforce MFA at login time. Avoid

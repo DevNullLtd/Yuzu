@@ -636,11 +636,16 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
     second factor again when you approved; real re-authentication at approval time is a planned
     follow-up. A sign-in with no MFA `amr` (or an ID token with no usable `iat`) is refused with `403` and
     `approver_assurance_required:mfa_proof_missing`; sign in again through your identity provider with
-    MFA, or ask an administrator to have the provider assert `amr` for approvers. If the identity provider re-authenticates you silently without asserting an MFA `amr`, the retry returns `403` `mfa_proof_missing` again; complete provider-side MFA (for example by signing out of the provider first) and then retry. Real re-authentication at approval time is a planned follow-up. An older proof is a
+    MFA, or ask an administrator to have the provider assert `amr` for approvers. If the identity provider re-authenticates you silently without asserting an MFA `amr`, the retry returns `403` `mfa_proof_missing` again; complete provider-side MFA (for example by signing out of the provider first) and then retry. Real re-authentication at approval time is a planned follow-up. With step-up on and `--mfa-enforcement`
+    protecting your role (`required`, or `admin-only` for an administrator), a sign-in with no MFA `amr` is
+    answered first by the central step-up check with a `401` that sends you back to your identity provider, so a
+    provider that never asserts an MFA `amr` loops instead of showing `mfa_proof_missing`. An older proof is a
     `401` whose `challenge_url` is `/auth/oidc/start`; the Approvals dialog follows that challenge by
     sending the browser through your identity provider, which abandons the decision you were
     making, so reopen the request and decide it again after you return.
-  - **SAML.** Refused with `403` and `approver_assurance_required:saml_mfa_unsupported` (#4935).
+  - **SAML.** Refused with `403` (#4935). With step-up on (the default) the central check's generic `403`
+    "MFA step-up is not available for SAML sessions in this release" answers first; the typed
+    `approver_assurance_required:saml_mfa_unsupported` appears only with `--mfa-step-up-window-secs=0`.
 
   A non-admin approver cannot enrol itself in the default modes. Local enrolment happens at sign-in only
   for accounts that `--mfa-enforcement` protects (`optional` protects nobody; `admin-only` protects

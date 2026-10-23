@@ -354,7 +354,10 @@ principal and not an engine principal. The existing rule that the reviewer canno
   approvals through MCP is unchanged. Their tier/permission mapping is `Approval:Approve` (it was
   mapped as `Approval:Write`, #3151).
 - **SAML users cannot approve.** SAML sessions can never pass step-up (#4935), so a SAML user is refused with
-  `403` `approver_assurance_required:saml_mfa_unsupported`. A deployment whose approvers all sign in through
+  `403`. With step-up on (the default `--mfa-step-up-window-secs`), the central step-up check answers first with its
+  generic `403` "MFA step-up is not available for SAML sessions in this release" and an `mfa.step_up.required` row
+  `reason=saml_session_no_mfa_this_release`; the typed `approver_assurance_required:saml_mfa_unsupported` appears only
+  with `--mfa-step-up-window-secs=0`. A deployment whose approvers all sign in through
   SAML therefore has no working approver path until they are given an OIDC provider or a local account (under
   `--auth-mode=sso-only` the only local sign-in left is the break-glass account, which is not a substitute).
   This is a known limitation, tracked in #6098. Before #6079, `--mfa-step-up-window-secs=0` admitted a SAML
@@ -403,8 +406,13 @@ principal and not an engine principal. The existing rule that the reviewer canno
     are using included (neither ends API tokens). **With RBAC enforcement off (the shipped default),** the legacy gate requires the `admin` role for
     approving, so a non-admin is refused `403` "admin role required" before the MFA check and enrolling a non-admin
     approver achieves nothing until RBAC enforcement is turned on.
-  - **An unreadable MFA store, or an unreadable stored session proof,** answers `503` with `retry_after_ms` and increments
-    `yuzu_auth_secret_unavailable_total{route="approval"}`; nothing is decided.
+  - **When the approver rule's own read fails** (an unreadable stored session proof for any approver, or, for a local
+    approver, an MFA-store fault at the approver's own read: with the step-up window at `0` or negative, or a fault
+    between the central check's read and that one), the answer is `503` with `retry_after_ms`, counted as
+    `yuzu_auth_secret_unavailable_total{route="approval"}`; nothing is decided. While step-up is on, a local approver
+    whose MFA store is unreadable is refused first by the central check: `503` without `retry_after_ms`, counted as
+    `yuzu_auth_secret_unavailable_total{route="mfa_stepup"}` and
+    `yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}`.
 - **A same-site `Origin` (or `Referer`) is now required.** A browser or script `POST` to
   `/api/approvals/{id}/approve` or `/reject` that authenticates with a session cookie and carries no `Origin` or
   `Referer` naming this site now gets `403` (audited as `csrf.denied`; the server-wide same-site check answers it before the step-up check, so a cross-site request that also has a stale proof gets this `403`, not the step-up `401`, and spends no step-up). A script that
@@ -558,8 +566,13 @@ dispatches.
    permission `403` first, so it does not prove the new check. Over MCP, an operator-tier or readonly-tier token is
    refused earlier by the tier check with `-32004`; use a supervised-tier or untiered token for this step.)
 4. Repeat step 2 with one account of each kind you run and check the outcome: a SAML user (expect `403`
-   `approver_assurance_required:saml_mfa_unsupported`), an OIDC user your identity provider does not send an MFA
-   `amr` for (expect `403` `approver_assurance_required:mfa_proof_missing`), a local account with no enrolled factor
+   `MFA step-up is not available for SAML sessions in this release` from the central step-up check, with an
+   `mfa.step_up.required` row `reason=saml_session_no_mfa_this_release` and no `approval.*` row; the typed
+   `approver_assurance_required:saml_mfa_unsupported` appears only with `--mfa-step-up-window-secs` at `0`), an OIDC user
+   your identity provider does not send an MFA `amr` for (expect `403`
+   `approver_assurance_required:mfa_proof_missing`; under `--mfa-enforcement=required`, or `admin-only` for an
+   administrator, the central check answers first with a `401` that sends the user back to the identity provider, so a
+   provider that never asserts `amr` loops instead of showing `mfa_proof_missing`), a local account with no enrolled factor
    (expect `403` `approver_assurance_required:mfa_not_enrolled`, with a `denied` row whose detail is
    `approver_assurance:mfa_not_enrolled`), and an enrolled local account whose last MFA proof is older than the
    window (expect the step-up `401`, then success after the code). Then enrol a non-admin approver through the
