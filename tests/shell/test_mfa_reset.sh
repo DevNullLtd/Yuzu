@@ -106,5 +106,26 @@ check "reset existing user -> ok/exit 0" 0 '"status":"ok"' admin
 # Missing user: error, exit 1.
 check "reset missing user -> error/exit 1" 1 'not found' ghost
 
+# The reset also ends the account's durable sessions (#6079). The first run above
+# created the session_store schema; seed one row each for the reset user and an
+# unrelated user, reset again, and require only the reset user's row to be gone
+# and the audit row to say how many were ended.
+sess_sql() { psql "$CHILD_DSN" -v ON_ERROR_STOP=1 -qtAc "$1"; }
+sess_sql "INSERT INTO session_store.sessions (token_hash, username, role, created_at_ms, expires_at_ms, last_activity_ms, mfa_verified_ms) VALUES ('yuzu_test_h_admin', 'admin', 'admin', 1, 9999999999999, 1, 1), ('yuzu_test_h_other', 'other', 'user', 1, 9999999999999, 1, 0);"
+check "reset ends the account's sessions -> ok/exit 0" 0 '"status":"ok"' admin
+left_admin="$(sess_sql "SELECT count(*) FROM session_store.sessions WHERE username='admin';")"
+left_other="$(sess_sql "SELECT count(*) FROM session_store.sessions WHERE username='other';")"
+if [ "$left_admin" = "0" ] && [ "$left_other" = "1" ]; then
+  echo "ok   - reset removed only the reset user's session"; pass=$((pass+1))
+else
+  echo "FAIL - session rows after reset (admin=$left_admin want 0, other=$left_other want 1)"; fail=$((fail+1))
+fi
+detail="$(sess_sql "SELECT detail FROM audit_store.audit_events WHERE action='mfa.reset.breakglass' ORDER BY id DESC LIMIT 1;" 2>&1 || true)"
+if printf '%s' "$detail" | grep -qF 'sessions_ended=1'; then
+  echo "ok   - audit row records sessions_ended=1"; pass=$((pass+1))
+else
+  echo "FAIL - audit detail lacks sessions_ended=1 (detail=$detail)"; fail=$((fail+1))
+fi
+
 echo "---- $pass passed, $fail failed ----"
 [ "$fail" -eq 0 ]

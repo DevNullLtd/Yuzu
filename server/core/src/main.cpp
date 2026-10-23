@@ -19,6 +19,7 @@
 #include "rbac_store.hpp" // fresh-start Administrator bootstrap (RbacStore::provision_first_admin)
 #include "scim_routes.hpp"
 #include "security_headers.hpp"
+#include "session_store.hpp" // --mfa-reset ends the account's durable sessions (#6079)
 #include "sso_boot_guard.hpp" // sso_only_boot_guard_ok / *_config_complete (CC6.3)
 
 #include <CLI/CLI.hpp>
@@ -1908,6 +1909,30 @@ int main(int argc, char* argv[]) {
             spdlog::error("--mfa-reset: failed to clear MFA for '{}'", mfa_reset_user);
             return EXIT_FAILURE;
         }
+        // End the account's durable sessions in the same one-shot (#6079). A session that
+        // survived the reset could hold an MFA proof made under the factor just cleared; the
+        // approver gate refuses a proof older than the CURRENT enrolment, but that comparison
+        // rests on the database clock never stepping backward, and a live session also keeps
+        // a password-only account's access. Ending them leaves no such proof to compare.
+        // The delete bumps the durable generation, so every replica drops its cached copy on
+        // its next refresh. A failure here is loud and non-zero: the factor is already
+        // cleared, so the operator must end the sessions by hand.
+        int sessions_ended = 0;
+        {
+            yuzu::server::SessionStore sessions(*auth_pg_pool);
+            auto ended = sessions.is_open() ? sessions.invalidate_user(mfa_reset_user)
+                                            : std::unexpected(yuzu::server::SessionStore::Error{
+                                                  "session store did not open"});
+            if (!ended) {
+                spdlog::error("--mfa-reset: MFA cleared for '{}' but ending its sessions failed "
+                              "({}). End them now with DELETE /api/v1/sessions?username=<name> "
+                              "and record the reset.",
+                              mfa_reset_user, ended.error().message);
+                std::cerr << "error: MFA cleared but the account's sessions were not ended\n";
+                return EXIT_FAILURE;
+            }
+            sessions_ended = *ended;
+        }
         // Attribute the break-glass to the KERNEL-AUTHORITATIVE OS identity, not
         // getenv("USER") — the env var is inherited from the parent and trivially
         // forgeable (USER=root ./yuzu-server --mfa-reset ...), which would let the
@@ -1923,8 +1948,9 @@ int main(int argc, char* argv[]) {
         ev.target_type = "User";
         ev.target_id = mfa_reset_user;
         ev.result = "success";
-        ev.detail = std::format("MFA enrollment cleared via --mfa-reset CLI (os_identity={})",
-                                os_user);
+        ev.detail = std::format("MFA enrollment cleared via --mfa-reset CLI (os_identity={}, "
+                                "sessions_ended={})",
+                                os_user, sessions_ended);
         if (!audit->log(ev)) {
             // The pre-check passed but the write failed (e.g. disk filled mid-op).
             // MFA is already cleared; fail loudly and non-zero so automation and
