@@ -836,7 +836,7 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`, `dex_cohort_export_key` and
   `audit_retention_days` applies one caller rule. For the first six it is the rule of the
   Settings routes that also write them; `audit_retention_days` has no Settings route
-  (the generic PUT is its only writer) and is in the class by maintainer ruling, because
+  (the generic PUT is its only writer) and is in the class by design, because
   it is the stored audit-retention setting (reported by `GET /api/config`, evidence-bearing,
   and the lever that will govern enforcement once #483 lands); the stored value is not
   enforced today, the enforced window being `--audit-retention-days` plus a restart. The Settings
