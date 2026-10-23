@@ -444,7 +444,8 @@ TEST_CASE("group-from-results: when every match is a Forensics row the caller ma
     CHECK(h.audits_for("response.read", "denied") == 0);
 }
 
-TEST_CASE("group-from-results: an Unknown Forensics decision refuses and creates no group",
+TEST_CASE("group-from-results: an Unknown Forensics decision shows a visible notice (200) and creates "
+          "no group",
           "[pg][server][dashboard][group_from_results][security][forensics]") {
     GroupFromResultsHarness h;
     StoredResponse r;
@@ -457,7 +458,9 @@ TEST_CASE("group-from-results: an Unknown Forensics decision refuses and creates
 
     h.forensics.unknown();
     auto res = h.post(GroupFromResultsHarness::form_body("tier-unknown-group"));
-    CHECK(res->status == 503);
+    // 200, not 503: htmx drops a 4xx/5xx body, and the notice below is the operator's only signal.
+    CHECK(res->status == 200);
+    CHECK(res->body.find("class=\"feedback-error\"") != std::string::npos);
     CHECK(res->body.find("could not be completed") != std::string::npos);
     CHECK(res->body.find("Nothing was created") != std::string::npos);
     CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
@@ -469,6 +472,7 @@ TEST_CASE("group-from-results: an Unknown Forensics decision refuses and creates
     h.forensics.viewer();
     auto ok = h.post(GroupFromResultsHarness::form_body("tier-denied-group"));
     CHECK(ok->status != 503);
+    CHECK(ok->body.find("Nothing was created") == std::string::npos);
     CHECK(h.mg.find_group_by_name("tier-denied-group").has_value());
 }
 

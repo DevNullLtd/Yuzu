@@ -704,7 +704,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  if (!tier) {
                      // Unknown: this action materialises membership, so it refuses outright rather
                      // than proceeding on a filter computed from a partial answer (#4990).
-                     res.status = 503;
+                     // Answered 200 with the notice in the body: htmx drops a 4xx/5xx body
+                     // (the console's sibling refusals render at 200 for the same reason), so a
+                     // 503 here would show the operator only a generic failure toast.
                      res.set_header("HX-Retarget", "#group-form-slot");
                      res.set_content(
                          "<span class=\"feedback-error\">"
