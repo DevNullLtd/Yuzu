@@ -779,6 +779,11 @@ public:
     /// not-enrolled rows.
     std::expected<void, AuthDBError> mfa_disable(const std::string& username);
 
+    /// `mfa_disable`, reporting whether the account had a verified factor at the moment of the
+    /// clear (the pre-image of the same row lock, #6079). `true` also when no active row matched,
+    /// so a caller deciding whether to end the account's sessions fails safe.
+    [[nodiscard]] std::expected<bool, AuthDBError> mfa_disable_report(const std::string& username);
+
     // ── Enrollment tokens + pending agents (WS-6 slice 6.2, ADR-2002 §8) ─────
     //
     // Authoritative, fleet-wide (every replica shares one PG), and FAIL-CLOSED:

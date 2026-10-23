@@ -1001,6 +1001,79 @@ TEST_CASE("POST /api/settings/mfa/disable still ends the sessions when the clear
     CHECK_FALSE(sessions.find(auth::AuthManager::sha256_hex(mine)).value().has_value());
 }
 
+TEST_CASE("AuthDB::mfa_disable_report reports the pre-image of the clear itself (#6079)",
+          "[pg][mfa][auth_db]") {
+    MfaSettingsHarness h;
+    // Provisional secret only: nothing verified, so the report is false.
+    REQUIRE(h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt).has_value());
+    auto provisional = h.auth_db->mfa_disable_report("admin");
+    REQUIRE(provisional.has_value());
+    CHECK_FALSE(*provisional);
+
+    // Verified factor: true, and the factor is gone afterwards.
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto bytes = mfa::base32_decode(init->secret_base32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
+    auto verified = h.auth_db->mfa_disable_report("admin");
+    REQUIRE(verified.has_value());
+    CHECK(*verified);
+    auto status = h.auth_db->mfa_status("admin");
+    REQUIRE(status.has_value());
+    CHECK_FALSE(status->enrolled);
+
+    // Already cleared: false (idempotent). An unknown account matches no row and reports true,
+    // so a caller deciding whether to end sessions fails safe.
+    auto again = h.auth_db->mfa_disable_report("admin");
+    REQUIRE(again.has_value());
+    CHECK_FALSE(*again);
+    auto unknown = h.auth_db->mfa_disable_report("nobody");
+    REQUIRE(unknown.has_value());
+    CHECK(*unknown);
+}
+
+TEST_CASE("POST /api/settings/mfa/disable says the state is unknown when neither the clear nor "
+          "the delete is confirmed (#6079)",
+          "[pg][mfa][routes][settings]") {
+    MfaSettingsHarness h;
+    yuzu::server::SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto bytes = mfa::base32_decode(init->secret_base32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
+    const auto mine = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    REQUIRE_FALSE(mine.empty());
+
+    yuzu::test::SqlFault users_fault(h.auth_db.pool(),
+                                     "ALTER TABLE auth.users RENAME TO users_gone",
+                                     "ALTER TABLE auth.users_gone RENAME TO users");
+    yuzu::test::SqlFault sessions_fault(
+        h.auth_db.pool(), "ALTER TABLE session_store.sessions RENAME TO sessions_gone",
+        "ALTER TABLE session_store.sessions_gone RENAME TO sessions");
+    users_fault.arm();
+    sessions_fault.arm();
+    auto res = h.sink.dispatch("POST", "/api/settings/mfa/disable", {},
+                               "application/x-www-form-urlencoded",
+                               {{"Host", "yuzu.example"},
+                                {"Origin", "http://yuzu.example"},
+                                {"Cookie", "yuzu_session=" + mine}});
+    sessions_fault.repair();
+    users_fault.repair();
+    REQUIRE(res);
+    CHECK(res->get_header_value("HX-Redirect").empty());
+    CHECK(res->body.find("state is unknown") != std::string::npos);
+    CHECK(h.has_audit("mfa.disabled", "error", "admin"));
+    CHECK(h.audit_detail("mfa.disabled") == "disable failed (sessions_ended=failed)");
+}
+
 TEST_CASE("POST /api/settings/mfa/disable is blocked for self under enforcement (PR3 invariant)",
           "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;

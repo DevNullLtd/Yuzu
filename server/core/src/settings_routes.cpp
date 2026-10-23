@@ -7006,9 +7006,6 @@ void SettingsRoutes::register_routes(
                           "text/html; charset=utf-8");
                       return;
                   }
-                  // A status read that fails counts as enrolled: the fail-safe is to end sessions.
-                  const auto before = db->mfa_status(session->username);
-                  const bool had_factor = !before || before->enrolled;
                   // The row is written AFTER the actor's own session is deleted, so it is
                   // attributed to the session already resolved, not re-resolved from the cookie.
                   const auto audit = [&](const char* result, const std::string& detail) {
@@ -7027,29 +7024,34 @@ void SettingsRoutes::register_routes(
                       res.set_header("HX-Redirect", "/home");
                       res.set_content("", "text/plain");
                   };
-                  auto r = db->mfa_disable(session->username);
+                  // The pre-image comes from the clear's own row lock, so it cannot miss an
+                  // enrolment verified in between. A failed clear leaves it unknown, which counts
+                  // as enrolled: the fail-safe is to end sessions.
+                  auto r = db->mfa_disable_report(session->username);
                   if (!r) {
-                      // The clear may have committed with its acknowledgement lost, so a factor
-                      // that was enrolled still has its sessions ended (#6079).
-                      if (had_factor) {
-                          const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
-                          audit("error",
-                                "disable failed (sessions_ended=" +
-                                    (ended.db_persisted ? std::to_string(ended.count)
-                                                        : std::string("failed")) +
-                                    ")");
-                          if (ended.db_persisted) {
-                              sign_out();
-                              return;
-                          }
-                      } else {
-                          audit("error", "disable failed");
+                      // The clear may have committed with its acknowledgement lost, so the
+                      // sessions end anyway (#6079).
+                      const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
+                      audit("error",
+                            "disable failed (sessions_ended=" +
+                                (ended.db_persisted ? std::to_string(ended.count)
+                                                    : std::string("failed")) +
+                                ")");
+                      if (ended.db_persisted) {
+                          sign_out();
+                          return;
                       }
-                      res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
-                                                          "Could not disable MFA"),
-                                      "text/html; charset=utf-8");
+                      // Neither the clear nor the delete is confirmed: say the state is unknown.
+                      res.set_content(
+                          render_mfa_fragment(
+                              *session, {}, {}, {}, {},
+                              "Could not confirm MFA was disabled, and the account's sessions "
+                              "could not be ended. Its state is unknown: ask an administrator "
+                              "to check it and end the sessions."),
+                          "text/html; charset=utf-8");
                       return;
                   }
+                  const bool had_factor = *r;
                   // Cancelling an enrolment that never completed clears no usable factor, so no
                   // proof can predate one: nothing to end.
                   if (!had_factor) {
