@@ -52,6 +52,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <shared_mutex>
@@ -1072,6 +1073,21 @@ TEST_CASE("POST /api/settings/mfa/disable says the state is unknown when neither
     CHECK(res->body.find("state is unknown") != std::string::npos);
     CHECK(h.has_audit("mfa.disabled", "error", "admin"));
     CHECK(h.audit_detail("mfa.disabled") == "disable failed (sessions_ended=failed)");
+}
+
+// The disable handler falls back to the request-resolving AuditFn when the session-bound writer
+// is unwired, which would silently write an empty principal (the actor's session is gone by the
+// time the row is written). A handler test cannot see server.cpp, so pin the production binding.
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+TEST_CASE("settings: server.cpp binds the session-bound audit writer to AuthRoutes (#6079)",
+          "[mfa][settings]") {
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    CHECK(src.find("settings_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn())") !=
+          std::string::npos);
 }
 
 TEST_CASE("POST /api/settings/mfa/disable is blocked for self under enforcement (PR3 invariant)",
