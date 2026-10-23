@@ -138,6 +138,10 @@ REQUIRED: list[tuple[str, str, str]] = [
     ("response-routes-fn",
      r"response::Deps\{[^;]{0,700}?(?P<k>\." + _VF + r"=" + _VF + r")",
      "the response routes must receive the visibility resolver"),
+    # NOTE (hardware-routes-fn / -set): these two anchor on the field ORDER at the tail of the
+    # HardwareRoutes::Deps initialiser (`.write_gate`, then the visibility fn, then the plugin set,
+    # then `});`). Reordering those designated fields breaks THIS gate, not the wiring: update the
+    # pattern rather than "fixing" the server.
     ("hardware-routes-fn",
      r"\.write_gate=WriteGate\{resolve_session_fn,cfg_\.csrf_trusted_origins\},(?P<k>\." + _VF + r"=" + _VF + r"),",
      "the hardware routes must receive the visibility resolver"),

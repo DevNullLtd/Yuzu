@@ -245,8 +245,9 @@ status, exit code and a failure text (`error_detail`). For a command of a Forens
 text is reduced, when it is stored and again when the tracker reads it, to a bounded machine token
 (`^[a-z0-9_]{1,32}(:[a-z0-9_.-]{1,48}){1,3}$`, at most 96 bytes) or to the fixed `forensics_error`
 (`forensics_error_detail.hpp`); status and exit code are unchanged, and other plugins' text is not
-touched. The event outbox replay (24 hours) is not reduced on read, so text written by a replica
-that predates the change can be replayed until it expires. The live `output` event stream publishes no
+touched. The durable event outbox (24 hours; other replicas re-publish its rows onto their own stream) is
+not reduced on read, so text written by a replica that predates the change can reach another
+replica's stream until it expires. The live `output` event stream publishes no
 Forensics-tier row.
 
 **Audit.** A read that serves at least one Forensics-tier row writes one `response.forensics.read`
