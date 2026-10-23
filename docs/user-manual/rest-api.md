@@ -5011,6 +5011,8 @@ Returns current configuration values and any active runtime overrides.
 
 **Permission:** `Infrastructure:Read`
 
+> **Replaying this response.** Writing the `overrides` map back with `PUT /api/config/{key}` stops at the first administrator-only key for a caller that is not an administrator account; see [Replaying `GET /api/config`](#put-apiconfigkey).
+
 > **Secret values are never returned.** For an override whose key holds a credential
 > (today: `oidc_client_secret`) the `value` field is **omitted entirely** and replaced
 > by `"is_set": true|false`. It is not a placeholder string: a placeholder is a legal
@@ -5072,6 +5074,8 @@ In production the permission gate runs first. A service-scoped token, and a `rea
 **Replaying `GET /api/config`.** Writing the whole `overrides` map back with a caller that is not an administrator account (for example an MCP-tier token) stops with `403` at the first administrator-only key it reaches, so keys written before that point stay applied and the rest are not (a half-applied configuration). `overrides` is a name-sorted object, so which keys come first depends on the order the client replays them in. `GET /api/config` does not yet list which keys are administrator-only, so a config-as-code client should replay with an administrator API token that is not MCP-tier, or write the seven keys separately (the Settings pages for the six that have one, `PUT /api/config/audit_retention_days` with an administrator account for the seventh).
 
 **Audit:** audit-first (ADR-0033 section 9, no audit row, no mutation). An `attempted` `config.update` row is written before anything changes; if it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and the key is neither stored nor applied. A `success` row follows a change, or a `failure` row a store refusal. If only that outcome row is lost the change stays applied and the `200` carries `Sec-Audit-Failed: true` (see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture)). Each accepted call therefore leaves two rows.
+
+**No MCP twin.** `PUT /api/config/{key}` has no MCP tool today (planned under #2146). A twin must apply the same write class (`RuntimeConfigStore::write_class`) and the same caller rule (`authz::admin_gate_verdict`) before it writes, or it reopens the gap this section closes.
 
 **Dangling `attempted` row.** An `attempted` `config.update` row with no `success` or `failure` row after it means the outcome is unknown (the server stopped between the two, or the outcome row was lost); read `GET /api/config` to see what is in force. A `failure` row for a database error records `store error; outcome unknown`, because the write may have committed before the acknowledgement was lost.
 
