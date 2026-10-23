@@ -392,9 +392,11 @@ accepted gap, because the generic *read* path had no typed-source filter, so suc
 readable via the far lower-privileged `Infrastructure:Read`/`Inventory:Read` securable until the
 next purge. Every generic read (`InventoryStore::list_tables`/`get`/`query`/`count`) now excludes
 each member of `kTypedInventorySources` in SQL, which closes that window for `app_usage`,
-`device_ci` and every other typed source. A server older than that change, or one rolled back below
-it, still shows such rows. The gateway skip, the boot purge and the read filter iterate the same
-one list.
+`device_ci` and every other typed source on each server at or after that change. The closure is
+per server, not per fleet: a server older than that change, or rolled back below it, still stores
+and serves such rows, so in a multi-replica deployment reads routed to an older replica expose them
+until every replica is upgraded. The gateway skip, the boot purge and the read filter iterate the
+same one list.
 
 ## Testing
 

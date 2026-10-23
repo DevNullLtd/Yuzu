@@ -7205,7 +7205,7 @@ The process data fetch control is not part of this page.
 
 Inventory data is structured per-plugin telemetry collected from agents and stored server-side. The generic store (`InventoryStore`, ADR-0037) is Postgres-backed with an AUTHORITATIVE read posture — a store/pool/query degrade returns **503**, never a silent empty result.
 
-The generic store never returns the typed daily-sync sources (`installed_software`, `app_perf`, `device_ci`, `software_licensing`, `app_usage` and the reserved `certificate_inventory`; ADR-0070 D12). They are absent from the table list and from query results, and a `GET` of one for an agent is **404**, as for any source the agent has not reported. Each has its own typed route and securable, for example the software inventory and app-usage routes.
+The generic store never returns the typed daily-sync sources (`installed_software`, `app_perf`, `device_ci`, `software_licensing`, `app_usage` and the reserved `certificate_inventory`; ADR-0070 D12). They are absent from the table list and from query results, and a `GET` of one for an agent is **404**, as for any source the agent has not reported. Each has its own typed route and securable, for example the software inventory and app-usage routes; `certificate_inventory` is reserved, and its route arrives with its store.
 
 #### `GET /api/v1/inventory/tables`
 
