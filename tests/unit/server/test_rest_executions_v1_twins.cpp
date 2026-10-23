@@ -642,7 +642,7 @@ TEST_CASE("GET /api/v1/executions/:id/responses: response.forensics.read is writ
         CHECK(rows[0].result == "success");
         CHECK(rows[0].target_type == "Execution");
         CHECK(rows[0].target_id == exec_id);
-        CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory");
+        CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory surface=rest");
     }
     h.forensics.scoped({"agent-B"});
     h.audit_log.clear();
@@ -651,7 +651,7 @@ TEST_CASE("GET /api/v1/executions/:id/responses: response.forensics.read is writ
         REQUIRE(res);
         const auto rows = verb_rows();
         REQUIRE(rows.size() == 1);
-        CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory");
+        CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory surface=rest");
     }
     h.forensics.admin();
     h.audit_log.clear();

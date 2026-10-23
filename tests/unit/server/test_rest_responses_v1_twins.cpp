@@ -805,7 +805,7 @@ TEST_CASE("v1 response row reads: response.forensics.read is written only when F
             CHECK(rows[0].result == "success");
             CHECK(rows[0].target_type == "Execution");
             CHECK(rows[0].target_id == "instr-faud");
-            CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory");
+            CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory surface=rest");
         }
 
         h.forensics.scoped({"agent-A"});
@@ -816,7 +816,7 @@ TEST_CASE("v1 response row reads: response.forensics.read is written only when F
             CHECK(res->status == 200);
             const auto rows = forensics_audits(h);
             REQUIRE(rows.size() == 1);
-            CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory");
+            CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory surface=rest");
         }
 
         // The verb row alone does not persist: fail closed, no data, the header says why.

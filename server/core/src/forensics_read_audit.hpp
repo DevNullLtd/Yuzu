@@ -15,12 +15,15 @@
 ///   * dashboard HTML      set-and-proceed, the failure surfaces as `Sec-Audit-Failed`.
 /// Row-returning surfaces only: aggregate, facet and count reads emit nothing.
 ///
-/// Detail is `forensics_rows=<n> plugins=<a,b>`. Every token goes through `audit_token` (CWE-117).
+/// Detail is `forensics_rows=<n> plugins=<a,b> surface=<s>`. Every token goes through `audit_token`
+/// (CWE-117). `surface` is the CLOSED `ForensicsSurface` set: the transport that served the rows, so
+/// an auditor can tell a dashboard view from an API read of the same rows without parsing paths.
 
 #include <httplib.h>
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <set>
 #include <string>
 #include <string_view>
@@ -33,6 +36,38 @@ namespace yuzu::server {
 
 /// The audit verb. One spelling for every surface.
 inline constexpr const char* kForensicsReadVerb = "response.forensics.read";
+
+/// Which surface served the rows. A closed set, spelled by `to_string`; it is server-chosen (never
+/// derived from the request), so it can never carry caller-influenced text.
+enum class ForensicsSurface : std::uint8_t {
+    kRest,           ///< REST v1 reads (responses, execution-scoped responses, export, visualization)
+    kLegacy,         ///< the legacy /api/responses reads
+    kMcp,            ///< the MCP response tools
+    kDashboard,      ///< the dashboard results fragment
+    kDrawer,         ///< the executions drawer
+    kExecutionsPage, ///< the Operate Executions page detail (`view=page`)
+    kHardware,       ///< the hardware result poll
+};
+
+[[nodiscard]] constexpr std::string_view to_string(ForensicsSurface s) noexcept {
+    switch (s) {
+    case ForensicsSurface::kRest:
+        return "rest";
+    case ForensicsSurface::kLegacy:
+        return "legacy";
+    case ForensicsSurface::kMcp:
+        return "mcp";
+    case ForensicsSurface::kDashboard:
+        return "dashboard";
+    case ForensicsSurface::kDrawer:
+        return "drawer";
+    case ForensicsSurface::kExecutionsPage:
+        return "executions_page";
+    case ForensicsSurface::kHardware:
+        return "hardware";
+    }
+    return "unknown"; // out-of-range value: a fixed token, never an unbounded one
+}
 
 /// What a surface served, with respect to the Forensics tier.
 struct ForensicsServed {
@@ -54,8 +89,8 @@ struct ForensicsServed {
         plugins.insert(std::move(lower));
     }
 
-    /// `forensics_rows=<n> plugins=<a,b>` with every token neutralised.
-    [[nodiscard]] std::string detail() const {
+    /// `forensics_rows=<n> plugins=<a,b> surface=<s>` with every token neutralised.
+    [[nodiscard]] std::string detail(ForensicsSurface surface) const {
         std::string out = "forensics_rows=" + std::to_string(rows) + " plugins=";
         bool first = true;
         for (const auto& p : plugins) {
@@ -64,6 +99,8 @@ struct ForensicsServed {
             out += audit_token(p);
             first = false;
         }
+        out += " surface=";
+        out += audit_token(to_string(surface));
         return out;
     }
 };
@@ -86,11 +123,12 @@ template <class Rows>
 template <class AuditFn>
 [[nodiscard]] bool emit_forensics_read_audit(const AuditFn& audit_fn, const httplib::Request& req,
                                              httplib::Response& res, const ForensicsServed& served,
-                                             const std::string& target_id) {
+                                             const std::string& target_id,
+                                             ForensicsSurface surface) {
     if (!served.any())
         return true;
     return detail::emit_behavioral_audit(audit_fn, req, res, kForensicsReadVerb, "success",
-                                         "Execution", target_id, served.detail());
+                                         "Execution", target_id, served.detail(surface));
 }
 
 } // namespace yuzu::server

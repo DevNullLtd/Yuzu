@@ -1110,7 +1110,7 @@ TEST_CASE("/fragments/results: response.forensics.read is written only when the 
         CHECK(rows[0].result == "success");
         CHECK(rows[0].target_type == "Execution");
         CHECK(rows[0].target_id == command_id);
-        CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory");
+        CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory surface=dashboard");
     }
     SECTION("only a page that shows a Forensics row counts it, though Forensics rows exist elsewhere") {
         h.forensics.admin();
@@ -1128,7 +1128,7 @@ TEST_CASE("/fragments/results: response.forensics.read is written only when the 
         CHECK(contains(first->body, "TOKEN-FORENSICS-A"));
         const auto rows = verb_rows();
         REQUIRE(rows.size() == 1);
-        CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory");
+        CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory surface=dashboard");
     }
     SECTION("a persist failure sets Sec-Audit-Failed and still renders the page") {
         h.forensics.admin();

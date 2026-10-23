@@ -55,7 +55,8 @@ void refuse_unaudited(httplib::Response& res) {
                                              httplib::Response& res,
                                              const ForensicsServed& served,
                                              const std::string& instruction_id) {
-    if (emit_forensics_read_audit(deps.audit_fn, req, res, served, instruction_id))
+    if (emit_forensics_read_audit(deps.audit_fn, req, res, served, instruction_id,
+                                  ForensicsSurface::kLegacy))
         return true;
     refuse_unaudited(res);
     return false;

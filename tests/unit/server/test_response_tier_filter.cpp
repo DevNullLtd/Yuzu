@@ -4,6 +4,7 @@
 // and the derivation (what counts as a Forensics plugin).
 #include "capability_fragments.hpp"
 #include "forensics_plugin_set.hpp"
+#include "forensics_read_audit.hpp"
 #include "forensics_visibility.hpp"
 #include "response_store.hpp"
 #include "response_tier_filter.hpp"
@@ -23,6 +24,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::server;
@@ -431,6 +433,36 @@ TEST_CASE("ResponseTierFilter::admits answers as the SQL predicate does",
     CHECK(scoped.admits("shellexec", "agent-b"));
     CHECK(ResponseTierFilter::unrestricted_internal_consumer().admits("app_usage", "agent-a"));
     CHECK_FALSE(ResponseTierFilter::refuse_unwired().admits("shellexec", "agent-a"));
+}
+
+TEST_CASE("response.forensics.read detail: rows, plugins and a closed surface token",
+          "[server][responses][security][forensics][audit]") {
+    const auto set = make_set({"app_usage", "execution_artifacts"});
+    ForensicsServed served;
+    served.note("execution_artifacts", &set);
+    served.note("APP_USAGE", &set); // ASCII case folded like the SQL predicate
+    served.note("shellexec", &set); // not Forensics-tier: not counted
+    REQUIRE(served.any());
+
+    // The format is `forensics_rows=<n> plugins=<a,b> surface=<s>`, exactly, for every surface.
+    const std::pair<ForensicsSurface, const char*> all[] = {
+        {ForensicsSurface::kRest, "rest"},
+        {ForensicsSurface::kLegacy, "legacy"},
+        {ForensicsSurface::kMcp, "mcp"},
+        {ForensicsSurface::kDashboard, "dashboard"},
+        {ForensicsSurface::kDrawer, "drawer"},
+        {ForensicsSurface::kExecutionsPage, "executions_page"},
+        {ForensicsSurface::kHardware, "hardware"},
+    };
+    for (const auto& [surface, spelling] : all) {
+        INFO(spelling);
+        CHECK(served.detail(surface) ==
+              std::string("forensics_rows=2 plugins=app_usage,execution_artifacts surface=") +
+                  spelling);
+    }
+    // An out-of-range value is a fixed token, never an unbounded or empty one.
+    CHECK(served.detail(static_cast<ForensicsSurface>(250)) ==
+          "forensics_rows=2 plugins=app_usage,execution_artifacts surface=unknown");
 }
 
 TEST_CASE("ResponseTierFilter::refuse_unwired and for_fixed_plugin_poll",

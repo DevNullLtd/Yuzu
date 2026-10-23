@@ -1385,6 +1385,8 @@ TEST_CASE("executions drawer and page detail: response.forensics.read is written
     for (const char* suffix : {"", "?view=page"}) {
         INFO(suffix);
         const auto url = "/fragments/executions/" + eid + "/detail" + suffix;
+        // The two renderings name themselves: the inline drawer and the Operate Executions page.
+        const std::string surface = std::string(suffix).empty() ? "drawer" : "executions_page";
         h.persist_fail_action.clear();
 
         h.forensics.viewer();
@@ -1407,7 +1409,7 @@ TEST_CASE("executions drawer and page detail: response.forensics.read is written
             CHECK(rows[0].result == "success");
             CHECK(rows[0].target_type == "Execution");
             CHECK(rows[0].target_id == eid);
-            CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory");
+            CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory surface=" + surface);
         }
 
         h.forensics.scoped({"agent-B"});
@@ -1417,7 +1419,7 @@ TEST_CASE("executions drawer and page detail: response.forensics.read is written
             REQUIRE(res);
             const auto rows = verb_rows();
             REQUIRE(rows.size() == 1);
-            CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory");
+            CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory surface=" + surface);
         }
 
         // The drawer proceeds on a persist failure and says so in the header.

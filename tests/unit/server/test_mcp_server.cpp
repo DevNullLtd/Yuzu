@@ -27677,7 +27677,7 @@ TEST_CASE("MCP query_responses: response.forensics.read is written only when For
             const auto rows = verb_rows();
             REQUIRE(rows.size() == 1);
             CHECK(rows[0] == Row{"success", "Execution", key,
-                                 "forensics_rows=2 plugins=browser_inventory"});
+                                 "forensics_rows=2 plugins=browser_inventory surface=mcp"});
         }
 
         ts.forensics_for_test.scoped({"agent-B"});
@@ -27689,7 +27689,7 @@ TEST_CASE("MCP query_responses: response.forensics.read is written only when For
         {
             const auto rows = verb_rows();
             REQUIRE(rows.size() == 1);
-            CHECK(rows[0][3] == "forensics_rows=1 plugins=browser_inventory");
+            CHECK(rows[0][3] == "forensics_rows=1 plugins=browser_inventory surface=mcp");
         }
 
         // The verb row alone does not persist: the data is still served, the gap is surfaced.

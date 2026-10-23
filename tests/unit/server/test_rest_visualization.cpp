@@ -467,7 +467,7 @@ TEST_CASE("REST visualization: response.forensics.read is written only when Fore
         REQUIRE(rows.size() == 1);
         CHECK(rows[0].result == "success");
         CHECK(rows[0].target_id == "cmd-faud");
-        CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory");
+        CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory surface=rest");
     }
     h.audit_log.clear();
     h.audit_fail_action = "response.forensics.read";

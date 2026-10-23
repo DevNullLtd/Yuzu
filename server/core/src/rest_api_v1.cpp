@@ -369,7 +369,8 @@ static bool deny_mcp_token_session(
                                                     httplib::Response& res,
                                                     const ForensicsServed& served,
                                                     const std::string& target_id) {
-    if (emit_forensics_read_audit(audit_fn, req, res, served, target_id))
+    if (emit_forensics_read_audit(audit_fn, req, res, served, target_id,
+                                  ForensicsSurface::kRest))
         return true;
     res.status = 503;
     res.set_content(detail::a4_error(res,

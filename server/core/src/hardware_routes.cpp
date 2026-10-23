@@ -976,7 +976,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             ForensicsServed served;
             if (served_row)
                 served.note(served_row->plugin, deps_.forensics_plugins);
-            (void)emit_forensics_read_audit(deps_.audit_fn, req, res, served, command_id);
+            (void)emit_forensics_read_audit(deps_.audit_fn, req, res, served, command_id,
+                                            ForensicsSurface::kHardware);
         }
         // action name isn't carried on the wire (only plugin + command_id are, to
         // keep the poll URL short) — the panel only needs it for the RenderedEmpty

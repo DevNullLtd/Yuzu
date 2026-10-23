@@ -1555,7 +1555,7 @@ TEST_CASE("result poll: response.forensics.read is recorded only when a Forensic
         const auto rows = forensics_audit_rows(h);
         CHECK(rows.count == 1);
         CHECK(rows.full == "response.forensics.read|success|Execution|browser_inventory-aaaa1111");
-        CHECK(rows.detail == "forensics_rows=1 plugins=browser_inventory");
+        CHECK(rows.detail == "forensics_rows=1 plugins=browser_inventory surface=hardware");
         // The page's own row is still written.
         CHECK(std::ranges::count(h.audits, "hardware.action.result|success") == 1);
     }
@@ -1578,7 +1578,7 @@ TEST_CASE("result poll: response.forensics.read is recorded only when a Forensic
         CHECK(contains(res->body, "TOKEN-HW-FORENSICS-ERR"));
         const auto rows = forensics_audit_rows(h);
         CHECK(rows.count == 1);
-        CHECK(rows.detail == "forensics_rows=1 plugins=browser_inventory");
+        CHECK(rows.detail == "forensics_rows=1 plugins=browser_inventory surface=hardware");
     }
     SECTION("an ordinary plugin's reply leaves no verb row, even for a Forensics:Read caller") {
         h.forensics.admin();

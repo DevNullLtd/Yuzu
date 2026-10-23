@@ -1754,7 +1754,7 @@ TEST_CASE("legacy row reads: response.forensics.read is written only when Forens
             CHECK(rows[0].result == "success");
             CHECK(rows[0].target_type == "Execution");
             CHECK(rows[0].target_id == "instr-faud");
-            CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory");
+            CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory surface=legacy");
         }
         SECTION(std::string(route.name) + ": a scoped grant counts only the rows it was served") {
             h.forensics.scoped({"agent-A"});
@@ -1763,7 +1763,7 @@ TEST_CASE("legacy row reads: response.forensics.read is written only when Forens
             CHECK(res->status == 200);
             const auto rows = forensics_audits(h);
             REQUIRE(rows.size() == 1);
-            CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory");
+            CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory surface=legacy");
         }
         SECTION(std::string(route.name) + ": a scoped grant that matches no Forensics row writes none") {
             h.forensics.scoped({"agent-C"});

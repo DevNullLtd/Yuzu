@@ -9997,7 +9997,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     served.any()) {
                     const bool forensics_ok = yuzu::server::detail::try_persist_audit(
                         audit_fn, req, kForensicsReadVerb, "success", "Execution", key,
-                        served.detail());
+                        served.detail(ForensicsSurface::kMcp));
                     audit_ok = audit_ok && forensics_ok;
                 }
                 // poll_hint was computed above, before the response-store

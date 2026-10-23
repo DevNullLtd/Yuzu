@@ -445,7 +445,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // #4990: a page that shows Forensics-tier rows leaves its own separately countable
                 // row. Set-and-proceed like the neighbouring dashboard fragments: a persist failure
                 // shows as `Sec-Audit-Failed` and never blanks the operator's view.
-                (void)emit_forensics_read_audit(persist_audit_fn_, req, res, served, command_id);
+                (void)emit_forensics_read_audit(persist_audit_fn_, req, res, served, command_id,
+                                                ForensicsSurface::kDashboard);
                 res.set_content(html, "text/html; charset=utf-8");
             });
 

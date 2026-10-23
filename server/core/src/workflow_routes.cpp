@@ -736,11 +736,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // `Sec-Audit-Failed` and the drawer still renders. Both render branches call it.
             auto emit_drawer_forensics_audit = [&](const ForensicsServed& served,
                                                    const httplib::Request& r,
-                                                   httplib::Response& out,
-                                                   const std::string& id) {
+                                                   httplib::Response& out, const std::string& id,
+                                                   ForensicsSurface surface) {
                 if (!served.any())
                     return;
-                (void)emit_forensics_read_audit(persist_audit_fn, r, out, served, id);
+                (void)emit_forensics_read_audit(persist_audit_fn, r, out, served, id, surface);
             };
             if (!execution_tracker) {
                 res.status = 503;
@@ -904,7 +904,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 res.set_content(operate_pages::render_exec_selected(view) +
                                     operate_pages::render_exec_devices(devs),
                                 "text/html; charset=utf-8");
-                emit_drawer_forensics_audit(pr.forensics, req, res, exec.id);
+                emit_drawer_forensics_audit(pr.forensics, req, res, exec.id,
+                                            ForensicsSurface::kExecutionsPage);
                 // Same forensic-read audit row as the drawer below: one per selection.
                 audit_fn(req, "execution.detail.view", "success", "Execution", exec.id, "");
                 return;
@@ -1324,7 +1325,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
             html += "</div>"; // exec-detail-grid
             res.set_content(html, "text/html; charset=utf-8");
-            emit_drawer_forensics_audit(inline_forensics, req, res, exec.id);
+            emit_drawer_forensics_audit(inline_forensics, req, res, exec.id,
+                                        ForensicsSurface::kDrawer);
 
             // sec-M2: emit audit on the forensic-data read so SOC 2 can
             // answer "who viewed execution X's per-agent error data and
