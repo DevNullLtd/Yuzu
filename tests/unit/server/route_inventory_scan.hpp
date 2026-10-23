@@ -232,13 +232,8 @@ inline std::vector<RegisteredRoute> extract_routes(const std::string& file, cons
     return out;
 }
 
-/// A representative concrete probe path for `resolve_body_cap` from a (possibly pattern)
-/// registered path: every `(...)` capture group is replaced with a fixed placeholder segment. See
-/// test_body_cap_route_inventory.cpp's header for why this is exact for this codebase's route
-/// patterns today.
-inline std::string probe_path(const std::string& raw_path) {
-    return ::yuzu::test::route_scan::probe_path(raw_path);
-}
+/// The linear probe-path builder, re-exported so the inventory tests find every scan helper here.
+using ::yuzu::test::route_scan::probe_path;
 
 /// Scan every `.cpp`/`.inc` under `YUZU_SERVER_SRC_DIR` and return every
 /// POST/PUT/PATCH/DELETE route registration found. Shared by every
