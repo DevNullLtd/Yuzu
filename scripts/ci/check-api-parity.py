@@ -3656,6 +3656,8 @@ def _selftest_body():
              ("plain", "Sec", "Read", (("scoped", "Sec", "Read"),))),
             ("two-extras-counted", f'{gate}\nperm_fn(q, p, "A", "Read");\nperm_fn(q, p, "A", "Read");\nperm_fn(q, p, "B", "Read");',
              ("plain", "Sec", "Read", (("plain", "A", "Read"), ("plain", "A", "Read"), ("plain", "B", "Read")))),
+            ("three-extras-counted", f'{gate}\nperm_fn(q, p, "A", "Read");\nperm_fn(q, p, "A", "Read");\nperm_fn(q, p, "A", "Read");',
+             ("plain", "Sec", "Read", (("plain", "A", "Read"),) * 3)),
             ("second-gate-unreadable", f"{gate}\nperm_fn(q, p, securable, op);",
              ("plain", "Sec", "Read", (("unparsed", "perm_fn", "?"),))),
             ("refused-first-then-plain-extra", f'if ({deny}) return;\n{gate}\nperm_fn(q, p, "A", "Read");',
@@ -3893,6 +3895,15 @@ def _selftest_body():
                                       {"t_two": collections.Counter({("plain", "Tee", "Read"): 1})}, {})
     check(not mt and not nt and not et,
           f"gate parity (one-to-one): the MCP call counts are copied per row, not shared across rows, got {mt} {nt} {et}")
+    # ... and per OWNER: a route held by two handlers (two owner entries) is compared once per owner,
+    # each with a fresh copy of the MCP call counts.
+    own_rows = {("GET", "/fragments/o"): _gp_row("t_own", path="/api/v1/o")}
+    own_gate = ("plain", *S, (("plain", "Tee", "Read"),))
+    own_rest = {("GET", "/api/v1/o"): [("a.cpp", own_gate), ("b.cpp", own_gate)]}
+    mo, no_, eo = gate_parity_findings(own_rows, {"t_own"}, own_rest, {"t_own": (*S, "denied")}, {},
+                                       {"t_own": collections.Counter({("plain", "Tee", "Read"): 1})}, {})
+    check(not mo and not no_ and not eo,
+          f"gate parity (one-to-one): the MCP call counts are copied per owner entry of one route, got {mo} {no_} {eo}")
     check(m1[("GET", "/api/v1/extra_bad", "extra_bad")] == ("plain:Sec:Read; also plain:Zed:Read", "denied:Sec:Read"),
           f"gate parity (further gates): the description names every further gate, got {m1[('GET', '/api/v1/extra_bad', 'extra_bad')]}")
     check(m1[("GET", "/api/v1/extra_unread", "extra_unread")][0] == "plain:Sec:Read; also unparsed:perm_fn:?",
