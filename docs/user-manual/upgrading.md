@@ -520,7 +520,7 @@ unlimited/no-expiry behaviour, or size them to the rollout window and the number
 |---|---|---|
 | `installed_software` | `GET /api/v1/inventory/software` | `query_installed_software` |
 | `device_ci` | `GET /api/v1/hardware/{id}` | `get_hardware_ci`, `list_hardware_ci` |
-| `app_perf` | the `/api/v1/dex/perf/*` routes | `list_dex_perf_apps`, `list_dex_perf_devices` |
+| `app_perf` | `GET /api/v1/dex/perf/apps` and the other `/api/v1/dex/perf/app*` routes | `list_dex_perf_apps`, `get_dex_app_perf` |
 | `software_licensing` | `GET /api/v1/sle/agents/{agent_id}` | `query_software_licenses` |
 | `app_usage` | `GET /api/v1/forensics/agents/{agent_id}/app-usage` | `get_agent_app_usage` |
 | `certificate_inventory` | reserved; its routes arrive with its store | — |
