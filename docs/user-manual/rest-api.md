@@ -6710,6 +6710,23 @@ row cap and the export byte cap. `GET
 (`response_query_row_json`, `docs/api-twin-recipe.md` Rule 1); `GET /api/v1/responses/{id}/aggregate`
 and MCP `aggregate_responses` share another (`response_aggregate_row_json`).
 
+**Forensics-tier rows (#4990).** Rows written by Forensics-tier plugins (`app_usage`,
+`browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`; the set is
+derived from the capability catalogue) are served only to callers who hold `Forensics:Read` in
+addition to `Response:Read`. This applies to every route that reads stored responses: the legacy
+`GET /api/responses/{id}[/aggregate|/export]`, the v1 twins above, `GET
+/api/v1/executions/{id}/responses`, `GET /api/v1/executions/{id}/visualization`, and the
+`GET /api/v1/management-groups/agent-count-preview` count. To any other caller those rows are
+absent, not marked: there is no extra field, flag or error, and the row cap, the truncation flags,
+the aggregate counts and the agent counts are all computed over the rows the caller may read. With a
+management-group-scoped `Forensics:Read` grant (RBAC enforcement on) only the Forensics rows of the
+agents in that scope are served. With RBAC enforcement off, `Forensics:Read` is administrator-only,
+so a non-administrator session does not receive these rows. A served read that includes at least one
+such row also writes a `response.forensics.read` audit row (`detail=forensics_rows=<n>
+plugins=<names>`), fail-closed like the neighbouring `response.read` row (`503` +
+`Sec-Audit-Failed: true`, no data); aggregate and count reads write none. The filter is per plugin,
+because only the `plugin` name is stored with a row.
+
 **Numeric query parameters are parsed strictly (#4644), on these routes AND the legacy
 `GET /api/responses/{id}[/aggregate|/export]` routes.** `status`, `since`, `until`, `limit` (and the
 legacy catch-all route's `offset`) must each be one complete base-10 integer, or the route answers

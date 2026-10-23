@@ -199,6 +199,35 @@ the cap, never an out-of-scope row), so this is not a security regression, but i
 not migrated onto the SQL-pushdown pattern above. Not the same surfaces as #3789/#3526;
 tracked separately as #3805.
 
+### The Forensics tier on stored-response reads (#4990)
+
+Rows written by Forensics-tier plugins are served only to a caller holding `Forensics:Read`. The
+seam is the `ResponseStore` read API: every public read takes a `const ResponseTierFilter&` as a
+required parameter with no default (`response_tier_filter.hpp`), and the filter is pushed into the
+SQL beside the agent scope, before `ORDER BY`/`LIMIT`/`GROUP BY`, so the cap flags, counts, facet
+options and aggregates are computed over the rows the caller may read. A filtered row is simply
+absent: there is no marker, field or error. The plugin set comes from the capability catalogue
+(`forensics_plugin_set.hpp`), never a hand-kept list, and boot refuses an empty set. Only `plugin` is
+stored with a row, so the filter is per plugin; a plugin that mixed tiers would be excluded wholesale
+until `action` is stored too. The exact set of read methods and the exact set of call sites that opt
+out through `unrestricted_internal_consumer()` (the dispatch-correlation and evaluation consumers of
+their own commands, none an operator surface) are frozen by `tests/test_response_store_read_tripwire.py`.
+
+**The executions drawer.** `GET /fragments/executions/{id}/detail` (both render branches: the
+drawer and `?view=page`) gates on `Execution:Read`, a lower tier than the `Response:Read` the stored
+output needs. Its responses section therefore asks the quiet `Response:Read` probe first: without
+it the section is a notice naming the permission, with no rows, no count and no response-store read;
+with it the Forensics filter applies. The `Execution:Read` gate scope keeps driving the
+confined-projection redaction and the row scope filter, so the effective row scope is the meet of
+the two, and this change only narrows: confined-execution admission still grants visibility only and
+never bypasses redaction. The execution event bus and the status routes carry status and exit code,
+not output, and are unchanged.
+
+**Audit.** A read that serves at least one Forensics-tier row writes one `response.forensics.read`
+row (`forensics_rows=<n> plugins=<names>`), on the row-returning surfaces only; see
+`docs/user-manual/audit-log.md`. The drawer's row is set-and-proceed (`Sec-Audit-Failed` on a failed
+persist).
+
 **#3789 (closed):** the legacy pre-v1 `/api/executions*` route family (`execution_routes.cpp` as
 of #2542 PR-7, extracted from `server.cpp` onto the `HttpRouteSink` seam) — the one
 execution-reading surface with NO confinement of any kind, not even a post-fetch filter — is now
