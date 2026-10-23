@@ -656,6 +656,39 @@ TEST_CASE("RbacStore: an engine principal cannot be granted ForensicsAnalyst (sy
     CHECK(store.get_principal_roles("engine", "engine:nvd").empty());
 }
 
+TEST_CASE("RbacStore: an existing database without the role gains it, with its four grants, on the next boot",
+          "[rbac_store][pg][forensics_analyst]") {
+    RBAC_STORE(store);
+    // Reproduce an upgrade: a database seeded by a build that predates the role (no role row, so no
+    // grants either; the grants cascade with the row), with unrelated principals already assigned.
+    REQUIRE(store.assign_role({"user", "pre-existing", "Operator"}).has_value());
+    {
+        auto lease = rbac_pool_fx_.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "DELETE FROM rbac_store.roles WHERE name = 'ForensicsAnalyst'",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    REQUIRE_FALSE(store.get_role("ForensicsAnalyst").has_value());
+    REQUIRE(store.get_role_permissions("ForensicsAnalyst").empty());
+
+    // The existing-database path: the same constructor the server runs on every boot, no migration.
+    RbacStore reopened{rbac_pool_fx_};
+    REQUIRE(reopened.is_open());
+
+    auto role = reopened.get_role("ForensicsAnalyst");
+    REQUIRE(role.has_value());
+    CHECK(role->is_system);
+    CHECK(role->description.find("Forensics:Read") != std::string::npos); // the seeded text
+    CHECK(grant_pairs(reopened, "ForensicsAnalyst") ==
+          std::vector<std::string>{"Execution:Read/allow", "Forensics:Read/allow",
+                                   "Inventory:Read/allow", "Response:Read/allow"});
+    // Nothing was auto-assigned, and the existing assignment is untouched.
+    CHECK(reopened.get_role_members("ForensicsAnalyst").empty());
+    CHECK(reopened.get_principal_roles("user", "pre-existing").size() == 1);
+}
+
 TEST_CASE("RbacStore: a pre-existing custom role named ForensicsAnalyst is merged into, not replaced",
           "[rbac_store][pg][forensics_analyst]") {
     RBAC_STORE(store);

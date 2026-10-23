@@ -118,10 +118,11 @@ TEST_CASE("REST POST .../rbac/roles/{name}/assignments: RBAC-on durable admin "
 
 // MINOR (Doomgoose external review, PR #4985): the enum-sync test
 // (kRbacAssignableRoles matches the MCP schema's role enum) covers the
-// ALLOW-LIST itself, but only 3 of the 6 names were ever exercised via a
+// ALLOW-LIST itself, but only 3 of the then-6 names were ever exercised via a
 // REAL assign call anywhere in this file (Administrator/Operator/Viewer) —
 // PlatformEngineer/ApiTokenManager/Reviewer never went through the actual
-// route. Small, direct coverage for the remaining 3.
+// route. Small, direct coverage for those 3 (ForensicsAnalyst, added later by
+// #4990, has its own cases at the end of this file).
 TEST_CASE("REST POST .../rbac/roles/{name}/assignments: the remaining 3 "
           "allow-listed roles (PlatformEngineer/ApiTokenManager/Reviewer) "
           "assign successfully too",
