@@ -130,6 +130,25 @@ std::int64_t affected_rows(const pg::PgResult& res) {
     return v;
 }
 
+// The typed-source read filter (ADR-0070 D12): every generic read binds this as a
+// `text[]` and excludes `plugin <> ALL(...)`, so a typed source's stray row is never
+// readable here whether or not the boot purge has reached it. Built from
+// kTypedInventorySources, the one list; the names are plain identifiers, so no
+// element needs array-literal quoting.
+const std::string& typed_sources_param() {
+    static const std::string param = [] {
+        std::string out = "{";
+        for (const auto name : kTypedInventorySources) {
+            if (out.size() > 1)
+                out += ',';
+            out += name;
+        }
+        out += '}';
+        return out;
+    }();
+    return param;
+}
+
 // ── Read-degrade observability (shared yuzu_inventory_read_degrade_total) ────
 
 struct DegradeSampler {
@@ -276,8 +295,9 @@ std::optional<std::vector<InventoryTable>> InventoryStore::list_tables() const {
         pg::exec_params(lease.get(),
                         "SELECT plugin, COUNT(DISTINCT agent_id) AS agent_count, "
                         "MAX(collected_at) AS last_collected "
-                        "FROM inventory_store.inventory_data GROUP BY plugin ORDER BY plugin",
-                        std::vector<std::string>{});
+                        "FROM inventory_store.inventory_data WHERE plugin <> ALL($1::text[]) "
+                        "GROUP BY plugin ORDER BY plugin",
+                        std::vector<std::string>{typed_sources_param()});
     if (res.status() != PGRES_TUPLES_OK) {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
@@ -320,8 +340,9 @@ InventoryStore::get(const std::string& agent_id, const std::string& plugin) cons
     pg::PgResult res =
         pg::exec_params(lease.get(),
                         "SELECT agent_id, plugin, data_json, collected_at "
-                        "FROM inventory_store.inventory_data WHERE agent_id = $1 AND plugin = $2",
-                        std::vector<std::string>{agent_id, plugin});
+                        "FROM inventory_store.inventory_data WHERE agent_id = $1 AND plugin = $2 "
+                        "AND plugin <> ALL($3::text[])",
+                        std::vector<std::string>{agent_id, plugin, typed_sources_param()});
     if (res.status() != PGRES_TUPLES_OK) {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
@@ -367,9 +388,10 @@ std::optional<std::vector<InventoryRecord>> InventoryStore::query(const Inventor
         limit = kQueryRowCap;
     const int offset = q.offset > 0 ? q.offset : 0;
 
-    std::string where = " WHERE 1=1";
     std::vector<std::string> params;
     int p = 0;
+    std::string where = " WHERE plugin <> ALL($" + std::to_string(++p) + "::text[])";
+    params.push_back(typed_sources_param());
     if (!q.agent_id.empty()) {
         where += " AND agent_id = $" + std::to_string(++p);
         params.push_back(q.agent_id);
@@ -562,9 +584,10 @@ std::optional<int64_t> InventoryStore::count() const {
                          pool_.last_error(), d.occurrence);
         return std::nullopt;
     }
-    pg::PgResult res =
-        pg::exec_params(lease.get(), "SELECT COUNT(*) FROM inventory_store.inventory_data",
-                        std::vector<std::string>{});
+    pg::PgResult res = pg::exec_params(lease.get(),
+                                       "SELECT COUNT(*) FROM inventory_store.inventory_data "
+                                       "WHERE plugin <> ALL($1::text[])",
+                                       std::vector<std::string>{typed_sources_param()});
     if (res.status() != PGRES_TUPLES_OK) {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)

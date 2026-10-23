@@ -212,20 +212,39 @@ TEST_CASE("GET /api/inventory/:agent_id/:plugin: happy path returns the stored b
           "and a genuinely-absent pair is 404",
           "[server][routes][data_inventory_routes][rest][pg]") {
     PgHarness h;
-    h.store->upsert("agent-2", "device_ci", R"({"serial":"abc123"})", 200);
+    h.store->upsert("agent-2", "os_info", R"({"build":"abc123"})", 200);
 
-    auto res = h.sink.Get("/api/inventory/agent-2/device_ci");
+    auto res = h.sink.Get("/api/inventory/agent-2/os_info");
     REQUIRE(res);
     CHECK(res->status == 200);
     auto body = json::parse(res->body, nullptr, false);
     REQUIRE_FALSE(body.is_discarded());
     CHECK(body["agent_id"] == "agent-2");
-    CHECK(body["plugin"] == "device_ci");
-    CHECK(body["data"]["serial"] == "abc123");
+    CHECK(body["plugin"] == "os_info");
+    CHECK(body["data"]["build"] == "abc123");
 
-    auto missing = h.sink.Get("/api/inventory/agent-nope/device_ci");
+    auto missing = h.sink.Get("/api/inventory/agent-nope/os_info");
     REQUIRE(missing);
     CHECK(missing->status == 404);
+}
+
+TEST_CASE("GET /api/inventory/:agent_id/:plugin: a typed source's stray generic row is 404, "
+          "never served under Infrastructure:Read (ADR-0070 D12)",
+          "[server][routes][data_inventory_routes][rest][pg]") {
+    PgHarness h;
+    // As an older server's gateway path would have written it: device_ci's serial
+    // belongs behind Inventory:Read in its own store, never in this generic read.
+    h.store->upsert("agent-2", "device_ci", R"({"serial":"abc123"})", 200);
+
+    auto res = h.sink.Get("/api/inventory/agent-2/device_ci");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(res->body.find("abc123") == std::string::npos);
+
+    auto tables = h.sink.Get("/api/inventory/tables");
+    REQUIRE(tables);
+    CHECK(tables->status == 200);
+    CHECK(tables->body.find("device_ci") == std::string::npos);
 }
 
 TEST_CASE("POST /api/inventory/query: happy path filters by agent_id",

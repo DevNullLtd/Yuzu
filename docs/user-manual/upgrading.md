@@ -509,6 +509,17 @@ spent or expired.
 
 **How to fix.** Pass an explicit `0` for `max_uses` and/or `ttl_hours` to keep the old
 unlimited/no-expiry behaviour, or size them to the rollout window and the number of machines.
+
+## Behaviour change: generic inventory reads never return a typed source's rows
+
+**What changed.** The generic inventory store's reads (`query_inventory`, `get_agent_inventory`, the inventory table list and the inventory-query result-set source) no longer return rows for the typed daily-sync sources: `installed_software`, `app_perf`, `device_ci`, `software_licensing`, `app_usage`, and the reserved `certificate_inventory`. Those sources have their own stores and gates. Before this change, a typed source's blob that reached the generic store through an older server's gateway path could be read there under `Infrastructure:Read` or `Inventory:Read` until the next boot purge removed it. That window is now closed. The gateway also drops a `certificate_inventory` blob, a source no agent sends yet, instead of storing it generically.
+
+**Who notices.** Only a caller that read one of those six source names from the generic store. Their data was never meant to be there, and the typed routes (for example, the software inventory and app-usage reads) are unchanged.
+
+**Deploy order.** Upgrade servers before agents, and do not roll a server back below this release while agents that send `certificate_inventory` are running. A server older than this release stores such a blob in the generic store, where it is readable until a server at this release or later is running. The boot purge then removes it.
+
+**No action on upgrade.** There is no schema change, and the boot purge still removes any stray typed rows.
+
 ## Behaviour change: the DEX score policy document carries a version (#6085, #6086)
 
 **What changed.** The canonical text of the `dex_score_policy` document now includes `"version": 1`, and `version` is a recognised key. A document without the field reads as version 1. A server that meets a version above the one it supports scores under the shipped defaults, reports `fault: unsupported_version at version: N above the supported 1` on every Apps response, and logs it once. It never applies part of a document, and the revision stays the hash of the stored text. `PUT /api/v1/dex/score-policy` writes the document from this release. A build that predates the score policy reader ignores it. A development build that has the reader but predates this change refuses a `version` key as an unknown key and serves the shipped defaults with a fault for any document that carries it.

@@ -44,6 +44,7 @@
 #include "notification_store.hpp"
 #include "offload_target_store.hpp"
 #include "peer_ip.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include "test_auth_db_pg_helper.hpp" // WS-6 6.2: enrollment state is PG-backed
@@ -2116,6 +2117,21 @@ TEST_CASE("ProxyRegister: a wired signer issues a per-agent cert for a gateway-e
 }
 
 namespace {
+// True when the generic store holds a raw row for (agent_id, plugin). Read in SQL,
+// NOT through InventoryStore::get: get() excludes typed sources (ADR-0070 D12), so
+// a get()-based check would stay green with the gateway skip deleted.
+bool generic_row_exists(yuzu::server::pg::PgPool& pool, const std::string& agent_id,
+                        const std::string& plugin) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT 1 FROM inventory_store.inventory_data WHERE agent_id = $1 AND plugin = $2",
+        std::vector<std::string>{agent_id, plugin});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    return PQntuples(res.get()) > 0;
+}
+
 // Pre-migrated template (see PgTestTemplate in test_helpers.hpp): the generic
 // InventoryStore is the only PG store these two [pg] tests construct.
 yuzu::test::PgTestTemplate inventory_h1_tpl{"agent_svc_inventory", [](const std::string& dsn) {
@@ -2163,13 +2179,15 @@ TEST_CASE("ProxyInventory: device_ci is NOT double-stored into the generic Inven
     apb::InventoryReport rpt;
     rpt.set_session_id(session_id);
     (*rpt.mutable_plugin_data())["device_ci"] = "raw-canonical-blob"; // typed → must be skipped
+    (*rpt.mutable_plugin_data())["certificate_inventory"] = "raw-cert-blob"; // typed, no seam yet
     (*rpt.mutable_plugin_data())["custom_source"] = "{\"k\":1}";      // generic → must be stored
     apb::InventoryAck ack;
     REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
 
-    auto device_ci_row = inv.get("agent-gw-inv", "device_ci");
-    REQUIRE(device_ci_row.has_value());      // not degraded
-    CHECK_FALSE(device_ci_row->has_value()); // H1: not in the generic store
+    CHECK_FALSE(generic_row_exists(pool, "agent-gw-inv", "device_ci")); // H1: not stored
+    // ADR-0070 D12 (slice-2 PR 2a-1): certificate_inventory is reserved as typed
+    // before its seam exists, so the gateway drops it rather than storing it here.
+    CHECK_FALSE(generic_row_exists(pool, "agent-gw-inv", "certificate_inventory"));
     auto custom_row = inv.get("agent-gw-inv", "custom_source");
     REQUIRE(custom_row.has_value());
     CHECK(custom_row->has_value()); // generic source still works
@@ -2218,9 +2236,7 @@ TEST_CASE("ProxyInventory: software_licensing is NOT double-stored into the gene
     apb::InventoryAck ack;
     REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
 
-    auto lic_row = inv.get("agent-gw-lic", "software_licensing");
-    REQUIRE(lic_row.has_value());      // not degraded
-    CHECK_FALSE(lic_row->has_value()); // not double-stored
+    CHECK_FALSE(generic_row_exists(pool, "agent-gw-lic", "software_licensing")); // not stored
     auto custom_row = inv.get("agent-gw-lic", "custom_source");
     REQUIRE(custom_row.has_value());
     CHECK(custom_row->has_value()); // generic source still works
@@ -2368,9 +2384,7 @@ TEST_CASE("ProxyInventory: app_usage is NOT double-stored into the generic Inven
     REQUIRE(rows.has_value());
     CHECK(rows->size() == 1);
     // ...but the generic store never sees it.
-    auto usage_row = inv.get("agent-gw-usage-mixed", "app_usage");
-    REQUIRE(usage_row.has_value());      // not degraded
-    CHECK_FALSE(usage_row->has_value()); // not double-stored
+    CHECK_FALSE(generic_row_exists(pool, "agent-gw-usage-mixed", "app_usage")); // not stored
     auto custom_row = inv.get("agent-gw-usage-mixed", "custom_source");
     REQUIRE(custom_row.has_value());
     CHECK(custom_row->has_value()); // generic source still works
@@ -4036,6 +4050,24 @@ TEST_CASE("typed_inventory_sources: app_usage is a typed source (PR7b.3 guard)",
     CHECK(yuzu::server::is_typed_inventory_source("app_perf"));
     CHECK(yuzu::server::is_typed_inventory_source("device_ci"));
     CHECK(yuzu::server::is_typed_inventory_source("software_licensing"));
+}
+
+TEST_CASE("typed_inventory_sources: one list drives the predicate, and certificate_inventory "
+          "is reserved before its seam exists (ADR-0070 D12)",
+          "[server][inventory][typed]") {
+    using yuzu::server::is_typed_inventory_source;
+    using yuzu::server::kTypedInventorySources;
+    // The predicate (gateway skip), the boot purge and the read filter all iterate
+    // kTypedInventorySources, so every member must satisfy the predicate.
+    for (const auto name : kTypedInventorySources)
+        CHECK(is_typed_inventory_source(name));
+    CHECK(is_typed_inventory_source("certificate_inventory"));
+    static_assert(is_typed_inventory_source("certificate_inventory"));
+    // A generic source and near-misses are not typed.
+    CHECK_FALSE(is_typed_inventory_source("custom_source"));
+    CHECK_FALSE(is_typed_inventory_source("certificates"));
+    CHECK_FALSE(is_typed_inventory_source(""));
+    CHECK_FALSE(is_typed_inventory_source("App_Usage"));
 }
 
 // ── WS-6 6.2 — token SHAPE pre-check + descriptive-field sanitising ─────────

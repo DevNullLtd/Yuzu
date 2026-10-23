@@ -10,10 +10,13 @@
 ///
 /// COEXISTS with `SoftwareInventoryStore` (ADR-0016, schema
 /// `software_inventory_store`) — this is NOT that store's migration. The
-/// typed sources (`installed_software`, `app_perf`, `device_ci`,
-/// `software_licensing`) are skipped by the generic gateway/direct ingest
-/// loop (`is_typed_inventory_source`) precisely so their rows never land
-/// here; every OTHER plugin's blob still lands in this store. See
+/// typed sources (`kTypedInventorySources`, typed_inventory_sources.hpp) are
+/// skipped by the generic gateway ingest loop (`is_typed_inventory_source`)
+/// precisely so their rows never land here; every OTHER plugin's blob still
+/// lands in this store. Every read (`list_tables`, `get`, `query`,
+/// `get_agent_inventory`, `count`) also excludes every typed source in SQL, so
+/// a stray typed row written by an older server is never readable here
+/// (ADR-0070 D12). See
 /// `docs/postgres-migration-ladder.md` and ADR-0037.
 ///
 /// Substrate contract (ADR-0008/0012): holds a `pg::PgPool&`, migrates at
@@ -145,15 +148,17 @@ public:
     /// List available inventory "tables" (distinct plugins with agent
     /// counts). AUTHORITATIVE read: `std::nullopt` on a store/pool/query
     /// degrade, NEVER a silent empty. An empty value = no plugins reported.
+    /// Typed sources are excluded (see the file comment).
     [[nodiscard]] std::optional<std::vector<InventoryTable>> list_tables() const;
 
     /// Get inventory data for a specific agent+plugin. AUTHORITATIVE read:
     /// see `InventoryReadError` above for the three-state contract (degrade
-    /// vs genuinely-absent vs found).
+    /// vs genuinely-absent vs found). A typed source's row reads as absent.
     [[nodiscard]] std::expected<std::optional<InventoryRecord>, InventoryReadError>
     get(const std::string& agent_id, const std::string& plugin) const;
 
-    /// Query inventory across agents with filters. AUTHORITATIVE read:
+    /// Query inventory across agents with filters; typed sources are
+    /// excluded (see the file comment). AUTHORITATIVE read:
     /// `std::nullopt` on a store/pool/query degrade, NEVER a silent empty. An
     /// empty value = no rows matched. When the result count hits the
     /// effective row limit or the aggregate 8 MiB payload budget, more rows
@@ -192,7 +197,7 @@ public:
     /// `startup_failed_` on it).
     [[nodiscard]] bool delete_source(std::string_view plugin_name);
 
-    /// Count total inventory records. AUTHORITATIVE read: `std::nullopt` on a
+    /// Count inventory records, typed sources excluded. AUTHORITATIVE read: `std::nullopt` on a
     /// store/pool/query degrade, NEVER a silent zero.
     [[nodiscard]] std::optional<int64_t> count() const;
 
