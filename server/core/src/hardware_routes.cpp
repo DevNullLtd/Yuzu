@@ -376,7 +376,15 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // Early exit on an explicit refusal from the agent (e.g. a release 0.13.0
                 // agent answering "plugin not found", or --inventory-disable).
                 if (!command_id.empty() && deps_.responses_fn) {
-                    for (const auto& r : deps_.responses_fn(command_id, id)) {
+                    // #4990: `command_id` is a client parameter, constrained above to a
+                    // `__sync__-` id: the sync command is a fixed system one that is never
+                    // Forensics-tier. The read excludes the Forensics plugins outright, so that
+                    // does not rest on the id check alone.
+                    const auto tier = deps_.forensics_plugins
+                                          ? ResponseTierFilter::exclude(*deps_.forensics_plugins,
+                                                                        authz::deny_all())
+                                          : ResponseTierFilter::refuse_unwired();
+                    for (const auto& r : deps_.responses_fn(command_id, tier, id)) {
                         if (r.agent_id != id) continue;
                         if (r.status >= 2) {
                             send_html(res, render_hardware_sync_terminal(
@@ -865,7 +873,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                      httplib::Response& res) {
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         const std::string command_id = req.has_param("command_id") ? req.get_param_value("command_id") : "";
-        const std::string plugin = req.has_param("plugin") ? req.get_param_value("plugin") : "";
+        // The client `plugin` parameter is a caption only (#4990). The plugin the poll reads for
+        // is DERIVED from the command id (server-minted ids are `<plugin>-<hex>`), so a client
+        // cannot point the read at another plugin's command by supplying a matching prefix.
+        const std::string caption_plugin = req.has_param("plugin") ? req.get_param_value("plugin") : "";
         if (id.empty()) { res.status = 400; send_html(res, "bad request"); return; }
         if (!id_is_audit_safe(id)) {
             res.status = 400;
@@ -874,8 +885,11 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         if (!deps_.scoped_perm_fn(req, res, "Inventory", "Read", id)) return;
 
-        if (bad_hw_ident(plugin) || command_id.size() > 64 ||
-            !command_id.starts_with(plugin + "-")) {
+        const auto id_dash = command_id.rfind('-');
+        const std::string plugin =
+            (id_dash == std::string::npos || id_dash == 0) ? std::string{} : command_id.substr(0, id_dash);
+        if (command_id.size() > 64 || bad_hw_ident(caption_plugin) || bad_hw_ident(plugin) ||
+            plugin != caption_plugin || !deps_.known_plugin_fn || !deps_.known_plugin_fn(plugin)) {
             res.status = 400;
             send_html(res, "bad request");
             return;
@@ -893,7 +907,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             send_html(res, "<div class=\"gp-mute\">Result polling unavailable on this server.</div>");
             return;
         }
-        const auto rows = deps_.responses_fn(command_id, id);
+        // Derived after the gates above (it never writes a response): the replies are read only
+        // as far as the caller may read the plugin's tier.
+        const auto tier = tier_filter_for(req, deps_.forensics_visibility_fn, deps_.forensics_plugins);
+        const auto rows = deps_.responses_fn(command_id, tier, id);
         const DexAgentResponse* with_output = nullptr;
         const DexAgentResponse* terminal = nullptr;
         for (const auto& r : rows) {

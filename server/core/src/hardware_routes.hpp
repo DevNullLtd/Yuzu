@@ -253,8 +253,16 @@ public:
     using SchemaFn =
         std::function<std::unordered_map<std::string, std::string>(const std::string& plugin)>;
 
-    using ResponsesFn = std::function<std::vector<DexAgentResponse>(const std::string& command_id,
-                                                                    const std::string& agent_id)>;
+    /// Reads the replies to `command_id` from `agent_id`. The `ResponseTierFilter` is REQUIRED
+    /// (#4990): the caller names what it may read with respect to the Forensics tier, the store
+    /// applies it in SQL.
+    using ResponsesFn = std::function<std::vector<DexAgentResponse>(
+        const std::string& command_id, const ResponseTierFilter& tier, const std::string& agent_id)>;
+
+    /// True when `plugin` is a plugin of the composed capability catalogue (case-insensitive).
+    /// Wired from `CommandCapabilityRegistry::knows_plugin`, never a hand-kept list. Unwired
+    /// answers "not known": the Actions-lens result poll then refuses every command id.
+    using KnownPluginFn = std::function<bool(const std::string& plugin)>;
 
     /// Per-device permission PROBE — a stricter check than the Read gate the
     /// record/list already passed, run against a throwaway `Response` so it never
@@ -305,6 +313,9 @@ public:
         ClassifyFn classify_fn;
         SchemaFn schema_fn;
         ResponsesFn responses_fn;
+        /// #4990: the catalogue plugin lookup the result poll validates the command id's plugin
+        /// prefix against (see `KnownPluginFn`).
+        KnownPluginFn known_plugin_fn;
         ScopedProbeFn scoped_probe_fn;
         const std::unordered_map<std::string, std::string>* action_descriptions{nullptr};
         ManifestFn manifest_fn;           // parameter hints (R2.5)
@@ -334,6 +345,9 @@ public:
         /// #4990: who may read Forensics-plugin rows out of the response store (see
         /// `forensics_visibility.hpp`). Unwired (empty) resolves to present-empty at the use site.
         ForensicsVisibilityFn forensics_visibility_fn;
+        /// #4990: `ServerImpl::forensics_plugin_set_` (borrowed). Unwired (nullptr) refuses every
+        /// row on the result poll, see `tier_filter_for`.
+        const ForensicsPluginSet* forensics_plugins{nullptr};
     };
 
     void register_routes(httplib::Server& svr, Deps deps);

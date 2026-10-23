@@ -86,15 +86,6 @@ public:
         return ResponseTierFilter{Key{}};
     }
 
-    /// TRANSITIONAL (#4990 wave 1): the call sites that will take a `ForensicsVisibilityFn` pass this
-    /// until it is wired. It produces the same no-clause filter as `exclude(set, nullopt)` and,
-    /// where the plugin set has not been plumbed to the site (nullptr), the same. REMOVED when the
-    /// surfaces are wired; do not add a new caller.
-    [[nodiscard]] static ResponseTierFilter operator_surface_pending_wiring(
-        const ForensicsPluginSet* plugins) {
-        return plugins ? exclude(*plugins, std::nullopt) : ResponseTierFilter{Key{}};
-    }
-
     /// A server-side poll that reads back the reply to a command the server dispatched itself from
     /// a FIXED set of plugins, none of them Forensics-tier (the device live snapshots, the DEX and
     /// TAR result polls). Excludes the Forensics plugins outright (present-empty visibility), so

@@ -211,6 +211,19 @@ public:
         return *found;
     }
 
+    /// True when any row of the composed catalogue names `plugin` (case-insensitive). The one
+    /// "is this a plugin the server dispatches" lookup: callers validate against it rather than
+    /// keep a list of their own.
+    [[nodiscard]] bool knows_plugin(std::string_view plugin) const noexcept {
+        for (std::size_t i = 0; i < source_count_; ++i) {
+            for (const auto& cap : sources_[i]) {
+                if (ci_equal(cap.plugin, plugin))
+                    return true;
+            }
+        }
+        return false;
+    }
+
     /// Every distinct plugin name carrying at least one row whose `securable` equals `securable`,
     /// lowercased and sorted. Derived from the composed sources on each call (a handful of
     /// fragments, boot-time use), so a new fragment row is reflected with no second list to keep.

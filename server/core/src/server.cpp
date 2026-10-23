@@ -19332,23 +19332,26 @@ private:
                              // (byte-identical shape to DexRoutes' own — #1634: scope the
                              // poll read AT THE STORE SEAM).
                              .responses_fn =
-                                 [this](const std::string& command_id, const std::string& agent_id)
-                                     -> std::vector<DexAgentResponse> {
+                                 [this](const std::string& command_id, const ResponseTierFilter& tier,
+                                        const std::string& agent_id) -> std::vector<DexAgentResponse> {
                                      std::vector<DexAgentResponse> out;
                                      if (!response_store_)
                                          return out;
                                      ResponseQuery q;
                                      q.agent_id = agent_id;
-                                     // TODO(#4990): wire ForensicsVisibilityFn and derive the
-                                     // plugin server-side - until then this reads as before.
-                                     const auto tier =
-                                         ResponseTierFilter::operator_surface_pending_wiring(
-                                             forensics_plugins());
+                                     // #4990: the route derives `tier` (after its gates) from the
+                                     // caller's Forensics visibility; the store applies it in SQL.
                                      for (const auto& r :
                                           response_store_->query(command_id, tier, q)
                                               .value_or(std::vector<StoredResponse>{}))
                                          out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                                      return out;
+                                 },
+                             // #4990: the poll validates the plugin prefix of its command id
+                             // against the composed catalogue, never a list of its own.
+                             .known_plugin_fn =
+                                 [this](const std::string& plugin) {
+                                     return capability_registry_.knows_plugin(plugin);
                                  },
                              // Execute-permission PROBE against a throwaway Response — the
                              // Read gate above already ran; this is the stricter check
@@ -19396,6 +19399,7 @@ private:
                              .sync_runner = software_sync_runner(),
                              .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins},
                              .forensics_visibility_fn = forensics_visibility_fn,
+                             .forensics_plugins = forensics_plugins(),
                          });
 
         // DashboardSummaryRoutes — /fragments/dashboard/summary (readout, needs
