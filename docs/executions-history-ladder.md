@@ -229,10 +229,18 @@ materialises empty for every creator), and bundle collation applies the caller's
 `tests/test_forensics_tier_wiring_lexical.py` pins that `server.cpp`
 wires the plugin set and the resolver into each of these.
 
-**Not covered by this tier.** The policy evaluator still dispatches a Forensics-tier plugin as a
-system caller if a policy check instruction names one (only its output is withheld); tightening who
-may cause that dispatch is separate follow-up work. Failure text stored before the sanitiser is reduced on read only
-while the execution's command correlation (24 hours) is still held.
+**Not covered by this tier.** A separate follow-up tracks the dispatch-side authorisation of policy
+checks. Failure text stored before the sanitiser is reduced on read only
+while the execution's command correlation (24 hours) is still held (`ExecutionTracker::get_execution()`
+applies the same reduction as its siblings; a failed correlation lookup reduces the text rather than
+showing it, with one warning per 60 seconds). The same bounded token is what the failure
+notification, the analytics event and the webhook and offload payload carry for a Forensics-tier
+command; rows written to those sinks before the upgrade keep their original text and are not
+rewritten. A `check_result` stored by a policy before the upgrade stays until that policy is next
+evaluated. A user holding only `ForensicsAnalyst` cannot dispatch: the `Execution:Execute` gate of
+`POST /api/command` refuses, and on the MCP `execute_instruction` tool at the supervised tier the
+approval step runs before the tool's own permission check (an ordering that already applied to any
+caller lacking that permission).
 
 **The executions drawer.** `GET /fragments/executions/{id}/detail` (both render branches: the
 drawer and `?view=page`) gates on `Execution:Read`, a lower tier than the `Response:Read` the stored
@@ -246,7 +254,10 @@ status, exit code and a failure text (`error_detail`). For a command of a Forens
 text is reduced, when it is stored and again when the tracker reads it, to a bounded machine token
 (`^[a-z0-9_]{1,32}(:[a-z0-9_.-]{1,48}){1,3}$`, at most 96 bytes) or to the fixed `forensics_error`
 (`forensics_error_detail.hpp`); status and exit code are unchanged, and other plugins' text is not
-touched. The durable event outbox (24 hours; other replicas re-publish its rows onto their own stream) is
+touched. The same value, computed once at ingest on both the Subscribe and the gateway path
+(`AgentServiceImpl::failure_text_for_sinks`), is what the failure notification (listed at
+`Infrastructure:Read`), the analytics event `error_message` and the webhook and offload `error`
+payload carry; the stored response row keeps the plugin's own message and is read through the tier. The durable event outbox (24 hours; other replicas re-publish its rows onto their own stream) is
 not reduced on read, so text written by a replica that predates the change can reach another
 replica's stream until it expires. The live `output` event stream publishes no
 Forensics-tier row.
