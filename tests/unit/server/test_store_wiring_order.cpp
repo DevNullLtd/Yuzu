@@ -469,7 +469,8 @@ TEST_CASE("the source-scan headers do not use the regular-expression library",
     for (const Header& h :
          {Header{"confined_sink_scan.hpp", "find_confined_dispatch_sink_sites"},
           Header{"source_scan.hpp", "stripped_source"},
-          Header{"route_registration_scan.hpp", "find_route_registrations"}}) {
+          Header{"route_registration_scan.hpp", "find_route_registrations"},
+          Header{"route_inventory_scan.hpp", "discover_mutating_routes"}}) {
         // YUZU_SERVER_SRC_DIR is <repo>/server/core/src, so three `..` reach the repo root.
         std::string text = read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / ".." / ".." / ".." /
                                           "tests" / "unit" / "server" / h.file);

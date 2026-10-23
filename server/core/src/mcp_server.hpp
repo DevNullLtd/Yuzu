@@ -1267,9 +1267,11 @@ private:
     // A member, not a build_handler local, so age_posture_cache_for_test can reach
     // it. The scope widens from "per handler" to "per McpServer", which is benign:
     // build_handler's one production call site is register_routes' single
-    // sink.Post("/mcp/v1/", build_handler(...)), so production still has exactly one
-    // cache per route (a test that calls build_handler again on the same McpServer
-    // shares this cache). build_handler copies the shared_ptr into the handler lambda.
+    // registration of its result on the /mcp/v1/ route (written without the call's
+    // quoted path: the header scan in test_step_up_route_inventory.cpp reads comments
+    // as code), so production still has exactly one cache per route (a test that calls
+    // build_handler again on the same McpServer shares this cache). build_handler
+    // copies the shared_ptr into the handler lambda.
     struct PostureCache {
         std::mutex mtx;
         std::chrono::steady_clock::time_point generated_at{};
