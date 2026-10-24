@@ -445,7 +445,7 @@ While a just-in-time elevation is active, `effective_role` is `admin`, `elevated
 
 Keys appear in the order shown; do not depend on it. The response is sent with
 `Cache-Control: no-store, private`. During a rolling upgrade an older replica omits the newer
-keys (`auth_source`, `mcp_tier`, `scope_service`, `rbac_roles`, `rbac_roles_resolved` and the
+keys (`principal_kind`, `auth_source`, `mcp_tier`, `scope_service`, `rbac_roles`, `rbac_roles_resolved` and the
 session fields); clients should treat a missing `can_access_settings` as `false`.
 [`GET /api/me`](#get-apime) returns the same keys without the `data` envelope.
 
@@ -3325,10 +3325,10 @@ administrator after the switch (enabling: no fleet-wide `Administrator`
 grant; disabling: local account role is not `admin`) — the response's
 `remediation` field names the exact follow-up call; `503` — the RBAC or
 `AuthDB` store is unavailable, or (on an otherwise-successful toggle) its
-audit row could not persist — treat the change as unconfirmed and confirm it with the access-review export's `rbac_enforcement` label (`AccessReview:Read`); `GET /api/v1/me` (`rbac_enabled`) is only the cached view, can lag on another replica and does not report the unconfirmed (degraded) state (#6033). Audited `rbac.enforcement_changed` — see
+audit row could not persist: treat the change as unconfirmed and check it with the access-review export's `rbac_enforcement` label (`GET /api/v1/access-reviews/export`, `AccessReview:Read`). `GET /api/v1/me` (`rbac_enabled`) is only the cached view; it can lag on another replica and does not report the unconfirmed (degraded) state (#6033). Audited `rbac.enforcement_changed` — see
 `docs/user-manual/audit-log.md`.
 
-There is no `GET` twin: this route's own response echoes the authoritative post-write value, and the access-review export's `rbac_enforcement` label (`enabled`, `disabled` or `degraded`) is the definitive read. `GET /api/v1/me` (`rbac_enabled`) is the cached view only (it can lag on another replica and does not report the degraded state, #6033).
+There is no `GET` twin: this route's own response echoes the authoritative post-write value, and the access-review export's `rbac_enforcement` label (`enabled`, `disabled` or `degraded`; `GET /api/v1/access-reviews/export`, which also writes an `access_review.exported` audit row) is the strongest available read. It is still the serving replica's view (see the degrade-versus-outage note in `docs/user-manual/rbac.md`). `GET /api/v1/me` (`rbac_enabled`) is the cached view only: it can lag on another replica and does not report the degraded state (#6033).
 
 MCP twin: `set_rbac_enforcement` — see `docs/user-manual/mcp.md`.
 

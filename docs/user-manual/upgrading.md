@@ -1166,7 +1166,7 @@ the old shell until reloaded. No configuration change is needed.
 
 ## Behaviour change: `GET /api/v1/me` and `GET /api/me` no longer invent a role (#2146)
 
-This is listed as a behaviour change rather than a break because the value that goes away was fabricated, never a documented contract for an engine principal; `rbac_role` is now documented as an optional key.
+This is listed as a behaviour change rather than a break because the value that goes away was fabricated, was never documented for an engine principal, and `rbac_role` is now documented as an optional key.
 
 - An engine principal's `rbac_role` is now absent where it used to read `Viewer` (or `Administrator`, taken from its legacy session role). The endpoints now look an engine principal up under its own RBAC principal type.
 - With RBAC on, an engine principal's grants now appear in `rbac_roles`. An engine principal with no grant has no `rbac_role`.
