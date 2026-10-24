@@ -1767,7 +1767,7 @@ TEST_CASE("AuthRoutes: an engine principal's gate decides 'RBAC is off' from the
     }
 }
 
-TEST_CASE("forensics visibility: an unavailable global proof is Unknown for every caller class, "
+TEST_CASE("forensics visibility: an unavailable global proof is Unknown for sessions, tokens and engines, "
           "counted, and recovers; a definitive refusal stays Denied",
           "[pg][auth_routes][authz_topology_floor][forensics]") {
     ForensicsVisRig rig;

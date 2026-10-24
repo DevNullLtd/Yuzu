@@ -108,12 +108,14 @@ void seed_forensics_tier_metrics(yuzu::MetricsRegistry& metrics);
 ///   floor) and writes no denial row for a cookie session. It differs from `probe_permission`
 ///   in ONE way: an RBAC read that could not be completed (store not open, breaker open, pool
 ///   acquire timeout, a failed role or permission query) answers 503 instead of the 403 of a
-///   definitive refusal, so the two can be told apart. A 503 => Unknown(RbacUnavailable), for
-///   every caller class. A definitive 401/403 => Denied (present-empty).
+///   definitive refusal, so the two can be told apart. A 503 => Unknown(RbacUnavailable) for
+///   sessions, API tokens, MCP tokens and engine principals. A service-scoped token never proves
+///   Forensics and is default-denied (403) under a degraded store, so it stays Denied and does not
+///   move the withheld counter. A definitive 401/403 => Denied (present-empty).
 /// There is no second step: no scoped (management-group) grant is ever consulted, for any caller
 /// class, and a definitive denial performs no group lookup (the dependency does not exist).
-/// An unavailable global read is never collapsed into Denied: no Forensics row is served and the
-/// caller gets the retryable answer, whatever the caller class.
+/// An unavailable global read is never collapsed into Denied for the caller classes above: no
+/// Forensics row is served and the caller gets the retryable answer.
 [[nodiscard]] ForensicsVisibility resolve_forensics_visible(const ForensicsVisibilityDeps& deps,
                                                             const httplib::Request& req);
 
