@@ -603,8 +603,9 @@ place, **Hardware** and **Software**, each its own page:
     result reached a terminal state — rendered, empty, failed, or timed out; the verb
     records that the *result view* was shown to the operator, not whether the
     underlying action itself succeeded) — see [Audit log](audit-log.md). The reply of
-    a Forensics-tier plugin is shown only to a caller who also holds `Forensics:Read` for that
-    device; any other caller sees a note naming that permission instead of the reply.
+    a Forensics-tier plugin is shown only to a caller who also holds a global `Forensics:Read`
+    (there is no per-device or management-group scoped read tier); any other caller sees a note naming that
+    permission instead of the reply.
 
 - **`/software`** — installed software by application, version and device, rebuilt on the
   catalogue model that the REST and MCP twins (`GET /api/v1/inventory/software/catalogue`,

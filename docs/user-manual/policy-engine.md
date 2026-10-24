@@ -266,15 +266,11 @@ plugin's response row is still stored (it is readable only through the
 default); only the verdict and `check_result` are withheld. A separate
 follow-up (#6065) tracks the dispatch-side authorization of policy checks.
 
-A `check_result` that an evaluation stored before the upgrade stays until that
-(policy, agent) pair is next written by an evaluation. It is not removed by the
-upgrade and has no age limit. For a disabled policy, a decommissioned agent
-(the decommission cascade does not include the policy store) or an agent that
-is no longer in the policy's scope, the pair is never written again, so the old
-text stays. To remove it, delete the policy (`DELETE /api/policies/{id}`,
-`Policy:Delete`; its status rows go with it), or enable the policy and
-evaluate it again (`POST /api/policies/{id}/evaluate`), which overwrites the
-rows of the agents it still covers. This is a documented residual of this release, tracked in the project's governance record; the new build never stores check output for such a policy again.
+This release stores no check output for such a policy, so there is nothing to
+clean up for it; deleting a policy (`DELETE /api/policies/{id}`, `Policy:Delete`)
+removes its status rows as before. The deployment assumption behind this is the
+hard-cutover contract in the [upgrade guide](upgrading.md): a fresh database with
+no data imported from earlier builds.
 
 Implementation/lifecycle: the thread is `PolicyEvaluator`
 (`policy_evaluator.{hpp,cpp}`), wired in `server.cpp` against a hoisted shared

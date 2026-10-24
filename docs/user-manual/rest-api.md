@@ -5006,8 +5006,8 @@ field rather than a header/status code.
 the check instruction runs a Forensics-tier plugin (`app_usage`, `browser_inventory`,
 `execution_artifacts`, `privacy_permissions`, `remote_access_audit`), the agent's `status` is
 `unknown` and `check_result` is empty, because the evaluator does not read or store that plugin's
-output. `unknown` there says nothing about the device. A `check_result` stored by an evaluation
-before the upgrade stays until that (policy, agent) pair is next written by an evaluation; for a disabled policy, a decommissioned agent or an agent no longer in the policy's scope it is never overwritten, and it has no age limit. Deleting the policy removes it (see the Policy Engine guide). This is a documented residual of this release, tracked in the project's governance record; the new build never stores check output for such a policy again. See "Forensics-tier rows" in the
+output. `unknown` there says nothing about the device. Check output of such a policy is never
+stored. See "Forensics-tier rows" in the
 Command/Instruction Responses section.
 
 ---
@@ -6736,16 +6736,12 @@ global grant, so that bundle never reports `complete=true` to that caller), and 
 not marked: there is no extra field or flag, and the row cap, the truncation flags, the aggregate
 counts and the agent counts are all computed over the rows the caller may read, so **an empty or
 short result does not imply that no data exists**. The one error is the unresolved case: if the
-server cannot determine whether the caller may read Forensics rows (an authorization or
-management-group store fault), the route answers a retryable A4 `503` (`retry_after_ms`, no
-`permission` field) instead of a result with those rows silently missing. One case is not covered by that
-rule: if only the global permission read degrades for a caller other than an engine principal, the caller is answered as not holding
-the global grant, so the result is a `200` with the Forensics rows absent and no `503`
-(an engine principal is answered `503` when the RBAC store is not open, while a failed permission query is a `403` for every caller class);
-`yuzu_server_rbac_read_degrade_total` (alert `YuzuRbacReadDegraded`) is the signal for that case. `Forensics:Read` is a global grant, or, for an ordinary session or plain API token while RBAC
-enforcement is on, a grant scoped to management groups (only the Forensics rows of the agents in
-that scope are served). Service-scoped tokens, MCP-tier tokens and engine principals need a global
-grant and get nothing from a scoped one. With RBAC enforcement off, `Forensics:Read` is
+server cannot determine whether the caller may read Forensics rows (the authorization store is
+unavailable, for any caller class), the route answers a retryable A4 `503` (`retry_after_ms` 5000, no
+`permission` field) instead of a result with those rows silently missing; `yuzu_server_rbac_read_degrade_total`
+(alert `YuzuRbacReadDegraded`) is the correlated signal. `Forensics:Read` is a global grant only: there is
+no management-group scoped read tier, and a hand-authored scoped grant reads nothing. Service-scoped tokens,
+MCP-tier tokens and engine principals need the global grant like everyone else. With RBAC enforcement off, `Forensics:Read` is
 administrator-only, so a non-administrator session does not receive these rows. The built-in
 `ForensicsAnalyst` role is the delegable read-only holder (see `rbac.md`). A served read that
 includes at least one such row also writes a `response.forensics.read` audit row
@@ -6771,8 +6767,11 @@ command-status events, which carry no plugin output, still go out, and a dashboa
 so open the execution results instead.) The per-agent `error_detail` of a Forensics-tier command (execution routes,
 `include=agents`) is a short machine token (`scope:cause[:detail]`) or the fixed value
 `forensics_error`; status and exit code are unchanged. The failure notification, the analytics
-event and the webhook and offload payload carry the same reduced text. Rows written to those
-sinks before the upgrade keep their original text.
+event and the webhook and offload payload carry the same reduced text. A response is labelled with the
+plugin the server recorded when it dispatched the command, not with the command id the agent echoes; a
+response with no server record is labelled `~unverified`, which is part of the Forensics set, so it is
+withheld from a caller without `Forensics:Read` like any other Forensics row (see "Provenance" in
+`docs/authz-model.md`).
 
 **Numeric query parameters are parsed strictly (#4644), on these routes AND the legacy
 `GET /api/responses/{id}[/aggregate|/export]` routes.** `status`, `since`, `until`, `limit` (and the
