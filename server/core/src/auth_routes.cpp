@@ -825,19 +825,24 @@ bool AuthRoutes::require_permission_impl(const httplib::Request& req, httplib::R
                             "application/json");
             return false;
         }
-        // Deny-first compound gate (a stale raw is_rbac_enabled() view can only bias toward
-        // denying). `engine_unavailable` is set only when the read itself could not be completed.
+        // The definitive "RBAC is off" refusal is decided exactly as the ordinary RBAC branch
+        // below decides it: `rbac_enforcement_in_effect`, never the raw cached flag. A replica
+        // that has not observed another replica's enable (or whose refresh is failing) holds a
+        // stale-false flag; the raw flag would answer a definitive 403 without ever running the
+        // typed check, so the unavailable answer could not surface. Only a view proven fresh and
+        // disabled is refused here; enforced or degraded runs the typed check. Engine authority
+        // stays RBAC-only: an engine is admitted solely through that check, never through a
+        // legacy or service-scoped path. `engine_unavailable` is set only when the read itself
+        // could not be completed.
         bool engine_unavailable = false;
-        const auto engine_granted = [&] {
+        bool engine_admitted = false;
+        if (rbac_enforcement_in_effect(rbac_store_)) {
             const auto checked =
                 rbac_store_->check_permission_checked(session->username, securable_type, operation);
             engine_unavailable = !checked && degrade == RbacDegradeMapping::UnavailableAs503;
-            return checked.value_or(false);
-        };
-        // clang-format off
-        if (!rbac_store_->is_rbac_enabled() ||
-            !engine_granted()) {
-        // clang-format on
+            engine_admitted = checked.value_or(false);
+        }
+        if (!engine_admitted) {
             if (engine_unavailable) {
                 // Opt-in only: still refused, but as the retryable outage it is, not as a
                 // definitive missing grant. The default stays 403.

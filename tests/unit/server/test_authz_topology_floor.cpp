@@ -1682,6 +1682,89 @@ TEST_CASE("AuthRoutes: probe_permission_unavailable_aware answers 503 where an u
     }
 }
 
+TEST_CASE("AuthRoutes: an engine principal's gate decides 'RBAC is off' from the enforcement view, "
+          "not the raw cached flag, so an unavailable read is never a definitive denial (#4990)",
+          "[pg][auth_routes][authz_topology_floor][forensics][engine_principal]") {
+    ForensicsVisRig rig;
+    REQUIRE_FALSE(rig.rbac.is_rbac_enabled()); // fresh install: RBAC off
+    REQUIRE(rig.auth_mgr.upsert_user("owner8", "password1234", auth::Role::admin));
+    REQUIRE(rig.engines->create("Vuln Sync 8", "owner8", "engine gate enforcement view", "internal",
+                                "admin", "engine:vuln8")
+                .has_value());
+    // A custom (non built-in-admin) role is the only way an engine holds the global proof.
+    REQUIRE(rig.rbac.create_role({"EngineForensicsRead", "", false, 0}).has_value());
+    REQUIRE(rig.rbac.set_permission({"EngineForensicsRead", "Forensics", "Read", "allow"})
+                .has_value());
+    REQUIRE(rig.rbac.assign_role({"engine", "engine:vuln8", "EngineForensicsRead"}).has_value());
+    auto raw = rig.api_tokens->create_token("engine-token8", "engine:vuln8",
+                                            forensics_vis_now() + 3600, "", "readonly", "engine");
+    REQUIRE(raw.has_value());
+    auto req = rig.bearer_request(*raw);
+
+    auto expect_status = [&](DegradedReplica& d, int aware_status, int default_status) {
+        httplib::Response aware;
+        const bool aware_ok = d.ar.probe_permission_unavailable_aware(req, aware, "Forensics", "Read");
+        CHECK(aware_ok == (aware_status == 200));
+        if (aware_status != 200)
+            CHECK(aware.status == aware_status);
+        httplib::Response plain;
+        const bool plain_ok = d.ar.require_permission(req, plain, "Forensics", "Read");
+        CHECK(plain_ok == (default_status == 200));
+        if (default_status != 200)
+            CHECK(plain.status == default_status);
+    };
+
+    SECTION("a genuinely disabled, fresh view is a definitive 403 under both mappings") {
+        DegradedReplica d(rig);
+        expect_status(d, 403, 403);
+        CHECK(d.degrade("query_error") == 0.0);
+        // The resolver answers Denied, not Unknown.
+        CHECK(is_present_empty(resolve_forensics_visible(d.deps(rig), req)));
+        CHECK(rig.withheld("rbac_unavailable") == 0.0);
+    }
+
+    SECTION("RBAC enforced and the role query fails: 503 when opted in, 403 by default") {
+        rig.rbac.set_rbac_enabled(true);
+        DegradedReplica d(rig);
+        RoleReadFault fault(rig.rbac_bundle.dsn());
+        fault.arm();
+        expect_status(d, 503, 403);
+        CHECK(d.degrade("query_error") >= 1.0);
+    }
+
+    SECTION("RBAC enforced, healthy: the granted engine is admitted") {
+        rig.rbac.set_rbac_enabled(true);
+        DegradedReplica d(rig);
+        expect_status(d, 200, 200);
+        CHECK(is_global(resolve_forensics_visible(d.deps(rig), req)));
+    }
+
+    SECTION("a stale-false view whose refresh succeeds adopts the enable and admits the granted engine") {
+        DegradedReplica d(rig); // loaded while RBAC was off: cached false
+        rig.rbac.set_rbac_enabled(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // clear the refresh gate
+        expect_status(d, 200, 200);
+    }
+
+    SECTION("a stale-false view whose refresh keeps failing is Unknown under the opt-in, 403 by default") {
+        DegradedReplica d(rig); // loaded while RBAC was off: cached false
+        rig.rbac.set_rbac_enabled(true); // another replica enables; this one cannot observe it
+        auto held = d.pool.acquire();    // starve the refresh and every role read on this replica
+        REQUIRE(held);
+        // Past kRbacStaleServeBoundMs the cached false is no longer proof of "disabled".
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5200));
+        while (!d.store.rbac_enabled_view_degraded() &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        REQUIRE(d.store.rbac_enabled_view_degraded());
+        REQUIRE_FALSE(d.store.is_rbac_enabled()); // the raw flag is still the stale false
+        expect_status(d, 503, 403);
+        CHECK(is_unknown(resolve_forensics_visible(d.deps(rig), req), ForensicsUnknown::RbacUnavailable));
+        CHECK(rig.withheld("rbac_unavailable") == 1.0);
+    }
+}
+
 TEST_CASE("forensics visibility: an unavailable global proof is Unknown for every caller class, "
           "counted, and recovers; a definitive refusal stays Denied",
           "[pg][auth_routes][authz_topology_floor][forensics]") {
