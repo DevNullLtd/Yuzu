@@ -16,6 +16,9 @@
 #include <libpq-fe.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_test_case_info.hpp>
+#include <catch2/reporters/catch_reporter_event_listener.hpp>
+#include <catch2/reporters/catch_reporter_registrars.hpp>
 
 #include <algorithm>
 #include <optional>
@@ -134,6 +137,55 @@ int wait_for_backends(const std::string& admin_dsn, const std::string& app, int 
 }
 
 } // namespace
+
+#ifndef _WIN32
+/// Runs every `[pg_reachability]` test with PGCONNECT_TIMEOUT unset.
+///
+/// The probe lets the environment variable win over the pool default it is
+/// handed (probe_conninfo: `!env_set("PGCONNECT_TIMEOUT")`), and the host-list
+/// tests above bound their waits by that 3s test default. A CI step that exports
+/// PGCONNECT_TIMEOUT for the rest of the suite (so a stalled backend fails fast
+/// instead of wedging a shard until its meson timeout) would otherwise stretch
+/// those waits to the exported value and fail the bounds. The tag, not a list of
+/// test names, selects the tests: a new `[pg_reachability]` test is covered
+/// without anyone remembering to opt in. The one test that exercises the variable
+/// sets it itself and restores what it found, which is the unset state here.
+class ReachabilityConnectTimeoutEnvListener : public Catch::EventListenerBase {
+public:
+    using Catch::EventListenerBase::EventListenerBase;
+
+    void testCaseStarting(Catch::TestCaseInfo const& info) override {
+        active_ = false;
+        saved_.reset();
+        for (auto const& tag : info.tags) {
+            if (tag.original == "pg_reachability") {
+                active_ = true;
+                break;
+            }
+        }
+        if (!active_)
+            return;
+        if (const char* v = std::getenv("PGCONNECT_TIMEOUT"))
+            saved_ = v;
+        ::unsetenv("PGCONNECT_TIMEOUT");
+    }
+
+    void testCaseEnded(Catch::TestCaseStats const& /*stats*/) override {
+        if (!active_)
+            return;
+        if (saved_)
+            ::setenv("PGCONNECT_TIMEOUT", saved_->c_str(), 1);
+        active_ = false;
+        saved_.reset();
+    }
+
+private:
+    bool active_{false};
+    std::optional<std::string> saved_;
+};
+
+CATCH_REGISTER_LISTENER(ReachabilityConnectTimeoutEnvListener)
+#endif
 
 // ---------------------------------------------------------------------------
 // The pure rule
