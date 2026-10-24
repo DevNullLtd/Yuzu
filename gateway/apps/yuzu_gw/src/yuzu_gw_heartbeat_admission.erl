@@ -26,11 +26,20 @@
 %%%
 %%% The caller answers every rejection with the same NOT_FOUND
 %%% "unknown session" regardless of reason.
+%%%
+%%% ReportInventory is admitted by the same decision (`admit_inventory/2',
+%%% #5695): an inventory report is forwarded upstream only for a session this
+%%% node holds, on the connection bound to it, and the check runs before the
+%%% call takes an upstream permit. Its rejections are counted apart, in
+%%% `yuzu_gw_inventory_rejected_total{reason}' (all four reasons, the
+%%% connection mismatch included), and logged by
+%%% `yuzu_gw_safe_call:warn_limited/3' (kind `inventory_refused', reason only,
+%%% never a session id), not folded into the heartbeat summary line.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_heartbeat_admission).
 
--export([admit/2, check/2]).
+-export([admit/2, admit_inventory/2, check/2]).
 -export([init_summary_state/0, reset_summary_state/0]).
 -export_type([reason/0]).
 
@@ -57,6 +66,25 @@ admit(Ctx, SessionId) ->
             ok;
         {reject, Reason} ->
             note_rejection(Reason),
+            rejected
+    end.
+
+%% @doc The same decision for a ReportInventory call: `ok' means forward it,
+%% `rejected' means answer NOT_FOUND without taking an upstream permit. A
+%% rejection is counted on its own family, by reason, and logged at most once
+%% per second (the reason only).
+-spec admit_inventory(ctx:t(), term()) -> ok | rejected.
+admit_inventory(Ctx, SessionId) ->
+    case check(Ctx, SessionId) of
+        ok ->
+            ok;
+        {reject, Reason} ->
+            telemetry:execute([yuzu, gw, inventory, rejected], #{count => 1},
+                              #{reason => Reason}),
+            yuzu_gw_safe_call:warn_limited(
+              inventory_refused,
+              "ReportInventory refused before forwarding: no session held on this "
+              "connection (~s)", [Reason]),
             rejected
     end.
 

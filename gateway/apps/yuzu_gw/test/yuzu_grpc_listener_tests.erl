@@ -321,6 +321,36 @@ socket_opts_may_not_set_the_bind_test_() ->
                    Opts([{reuseaddr, true}, {ifaddr, {0, 0, 0, 0}}, {fd, 3}])),
      ?_assertEqual(ok, Opts([{reuseaddr, true}, {keepalive, true}, nodelay]))].
 
+%% Renegotiation is fixed by ssl_opts/1 for every TLS listener (#5695): a socket
+%% option may not set it, and a bind option is still reported first.
+socket_opts_may_not_set_renegotiation_test_() ->
+    Opts = fun(SocketOpts) ->
+               refused(#{listen => #{port => 0, ip => {127, 0, 0, 1}, socket_opts => SocketOpts}})
+           end,
+    [?_assertEqual({error, {listen_socket_opts_set_tls_policy, [client_renegotiation]}},
+                   Opts([{client_renegotiation, true}])),
+     ?_assertEqual({error, {listen_socket_opts_set_tls_policy, [secure_renegotiate]}},
+                   Opts([{secure_renegotiate, false}])),
+     ?_assertEqual({error, {listen_socket_opts_set_tls_policy,
+                            [client_renegotiation, secure_renegotiate]}},
+                   Opts([{secure_renegotiate, false}, {client_renegotiation, true}])),
+     ?_assertEqual({error, {listen_socket_opts_set_the_bind, [port]}},
+                   Opts([{client_renegotiation, true}, {port, 1}]))].
+
+%% Every TLS listener, agent or management, mutual or one-way, refuses a
+%% client-initiated renegotiation and requires secure renegotiation.
+ssl_opts_refuse_client_renegotiation_test_() ->
+    Reneg = fun(Tls) ->
+                Opts = yuzu_grpc_listener:ssl_opts(maps:merge(?TLS, Tls)),
+                {proplists:get_all_values(client_renegotiation, Opts),
+                 proplists:get_all_values(secure_renegotiate, Opts)}
+            end,
+    [?_assertEqual({[false], [true]}, Reneg(#{})),
+     ?_assertEqual({[false], [true]}, Reneg(#{verify => verify_none})),
+     ?_assertEqual({[false], [true]},
+                   Reneg(#{verify => verify_peer, fail_if_no_peer_cert => false})),
+     ?_assertEqual({[false], [true]}, Reneg(#{ciphers => ["ECDHE-RSA-AES128-GCM-SHA256"]}))].
+
 %%--------------------------------------------------------------------
 %% Cipher suites follow the key type of the certificate
 %%--------------------------------------------------------------------
@@ -356,8 +386,42 @@ cipher_selection_test_() ->
           {"an EC gateway certificate completes a TLS 1.2 handshake",
            ?_assertMatch({ok, 'tlsv1.2'}, handshake(Ec, tls_of(Ec)))},
           {"the ECDSA suites cannot serve an RSA certificate",
-           ?_assertMatch({error, _}, handshake(Rsa, (tls_of(Rsa))#{ciphers => ?EC_SUITES}))}]
+           ?_assertMatch({error, _}, handshake(Rsa, (tls_of(Rsa))#{ciphers => ?EC_SUITES}))},
+          {"a client-initiated renegotiation is refused and the connection carries on",
+           ?_assertEqual({{error, renegotiation_rejected}, {ok, <<"after">>}},
+                         renegotiate(Ec, tls_of(Ec)))}]
      end}.
+
+%% A server on the listener's socket options; the client completes a handshake,
+%% asks to renegotiate, then sends a message the server echoes back.
+renegotiate(#{cacerts := CaCerts}, Tls) ->
+    {ok, _} = application:ensure_all_started(ssl),
+    {ok, Listen} = ssl:listen(0, [{ip, {127, 0, 0, 1}}, {reuseaddr, true}, binary,
+                                  {active, false} | yuzu_grpc_listener:ssl_opts(Tls)]),
+    {ok, {_, Port}} = ssl:sockname(Listen),
+    Self = self(),
+    Server = spawn_link(fun() ->
+        {ok, T} = ssl:transport_accept(Listen, 5000),
+        {ok, Sock} = ssl:handshake(T, 5000),
+        Echo = case ssl:recv(Sock, 0, 5000) of
+                   {ok, Data} -> ssl:send(Sock, Data);
+                   Other -> Other
+               end,
+        Self ! {server, self(), Echo},
+        receive stop -> ssl:close(Sock) after 5000 -> ok end
+    end),
+    {ok, C} = ssl:connect({127, 0, 0, 1}, Port,
+                          [{versions, ['tlsv1.2']}, {verify, verify_none}, {cacerts, CaCerts},
+                           {alpn_advertised_protocols, [<<"h2">>]}, binary, {active, false},
+                           {ciphers, ssl:cipher_suites(all, 'tlsv1.2')}], 5000),
+    Reneg = ssl:renegotiate(C),
+    ok = ssl:send(C, <<"after">>),
+    After = ssl:recv(C, 0, 5000),
+    receive {server, Server, _} -> ok after 5000 -> ok end,
+    Server ! stop,
+    ssl:close(C),
+    ssl:close(Listen),
+    {Reneg, After}.
 
 tls_of(#{dir := Dir}) ->
     #{certfile => filename:join(Dir, "cert.pem"), keyfile => filename:join(Dir, "key.pem"),

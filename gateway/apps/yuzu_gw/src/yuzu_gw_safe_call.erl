@@ -50,8 +50,11 @@
 %% notify_unacknowledged: the server answered a stream-status notice
 %% acknowledged=false (yuzu_gw_upstream, NOTIFY-ACK #5695); a refusing server
 %% answers every registration's CONNECTED that way.
+%% inventory_refused: a ReportInventory with no session held on its connection
+%% (yuzu_gw_heartbeat_admission:admit_inventory/2); any TLS peer can send one
+%% per request.
 -define(KINDS, [register_refused, register_peer_addr, register_failed, inventory_failed,
-                rpc_raised, rpc_answered_error, notify_unacknowledged]).
+                inventory_refused, rpc_raised, rpc_answered_error, notify_unacknowledged]).
 
 -type kind() :: atom() | {mgmt_peer_rejected, atom()}.
 -export_type([kind/0]).

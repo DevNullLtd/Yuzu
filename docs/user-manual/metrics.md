@@ -240,6 +240,7 @@ peer node) or because it is a histogram; every other family exists from start.
 | `yuzu_gw_guardian_forward_dropped_total` | counter | `reason` | Guardian drift events dropped (`circuit_open`, `at_capacity`) |
 | `yuzu_gw_heartbeat_rejected_total` | counter | `reason` | Heartbeats refused for want of a usable session binding |
 | `yuzu_gw_heartbeat_session_mismatch_total` | counter | `event` | Heartbeats refused because they came on another connection (`event="security"`) |
+| `yuzu_gw_inventory_rejected_total` | counter | `reason` | `ReportInventory` calls refused before forwarding because no session is held on the calling connection (`unknown_session`, `no_connection`, `registry_unavailable`, `connection_mismatch`) |
 | `yuzu_gw_heartbeat_unknown_truncated_total` | counter | | Heartbeat verdicts whose unknown-session list the server truncated |
 | `yuzu_gw_heartbeat_verdict_dropped_total` | counter | `reason` | Session ids from a verdict not queued for replay |
 | `yuzu_gw_heartbeat_buffer_dropped_total` | counter | `reason` | Heartbeat data the buffer gave up to stay bounded |

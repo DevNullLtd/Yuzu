@@ -12,7 +12,7 @@
 
 -export([setup/0, handle_event/4]).
 -export([metric_specs/0, declared_metrics/0, unseeded_metrics/0]).
--export([mgmt_auth_reject_reasons/0, heartbeat_reject_reasons/0,
+-export([mgmt_auth_reject_reasons/0, heartbeat_reject_reasons/0, inventory_reject_reasons/0,
          origin_ignored_labels/0, dropped_data_reasons/0,
          upstream_dropped_rpcs/0]).
 
@@ -56,6 +56,9 @@
     [yuzu, gw, heartbeat, verdict_dropped],
     [yuzu, gw, heartbeat, coalesced],
     [yuzu, gw, heartbeat, buffer_dropped],
+
+    %% ReportInventory admission (the heartbeat decision, #5695)
+    [yuzu, gw, inventory, rejected],
 
     %% Registrations refused by the per-connection session quota
     [yuzu, gw, session, limit_rejected],
@@ -447,6 +450,15 @@ handle_event([yuzu, gw, upstream, backpressure_state],
     prometheus_gauge:set(yuzu_gw_upstream_backpressure_duty_cycle, [], DutyCycle),
     prometheus_gauge:set(yuzu_gw_upstream_slow, [], Slow);
 
+%% ReportInventory admission: a report refused before any upstream permit was
+%% asked for, by the closed reason set of yuzu_gw_heartbeat_admission:check/2
+%% (connection_mismatch included: an inventory report has no security family of
+%% its own).
+handle_event([yuzu, gw, inventory, rejected], #{count := N}, Meta, _Config) ->
+    Reason = maps:get(reason, Meta, unknown_session),
+    prometheus_counter:inc(yuzu_gw_inventory_rejected_total,
+                           [atom_to_binary(Reason, utf8)], N);
+
 handle_event([yuzu, gw, heartbeat, session_mismatch], #{count := N}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_heartbeat_session_mismatch_total,
                            [<<"security">>], N);
@@ -721,6 +733,12 @@ mgmt_auth_reject_reasons() ->
 heartbeat_reject_reasons() ->
     [unknown_session, no_connection, registry_unavailable].
 
+%% The closed set of `reason' values on yuzu_gw_inventory_rejected_total: every
+%% `{reject, Reason}' yuzu_gw_heartbeat_admission:check/2 returns.
+-spec inventory_reject_reasons() -> [atom()].
+inventory_reject_reasons() ->
+    heartbeat_reject_reasons() ++ [connection_mismatch].
+
 %% The closed set of {mode, reason} labels on yuzu_gw_grpc_origin_ignored_total:
 %% what yuzu_grpc_origin:resolve/4 can report for each proxy mode (a mode that
 %% trusts nothing in particular, `transport', never ignores a claim). For a peer
@@ -895,6 +913,15 @@ metric_specs() ->
                    "session whose heartbeat arrived on "
                    "a different connection is counted in "
                    "yuzu_gw_heartbeat_session_mismatch_total instead"}]},
+        {counter, [
+            {name, yuzu_gw_inventory_rejected_total},
+            {labels, [reason]},
+            {help, "Agent ReportInventory calls refused before any upstream permit "
+                   "was taken because no session is held on the calling "
+                   "connection, by reason (closed set: unknown_session, "
+                   "no_connection, registry_unavailable, connection_mismatch; the "
+                   "same decision as Heartbeat admission). The agent is answered "
+                   "NOT_FOUND and retries on its next sync tick"}]},
         {counter, [
             {name, yuzu_gw_heartbeat_session_mismatch_total},
             {labels, [event]},
@@ -1489,6 +1516,9 @@ seed_metrics() ->
      || R <- heartbeat_reject_reasons()],
     prometheus_counter:inc(yuzu_gw_heartbeat_session_mismatch_total,
                            [<<"security">>], 0),
+    [prometheus_counter:inc(yuzu_gw_inventory_rejected_total,
+                            [atom_to_binary(R, utf8)], 0)
+     || R <- inventory_reject_reasons()],
     [prometheus_counter:inc(yuzu_gw_grpc_origin_ignored_total,
                             [atom_to_binary(M, utf8), atom_to_binary(R, utf8)], 0)
      || {M, R} <- origin_ignored_labels()],
