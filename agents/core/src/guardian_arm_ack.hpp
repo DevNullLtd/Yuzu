@@ -156,15 +156,14 @@ public:
     /// Suppress decision (decide_retry(), below) can hand it straight back
     /// without recomputing anything.
     ///
-    /// #5547: starts an application for an authoritative full_sync push (Application::full_sync
-    /// is true). The only OBLIGATION it carries is the unattributed legacy debt:
-    /// `inherited_latch = old.inherited_latch || old.latched_failure` (spark flip gate AC-11 (3); it is
-    /// discharged by discharge_inherited_latch() once a full sync completes cleanly, never
-    /// here). Every per-rule outcome is dropped: a full sync re-arms its named rules and
-    /// detaches the rest. It also copies boot_claims (claim IDENTITY only, never an
-    /// obligation), so a full sync that re-observes an unchanged boot-origin claim keeps its
-    /// boot tag. Built into a local and published last: if anything throws, the open
-    /// application is untouched. Not noexcept.
+    /// #5547: starts an application for an authoritative full_sync push (Application::full_sync is
+    /// true). The only OBLIGATION it carries is the unattributed legacy debt: `inherited_latch =
+    /// old.inherited_latch || old.latched_failure` (spark flip gate AC-11 (3); it is discharged by
+    /// discharge_inherited_latch() once a full sync completes cleanly, never here). Every per-rule
+    /// outcome is dropped: a full sync re-arms its named rules and detaches the rest. It also
+    /// copies boot_claims (claim IDENTITY only, never an obligation), so a full sync that
+    /// re-observes an unchanged boot-origin claim keeps its boot tag. Built into a local and
+    /// published last: if anything throws, the open application is untouched. Not noexcept.
     void begin_full_application(std::uint64_t generation, std::string content_id,
                                 std::size_t applied);
 
@@ -238,10 +237,13 @@ public:
     /// application.
     /// Also called by GuardianEngine::note_boot_rearm_failure_locked() (#5513) as the FALLBACK
     /// when note_sync_failure() (which records the boot failure against its rule, #5547)
-    /// itself throws, and by apply_rules()'s unwind guard (#5547). noexcept: those callers are
-    /// noexcept or run during unwinding, so this must never throw (the body is a pointer test
-    /// and a bool store). A latch is inherited by every later application (inherited_latch)
-    /// and discharged only by a full sync that completes cleanly.
+    /// itself throws, by apply_rules()'s unwind guard (#5547), by apply_rules()'s
+    /// note_rule_failure fallback when note_sync_failure() throws for a rule's reconcile failure,
+    /// by its put_rule failure return, and at its tail when a failure with no rule id was seen.
+    /// noexcept: the fallback and unwind-guard callers are noexcept or run during unwinding, so
+    /// this must never throw (the body is a pointer test and a bool store). A latch is inherited
+    /// by every later application (inherited_latch) and discharged only by a full sync that
+    /// completes cleanly.
     void latch_failure() noexcept;
 
     /// Expected to be called with the caller's own engine lock held, matching

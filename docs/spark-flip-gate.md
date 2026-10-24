@@ -1107,7 +1107,7 @@ flip, with a red-first test each:
     same-type effects; a healthy, unchanged rule is skipped, AC-18), because `decide_retry()` answers Reapply for every push except
     an identical retry of an open application whose unresolved work is still Pending,
     Committed or an outstanding wedge; this is true of a full push sent for any reason, and
-    the Re-deploy sends one to every agent and also publishes every other staged member edit on
+    the Re-deploy sends one to every agent connected to the server that handles it and also publishes every other staged member edit on
     that Baseline, because it snapshots the current member set (`deploy_baseline`). Taking the
     rule out of the push also stops enforcing it: disabling it stops it
     everywhere it is deployed, narrowing scope or OS target stops it on the agents that drop
@@ -1339,8 +1339,8 @@ flip, with a red-first test each:
     put_rule failure, an unwind) is carried as `inherited_latch` into every later application and
     is discharged only at the tail of a full_sync whose synchronous phases all succeeded. Before
     #5547 the next operator delta forgot it and the generation was acknowledged. The discharge
-    shows a clean synchronous tail: withdrawals were issued and queued, which is not the same as
-    each backend `disarm()` having completed (the ledger does not track Disarm claims).
+    shows a clean synchronous tail: withdrawals were issued and queued, which, for a Spark-attached rule, is not the
+    same as its backend `disarm()` having completed (the ledger does not track Disarm claims).
     (4) The suppress budget restarts at 0 on every replacement, delta or full (as it did before
     #5547), so with a carried hold alternating deltas and full pushes give no per-wedge
     elapsed-time bound.
@@ -1421,8 +1421,9 @@ flip, with a red-first test each:
     actually arms (Windows; Linux with libsystemd and a reachable system bus, Service
     rules only; macOS legacy guards are stubs, so it does not apply there). The
     Spark-path parts (a boot arm that fails late or is drained as a failure, and the latch
-    on the boot application) are dormant while `prefer_spark_` is false and are covered by
-    those tests alone. Since #5547 the synchronous boot failure is recorded against its rule
+    on the boot application) are dormant while `prefer_spark_` is false (the one exception is the fallback latch that
+    `note_boot_rearm_failure_locked` takes when recording the failure against its rule itself
+    throws, which the legacy boot loop can also reach) and are covered by those tests alone. Since #5547 the synchronous boot failure is recorded against its rule
     (boot-origin) rather than as the application-wide latch, and the tick's late-failure set
     also fires for a boot-origin entry carried into a later application; an
     `apply_rules` throw after `begin_*_application()` and before the tail is latched on

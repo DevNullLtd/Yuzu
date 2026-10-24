@@ -1457,8 +1457,8 @@ TEST_CASE("#5513 live (prefer_spark=false): a catch-up whose generation persist 
 TEST_CASE("#5547 live (prefer_spark=false): boot debt is not cleared by an unrelated empty delta, "
           "only by a clean full_sync",
           "[spark][guardian][reconcile][boot][5513][5547]") {
-    // AC-13 (flip gate): an unrelated delta must not clear boot_unresolved_. The boot re-arm failure
-    // is recorded against r1 (tagged boot-origin; the application-wide latch is only the
+    // AC-13 (flip gate): an unrelated delta must not clear boot_unresolved_. The boot re-arm
+    // failure is recorded against r1 (tagged boot-origin; the application-wide latch is only the
     // allocation-failure fallback), and the omitting empty delta carries that record, so the
     // delta's application is not clean and the flag, and the reported generation 0, stay. A
     // full_sync at the next generation is the authoritative repair (it carries no per-rule
@@ -1477,6 +1477,27 @@ TEST_CASE("#5547 live (prefer_spark=false): boot debt is not cleared by an unrel
     CHECK(r.engine->policy_generation() == 0); // reported, not the persisted kGen5513
 
     r.push_ok({make_file_rule("r1")}, kGen5513 + 1); // the authoritative full_sync
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == kGen5513 + 1);
+}
+
+TEST_CASE("#5547 live (prefer_spark=false): a delta that names the failed boot rule as DISABLED "
+          "drops its carried boot failure",
+          "[spark][guardian][reconcile][boot][5513][5547]") {
+    // A rule a push names is covered by it whatever its enabled flag: a disabled rule is disarmed,
+    // not armed, and that is clean, so the record the boot failure left against r1 is dropped with
+    // it (the omitting delta in the case above is the one that carries it). Mutation: the named
+    // set narrowed to enabled rules (the boot record stays carried and the flag stays).
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+    r.construct(false, false);
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+    REQUIRE(r.engine->ack_boot_origin_for_test("r1"));
+
+    r.push_ok({make_file_rule("r1", /*enabled=*/false)}, kGen5513 + 1, /*full_sync=*/false);
+    CHECK_FALSE(r.engine->ack_boot_origin_for_test("r1"));
     CHECK_FALSE(r.engine->boot_rearm_unresolved());
     CHECK(r.engine->policy_generation() == kGen5513 + 1);
 }
@@ -1568,6 +1589,8 @@ TEST_CASE("#5547: a push naming a rule id twice is rejected with no state change
         CHECK(r.engine->boot_rearm_unresolved());
         CHECK(r.engine->arm_failure_count() == failures_before);
         CHECK(r.engine->boot_catchup_failures_for_test() == holdoff_failures_before);
+        // The rejection precedes the ack application: the ledger still holds the boot record.
+        CHECK(r.engine->ack_boot_origin_for_test("r1"));
     }
     // r2 was not persisted by the rejected pushes: a later valid full_sync still applies cleanly.
     r.push_ok({make_file_rule("r1")}, kGen5513 + 1);
@@ -1752,11 +1775,11 @@ namespace {
 
 /// C3 body. An allocation failure after begin_*_application() has published the new ack
 /// application unwinds out of apply_rules() (dispatch() has no try around it). `full_sync`
-/// selects the push shape. The meaningful assertions are that the heartbeat tick, which acknowledges
-/// any application whose pending set is empty and that holds no failure, does NOT acknowledge the
-/// generation of the application the unwind left behind, and that the ledger holds a latched
-/// failure. (An empty unlatched application already returns Reapply from decide_retry, so a
-/// "next identical push is a Reapply" assertion would pass without the guard.)
+/// selects the push shape. The meaningful assertions are that the heartbeat tick, which
+/// acknowledges any application whose pending set is empty and that holds no failure, does NOT
+/// acknowledge the generation of the application the unwind left behind, and that the ledger holds
+/// a latched failure. (An empty unlatched application already returns Reapply from decide_retry, so
+/// a "next identical push is a Reapply" assertion would pass without the guard.)
 void run_unwind_after_publication_5547(bool full_sync) {
     BootRig5513 r;
     r.seed(true, true, {make_service_rule("r1")}, kGen5513);
@@ -3000,14 +3023,13 @@ TEST_CASE("GuardianEngine::arm_stats(): prefer_spark_=true, Available, not stopp
     // was previously proven only at GuardianArmAckLedger::arm_stats()'s own call
     // site, never through GuardianEngine::arm_stats()'s forwarding.
     //
-    // NOT SparkReconcileFixture: that fixture's constructor calls start_local()
-    // (which unconditionally opens a boot-bookkeeping application, guardian_engine.cpp
-    // ~line 503) BEFORE wire_spark_engine() - so by the time the fixture's own
-    // constructor returns, ack_ledger_ already has a live application and this state
-    // is unreachable through it. Uses the file's own documented PRODUCTION wire order
-    // instead (wire_spark_engine() before start_local() - see "a production-order
-    // restart..." above) and stops BEFORE calling start_local(), so ack_ledger_ has
-    // never had begin_*_application() called on it at all.
+    // NOT SparkReconcileFixture: that fixture's constructor calls start_local() (which
+    // unconditionally opens a boot-bookkeeping application, in GuardianEngine::start_local()'s
+    // begin_full_application() call) BEFORE wire_spark_engine() - so by the time the fixture's own
+    // constructor returns, ack_ledger_ already has a live application and this state is unreachable
+    // through it. Uses the file's own documented PRODUCTION wire order instead (wire_spark_engine()
+    // before start_local() - see "a production-order restart..." above) and stops BEFORE calling
+    // start_local(), so ack_ledger_ has never had begin_*_application() called on it at all.
     auto opened = KvStore::open(unique_kv_path());
     REQUIRE(opened.has_value());
     KvStore kv{std::move(*opened)};

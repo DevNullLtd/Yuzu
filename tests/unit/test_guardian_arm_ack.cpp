@@ -3004,3 +3004,41 @@ TEST_CASE("GuardianArmAckLedger: boot tags ride with carried obligations; boot_c
     f.open_delta({"r1"});
     CHECK(f.ledger.boot_claim_count_for_test() == 0); // retire() drops everything
 }
+
+TEST_CASE("GuardianArmAckLedger::drain_locked(): a Withdrawn or a Stopped receipt is an ordinary "
+          "failure kept in failed_ids, its receipt discarded (#5547)",
+          "[spark][ack][5547]") {
+    // Both statuses share the ordinary-failure arm of drain_locked() with Failed: only the rule id
+    // is kept, in failed_ids. Mutation: either status removed from that case label (the receipt
+    // stays pending and the failure is never counted).
+    {
+        Rig5459 f;
+        f.open_delta({"r1"});
+        auto p = f.pending_sibling("r1", "/a");
+        f.ledger.add_pending("r1", p);
+        f.rt->detach_rule("r1"); // the rule is detached while its arm is in flight
+        REQUIRE(f.rt->receipt_status(p) == RT::ReceiptStatus::Withdrawn);
+        CHECK(f.ledger.drain_locked(*f.rt, 10) == 1);
+        CHECK(f.ledger.obligation_for_test("r1") == OB::FailedId);
+        CHECK(f.ledger.failed_id_count_for_test() == 1);
+        CHECK(f.ledger.failed_receipt_count_for_test() == 0);
+        CHECK(f.ledger.pending_count_for_test() == 0);
+        CHECK_FALSE(f.ledger.can_advance());
+    }
+    {
+        Rig5459 f;
+        f.open_delta({"r1"});
+        auto p = f.pending_sibling("r1", "/a");
+        f.ledger.add_pending("r1", p);
+        f.rt->begin_stop(); // the runtime stops while the arm is in flight
+        f.b->release_path("/a");
+        REQUIRE(yuzu::test::spin_until([&] { return f.rt->is_terminal(p); }, std::chrono::seconds(10)));
+        REQUIRE(f.rt->receipt_status(p) == RT::ReceiptStatus::Stopped);
+        CHECK(f.ledger.drain_locked(*f.rt, 10) == 1);
+        CHECK(f.ledger.obligation_for_test("r1") == OB::FailedId);
+        CHECK(f.ledger.failed_id_count_for_test() == 1);
+        CHECK(f.ledger.failed_receipt_count_for_test() == 0);
+        CHECK(f.ledger.pending_count_for_test() == 0);
+        CHECK_FALSE(f.ledger.can_advance());
+    }
+}

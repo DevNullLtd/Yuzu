@@ -840,7 +840,7 @@ The unattributed legacy debt (the application-wide latch from a full push's rule
 sweep, key delete or teardown failure, or a put_rule failure) is carried as
 `inherited_latch` and discharged only at the tail of a full push whose synchronous phases
 all succeeded (a clean synchronous tail shows that withdrawals were issued and queued, not
-that each backend disarm completed; the ledger does not track Disarm claims); this is live at
+that, for a Spark-attached rule, its backend disarm completed; the ledger does not track Disarm claims); this is live at
 `prefer_spark_=false`, where before the next operator delta forgot it. Known costs: the carried set is bounded by the distinct rule ids pushed since
 the last full push (a cardinality bound, not a work or memory cap; each replacement copies
 it under the engine lock); the carried AC-15 shape (a wedge adopted or settled before the

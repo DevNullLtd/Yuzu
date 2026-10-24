@@ -2210,6 +2210,9 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // the primary key and pushes are built from list_rules()), so this is defensive against a
     // hand-built push. Built in its OWN try returning std::unexpected, like the begin-application
     // firewall below: this is pre-publication, so a failure is a clean side-effect-free abort.
+    // It also runs before the retry-suppression check below, so an allocation failure here aborts
+    // a push that decide_retry() would have Suppressed, with the same error and before anything
+    // has changed.
     // (The error-string allocation in the invalid-id and duplicate returns is unfirewalled, as it
     // was before this change.)
     // transparent comparator: contains(string_view) allocates nothing
@@ -2750,13 +2753,14 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // and put_rule early returns above all leave the counters alone.
         // #5547: and only a FULL_SYNC counts. The catch-up the server sends for a boot failure is
         // always a full_sync (the heartbeat reconcile re-pushes full_sync=true), whereas a delta
-        // now carries the boot debt (a delta that omits the failed rule is unclean, except when
-        // the boot application could not be opened, see start_local()), so counting it would let a stream of unrelated operator deltas keep
-        // extending the holdoff and postpone the real catch-up indefinitely. The whole update is
-        // gated, not only the increment: a delta also leaves the existing holdoff untouched. A pending Spark arm
-        // also lands here (!can_advance()); the tick clears the flag, and the counters, once it
-        // commits, so at worst the real generation is reported for a few heartbeats first. The
-        // internal generation is untouched; only the next generation_report() calls change.
+        // now carries the boot debt (a delta that omits the failed rule is unclean, except when the
+        // boot application could not be opened, see start_local()), so counting it would let a
+        // stream of unrelated operator deltas keep extending the holdoff and postpone the real
+        // catch-up indefinitely. The whole update is gated, not only the increment: a delta also
+        // leaves the existing holdoff untouched. A pending Spark arm also lands here
+        // (!can_advance()); the tick clears the flag, and the counters, once it commits, so at
+        // worst the real generation is reported for a few heartbeats first. The internal generation
+        // is untouched; only the next generation_report() calls change.
         if (boot_catchup_failures_ < kBootCatchupFailuresCap)
             ++boot_catchup_failures_;
         boot_report_holdoff_ = std::min<std::uint32_t>(1u << (boot_catchup_failures_ - 1),
