@@ -1794,12 +1794,12 @@ workers busy" is inferred from sum/wall.
 
 *Expectation (an estimate, not a measurement).* About 454 serial-s of work other
 than `gateway eunit` and `gateway ct` over four workers is about 113 s. Meson
-starts entries in definition order (these suites set no `priority:`), and
+starts entries in definition order (these suites set no `priority:` until Push 2b), and
 `gateway eunit` and `gateway ct` are defined last, so they start after that work
 drains and run side by side: wall time near 235 s, about 100 s saved on the
 invocation and less on the job, where the pg step dominates. That makes rule (a)
 near-certain, so the decision content is rules (b) and (c) and the revert
-triggers. A `priority:` on `gateway eunit` is a separate, later axis.
+triggers. A `priority:` on `gateway eunit` is a separate, later axis (Push 2b below).
 
 *How to measure* (read-only `gh`, no runner access):
 
@@ -1883,14 +1883,14 @@ estimate above.
 One observation outside the rule: the pg-shards step, whose width is unchanged,
 took 511 s and 545 s in these two samples, against 452 s and 453 s in the two
 np=2 PR runs, and its 14 shards summed to 1005 s and 1079 s against 884 s and
-880 s. Read against the `dev` push runs of the same day (np=2, pg-shard sums
-885 s to 1028 s through 16:38, mean 942 s; 1335 s to 1437 s the evening before)
-the np=2 baselines sit at the very bottom of the range and the np=4 samples
-inside it (1005 s) or 5% above its top (1079 s). Later that day an np=2 push
-(19:12) had the pg step at 586 s and the first np=4 push on `dev` (19:37, the
-#6436 merge) at 579 s, and its non-pg step took 288 s against 393 s to 405 s at
-np=2. The step runs after the non-pg step and shares no code path with this
-change, so this is box state and an unusually fast baseline, not evidence of a
+880 s. Read against the `dev` push runs of the same day (np=2, pg-shard sums 885
+s to 1028 s through 16:38, mean 942 s; 1335 s to 1437 s the evening before) the
+np=2 baselines sit at the very bottom of the range and the np=4 samples inside
+it (1005 s) or 5% above its top (1079 s). Later that day an np=2 push (19:12)
+had the pg step at 586 s and the first np=4 push on `dev` (19:37, the #6436
+merge) at 579 s, and its non-pg step took 288 s against 393 s to 405 s at np=2.
+The step runs after the non-pg step and shares no code path with this change, so
+this is most likely box state and an unusually fast baseline, not evidence of a
 spillover; it is why the job total fell by only about 50 s. Day-to-day noise in
 this step is large, so judge it only against runs taken in the same window.
 
@@ -1902,11 +1902,12 @@ in the arithmetic paragraphs above describe the width in force when they were
 written and are brought forward by the width commit, not before.
 
 **Push 2b (`gateway eunit` starts first, `priority: 120`).** A meson `priority:`
-on the `gateway eunit` test in the root `meson.build` (the server shards use
-approximately their measured seconds, and so does this). It only orders starts:
-the entry that ran last at np=4 now starts first, so its 120 s overlaps the
-other entries instead of trailing them. The 105 entries, the suites and the
-width are unchanged, and it does nothing at `--num-processes 1`. Meson sorts the
+on the `gateway eunit` test in the root `meson.build` (about the entry's measured
+seconds; the non-pg server shards use 10 to 50 and the pg shards a sparse rank
+scale of 160 to 260). It only orders starts: the entry that ran last at np=4 now
+starts first, so its 120 s overlaps the other entries instead of trailing them.
+The 105 entries, the suites and the width are unchanged, and at
+`--num-processes 1` the order changes but the wall time cannot. Meson sorts the
 tests once, by descending priority and stably, so only the priority and the
 definition order decide who starts first.
 
@@ -1920,23 +1921,44 @@ not 165 s: the `blocked log sink SIGTERM harness` (59 s) then starts at about
 168 s. So expect about 45 s saved on the invocation and the step near 247 s,
 which still clears rule (a)'s bar of about 29 s. The harness and `gateway ct` are
 the new tail; giving them priorities too (59 and 37) would take the replay to
-about 159 s, and is the next ordering rung, not part of this push.
+about 160 s, and is the next ordering rung, not part of this push.
 *Measurement and rule* are those of Push 2a above (job log, jobs API, two
-same-SHA samples), with the Push 2a np=4 samples as the comparator: (a) the step
-median improves by 10% or more; (b) no entry of 5 s or more takes more than 1.5x
+same-SHA samples), with these changes. The comparator is the np=4 data, not np=2
+runs (the np=2 step is far noisier): the Push 2a samples (invocation 223 s to 224
+s, step 291 s to 292 s) and, as a drift control, np=4 `dev` pushes on other
+commits (220.6 s and 221.4 s invocation wall, 288 s and 290 s step); np=4 walls
+have a spread of about 1.5 s, so a 45 s effect is plainly visible. Read the log of
+the right attempt: `gh run view <run> --attempt <n> --job <id> --log`, or
+`gh api --allow-escape-sequences repos/DevNullLtd/Yuzu/actions/jobs/<id>/logs`.
+Without `--attempt`, `gh run view --job <id> --log` returns the latest attempt's
+log for every attempt's job id, so a re-run pair would be the same sample twice;
+attempt-1 job ids come from the jobs API. Judge the non-pg step and the
+invocation wall (first call to the first `Ok:` line), not the job total or the
+pg step. (a) the step median improves by 10% or more; (b) no entry of 5 s or more takes more than 1.5x
 its Push 2a time (eunit may stretch a little, and the harness now runs from about
 120 s to 179 s beside eunit's tail and `gateway ct`); (c) no entry reaches 80% of
-its own meson timeout; entry count 105 and skip count 5 unchanged. The Push 2a
-revert triggers apply, the harness failing its fixed 8 s bound being the one to
-watch. To revert, delete the `priority: 120` line from the `gateway eunit` test.
+its own meson timeout; entry count and skip count unchanged against a contemporaneous `dev` push
+(105 and 5 at the time of writing; a test added to `dev` meanwhile would move
+them). The Push 2a revert triggers apply, the harness failing its fixed 8 s
+bound being the one to watch: grep the log for `FAIL:` and `still alive`. A gain
+below the bar with no rule (b) or (c) violation means the reorder buys little:
+revert it rather than keep an unexplained change. To revert, delete the `priority: 120` line from the `gateway eunit` test.
 
-*Other runs that see this.* The Windows `gateway` suite contains the test, so it
-starts first there too; in the #6436 Windows job `gateway eunit` took 171.5 s and
-was the last of 29 entries, so a gain at least as large as Linux's is likely
-there, but it is not measured by this push. Unfiltered nightly, sanitizer and
-coverage runs, which run every test at the default width, will start it right
-after the pg shards (priorities 160 to 260) instead of in the last wave; also not
-measured. *Samples:* pending.
+*Other runs that see this (none measured by this push).* The Windows `gateway`
+suite contains the test, so it starts first there too: in the #6436 Windows job
+`gateway eunit` took 171.5 s and was the last of 29 entries, and a replay of that
+job with eunit first gives about 275 s against the observed 337 s (about 62 s),
+with `agent unit tests shard C` (148 s of its 240 s timeout) as the new tail; the
+stretch of eunit when it runs beside the heavy shards is unverifiable. On macOS
+(default width, no pg shards) eunit took 118.8 s and finished last of 47 entries
+in about 138 s, so the gain is about 19 s if its duration holds. Unfiltered
+nightly, sanitizer and coverage runs, which run every test at the default width,
+start it right after the pg shards (priorities 160 to 260) instead of in the
+quiet tail, which is the peak-contention wave: a false-red nightly opens
+`nightly-broken` and blocks merges to main, so read eunit's duration on the first
+nightlies after this merges (the wrapper's own deadline is a fixed 540 s, not
+scaled by `--timeout-multiplier 2`, about 4.5 times its healthy 120 s).
+*Samples:* pending.
 
 ### Persistent runner-local test history
 
