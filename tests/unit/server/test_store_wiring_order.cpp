@@ -69,7 +69,8 @@
  * be very slow on MSVC debug depending on the pattern's shape -- one with an
  * optional capture group at its head took 231 s there (about 1.5 s on libc++),
  * while the plain patterns in this file cost a few seconds per pass. Literal anchors
- * use std::string_view::find (the four in the #1712 and HA WS-5 cases). The setter and
+ * use std::string_view::find (the anchors in the #1712 and HA WS-5 cases, and the bounded
+ * window find after the #1712 resolver definition). The setter and
  * construction scans and the `wired_re`, `occurrence_re`, `construct_re`, `wire_re` and
  * `null_wire_re` anchors are structural and still use the pattern library. For a
  * new scan prefer std::string_view::find plus a small matcher (see
@@ -745,7 +746,8 @@ TEST_CASE("find_confined_dispatch_sink_sites recognises the documented construct
 // delegation with its store arguments in order (rbac, then management groups, then the username).
 // That catches a seam rebound to inline logic, a dropped call, a swapped or wrong store, and a
 // delegation moved into dead code. It does not prove the seam is the one the routes receive; the
-// [1712] case above covers the response-visible-set seam; the use-site counts below cover the rest.
+// response-visible-set seam is checked here and again by the [1712] case above; the use-site
+// counts below cover the rest.
 TEST_CASE("server.cpp: every username-keyed resolver seam delegates to the engine-aware "
           "resolver (#6204)",
           "[wiring_order][6204]") {
@@ -758,7 +760,7 @@ TEST_CASE("server.cpp: every username-keyed resolver seam delegates to the engin
         return n;
     };
     // A seam matches when its anchor literal is followed, at that exact position, by the pattern.
-    // Anchoring first keeps the regex off the whole ~1.5 MB file (the banner above records what a
+    // Anchoring first keeps the regex off the whole stripped file (the banner above records what a
     // whole-file std::regex costs on MSVC debug).
     const auto seam = [&text](std::string_view anchor, const char* pattern) {
         const std::regex re(pattern);
@@ -818,7 +820,7 @@ TEST_CASE("server.cpp: every username-keyed resolver seam delegates to the engin
     }
     // The seams are handed on: visible_set_fn to the two route registrations that take it, and the
     // dispatch binder to both classify_and_authorize_dispatch lambdas. (The response-visible-set seam
-    // is covered by the [1712] case above.)
+    // is also covered by the [1712] case above.)
     {
         INFO("use sites of visible_set_fn");
         std::size_t uses = 0;
