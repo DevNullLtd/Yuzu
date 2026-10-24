@@ -1129,7 +1129,9 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
     }
 
     html += "  </tbody></table>";
-    if (credentials_unreadable)
+    // Only with rows: an empty roster has no row hint to point at it, and for a store that was
+    // never wired a retry cannot help.
+    if (credentials_unreadable && !principals.empty())
         html += "<p>" + std::string(kEngineRetryControl) + "</p>";
 
     // NOTE: the one-time-reveal target (#engine-principal-reveal) is
