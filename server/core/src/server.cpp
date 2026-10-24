@@ -159,6 +159,7 @@
 #include "response_store.hpp"
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_confined
 #include "dispatch_target_shape.hpp" // check_targeting_shape / targeting_supplied (#2500)
+#include "engine_aware_visibility.hpp" // #6204: engine-aware username-keyed resolvers (unit-tested)
 #include "authz_model.hpp" // #1788: per-arm visibility intersection (in_scope/filter_to_scope)
 #include "dispatch_confined_arms.hpp" // the ONE per-arm intersection, shared with /api/command
 #include "dispatch_destructive_gate.hpp" // #3685: the Destructive-class targeting verdict
@@ -12556,6 +12557,7 @@ private:
         // so a broken store stays fail-closed (BR-002).
         facts.legacy_open = !rbac_enforcement_in_effect(rbac_store_.get());
         facts.elevated = auth::is_elevated(sess);
+        facts.principal_is_engine = sess.is_engine();
         facts.global_grant =
             rbac_store_ && rbac_store_->check_permission(sess.username, "Execution", "Execute");
         if (rbac_store_) {
@@ -12644,6 +12646,9 @@ private:
 
         yuzu::server::authz::ExecVisibleFacts facts;
         facts.legacy_open = !rbac_enforcement_in_effect(rbac_store_.get());
+        // Tripwire: an engine is not an AuthDB user, so the principal_resolves check above already
+        // denied an `engine:` creator; this keeps the composer correct if that ever changes.
+        facts.principal_is_engine = yuzu::server::authz::is_engine_principal_name(username);
         facts.global_grant =
             rbac_store_ && rbac_store_->check_permission(username, "Execution", "Execute");
         if (rbac_store_) {
@@ -12910,17 +12915,16 @@ private:
     /// Mirrors every other dispatch-adjacent RBAC read in this file (e.g.
     /// derive_exec_visible's own `legacy_open` composition): a
     /// loaded-and-explicitly-disabled store is legacy-open, and legacy-open
-    /// means "RBAC off, everyone may do everything" — the SAME bypass every
-    /// other securable already grants here, not a new one minted for this
-    /// chokepoint.
+    /// means "RBAC off, every HUMAN principal may do everything" — the SAME
+    /// bypass every other securable already grants here, not a new one minted
+    /// for this chokepoint. An ENGINE principal (`engine:<slug>`) is the one
+    /// exclusion: its only authority is an explicit RBAC grant, so under
+    /// legacy-open it is refused, never admitted (#6204).
     [[nodiscard]] bool dispatch_has_permission(std::string_view principal,
                                                std::string_view securable,
                                                yuzu::server::authz::Operation op) const {
-        if (!rbac_enforcement_in_effect(rbac_store_.get()))
-            return true;
-        return rbac_store_ != nullptr &&
-               rbac_store_->check_permission(std::string(principal), std::string(securable),
-                                             std::string(yuzu::server::authz::to_string(op)));
+        return yuzu::server::visibility::dispatch_permission(rbac_store_.get(), principal,
+                                                             securable, op);
     }
 
     std::expected<detail::ClassifiedCommand, detail::DispatchDenial> build_classified_command(
@@ -13452,44 +13456,14 @@ private:
     /// true (enforce), and `check_scoped_permission` then denies on the dead handle —
     /// so a corrupt rbac.db yields zero rows, never the whole fleet (#1498 ruling).
     bool response_agent_in_scope(const std::string& username, const std::string& agent_id) const {
-        if (!rbac_enforcement_in_effect(rbac_store_.get()))
-            return true; // loaded & explicitly disabled → legacy-open
-        return rbac_store_ && rbac_store_->check_scoped_permission(username, "Response", "Read",
-                                                                   agent_id, mgmt_group_store_.get());
+        return yuzu::server::visibility::response_agent_in_scope(
+            rbac_store_.get(), mgmt_group_store_.get(), username, agent_id);
     }
 
     /// Return the agent list as JSON, filtered by RBAC visibility for the given user.
     nlohmann::json get_visible_agents_json(const std::string& username) {
-        auto agents = registry_.to_json_obj();
-        // #1498 — restrict whenever RBAC enforcement is in effect, which includes
-        // a missing/load-failed store (fail closed); only a loaded-and-explicitly-
-        // disabled store skips filtering and returns the full fleet. Shares the
-        // rbac_enforcement_in_effect predicate with the get_visible_agents probe
-        // so /api/agents and the TAR fleet scan can never disagree.
-        if (mgmt_group_store_ && rbac_enforcement_in_effect(rbac_store_.get())) {
-            // A global Infrastructure:Read grant sees the whole fleet even under
-            // RBAC-on. On a load-failed store check_permission is unavailable
-            // (is_open()==false), so this is false and visibility falls to the
-            // role-scoped join, which itself fails closed.
-            bool global_read = rbac_store_ && rbac_store_->is_open() &&
-                               rbac_store_->check_permission(username, "Infrastructure", "Read");
-            if (!global_read) {
-                // ADR-0042: nullopt (store degraded) → empty visible set
-                // (fail-closed: return no agents rather than the full fleet).
-                auto visible = mgmt_group_store_->get_visible_agents(username);
-                std::set<std::string> visible_set;
-                if (visible)
-                    visible_set.insert(visible->begin(), visible->end());
-                nlohmann::json filtered = nlohmann::json::array();
-                for (const auto& a : agents) {
-                    if (a.contains("agent_id") &&
-                        visible_set.count(a["agent_id"].get<std::string>()))
-                        filtered.push_back(a);
-                }
-                return filtered;
-            }
-        }
-        return agents;
+        return yuzu::server::visibility::visible_agents_json(
+            registry_.to_json_obj(), rbac_store_.get(), mgmt_group_store_.get(), username);
     }
 
     /// Auto-create a dynamic management group for a service tag value.
@@ -15956,20 +15930,8 @@ private:
         // fix immediately above.
         auto visible_set_fn =
             [this](const std::string& username) -> std::optional<std::set<std::string>> {
-            if (mgmt_group_store_ && rbac_enforcement_in_effect(rbac_store_.get())) {
-                bool global_read = rbac_store_ && rbac_store_->is_open() &&
-                                   rbac_store_->check_permission(username, "Infrastructure", "Read");
-                if (!global_read) {
-                    // ADR-0042: get_visible_agents nullopt means the mgmt-store
-                    // DEGRADED — return an EMPTY confined set (fail-closed: sees
-                    // nothing), NOT nullopt here (which means "sees all fleet").
-                    auto v = mgmt_group_store_->get_visible_agents(username);
-                    if (!v)
-                        return std::set<std::string>{};
-                    return std::set<std::string>(v->begin(), v->end());
-                }
-            }
-            return std::nullopt; // global read or RBAC disabled → sees all
+            return yuzu::server::visibility::infrastructure_visible_set(
+                rbac_store_.get(), mgmt_group_store_.get(), username);
         };
         // D3: the dashboard facet/scope surfaces' Response:Read-visible set
         // (dashboard_routes.hpp VisibleSetFn) — deliberately NOT built on
@@ -15989,17 +15951,8 @@ private:
         // perm_fn_ admission gates are untouched by this resolver.
         auto response_visible_set_fn =
             [this](const std::string& username) -> std::optional<std::set<std::string>> {
-            if (!rbac_enforcement_in_effect(rbac_store_.get())) return std::nullopt;
-            bool global_read = rbac_store_ && rbac_store_->is_open() &&
-                               rbac_store_->check_permission(username, "Response", "Read");
-            if (global_read) return std::nullopt; // global Response:Read sees all, #1715(b)
-            if (!rbac_store_ || !mgmt_group_store_) {
-                return std::set<std::string>{}; // fail-closed, no store to resolve against
-            }
-            auto v = rbac_store_->visible_agents_for_permission(username, "Response", "Read",
-                                                                 mgmt_group_store_.get());
-            if (!v) return std::set<std::string>{}; // degrade → fail-closed, never nullopt
-            return std::set<std::string>(v->begin(), v->end());
+            return yuzu::server::visibility::response_visible_set(
+                rbac_store_.get(), mgmt_group_store_.get(), username);
         };
         // #4035 review fix's bespoke `dex_visible_fn` resolver (a global-Read
         // bypass + `RbacStore::visible_agents_for_permission` join) is
