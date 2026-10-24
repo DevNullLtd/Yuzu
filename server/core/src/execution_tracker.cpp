@@ -2476,7 +2476,27 @@ namespace {
 // is stored unverified (response_provenance.hpp). Re-driven commands refresh the record
 // (record_command_dispatch), so this bites only a single execution that outlives the window.
 constexpr std::int64_t kCmdExecutionReapWindowSecs = 24 * 3600;
-constexpr int kCmdExecutionReapCap = 5000;
+// Per-pass delete cap. RE-DECIDED for #4990 (recorded reasoning, not a copied number): this table
+// held one row per TRACKED execution; it now holds one row per DISPATCH (server-authored
+// provenance), including per-agent system pushes (`__guard__` policy pushes, `asset_tags` sync),
+// so inflow can reach one row per connected agent per fleet-wide event. The old cap (5000 per
+// ~60-minute pass = 120k rows/day of reclaim) would let the table grow without bound once
+// inflow exceeded that. Sizing (assumptions stated, not measured on a fleet): the short-term
+// target is ~5,000 agents (about 1e4 rows/day organically, a few 5,000-row bursts per fleet event);
+// the long-term target is 500,000 agents (one fleet-wide push event = 500,000 rows, a few events
+// a day = low millions/day). 50,000 x 24 passes = 1.2M rows/day of reclaim covers the short-term
+// target by two orders of magnitude and the long-term steady state, and drains a 500,000-row
+// burst past the window in ten passes. Measured on a synthetic 1M-row table (PostgreSQL 16, the
+// exact DELETE .. IN (SELECT .. LIMIT n) shape below, rolled back and repeated): ~0.13 s for 5,000
+// rows, ~0.28 s for 50,000, ~0.38 s for 100,000, so one 50,000-row pass is a sub-second
+// transaction that holds row locks only on rows already past the window (no live dispatch or
+// lookup touches them). A larger cap buys nothing the cadence does not, and the cap stays an
+// UNCONDITIONAL bound on the work one pass (and one skewed-clock pass) can do. Saturation is
+// observable: a pass that deletes exactly this cap is `yuzu_exec_correlation_reap_total`
+// moving by the cap every hour. Cadence stays the caller's ~60 minutes
+// (server.cpp kCmdExecutionReapEveryNTicks); it is NOT shortened, because the clock-anomaly
+// threshold below is sized against it.
+constexpr int kCmdExecutionReapCap = 50000;
 // A DB `now()` reading more than this far ahead of the persisted anchor is
 // an anomaly, not legitimate elapsed time between reap ticks. The nominal
 // inter-pass interval is ~3600s (server.cpp's kCmdExecutionReapEveryNTicks),
@@ -2700,18 +2720,21 @@ ExecutionTracker::reap_command_execution_mappings() {
             clock_anomaly = true;
             return true;
         }
+        // The deleted ids are counted in SQL, not returned: at the 50,000-row cap a RETURNING
+        // list would ship megabytes of ids to count them.
         pg::PgResult dr = pg::exec_params(
             c,
-            "DELETE FROM execution_tracker.command_execution WHERE command_id IN "
+            "WITH d AS (DELETE FROM execution_tracker.command_execution WHERE command_id IN "
             "(SELECT command_id FROM execution_tracker.command_execution "
-            " WHERE created_at < $1::bigint LIMIT $2::bigint) RETURNING command_id",
+            " WHERE created_at < $1::bigint LIMIT $2::bigint) RETURNING 1) "
+            "SELECT count(*) FROM d",
             std::vector<std::string>{std::to_string(now_s - kCmdExecutionReapWindowSecs),
                                      std::to_string(kCmdExecutionReapCap)});
-        if (dr.status() != PGRES_TUPLES_OK) {
+        if (dr.status() != PGRES_TUPLES_OK || PQntuples(dr.get()) != 1) {
             err = std::string("reap delete failed: ") + PQerrorMessage(c);
             return false;
         }
-        deleted = PQntuples(dr.get());
+        deleted = static_cast<int>(to_i64(col(dr.get(), 0, 0)));
         const std::int64_t new_anchor = has_anchor ? (std::max)(anchor, now_s) : now_s;
         pg::PgResult ur = pg::exec_params(
             c,
@@ -2730,9 +2753,13 @@ ExecutionTracker::reap_command_execution_mappings() {
 }
 
 namespace {
-// These values are bit-identical to the command_execution sibling's
-// (kCmdExecutionReapWindowSecs / kCmdExecutionReapCap / kMaxPlausibleSkewSecs)
-// and that is DELIBERATE, not a copy the clock-guarded-retention routed concern
+// The window and skew values are bit-identical to the command_execution sibling's
+// (kCmdExecutionReapWindowSecs / kMaxPlausibleSkewSecs) and that is DELIBERATE;
+// the CAP is NOT in lockstep any more: #4990 re-decided the sibling's cap (50,000, see
+// kCmdExecutionReapCap) because that table now takes a row per dispatch, while this table's
+// volume (one row per agent state change) is unchanged and its 5000 is left as it was. The
+// identical-values statement below therefore holds for the window and the skew only, and is
+// DELIBERATE, not a copy the clock-guarded-retention routed concern
 // forbids: that prohibition (part 1) is scoped to the WOULD-WIPE implausible-
 // ahead FLOOR, and this table takes the would-wipe carve-out, so it computes no
 // such floor at all. The two tables are the same KIND of thing — short-lived

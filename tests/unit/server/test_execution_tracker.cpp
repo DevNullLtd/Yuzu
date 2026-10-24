@@ -1526,6 +1526,31 @@ TEST_CASE("ExecutionTracker: the dispatch record carries the plugin; the plugin 
     }
 }
 
+TEST_CASE("ExecutionTracker: the 24h sweep takes at most 50000 expired dispatch records per pass "
+          "(#4990 retention re-decision)",
+          "[pg][execution_tracker][forensics_tier]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        // 50,010 records aged past the window: more than one pass may take.
+        auto ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO execution_tracker.command_execution "
+            "(command_id, plugin, execution_id, created_at) "
+            "SELECT 'aged-' || g, 'echo', '', extract(epoch FROM now())::bigint - 100000 "
+            "FROM generate_series(1, 50010) g",
+            std::vector<std::string>{});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+    }
+    auto first = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(first.has_value());
+    CHECK(first->deleted == 50000);
+    auto second = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(second.has_value());
+    CHECK(second->deleted == 10);
+}
+
 TEST_CASE("ExecutionTracker: a command_execution mapping written on one "
           "instance resolves on a SEPARATE instance against the same "
           "database (WS-9 failover scenario)",
