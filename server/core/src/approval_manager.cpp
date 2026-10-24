@@ -115,11 +115,12 @@ constexpr const char* kDbWallEpochSql = "EXTRACT(EPOCH FROM clock_timestamp())::
 // true. The sweep and `ticket_is_live()` keep `now()`: the sweeps run first inside the mint's
 // own transaction (opened in submit_impl, never a caller's; under the default pool
 // settings each statement is bounded by a 30 s statement timeout and a 10 s lock timeout,
-// but nothing bounds the whole transaction or a DSN that sets its own options, so a stale
-// `now()` here is tolerated rather than excluded: it can only under-expire a ticket, which
-// consume refuses anyway, or expire one early, which a resubmit recovers), and
-// `ticket_is_live()` is one statement, so neither can age the way a caller-held
-// transaction does.
+// but the pool puts no deadline on the whole transaction, and a DSN that sets its own
+// options replaces those defaults). A stale `now()` in the sweeps is therefore tolerated
+// rather than excluded: an older reading can leave an expired ticket approved a little
+// longer, which consume refuses anyway, or, if the transaction is older than the 300 s
+// slack, expire a just-approved ticket as future-dated, which only a fresh request and
+// review recovers. `ticket_is_live()` is one statement and does not age that way.
 std::string ticket_live_sql(bool wall_clock = false) {
     const std::string now = wall_clock ? kDbWallEpochSql : kDbNowEpochSql;
     return "(reviewed_at >= (" + now + " - " + std::to_string(kApprovalTicketTtlSeconds) +
