@@ -47,9 +47,11 @@ on distinctive tokens, never line numbers.
 
 The raw-failure-text pins are lexical too: they count the spellings `X.error().message()`,
 `X->error().message()`, any `.message()` / `->message()`, `resp.error()` / `resp->error()` and forbid
-the whole-message dumps (`DebugString`, `SerializeAsString`, ...) and `mutable_error()`. A response
+the whole-message dumps (`DebugString`, the `Serialize*` and `AppendToString` family, JSON and text
+format printers, `GetReflection()`) and the submessage hand-outs (`mutable_error()`,
+`release_error()`). A response
 renamed to something other than `resp` and then read only through a dump helper outside this file
-is not seen (review-enforced).
+is not seen (review-enforced), and neither is a read through a dump spelling not listed here.
 
 Lexical only: it cannot see a relocation that keeps the tokens but changes control flow, or a
 statement that is present but sits in a branch that never runs (review-enforced). The companion
@@ -320,12 +322,14 @@ EXACT_AGENT_SERVICE: list[tuple[str, str, int, str]] = [
 # `.message()`. None occurs in agent_service_impl.cpp today; each must NOT occur.
 FORBIDDEN_AGENT_SERVICE: list[tuple[str, str, str]] = [
     ("raw-failure-text-dump",
-     r"(?:Short|Utf8)?DebugString\(|SerializeAsString\(|SerializeToString\(|SerializePartial\w*\(|"
-     r"\bMessageToJson|\bTextFormat\b",
+     r"(?:Short|Utf8)?DebugString\(|SerializeAsString\(|SerializeToString\(|SerializeToArray\(|"
+     r"SerializeToOstream\(|SerializeToCodedStream\(|SerializePartial\w*\(|AppendToString\(|"
+     r"AppendPartialToString\(|\bMessageToJson|\bTextFormat\b|GetReflection\(",
      "a whole-message dump of a command response would carry the raw failure text; reduce it with "
      "failure_text_for_sinks and log or store only that"),
-    ("raw-failure-text-mutable-error", r"(?:\.|->)mutable_error\(\)",
-     "mutable_error() hands out the error submessage; no ingest path needs it"),
+    ("raw-failure-text-mutable-error", r"(?:\.|->)(?:mutable_error|release_error|unsafe_arena_release_error)\(\)",
+     "mutable_error(), release_error() and unsafe_arena_release_error() hand out the error "
+     "submessage; no ingest path needs them"),
 ]
 
 

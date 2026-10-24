@@ -149,9 +149,30 @@ def main() -> int:
                         ("auto m = resp.SerializeAsString();", "raw-failure-text-dump"),
                         ("resp.SerializeToString(&out);", "raw-failure-text-dump"),
                         ("auto m = resp.error().ShortDebugString();", "raw-failure-text-dump"),
-                        ("resp.mutable_error()->set_message(x);", "raw-failure-text-mutable-error")):
+                        ("resp.mutable_error()->set_message(x);", "raw-failure-text-mutable-error"),
+                        ("resp->mutable_error()->set_message(x);", "raw-failure-text-mutable-error"),
+                        ("auto* e = resp.release_error();", "raw-failure-text-mutable-error"),
+                        ("auto* e = resp->unsafe_arena_release_error();", "raw-failure-text-mutable-error"),
+                        # The accessor row must see the pointer spelling too: only this row fires.
+                        ("auto e = resp->error();", "raw-failure-text-error-accessor"),
+                        # Whole-message dumps that never call .message(): one case per alternative,
+                        # so dropping an alternative from the dump pattern turns this red.
+                        ("resp.SerializeToArray(buf, n);", "raw-failure-text-dump"),
+                        ("resp.SerializeToOstream(&os);", "raw-failure-text-dump"),
+                        ("resp.SerializeToCodedStream(&cs);", "raw-failure-text-dump"),
+                        ("resp.SerializePartialToString(&s);", "raw-failure-text-dump"),
+                        ("resp.AppendToString(&s);", "raw-failure-text-dump"),
+                        ("resp.AppendPartialToString(&s);", "raw-failure-text-dump"),
+                        ("google::protobuf::util::MessageToJsonString(resp, &s);", "raw-failure-text-dump"),
+                        ("google::protobuf::TextFormat::PrintToString(resp, &s);", "raw-failure-text-dump"),
+                        ("const auto* r = resp.GetReflection();", "raw-failure-text-dump")):
         expect(want in ids(g.agent_service_problems(asrc + "\n" + extra + "\n")),
                f"{want} was NOT raised for: {extra!r}")
+    # The accessor-only spelling must raise ONLY the accessor row (not another row that would
+    # mask a loosened accessor pattern).
+    expect(ids(g.agent_service_problems(asrc + "\nauto e = resp->error();\n")) ==
+           {"raw-failure-text-error-accessor"},
+           "resp->error() alone must be named by the accessor row and no other")
     expect(g.agent_service_problems(asrc + "\n// auto m = resp.DebugString(); e->message();\n") == [],
            "a comment mentioning a dump or a message read is not one")
     stored = "err_detail = resp.error().message();"
