@@ -1231,9 +1231,12 @@ dispatches.
    being refused `503` because their proof is dated after the database clock; the fix is clock synchronisation (see
    [OIDC approvers refused with a clock-skew 503](../ops-runbooks/auth-db-recovery.md#oidc-approvers-refused-with-a-clock-skew-503)).
 
-**Rolling back, or running mixed versions.** The approver-assurance change itself adds no schema; the separate
-scheduled-approval change (#6096, below) adds a data-only approvals step and a command-outbox index, both of which an
-older binary ignores, so a rollback starts cleanly. What changes is which checks run.
+**Rolling back, or running mixed versions.** The approver-assurance change adds two additive schema migrations, in
+the `auth` schema (a `users.mfa_factor_gen` column and a trigger that advances it) and in the session store (the
+`mfa_factor_gen` and `mfa_bind_seq` columns on `sessions` and a guard trigger). Neither drops or rewrites existing
+data, and an older binary does not read the new columns; it also does not maintain the binding (see the warning
+below). The separate scheduled-approval change (#6096, below) adds a data-only approvals step and a command-outbox
+index, both of which an older binary ignores. What changes is which checks run.
 
 > **Warning: mixed versions silently weaken the approver control.** The enrolled-factor and fresh-proof
 > requirement (#6079) is in force **only while every replica that serves `/api/approvals/*` runs a build that
