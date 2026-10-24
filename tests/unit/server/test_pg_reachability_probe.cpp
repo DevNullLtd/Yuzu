@@ -153,7 +153,8 @@ namespace {
 /// those waits to the exported value and fail the bounds. The tag, not a list of
 /// test names, selects the tests: a new `[pg_reachability]` test is covered
 /// without anyone remembering to opt in. The one test that exercises the variable
-/// sets it itself and restores what it found, which is the unset state here.
+/// sets it itself and restores what it found, which is the unset state here; a new
+/// test that needs the variable should do the same.
 ///
 /// POSIX only: the timing-sensitive host-list tests are themselves compiled out
 /// on Windows, so an exported value cannot reach them there.
@@ -183,7 +184,7 @@ private:
 
 CATCH_REGISTER_LISTENER(ReachabilityConnectTimeoutEnvListener)
 
-// Proves the tag selects this case and the listener ran. Only meaningful when the
+// Checks that the tag selected this case and the listener ran. Only meaningful when the
 // runner exports PGCONNECT_TIMEOUT (the CI step that motivates the listener); with
 // it unexported the check passes trivially, never falsely red.
 TEST_CASE("pg_reachability env guard: PGCONNECT_TIMEOUT is unset inside the case",
