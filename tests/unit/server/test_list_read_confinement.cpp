@@ -414,6 +414,95 @@ TEST_CASE("authorize_list_read: a degraded mgmt store denies a confined operator
     CHECK_FALSE(r.rbac.check_scoped_permission("alice", "Response", "Read", "a_p", &r.mgmt));
 }
 
+// ── read_failed: a failed read is told apart from "no grant" (CA-S3 / CA-A2 / CH-1) ──────────
+//
+// `DenyAll` alone cannot say whether the caller holds no grant or a read failed; a caller that
+// served a list on the first reading served it on the second. read_failed is set for the failed
+// reads (the global-grant read, the permission-group resolution, the subtree expansion, a store
+// that is not wired) and NEVER for a genuine refusal or an admission.
+
+namespace {
+void break_table(const std::string& dsn, const char* table) {
+    yuzu::server::pg::PgConn c{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult dr{PQexec(c.get(), (std::string("DROP TABLE ") + table + " CASCADE").c_str())};
+    REQUIRE(dr.ok());
+}
+} // namespace
+
+TEST_CASE("authorize_list_read: read_failed is false for a genuine no-grant and for every admission",
+          "[list_read][rbac][read_failed][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    Rig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.assign_role({"user", "glob", "RespReader"}).has_value()); // GLOBAL allow
+    r.group_assign(r.gP, "scoped", "RespReader");
+
+    auto none = r.rbac.authorize_list_read("nobody", "Response", "Read", &r.mgmt);
+    CHECK(none.decision == ListReadDecision::DenyAll);
+    CHECK_FALSE(none.read_failed);
+
+    auto all = r.rbac.authorize_list_read("glob", "Response", "Read", &r.mgmt);
+    CHECK(all.decision == ListReadDecision::AdmitAll);
+    CHECK_FALSE(all.read_failed);
+
+    auto sc = r.rbac.authorize_list_read("scoped", "Response", "Read", &r.mgmt);
+    CHECK(sc.decision == ListReadDecision::AdmitScoped);
+    CHECK_FALSE(sc.read_failed);
+
+    // Removing the LAST scoped allow leaves a genuine no-grant, not a failed read.
+    REQUIRE(r.mgmt.unassign_role(r.gP, "user", "scoped", "RespReader").has_value());
+    auto gone = r.rbac.authorize_list_read("scoped", "Response", "Read", &r.mgmt);
+    CHECK(gone.decision == ListReadDecision::DenyAll);
+    CHECK_FALSE(gone.read_failed);
+}
+
+TEST_CASE("authorize_list_read: read_failed is true for each failed-read arm, and DenyAll holds",
+          "[list_read][rbac][read_failed][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    Rig r{rbac_db_.dsn()};
+    r.group_assign(r.gP, "alice", "RespReader");
+    r.group_assign(r.gP, "bob", "RespReader");
+
+    SECTION("no management-group store wired") {
+        auto d = r.rbac.authorize_list_read("alice", "Response", "Read", nullptr);
+        CHECK(d.decision == ListReadDecision::DenyAll);
+        CHECK(d.read_failed);
+    }
+
+    SECTION("the subtree expansion fails (second arm)") {
+        REQUIRE(r.rbac.authorize_list_read("alice", "Response", "Read", &r.mgmt).decision ==
+                ListReadDecision::AdmitScoped);
+        break_table(r.mgmt_bundle.dsn(), "management_group_store.management_group_members");
+        auto d = r.rbac.authorize_list_read("alice", "Response", "Read", &r.mgmt);
+        CHECK(d.decision == ListReadDecision::DenyAll);
+        CHECK(d.read_failed);
+    }
+
+    SECTION("the group-membership reads fail (the global read and the group-names read both)") {
+        REQUIRE(r.rbac.authorize_list_read("alice", "Response", "Read", &r.mgmt).decision ==
+                ListReadDecision::AdmitScoped);
+        break_table(rbac_db_.dsn(), "rbac_store.group_members"); // user_rbac_group_names
+        // "bob" has no cached verdict, so the global read runs; the group-names read then fails.
+        auto d = r.rbac.authorize_list_read("bob", "Response", "Read", &r.mgmt);
+        CHECK(d.decision == ListReadDecision::DenyAll);
+        CHECK(d.read_failed);
+    }
+
+    SECTION("ONLY the global-grant read fails: not no-grant, and not a narrower scoped view") {
+        REQUIRE(r.rbac.check_permission_checked("alice", "Response", "Read").has_value());
+        // The role lookup is the global read's alone: group names, assignments and role effects
+        // do not read principal_roles, so the later reads would all succeed.
+        break_table(rbac_db_.dsn(), "rbac_store.principal_roles");
+        // "bob" has no cached verdict, so check_permission really reads (and fails).
+        const auto checked = r.rbac.check_permission_checked("bob", "Response", "Read");
+        CHECK_FALSE(checked.has_value());
+        CHECK_FALSE(r.rbac.check_permission("bob", "Response", "Read")); // the plain form denies
+        auto d = r.rbac.authorize_list_read("bob", "Response", "Read", &r.mgmt);
+        CHECK(d.decision == ListReadDecision::DenyAll); // not AdmitScoped from the later reads
+        CHECK(d.read_failed);
+    }
+}
+
 // Governance re-review, #2703 Gate 7 (G11-SEC-CALLSITE-01 / QA-1): a lexical
 // regression backstop for the class of defect just found and fixed —
 // confinement-relevant closures reading the raw `is_rbac_enabled()` accessor
@@ -508,6 +597,12 @@ TEST_CASE("every live is_rbac_enabled() call site is display-only "
              // sites (2 occurrences each).
              "if (!rbac_store_->is_rbac_enabled() ||",
              "if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {",
+             // The engine-principal arm of require_list_read: still deny-first (RBAC off is a
+             // 403 with no read at all; RBAC on reads through check_permission_checked, whose
+             // failure is a 503 and whose refusal is a 403), so a stale raw view here can only
+             // bias toward denying. The shape changed from the compound `!is_rbac_enabled() ||`
+             // above only to carry the checked read's failure.
+             "const auto engine_grant = rbac_store_->is_rbac_enabled()",
          }},
     };
 

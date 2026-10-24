@@ -1470,8 +1470,22 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
                             "application/json");
             return gate;
         }
-        if (!rbac_store_->is_rbac_enabled() ||
-            !rbac_store_->check_permission(session->username, securable_type, operation)) {
+        // The checked read: a failed read is a retryable 503, not the 403 of "no grant".
+        const auto engine_grant = rbac_store_->is_rbac_enabled()
+                                      ? rbac_store_->check_permission_checked(session->username,
+                                                                              securable_type,
+                                                                              operation)
+                                      : std::expected<bool, std::string>(false);
+        if (!engine_grant) {
+            audit_log(req, "auth.permission_required", "failure", "", "",
+                      "engine principal: authorization read failed for " + perm);
+            res.status = 503;
+            res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                              detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                            "application/json");
+            return gate;
+        }
+        if (!*engine_grant) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "engine principal denied " + perm);
             res.status = 403;
@@ -1532,12 +1546,13 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
     if (decision.read_failed) {
         // DenyAll because a READ failed, not because the caller holds no grant: retryable, and
         // never a 403 a client would read as a permanent "no grant".
-        audit_log(req, "auth.permission_required", "denied", "", "",
+        // An outage is not cured by any grant: no `.permission` in the body, and a `failure`
+        // row (no authorization decision was made).
+        audit_log(req, "auth.permission_required", "failure", "", "",
                   "RBAC list read " + perm + " blocked: authorization read failed");
         res.status = 503;
         res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
-                                          detail::A4ErrorOpts{.retry_after_ms = 5000,
-                                                              .permission = perm}),
+                                          detail::A4ErrorOpts{.retry_after_ms = 5000}),
                         "application/json");
         return gate;
     }

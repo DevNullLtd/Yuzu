@@ -20861,6 +20861,9 @@ private:
                             out.visible_agents = std::move(authz.visible_agents);
                             break;
                         case ListReadDecision::DenyAll:
+                            // Deliberately ignores `authz.read_failed`: this seam's decision
+                            // type has no "degraded" arm, so a failed read maps to deny-all
+                            // (fail closed, nothing served), as before.
                             break; // out already kDenyAll (default)
                         }
                         return out;
@@ -21961,6 +21964,7 @@ private:
                         out.visible_agents = std::move(authz.visible_agents);
                         break;
                     case ListReadDecision::DenyAll:
+                        // Deliberately ignores `authz.read_failed` (see the REST twin above).
                         break; // out already kDenyAll (default)
                     }
                     return out;

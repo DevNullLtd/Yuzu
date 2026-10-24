@@ -148,8 +148,22 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
                             "application/json");
             return std::unexpected(authz::GateFailure::Degraded);
         }
-        if (!rbac_store_->is_rbac_enabled() ||
-            !rbac_store_->check_permission(session->username, securable_type, operation)) {
+        // The checked read: a failed read is a retryable 503, not the 403 of "no grant".
+        const auto engine_grant = rbac_store_->is_rbac_enabled()
+                                      ? rbac_store_->check_permission_checked(session->username,
+                                                                              securable_type,
+                                                                              operation)
+                                      : std::expected<bool, std::string>(false);
+        if (!engine_grant) {
+            audit_log(req, "auth.fleet_read_required", "failure", "", "",
+                      "engine principal: authorization read failed for " + perm);
+            res.status = 503;
+            res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                              detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                            "application/json");
+            return std::unexpected(authz::GateFailure::Degraded);
+        }
+        if (!*engine_grant) {
             audit_log(req, "auth.fleet_read_required", "denied", "", "",
                       "engine principal denied " + perm);
             res.status = 403;
@@ -193,10 +207,8 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
         // own two Degraded branches below (tag-store unavailable/degraded),
         // not the auth_routes.cpp siblings, which don't set it — this
         // branch is Degraded now, so it carries the same retry signal as
-        // every other Degraded branch here. The deliberate DenyAll
-        // weakening (implementation plan §2c) now covers only the
-        // management-group axis's real-deny-vs-in-query-store-error
-        // ambiguity below, not this null-store case.
+        // every other Degraded branch here. The in-query store errors of the
+        // management-group axis below are Degraded too (`read_failed`).
         audit_log(req, "auth.fleet_read_required", "denied", "", "",
                   "fleet read blocked: RBAC store unavailable");
         res.status = 503;
@@ -361,12 +373,13 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
                                                        mgmt_group_store_);
     if (mgmt_authz.read_failed) {
         // DenyAll because a READ failed, not because the caller holds no grant: retryable.
-        audit_log(req, "auth.fleet_read_required", "denied", "", "",
+        // An outage is not cured by any grant, so the body names no `.permission`; and it is a
+        // `failure`, not a `denied`: no authorization decision was made.
+        audit_log(req, "auth.fleet_read_required", "failure", "", "",
                   "fleet read blocked: authorization read failed for " + perm);
         res.status = 503;
         res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
-                                          detail::A4ErrorOpts{.retry_after_ms = 5000,
-                                                              .permission = perm}),
+                                          detail::A4ErrorOpts{.retry_after_ms = 5000}),
                         "application/json");
         return std::unexpected(authz::GateFailure::Degraded);
     }

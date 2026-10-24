@@ -117,7 +117,7 @@ struct ReconcileResult {
 /// Discriminated result of `RbacStore::authorize_list_read` — the ADR-0017
 /// admit-then-filter list gate for per-agent list/fan-out reads.
 enum class ListReadDecision {
-    DenyAll,     ///< no grant anywhere — 403 (REST) / empty (dashboard)
+    DenyAll,     ///< no grant anywhere — 403 (REST) / empty (dashboard); or a failed read (see read_failed)
     AdmitAll,    ///< global grant, or RBAC loaded-and-disabled → unfiltered read
     AdmitScoped, ///< management-group-confined — read ONLY `visible_agents`
 };
@@ -127,8 +127,9 @@ struct ListReadAuthorization {
     /// Populated ONLY for `AdmitScoped`; the management-group-visible agent set
     /// (possibly empty ⇒ zero rows, INV-2). Left empty for Deny/AdmitAll.
     std::vector<std::string> visible_agents;
-    /// True ONLY when `decision` is `DenyAll` because a READ failed (the permission-group
-    /// resolution, the subtree expansion, or a store that is not wired), as opposed to a
+    /// True ONLY when `decision` is `DenyAll` because a READ failed (the global-grant read, the
+    /// permission-group resolution, the subtree expansion, or a store that is not wired or not
+    /// open), as opposed to a
     /// genuine "no grant". It is still `DenyAll` (INV-1/INV-5: a failed read never admits); the
     /// flag lets a caller answer a retryable 503 instead of a 403 it cannot tell from "this
     /// caller holds no grant" - and, above all, never SERVE a list to a caller the check did
@@ -651,6 +652,16 @@ public:
     bool check_permission(const std::string& username, const std::string& securable_type,
                           const std::string& operation) const;
 
+    /// Checked twin of `check_permission`: the SAME decision (it is the implementation; the
+    /// plain form is `.value_or(false)`), but a closed store, an open circuit breaker, a pool
+    /// lease timeout or a failed role / permission query is `unexpected(reason)` instead of a
+    /// bare `false`, so a caller that must not read a failure as "no grant" (the list-read
+    /// gates, via `ListReadAuthorization::read_failed`) can tell them apart. A cached verdict
+    /// is returned without a read, as before. A genuine "no roles" or "no allow" is `false`.
+    [[nodiscard]] std::expected<bool, std::string>
+    check_permission_checked(const std::string& username, const std::string& securable_type,
+                             const std::string& operation) const;
+
     /// Scoped permission check: first tries global, then checks group-scoped
     /// roles. FAIL-CLOSED: false on any store error.
     bool check_scoped_permission(const std::string& username, const std::string& securable_type,
@@ -781,6 +792,9 @@ private:
     /// membership + direct engine-principal grant, §4.1) using `conn`. Returns
     /// empty on a query error (fail-closed: an empty role set denies).
     std::vector<std::string> collect_roles(void* conn, const std::string& username) const;
+    /// Checked twin: a failed query is `unexpected`, not an empty role set.
+    std::expected<std::vector<std::string>, std::string>
+    collect_roles_checked(void* conn, const std::string& username) const;
 
     // ── ADR-0017 shared list-gate resolver (INV-7) ───────────────────────
     struct PermGroups {
