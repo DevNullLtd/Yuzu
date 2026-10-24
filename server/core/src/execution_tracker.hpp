@@ -325,9 +325,9 @@ public:
     /// #4990: the Forensics plugin set. When wired, every read of a per-agent `error_detail` (and
     /// of an execution's `last_error_detail`) for an execution that ran a Forensics-tier plugin
     /// command is reduced to a bounded failure token (`forensics_error_detail.hpp`), so rows
-    /// written before the write-side sanitiser existed are covered too. The plugin is resolved
+    /// written before the write-side sanitizer existed are covered too. The plugin is resolved
     /// from the `command_execution` correlation (command id prefix), so an execution whose
-    /// mapping has aged out (24h) or was never recorded is not recognised. Borrowed; set before
+    /// mapping has aged out (24h) or was never recorded is not recognized. Borrowed; set before
     /// the listener starts. Unset = reads are returned as stored (a test harness; production boot
     /// refuses without the set). The write path (`update_agent_status`) relies on its caller
     /// having reduced the incoming text already; it re-reduces only a PERSISTED text that differs

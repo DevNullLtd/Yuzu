@@ -2,9 +2,9 @@
 """#4990 static lexical gate over server/core/src/server.cpp: the Forensics response tier stays wired.
 
 The tier is enforced in the stored-response read seam, but every route class, the live event bus,
-the execution tracker, the policy evaluator and the result-set materialiser receive the Forensics
+the execution tracker, the policy evaluator and the result-set materializer receive the Forensics
 plugin set (and, for the operator-facing surfaces, the visibility resolver) from ONE place:
-ServerImpl in server.cpp. Each of those is a setter call or a designated-initialiser field, and
+ServerImpl in server.cpp. Each of those is a setter call or a designated-initializer field, and
 nothing exercises ServerImpl's wiring in a unit test. A refactor could drop one of them and every
 unit test would stay green, because a route class built without its plugin set fails CLOSED
 (present-empty visibility, an unwired live bus publishes nothing): the surface would quietly lose
@@ -16,7 +16,7 @@ Required statements (each is one requirement id below):
     registry it is derived from, and forensics_plugins() hands out nullptr only for a failed boot;
   * the plugin set reaches the agent service (live output bus), the execution tracker, the policy
     evaluator, the response routes, the hardware routes, the dashboard routes, the workflow routes
-    (executions drawer and bundle paths), REST v1 and MCP; the result-set materialiser reads
+    (executions drawer and bundle paths), REST v1 and MCP; the result-set materializer reads
     through result_set_members(...) with it; every fixed-plugin poll uses
     for_fixed_plugin_poll(forensics_plugins());
   * the visibility resolver is wired into the response routes, hardware routes, dashboard routes,
@@ -148,7 +148,7 @@ REQUIRED: list[tuple[str, str, str]] = [
      "the live output bus must receive the plugin set (unset publishes no output row)"),
     ("tracker-set",
      r"(?P<k>execution_tracker_->set_forensics_plugin_set\(" + _FP + r"\);)",
-     "the execution tracker must receive the plugin set (error text sanitisation)"),
+     "the execution tracker must receive the plugin set (error text sanitization)"),
     ("policy-evaluator-set",
      r"PolicyEvaluator::Deps\{[^;]{0,1500}?(?P<k>\.forensics_plugins=" + _FP + r")",
      "the policy evaluator must receive the plugin set (a Forensics check scores unknown)"),
@@ -159,7 +159,7 @@ REQUIRED: list[tuple[str, str, str]] = [
      r"response::Deps\{[^;]{0,700}?(?P<k>\." + _VF + r"=" + _VF + r")",
      "the response routes must receive the visibility resolver"),
     # NOTE (hardware-routes-fn / -set): these two anchor on the field ORDER at the tail of the
-    # HardwareRoutes::Deps initialiser (`.write_gate`, then the visibility fn, then the plugin set,
+    # HardwareRoutes::Deps initializer (`.write_gate`, then the visibility fn, then the plugin set,
     # then `});`). Reordering those designated fields breaks THIS gate, not the wiring: update the
     # pattern rather than "fixing" the server.
     ("hardware-routes-fn",
@@ -217,9 +217,9 @@ REQUIRED: list[tuple[str, str, str]] = [
     ("resolver-metrics",
      r"resolve_forensics_visible\(\{[^}]*?(?P<k>\.metrics=&metrics_)\}",
      "the resolver needs the metrics registry (the withheld-read counter)"),
-    ("materialiser",
+    ("materializer",
      r"(?P<k>result_set_members\(\*response_store_," + _FP + r",p\))",
-     "the result-set materialiser must read through result_set_members with the plugin set"),
+     "the result-set materializer must read through result_set_members with the plugin set"),
 ]
 
 # Lifetime orderings. Each row's key statement must appear BEFORE its anchor in the file; the
@@ -318,7 +318,7 @@ EXACT_AGENT_SERVICE: list[tuple[str, str, int, str]] = [
 ]
 
 
-# Spellings that serialise or dump a whole message, including the error text, without ever calling
+# Spellings that serialize or dump a whole message, including the error text, without ever calling
 # `.message()`. None occurs in agent_service_impl.cpp today; each must NOT occur.
 FORBIDDEN_AGENT_SERVICE: list[tuple[str, str, str]] = [
     ("raw-failure-text-dump",

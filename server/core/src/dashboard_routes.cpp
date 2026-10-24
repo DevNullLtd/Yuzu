@@ -444,7 +444,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                            definition_id, template_id,
                                            visible_columns, gate.scope, &served);
                 // #4990: a page that shows Forensics-tier rows leaves its own separately countable
-                // row. Set-and-proceed like the neighbouring dashboard fragments: a persist failure
+                // row. Set-and-proceed like the neighboring dashboard fragments: a persist failure
                 // shows as `Sec-Audit-Failed` and never blanks the operator's view.
                 (void)emit_forensics_read_audit(persist_audit_fn_, req, res, served, command_id,
                                                 ForensicsSurface::kDashboard);
@@ -698,11 +698,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // a write-adjacent action (it would tell the operator their
                  // filters are bad when the store just couldn't be read).
                  // #4990: after the ManagementGroup:Write gate and the same-site gate; the tier
-                 // filter alone closes the Forensics half, so the membership this materialises
+                 // filter alone closes the Forensics half, so the membership this materializes
                  // never reflects rows the caller may not read.
                  const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
                  if (!tier) {
-                     // Unknown: this action materialises membership, so it refuses outright rather
+                     // Unknown: this action materializes membership, so it refuses outright rather
                      // than proceeding on a filter computed from a partial answer (#4990).
                      // The form is hx-swap="none", so neither a body nor HX-Retarget is ever
                      // shown; the operator sees the refusal through the page's toast channel

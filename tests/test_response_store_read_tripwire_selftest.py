@@ -158,7 +158,7 @@ def main() -> int:
             "(std::nullopt)",
             "((std::nullopt))",
             "static_cast<authz::VisibleSet>((std::nullopt))",
-            # g8p2-qe-2: the spellings the first hardening missed.
+            # Spellings that wrap the literal in a leading-scope qualifier or a braced initializer.
             "::yuzu::server::authz::VisibleSet{std::nullopt}",
             "::yuzu::server::authz::VisibleSet{}",
             "::std::nullopt",
@@ -174,7 +174,7 @@ def main() -> int:
             "decltype(vis)()"):
         expect(any_mentions(idiom(f"auto f = ResponseTierFilter::exclude(*set, {spelling});"), "idiom.cpp"),
                f"exclude(set, {spelling}) must fail")
-    # g8p3-qe-3(a): whitespace around `::`, a line splice, a bare nullopt after a using-declaration
+    # Whitespace around `::`, a line splice, a bare nullopt after a using-declaration
     # in the same file, and an alias of an alias.
     for spelling in ("std :: nullopt", "std:: nullopt", "std ::nullopt", ":: std :: nullopt",
                      "std :: optional<std::unordered_set<std::string>>{}",

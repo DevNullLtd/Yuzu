@@ -112,7 +112,7 @@ struct ForensicsServed {
     }
 };
 
-/// Summarise the served rows (anything iterable whose elements have a `.plugin` string).
+/// Summarize the served rows (anything iterable whose elements have a `.plugin` string).
 template <class Rows>
 [[nodiscard]] ForensicsServed summarize_forensics_served(const Rows& rows,
                                                          const ForensicsPluginSet* set) {
@@ -122,7 +122,7 @@ template <class Rows>
     return served;
 }
 
-/// Summarise a collated bundle: one served row per step that RESPONDED (a pending or
+/// Summarize a collated bundle: one served row per step that RESPONDED (a pending or
 /// dispatch-failed step carries no output, and a step the caller's tier filter excluded collates
 /// as pending, so it is never counted). Counts only what the aggregate actually hands the caller.
 [[nodiscard]] inline ForensicsServed summarize_forensics_served(const BundleAggregate& agg,
@@ -137,7 +137,7 @@ template <class Rows>
 /// REST/HTML helper: emit the `response.forensics.read` row for `served` through
 /// `emit_behavioral_audit` (sets `Sec-Audit-Failed` on a persist failure). Returns true when there
 /// is nothing to audit or the row persisted (or audit is off); false when it did not persist, and
-/// the fail-closed REST caller must then refuse to serve. `target_id` is the id the neighbouring
+/// the fail-closed REST caller must then refuse to serve. `target_id` is the id the neighboring
 /// `response.read` row names (instruction or execution id).
 template <class AuditFn>
 [[nodiscard]] bool emit_forensics_read_audit(const AuditFn& audit_fn, const httplib::Request& req,

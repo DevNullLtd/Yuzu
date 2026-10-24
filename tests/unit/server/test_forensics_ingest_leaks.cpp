@@ -1,4 +1,4 @@
-// #4990 wave A: the paths that carry Forensics-tier plugin output OUTSIDE the stored-response
+// #4990: the paths that carry Forensics-tier plugin output OUTSIDE the stored-response
 // read seam. Each case drives the real ingest (AgentServiceImpl::process_gateway_response) or the
 // real consumer and asserts the exact observable output, with an ordinary-plugin control so a
 // filter that silenced everything would fail too.
@@ -311,7 +311,7 @@ TEST_CASE("tracker error_detail: a Forensics plugin's free-text failure is store
     }
 }
 
-TEST_CASE("tracker error_detail: an unwired plugin set sanitises every plugin's message",
+TEST_CASE("tracker error_detail: an unwired plugin set sanitizes every plugin's message",
           "[pg][server][forensics_tier][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, forensics_leaks_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -336,7 +336,7 @@ TEST_CASE("tracker error_detail: a later RUNNING frame never republishes a store
     ts.tracker->set_forensics_plugin_set(&test::forensics_plugin_set());
 
     // A terminal row holding RAW text, written straight to the tracker the way a row from before
-    // the write-side sanitiser exists (an older binary or replica). A later RUNNING frame for the
+    // the write-side sanitizer exists (an older binary or replica). A later RUNNING frame for the
     // same (execution, agent) leaves that terminal row as it is, and the transition event built
     // from the persisted row is published on the bus and appended to the durable outbox.
     const auto seed_raw_terminal = [&](const std::string& command_id) {
@@ -428,7 +428,7 @@ TEST_CASE("tracker error_detail: a later RUNNING frame never republishes a store
     }
 }
 
-TEST_CASE("tracker error_detail: rows written before the sanitiser are reduced on every read",
+TEST_CASE("tracker error_detail: rows written before the sanitizer are reduced on every read",
           "[pg][server][forensics_tier][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, forensics_leaks_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -463,8 +463,8 @@ TEST_CASE("tracker error_detail: rows written before the sanitiser are reduced o
     const auto unmapped = make_failed(std::string{test::kForensicsPlugin} + "-0e", false, kFreeText);
 
     SECTION("an UNWIRED tracker's read scrub fails OPEN: it returns the stored text") {
-        // Characterised, not endorsed: the READ side is open when no plugin set is wired, while the
-        // WRITE side (notify_exec_tracker, see the unwired test above) sanitises every plugin.
+        // Characterized, not endorsed: the READ side is open when no plugin set is wired, while the
+        // WRITE side (notify_exec_tracker, see the unwired test above) sanitizes every plugin.
         // Production cannot reach the open state: boot refuses an empty set and the wiring is
         // pinned lexically (tests/test_forensics_tier_wiring_lexical.py, row `tracker-set`).
         CHECK(tracker.get_agent_statuses(forensic)[0].error_detail == kFreeText);
@@ -490,7 +490,7 @@ TEST_CASE("tracker error_detail: rows written before the sanitiser are reduced o
     }
     SECTION("a row whose command mapping is gone keeps its stored text (the disclosed 24 h residual)") {
         // The scrub is keyed on the command_execution mapping, which is reaped after 24 h; older
-        // rows are outside it. The write-time sanitiser covers every row written since the fix, so
+        // rows are outside it. The write-time sanitizer covers every row written since the fix, so
         // this only concerns pre-upgrade rows. Pinned so the residual stays a decision.
         CHECK(tracker.get_agent_statuses(unmapped)[0].error_detail == kFreeText);
         CHECK(tracker.get_agent_statuses_for_executions({unmapped}).at(unmapped)[0].error_detail ==
@@ -585,7 +585,7 @@ TEST_CASE("tracker error_detail: a failed Forensics execution lookup withholds t
     CHECK(lines == 1);
 }
 
-// The write path (#4990 H-1). `upsert_agent_status_once` shares ONE transaction between the
+// The write path (#4990). `upsert_agent_status_once` shares ONE transaction between the
 // agent_exec_status upsert and the durable event_outbox append. A Forensics-lookup statement that
 // fails INSIDE that transaction would abort it, and the agent's terminal status would be lost
 // (agents do not re-send). So the lookup is not issued in the ordinary case (the incoming text was
@@ -739,7 +739,7 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
         REQUIRE(frames.size() == 1);
         CHECK(frames[0] == added);
     }
-    SECTION("CHARACTERISATION: a raw Forensics text written straight to the tracker is published "
+    SECTION("CHARACTERIZATION: a raw Forensics text written straight to the tracker is published "
             "raw on that first write (the incoming text is trusted to be reduced already)") {
         // The write path skips its lookup when the persisted text equals the incoming one,
         // because the one production caller (AgentServiceImpl::notify_exec_tracker) reduces the
@@ -765,8 +765,8 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
         CHECK(statuses[0].error_detail == "forensics_error");
     }
     SECTION("an UNWIRED tracker never looks anything up: the replay publishes the stored text") {
-        // Characterisation of the documented harness fail-open (production always wires the set;
-        // ingest itself sanitises every plugin's text when its own set is unwired).
+        // Characterization of the documented harness fail-open (production always wires the set;
+        // ingest itself sanitizes every plugin's text when its own set is unwired).
         const auto id = make(std::string{test::kForensicsPlugin} + "-0w4");
         tracker.update_agent_status(id, frame("failure", kFreeText));
         const auto seeded = outbox_high_water(pool, id);
@@ -787,7 +787,7 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
 // The tracker is one reader of a terminal frame's failure text. The notification store (read at
 // Infrastructure:Read), the analytics event and the webhook / offload payload are the others; each
 // is observed here on BOTH ingest paths (the gateway-proxied one and the direct Subscribe stream),
-// with an ordinary plugin as the control so a sanitiser that blanked everything would fail too.
+// with an ordinary plugin as the control so a sanitizer that blanked everything would fail too.
 
 namespace {
 
@@ -1009,7 +1009,7 @@ TEST_CASE("terminal failure text: every derived sink carries only a bounded toke
     }
 }
 
-TEST_CASE("terminal failure text: an unwired plugin set sanitises every plugin in every sink",
+TEST_CASE("terminal failure text: an unwired plugin set sanitizes every plugin in every sink",
           "[pg][server][forensics_tier][security]") {
     const bool direct = GENERATE(false, true);
     INFO((direct ? "direct Subscribe path" : "gateway path"));
@@ -1067,7 +1067,7 @@ TEST_CASE("live output bus: the direct Subscribe path publishes nothing for a Fo
     }
 }
 
-// -- A5: the result-set materialiser's content-membership read ------------------------------------
+// -- A5: the result-set materializer's content-membership read ------------------------------------
 
 namespace {
 
@@ -1100,7 +1100,7 @@ constexpr const char* kContentMatcher =
 
 } // namespace
 
-TEST_CASE("result-set materialiser: membership is never derived from a Forensics plugin's rows",
+TEST_CASE("result-set materializer: membership is never derived from a Forensics plugin's rows",
           "[pg][server][forensics_tier][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, leaks_responsestore_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};

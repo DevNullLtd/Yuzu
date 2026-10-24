@@ -134,7 +134,7 @@ def main() -> int:
                   "auto m = (&resp)->error().message();"):
         expect("raw-failure-text-reads" in ids(g.agent_service_problems(asrc + "\n" + extra + "\n")),
                f"a new raw failure-text read was NOT detected: {extra!r}")
-    # g8p3-qe-3(b): the same text reached through a held reference, a pointer, or a dump.
+    # The same text reached through a held reference, a pointer, or a dump.
     for extra, want in (("const auto& e = resp.error();\n auto m = e.message();",
                          "raw-failure-text-error-accessor"),
                         ("const auto& e = resp.error();\n auto m = e.message();",

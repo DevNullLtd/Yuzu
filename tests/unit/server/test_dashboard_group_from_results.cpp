@@ -368,10 +368,10 @@ TEST_CASE("group-from-results: an all-dropped scope falls into the existing "
     CHECK_FALSE(h.mg.find_group_by_name("alldropped-group").has_value());
 }
 
-// ── (2a) #4990: the Forensics tier narrows the membership this materialises ───────────────────────
+// ── (2a) #4990: the Forensics tier narrows the membership this materializes ───────────────────────
 
 TEST_CASE("group-from-results: agents matched only through Forensics rows the caller may not read "
-          "are not materialised, and look like no match",
+          "are not materialized, and look like no match",
           "[pg][server][dashboard][group_from_results][security][forensics]") {
     GroupFromResultsHarness h;
     // agent-A and agent-B match through a Forensics plugin; agent-C through an ordinary one.
@@ -402,7 +402,7 @@ TEST_CASE("group-from-results: agents matched only through Forensics rows the ca
         REQUIRE(group.has_value());
         CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-C"});
     }
-    SECTION("a global Forensics:Read materialises every match") {
+    SECTION("a global Forensics:Read materializes every match") {
         h.forensics.admin();
         auto res = h.post(GroupFromResultsHarness::form_body("tier-admin-group"));
         CHECK(res->status == 200);
@@ -470,7 +470,7 @@ TEST_CASE("group-from-results: an Unknown Forensics decision shows a visible not
           R"({"showToast":{"message":"The permission check for this action could not be completed. )"
           R"(Nothing was created. Retry shortly.","level":"error"}})");
     CHECK(res->get_header_value("HX-Retarget").empty());
-    // This action materialises membership: an Unknown answer must create nothing, not a group from
+    // This action materializes membership: an Unknown answer must create nothing, not a group from
     // the ordinary rows alone.
     CHECK_FALSE(h.mg.find_group_by_name("tier-unknown-group").has_value());
 

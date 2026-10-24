@@ -149,7 +149,7 @@ struct CommandHarness {
     bool auth_fails = false;
     bool perm_allow = true;
     /// When set, decides each (securable, operation) the route's permission gate asks, instead of
-    /// `perm_allow` (a real RbacStore-backed decision for the role cases). Unset = old behaviour.
+    /// `perm_allow` (a real RbacStore-backed decision for the role cases). Unset = old behavior.
     std::function<bool(const std::string&, const std::string&)> perm_probe;
 
     // -- audit --

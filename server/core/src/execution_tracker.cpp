@@ -247,7 +247,7 @@ bool scrub_error_texts(PGconn* conn, const ForensicsPluginSet* set,
 // failure: the transaction stays usable and the text is reduced to its bounded form (the same
 // fail-closed reading as the read paths) while the status write, the outbox row and the bus event
 // still commit. If the SAVEPOINT itself cannot be created the lookup is not attempted and the text
-// is reduced the same way. One sanitiser path: this calls `scrub_error_texts`.
+// is reduced the same way. One sanitizer path: this calls `scrub_error_texts`.
 void scrub_error_texts_in_txn(PGconn* conn, const ForensicsPluginSet* set,
                               std::vector<std::pair<std::string, std::string*>> slots) {
     if (!set)

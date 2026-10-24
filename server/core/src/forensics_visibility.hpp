@@ -10,14 +10,14 @@
 ///       present subset = RBAC enforcement is on and the caller holds a management-group-scoped
 ///                        `Forensics:Read`: only those agents' Forensics rows
 ///   * Denied   (value, present EMPTY): a DEFINITIVE answer, there is no grant (also a caller class
-///                        that never carries per-agent authority here). Correct behaviour, silent.
+///                        that never carries per-agent authority here). Correct behavior, silent.
 ///   * Unknown  (error, `ForensicsUnknown`): the question could not be answered (a store degrade or
 ///                        an unwired dependency). Never admits a Forensics row. A surface that
 ///                        hands a machine caller rows must answer a retryable 503 rather than a 200
 ///                        with the Forensics rows silently missing; an HTML surface shows a visible
 ///                        notice, never an empty or "no results" state.
 ///
-/// Deliberately NOT modelled on `response_visible_set_fn`, which returns `nullopt` whenever RBAC is
+/// Deliberately NOT modeled on `response_visible_set_fn`, which returns `nullopt` whenever RBAC is
 /// off: right for `Response:Read` (an unconfined read), wrong here, where a global grant is the only
 /// thing that may admit, and with RBAC off `Forensics:Read` is floored to administrators
 /// (`authz_topology_floor.hpp`). The global proof therefore goes through
@@ -97,7 +97,7 @@ struct ForensicsVisibilityDeps {
 /// answered Unknown, i.e. a read whose Forensics rows were withheld because the caller's authority
 /// could not be determined (the read was refused with a 503 or showed a notice). `reason` is the
 /// CLOSED set `kForensicsUnknownReasons` (`to_string`): `rbac_unavailable`, `scope_read_failed`,
-/// `unwired`. A definitive refusal (Denied) is correct behaviour and is never counted, so the
+/// `unwired`. A definitive refusal (Denied) is correct behavior and is never counted, so the
 /// series stays flat on a healthy server whatever the callers' roles. Operational, not
 /// `event="security"`.
 inline constexpr const char* kForensicsTierWithheldMetric =

@@ -184,7 +184,7 @@ struct GatewayResponseHarness {
         REQUIRE(audit->is_open());
         svc.set_response_store(&responses);
         svc.set_audit_store(audit.get());
-        // #4990: unwired fails closed (error_detail is sanitised for every plugin), so the
+        // #4990: unwired fails closed (error_detail is sanitized for every plugin), so the
         // ordinary-plugin cases below need the set wired like production.
         svc.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
     }

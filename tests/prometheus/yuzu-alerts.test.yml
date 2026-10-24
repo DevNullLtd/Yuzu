@@ -4428,7 +4428,7 @@ tests:
   # BOUNDARY, BY DESIGN: a refusal that recurs only every ~6 minutes or longer leaves the 5m rate
   # false between events, so it never reaches 10 consecutive minutes and does not fire (case E).
 
-  # CASE A -- a recurring failure (one more event every minute from minute 2) fires, labelled with
+  # CASE A -- a recurring failure (one more event every minute from minute 2) fires, labeled with
   # instance and reason. RED if the rule lost the by (instance, reason) or the metric name.
   - interval: 1m
     name: forensics tier unresolved - a sustained failure fires with the reason label

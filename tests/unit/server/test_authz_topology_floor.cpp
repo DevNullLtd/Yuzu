@@ -1237,7 +1237,7 @@ TEST_CASE("forensics visibility: RBAC on - a group-scoped Forensics:Read grant r
     auto other = rig.cookie_request("scoped2", auth::Role::user);
     CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), other)));
 
-    // The same grant with enforcement OFF is not honoured (no scoped grants exist in that world).
+    // The same grant with enforcement OFF is not honored (no scoped grants exist in that world).
     rig.rbac.set_rbac_enabled(false);
     CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), scoped)));
 }
@@ -1324,10 +1324,10 @@ TEST_CASE("forensics visibility: RBAC off - an assigned ForensicsAnalyst grant d
     rig.rbac.set_rbac_enabled(true);
     auto analyst = rig.cookie_request("ana2", auth::Role::user);
     REQUIRE(rig.rbac.assign_role({"user", "ana2", "ForensicsAnalyst"}).has_value());
-    REQUIRE(is_global(resolve_forensics_visible(rig.deps(), analyst))); // sanity: honoured while enforced
+    REQUIRE(is_global(resolve_forensics_visible(rig.deps(), analyst))); // sanity: honored while enforced
 
     // Enforcement off: the legacy fallback plus the topology floor decide, and the floor keeps
-    // Forensics:Read administrator-only. The stored grant is inert, not honoured and not erased.
+    // Forensics:Read administrator-only. The stored grant is inert, not honored and not erased.
     rig.rbac.set_rbac_enabled(false);
     CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), analyst)));
     CHECK(rig.rbac.get_principal_roles("user", "ana2").size() == 1);
@@ -1443,7 +1443,7 @@ TEST_CASE("forensics visibility: a degraded or unwired input is Unknown, a defin
     }
 }
 
-// ── Resolver skip rules (#4990, wave D) ──────────────────────────────────────────────────────
+// ── Resolver skip rules (#4990) ──────────────────────────────────────────────────────
 // Step 2 of resolve_forensics_visible (the scoped composition) deliberately skips three caller
 // classes whose authority is not "the user's own scoped grants". Each of these cases gives the
 // OWNER a scoped-only Forensics:Read grant (no global one), so deleting the skip rule would widen

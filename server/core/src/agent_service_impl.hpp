@@ -697,7 +697,7 @@ private:
     /// the notification store, the analytics event, and the webhook / offload payload. Those sinks
     /// are read below the Forensics tier of the plugin's own rows, so a Forensics-tier plugin keeps
     /// only a bounded failure token (`sanitize_forensics_error_detail`); an unwired plugin set
-    /// cannot tell the plugins apart and sanitises every plugin's message. Any other plugin keeps
+    /// cannot tell the plugins apart and sanitizes every plugin's message. Any other plugin keeps
     /// its full text. Empty when the frame carries no error. Each ingest branch computes it once
     /// per terminal response and feeds that value to the notification, the analytics event and the
     /// webhook / offload payload; `notify_exec_tracker` applies this same function for the tracker.

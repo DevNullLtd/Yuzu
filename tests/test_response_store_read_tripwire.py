@@ -25,7 +25,7 @@ CHECK 2 (internal-consumer allowlist). `ResponseTierFilter::unrestricted_interna
   passes the principled definition of "internal": the read-back of a command the server dispatches
   itself from a FIXED server-side plugin set none of which is Forensics-tier (a unit test pins that
   set against the catalogue), or a read whose bytes reach no principal lacking the dispatcher's
-  authority. The policy evaluator, bundle collate and result-set materialiser were three more sites
+  authority. The policy evaluator, bundle collate and result-set materializer were three more sites
   that failed that definition and now read through a real tier filter.
 
 CHECK 2b (the other unrestricted spellings). The factory is not the only way to build a filter that
@@ -378,8 +378,8 @@ def check_internal_sites(files: dict[str, str]) -> list[str]:
 
 
 # The literal spellings of "no restriction" for the second argument of exclude(): `std::nullopt`,
-# a value-initialised nullopt_t, a bare `{}` or `{std::nullopt}` (a trailing comma allowed), a
-# value-initialised VisibleSet or `std::optional<...>` built from nothing or from `std::nullopt`
+# a value-initialized nullopt_t, a bare `{}` or `{std::nullopt}` (a trailing comma allowed), a
+# value-initialized VisibleSet or `std::optional<...>` built from nothing or from `std::nullopt`
 # (braces or parentheses), `auto{std::nullopt}` / `auto(std::nullopt)`, `decltype(x){}`, each with an
 # optional leading `::`, and each optionally wrapped in a `static_cast<...>(...)`, a C-style cast,
 # `std::move(...)` or redundant parentheses. A VARIABLE holding a nullopt cannot be seen lexically

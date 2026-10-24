@@ -140,7 +140,7 @@ TEST_CASE("response tier filter: the types cannot be default-constructed",
     STATIC_REQUIRE_FALSE(std::is_default_constructible_v<ResponseTierFilter>);
 }
 
-TEST_CASE("ForensicsPluginSet::from_names normalises and refuses an empty set",
+TEST_CASE("ForensicsPluginSet::from_names normalizes and refuses an empty set",
           "[server][responses][security][forensics]") {
     const auto s = make_set({"Privacy_Permissions", "app_usage", "APP_USAGE", ""});
     CHECK(s.names() == std::vector<std::string>{"app_usage", "privacy_permissions"});

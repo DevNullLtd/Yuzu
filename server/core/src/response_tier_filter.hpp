@@ -89,7 +89,7 @@ public:
     /// the tar fleet snapshot poll, the deployment collect, the pre-flight check collation and the
     /// quarantine containment reconciler; they are frozen by
     /// tests/test_response_store_read_tripwire.py. The policy evaluator, the bundle collate and the
-    /// result-set materialiser read through a real filter instead. Do not use this to silence a
+    /// result-set materializer read through a real filter instead. Do not use this to silence a
     /// filter on anything an operator can reach.
     [[nodiscard]] static ResponseTierFilter unrestricted_internal_consumer() {
         return ResponseTierFilter{Key{}};

@@ -760,7 +760,7 @@ TEST_CASE("RbacStore: a pre-existing custom role named ForensicsAnalyst is merge
 
     auto role = reopened.get_role("ForensicsAnalyst");
     REQUIRE(role.has_value());
-    // Observed behaviour: the role row is untouched (ON CONFLICT DO NOTHING) so it stays a
+    // Observed behavior: the role row is untouched (ON CONFLICT DO NOTHING) so it stays a
     // NON-system role with its own description, and the four seeded pairs are merged into
     // whatever grants it already had. Nothing is removed.
     CHECK_FALSE(role->is_system);
@@ -770,7 +770,7 @@ TEST_CASE("RbacStore: a pre-existing custom role named ForensicsAnalyst is merge
                                    "Inventory:Read/allow", "Response:Read/allow", "Tag:Read/allow"});
     // Consequence worth knowing: because the row is not is_system, the engine-principal
     // built-in bar does not apply to this collided role (the structural refusal only holds
-    // for the seeded row). Characterised here so a future change to it is deliberate.
+    // for the seeded row). Characterized here so a future change to it is deliberate.
     CHECK(reopened.assign_role({"engine", "engine:nvd", "ForensicsAnalyst"}).has_value());
 }
 
@@ -819,7 +819,7 @@ TEST_CASE("RbacStore: Operator + ForensicsAnalyst gets only approval-gated Foren
     REQUIRE_FALSE(ana.has_value());
     CHECK(ana.error().reason == detail::DispatchDenialReason::ApprovalRequired);
     CHECK_FALSE(store.check_permission("ana", "Execution", "Execute"));
-    // Characterised: THIS chokepoint, on its own, admits that holder once a real approval ticket is
+    // Characterized: THIS chokepoint, on its own, admits that holder once a real approval ticket is
     // present (the RBAC pair a Forensics-class plugin is dispatched under is Forensics:Read). What
     // stops an analyst is the dispatch routes' own Execution:Execute gate, which sits in front of
     // this decision: /api/command (test_command_routes.cpp) and MCP execute_instruction

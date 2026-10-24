@@ -21765,7 +21765,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                          " complete=" + (agg->complete ? "1" : "0"));
                 // #4990: a collation that serves a Forensics-tier step's output leaves its own
                 // separately countable row (set-and-proceed: a drop shows as audit_persisted:false).
-                // Only this row is surfaced: the ordinary collate row keeps its existing behaviour.
+                // Only this row is surfaced: the ordinary collate row keeps its existing behavior.
                 if (const auto served = summarize_forensics_served(*agg, forensics_plugins_);
                     served.any() &&
                     !yuzu::server::detail::try_persist_audit(
