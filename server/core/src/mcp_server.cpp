@@ -12,6 +12,7 @@
 #include "mcp_jsonrpc.hpp"
 #include "discovered_devices_model.hpp" // list_discovered_devices shared builders
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
+#include "me_response.hpp" // shared get_me body builder (REST /api/v1/me + legacy /api/me twin)
 #include "mcp_policy.hpp"
 #include "hardware_routes.hpp"   // HardwareRoutes::*Fn: the static_asserts pinning ToolDeps
 #include "mcp_tool_registry.hpp" // ToolRecord/ToolCallContext: the registry seam (merged by catalogue())
@@ -4214,6 +4215,50 @@ static const ToolDef kTools[] = {
      R"j("week_basis":{"type":"string"},"weeks":{"type":"array","items":{"type":"object","properties":{"week":{"type":"string","description":"ISO 8601 week, e.g. 2026-W40"},"week_start":{"type":"integer"},"partial":{"type":"boolean"},"issued":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]},"revoked":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]}}},"required":["week","week_start","partial","issued","revoked"]}},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
      R"j(},"required":["scope","scope_note","rule_set_version","as_of","as_of_iso","active","expiring_within_days","expired_within_days","revoked_within_days","issued_within_days","week_basis","weeks"]})j"},
+    // Twin of REST GET /api/v1/me (and legacy GET /api/me): the caller's own session
+    // self-description, built by the ONE shared me_response::build_me_json. Legacy
+    // (non-registry) tool, mirroring check_permission: the generic tier gate only,
+    // no perm_fn (REST /api/v1/me has none: it describes only the caller). The security row
+    // below is {"Infrastructure","Read"} with the default `denied` service-scope class,
+    // so a service-scoped token is refused at C8. Not in kWriteToolsRaw, no step-up row.
+    {"get_me",
+     "Describe the CALLING session: its stable principal id (username), display name, persisted "
+     "legacy role and effective role, whether it is a human or an engine principal "
+     "(principal_kind), how it authenticated (auth_source), its MCP tier, whether JIT admin "
+     "elevation is active, and its RBAC role names. Takes no arguments and cannot name another "
+     "principal: the answer is always about the caller. rbac_enabled says whether RBAC "
+     "enforcement is on; rbac_roles lists the caller's DIRECT role assignments only, so roles "
+     "granted through group membership are NOT included and an empty rbac_roles is not proof "
+     "of no access (call check_permission to ask about one specific permission). rbac_role is "
+     "the alphabetically first direct role, kept for dashboard compatibility and deprecated: "
+     "use role and effective_role as the authority summary. rbac_roles_resolved:false means "
+     "the RBAC store could not be read; rbac_role and rbac_roles are then omitted, never "
+     "guessed, so retry later. An engine principal never receives a fabricated role: with "
+     "RBAC off, or with no engine grant, rbac_role is omitted. For an MCP bearer token "
+     "(non-empty mcp_tier) can_access_settings is always false, because the admin gate denies "
+     "any MCP tier before it tests the role, and effective_role equals role because token "
+     "sessions are never elevated. Read-only, available at every MCP tier, no RBAC permission "
+     "required. A service-scoped token is refused. Audited as mcp.get_me; audit_persisted:false "
+     "is returned when that row is dropped. Mirrors REST GET /api/v1/me.",
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("username":{"type":"string","description":"Stable principal id: the login name, an opaque oidc:<iss>#<sub> id for SSO sessions, or engine:<slug> for an engine principal"},)j"
+     R"j("display_name":{"type":"string","description":"Human-readable label; falls back to username"},)j"
+     R"j("role":{"type":"string","description":"Persisted legacy role (admin or user)"},)j"
+     R"j("principal_kind":{"type":"string","description":"human (the default for every non-engine session) or engine"},)j"
+     R"j("auth_source":{"type":"string","description":"How the caller authenticated: local, oidc, saml, api_token, mcp_token or engine_token"},)j"
+     R"j("mcp_tier":{"type":"string","description":"readonly, operator or supervised; empty for a non-MCP session"},)j"
+     R"j("scope_service":{"type":"string","description":"Service the token is scoped to; empty when unscoped. Always empty over MCP because a service-scoped token is refused"},)j"
+     R"j("rbac_enabled":{"type":"boolean","description":"Whether RBAC enforcement is on"},)j"
+     R"j("rbac_role":{"type":"string","description":"Deprecated display field: the alphabetically first DIRECT role, or for a human with none the legacy mapping (Administrator or Viewer). Omitted for an engine principal with RBAC off or no engine grant, and when rbac_roles_resolved is false. Use role and effective_role as the authority summary"},)j"
+     R"j("rbac_roles":{"type":"array","items":{"type":"string"},"description":"DIRECT role assignments for this principal only; roles granted through group membership are NOT included. Empty when RBAC is off. Omitted when rbac_roles_resolved is false"},)j"
+     R"j("rbac_roles_resolved":{"type":"boolean","description":"False when the RBAC store could not be read; rbac_role and rbac_roles are then omitted"},)j"
+     R"j("effective_role":{"type":"string","description":"Role the server will honour (admin while JIT elevation is active)"},)j"
+     R"j("elevated":{"type":"boolean","description":"Whether JIT admin elevation is active"},)j"
+     R"j("elevated_until":{"type":"string","description":"ISO 8601 UTC end of the elevation window; present only while elevated"},)j"
+     R"j("can_access_settings":{"type":"boolean","description":"Whether the admin-only settings pages admit this session; always false for an MCP tier or service-scoped token"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
+     R"j(},"required":["username","display_name","role","rbac_enabled","effective_role","elevated","can_access_settings","principal_kind","mcp_tier","scope_service","rbac_roles_resolved"],"additionalProperties":false})j"},
 };
 
 // The audit-detail tag of a /crypto layout failure (never the username), shared by the two
@@ -4740,6 +4785,11 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // every tier, so it does not narrow REST's zero-RBAC-gate posture, and the
     // tool's own handler makes no perm_fn call, matching REST exactly.
     {"check_permission", {"Infrastructure", "Read"}},
+    // get_me: twin of GET /api/v1/me, which calls auth_fn only (no perm_fn). Same posture as
+    // check_permission above: this row drives ONLY the generic tier gate (Read is allowed at
+    // every tier). Default `denied` service-scope class on purpose: do NOT widen it, and it is
+    // not in kServiceScopeGlobalSafe.
+    {"get_me", {"Infrastructure", "Read"}},
     // B4 (#2146 API-parity) — matches the REST route's own perm_fn op exactly.
     {"unlock_account", {"UserManagement", "Write"}},
     // A2 discovery tools (mirrors of GET /api/v1/discover/*).
@@ -5278,6 +5328,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
      {ToolEffect::ReadOnly, true, "List management group role grants"}},
     {"list_api_tokens", {ToolEffect::ReadOnly, true, "List own API tokens"}},
     {"check_permission", {ToolEffect::ReadOnly, true, "Check own RBAC permission"}},
+    {"get_me", {ToolEffect::ReadOnly, true, "Get my identity and roles"}},
     {"get_execution_status", {ToolEffect::ReadOnly, true, "Get execution status"}},
     {"get_execution_children", {ToolEffect::ReadOnly, true, "List execution children"}},
     {"list_executions", {ToolEffect::ReadOnly, true, "List executions"}},
@@ -28573,6 +28624,32 @@ McpServer::HandlerFn McpServer::build_handler(
                     success_response(id, tool_result(JObj().add("allowed", allowed).str(),
                                                      kObjectOutputSchema)),
                     "application/json");
+                return;
+            }
+
+            // ── get_me ─────────────────────────────────────────────────────
+            // Twin of GET /api/v1/me and legacy GET /api/me: the SAME builder
+            // (me_response.hpp), so the three bodies cannot drift. Mirrors
+            // check_permission's posture exactly: the generic tier gate only, NO
+            // perm_fn (REST /api/v1/me calls auth_fn only), and it describes the
+            // CALLING session alone: there is no argument that can name another
+            // principal. A store fault is a 200 body with rbac_roles_resolved:false
+            // (never an error and never an invented role), so there is no error
+            // branch needing a retry hint. Audit is set-and-proceed through the
+            // generic mcp_audit; the generic helper does not itself report a dropped
+            // row, so audit_persisted:false is added here.
+            if (tool_name == "get_me") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                auto me_json = me_response::build_me_json(*session, me_response::rbac_view(rbac_store));
+                if (!mcp_audit("success"))
+                    me_json["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(me_json.dump(), kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 

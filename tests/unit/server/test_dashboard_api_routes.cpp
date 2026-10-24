@@ -61,6 +61,8 @@ struct Harness {
     auth::Role session_role{auth::Role::user};
     std::string session_mcp_tier;
     std::string session_scope_service;
+    std::string session_principal_kind{"human"};
+    std::string session_auth_source{"local"};
     bool session_elevated{false};
 
     RbacStore* rbac_store{nullptr};
@@ -104,6 +106,8 @@ struct Harness {
             s.role = session_role;
             s.mcp_tier = session_mcp_tier;
             s.token_scope_service = session_scope_service;
+            s.principal_kind = session_principal_kind;
+            s.auth_source = session_auth_source;
             if (session_elevated) {
                 s.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
                 s.elevated_until = std::chrono::system_clock::now() + std::chrono::hours(1);
@@ -218,6 +222,47 @@ TEST_CASE("dashboard_api_routes: /api/me falls back to the legacy-role mapping f
     auto j = json::parse(r->body);
     CHECK(j["rbac_enabled"] == false);
     CHECK(j["rbac_role"] == "Viewer");
+}
+
+TEST_CASE("dashboard_api_routes: /api/me for an engine principal omits rbac_role and carries the "
+          "new identity keys (the shell JS falls back to `role`)",
+          "[server][routes][dashboard_api_routes]") {
+    Harness h; // rbac_store stays null: RBAC off
+    h.session_username = "engine:indexer";
+    h.session_role = auth::Role::user;
+    h.session_principal_kind = "engine";
+    h.session_auth_source = "engine_token";
+    h.wire();
+
+    auto r = h.sink.Get("/api/me");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    auto j = json::parse(r->body);
+    CHECK(j["username"] == "engine:indexer");
+    CHECK(j["role"] == "user");
+    CHECK(j["principal_kind"] == "engine");
+    CHECK(j["auth_source"] == "engine_token");
+    CHECK_FALSE(j.contains("rbac_role")); // never a fabricated Viewer
+    CHECK(j["rbac_roles"].is_array());
+    CHECK(j["rbac_roles_resolved"] == true);
+    CHECK(r->get_header_value("Cache-Control") == "no-store, private");
+}
+
+TEST_CASE("dashboard_api_routes: /api/me human keeps every legacy key and adds the new ones",
+          "[server][routes][dashboard_api_routes]") {
+    Harness h;
+    h.session_role = auth::Role::user;
+    h.session_mcp_tier = "readonly";
+    h.session_scope_service = "finance";
+    h.wire();
+
+    auto j = json::parse(h.sink.Get("/api/me")->body);
+    for (const char* k : {"username", "display_name", "role", "rbac_enabled", "rbac_role",
+                          "effective_role", "elevated", "can_access_settings"})
+        CHECK(j.contains(k));
+    CHECK(j["principal_kind"] == "human");
+    CHECK(j["mcp_tier"] == "readonly");
+    CHECK(j["scope_service"] == "finance");
 }
 
 // ── GET /api/agents: perm_fn(Infrastructure, Read) THEN auth_fn ────────────
@@ -592,6 +637,57 @@ TEST_CASE("dashboard_api_routes: /api/me falls back to the legacy-role mapping w
     auto j = json::parse(r->body);
     CHECK(j["rbac_enabled"] == true);
     CHECK(j["rbac_role"] == "Administrator");
+}
+
+TEST_CASE("dashboard_api_routes: /api/me reads grants under the namespace of the session kind, "
+          "not the username prefix",
+          "[pg][server][routes][dashboard_api_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dashapi_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    // RbacStore refuses a ('user', 'engine:...') row, so the engine grant is the only
+    // row that carries this id. A user-namespace read of the same string must not see it.
+    REQUIRE(rbac.create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(rbac.assign_role({"engine", "engine:shared", "EngineReader"}).has_value());
+
+    SECTION("a human named engine:shared is a user lookup and does not see the engine grant") {
+        Harness h;
+        h.session_username = "engine:shared";
+        h.rbac_store = &rbac;
+        h.wire();
+        auto j = json::parse(h.sink.Get("/api/me")->body);
+        CHECK(j["rbac_role"] == "Viewer"); // legacy fallback for a human with no user grant
+        CHECK(j["rbac_roles"].empty());
+        CHECK(j["rbac_roles_resolved"] == true);
+    }
+    SECTION("an engine principal is an engine lookup") {
+        Harness h;
+        h.session_username = "engine:shared";
+        h.session_principal_kind = "engine";
+        h.session_auth_source = "engine_token";
+        h.rbac_store = &rbac;
+        h.wire();
+        auto j = json::parse(h.sink.Get("/api/me")->body);
+        CHECK(j["rbac_role"] == "EngineReader");
+        CHECK(j["rbac_roles"] == json::array({"EngineReader"}));
+        CHECK(j["rbac_roles_resolved"] == true);
+    }
+    SECTION("an engine with no engine grant gets no rbac_role, not Viewer") {
+        Harness h;
+        h.session_username = "engine:ungranted";
+        h.session_principal_kind = "engine";
+        h.session_auth_source = "engine_token";
+        h.rbac_store = &rbac;
+        h.wire();
+        auto j = json::parse(h.sink.Get("/api/me")->body);
+        CHECK(j["rbac_enabled"] == true);
+        CHECK_FALSE(j.contains("rbac_role"));
+        CHECK(j["rbac_roles"].empty());
+        CHECK(j["rbac_roles_resolved"] == true);
+    }
 }
 
 TEST_CASE("dashboard_api_routes: /api/audit queries a real store and reports events, count, and "

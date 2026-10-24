@@ -14,6 +14,7 @@
 #include "mcp_jsonrpc.hpp"
 #include "secure_random.hpp" // test_hooks: force the next CSPRNG failure
 #include "mcp_orientation.hpp" // 2g PR 1: shared orientation source + tool_families()
+#include "test_json_schema_subset.hpp" // yuzu::test::schema_violation (get_me output-schema conformance)
 #include "mcp_policy.hpp"
 #include "../test_log_capture.hpp"
 #include "execution_event_bus.hpp" // 2f PR 3a: progress-bridge integration tests
@@ -7783,6 +7784,208 @@ TEST_CASE("MCP check_permission: an oversized securable_type/operation is reject
     CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
                       {{"tool", "check_permission"}, {"reason", "arg_too_large"}})
               .value() == 1.0);
+}
+
+// ── get_me (twin of GET /api/v1/me) ─────────────────────────────────────────
+// Legacy kTools[] tool, mirroring check_permission: generic tier gate only, no
+// perm_fn, default `denied` service-scope class, generic mcp.get_me audit. One shared
+// builder (me_response.hpp) with REST /api/v1/me and legacy /api/me.
+
+namespace {
+
+nlohmann::json get_me_output_schema(McpTestServer& ts) {
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7000})");
+    nlohmann::json schema;
+    for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"])
+        if (t["name"] == "get_me")
+            schema = t["outputSchema"];
+    return schema;
+}
+
+nlohmann::json call_get_me(McpTestServer& ts, const std::string& arguments = "{}") {
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":7001,"params":{"name":"get_me","arguments":)" +
+        arguments + "}}");
+    return nlohmann::json::parse(res->body);
+}
+
+} // namespace
+
+TEST_CASE("MCP get_me: describes the caller and conforms to the served output schema",
+          "[mcp][get_me]") {
+    McpTestServer ts;
+    ts.mock_username = "test-user";
+    ts.mock_role = yuzu::server::auth::Role::admin;
+    ts.start("readonly");
+    const auto schema = get_me_output_schema(ts);
+    REQUIRE(schema.is_object());
+    // Every key the builder can emit is declared; the required set is exactly the
+    // always-present keys.
+    CHECK(schema["required"].size() == 11);
+
+    const auto body = call_get_me(ts);
+    REQUIRE(body.contains("result"));
+    const auto& sc = body["result"]["structuredContent"];
+    CHECK(yuzu::test::schema_violation(schema, sc) == "");
+    CHECK(sc["username"] == "test-user");
+    CHECK(sc["role"] == "admin");
+    CHECK(sc["principal_kind"] == "human");
+    CHECK(sc["mcp_tier"] == "readonly");
+    CHECK(sc["scope_service"] == "");
+    CHECK(sc["rbac_enabled"] == false); // no store wired
+    CHECK(sc["rbac_roles_resolved"] == true);
+    // An MCP-tier session is never admitted to settings, whatever its role.
+    CHECK(sc["can_access_settings"] == false);
+    CHECK(sc["effective_role"] == "admin");
+    CHECK_FALSE(sc.contains("audit_persisted"));
+    // content[0].text carries the same object.
+    CHECK(nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>()) == sc);
+}
+
+TEST_CASE("MCP get_me: emits the generic audit row and takes no perm_fn gate",
+          "[mcp][get_me]") {
+    McpTestServer ts;
+    // Deny EVERY permission: the REST twin calls auth_fn only, so this tool must not be
+    // refused by a perm_fn call.
+    ts.perm_override_for_test = [](const std::string&, const std::string&) { return false; };
+    ts.start("readonly");
+    const auto body = call_get_me(ts);
+    REQUIRE(body.contains("result"));
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.get_me|success");
+}
+
+TEST_CASE("MCP get_me: a dropped audit row is reported as audit_persisted:false",
+          "[mcp][get_me]") {
+    McpTestServer ts;
+    ts.audit_succeeds_ = false;
+    ts.start("readonly");
+    const auto schema = get_me_output_schema(ts);
+    const auto body = call_get_me(ts);
+    REQUIRE(body.contains("result"));
+    const auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["audit_persisted"] == false);
+    CHECK(yuzu::test::schema_violation(schema, sc) == "");
+    CHECK(sc["username"] == "test-user"); // the data is still returned (set-and-proceed)
+}
+
+TEST_CASE("MCP get_me: identity isolation, no argument can name another principal",
+          "[mcp][get_me]") {
+    McpTestServer ts;
+    ts.mock_username = "carol";
+    ts.start("operator");
+    const auto body = call_get_me(
+        ts, R"({"username":"someone-else","principal_id":"engine:other","agent_id":"x"})");
+    REQUIRE(body.contains("result"));
+    CHECK(body["result"]["structuredContent"]["username"] == "carol");
+}
+
+TEST_CASE("MCP get_me: available at every MCP tier, refused for an unknown tier",
+          "[mcp][get_me]") {
+    for (const char* tier : {"readonly", "operator", "supervised", ""}) {
+        INFO("tier = " << tier);
+        McpTestServer ts;
+        ts.start(tier);
+        const auto body = call_get_me(ts);
+        CHECK(body.contains("result"));
+        CHECK_FALSE(body.contains("error"));
+    }
+    McpTestServer bad;
+    bad.start("not-a-real-tier"); // tier_allows denies an unknown tier
+    auto res = bad.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":7002,"params":{"name":"get_me","arguments":{}}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body.contains("error"));
+    CHECK_FALSE(body.contains("result"));
+}
+
+TEST_CASE("MCP get_me: a service-scoped token is refused (default denied class)",
+          "[mcp][get_me]") {
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+    const auto body = call_get_me(ts);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK_FALSE(body.contains("result"));
+}
+
+TEST_CASE("MCP get_me: an engine principal with RBAC off carries no fabricated rbac_role",
+          "[mcp][get_me]") {
+    McpTestServer ts;
+    ts.mock_username = "engine:indexer";
+    ts.mock_principal_kind = "engine";
+    ts.mock_auth_source = "engine_token";
+    ts.mock_role = yuzu::server::auth::Role::user;
+    ts.start("readonly");
+    const auto schema = get_me_output_schema(ts);
+    const auto body = call_get_me(ts);
+    REQUIRE(body.contains("result"));
+    const auto& sc = body["result"]["structuredContent"];
+    CHECK(yuzu::test::schema_violation(schema, sc) == "");
+    CHECK(sc["principal_kind"] == "engine");
+    CHECK(sc["auth_source"] == "engine_token");
+    CHECK_FALSE(sc.contains("rbac_role"));
+    CHECK(sc["rbac_roles"].empty());
+    CHECK(sc["rbac_roles_resolved"] == true);
+}
+
+TEST_CASE("MCP get_me: RBAC on reads the caller's direct roles under the session-kind namespace",
+          "[mcp][pg][rbac][get_me]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool};
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    REQUIRE(rbac.assign_role({"user", "test-user", "PlatformEngineer"}).has_value());
+    REQUIRE(rbac.assign_role({"user", "test-user", "Viewer"}).has_value());
+    REQUIRE(rbac.create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(rbac.assign_role({"engine", "engine:indexer", "EngineReader"}).has_value());
+
+    SECTION("human: direct roles, rbac_role is the alphabetically first") {
+        McpTestServer ts;
+        ts.rbac_store_for_test = &rbac;
+        ts.start("readonly");
+        const auto schema = get_me_output_schema(ts);
+        const auto body = call_get_me(ts);
+        REQUIRE(body.contains("result"));
+        const auto& sc = body["result"]["structuredContent"];
+        CHECK(yuzu::test::schema_violation(schema, sc) == "");
+        CHECK(sc["rbac_enabled"] == true);
+        CHECK(sc["rbac_role"] == "PlatformEngineer");
+        CHECK(sc["rbac_roles"] == nlohmann::json::array({"PlatformEngineer", "Viewer"}));
+        CHECK(sc["rbac_roles_resolved"] == true);
+    }
+    SECTION("engine: reads the engine grant keyed by engine:<slug>") {
+        McpTestServer ts;
+        ts.rbac_store_for_test = &rbac;
+        ts.mock_username = "engine:indexer";
+        ts.mock_principal_kind = "engine";
+        ts.mock_auth_source = "engine_token";
+        ts.start("readonly");
+        const auto body = call_get_me(ts);
+        REQUIRE(body.contains("result"));
+        const auto& sc = body["result"]["structuredContent"];
+        CHECK(sc["rbac_role"] == "EngineReader");
+        CHECK(sc["rbac_roles"] == nlohmann::json::array({"EngineReader"}));
+    }
+    SECTION("engine with no grant: no rbac_role, never Viewer") {
+        McpTestServer ts;
+        ts.rbac_store_for_test = &rbac;
+        ts.mock_username = "engine:ungranted";
+        ts.mock_principal_kind = "engine";
+        ts.mock_auth_source = "engine_token";
+        ts.start("readonly");
+        const auto body = call_get_me(ts);
+        REQUIRE(body.contains("result"));
+        const auto& sc = body["result"]["structuredContent"];
+        CHECK_FALSE(sc.contains("rbac_role"));
+        CHECK(sc["rbac_roles"].empty());
+        CHECK(sc["rbac_roles_resolved"] == true);
+    }
 }
 
 // ── #4353 follow-up, empty-tier discriminating test ─────────────────────────

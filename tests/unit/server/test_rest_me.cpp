@@ -38,6 +38,14 @@ auth::Session make_session(auth::Role role, bool elevated = false, std::string m
     return s;
 }
 
+auth::Session make_engine_session() {
+    auth::Session s = make_session(auth::Role::user);
+    s.username = "engine:indexer";
+    s.principal_kind = "engine";
+    s.auth_source = "engine_token";
+    return s;
+}
+
 json get_me(const auth::Session& session, std::string* cache_control = nullptr) {
     yuzu::server::test::TestRouteSink sink;
     RestApiV1 api;
@@ -149,7 +157,35 @@ TEST_CASE("GET /api/me and GET /api/v1/me carry identical keys and values (the t
     for (const auto& session :
          {make_session(auth::Role::admin), make_session(auth::Role::user, true),
           make_session(auth::Role::user), make_session(auth::Role::admin, false, "readonly"),
-          make_session(auth::Role::user, false, "", "finance")}) {
+          make_session(auth::Role::user, false, "", "finance"), make_engine_session()}) {
         CHECK(legacy(session) == get_me(session));
     }
+}
+
+TEST_CASE("GET /api/v1/me: reports the principal and credential facts", "[server][routes][rest_me]") {
+    auto d = get_me(make_session(auth::Role::user));
+    CHECK(d["principal_kind"] == "human");
+    CHECK(d["auth_source"] == "local");
+    CHECK(d["mcp_tier"] == "");
+    CHECK(d["scope_service"] == "");
+    CHECK(d["rbac_roles_resolved"] == true);
+
+    auto tok = get_me(make_session(auth::Role::user, false, "readonly", "finance"));
+    CHECK(tok["mcp_tier"] == "readonly");
+    CHECK(tok["scope_service"] == "finance");
+}
+
+TEST_CASE("GET /api/v1/me: an engine principal is not labelled Viewer or Administrator",
+          "[server][routes][rest_me]") {
+    // No store wired (RBAC off): an engine session carries no rbac_role at all, and
+    // the legacy `role` stays the persisted value.
+    auto d = get_me(make_engine_session());
+    CHECK(d["username"] == "engine:indexer");
+    CHECK(d["principal_kind"] == "engine");
+    CHECK(d["auth_source"] == "engine_token");
+    CHECK(d["role"] == "user");
+    CHECK_FALSE(d.contains("rbac_role"));
+    CHECK(d["rbac_roles"].is_array());
+    CHECK(d["rbac_roles"].empty());
+    CHECK(d["rbac_roles_resolved"] == true);
 }

@@ -31,6 +31,7 @@
 #include "execution_event_bus.hpp"
 #include "execution_event_scope.hpp"
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
+#include "me_response.hpp" // shared GET /api/v1/me + /api/me + MCP get_me body builder
 #include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
                                      // response query/aggregate/export row builders
 #include "response_export_metrics.hpp"
@@ -3125,46 +3126,11 @@ void RestApiV1::register_routes(
         auto session = auth_fn(req, res);
         if (!session)
             return;
-
-        JObj data;
-        // #1837: `username` is the STABLE authorization principal (an
-        // opaque `oidc:<iss>#<sub>` id for SSO sessions); `display_name` is
-        // the human-readable label ("" for a legacy session created before
-        // this field existed, so fall back to `username`) — expose both so
-        // API/dashboard callers keep a readable identity without weakening
-        // what `check_permission`/audit key on.
-        data.add("username", session->username)
-            .add("display_name",
-                session->display_name.empty() ? session->username : session->display_name)
-            .add("role", auth::role_to_string(session->role));
-
-        if (rbac_store && rbac_store->is_rbac_enabled()) {
-            data.add("rbac_enabled", true);
-            auto roles = rbac_store->get_principal_roles("user", session->username);
-            if (!roles.empty()) {
-                data.add("rbac_role", roles[0].role_name);
-            } else {
-                data.add("rbac_role",
-                         session->role == auth::Role::admin ? "Administrator" : "Viewer");
-            }
-        } else {
-            data.add("rbac_enabled", false);
-            data.add("rbac_role", session->role == auth::Role::admin ? "Administrator" : "Viewer");
-        }
-        // Same session self-description as legacy GET /api/me (#5779, #4208).
-        const bool elevated = auth::is_elevated(*session);
-        data.add("effective_role", auth::role_to_string(auth::effective_role(*session)))
-            .add("elevated", elevated);
-        if (elevated) {
-            data.add("elevated_until",
-                     format_iso_utc(std::chrono::duration_cast<std::chrono::seconds>(
-                                        session->elevated_until.time_since_epoch())
-                                        .count()));
-        }
-        data.add("can_access_settings",
-                 authz::admin_gate_verdict(*session) == authz::AdminGate::Admit);
+        // One builder shared with legacy GET /api/me and MCP get_me (me_response.hpp):
+        // the principal namespace, the checked RBAC read and the engine/degrade arms
+        // live there, so the three surfaces cannot drift.
         res.set_header("Cache-Control", "no-store, private");
-        res.set_content(ok_json(data.str()), "application/json");
+        res.set_content(ok_json(me_response::build_me_body(*session, rbac_store)), "application/json");
     });
 
     // ── Live-query bundle (/api/v1/bundles) — ADR-0011 ───────────────────

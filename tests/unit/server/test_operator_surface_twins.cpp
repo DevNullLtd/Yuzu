@@ -512,6 +512,7 @@ TEST_CASE("operator surface MCP twins: every tool satisfies the A5 contract",
             "list_crypto_widgets",
             "get_crypto_dashboard_layout",
             "get_crypto_ca_stats",
+            "get_me",
         };
         if (!kNoArgTools.contains(expected.tool))
             CHECK(schema_it->schema_json != R"({"type":"object","properties":{}})");
