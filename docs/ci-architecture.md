@@ -1764,6 +1764,7 @@ delta is attributable to one axis ("never bundled with a topology change"):
 |---|---|---|---|---|---|---|---|---|
 | 1 | Preflight split, `platform` suite + Linux-only `docs`, `max-parallel` 4, duration summary, PGDATA/RAM probe (np stays 2) | topology | | | | | | |
 | 2a | Linux np 2 → 4 on the cheap-suites invocation only (see Push 2a below) | width | | | | | | |
+| 2b | `gateway eunit` meson `priority: 120`, so it starts first in the cheap-suites invocation (see Push 2b below) | ordering | | | | | | |
 | 2 | Linux np 2 → 4 on the remaining two invocations (server shards, pg); Windows pg 6 → 8, non-pg 4 → 6 | width | | | | | | |
 | 3 | tmpfs PGDATA, cap from the push-1 probe (see "Postgres for server tests") | storage | | | | | | |
 | 4 | Linux np 4 → 6, then stop | width | | | | | | |
@@ -1881,13 +1882,37 @@ estimate above.
 
 One observation outside the rule: the pg-shards step, whose width is unchanged,
 took 511 s and 545 s in these two samples, against 452 s and 453 s in the two
-np=2 PR runs and 451 s to 521 s in the `dev` push runs of the same day (673 s to
-723 s the evening before). Its 14 shards summed to 1005 s and 1079 s against 884
-s and 880 s, with every shard slower. The step runs after the non-pg step and
-shares no code path with this change, so this is most likely box state, but two
-samples cannot rule out a spillover; it is why the job total fell by only about
-50 s. Watch the pg step on the next runs.
+np=2 PR runs, and its 14 shards summed to 1005 s and 1079 s against 884 s and
+880 s. Read against the `dev` push runs of the same day (np=2, pg-shard sums
+885 s to 1028 s, mean 942 s; 1335 s to 1437 s the evening before) the np=2
+baselines sit at the very bottom of the range and the np=4 samples inside it
+(1005 s) or 5% above its top (1079 s). The step runs after the non-pg step and
+shares no code path with this change, so this is box state and an unusually
+fast baseline, not evidence of a spillover; it is why the job total fell by only
+about 50 s. Day-to-day noise in this step is large, so judge it only against
+runs taken in the same window.
 
+**Push 2b (`gateway eunit` starts first, `priority: 120`).** A meson `priority:`
+on the `gateway eunit` test in the root `meson.build` (the server shards use
+approximately their measured seconds, and so does this). It only orders starts:
+the entry that ran last at np=4 now starts first, so its 120 s overlaps the
+other entries instead of trailing them. The 105 entries, the suites and the
+width are unchanged, and it does nothing at `--num-processes 1`. The Windows
+`gateway` suite also contains this test, so it starts first there too.
+
+*Baseline.* The Push 2a np=4 samples: cheap-suites invocation 224 s and 224 s,
+`Test (non-pg suites)` step 291 s and 292 s, `gateway eunit` 119.99 s.
+*Expectation (an estimate).* Eunit holds one worker for about 120 s while the
+other three drain the remaining work (about 488 s, `gateway ct` included, over
+three workers is about 163 s), so the invocation should end near 165 s: about
+60 s saved, the step near 230 s. *Measurement and rule* are those of Push 2a
+above (job log, jobs API, two same-SHA samples), with the Push 2a np=4 samples
+as the comparator: (a) the step median improves by 10% or more (about 29 s);
+(b) no entry of 5 s or more takes more than 1.5x its Push 2a time (eunit itself
+may stretch a little, since it now overlaps the early heavy agent shards);
+(c) no entry reaches 80% of its own meson timeout; entry count 105 and skip
+count 5 unchanged. The Push 2a revert triggers apply. To revert, delete the
+`priority: 120` line from the `gateway eunit` test. *Samples:* pending.
 
 Worst-case ceiling by width (14 pg shards, one shared 700 s timeout, every
 shard at its cap; the degenerate figure, not an expected case): np=2 is 7
