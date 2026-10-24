@@ -715,14 +715,15 @@ if _gw_otp_bin != ''
   # Timeout 600s — upper-bound safety net for the nightly Coverage and
   # sanitizer jobs on slower cloud runners (scw-eager-lumiere) where
   # parallel meson test execution can starve the eunit job of CPU.
-  # Healthy runs finish in ~30-90s on a fast runner and are unaffected
-  # by the upper bound. The previous 120s landed at exactly 120.03s on
-  # nightly Coverage and killed the suite by SIGTERM; gateway eunit is
-  # only reached during nightly anyway, so a generous bound is free.
+  # Healthy runs finish in about 110-122 s on the self-hosted Linux runner
+  # (eleven runs, 2026-10-24) and are unaffected by the upper bound. The
+  # previous 120s landed at exactly 120.03s on nightly Coverage and killed the
+  # suite by SIGTERM; gateway eunit runs in every Linux job's cheap-suites
+  # invocation as well as in nightly, and a generous bound is free.
   # priority 120 (approximately its measured seconds, the convention the server
   # shards use in tests/meson.build): this is the longest entry of the Linux
-  # cheap-suites invocation (117.8 to 121.6 s on the self-hosted runner, three
-  # runs) and, defined last, it used to start last. With nothing else in those
+  # cheap-suites invocation (about 111 to 122 s over eleven runs on the
+  # self-hosted Linux runner) and, defined last, it used to start last. With nothing else in those
   # suites setting a priority, 120 starts it first, so its 120 s overlaps the
   # other entries instead of trailing them. Priority only orders starts: it
   # moves no case and changes nothing at --num-processes 1.
