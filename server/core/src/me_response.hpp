@@ -47,6 +47,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server::me_response {
@@ -140,8 +141,9 @@ struct RbacView {
     }
 
     // Session self-description (#5779, #4208). `role` stays the persisted role;
-    // these report what the server will actually honour. No store read, no gate
-    // call, no audit row.
+    // effective_role is the legacy session role after JIT elevation. Neither is an
+    // authority summary: with RBAC on, authority is decided per permission. No
+    // store read, no gate call, no audit row.
     const bool elevated = auth::is_elevated(s);
     j["effective_role"] = auth::role_to_string(auth::effective_role(s));
     j["elevated"] = elevated;

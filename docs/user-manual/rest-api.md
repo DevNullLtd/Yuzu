@@ -391,7 +391,7 @@ All endpoints are under the `/api/v1/` prefix.
 
 #### `GET /api/v1/me`
 
-Returns the authenticated caller's identity, role and what the server will honour for this session.
+Returns the authenticated caller's identity, legacy role and session context (not an authority summary: see `role` below).
 The MCP twin is `get_me`.
 
 **Permission:** Authenticated session (no specific RBAC permission required). The route is
@@ -438,7 +438,7 @@ While a just-in-time elevation is active, `effective_role` is `admin`, `elevated
 | `rbac_role` | Deprecated display field: the first DIRECT role assignment in role-name order. Omitted for an engine principal while RBAC is off, for an engine principal with no grant while RBAC is on, and when the role-store read failed. For a human with no direct role it shows the legacy label `Administrator` or `Viewer`, including while RBAC is on; that label is not a grant and not authority. Read `rbac_roles` instead. |
 | `rbac_roles` | The principal's DIRECT role assignments only; roles held through a group grant are not listed. It is not access-review evidence: the access-review export (`AccessReview:Read`) is. With RBAC off it is `[]`. Omitted when the role-store read failed. |
 | `rbac_roles_resolved` | `false` only when the role-store read failed; it is `true` otherwise, including with RBAC off (no read is made then, so `true` is not proof that enforcement is off). When `false` the route still answers `200` and omits `rbac_role` and `rbac_roles`; treat an absent list as unknown, not as "no roles". |
-| `effective_role` | The legacy role the server enforces now: `admin` while a just-in-time elevation is active, otherwise `role`. |
+| `effective_role` | The effective legacy session role: `admin` while a just-in-time elevation is active, otherwise `role`. Like `role`, it is not a summary of authority. |
 | `elevated` | `true` while a just-in-time elevation is active. Always `false` for API and MCP token sessions. |
 | `elevated_until` | End of the elevation window, ISO-8601 UTC. Present only when `elevated` is `true`. |
 | `can_access_settings` | `true` when `GET /settings` would render for this session. Always `false` for an MCP-tier or service-scoped token, because the admin gate refuses either before it tests the role; for an MCP token `effective_role` therefore equals `role`. A display hint only: every route is still gated server-side. |
