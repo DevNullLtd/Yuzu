@@ -270,8 +270,8 @@ is sticky), so that text is reduced again for a Forensics execution before it re
 `running` frame therefore cannot republish a pre-upgrade raw value. The lookup that decides whether the execution is a
 Forensics one runs on the write path only when the persisted text differs from the incoming text and is not already a
 bounded token, and it runs under a SAVEPOINT: if the lookup fails, the text is reduced to the fixed value
-`forensics_error`, and the status write, the outbox row and the bus event still commit (an agent's status is never lost to a
-failed lookup). The write path trusts that the incoming text was already reduced at ingest
+`forensics_error`, and the status write, the outbox row and the bus event still commit (a failed lookup statement never costs the
+agent's status; a lost connection is not a failed statement and follows the write path's generic single retry). The write path trusts that the incoming text was already reduced at ingest
 (`notify_exec_tracker` calls `AgentServiceImpl::failure_text_for_sinks`; `tests/test_forensics_tier_wiring_lexical.py`
 pins that call), which is why an ordinary frame, whose persisted text equals the incoming text, costs no lookup. An unwired tracker (a test harness only; production
 boot refuses an unwired plugin set) publishes the text as stored. The durable event outbox (24 hours; other replicas re-publish its rows onto their own stream) is
