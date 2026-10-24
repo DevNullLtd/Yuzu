@@ -569,14 +569,14 @@ TEST_CASE("crypto widgets: audit_detail_inventory - the unfiltered list's succes
           "inventory rows=5 limit=5 offset=10 has_more=true");
 }
 
-TEST_CASE("crypto widgets: audit_detail_with_standing - one token per standing and never a false "
-          "refused",
+TEST_CASE("crypto widgets: audit_detail_with_standing - only a served standing is named, never a "
+          "false available",
           "[crypto][widgets]") {
     namespace cw = yuzu::server::crypto_widgets;
     CHECK(cw::audit_detail_with_standing("x", cw::Access::kAvailable) == "x standing=available");
-    CHECK(cw::audit_detail_with_standing("x", cw::Access::kRefused) == "x standing=refused");
-    // kConfined and kDegraded are answered before any success row; if one ever reached a row
-    // it must not read as the by-design `refused` standing.
+    // Only kAvailable is ever served. kRefused, kConfined and kDegraded are answered before any
+    // success row; if one ever reached a row it must not read as the real `available` standing.
+    CHECK(cw::audit_detail_with_standing("x", cw::Access::kRefused) == "x standing=unexpected");
     CHECK(cw::audit_detail_with_standing("x", cw::Access::kConfined) == "x standing=unexpected");
     CHECK(cw::audit_detail_with_standing("x", cw::Access::kDegraded) == "x standing=unexpected");
 }

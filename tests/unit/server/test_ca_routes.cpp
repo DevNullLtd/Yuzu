@@ -10,22 +10,39 @@
  * and 503 when the CA store is unavailable.
  */
 
+#include "api_token_store.hpp"
+#include "auth_routes.hpp"
 #include "ca_routes.hpp"
 #include "ca_store.hpp"
+#include "crypto_access.hpp"
 #include "crypto_api_local.hpp"
 #include "crypto_widget_catalogue.hpp"
+#include "management_group_store.hpp"
+#include "oidc_provider.hpp"
+#include "rbac_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+#include "test_api_token_pg_helper.hpp"  // ApiTokenStorePg
+#include "test_mgmt_group_pg_helper.hpp" // ManagementGroupStorePg
+#include "test_rbac_store_pg_helper.hpp"  // RbacStorePg
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/server/auth.hpp>
+#include <yuzu/server/server.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
+#include <shared_mutex>
+#include <unordered_map>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -112,6 +129,14 @@ struct Harness {
     bool wire_filtered{true};
     yuzu::server::crypto_widgets::Access standing{yuzu::server::crypto_widgets::Access::kAvailable};
     int standing_calls{0};
+    // Real-stack overrides (RealStandingRig): when set they replace the fakes above, so a test
+    // can put the REAL permission gate, the REAL fleet-read probe and the REAL standing
+    // composition (crypto_access_for) behind the routes.
+    std::function<bool(const httplib::Request&, httplib::Response&, const std::string&,
+                       const std::string&)>
+        perm_override;
+    std::function<yuzu::server::crypto_widgets::Access(const httplib::Request&)> standing_override;
+    std::function<bool(const httplib::Request&)> probe_override;
     std::string last_issue_csr;
     std::string last_issue_label;
     std::optional<int> last_issue_validity_days;
@@ -137,10 +162,12 @@ struct Harness {
                                    httplib::Response&) -> std::optional<auth::Session> {
             return std::nullopt;
         };
-        CaRoutes::PermFn perm = [this](const httplib::Request&, httplib::Response& res,
+        CaRoutes::PermFn perm = [this](const httplib::Request& req, httplib::Response& res,
                                        const std::string& type, const std::string& op) {
             last_perm_type = type;
             last_perm_op = op;
+            if (perm_override)
+                return perm_override(req, res, type, op);
             if (unauthenticated) {
                 res.status = 401;
                 res.set_content(R"({"error":{"code":401,"message":"authentication required"}})",
@@ -188,12 +215,16 @@ struct Harness {
         if (wire_filtered)
             routes.set_filtered_issued(CaRoutes::FilteredIssuedDeps{
                 .api = make_local_crypto_api(LocalCryptoApiDeps{.ca = null_store ? nullptr : store.get()}),
-                .confinement_fn = [this](const httplib::Request&) {
+                .confinement_fn = [this](const httplib::Request& req) {
                     ++standing_calls;
+                    if (standing_override)
+                        return standing_override(req);
                     return standing;
                 }});
         if (probe_wired)
-            routes.set_read_probe([this](const httplib::Request&) {
+            routes.set_read_probe([this](const httplib::Request& req) {
+                if (probe_override)
+                    return probe_override(req);
                 return perm_allow && deny_ops.count("Read") == 0;
             });
         routes.register_routes(sink, auth, perm, audit, null_store ? nullptr : store.get(), crl,
@@ -1520,12 +1551,15 @@ TEST_CASE("ca_routes: the FILTERED list names its standing on the success row",
     h.standing = Access::kRefused;
     auto refused = h.sink.Get("/api/v1/ca/issued?kind=active");
     REQUIRE(refused);
-    CHECK(refused->status == 200);
+    // Not admitted (no Inventory grant, or a refusal the check cannot explain): withheld like a
+    // confined caller, never served (governance adjudication of CA-U2, 2026-10-24).
+    CHECK(refused->status == 403);
+    CHECK(refused->body.find("agent-C5") == std::string::npos);
     REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[0].result == "success");
     CHECK_THAT(h.audits[0].detail, Catch::Matchers::ContainsSubstring("standing=available"));
-    CHECK(h.audits[1].result == "success");
-    CHECK_THAT(h.audits[1].detail, Catch::Matchers::ContainsSubstring("standing=refused"));
+    CHECK(h.audits[1].result == "denied");
+    CHECK_THAT(h.audits[1].detail, Catch::Matchers::ContainsSubstring("withheld"));
 }
 
 namespace {
@@ -2346,9 +2380,9 @@ TEST_CASE("ca_routes: an unconfined or grant-less caller passes the probe; an un
           "audited failure",
           "[ca_routes][pki][crypto][security]") {
     using yuzu::server::crypto_widgets::Access;
-    for (const Access a : {Access::kAvailable, Access::kRefused}) {
+    {
         ProbeHarness h;
-        h.standing = a;
+        h.standing = Access::kAvailable;
         h.wire();
         auto res = h.sink.Get("/api/v1/ca/issued");
         REQUIRE(res);
@@ -2357,6 +2391,19 @@ TEST_CASE("ca_routes: an unconfined or grant-less caller passes the probe; an un
         REQUIRE(h.audits.size() == 1);
         CHECK(h.audits[0].result == "failure");
         CHECK(h.audits[0].action == "crypto.ca.certificates.view");
+    }
+    {
+        // A caller the access check admitted nobody for is stopped AT the probe (403, denied),
+        // before the store is consulted: it does not reach the store check.
+        ProbeHarness h;
+        h.standing = Access::kRefused;
+        h.wire();
+        auto res = h.sink.Get("/api/v1/ca/issued");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.standing_calls == 1);
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].result == "denied");
     }
 }
 
@@ -2443,20 +2490,30 @@ TEST_CASE("ca_routes: the Settings CA panel withholds ONLY the inventory from a 
             // note (the pki shape used to drop it).
             CHECK(res->body.find("TLS / mTLS Configuration") != std::string::npos);
         }
-        // An unconfined caller still gets the inventory. A kRefused caller (no Inventory
-        // grant, or a failed read inside the access check: the answer cannot tell them apart)
-        // is shown it too, as the API list serves it; pinned so a tri-state change flips this
-        // deliberately.
-        for (const Access a : {Access::kAvailable, Access::kRefused}) {
+        // An unconfined caller still gets the inventory.
+        {
             Harness h;
             REQUIRE(h.store->set_root(sample_root()));
             REQUIRE(h.store->record_issued(sample_issued("DEAD")));
-            h.standing = a;
+            h.standing = Access::kAvailable;
             h.wire();
             auto res = h.sink.Get(path);
             REQUIRE(res);
             CHECK(res->body.find("agent-DEAD") != std::string::npos);
             CHECK(res->body.find(std::string(kWithheld)) == std::string::npos);
+        }
+        // A kRefused caller (no Inventory grant, or a refusal the check cannot explain) is
+        // withheld the inventory exactly as a confined caller is; the rest of the panel renders.
+        {
+            Harness h;
+            REQUIRE(h.store->set_root(sample_root()));
+            REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+            h.standing = Access::kRefused;
+            h.wire();
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->body.find("agent-DEAD") == std::string::npos);
+            check_inventory_withheld_panel_intact(res->body);
         }
     }
 }
@@ -2538,8 +2595,8 @@ TEST_CASE("ca_routes: a confined caller's import-chain wrapper answers the panel
     }
 }
 
-TEST_CASE("ca_routes: a degraded or unwired caller's wrappers confirm success without the "
-          "inventory; an unconfined caller's reply is unchanged",
+TEST_CASE("ca_routes: a degraded, unwired or not-admitted caller's wrappers confirm success "
+          "without the inventory; an unconfined caller's reply is unchanged",
           "[ca_routes][pki][crypto][security][pg]") {
     using yuzu::server::crypto_widgets::Access;
     struct Case {
@@ -2548,7 +2605,7 @@ TEST_CASE("ca_routes: a degraded or unwired caller's wrappers confirm success wi
         bool expect_confirmation;
     };
     for (const Case c : {Case{Access::kDegraded, true, true}, Case{Access::kAvailable, false, true},
-                         Case{Access::kAvailable, true, false}, Case{Access::kRefused, true, false}}) {
+                         Case{Access::kAvailable, true, false}, Case{Access::kRefused, true, true}}) {
         INFO("standing=" << static_cast<int>(c.standing) << " wired=" << c.wire_filtered);
         Harness h;
         REQUIRE(h.store->set_root(sample_root()));
@@ -2608,14 +2665,14 @@ TEST_CASE("ca_routes: a wrapper caller without Security:Read gets a confirmation
 
 // ── Standing, audit shape and serving order (Postgres) ──────────────────────────────────────
 
-TEST_CASE("ca_routes: KNOWN RESIDUAL - kRefused serves the unfiltered list and the success row "
-          "says standing=refused (tracked by #6382)",
+TEST_CASE("ca_routes: kRefused withholds the unfiltered list and writes a denied row, never a "
+          "served page",
           "[ca_routes][pki][crypto][security][pg]") {
     // kRefused = the access check admitted nobody and did not answer 503: no Inventory grant at
-    // all, OR a read failure partway through the check (the answer cannot tell them apart). The
-    // list is SERVED to both. This test pins that so a future tri-state fix (a read failure
-    // answering 503) flips it DELIBERATELY, in the same change that updates the docs, rather
-    // than by accident. When that lands, the read-failure half of this case must become 503.
+    // all. It is NOT a confined view and it is not an affirmative admission, so the list is
+    // withheld exactly as for a confined caller (independent adjudication of CA-U2 / CH-2,
+    // 2026-10-24; supersedes the 2026-10-23 "keep serving" ruling). A failed read is answered
+    // 503 before it can become a kRefused (see test_ca_issued_real_standing for the real stack).
     using yuzu::server::crypto_widgets::Access;
     Harness h;
     h.standing = Access::kRefused;
@@ -2623,21 +2680,202 @@ TEST_CASE("ca_routes: KNOWN RESIDUAL - kRefused serves the unfiltered list and t
     REQUIRE(h.store->record_issued(sample_issued("C3")));
     auto res = h.sink.Get("/api/v1/ca/issued");
     REQUIRE(res);
-    CHECK(res->status == 200);
-    const auto j = json::parse(res->body);
-    CHECK(j["count"] == 1);
-    CHECK(j["items"][0]["subject"] == "agent-C3");
+    CHECK(res->status == 403);
+    CHECK(res->body.find("agent-C3") == std::string::npos);
+    CHECK(res->body.find("\"items\"") == std::string::npos);
     REQUIRE(h.audits.size() == 1);
-    CHECK(h.audits[0].result == "success");
-    CHECK_THAT(h.audits[0].detail, Catch::Matchers::ContainsSubstring("standing=refused"));
+    CHECK(h.audits[0].result == "denied");
+    CHECK_THAT(h.audits[0].detail, Catch::Matchers::ContainsSubstring("withheld"));
+    CHECK_THAT(h.audits[0].detail, !Catch::Matchers::ContainsSubstring("standing=refused"));
 
-    // The unrestricted standing is told apart in the same row.
+    // The unrestricted standing is served and named on the row.
     h.standing = Access::kAvailable;
     auto avail = h.sink.Get("/api/v1/ca/issued");
     REQUIRE(avail);
     CHECK(avail->status == 200);
     REQUIRE(h.audits.size() == 2);
     CHECK_THAT(h.audits[1].detail, Catch::Matchers::ContainsSubstring("standing=available"));
+}
+
+// ── The REAL stack: RBAC + management groups + the real standing probe (Postgres) ──────────
+//
+// The cases above inject a standing. These put the real AuthRoutes permission gate, the real
+// RbacStore::authorize_list_read and the real crypto_access_for behind the routes, so a database
+// fault inside the access check and a change to a caller's grants are exercised for real
+// (independent adjudication of CA-S3 / CA-U1 / CA-U2 / CH-1 / CH-2 / CH-8, 2026-10-24).
+
+namespace {
+
+struct RealStandingRig {
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    yuzu::test::RbacStorePg rbac_bundle;
+    RbacStore& rbac = *rbac_bundle;
+    yuzu::test::ManagementGroupStorePg mgmt_bundle;
+    ManagementGroupStore& mgmt = *mgmt_bundle;
+    yuzu::test::ApiTokenStorePg api_tokens;
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    std::unique_ptr<AuthRoutes> ar;
+    std::string group;
+
+    RealStandingRig() {
+        REQUIRE(rbac.is_open());
+        rbac.set_rbac_enabled(true); // enforcement in effect: the real admit-then-filter path
+        REQUIRE(rbac.create_role({"SecReader", "", false, 0}).has_value());
+        REQUIRE(rbac.set_permission({"SecReader", "Security", "Read", "allow"}).has_value());
+        REQUIRE(rbac.create_role({"InvReader", "", false, 0}).has_value());
+        REQUIRE(rbac.set_permission({"InvReader", "Inventory", "Read", "allow"}).has_value());
+        REQUIRE(rbac.create_role({"InvDenier", "", false, 0}).has_value());
+        REQUIRE(rbac.set_permission({"InvDenier", "Inventory", "Read", "deny"}).has_value());
+        ManagementGroup g;
+        g.name = "G";
+        g.membership_type = "static";
+        auto id = mgmt.create_group(g);
+        REQUIRE(id.has_value());
+        group = *id;
+        REQUIRE(mgmt.add_member(group, "agent-in-g").has_value());
+        ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac, api_tokens.get(),
+                                          /*audit_store=*/nullptr, &mgmt, /*tag_store=*/nullptr,
+                                          /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+    }
+
+    /// A user holding GLOBAL Security:Read (so the route's own gate passes) plus whatever the
+    /// caller then grants on Inventory:Read.
+    std::unordered_map<std::string, std::string> user(const std::string& name) {
+        REQUIRE(auth_mgr.upsert_user(name, "password1234", auth::Role::user));
+        REQUIRE(rbac.assign_role({"user", name, "SecReader"}).has_value());
+        const auto token =
+            auth_mgr.create_local_session_for_test(name, auth::Role::user, /*mfa_verified=*/true);
+        return {{"Cookie", "yuzu_session=" + token}};
+    }
+
+    void scoped_inventory(const std::string& name) {
+        REQUIRE(mgmt.assign_role({group, "user", name, "InvReader"}).has_value());
+    }
+
+    /// Breaks the management-group store mid-flight: the subtree/member reads inside
+    /// authorize_list_read then return a genuine query error.
+    void break_mgmt_store() {
+        yuzu::server::pg::PgConn c{PQconnectdb(mgmt_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult dr{PQexec(
+            c.get(), "DROP TABLE management_group_store.management_group_members CASCADE")};
+        REQUIRE(dr.ok());
+    }
+
+    void wire(Harness& h) {
+        namespace cw = yuzu::server::crypto_widgets;
+        h.perm_override = [this](const httplib::Request& req, httplib::Response& res,
+                                 const std::string& t, const std::string& o) {
+            return ar->require_permission(req, res, t, o);
+        };
+        h.probe_override = [this](const httplib::Request& req) {
+            return ar->has_permission(req, "Security", "Read");
+        };
+        h.standing_override = [this](const httplib::Request& req) {
+            return crypto_access_for(*ar, req, cw::WidgetGate::kFleetWideOnly, "Inventory", "Read");
+        };
+        h.wire();
+    }
+};
+
+} // namespace
+
+TEST_CASE("ca_routes real stack: a group-scoped Inventory:Read caller is withheld the list; a "
+          "global holder is served it",
+          "[ca_routes][pki][crypto][security][pg][rbac]") {
+    RealStandingRig rig;
+    Harness h;
+    rig.wire(h);
+    REQUIRE(h.store->record_issued(sample_issued("C9")));
+
+    const auto scoped = rig.user("scoped");
+    rig.scoped_inventory("scoped");
+    auto withheld = h.sink.Get("/api/v1/ca/issued", scoped);
+    REQUIRE(withheld);
+    CHECK(withheld->status == 403);
+    CHECK(withheld->body.find("agent-C9") == std::string::npos);
+
+    const auto global = rig.user("global");
+    REQUIRE(rig.rbac.assign_role({"user", "global", "InvReader"}).has_value()); // GLOBAL
+    auto served = h.sink.Get("/api/v1/ca/issued", global);
+    REQUIRE(served);
+    CHECK(served->status == 200);
+    CHECK(json::parse(served->body)["items"][0]["subject"] == "agent-C9");
+}
+
+TEST_CASE("ca_routes real stack: a failed scope-resolution read is a retryable 503, never the list "
+          "(CA-S3 / CA-U1 / CH-1 / CH-8)",
+          "[ca_routes][pki][crypto][security][pg][rbac]") {
+    RealStandingRig rig;
+    Harness h;
+    rig.wire(h);
+    REQUIRE(h.store->record_issued(sample_issued("C9")));
+    const auto scoped = rig.user("scoped");
+    rig.scoped_inventory("scoped");
+
+    // Warm: the permission cache is populated by a healthy request first (Security:Read can then
+    // pass from the cache while the uncached group/subtree reads fail).
+    auto healthy = h.sink.Get("/api/v1/ca/issued", scoped);
+    REQUIRE(healthy);
+    REQUIRE(healthy->status == 403);
+    h.audits.clear();
+
+    rig.break_mgmt_store();
+    for (const char* path : {"/api/v1/ca/issued", "/api/v1/ca/issued?kind=active"}) {
+        INFO(path);
+        auto res = h.sink.Get(path, scoped);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("agent-C9") == std::string::npos);
+        CHECK(res->body.find("\"items\"") == std::string::npos);
+    }
+    REQUIRE_FALSE(h.audits.empty());
+    for (const auto& a : h.audits) {
+        CHECK(a.result != "success");
+    }
+}
+
+TEST_CASE("ca_routes real stack: removing the last scoped grant never widens the list (CA-U2 / "
+          "CH-2); a deny that leaves the scoped allow stays withheld",
+          "[ca_routes][pki][crypto][security][pg][rbac]") {
+    RealStandingRig rig;
+    Harness h;
+    rig.wire(h);
+    REQUIRE(h.store->record_issued(sample_issued("C9")));
+    const auto who = rig.user("alice");
+    rig.scoped_inventory("alice");
+
+    // A GLOBAL deny does not erase the group allow: still scoped, still withheld.
+    REQUIRE(rig.rbac.assign_role({"user", "alice", "InvDenier"}).has_value());
+    auto with_deny = h.sink.Get("/api/v1/ca/issued", who);
+    REQUIRE(with_deny);
+    CHECK(with_deny->status == 403);
+    CHECK(with_deny->body.find("agent-C9") == std::string::npos);
+
+    // Remove the last scoped allow: no grant is left. It must not become the full list.
+    REQUIRE(rig.mgmt.unassign_role(rig.group, "user", "alice", "InvReader").has_value());
+    auto after = h.sink.Get("/api/v1/ca/issued", who);
+    REQUIRE(after);
+    CHECK(after->status == 403);
+    CHECK(after->body.find("agent-C9") == std::string::npos);
+}
+
+TEST_CASE("ca_routes real stack: a Security:Read holder with no Inventory:Read grant at all is "
+          "refused the list (CA-U2, the no-grant policy)",
+          "[ca_routes][pki][crypto][security][pg][rbac]") {
+    RealStandingRig rig;
+    Harness h;
+    rig.wire(h);
+    REQUIRE(h.store->record_issued(sample_issued("C9")));
+    const auto who = rig.user("bare"); // global Security:Read only
+    auto res = h.sink.Get("/api/v1/ca/issued", who);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("agent-C9") == std::string::npos);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "denied");
 }
 
 TEST_CASE("ca_routes: a sanitised subject is served with exactly one success row",

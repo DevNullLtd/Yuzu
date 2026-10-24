@@ -20032,18 +20032,19 @@ TEST_CASE("MCP CA: list_issued_certs unfiltered writes a success audit row; a dr
     CHECK(payload["audit_persisted"] == false);
 }
 
-TEST_CASE("MCP CA: KNOWN RESIDUAL - kRefused serves the unfiltered list and the success row says "
-          "standing=refused (tracked by #6382)",
+TEST_CASE("MCP CA: kRefused is withheld like a confined caller - no row text in the reply or the "
+          "audit detail, a denied row and never a success row",
           "[mcp][integration][pki][security][pg]") {
-    // The REST twin's pin in test_ca_routes.cpp: kRefused (no Inventory grant, or a read failure
-    // partway through the access check, which the answer cannot tell apart) is SERVED. A future
-    // tri-state fix flips this case deliberately, not by accident.
+    // kRefused = the access check admitted nobody and did not answer 503: no Inventory grant at
+    // all. Not an affirmative admission, so not served (independent adjudication of CA-U2 /
+    // CA-U12 / CH-2, 2026-10-24; supersedes the 2026-10-23 "keep serving" ruling). The REST twin
+    // is in test_ca_routes.cpp; a failed read is answered 503 before it can become a kRefused.
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     yuzu::server::CaStore store{pool};
     yuzu::server::IssuedCertRecord rec;
     rec.serial_hex = "A0D2";
-    rec.subject = "agent-refused-served";
+    rec.subject = "agent-refused-withheld";
     rec.purpose = "agent";
     rec.not_after = 4102444800;
     REQUIRE(store.record_issued(rec).has_value());
@@ -20055,16 +20056,18 @@ TEST_CASE("MCP CA: KNOWN RESIDUAL - kRefused serves the unfiltered list and the 
         return yuzu::server::crypto_widgets::Access::kRefused;
     };
     ts.start("operator");
-    auto body = nlohmann::json::parse(
-        ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_issued_certs"}})")
-            ->body);
-    REQUIRE(body.contains("result"));
-    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
-    CHECK(payload["count"] == 1);
-    CHECK(payload["items"][0]["subject"] == "agent-refused-served");
-    CHECK(mcp_audit_count(ts, "crypto.ca.certificates.view|success") == 1);
-    REQUIRE_FALSE(ts.audit_details.empty());
-    CHECK_THAT(ts.audit_details.front(), Catch::Matchers::ContainsSubstring("standing=refused"));
+    const auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_issued_certs"}})");
+    REQUIRE(res);
+    CHECK(res->body.find("agent-refused-withheld") == std::string::npos);
+    CHECK(res->body.find("A0D2") == std::string::npos);
+    CHECK(nlohmann::json::parse(res->body).contains("error"));
+    CHECK(mcp_audit_count(ts, "crypto.ca.certificates.view|denied") == 1);
+    CHECK(mcp_audit_count(ts, "crypto.ca.certificates.view|success") == 0);
+    for (const auto& d : ts.audit_details) {
+        CHECK(d.find("agent-refused-withheld") == std::string::npos);
+        CHECK(d.find("standing=refused") == std::string::npos);
+    }
 }
 
 TEST_CASE("MCP CA: a confined caller is withheld a populated inventory - no row text in the reply "

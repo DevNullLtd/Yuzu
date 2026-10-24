@@ -453,10 +453,11 @@ bool issued_audit(const CaRoutes::AuditFn& audit_fn, const httplib::Request& req
 /// The standing check BOTH `/api/v1/ca/issued` lists share (ADR-0070 R2): rows of per-agent
 /// certificates (subject, SAN) are fleet-wide, so a caller whose view is confined gets the
 /// withheld answer, never a narrowed list (`list_issued` has no scope parameter). Returns the
-/// standing the read may proceed under (kAvailable, or kRefused: the check admitted nobody, no
-/// Inventory grant or a read failure partway through it, which the answer cannot tell apart; the
-/// list is served and its success row names the standing; see the ADR-0070 Update (2026-10-23),
-/// the read-failure arm is tracked by #6382); nullopt = the response is written. An
+/// standing the read may proceed under (only kAvailable: the list is served to an affirmatively
+/// unconfined caller and nobody else); nullopt = the response is written. A confined caller and a
+/// caller with no Inventory grant (kRefused) are withheld (403, denied row); a failed access check
+/// (kDegraded, which now includes a read failure inside it) is a retryable 503. See the ADR-0070
+/// Update (2026-10-24). An
 /// unwired probe fails closed (503, no retry hint: a wiring fault lasts until a restart).
 /// `needs_api` is set by the filtered list, which also reads through the CryptoApi seam. Asked
 /// before any parameter is parsed, so the answer does not depend on them. `target` names the
@@ -490,8 +491,13 @@ admit_issued_read(const CaRoutes::FilteredIssuedDeps& filtered, const httplib::R
     const cw::Access standing = filtered.confinement_fn(req);
     switch (standing) {
     case cw::Access::kConfined:
-        (void)issued_audit(audit_fn, req, res, "denied", target, cw::audit_detail_ca_withheld(cid));
-        issued_fail(res, 403, cw::kConfinedWithheldMessage, cid, false);
+    case cw::Access::kRefused: // no grant is not an affirmative admission to a fleet-wide list
+        (void)issued_audit(audit_fn, req, res, "denied", target,
+                           cw::audit_detail_ca_withheld(cid, standing));
+        issued_fail(res, 403,
+                    standing == cw::Access::kRefused ? cw::kRefusedWithheldMessage
+                                                     : cw::kConfinedWithheldMessage,
+                    cid, false);
         return std::nullopt;
     case cw::Access::kDegraded:
         (void)issued_audit(audit_fn, req, res, "failure", target,
@@ -500,7 +506,6 @@ admit_issued_read(const CaRoutes::FilteredIssuedDeps& filtered, const httplib::R
         issued_fail(res, 503, "access check unavailable", cid, true);
         return std::nullopt;
     case cw::Access::kAvailable:
-    case cw::Access::kRefused: // no Inventory grant at all is not a confined view
         break;
     }
     return standing;
@@ -525,10 +530,11 @@ issued_panel_withheld(const CaRoutes::FilteredIssuedDeps& filtered, const httpli
     switch (filtered.confinement_fn(req)) {
     case cw::Access::kConfined:
         return cw::kConfinedWithheldMessage;
+    case cw::Access::kRefused:
+        return cw::kRefusedWithheldMessage;
     case cw::Access::kDegraded:
         return "Certificate inventory unavailable (access check failed).";
     case cw::Access::kAvailable:
-    case cw::Access::kRefused:
         break;
     }
     return std::nullopt;

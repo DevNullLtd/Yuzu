@@ -889,17 +889,15 @@ std::string audit_detail_inventory(std::string_view cid, std::size_t rows, int l
 }
 
 std::string audit_detail_with_standing(std::string detail, Access standing) {
-    // Exhaustive, no default: a new enumerator must be decided here. kConfined and kDegraded
-    // never reach a success row (the handlers answer them first); if a caller ever passed one,
-    // the row says so under a token distinct from the two real standings, never a false
-    // `refused`.
+    // Exhaustive, no default: a new enumerator must be decided here. Only kAvailable is ever
+    // served, so only kAvailable reaches a success row; kRefused, kConfined and kDegraded are
+    // answered first. If a caller ever passed one, the row says so under a token distinct from
+    // the real standing, never a false `available`.
     switch (standing) {
     case Access::kAvailable:
         detail += " standing=available";
         break;
     case Access::kRefused:
-        detail += " standing=refused";
-        break;
     case Access::kConfined:
     case Access::kDegraded:
         detail += " standing=unexpected";
@@ -927,8 +925,9 @@ std::string audit_detail_ca_degraded(std::string_view cid, std::optional<std::in
                        as_of ? std::to_string(*as_of) : std::string("db_now"), what);
 }
 
-std::string audit_detail_ca_withheld(std::string_view cid) {
-    return std::format("{}ws={} withheld=confined", cid_prefix(cid), kWindowSetVersion);
+std::string audit_detail_ca_withheld(std::string_view cid, Access standing) {
+    return std::format("{}ws={} withheld={}", cid_prefix(cid), kWindowSetVersion,
+                       standing == Access::kRefused ? "refused" : "confined");
 }
 
 std::string audit_detail_layout(std::string_view cid, std::size_t widgets,

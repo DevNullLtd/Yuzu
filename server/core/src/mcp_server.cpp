@@ -22151,10 +22151,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 // Exhaustive, no default: a new enumerator must be decided here, not served.
                 switch (standing) {
                 case cw::Access::kConfined:
+                case cw::Access::kRefused: // no grant is not an affirmative admission to a fleet-wide list
                     (void)audit_fn(req, "crypto.ca.certificates.view", "denied", "Security",
-                                   list_target, cw::audit_detail_ca_withheld(""));
-                    mcp_audit("denied", "withheld=confined");
-                    res.set_content(a4_error(kPermissionDenied, cw::kConfinedWithheldMessage), "application/json"); // retry-hint-exempt: authorization outcome, retrying cannot change it
+                                   list_target, cw::audit_detail_ca_withheld("", standing));
+                    mcp_audit("denied", standing == cw::Access::kRefused ? "withheld=refused"
+                                                                         : "withheld=confined");
+                    res.set_content(a4_error(kPermissionDenied,
+                                             standing == cw::Access::kRefused
+                                                 ? cw::kRefusedWithheldMessage
+                                                 : cw::kConfinedWithheldMessage),
+                                    "application/json"); // retry-hint-exempt: authorization outcome, retrying cannot change it
                     return;
                 case cw::Access::kDegraded:
                     (void)audit_fn(req, "crypto.ca.certificates.view", "failure", "Security",
@@ -22168,7 +22174,6 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 case cw::Access::kAvailable:
-                case cw::Access::kRefused: // no Inventory grant at all is not a confined view
                     break;
                 }
                 // ADR-0070 R2-2: any filter argument lists the certificates behind one

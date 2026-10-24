@@ -122,6 +122,12 @@ inline constexpr std::string_view kConfinedWithheldMessage =
     "Yuzu-issued certificate figures are not available to this account: its view of the fleet "
     "is confined, and these are fleet-wide figures.";
 
+/// The refusal a caller with NO Inventory read grant gets for the Yuzu-issued certificate list:
+/// holding no grant is not an affirmative admission to a fleet-wide list. Names no permission.
+inline constexpr std::string_view kRefusedWithheldMessage =
+    "Yuzu-issued certificate figures are not available to this account: it holds no read "
+    "access to the fleet inventory, and these are fleet-wide figures.";
+
 // ── The catalogue ────────────────────────────────────────────────────────────
 
 enum class WidgetKind { kNumber, kBar, kLine, kTable };
@@ -203,11 +209,13 @@ struct MergedLayout {
 
 // ── Availability (drawing only, never a grant) ───────────────────────────────
 
-/// A caller's standing for one gate: kAvailable; kRefused (not admitted for any cause other than a
-/// 503: no grant, or a read failure partway through the check, which the answer cannot tell
-/// apart; the issued-certificate LIST serves this standing); kConfined (a
-/// kFleetWideOnly widget and the caller's view is confined); kDegraded (the check answered 503:
-/// it could not be completed because a store behind it could not be read).
+/// A caller's standing for one gate: kAvailable; kRefused (not admitted and the check did not
+/// answer 503: the caller holds no grant. A READ failure inside the check is kDegraded, never
+/// this: the access check reports it separately, `ListReadAuthorization::read_failed`); kConfined
+/// (a kFleetWideOnly widget and the caller's view is confined); kDegraded (the check answered
+/// 503: it could not be completed because a store behind it could not be read). The
+/// issued-certificate LIST is served ONLY to kAvailable: kRefused and kConfined are withheld,
+/// kDegraded is a retryable 503.
 enum class Access { kAvailable, kRefused, kConfined, kDegraded };
 [[nodiscard]] std::string_view access_name(Access a);
 
@@ -373,8 +381,10 @@ struct LayoutRequest {
 [[nodiscard]] std::string audit_detail_ca_degraded(std::string_view cid,
                                                    std::optional<std::int64_t> as_of,
                                                    CryptoReadCause cause);
-/// `[cid=<cid> ]ws=<window set> withheld=confined` (a denied row: R2).
-[[nodiscard]] std::string audit_detail_ca_withheld(std::string_view cid);
+/// `[cid=<cid> ]ws=<window set> withheld=confined|refused` (a denied row: R2). `refused` names a
+/// caller with no Inventory grant; the default is the confined caller.
+[[nodiscard]] std::string audit_detail_ca_withheld(std::string_view cid,
+                                                   Access standing = Access::kConfined);
 /// `[cid=<cid> ]widgets=<n>[ expected_version=<v>]` (crypto.dashboard.layout.update).
 [[nodiscard]] std::string audit_detail_layout(std::string_view cid, std::size_t widgets,
                                               std::optional<std::int64_t> expected_version = std::nullopt);

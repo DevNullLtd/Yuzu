@@ -181,7 +181,7 @@ bool ca_counts_gate(const CryptoRoutes::Deps& d, const httplib::Request& req,
 /// The Yuzu-issued drill fragment's gates: perm_fn Security:Read, then the R2 confinement
 /// withhold (asked through the non-auditing access probe). A refusal or a withhold is a 200
 /// note, a degraded gate a banner with Retry - never a 4xx htmx would not swap.
-enum class CaGateOutcome { kAdmitted, kRefused, kConfined, kDegraded };
+enum class CaGateOutcome { kAdmitted, kRefused, kConfined, kNoInventoryGrant, kDegraded };
 CaGateOutcome ca_drill_gate(const CryptoRoutes::Deps& d, const httplib::Request& req,
                             httplib::Response& res) {
     if (!d.perm_fn || !d.access_fn) {
@@ -197,10 +197,11 @@ CaGateOutcome ca_drill_gate(const CryptoRoutes::Deps& d, const httplib::Request&
     switch (d.access_fn(req, cw::WidgetGate::kFleetWideOnly, "Inventory", "Read")) {
     case cw::Access::kConfined:
         return CaGateOutcome::kConfined;
+    case cw::Access::kRefused: // no grant is not an affirmative admission to a fleet-wide list
+        return CaGateOutcome::kNoInventoryGrant;
     case cw::Access::kDegraded:
         return CaGateOutcome::kDegraded;
     case cw::Access::kAvailable:
-    case cw::Access::kRefused: // no Inventory grant at all is not a confined view
         break;
     }
     return CaGateOutcome::kAdmitted;
@@ -641,6 +642,9 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         case CaGateOutcome::kConfined:
             send_html(res, crypto_html::render_ca_caveat(cw::kConfinedWithheldMessage, row));
+            return;
+        case CaGateOutcome::kNoInventoryGrant:
+            send_html(res, crypto_html::render_ca_caveat(cw::kRefusedWithheldMessage, row));
             return;
         case CaGateOutcome::kDegraded:
             res.status = 200;
