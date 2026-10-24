@@ -1540,7 +1540,7 @@ the `/crypto` drill and the Settings certificate panel's inventory is now:
 
 | Standing | Answer |
 |---|---|
-| kAvailable (a global `Inventory:Read`, an elevated session, or RBAC enforcement off) | served; success row ends `standing=available` |
+| kAvailable (a global `Inventory:Read`, an elevated session, an engine principal holding the grant, or RBAC enforcement off) | served; success row ends `standing=available` |
 | kConfined (`Inventory:Read` granted only through management groups) | withheld: 403 / permission denied; `denied` row ending `withheld=confined` |
 | kRefused (no `Inventory:Read` grant at all) | **withheld**: 403 / permission denied; `denied` row ending `withheld=refused` |
 | kDegraded (the access check could not complete, **including a read failure inside it**) | 503, `retry_after_ms` 5000; `failure` row; never the list |
