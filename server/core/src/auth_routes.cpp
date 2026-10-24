@@ -825,20 +825,22 @@ bool AuthRoutes::require_permission_impl(const httplib::Request& req, httplib::R
                             "application/json");
             return false;
         }
-        bool engine_granted = false;
-        if (rbac_store_->is_rbac_enabled()) {
+        // Deny-first compound gate (a stale raw is_rbac_enabled() view can only bias toward
+        // denying). `engine_unavailable` is set only when the read itself could not be completed.
+        bool engine_unavailable = false;
+        const auto engine_granted = [&] {
             const auto checked =
                 rbac_store_->check_permission_checked(session->username, securable_type, operation);
-            if (checked) {
-                engine_granted = *checked;
-            } else if (degrade == RbacDegradeMapping::UnavailableAs503) {
-                // The read could not be completed: still refused, but as the retryable outage it
-                // is, not as a definitive missing grant. Opt-in only; the default stays 403.
+            engine_unavailable = !checked && degrade == RbacDegradeMapping::UnavailableAs503;
+            return checked.value_or(false);
+        };
+        if (!rbac_store_->is_rbac_enabled() || !engine_granted()) {
+            if (engine_unavailable) {
+                // Opt-in only: still refused, but as the retryable outage it is, not as a
+                // definitive missing grant. The default stays 403.
                 respond_rbac_unavailable(req, res, securable_type, operation, "engine principal");
                 return false;
             }
-        }
-        if (!engine_granted) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "engine principal denied " + securable_type + ":" + operation);
             res.status = 403;
