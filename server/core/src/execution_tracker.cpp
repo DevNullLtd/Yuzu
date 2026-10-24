@@ -2571,7 +2571,10 @@ bool ExecutionTracker::record_command_dispatch(const std::string& command_id,
     // calls it BEFORE any frame is sent); a retry-once here would double the worst-case block on
     // the calling worker thread (REST/dashboard/MCP dispatch, or a background runner such as
     // ScheduleRunner/PreflightRunner/PolicyEvaluator, anything feeding the dispatch chokepoint)
-    // (2*kWriteTimeout) under sustained pool contention. update_agent_status's retry lives on the
+    // under sustained pool contention. kWriteTimeout bounds only the lease acquire; the statement
+    // itself runs under the pool's lock_timeout (10 s) and statement_timeout (30 s), so a held
+    // table lock blocks this write for about 10 s before it fails (measured 10.04 s), and a retry
+    // would double that. update_agent_status's retry lives on the
     // async gateway-response path, where that tradeoff is free.
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     // Every failed record is counted by the caller (`yuzu_exec_correlation_write_degrade_total`);

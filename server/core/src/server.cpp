@@ -13042,9 +13042,13 @@ private:
         // (a forged or never-issued id, a failed write, a reaped record) is stored and treated as
         // unverified, i.e. Forensics-tier (response_provenance.hpp). The plugin is the wire
         // plugin the agent will be sent (the catalogue's canonical spelling), not the caller's raw
-        // string. One upsert, at most one `kWriteTimeout` of added latency, never refuses or
-        // delays the dispatch beyond that bound (a failure is counted:
-        // yuzu_exec_correlation_write_degrade_total). Honest limit: the record proves the server
+        // string. One upsert, one attempt, never refused or retried on failure (a failure is
+        // counted: yuzu_exec_correlation_write_degrade_total). Its latency is bounded, but not by
+        // `kWriteTimeout`: that bounds only the lease acquire (2 s). Once the lease is held the
+        // statement runs under the pool's server-side lock_timeout (10 s) and statement_timeout
+        // (30 s); a held lock on the table was measured blocking the upsert for 10.04 s before it
+        // failed, so the worst case on the dispatching thread is about 2 s plus 10 s (30 s for a
+        // wedged statement), not 2 s. Honest limit: the record proves the server
         // issued this command id for this plugin; an endpoint it was sent to can still replay
         // that id on a frame of its own, and the content of a frame is not validated.
         agent_service_.record_command_dispatch(command_id, finalized->wire().plugin(),

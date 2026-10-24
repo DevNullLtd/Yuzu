@@ -581,9 +581,12 @@ public:
     /// and treated as Forensics-tier, withheld from a reader without the Forensics grant) and are
     /// not stamped with an execution id; the caller counts it
     /// (`yuzu_exec_correlation_write_degrade_total`). It DOES have a bounded worst-case DELAY: a
-    /// single attempt at `kWriteTimeout` (no retry; this sits on the SYNCHRONOUS pre-RPC dispatch
-    /// path, where a second attempt would double the worst-case block on the calling worker thread
-    /// under sustained pool contention). Returns false on failure; a caller MUST NOT fail or
+    /// single attempt (no retry; this sits on the SYNCHRONOUS pre-RPC dispatch path, where a second
+    /// attempt would double the worst-case block on the calling worker thread under sustained pool
+    /// contention). `kWriteTimeout` (2 s) bounds only the lease acquire; once the lease is held the
+    /// statement runs under the pool's server-side lock_timeout (10 s) and statement_timeout
+    /// (30 s), so a lock held on the table blocks the write for about 10 s (measured 10.04 s)
+    /// before it fails, and a wedged statement for up to 30 s. Returns false on failure; a caller MUST NOT fail or
     /// delay dispatch on a false return.
     ///
     /// `plugin` must be non-empty (an empty plugin is refused with false): a record without a
