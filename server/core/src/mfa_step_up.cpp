@@ -137,7 +137,7 @@ MfaFactorProbe probe_mfa_factor(const auth::Session& session, AuthDB& auth_db) {
     // every enrolment). A non-positive value is an unreadable row (fail closed): it would make
     // the binding comparison vacuous.
     if (status->factor_gen <= 0)
-        return {MfaFactorState::kStoreUnavailable};
+        return {.state = MfaFactorState::kStoreUnavailable, .unusable_row = true};
     return {MfaFactorState::kEnrolledLocal, status->factor_gen, status->db_now_ms,
             status->binding_enforced};
 }
@@ -172,7 +172,7 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
     case MfaFactorState::kIdpAttested:
         break;
     case MfaFactorState::kStoreUnavailable:
-        return store_unavailable("mfa_status");
+        return store_unavailable("mfa_status", probe.unusable_row);
     case MfaFactorState::kNoIdpProof:
         // The cached anchor of an SSO session is left empty both when the IdP attested no
         // second factor AND when the stored proof is dated after the database clock (the
@@ -205,7 +205,7 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
     // A degraded durable-proof read cannot tell a fresh proof from an over-age one: refuse
     // as unavailable (503, retryable), never as "no proof" (401 step-up the user cannot fix).
     if (durable.source == Source::kUnavailable)
-        return store_unavailable("durable mfa proof");
+        return store_unavailable("durable mfa proof", durable.binding_untrusted);
 
     // One window for the age test and the challenge: min(configured, 300 s).
     const int window_secs = approver_step_up_window(configured_window_secs);
@@ -251,9 +251,13 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
             judge_local_mfa_binding(durable, probe.factor_gen, probe.binding_enforced);
         switch (judgement.kind) {
         case LocalMfaBinding::kUnavailable:
-            return store_unavailable("durable mfa proof");
+            return store_unavailable("durable mfa proof", durable.binding_untrusted);
         case LocalMfaBinding::kUnenforced:
-            return store_unavailable("mfa factor binding", /*persistent=*/true);
+            // Persistent only once a validation OBSERVED the trigger not in force (or a recovery
+            // bypass): one catalog check that could not run reports not-enforced for that read
+            // alone and the next read passes, so that case keeps the transient answer.
+            return store_unavailable("mfa factor binding",
+                                     /*persistent=*/!auth_db.mfa_binding_enforced());
         case LocalMfaBinding::kNoProof:
         case LocalMfaBinding::kUnbound:
         case LocalMfaBinding::kMismatch:

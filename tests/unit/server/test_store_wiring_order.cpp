@@ -491,6 +491,52 @@ TEST_CASE("the source-scan headers and the step-up inventory do not use the regu
     }
 }
 
+// The MFA binding recovery bypass (#6079): `MfaBindingCheck::kBypassForRecovery` lets AuthDB and
+// SessionStore open past a missing or altered binding trigger, so a bypassed instance never vouches
+// for a binding. It exists for exactly two host recovery one-shots, both in main.cpp
+// (`--mfa-reset`, `--break-glass-arm`). Passing it anywhere a serving process builds its stores
+// would let a damaged trigger boot silently, so this pins WHERE it may appear: main.cpp exactly
+// twice, the declaring header and the two store implementations, and nowhere else under the server
+// sources (server.cpp builds the serving stores with the default). LEXICAL: it sees the token, not
+// a macro or an alias.
+TEST_CASE("kBypassForRecovery is passed only by the two recovery one-shots in main.cpp",
+          "[wiring_order]") {
+    const fs::path src = fs::path(YUZU_SERVER_SRC_DIR);
+    std::map<std::string, int> hits; // path relative to server/core -> occurrences
+    std::size_t scanned = 0;
+    for (const fs::path& root : {src, src / ".." / "include"}) {
+        REQUIRE(fs::is_directory(root));
+        for (const auto& entry : fs::recursive_directory_iterator(root)) {
+            if (!entry.is_regular_file())
+                continue;
+            const auto ext = entry.path().extension();
+            if (ext != ".cpp" && ext != ".hpp" && ext != ".h")
+                continue;
+            ++scanned;
+            const std::string text = read_text_file(entry.path());
+            int n = 0;
+            for (std::size_t at = text.find("kBypassForRecovery"); at != std::string::npos;
+                 at = text.find("kBypassForRecovery", at + 1))
+                ++n;
+            if (n > 0)
+                hits[entry.path().filename().string()] = n;
+        }
+    }
+    CHECK(scanned > 100); // not vacuous: the whole server tree was read
+    // Only these files may name it.
+    for (const auto& [file, n] : hits) {
+        INFO(file << " mentions kBypassForRecovery " << n << " time(s)");
+        CHECK((file == "main.cpp" || file == "auth_db.cpp" || file == "auth_db.hpp" ||
+               file == "session_store.cpp" || file == "session_store.hpp" ||
+               file == "mfa_binding_check.hpp"));
+    }
+    // main.cpp passes it at exactly two sites: the bootstrap AuthDB (a recovery one-shot only)
+    // and the SessionStore opened by --mfa-reset.
+    REQUIRE(hits.contains("main.cpp"));
+    CHECK(hits["main.cpp"] == 2);
+    CHECK_FALSE(hits.contains("server.cpp"));
+}
+
 // The matcher against small engineered inputs, independent of whatever
 // server.cpp contains on a given day; each section pins one clause of its grammar.
 TEST_CASE("find_confined_dispatch_sink_sites recognises the documented construction "

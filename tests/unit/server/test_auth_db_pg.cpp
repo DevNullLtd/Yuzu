@@ -42,6 +42,7 @@
 #include <barrier>
 #include <chrono>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -3581,8 +3582,13 @@ TEST_CASE("AuthDB recovery bypass opens past a tampered trigger and never report
           "[pg][auth_db][mfa_binding]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     PgConn conn = connect(db.dsn());
+    // Opens a store with `check`, seeds the account t1 and reads its status, so the status
+    // assertions observe `MfaStatus::binding_enforced` (an absent account answers an error before
+    // that field is set). `after` runs on the open store, for the recovery primitive.
     const auto open_with = [&](yuzu::server::MfaBindingCheck check, bool& opened,
-                               bool& enforced_flag, bool& enforced_status) {
+                               bool& enforced_flag, bool& enforced_status,
+                               const std::function<void(AuthDB&)>& after = {},
+                               bool read_status = true) {
         yuzu::test::TempDir keys;
         FileKeyProvider provider(keys.path);
         SecretCodec codec(provider);
@@ -3592,9 +3598,16 @@ TEST_CASE("AuthDB recovery bypass opens past a tampered trigger and never report
         enforced_flag = store.mfa_binding_enforced();
         enforced_status = false;
         if (opened) {
-            const auto st = store.mfa_status("no-such-user");
-            // An absent account answers an error; the flag is the contract either way.
-            enforced_status = st.has_value() && st->binding_enforced;
+            // The account is created on the first open; a later open finds it already there, so
+            // the upsert result is not asserted: the status read below is what must succeed.
+            (void)store.upsert_user("t1", "h", "s", yuzu::server::auth::Role::user);
+            if (read_status) {
+                const auto st = store.mfa_status("t1");
+                REQUIRE(st.has_value());
+                enforced_status = st->binding_enforced;
+            }
+            if (after)
+                after(store);
         }
     };
     bool opened = false, flag = false, status = false;
@@ -3608,12 +3621,29 @@ TEST_CASE("AuthDB recovery bypass opens past a tampered trigger and never report
     CHECK_FALSE(flag); // fail closed for any binding decision made through it
     CHECK_FALSE(status);
 
+    // The recovery promise itself: with the trigger disabled, the bypassed store can still clear
+    // an enrolled account's factor (the whole point of the bypass).
+    run_sql(conn.get(), "UPDATE auth.users SET mfa_totp_secret = '\\x01'::bytea, "
+                        "mfa_enrolled_at = now() WHERE username = 't1'");
+    // (The seeded secret is not a valid envelope, so the status of the still-enrolled row is not
+    // read: only the clear is under test.)
+    open_with(yuzu::server::MfaBindingCheck::kBypassForRecovery, opened, flag, status,
+              [&](AuthDB& store) {
+                  REQUIRE(store.mfa_disable("t1").has_value());
+                  const auto after_clear = store.mfa_status("t1");
+                  REQUIRE(after_clear.has_value());
+                  CHECK_FALSE(after_clear->enrolled);
+              },
+              /*read_status=*/false);
+    CHECK(opened);
+
     // Intact: the bypass still reports the binding as not enforced (a bypassed instance never
-    // vouches for it), while the default is unchanged.
+    // vouches for it), while the default is unchanged and DOES report it enforced.
     run_sql(conn.get(), kRestoreTriggerSql);
     open_with(yuzu::server::MfaBindingCheck::kEnforce, opened, flag, status);
     CHECK(opened);
     CHECK(flag);
+    CHECK(status);
     open_with(yuzu::server::MfaBindingCheck::kBypassForRecovery, opened, flag, status);
     CHECK(opened);
     CHECK_FALSE(flag);
@@ -3680,11 +3710,11 @@ TEST_CASE("AuthDB trigger validation latches (Invalid, sticky) on an AFTER or st
 }
 
 TEST_CASE("AuthDB trigger validation under 8 concurrent readers latches when the trigger is "
-          "disabled half-way and never un-latches",
+          "disabled between phases and stays latched after it is restored",
           "[pg][auth_db][mfa_binding]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     constexpr int kThreads = 8;
-    constexpr int kCalls = 50;
+    constexpr int kCalls = 25;
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("cc", "h", "s", yuzu::server::auth::Role::user).has_value());
     // A reader store with a pool wide enough for all threads at once (the harness pool is 4).
@@ -3696,40 +3726,59 @@ TEST_CASE("AuthDB trigger validation under 8 concurrent readers latches when the
     REQUIRE(reader.is_open());
     reader.set_binding_validation_memo_for_test(std::chrono::milliseconds(0)); // validate every read
 
+    // Three phases separated by barriers, so what each reader must see is deterministic: (1) the
+    // trigger is intact, every read is enforced; (2) thread 0 disabled it before the barrier
+    // opened, so EVERY read is not-enforced (a flag that did not publish to all threads, or a
+    // validation that raced and lost, shows here); (3) thread 0 restored it, and every read is
+    // STILL not-enforced (the latch is sticky: a re-enable cannot reconstruct the missed
+    // writes). Catch2 macros are used only after the join: they are not thread-safe.
     std::barrier start(kThreads);
-    std::atomic<int> calls{0};
     std::atomic<int> read_failures{0};
-    std::atomic<int> unlatched_after_seen_false{0};
+    std::atomic<int> phase1_unenforced{0};
+    std::atomic<int> phase2_enforced{0};
+    std::atomic<int> phase3_enforced{0};
+    std::atomic<int> ddl_failures{0};
+    const auto ddl = [&](const char* statement) {
+        PgConn c{PQconnectdb(db.dsn().c_str())};
+        PgResult r{PQexec(c.get(), statement)};
+        if (PQstatus(c.get()) != CONNECTION_OK || !r.ok())
+            ++ddl_failures;
+    };
+    const auto read_phase = [&](std::atomic<int>& wrong, bool expect_enforced) {
+        for (int i = 0; i < kCalls; ++i) {
+            auto st = reader.mfa_status("cc");
+            if (!st.has_value()) {
+                ++read_failures;
+                continue;
+            }
+            if (st->binding_enforced != expect_enforced)
+                ++wrong;
+        }
+    };
     {
         std::vector<std::jthread> threads;
         for (int t = 0; t < kThreads; ++t) {
-            threads.emplace_back([&] {
+            threads.emplace_back([&, t] {
                 start.arrive_and_wait();
-                bool seen_false = false;
-                for (int i = 0; i < kCalls; ++i) {
-                    if (calls.fetch_add(1) + 1 == kThreads * kCalls / 2) {
-                        // The middle call takes the trigger away (own connection, no pool).
-                        PgConn c{PQconnectdb(db.dsn().c_str())};
-                        PgResult r{PQexec(c.get(), "ALTER TABLE auth.users DISABLE TRIGGER "
-                                                   "users_mfa_factor_gen")};
-                        if (PQstatus(c.get()) != CONNECTION_OK || !r.ok())
-                            ++read_failures;
-                    }
-                    auto st = reader.mfa_status("cc");
-                    if (!st.has_value()) {
-                        ++read_failures;
-                        continue;
-                    }
-                    if (!st->binding_enforced)
-                        seen_false = true;
-                    else if (seen_false)
-                        ++unlatched_after_seen_false;
-                }
+                read_phase(phase1_unenforced, /*expect_enforced=*/true);
+                start.arrive_and_wait();
+                if (t == 0)
+                    ddl("ALTER TABLE auth.users DISABLE TRIGGER users_mfa_factor_gen");
+                start.arrive_and_wait();
+                read_phase(phase2_enforced, /*expect_enforced=*/false);
+                start.arrive_and_wait();
+                if (t == 0)
+                    ddl("ALTER TABLE auth.users ENABLE ALWAYS TRIGGER users_mfa_factor_gen");
+                start.arrive_and_wait();
+                read_phase(phase3_enforced, /*expect_enforced=*/false);
             });
         }
     } // jthreads join here
+    CHECK(ddl_failures.load() == 0);
     CHECK(read_failures.load() == 0);
-    CHECK(unlatched_after_seen_false.load() == 0);
+    CHECK(phase1_unenforced.load() == 0);
+    CHECK(phase2_enforced.load() == 0);
+    CHECK(phase3_enforced.load() == 0);
     // Every call that starts after the join sees it too.
     CHECK_FALSE(reader.mfa_binding_enforced());
     CHECK_FALSE(reader.mfa_status("cc")->binding_enforced);

@@ -2356,6 +2356,10 @@ TEST_CASE("a latched rebind guard makes the local proof read unavailable and lea
         REQUIRE(res);
         CHECK(res->status == 503);
         CHECK(fx->status_of(ticket) == "pending");
+        // The latched guard lasts until an operator repairs it and restarts: no retry hint.
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(body.at("error").at("retry_after_ms").is_null());
+        CHECK(res->body.find("retry the request") == std::string::npos);
     }
     {
         auto fx = fx_for(true);

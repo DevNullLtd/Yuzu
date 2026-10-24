@@ -217,13 +217,15 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
                                             "approval", audit_id,
                                             "approver_assurance:mfa_store_unavailable");
         if (mfa.persistent) {
-            // The factor-generation trigger is not in force: no retry can succeed until an
-            // operator repairs it and restarts, so no retry hint and no "retry the request".
+            // The condition does not clear by itself (a binding trigger or rebind guard not in
+            // force, or an enrolled row with an unusable factor generation): no retry can
+            // succeed until an operator repairs it, so no retry hint and no "retry the request".
             write_a4(res, 503,
                      "the approver's MFA binding cannot be verified, so the decision was not "
                      "recorded",
-                     "ask an operator to restore the auth store's MFA trigger and restart the "
-                     "server; the approval ticket is unchanged and still pending");
+                     "ask an operator to follow the MFA binding enforcement runbook (restore the "
+                     "auth store's MFA triggers and restart the server, or repair the account's "
+                     "MFA state); the approval ticket is unchanged and still pending");
             return;
         }
         write_a4(res, 503,

@@ -1127,48 +1127,62 @@ TEST_CASE("SessionStore v3: a failure observed by find is sticky until restart",
     CHECK(fresh.rebind_guard_ok());
 }
 
-TEST_CASE("SessionStore v3: concurrent validation with the trigger disabled half-way latches the "
-          "flag and never un-latches",
+TEST_CASE("SessionStore v3: concurrent validation latches when the trigger is disabled between "
+          "phases and stays latched after it is restored",
           "[session_store][pg][mfa_binding]") {
     YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
     constexpr int kThreads = 8;
-    constexpr int kCalls = 50;
+    constexpr int kCalls = 25;
     PgPool pool{{.conninfo = db.dsn(), .size = kThreads + 2}};
     SessionStore store{pool};
     REQUIRE(store.is_open());
     store.set_binding_validation_memo_for_test(std::chrono::milliseconds{0}); // every find validates
 
+    // Three phases separated by barriers, so what each reader must see is deterministic: (1) the
+    // trigger is intact, the guard reads in force; (2) thread 0 disabled it before the barrier
+    // opened, so EVERY reader sees it latched; (3) thread 0 restored it, and every reader STILL
+    // sees it latched (a re-enabled guard cannot reconstruct the writes it missed). Catch2 macros
+    // are used only after the join: they are not thread-safe.
     std::barrier start(kThreads);
-    std::atomic<int> calls{0};
     std::atomic<int> find_failures{0};
-    std::atomic<int> unlatched_after_seen_false{0};
-    std::atomic<bool> disable_failed{false};
+    std::atomic<int> phase1_latched{0};
+    std::atomic<int> phase2_in_force{0};
+    std::atomic<int> phase3_in_force{0};
+    std::atomic<int> ddl_failures{0};
+    const auto read_phase = [&](std::atomic<int>& wrong, bool expect_in_force) {
+        for (int i = 0; i < kCalls; ++i) {
+            if (!store.find("none").has_value())
+                ++find_failures;
+            if (store.rebind_guard_ok() != expect_in_force)
+                ++wrong;
+        }
+    };
     {
         std::vector<std::jthread> threads;
         for (int t = 0; t < kThreads; ++t) {
-            threads.emplace_back([&] {
+            threads.emplace_back([&, t] {
                 start.arrive_and_wait();
-                bool seen_false = false;
-                for (int i = 0; i < kCalls; ++i) {
-                    // Exactly one call, the middle one, takes the trigger away.
-                    if (calls.fetch_add(1) + 1 == kThreads * kCalls / 2 &&
-                        !exec_ok(pool, "ALTER TABLE session_store.sessions DISABLE TRIGGER "
-                                       "sessions_mfa_rebind_guard"))
-                        disable_failed = true;
-                    if (!store.find("none").has_value())
-                        ++find_failures;
-                    const bool ok = store.rebind_guard_ok();
-                    if (!ok)
-                        seen_false = true;
-                    else if (seen_false)
-                        ++unlatched_after_seen_false; // a latched flag must never read true again
-                }
+                read_phase(phase1_latched, /*expect_in_force=*/true);
+                start.arrive_and_wait();
+                if (t == 0 && !exec_ok(pool, "ALTER TABLE session_store.sessions DISABLE TRIGGER "
+                                             "sessions_mfa_rebind_guard"))
+                    ++ddl_failures;
+                start.arrive_and_wait();
+                read_phase(phase2_in_force, /*expect_in_force=*/false);
+                start.arrive_and_wait();
+                if (t == 0 && !exec_ok(pool, "ALTER TABLE session_store.sessions ENABLE ALWAYS "
+                                             "TRIGGER sessions_mfa_rebind_guard"))
+                    ++ddl_failures;
+                start.arrive_and_wait();
+                read_phase(phase3_in_force, /*expect_in_force=*/false);
             });
         }
     } // jthreads join here
-    REQUIRE_FALSE(disable_failed.load());
+    REQUIRE(ddl_failures.load() == 0);
     CHECK(find_failures.load() == 0);
-    CHECK(unlatched_after_seen_false.load() == 0);
+    CHECK(phase1_latched.load() == 0);
+    CHECK(phase2_in_force.load() == 0);
+    CHECK(phase3_in_force.load() == 0);
     // Every call that starts after the join sees the same answer.
     CHECK_FALSE(store.rebind_guard_ok());
     REQUIRE(store.find("none").has_value());

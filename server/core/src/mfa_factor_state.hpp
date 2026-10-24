@@ -51,6 +51,10 @@ struct MfaFactorProbe {
     std::int64_t factor_gen{0};
     std::int64_t db_now_ms{0};
     bool binding_enforced{true};
+    /// With `kStoreUnavailable` only: the read worked but the ROW is wrong (an enrolled account
+    /// whose factor generation is not positive: a tampered row or a data-only restore). That does
+    /// not clear on its own, unlike a failed read.
+    bool unusable_row{false};
 };
 
 /// Hard ceiling on how old an MFA proof may be to decide an approval. A
@@ -71,7 +75,8 @@ enum class LocalMfaBinding : std::uint8_t {
     kNoProof,     ///< the durable row carries no proof (absent row, other principal, or 0 instant)
     kUnbound,     ///< a proof with no generation (legacy row, or a write the rebind guard unbound)
     kMismatch,    ///< bound to a generation that is no longer the account's
-    kUnavailable, ///< the durable read is degraded or unusable: no decision can be made (503)
+    kUnavailable, ///< the durable read is degraded or unusable, or the enrolled generation is not
+                  ///< positive: no decision can be made (503)
     kUnenforced,  ///< the generation trigger is not observed in force: no decision (503)
 };
 
@@ -172,10 +177,12 @@ struct ApproverMfaOutcome {
     };
     Kind kind{Kind::kRefuse};
     MfaFactorState factor{MfaFactorState::kNotEnrolled};
-    /// Only with `kStoreUnavailable`: the cause is PERSISTENT (the factor-generation trigger is
-    /// not observed in force, `mfa_binding_unenforced`), so a retry cannot succeed until an
-    /// operator repairs it and restarts. False for the transient causes (an unreadable enrolment
-    /// or durable-proof read), where a short retry is honest.
+    /// Only with `kStoreUnavailable`: the cause is PERSISTENT, so a retry cannot succeed until an
+    /// operator repairs something: a binding trigger that a validation OBSERVED not in force (or
+    /// a recovery bypass), a session-store rebind guard latched not in force, or an enrolled row
+    /// whose factor generation is not positive. False for the transient causes (an unreadable
+    /// enrolment or durable-proof read, or one catalog check that could not run), where a short
+    /// retry is honest.
     bool persistent{false};
 };
 

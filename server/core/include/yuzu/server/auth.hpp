@@ -373,6 +373,11 @@ struct DurableMfaProof {
     /// unbound, or a proof written before the binding existed. A binding decision treats an unbound
     /// proof as no proof. Meaningful only for `kRow`.
     std::int64_t mfa_factor_gen{0};
+    /// With `kUnavailable` only: the read itself succeeded but the stored generation cannot be
+    /// trusted because the session store's rebind guard is not observed in force
+    /// (`AuthRoutes::durable_mfa_proof_for`). That state is sticky until an operator repairs the
+    /// guard and restarts, unlike a failed read, so a caller must not advertise a retry for it.
+    bool binding_untrusted{false};
 };
 static_assert(DurableMfaProof{}.source == DurableMfaProof::Source::kUnavailable,
               "a default-constructed DurableMfaProof must refuse (fail closed)");

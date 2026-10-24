@@ -744,8 +744,10 @@ public:
         /// False once the generation trigger has been observed missing, disabled, replica-only, or
         /// with an altered body (validated at boot and behind a 60 s memo). STICKY until restart:
         /// generation changes made while the trigger was not firing are not reconstructable, so a
-        /// re-enable must not silently re-admit. A gate that compares generations MUST answer
-        /// store-unavailable while this is false.
+        /// re-enable must not silently re-admit. Also false from construction for a recovery-
+        /// bypassed instance (`MfaBindingCheck::kBypassForRecovery`), and for ONE read when the
+        /// catalog check could not run (the next read re-validates). A gate that compares
+        /// generations MUST answer store-unavailable while this is false.
         bool binding_enforced{true};
     };
 
@@ -793,8 +795,10 @@ public:
 
     /// #6079: the sticky flag behind `MfaStatus::binding_enforced`, read without a database
     /// round trip (the `yuzu_auth_mfa_binding_enforcement_ok{store="auth"}` gauge samples it).
-    /// False only after a validation has OBSERVED the generation trigger not in force; it does
-    /// not run a validation itself, so it reads true until a `mfa_status` call finds the fault.
+    /// False only after a validation has OBSERVED the generation trigger not in force, or from
+    /// construction for a recovery-bypassed instance; it does not run a validation itself, so it
+    /// reads true until a `mfa_status` call finds the fault. A single catalog check that could
+    /// not run does NOT set it (that read alone reports not-enforced).
     [[nodiscard]] bool mfa_binding_enforced() const noexcept;
 
     /// Generate a fresh TOTP secret and write it as provisional (encrypted).

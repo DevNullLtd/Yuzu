@@ -73,7 +73,8 @@
  * affected; `touch_activity`, elevation and reap name none of those columns. A proof
  * instant later than the writing statement's `now()` is REFUSED (stored as no proof, no
  * binding), never clamped to an age-zero proof. The trigger's effective firing is
- * validated at construction (a failure leaves the store closed) and again by `find`
+ * validated at construction (a failure leaves the store closed, except for the recovery
+ * one-shots that open it with `MfaBindingCheck::kBypassForRecovery`) and again by `find`
  * behind a steady-clock memo; a failure observed after boot is STICKY until restart
  * (`rebind_guard_ok()` reads false), because a re-enabled trigger cannot reconstruct
  * the writes it missed. Validation is request-driven only: a disable, change and

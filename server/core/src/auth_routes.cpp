@@ -290,7 +290,8 @@ auth::DurableMfaProof AuthRoutes::durable_mfa_proof_for(const httplib::Request& 
     // does not apply to an SSO session.
     if (durable.source == auth::DurableMfaProof::Source::kRow &&
         !auth_mgr_.stored_binding_trustworthy())
-        return auth::DurableMfaProof{.source = auth::DurableMfaProof::Source::kUnavailable};
+        return auth::DurableMfaProof{.source = auth::DurableMfaProof::Source::kUnavailable,
+                                     .binding_untrusted = true};
     return durable;
 }
 
@@ -3656,10 +3657,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         if (mfa_verify_barrier_for_test_) // test seam, empty in production
             mfa_verify_barrier_for_test_("/login/mfa/stepup", proof);
         // #6079: the stamp stores the verifier's own generation and instant. Anything but
-        // kStamped admits nothing (the clear, where one was needed, is the primitive's): for
-        // kFutureDated and kFactorChanged the session holds no proof (mark_mfa already wrote 0,
-        // or the factor recheck cleared it), the answer is the uniform 401 (503 for a store
-        // error), and the audit detail says why. kNoSession keeps the pre-binding wording.
+        // kStamped admits nothing new (the clear, where one was needed, is the primitive's): a
+        // kFutureDated stamp left no proof (mark_mfa wrote 0); after kFactorChanged the
+        // recheck clears the proof, and if that clear fails the row keeps a proof bound to the
+        // OLD generation, which equality refuses. The answer is the uniform 401 (503 for a
+        // store error), and the audit detail says why. kNoSession keeps the pre-binding wording.
         const auto stamp = auth_mgr_.stamp_session_mfa_proof(token, proof);
         if (stamp != auth::AuthManager::MfaStampOutcome::kStamped) {
             using O = auth::AuthManager::MfaStampOutcome;
@@ -3683,8 +3685,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
             if (stamp == O::kStoreError) {
                 // The code was valid and is ALREADY consumed (the TOTP counter or recovery code
-                // is spent), but the session store could not record it, so nothing was admitted.
-                // An outage, not a bad credential, yet a retry with the SAME code is a 401 replay:
+                // is spent), but the stamp could not be confirmed: the store write failed, or the
+                // factor recheck could not read the generation and the proof was cleared (a
+                // failed clear in that double fault leaves a genuine proof for the current
+                // generation). An outage, not a bad credential, yet a retry with the SAME code is a 401 replay:
                 // so no retry_after_ms (an immediate retry cannot succeed) and a message that
                 // tells the operator to wait for the next code.
                 res.status = 503;

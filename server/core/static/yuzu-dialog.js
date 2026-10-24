@@ -155,10 +155,11 @@
         submit: function (v) {
           return rawRequest('POST', challenge, { form: { code: v.code.trim() } }).then(function (r) {
             if (r.ok) return null;
-            // 503: the code was valid and is spent, but could not be recorded; a retry with the
-            // same code would be refused as a replay.
-            return r.status === 503
-              ? 'Your code was accepted but could not be recorded. Wait for the next code and try again.'
+            // 503: the server names the cause itself. Before verification the code was not
+            // checked (retry now); after it the code is spent and could not be recorded (wait
+            // for the next one), so show the server's own message rather than guess.
+            return r.status === 503 && r.message
+              ? r.message
               : 'That code was not accepted. Check it and try again.';
           });
         }

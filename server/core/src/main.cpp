@@ -549,10 +549,11 @@ int main(int argc, char* argv[]) {
                    "is neither refused nor recorded, SAML sessions and token principals pass "
                    "those 35, and the auth store is not read; engine denials and unwired-store "
                    "refusals still apply and are recorded. The two factor-credential routes "
-                   "(regenerate recovery codes, disable MFA) ignore this setting and always "
-                   "require a local session with a proof inside min(this value, 300) seconds. "
-                   "Approval approve/reject always use the approver window (at most 300 "
-                   "seconds): an enrolled factor and a proof within min(this value, 300) seconds")
+                   "(regenerate recovery codes, disable MFA) ignore a value <= 0 and always "
+                   "require a local session with a proof inside the approver window. "
+                   "Approval approve/reject always use that window too: an enrolled factor and "
+                   "a proof within min(this value, 300) seconds, or 300 seconds when this value "
+                   "is <= 0")
         ->default_val(300)
         ->envname("YUZU_MFA_STEP_UP_WINDOW_SECS");
     app.add_option("--mfa-login-pending-secs", cfg.mfa_login_pending_secs,
@@ -1251,14 +1252,15 @@ int main(int argc, char* argv[]) {
             "step-up routes only (REST, dashboard and Settings routes; the three JIT-elevation "
             "routes keep their own 300 s window). On those 35 a stale or absent proof is neither "
             "refused nor recorded (no SOC 2 CC6.6 `mfa.step_up.required` evidence row), they will "
-            "NOT re-prompt for MFA proof, SAML sessions and token principals pass, and the auth "
+            "NOT re-prompt for MFA proof, SAML sessions pass, and the auth "
             "store is not read. Engine-principal denials and unwired-auth-store refusals still "
             "apply on those routes and are still recorded. Set to a positive value (default 300) "
             "to restore the requirement. Two route classes ignore the setting: the two "
             "factor-credential routes (regenerate recovery codes, disable MFA) always require a "
-            "local session with a proof inside min(window, 300) s, and the approval decide routes "
-            "(POST /api/approvals/{{id}}/approve and /reject) always require an ENROLLED caller's "
-            "proof no older than the approver window (300 s at most).",
+            "local session with a proof inside the approver window, and the approval decide "
+            "routes (POST /api/approvals/{{id}}/approve and /reject) always require an ENROLLED "
+            "caller's proof inside that window; the approver window is 300 s when the setting is "
+            "<= 0 and never more than 300 s.",
             cfg.mfa_step_up_window_secs);
     }
 
@@ -1996,11 +1998,13 @@ int main(int argc, char* argv[]) {
                          "status and re-run\n";
             return EXIT_FAILURE;
         }
-        // End the account's durable sessions in the same one-shot (#6079). A surviving proof
-        // made under the factor just cleared is already refused: it records the old factor
-        // generation and the next enrolment advances it, so equality fails (no clock is
-        // involved). What ending the sessions removes is the password access a live session
-        // made under the cleared factor keeps. The delete bumps the durable generation, so
+        // End the account's durable sessions in the same one-shot (#6079). While the
+        // generation trigger is in force a surviving proof made under the factor just cleared
+        // is already refused: it records the old factor generation and the next enrolment
+        // advances it, so equality fails (no clock is involved). With the trigger ABSENT (the
+        // recovery bypass) the clear does not advance the generation, so this delete is the
+        // only barrier. Either way it removes the password access a live session made under
+        // the cleared factor keeps. The delete bumps the durable generation, so
         // every replica drops its cached copy on its next refresh. A failure here is loud and
         // non-zero: the factor is already cleared, so the operator must end the sessions by
         // hand.

@@ -1559,6 +1559,39 @@ TEST_CASE_METHOD(BindingFixture,
     CHECK(run(with_wall_proof(*this, "oidc:x#y", "oidc", seconds(10))).outcome.kind == Kind::kPass);
 }
 
+TEST_CASE_METHOD(BindingFixture,
+                 "require_enrolled_fresh_mfa: a sticky unavailable cause is persistent (no retry "
+                 "hint); a failed read is transient",
+                 "[pg][mfa][stepup][approver][binding]") {
+    const auto g = gen_of("alice");
+    const auto cached = make_session("alice", "local", system_clock::now());
+
+    // A durable read that was refused because the session store's rebind guard is latched
+    // (`durable_mfa_proof_for` marks it) lasts until an operator repairs it; a plain failed read
+    // does not.
+    {
+        auth::DurableMfaProof untrusted;
+        untrusted.source = Source::kUnavailable;
+        untrusted.binding_untrusted = true;
+        auto r = run(cached, 300, nullptr, untrusted);
+        CHECK(r.outcome.kind == Kind::kStoreUnavailable);
+        CHECK(r.outcome.persistent);
+        auto transient = run(cached, 300, nullptr, auth::DurableMfaProof{});
+        CHECK(transient.outcome.kind == Kind::kStoreUnavailable);
+        CHECK_FALSE(transient.outcome.persistent);
+    }
+
+    // An enrolled row whose factor generation is not positive (a tampered row, or a data-only
+    // restore of a dump that predates the generation) does not clear on its own either.
+    exec_plain("ALTER TABLE auth.users DISABLE TRIGGER users_mfa_factor_gen");
+    exec_plain("UPDATE auth.users SET mfa_factor_gen = 0 WHERE username = 'alice'");
+    exec_plain("ALTER TABLE auth.users ENABLE ALWAYS TRIGGER users_mfa_factor_gen");
+    auto r = run(cached, 300, nullptr, durable_aged(5'000, g));
+    CHECK(r.outcome.kind == Kind::kStoreUnavailable);
+    CHECK(r.outcome.persistent);
+    check_untouched(r);
+}
+
 TEST_CASE("ApproverMfaOutcome: a value-initialised outcome refuses (R20)",
           "[mfa][stepup][approver]") {
     static_assert(ApproverMfaOutcome{}.kind == ApproverMfaOutcome::Kind::kRefuse);
