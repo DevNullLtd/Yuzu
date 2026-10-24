@@ -20,6 +20,7 @@
 #include <functional>
 #include <array>
 #include <charconv>
+#include <optional>
 #include <set>
 #include <string>
 #include <tuple>
@@ -197,7 +198,6 @@ const std::vector<pg::PgMigration>& build_migrations() {
          "CREATE INDEX cert_fact_sig_alg_idx ON cert_fact (sig_alg_oid, pss_hash_oid);"
          "CREATE INDEX cert_fact_key_alg_idx ON cert_fact (key_alg_oid, rsa_modulus_bits);"
          "CREATE INDEX cert_fact_ec_order_idx ON cert_fact (ec_order_bits);"
-         "CREATE INDEX cert_fact_sha256_idx ON cert_fact (sha256);"
          "CREATE INDEX cert_fact_spki_idx ON cert_fact (spki_sha256);"
          "CREATE INDEX cert_fact_aki_idx ON cert_fact (aki_key_id);"
          // Where a certificate was seen. full_report_at is the last_full_at of the full report
@@ -365,18 +365,16 @@ Json fact_json(const CertFactRow& f, const std::string& child_digest) {
 }
 
 /// A fresh 64-bit sample key from the process CSPRNG (the server's own, unpredictable to agents).
-/// A CSPRNG failure falls back to a time-derived value: the key only orders a sample, it is never an
-/// authenticator, and ingest must not fail for it.
-std::int64_t random_sample_key() {
+/// nullopt on a CSPRNG failure: there is deliberately NO fallback, a predictable key must never be
+/// stored (the caller fails that ingest, which the agent retries).
+std::optional<std::int64_t> random_sample_key() {
     std::array<std::uint8_t, 8> b{};
-    if (fill_random(b)) {
-        std::uint64_t v = 0;
-        for (const auto x : b)
-            v = (v << 8) | x;
-        return static_cast<std::int64_t>(v);
-    }
-    return static_cast<std::int64_t>(
-        std::chrono::steady_clock::now().time_since_epoch().count() * 0x9E3779B97F4A7C15ULL);
+    if (!fill_random(b))
+        return std::nullopt;
+    std::uint64_t v = 0;
+    for (const auto x : b)
+        v = (v << 8) | x;
+    return static_cast<std::int64_t>(v);
 }
 
 std::int64_t result_i64(const pg::PgResult& res, int row, int col) {
@@ -499,6 +497,7 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
         digests.push_back(std::move(d));
     }
     bool budget_hit = false;
+    bool entropy_failed = false;
     const bool committed = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
         std::size_t rows = facts.size() + locs.size();
         for (const auto* f : facts)
@@ -529,6 +528,25 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
             return false;
         const std::string T = PQgetvalue(tr.get(), 0, 0);
 
+        // The key is drawn only for an agent never seen before (the per-agent advisory lock makes
+        // the existence check race-free) and is never rewritten afterwards.
+        pg::PgResult ks = pg::exec_params(
+            c, "SELECT sample_key::text FROM certificate_inventory_store.agent_state WHERE agent_id = $1",
+            std::vector<std::string>{id});
+        if (!tup_ok(ks))
+            return false;
+        std::string key_text;
+        if (PQntuples(ks.get()) == 1) {
+            key_text = PQgetvalue(ks.get(), 0, 0);
+        } else {
+            const auto k = random_sample_key();
+            if (!k) {
+                entropy_failed = true;
+                return false;
+            }
+            key_text = std::to_string(*k);
+        }
+
         pg::PgResult as = pg::exec_params(
             c,
             "INSERT INTO certificate_inventory_store.agent_state "
@@ -537,10 +555,8 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
             "ON CONFLICT (agent_id) DO UPDATE SET content_hash = EXCLUDED.content_hash, "
             "  first_seen = LEAST(certificate_inventory_store.agent_state.first_seen, EXCLUDED.first_seen), "
             "  blob_version = EXCLUDED.blob_version, last_seen = EXCLUDED.last_seen, "
-            "  last_full_at = EXCLUDED.last_full_at, "
-            "  sample_key = COALESCE(certificate_inventory_store.agent_state.sample_key, EXCLUDED.sample_key)",
-            std::vector<std::string>{id, std::string(content_hash), report.blob_version, T,
-                                     std::to_string(random_sample_key())});
+            "  last_full_at = EXCLUDED.last_full_at",
+            std::vector<std::string>{id, std::string(content_hash), report.blob_version, T, key_text});
         if (!cmd_ok(as))
             return false;
 
@@ -742,6 +758,12 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
         CertIngestResult r;
         r.outcome = CertIngestOutcome::kBudgetExceeded;
         return r;
+    }
+    if (!committed && entropy_failed) {
+        spdlog::error("CertificateInventoryStore: CSPRNG failure assigning the sample key for agent={} - "
+                      "report not stored, the agent will retry",
+                      agent_id);
+        return CertIngestResult{};
     }
     if (!committed) {
         spdlog::warn("CertificateInventoryStore: ingest_full transaction failed for agent={} ({})",
