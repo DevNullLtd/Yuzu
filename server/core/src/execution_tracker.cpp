@@ -2480,22 +2480,37 @@ constexpr std::int64_t kCmdExecutionReapWindowSecs = 24 * 3600;
 // held one row per TRACKED execution; it now holds one row per DISPATCH (server-authored
 // provenance), including per-agent system pushes (`__guard__` policy pushes, `asset_tags` sync),
 // so inflow can reach one row per connected agent per fleet-wide event. The old cap (5000 per
-// ~60-minute pass = 120k rows/day of reclaim) would let the table grow without bound once
-// inflow exceeded that. Sizing (assumptions stated, not measured on a fleet): the short-term
-// target is ~5,000 agents (about 1e4 rows/day organically, a few 5,000-row bursts per fleet event);
-// the long-term target is 500,000 agents (one fleet-wide push event = 500,000 rows, a few events
-// a day = low millions/day). 50,000 x 24 passes = 1.2M rows/day of reclaim covers the short-term
-// target by two orders of magnitude and the long-term steady state, and drains a 500,000-row
-// burst past the window in ten passes. Measured on a synthetic 1M-row table (PostgreSQL 16, the
-// exact DELETE .. IN (SELECT .. LIMIT n) shape below, rolled back and repeated): ~0.13 s for 5,000
-// rows, ~0.28 s for 50,000, ~0.38 s for 100,000, so one 50,000-row pass is a sub-second
-// transaction that holds row locks only on rows already past the window (no live dispatch or
-// lookup touches them). A larger cap buys nothing the cadence does not, and the cap stays an
-// UNCONDITIONAL bound on the work one pass (and one skewed-clock pass) can do. Saturation is
-// observable: a pass that deletes exactly this cap is `yuzu_exec_correlation_reap_total`
-// moving by the cap every hour. Cadence stays the caller's ~60 minutes
-// (server.cpp kCmdExecutionReapEveryNTicks); it is NOT shortened, because the clock-anomaly
-// threshold below is sized against it.
+// ~60-minute pass = 120k rows/day of reclaim) would let the table grow without bound once inflow
+// exceeded that.
+//
+// What 50,000 per pass covers (assumptions stated, not measured on a fleet): 50,000 rows x 24
+// hourly passes = 1.2M rows/day of reclaim, so the table stays bounded while the SUSTAINED inflow
+// stays under 1.2M dispatch records a day (about 50,000 an hour, roughly 14 a second).
+//   - Short-term target, about 5,000 agents: a fleet-wide per-agent event is 5,000 rows, so 1.2M a
+//     day is about 240 such events a day; the organic dispatch rate is on the order of 1e4 rows a
+//     day. Covered by two orders of magnitude.
+//   - Long-term target, 500,000 agents: one fleet-wide per-agent event is 500,000 rows, so the cap
+//     covers up to two such events a day (1.0M rows) plus about 0.2M rows of other dispatches. A
+//     third event (1.5M rows) is above the reclaim rate. A burst is drained over the following
+//     passes (a 500,000-row burst past the window takes ten), but a SUSTAINED inflow above
+//     1.2M rows/day saturates the cap on every pass and the table then grows by the difference
+//     (about 210 bytes a row, indexes included).
+//   - The same ceiling applies to API-driven dispatch: a sustained rate above about 14 a second
+//     saturates it. A per-principal or per-address inflow quota is NOT part of this bound; it is
+//     tracked as a separate follow-up.
+// Saturation is observable but not alerted: a saturated pass deletes exactly this cap, so
+// `yuzu_exec_correlation_reap_total` moves by the cap every hour. No shipped alert rule watches it.
+//
+// Cost, measured (PostgreSQL 16, synthetic time-ordered tables built with generate_series, the
+// exact statement below, rolled back and repeated 5-6 times, cap 50,000): median 34 ms at 1M rows
+// and 35 ms at 10M rows. The earlier `DELETE .. WHERE command_id IN (SELECT .. LIMIT n)` shape
+// planned a Hash Semi Join over a Seq Scan of the whole table, so it cost O(table) whatever the
+// cap: median 180 ms at 1M rows and 1.74 s at 10M. The ctid form reads only the cap's worth of
+// index entries (Index Scan feeding a Tid Scan), so the pass cost follows the cap, not the table.
+// A pass holds row locks only on rows already past the window and no live dispatch touches them.
+// The cap stays an UNCONDITIONAL bound on the work one pass (and one skewed-clock pass) can do.
+// Cadence stays the caller's ~60 minutes (server.cpp kCmdExecutionReapEveryNTicks); it is NOT
+// shortened, because the clock-anomaly threshold below is sized against it.
 constexpr int kCmdExecutionReapCap = 50000;
 // A DB `now()` reading more than this far ahead of the persisted anchor is
 // an anomaly, not legitimate elapsed time between reap ticks. The nominal
@@ -2720,13 +2735,20 @@ ExecutionTracker::reap_command_execution_mappings() {
             clock_anomaly = true;
             return true;
         }
-        // The deleted ids are counted in SQL, not returned: at the 50,000-row cap a RETURNING
-        // list would ship megabytes of ids to count them.
+        // The deleted rows are counted in SQL, not returned: at the 50,000-row cap a RETURNING
+        // list would ship megabytes of ids to count them. The oldest rows go first (the index on
+        // created_at feeds the subselect, so the work follows the cap, not the table). The outer
+        // `created_at < cutoff` re-tests the age on the row version actually deleted: a row that
+        // `record_command_dispatch` refreshed between the subselect and the delete is a live
+        // dispatch, and must not be taken from under it (a refreshed row also changes ctid, which
+        // is skipped by the ctid match; the re-test is the explicit statement of the same rule).
         pg::PgResult dr = pg::exec_params(
             c,
-            "WITH d AS (DELETE FROM execution_tracker.command_execution WHERE command_id IN "
-            "(SELECT command_id FROM execution_tracker.command_execution "
-            " WHERE created_at < $1::bigint LIMIT $2::bigint) RETURNING 1) "
+            "WITH d AS (DELETE FROM execution_tracker.command_execution "
+            " WHERE ctid = ANY(ARRAY(SELECT ctid FROM execution_tracker.command_execution "
+            "                         WHERE created_at < $1::bigint "
+            "                         ORDER BY created_at LIMIT $2::bigint)) "
+            "   AND created_at < $1::bigint RETURNING 1) "
             "SELECT count(*) FROM d",
             std::vector<std::string>{std::to_string(now_s - kCmdExecutionReapWindowSecs),
                                      std::to_string(kCmdExecutionReapCap)});
@@ -2754,27 +2776,24 @@ ExecutionTracker::reap_command_execution_mappings() {
 
 namespace {
 // The window and skew values are bit-identical to the command_execution sibling's
-// (kCmdExecutionReapWindowSecs / kMaxPlausibleSkewSecs) and that is DELIBERATE;
-// the CAP is NOT in lockstep any more: #4990 re-decided the sibling's cap (50,000, see
-// kCmdExecutionReapCap) because that table now takes a row per dispatch, while this table's
-// volume (one row per agent state change) is unchanged and its 5000 is left as it was. The
-// identical-values statement below therefore holds for the window and the skew only, and is
-// DELIBERATE, not a copy the clock-guarded-retention routed concern
-// forbids: that prohibition (part 1) is scoped to the WOULD-WIPE implausible-
-// ahead FLOOR, and this table takes the would-wipe carve-out, so it computes no
-// such floor at all. The two tables are the same KIND of thing — short-lived
-// per-execution observability feeds on the same maintenance cadence, same
-// substrate, same failover/reconnect replay horizon — so their window/cap/skew
-// are kept in LOCKSTEP with the sibling ON PURPOSE, and should be revisited
-// TOGETHER, not diverged silently. Rationale for the shared values: 24h of
-// durable frames comfortably covers a failover + a client-reconnect replay
-// window while bounding table growth; the skew threshold is ~24x the sibling's
-// ~3600s nominal cadence and absorbs scheduler jitter while still catching a
-// genuinely wrong clock (the event_outbox reap itself runs on a TIGHTER ~60s
-// cadence for volume reasons — see server.cpp — but the skew headroom is sized
-// against the same worst-case inter-pass gap the sibling documents). If a
-// future event-outbox-specific input (a consumer replay SLA, a failover MTTR
-// bound) argues for a different value, derive it then and let the two diverge.
+// (kCmdExecutionReapWindowSecs / kMaxPlausibleSkewSecs) and that is DELIBERATE; the CAP is
+// deliberately NOT: #4990 re-decided the sibling's cap (50,000, see kCmdExecutionReapCap) because
+// that table now takes a row per dispatch, while this table's volume (one row per agent state
+// change) is unchanged and its 5000 is left as it was. So the two are kept together for the window
+// and the skew only; the cap of each is derived from its own table's inflow. The identical window
+// and skew are not a copy the clock-guarded-retention routed concern forbids: that prohibition
+// (part 1) is scoped to the WOULD-WIPE implausible-ahead FLOOR, and this table takes the
+// would-wipe carve-out, so it computes no such floor at all. The two tables are the same KIND of
+// thing (short-lived per-execution observability feeds on the same maintenance cadence, same
+// substrate, same failover/reconnect replay horizon), so their window and skew are kept equal ON
+// PURPOSE and should be revisited TOGETHER, not diverged silently. Rationale for the shared
+// values: 24h of durable frames comfortably covers a failover + a client-reconnect replay window
+// while bounding table growth; the skew threshold is ~24x the sibling's ~3600s nominal cadence and
+// absorbs scheduler jitter while still catching a genuinely wrong clock (the event_outbox reap
+// itself runs on a TIGHTER ~60s cadence for volume reasons, see server.cpp, but the skew headroom
+// is sized against the same worst-case inter-pass gap the sibling documents). If a future
+// event-outbox-specific input (a consumer replay SLA, a failover MTTR bound) argues for a
+// different value, derive it then and let the two diverge.
 constexpr std::int64_t kEventOutboxReapWindowSecs = 24 * 3600;
 constexpr int kEventOutboxReapCap = 5000;
 constexpr std::int64_t kEventOutboxMaxPlausibleSkewSecs = 24 * 3600;

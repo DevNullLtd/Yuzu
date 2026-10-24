@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <expected>
 #include <latch>
 #include <memory>
 #include <optional>
@@ -1549,6 +1550,71 @@ TEST_CASE("ExecutionTracker: the 24h sweep takes at most 50000 expired dispatch 
     auto second = tracker_bundle->reap_command_execution_mappings();
     REQUIRE(second.has_value());
     CHECK(second->deleted == 10);
+}
+
+TEST_CASE("ExecutionTracker: the 24h sweep does not delete a record a live dispatch refreshes while "
+          "the sweep is running (#4990)",
+          "[pg][execution_tracker][forensics_tier]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    pg::PgPool& pool = tracker_bundle.pool();
+
+    REQUIRE(tracker.record_command_dispatch("old-a", "echo", ""));
+    REQUIRE(tracker.record_command_dispatch("old-b", "echo", ""));
+    REQUIRE(tracker.record_command_dispatch("refreshed", "echo", ""));
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "UPDATE execution_tracker.command_execution "
+                                "SET created_at = created_at - 90000",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+
+    // A concurrent writer refreshes one record (the re-drive of `record_command_dispatch`) and
+    // holds its transaction open, so the sweep's DELETE reaches the row version it already chose
+    // and has to wait for the lock. When the writer commits, the sweep must re-test the age on the
+    // refreshed version and leave the row alone.
+    auto writer = pool.acquire();
+    REQUIRE(writer);
+    REQUIRE(pg::exec_params(writer.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(writer.get(),
+                            "UPDATE execution_tracker.command_execution "
+                            "SET created_at = extract(epoch FROM now())::bigint "
+                            "WHERE command_id = 'refreshed'",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    std::optional<std::expected<CommandExecutionReapOutcome, std::string>> reaped;
+    std::thread sweeper([&] { reaped = tracker.reap_command_execution_mappings(); });
+
+    // Wait (bounded) until the sweep is blocked on the writer's row lock.
+    bool blocked = false;
+    for (int i = 0; i < 200 && !blocked; ++i) {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto r = pg::exec_params(lease.get(),
+                                 "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                                 "AND datname = current_database()",
+                                 std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        blocked = std::string(PQgetvalue(r.get(), 0, 0)) != "0";
+        if (!blocked)
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    REQUIRE(blocked);
+    REQUIRE(pg::exec_params(writer.get(), "COMMIT", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    sweeper.join();
+
+    REQUIRE(reaped.has_value());
+    REQUIRE(reaped->has_value());
+    CHECK((*reaped)->deleted == 2); // old-a and old-b only
+    CHECK_FALSE(lookup_exec(tracker, "old-a").has_value());
+    CHECK_FALSE(lookup_exec(tracker, "old-b").has_value());
+    CHECK(tracker.lookup_command_record("refreshed").has_value());
 }
 
 TEST_CASE("ExecutionTracker: a command_execution mapping written on one "
