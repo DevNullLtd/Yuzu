@@ -279,8 +279,10 @@ not reduced on read, so text written by a replica that predates the change can r
 replica's stream until it expires. The live `output` event stream publishes nothing for a
 Forensics-tier frame: no row and no notice, because a notice would itself be an event every subscriber of the
 shared stream could see. It likewise publishes nothing when the plugin set is unwired or the frame carries no
-output. The dashboard Console therefore stays on "Waiting for results..." for such an action; read the rows
-through the execution results (Executions page), which apply the tier.
+output. The timing and command-status events carry no plugin output and are plugin-agnostic, so they still go out,
+and a dashboard dispatch still resets the Console to "Waiting for results..."; the Console's results table therefore stays
+on that placeholder for such an action. Read the rows through the execution results (Executions page), which apply
+the tier.
 
 **Audit.** A read that serves at least one Forensics-tier row writes one `response.forensics.read`
 row (`forensics_rows=<n> plugins=<names> surface=<s>`), on the row-returning surfaces only; see
