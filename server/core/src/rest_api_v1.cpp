@@ -4186,7 +4186,7 @@ void RestApiV1::register_routes(
     // fleet-wide role-assignment AUTHORING surface for engine principals.
     // Without this route, `RbacStore::assign_role` has NO production caller
     // for `principal_type="engine"`: the resolution side (the third UNION
-    // arm in `RbacStore::collect_roles_locked`) exists but is unreachable —
+    // arm in `RbacStore::collect_roles`) exists but is unreachable —
     // a real grant that never takes effect (design §4.1 "resolution side"
     // deliverable). `{id}` is the bare slug (no "engine:" prefix in the
     // URL, mirroring `/management-groups/{id}` taking a bare group id); the
@@ -19083,7 +19083,7 @@ void RestApiV1::register_routes(
     // then a direct rbac_store->authorize_list_read(...) call inside the handler
     // — and shipped a no-op: require_permission's ordinary RBAC branch calls
     // ONLY RbacStore::check_permission, which never consults ManagementGroupStore
-    // (collect_roles_locked unions only rbac.db's own principal_roles/group_members
+    // (collect_roles unions only rbac.db's own principal_roles/group_members
     // arms, a different and older mechanism). So a caller whose only grant was
     // management-group-scoped was denied 403 by perm_fn before authorize_list_read
     // was ever reached, and a global-grant caller passed both unfiltered — #3038

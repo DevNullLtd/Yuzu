@@ -90,9 +90,9 @@ struct ForensicsVisibilityDeps {
 /// `yuzu_server_forensics_tier_withheld_total{reason}`: one increment per resolver call that
 /// answered Unknown, i.e. a read whose Forensics rows were withheld because the caller's authority
 /// could not be determined (the read was refused with a 503 or showed a notice). `reason` is the
-/// CLOSED set `kForensicsUnknownReasons` (`to_string`): `rbac_unavailable`, `unwired`. A definitive refusal (Denied) is correct behavior and is never counted, so the
-/// series stays flat on a healthy server whatever the callers' roles. Operational, not
-/// `event="security"`.
+/// CLOSED set `kForensicsUnknownReasons` (`to_string`): `rbac_unavailable`, `unwired`. A
+/// definitive refusal (Denied) is correct behavior and is never counted, so the series stays flat
+/// on a healthy server whatever the callers' roles. Operational, not `event="security"`.
 inline constexpr const char* kForensicsTierWithheldMetric =
     "yuzu_server_forensics_tier_withheld_total";
 

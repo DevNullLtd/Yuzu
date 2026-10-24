@@ -1249,7 +1249,7 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
         // at ingest (`AgentServiceImpl::failure_text_for_sinks`), so a persisted value equal to it
         // needs no lookup: that is every ordinary frame, and it keeps this write transaction free
         // of the Forensics scan. Only a persisted value that DIFFERS from the incoming one (the
-        // sticky-terminal case, or a row from an older writer) is reduced here, as the read paths
+        // sticky-terminal case, or a raw text a caller wrote around the ingest-time reduction) is reduced here, as the read paths
         // do, before it reaches the durable outbox or the bus; a value that already has the bounded
         // shape needs no lookup either (the reduction is idempotent). The lookup runs under a
         // SAVEPOINT so a failure of it can never abort this transaction (see

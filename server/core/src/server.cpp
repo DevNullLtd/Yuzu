@@ -3377,15 +3377,17 @@ public:
                           "--auth-mode=sso-only (the TOTP challenge still follows)",
                           "counter");
         metrics_.counter("yuzu_auth_break_glass_login_total");
-        // HA WS-1(1b), ADR-2002 section 5: command_id -> execution_id
-        // correlation-table retention (ExecutionTracker's PG-backed
-        // command_execution table, replacing AgentServiceImpl's former
-        // in-process cmd_execution_ids_ map). Mirrors the session-reap
-        // metric trio above — same clock-guarded-retention shape, a
-        // separate table/store, so a separate counter family.
+        // HA WS-1(1b), ADR-2002 section 5, and #4990: the dispatch-record
+        // table's retention (ExecutionTracker's PG-backed command_execution
+        // table: one row per dispatch carrying command_id -> plugin and
+        // execution_id, replacing AgentServiceImpl's former in-process
+        // cmd_execution_ids_ map). Mirrors the session-reap metric trio
+        // above — same clock-guarded-retention shape, a separate
+        // table/store, so a separate counter family. A pass that deletes
+        // exactly the per-pass cap (50,000) is a saturated pass.
         metrics_.describe("yuzu_exec_correlation_reap_total",
-                          "Aged-out command_id -> execution_id correlation-table rows deleted by "
-                          "the clock-guarded retention sweep (HA WS-1(1b))",
+                          "Aged-out dispatch records (command_id -> plugin and execution_id) "
+                          "deleted by the clock-guarded retention sweep (HA WS-1(1b))",
                           "counter");
         metrics_.counter("yuzu_exec_correlation_reap_total");
         metrics_.describe("yuzu_exec_correlation_reap_clock_anomaly_total",
@@ -5491,10 +5493,12 @@ public:
         //    executions tracker is operator-facing; an automated cache
         //    refill happening every 60s would otherwise spam its history
         //    pane. record_send_time stays so the standard latency
-        //    histogram still observes these dispatches (sec-INFO-10:
-        //    intentionally opted out of the command_id -> execution_id
-        //    correlation, HA WS-1(1b)'s ExecutionTracker::command_execution
-        //    table).
+        //    histogram still observes these dispatches. The dispatch IS
+        //    recorded (command_id -> plugin, empty execution id) like every
+        //    other dispatch, by the build_classified_command chokepoint
+        //    (#4990), so the replies are labelled by the recorded plugin;
+        //    only the command_id -> execution_id correlation is empty
+        //    (sec-INFO-10).
         //  * forward_gateway_pending() drains commands queued for
         //    gateway-proxied agents so a fleet that mixes direct and
         //    gateway-connected hosts gets uniform dispatch.
@@ -17820,8 +17824,9 @@ private:
                 // The event_outbox drains on a MUCH tighter cadence than the
                 // correlation table above: it receives ~2-3 rows per agent
                 // CommandResponse (agent-transition + progress + terminal),
-                // vs one row per command for command_execution, so on a busy
-                // fleet the hourly 5000-row cap cannot keep up (governance
+                // vs one row per dispatch for command_execution (which has its
+                // own 50,000-row cap, see kCmdExecutionReapCap), so on a busy
+                // fleet an hourly 5000-row cap could not keep up (governance
                 // Gate 3 performance/sre finding — insert rate can exceed a
                 // 5000/hr drain, growing the table unbounded). At ~60s the
                 // same 5000-row cap gives ~300k/hr of drain headroom, well

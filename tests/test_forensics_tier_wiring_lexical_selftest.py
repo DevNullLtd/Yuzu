@@ -305,7 +305,7 @@ def main() -> int:
             moved = g.canonical(psources["server.cpp"])
             expect(re.search(pat, moved, re.S) is not None, "the record-after-finalize pin must match")
             broken = psources["server.cpp"].replace(
-                "agent_service_.record_command_dispatch(command_id, finalized->wire().plugin(),", 
+                "agent_service_.record_command_dispatch(command_id, finalized->wire().plugin(),",
                 "agent_service_.record_command_dispatch(command_id, plugin,", 1)
             sc = dict(psources)
             sc["server.cpp"] = broken

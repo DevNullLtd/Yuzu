@@ -885,12 +885,14 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         if (!deps_.scoped_perm_fn(req, res, "Inventory", "Read", id)) return;
 
-        // This LAST-dash split recovers the plugin the server recorded at dispatch (the ingest and
-        // the tracker label a response with that record, never with the id) only because
-        // server-minted ids are `<plugin>-<hex>` and Forensics plugin names are dash-free; the boot
-        // soundness check (`forensics_catalogue_defect`) refuses a catalogue that breaks the second
-        // part. A command id the server never issued is stored as unverified and this poll never
-        // finds it (the fixed-plugin tier excludes that label).
+        // This LAST-dash split names the plugin the poll asks about: server-minted ids are
+        // `<plugin>-<hex>`, and the poll validates the name against the catalogue below. It never
+        // decides what a stored row is: the ingest and the tracker label a response with the plugin
+        // the server RECORDED at dispatch, never with the id. The split is exact for a Forensics
+        // plugin only because Forensics plugin names are dash-free, and the boot soundness check
+        // (`forensics_catalogue_defect`) refuses a catalogue that breaks that. A command id the
+        // server never issued is stored as unverified and this poll never finds it (the
+        // fixed-plugin tier excludes that label).
         const auto id_dash = command_id.rfind('-');
         const std::string plugin =
             (id_dash == std::string::npos || id_dash == 0) ? std::string{} : command_id.substr(0, id_dash);
@@ -915,13 +917,13 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         // Derived after the gates above (it never writes a response): the replies are read only
         // as far as the caller may read the plugin's tier.
-        // The visibility resolver (two authorization probes) runs only for a poll of a Forensics-tier
-        // plugin. The plugin here is derived from the server-minted command id and validated
-        // against the catalogue above (never taken from the client), and stored rows carry the
-        // plugin of their command id, so a poll of any other plugin can only ever meet its own
-        // plugin's rows: excluding the Forensics plugins outright is exact, needs no per-caller
-        // answer, and spares up to 40 resolver runs per action. An unwired plugin set keeps the
-        // fail-closed path through `tier_filter_for`.
+        // The visibility resolver (one global Forensics:Read authorization probe) runs only for a
+        // poll of a Forensics-tier plugin. The plugin here is derived from the server-minted
+        // command id and validated against the catalogue above (never taken from the client), and
+        // stored rows carry the plugin the server recorded for their command id, so a poll of any
+        // other plugin can only ever meet its own plugin's rows: excluding the Forensics plugins
+        // outright is exact, needs no per-caller answer, and spares up to 40 resolver runs per
+        // action. An unwired plugin set keeps the fail-closed path through `tier_filter_for`.
         const bool resolve_for_caller =
             !deps_.forensics_plugins || deps_.forensics_plugins->contains(plugin);
         const auto tier_resolved =

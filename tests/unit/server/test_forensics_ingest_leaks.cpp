@@ -474,7 +474,7 @@ TEST_CASE("tracker error_detail: rows written before the sanitizer are reduced o
         REQUIRE(id.has_value());
         if (map_command)
             REQUIRE(tracker.record_command_dispatch(command_id, command_id.substr(0, command_id.find('-')), *id));
-        AgentExecStatus s; // the pre-upgrade write: raw text, straight to the tracker
+        AgentExecStatus s; // a write that skips the ingest-time reduction: raw text, straight to the tracker
         s.agent_id = "agent-1";
         s.status = "failure";
         s.completed_at = 100;
@@ -517,9 +517,11 @@ TEST_CASE("tracker error_detail: rows written before the sanitizer are reduced o
         CHECK(batch.at(ordinary)[0].error_detail == kFreeText);
     }
     SECTION("a row whose command mapping is gone keeps its stored text (the disclosed 24 h residual)") {
-        // The scrub is keyed on the command_execution mapping, which is reaped after 24 h; older
-        // rows are outside it. The write-time sanitizer covers every row written since the fix, so
-        // this only concerns pre-upgrade rows. Pinned so the residual stays a decision.
+        // The read-time scrub is keyed on the dispatch record in command_execution, which is
+        // reaped 24 h after it was last written; a row with no record is returned as stored. The
+        // ingest-time reduction (failure_text_for_sinks) covers every text written through the
+        // ingest, so this only concerns a raw text a caller wrote around it. Pinned so the
+        // residual stays a decision.
         CHECK(tracker.get_agent_statuses(unmapped)[0].error_detail == kFreeText);
         CHECK(tracker.get_agent_statuses_for_executions({unmapped}).at(unmapped)[0].error_detail ==
               kFreeText);

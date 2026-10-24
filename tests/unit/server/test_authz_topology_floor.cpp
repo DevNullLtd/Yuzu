@@ -1475,9 +1475,11 @@ namespace {
 // and the breaker are its own, so each case can starve the pool, open the breaker or break the role
 // read on THIS replica without touching the rig's healthy store.
 struct DegradedReplica {
+    // Declaration order is destruction order in reverse: the store keeps a pointer to the metrics
+    // registry (set_metrics) and a connection pool, so both are declared BEFORE it and outlive it.
     yuzu::server::pg::PgPool pool;
-    RbacStore store;
     yuzu::MetricsRegistry store_metrics;
+    RbacStore store;
     AuthRoutes ar;
 
     explicit DegradedReplica(ForensicsVisRig& rig)

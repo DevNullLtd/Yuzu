@@ -2760,7 +2760,8 @@ RbacStore::collect_roles_accounted(void* conn, const std::string& username) cons
         breaker_note_result(false);
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonQueryError, sampler))
-            spdlog::warn("RbacStore: role read failed: {} — DENY", roles.error());
+            spdlog::warn("RbacStore: role read failed: {}; permission check unavailable",
+                         roles.error());
     }
     return roles;
 }

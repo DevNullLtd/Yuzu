@@ -18,6 +18,7 @@
 
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "agent_service_impl.hpp"
 #include "response_provenance.hpp"

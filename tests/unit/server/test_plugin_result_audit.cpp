@@ -360,8 +360,7 @@ TEST_CASE("registry audit: only the three mutating actions of the registry plugi
         for (const char* spelling : {"Registry", "REGISTRY", "rEgIsTrY"}) {
             const auto id = rid(9, spelling);
             INFO(id);
-            CHECK(registry_audit_events_for_frame("agent-1", id, extract_plugin(id), "set_value",
-                                                  output, 5)
+            CHECK(registry_audit_events_for_frame("agent-1", id, spelling, "set_value", output, 5)
                       .events.size() == 1);
         }
         CHECK(events("registr", "set_value").empty());

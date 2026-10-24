@@ -11,7 +11,10 @@
 /// `forensics_error`. The status and exit code are untouched.
 ///
 /// The same function is applied at WRITE time (so the durable column, the outbox and the bus are
-/// clean) and at READ time in the tracker (so rows written before the upgrade are covered).
+/// clean) and at READ time in the tracker (so a persisted raw text, which only a caller that broke
+/// the write-side precondition can leave, is still reduced on the way out). The read-time reduction
+/// is keyed on the server's dispatch record: a row with no record (reaped after 24 h, or never
+/// written) is returned as stored.
 
 #include <cstddef>
 #include <string>

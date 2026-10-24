@@ -41,7 +41,7 @@ forensics_catalogue_defect(const CommandCapabilityRegistry& registry) {
     });
     for (const auto& plugin : on_forensics) {
         if (plugin.find('-') != std::string::npos)
-            return "Forensics plugin '" + plugin + "' contains '-', which the stored plugin split cannot represent";
+            return "Forensics plugin '" + plugin + "' contains '-', which the hardware result poll's command-id split (<plugin>-<hex>) cannot represent";
         if (elsewhere.contains(plugin))
             return "plugin '" + plugin + "' has rows on the Forensics securable and on another securable: "
                    "the response tier is per plugin, so the other rows would be withheld too";

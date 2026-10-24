@@ -2983,7 +2983,7 @@ static const ToolDef kTools[] = {
     // ── Engine principal role assignments (PR 4.2, design §4.1) — MCP twins of
     // POST/DELETE/GET /api/v1/engine-principals/{id}/roles. Closes the "no
     // production caller" gap for RbacStore::assign_role(principal_type="engine"):
-    // without an authoring surface the resolution side (collect_roles_locked's
+    // without an authoring surface the resolution side (collect_roles's
     // engine UNION arm) is unreachable — a real grant that never takes effect.
     {"assign_engine_role",
      "Grant a FLEET-WIDE RBAC role to an engine principal — the durable identity behind an "

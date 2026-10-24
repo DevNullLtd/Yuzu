@@ -117,7 +117,8 @@ constexpr std::array<CommandCapability, 2> kMixedTierPlugin{{
     },
 }};
 
-// A Forensics plugin whose name contains '-': the stored plugin is the text before the first '-'.
+// A Forensics plugin whose name contains '-': the hardware result poll splits the server-minted
+// command id (`<plugin>-<hex>`) at the last '-', so such a name cannot be represented there.
 constexpr std::array<CommandCapability, 1> kDashedForensicsPlugin{{
     {
         .plugin = "dashed-plugin",
