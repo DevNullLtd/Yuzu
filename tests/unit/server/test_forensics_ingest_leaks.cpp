@@ -592,7 +592,10 @@ TEST_CASE("tracker error_detail: a failed Forensics execution lookup withholds t
 // tracker's own reads would run the same (faulted) lookup.
 //
 // The write path has its own warning throttle key, so these cases do not consume the one the read
-// path case above asserts on (exactly one line), whatever order the cases run in.
+// path case above asserts on (exactly one line), whatever order the cases run in. The throttle is
+// a function-local static with no reset hook, so the "lookup failed" line is asserted only in the
+// one section that makes the write-path lookup fail; a second such case in this process would find
+// the key already used within the minute and must not assert the line.
 TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path never costs the "
           "agent's status",
           "[pg][server][forensics_tier][security]") {
@@ -629,10 +632,14 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
             "ALTER TABLE execution_tracker.command_execution RENAME TO command_execution_gone",
             "ALTER TABLE execution_tracker.command_execution_gone RENAME TO command_execution");
     };
-    const auto any_has = [](const std::vector<std::string>& frames, std::string_view needle) {
-        return std::ranges::any_of(frames, [&](const std::string& f) {
-            return f.find(needle) != std::string::npos;
-        });
+    // The one outbox row a step appended, parsed (a second or a missing row fails here, so a
+    // duplicated or lost transition event cannot hide behind a substring match).
+    const auto sole_row = [](const std::string& added) {
+        REQUIRE_FALSE(added.empty());
+        CHECK(added.find('\n') == std::string::npos);
+        auto row = nlohmann::json::parse(added, nullptr, /*allow_exceptions=*/false);
+        REQUIRE_FALSE(row.is_discarded());
+        return row;
     };
 
     SECTION("a replayed RUNNING frame after a RAW terminal row: recorded, text reduced, nothing lost") {
@@ -654,14 +661,16 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
         exec_bus.unsubscribe(id, sub);
         fault.repair();
 
-        // The transition event WAS appended and published, with the fail-closed bounded value.
+        // The transition event WAS appended and published, with the fail-closed bounded value:
+        // exactly one outbox row and one bus frame, carrying the same payload.
         const auto added = outbox_data_after(pool, id, seeded);
-        REQUIRE_FALSE(added.empty());
-        CHECK(added.find("marker-4990") == std::string::npos);
-        CHECK(added.find("forensics_error") != std::string::npos);
-        REQUIRE_FALSE(frames.empty());
-        CHECK_FALSE(any_has(frames, "marker-4990"));
-        CHECK(any_has(frames, "forensics_error"));
+        const auto row = sole_row(added);
+        CHECK(row["error_detail"] == "forensics_error");
+        CHECK(row["status"] == "failure");
+        CHECK(row["agent_id"] == "agent-1");
+        CHECK(row["exit_code"] == 3);
+        REQUIRE(frames.size() == 1);
+        CHECK(frames[0] == added);
         // The write itself did not fail: no "NOT recorded" line, and the terminal row is intact.
         CHECK(logs.text().find("NOT recorded") == std::string::npos);
         CHECK(logs.text().find("upsert failed") == std::string::npos);
@@ -682,6 +691,7 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
     SECTION("an ordinary plugin's free-text failure frame: recorded in full, no lookup is issued") {
         tracker.set_forensics_plugin_set(&test::forensics_plugin_set());
         const auto id = make(std::string{test::kOrdinaryPlugin} + "-0w2");
+        const auto seeded = outbox_high_water(pool, id);
         auto fault = lookup_fault();
         fault.arm(); // any lookup on this path would fail, abort the transaction and lose the row
         std::vector<std::string> frames;
@@ -697,20 +707,35 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
         CHECK(logs.text().find("NOT recorded") == std::string::npos);
         CHECK(logs.text().find("Forensics execution lookup failed") == std::string::npos);
         CHECK(stored_error_detail(pool, id) == kFreeText);
-        CHECK(outbox_data(pool, id).find("marker-4990-error") != std::string::npos);
-        REQUIRE_FALSE(frames.empty());
-        CHECK(any_has(frames, "marker-4990-error"));
+        const auto added = outbox_data_after(pool, id, seeded);
+        CHECK(sole_row(added)["error_detail"] == kFreeText);
+        REQUIRE(frames.size() == 1);
+        CHECK(frames[0] == added);
     }
-    SECTION("a Forensics plugin's reduced failure frame: recorded as the bounded value, no lookup") {
+    SECTION("CONTROL: a Forensics plugin's already-reduced failure frame is stored and published "
+            "as the bounded value") {
+        // A control, not a regression discriminator: the reduction is idempotent, so no lookup
+        // is issued for an already-reduced value under the old code or the new, and this stays
+        // green with the fault armed either way. It pins that the bounded value passes through
+        // the write path unchanged (one row, one frame).
         tracker.set_forensics_plugin_set(&test::forensics_plugin_set());
         const auto id = make(std::string{test::kForensicsPlugin} + "-0w3");
+        const auto seeded = outbox_high_water(pool, id);
         auto fault = lookup_fault();
         fault.arm();
+        std::vector<std::string> frames;
+        const auto sub = exec_bus.subscribe(id, [&frames](const ExecutionEvent& e) {
+            frames.push_back(e.data);
+        });
         // Ingest reduces a Forensics plugin's text before the tracker sees it.
         tracker.update_agent_status(id, frame("failure", "forensics_error"));
+        exec_bus.unsubscribe(id, sub);
         fault.repair();
         CHECK(stored_error_detail(pool, id) == "forensics_error");
-        CHECK(outbox_data(pool, id).find("forensics_error") != std::string::npos);
+        const auto added = outbox_data_after(pool, id, seeded);
+        CHECK(sole_row(added)["error_detail"] == "forensics_error");
+        REQUIRE(frames.size() == 1);
+        CHECK(frames[0] == added);
     }
     SECTION("CHARACTERISATION: a raw Forensics text written straight to the tracker is published "
             "raw on that first write (the incoming text is trusted to be reduced already)") {
@@ -725,10 +750,13 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
         const auto sub = exec_bus.subscribe(id, [&frames](const ExecutionEvent& e) {
             frames.push_back(e.data);
         });
+        const auto seeded = outbox_high_water(pool, id);
         tracker.update_agent_status(id, frame("failure", kFreeText));
         exec_bus.unsubscribe(id, sub);
-        CHECK(outbox_data(pool, id).find("marker-4990") != std::string::npos);
-        CHECK(any_has(frames, "marker-4990"));
+        const auto added = outbox_data_after(pool, id, seeded);
+        CHECK(sole_row(added)["error_detail"] == kFreeText);
+        REQUIRE(frames.size() == 1);
+        CHECK(frames[0] == added);
         // The reads do reduce it.
         const auto statuses = tracker.get_agent_statuses(id);
         REQUIRE(statuses.size() == 1);
@@ -748,8 +776,7 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
         fault.repair();
         CHECK(logs.text().find("NOT recorded") == std::string::npos);
         const auto added = outbox_data_after(pool, id, seeded);
-        REQUIRE_FALSE(added.empty());
-        CHECK(added.find("marker-4990") != std::string::npos);
+        CHECK(sole_row(added)["error_detail"] == kFreeText);
     }
 }
 

@@ -267,9 +267,15 @@ void scrub_error_texts_in_txn(PGconn* conn, const ForensicsPluginSet* set,
     pg::PgResult fin = pg::exec_params(
         conn, lookup_ok ? "RELEASE SAVEPOINT forensics_lookup" : "ROLLBACK TO SAVEPOINT forensics_lookup",
         std::vector<std::string>{});
-    if (fin.status() != PGRES_COMMAND_OK)
-        spdlog::warn("ExecutionTracker: closing the Forensics lookup savepoint failed: {}",
-                     PQerrorMessage(conn));
+    if (fin.status() != PGRES_COMMAND_OK) {
+        // Throttled like the two warnings above, and without the driver's error text (which can
+        // echo statement context): a failing connection makes every frame hit this line, and the
+        // outbox append that follows reports the lost write itself.
+        static RefusalLogThrottle throttle;
+        if (throttle.should_warn("forensics_execution_savepoint_close_failed_in_write_txn"))
+            spdlog::warn("ExecutionTracker: closing the Forensics lookup savepoint failed "
+                         "(#4990; at most one log per 60 s)");
+    }
 }
 
 void scrub_executions(PGconn* conn, const ForensicsPluginSet* set, std::vector<Execution>& execs) {
