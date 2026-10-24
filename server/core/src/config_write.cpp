@@ -134,7 +134,8 @@ std::expected<void, WriteFault> write_and_apply(const Backing& b, const std::str
                                                 const std::string& username) {
     // One writer at a time across the store write and the live apply, so two concurrent writes of
     // the same key cannot leave the store holding one value and the live config the other. This
-    // orders writers only; the plain-int Config fields are still read without it by other threads.
+    // orders writers only; readers take no lock and rely on the atomic Config fields (LiveInt,
+    // LiveSeconds).
     static std::mutex write_mutex;
     const std::scoped_lock lock(write_mutex);
     auto result = b.store->set(key, value, username);
@@ -227,10 +228,10 @@ std::expected<nlohmann::json, ViewFault> build_config_view(const Backing& b,
     nlohmann::json config_obj;
     // Current effective values (from cfg + overrides)
     config_obj["heartbeat_timeout"] = b.cfg->session_timeout.count();
-    config_obj["response_retention_days"] = b.cfg->response_retention_days;
+    config_obj["response_retention_days"] = b.cfg->response_retention_days.get();
     if (!withheld.contains("audit_retention_days"))
-        config_obj["audit_retention_days"] = b.cfg->audit_retention_days;
-    config_obj["guardian_event_retention_days"] = b.cfg->guardian_event_retention_days;
+        config_obj["audit_retention_days"] = b.cfg->audit_retention_days.get();
+    config_obj["guardian_event_retention_days"] = b.cfg->guardian_event_retention_days.get();
     config_obj["auto_approve_enabled"] = !b.auto_approve->list_rules().empty();
     // spdlog names the level "warning"; the write accepts "warn". Report the writable spelling so
     // a read followed by a write of the same value round-trips.

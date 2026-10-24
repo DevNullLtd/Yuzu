@@ -1545,6 +1545,55 @@ TEST_CASE("config_routes: an open store whose read fails answers 503 on every GE
     }
 }
 
+TEST_CASE("config_write: concurrent writers and readers leave the store and the live config on the "
+          "same value, and the live fields are safe to read (run under TSan in the nightly)",
+          "[pg][server][config_write][tsan]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    yuzu::server::Config cfg{};
+    auth::AutoApproveEngine engine{};
+    const config::Backing backing{&cfg, &engine, &w.store};
+    auth::Session admin;
+    admin.username = "alice";
+    admin.role = auth::Role::admin;
+
+    constexpr int kWriters = 4;
+    constexpr int kReaders = 2;
+    constexpr int kIterations = 40;
+    std::atomic<bool> stop{false};
+    std::atomic<int> read_faults{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kWriters; ++t)
+        threads.emplace_back([&, t] {
+            for (int i = 0; i < kIterations; ++i) {
+                const int v = 100 + t * 1000 + i;
+                auto r = config::write_and_apply(backing, "response_retention_days",
+                                                 std::to_string(v), v, "writer");
+                if (!r)
+                    read_faults.fetch_add(1);
+            }
+        });
+    for (int t = 0; t < kReaders; ++t)
+        threads.emplace_back([&] {
+            while (!stop.load()) {
+                auto view = config::build_config_view(backing, admin, true);
+                if (!view || !view->at("config").contains("response_retention_days"))
+                    read_faults.fetch_add(1);
+            }
+        });
+    for (int t = 0; t < kWriters; ++t)
+        threads[static_cast<std::size_t>(t)].join();
+    stop.store(true);
+    for (std::size_t t = kWriters; t < threads.size(); ++t)
+        threads[t].join();
+
+    CHECK(read_faults.load() == 0);
+    // The writers are serialised across the store write and the live apply, so whichever wrote
+    // last left BOTH on its value: the store and the live config never disagree.
+    CHECK(w.store.get_value("response_retention_days") ==
+          std::to_string(cfg.response_retention_days.get()));
+}
+
 TEST_CASE("config_routes: an open store is not enough, the live config and the engine must be wired",
           "[pg][server][routes][config_routes]") {
     YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);

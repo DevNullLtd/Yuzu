@@ -7102,7 +7102,7 @@ public:
                     [this] { invalidate_guardian_reconcile_caches(); });
                 spdlog::info("GuaranteedStateStore initialized (schema guaranteed_state_store; "
                              "retention={}d)",
-                             cfg_.guardian_event_retention_days);
+                             cfg_.guardian_event_retention_days.get());
                 // Step 5: ingest agent `__guard__` events arriving on the Subscribe
                 // stream → guaranteed_state_events. See docs/guardian-mvp-contract.md.
                 agent_service_.set_guaranteed_state_store(guaranteed_state_store_.get());
@@ -16217,7 +16217,7 @@ private:
                         // The enforced figure (the store copies it at construction), not the
                         // live config value; without a store, the startup config.
                         return audit_store_ ? audit_store_->retention_days()
-                                            : cfg_.audit_retention_days;
+                                            : cfg_.audit_retention_days.get();
                     },
                 .now_fn = []() { return static_cast<std::int64_t>(std::time(nullptr)); },
             });

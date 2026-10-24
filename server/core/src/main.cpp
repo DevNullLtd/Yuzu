@@ -993,16 +993,20 @@ int main(int argc, char* argv[]) {
                    "Used only as a display fallback and logged, never stored or used for identity")
         ->envname("YUZU_SAML_EMAIL_ATTRIBUTE");
 
-    // Data infrastructure options
-    app.add_option("--response-retention-days", cfg.response_retention_days,
+    // Data infrastructure options. Bound to plain ints (CLI11 cannot fill a LiveInt) and copied into
+    // the config right after the parse.
+    int response_retention_days = cfg.response_retention_days;
+    int audit_retention_days = cfg.audit_retention_days;
+    int guardian_event_retention_days = cfg.guardian_event_retention_days;
+    app.add_option("--response-retention-days", response_retention_days,
                    "Response retention period in days (default: 90)")
         ->default_val(90)
         ->envname("YUZU_RESPONSE_RETENTION_DAYS");
-    app.add_option("--audit-retention-days", cfg.audit_retention_days,
+    app.add_option("--audit-retention-days", audit_retention_days,
                    "Audit log retention period in days (default: 365)")
         ->default_val(365)
         ->envname("YUZU_AUDIT_RETENTION_DAYS");
-    app.add_option("--guardian-event-retention-days", cfg.guardian_event_retention_days,
+    app.add_option("--guardian-event-retention-days", guardian_event_retention_days,
                    "Guardian (guaranteed-state) event retention period in days (default: 30)")
         ->default_val(30)
         ->envname("YUZU_GUARDIAN_EVENT_RETENTION_DAYS");
@@ -1047,6 +1051,9 @@ int main(int argc, char* argv[]) {
     app.add_flag("--remove-service", remove_service, "Remove Windows service and exit");
 
     CLI11_PARSE(app, argc, argv);
+    cfg.response_retention_days = response_retention_days;
+    cfg.audit_retention_days = audit_retention_days;
+    cfg.guardian_event_retention_days = guardian_event_retention_days;
 
     // #5906: probe-and-exit, before any server init (no config, secrets, DB, log or
     // cert-dir side effects).
