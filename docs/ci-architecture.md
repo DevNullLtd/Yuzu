@@ -1858,7 +1858,36 @@ clang-21 and release legs run only on a push, where all four non-pg steps can
 overlap at four wide on the box, so the 10-push-run check above is the only
 coverage for them.
 
-*Samples:* pending.
+*Samples (measured, 2026-10-24).* Two same-SHA np=4 samples on the PR #6436
+head `df7f2fd93` (run 40118483411, job 120944791805 attempt 1 and job 120949716811
+attempt 2), each with the np=2 baseline above (jobs 120892371842 and 120898156494).
+
+| | np=2 (two PR runs) | np=4 sample 1 | np=4 sample 2 |
+|---|---|---|---|
+| `Test (non-pg suites)` step | 406 s, 405 s | 291 s | 292 s |
+| cheap-suites invocation wall | 340 s, 339 s | 224 s | 224 s |
+| second invocation wall | 66 s | 66 s | 68 s |
+| worst per-entry ratio (entries of 5 s or more) | | 1.12x | 1.12x |
+| entries; Ok / Fail / Skipped | 105; 100 / 0 / 5 | same | same |
+
+Rule (a): the step median fell from about 405 s to about 292 s (-28%), against
+the 10% bar. Rule (b): the worst ratio of an entry of 5 s or more is 1.12x
+(`docs drift gate self-test`, 7.8 s against 7.0 s; `personal data guard`), and
+`gateway eunit`, `gateway ct`, the SIGTERM harness and the agent shards are
+within 1.02x. Rule (c): the largest share of an entry's own timeout is agent
+shard B at 83 s of 240 s (35%). Entry and skip counts are unchanged and no
+revert trigger fired. The invocation saved about 116 s, a little more than the
+estimate above.
+
+One observation outside the rule: the pg-shards step, whose width is unchanged,
+took 511 s and 545 s in these two samples, against 452 s and 453 s in the two
+np=2 PR runs and 451 s to 521 s in the `dev` push runs of the same day (673 s to
+723 s the evening before). Its 14 shards summed to 1005 s and 1079 s against 884
+s and 880 s, with every shard slower. The step runs after the non-pg step and
+shares no code path with this change, so this is most likely box state, but two
+samples cannot rule out a spillover; it is why the job total fell by only about
+50 s. Watch the pg step on the next runs.
+
 
 Worst-case ceiling by width (14 pg shards, one shared 700 s timeout, every
 shard at its cap; the degenerate figure, not an expected case): np=2 is 7
