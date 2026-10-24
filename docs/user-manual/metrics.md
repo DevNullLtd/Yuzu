@@ -548,7 +548,7 @@ The self-service change route's lockout check shares `/login`'s instrumentation:
 
 ## MFA factor-binding metrics (#6079)
 
-A local MFA proof is bound to the account's factor generation, a database-owned counter that advances on every change of the enrolled factor (see `docs/auth-architecture.md`, "Factor-generation binding"). These series show the binding being enforced, refused, or unable to decide. All counters below are pre-seeded to 0 at boot, so `increase()` sees the first event.
+A local MFA proof is bound to the account's factor generation, a database-owned counter that advances on every change of the enrolled factor (see `docs/auth-architecture.md`, "Factor-generation binding of MFA proofs (#6079)"). These series show the binding being enforced, refused, or unable to decide. All counters below are pre-seeded to 0 at boot, so `increase()` sees the first event.
 
 | Metric | Type | Meaning |
 |---|---|---|

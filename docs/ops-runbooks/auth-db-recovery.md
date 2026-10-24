@@ -39,6 +39,8 @@ the Windows event log shows one of these, and they mean different things:
 | `[PG] Refusing to start: auth store (AuthDB) migration/open failed` | Database reachable, `auth` schema could not be created/opened | [Migration failure](#auth-schema-migration-failure) |
 | `SecretCodec::init() failed for the auth store bootstrap — …` or `[PG] Refusing to start: SecretCodec::init() failed — …` | The secrets seam could not initialise — usually a missing or unreadable KEK | [KEK problems](#kek-missing-or-unreadable) |
 | `SecretCodec::init() failed` … `kek_orphaned: stored secret blobs reference KEK version(s) […] absent from kek_meta` | A stored secret blob (for example one account's TOTP secret) names a key-encryption-key version that is not registered in `secrets.kek_meta` | [Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version) |
+| `AuthDB: the MFA factor-generation trigger (auth.users_mfa_factor_gen) is missing, not ENABLE ALWAYS, or altered - auth store disabled`, followed by `[PG] Refusing to start: auth store (AuthDB) migration/open failed` | The trigger that binds an MFA proof to the account's factor generation is not in force | [MFA binding enforcement failed](#mfa-binding-enforcement-failed) |
+| `SessionStore: sessions_mfa_rebind_guard is missing, not ENABLE ALWAYS, or altered; refusing to open …`, followed by `[PG] Refusing to start: session store migration/open failed` | The session rebind guard trigger is not in force | [MFA binding enforcement failed](#mfa-binding-enforcement-failed) |
 | `[auth] Refusing to start: the 'engine:' namespace …` | An `engine:`-prefixed principal collides with the reserved namespace | `docs/ops-runbooks/engine-principal-store-recovery.md` |
 
 If the shipped systemd unit is in use it retries `StartLimitBurst=3` times
@@ -1474,8 +1476,9 @@ who is not the submitter of each request you expect to be decided: a request can
 submitter, and an administrator who is the only enrolled approver cannot approve their own request.
 Break-glass accounts are enrolled by validation and get no exemption. OIDC approvers are not enrolled in
 Yuzu at all; they need their identity provider to assert an MFA-method `amr`. SAML approvers cannot approve
-(#4935). A proof made before an account's current enrolment does not count, so an approver who was
-re-enrolled signs in or steps up again before approving. A non-admin approver who loses a device is in the same
+(#4935). A proof belongs to the factor it was earned with, so an approver who was
+re-enrolled signs in or steps up again before approving (the refusal is a `401` with
+`reason=proof_factor_mismatch` in the audit detail). A non-admin approver who loses a device is in the same
 position as before enrolment: `--mfa-reset <user>` removes the factor and the account must be enrolled again by
 one of the two paths above.
 
@@ -1486,7 +1489,7 @@ RBAC and Guardian writes, password reset and the others listed in the
 [REST API reference](../user-manual/rest-api.md#step-up-envelope-on-high-risk-endpoints))
 check the caller's MFA state before the route runs. Other mutating routes and all
 MCP tools are not step-up gated in this release, so this incident does not close
-them. A gated route answers **`503`** and does not run in three cases:
+them. A gated route answers **`503`** and does not run in four cases:
 
 - the server has **no wired authentication store** (reason
   `auth_store_unwired`). This is a defensive state (a boot-wiring fault, or a
@@ -1499,6 +1502,13 @@ them. A gated route answers **`503`** and does not run in three cases:
   whose enrollment is read from the store. API-token and MCP-token callers pass
   before any store read, OIDC sessions are judged on the identity provider's
   assertion, SAML sessions get their `403`, and engine principals get `403`;
+- for a local session with an **enrolled** factor, the proof stored with its session **cannot be
+  read** (reason `mfa_proof_unavailable`), or the database trigger that binds a proof to the factor
+  generation is **not observed in force** (reason `mfa_binding_unenforced`). The first is a
+  session-store fault; the second is sticky and is the incident in
+  [MFA binding enforcement failed](#mfa-binding-enforcement-failed). Both are counted
+  `yuzu_auth_secret_unavailable_total{route="mfa_binding"}`, and the window lever below does not help
+  the second;
 - the check itself **threw an unexpected exception**, or could not fingerprint the session
   (reason `chokepoint_exception` for both). An exception can arise for any caller class; a
   fingerprint failure is reached only after the decision has passed, so an engine principal or a
@@ -1529,7 +1539,8 @@ with the same `mfa_status_unavailable` reason and a remediation that says the
 authentication store is unavailable; it is counted as `refused`, not
 `unavailable`, so the alert below does not see it. A `503` is never a pass: the
 gated route stays closed until the cause is fixed. Approve and reject add their own
-check after this one. An approver whose stored session proof cannot be read, or a local
+check after this one. An approver whose stored session proof cannot be read, whose binding trigger
+is not observed in force, or a local
 approver whose MFA state cannot be read at that check (the window is `0` or less, or the
 fault falls between the two reads), can still receive a `503` from that check (A4 envelope with `retry_after_ms`,
 counted `route="approval"` on `yuzu_auth_secret_unavailable_total`, audit
@@ -1698,10 +1709,14 @@ authentication store or reset the affected account. Know its limits:
   protection for as long as it runs.
 - **The JIT-elevation routes ignore it.** They substitute a 300 s window, so
   elevation still asks for a fresh proof and still fails if the store cannot be
-  read.
+  read. The two factor-credential routes (`POST /api/settings/mfa/recovery-codes` and
+  `/disable`) ignore it too, with a window of at most 300 s.
+- **It also switches the binding check off.** At a window of `0` or less the 34 ordinary routes do not
+  read the stored proof, so the factor-generation binding is not applied to them either.
 - **SAML sessions pass too.** The window check precedes the SAML denial, so while
-  the window is `0` or less a SAML session reaches the 37 central routes instead of
-  getting its `403`, except approve and reject (`POST /api/approvals/{id}/approve` and
+  the window is `0` or less a SAML session reaches the 34 ordinary central routes instead of
+  getting its `403` (the two factor-credential routes, recovery-code regeneration and MFA disable,
+  ignore the lever and refuse every non-local session), except approve and reject (`POST /api/approvals/{id}/approve` and
   `/reject`), which keep their own gate whatever this value is (next bullet).
 - **Approval approve and reject keep a gate of their own.** The approver gate
   (#6079) ignores this flag: an approver still needs an enrolled factor and a
@@ -1783,7 +1798,9 @@ observed, not when the trigger was changed.
    firing were not counted, so a proof bound before such a change still equals the unchanged
    generation. End the sessions of **every account whose factor changed in the window**
    (`DELETE /api/v1/sessions?username=<name>`; see [Sessions are durable](#sessions-are-durable)). The
-   window starts no later than the last start of the server whose boot check passed. Accounts whose
+   window cannot have begun before the last start of a server whose boot check passed (that
+   check proves the triggers were in force then); the log line records when the fault was observed,
+   not when it began. Accounts whose
    factor changed through the product are in the audit log (`mfa.enroll.verified`, `mfa.disabled`,
    `mfa.reset.breakglass`); a change made by a direct database write has **no** audit row. If the
    window cannot be bounded, end every operator's sessions with the emergency procedure in the same

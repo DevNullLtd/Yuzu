@@ -195,6 +195,28 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   to prevent (a Postgres substrate makes transient read failures materially
   more likely than a local SQLite file ever did).
 
+- **MFA proofs bind to a DATABASE-OWNED factor generation (#6079).**
+  `auth.users.mfa_factor_gen` is advanced only by the row trigger
+  `users_mfa_factor_gen` (`ENABLE ALWAYS`, auth migration v3) on every change
+  of `mfa_enrolled_at`; application code never writes it. The three verifiers
+  return `{ok, factor_gen, verified_ms}`: the instant is the database `now()`
+  of the statement that LOADED the secret or candidates (before any crypto
+  check) and `ok` is published only after COMMIT (a failed or unacknowledged
+  COMMIT is `WriteFailed`, never a proof). The constructor validates the
+  trigger and does not open if it fails; `mfa_status` re-validates behind a
+  request-driven 60 s memo and a failure is STICKY
+  (`MfaStatus::binding_enforced == false`), which every gate must answer `503`
+  through the one `judge_local_mfa_binding` (a second copy of that decision is
+  a defect). `mfa_regenerate_recovery_codes` and `mfa_disable_report` take a
+  REQUIRED `expected_factor_gen` and compare it under the `auth.users` row lock
+  before writing (`FactorChanged`, deliberately NOT a store-unavailable error);
+  a new factor mutation does the same. **A PR that writes `mfa_factor_gen`,
+  weakens the trigger or its pinned-body check, publishes a verifier's success
+  before COMMIT, takes the verification instant after the crypto check, or
+  adds an MFA-state read that ignores `binding_enforced` is CRITICAL.**
+  Runbook: `docs/ops-runbooks/auth-db-recovery.md` "MFA binding enforcement
+  failed".
+
 - **No session surface on `AuthDB` at all.** `create_session` /
   `validate_session` / `invalidate_session` / `invalidate_all_sessions` /
   `cleanup_expired_sessions` / `touch_session_activity` /
@@ -255,6 +277,9 @@ out each item as PASS / FINDING / N/A:
 - [ ] Every new/modified MFA-state read distinguishes `SecretUnavailable`/
       `QueryFailed` from "not enrolled" / "code rejected" and fails closed
       (503), not silently treating either as a pass-through
+- [ ] Every new MFA verifier or factor mutation carries the factor generation
+      and the pre-crypto database instant, publishes success only after
+      COMMIT, and compares an admitted generation under the row lock (#6079)
 - [ ] No new session-persistence method added to `AuthDB` (sessions stay
       `AuthManager::sessions_`-only)
 - [ ] All SQL parameterised via `pg::exec_params`; zero string interpolation

@@ -339,7 +339,8 @@ human roles first and follow the prerequisites in [Role-Based Access Control](rb
 A fresh MFA proof is required on 37 named high-risk routes (the list is in
 [REST API](rest-api.md#step-up-envelope-on-high-risk-endpoints), which also names the three
 JIT-elevation routes) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`;
-un-enrolled accounts and API-token and MCP-token callers pass, and engine principals are denied.
+un-enrolled accounts and API-token and MCP-token callers pass (except on the two Settings MFA
+routes named below, which accept only a local session), and engine principals are denied.
 "High-risk" names these routes; it is not a claim that every high-risk operation is covered. Other
 mutating routes and all MCP tools are not MFA-step-up gated in this release. The check on those 37
 routes now runs in one place, in the server's request pipeline, instead of inside each handler,
@@ -356,7 +357,14 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   only, because enrolment confirmation records a fresh proof for that session (the audit row
   `mfa.enroll.verified` says `step_up_proof=stamped`, or `step_up_proof=not_stamped` when the
   session could not be stamped: a bearer principal, an absent or mismatched cookie, or a store
-  failure). An account with no MFA enrolled is not affected.
+  failure). An account with no MFA enrolled is not affected. These two routes are stricter than the
+  rest (#6079): they use the approver window, `min(--mfa-step-up-window-secs, 300)` and 300 when
+  that setting is `0` or less, so `--mfa-step-up-window-secs=0` does not switch them off; only a
+  signed-in local session can use them (an API token, an SSO identity or an engine principal is
+  refused `403`; neither route has a REST v1 or MCP twin, so no documented automation is affected);
+  and a request whose account factor changed after the step-up check admitted it is refused `409`
+  with nothing written. See "Behaviour change: MFA proofs are bound to the factor they were earned
+  with" below.
 - **What is newly gated, measured against the last release (v0.14.1).** Only the two Settings MFA
   routes above are gated for the first time by this change. Of the other 35, 25 already called the
   step-up check from their handlers in v0.14.1. The remaining ten were gated in their handlers
@@ -428,7 +436,7 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   The new alert `YuzuStepUpGateUnavailable` fires on it.
 - **SAML sessions cannot satisfy step-up in this release.** They receive `403` on all 37 routes (reason
   `saml_session_no_mfa_this_release`, see #4935), unless `--mfa-step-up-window-secs` is `0` or less:
-  the disabled window is checked before the SAML refusal, so SAML sessions then pass all 37. A
+  the disabled window is checked before the SAML refusal, so SAML sessions then pass the 34 ordinary routes (the two Settings MFA routes ignore the setting and refuse every non-local session). A
   deployment whose only interactive sign-in is SAML has no session route to any of them. The
   refusal's remediation says SAML sessions cannot satisfy step-up in this release (re-authenticating
   does not help) and to use an existing untiered, unscoped API token where the route accepts one, or
@@ -489,12 +497,52 @@ v0.14.1, six existing routes that needed no fresh proof now need one inside the 
 Settings MFA routes (gated by this change) and the four existing routes listed under "What is newly gated"
 above (gated earlier in this release cycle). The six routes that are new in this release need one too.
 `--mfa-step-up-window-secs 0` (or less) disables
-the stale-proof requirement on the 37 routes and still logs a startup `WARN`. While it is in
+the stale-proof requirement on the 34 ordinary routes (not on the two Settings MFA routes, which use a window of at most 300 s) and still logs a startup `WARN`. While it is in
 force no stale proof is refused (so none is recorded), and the SAML refusal and the
 authentication-store read are skipped too, so SAML sessions also pass; engine denials and
 unwired-store refusals still apply and are still recorded. The JIT-elevation routes keep a 300 s window (the global
 window when it is positive, else 300 s). The new alert `YuzuStepUpWindowDisabled` fires while the
 window is 0 or less. This release has no supported return to v0.14.1 (see "Deployment contract (hard cutover)"). v0.14.1 does not gate the two Settings routes or the four existing routes listed under "What is newly gated" above in their handlers, and it does not have the six routes that are new in this release. A server whose `/metrics` lacks `yuzu_auth_mfa_step_up_gate_total` and `yuzu_auth_mfa_step_up_window_seconds` has no step-up gate on these routes at all, and `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled` cannot fire there: their silence is not evidence that the gate is on.
+
+## Behaviour change: MFA proofs are bound to the factor they were earned with; one re-prove after upgrade (#6079)
+
+**What changed.** A step-up proof of a local, MFA-enrolled account now counts only for the factor
+that was enrolled when the code was verified. The central step-up check (the 34 ordinary rows), JIT
+elevation and approve and reject all compare a generation stored with the session's proof against the
+account's current one, so disabling MFA and enrolling again, or an administrator resetting the factor
+with `yuzu-server --mfa-reset`, makes every earlier proof stop counting. The generic check also holds a
+local proof to the window on the database clock, to the millisecond, as well as on the server's own
+clock. Two additive schema migrations run at the first start of the new version: `auth` v3 adds
+`users.mfa_factor_gen` and a trigger that advances it, and `session_store` v2 adds two columns and a
+trigger that unbinds a proof written without a generation. The `auth` migration only seeds the generation
+(`1`) on accounts that are already enrolled, the `session_store` migration rewrites no row, and both triggers are
+checked at every start: a server whose database does not have them in force refuses to start (the log
+says `auth store (AuthDB) migration/open failed` or `session store migration/open failed`).
+
+**What you will see.**
+
+- **Each operator session is asked to prove again once.** Sessions that exist when the new version
+  starts serving hold proofs with no generation, so the first gated request or approval on each is a
+  `401` step-up (audit `mfa.step_up.required`, `reason=proof_factor_unbound`) until the operator posts
+  a code to `/login/mfa/stepup`. Accounts with no enrolled factor, API tokens and SSO sessions are
+  unaffected. A script that holds a session cookie must repeat its step-up once.
+- **A rolling upgrade costs availability, never admission.** A sign-in or step-up served by a replica
+  that has not been upgraded yet leaves an unbound proof, and an upgraded replica refuses it with the
+  same `401` until the operator proves again through an upgraded replica; a replica that has not been
+  upgraded still applies the earlier, weaker rule on its own gates. Upgrade the replicas that serve the
+  step-up-gated routes and approvals first, or expect repeated prompts until the rollout completes.
+- **Rolling back is safe for the schema.** The old binary ignores the new columns, and the triggers stay
+  and keep advancing the generation; its own stamps unbind proofs, and its gates apply the earlier rule.
+  Nothing needs undoing, and upgrading again needs no reseeding.
+- **Regenerating recovery codes and disabling MFA are local-session-only.** An API token or an SSO
+  session that reached these two Settings routes before now gets `403`, and `--mfa-step-up-window-secs=0`
+  no longer switches their step-up off (they use a window of at most 300 seconds). A request whose factor
+  changed while it was in flight is refused `409`; reload the page and prove again if asked.
+- **New monitoring.** `yuzu_auth_mfa_binding_enforcement_ok{store="auth"|"session"}` should read `1` on
+  every replica once it has started; `0` means a validation observed a trigger not in force, every
+  local binding decision then answers `503` (`reason=mfa_binding_unenforced`) until a restart, and the
+  shipped `YuzuMfaBindingNotEnforced` alert fires. The procedure is
+  [MFA binding enforcement failed](../ops-runbooks/auth-db-recovery.md#mfa-binding-enforcement-failed).
 
 ## Behaviour change: /health and /api/health per-source budget
 
@@ -916,9 +964,10 @@ principal and not an engine principal. The existing rule that the reviewer canno
   generic step-up gate can only ask for a factor the account has, so it passed an account with none; approve and
   reject now use their own rule, in every `--mfa-enforcement` mode:
   - **Local account:** it must have an enrolled TOTP factor, or the decision is refused `403`
-    `approver_assurance_required:mfa_not_enrolled`. The proof must also be no older than the window and must not
-    predate the account's current enrolment (disabling MFA and enrolling again invalidates older proofs; the
-    response is the usual step-up `401`).
+    `approver_assurance_required:mfa_not_enrolled`. The proof must also be no older than the window and must be
+    bound to the factor enrolled now (disabling MFA and enrolling again replaces the factor, so older proofs
+    stop counting; the response is the usual step-up `401`, with `reason=proof_factor_mismatch`,
+    `proof_factor_unbound` or `mfa_proof_missing` in the `mfa.step_up.required` audit detail).
   - **OIDC session:** the identity provider must have asserted an MFA-method `amr` (with an `iat`) on the ID
     token at sign-in. If it did not (no MFA `amr`, or `iat` missing or not positive), the decision is refused
     `403` `approver_assurance_required:mfa_proof_missing` (with step-up on, typed only when `--mfa-enforcement` does not
@@ -971,7 +1020,7 @@ principal and not an engine principal. The existing rule that the reviewer canno
     approver achieves nothing until RBAC enforcement is turned on.
   - **When the approver rule's own read fails** (an unreadable stored session proof for any approver, or, for a local
     approver, an MFA-store fault at the approver's own read: with the step-up window at `0` or negative, or a fault
-    between the central check's read and that one), the answer is `503` with `retry_after_ms`, counted as
+    between the central check's read and that one; or a binding trigger that is not observed in force), the answer is `503` with `retry_after_ms`, counted as
     `yuzu_auth_secret_unavailable_total{route="approval"}`; nothing is decided. While step-up is on, a local approver
     whose MFA store is unreadable is refused first by the central check: `503` without `retry_after_ms`, counted as
     `yuzu_auth_secret_unavailable_total{route="mfa_stepup"}` and

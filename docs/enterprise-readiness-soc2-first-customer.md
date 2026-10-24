@@ -529,38 +529,27 @@ session (the server sends no `prompt=login` or `max_age`), and no second factor 
 at approval time; any single MFA-method `amr` value the gate accepts counts; real re-authentication (`auth_time` with `max_age`) is a planned
 follow-up; (b) clearing an account's MFA factor ends that account's dashboard sessions, in a second database
 commit and not for API tokens. `yuzu-server --mfa-reset` and an administrator's own Disable in Settings
-(which needs a fresh step-up proof unless `--mfa-step-up-window-secs` is `0` or less, and signs the
-caller out too, except when it only cancels an enrolment that was never verified) clear the factor in
-one commit and delete the account's sessions in another, so the pair is not atomic. Both audit the
-clear in two phases: an `attempted` intent row (`mfa.reset.breakglass` or `mfa.disabled`) is written
-first and fails closed, and an outcome row follows the work. No factor is cleared unless the intent
-row is durable (on the Settings route this relies on the audit store having opened and the audit
-writer being wired into the route, which server boot requires; the CLI checks the write result
-directly); an `attempted` row with no outcome row marks a clear that was requested and whose outcome
-is unknown; the residual, until the clear and the session delete share one transaction, is the loss
-of the outcome row (a process that dies after the clear, or an outcome write that fails after it),
-which leaves the factor cleared, the sessions possibly live and an `attempted` row with nothing after
-it. A process that dies between the intent write and the clear leaves the factor intact and the same
-lone `attempted` row, so that row alone does not prove the factor was cleared: check
-`auth.users.mfa_enrolled_at`. If the session delete fails the factor
-stays cleared and the sessions stay live until an operator ends them: Settings records `mfa.disabled`
-with `result=partial`, `--mfa-reset` records `mfa.reset.breakglass` with `result=partial` and exits
-non-zero (both with `sessions_ended=failed`), and the Settings page offers no retry control (an
-administrator calls `DELETE /api/v1/sessions?username=`; the recovery runbook has a single-transaction
-SQL fallback, which writes no audit row). If the clear itself fails the result is `error` and the
-state is unknown, because the commit acknowledgement may have been lost and the clear may have
-landed: Settings still ends the sessions, and `--mfa-reset` ends none and exits non-zero. A sign-in in
-flight when the delete runs can leave a session the delete did not cover; and a replica or CLI image
-still on an older build ends none and writes no `attempted` row. `sessions_ended` counts the durable
-session rows deleted, expired rows not yet reaped included. Other replicas drop their cached sessions
-within about one second in normal operation and within 30 seconds while a replica's session-generation
-poll is failing; neither bound holds after a database restore or a failover to a lagging standby
-(runbook, "Sessions are durable"). The outcome row cannot undo the clear, so a failed outcome write
-after it leaves only the intent row: `yuzu-server --mfa-reset` then exits non-zero, and Settings logs
-an error and completes the request. The comparison of the proof with the current
-enrolment (an older proof is refused after re-enrolment, `proof_predates_enrolment`) is the second
-line of defence: it stops an older proof being reused after re-enrolment and assumes the database
-primary clock does not step backward. ADR-2002 section 4 treats that clock as a security dependency,
+(which needs a fresh step-up proof and signs the caller out too, except when it only cancels an
+enrolment that was never verified) clear the factor in one commit and delete the account's sessions in
+another, so the pair is not atomic. If the delete fails the factor stays cleared and the sessions stay
+live until an operator ends them: Settings records `mfa.disabled` with `result=partial` (or
+`result=error` with `sessions_ended=failed`) and the page offers no retry control (an administrator
+calls `DELETE /api/v1/sessions?username=`; the recovery runbook has a single-transaction SQL fallback),
+and `--mfa-reset` exits non-zero and records `sessions_ended=failed` in its `mfa.reset.breakglass` row.
+A process that dies between the two commits leaves the factor cleared, the sessions live and no audit
+row; a sign-in in flight when the delete runs can leave a session the delete did not cover; and a
+replica or CLI image still on an older build ends none. `sessions_ended` counts the durable session
+rows deleted, expired rows not yet reaped included. Other replicas drop their cached sessions within
+about one second in normal operation and within 30 seconds while a replica's session-generation poll
+is failing; neither bound holds after a database restore or a failover to a lagging standby (runbook,
+"Sessions are durable"). The Settings audit row is written after the changes and its write is best
+effort: if the audit store cannot be written the request still completes and only a server WARN line
+records it, whereas `yuzu-server --mfa-reset` verifies the audit store is writable before it clears
+anything (use it when the evidence must exist). The comparison of the proof's factor generation with the account's
+current one (a proof of a replaced factor is refused after re-enrolment, `proof_factor_mismatch`) is the
+second line of defence: it reads no clock, so it stops a proof being reused after re-enrolment even when
+the database primary clock steps; the proof's age ceiling does assume that clock does not step backward.
+ADR-2002 section 4 treats that clock as a security dependency,
 and keeping the primary's time source correct is the customer's responsibility; the shipped detector
 is the `YuzuSessionReapClockAnomaly` alert, which sees a backward step only when it exceeds the time
 since the last accepted session reap pass (nominally about 15 minutes while the session store is

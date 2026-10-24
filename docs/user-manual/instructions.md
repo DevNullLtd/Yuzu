@@ -625,11 +625,10 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
     request returns `401` with `meta.mfa_step_up_required: true`; the dashboard prompts for the code
     inline, and a script posts the code to `/login/mfa/stepup` and retries (see
     [Step-up on high-risk surfaces](authentication.md#step-up-on-high-risk-surfaces-pr-2)). A proof
-    made before the account's current enrolment does not count: if MFA was disabled and enrolled again,
-    enter a fresh code. If the account itself has been deleted or deactivated while you were signed in,
-    the decision is refused: with step-up on (the default) the central check answers first with `401`
-    `MFA step-up required`, and `403` `approver_assurance_required:account_unavailable` appears only with
-    `--mfa-step-up-window-secs=0` (or when the account is removed in the middle of the request). Either way, sign in again or contact an administrator.
+    must belong to the factor enrolled now: if MFA was disabled and enrolled again, or the session predates
+    the upgrade that introduced this check, the request returns the same `401` and you enter a fresh code. If the account itself has been deleted or deactivated while you were signed in,
+    the decision is refused with `403` and `approver_assurance_required:account_unavailable`; sign in
+    again or contact an administrator.
   - **OIDC single sign-on.** There is no local factor to check. The sign-in must have carried an MFA
     method claim (`amr`) from your identity provider, on an ID token issued within the approver window
     (at most 300 seconds, and shorter if `--mfa-step-up-window-secs` is lower). "Fresh" here means the
