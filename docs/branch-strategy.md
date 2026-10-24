@@ -65,10 +65,11 @@ is actually used.
 
 1. **Branch from `origin/dev`** after a `git fetch origin` — never from whatever branch you
    happen to be on (the repository's default branch is `main`). Three kinds of branch are cut
-   from somewhere else: a hotfix and a `main`-side release-prep branch (`chore/release-*`,
-   `release/*-prep` — #5299, #5318, #5540) are cut from `main`; a sub-PR of a long-lived
-   `feat/*` branch is cut from that branch (below). Name it with a prefix from the table above
-   and keep it to a single change.
+   from somewhere else: a hotfix, a `chore/release-*` fold branch and a *patch* release's
+   `release/vX.Y.Z-prep` are cut from `main` (#5299, #5318, #5540); a *promotion*'s
+   `release/vX.Y.Z-prep` is cut from the reconciled `dev` it promotes (#5113); a sub-PR of a
+   long-lived `feat/*` branch is cut from that branch (below). Name it with a prefix from the
+   table above and keep it to a single change.
 2. **Open the PR against `dev`.** CI runs the Tier 1 fast path on `pull_request`; the full matrix
    runs on the push that lands on `dev` or `main` (`ci.yml`, `on:` block).
 3. **Run `/governance <base>..HEAD` locally before asking for review** (`CLAUDE.md` → *Agent team
@@ -80,11 +81,13 @@ is actually used.
 4. **Add a `changelog.d/<PR#>-<slug>.<section>.md` fragment** for any operator-visible change;
    never edit `CHANGELOG.md` directly (`changelog.d/README.md`). Pure refactors, CI plumbing and
    test-only changes may skip it.
-5. **Documentation gates run in CI** on every PR: the docs-drift fact-parity check, the
-   plugin README touch rule and the changelog-fragment lint block a merge when they fail; the
-   doc-coupling touch rule runs too but is *advisory* — its `Doc-coupling touch rule` job is not
-   among the six required checks, so a red result does not stop the merge
-   (`docs/docs-drift-gate.md`, `docs/plugin-readme-standard.md`).
+5. **Documentation gates run in CI** on every PR. Only one of them can stop a merge: the
+   docs-drift fact-parity check runs inside the *CHANGELOG order* job, which is one of the six
+   required checks. The plugin README touch rule, the changelog-fragment lint and the
+   doc-coupling touch rule are separate jobs that are not required, so a red result from any of
+   them is *advisory* — visible on the PR, not blocking — until the repository owner adds them to
+   the rulesets (`docs/docs-drift-gate.md`, `docs/plugin-readme-standard.md`; `CLAUDE.md`'s
+   "the `Changelog fragments` CI job enforce[s] this" is true only in that advisory sense).
 6. **One non-author approval, then merge.** All three merge methods are enabled on the
    repository; the practice is a merge commit, so a PR's own commits survive on `dev` (27 of the
    last 300 commits on `dev` are PR merge commits; the rest are the PRs' own commits). The source
@@ -124,7 +127,10 @@ On `main`, one commit (often in the same PR as the promotion) that:
 - sets the `${YUZU_VERSION:-X.Y.Z}` default in every compose file listed in
   `scripts/check-compose-versions.sh` (ten files at the time of writing) to the **base** version,
   with no `-rcN` suffix. A new compose file must be added to that script's `FILES` array; discovery
-  is deliberately not automatic (`CLAUDE.md` → *Release gates*).
+  is deliberately not automatic (`CLAUDE.md` → *Release gates*);
+- updates the README quickstart's release URL and `YUZU_VERSION=` line (`README.md`, the Docker
+  quickstart block) — #5540 did this for 0.14.1; `tests/test_readme_quickstart.py` checks it but
+  runs only locally, so a missed bump ships a quickstart that installs the previous release.
 
 The version bump is a deliberate operator decision; nothing automates it
 (`.claude/skills/release/SKILL.md`, pre-conditions).
@@ -149,8 +155,9 @@ back-merge `dev` is. The only way the tips have ever coincided is a direct fast-
 which only a bypass actor can perform (§1). Every 0.14.x tag — `v0.14.0-rc1`, `v0.14.0`,
 `v0.14.1` — points at a PR merge commit on `main`, and at both `v0.14.0` and `v0.14.1` the
 check would have reported `main` 5 ahead and `dev` several hundred ahead: the releases were cut
-with check 9 red and the operator proceeding past the script's stop. Until #6427 makes the
-check merge-aware, a red 9 is accepted only on this test, and the result is written into the
+with check 9 red and the operator proceeding past the script's stop. Until #6427 changes the
+check (it must tolerate the release-prep commit, which is always on `main` first, as well as
+merge commits), a red 9 is accepted only on this test, and the result is written into the
 promotion PR's body (counts, the `git cherry` output, who judged it) so the judgement is
 reviewable afterwards:
 
@@ -158,10 +165,25 @@ reviewable afterwards:
   release-prep commits (promote, version stamp, compose defaults) and hotfixes you can name.
   `git cherry -v origin/dev origin/main` shows each as `-` (already patch-equivalent on `dev`)
   or `+`; every `+` must be a release-prep commit or a hotfix the back-merge (§3.5) will carry.
-  A `+` you cannot name stops the release.
+  A `+` you cannot name stops the release. Both commands skip merge commits, so also run
+  `git log --merges -p --cc origin/dev..origin/main`: a merge that shows a non-empty `--cc` diff
+  was hand-resolved and may have dropped or altered a hunk — read it before accepting.
 - **`dev` side:** `git log --no-merges --oneline origin/main..origin/dev` is expected to be
-  long; what matters is that every commit you meant to ship is in the promotion —
-  `git diff --stat origin/main release/vX.Y.Z-prep` must be the intended delta and nothing else.
+  long; what matters is that every commit you meant to ship is in the promotion. Run this on
+  the merged tip, after the promotion PR has landed: `git diff --stat origin/main^1 origin/main`
+  (the promotion merge against its first parent — what the release added) must be the intended
+  delta and nothing else. Diffing against the prep *branch* after the merge is empty and proves
+  nothing.
+
+Write the expected `+` list down *before* running `git cherry`, so it is a pre-commitment, not
+a transcription. The promotion PR body carries:
+
+```
+Preflight #9: main ahead <n> (no-merges <k>) / dev ahead <m>
+Expected + (named): <sha> <subject> [release-prep | hotfix #NNNN]; …
+git cherry -v output (verbatim): <paste>
+Unexplained +: none          Judged by: <name>
+```
 
 Preflight reads the *local* tree for checks 2–5, so before running it and again immediately
 before tagging: `git switch main && git merge --ff-only origin/main` and confirm
@@ -200,26 +222,36 @@ back-merged) — the next release does not start from the rc1 tooling.
    promotion commit, every hotfix, every `--append` fold — must reach `dev`, or the next
    promotion re-opens the fixes. Current practice is a PR from a `chore/back-merge-*` branch
    (#6271, 21 October 2026, after the 0.15.0-development promotion). Skip it only when
-   `git merge-base --is-ancestor origin/main origin/dev` already holds (nothing to carry).
+   `git merge-base --is-ancestor origin/main origin/dev` already holds (nothing to carry) — which
+   also means a back-merge PR must land as a **merge commit**, never squashed or rebased, or that
+   test never becomes true and every later release re-merges `main` for nothing.
    **One trap:** a fix that was cherry-picked from `dev` to `main` (§4) has its
    `changelog.d/` fragment on both branches; the fold deleted `main`'s copy, but the three-way
    merge sees `dev`'s copy as "added on one side" and keeps it, and the next plain `promote`
    releases the bullet a second time. `promote` dedupes only inside the section it is writing
    (#6428). Delete the fragment on `dev` when you cherry-pick, or in the back-merge PR.
 2. **Set the next version on `dev`.** `.claude/skills/release/SKILL.md` Phase 6 says to bump
-   `meson.build` to the next plain version straight after a release. At the time of writing
+   `meson.build` to the next plain version straight after a release, as a second commit in the
+   back-merge PR of step 1 (Phase 6 step 1). At the time of writing
    `dev` still carries `0.14.1`, the version released on 7 October, while the 21 October promotion
    PR calls the cycle "0.15.0 development" — so in practice the bump has been happening at the
    next promotion rather than straight after the release.
 3. Patch releases follow the same path: `release/v0.14.1-prep` (#5540) promoted the changelog
    and bumped the version, then `v0.14.1` was tagged.
-4. **Post-tag inspection.** Nothing after the tag push checks these, so look yourself once the
-   release workflow is green: `git ls-tree origin/main changelog.d/` lists only `README.md`
-   (a fragment left behind means a hotfix is missing from the notes — the one case with no
-   mechanical check at all); `git show vX.Y.Z:CHANGELOG.md` has no bullet that also appears
-   under an earlier header (the §3.5 trap); the `${YUZU_VERSION:-…}` defaults in the compose
-   files read `X.Y.Z`; and after the back-merge `git merge-base --is-ancestor origin/main
-   origin/dev` succeeds.
+4. **Post-tag inspection.** Nothing after the tag push checks these (§3.3 covers what preflight
+   checks beforehand), so look yourself once the release workflow is green, after
+   `git fetch origin --tags`:
+   - `git ls-tree --name-only vX.Y.Z changelog.d/` prints only `changelog.d/README.md`. A
+     fragment left behind means a hotfix is missing from the notes — the one case nothing
+     checks once the tag is pushed.
+   - No bullet in the new section also appears under an earlier header (the step 1 trap). The
+     file already carries older duplicates, so compare the new section against the rest, not
+     the whole file against itself; with the new section first in the file:
+     `git show vX.Y.Z:CHANGELOG.md | awk '/^## \[/{n++} n==1&&/^- /' > /tmp/new.txt;
+     git show vX.Y.Z:CHANGELOG.md | awk '/^## \[/{n++} n>1&&/^- /' | grep -Fxf /tmp/new.txt`
+     — empty output is a pass (if `[Unreleased]` precedes the new section, use `n==2`/`n>2`).
+   - The `${YUZU_VERSION:-…}` defaults in the compose files read `X.Y.Z`.
+   - After the back-merge, `git merge-base --is-ancestor origin/main origin/dev` succeeds.
 
 ## 4. Hotfixes
 
@@ -251,7 +283,7 @@ The sequence, as practised:
 Two variants also occur. A fix that was *first* merged to `dev` and then needed on `main` is
 cherry-picked onto a branch off `main` (#5311 `hotfix/5298-line-cap-truncation-main`, #6245
 `fix/nightly-flakes-main-backport` — both say so in their titles); its fragment then exists on
-both branches, so delete the `dev` copy or expect the duplicate-bullet trap in §3.5 step 1. And
+both branches — see §3.5 step 1 for what to do about that. And
 fixes to the release machinery itself (`release.yml`, `pre-release.yml`, packaging) go straight
 to `main`, because that is the only branch a release runs from; they are the majority of
 hotfixes.
@@ -260,12 +292,21 @@ hotfixes.
 
 There is no rollback once `release.yml` has published: untagging is possible but the images and
 packages may already be pulled, so the `/release` skill's advice is a patch. The recovery is the
-two sequences above joined: hotfix (§4 steps 1–2) → that version's plain `promote X.Y.(Z+1)` in a
-`release/vX.Y.(Z+1)-prep` PR (§3.2, §3.4 — `--append` is refused on a final section) → preflight
-with the red-9 test (§3.3) → tag → the stable tag moves `:X.Y` and `:latest` again
-(`release.yml`'s `docker-publish` tag rules) → back-merge, deleting any `dev`-side fragment if
-the fix was a cherry-pick (§3.5). The hotfix PR touches `CHANGELOG.md` via the fold, so the
-*CHANGELOG order* required check applies to the prep PR.
+two sequences above joined, and every step of it happens on `main` — do not wait for `dev`, and
+do not promote it:
+
+1. Hotfix PR to `main` (§4 steps 1–2).
+2. A `release/vX.Y.(Z+1)-prep` branch **cut from `origin/main`** (not `dev` — a prep branch cut
+   from `dev` would ship every unreleased commit in the patch; #5540 is the 0.14.1 precedent).
+   On it, run plain `promote X.Y.(Z+1)` (§3.4 — `--append` is refused on a final section), stamp
+   `meson.build` and the compose defaults with the higher version, open the PR to `main`. The
+   fold touches `CHANGELOG.md`, so the *CHANGELOG order* required check applies.
+3. Preflight on the merged tip with the red-9 test (§3.3), then a **new** tag — never a re-push
+   of the bad one. Only a stable tag moves `:X.Y` and `:latest` off the bad release
+   (`release.yml`'s `docker-publish` rules); an `-rcN` patch candidate leaves them where they
+   are, so a recovery is not finished until the stable patch tag exists.
+4. Back-merge into `dev`, deleting any `dev`-side fragment if the fix was a cherry-pick
+   (§3.5 step 1).
 
 ## 5. Who decides
 
@@ -286,21 +327,24 @@ may change, and this section is where the change should be recorded.
   decide the version, run the promotion and the tag, and own the `main`→`dev` back-merge. In
   the 0.14.0 and 0.14.1 cycles that was one person in practice: all 28 pull requests merged to
   `main` between 29 September and 24 October 2026 were authored and merged by the same release
-  authority, with approving reviews from two other maintainers on 23 of them and none on five
-  (§1). That is a structural fact about the rulesets and staffing, not a conduct finding.
+  authority, with approving reviews from two other maintainers on 23 of them and no effective
+  approval on five (four never approved, one approval dismissed by a later push; §1). That is a
+  structural fact about the rulesets and staffing, not a conduct finding; the
+  remedy is a compensating control (#6431), not a change of person.
 
 ### Open control gaps
 
-Each of the three facts below is true today, disclosed here on purpose, and has a tracking
-issue. Until the issue closes, the honest answer to "is every change to `main` independently
+Each of the four gaps below is true today, disclosed here on purpose, and has a tracking
+issue. Until the issue is closed *as fixed* (a won't-fix close leaves the gap and should be
+recorded here as a decision), the honest answer to "is every change to `main` independently
 reviewed?" is *no*; to "is the process documented and followed?" it is *yes, with these gaps*.
 
-| Gap | Where stated | Tracked in |
-|---|---|---|
-| The one-approval rule can be bypassed; six merges since 29 Sep 2026 had no approving review, and there is no written emergency-change policy saying when bypass is acceptable or what record it leaves | §1 | #6431 |
-| One role authors, approves-by-bypass and merges every change to `main`; no compensating control (post-merge second review, bypass-use report, tag separated from merge) is in place | §5 | #6431 |
-| Preflight check 9 cannot pass under PR-only rulesets and has been red at every 0.14.x release; the operator's judgement is now written into the promotion PR body (§3.3) but the check itself is not merge-aware | §3.3 | #6427 |
-| The governance review's only evidence is a committed `governance.d/` fragment that CI does not check for; 22% of code PRs in the last 60 days lacked one | §2 step 3 | #6430 |
+| Gap | Where stated | Tracked in | Owner / target |
+|---|---|---|---|
+| The one-approval rule can be bypassed (inferred from PR review states — the bypass list itself is admin-only); six merges since 29 Sep 2026 had no approving review, and there is no written emergency-change policy saying when bypass is acceptable or what record it leaves | §1 | #6431 | Unassigned — owner to be named in the issue's decision record; no target date set |
+| One role authors and merges every change to `main`, by bypass where no review was given; no compensating control (post-merge second review, bypass-use report, tag separated from merge) is in place | §5 | #6431 | as above |
+| Preflight check 9 cannot pass under PR-only rulesets and has been red at every 0.14.x release; the operator's judgement is now written into the promotion PR body (§3.3) but the check itself is not merge-aware | §3.3 | #6427 | Unassigned |
+| The governance review's only evidence is a committed `governance.d/` fragment that CI does not check for; a material share of code PRs lack one (figure, method and date in §2 step 3) | §2 step 3 | #6430 | Unassigned |
 
 ## 6. Verified against
 
@@ -310,7 +354,8 @@ PR changes any of the files in the first group without touching this document or
 `doc-coupling-exempt: release-process — <reason>` in its body; it is not a required check and
 does not stop a merge (`docs/docs-drift-gate.md`). **Not coupled, so they drift silently:** the
 rulesets (not in git), `ci.yml`'s triggers (§2 step 2), the gate list in `docs-lint.yml` and
-`doc-coupling.yml` (§2 step 5), `CONTRIBUTING.md`'s prefix list, and the PR-history figures.
+`doc-coupling.yml` (§2 step 5), `CONTRIBUTING.md`'s prefix list, the PR-history figures, and the
+state of the tracking issues in §5.
 
 | Section | Source |
 |---|---|
@@ -323,6 +368,6 @@ rulesets (not in git), `ci.yml`'s triggers (§2 step 2), the gate list in `docs-
 | §2 step 3 governance fragment | `.claude/skills/governance/SKILL.md` Gate 8 step 3; `.github/workflows/docs-lint.yml` "Governance-ledger linter self-test" comment |
 | §2 long-lived branches | #6123→#6143, #6078→#6146, #6145→#6126 |
 | §3 worked example | #5113, #5299, #5318, #5540, #6264, #6271; tags `v0.14.0-rc1` (2026-09-29) … `v0.14.0` (2026-10-03), `v0.14.1` (2026-10-07) |
-| §3.3 check 9 | `scripts/release-preflight.sh:132-137` (both counts must be 0); `git log --format='%h %p' -1 <tag>^{commit}` shows two parents for all three 0.14.x tags; `git rev-list --count` of `dev..main` / `main..dev` at the tag commits against `dev`'s contemporaneous tip gave 5/529 (`v0.14.0`) and 5/1058 (`v0.14.1`); `main`'s first-parent line since 2026-09-29 contains only PR merge commits |
+| §3.3 check 9 | `scripts/release-preflight.sh:132-137` (both counts must be 0); `git log --format='%h %p' -1 <tag>^{commit}` shows two parents for all three 0.14.x tags; `git rev-list --count` of `dev..main` / `main..dev` at the tag commits against `dev`'s tip at the time gave `main` 2–5 ahead and `dev` ~470–530 ahead at `v0.14.0` (the exact pair depends on which instant is taken for `dev`) and 5 / 1058 at `v0.14.1`; `main`'s first-parent line since 2026-09-29 contains only PR merge commits |
 | §4 hotfix sample | the 28 PRs merged to `main` 2026-09-29 → 2026-10-24; #5199, #5255, #5311, #5326, #5447, #5490, #5493, #6245 |
 | §5 who decides | the 2026-10-24 comment on #119 linked from §5; the merger/approver figures from the 28 `main` PRs (`gh pr list --base main --search "merged:>=2026-09-29" --json author,mergedBy,reviewDecision`) |

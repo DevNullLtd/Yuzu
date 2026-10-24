@@ -83,8 +83,8 @@ Branch from `origin/dev` — all work merges into `dev`; `main` is release-only.
 default branch is `main`, so do not branch from "wherever you are". The exceptions: a hotfix to a
 released version branches from `main`, merges to `main`, and is carried back to `dev`
 afterwards; maintainers' release-prep branches (`release/*`, `chore/release-*`) are cut from
-`main`; a sub-PR of a long-lived `feat/*` branch is cut from that branch. Keep branches focused
-on a single change.
+`main` for a patch or a changelog fold and from `dev` for a promotion; a sub-PR of a long-lived
+`feat/*` branch is cut from that branch. Keep branches focused on a single change.
 
 How a change travels from `dev` to a tagged release, how release candidates and hotfixes are
 handled, and who decides what counts as a hotfix and who cuts releases:
