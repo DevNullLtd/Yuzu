@@ -2228,7 +2228,10 @@ groups:
       # #4990: stored-response reads withhold Forensics-tier rows from a caller without
       # Forensics:Read. When the caller's authority itself cannot be determined (the
       # authorization read answered unavailable, or a dependency was never wired) the read is
-      # refused with a retryable 503 or shows a notice, for every caller class; it is not served
+      # refused with a retryable 503 or shows a notice (sessions, API tokens, MCP tokens and engine
+      # principals; a service-scoped token is default-denied instead, and a whole-store outage
+      # that fails the surface's earlier admission gate first is answered by that gate and does
+      # not move this counter); it is not served
       # as a 200 with the Forensics rows silently missing. Only a global Forensics:Read admits
       # rows (there is no scoped read tier). A definitive
       # refusal is correct behavior and is not counted, so the series is flat on a healthy

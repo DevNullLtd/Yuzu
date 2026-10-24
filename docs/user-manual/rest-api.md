@@ -6737,10 +6737,14 @@ not marked: there is no extra field or flag, and the row cap, the truncation fla
 counts and the agent counts are all computed over the rows the caller may read, so **an empty or
 short result does not imply that no data exists**. The one error is the unresolved case: if the
 server cannot determine whether the caller may read Forensics rows (the authorization store is
-unavailable, for any caller class), the route answers a retryable A4 `503` (`retry_after_ms` 5000, no
-`permission` field) instead of a result with those rows silently missing; `yuzu_server_rbac_read_degrade_total`
+unavailable; this applies to sessions, API tokens, MCP tokens and engine principals, while a service-scoped token is
+default-denied with a definitive `403`), the route answers a retryable A4 `503` (`retry_after_ms` 5000, no
+`permission` field) instead of a result with those rows silently missing; that shape is the Forensics check's own, and
+when a whole-store outage fails the route's earlier `Response:Read` gate first, that gate's own answer is returned
+in its own shape (it can name a `permission`). `yuzu_server_rbac_read_degrade_total`
 (alert `YuzuRbacReadDegraded`) is the correlated signal. `Forensics:Read` is a global grant only: there is
-no management-group scoped read tier, and a hand-authored scoped grant reads nothing. Service-scoped tokens,
+no management-group scoped read tier on these stored-response routes, and a hand-authored scoped grant reads
+nothing from them (the per-device application-usage read is a separate data set and keeps its own scoped gate). Service-scoped tokens,
 MCP-tier tokens and engine principals need the global grant like everyone else. With RBAC enforcement off, `Forensics:Read` is
 administrator-only, so a non-administrator session does not receive these rows. The built-in
 `ForensicsAnalyst` role is the delegable read-only holder (see `rbac.md`). A served read that
