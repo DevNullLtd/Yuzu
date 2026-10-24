@@ -5179,11 +5179,29 @@ void RestApiV1::register_routes(
                  auto principals = eps->list_all();
                  JArr arr;
                  for (const auto& p : principals) {
-                     std::int64_t active_creds =
-                         token_store
-                             ? static_cast<std::int64_t>(
-                                   token_store->list_active_for_principal(p.principal_id).size())
-                             : 0;
+                     std::int64_t active_creds = 0;
+                     if (token_store) {
+                         // The CHECKED read: the plain accessor turns a pool-lease timeout
+                         // or query failure into an empty vector, which this list would
+                         // show as "0 credentials" for a principal that holds a live one.
+                         // A read that cannot answer fails the whole list (503), so no
+                         // count is ever shown that the store did not confirm.
+                         auto active = token_store->list_active_for_principal_checked(p.principal_id);
+                         if (!active) {
+                             res.status = 503;
+                             res.set_header("Retry-After", "2");
+                             res.set_content(
+                                 detail::a4_error(res,
+                                                  "could not read the credential counts; retry",
+                                                  detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                                 "application/json");
+                             (void)detail::emit_behavioral_audit(
+                                 audit_fn, req, res, "engine_principal.list", "failure",
+                                 "EnginePrincipal", "", active.error());
+                             return;
+                         }
+                         active_creds = static_cast<std::int64_t>(active->size());
+                     }
                      arr.add(JObj()
                                  .add("principal_id", p.principal_id)
                                  .add("display_name", p.display_name)
@@ -5243,7 +5261,23 @@ void RestApiV1::register_routes(
 
                  JArr creds;
                  if (token_store) {
-                     for (const auto& t : token_store->list_active_for_principal(principal_id)) {
+                     // CHECKED read, as on the list route: a degraded read must not render
+                     // as "no active credentials" for a principal that holds one.
+                     auto active = token_store->list_active_for_principal_checked(principal_id);
+                     if (!active) {
+                         res.status = 503;
+                         res.set_header("Retry-After", "2");
+                         res.set_content(
+                             detail::a4_error(res, "could not read the principal's credentials; retry",
+                                              detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                             "application/json");
+                         (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                             "engine_principal.get", "failure",
+                                                             "EnginePrincipal", principal_id,
+                                                             active.error());
+                         return;
+                     }
+                     for (const auto& t : *active) {
                          // token_hash is masked ('') by list_active_for_principal already —
                          // never echo the raw secret on a plain GET.
                          creds.add(JObj()

@@ -3472,6 +3472,68 @@ TEST_CASE("MCP mint_engine_credential: fails CLOSED with a retry hint and mints 
     CHECK(store.list_active_for_principal(principal).size() == 1);
 }
 
+TEST_CASE("MCP list_engine_principals and get_engine_principal: fail with a retry hint, not "
+          "zero credentials, when the credential read cannot answer",
+          "[mcp][pg][engine_principal][read][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    // The principal store gets its OWN pool: holding the token pool's leases must degrade only
+    // the credential read, not the principal-roster read the tools make first.
+    yuzu::server::pg::PgPool eps_pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(eps_pool.valid());
+    yuzu::server::EnginePrincipalStore eps{eps_pool};
+    REQUIRE(eps.is_open());
+    const std::string principal = "engine:mcp-read-degraded";
+    REQUIRE(eps.create("mcp read", "alice", "j", "internal", "alice", principal).has_value());
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("mcp read", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.engine_principal_store_for_test = &eps;
+    ts.start("readonly");
+    const std::string list_call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"list_engine_principals","arguments":{}}})";
+    const std::string get_call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,)"
+        R"("params":{"name":"get_engine_principal","arguments":{"principal_id":"engine:mcp-read-degraded"}}})";
+
+    {
+        auto held = hold_all_leases(pool);
+        for (const auto& call : {list_call, get_call}) {
+            auto r = ts.call(call);
+            REQUIRE(r);
+            auto body = nlohmann::json::parse(r->body);
+            REQUIRE(body.contains("error"));
+            REQUIRE_FALSE(body.contains("result"));
+            CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+                  mcp::kMcpStoreFaultShortRetryMs);
+            CHECK(r->body.find("active_credentials") == std::string::npos);
+        }
+    }
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(), "mcp.list_engine_principals|failure") ==
+          1);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(), "mcp.get_engine_principal|failure") ==
+          1);
+
+    // Leases back: both now report the credential that was there all along.
+    for (const auto& call : {list_call, get_call}) {
+        auto r = ts.call(call);
+        REQUIRE(r);
+        auto j = nlohmann::json::parse(r->body);
+        REQUIRE(j.contains("result"));
+        const auto text = j["result"]["content"][0]["text"].get<std::string>();
+        CHECK(text.find("\"active_credentials\":1") != std::string::npos);
+    }
+}
+
 TEST_CASE("MCP mint_engine_credential: withholds the secret with a partial audit when the "
           "read-back after the insert cannot answer",
           "[mcp][pg][engine_principal][mint][degraded]") {

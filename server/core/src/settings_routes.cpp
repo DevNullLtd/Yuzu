@@ -910,9 +910,22 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
             const std::string status_cls = active ? "role-ok" : "role-user";
             const std::string status_txt = active ? "Active" : "Revoked";
 
+            // CHECKED read: the plain accessor turns a closed store, pool-lease timeout or
+            // query failure into an empty vector, which this cell would show as "0" for a
+            // principal that holds a live credential. A read that cannot answer says so in
+            // the cell and leaves the rest of the row (read from the principal store) intact.
             std::size_t active_creds = 0;
-            if (api_token_store_ && api_token_store_->is_open()) {
-                active_creds = api_token_store_->list_active_for_principal(p.principal_id).size();
+            bool creds_known = true;
+            std::string active_creds_cell = "0";
+            if (api_token_store_) {
+                auto checked = api_token_store_->list_active_for_principal_checked(p.principal_id);
+                if (checked) {
+                    active_creds = checked->size();
+                    active_creds_cell = std::to_string(active_creds);
+                } else {
+                    creds_known = false;
+                    active_creds_cell = "<span class=\"muted\">unavailable</span>";
+                }
             }
 
             // Revoked rows MUST surface the `superseded_by` linkage AND the
@@ -977,7 +990,7 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                     status_cls + "\">" + status_txt +
                     "</span></td>"
                     "<td>" +
-                    std::to_string(active_creds) +
+                    active_creds_cell +
                     "</td>"
                     "<td>" +
                     revocation_cell +
@@ -1013,7 +1026,12 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                 // htmx's own `hx-confirm` (that only fires for htmx-owned
                 // hx-post/hx-get triggers, which these forms deliberately
                 // are not).
-                if (active_creds == 0) {
+                if (!creds_known) {
+                    // The credential store could not answer, so neither "Mint" (no live
+                    // credential) nor "Rotate" (exactly one) can be offered truthfully.
+                    html += "<span class=\"hint\">Credential state unavailable; "
+                            "reload to retry.</span> ";
+                } else if (active_creds == 0) {
                     // No live credential yet — this principal needs an
                     // initial mint (POST .../credentials), not a rotate
                     // (rotate_engine_credential requires exactly one active

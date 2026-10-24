@@ -26459,11 +26459,25 @@ McpServer::HandlerFn McpServer::build_handler(
                         .add("superseded_by", p.superseded_by)
                         .add("created_at", p.created_at)
                         .add("revoked_at", p.revoked_at);
-                    if (engine_credential_store_)
-                        row.add("active_credentials",
-                                static_cast<int64_t>(
-                                    engine_credential_store_->list_active_for_principal(p.principal_id)
-                                        .size()));
+                    if (engine_credential_store_) {
+                        // CHECKED read: the plain accessor turns a pool-lease timeout or
+                        // query failure into an empty vector, shown here as "0 credentials"
+                        // for a principal that holds a live one. Fail the whole list instead.
+                        auto active =
+                            engine_credential_store_->list_active_for_principal_checked(
+                                p.principal_id);
+                        if (!active) {
+                            mcp_audit("failure", active.error());
+                            res.set_content(
+                                a4_error(kInternalError,
+                                         "could not read the credential counts; retry",
+                                         "retry the request",
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                "application/json");
+                            return;
+                        }
+                        row.add("active_credentials", static_cast<int64_t>(active->size()));
+                    }
                     arr.add(row);
                 }
                 JObj payload;
@@ -26525,11 +26539,23 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("created_at", p.created_at)
                     .add("revoked_at", p.revoked_at)
                     .add("created_by", p.created_by);
-                if (engine_credential_store_)
-                    payload.add("active_credentials",
-                               static_cast<int64_t>(
-                                   engine_credential_store_->list_active_for_principal(principal_id)
-                                       .size()));
+                if (engine_credential_store_) {
+                    // CHECKED read, as on list_engine_principals: a degraded read must not
+                    // render as "0 active credentials".
+                    auto active =
+                        engine_credential_store_->list_active_for_principal_checked(principal_id);
+                    if (!active) {
+                        mcp_audit("failure", active.error());
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "could not read the principal's credentials; retry",
+                                     "retry the request",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    payload.add("active_credentials", static_cast<int64_t>(active->size()));
+                }
                 mcp_audit("success", principal_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");

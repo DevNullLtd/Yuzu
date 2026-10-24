@@ -894,6 +894,57 @@ TEST_CASE("Engine-principal REST: mint fails closed with 503 when the active-cre
     CHECK(again->status == 409);
 }
 
+TEST_CASE("Engine-principal REST: GET list and GET one answer 503, not zero credentials, when "
+          "the credential read cannot answer",
+          "[pg][rest][engine_principal][read][degraded]") {
+    RestEngineHarness h;
+    auto [pid, raw] = h.create_and_mint("read-degraded");
+    (void)raw;
+
+    {
+        auto held = hold_all_token_pool_leases();
+
+        auto list = h.list();
+        REQUIRE(list);
+        CHECK(list->status == 503);
+        CHECK(list->get_header_value("Retry-After") == "2");
+        // No principal row, so no "0" count, was served.
+        CHECK(list->body.find("active_credential_count") == std::string::npos);
+        CHECK(nlohmann::json::parse(list->body)["error"]["retry_after_ms"].get<int>() == 2000);
+        REQUIRE(!h.audit_log.empty());
+        CHECK(h.audit_log.back().action == "engine_principal.list");
+        CHECK(h.audit_log.back().result == "failure");
+        CHECK(h.audit_log.back().detail == "pool lease timed out");
+
+        auto one = h.get(pid);
+        REQUIRE(one);
+        CHECK(one->status == 503);
+        CHECK(one->get_header_value("Retry-After") == "2");
+        CHECK(one->body.find("active_credentials") == std::string::npos);
+        CHECK(nlohmann::json::parse(one->body)["error"]["retry_after_ms"].get<int>() == 2000);
+        CHECK(h.audit_log.back().action == "engine_principal.get");
+        CHECK(h.audit_log.back().result == "failure");
+        CHECK(h.audit_log.back().detail == "pool lease timed out");
+    }
+
+    // The leases are back: the same reads now report the credential that was there all along.
+    auto list = h.list();
+    REQUIRE(list);
+    REQUIRE(list->status == 200);
+    bool found = false;
+    for (const auto& row : nlohmann::json::parse(list->body)["data"]) {
+        if (row["principal_id"] == pid) {
+            found = true;
+            CHECK(row["active_credential_count"].get<int>() == 1);
+        }
+    }
+    CHECK(found);
+    auto one = h.get(pid);
+    REQUIRE(one);
+    REQUIRE(one->status == 200);
+    CHECK(nlohmann::json::parse(one->body)["data"]["active_credentials"].size() == 1);
+}
+
 TEST_CASE("Engine-principal REST: rotate withholds the secret with 503 and a partial audit when "
           "the successor read-back cannot answer and a retry re-serves the same secret",
           "[pg][rest][engine_principal][rotation][degraded]") {
@@ -2220,6 +2271,40 @@ struct SettingsOwnerDeleteHarness {
 };
 
 } // namespace
+
+TEST_CASE("SettingsRoutes engine-principals fragment: a credential read that cannot answer "
+          "says unavailable and offers neither Mint nor Rotate",
+          "[pg][settings][engine_principal][read][degraded]") {
+    EnginePrincipalStorePg engine_store;
+    REQUIRE(engine_store->create("Vuln Sync", "bob", "j", "internal", "admin", "engine:panel-deg")
+                .has_value());
+    SettingsOwnerDeleteHarness h(engine_store.get());
+    // One live credential, so a "0" with a Mint button would be the false reading.
+    h.token_store->set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(h.token_store
+                ->create_token("Vuln Sync", "engine:panel-deg", now + 90 * 24 * 3600, "",
+                               "readonly", "engine")
+                .has_value());
+
+    {
+        auto held = hold_all_token_pool_leases();
+        auto res = h.sink.Get("/fragments/settings/engine-principals");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("unavailable") != std::string::npos);
+        CHECK(res->body.find("data-engine-action=\"mint\"") == std::string::npos);
+        CHECK(res->body.find("data-engine-action=\"rotate\"") == std::string::npos);
+        // The principal row itself, read from the principal store, is still shown.
+        CHECK(res->body.find("engine:panel-deg") != std::string::npos);
+    }
+
+    auto res = h.sink.Get("/fragments/settings/engine-principals");
+    REQUIRE(res);
+    CHECK(res->body.find("unavailable") == std::string::npos);
+    CHECK(res->body.find("data-engine-action=\"rotate\"") != std::string::npos);
+}
 
 TEST_CASE("SettingsRoutes owner-delete guard: blocks deleting a user who owns an "
           "active engine principal (409)",
