@@ -48,6 +48,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <regex>
 #include <set>
@@ -67,6 +68,14 @@ struct AuditRow {
 };
 
 json body(const std::string& s) { return json::parse(s); }
+
+/// Restores the process-wide spdlog level when the test ends, however it ends: the config routes
+/// really set it (log_level is applied by RuntimeConfigStore::set), and a failed REQUIRE must not
+/// leak a changed level into the tests that run after it.
+struct LogLevelGuard {
+    spdlog::level::level_enum saved{spdlog::default_logger()->level()};
+    ~LogLevelGuard() { spdlog::default_logger()->set_level(saved); }
+};
 
 /// MockHarness — no Postgres needed. `runtime_config_store` defaults null;
 /// every gate-pinning / body-shape case relies on the route returning
@@ -680,13 +689,19 @@ TEST_CASE("config: LiveSeconds copies and assigns by value and is safe across th
     CHECK_FALSE(bad.load());
 }
 
-TEST_CASE("config: clamp_heartbeat_timeout raises a sub-floor stored value to the floor",
+TEST_CASE("config: clamp_heartbeat_timeout moves an out-of-range stored value to the nearest bound",
           "[server][config_routes]") {
-    // A heartbeat stored before the floor existed is raised to it, never dropped or lowered.
+    // A heartbeat stored before the floor or the ceiling existed is moved to the nearest bound at
+    // boot, never dropped: a sub-floor value would flap every agent, a huge one would stop
+    // stale-agent reaping.
     CHECK(clamp_heartbeat_timeout(1) == kMinHeartbeatTimeoutSeconds);
     CHECK(clamp_heartbeat_timeout(29) == kMinHeartbeatTimeoutSeconds);
     CHECK(clamp_heartbeat_timeout(30) == 30);
     CHECK(clamp_heartbeat_timeout(120) == 120);
+    CHECK(clamp_heartbeat_timeout(86400) == 86400);
+    CHECK(clamp_heartbeat_timeout(86401) == kMaxHeartbeatTimeoutSeconds);
+    CHECK(clamp_heartbeat_timeout(std::numeric_limits<int>::max()) == kMaxHeartbeatTimeoutSeconds);
+    static_assert(kMinHeartbeatTimeoutSeconds == 30 && kMaxHeartbeatTimeoutSeconds == 86400);
 }
 
 TEST_CASE("config_routes: PUT a non-numeric value for an integer key is a 400, cfg untouched, "
@@ -1635,6 +1650,7 @@ TEST_CASE("config_routes: PUT /api/v1/config/{param} writes, applies and audits 
 
 TEST_CASE("config_routes: the v1 PUT reports how soon a write takes effect; the legacy body has no effect field",
           "[pg][server][routes][config_routes]") {
+    LogLevelGuard level_guard;
     YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
     PgWired w{db.dsn()};
     MockHarness h;
@@ -1647,7 +1663,9 @@ TEST_CASE("config_routes: the v1 PUT reports how soon a write takes effect; the 
         {"plugin_signing_required", {"true", "stored_only"}},
         {"auto_approve_enabled", {"false", "stored_only"}},
         {"audit_retention_days", {"400", "stored_only"}},
-        {"oidc_issuer", {"https://idp.example.com", "stored_only"}}};
+        {"oidc_issuer", {"https://idp.example.com", "stored_only"}},
+        {"oidc_admin_group", {"grp-admins", "deferred"}},
+        {"oidc_redirect_uri", {"https://yuzu.example.com/auth/callback", "deferred"}}};
     for (const auto& [key, vv] : cases) {
         INFO(key);
         auto res = h.sink.Put("/api/v1/config/" + key, json({{"value", vv.first}}).dump());
@@ -1719,7 +1737,7 @@ TEST_CASE("config_routes: log_level reads back in the spelling the write accepts
     MockHarness h;
     h.runtime_config_store = &w.store;
     h.wire();
-    const auto before = spdlog::default_logger()->level();
+    LogLevelGuard level_guard;
     REQUIRE(h.sink.Put("/api/v1/config/log_level", R"({"value":"warn"})")->status == 200);
     for (const char* path : {"/api/config", "/api/v1/config"}) {
         auto res = h.sink.Get(path);
@@ -1733,7 +1751,6 @@ TEST_CASE("config_routes: log_level reads back in the spelling the write accepts
                            json({{"value", data["config"]["log_level"]}}).dump())
                     ->status == 200);
     }
-    spdlog::default_logger()->set_level(before);
 }
 
 TEST_CASE("config_routes: the v1 PUT refuses the change when the attempted row cannot be written, "

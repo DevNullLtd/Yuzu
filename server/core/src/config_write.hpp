@@ -141,11 +141,13 @@ struct ViewFault {};
 /// How soon a successful write of `key` changes what the server does, for the `effect` field of
 /// the v1 and MCP write answers (`applied` only says the value was accepted and stored):
 ///   "immediate"   the running server uses it now (heartbeat_timeout on the local reaper, log_level)
-///   "deferred"    stored, applied only by the next DEX Alerts save or a restart (the dex_* keys)
+///   "deferred"    stored, applied only later: the dex_* keys by the next DEX Alerts save or a
+///                 restart, oidc_admin_group and oidc_redirect_uri by a restart (the boot loader
+///                 copies them into the live config, which every SSO login reads)
 ///   "stored_only" stored and reported, but nothing consumes it: the retention windows (the stores
 ///                 take theirs from the command-line flags), auto_approve_enabled,
-///                 plugin_signing_required (records intent) and the oidc_* keys (a restart does not
-///                 rebuild the provider from them).
+///                 plugin_signing_required (records intent) and the other oidc_* keys (a restart
+///                 does not rebuild the provider from them).
 [[nodiscard]] std::string_view effect_of(std::string_view key);
 
 } // namespace yuzu::server::config

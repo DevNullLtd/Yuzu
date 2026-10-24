@@ -3454,14 +3454,15 @@ static const ToolDef kTools[] = {
      "nothing changes. `applied: true` means the value was accepted and stored, not that it is in "
      "use: `effect` says how soon it matters. 'immediate' is used by the running server now "
      "(heartbeat_timeout, log_level); 'deferred' waits for the next DEX Alerts save or a restart "
-     "(the dex_* keys); 'stored_only' means nothing consumes it. The retention values are "
+     "(the dex_* keys) or for a restart (oidc_admin_group, oidc_redirect_uri); 'stored_only' means "
+     "nothing consumes it. The retention values are "
      "stored_only: they are shown by get_runtime_config but are not enforced, even after a "
      "restart, because the response and guardian-event stores take their window from the "
      "server's command-line flags (#483), so this call does not change what they delete. "
      "auto_approve_enabled, plugin_signing_required (which records intent and hardens nothing) "
-     "and the oidc_* keys are stored_only too.",
+     "and the other oidc_* keys are stored_only too.",
      R"j({"type":"object","properties":{"key":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[a-z_]+$","description":"Runtime config key, one of get_runtime_config's allowed_keys"},"value":{"type":"string","maxLength":256,"description":"The new value as a string, e.g. \"90\" or \"debug\""}},"required":["key","value"],"additionalProperties":false})j",
-     R"j({"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"applied":{"type":"boolean","description":"the value was accepted and stored; see effect for whether it is in use"},"effect":{"type":"string","enum":["immediate","deferred","stored_only"],"description":"immediate: used by the running server now; deferred: applied by the next DEX Alerts save or a restart; stored_only: nothing consumes it"},"audit_persisted":{"type":"boolean","description":"present and false only when the outcome audit row could not be persisted"}},"required":["key","applied","effect"]})j"},
+     R"j({"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"applied":{"type":"boolean","description":"the value was accepted and stored; see effect for whether it is in use"},"effect":{"type":"string","enum":["immediate","deferred","stored_only"],"description":"immediate: used by the running server now; deferred: applied by the next DEX Alerts save or a restart (dex_*), or by a restart (oidc_admin_group, oidc_redirect_uri); stored_only: nothing consumes it"},"audit_persisted":{"type":"boolean","description":"present and false only when the outcome audit row could not be persisted"}},"required":["key","applied","effect"]})j"},
 
     {"get_plugin_config",
      "Read one plugin config value by (plugin, key). Mirrors GET "
@@ -22814,9 +22815,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // additionalProperties:false is advertised; enforce it, because an extra argument
                 // such as {"dry_run":true} must not turn into a real write.
-                for (const auto& [name, unused] : args.items())
-                    if (name != "key" && name != "value") {
-                        res.set_content(error_response(id, kInvalidParams, "unknown argument '" + name + "'; set_runtime_config takes key and value only"), "application/json"); // retry-hint-exempt: caller-input rejection
+                for (auto it = args.begin(); it != args.end(); ++it)
+                    if (it.key() != "key" && it.key() != "value") {
+                        res.set_content(error_response(id, kInvalidParams, "unknown argument '" + it.key().substr(0, 64) + "'; set_runtime_config takes key and value only"), "application/json"); // retry-hint-exempt: caller-input rejection
                         return;
                     }
                 const std::string key = args["key"].get<std::string>();

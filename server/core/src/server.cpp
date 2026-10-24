@@ -14475,16 +14475,22 @@ private:
                 spdlog::set_level(spdlog::level::from_str(e.value));
             } else if (e.key == "heartbeat_timeout") {
                 try {
-                    // A value stored before the 30 s floor existed would make every directly
-                    // connected agent flap; raise it to the floor and say how to clear it.
+                    // A value stored before the 30 s floor (or the one-day ceiling) existed would
+                    // make every directly connected agent flap, or stop stale-agent reaping; move it
+                    // to the nearest bound and say how to clear it.
                     const int stored = std::stoi(e.value);
                     const int applied = clamp_heartbeat_timeout(stored);
                     if (applied != stored)
-                        spdlog::warn("Stored heartbeat_timeout {} is below the {} second minimum; "
-                                     "using {} seconds. PUT /api/config/heartbeat_timeout with a "
-                                     "value of {} or more to replace the stored one.",
-                                     stored, kMinHeartbeatTimeoutSeconds, applied,
-                                     kMinHeartbeatTimeoutSeconds);
+                        spdlog::warn("Stored heartbeat_timeout {} is {} the {} second {}; using "
+                                     "{} seconds. PUT /api/config/heartbeat_timeout with a value "
+                                     "from {} to {} to replace the stored one.",
+                                     stored, stored < kMinHeartbeatTimeoutSeconds ? "below" : "above",
+                                     stored < kMinHeartbeatTimeoutSeconds
+                                         ? kMinHeartbeatTimeoutSeconds
+                                         : kMaxHeartbeatTimeoutSeconds,
+                                     stored < kMinHeartbeatTimeoutSeconds ? "minimum" : "maximum",
+                                     applied, kMinHeartbeatTimeoutSeconds,
+                                     kMaxHeartbeatTimeoutSeconds);
                     cfg_.session_timeout = std::chrono::seconds(applied);
                 } catch (...) {}
             } else if (e.key == "response_retention_days") {

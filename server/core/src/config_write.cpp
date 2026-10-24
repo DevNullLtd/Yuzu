@@ -103,9 +103,9 @@ std::optional<WriteRefusal> write_refusal(const std::string& key, const auth::Se
         return std::nullopt;
     return WriteRefusal{.kind = WriteRefusal::Kind::Denied,
                         .message = refusal_message,
-                        .remediation = "change this setting as an administrator, from the "
-                                       "Settings page or with an administrator API token that is "
-                                       "not MCP-tier",
+                        .remediation = "change this setting with an administrator API token that is "
+                                       "not MCP-tier, or as an administrator from the Settings "
+                                       "page where one exists",
                         .audit_detail = refusal_detail};
 }
 
@@ -193,6 +193,10 @@ std::string_view effect_of(std::string_view key) {
     if (key == "dex_alert_routing" || key == "dex_blast_min_devices" ||
         key == "dex_blast_window_seconds" || key == "dex_blast_cooldown_seconds" ||
         key == "dex_cohort_export_key")
+        return "deferred";
+    // Applied into the live config by the boot loader, and read from it at every SSO login
+    // (/auth/callback), so a restart makes them take effect.
+    if (key == "oidc_admin_group" || key == "oidc_redirect_uri")
         return "deferred";
     return "stored_only";
 }

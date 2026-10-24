@@ -18,6 +18,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -192,23 +193,36 @@ TEST_CASE("config_write: with no store the view is a fault, never an empty confi
     CHECK_FALSE(config::build_config_view(none, viewer, false).has_value());
 }
 
-TEST_CASE("config_write: effect_of classifies every allowed key and only the live ones are immediate",
-          "[server][config_write]") {
+TEST_CASE("config_write: effect_of is pinned for every allowed key", "[server][config_write]") {
+    // Spelled out, not derived: the wrong answer here tells an operator a hardening setting is in
+    // force. A new allowed key fails this until it is classified on purpose.
+    const std::map<std::string, std::string_view> expected{
+        {"heartbeat_timeout", "immediate"},
+        {"log_level", "immediate"},
+        {"response_retention_days", "stored_only"},
+        {"audit_retention_days", "stored_only"},
+        {"guardian_event_retention_days", "stored_only"},
+        {"auto_approve_enabled", "stored_only"},
+        {"plugin_signing_required", "stored_only"},
+        {"dex_alert_routing", "deferred"},
+        {"dex_blast_min_devices", "deferred"},
+        {"dex_blast_window_seconds", "deferred"},
+        {"dex_blast_cooldown_seconds", "deferred"},
+        {"dex_cohort_export_key", "deferred"},
+        {"dex_score_policy", "stored_only"},
+        {"oidc_issuer", "stored_only"},
+        {"oidc_client_id", "stored_only"},
+        {"oidc_client_secret", "stored_only"},
+        {"oidc_skip_tls_verify", "stored_only"},
+        {"oidc_admin_group", "deferred"},
+        {"oidc_redirect_uri", "deferred"},
+    };
     for (const auto& k : RuntimeConfigStore::allowed_keys()) {
         INFO(k);
-        const auto e = config::effect_of(k);
-        CHECK((e == "immediate" || e == "deferred" || e == "stored_only"));
-        const bool live = k == "heartbeat_timeout" || k == "log_level";
-        CHECK((e == "immediate") == live);
-        const bool deferred = k.starts_with("dex_alert") || k.starts_with("dex_blast") ||
-                              k == "dex_cohort_export_key";
-        CHECK((e == "deferred") == deferred);
+        REQUIRE(expected.contains(k));
+        CHECK(config::effect_of(k) == expected.at(k));
     }
-    // The inert ones an operator might believe are in force.
-    for (const char* k : {"plugin_signing_required", "auto_approve_enabled", "audit_retention_days",
-                          "response_retention_days", "guardian_event_retention_days",
-                          "oidc_issuer", "oidc_admin_group", "oidc_client_secret"})
-        CHECK(config::effect_of(k) == "stored_only");
+    CHECK(expected.size() == RuntimeConfigStore::allowed_keys().size());
 }
 
 TEST_CASE("config_write: applied_json adds the effect only when asked, and never a secret's value",

@@ -40500,6 +40500,13 @@ struct RuntimeConfigPgWired {
     yuzu::server::config::Backing backing() { return {&cfg, &auto_approve, &store}; }
 };
 
+/// Restores the process-wide spdlog level when the test ends, however it ends (set_runtime_config
+/// really applies log_level).
+struct RuntimeConfigLogLevelGuard {
+    spdlog::level::level_enum saved{spdlog::default_logger()->level()};
+    ~RuntimeConfigLogLevelGuard() { spdlog::default_logger()->set_level(saved); }
+};
+
 nlohmann::json set_runtime_config_call(McpTestServer& ts, const std::string& key,
                                        const std::string& value) {
     return mcp_tool_call(ts, "set_runtime_config",
@@ -40652,6 +40659,7 @@ TEST_CASE("MCP runtime config: the route-owned key and bad input are invalid par
 TEST_CASE("MCP runtime config: an extra argument is refused, not ignored; effect and the heartbeat "
           "ceiling are reported",
           "[pg][mcp][integration][runtime_config]") {
+    RuntimeConfigLogLevelGuard level_guard;
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
     RuntimeConfigPgWired w{db.dsn()};
     McpTestServer ts;
@@ -40838,6 +40846,30 @@ TEST_CASE("MCP runtime config: a secret value reaches neither the response nor a
         CHECK(d.find("s3cret-via-mcp") == std::string::npos);
     CHECK(ts.audit_details[0].empty()); // the attempted row carries no value
     CHECK(ts.audit_details[1] == "value=<redacted>");
+}
+
+TEST_CASE("MCP runtime config: an open store whose read fails is an error with a retry hint, "
+          "never an empty configuration",
+          "[pg][mcp][integration][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
+    RuntimeConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.runtime_config_for_test = w.backing();
+    ts.start("supervised");
+    REQUIRE_FALSE(mcp_tool_call(ts, "get_runtime_config", "{}").contains("error"));
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult rename{PQexec(
+            conn.get(), "ALTER TABLE runtime_config_store.runtime_config RENAME TO runtime_config_gone")};
+        REQUIRE(rename.ok());
+    }
+    auto get = mcp_tool_call(ts, "get_runtime_config", "{}");
+    REQUIRE(get.contains("error"));
+    CHECK(get["error"]["message"].get<std::string>().find("runtime config store unavailable") !=
+          std::string::npos);
+    CHECK(get["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(get.dump().find("overrides") == std::string::npos);
 }
 
 TEST_CASE("MCP runtime config: get_runtime_config withholds what the caller could not write",

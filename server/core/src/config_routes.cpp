@@ -204,7 +204,7 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
         if (!deps.perm_fn(req, res, "Infrastructure", "Read"))
             return;
         // The view is scoped to the caller (build_config_view): an administrator's body is the
-        // original, byte for byte; a reader that could not write a key does not get its override.
+        // original apart from the log_level spelling; a reader that could not write a key does not get its override.
         auto session = deps.auth_fn(req, res);
         if (!session)
             return;
