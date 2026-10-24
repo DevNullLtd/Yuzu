@@ -1803,15 +1803,15 @@ API). The runner telemetry database does not carry them: the junit import runs
 once at job end and reads the last invocation's file. Take the np=2 comparison
 from recent `gcc-15`/`debug` PR runs, not push runs: a push runs the whole
 four-leg matrix and saturates the box, a PR run does not, and comparing a quiet
-np=4 run against busy np=2 runs would flatter 4. Two same-SHA samples (the first
-run plus a re-run of the same SHA).
+np=4 run against busy np=2 runs would flatter 4. Take two same-SHA samples:
+the first run of the PR plus a re-run of the same SHA.
 
 *Decision rule.* The one under "Windows test-phase concurrency gate" above,
 applied to this step: (a) the `Test (non-pg suites)` median improves by 10% or
 more (about 40 s); (b) no entry takes more than 1.5x its np=2 time; (c) no entry
-reaches 80% of its own meson timeout (the entries differ: agent shards 240 s,
-tar 90 s, `gateway eunit` and `gateway ct` 600 s, 30 to 180 s for docs, platform
-and proto); and entry count and skip count are unchanged. Revert at once on any
+reaches 80% of its own meson timeout (timeouts differ per entry, from 10 s up
+to 1500 s; read each from the "Suite durations vs meson budgets" table); and
+entry count and skip count are unchanged. Revert at once on any
 of: a spark or guardian case failing (a `spin_until` that never resolves, an
 `ArmOutcomeKind`/`ReceiptStatus` mismatch), even if later retried green; the
 `blocked log sink SIGTERM harness` failing (it asserts a fixed 8 s exit after
@@ -1825,8 +1825,11 @@ push runs on the leg with no non-timing red.
 the BEAM are multi-threaded, so load follows threads, not entries. With four
 runner agents, Linux can now have 16 concurrent entries box-wide (up from 8).
 The Linux non-pg step has no `with-test-slot.sh` gate, whereas the Windows
-non-pg step runs the same cheap set at 4 behind a slot of 2. No per-runner
-memory limit is documented, and host RAM is not stated here. Samples: pending.
+non-pg step runs a similar set (it adds the server non-pg entries and drops
+docs) at 4 behind a slot of 2. No per-runner
+memory limit is documented, and host RAM is not stated here.
+
+*Samples:* pending.
 
 Worst-case ceiling by width (14 pg shards, one shared 700 s timeout, every
 shard at its cap; the degenerate figure, not an expected case): np=2 is 7

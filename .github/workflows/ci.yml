@@ -1187,7 +1187,7 @@ jobs:
         # added shard D, carved from B's [body_cap] tests — + the mcp bridge
         # teardown budget test + the pg shard partition invariant, #3443
         # Phase 1 — needs no Postgres DSN,
-        # --list-tests only enumerates TEST_CASE macros). Both then passed
+        # --list-tests only enumerates TEST_CASE macros). Both were then run with
         # --num-processes 2 (2026-09-18, extends #3443; the first invocation is
         # now 4, see 'Width history' below). The old reasoning
         # here ("UNCAPPED since neither touches Postgres") conflated
