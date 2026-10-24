@@ -1535,15 +1535,20 @@ its "A read failure partway through the access check" exception are **superseded
 the maintainer's 2026-10-23 ruling to keep serving was reviewed by an independent adjudicator on
 2026-10-24 and was not upheld (see "Why", below). Its "Detective control until then" paragraph and its statement about the Settings panel are superseded too: success rows now carry only `standing=available`, `refused` is a withheld standing with its own `denied` row, and the panel withholds the list for a refused caller. Nothing in the 2026-10-23 Update is deleted.
 
-**What changed.** The standing table for `GET /api/v1/ca/issued` (both forms), MCP `list_issued_certs`,
-the `/crypto` drill and the Settings certificate panel's inventory is now:
+**What changed.** The standing decides what `GET /api/v1/ca/issued` (both forms), MCP `list_issued_certs`,
+the `/crypto` drill and the Settings certificate panel's inventory do. The standing is the same on all
+four; the answer shape and the audit row differ by surface.
 
-| Standing | Answer |
-|---|---|
-| kAvailable (a global `Inventory:Read`, an elevated session, an engine principal holding the grant, or RBAC enforcement off) | served; success row ends `standing=available` |
-| kConfined (`Inventory:Read` granted only through management groups) | withheld: 403 / permission denied; `denied` row ending `withheld=confined` |
-| kRefused (no `Inventory:Read` grant at all) | **withheld**: 403 / permission denied; `denied` row ending `withheld=refused` |
-| kDegraded (the access check could not complete, **including a read failure inside it**) | 503, `retry_after_ms` 5000; `failure` row; never the list |
+| Standing | Served? | REST route and MCP tool | `/crypto` drill and Settings panel |
+|---|---|---|---|
+| kAvailable (a global `Inventory:Read`, an elevated session, an engine principal holding the grant, or RBAC enforcement off) | yes | list served; success row ends `standing=available` | list rendered; the drill's success row carries no standing token, the panel is not audited |
+| kConfined (`Inventory:Read` granted only through management groups) | no | 403 / permission denied; `denied` row ending `withheld=confined` | HTTP 200 fragment with a note in place of the list; no CA-view row |
+| kRefused (no `Inventory:Read` grant at all) | **no** | 403 / permission denied; `denied` row ending `withheld=refused` | HTTP 200 fragment with a different note; no CA-view row |
+| kDegraded (the access check could not complete, **including a read failure inside it**) | no | 503, `retry_after_ms` 5000; `failure` row | HTTP 200 fragment with an unavailable note and Retry; no CA-view row (the drill writes none when its check is unavailable) |
+
+The missing rows on the drill and the panel are an existing gap, tracked as #6384; this Update does not
+change it. The `failure` row is written for the resolver and engine branches this Update adds. A failed
+service-ceiling or service-tag read at the fleet gate still audits `denied`.
 
 1. **A read failure inside the access check is a 503, never the list.** `ListReadAuthorization` gains
    `bool read_failed`, set when the global-grant read, the permission-group resolution or the
@@ -1564,8 +1569,10 @@ the `/crypto` drill and the Settings certificate panel's inventory is now:
    inventory; it does not filter it per device (`list_issued` has no scope parameter). (b) "Adding a
    deny" does not by itself widen the list: a global deny does not erase a group allow. The widening
    was the loss of the last scoped allow. (c) The two "KNOWN RESIDUAL" tests injected kRefused; they
-   did not reproduce an authorization query failure. They are replaced by tests that run the real
-   access check against a broken management-group store and against grant removal.
+   did not reproduce an authorization query failure. They are replaced by REST tests that run the real
+   access check against a broken management-group store and against grant removal. The MCP
+   refused-standing test still injects `kRefused`; it covers the consumer, and the failed-read and
+   engine paths are covered by the real-stack and engine-gate tests.
 
 **Why.** The governance rules do not let an author defer a CRITICAL or HIGH finding, and an
 adjudication is not a waiver. The adjudicator (a second model, read-only, 2026-10-24) derived the
