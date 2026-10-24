@@ -4846,3 +4846,161 @@ tests:
       - expr: 'ALERTS{alertname="YuzuResponseProvenanceLookupDegraded", alertstate="firing"}'
         eval_time: 30m
         exp_samples: []
+
+
+  # -- Dispatch-record reap saturated (group yuzu-executions, #4990) ---------------------------
+  #
+  # Mutations run against the pinned promtool image, each turned the named instance red:
+  #   * `for:` 23h or less                           -> s1 (must be quiet at 27h); 20h also s2 (24h30m), 12h also s2 (pending at 20h)
+  #   * `for:` 25h or more                           -> s1 (firing at exactly 28h); 27h also s3
+  #   * threshold 190,000 or less                    -> s5 (never fires); 150,000 also s1 (not true at 3h)
+  #   * threshold 210,000 (also 250,000, 300,000)    -> s1 (firing at exactly 28h); 250,000 also s3
+  #   * window 3h or 5h or 7h or 12h                 -> s1 (3h), s6 (5h), s5 (7h), s2 (12h)
+  #   * `>=` weakened to `>`                         -> s1 (the first true evaluation is exactly 200,000)
+  #   * an average over `changes()` (45,000 per productive pass) -> s1 and s7 (the restart dips it)
+  #   * the metric swapped                           -> s1
+  # SURVIVING MUTANT, equivalent: `rate(...[6h]) * 3600 >= 33333.3` is the same expression (rate is
+  # increase over the window), so no case can tell the two apart.
+
+  # YuzuExecCorrelationReapSaturated. ONE run, seven instances, because the rule needs a 24 hour `for:`
+  # and promtool evaluates every rule in the file each minute of simulated time (a case costs about
+  # 0.17 s per simulated hour, and the whole file runs under a 120 s harness timeout). Hourly passes
+  # are modelled as a step of the counter every 12 samples at a 5m input interval; instance =
+  # case. The window is 6h, so it holds 5 or 6 passes depending on phase, and the threshold is
+  # 200,000 (four caps).
+  #   s1 CASE A  sustained saturation (50,000 every hour from hour 1): the window first holds 4
+  #              passes at hour 4, so `for: 24h` fires at hour 28. Not true at 3h (3 passes),
+  #              pending at 5h and 27h (true, not vacuous), firing at exactly 28h. RED if `for:` is
+  #              23h or less, 25h or more, or the rule is lost.
+  #   s2 CASE B  the drain a one-off burst makes: 22 saturated passes (1.1 million rows, more than
+  #              the two fleet-wide events the cap is sized for), then a partial pass and nothing.
+  #              True from hour 4 to about hour 25, so a 24h `for:` never completes. Pending at 20h
+  #              proves it IS true. RED if `for:` is 20h or less (a drain this size would page).
+  #   s3 CASE B2 the backlog that should page: 27 saturated passes (1.35 million rows, past a whole
+  #              day of the ceiling). True for about 27h, so it fires (hour 29) and has resolved by hour 34. RED if `for:`
+  #              is 27h or more, or the rule cannot see a long drain.
+  #   s4 CASE C  a healthy server: the counter is pre-seeded at 0 and never moves. RED on a
+  #              `>= 0` form.
+  #   s5 CASE D  BOUNDARY BELOW: 38,000 rows every pass (76 percent of the cap). Five passes are
+  #              190,000 (under), six are 228,000 (over), so the expression is true in the 6-pass
+  #              phase only and flaps, restarting the 24h pending: never fires. RED if the
+  #              threshold drops to 190,000 or lower.
+  #   s6 CASE E  BOUNDARY ABOVE: 42,000 rows every pass (84 percent). Five passes are 210,000, so it
+  #              is true in every phase from hour 5 and fires at hour 29: the headroom warning. RED
+  #              if the threshold rises to 210,000 or more.
+  #   s7 CASE F  a server restart in the middle of sustained saturation (counter reset to 0 at hour
+  #              29.5, first pass after the restart at 30.5) does not resolve the alert: `increase`
+  #              carries the window across the reset. RED if the expression is built on an average
+  #              over `changes()`, which dips under the threshold across a reset.
+  - interval: 5m
+    name: exec correlation reap saturated - sustained, drain, boundary and restart cases
+    input_series:
+      - series: 'yuzu_exec_correlation_reap_total{job="yuzu",instance="s1"}'
+        values: "0x11 50000x11 100000x11 150000x11 200000x11 250000x11 300000x11 350000x11 400000x11 450000x11 500000x11 550000x11 600000x11 650000x11 700000x11 750000x11 800000x11 850000x11 900000x11 950000x11 1000000x11 1050000x11 1100000x11 1150000x11 1200000x11 1250000x11 1300000x11 1350000x11 1400000x11 1450000x11 1500000x11 1550000x11 1600000x11 1650000x11 1700000x11 1750000x11 1800000x11 1850000x11 1900000x11 1950000x11 2000000x11"
+      - series: 'yuzu_exec_correlation_reap_total{job="yuzu",instance="s2"}'
+        values: "0x11 50000x11 100000x11 150000x11 200000x11 250000x11 300000x11 350000x11 400000x11 450000x11 500000x11 550000x11 600000x11 650000x11 700000x11 750000x11 800000x11 850000x11 900000x11 950000x11 1000000x11 1050000x11 1100000x11 1130000x11 1130000x11 1130000x11 1130000x11 1130000x11 1130000x11 1130000x11 1130000x11 1130000x11 1130000x11 1130000x11 1130000x11 1130000x11 1130000x11 1130000x11 1130000x11 1130000x11"
+      - series: 'yuzu_exec_correlation_reap_total{job="yuzu",instance="s3"}'
+        values: "0x11 50000x11 100000x11 150000x11 200000x11 250000x11 300000x11 350000x11 400000x11 450000x11 500000x11 550000x11 600000x11 650000x11 700000x11 750000x11 800000x11 850000x11 900000x11 950000x11 1000000x11 1050000x11 1100000x11 1150000x11 1200000x11 1250000x11 1300000x11 1350000x11 1350000x11 1350000x11 1350000x11 1350000x11 1350000x11 1350000x11 1350000x11 1350000x11 1350000x11 1350000x11 1350000x11 1350000x11"
+      - series: 'yuzu_exec_correlation_reap_total{job="yuzu",instance="s4"}'
+        values: "0x500"
+      - series: 'yuzu_exec_correlation_reap_total{job="yuzu",instance="s5"}'
+        values: "0x11 38000x11 76000x11 114000x11 152000x11 190000x11 228000x11 266000x11 304000x11 342000x11 380000x11 418000x11 456000x11 494000x11 532000x11 570000x11 608000x11 646000x11 684000x11 722000x11 760000x11 798000x11 836000x11 874000x11 912000x11 950000x11 988000x11 1026000x11 1064000x11 1102000x11 1140000x11 1178000x11 1216000x11 1254000x11 1292000x11 1330000x11 1368000x11 1406000x11 1444000x11 1482000x11 1520000x11"
+      - series: 'yuzu_exec_correlation_reap_total{job="yuzu",instance="s6"}'
+        values: "0x11 42000x11 84000x11 126000x11 168000x11 210000x11 252000x11 294000x11 336000x11 378000x11 420000x11 462000x11 504000x11 546000x11 588000x11 630000x11 672000x11 714000x11 756000x11 798000x11 840000x11 882000x11 924000x11 966000x11 1008000x11 1050000x11 1092000x11 1134000x11 1176000x11 1218000x11 1260000x11 1302000x11 1344000x11 1386000x11 1428000x11 1470000x11 1512000x11 1554000x11 1596000x11 1638000x11 1680000x11"
+      - series: 'yuzu_exec_correlation_reap_total{job="yuzu",instance="s7"}'
+        values: "0x11 50000x11 100000x11 150000x11 200000x11 250000x11 300000x11 350000x11 400000x11 450000x11 500000x11 550000x11 600000x11 650000x11 700000x11 750000x11 800000x11 850000x11 900000x11 950000x11 1000000x11 1050000x11 1100000x11 1150000x11 1200000x11 1250000x11 1300000x11 1350000x11 1400000x11 1450000x5 0x5 0x5 50000x11 100000x11 150000x11 200000x11 250000x11 300000x11 350000x11 400000x11"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", instance="s1"}'
+        eval_time: 3h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="pending", instance="s1"}'
+        eval_time: 5h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="pending", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s1"}'
+        eval_time: 27h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="pending", instance="s1"}'
+        eval_time: 27h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="pending", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s1"}'
+        eval_time: 28h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s1"}'
+        eval_time: 34h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="pending", instance="s2"}'
+        eval_time: 20h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="pending", instance="s2", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s2"}'
+        eval_time: 20h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s2"}'
+        eval_time: 24h30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s2"}'
+        eval_time: 28h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s2"}'
+        eval_time: 31h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", instance="s2"}'
+        eval_time: 34h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s3"}'
+        eval_time: 29h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s3", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", instance="s3"}'
+        eval_time: 34h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", instance="s4"}'
+        eval_time: 34h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s5"}'
+        eval_time: 28h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s5"}'
+        eval_time: 30h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s5"}'
+        eval_time: 34h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s6"}'
+        eval_time: 28h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s6"}'
+        eval_time: 29h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s6", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s6"}'
+        eval_time: 34h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s6", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s7"}'
+        eval_time: 28h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s7", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s7"}'
+        eval_time: 31h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s7", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s7"}'
+        eval_time: 34h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuExecCorrelationReapSaturated", alertstate="firing", instance="s7", job="yuzu", severity="warning"}'
+            value: 1
