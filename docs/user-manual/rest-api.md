@@ -9976,7 +9976,7 @@ Queue a push of the active rule set to scoped agents. Returns `202 Accepted` —
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `scope` | string | No | Scope DSL selector. Empty = all agents. |
-| `full_sync` | boolean | No | If `true`, agents replace their rule set; otherwise they merge. |
+| `full_sync` | boolean | No | If `true`, agents replace their rule set; otherwise (the default, so a request that omits it) they merge. A merge push does not retry a rule it omits that is still unresolved on the agent (the agent holds its policy generation instead); only a full push, or a push that names the rule, does. See [Guaranteed State](guaranteed-state.md). |
 
 - **Response:** `202` with `data.queued = true`, `data.rules` (server-side rule count), `data.agents` (number of agents the push was dispatched to), `data.scope`.
 - **4xx:** `400` if the JSON body is present but not an object, or if `scope` fails to parse as a Scope DSL expression; `403` `cross-site request refused` for a cross-site or header-less cookie-session call (see above); `403` if a service-scoped API token calls this route — the single most severe instance of this confinement-gap class on this branch, since a `full_sync` push mutates what every OTHER service's agents enforce, not merely reads it. An invalid `scope` is refused with `400` before the fan-out reads the policy generation, the rule list or the deployed set, so it wins over a degraded-store `503` and does not disturb the heartbeat reconcile; a `group:` scope is not parsed here when a management-group store is wired (it names a group, and its members are looked up later).
