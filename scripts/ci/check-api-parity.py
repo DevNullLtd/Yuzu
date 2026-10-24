@@ -2381,8 +2381,8 @@ GATE_PARITY_NO_GATE_ALLOWED = {
         "authority; the tool is gated at Infrastructure:Read for the MCP tier ladder only. REST "
         "permits a service-scoped token to describe itself while get_me is service-scope class "
         "`denied`, a documented asymmetry; an explicit self-only service-scope policy is a "
-        "follow-up proposed as exception:#TBD-FILE-BEFORE-PUSH revisit:2026-11-30, owner to "
-        "confirm (ADR-1005 2026-10-24 entry)"),
+        "follow-up recorded as exception:#TBD-FILE-BEFORE-PUSH revisit:2026-11-30, confirmed "
+        "by the ADR owner (ADR-1005 2026-10-24 entry)"),
     ("GET", "/api/v1/result-sets", "list_result_sets"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
         "call (result-set precedent)"),

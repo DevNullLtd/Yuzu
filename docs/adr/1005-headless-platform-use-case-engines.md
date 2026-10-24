@@ -895,8 +895,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      statement by the ADR owner, not a signed decision.
 
    - **2026-10-24 - `get_me` as the MCP twin of `GET /api/v1/me`, and one
-     `GATE_PARITY_NO_GATE_ALLOWED` entry. Proposed 2026-10-24, pending owner
-     confirmation (a DRAFT ruling, not yet a ruling of record).** Three parts.
+     `GATE_PARITY_NO_GATE_ALLOWED` entry. Confirmed 2026-10-24 by the ADR owner,
+     as written.** Three parts.
      First, `get.api-me` flips from `planned:#2146` to `twinned` (untwinned 215
      to 214, generic `planned:#2146` 86 to 85). Second, the gate-parity check
      reads `GET /api/v1/me` as a route with no gate call it can read: the
@@ -915,14 +915,15 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      token describe itself, while `get_me` has service-scope class `denied` and
      refuses it. That is the conservative default for a new tool, and it is a
      documented difference rather than a defect; a self-only service-scope
-     policy that would let both transports agree is the follow-up, proposed as
-     `exception:#TBD-FILE-BEFORE-PUSH revisit:2026-11-30` (proposed, owner to
-     confirm; the issue number is a placeholder to replace once the issue is
-     filed). Scope of the twin: `rbac_enabled` is the server's cached view of
+     policy that would let both transports agree is the follow-up, recorded as
+     `exception:#TBD-FILE-BEFORE-PUSH revisit:2026-11-30` (revisit date
+     confirmed by the owner; the issue number is a placeholder to replace once
+     the issue is filed). Scope of the twin: `rbac_enabled` is the server's cached view of
      the RBAC switch and does not report the degraded state in which
      enforcement fails closed; that bit is owned by #6033, not by this twin.
-     As with the entries above, this is a session statement pending the ADR
-     owner's confirmation, not a signed decision.
+     The owner gave the confirmation in the authoring session and this entry
+     records it; like the entries above it is not a separately signed
+     decision.
 
 ## Interim rules (until the named follow-ups ship)
 
