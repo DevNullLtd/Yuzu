@@ -113,6 +113,8 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::pending("create_offload_target",                "POST",   R"(/api/v1/offload-targets)"),
     step_up_mcp_detail::exempt ("create_result_set",                    step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets)"),
     step_up_mcp_detail::exempt ("set_crypto_dashboard_layout",          step_up_detail::kOperationalData,   "PUT",    R"(/api/v1/crypto/dashboard/layout)"),
+    // On kMcpPendingBecauseRestTwinRequired: the twin is kRequired (an administrator can write the plugin-signing and audit-retention keys through it).
+    step_up_mcp_detail::pending("set_runtime_config",                   "PUT",    R"(/api/v1/config/([a-z_]+))"),
     step_up_mcp_detail::pending("delete_offload_target",                "DELETE", R"(/api/v1/offload-targets/(\d+))"),
     step_up_mcp_detail::exempt ("pin_result_set",                       step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets/(rs_[0-9a-f]+)/pin)"),
     step_up_mcp_detail::exempt ("unpin_result_set",                     step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets/(rs_[0-9a-f]+)/unpin)"),
@@ -179,8 +181,9 @@ inline constexpr std::size_t kMcpPendingBaselineMax = 44;
 /// kRequired cannot be listed here and must be kExempt. Many baseline tools also have a kRequired
 /// twin; this list is not the only such group. The class of these entries needs a maintainer
 /// ruling once an MCP step-up consumer exists. Sorted, unique.
-inline constexpr std::array<std::string_view, 1> kMcpPendingBecauseRestTwinRequired = {
+inline constexpr std::array<std::string_view, 2> kMcpPendingBecauseRestTwinRequired = {
     "raise_guardian_policy_generation",
+    "set_runtime_config",
 };
 
 /// True when `tool` is on `kMcpPendingBecauseRestTwinRequired`.

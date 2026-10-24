@@ -7102,7 +7102,7 @@ public:
                     [this] { invalidate_guardian_reconcile_caches(); });
                 spdlog::info("GuaranteedStateStore initialized (schema guaranteed_state_store; "
                              "retention={}d)",
-                             cfg_.guardian_event_retention_days);
+                             cfg_.guardian_event_retention_days.get());
                 // Step 5: ingest agent `__guard__` events arriving on the Subscribe
                 // stream → guaranteed_state_events. See docs/guardian-mvp-contract.md.
                 agent_service_.set_guaranteed_state_store(guaranteed_state_store_.get());
@@ -14475,16 +14475,22 @@ private:
                 spdlog::set_level(spdlog::level::from_str(e.value));
             } else if (e.key == "heartbeat_timeout") {
                 try {
-                    // A value stored before the 30 s floor existed would make every directly
-                    // connected agent flap; raise it to the floor and say how to clear it.
+                    // A value stored before the 30 s floor (or the one-day ceiling) existed would
+                    // make every directly connected agent flap, or stop stale-agent reaping; move it
+                    // to the nearest bound and say how to clear it.
                     const int stored = std::stoi(e.value);
                     const int applied = clamp_heartbeat_timeout(stored);
                     if (applied != stored)
-                        spdlog::warn("Stored heartbeat_timeout {} is below the {} second minimum; "
-                                     "using {} seconds. PUT /api/config/heartbeat_timeout with a "
-                                     "value of {} or more to replace the stored one.",
-                                     stored, kMinHeartbeatTimeoutSeconds, applied,
-                                     kMinHeartbeatTimeoutSeconds);
+                        spdlog::warn("Stored heartbeat_timeout {} is {} the {} second {}; using "
+                                     "{} seconds. PUT /api/config/heartbeat_timeout with a value "
+                                     "from {} to {} to replace the stored one.",
+                                     stored, stored < kMinHeartbeatTimeoutSeconds ? "below" : "above",
+                                     stored < kMinHeartbeatTimeoutSeconds
+                                         ? kMinHeartbeatTimeoutSeconds
+                                         : kMaxHeartbeatTimeoutSeconds,
+                                     stored < kMinHeartbeatTimeoutSeconds ? "minimum" : "maximum",
+                                     applied, kMinHeartbeatTimeoutSeconds,
+                                     kMaxHeartbeatTimeoutSeconds);
                     cfg_.session_timeout = std::chrono::seconds(applied);
                 } catch (...) {}
             } else if (e.key == "response_retention_days") {
@@ -16211,7 +16217,7 @@ private:
                         // The enforced figure (the store copies it at construction), not the
                         // live config value; without a store, the startup config.
                         return audit_store_ ? audit_store_->retention_days()
-                                            : cfg_.audit_retention_days;
+                                            : cfg_.audit_retention_days.get();
                     },
                 .now_fn = []() { return static_cast<std::int64_t>(std::time(nullptr)); },
             });
@@ -16613,6 +16619,7 @@ private:
                              .auth_fn = auth_fn,
                              .perm_fn = perm_fn,
                              .audit_fn = audit_fn,
+                             .step_up_fn = step_up_fn,
                              .cfg = &cfg_,
                              .auto_approve = &auto_approve_,
                              .runtime_config_store = runtime_config_store_.get(),
@@ -21901,6 +21908,10 @@ private:
             // with no MCP twin — an ADR-1005 gap for an ordinary
             // authenticated operator action).
             mcp_server_->set_plugin_config_store(plugin_config_store_.get());
+            // get_runtime_config / set_runtime_config: the same cfg_, auto_approve_ and
+            // runtime_config_store_ the config routes hold.
+            mcp_server_->set_runtime_config_backing(
+                {&cfg_, &auto_approve_, runtime_config_store_.get()});
             // #4036 (api-parity Batch A) — backs list_preflight_runs +
             // get_deployment_preview. Same store PreflightRoutes/
             // DeploymentRoutes already hold (constructed well before this

@@ -179,11 +179,19 @@ inline constexpr std::string_view kRuntimeConfigDbErrorPrefix = kDbErrorPrefix;
 /// script, so the floor lives here, not only in the General page.
 inline constexpr int kMinHeartbeatTimeoutSeconds = 30;
 
-/// A `heartbeat_timeout` stored before the floor existed, as the boot loader applies it: raised to
-/// the floor rather than dropped, so the operator's intent (a short window) is kept as nearly as
-/// the floor allows.
+/// Largest `heartbeat_timeout` (seconds) the store accepts: one day. A larger window leaves a dead
+/// agent reading online for as long, and a value near INT_MAX stops stale-stream reaping
+/// altogether. A script or an agentic worker can reach the generic write, so the ceiling lives
+/// here, beside the floor.
+inline constexpr int kMaxHeartbeatTimeoutSeconds = 86400;
+
+/// A `heartbeat_timeout` stored before the floor or the ceiling existed, as the boot loader applies
+/// it: moved to the nearest bound rather than dropped, so the operator's intent is kept as nearly
+/// as the bounds allow.
 [[nodiscard]] constexpr int clamp_heartbeat_timeout(int stored) noexcept {
-    return stored < kMinHeartbeatTimeoutSeconds ? kMinHeartbeatTimeoutSeconds : stored;
+    return stored < kMinHeartbeatTimeoutSeconds   ? kMinHeartbeatTimeoutSeconds
+           : stored > kMaxHeartbeatTimeoutSeconds ? kMaxHeartbeatTimeoutSeconds
+                                                  : stored;
 }
 
 class RuntimeConfigStore {
