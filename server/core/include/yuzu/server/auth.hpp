@@ -810,16 +810,6 @@ public:
                                      const yuzu::server::LocalMfaProof& proof,
                                      MintDenial* denial = nullptr);
 
-    /// TRANSITIONAL (#6079, removed once every caller carries a proof): the pre-binding form.
-    /// `mfa_verified == false` is the no-proof overload above. `true` stores an UNBOUND proof
-    /// (`{0, instant}`) whose instant is the database clock read from `AuthDB::mfa_status`
-    /// just before the write (never fresher than the DB clock, never bound; this host's wall
-    /// clock when no AuthDB answers or no SessionStore writes it), so a caller that has not
-    /// been migrated keeps its behaviour while no gate reads the generation. A gate that
-    /// compares generations treats this proof as unbound.
-    std::string create_local_session(const std::string& username, Role role, bool mfa_verified,
-                                     const std::string& expected_hash_hex);
-
     /// TEST-ONLY: `create_local_session` WITHOUT the credential anchor — the
     /// post-mint role/active recheck still runs, only the stored-hash compare
     /// is skipped. For tests that synthesise a session for a principal whose
@@ -854,13 +844,6 @@ public:
     /// `stamp_session_mfa_proof(token, proof) == kStamped`.
     bool mark_session_mfa_verified(const std::string& token,
                                    const yuzu::server::LocalMfaProof& proof);
-
-    /// TRANSITIONAL (#6079, removed once every caller carries a proof): stamp an UNBOUND proof
-    /// at the database clock (the session store's own read of the row, never the replica
-    /// clock). Returns true if the session existed and was updated. Used by the
-    /// /login/mfa/stepup route (PR 2) to mark an already-issued session
-    /// as freshly MFA-verified.
-    bool mark_session_mfa_verified(const std::string& token);
 
     /// JIT admin elevation: set `elevated_until = min(now + duration,
     /// session.expires_at)` on the named session, so its effective role is admin
@@ -1709,8 +1692,8 @@ private:
                                                          const std::string& token_hash,
                                                          std::int64_t stamped_gen);
 
-    /// Live MFA state for the transitional wrappers and `create_local_session_for_test`: one
-    /// `AuthDB::mfa_status` read. nullopt when no AuthDB is attached or the read fails.
+    /// Live MFA state for `create_local_session_for_test`: one `AuthDB::mfa_status` read.
+    /// nullopt when no AuthDB is attached or the read fails.
     struct LiveMfaState {
         bool enrolled{false};
         std::int64_t factor_gen{0};

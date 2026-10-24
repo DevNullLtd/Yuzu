@@ -348,16 +348,16 @@ SessionStore::create(const SessionWriteParams& params) {
     // stamp), and at most one MFA option may be set.
     if (lp.verified_ms < 0 || lp.factor_gen < 0 || (lp.factor_gen > 0 && lp.verified_ms == 0))
         return std::unexpected(Error{"invalid local MFA proof (binding without an instant)"});
-    if (lp.verified_ms > 0 && (params.mfa_verified_now || params.mfa_verified_ms_abs != 0))
+    if (lp.verified_ms > 0 && params.mfa_verified_ms_abs != 0)
         return std::unexpected(Error{"more than one MFA proof option set"});
 
     AuthoredTimes authored;
     std::string err;
     // created_at / expires_at / last_activity are authored from the ONE DB clock
-    // (`now()`, txn-stable); mfa_verified is the carried local instant ($13) when it is
+    // (`now()`, txn-stable); mfa_verified is the carried local instant ($12) when it is
     // not in the future of this statement's now() (a future-dated instant stores NO proof
-    // and NO binding, never a clamped age-zero one), else now() for a local login
-    // step-up (UNBOUND), else the passed absolute (an IdP proof time, or 0). `n.ms` is
+    // and NO binding, never a clamped age-zero one), else the passed absolute (an IdP
+    // proof time, or 0). `n.ms` is
     // that now() reused across the INSERT and the RETURNING so the caller's cache gets
     // exact values. The bind sequence starts at 1 and advances on a conflicting rewrite,
     // so the rebind guard never unbinds THIS writer; a legacy INSERT omits the column.
@@ -369,9 +369,9 @@ SessionStore::create(const SessionWriteParams& params) {
             "mcp_tier, principal_kind, created_at_ms, expires_at_ms, last_activity_ms, "
             "mfa_verified_ms, elevated_until_ms, elevation_issued_ms, mfa_factor_gen, mfa_bind_seq) "
             "SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9, n.ms, n.ms + $10::bigint, n.ms, "
-            "CASE WHEN $13::bigint > 0 THEN (CASE WHEN $13::bigint <= n.ms THEN $13::bigint "
-            "ELSE 0 END) WHEN $11::bool THEN n.ms ELSE $12::bigint END, 0, 0, "
-            "CASE WHEN $13::bigint > 0 AND $13::bigint <= n.ms THEN $14::bigint ELSE 0 END, 1 "
+            "CASE WHEN $12::bigint > 0 THEN (CASE WHEN $12::bigint <= n.ms THEN $12::bigint "
+            "ELSE 0 END) ELSE $11::bigint END, 0, 0, "
+            "CASE WHEN $12::bigint > 0 AND $12::bigint <= n.ms THEN $13::bigint ELSE 0 END, 1 "
             "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
             "ON CONFLICT (token_hash) DO UPDATE SET "
             "username=EXCLUDED.username, display_name=EXCLUDED.display_name, role=EXCLUDED.role, "
@@ -391,7 +391,6 @@ SessionStore::create(const SessionWriteParams& params) {
                                      params.token_scope_service, params.mcp_tier,
                                      params.principal_kind,
                                      std::to_string(params.session_lifetime_ms),
-                                     params.mfa_verified_now ? "true" : "false",
                                      std::to_string(params.mfa_verified_ms_abs),
                                      std::to_string(lp.verified_ms),
                                      std::to_string(lp.factor_gen)});
@@ -536,38 +535,6 @@ SessionStore::clear_user_elevations(const std::string& username) {
     if (!ok)
         return std::unexpected(Error{err.empty() ? "clear_user_elevations failed" : err});
     return count;
-}
-
-std::expected<std::optional<AuthoredTimes>, SessionStore::Error>
-SessionStore::mark_mfa(const std::string& token_hash) {
-    if (!open_)
-        return std::unexpected(Error{"session store not open"});
-    std::optional<AuthoredTimes> authored;
-    std::string err;
-    // An explicit UNBOUND stamp: the instant is this statement's now() and the factor
-    // generation is 0, with the bind sequence advanced so the rebind guard leaves the
-    // row exactly as written. A bound proof goes through mark_mfa(hash, proof).
-    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
-        PgResult r = exec_params(
-            c,
-            (std::string("UPDATE session_store.sessions s SET mfa_verified_ms = n.ms, "
-                         "mfa_factor_gen = 0, mfa_bind_seq = s.mfa_bind_seq + 1 "
-                         "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
-                         "WHERE s.token_hash = $1 RETURNING ") +
-             kAuthoredReturningUpd)
-                .c_str(),
-            std::vector<std::string>{token_hash});
-        if (r.status() != PGRES_TUPLES_OK) {
-            err = std::string("mark_mfa failed: ") + PQerrorMessage(c);
-            return false;
-        }
-        if (PQntuples(r.get()) > 0)
-            authored = authored_from(r.get(), 0);
-        return authored.has_value() ? bump_generation_in_txn(c) : true;
-    });
-    if (!ok)
-        return std::unexpected(Error{err.empty() ? "mark_mfa failed" : err});
-    return authored;
 }
 
 std::expected<std::optional<AuthoredTimes>, SessionStore::Error>

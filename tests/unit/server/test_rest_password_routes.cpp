@@ -1012,7 +1012,7 @@ TEST_CASE("password routes: a session minted with the OLD credential during the 
         if (fired.exchange(true))
             return;
         racer = std::jthread(
-            [&] { minted = h.auth_mgr.create_local_session("vic", Role::user, false, old_anchor); });
+            [&] { minted = h.auth_mgr.create_local_session("vic", Role::user, old_anchor); });
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
     });
     auto res = h.reset("vic", kNew);

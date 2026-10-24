@@ -786,15 +786,14 @@ TEST_CASE_METHOD(ApproverFixture,
                  "[pg][mfa][stepup][approver][probe]") {
     auto alice = probe_mfa_factor(make_session("alice", "local", system_clock::now()), *db);
     CHECK(alice.state == MfaFactorState::kEnrolledLocal); // P1
-    CHECK(alice.enrolled_at_ms == enrolled_ms_from_column("alice"));
-    CHECK(alice.enrolled_at_ms > 0);
+    CHECK(alice.factor_gen > 0);
 
     auto carol = probe_mfa_factor(make_session("carol", "local", system_clock::now()), *db);
     CHECK(carol.state == MfaFactorState::kEnrolledLocal);
 
     auto bob = probe_mfa_factor(make_session("bob", "local"), *db);
     CHECK(bob.state == MfaFactorState::kNotEnrolled); // P2
-    CHECK(bob.enrolled_at_ms == 0);
+    CHECK(bob.factor_gen == 0);
 
     add_user("dave"); // P3 provisional secret only
     REQUIRE(db->mfa_init_enrollment("dave", "Yuzu", std::nullopt).has_value());
@@ -817,36 +816,8 @@ TEST_CASE_METHOD(ApproverFixture,
           MfaFactorState::kAccountUnavailable);
 }
 
-TEST_CASE_METHOD(ApproverFixture,
-                 "probe_mfa_factor: an enrolled row with no usable enrolment "
-                 "instant fails closed as kStoreUnavailable (sec-4)",
-                 "[pg][mfa][stepup][approver][probe]") {
-    // `enrolled` is `mfa_enrolled_at IS NOT NULL`, so an epoch-or-earlier instant reads back
-    // as enrolled with enrolled_at_ms <= 0. Left as kEnrolledLocal it would make the
-    // pre-enrolment proof comparison vacuous.
-    for (const char* instant : {"to_timestamp(0)", "to_timestamp(-5)"}) {
-        INFO(instant);
-        sql((std::string("UPDATE auth.users SET mfa_enrolled_at = ") + instant +
-             " WHERE username = $1")
-                .c_str(),
-            "alice");
-        const auto probe =
-            probe_mfa_factor(make_session("alice", "local", system_clock::now()), *db);
-        CHECK(probe.state == MfaFactorState::kStoreUnavailable);
-        CHECK(probe.enrolled_at_ms == 0);
-
-        yuzu::MetricsRegistry metrics;
-        auto r = run(make_session("alice", "local", system_clock::now()), 300, &metrics);
-        CHECK(r.outcome.kind == Kind::kStoreUnavailable);
-        check_untouched(r);
-        CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}})
-                  .value() == 1.0);
-    }
-}
-
-TEST_CASE_METHOD(ApproverFixture,
-                 "probe_mfa_factor: an SSO or bearer session never borrows a "
-                 "local namesake's factor",
+TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an SSO or bearer session never borrows a "
+                                  "local namesake's factor",
                  "[pg][mfa][stepup][approver][probe]") {
     // Both an SSO-shaped name and an ENROLLED local namesake (alice) must give the same answer.
     for (const char* user : {"oidc:x#y", "alice"}) {
@@ -1121,7 +1092,7 @@ TEST_CASE_METHOD(ApproverFixture,
     enroll("bob");
     const auto probe = probe_mfa_factor(make_session("bob", "local"), *db);
     REQUIRE(probe.state == MfaFactorState::kEnrolledLocal);
-    const auto at_ms = probe.enrolled_at_ms;
+    const auto at_ms = enrolled_ms_from_column("bob");
     REQUIRE(at_ms > 0);
     auto at = [&](std::int64_t ms) {
         return make_session("bob", "local", system_clock::time_point{milliseconds(ms)});
@@ -1385,7 +1356,7 @@ TEST_CASE_METHOD(BindingFixture,
     sql("UPDATE auth.users SET mfa_enrolled_at = now() WHERE username = $1", "alice");
     const auto g = gen_of("alice");
     REQUIRE(g >= 2);
-    const auto enrolled_at = probe_mfa_factor(make_session("alice", "local"), *db).enrolled_at_ms;
+    const auto enrolled_at = enrolled_ms_from_column("alice");
     const auto bound = durable_aged(10'000, g);
     REQUIRE(bound.mfa_verified_ms < enrolled_at); // the premise: the instant precedes enrolment
 
@@ -1462,15 +1433,16 @@ TEST_CASE_METHOD(BindingFixture,
     // naming proof_factor_unbound before, at and after that instant, and a negative generation is
     // as unbound as zero. The instant rule it replaces is gone.
     enroll("bob");
-    const auto probe = probe_mfa_factor(make_session("bob", "local"), *db);
-    REQUIRE(probe.state == MfaFactorState::kEnrolledLocal);
+    REQUIRE(probe_mfa_factor(make_session("bob", "local"), *db).state ==
+            MfaFactorState::kEnrolledLocal);
+    const auto enrolled_at = enrolled_ms_from_column("bob");
     const auto cached = make_session("bob", "local", system_clock::now());
     for (const std::int64_t gen : {std::int64_t{0}, std::int64_t{-3}}) {
         for (const std::int64_t delta : {-1, 0, 1}) {
             INFO("gen=" << gen << " instant=enrolment" << delta);
             audits.clear();
-            const auth::DurableMfaProof d{Source::kRow, probe.enrolled_at_ms + delta,
-                                          probe.enrolled_at_ms + 60'000, gen};
+            const auth::DurableMfaProof d{Source::kRow, enrolled_at + delta, enrolled_at + 60'000,
+                                          gen};
             auto r = run(cached, 300, nullptr, d);
             CHECK(r.outcome.kind == Kind::kChallengeWritten);
             CHECK(r.res.status == 401);

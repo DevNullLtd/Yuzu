@@ -253,7 +253,7 @@ TEST_CASE("commit_password_change (self): anchor compared under the row lock; ol
     AuthManager mgr;
     f.wire(mgr);
     REQUIRE(mgr.upsert_user("alice", kOld, Role::user));
-    auto s1 = mgr.create_local_session("alice", Role::user, false, anchor_of(mgr, "alice", kOld));
+    auto s1 = mgr.create_local_session("alice", Role::user, anchor_of(mgr, "alice", kOld));
     REQUIRE_FALSE(s1.empty());
 
     const auto r = mgr.commit_password_change(
@@ -463,7 +463,7 @@ TEST_CASE("commit_password_change: a REAL audit statement fault rolls the whole 
     f.wire(mgr);
     seed_local(*f.db, "ivy", kOld, Role::user);
     const auto before = f.db->get_user("ivy")->hash_hex;
-    auto s = mgr.create_local_session("ivy", Role::user, false, anchor_of(mgr, "ivy", kOld));
+    auto s = mgr.create_local_session("ivy", Role::user, anchor_of(mgr, "ivy", kOld));
     REQUIRE_FALSE(s.empty());
     f.exec("ALTER TABLE audit_store.audit_events RENAME TO audit_events_gone");
 
@@ -489,7 +489,7 @@ TEST_CASE("commit_password_change (admin): a fault on ONLY the auth.lockout.clea
     f.wire(mgr);
     seed_local(*f.db, "lockd", kOld, Role::user);
     const auto before = f.db->get_user("lockd")->hash_hex;
-    auto s = mgr.create_local_session("lockd", Role::user, false, anchor_of(mgr, "lockd", kOld));
+    auto s = mgr.create_local_session("lockd", Role::user, anchor_of(mgr, "lockd", kOld));
     REQUIRE_FALSE(s.empty());
     for (int i = 0; i < 3; ++i)
         REQUIRE(f.db->record_failed_login("lockd", 3, 3600).has_value());
@@ -577,18 +577,18 @@ TEST_CASE("create_local_session denies a mint whose verified hash is no longer s
     const auto anchor = anchor_of(mgr, "mira", kOld);
 
     // The anchor is current: the mint lands.
-    auto ok = mgr.create_local_session("mira", Role::user, false, anchor);
+    auto ok = mgr.create_local_session("mira", Role::user, anchor);
     REQUIRE_FALSE(ok.empty());
     CHECK(mgr.validate_session(ok).has_value());
 
     // An empty anchor never disables the check — it denies (fail closed).
-    CHECK(mgr.create_local_session("mira", Role::user, false, "").empty());
+    CHECK(mgr.create_local_session("mira", Role::user, "").empty());
 
     // A reset after the verify: the OLD anchor can no longer mint, and the
     // denied mint leaves no live session behind.
     REQUIRE(mgr.commit_password_change(mkreq(Kind::kAdminReset, "mira", kNew)).result ==
             Result::kOk);
-    CHECK(mgr.create_local_session("mira", Role::user, false, anchor).empty());
+    CHECK(mgr.create_local_session("mira", Role::user, anchor).empty());
     CHECK_FALSE(mgr.validate_session(ok).has_value());
     CHECK(f.sessions_of("mira") == 0);
 }
@@ -646,7 +646,7 @@ TEST_CASE("post-mint recheck WAITS on an uncommitted credential write and then d
     std::string token = "unset";
     // jthread: joined on every exit path (a failed REQUIRE below never leaves a
     // joinable std::thread to std::terminate; at worst B waits out lock_timeout).
-    std::jthread b([&] { token = mgr.create_local_session("mona", Role::user, false, anchor); });
+    std::jthread b([&] { token = mgr.create_local_session("mona", Role::user, anchor); });
     // Give B ample time to persist its session and reach the row-locked
     // re-read (where it blocks). At HEAD's plain read it would already have
     // returned a live token by now.

@@ -119,9 +119,19 @@ void drop_session_schema(PgPool& pool) {
                                   std::vector<std::string>{});
 }
 
+using yuzu::server::LocalMfaProof;
+
+std::int64_t pg_now_ms(PgPool& pool) {
+    auto lease = pool.acquire();
+    auto r = yuzu::server::pg::exec_params(
+        lease.get(), "SELECT (extract(epoch from now())*1000)::bigint", std::vector<std::string>{});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
+}
+
 } // namespace
 
-TEST_CASE("AuthManager+SessionStore: mark_session_mfa_verified authors the proof from the DB clock "
+TEST_CASE("AuthManager+SessionStore: mark_session_mfa_verified stores the carried DB-clock proof "
           "and advances the generation",
           "[auth][session_store][pg][stepup]") {
     // The Settings enrol-confirm stamp and POST /login/mfa/stepup both go through this primitive; the
@@ -141,7 +151,7 @@ TEST_CASE("AuthManager+SessionStore: mark_session_mfa_verified authors the proof
 
     auto g0 = store.read_generation();
     REQUIRE(g0.has_value());
-    REQUIRE(mgr->mark_session_mfa_verified(token));
+    REQUIRE(mgr->mark_session_mfa_verified(token, LocalMfaProof{0, pg_now_ms(pool)}));
     auto g1 = store.read_generation();
     REQUIRE(g1.has_value());
     CHECK(*g1 > *g0); // every replica's cache drops its stale copy on the next refresh
@@ -161,7 +171,8 @@ TEST_CASE("AuthManager+SessionStore: mark_session_mfa_verified authors the proof
     CHECK(seen->steady_mfa_verified.time_since_epoch().count() != 0);
 
     // No such durable session: nothing is stamped and the caller is told so.
-    CHECK_FALSE(mgr->mark_session_mfa_verified("no-such-session-token"));
+    CHECK_FALSE(
+        mgr->mark_session_mfa_verified("no-such-session-token", LocalMfaProof{0, pg_now_ms(pool)}));
 }
 
 TEST_CASE("AuthManager+SessionStore: create_local_session → validate round-trips",
@@ -796,21 +807,12 @@ TEST_CASE("Gates: a restored (engine_token source, human kind) session takes the
 // ── #6079: carried, factor-bound MFA proofs through AuthManager ────────────────────────────────
 //
 // AuthManager hands the store the verifier's {factor generation, DB instant} unchanged, refuses an
-// instant later than the DB clock (never clamps it), and keeps the pre-binding overloads working as
-// UNBOUND proofs. The AuthDB-dependent rechecks (S1) are in test_auth.cpp.
+// instant later than the DB clock (never clamps it). The AuthDB-dependent rechecks (S1) are in
+// test_auth.cpp.
 
 namespace {
 
-using yuzu::server::LocalMfaProof;
 using yuzu::server::auth::DurableMfaProof;
-
-std::int64_t pg_now_ms(PgPool& pool) {
-    auto lease = pool.acquire();
-    auto r = yuzu::server::pg::exec_params(
-        lease.get(), "SELECT (extract(epoch from now())*1000)::bigint", std::vector<std::string>{});
-    REQUIRE(r.status() == PGRES_TUPLES_OK);
-    return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
-}
 
 void exec_sql(PgPool& pool, const std::string& sql) {
     auto lease = pool.acquire();
@@ -986,39 +988,6 @@ TEST_CASE("AuthManager+SessionStore: stamping a carried proof stores it; a futur
     // No such session.
     CHECK(mgr->stamp_session_mfa_proof("no-such-session-token", {9, verified}) ==
           AuthManager::MfaStampOutcome::kNoSession);
-}
-
-TEST_CASE(
-    "AuthManager+SessionStore: the pre-binding overloads write an UNBOUND proof at the DB clock",
-    "[auth][session_store][pg][mfa_binding]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    SessionStore store{pool};
-    REQUIRE(store.is_open());
-    auto mgr = make_mgr(store);
-
-    // mfa_verified == false: no proof at all.
-    auto plain = mgr->create_local_session("alice", Role::admin, /*mfa_verified=*/false, "");
-    REQUIRE_FALSE(plain.empty());
-    CHECK(durable_row(store, plain).mfa_verified_ms == 0);
-
-    // mfa_verified == true: a proof, never bound, never later than the DB clock.
-    const auto before = pg_now_ms(pool);
-    auto stamped = mgr->create_local_session("alice", Role::admin, /*mfa_verified=*/true, "");
-    REQUIRE_FALSE(stamped.empty());
-    const auto row = durable_row(store, stamped);
-    CHECK(row.mfa_verified_ms >= before - 1'000); // no AuthDB: the replica clock, same host
-    CHECK(row.mfa_verified_ms <= pg_now_ms(pool));
-    CHECK(row.mfa_factor_gen == 0);
-
-    // The old stamp: an unbound proof at the DB clock read from the session row.
-    REQUIRE(mgr->mark_session_mfa_verified(plain));
-    const auto marked = durable_row(store, plain);
-    CHECK(marked.mfa_verified_ms > 0);
-    CHECK(marked.mfa_verified_ms <= pg_now_ms(pool));
-    CHECK(marked.mfa_factor_gen == 0);
-    CHECK(marked.mfa_bind_seq == 2);
-    CHECK_FALSE(mgr->mark_session_mfa_verified("no-such-session-token"));
 }
 
 TEST_CASE(

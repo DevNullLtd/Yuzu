@@ -254,6 +254,20 @@ post_same_origin(yuzu::server::test::TestRouteSink& sink, const std::string& pat
 
 } // namespace
 
+/// `auth.users.mfa_enrolled_at` as epoch milliseconds, read from the column (0 = not enrolled).
+static std::int64_t enrolled_ms(yuzu::test::AuthDbPg& auth_db, const std::string& user) {
+    auto lease = auth_db.pool().acquire();
+    REQUIRE(lease);
+    auto r = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT COALESCE((extract(epoch from mfa_enrolled_at)*1000)::bigint, 0) "
+        "FROM auth.users WHERE username = $1",
+        std::vector<std::string>{user});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(r.get()) == 1);
+    return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
+}
+
 TEST_CASE("GET /fragments/settings/mfa renders 'Not enrolled' panel for fresh admin",
           "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
@@ -1556,7 +1570,8 @@ TEST_CASE("POST /api/settings/mfa/verify stamps the enrolment's generation and i
     CHECK(row.mfa_factor_gen == st->factor_gen);
     CHECK(row.mfa_factor_gen > 0);
     CHECK(row.mfa_verified_ms > 0);
-    CHECK(row.mfa_verified_ms <= st->enrolled_at_ms); // captured before the enrolling UPDATE
+    // captured before the enrolling UPDATE
+    CHECK(row.mfa_verified_ms <= enrolled_ms(h.auth_db, "admin"));
     const auto durable = h.auth_mgr.read_durable_mfa_proof(token, "admin");
     CHECK(judge_local_mfa_binding(durable, st->factor_gen, st->binding_enforced).kind ==
           LocalMfaBinding::kBound);

@@ -679,7 +679,6 @@ bool AuthManager::persist_new_session(const std::string& raw_token,
             return false;
         }
         const std::int64_t mfa_ms = params.local_mfa.verified_ms > 0 ? params.local_mfa.verified_ms
-                                    : params.mfa_verified_now        ? now_ms
                                                                      : params.mfa_verified_ms_abs;
         derive_session_deadlines(s, now_ms, now_ms + params.session_lifetime_ms, now_ms, mfa_ms,
                                  /*elevated_until*/ 0, /*elevation_issued*/ 0, now_ms);
@@ -857,7 +856,8 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
     // the caller verified the supplied password against.
     bool credential_changed = false;
     auto outcome = auth_db_->recheck_role_locked(username, [&](Role db_role,
-                                                               const std::string& db_hash) {
+                                                               const std::string& db_hash,
+                                                               std::int64_t /*factor_gen*/) {
         // Invoked while AuthDB holds this row's lock - see the header doc.
         // Lock ORDERING invariant (cpp-expert Gate 8 catch): this is the
         // first place in this file mu_ is acquired from INSIDE an open
@@ -1379,20 +1379,6 @@ std::string AuthManager::create_local_session(const std::string& username, Role 
     return mint_local_session(username, role, &proof, expected_hash_hex, denial);
 }
 
-std::string AuthManager::create_local_session(const std::string& username, Role role,
-                                              bool mfa_verified,
-                                              const std::string& expected_hash_hex) {
-    if (!mfa_verified)
-        return mint_local_session(username, role, nullptr, expected_hash_hex);
-    // Transitional: an UNBOUND proof at the database clock (see the declaration).
-    // The instant comes from the clock that will judge it: the database's when a session
-    // store writes it, this host's wall clock on the legacy no-store path.
-    const auto live = read_live_mfa_state(username);
-    const yuzu::server::LocalMfaProof proof{0, (live && session_store_) ? live->db_now_ms
-                                                                        : wall_now_ms()};
-    return mint_local_session(username, role, &proof, expected_hash_hex);
-}
-
 std::string AuthManager::create_local_session_for_test(const std::string& username, Role role,
                                                        bool mfa_verified) {
     if (!mfa_verified)
@@ -1564,33 +1550,6 @@ AuthManager::stamp_session_mfa_proof(const std::string& token,
 bool AuthManager::mark_session_mfa_verified(const std::string& token,
                                             const yuzu::server::LocalMfaProof& proof) {
     return stamp_session_mfa_proof(token, proof) == MfaStampOutcome::kStamped;
-}
-
-bool AuthManager::mark_session_mfa_verified(const std::string& token) {
-    if (token.size() > auth::kMaxSessionTokenLength)
-        return false;
-    if (session_store_) {
-        // Transitional: an UNBOUND proof at the database clock, read from the session row
-        // itself (the same DB clock the write is judged against, never the replica's).
-        auto found = session_store_->find(hash_token(token));
-        if (!found) {
-            spdlog::error("mark_session_mfa_verified: durable lookup failed ({})",
-                          found.error().message);
-            note_session_store_degrade("validate");
-            return false;
-        }
-        if (!found->has_value())
-            return false; // no such durable session
-        return stamp_session_mfa_proof(token, {0, found->value().db_now_ms}) ==
-               MfaStampOutcome::kStamped;
-    }
-    std::unique_lock lock(mu_);
-    auto it = sessions_.find(token);
-    if (it == sessions_.end())
-        return false;
-    it->second.mfa_verified_at = std::chrono::system_clock::now();
-    it->second.steady_mfa_verified = std::chrono::steady_clock::now();
-    return true;
 }
 
 std::optional<std::chrono::system_clock::time_point>

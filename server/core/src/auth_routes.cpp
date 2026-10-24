@@ -2777,8 +2777,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
 
         if (!mfa_enrolled) {
-            auto token =
-                auth_mgr_.create_local_session(username, *role_opt, false, verified_hash_hex);
+            auto token = auth_mgr_.create_local_session(username, *role_opt, verified_hash_hex);
             if (token.empty()) {
                 // #4107 Gate 8 finding (security-guardian): create_local_
                 // session's empty-token sentinel (durable-persist failure,

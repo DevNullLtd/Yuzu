@@ -226,13 +226,15 @@ TEST_CASE("SessionStore: create authors from now() and find round-trips every fi
     auto p = make_params("hash-abc", "alice");
     p.oidc_sub = "sub-123";
     p.mcp_tier = "operator";
-    p.mfa_verified_now = true; // local step-up → mfa_verified authored = now()
+    const std::int64_t proof_ms = db_now_ms(pool) - 1'000;
+    p.local_mfa = {0, proof_ms}; // local step-up: the carried instant is stored as given
 
     auto created = store.create(p);
     REQUIRE(created.has_value());
-    // Timestamps are DB-authored: expires = now() + lifetime; mfa/last_activity = now().
+    // Timestamps are DB-authored: expires = now() + lifetime; last_activity = now(); the MFA
+    // instant is the carried one.
     CHECK(created->expires_at_ms == created->db_now_ms + k8hMs);
-    CHECK(created->mfa_verified_ms == created->db_now_ms);
+    CHECK(created->mfa_verified_ms == proof_ms);
     CHECK(created->last_activity_ms == created->db_now_ms);
     CHECK(created->created_at_ms == created->db_now_ms);
 
@@ -268,7 +270,7 @@ TEST_CASE("SessionStore: mutations bump the durable generation; touch does not",
     REQUIRE(g1.has_value());
     CHECK(*g1 > *g0); // create bumped
 
-    auto mfa = store.mark_mfa("h1");
+    auto mfa = store.mark_mfa("h1", {0, db_now_ms(pool) - 1'000});
     REQUIRE(mfa.has_value());
     REQUIRE(mfa->has_value()); // session existed
     auto g2 = store.read_generation();
@@ -723,31 +725,34 @@ TEST_CASE("SessionStore v3: create and mark_mfa round-trip factor generation and
     CHECK(sp.seq == 4);
 }
 
-TEST_CASE("SessionStore v3: the pre-binding stamps write an UNBOUND proof",
+TEST_CASE("SessionStore v3: an unbound proof {0, instant} is stored unbound and re-stamps over a "
+          "bound one",
           "[session_store][pg][mfa_binding]") {
     YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     SessionStore store{pool};
     REQUIRE(store.is_open());
 
+    const std::int64_t t0 = db_now_ms(pool) - 2'000;
     auto p = make_params("h1", "bob");
-    p.mfa_verified_now = true;
+    p.local_mfa = {0, t0};
     auto created = store.create(p);
     REQUIRE(created.has_value());
-    CHECK(created->mfa_verified_ms == created->db_now_ms);
+    CHECK(created->mfa_verified_ms == t0);
     CHECK(created->mfa_factor_gen == 0);
 
-    // Bind it, then the legacy-shaped mark_mfa(hash) restamps UNBOUND.
-    REQUIRE(store.mark_mfa("h1", {5, db_now_ms(pool) - 1'000}).has_value());
+    // Bind it, then an unbound stamp restamps the instant and drops the binding.
+    REQUIRE(store.mark_mfa("h1", {5, db_now_ms(pool) - 1'500}).has_value());
     CHECK(stored_proof(pool, "h1").gen == 5);
-    auto m = store.mark_mfa("h1");
+    const std::int64_t t1 = db_now_ms(pool) - 1'000;
+    auto m = store.mark_mfa("h1", {0, t1});
     REQUIRE(m.has_value());
     REQUIRE(m->has_value());
-    CHECK((*m)->mfa_verified_ms == (*m)->db_now_ms);
+    CHECK((*m)->mfa_verified_ms == t1);
     CHECK((*m)->mfa_factor_gen == 0);
     auto sp = stored_proof(pool, "h1");
     CHECK(sp.gen == 0);
-    CHECK(sp.ms > 0);
+    CHECK(sp.ms == t1);
     CHECK(sp.seq == 3); // create 1, bound stamp 2, unbound stamp 3
 
     // A missing session is nullopt on every stamp, not an error.
@@ -801,10 +806,6 @@ TEST_CASE("SessionStore v3: writer errors are refused, not stored",
     auto negative = make_params("e2", "dan");
     negative.local_mfa = {-1, t};
     CHECK_FALSE(store.create(negative).has_value());
-    auto two_options = make_params("e3", "dan");
-    two_options.local_mfa = {5, t};
-    two_options.mfa_verified_now = true;
-    CHECK_FALSE(store.create(two_options).has_value());
     auto with_abs = make_params("e4", "dan");
     with_abs.local_mfa = {5, t};
     with_abs.mfa_verified_ms_abs = t;

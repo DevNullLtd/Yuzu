@@ -300,6 +300,20 @@ void corrupt_secret(const std::string& dsn, const std::string& username) {
 
 } // namespace
 
+/// `auth.users.mfa_enrolled_at` as epoch milliseconds, read from the column (0 = not enrolled).
+static std::int64_t enrolled_ms(yuzu::test::AuthDbPg& auth_db, const std::string& user) {
+    auto lease = auth_db.pool().acquire();
+    REQUIRE(lease);
+    auto r = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT COALESCE((extract(epoch from mfa_enrolled_at)*1000)::bigint, 0) "
+        "FROM auth.users WHERE username = $1",
+        std::vector<std::string>{user});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(r.get()) == 1);
+    return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
+}
+
 TEST_CASE("POST /login no-MFA success returns 200 + session cookie + auth.login audit",
           "[pg][mfa][routes][auth_routes]") {
     AuthRoutesHarness h;
@@ -2022,7 +2036,7 @@ TEST_CASE("POST /login/mfa/enroll stores the enrolment's generation and a pre-UP
     // comparison would have called this proof stale; the generation decides).
     const auto st = h.auth_db->mfa_status("alice");
     REQUIRE(st.has_value());
-    CHECK(seen[0].proof.verified_ms <= st->enrolled_at_ms);
+    CHECK(seen[0].proof.verified_ms <= enrolled_ms(h.auth_db, "alice"));
 }
 
 TEST_CASE("POST /login/mfa/stepup stores the verifier's generation and instant (#6079 T5, T8)",
@@ -2253,7 +2267,8 @@ TEST_CASE("enrol via /login/mfa/enroll then approve at once passes the real appr
     REQUIRE(seen.size() == 1);
     const auto st = h.auth_db->mfa_status("admin");
     REQUIRE(st.has_value());
-    REQUIRE(seen[0].proof.verified_ms <= st->enrolled_at_ms); // the case the timestamp rule refused
+    // the case the timestamp rule refused
+    REQUIRE(seen[0].proof.verified_ms <= enrolled_ms(h.auth_db, "admin"));
 
     const auto approve_ticket = fx.submit();
     auto approved = fx.decide("approve", approve_ticket, token);

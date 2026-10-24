@@ -225,14 +225,17 @@ struct StepUpCall {
 // `req, res, *session, "<plain string literal>")`; any other shape is reported with
 // `readable == false` so the caller can name it rather than skip it.
 inline std::vector<StepUpCall> find_step_up_calls(std::string_view text) {
-    constexpr std::string_view kName = "step_up_fn";
+    // `factor_credential_gate_fn_` is the in-handler gate of the two kFactorCredential rows (#6079);
+    // it takes the same `(req, res, *session, "label")` shape, so the label pin covers it too.
+    constexpr std::array<std::string_view, 2> kNames{"step_up_fn", "factor_credential_gate_fn_"};
     std::vector<StepUpCall> out;
+    for (const std::string_view kName : kNames)
     for (std::size_t at = text.find(kName); at != std::string_view::npos;
          at = text.find(kName, at + 1)) {
         if (at > 0 && is_word(text[at - 1]))
             continue;
         std::size_t j = at + kName.size();
-        if (j < text.size() && text[j] == '_')
+        if (kName == "step_up_fn" && j < text.size() && text[j] == '_')
             ++j;
         const auto skip = [&] {
             while (j < text.size() && is_space(text[j]))
@@ -263,6 +266,8 @@ inline std::vector<StepUpCall> find_step_up_calls(std::string_view text) {
             call.label.clear();
         out.push_back(std::move(call));
     }
+    std::sort(out.begin(), out.end(),
+              [](const StepUpCall& a, const StepUpCall& b) { return a.pos < b.pos; });
     return out;
 }
 

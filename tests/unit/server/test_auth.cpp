@@ -2330,6 +2330,19 @@ struct BindingFixture {
         REQUIRE(r.status() == PGRES_TUPLES_OK);
         return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
     }
+    /// `auth.users.mfa_enrolled_at` as epoch milliseconds, read from the column (0 = not enrolled).
+    std::int64_t enrolled_ms(const std::string& user) {
+        auto lease = db.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(),
+            "SELECT COALESCE((extract(epoch from mfa_enrolled_at)*1000)::bigint, 0) "
+            "FROM auth.users WHERE username = $1",
+            std::vector<std::string>{user});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(r.get()) == 1);
+        return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
+    }
     double counter(const std::string& name, const yuzu::Labels& labels = {}) {
         return labels.empty() ? metrics.counter(name).value()
                               : metrics.counter(name, labels).value();
@@ -2352,7 +2365,7 @@ TEST_CASE_METHOD(BindingFixture,
     REQUIRE_FALSE(at.empty());
     const auto arow = row(at);
     CHECK(arow.mfa_factor_gen == alice.factor_gen);
-    CHECK(arow.mfa_verified_ms >= alice.enrolled_at_ms); // enrol-then-approve keeps passing
+    CHECK(arow.mfa_verified_ms >= enrolled_ms("alice")); // enrol-then-approve keeps passing
     CHECK(arow.mfa_verified_ms <= status("alice").db_now_ms);
     const auto durable = mgr.read_durable_mfa_proof(at, "alice");
     REQUIRE(durable.source == DurableMfaProof::Source::kRow);
@@ -2375,32 +2388,6 @@ TEST_CASE_METHOD(BindingFixture,
     auto early = mgr.create_local_session_for_test("bob", Role::user, true);
     enroll("bob");
     CHECK(row(early).mfa_factor_gen == 0);
-}
-
-TEST_CASE_METHOD(BindingFixture, "the transitional overloads keep enrol-then-approve working",
-                 "[pg][auth][session][mfa_binding]") {
-    add_user("alice");
-    enroll("alice"); // the enrolment instant
-    const auto enrolled = status("alice");
-
-    // Old create (mfa_verified = true): an UNBOUND proof at the DB clock read just before the
-    // write, so it is never earlier than the enrolment that preceded it.
-    auto t1 = mgr.create_local_session("alice", Role::admin, true, anchor("alice"));
-    REQUIRE_FALSE(t1.empty());
-    const auto r1 = row(t1);
-    CHECK(r1.mfa_factor_gen == 0);
-    CHECK(r1.mfa_verified_ms >= enrolled.enrolled_at_ms);
-    CHECK(r1.mfa_verified_ms <= status("alice").db_now_ms);
-
-    // Old stamp: unbound, at the DB clock, also not earlier than the enrolment.
-    auto t2 = mgr.create_local_session("alice", Role::admin, false, anchor("alice"));
-    REQUIRE_FALSE(t2.empty());
-    CHECK(row(t2).mfa_verified_ms == 0);
-    REQUIRE(mgr.mark_session_mfa_verified(t2));
-    const auto r2 = row(t2);
-    CHECK(r2.mfa_factor_gen == 0);
-    CHECK(r2.mfa_verified_ms >= enrolled.enrolled_at_ms);
-    CHECK(r2.mfa_bind_seq == 2);
 }
 
 TEST_CASE_METHOD(BindingFixture,

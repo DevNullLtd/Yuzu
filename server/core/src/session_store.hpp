@@ -143,10 +143,9 @@ struct LocalMfaProof {
 /// (ADR-2002 §4 DB-clock authority; the fix for cross-host skew). The MFA proof
 /// time is the sole exception: for a federated (OIDC/SAML) login it is the IdP's
 /// asserted proof instant, not a local authoring, so it is passed through in
-/// `mfa_verified_ms_abs`; a LOCAL step-up at login sets `mfa_verified_now` to
-/// stamp `now()` instead (an UNBOUND proof, factor generation 0), or `local_mfa`
-/// carries a bound verification instant. At most one MFA option is set; setting
-/// more than one is refused with an `Error`.
+/// `mfa_verified_ms_abs`; a LOCAL step-up at login carries its verification instant
+/// and factor generation in `local_mfa`. At most one MFA option is set; setting
+/// both is refused with an `Error`.
 struct SessionWriteParams {
     std::string token_hash;
     std::string username;
@@ -159,7 +158,6 @@ struct SessionWriteParams {
     std::string principal_kind{"human"};
     std::int64_t session_lifetime_ms{0};  ///< expires_at = now() + this
     std::int64_t mfa_verified_ms_abs{0};  ///< 0 = no proof; >0 = absolute IdP proof time
-    bool mfa_verified_now{false};         ///< true = stamp mfa_verified = now() (local login step-up)
     LocalMfaProof local_mfa;              ///< carried verification instant + factor generation
 };
 
@@ -239,13 +237,6 @@ public:
 
     /// Clear elevation on every session for a username. Returns the count cleared.
     [[nodiscard]] std::expected<int, Error> clear_user_elevations(const std::string& username);
-
-    /// Stamp an UNBOUND MFA step-up proof time = Postgres `now()` (DB clock
-    /// domain): factor generation 0, bind sequence advanced. Returns the authored
-    /// times (incl. db_now_ms) to seed the cache, or nullopt when the session did
-    /// not exist.
-    [[nodiscard]] std::expected<std::optional<AuthoredTimes>, Error>
-    mark_mfa(const std::string& token_hash);
 
     /// Stamp a carried, bound MFA proof (#6079): `mfa_verified_ms = proof.verified_ms`
     /// and `mfa_factor_gen = proof.factor_gen` when `0 < verified_ms <= now()` of this

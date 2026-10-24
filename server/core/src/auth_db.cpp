@@ -1187,17 +1187,6 @@ std::expected<void, AuthDBError> AuthDB::update_role(const std::string& username
 }
 
 std::expected<void, AuthDBError>
-AuthDB::recheck_role_locked(
-    const std::string& username,
-    const std::function<void(auth::Role, const std::string& password_hash)>& under_row_lock) {
-    // The two-argument form is the three-argument one with the generation dropped.
-    return recheck_role_locked(username,
-                               std::function<void(auth::Role, const std::string&, std::int64_t)>(
-                                   [&under_row_lock](auth::Role r, const std::string& hash,
-                                                     std::int64_t) { under_row_lock(r, hash); }));
-}
-
-std::expected<void, AuthDBError>
 AuthDB::recheck_role_locked(const std::string& username,
                             const std::function<void(auth::Role, const std::string& password_hash,
                                                      std::int64_t factor_gen)>& under_row_lock) {
@@ -1671,7 +1660,6 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
                         "SELECT id, encode(mfa_totp_secret, 'hex'), (mfa_enrolled_at IS NOT NULL), "
                         "COALESCE((mfa_enrolled_at AT TIME ZONE 'UTC')::text, ''), "
                         "COALESCE((mfa_disabled_at AT TIME ZONE 'UTC')::text, ''), "
-                        "COALESCE((extract(epoch from mfa_enrolled_at)*1000)::bigint, 0), "
                         "mfa_factor_gen, (extract(epoch from now())*1000)::bigint "
                         "FROM auth.users WHERE username = $1 AND is_active = TRUE",
                         std::vector<std::string>{username});
@@ -1687,8 +1675,8 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
     MfaStatus status;
     status.disabled_at = col_str(res.get(), 0, 4);
     // #6079: read for an un-enrolled account too (0 never enrolled, g cleared g times).
-    status.factor_gen = to_i64(col(res.get(), 0, 6));
-    status.db_now_ms = to_i64(col(res.get(), 0, 7));
+    status.factor_gen = to_i64(col(res.get(), 0, 5));
+    status.db_now_ms = to_i64(col(res.get(), 0, 6));
 
     if (!enrolled_flag) {
         // Genuinely not enrolled — a provisional secret, if any, does not
@@ -1707,7 +1695,6 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
             return std::unexpected(dec.error());
         status.enrolled = true;
         status.enrolled_at = col_str(res.get(), 0, 3);
-        status.enrolled_at_ms = to_i64(col(res.get(), 0, 5));
     }
 
     // Recovery-code count is best-effort display metadata (matches the

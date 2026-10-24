@@ -492,14 +492,9 @@ public:
     /// a concurrent removal has committed, or blocks until one in flight
     /// does). `InvalidUsername` / `QueryFailed` on the usual input/store
     /// failures, callback not invoked either way.
-    std::expected<void, AuthDBError>
-    recheck_role_locked(
-        const std::string& username,
-        const std::function<void(auth::Role, const std::string& password_hash)>& under_row_lock);
-
-    /// #6079: as above, and `under_row_lock` also receives the account's `mfa_factor_gen` read
-    /// under the same row lock, so a mint can deny when the factor it verified against has since
-    /// been replaced. The two-argument form adapts onto this one.
+    ///
+    /// #6079: `under_row_lock` also receives the account's `mfa_factor_gen` read under the same
+    /// row lock, so a mint can deny when the factor it verified against has since been replaced.
     std::expected<void, AuthDBError>
     recheck_role_locked(const std::string& username,
                         const std::function<void(auth::Role, const std::string& password_hash,
@@ -726,10 +721,6 @@ public:
         std::string enrolled_at;
         std::string disabled_at;
         int recovery_codes_remaining{0};
-        /// `mfa_enrolled_at` as milliseconds since the Unix epoch, authored from
-        /// the Postgres `now()` that stamped the enrolment (the same clock domain
-        /// as `session_store.sessions.mfa_verified_ms`). 0 == not enrolled.
-        std::int64_t enrolled_at_ms{0};
         /// #6079: the account's factor generation (`auth.users.mfa_factor_gen`), read in the same
         /// statement as the rest of the row. Database-owned: a row trigger advances it on EVERY
         /// change of `mfa_enrolled_at`, whichever binary issued the write, so it is a monotonic

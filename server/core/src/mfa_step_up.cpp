@@ -133,15 +133,13 @@ MfaFactorProbe probe_mfa_factor(const auth::Session& session, AuthDB& auth_db) {
     }
     if (!status->enrolled)
         return {MfaFactorState::kNotEnrolled};
-    // `enrolled` implies a non-NULL enrolment instant, which reads back as a positive epoch
-    // ms, and a database-owned generation of at least 1 (the trigger advances it on every
-    // enrolment). A non-positive value of either is an unreadable row (fail closed): the
-    // first would silently skip the pre-enrolment proof check, the second would make the
-    // binding comparison vacuous.
-    if (status->enrolled_at_ms <= 0 || status->factor_gen <= 0)
+    // `enrolled` implies a database-owned generation of at least 1 (the trigger advances it on
+    // every enrolment). A non-positive value is an unreadable row (fail closed): it would make
+    // the binding comparison vacuous.
+    if (status->factor_gen <= 0)
         return {MfaFactorState::kStoreUnavailable};
-    return {MfaFactorState::kEnrolledLocal, status->enrolled_at_ms, status->factor_gen,
-            status->db_now_ms, status->binding_enforced};
+    return {MfaFactorState::kEnrolledLocal, status->factor_gen, status->db_now_ms,
+            status->binding_enforced};
 }
 
 ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httplib::Response& res,

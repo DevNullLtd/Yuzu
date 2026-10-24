@@ -343,7 +343,8 @@ TEST_CASE("AuthDB::recheck_role_locked hands the current password_hash to the ca
     REQUIRE(h.db.upsert_user("rr", "h0", "s0", yuzu::server::auth::Role::admin).has_value());
     std::string seen_hash;
     yuzu::server::auth::Role seen_role = yuzu::server::auth::Role::user;
-    REQUIRE(h.db.recheck_role_locked("rr", [&](yuzu::server::auth::Role r, const std::string& hh) {
+    REQUIRE(h.db.recheck_role_locked("rr", [&](yuzu::server::auth::Role r, const std::string& hh,
+                                               std::int64_t) {
                     seen_role = r;
                     seen_hash = hh;
                 }).has_value());
@@ -354,9 +355,9 @@ TEST_CASE("AuthDB::recheck_role_locked hands the current password_hash to the ca
                         "UPDATE auth.users SET password_hash = 'h1', salt_hex = 's1' "
                         "WHERE username = 'rr'")};
     REQUIRE(upd.ok());
-    REQUIRE(h.db.recheck_role_locked("rr", [&](yuzu::server::auth::Role, const std::string& hh) {
-                    seen_hash = hh;
-                }).has_value());
+    REQUIRE(h.db.recheck_role_locked("rr", [&](yuzu::server::auth::Role, const std::string& hh,
+                                               std::int64_t) { seen_hash = hh; })
+                .has_value());
     CHECK(seen_hash == "h1");
 }
 
@@ -2723,10 +2724,9 @@ TEST_CASE("AuthDB MFA fail-closed: mfa_verify_enrollment refuses a corrupted pro
     CHECK_FALSE(status->enrolled);
 }
 
-// ── MfaStatus::enrolled_at_ms (#6079) ────────────────────────────────────────
-// The approver gate compares a session's MFA-proof instant to the CURRENT enrolment instant,
-// so enrolled_at_ms must be the Postgres-authored instant in epoch milliseconds, and 0 for
-// any row that is not (or is no longer) enrolled.
+// ── MfaStatus enrolment state and the enrolment instant column (#6079) ───────
+// `mfa_status` reports whether a factor is enrolled and the account's factor generation; the
+// enrolment instant itself is the Postgres-authored `mfa_enrolled_at` column.
 
 namespace {
 std::int64_t db_now_ms(PGconn* conn) {
@@ -2748,9 +2748,18 @@ void enroll(AuthDB& db, const std::string& user) {
 }
 } // namespace
 
-TEST_CASE("AuthDB::mfa_status enrolled_at_ms is 0 for a user who is not enrolled, including one "
-          "with only a provisional secret",
-          "[pg][auth_db][mfa]") {
+namespace {
+std::int64_t enrolled_column_ms(PGconn* conn, const char* user) {
+    return std::stoll(scalar(conn,
+                             "SELECT COALESCE((extract(epoch from mfa_enrolled_at)*1000)::bigint, "
+                             "0) FROM auth.users WHERE username = $1",
+                             {user}));
+}
+} // namespace
+
+TEST_CASE("AuthDB::mfa_status is not enrolled, at generation 0, for a user who never enrolled, "
+          "including one with only a provisional secret",
+          "[pg][authdb][mfa]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("d1", "h", "s", yuzu::server::auth::Role::user).has_value());
@@ -2758,17 +2767,19 @@ TEST_CASE("AuthDB::mfa_status enrolled_at_ms is 0 for a user who is not enrolled
     auto never = h.db.mfa_status("d1");
     REQUIRE(never.has_value());
     CHECK_FALSE(never->enrolled);
-    CHECK(never->enrolled_at_ms == 0);
+    CHECK(never->factor_gen == 0);
+    CHECK(enrolled_column_ms(h.conn.get(), "d1") == 0);
 
     REQUIRE(h.db.mfa_init_enrollment("d1", "Yuzu", std::nullopt).has_value());
     auto provisional = h.db.mfa_status("d1");
     REQUIRE(provisional.has_value());
     CHECK_FALSE(provisional->enrolled);
-    CHECK(provisional->enrolled_at_ms == 0);
+    CHECK(provisional->factor_gen == 0);
+    CHECK(enrolled_column_ms(h.conn.get(), "d1") == 0);
 }
 
-TEST_CASE("AuthDB::mfa_status enrolled_at_ms is the database instant that completed enrolment",
-          "[pg][auth_db][mfa]") {
+TEST_CASE("AuthDB enrolment stamps mfa_enrolled_at with the database instant that completed it",
+          "[pg][authdb][mfa]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("d2", "h", "s", yuzu::server::auth::Role::user).has_value());
@@ -2780,27 +2791,31 @@ TEST_CASE("AuthDB::mfa_status enrolled_at_ms is the database instant that comple
     auto st = h.db.mfa_status("d2");
     REQUIRE(st.has_value());
     REQUIRE(st->enrolled);
-    CHECK(st->enrolled_at_ms >= lo);
-    CHECK(st->enrolled_at_ms <= hi);
-    CHECK(st->enrolled_at_ms > 0);
+    CHECK(st->factor_gen == 1);
+    const std::int64_t at = enrolled_column_ms(h.conn.get(), "d2");
+    CHECK(at >= lo);
+    CHECK(at <= hi);
+    CHECK(at > 0);
 }
 
-TEST_CASE("AuthDB::mfa_status enrolled_at_ms returns to 0 after mfa_disable and moves forward on "
-          "re-enrolment",
-          "[pg][auth_db][mfa]") {
+TEST_CASE("AuthDB::mfa_status reports not enrolled after mfa_disable and a later generation and "
+          "instant on re-enrolment",
+          "[pg][authdb][mfa]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("d3", "h", "s", yuzu::server::auth::Role::user).has_value());
     enroll(h.db, "d3");
     auto first = h.db.mfa_status("d3");
     REQUIRE(first.has_value());
-    REQUIRE(first->enrolled_at_ms > 0);
+    REQUIRE(first->enrolled);
+    const std::int64_t first_at = enrolled_column_ms(h.conn.get(), "d3");
+    REQUIRE(first_at > 0);
 
     REQUIRE(h.db.mfa_disable("d3").has_value());
     auto off = h.db.mfa_status("d3");
     REQUIRE(off.has_value());
     CHECK_FALSE(off->enrolled);
-    CHECK(off->enrolled_at_ms == 0);
+    CHECK(enrolled_column_ms(h.conn.get(), "d3") == 0);
 
     std::this_thread::sleep_for(
         std::chrono::milliseconds(20)); // ms resolution: force a later instant
@@ -2808,8 +2823,11 @@ TEST_CASE("AuthDB::mfa_status enrolled_at_ms returns to 0 after mfa_disable and 
     enroll(h.db, "d3");
     auto again = h.db.mfa_status("d3");
     REQUIRE(again.has_value());
-    CHECK(again->enrolled_at_ms >= lo);
-    CHECK(again->enrolled_at_ms > first->enrolled_at_ms);
+    CHECK(again->enrolled);
+    CHECK(again->factor_gen > first->factor_gen);
+    const std::int64_t again_at = enrolled_column_ms(h.conn.get(), "d3");
+    CHECK(again_at >= lo);
+    CHECK(again_at > first_at);
 }
 
 // cs-S2 / au-F2 (#6079): mfa_disable_report's pre-image comes from the SAME row lock as the clear.
@@ -3103,7 +3121,6 @@ TEST_CASE("AuthDB::mfa_status carries the database clock and reports the binding
     CHECK(st->db_now_ms <= hi);
     CHECK(st->binding_enforced);
     CHECK(st->factor_gen == 0);
-    CHECK(st->enrolled_at_ms == 0); // still present alongside the new fields until C6
 }
 
 TEST_CASE("AuthDB verifiers return the generation and an instant captured BEFORE the check",
@@ -3130,7 +3147,10 @@ TEST_CASE("AuthDB verifiers return the generation and an instant captured BEFORE
         CHECK(e->factor_gen == 1);
         CHECK(e->verified_ms >= lo);
         CHECK(e->verified_ms <= hook_now);
-        const std::int64_t enrolled_ms = h.db.mfa_status("v1")->enrolled_at_ms;
+        const std::int64_t enrolled_ms = std::stoll(scalar(
+            h.conn.get(),
+            "SELECT (extract(epoch from mfa_enrolled_at)*1000)::bigint FROM auth.users "
+            "WHERE username = 'v1'"));
         CHECK(e->verified_ms < enrolled_ms); // captured before the pause, so before the UPDATE
         CHECK(e->recovery_codes.size() == 10);
     }
@@ -3476,12 +3496,6 @@ TEST_CASE("AuthDB::recheck_role_locked hands the factor generation read under th
                                                std::int64_t gen) { seen = gen; })
                 .has_value());
     CHECK(seen == f.result.factor_gen);
-    // The two-argument form still compiles and runs against the same row.
-    int calls = 0;
-    REQUIRE(h.db.recheck_role_locked("rg",
-                                     [&](yuzu::server::auth::Role, const std::string&) { ++calls; })
-                .has_value());
-    CHECK(calls == 1);
 }
 
 TEST_CASE("AuthDB refuses to open when the generation trigger is not in force",

@@ -1619,6 +1619,19 @@ struct RealGate {
         INFO(PQresultErrorMessage(r.get()));
         REQUIRE(r.status() == PGRES_COMMAND_OK);
     }
+    /// `auth.users.mfa_enrolled_at` as epoch milliseconds, read from the column (0 = not enrolled).
+    std::int64_t enrolled_ms(const std::string& user) {
+        auto lease = authdb.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(),
+            "SELECT COALESCE((extract(epoch from mfa_enrolled_at)*1000)::bigint, 0) "
+            "FROM auth.users WHERE username = $1",
+            std::vector<std::string>{user});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(r.get()) == 1);
+        return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
+    }
     void backdate_enrolment(const std::string& user) {
         sql("UPDATE auth.users SET mfa_enrolled_at = now() - interval '1 hour' "
             "WHERE username = $1",
@@ -1968,7 +1981,7 @@ TEST_CASE("approval integration: a bound proof decides by generation equality, a
         return auth::DurableMfaProof{auth::DurableMfaProof::Source::kRow, now_ms - 10'000, now_ms,
                                      gen};
     };
-    REQUIRE(bound(0).mfa_verified_ms < status->enrolled_at_ms);
+    REQUIRE(bound(0).mfa_verified_ms < g.enrolled_ms("alice"));
 
     g.h.session = g.session("alice", "local", auth::Role::admin, milliseconds(10'000));
     g.durable = bound(status->factor_gen - 1);
@@ -2029,9 +2042,12 @@ TEST_CASE("approval integration: enrol then approve at once passes for a bound s
         if (bound) {
             // Verified 2 s BEFORE the enrolment instant, bound to the generation it produced.
             REQUIRE(mgr.mark_session_mfa_verified(
-                token, yuzu::server::LocalMfaProof{st->factor_gen, st->enrolled_at_ms - 2'000}));
+                token,
+                yuzu::server::LocalMfaProof{st->factor_gen, g.enrolled_ms(user) - 2'000}));
         } else {
-            REQUIRE(mgr.mark_session_mfa_verified(token));
+            // A proof with no generation: what a legacy row or a rebind-guard unbind holds.
+            REQUIRE(mgr.mark_session_mfa_verified(
+                token, yuzu::server::LocalMfaProof{0, st->db_now_ms}));
         }
         auto live = mgr.validate_session(token);
         REQUIRE(live.has_value());
@@ -2040,7 +2056,7 @@ TEST_CASE("approval integration: enrol then approve at once passes for a bound s
         REQUIRE(g.durable->source == auth::DurableMfaProof::Source::kRow);
         CHECK((g.durable->mfa_factor_gen > 0) == bound);
         if (bound)
-            CHECK(g.durable->mfa_verified_ms < st->enrolled_at_ms);
+            CHECK(g.durable->mfa_verified_ms < g.enrolled_ms(user));
 
         const auto ticket = g.submit();
         g.h.audits.clear();

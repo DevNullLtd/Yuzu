@@ -602,19 +602,8 @@ TEST_CASE("step-up route inventory: every kRequired row is registered (its handl
 // (`step_up_fn (req`, a first argument that is not `req`) is not seen by this scan.
 TEST_CASE("step-up route inventory (lexical): kRequired labels equal the in-handler step_up_fn labels",
           "[stepup][inventory][label_pin][body_cap]") {
-<<<<<<< /tmp/m.cpp
     namespace linear = ::yuzu::test::route_scan;
     namespace text_scan = ::yuzu::test::source_scan;
-=======
-    static const std::regex literal_call(
-        R"regex(\b(?:step_up_fn_?|factor_credential_gate_fn_)\(\s*req\s*,\s*res\s*,\s*\*session\s*,\s*"((?:[^"\\]|\\.)*)"\s*\))regex");
-    static const std::regex any_call(R"regex(\b(?:step_up_fn_?|factor_credential_gate_fn_)\(\s*req\b)regex");
-
-    const auto line_of = [](const std::string& text, std::size_t pos) {
-        return static_cast<int>(std::count(text.begin(), text.begin() + static_cast<std::ptrdiff_t>(pos),
-                                           '\n')) + 1;
-    };
->>>>>>> /tmp/t.cpp
 
     std::map<std::string, std::vector<std::string>> handler_labels; // label -> "file:line" sites
     std::vector<std::string> unreadable;

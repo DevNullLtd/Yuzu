@@ -30,26 +30,24 @@ namespace yuzu::server {
 /// The second factor a session stands on, as seen by the approver gate. The
 /// zero value is the refusing one: a value-initialised state never admits.
 enum class MfaFactorState : std::uint8_t {
-    kNotEnrolled = 0,    ///< local account with no enrolled factor
-    kEnrolledLocal,      ///< local account with an enrolled TOTP factor
-    kIdpAttested,        ///< OIDC session carrying an IdP `amr`-seeded proof
-    kNoIdpProof,         ///< OIDC session with no usable `amr`-seeded proof
-    kSamlUnsupported,    ///< SAML carries no MFA attestation in this release (#4935)
-    kNotInteractive,     ///< any other auth_source (bearer, engine, unknown)
-    kStoreUnavailable,   ///< the enrolment read failed (outage, undecryptable secret, or an
-                         ///< enrolled row with no usable enrolment instant)
+    kNotEnrolled = 0,   ///< local account with no enrolled factor
+    kEnrolledLocal,     ///< local account with an enrolled TOTP factor
+    kIdpAttested,       ///< OIDC session carrying an IdP `amr`-seeded proof
+    kNoIdpProof,        ///< OIDC session with no usable `amr`-seeded proof
+    kSamlUnsupported,   ///< SAML carries no MFA attestation in this release (#4935)
+    kNotInteractive,    ///< any other auth_source (bearer, engine, unknown)
+    kStoreUnavailable,  ///< the enrolment read failed (outage, undecryptable secret, or an
+                        ///< enrolled row with no usable factor generation)
     kAccountUnavailable, ///< local session whose account is deactivated, deleted or malformed
 };
 
-/// `enrolled_at_ms`, `factor_gen`, `db_now_ms` and `binding_enforced` are meaningful only for
-/// `kEnrolledLocal` (0 / 0 / 0 / true otherwise; a probe never reports `kEnrolledLocal` with a
-/// non-positive `enrolled_at_ms` or `factor_gen`). They are read from `AuthDB::MfaStatus` in the
-/// same statement: `factor_gen` is the account's database-owned factor generation,
-/// `db_now_ms` the database clock at that read, and `binding_enforced` false once the
-/// generation trigger has been observed not firing.
+/// `factor_gen`, `db_now_ms` and `binding_enforced` are meaningful only for `kEnrolledLocal`
+/// (0 / 0 / true otherwise; a probe never reports `kEnrolledLocal` with a non-positive
+/// `factor_gen`). They are read from `AuthDB::MfaStatus` in the same statement: `factor_gen` is
+/// the account's database-owned factor generation, `db_now_ms` the database clock at that
+/// read, and `binding_enforced` false once the generation trigger has been observed not firing.
 struct MfaFactorProbe {
     MfaFactorState state{MfaFactorState::kNotEnrolled};
-    std::int64_t enrolled_at_ms{0};
     std::int64_t factor_gen{0};
     std::int64_t db_now_ms{0};
     bool binding_enforced{true};
@@ -159,8 +157,8 @@ struct ApproverMfaOutcome {
     enum class Kind : std::uint8_t {
         kRefuse = 0,       ///< no usable second factor; nothing was written to the response
         kStoreUnavailable, ///< the enrolment read failed; nothing was written to the response
-        kChallengeWritten, ///< the proof is stale, predates the enrolment, or is bound to another
-                           ///< factor generation; a 401 was written
+        kChallengeWritten, ///< the proof is stale, unbound, or bound to another factor
+                           ///< generation; a 401 was written
         kProofClockSkew,   ///< an SSO proof dated after the database clock; nothing was written
                            ///< to the response (a server-side clock fault, not a store fault)
         kPass,             ///< enrolled and fresh
