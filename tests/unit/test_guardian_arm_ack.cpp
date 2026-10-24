@@ -3009,8 +3009,9 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a Withdrawn or a Stopped receip
           "failure kept in failed_ids, its receipt discarded (#5547)",
           "[spark][ack][5547]") {
     // Both statuses share the ordinary-failure arm of drain_locked() with Failed: only the rule id
-    // is kept, in failed_ids. Mutation: either status removed from that case label (the receipt
-    // stays pending and the failure is never counted).
+    // is kept, in failed_ids. Mutation: either status removed from that case label (the receipt is
+    // dropped from pending without being counted: drain_locked() still returns 1, failed_ids and
+    // resolved_failed stay empty).
     {
         Rig5459 f;
         f.open_delta({"r1"});
