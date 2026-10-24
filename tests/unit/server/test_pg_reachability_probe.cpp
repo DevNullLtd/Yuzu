@@ -106,10 +106,10 @@ std::optional<std::string> admin_scalar(const std::string& admin_dsn, const char
                                         const std::string& param) {
     // Bound the connect itself: on POSIX the listener below unsets
     // PGCONNECT_TIMEOUT for these cases, so the cap CI exports does not reach this
-    // helper. 10 s matches that export and PgPool's default, so Windows, where the
-    // export still applies, sees the same bound. libpq takes the last
-    // connect_timeout in a DSN, so this also wins over one already set.
-    const std::string bounded = dsn_with(admin_dsn, "connect_timeout", "10");
+    // helper. 30 s matches that export, so Windows, where the export still
+    // applies, sees the same bound. libpq takes the last connect_timeout in a
+    // DSN, so this also wins over one already set.
+    const std::string bounded = dsn_with(admin_dsn, "connect_timeout", "30");
     yuzu::server::pg::PgConn c{PQconnectdb(bounded.c_str())};
     if (PQstatus(c.get()) != CONNECTION_OK)
         return std::nullopt;
@@ -135,9 +135,13 @@ int count_backends(const std::string& admin_dsn, const std::string& app) {
 
 int wait_for_backends(const std::string& admin_dsn, const std::string& app, int want) {
     int n = -1;
-    for (int i = 0; i < 50; ++i) { // ≤5s: backend exit after a client close is asynchronous
+    // ≤5s when the admin host answers: backend exit after a client close is
+    // asynchronous. The wall-clock deadline keeps a stalled admin host (each
+    // attempt can take the full connect_timeout) from consuming the shard budget.
+    const auto deadline = std::chrono::steady_clock::now() + 90s;
+    for (int i = 0; i < 50; ++i) {
         n = count_backends(admin_dsn, app);
-        if (n == want)
+        if (n == want || std::chrono::steady_clock::now() >= deadline)
             break;
         std::this_thread::sleep_for(100ms);
     }
