@@ -79,9 +79,12 @@ See [`docs/capability-map.md`](docs/capability-map.md) for the target feature se
 - `hotfix/<issue>-<short-description>` for a fix to a released version (see below)
 - `release/` and `chore/release-*` for release preparation (maintainers)
 
-Branch from `dev` — all work merges into `dev`; `main` is release-only. The one exception is a
-hotfix to a released version, which branches from `main`, merges to `main`, and is carried back
-to `dev` afterwards. Keep branches focused on a single change.
+Branch from `origin/dev` — all work merges into `dev`; `main` is release-only. The repository's
+default branch is `main`, so do not branch from "wherever you are". The exceptions: a hotfix to a
+released version branches from `main`, merges to `main`, and is carried back to `dev`
+afterwards; maintainers' release-prep branches (`release/*`, `chore/release-*`) are cut from
+`main`; a sub-PR of a long-lived `feat/*` branch is cut from that branch. Keep branches focused
+on a single change.
 
 How a change travels from `dev` to a tagged release, how release candidates and hotfixes are
 handled, and who decides what counts as a hotfix and who cuts releases:
