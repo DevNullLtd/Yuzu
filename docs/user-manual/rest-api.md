@@ -6750,11 +6750,11 @@ administrator-only, so a non-administrator session does not receive these rows. 
 `ForensicsAnalyst` role is the delegable read-only holder (see `rbac.md`). A served read that
 includes at least one such row also writes a `response.forensics.read` audit row
 (`detail=forensics_rows=<n> plugins=<names> surface=<s>`, `surface` being `rest` for the v1 routes
-and `legacy` for the unversioned ones), fail-closed like the neighbouring `response.read` row
+and `legacy` for the unversioned ones), fail-closed like the neighboring `response.read` row
 (`503` + `Sec-Audit-Failed: true`, no data); aggregate, facet-option and count reads write none. For an export the
 `forensics_rows` count is taken before the byte cap trims the file, so it can exceed the rows the file holds. When the
 `response.forensics.read` row cannot persist and the route answers `503`, the attempt has already left its
-neighbouring success row (`response.read` or `execution.detail.fetch`, written first), and a retry leaves a second one. A caller using
+neighboring success row (`response.read` or `execution.detail.fetch`, written first), and a retry leaves a second one. A caller using
 an API token, an MCP token or an engine principal that does not hold a global `Forensics:Read`
 also leaves one `auth.permission_required` denied audit row per read attempt (an interactive
 browser sign-in does not), so expect denial rows from automation that polls stored responses.
@@ -6762,7 +6762,7 @@ The filter is per plugin, because only the `plugin` name is stored with a row, a
 about these plugins' rows, not about a kind of data: other plugins can return comparable
 information under their own securables, and their stored rows stay under `Response:Read`. The same filter is applied to the
 server's own consumers of these rows: policy check output (such a policy scores `unknown`), result
-set membership (a set sourced from such a command materialises empty) and the live output stream,
+set membership (a set sourced from such a command materializes empty) and the live output stream,
 which publishes no row of a Forensics-tier plugin on `GET /events`, `GET /sse/executions/{id}` or
 `GET /api/v1/events`. (Such a frame publishes nothing to the live output stream, not a row and not a notice, and
 nothing is published there when the plugin set is unwired or the frame carries no output. The timing and

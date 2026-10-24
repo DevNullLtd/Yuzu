@@ -225,8 +225,8 @@ dispatched itself from a fixed non-Forensics plugin (the pre-flight check collat
 containment poll, the `tar.fleet_snapshot` topology poll and the deployment collect), none of which returns raw rows
 to an operator. The server-side consumers that used to read the store unfiltered now apply the tier
 through a real filter: the policy evaluator excludes the Forensics plugins outright (such a check
-scores `unknown`), the result-set materialiser does the same (a set sourced from such a command
-materialises empty for every creator), and bundle collation applies the caller's own decision
+scores `unknown`), the result-set materializer does the same (a set sourced from such a command
+materializes empty for every creator), and bundle collation applies the caller's own decision
 (approval to dispatch a step does not imply reading its output; a step the caller may not read stays
 `pending` with an empty output; a collation that serves a Forensics-tier step's output writes the
 `response.forensics.read` row with `surface=bundle`, REST fail-closed and MCP `audit_persisted:false`).
