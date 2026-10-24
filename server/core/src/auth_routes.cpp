@@ -834,7 +834,10 @@ bool AuthRoutes::require_permission_impl(const httplib::Request& req, httplib::R
             engine_unavailable = !checked && degrade == RbacDegradeMapping::UnavailableAs503;
             return checked.value_or(false);
         };
-        if (!rbac_store_->is_rbac_enabled() || !engine_granted()) {
+        // clang-format off
+        if (!rbac_store_->is_rbac_enabled() ||
+            !engine_granted()) {
+        // clang-format on
             if (engine_unavailable) {
                 // Opt-in only: still refused, but as the retryable outage it is, not as a
                 // definitive missing grant. The default stays 403.
