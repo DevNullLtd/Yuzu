@@ -182,7 +182,10 @@ const char* kSelectErrorDetailEmpty = ", '' AS last_error_detail";
 // #4990: the executions, among `ids`, that ran at least one command of a Forensics-tier plugin.
 // The plugin is the one the server RECORDED at dispatch in `command_execution.plugin` (the same
 // value the ingest stores in `responses.plugin`), folded to ASCII lowercase in SQL with COLLATE "C"
-// so it agrees with `ForensicsPluginSet`. A failed read returns nullopt; the caller then treats EVERY
+// so it agrees with `ForensicsPluginSet`. A record whose plugin is the empty string names no
+// plugin at all (the column default; `record_command_dispatch` refuses to write one, and the
+// ingest treats an empty plugin as unverified), so it counts as Forensics-tier here: the fail
+// closed reading, the same one the ingest takes. A failed read returns nullopt; the caller then treats EVERY
 // candidate as Forensics (the safe reading: a bounded token or the placeholder is shown instead of
 // free text). `command_execution` has no `execution_id` index (a plain CREATE INDEX on an existing
 // table is barred by the store playbook), so this is a scan of at most 24h of mappings; it runs
@@ -196,7 +199,7 @@ forensics_executions_among(PGconn* conn, const ForensicsPluginSet& set,
         conn,
         "SELECT DISTINCT execution_id FROM execution_tracker.command_execution "
         "WHERE execution_id = ANY($1::text[]) "
-        "AND lower(plugin COLLATE \"C\") = ANY($2::text[])",
+        "AND (plugin = '' OR lower(plugin COLLATE \"C\") = ANY($2::text[]))",
         std::vector<std::string>{pg::to_text_array(idv), pg::to_text_array(names)});
     if (res.status() != PGRES_TUPLES_OK)
         return std::nullopt;

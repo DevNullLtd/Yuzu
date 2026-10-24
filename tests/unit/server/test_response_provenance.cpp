@@ -596,6 +596,35 @@ TEST_CASE("provenance tracker: a Forensics-looking id recorded as an ordinary pl
     CHECK(one->last_error_detail == kFreeText);
 }
 
+TEST_CASE("provenance tracker: a dispatch record with an empty plugin is read as Forensics-tier",
+          "[pg][server][forensics_tier][provenance][tracker][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, provenance_tpl);
+    Harness h(db.dsn(), /*use_direct=*/false);
+    h.tracker->set_forensics_plugin_set(&test::forensics_plugin_set());
+
+    const auto exec = make_execution(h, "def-prov-empty-plugin");
+    {
+        // `record_command_dispatch` refuses an empty plugin, so the row is written the way the
+        // column default would leave one.
+        auto lease = h.pool.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "INSERT INTO execution_tracker.command_execution "
+                                "(command_id, execution_id, created_at, plugin) "
+                                "VALUES ('anonymous-00ee0001', $1, extract(epoch FROM now())::bigint, '')",
+                                std::vector<std::string>{exec})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    store_raw_status(h, exec, "agent-raw");
+    const auto statuses = h.tracker->get_agent_statuses(exec);
+    const auto* raw = status_of(statuses, "agent-raw");
+    REQUIRE(raw != nullptr);
+    CHECK(raw->error_detail == "forensics_error");
+    const auto one = h.tracker->get_execution(exec);
+    REQUIRE(one.has_value());
+    CHECK(one->last_error_detail == "forensics_error");
+}
+
 TEST_CASE("provenance ingest: the server's own correlation-id families keep their plugin and their "
           "consumers",
           "[pg][server][forensics_tier][provenance]") {
