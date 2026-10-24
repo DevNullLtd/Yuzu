@@ -24,6 +24,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
+#include <yuzu/metrics.hpp>
 
 #include <algorithm>
 #include <filesystem>
@@ -489,17 +490,24 @@ TEST_CASE("authorize_list_read: read_failed is true for each failed-read arm, an
     }
 
     SECTION("ONLY the global-grant read fails: not no-grant, and not a narrower scoped view") {
-        REQUIRE(r.rbac.check_permission_checked("alice", "Response", "Read").has_value());
+        // "carol" holds a group-scoped allow and has no cached verdict, so authorize_list_read's
+        // OWN first call is the one that reads (and fails). Nothing may query "carol" before it:
+        // two failed reads open the breaker (threshold 2), and a breaker shed would then deny
+        // the call whether or not authorize_list_read tells a failed read from "no grant".
+        r.group_assign(r.gP, "carol", "RespReader");
+        yuzu::MetricsRegistry metrics;
+        r.rbac.set_metrics(&metrics);
         // The role lookup is the global read's alone: group names, assignments and role effects
-        // do not read principal_roles, so the later reads would all succeed.
+        // do not read principal_roles, so with the early return reverted the later reads
+        // would all succeed and carol would be admitted scoped.
         break_table(rbac_db_.dsn(), "rbac_store.principal_roles");
-        // "bob" has no cached verdict, so check_permission really reads (and fails).
-        const auto checked = r.rbac.check_permission_checked("bob", "Response", "Read");
-        CHECK_FALSE(checked.has_value());
-        CHECK_FALSE(r.rbac.check_permission("bob", "Response", "Read")); // the plain form denies
-        auto d = r.rbac.authorize_list_read("bob", "Response", "Read", &r.mgmt);
+        auto d = r.rbac.authorize_list_read("carol", "Response", "Read", &r.mgmt);
         CHECK(d.decision == ListReadDecision::DenyAll); // not AdmitScoped from the later reads
         CHECK(d.read_failed);
+        // One failed read: the breaker did not trip, so the result came from the read itself.
+        CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
+        CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+                  .value() == 1.0);
     }
 }
 
