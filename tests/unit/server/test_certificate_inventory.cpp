@@ -1665,3 +1665,50 @@ TEST_CASE("cert ingest: an exception at a call site follows the leg rule (full r
     CHECK_FALSE(nacked(hash_ack));
     CHECK(metric_count(m, "error", "exception") == 2);
 }
+
+TEST_CASE("CertificateInventoryStore: every agent gets a server-assigned random sample_key at first "
+          "ingest, stable and copied onto its facts",
+          "[certinv][pg][samplekey]") {
+    CERT_SHARED(store, pool);
+    // Agent ids in ascending order: the keys must not follow it.
+    std::vector<std::string> agents;
+    for (int i = 0; i < 8; ++i)
+        agents.push_back("agent-" + std::to_string(i));
+    for (const auto& a : agents)
+        ingest(store, a, full_report(blob(store_rec("S", "ok", "", "2"), {cert(1, {{"S", ""}}), cert(2, {{"S", ""}})})));
+
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.agent_state WHERE sample_key IS NULL") == "0");
+    CHECK(scalar(pool, "SELECT count(DISTINCT sample_key) FROM certificate_inventory_store.agent_state") == "8");
+    // Every fact row carries its own agent's key.
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.cert_fact f JOIN "
+                       "certificate_inventory_store.agent_state a USING (agent_id) "
+                       "WHERE f.sample_key IS DISTINCT FROM a.sample_key") == "0");
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.cert_fact") == "16");
+    // Not monotone in agent_id (8 random keys ascending by chance is 1 in 40320).
+    CHECK(scalar(pool, "SELECT (array_agg(sample_key ORDER BY agent_id) = "
+                       "array_agg(sample_key ORDER BY sample_key))::text FROM "
+                       "certificate_inventory_store.agent_state") == "false");
+
+    // Stable across a changed full report and a re-report.
+    const auto before = scalar(pool, "SELECT string_agg(sample_key::text, ',' ORDER BY agent_id) FROM "
+                                     "certificate_inventory_store.agent_state");
+    for (const auto& a : agents)
+        ingest(store, a, full_report(blob(store_rec("S", "ok", "", "1"), {cert(3, {{"S", ""}})})));
+    CHECK(scalar(pool, "SELECT string_agg(sample_key::text, ',' ORDER BY agent_id) FROM "
+                       "certificate_inventory_store.agent_state") == before);
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.cert_fact f JOIN "
+                       "certificate_inventory_store.agent_state a USING (agent_id) "
+                       "WHERE f.sample_key IS DISTINCT FROM a.sample_key") == "0");
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.cert_fact") == "8");
+}
+
+TEST_CASE("CertificateInventoryStore: sample_key is NOT NULL on both tables and indexed for the sample",
+          "[certinv][pg][samplekey]") {
+    CERT_SHARED(store, pool);
+    CHECK(scalar(pool, "SELECT string_agg(table_name || ':' || is_nullable, ',' ORDER BY table_name) FROM "
+                       "information_schema.columns WHERE table_schema = 'certificate_inventory_store' "
+                       "AND column_name = 'sample_key'") == "agent_state:NO,cert_fact:NO");
+    CHECK(scalar(pool, "SELECT indexdef FROM pg_indexes WHERE schemaname = 'certificate_inventory_store' "
+                       "AND indexname = 'cert_fact_sample_idx'")
+              .find("(sha256, sample_key, agent_id)") != std::string::npos);
+}
