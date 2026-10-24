@@ -689,6 +689,48 @@ TEST_CASE("config: LiveSeconds copies and assigns by value and is safe across th
     CHECK_FALSE(bad.load());
 }
 
+TEST_CASE("config: LiveInt copies and assigns by value and is safe across threads",
+          "[server][config_routes][concurrency]") {
+    yuzu::server::Config a;
+    CHECK(a.response_retention_days == 90);
+    CHECK(a.audit_retention_days == 365);
+    CHECK(a.guardian_event_retention_days == 30);
+    a.response_retention_days = 45;
+    yuzu::server::Config b = a; // Config is passed and copied by value
+    CHECK(b.response_retention_days == 45);
+    b.audit_retention_days = 60;
+    a = b;
+    CHECK(a.audit_retention_days.get() == 60);
+    a.guardian_event_retention_days = a.guardian_event_retention_days; // self-assignment
+    CHECK(a.guardian_event_retention_days.get() == 30);
+
+    // One writer and several readers/copiers on fixed iteration counts (no sleeps): every value
+    // seen is one that was written. Under the CI sanitizer leg a plain int member races here.
+    yuzu::server::Config shared;
+    shared.response_retention_days = 30;
+    std::atomic<bool> bad{false};
+    std::thread writer([&] {
+        for (int i = 0; i < 20000; ++i)
+            shared.response_retention_days = i % 2 ? 30 : 90;
+    });
+    std::vector<std::thread> readers;
+    readers.reserve(3); // no throw between the writer starting and the joins
+    for (int t = 0; t < 3; ++t)
+        readers.emplace_back([&] {
+            for (int i = 0; i < 20000; ++i) {
+                const int v = shared.response_retention_days;
+                const yuzu::server::Config copy = shared;
+                const int c = copy.response_retention_days;
+                if ((v != 30 && v != 90) || (c != 30 && c != 90))
+                    bad = true;
+            }
+        });
+    writer.join();
+    for (auto& r : readers)
+        r.join();
+    CHECK_FALSE(bad.load());
+}
+
 TEST_CASE("config: clamp_heartbeat_timeout moves an out-of-range stored value to the nearest bound",
           "[server][config_routes]") {
     // A heartbeat stored before the floor or the ceiling existed is moved to the nearest bound at
@@ -1560,38 +1602,53 @@ TEST_CASE("config_write: concurrent writers and readers leave the store and the 
     constexpr int kWriters = 4;
     constexpr int kReaders = 2;
     constexpr int kIterations = 40;
+    const char* const kKeys[] = {"response_retention_days", "audit_retention_days",
+                                 "guardian_event_retention_days"};
+    std::atomic<bool> go{false};
     std::atomic<bool> stop{false};
-    std::atomic<int> read_faults{0};
+    std::atomic<int> faults{0};
     std::vector<std::thread> threads;
+    threads.reserve(kWriters + kReaders); // no throw between the first start and the joins
     for (int t = 0; t < kWriters; ++t)
         threads.emplace_back([&, t] {
+            while (!go.load()) {
+            }
             for (int i = 0; i < kIterations; ++i) {
                 const int v = 100 + t * 1000 + i;
-                auto r = config::write_and_apply(backing, "response_retention_days",
-                                                 std::to_string(v), v, "writer");
+                auto r = config::write_and_apply(backing, kKeys[(t + i) % 3], std::to_string(v), v,
+                                                 "writer");
                 if (!r)
-                    read_faults.fetch_add(1);
+                    faults.fetch_add(1);
             }
         });
     for (int t = 0; t < kReaders; ++t)
         threads.emplace_back([&] {
+            while (!go.load()) {
+            }
             while (!stop.load()) {
                 auto view = config::build_config_view(backing, admin, true);
-                if (!view || !view->at("config").contains("response_retention_days"))
-                    read_faults.fetch_add(1);
+                if (!view || !view->at("config").contains("response_retention_days") ||
+                    !view->at("config").contains("audit_retention_days") ||
+                    !view->at("config").contains("guardian_event_retention_days"))
+                    faults.fetch_add(1);
             }
         });
+    go.store(true); // start everyone together so the writers and readers overlap
     for (int t = 0; t < kWriters; ++t)
         threads[static_cast<std::size_t>(t)].join();
     stop.store(true);
     for (std::size_t t = kWriters; t < threads.size(); ++t)
         threads[t].join();
 
-    CHECK(read_faults.load() == 0);
+    CHECK(faults.load() == 0);
     // The writers are serialised across the store write and the live apply, so whichever wrote
-    // last left BOTH on its value: the store and the live config never disagree.
+    // last left BOTH on its value, for every key: the store and the live config never disagree.
     CHECK(w.store.get_value("response_retention_days") ==
           std::to_string(cfg.response_retention_days.get()));
+    CHECK(w.store.get_value("audit_retention_days") ==
+          std::to_string(cfg.audit_retention_days.get()));
+    CHECK(w.store.get_value("guardian_event_retention_days") ==
+          std::to_string(cfg.guardian_event_retention_days.get()));
 }
 
 TEST_CASE("config_routes: an open store is not enough, the live config and the engine must be wired",
