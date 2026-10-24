@@ -31,8 +31,9 @@ callers): the dispatch is still recorded, with an empty execution id.
 ### Known coverage gap (every PR in this ladder must check this)
 
 Provenance is not part of this gap: since #4990 every dispatch writes its `command_execution` row (plugin
-and, when tracked, execution id) at the shared dispatch builder, so a response always has a server
-record to be labelled from. What follows concerns only the EXECUTION ID the record carries.
+and, when tracked, execution id) at the shared dispatch builder, so a response normally has a server
+record to be labelled from. A failed record write, a record reaped after its 24 hour window or a degraded
+read yields `~unverified` instead (below). What follows concerns only the EXECUTION ID the record carries.
 
 Only `/api/instructions/:id/execute` (`workflow_routes.cpp`) creates an
 execution row AND threads `execution_id` into `cmd_dispatch`. The following
@@ -65,11 +66,24 @@ clock-guarded retention sweep on a ~60m cadence
 `_store_degrade_total`), not an unbounded in-process leak. The window is 24 hours from the
 row's last write (a re-driven command refreshes its record) and a pass deletes at most 50,000 rows:
 the cap was re-decided for the one-row-per-dispatch inflow (reasoning in
-`docs/clock-guarded-retention.md`). The dispatch-time
-write (`record_command_dispatch`, single attempt, no retry — deliberately
-bounded to `kWriteTimeout` since it sits on the synchronous pre-RPC dispatch
-path) has its own counter on failure, `yuzu_exec_correlation_write_degrade_total`,
-distinct from the reap counters above.
+`docs/clock-guarded-retention.md`). The pass deletes through a `ctid` match plus a repeated
+`created_at < cutoff` test, so a record refreshed between the selection and the delete is kept; it
+costs about 34 ms at 1M rows and 35 ms at 10M (the earlier `IN (SELECT command_id ...)` form was
+180 ms and 1.74 s), and a pass that deletes exactly the cap is visible as
+`yuzu_exec_correlation_reap_total` moving by 50,000. That covers a sustained inflow of about 14
+dispatch records a second, or two fleet-wide per-agent events a day at 500,000 agents; a sustained
+excess grows the table and raises `YuzuExecCorrelationReapSaturated` after a day at the cap. No
+per-principal or per-address limit on dispatch inflow exists yet; a separate follow-up tracks it.
+
+The dispatch-time write (`record_command_dispatch`) is a single attempt with no retry, on the
+synchronous pre-RPC dispatch path, and it never refuses or delays the dispatch beyond its own
+bound. The bound is two-part: the pool lease is acquired within `kWriteTimeout` (2 seconds), and the
+statement then runs under the pool's server-side `lock_timeout` (10 seconds) and `statement_timeout`
+(30 seconds), so the worst case on the dispatching thread is about 2 seconds plus 10 seconds on a lock wait
+(measured at 10.04 seconds against a held table lock), or about 2 seconds plus 30 seconds for a
+statement that wedges for another reason.
+A failed write has its own counter, `yuzu_exec_correlation_write_degrade_total`, distinct from the
+reap counters above, and the alert `YuzuDispatchRecordWriteFailing` fires on a sustained rate.
 
 Regression pin: `tests/unit/server/test_agent_service_impl.cpp` (9 cases /
 47 assertions) drives `process_gateway_response` end-to-end into a real
@@ -223,15 +237,18 @@ SQL beside the agent scope, before `ORDER BY`/`LIMIT`/`GROUP BY`, so the cap fla
 options and aggregates are computed over the rows the caller may read. A filtered row is simply
 absent: there is no marker or field, so an empty result no longer implies that no data exists. The
 one error is an unresolved decision: when the caller's authority cannot be determined (the global `Forensics:Read` check
-is unavailable, for any caller class; `yuzu_server_rbac_read_degrade_total` and the `YuzuRbacReadDegraded` alert
-correlate, see `docs/authz-model.md`) the REST routes
+is unavailable; this covers sessions, API tokens, MCP tokens and engine principals, while a service-scoped token is
+default-denied; `yuzu_server_rbac_read_degrade_total` and the `YuzuRbacReadDegraded` alert
+correlate, see `docs/authz-model.md`, which also says what happens when the surface's earlier admission gate fails
+first) the REST routes
 answer a retryable `503` (`retry_after_ms`), MCP a retryable `kInternalError`, and an HTML surface a
 notice, and
 `yuzu_server_forensics_tier_withheld_total{reason}` counts it (see `docs/observability-conventions.md`).
 The plugin set comes from the capability catalogue
 (`forensics_plugin_set.hpp`), never a hand-kept list, and boot refuses an empty set; it also carries the
 `~unverified` provenance sentinel (below). Only a global `Forensics:Read` admits a row: there is no scoped
-(management-group) read tier, and a hand-authored scoped grant reads nothing. Only `plugin` is
+(management-group) read tier on the stored-response reads, and a hand-authored scoped grant reads nothing from
+them (the per-device application-usage read is a separate data set with its own scoped gate). Only `plugin` is
 stored with a row, so the filter is per plugin; a plugin that mixed tiers would be excluded wholesale
 until `action` is stored too. The exact set of read methods and the exact set of call sites that opt
 out through `unrestricted_internal_consumer()` are frozen by
@@ -259,12 +276,13 @@ the retired record API). A record with a plugin is `verified`; no record, a reco
 that failed twice (one retry) yields the label `~unverified`, a character no plugin name contains, which
 `derive_forensics_plugin_set` adds to the Forensics set once at boot, so unresolved provenance is Forensics-tier in every
 SQL filter and every sink with no per-consumer code. `yuzu_server_response_provenance_total{outcome}` counts
-`verified`, `unrecorded` and `lookup_degraded`. What it does NOT prove: the record shows the server issued that command
+`verified`, `unrecorded` and `lookup_degraded` (alert `YuzuResponseProvenanceLookupDegraded` covers the last; `unrecorded`
+has no alert by design because it is non-zero on a healthy fleet). What it does NOT prove: the record shows the server issued that command
 id for that plugin, not who sent the frame. An endpoint that was legitimately sent a command (or was inside a broadcast
 of it) can replay that id on a frame of its own and so label that frame with the command's plugin; the content of a
 frame is not validated; a single execution that outlives the 24 hour record window is stored `~unverified`; a failed
-record write (`yuzu_exec_correlation_write_degrade_total`) hides that dispatch's responses from readers that exclude the
-Forensics set (the Hardware Actions-lens poll never finds them); an unrecorded `registry` command id mints no
+record write (`yuzu_exec_correlation_write_degrade_total`, alert `YuzuDispatchRecordWriteFailing`) hides that dispatch's
+responses from readers that exclude the Forensics set (the Hardware Actions-lens poll never finds them); an unrecorded `registry` command id mints no
 `registry.write` audit row (those are minted only for a response labelled `registry`); and the live output for an
 `~unverified` frame publishes nothing.
 

@@ -409,18 +409,34 @@ per connected agent per fleet-wide event, and the old cap (5000 per pass, 120k r
 a ~60 minute cadence) would let the table grow without bound once inflow exceeded that. The sizing
 assumptions are stated in the code and not measured on a fleet: a short-term target of about 5,000
 agents (about 1e4 rows/day organically, a few 5,000-row bursts per fleet event) and a long-term
-target of 500,000 agents (one fleet-wide push event = 500,000 rows, a few events a day = low
-millions/day). 50,000 rows x 24 passes = 1.2M rows/day of reclaim covers the short-term target by two
-orders of magnitude and the long-term steady state, and drains a 500,000-row burst past the window in
-ten passes. Measured on a synthetic 1M-row table (PostgreSQL 16, the same
-`DELETE .. IN (SELECT .. LIMIT n)` shape, rolled back and repeated): about 0.13 s for 5,000 rows,
-0.28 s for 50,000, 0.38 s for 100,000, so one 50,000-row pass is a sub-second transaction that holds
-row locks only on rows already past the window. The cap stays an UNCONDITIONAL bound on the work one
-pass (and one skewed-clock pass) can do, and saturation is observable: a pass that deletes exactly
-the cap moves `yuzu_exec_correlation_reap_total` by the cap every hour. The ~60 minute cadence is not
-shortened, because the clock-anomaly threshold is sized against it. The sibling event-outbox reap
-keeps its own cap; its window and skew values stay identical to this table's on purpose, its cap does
-not (`execution_tracker.cpp`, beside `kCmdExecutionReapCap`).
+target of 500,000 agents (one fleet-wide per-agent event = 500,000 rows). 50,000 rows x 24 passes =
+1.2M rows/day of reclaim, which is a sustained inflow of about 14 dispatch records a second. That
+covers the short-term target by two orders of magnitude (240 fleet-wide events a day). At the
+long-term target it covers up to two fleet-wide per-agent events a day (1.0M rows) plus about 0.2M
+rows of other dispatches; a third event (1.5M rows) is above the reclaim rate. A burst is drained over
+the following passes (a 500,000-row burst past the window takes ten), but a SUSTAINED inflow above
+1.2M rows/day saturates the cap on every pass and the table then grows by the difference (about
+210 bytes a row, indexes included). The same ceiling applies to API-driven dispatch: a sustained rate
+above about 14 a second saturates it, and a per-principal or per-address inflow quota is NOT part of
+this bound (it is tracked as a separate follow-up).
+
+The pass deletes with `DELETE .. WHERE ctid = ANY(ARRAY(SELECT ctid .. WHERE created_at < cutoff
+ORDER BY created_at LIMIT cap)) AND created_at < cutoff`. Measured on synthetic time-ordered tables
+(PostgreSQL 16, the exact statement, rolled back and repeated 5 to 6 times, cap 50,000): median 34 ms
+at 1M rows and 35 ms at 10M. The earlier `IN (SELECT command_id .. LIMIT n)` form planned a Hash Semi
+Join over a Seq Scan of the whole table, so its cost followed the table, not the cap (180 ms at 1M
+rows, 1.74 s at 10M); the `ctid` form reads only the cap's worth of index entries, so the pass cost
+follows the cap. The repeated `created_at < cutoff` test in the outer statement keeps a record that
+`record_command_dispatch` refreshed between the selection and the delete (a refreshed row also
+changes its `ctid` and is skipped by the match; the re-test states the same rule explicitly). A pass
+holds row locks only on rows already past the window. The cap stays an UNCONDITIONAL bound on the
+work one pass (and one skewed-clock pass) can do. Saturation is visible and alerted: a pass that
+deletes exactly the cap moves `yuzu_exec_correlation_reap_total` by the cap every hour, and the alert
+`YuzuExecCorrelationReapSaturated` fires when the counter has risen by at least 200,000 over 6 hours
+for 24 hours running. The ~60 minute cadence is not shortened, because the clock-anomaly threshold is
+sized against it. The sibling event-outbox reap keeps its own cap; its window and skew values stay
+identical to this table's on purpose, its cap does not (`execution_tracker.cpp`, beside
+`kCmdExecutionReapCap`).
 
 ### `ExecutionTracker::reap_stuck_running_executions` (#4982 Part B, fix round 2)
 

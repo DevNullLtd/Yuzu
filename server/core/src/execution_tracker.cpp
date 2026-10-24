@@ -2501,8 +2501,9 @@ constexpr std::int64_t kCmdExecutionReapWindowSecs = 24 * 3600;
 //   - The same ceiling applies to API-driven dispatch: a sustained rate above about 14 a second
 //     saturates it. A per-principal or per-address inflow quota is NOT part of this bound; it is
 //     tracked as a separate follow-up.
-// Saturation is observable but not alerted: a saturated pass deletes exactly this cap, so
-// `yuzu_exec_correlation_reap_total` moves by the cap every hour. No shipped alert rule watches it.
+// Saturation is observable and alerted: a saturated pass deletes exactly this cap, so
+// `yuzu_exec_correlation_reap_total` moves by the cap every hour, and the alert
+// YuzuExecCorrelationReapSaturated fires when the reap has run at or near the cap for 24 hours.
 //
 // Cost, measured (PostgreSQL 16, synthetic time-ordered tables built with generate_series, the
 // exact statement below, rolled back and repeated 5-6 times, cap 50,000): median 34 ms at 1M rows
