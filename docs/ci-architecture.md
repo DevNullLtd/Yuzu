@@ -1771,6 +1771,21 @@ Push 1 is the comparison baseline for the rest: its two samples are the new
 non-pg baselines (the docs suite left the Windows and macOS legs) and its probe
 output fills the line below.
 
+**Push 2a (Linux cheap-suites invocation only, `--num-processes 2 → 4`).** The
+second `Test (non-pg suites)` invocation (server shards) and the pg step stay at
+2, so the delta is attributable to this one invocation. Baseline at np=2, from
+the 12 successful `gcc-15`/`debug` runs on `dev` between 2026-10-22 and
+2026-10-24: the `Test (non-pg suites)` step median is 6.7 min (range 6.6 to
+7.0, so the step is stable enough that two samples show a 10% change). In one of
+those runs the cheap-suites invocation took about 340 s of wall time for 610
+serial-s (agent 239 s, gateway 158 s of which the eunit entry alone is 122 s,
+docs 116 s, platform 96 s), so both workers were busy; the lower bound at np=4
+is the 122 s eunit entry plus the rest spread four ways, about 153 s. Decision
+rule: the one stated under "Windows test-phase concurrency gate" above, applied
+to the non-pg step median (≥10% improvement, no entry past 1.5x its np=2 time,
+none near its timeout). Samples: pending (the first run of the PR plus a re-run
+of the same SHA).
+
 Probe (push 1, `Postgres container footprint (tmpfs sizing probe)` step):
 host RAM: pending (filled by the tmpfs commit from the probe step log); post-run PGDATA per container (residual on-disk size after the pg step, not peak): pending.
 
