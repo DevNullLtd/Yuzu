@@ -1720,6 +1720,83 @@ authentication store or reset the affected account. Know its limits:
 The server logs a startup `WARN` while the flag is in force. Restore the window and
 restart once the store is back.
 
+## MFA binding enforcement failed
+
+`YuzuMfaBindingNotEnforced` fires (critical) when `yuzu_auth_mfa_binding_enforcement_ok{store}` reads `0`
+for a minute. A validation on this replica has observed that one of the two database triggers that
+bind an MFA proof to the account's factor is no longer in force:
+
+| `store` | Object | Healthy state |
+|---|---|---|
+| `auth` | trigger `users_mfa_factor_gen` on `auth.users` (advances `mfa_factor_gen` on every change of `mfa_enrolled_at`) | `pg_trigger.tgenabled = 'A'` |
+| `session` | trigger `sessions_mfa_rebind_guard` on `session_store.sessions` (unbinds a proof written without a rebind) | `pg_trigger.tgenabled = 'A'` |
+
+**What stops, what keeps working.** While the gauge reads `0`, every binding decision for a local
+session with an enrolled factor answers `503` with `reason=mfa_binding_unenforced`: approvals
+(`approve` and `reject`), the step-up-gated routes, the two Settings routes that issue or retire a
+second factor, and JIT elevation. Sign-in, the step-up prompt itself (`/login/mfa/stepup`), accounts
+with no enrolled factor, API tokens and SSO sessions are not affected by this. The state is
+**sticky**: the server never returns to `1` on its own, because the changes a disabled trigger missed
+cannot be reconstructed. Repairing the trigger is not enough; the restart is the gate back in.
+
+**What the gauge can and cannot tell you.** It reads an in-process flag that a request-driven
+validation sets (at most one catalog query per minute per process, on an MFA status read for `auth`
+and a session lookup for `session`). A tampering that is in place when a validation runs (the trigger
+missing, disabled, replica-only, or its function altered) makes every local binding decision fail
+closed until the server restarts, and the boot check must pass before it serves again. A disable,
+change and re-enable completed entirely between two validations is not observable by this mechanism,
+and shortening the memo does not change that. The control's trust boundary is the database role: a
+principal who can alter triggers can alter the generation itself. The server log line
+(`AuthDB: the MFA factor-generation trigger is no longer in force ...` or `SessionStore:
+sessions_mfa_rebind_guard is missing, not ENABLE ALWAYS, or altered ...`) records when the failure was
+observed, not when the trigger was changed.
+
+1. **Find the cause.** Ask the database which state the trigger is in:
+
+   ```bash
+   psql "$YUZU_POSTGRES_DSN" -c "SELECT tgrelid::regclass AS tbl, tgname, tgenabled
+       FROM pg_trigger WHERE NOT tgisinternal
+        AND tgname IN ('users_mfa_factor_gen', 'sessions_mfa_rebind_guard');"
+   ```
+
+   Two rows with `tgenabled = A` mean the triggers are fine now and the flag is a past observation
+   (restart to clear it). A missing row, or `O`, `R` or `D`, is the fault. Find out who changed it
+   (database audit or `log_statement` output, if you have it) before you repair it: this is a
+   privileged change to a security control.
+2. **Repair the trigger.** For a trigger that is merely disabled or not `ENABLE ALWAYS`:
+
+   ```bash
+   psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" \
+     -c "ALTER TABLE auth.users ENABLE ALWAYS TRIGGER users_mfa_factor_gen;" \
+     -c "ALTER TABLE session_store.sessions ENABLE ALWAYS TRIGGER sessions_mfa_rebind_guard;"
+   ```
+
+   (run only the statement for the store that failed). For a trigger that was dropped, or whose
+   function body was replaced, run the function, trigger and `ENABLE ALWAYS` statements of the
+   migration text (`migration_v3_sql()` in `server/core/src/auth_db.cpp` for `auth`,
+   `migration_v2_sql()` in `server/core/src/session_store.cpp` for `session`), schema-qualified, with
+   `CREATE OR REPLACE FUNCTION` where the function still exists. The function body must match the
+   pinned text exactly, or the boot check still refuses. Do not run the migration's `ALTER TABLE ...
+   ADD COLUMN` (the column exists).
+3. **End the sessions that cannot be trusted.** Generation changes made while the trigger was not
+   firing were not counted, so a proof bound before such a change still equals the unchanged
+   generation. End the sessions of **every account whose factor changed in the window**
+   (`DELETE /api/v1/sessions?username=<name>`; see [Sessions are durable](#sessions-are-durable)). The
+   window starts no later than the last start of the server whose boot check passed. Accounts whose
+   factor changed through the product are in the audit log (`mfa.enroll.verified`, `mfa.disabled`,
+   `mfa.reset.breakglass`); a change made by a direct database write has **no** audit row. If the
+   window cannot be bounded, end every operator's sessions with the emergency procedure in the same
+   section.
+4. **Restart every replica.** The boot check re-validates the trigger and the pinned function body
+   for each store. If it still fails, the server refuses to start with `[PG] Refusing to start: auth
+   store (AuthDB) migration/open failed` (`auth`) or `session store migration/open failed`
+   (`session`); go back to step 2.
+5. **Confirm.** `yuzu_auth_mfa_binding_enforcement_ok` reads `1` for both stores on every replica, and
+   an approval or a gated mutation by a re-proved operator succeeds.
+
+Accounts whose proofs were unbound or mismatched are not affected by this: they simply re-prove once
+through `/login/mfa/stepup`.
+
 ## What you cannot recover from
 
 - **Lost `yuzu-server.cfg` and an empty `auth` schema.** The config is the seed

@@ -105,6 +105,7 @@
 #include "principal_class.hpp"
 #include "principal_quota_gate.hpp"
 #include "step_up_wiring.hpp" // post-read body cap + MFA step-up chokepoint (pre-request handler body)
+#include "mfa_binding_gauge.hpp" // yuzu_auth_mfa_binding_enforcement_ok (#6079)
 #include "step_up_gate.hpp" // MFA step-up chokepoint (policy table: step_up_policy.hpp)
 #include "same_site_write_gate.hpp" // cookie-session writes require a same-site Origin or Referer
 #include "rest_a4_envelope_http.hpp"
@@ -763,6 +764,9 @@ public:
                           "gauge");
         metrics_.gauge("yuzu_auth_mfa_step_up_window_seconds")
             .set(static_cast<double>(cfg_.mfa_step_up_window_secs));
+        // #6079: binding-enforcement health. The series are published once both stores are open
+        // (right after the SessionStore is wired) and re-sampled on the 15 s health sweep.
+        describe_mfa_binding_gauge(metrics_);
 
         // Agent OTA pull bounds (#913 / #911 / #416). Pre-seeded closed series
         // per docs/observability-conventions.md so absent() alerts stay
@@ -3366,14 +3370,40 @@ public:
             "Durable session-store operations that hit a degraded PostgreSQL read/"
             "write on the auth hot path (labelled by op: validate / create / touch / "
             "generation_refresh / reap / invalidate_user / invalidate / mark_mfa / "
-            "elevate); a validate degrade fails the request closed, and elevate / "
+            "clear_mfa_proof / rebind_guard / elevate); a validate degrade fails the "
+            "request closed, and elevate / "
             "revoke (via invalidate_user) degrades fail the privileged op closed, except "
             "that an invalidate_user after an already-committed MFA clear leaves the "
             "clear in place and ends partial",
             "counter");
-        for (auto op : {"validate", "create", "touch", "generation_refresh", "reap",
-                        "invalidate_user", "invalidate", "mark_mfa", "elevate"})
+        for (auto op :
+             {"validate", "create", "touch", "generation_refresh", "reap", "invalidate_user",
+              "invalidate", "mark_mfa", "clear_mfa_proof", "rebind_guard", "elevate"})
             metrics_.counter("yuzu_auth_session_store_degrade_total", {{"op", op}});
+        // #6079 factor-generation binding: the three closed-set counters AuthManager increments
+        // when a local MFA proof is refused or withdrawn. Pre-seeded to 0 per
+        // docs/observability-conventions.md so increase() sees the first event of each series.
+        metrics_.describe("yuzu_auth_mfa_stamp_denied_total",
+                          "MFA step-up proofs cleared right after being stamped, by reason "
+                          "(factor_changed: the account's factor generation moved between the "
+                          "verification and the stamp; unverifiable: the generation could not be "
+                          "read to check it)",
+                          "counter");
+        for (auto reason : {"factor_changed", "unverifiable"})
+            metrics_.counter("yuzu_auth_mfa_stamp_denied_total", {{"reason", reason}});
+        metrics_.describe("yuzu_auth_mfa_verification_future_dated_total",
+                          "MFA verifications refused because their database-clock instant was "
+                          "later than the write that would have stored it (the database clock "
+                          "stepped back); the proof is never stored",
+                          "counter");
+        metrics_.counter("yuzu_auth_mfa_verification_future_dated_total");
+        metrics_.describe("yuzu_auth_role_recheck_post_mint_denied_total",
+                          "Freshly minted sessions revoked and denied by the post-mint recheck, "
+                          "by reason (role / credential / factor changed during the mint, removed "
+                          "account, store unavailable)",
+                          "counter");
+        for (auto reason : {"role", "credential", "factor", "removed", "store"})
+            metrics_.counter("yuzu_auth_role_recheck_post_mint_denied_total", {{"reason", reason}});
         // WS-6 6.2: enrollment tokens + pending agents are AuthDB-only (Postgres,
         // shared by every replica) and fail CLOSED on any store failure. This
         // counts each degrade so an operator can tell "agents cannot enroll /
@@ -5370,6 +5400,8 @@ public:
                 auth_mgr_.set_session_store(session_store_.get());
             }
         }
+        // #6079: both binding flags read healthy here (a boot check that failed refused to open).
+        publish_mfa_binding_gauges(metrics_, auth_db_.get(), session_store_.get());
 
         // ScimStore — born-on-PG SCIM v2 store (ADR-0006). Constructed
         // unconditionally (cheap to open; mirrors every other always-on
@@ -9271,6 +9303,9 @@ public:
                     metrics_.gauge("yuzu_http_held_open_responses")
                         .set(static_cast<double>(stream_budget_->active()));
                 }
+                // #6079: two atomic flag reads. The flags flip only when a request-driven
+                // validation observes the fault (AuthDB::mfa_status, SessionStore::find).
+                publish_mfa_binding_gauges(metrics_, auth_db_.get(), session_store_.get());
                 if (pg_pool_) {
                     metrics_.gauge("yuzu_pg_pool_in_use")
                         .set(static_cast<double>(pg_pool_->in_use()));

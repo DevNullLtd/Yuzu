@@ -833,6 +833,10 @@ void AuthDB::set_enrolment_pre_txn_hook_for_test(std::function<void()> hook) {
     impl_->enrolment_pre_txn_hook = std::move(hook);
 }
 
+bool AuthDB::mfa_binding_enforced() const noexcept {
+    return impl_ && impl_->binding_ok.load(std::memory_order_acquire);
+}
+
 void AuthDB::set_binding_validation_memo_for_test(std::chrono::milliseconds memo) noexcept {
     if (!impl_)
         return;

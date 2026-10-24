@@ -1870,6 +1870,40 @@ groups:
             See docs/user-manual/rbac.md "Enabling RBAC".
           runbook_url: "https://docs.yuzu.io/runbooks/rbac-enforcement-changed"
 
+      - alert: YuzuMfaBindingNotEnforced
+        # #6079: a validation observed that the trigger which binds an MFA proof to the account's
+        # factor generation (store="auth") or the session rebind guard (store="session") is no
+        # longer in force. From then on every local MFA binding decision answers 503 with
+        # reason=mfa_binding_unenforced: approvals, the step-up-gated mutations and JIT elevation
+        # are refused for local sessions until a server restart whose boot check passes. The
+        # gauge is STICKY (a re-enabled trigger cannot reconstruct the changes it missed), so the
+        # value never recovers on its own and `for:` only rides out a scrape gap; it is not a
+        # flap filter.
+        #
+        # What this does NOT cover: the flag flips only when a request-driven validation (a 60 s
+        # memo, run by AuthDB::mfa_status and SessionStore::find) sees the fault, so a tamper that
+        # no request has validated yet still reads 1, and a disable, change and re-enable that
+        # all complete between two validations is never observed. The gauge is published only
+        # after both stores open, so the series is absent before the first sample and an absent()
+        # rule would page every booting replica; none is shipped.
+        expr: |
+          yuzu_auth_mfa_binding_enforcement_ok == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MFA binding enforcement failed ({{ $labels.store }}) on {{ $labels.instance }}"
+          description: >-
+            yuzu_auth_mfa_binding_enforcement_ok{store="{{ $labels.store }}"} is 0 on this
+            replica: a validation observed the MFA factor-generation trigger (store="auth") or the
+            session rebind guard (store="session") missing, disabled, replica-only or altered.
+            Local MFA binding decisions now fail closed with 503 (reason=mfa_binding_unenforced)
+            until the server restarts; approvals and step-up-gated mutations are refused for local
+            sessions. Sign-in and step-up proving still work. Factor changes made while the
+            trigger was not firing cannot be reconstructed, so after repairing the trigger end
+            the sessions of every account whose factor changed in that window, then restart.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/auth-db-recovery.md#mfa-binding-enforcement-failed"
+
   # ── yuzu-scim — ADR-2001 (SCIM ↔ OIDC/SAML identity-link revoke chokepoint,
   # CC6.8) ─────────────────────────────────────────────────────────────────
   # Every BARE (unlabeled) counter in this group is boot-seeded to 0 (never

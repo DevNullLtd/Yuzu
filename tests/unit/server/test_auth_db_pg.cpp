@@ -20,9 +20,11 @@
 
 #include "acquire_retry.hpp"
 #include "key_provider.hpp"
+#include "mfa_binding_gauge.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
+#include "session_store.hpp"
 #include "totp.hpp"
 
 #include <yuzu/server/auth.hpp>
@@ -3584,6 +3586,64 @@ TEST_CASE("AuthDB trigger validation is sticky once it observes tampering",
     AuthDB fresh{pool2, codec2, 0};
     REQUIRE(fresh.is_open());
     CHECK(fresh.mfa_status("t1")->binding_enforced);
+}
+
+TEST_CASE(
+    "binding-enforcement gauge is registered, reads 1 while healthy, and flips to 0 per store",
+    "[pg][auth_db][mfa_binding]") {
+    using yuzu::server::SessionStore;
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    SessionStore sessions{h.pool}; // the production shape: one database, both stores
+    REQUIRE(sessions.is_open());
+
+    yuzu::MetricsRegistry reg;
+    yuzu::server::describe_mfa_binding_gauge(reg);
+    const auto sample = [&](const char* store) {
+        return reg.gauge(yuzu::server::kMfaBindingEnforcementGauge, {{"store", store}}).value();
+    };
+
+    // A store that is not wired publishes nothing: no series, never a false healthy value.
+    yuzu::server::publish_mfa_binding_gauges(reg, nullptr, nullptr);
+    CHECK(reg.serialize().find("{store=") == std::string::npos);
+
+    yuzu::server::publish_mfa_binding_gauges(reg, &h.db, &sessions);
+    const auto text = reg.serialize();
+    CHECK(text.find("# TYPE yuzu_auth_mfa_binding_enforcement_ok gauge") != std::string::npos);
+    CHECK(text.find("yuzu_auth_mfa_binding_enforcement_ok{store=\"auth\"} 1") != std::string::npos);
+    CHECK(text.find("yuzu_auth_mfa_binding_enforcement_ok{store=\"session\"} 1") !=
+          std::string::npos);
+
+    // The auth flag flips only once a validation observes the fault, and the session store is
+    // unaffected: the label names the store that failed.
+    h.db.set_binding_validation_memo_for_test(std::chrono::milliseconds(0));
+    sessions.set_binding_validation_memo_for_test(std::chrono::milliseconds{0});
+    REQUIRE(h.db.upsert_user("g1", "h", "s", yuzu::server::auth::Role::user).has_value());
+    run_sql(h.conn.get(), "ALTER TABLE auth.users DISABLE TRIGGER users_mfa_factor_gen");
+    yuzu::server::publish_mfa_binding_gauges(reg, &h.db, &sessions);
+    CHECK(sample("auth") == 1.0); // tampered but not yet observed: request-driven validation
+    REQUIRE(h.db.mfa_status("g1").has_value());
+    yuzu::server::publish_mfa_binding_gauges(reg, &h.db, &sessions);
+    CHECK(sample("auth") == 0.0);
+    CHECK(sample("session") == 1.0);
+
+    run_sql(h.conn.get(),
+            "ALTER TABLE session_store.sessions DISABLE TRIGGER sessions_mfa_rebind_guard");
+    REQUIRE(sessions.find("no-such-hash").has_value());
+    yuzu::server::publish_mfa_binding_gauges(reg, &h.db, &sessions);
+    CHECK(sample("session") == 0.0);
+    CHECK(reg.serialize().find("yuzu_auth_mfa_binding_enforcement_ok{store=\"auth\"} 0") !=
+          std::string::npos);
+
+    // Sticky: repairing the triggers does not bring either gauge back; a restart does.
+    run_sql(h.conn.get(), kRestoreTriggerSql);
+    run_sql(h.conn.get(),
+            "ALTER TABLE session_store.sessions ENABLE ALWAYS TRIGGER sessions_mfa_rebind_guard");
+    REQUIRE(h.db.mfa_status("g1").has_value());
+    REQUIRE(sessions.find("no-such-hash").has_value());
+    yuzu::server::publish_mfa_binding_gauges(reg, &h.db, &sessions);
+    CHECK(sample("auth") == 0.0);
+    CHECK(sample("session") == 0.0);
 }
 
 TEST_CASE("AuthDB trigger validation cannot see a disable that ends before the next validation",

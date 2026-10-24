@@ -1855,6 +1855,76 @@ tests:
         eval_time: 5m
         exp_samples: []
 
+  # ── YuzuMfaBindingNotEnforced (#6079) ───────────────────────────────────
+  #
+  # Reads yuzu_auth_mfa_binding_enforcement_ok{store}, a sticky 1 -> 0 gauge (server.cpp,
+  # mfa_binding_gauge.hpp). The rule is `== 0` held for 1m, per instance and store. These cases
+  # pin: a healthy series never fires; a series that flips to 0 fires once held past `for:`, for
+  # the store that flipped and not the other; and a one-sample dip shorter than `for:` stays quiet.
+
+  # CASE mfa-binding-1 -- the auth gauge flips to 0 at minute 3 and stays there; the session gauge stays
+  # healthy. Only the auth series fires, and not before the `for:` window has elapsed.
+  - interval: 1m
+    name: mfa binding not enforced - a flipped store fires, the healthy store does not
+    input_series:
+      - series: 'yuzu_auth_mfa_binding_enforcement_ok{job="yuzu",instance="s1",store="auth"}'
+        values: "1 1 1 0 0 0 0 0 0 0"
+      - series: 'yuzu_auth_mfa_binding_enforcement_ok{job="yuzu",instance="s1",store="session"}'
+        values: "1x10"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing"}'
+        eval_time: 3m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing", instance="s1", job="yuzu", severity="critical", store="auth"}'
+            value: 1
+
+  # CASE mfa-binding-2 -- the session gauge flips; the auth gauge does not. The store label is carried
+  # through, so the page names the store that failed.
+  - interval: 1m
+    name: mfa binding not enforced - the session store flipping names the session store
+    input_series:
+      - series: 'yuzu_auth_mfa_binding_enforcement_ok{job="yuzu",instance="s1",store="auth"}'
+        values: "1x10"
+      - series: 'yuzu_auth_mfa_binding_enforcement_ok{job="yuzu",instance="s1",store="session"}'
+        values: "1 0 0 0 0 0 0 0 0 0"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing", instance="s1", job="yuzu", severity="critical", store="session"}'
+            value: 1
+
+  # CASE mfa-binding-3 -- healthy series on both stores stay quiet.
+  - interval: 1m
+    name: mfa binding not enforced - healthy series never fire
+    input_series:
+      - series: 'yuzu_auth_mfa_binding_enforcement_ok{job="yuzu",instance="s1",store="auth"}'
+        values: "1x30"
+      - series: 'yuzu_auth_mfa_binding_enforcement_ok{job="yuzu",instance="s1",store="session"}'
+        values: "1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CASE mfa-binding-4 -- a single 0 sample (a scrape-level glitch shorter than `for:`) stays quiet: the
+  # 1m `for:` is the only thing between one bad sample and a critical page.
+  - interval: 1m
+    name: mfa binding not enforced - a one-sample dip shorter than for stays quiet
+    input_series:
+      - series: 'yuzu_auth_mfa_binding_enforcement_ok{job="yuzu",instance="s1",store="auth"}'
+        values: "1 1 0 1 1 1 1 1 1 1"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing"}'
+        eval_time: 3m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+
   # ── YuzuRotationSweepNotRunning (#2964) ─────────────────────────────────
   #
   # Reads `yuzu_rotation_sweep_last_pass_timestamp_seconds` (server.cpp) --

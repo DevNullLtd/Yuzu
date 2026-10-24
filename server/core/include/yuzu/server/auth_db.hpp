@@ -781,6 +781,12 @@ public:
     ///     unchanged from the SQLite-era contract.
     std::expected<MfaStatus, AuthDBError> mfa_status(const std::string& username);
 
+    /// #6079: the sticky flag behind `MfaStatus::binding_enforced`, read without a database
+    /// round trip (the `yuzu_auth_mfa_binding_enforcement_ok{store="auth"}` gauge samples it).
+    /// False only after a validation has OBSERVED the generation trigger not in force; it does
+    /// not run a validation itself, so it reads true until a `mfa_status` call finds the fault.
+    [[nodiscard]] bool mfa_binding_enforced() const noexcept;
+
     /// Generate a fresh TOTP secret and write it as provisional (encrypted).
     /// Returns the base32 form + otpauth URI for the enrollment UI.
     /// Idempotent on provisional rows (reuse, not rotate — see the file
