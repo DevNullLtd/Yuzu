@@ -143,6 +143,7 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     {"POST",   R"(/api/v1/rbac/roles/([A-Za-z0-9._-]+)/assignments)",           StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/rbac/roles/{name}/assignments"},
     {"DELETE", R"(/api/v1/rbac/roles/([A-Za-z0-9._-]+)/assignments/([A-Za-z0-9._-]+))", StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}"},
     {"PUT",    R"(/api/v1/rbac/enforcement)",                                   StepUpClass::kRequired, step_up_detail::kNoReason, "PUT /api/v1/rbac/enforcement"},
+    {"PUT",    R"(/api/v1/config/([a-z_]+))",                                   StepUpClass::kRequired, step_up_detail::kNoReason, "PUT /api/v1/config/{key}"},
     {"POST",   R"(/api/v1/software-packages)",                                  StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/software-packages"},
     {"POST",   R"(/api/v1/software-deployments/([a-f0-9]+)/start)",             StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/software-deployments/{id}/start"},
     {"POST",   R"(/api/v1/guaranteed-state/rules)",                             StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/guaranteed-state/rules"},

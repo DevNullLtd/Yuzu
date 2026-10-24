@@ -100,6 +100,7 @@
 // internally — reused here so a handler's pre-validation can never diverge
 // from what the store would accept or reject.
 #include "plugin_config_store.hpp"
+#include "runtime_config_store.hpp"
 #include "plugin_config_parsers.hpp"
 #include "upload_grant_parsers.hpp"
 #include <yuzu/log_token.hpp> // is_valid_rule_id — shared REST/MCP/agent rule id charset (#4665)
@@ -3414,6 +3415,39 @@ static const ToolDef kTools[] = {
     // surfaces" ledger, not just here; tests/unit/server/
     // test_operator_surface_twins.cpp asserts no served tool answers to any
     // of those five routes.
+    {"get_runtime_config",
+     "Read the server's runtime configuration. Mirrors GET /api/v1/config. Read-only. Returns "
+     "the effective values (heartbeat_timeout in seconds, response_retention_days, "
+     "audit_retention_days, guardian_event_retention_days, auto_approve_enabled, log_level), the "
+     "stored overrides (a secret key reports is_set and updated_by, never its value; a store that "
+     "cannot be read is an error, never an empty list), allowed_keys (every key set_runtime_config "
+     "knows) and read_only_keys (allowed keys with their own writer, today dex_score_policy). "
+     "auto_approve_enabled is derived from whether any auto-approve rule exists. This is "
+     "platform configuration, not agent-scoped data, so there is no per-agent filter to apply; a "
+     "service-scoped token is refused. Requires Infrastructure:Read.",
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"config":{"type":"object","description":"effective values"},"overrides":{"type":"object","description":"stored overrides by key: value, updated_by, updated_at; a secret key carries is_set instead of value"},"allowed_keys":{"type":"array","items":{"type":"string"}},"read_only_keys":{"type":"array","items":{"type":"string"}}},"required":["config","overrides","allowed_keys","read_only_keys"]})j"},
+
+    {"set_runtime_config",
+     "Set one runtime configuration override. Mirrors PUT /api/v1/config/{key} (body {value}). "
+     "Idempotent: the same key and value converge on the same stored state. Requires "
+     "Infrastructure:Write; not approval-gated. An MCP-tier token can write only these keys: "
+     "heartbeat_timeout (whole seconds, at least 30), response_retention_days and "
+     "guardian_event_retention_days (whole days), auto_approve_enabled ('true' or 'false'; stored, "
+     "but it changes nothing today because GET reports it from the auto-approve rules), log_level "
+     "(trace, debug, info, warn or error). Every other key in get_runtime_config's allowed_keys is "
+     "refused with a permission error and an audit row: plugin_signing_required, "
+     "audit_retention_days, dex_alert_routing, dex_blast_min_devices, dex_blast_window_seconds, "
+     "dex_blast_cooldown_seconds, dex_cohort_export_key and the oidc_* keys need an administrator "
+     "account on REST or the Settings page; dex_score_policy has its own route. Values are sent "
+     "as strings, e.g. \"90\". The write is audited before it applies: if the audit row cannot be "
+     "stored the call fails and nothing changes. response_retention_days and "
+     "guardian_event_retention_days update the in-memory config, but the response and "
+     "guardian-event stores copy their retention window when the server starts (#483), so a new "
+     "value changes what they delete only after a restart.",
+     R"j({"type":"object","properties":{"key":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[a-z_]+$","description":"Runtime config key, one of get_runtime_config's allowed_keys"},"value":{"type":"string","maxLength":256,"description":"The new value as a string, e.g. \"90\" or \"debug\""}},"required":["key","value"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"applied":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"present and false only when the outcome audit row could not be persisted"}},"required":["key","applied"]})j"},
+
     {"get_plugin_config",
      "Read one plugin config value by (plugin, key). Mirrors GET "
      "/api/v1/plugin-config/{plugin}/{key}. Read-only. Requires PluginConfig:Read.",
@@ -4278,6 +4312,8 @@ static const char* const kWriteToolsRaw[] = {
     // list_upload_grants are read-only and deliberately absent.
     "set_plugin_config", "delete_plugin_config", "set_plugin_secret",
     "delete_plugin_secret", "set_plugin_kill_switch",
+    // set_runtime_config mutates; get_runtime_config is read-only and deliberately absent.
+    "set_runtime_config",
     // mint/revoke_upload_grant mutate; list_upload_grants is read-only and
     // deliberately absent.
     "mint_upload_grant", "revoke_upload_grant",
@@ -4774,6 +4810,13 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // file_retrieval_routes.hpp doc comments). Delete ops are approval-gated
     // on the supervised tier generically (mcp_policy.hpp's
     // `operation == "Delete"` rule) — no bespoke policy change needed here.
+    // Infrastructure, the securable of the REST routes these mirror. The default service scope
+    // (denied) is deliberate: runtime config is platform-wide, so a service-scoped token has no
+    // confined view of it. Not approval-gated on the supervised tier (mcp_policy.hpp), like
+    // Infrastructure:Write on set_crypto_dashboard_layout; the per-key refusal is
+    // config::write_refusal's, not this row's.
+    {"get_runtime_config", {"Infrastructure", "Read"}},
+    {"set_runtime_config", {"Infrastructure", "Write"}},
     {"get_plugin_config", {"PluginConfig", "Read"}},
     {"list_plugin_config", {"PluginConfig", "Read"}},
     {"set_plugin_config", {"PluginConfig", "Write"}},
@@ -5533,6 +5576,10 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"rewrap_secrets", {ToolEffect::Additive, true, "Resume KEK re-wrap"}},
 
     // ── ADR-0031 operator surface (PR1.5c/1.6c, p14) ──────────────────────
+    {"get_runtime_config", {ToolEffect::ReadOnly, true, "Get runtime configuration"}},
+    // set_runtime_config overwrites a stored value and the live setting (same reasoning as
+    // set_plugin_config); the end state on retry with the same arguments is identical.
+    {"set_runtime_config", {ToolEffect::Destructive, true, "Set runtime config value"}},
     {"get_plugin_config", {ToolEffect::ReadOnly, true, "Get plugin config value"}},
     {"list_plugin_config", {ToolEffect::ReadOnly, true, "List plugin config"}},
     // set_plugin_config/set_plugin_secret/set_plugin_kill_switch: upsert
@@ -22711,6 +22758,114 @@ McpServer::HandlerFn McpServer::build_handler(
             //   - mint_upload_grant mutates THEN audits and reports a dropped row
             //     via `audit_persisted:false` — its grant_id does not exist until
             //     the store generates it, so there is nothing to audit first.
+
+            if (tool_name == "get_runtime_config") {
+                if (!args.is_object() || !args.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "get_runtime_config takes no arguments"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                auto view = config::build_config_view(runtime_config_);
+                if (!view) {
+                    mcp_audit("failure", "runtime config store unavailable");
+                    res.set_content(a4_error(kInternalError, "runtime config store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                    "application/json");
+                    return;
+                }
+                mcp_audit("success");
+                res.set_content(success_response(
+                                    id, tool_result(view->dump(-1, ' ', false,
+                                                                nlohmann::json::error_handler_t::replace),
+                                                    kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "set_runtime_config") {
+                // Gate order mirrors PUT /api/v1/config/{key}: permission, then the per-key
+                // refusal (config::write_refusal, shared with both REST routes), then the store,
+                // the value, the audit-first row and the write.
+                if (!perm_fn(req, res, "Infrastructure", "Write"))
+                    return;
+                if (!args.is_object() || !args.contains("key") || !args["key"].is_string() ||
+                    !args.contains("value") || !args["value"].is_string()) {
+                    res.set_content(error_response(id, kInvalidParams, "key and value must be strings"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                const std::string key = args["key"].get<std::string>();
+                const std::string value = args["value"].get<std::string>();
+                if (auto refusal = config::write_refusal(key, *session)) {
+                    if (refusal->kind == config::WriteRefusal::Kind::RouteOwned) {
+                        res.set_content(a4_error(kInvalidParams, refusal->message, refusal->remediation), "application/json"); // retry-hint-exempt: the key has its own route, retrying fails identically
+                        return;
+                    }
+                    // A `denied` row, as the REST routes write, and no `attempted` row.
+                    (void)audit_fn(req, "config.update", "denied", "RuntimeConfig", key,
+                                   refusal->audit_detail);
+                    mcp_audit("denied", refusal->audit_detail);
+                    res.set_content(a4_error(kPermissionDenied, refusal->message, refusal->remediation), "application/json"); // retry-hint-exempt: authorization outcome, retrying cannot change it
+                    return;
+                }
+                if (!config::store_ready(runtime_config_)) {
+                    mcp_audit("failure", "runtime config store unavailable");
+                    res.set_content(a4_error(kInternalError, "runtime config store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto parsed = config::validate_value(key, value);
+                if (!parsed) {
+                    res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!RuntimeConfigStore::is_allowed_key(key)) {
+                    res.set_content(error_response(id, kInvalidParams, "key '" + key + "' is not a configurable runtime setting; see get_runtime_config allowed_keys"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                // "No audit row, no mutation" (ADR-0033 section 9), as the REST twins. The
+                // attempted row carries no value.
+                if (!audit_fn(req, "config.update", "attempted", "RuntimeConfig", key, "")) {
+                    mcp_audit("failure", "audit unavailable; config not changed");
+                    res.set_content(a4_error(kInternalError,
+                                             "audit log unavailable; the change was not made",
+                                             "retry once the audit log is available",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                auto written = config::write_and_apply(runtime_config_, key, value, *parsed,
+                                                       session->username);
+                if (!written) {
+                    (void)audit_fn(req, "config.update", "failure", "RuntimeConfig", key,
+                                   written.error().audit_detail);
+                    mcp_audit("failure", written.error().audit_detail);
+                    if (written.error().kind == config::WriteFault::Kind::Rejected) {
+                        res.set_content(error_response(id, kInvalidParams, written.error().message), "application/json"); // retry-hint-exempt: the store refused the value, resending it fails identically
+                        return;
+                    }
+                    res.set_content(a4_error(kInternalError, written.error().message,
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "config.update", "success", "RuntimeConfig", key,
+                                               config::success_audit_detail(key, value));
+                mcp_audit("success");
+                auto payload = config::applied_json(key, value);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(
+                                    id, tool_result(payload.dump(-1, ' ', false,
+                                                                 nlohmann::json::error_handler_t::replace),
+                                                    kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
 
             if (tool_name == "get_plugin_config") {
                 if (!tier_allows(tier, "PluginConfig", "Read")) {

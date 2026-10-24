@@ -18,6 +18,7 @@
                          // rather than re-declared, so the two error-prefix constants stay one copy.
 #include "ca_store.hpp"
 #include "command_capability.hpp" // #3685: CommandCapability / ClassificationError — ClassifyFn's return type
+#include "config_write.hpp" // config::Backing: get/set_runtime_config's backing pointers
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
 // ADR-0031 operator surface (PR1.6c) — MCP twins of the operator
 // mint/list/revoke upload-grant routes. Reuses UploadGrantListAuthorization/
@@ -504,6 +505,11 @@ public:
     /// (`nullptr`, the default) ⇒ every one of those tools answers
     /// "unavailable" rather than crashing or silently no-op'ing.
     void set_plugin_config_store(PluginConfigStore* store) { plugin_config_store_ = store; }
+
+    /// Backs get_runtime_config / set_runtime_config, the MCP twins of GET/PUT /api/v1/config
+    /// (api-parity rows get.api-config, put.api-config-param). Same objects the config routes
+    /// hold. Unset (all nullptr, the default) => both tools answer "unavailable".
+    void set_runtime_config(config::Backing backing) { runtime_config_ = backing; }
 
     /// ADR-0031 operator surface (PR1.6c) — upload-grant store + the
     /// ADR-0017 list-admit resolver for list_upload_grants, backing
@@ -1288,6 +1294,7 @@ private:
     // use and answers a clean "unavailable" error, matching
     // engine_principal_store_'s contract above.
     PluginConfigStore* plugin_config_store_{nullptr};
+    config::Backing runtime_config_{};
     UploadGrantStore* upload_grant_store_{nullptr};
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.

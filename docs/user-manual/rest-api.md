@@ -370,6 +370,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | any | `/api/v1/guaranteed-state/policy-generation` | 1 KiB | `guardian_policy_generation` | The Guardian policy-generation raise (`POST .../raise`). Body is `{"target_generation": <integer>, "acknowledge_rule_set_replaced": true}`, under 128 bytes even pretty-printed; 1 KiB is 8× headroom. The row is any-method, so the read-only `GET .../policy-generation` resolves to the same class; it carries no body. A segment-boundary-distinct prefix from `guardian_rule_authoring` (`/api/v1/guaranteed-state/rules`), so it needs its own row or it would fall to the 4 MiB catch-all. |
 | any | `/api/v1/users` | 16 KiB | `users` | The local-account user subtree: `POST .../me/password` and `POST .../{name}/password` (#5342) plus the bodyless `.../unlock` and the small `.../elevation-eligibility`. The largest legitimate body is two passwords at the 1024-byte policy maximum; worst-case JSON escaping puts that near 12.3 KiB, so 16 KiB admits every policy-conformant request. Any method, because the bodyless siblings share the prefix. |
 | any | `/api/v1/crypto` | 16 KiB | `crypto` | The `/crypto` REST v1 subtree. The only body-bearing route is `PUT /api/v1/crypto/dashboard/layout` (at most 64 catalogue ids, about 4.4 KiB even fully escaped); 16 KiB mirrors the handler's own `kLayoutBodyMaxBytes` exactly. Any method, because every sibling is a bodyless GET and shares the prefix. |
+| any | `/api/v1/config` | 16 KiB | `config` | The runtime-configuration REST v1 subtree. The only body-bearing route is `PUT /api/v1/config/{key}` (`{"value": ...}`, one scalar: an integer, a flag, a log level, a tag key, an OIDC client secret or a short JSON array); 16 KiB is far above any legal value. Any method, because the sibling `GET /api/v1/config` is bodyless and shares the prefix. The legacy `PUT /api/config/{key}` stays on the catch-all. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `tar_dashboard_sql`/`tar_result_set_sql` history above is a shipped example).
@@ -5074,7 +5075,7 @@ In production the permission gate runs first. A service-scoped token, and a `rea
 
 **Audit:** audit-first (ADR-0033 section 9, no audit row, no mutation). An `attempted` `config.update` row is written before anything changes; if it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and the key is neither stored nor applied. A `success` row follows a change, or a `failure` row a store refusal. If only that outcome row is lost the change stays applied and the `200` carries `Sec-Audit-Failed: true` (see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture)). Each accepted call therefore leaves two rows.
 
-**No MCP twin.** `PUT /api/config/{key}` has no MCP tool today (planned under #2146). A twin must apply the same write class (`RuntimeConfigStore::write_class`) and the same caller rule (`authz::admin_gate_verdict`) before it writes, or it reopens the gap this section closes.
+**Twins.** `GET /api/v1/config` and `PUT /api/v1/config/{param}` (below) and the MCP tools `get_runtime_config` and `set_runtime_config` do the same reads and writes. All four share one core (`config_write.hpp`), so the write class (`RuntimeConfigStore::write_class`), the caller rule (`authz::admin_gate_verdict`), the value checks and the audit rows are one implementation, not four. A further surface that writes these keys must call it, or it reopens the gap this section closes. What differs is only the envelope: the legacy routes keep their original bodies, the v1 routes answer in the A4 envelope.
 
 **Dangling `attempted` row.** An `attempted` `config.update` row with no `success` or `failure` row after it means the outcome is unknown (the server stopped between the two, or the outcome row was lost); read `GET /api/config` to see what is in force. A `failure` row for a database error records `store error; outcome unknown`, because the write may have committed before the acknowledgement was lost.
 
@@ -5269,6 +5270,20 @@ client secret contains `<redacted>`, rotate it at the IdP to a value that does n
 See [Audit log](audit-log.md) for the `detail` contract, which differs for secret-valued keys.
 
 ---
+
+#### `GET /api/v1/config`
+
+The v1 twin of `GET /api/config`: the effective values, the stored overrides, `allowed_keys` and `read_only_keys`, in the A4 envelope (`{"data": {...}, "meta": {"api_version": "v1"}}`, `Cache-Control: no-store`). The `data` object is the legacy response body, key for key, and a secret key reports `is_set` and never its value. **Permission:** `Infrastructure:Read`. Not audited. A store that is closed or cannot be read answers `503` (A4 error with `retry_after_ms`), never an empty list. MCP: `get_runtime_config`.
+
+#### `PUT /api/v1/config/{param}`
+
+The v1 twin of `PUT /api/config/:key`; `{param}` is the key. Body `{"value": ...}`, at most 16 KiB (`413` above that). Same permission (`Infrastructure:Write`), same caller rule for the seven administrator-only keys and the `oidc_*` keys, same same-site check for a cookie session, same audit-first rows (`config.update`: `denied`, or `attempted` then `success` or `failure`), same value checks. What changes is the answer:
+
+- **Success:** `200 {"data": {"key": "...", "value": "...", "applied": true}, "meta": {"api_version": "v1"}}`. A secret key's `value` is omitted. If only the outcome audit row is lost the change stays applied, `data` carries `"audit_persisted": false` and the response carries `Sec-Audit-Failed: true`.
+- **Errors:** every refusal is an A4 error envelope: `400` for a missing or invalid `value`, an unknown key, or a key with its own route (`dex_score_policy`); `403` for a refused caller (with `remediation`, no `permission` field) or a cross-site cookie write; `503` when the store is unavailable or the `attempted` row cannot be stored (with `retry_after_ms`).
+- **Step-up:** a cookie session needs a fresh MFA proof. Token callers are exempt from step-up, as on every step-up route. The legacy `PUT /api/config/:key` is unchanged and is not step-up gated.
+
+MCP: `set_runtime_config`, with the same arguments in `{"key": "...", "value": "..."}` form. An MCP-tier token reaches only the five keys that are not administrator-only (`heartbeat_timeout`, `response_retention_days`, `guardian_event_retention_days`, `auto_approve_enabled`, `log_level`); the rest answer a permission error and the `config.update / denied` audit row. It is not approval-gated at the supervised tier: the write is audit-first, and the administrator-only keys, including every sign-in setting, are out of its reach.
 
 ### Settings
 

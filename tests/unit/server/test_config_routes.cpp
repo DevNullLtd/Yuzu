@@ -1,6 +1,6 @@
 /**
- * test_config_routes.cpp — route-handler coverage for the 2-route Runtime
- * Configuration API (7.3, #2542 PR-12), driven in-process through
+ * test_config_routes.cpp — route-handler coverage for the Runtime Configuration API
+ * (7.3, #2542 PR-12; the legacy GET/PUT pair plus their /api/v1 twins), driven in-process through
  * TestRouteSink (no httplib acceptor, #438), mirroring
  * test_schedule_routes.cpp's / test_custom_properties_routes.cpp's
  * MockHarness-plus-[pg]-Harness split.
@@ -94,6 +94,11 @@ struct MockHarness {
     bool perm_allow{true};
     std::vector<std::pair<std::string, std::string>> perm_calls;
 
+    /// The step-up closure: refuses (403, as the real one does for a missing proof) when false.
+    bool stepup_allow{true};
+    bool stepup_wired{true};
+    std::vector<std::string> stepup_labels;
+
     bool audit_succeeds{true};
     /// 0-based index of the one audit call that fails (-1: none); independent of audit_succeeds.
     int audit_fails_at{-1};
@@ -146,6 +151,18 @@ struct MockHarness {
             audits.push_back({a, r, tt, ti, d});
             return audit_succeeds && idx != audit_fails_at;
         };
+        if (stepup_wired)
+            deps.step_up_fn = [this](const httplib::Request&, httplib::Response& res,
+                                     const auth::Session&, const std::string& label) {
+                stepup_labels.push_back(label);
+                if (!stepup_allow) {
+                    res.status = 403;
+                    res.set_content(R"({"error":{"code":403,"message":"step-up required"}})",
+                                    "application/json");
+                    return false;
+                }
+                return true;
+            };
         config::register_config_routes(sink, deps);
     }
 };
@@ -154,10 +171,10 @@ struct MockHarness {
 
 // ── Registration shape ──────────────────────────────────────────────────
 
-TEST_CASE("config_routes: registers exactly 2 routes", "[server][routes][config_routes]") {
+TEST_CASE("config_routes: registers exactly 4 routes", "[server][routes][config_routes]") {
     MockHarness h;
     h.wire();
-    CHECK(h.sink.route_count() == 2);
+    CHECK(h.sink.route_count() == 4); // GET and PUT, on /api/config and on /api/v1/config
 }
 
 // ── Gate pinning (no Postgres needed) ───────────────────────────────────
@@ -937,10 +954,10 @@ std::vector<std::string> admin_route_keys() {
 // One refused PUT: 403, the A4 envelope without a `permission` field, exactly one denied row
 // carrying `detail`, and nothing stored.
 void check_refused(MockHarness& h, const std::string& key, const std::string& message_part,
-                   const std::string& detail) {
-    INFO(key);
+                   const std::string& detail, const std::string& prefix = "/api/config/") {
+    INFO(prefix + key);
     h.audits.clear();
-    auto res = h.sink.Put("/api/config/" + key, R"({"value":"true"})");
+    auto res = h.sink.Put(prefix + key, R"({"value":"true"})");
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(res->body.find(message_part) != std::string::npos);
@@ -1131,6 +1148,357 @@ TEST_CASE("config_routes: an MCP-tier token can still write the general keys",
     res = h.sink.Put("/api/config/log_level", R"({"value":"warn"})");
     REQUIRE(res);
     CHECK(res->status == 200);
+}
+
+// ── v1 twins: GET /api/v1/config and PUT /api/v1/config/{param} ─────────────────────────────
+//
+// The twins share the core (config_write.hpp) and the handler with the legacy routes; the cases
+// below pin the parts that differ (the envelope) and prove the parts that must not (the gate, the
+// caller rule, the audit rows) by running both routes on the same input.
+
+TEST_CASE("config_routes: the v1 twins gate on the same securables as the legacy routes",
+          "[server][routes][config_routes]") {
+    MockHarness h;
+    h.wire();
+    REQUIRE(h.sink.Get("/api/v1/config"));
+    REQUIRE(h.sink.Put("/api/v1/config/log_level", R"({"value":"debug"})"));
+    REQUIRE(h.perm_calls.size() == 2);
+    CHECK(h.perm_calls[0] == std::pair<std::string, std::string>{"Infrastructure", "Read"});
+    CHECK(h.perm_calls[1] == std::pair<std::string, std::string>{"Infrastructure", "Write"});
+}
+
+TEST_CASE("config_routes: a perm_fn denial 403s the v1 routes before the store or the body",
+          "[server][routes][config_routes]") {
+    MockHarness h;
+    h.perm_allow = false;
+    h.wire();
+    auto get_res = h.sink.Get("/api/v1/config");
+    REQUIRE(get_res);
+    CHECK(get_res->status == 403);
+    auto put_res = h.sink.Put("/api/v1/config/log_level", "not json");
+    REQUIRE(put_res);
+    CHECK(put_res->status == 403);
+    CHECK(h.audits.empty());
+}
+
+TEST_CASE("config_routes: the v1 PUT refuses the administrator-only keys like the legacy PUT "
+          "(no store, no PostgreSQL)",
+          "[server][routes][config_routes][elevation]") {
+    MockHarness h;
+    h.session_role = auth::Role::admin;
+    h.session_mcp_tier = "supervised";
+    h.wire();
+    const std::string v1 = "/api/v1/config/";
+
+    const auto keys = admin_route_keys();
+    REQUIRE(keys.size() == 7);
+    for (const auto& key : keys)
+        check_refused(h, key, "administrator account is required",
+                      "token_session_admin_setting_blocked", v1);
+
+    h.session_mcp_tier.clear();
+    h.session_token_scope_service = "svc-a";
+    for (const auto& key : keys)
+        check_refused(h, key, "administrator account is required",
+                      "token_session_admin_setting_blocked", v1);
+
+    h.session_token_scope_service.clear();
+    h.session_role = auth::Role::user;
+    for (const auto& key : keys)
+        check_refused(h, key, "own administrator role", "admin_role_required_setting_blocked", v1);
+
+    h.session_role = auth::Role::admin;
+    h.session_token_scope_service = "svc-a";
+    check_refused(h, "oidc_admin_group", "administrator account is required",
+                  "token_session_oidc_setting_blocked", v1);
+
+    // An admin with a null store: 503 for a key the class admits, 400 for the route-owned key.
+    h.session_token_scope_service.clear();
+    auto res = h.sink.Put(v1 + "plugin_signing_required", R"({"value":"true"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(body(res->body)["error"]["code"] == 503);
+    CHECK(body(res->body)["error"].contains("retry_after_ms"));
+    res = h.sink.Put(v1 + "dex_score_policy", R"({"value":"{}"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(body(res->body)["error"].contains("remediation"));
+}
+
+// Differential: the legacy and v1 PUT answer the same status and write the same audit rows for
+// every allowed key under every caller shape. A fix to one that misses the other fails here.
+TEST_CASE("config_routes: the legacy and v1 PUT agree on status and audit rows for every key and "
+          "caller shape",
+          "[server][routes][config_routes][elevation]") {
+    struct Caller {
+        const char* name;
+        auth::Role role;
+        const char* mcp_tier;
+        const char* scope_service;
+        const char* auth_source;
+        bool elevated;
+    };
+    const Caller callers[] = {
+        {"admin api token", auth::Role::admin, "", "", "api_token", false},
+        {"supervised mcp token", auth::Role::admin, "supervised", "", "api_token", false},
+        {"service-scoped token", auth::Role::admin, "", "svc-a", "api_token", false},
+        {"plain user", auth::Role::user, "", "", "api_token", false},
+        {"elevated user", auth::Role::user, "", "", "api_token", true},
+        {"cross-site cookie admin", auth::Role::admin, "", "", "local", false},
+    };
+    auto keys = RuntimeConfigStore::allowed_keys();
+    keys.push_back("not_a_setting");
+
+    for (const auto& c : callers) {
+        MockHarness h; // null store: every admitted write ends at the store gate
+        h.session_role = c.role;
+        h.session_mcp_tier = c.mcp_tier;
+        h.session_token_scope_service = c.scope_service;
+        h.auth_source = c.auth_source;
+        h.session_elevated = c.elevated;
+        h.wire();
+        for (const auto& key : keys) {
+            INFO(std::string(c.name) + " / " + key);
+            h.audits.clear();
+            auto legacy = h.sink.Put("/api/config/" + key, R"({"value":"true"})");
+            REQUIRE(legacy);
+            const auto legacy_audits = h.audits;
+            h.audits.clear();
+            auto v1 = h.sink.Put("/api/v1/config/" + key, R"({"value":"true"})");
+            REQUIRE(v1);
+            CHECK(v1->status == legacy->status);
+            REQUIRE(h.audits.size() == legacy_audits.size());
+            for (std::size_t i = 0; i < legacy_audits.size(); ++i) {
+                CHECK(h.audits[i].action == legacy_audits[i].action);
+                CHECK(h.audits[i].result == legacy_audits[i].result);
+                CHECK(h.audits[i].target_id == legacy_audits[i].target_id);
+                CHECK(h.audits[i].detail == legacy_audits[i].detail);
+            }
+            if (v1->status >= 400)
+                CHECK(body(v1->body)["error"]["code"] == v1->status);
+        }
+    }
+}
+
+TEST_CASE("config_routes: only the v1 PUT calls the MFA step-up closure, with its table label",
+          "[server][routes][config_routes][stepup]") {
+    MockHarness h;
+    h.wire();
+    REQUIRE(h.sink.Put("/api/config/log_level", R"({"value":"debug"})"));
+    REQUIRE(h.sink.Get("/api/config"));
+    REQUIRE(h.sink.Get("/api/v1/config"));
+    CHECK(h.stepup_labels.empty()); // legacy PUT (pending row) and both GETs never call it
+
+    REQUIRE(h.sink.Put("/api/v1/config/log_level", R"({"value":"debug"})"));
+    REQUIRE(h.stepup_labels.size() == 1);
+    CHECK(h.stepup_labels[0] == "PUT /api/v1/config/{key}");
+}
+
+TEST_CASE("config_routes: a missing step-up proof stops the v1 PUT before any refusal, audit or "
+          "write; the legacy PUT is unaffected",
+          "[server][routes][config_routes][stepup]") {
+    MockHarness h;
+    h.stepup_allow = false;
+    h.session_mcp_tier = "supervised"; // would otherwise get the 403 refusal + denied row
+    h.wire();
+
+    auto v1 = h.sink.Put("/api/v1/config/plugin_signing_required", R"({"value":"true"})");
+    REQUIRE(v1);
+    CHECK(v1->status == 403);
+    CHECK(v1->body.find("step-up required") != std::string::npos);
+    CHECK(h.audits.empty());
+
+    // The legacy route does not step up, so it reaches its own refusal.
+    auto legacy = h.sink.Put("/api/config/plugin_signing_required", R"({"value":"true"})");
+    REQUIRE(legacy);
+    CHECK(legacy->status == 403);
+    CHECK(legacy->body.find("administrator account is required") != std::string::npos);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "denied");
+}
+
+TEST_CASE("config_routes: an unwired step-up closure is skipped, not a fault",
+          "[server][routes][config_routes][stepup]") {
+    MockHarness h;
+    h.stepup_wired = false;
+    h.wire();
+    auto res = h.sink.Put("/api/v1/config/not_a_setting", R"({"value":"x"})");
+    REQUIRE(res);
+    CHECK(res->status == 503); // null store: reached the store gate, so nothing blocked it earlier
+}
+
+TEST_CASE("config_routes: a degraded runtime_config_store answers the v1 routes 503 with a retry hint",
+          "[server][routes][config_routes]") {
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
+    FileKeyProvider provider(keys.path);
+    pg::SecretCodec codec(provider);
+    pg::PgPool pool{{.conninfo = "this is not a valid conninfo :::", .size = 1}};
+    REQUIRE_FALSE(pool.valid());
+    RuntimeConfigStore store{pool, codec};
+    REQUIRE_FALSE(store.is_open());
+
+    MockHarness h;
+    h.runtime_config_store = &store;
+    h.wire();
+    auto check = [](const auto& res) {
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        const auto err = body(res->body)["error"];
+        CHECK(err["code"] == 503);
+        CHECK(err["retry_after_ms"] == 5000);
+        CHECK(err.contains("correlation_id"));
+    };
+    check(h.sink.Get("/api/v1/config"));
+    check(h.sink.Put("/api/v1/config/log_level", R"({"value":"debug"})"));
+}
+
+TEST_CASE("config_routes: GET /api/v1/config is the legacy body under data, secrets as is_set",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+    REQUIRE(h.sink.Put("/api/config/response_retention_days", R"({"value":"120"})")->status == 200);
+    REQUIRE(h.sink.Put("/api/config/oidc_client_secret", R"({"value":"s3cret"})")->status == 200);
+
+    auto legacy = h.sink.Get("/api/config");
+    auto v1 = h.sink.Get("/api/v1/config");
+    REQUIRE(legacy);
+    REQUIRE(v1);
+    CHECK(v1->status == 200);
+    CHECK(v1->get_header_value("Cache-Control") == "no-store");
+    const auto envelope = body(v1->body);
+    CHECK(envelope["meta"]["api_version"] == "v1");
+    CHECK(envelope["data"] == body(legacy->body));
+    CHECK(envelope["data"]["overrides"]["response_retention_days"]["value"] == "120");
+    CHECK(envelope["data"]["overrides"]["oidc_client_secret"]["is_set"] == true);
+    CHECK(v1->body.find("s3cret") == std::string::npos);
+}
+
+TEST_CASE("config_routes: PUT /api/v1/config/{param} writes, applies and audits like the legacy PUT",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+
+    auto res = h.sink.Put("/api/v1/config/response_retention_days", R"({"value":"130"})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Cache-Control") == "no-store");
+    const auto b = body(res->body);
+    CHECK(b["meta"]["api_version"] == "v1");
+    CHECK(b["data"] == json({{"key", "response_retention_days"}, {"value", "130"}, {"applied", true}}));
+    CHECK(h.cfg.response_retention_days == 130);
+    CHECK(w.store.get_value("response_retention_days") == "130");
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[0].detail.empty());
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].target_type == "RuntimeConfig");
+    CHECK(h.audits[1].detail == "value=130");
+
+    // A secret key: the value reaches neither the response nor the audit detail.
+    h.audits.clear();
+    res = h.sink.Put("/api/v1/config/oidc_client_secret", R"({"value":"s3cret-v1"})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("s3cret-v1") == std::string::npos);
+    CHECK_FALSE(body(res->body)["data"].contains("value"));
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1].detail.find("s3cret-v1") == std::string::npos);
+
+    // A JSON scalar is stored as its text, like the legacy route.
+    res = h.sink.Put("/api/v1/config/heartbeat_timeout", R"({"value":45})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(w.store.get_value("heartbeat_timeout") == "45");
+}
+
+TEST_CASE("config_routes: the v1 PUT refuses the change when the attempted row cannot be written, "
+          "and flags a lost outcome row in the body",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+    const int before = h.cfg.response_retention_days;
+
+    h.audit_fails_at = 0; // the attempted row
+    auto refused = h.sink.Put("/api/v1/config/response_retention_days", R"({"value":"131"})");
+    REQUIRE(refused);
+    CHECK(refused->status == 503);
+    CHECK(refused->get_header_value("Sec-Audit-Failed") == "true");
+    const auto err = body(refused->body)["error"];
+    CHECK(err["message"] == "audit log unavailable; the change was not made");
+    CHECK(err["retry_after_ms"] == 5000);
+    CHECK(h.cfg.response_retention_days == before);
+    CHECK(h.audits.size() == 1);
+
+    h.audits.clear();
+    h.audit_fails_at = 1; // the outcome row
+    auto res = h.sink.Put("/api/v1/config/response_retention_days", R"({"value":"132"})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(body(res->body)["data"]["audit_persisted"] == false);
+    CHECK(h.cfg.response_retention_days == 132);
+}
+
+TEST_CASE("config_routes: the v1 PUT answers every rejected input in the A4 envelope",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+
+    struct Case {
+        const char* what;
+        const char* path;
+        const char* req_body;
+        const char* message_part;
+    };
+    const Case cases[] = {
+        {"non-numeric integer", "/api/v1/config/response_retention_days", R"({"value":"abc"})",
+         "non-negative integer"},
+        {"missing value", "/api/v1/config/log_level", R"({"other":1})", "missing 'value'"},
+        {"invalid json", "/api/v1/config/log_level", "{not json", "invalid JSON"},
+        {"unknown key", "/api/v1/config/not_a_setting", R"({"value":"x"})", "not a configurable"},
+        {"store-refused value", "/api/v1/config/log_level", R"({"value":"loud"})", "one of"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.what);
+        h.audits.clear();
+        auto res = h.sink.Put(c.path, c.req_body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        const auto err = body(res->body)["error"];
+        CHECK(err["code"] == 400);
+        CHECK(err["message"].get<std::string>().find(c.message_part) != std::string::npos);
+        CHECK(err.contains("correlation_id"));
+    }
+    CHECK(h.cfg.response_retention_days != 0);
+}
+
+TEST_CASE("config_routes: an MCP-tier token can still write the general keys through the v1 PUT",
+          "[pg][server][routes][config_routes][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.session_mcp_tier = "supervised";
+    h.wire();
+    for (const auto* key : {"heartbeat_timeout", "response_retention_days", "log_level"}) {
+        INFO(key);
+        const std::string value = std::string(key) == "log_level" ? "info" : "120";
+        auto res = h.sink.Put(std::string("/api/v1/config/") + key, R"({"value":")" + value + R"("})");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
 }
 
 // Drift tripwire (source scan; no PostgreSQL). The class table is only as good as its fit to the

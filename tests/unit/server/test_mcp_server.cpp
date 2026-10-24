@@ -80,6 +80,8 @@
 #include "pg/pg_raii.hpp"     // PgConn/PgResult — direct-SQL secret-row verification
 #include "pg/secret_codec.hpp"
 #include "plugin_config_store.hpp"
+#include "runtime_config_store.hpp" // get/set_runtime_config tests
+#include <yuzu/server/auto_approve.hpp>
 #include "deployment_routes.hpp"    // deployment_row_json (shared REST/MCP builder)
 #include "deployment_run_store.hpp" // list_deployments / get_deployment
 #include "preflight_run_store.hpp" // #4036: PreflightRunStore for list_preflight_runs / get_deployment_preview
@@ -1112,6 +1114,9 @@ struct McpTestServer {
     /// must opt in with an explicit AdmitAll/AdmitScoped lambda, same as
     /// production wiring in server.cpp.
     yuzu::server::PluginConfigStore* plugin_config_store_for_test{nullptr};
+    /// get_runtime_config / set_runtime_config backing (cfg, auto-approve engine, store). Default
+    /// (all nullptr) keeps every other test on the "store unavailable" path.
+    yuzu::server::config::Backing runtime_config_for_test{};
     yuzu::server::UploadGrantStore* upload_grant_store_for_test{nullptr};
     yuzu::server::mcp::McpServer::UploadGrantListReadFn upload_grant_list_read_fn_for_test{};
 
@@ -1676,6 +1681,8 @@ private:
         // are built.
         if (plugin_config_store_for_test)
             mcp.set_plugin_config_store(plugin_config_store_for_test);
+        if (runtime_config_for_test.store)
+            mcp.set_runtime_config(runtime_config_for_test);
         if (upload_grant_store_for_test)
             mcp.set_upload_grant_ops(upload_grant_store_for_test, upload_grant_list_read_fn_for_test);
         // #4036: preflight_run_store ALSO rides a setter, same pattern as
@@ -40447,4 +40454,277 @@ TEST_CASE("MCP build_catalogue refuses a served text that still carries an ecosy
                           Catch::Matchers::ContainsSubstring("output schema") &&
                               Catch::Matchers::ContainsSubstring("not valid JSON"));
     }
+}
+
+
+// ── get_runtime_config / set_runtime_config ─────────────────────────────────────────────────
+
+namespace {
+
+yuzu::test::PgTestTemplate mcp_runtime_config_tpl{
+    "mcprtcfg", [](const std::string& dsn) {
+        yuzu::test::TempDir keys{"yuzu_test_keys_"};
+        yuzu::server::FileKeyProvider provider(keys.path);
+        yuzu::server::pg::SecretCodec codec(provider);
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::RuntimeConfigStore store{pool, codec};
+        if (!store.is_open())
+            throw std::runtime_error("mcp runtime config template: store failed to migrate");
+        yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+        if (PQstatus(conn.get()) != CONNECTION_OK)
+            throw std::runtime_error("mcp runtime config template: connect failed");
+        if (!codec.init(conn.get()).has_value())
+            throw std::runtime_error("mcp runtime config template: codec init failed");
+        yuzu::server::pg::PgResult reset{PQexec(conn.get(), "DELETE FROM secrets.kek_meta")};
+        if (!reset.ok())
+            throw std::runtime_error("mcp runtime config template: kek_meta reset failed");
+    }};
+
+/// A real RuntimeConfigStore plus the Config and auto-approve engine the tools mutate/read.
+struct RuntimeConfigPgWired {
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
+    yuzu::server::FileKeyProvider provider{keys.path};
+    yuzu::server::pg::SecretCodec codec{provider};
+    yuzu::server::pg::PgPool pool;
+    yuzu::server::RuntimeConfigStore store;
+    yuzu::server::Config cfg{};
+    yuzu::server::auth::AutoApproveEngine auto_approve{};
+
+    explicit RuntimeConfigPgWired(const std::string& dsn)
+        : pool{{.conninfo = dsn, .size = 4}}, store{pool, codec} {
+        REQUIRE(store.is_open());
+        yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        REQUIRE(codec.init(conn.get()).has_value());
+    }
+    yuzu::server::config::Backing backing() { return {&cfg, &auto_approve, &store}; }
+};
+
+nlohmann::json set_runtime_config_call(McpTestServer& ts, const std::string& key,
+                                       const std::string& value) {
+    return mcp_tool_call(ts, "set_runtime_config",
+                         nlohmann::json({{"key", key}, {"value", value}}).dump());
+}
+
+std::vector<std::string> config_keys_of_class(yuzu::server::ConfigWriteClass cls) {
+    std::vector<std::string> keys;
+    for (const auto& k : yuzu::server::RuntimeConfigStore::allowed_keys())
+        if (yuzu::server::RuntimeConfigStore::write_class(k) == cls)
+            keys.push_back(k);
+    return keys;
+}
+
+} // namespace
+
+TEST_CASE("MCP runtime config: set writes the store and the live config, get reads it back; "
+          "proven by a direct store read",
+          "[pg][mcp][integration][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
+    RuntimeConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.runtime_config_for_test = w.backing();
+    ts.start("supervised");
+
+    auto set = set_runtime_config_call(ts, "response_retention_days", "140");
+    INFO(set.dump());
+    REQUIRE_FALSE(set.contains("error"));
+    auto payload = nlohmann::json::parse(set["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload == nlohmann::json({{"key", "response_retention_days"},
+                                     {"value", "140"},
+                                     {"applied", true}}));
+    CHECK(w.store.get_value("response_retention_days") == "140");
+    CHECK(w.cfg.response_retention_days == 140);
+    REQUIRE(ts.audit_log.size() == 3);
+    CHECK(ts.audit_log[0] == "config.update|attempted");
+    CHECK(ts.audit_log[1] == "config.update|success");
+    CHECK(ts.audit_log[2] == "mcp.set_runtime_config|success");
+
+    auto get = mcp_tool_call(ts, "get_runtime_config", "{}");
+    INFO(get.dump());
+    REQUIRE_FALSE(get.contains("error"));
+    auto view = nlohmann::json::parse(get["result"]["content"][0]["text"].get<std::string>());
+    CHECK(view["config"]["response_retention_days"] == 140);
+    CHECK(view["overrides"]["response_retention_days"]["value"] == "140");
+    CHECK(view["allowed_keys"].is_array());
+    CHECK(view["read_only_keys"] == nlohmann::json::array({"dex_score_policy"}));
+}
+
+TEST_CASE("MCP runtime config: a supervised token is refused every administrator-only key with a "
+          "denied row and no write",
+          "[pg][mcp][integration][runtime_config][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
+    RuntimeConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.runtime_config_for_test = w.backing();
+    ts.start("supervised"); // an admin-minted token: mock_role is admin
+
+    auto keys = config_keys_of_class(yuzu::server::ConfigWriteClass::AdminRoute);
+    REQUIRE(keys.size() == 7);
+    keys.push_back("oidc_admin_group");
+    for (const auto& key : keys) {
+        INFO(key);
+        ts.audit_log.clear();
+        auto body = set_runtime_config_call(ts, key, "true");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(body["error"]["message"].get<std::string>().find("administrator account is required") !=
+              std::string::npos);
+        CHECK(body["error"]["data"].contains("remediation"));
+        REQUIRE(ts.audit_log.size() == 2);
+        CHECK(ts.audit_log[0] == "config.update|denied");
+        CHECK(ts.audit_log[1].starts_with("mcp.set_runtime_config|denied"));
+        CHECK(w.store.get_value(key).empty());
+    }
+}
+
+TEST_CASE("MCP runtime config: a non-administrator role is refused administrator-only keys but "
+          "may write a general key",
+          "[pg][mcp][integration][runtime_config][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
+    RuntimeConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.runtime_config_for_test = w.backing();
+    ts.mock_role = yuzu::server::auth::Role::user;
+    ts.start(); // no tier: not an MCP-tier session
+
+    auto refused = set_runtime_config_call(ts, "plugin_signing_required", "true");
+    REQUIRE(refused.contains("error"));
+    CHECK(refused["error"]["message"].get<std::string>().find("own administrator role") !=
+          std::string::npos);
+    CHECK(w.store.get_value("plugin_signing_required").empty());
+
+    auto ok = set_runtime_config_call(ts, "response_retention_days", "150");
+    REQUIRE_FALSE(ok.contains("error"));
+    CHECK(w.store.get_value("response_retention_days") == "150");
+}
+
+TEST_CASE("MCP runtime config: the route-owned key and bad input are invalid params with no audit "
+          "row and no write",
+          "[pg][mcp][integration][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
+    RuntimeConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.runtime_config_for_test = w.backing();
+    ts.start("supervised");
+
+    struct Case {
+        const char* key;
+        const char* value;
+        const char* message_part;
+    };
+    const Case cases[] = {
+        {"dex_score_policy", "{}", "PUT /api/v1/dex/score-policy"},
+        {"response_retention_days", "abc", "non-negative integer"},
+        {"not_a_setting", "x", "not a configurable"},
+        {"log_level", "loud", "one of"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.key);
+        ts.audit_log.clear();
+        auto body = set_runtime_config_call(ts, c.key, c.value);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find(c.message_part) != std::string::npos);
+        // A rejected input writes no config.update row (the store-refused value, log_level, is
+        // the one case that reaches the attempted/failure pair).
+        if (std::string(c.key) != "log_level")
+            for (const auto& entry : ts.audit_log)
+                CHECK_FALSE(entry.starts_with("config.update"));
+        CHECK(w.store.get_value(c.key).empty());
+    }
+    // Schema bounds: a key outside ^[a-z_]+$ never reaches the handler.
+    auto bad = set_runtime_config_call(ts, "BAD-KEY", "1");
+    REQUIRE(bad.contains("error"));
+}
+
+TEST_CASE("MCP runtime config: no audit row, no mutation",
+          "[pg][mcp][integration][runtime_config][audit_failclose]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
+    RuntimeConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.runtime_config_for_test = w.backing();
+    ts.start("supervised");
+    const int before = w.cfg.response_retention_days;
+
+    ts.audit_fail_result_ = "attempted";
+    auto body = set_runtime_config_call(ts, "response_retention_days", "160");
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("the change was not made") !=
+          std::string::npos);
+    CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(w.cfg.response_retention_days == before);
+    CHECK(w.store.get_value("response_retention_days").empty());
+
+    // A lost outcome row keeps the change and says so.
+    ts.audit_fail_result_ = "success";
+    auto ok = set_runtime_config_call(ts, "response_retention_days", "161");
+    REQUIRE_FALSE(ok.contains("error"));
+    auto payload = nlohmann::json::parse(ok["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["audit_persisted"] == false);
+    CHECK(w.cfg.response_retention_days == 161);
+}
+
+TEST_CASE("MCP runtime config: the tier gate, the service-scope gate and the unwired store",
+          "[mcp][runtime_config]") {
+    {
+        // readonly: the write is denied before the handler, the read is served (store unwired).
+        McpTestServer ts;
+        ts.start("readonly");
+        auto set = set_runtime_config_call(ts, "log_level", "info");
+        REQUIRE(set.contains("error"));
+        CHECK(ts.audit_log.size() == 1);
+        auto get = mcp_tool_call(ts, "get_runtime_config", "{}");
+        REQUIRE(get.contains("error"));
+        CHECK(get["error"]["message"].get<std::string>().find("runtime config store unavailable") !=
+              std::string::npos);
+        CHECK(get["error"]["data"]["retry_after_ms"] ==
+              yuzu::server::mcp::kMcpStoreFaultShortRetryMs);
+    }
+    {
+        // A service-scoped token has no confined view of platform configuration: both refused.
+        McpTestServer ts;
+        ts.mock_token_scope_service = "svc-a";
+        ts.start("supervised");
+        CHECK(set_runtime_config_call(ts, "log_level", "info").contains("error"));
+        CHECK(mcp_tool_call(ts, "get_runtime_config", "{}").contains("error"));
+    }
+}
+
+// Drift tripwire: set_runtime_config's description is read by an agent deciding what it may write.
+// The sentence naming the writable keys must be exactly the General class, and every
+// administrator-only key must appear after it as refused.
+TEST_CASE("MCP runtime config: the set_runtime_config description names exactly the writable keys",
+          "[mcp][runtime_config]") {
+    McpTestServer ts;
+    ts.start("supervised");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    std::string description;
+    for (const auto& tool : nlohmann::json::parse(res->body)["result"]["tools"])
+        if (tool["name"] == "set_runtime_config")
+            description = tool["description"].get<std::string>();
+    REQUIRE_FALSE(description.empty());
+
+    const auto start = description.find("can write only these keys:");
+    const auto stop = description.find("Every other key");
+    REQUIRE(start != std::string::npos);
+    REQUIRE(stop != std::string::npos);
+    REQUIRE(start < stop);
+    const auto writable = description.substr(start, stop - start);
+    const auto refused = description.substr(stop);
+
+    using yuzu::server::ConfigWriteClass;
+    for (const auto& k : config_keys_of_class(ConfigWriteClass::General)) {
+        INFO(k);
+        CHECK(writable.find(k) != std::string::npos);
+    }
+    for (const auto cls : {ConfigWriteClass::AdminRoute, ConfigWriteClass::RouteOwned}) {
+        for (const auto& k : config_keys_of_class(cls)) {
+            INFO(k);
+            CHECK(writable.find(k) == std::string::npos);
+            CHECK(refused.find(k) != std::string::npos);
+        }
+    }
+    CHECK(writable.find("oidc_") == std::string::npos);
+    CHECK(refused.find("oidc_") != std::string::npos);
 }
