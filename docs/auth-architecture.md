@@ -3158,11 +3158,18 @@ ADR-0041, currently at v3).
 
 ## Render-time permission probes (capability hints)
 
-Five `AuthRoutes` methods answer a permission question without writing a denial row for an
+Six `AuthRoutes` methods answer a permission question without writing a denial row for an
 interactive sign-in, for pages
 that decide what to DRAW: `has_permission` (the verdict only), `probe_permission` (the verdict
-with the gate's own response kept, so "denied" and "store unavailable" stay distinguishable),
-`probe_admin` (`require_admin`'s decision), `probe_fleet_read` (`require_fleet_read`'s decision and
+with the gate's own response kept: it receives the 401/403/503 the gate wrote, and the 503 appears
+only where the gate itself writes one, such as an engine principal with the store not open; an RBAC
+read that fails (breaker open, pool timeout, a failed role or permission query) is a `403` here and
+cannot be told apart from a refusal), `probe_permission_unavailable_aware` (`probe_permission`
+with one difference: such a failed RBAC read is answered with a retryable `503`, `retry_after_ms`
+5000 and no `permission` field. It exists for the one consumer whose correctness depends on telling
+"could not determine" from "definitively denied", the Forensics-tier resolver, where a collapsed
+answer would serve a `200` with the Forensics rows silently missing; a new caller needs the same
+justification, and `require_permission` itself stays a `403` on a degrade, ADR-0041), `probe_admin` (`require_admin`'s decision), `probe_fleet_read` (`require_fleet_read`'s decision and
 scope) and `probe_global_list_read` (`require_list_read`'s decision, with a management-group-
 confined admission refused as a denial, for a resource that is not agent-scoped; its loud twin
 `require_global_list_read` is the gate of the plugin-config REST list). Each runs the gate's own
@@ -4785,7 +4792,7 @@ DENYING reasons (`pool_acquire_timeout` / `query_error` /
 `generation_refresh_failed`): each failed read denies the request that
 needed it (operator permission and list-read checks on a permission-cache
 miss, service-scoped tokens on every `require_fleet_read` or
-`require_scoped_permission` request whose `ITServiceOwner` ceiling read fails), so a non-zero rate on one of these is an authorization-availability
+`require_scoped_permission` request whose `ITServiceOwner` ceiling read fails). A failed role query, the read that precedes a permission check, counts `query_error` and books a breaker failure on every path that makes it (`require_permission`'s RBAC branch included; `get_effective_permissions`, a display read that denies nobody, counts it too), while the `ITServiceOwner` ceiling read inside `require_permission` is uncounted. So a non-zero rate on one of these is an authorization-availability
 event, though not necessarily one that denies every caller, and the
 `YuzuRbacReadDegraded` alert pages on exactly this subset.
 Two OBSERVE-ONLY reasons share the same metric but deny nothing — the read
