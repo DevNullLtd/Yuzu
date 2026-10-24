@@ -351,8 +351,7 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
     // exponential backoff (unhappy-path finding UP-1, governance run 2026-08-20). A read that
     // fails MID-query (the store opens fine but a later read errors) is answered below from
     // `ListReadAuthorization::read_failed`, for the same reason and one more: a caller that read
-    // the 403 as "no grant" could serve a list to someone the check never cleared (CA-S3,
-    // adjudicated 2026-10-24).
+    // the 403 as "no grant" could serve a list to someone the check never cleared.
     if (!mgmt_group_store_ || !mgmt_group_store_->is_open()) {
         audit_log(req, "auth.fleet_read_required", "denied", "", "",
                   "fleet read blocked: management-group store unavailable");

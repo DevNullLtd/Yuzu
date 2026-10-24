@@ -2739,7 +2739,7 @@ std::expected<bool, std::string>
 RbacStore::check_permission_checked(const std::string& username, const std::string& securable_type,
                                    const std::string& operation) const {
     if (!open_)
-        return std::unexpected(std::string("rbac store not open")); // fail-closed
+        return std::unexpected(std::string(kRbacErrStoreNotOpen)); // fail-closed
 
     // #2703 Gate 7 item 1 commit C: observes on every exit below, whichever
     // return statement fires — excludes the trivial !open_ short-circuit
