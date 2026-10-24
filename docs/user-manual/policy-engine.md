@@ -274,7 +274,7 @@ is no longer in the policy's scope, the pair is never written again, so the old
 text stays. To remove it, delete the policy (`DELETE /api/policies/{id}`,
 `Policy:Delete`; its status rows go with it), or enable the policy and
 evaluate it again (`POST /api/policies/{id}/evaluate`), which overwrites the
-rows of the agents it still covers. This is a documented residual (accepted verbally by the project owner, Dave Rae, on 2026-10-23; ledger id `g8p2-comp-1a-residual`, formal adjudication pending).
+rows of the agents it still covers. This is a documented residual of this release, tracked in the project's governance record; the new build never stores check output for such a policy again.
 
 Implementation/lifecycle: the thread is `PolicyEvaluator`
 (`policy_evaluator.{hpp,cpp}`), wired in `server.cpp` against a hoisted shared

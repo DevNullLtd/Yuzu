@@ -5007,7 +5007,7 @@ the check instruction runs a Forensics-tier plugin (`app_usage`, `browser_invent
 `execution_artifacts`, `privacy_permissions`, `remote_access_audit`), the agent's `status` is
 `unknown` and `check_result` is empty, because the evaluator does not read or store that plugin's
 output. `unknown` there says nothing about the device. A `check_result` stored by an evaluation
-before the upgrade stays until that (policy, agent) pair is next written by an evaluation; for a disabled policy, a decommissioned agent or an agent no longer in the policy's scope it is never overwritten, and it has no age limit. Deleting the policy removes it (see the Policy Engine guide). This is a documented residual (accepted verbally by the project owner, Dave Rae, on 2026-10-23; ledger id `g8p2-comp-1a-residual`, formal adjudication pending). See "Forensics-tier rows" in the
+before the upgrade stays until that (policy, agent) pair is next written by an evaluation; for a disabled policy, a decommissioned agent or an agent no longer in the policy's scope it is never overwritten, and it has no age limit. Deleting the policy removes it (see the Policy Engine guide). This is a documented residual of this release, tracked in the project's governance record; the new build never stores check output for such a policy again. See "Forensics-tier rows" in the
 Command/Instruction Responses section.
 
 ---

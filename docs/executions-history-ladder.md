@@ -243,7 +243,7 @@ command; rows written to those sinks before the upgrade keep their original text
 rewritten, and they have no age limit: `agent_exec_status` has no retention sweep, notification rows
 have no reaper and no delete endpoint, analytics buffer rows are never reaped, and webhook and
 offload delivery rows go only when their webhook or target is deleted. A `check_result` stored by a
-policy before the upgrade stays until that (policy, agent) pair is next written by an evaluation; for a disabled policy, a decommissioned agent or an agent no longer in the policy's scope it is never overwritten, and it has no age limit. Deleting the policy removes it (see the Policy Engine guide). This is a documented residual (accepted verbally by the project owner, Dave Rae, on 2026-10-23; ledger id `g8p2-comp-1a-residual`, formal adjudication pending). A user holding only `ForensicsAnalyst` cannot dispatch: the `Execution:Execute` gate of
+policy before the upgrade stays until that (policy, agent) pair is next written by an evaluation; for a disabled policy, a decommissioned agent or an agent no longer in the policy's scope it is never overwritten, and it has no age limit. Deleting the policy removes it (see the Policy Engine guide). This is a documented residual of this release, tracked in the project's governance record; the new build never stores check output for such a policy again. A user holding only `ForensicsAnalyst` cannot dispatch: the `Execution:Execute` gate of
 `POST /api/command` refuses, and on the MCP `execute_instruction` tool at the supervised tier the
 approval step runs before the tool's own permission check (an ordering that already applied to any
 caller lacking that permission).
