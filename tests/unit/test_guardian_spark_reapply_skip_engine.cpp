@@ -2726,10 +2726,12 @@ TEST_CASE("#5547 (option A): a wedge drained after its claim popped is a carried
     CHECK(probe->count("s0") == before + 1); // a failure with no wedge to protect: Reapply every time
     r.require_generation_held();
 
-    // The skip below needs the Service rule to read compliant. A host with no system bus (macOS, a
-    // bare container) reads it Unknown, so the full_sync rebuilds it instead; the watch and unwatch
-    // counts then say nothing about the carry, and only the generation is checked there. The
-    // poll is bounded and its result unused: a verdict that never settles keeps the checks on.
+    // The skip below needs the Service rule to read Known, not Unknown. A host with no system bus
+    // or no service reader (a bare container, macOS) reads it Unknown, so the full_sync rebuilds
+    // it instead; the watch and unwatch counts then say nothing about the carry, and only the
+    // generation is checked there, with a WARN so the run says it skipped them. The poll is
+    // bounded and its result unused (nothing here REQUIREs a verdict, so the bound only limits
+    // the wait): a verdict that never settles keeps the checks on and a slow read fails visibly.
     bool h_reads_unknown = false;
     {
         auto& rt = r.rt(); // once, outside the poll
@@ -2745,7 +2747,10 @@ TEST_CASE("#5547 (option A): a wedge drained after its claim popped is a carried
     }
     r.dispatch(push_bytes({h, s0}, kGen)); // a full_sync names h: healthy and unchanged, skipped
     CHECK(r.wait_generation(kGen));
-    if (!h_reads_unknown) {
+    if (h_reads_unknown) {
+        WARN("the Service rule h read Unknown on this host, so the full_sync rebuilt it: the skip "
+             "checks (watch_calls == 1, unwatch_calls == 0) were not run");
+    } else {
         CHECK(r.sm->watch_calls(hk) == 1);
         CHECK(r.sm->unwatch_calls(hk) == 0);
     }
