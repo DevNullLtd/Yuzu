@@ -55,13 +55,23 @@ human roles first and follow the prerequisites in [Role-Based Access Control](rb
 **What did not change, stated plainly.**
 
 - **RBAC-off installs** (the shipped default) are unchanged: every `Security:Read` session is served.
-- **A failed access check is never read as permission.** If a store behind the check (permissions, management groups) cannot be read partway through, the route answers `503` with `retry_after_ms: 5000` and the tool a retryable error, and the panel and the `/crypto` drill show a note, each with a `failure` row. A client that polls the list should retry after the interval.
+- **A failed access check is never read as permission.** If a store behind the check (permissions, management groups) cannot be read, the route answers `503` with `retry_after_ms: 5000` and a `failure` row, and the tool a retryable error and a `failure` row; the panel and the `/crypto` drill show a note and write no row (#6384). A client that polls the list should retry after the interval. The check that tells a failed read from "no grant" is shared: see "Every fleet-gated read answers 503, not 403, when its authorization read fails" below.
 - Removing a caller's last scoped `Inventory:Read` grant no longer widens what it can see: such a caller holds no grant and is refused like any other caller without one.
 
 **What to check.**
 
 - A confined caller that needs the inventory must use an account with an unconfined view (for example one holding a global `Inventory:Read`). A confined `Security:Delete` holder can still revoke a serial it already knows, but cannot list serials; revoked serials are in the CRL (`/api/v1/ca/crl`).
-- **SIEM volume.** A SIEM rule or report that counts `crypto.ca.certificates.view` rows now sees one `success` row per inventory page (two rows per MCP call, with `mcp.list_issued_certs`), `denied` rows for refusals, and `failure` rows when the access check or the store is unavailable (a polling client during an outage writes one per call). Every `success` row ends `standing=available`; `denied` rows end `withheld=confined` (a confined view) or `withheld=refused` (no `Inventory:Read` grant).
+- **SIEM volume.** A SIEM rule or report that counts `crypto.ca.certificates.view` rows now sees one `success` row per inventory page (two rows per MCP call, with `mcp.list_issued_certs`), `denied` rows for refusals, and `failure` rows when the access check or the store is unavailable (a polling client during an outage writes one per call). Every `success` row ends `standing=available`; `denied` rows end `withheld=confined` (a confined view) or `withheld=refused` (no `Inventory:Read` grant). A token or MCP caller (not an interactive cookie session) also leaves the gate's own `auth.fleet_read_required` row, so one refused or failed call writes two rows.
+
+## Behaviour change: every fleet-gated read answers 503, not 403, when its authorization read fails
+
+**What changed.** The shared list-read check (`RbacStore::authorize_list_read`) used to answer the same "deny" for a caller who holds no grant and for a caller whose permission, permission-group or management-group read FAILED, and every fleet-gated route turned that into a `403`. It now reports a failed read separately, and the fleet-read gate and the list-read gate answer a retryable `503` (`retry_after_ms: 5000`, no `permission` named) with an audit row `result=failure` (`auth.fleet_read_required` or `auth.permission_required`, detail `... authorization read failed ...`) instead. An engine principal whose grant read fails gets the same `503`. A management-group store that is not wired or not open now also reads as unavailable (`503`) on `require_list_read` routes, as it already did on the fleet-read gate. Both answers still deny.
+
+**Who is affected.** A client of any fleet-gated or list-gated read (status and drill-down views, plugin configuration lists, inventory, executions, responses, devices, hardware, enrollment, result sets and others) that treats `403` as terminal will now see `503` on a transient database fault and should retry after the interval. Dashboard fragments already handle `503` as "unavailable". The two upload-grants list resolvers do not carry the new answer: a failed read there is still a plain deny.
+
+**What to check.** Alerts or dashboards that count `403`s on these routes see fewer during an outage; the root-cause signals are the RBAC and management-group read-degrade counters and their alerts (`YuzuRbacReadDegraded`, `YuzuRbacBreakerOpen`, `YuzuMgmtGroupReadDegraded`). A SIEM rule that counts `auth.fleet_read_required` rows with `result=denied` as authorization denials is unaffected; the new rows are `failure`.
+
+**No action on upgrade.** There is no schema change.
 
 ## Behaviour change: every TAR capture source is on by default; stored opt-outs reset once (tar.db schema v8)
 

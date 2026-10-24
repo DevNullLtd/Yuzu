@@ -200,7 +200,8 @@ where it is approval-gated exactly like every other destructive MCP op (so an
 autonomous worker cannot revoke without the approval workflow — the same
 platform-wide approval-gated-execution boundary, not a CA-specific carve-out).
 `list_issued_certs` applies the same confinement check as the route (both forms): a confined
-caller gets permission-denied (-32003), an unavailable check is a retryable internal error, and
+caller, or one with no `Inventory:Read` grant, gets permission-denied (-32003), an unavailable
+check (including a read failure inside it) is a retryable internal error, and
 each call writes `crypto.ca.certificates.view` plus `mcp.list_issued_certs`.
 
 Audit actions: `ca.cert.issued` (PR3, at enrollment), `ca.cert.revoked`,

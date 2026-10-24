@@ -2327,9 +2327,10 @@ the CA store is unavailable.
 
 The inventory is fleet-wide data about every enrolled agent (subject, SAN), so it is
 held to the same rules as the filtered list below. A caller whose view of the fleet is
-confined (management-group confinement) is refused `403` with no `permission` named, and
-the refusal is written as a `denied` `crypto.ca.certificates.view` row (target `inventory`,
-detail `cid=<cid> ws=crypto_widget_windows_v1 withheld=confined`). A served page is
+confined (management-group confinement), or who holds no `Inventory:Read` grant, is refused
+`403` with no `permission` named, and the refusal is written as a `denied`
+`crypto.ca.certificates.view` row (target `inventory`, detail
+`cid=<cid> ws=crypto_widget_windows_v1 withheld=confined` or `withheld=refused`). A served page is
 written as a `success` row (target `inventory`, detail `cid=<cid> inventory rows=<n> limit=<n>
 offset=<n> has_more=<bool> standing=available`), set-and-proceed: if the row cannot be
 written the page is still served, with `Sec-Audit-Failed: true` and `audit_persisted: false` in
@@ -2396,8 +2397,8 @@ The MCP `list_issued_certs` tool mirrors this contract (same `has_more` / `next_
 **Filtered: the certificates behind one `/crypto` count (ADR-0070 R2, R8).** When any of `kind`,
 `days`, `week`, `bucket`, `as_of` or `cursor` is present, the route lists exactly the certificates behind
 one Yuzu-issued count of [`GET /api/v1/crypto/ca/stats`](#get-apiv1cryptocastats), with the same
-predicate. **Permission:** `Security:Read`, and a caller whose view of the fleet is confined is
-refused `403` with no `permission` field (`Yuzu-issued certificate figures are not available to
+predicate. **Permission:** `Security:Read`, and a caller whose view of the fleet is confined, or who holds
+no `Inventory:Read` grant, is refused `403` with no `permission` field (`Yuzu-issued certificate figures are not available to
 this account: ...`), whatever the parameters. The input is strict, and each malformed parameter is
 a `400` whose message names it:
 
