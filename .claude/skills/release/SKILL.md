@@ -51,7 +51,10 @@ If any of these are missing, the skill prompts the operator to fix-and-commit-an
 Run from the repo root on `main` (or whatever branch is being tagged):
 
 ```bash
+gh auth status                                    # every later `gh` call needs it; fail here, not mid-run
 git fetch origin
+git switch main && git merge --ff-only origin/main   # preflight checks 2-5 read the LOCAL tree
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || { echo "local main != origin/main"; exit 1; }
 git status -sb                                    # confirm branch + clean tree
 bash scripts/release-preflight.sh vX.Y.Z          # CRLF, version, CHANGELOG, compose pins
 bash scripts/check-compose-versions.sh X.Y.Z      # explicit compose check (preflight wraps this too)
@@ -105,20 +108,29 @@ git fetch origin                             # every command below reads origin/
 git log --oneline origin/dev..origin/main    # commits on main, not on dev (release prep, hotfixes)
 git log --oneline origin/main..origin/dev    # commits on dev, not on main (usually all the merged work)
 
-# Step 1 — carry main's missing commits back to dev, as a PR into dev. Skip if
-# `git merge-base --is-ancestor origin/main origin/dev` already succeeds (nothing to carry).
-# A merge is usually right (it keeps the hotfix history); cherry-pick only when main
-# holds nothing but a CHANGELOG/version commit that would conflict anyway.
-git switch -c chore/back-merge-main-into-dev origin/dev
-git merge origin/main            # resolve any CHANGELOG / meson.build conflicts; commit.
-                                 # If a fix was cherry-picked dev->main, delete its changelog.d
-                                 # fragment here: main's copy was folded and removed, dev's copy
-                                 # survives the merge and would be released twice.
-git push -u origin chore/back-merge-main-into-dev
-gh pr create --base dev \
-  --title "chore: back-merge main into dev after the <release> promotion" \
-  --body "Carries the <release> promotion, folds and hotfixes back to dev. Closes nothing."
-# Get it approved and merged.
+# Step 1 — carry main's missing commits back to dev, as a PR into dev.
+if git merge-base --is-ancestor origin/main origin/dev; then
+  echo "step 1: origin/main is already an ancestor of origin/dev - nothing to carry, skip to step 2"
+else
+  echo "step 1: $(git rev-list --count origin/dev..origin/main) commit(s) on main to carry back"
+  # A merge is usually right (it keeps the hotfix history); cherry-pick only when main
+  # holds nothing but a CHANGELOG/version commit that would conflict anyway.
+  git switch -c chore/back-merge-main-into-dev origin/dev
+  git merge --no-edit origin/main  # ON CONFLICT: stop and report the conflicting paths to the
+                                   # operator. Never `git merge --abort` silently and never
+                                   # resolve with -X ours/theirs - a dropped CHANGELOG bullet
+                                   # passes every later check.
+                                   # If a fix was cherry-picked dev->main, delete its changelog.d
+                                   # fragment here (#6428): main's copy was folded and removed,
+                                   # dev's copy survives the merge and would be released twice.
+  git push -u origin chore/back-merge-main-into-dev
+  gh pr create --base dev \
+    --title "chore: back-merge main into dev after the <release> promotion" \
+    --body "Carries the <release> promotion, folds and hotfixes back to dev. Closes nothing."
+  # STOP. Step 2 cuts from origin/dev and needs this merged. Poll until MERGED; do not continue
+  # on OPEN, CLOSED or a dirty mergeStateStatus:
+  #   gh pr view <n> --json state,mergeStateStatus
+fi
 
 # Step 2 — promote dev to main, as a PR into main, from a release/vX.Y.Z-prep branch cut from
 # the reconciled dev that ALSO carries the release commit (CHANGELOG promotion, meson.build
@@ -134,9 +146,13 @@ gh pr create --base main --head release/vX.Y.Z-prep \
   --body "dev -> main promotion for vX.Y.Z. Tag follows once merged."
 # Get it approved and merged (a merge commit; the ruleset forbids a force or direct push).
 
-# Step 3 — re-run preflight. Expect check #9 to report main ahead by the step-2 merge commit
-# (and dev ahead by anything merged since); confirm the dev..main list is only release prep,
-# hotfixes and merges, then proceed to Phase 1.
+# Step 3 — re-run preflight (after re-syncing local main as in Phase 0). Expect check #9 to
+# report main ahead by the step-2 merge commit (and dev ahead by anything merged since).
+# ACCEPTANCE TEST for the red #9 (docs/branch-strategy.md §3.3; tooling fix tracked in #6427):
+git log --no-merges --oneline origin/dev..origin/main   # must be ONLY release prep + hotfixes you can name
+git cherry -v origin/dev origin/main                     # every `+` must be one of those; an unnamed `+` STOPS the release
+git diff --stat origin/main release/vX.Y.Z-prep          # must be exactly the intended release delta
+# Record all three outputs and "judged by <name>" in the promotion PR's body, then proceed.
 bash scripts/release-preflight.sh vX.Y.Z
 ```
 
@@ -151,6 +167,8 @@ happens after the release (Phase 6 step 1).
 ## Phase 1 — Tag and push (~5 sec)
 
 ```bash
+git fetch origin && git switch main && git merge --ff-only origin/main
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || { echo "local main != origin/main - do not tag"; exit 1; }
 git tag -a vX.Y.Z -m "Release vX.Y.Z"
 git push origin vX.Y.Z
 ```
@@ -413,7 +431,8 @@ After all verification passes:
    # the entire C++ matrix on dev + every open PR (fixed in fca69e34).
    # (No CHANGELOG step: the promote already left the ## [Unreleased] header +
    # do-not-edit note in place; new entries arrive as changelog.d/ fragments.)
-   git commit -am "chore(post-release): bump dev to X.Y.Z+1"
+   git add meson.build            # never `commit -a`: a stray tracked change would ride along
+   git commit -m "chore(post-release): bump dev to X.Y.Z+1"
    ```
    One PR, not two: a separate bump branch cut from `origin/dev` before the back-merge has
    merged lacks `main`'s commits and conflicts with the promotion's version stamp. #6271 is the
@@ -442,7 +461,10 @@ SHA256SUMS:  verified
 
 Compose Wizard: bundled (or absent — see Phase 5)
 
-Next dev version: X.Y.(Z+1) (operator: bump on dev branch — plain version, no -dev suffix)
+Preflight #9:  main ahead <n> / dev ahead <m>; `git cherry` + lines: <list or none>; judged benign by <name> (promotion PR #<n> body)
+Post-tag:      changelog.d/ on main = README.md only; no duplicate bullet across headers; compose defaults = X.Y.Z
+
+Next dev version: X.Y.(Z+1) (bumped in the back-merge PR #<n>, Phase 6 step 1)
 ```
 
 If anything failed, list the failures + the fix attempted + final status, and explicitly state whether the release is shippable as-is or requires a follow-up patch release.
