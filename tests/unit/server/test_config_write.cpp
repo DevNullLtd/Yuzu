@@ -187,7 +187,37 @@ TEST_CASE("config_write: with no store the view is a fault, never an empty confi
           "[server][config_write]") {
     config::Backing none{};
     CHECK_FALSE(config::store_ready(none));
-    CHECK_FALSE(config::build_config_view(none).has_value());
     const auto viewer = session(auth::Role::admin);
-    CHECK_FALSE(config::build_config_view(none, &viewer).has_value());
+    CHECK_FALSE(config::build_config_view(none, viewer, true).has_value());
+    CHECK_FALSE(config::build_config_view(none, viewer, false).has_value());
+}
+
+TEST_CASE("config_write: effect_of classifies every allowed key and only the live ones are immediate",
+          "[server][config_write]") {
+    for (const auto& k : RuntimeConfigStore::allowed_keys()) {
+        INFO(k);
+        const auto e = config::effect_of(k);
+        CHECK((e == "immediate" || e == "deferred" || e == "stored_only"));
+        const bool live = k == "heartbeat_timeout" || k == "log_level";
+        CHECK((e == "immediate") == live);
+        const bool deferred = k.starts_with("dex_alert") || k.starts_with("dex_blast") ||
+                              k == "dex_cohort_export_key";
+        CHECK((e == "deferred") == deferred);
+    }
+    // The inert ones an operator might believe are in force.
+    for (const char* k : {"plugin_signing_required", "auto_approve_enabled", "audit_retention_days",
+                          "response_retention_days", "guardian_event_retention_days",
+                          "oidc_issuer", "oidc_admin_group", "oidc_client_secret"})
+        CHECK(config::effect_of(k) == "stored_only");
+}
+
+TEST_CASE("config_write: applied_json adds the effect only when asked, and never a secret's value",
+          "[server][config_write]") {
+    CHECK_FALSE(config::applied_json("log_level", "info").contains("effect"));
+    const auto with = config::applied_json("log_level", "info", true);
+    CHECK(with["effect"] == "immediate");
+    CHECK(with["value"] == "info");
+    const auto secret = config::applied_json("oidc_client_secret", "s3cret", true);
+    CHECK_FALSE(secret.contains("value"));
+    CHECK(secret["effect"] == "stored_only");
 }

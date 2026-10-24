@@ -109,8 +109,10 @@ struct WriteFault {
 /// is durable and readable by every role seeded AuditLog:Read.
 [[nodiscard]] std::string success_audit_detail(const std::string& key, const std::string& value);
 
-/// The body of a successful write. A secret key's value is never echoed.
-[[nodiscard]] nlohmann::json applied_json(const std::string& key, const std::string& value);
+/// The body of a successful write. A secret key's value is never echoed. `with_effect` adds the
+/// `effect_of(key)` field (v1 and MCP only: the legacy body keeps its shape).
+[[nodiscard]] nlohmann::json applied_json(const std::string& key, const std::string& value,
+                                          bool with_effect = false);
 
 /// Why a read failed: the store is not open or could not be read. A degraded store must NOT read
 /// as "nothing is configured": the presence of a secret key and its `is_set` are how an operator
@@ -120,15 +122,30 @@ struct ViewFault {};
 /// The effective values, the stored overrides, `allowed_keys` and `read_only_keys` (the allowed
 /// keys the generic write refuses because they have their own route).
 ///
-/// `viewer` selects the audience. Null (the legacy `GET /api/config`, kept byte-identical) shows
-/// every override to every caller that passed the `Infrastructure:Read` gate. A session (the v1
-/// route and the MCP tool) is shown only the values it could WRITE: for every key
-/// `write_refusal` would deny it, the stored override is dropped and, for `audit_retention_days`,
-/// so is the effective value; the response then carries `withheld_keys`, the sorted keys withheld
-/// from this caller, so a client can tell "not set" from "not shown to you". This keeps a
-/// readonly-tier MCP token, which `tier_allows` bars from `OidcConfig:Read`, from reading the
-/// `oidc_*` overrides (`oidc_admin_group` is authorization topology) through the generic view.
-[[nodiscard]] std::expected<nlohmann::json, ViewFault> build_config_view(
-    const Backing& b, const auth::Session* viewer = nullptr);
+/// The view is scoped to `viewer`, on every surface: a caller is shown only the overrides it could
+/// WRITE. For every key `write_refusal` would deny it, the stored override is dropped and, for
+/// `audit_retention_days`, so is the effective value; a stored row whose key has no write class at
+/// all (stale or renamed) is shown only to an effective administrator. This keeps a readonly-tier
+/// MCP token, which `tier_allows` bars from `OidcConfig:Read`, from reading the `oidc_*` overrides
+/// (`oidc_admin_group` is authorization topology) through the generic view. An administrator whose
+/// own role is `admin` sees everything, so the legacy body is unchanged for the Settings page.
+///
+/// `declare_withheld` adds `withheld_keys`, the sorted allowed keys withheld from this viewer, so a
+/// client can tell "not shown to you" from "not set". The v1 route and the MCP tool declare it; the
+/// legacy route does not, to keep its body shape. The viewer is REQUIRED: there is no "show
+/// everything" audience, so a new surface cannot get the unscoped view by omitting an argument.
+[[nodiscard]] std::expected<nlohmann::json, ViewFault> build_config_view(const Backing& b,
+                                                                         const auth::Session& viewer,
+                                                                         bool declare_withheld);
+
+/// How soon a successful write of `key` changes what the server does, for the `effect` field of
+/// the v1 and MCP write answers (`applied` only says the value was accepted and stored):
+///   "immediate"   the running server uses it now (heartbeat_timeout on the local reaper, log_level)
+///   "deferred"    stored, applied only by the next DEX Alerts save or a restart (the dex_* keys)
+///   "stored_only" stored and reported, but nothing consumes it: the retention windows (the stores
+///                 take theirs from the command-line flags), auto_approve_enabled,
+///                 plugin_signing_required (records intent) and the oidc_* keys (a restart does not
+///                 rebuild the provider from them).
+[[nodiscard]] std::string_view effect_of(std::string_view key);
 
 } // namespace yuzu::server::config

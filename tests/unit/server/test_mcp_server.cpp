@@ -40531,7 +40531,8 @@ TEST_CASE("MCP runtime config: set writes the store and the live config, get rea
     auto payload = nlohmann::json::parse(set["result"]["content"][0]["text"].get<std::string>());
     CHECK(payload == nlohmann::json({{"key", "response_retention_days"},
                                      {"value", "140"},
-                                     {"applied", true}}));
+                                     {"applied", true},
+                                     {"effect", "stored_only"}}));
     CHECK(w.store.get_value("response_retention_days") == "140");
     CHECK(w.cfg.response_retention_days == 140);
     REQUIRE(ts.audit_log.size() == 3);
@@ -40648,6 +40649,46 @@ TEST_CASE("MCP runtime config: the route-owned key and bad input are invalid par
     }
 }
 
+TEST_CASE("MCP runtime config: an extra argument is refused, not ignored; effect and the heartbeat "
+          "ceiling are reported",
+          "[pg][mcp][integration][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
+    RuntimeConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.runtime_config_for_test = w.backing();
+    ts.start("supervised");
+
+    // additionalProperties:false is advertised on a tool that never takes the schema-validated
+    // path, so the handler refuses it: {"dry_run":true} must not become a real write.
+    auto extra = mcp_tool_call(ts, "set_runtime_config",
+                               R"({"key":"response_retention_days","value":"150","dry_run":true})");
+    REQUIRE(extra.contains("error"));
+    CHECK(extra["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(extra["error"]["message"].get<std::string>().find("dry_run") != std::string::npos);
+    CHECK(w.store.get_value("response_retention_days").empty());
+    for (const auto& entry : ts.audit_log)
+        CHECK_FALSE(entry.starts_with("config.update"));
+
+    // The effect is reported so applied:true is not read as "in use".
+    auto live = set_runtime_config_call(ts, "log_level", "info");
+    REQUIRE_FALSE(live.contains("error"));
+    CHECK(nlohmann::json::parse(live["result"]["content"][0]["text"].get<std::string>())["effect"] ==
+          "immediate");
+    auto stored = set_runtime_config_call(ts, "auto_approve_enabled", "true");
+    REQUIRE_FALSE(stored.contains("error"));
+    CHECK(nlohmann::json::parse(stored["result"]["content"][0]["text"].get<std::string>())["effect"] ==
+          "stored_only");
+
+    // heartbeat_timeout is bounded: a value that would stop stale-agent reaping is refused.
+    for (const char* bad : {"29", "86401", "2147483647"}) {
+        INFO(bad);
+        auto body = set_runtime_config_call(ts, "heartbeat_timeout", bad);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    CHECK_FALSE(set_runtime_config_call(ts, "heartbeat_timeout", "86400").contains("error"));
+}
+
 TEST_CASE("MCP runtime config: no audit row, no mutation",
           "[pg][mcp][integration][runtime_config][audit_failclose]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
@@ -40702,6 +40743,7 @@ TEST_CASE("MCP runtime config: readonly and operator tokens cannot write, a serv
         ts.start("supervised");
         auto set = set_runtime_config_call(ts, "response_retention_days", "171");
         REQUIRE(set.contains("error"));
+        CHECK(set["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
         CHECK(set["error"]["message"].get<std::string>().find("runtime config store") ==
               std::string::npos); // refused by the gate, not by an unwired handler
         for (const auto& entry : ts.audit_log)
@@ -40822,7 +40864,10 @@ TEST_CASE("MCP runtime config: get_runtime_config withholds what the caller coul
     CHECK(data["overrides"].contains("response_retention_days"));
     CHECK_FALSE(data["overrides"].contains("oidc_admin_group"));
     CHECK_FALSE(data["config"].contains("audit_retention_days"));
-    CHECK(std::ranges::find(data["withheld_keys"], "oidc_admin_group") != data["withheld_keys"].end());
+    bool oidc_group_declared = false;
+    for (const auto& k : data["withheld_keys"])
+        oidc_group_declared = oidc_group_declared || k == "oidc_admin_group";
+    CHECK(oidc_group_declared);
     CHECK(view.dump().find("grp-admins") == std::string::npos);
 }
 

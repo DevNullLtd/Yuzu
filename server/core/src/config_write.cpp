@@ -13,7 +13,9 @@
 
 #include <charconv>
 #include <chrono>
+#include <mutex>
 #include <set>
+#include <string_view>
 #include <system_error>
 
 namespace yuzu::server::config {
@@ -130,6 +132,11 @@ std::expected<int, std::string> validate_value(std::string_view key, std::string
 std::expected<void, WriteFault> write_and_apply(const Backing& b, const std::string& key,
                                                 const std::string& value, int parsed_int,
                                                 const std::string& username) {
+    // One writer at a time across the store write and the live apply, so two concurrent writes of
+    // the same key cannot leave the store holding one value and the live config the other. This
+    // orders writers only; the plain-int Config fields are still read without it by other threads.
+    static std::mutex write_mutex;
+    const std::scoped_lock lock(write_mutex);
     auto result = b.store->set(key, value, username);
     if (!result) {
         // A refusal of the value is operator-written text (no value, no secret). A database
@@ -171,14 +178,28 @@ std::string success_audit_detail(const std::string& key, const std::string& valu
                            : value);
 }
 
-nlohmann::json applied_json(const std::string& key, const std::string& value) {
-    return RuntimeConfigStore::is_secret_key(key)
-               ? nlohmann::json{{"key", key}, {"applied", true}}
-               : nlohmann::json{{"key", key}, {"value", value}, {"applied", true}};
+nlohmann::json applied_json(const std::string& key, const std::string& value, bool with_effect) {
+    auto body = RuntimeConfigStore::is_secret_key(key)
+                    ? nlohmann::json{{"key", key}, {"applied", true}}
+                    : nlohmann::json{{"key", key}, {"value", value}, {"applied", true}};
+    if (with_effect)
+        body["effect"] = effect_of(key);
+    return body;
+}
+
+std::string_view effect_of(std::string_view key) {
+    if (key == "heartbeat_timeout" || key == "log_level")
+        return "immediate";
+    if (key == "dex_alert_routing" || key == "dex_blast_min_devices" ||
+        key == "dex_blast_window_seconds" || key == "dex_blast_cooldown_seconds" ||
+        key == "dex_cohort_export_key")
+        return "deferred";
+    return "stored_only";
 }
 
 std::expected<nlohmann::json, ViewFault> build_config_view(const Backing& b,
-                                                           const auth::Session* viewer) {
+                                                           const auth::Session& viewer,
+                                                           bool declare_withheld) {
     // Checked first: a degraded store must not read as "nothing is configured" (see ViewFault).
     if (!store_ready(b))
         return std::unexpected(ViewFault{});
@@ -189,15 +210,15 @@ std::expected<nlohmann::json, ViewFault> build_config_view(const Backing& b,
         return std::unexpected(ViewFault{});
     }
 
-    // Keys this viewer may not see (empty for the legacy audience). Only a DENIED key is
-    // withheld: a route-owned key's value is not authority, and it stays listed.
+    // Keys this viewer may not see. Only a DENIED key is withheld: a route-owned key's value is not
+    // authority, and it stays listed.
     std::set<std::string> withheld;
-    if (viewer)
-        for (const auto& k : RuntimeConfigStore::allowed_keys()) {
-            auto refusal = write_refusal(k, *viewer);
-            if (refusal && refusal->kind == WriteRefusal::Kind::Denied)
-                withheld.insert(k);
-        }
+    for (const auto& k : RuntimeConfigStore::allowed_keys()) {
+        auto refusal = write_refusal(k, viewer);
+        if (refusal && refusal->kind == WriteRefusal::Kind::Denied)
+            withheld.insert(k);
+    }
+    const bool viewer_is_admin = authz::admin_gate_verdict(viewer) == authz::AdminGate::Admit;
 
     nlohmann::json config_obj;
     // Current effective values (from cfg + overrides)
@@ -207,13 +228,22 @@ std::expected<nlohmann::json, ViewFault> build_config_view(const Backing& b,
         config_obj["audit_retention_days"] = b.cfg->audit_retention_days;
     config_obj["guardian_event_retention_days"] = b.cfg->guardian_event_retention_days;
     config_obj["auto_approve_enabled"] = !b.auto_approve->list_rules().empty();
-    config_obj["log_level"] = spdlog::level::to_string_view(spdlog::default_logger()->level()).data();
+    // spdlog names the level "warning"; the write accepts "warn". Report the writable spelling so
+    // a read followed by a write of the same value round-trips.
+    const auto level_sv = spdlog::level::to_string_view(spdlog::default_logger()->level());
+    const std::string level(level_sv.data(), level_sv.size());
+    config_obj["log_level"] = level == "warning" ? std::string("warn") : level;
 
+    // Drop what this viewer may not see: a withheld key, and a stored row whose key has no write
+    // class at all (stale or renamed), which only an effective administrator is shown. This
+    // default is deny: a row we cannot classify is not shown to a caller we cannot vouch for.
+    std::erase_if(*overrides_result, [&](const RuntimeConfigEntry& e) {
+        if (withheld.contains(e.key))
+            return true;
+        return !RuntimeConfigStore::write_class(e.key).has_value() && !viewer_is_admin;
+    });
     // The omission rule for a secret's value lives in build_overrides_json
     // (runtime_config_view.hpp), the site the secret leaked from twice.
-    if (!withheld.empty())
-        std::erase_if(*overrides_result,
-                      [&](const RuntimeConfigEntry& e) { return withheld.contains(e.key); });
     nlohmann::json overrides = build_overrides_json(*overrides_result);
 
     nlohmann::json allowed = nlohmann::json::array();
@@ -232,7 +262,7 @@ std::expected<nlohmann::json, ViewFault> build_config_view(const Backing& b,
                          {"overrides", overrides},
                          {"allowed_keys", allowed},
                          {"read_only_keys", read_only}});
-    if (viewer)
+    if (declare_withheld)
         view["withheld_keys"] = withheld; // a std::set serialises as a sorted array
     return view;
 }

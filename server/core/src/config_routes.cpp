@@ -121,6 +121,14 @@ void handle_put(const Deps& deps, const httplib::Request& req, httplib::Response
             return;
         }
         auto j = nlohmann::json::parse(req.body);
+        // The v1 route takes a string or a JSON scalar, as its OpenAPI schema says; null, an
+        // array and an object would be stored as their JSON text. The legacy route keeps taking
+        // them (its bodies are unchanged).
+        if (v1 && j.is_object() && j.contains("value") && !j["value"].is_string() &&
+            !j["value"].is_number() && !j["value"].is_boolean()) {
+            refuse(400, "value must be a string, number or boolean");
+            return;
+        }
         if (j.contains("value")) {
             value = j["value"].is_string() ? j["value"].get<std::string>() : j["value"].dump();
         } else {
@@ -177,7 +185,7 @@ void handle_put(const Deps& deps, const httplib::Request& req, httplib::Response
     const bool persisted = detail::emit_behavioral_audit(deps.audit_fn, req, res, "config.update",
                                                          "success", "RuntimeConfig", key,
                                                          success_audit_detail(key, value));
-    auto body = applied_json(key, value);
+    auto body = applied_json(key, value, /*with_effect=*/v1);
     if (!v1) {
         res.set_content(body.dump(), "application/json");
         return;
@@ -195,9 +203,14 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/api/config", [deps](const httplib::Request& req, httplib::Response& res) {
         if (!deps.perm_fn(req, res, "Infrastructure", "Read"))
             return;
+        // The view is scoped to the caller (build_config_view): an administrator's body is the
+        // original, byte for byte; a reader that could not write a key does not get its override.
+        auto session = deps.auth_fn(req, res);
+        if (!session)
+            return;
         // A degraded store must NOT read as "nothing is configured" (config_write.hpp,
         // ViewFault). The PUT twin answers 503 on the same condition.
-        auto view = build_config_view(deps.backing());
+        auto view = build_config_view(deps.backing(), *session, /*declare_withheld=*/false);
         if (!view) {
             res.status = 503;
             res.set_content(terse_body(503, "runtime config store unavailable"), "application/json");
@@ -217,13 +230,13 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/api/v1/config", [deps](const httplib::Request& req, httplib::Response& res) {
         if (!deps.perm_fn(req, res, "Infrastructure", "Read"))
             return;
-        // The viewing session scopes what is shown (build_config_view): the legacy route above
-        // shows every override to every reader; this route shows only what the caller could write.
+        // The viewing session scopes what is shown (build_config_view), as on the legacy route;
+        // this route also declares the keys withheld from the caller.
         auto session = deps.auth_fn(req, res);
         if (!session)
             return;
         res.set_header("Cache-Control", "no-store");
-        auto view = build_config_view(deps.backing(), &*session);
+        auto view = build_config_view(deps.backing(), *session, /*declare_withheld=*/true);
         if (!view) {
             res.status = 503;
             res.set_content(

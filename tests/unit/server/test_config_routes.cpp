@@ -40,6 +40,7 @@
 #include <httplib.h>
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <atomic>
@@ -1383,20 +1384,25 @@ TEST_CASE("config_routes: GET /api/v1/config is the legacy body under data, secr
     CHECK(v1->body.find("s3cret") == std::string::npos);
 }
 
-// The v1 view is scoped to the caller; the legacy view is not.
-TEST_CASE("config_routes: GET /api/v1/config withholds the overrides a caller could not write; "
-          "the legacy GET still shows them",
+// Every GET shape is scoped to the caller; only the v1 route and the MCP tool declare what is withheld.
+TEST_CASE("config_routes: both GET routes withhold the overrides a caller could not write; the v1 "
+          "route declares them",
           "[pg][server][routes][config_routes][elevation]") {
     YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
     PgWired w{db.dsn()};
     MockHarness h; // an administrator first, to store one override of each class
     h.runtime_config_store = &w.store;
     h.wire();
-    REQUIRE(h.sink.Put("/api/config/oidc_admin_group", R"({"value":"grp-admins"})")->status == 200);
-    REQUIRE(h.sink.Put("/api/config/plugin_signing_required", R"({"value":"true"})")->status == 200);
-    REQUIRE(h.sink.Put("/api/config/audit_retention_days", R"({"value":"400"})")->status == 200);
-    REQUIRE(h.sink.Put("/api/config/response_retention_days", R"({"value":"120"})")->status == 200);
+    for (const auto& [key, value] : std::vector<std::pair<std::string, std::string>>{
+             {"oidc_admin_group", "grp-admins"},
+             {"oidc_issuer", "https://idp.example.com"},
+             {"oidc_client_secret", "s3cret"},
+             {"plugin_signing_required", "true"},
+             {"audit_retention_days", "400"},
+             {"response_retention_days", "120"}})
+        REQUIRE(h.sink.Put("/api/config/" + key, json({{"value", value}}).dump())->status == 200);
 
+    // The oracle is spelled out, not derived: 6 oidc keys, plugin signing, audit retention, 5 dex.
     const std::vector<std::string> withheld_for_token{
         "audit_retention_days",       "dex_alert_routing",
         "dex_blast_cooldown_seconds", "dex_blast_min_devices",
@@ -1406,7 +1412,7 @@ TEST_CASE("config_routes: GET /api/v1/config withholds the overrides a caller co
         "oidc_redirect_uri",          "oidc_skip_tls_verify",
         "plugin_signing_required"};
 
-    // An MCP-tier token (and a plain user) sees the general override, not the others.
+    // An MCP-tier token and a plain user see the general override and none of the others.
     for (const bool token : {true, false}) {
         MockHarness t;
         t.runtime_config_store = &w.store;
@@ -1415,33 +1421,113 @@ TEST_CASE("config_routes: GET /api/v1/config withholds the overrides a caller co
         else
             t.session_role = auth::Role::user;
         t.wire();
-        auto v1 = t.sink.Get("/api/v1/config");
-        REQUIRE(v1);
-        CHECK(v1->status == 200);
-        const auto data = body(v1->body)["data"];
-        CHECK(data["overrides"].contains("response_retention_days"));
-        for (const auto& k : withheld_for_token) {
-            INFO(k);
-            CHECK_FALSE(data["overrides"].contains(k));
+        for (const bool v1_route : {true, false}) {
+            INFO((token ? "token " : "user ") << (v1_route ? "v1" : "legacy"));
+            auto res = t.sink.Get(v1_route ? "/api/v1/config" : "/api/config");
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            auto data = body(res->body);
+            if (v1_route)
+                data = data["data"];
+            CHECK(data["overrides"].contains("response_retention_days"));
+            for (const auto& k : withheld_for_token) {
+                INFO(k);
+                CHECK_FALSE(data["overrides"].contains(k));
+            }
+            CHECK_FALSE(data["config"].contains("audit_retention_days"));
+            CHECK(data.contains("withheld_keys") == v1_route);
+            if (v1_route)
+                CHECK(data["withheld_keys"] == json(withheld_for_token));
+            CHECK(res->body.find("grp-admins") == std::string::npos);
+            CHECK(res->body.find("idp.example.com") == std::string::npos);
         }
-        CHECK_FALSE(data["config"].contains("audit_retention_days"));
-        CHECK(data["withheld_keys"] == json(withheld_for_token));
-        // The same session on the legacy route is unchanged: every override, no declaration.
-        auto legacy = t.sink.Get("/api/config");
-        REQUIRE(legacy);
-        const auto old = body(legacy->body);
-        CHECK(old["overrides"].contains("oidc_admin_group"));
-        CHECK(old["config"].contains("audit_retention_days"));
-        CHECK_FALSE(old.contains("withheld_keys"));
     }
 
-    // An administrator sees everything and withholds nothing.
+    // An administrator sees everything on both routes; the legacy body has no withheld_keys.
+    auto legacy = h.sink.Get("/api/config");
     auto admin = h.sink.Get("/api/v1/config");
+    REQUIRE(legacy);
     REQUIRE(admin);
+    const auto old = body(legacy->body);
+    CHECK(old["overrides"].contains("oidc_admin_group"));
+    CHECK(old["overrides"]["oidc_client_secret"]["is_set"] == true);
+    CHECK(old["config"].contains("audit_retention_days"));
+    CHECK_FALSE(old.contains("withheld_keys"));
     const auto adm = body(admin->body)["data"];
-    CHECK(adm["overrides"].contains("oidc_admin_group"));
-    CHECK(adm["config"].contains("audit_retention_days"));
     CHECK(adm["withheld_keys"] == json::array());
+    auto adm_without = adm;
+    adm_without.erase("withheld_keys");
+    CHECK(adm_without == old);
+
+    // An elevated-only user is refused the oidc_* keys but not the other admin-class ones.
+    MockHarness e;
+    e.runtime_config_store = &w.store;
+    e.session_role = auth::Role::user;
+    e.session_elevated = true;
+    e.wire();
+    const auto ev = body(e.sink.Get("/api/v1/config")->body)["data"];
+    CHECK_FALSE(ev["overrides"].contains("oidc_admin_group"));
+    CHECK(ev["overrides"].contains("plugin_signing_required"));
+    CHECK(ev["withheld_keys"].size() == 6);
+}
+
+// A stored row the write classes know nothing about (stale, renamed) is shown only to an effective
+// administrator: the scoped view defaults to deny.
+TEST_CASE("config_routes: a stored row with no write class is withheld from a non-administrator",
+          "[pg][server][routes][config_routes][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult ins{PQexec(conn.get(),
+                                "INSERT INTO runtime_config_store.runtime_config "
+                                "(key, value, updated_by, updated_at) "
+                                "VALUES ('legacy_removed_key', 'leftover', 'old', 1)")};
+        REQUIRE(ins.ok());
+    }
+    MockHarness user;
+    user.runtime_config_store = &w.store;
+    user.session_role = auth::Role::user;
+    user.wire();
+    MockHarness admin;
+    admin.runtime_config_store = &w.store;
+    admin.wire();
+    for (const char* path : {"/api/config", "/api/v1/config"}) {
+        INFO(path);
+        auto u = user.sink.Get(path);
+        auto a = admin.sink.Get(path);
+        REQUIRE(u);
+        REQUIRE(a);
+        CHECK(u->body.find("legacy_removed_key") == std::string::npos);
+        CHECK(a->body.find("legacy_removed_key") != std::string::npos);
+    }
+}
+
+// The view must fail, not read as empty, when the store is open but the read itself fails.
+TEST_CASE("config_routes: an open store whose read fails answers 503 on every GET",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+    REQUIRE(h.sink.Get("/api/config")->status == 200);
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult drop{PQexec(conn.get(), "ALTER TABLE runtime_config_store.runtime_config "
+                                             "RENAME TO runtime_config_gone")};
+        REQUIRE(drop.ok());
+    }
+    for (const char* path : {"/api/config", "/api/v1/config"}) {
+        INFO(path);
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(body(res->body)["error"]["code"] == 503);
+        CHECK(res->body.find("overrides") == std::string::npos); // never an empty configuration
+    }
 }
 
 TEST_CASE("config_routes: an open store is not enough, the live config and the engine must be wired",
@@ -1453,7 +1539,9 @@ TEST_CASE("config_routes: an open store is not enough, the live config and the e
     CHECK(config::store_ready({&cfg, &engine, &w.store}));
     CHECK_FALSE(config::store_ready({nullptr, &engine, &w.store}));
     CHECK_FALSE(config::store_ready({&cfg, nullptr, &w.store}));
-    CHECK_FALSE(config::build_config_view({nullptr, &engine, &w.store}).has_value());
+    auth::Session admin;
+    admin.role = auth::Role::admin;
+    CHECK_FALSE(config::build_config_view({nullptr, &engine, &w.store}, admin, true).has_value());
 }
 
 TEST_CASE("config_routes: the legacy and v1 PUT agree on validation, audit rows and the success "
@@ -1515,7 +1603,10 @@ TEST_CASE("config_routes: PUT /api/v1/config/{param} writes, applies and audits 
     CHECK(res->get_header_value("Cache-Control") == "no-store");
     const auto b = body(res->body);
     CHECK(b["meta"]["api_version"] == "v1");
-    CHECK(b["data"] == json({{"key", "response_retention_days"}, {"value", "130"}, {"applied", true}}));
+    CHECK(b["data"] == json({{"key", "response_retention_days"},
+                             {"value", "130"},
+                             {"applied", true},
+                             {"effect", "stored_only"}}));
     CHECK(h.cfg.response_retention_days == 130);
     CHECK(w.store.get_value("response_retention_days") == "130");
     REQUIRE(h.audits.size() == 2);
@@ -1540,6 +1631,109 @@ TEST_CASE("config_routes: PUT /api/v1/config/{param} writes, applies and audits 
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(w.store.get_value("heartbeat_timeout") == "45");
+}
+
+TEST_CASE("config_routes: the v1 PUT reports how soon a write takes effect; the legacy body has no effect field",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+    const std::vector<std::pair<std::string, std::pair<std::string, std::string>>> cases{
+        {"log_level", {"info", "immediate"}},
+        {"heartbeat_timeout", {"45", "immediate"}},
+        {"dex_blast_min_devices", {"5", "deferred"}},
+        {"plugin_signing_required", {"true", "stored_only"}},
+        {"auto_approve_enabled", {"false", "stored_only"}},
+        {"audit_retention_days", {"400", "stored_only"}},
+        {"oidc_issuer", {"https://idp.example.com", "stored_only"}}};
+    for (const auto& [key, vv] : cases) {
+        INFO(key);
+        auto res = h.sink.Put("/api/v1/config/" + key, json({{"value", vv.first}}).dump());
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        CHECK(body(res->body)["data"]["effect"] == vv.second);
+        auto legacy = h.sink.Put("/api/config/" + key, json({{"value", vv.first}}).dump());
+        REQUIRE(legacy);
+        CHECK_FALSE(body(legacy->body).contains("effect"));
+    }
+}
+
+TEST_CASE("config_routes: heartbeat_timeout is bounded to 30..86400 on both PUT routes",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+    for (const char* prefix : {"/api/config/", "/api/v1/config/"}) {
+        INFO(prefix);
+        for (const char* ok : {"30", "86400"}) {
+            auto res = h.sink.Put(std::string(prefix) + "heartbeat_timeout",
+                                  std::string(R"({"value":")") + ok + R"("})");
+            REQUIRE(res);
+            CHECK(res->status == 200);
+        }
+        for (const char* bad : {"29", "86401", "2147483647"}) {
+            INFO(bad);
+            auto res = h.sink.Put(std::string(prefix) + "heartbeat_timeout",
+                                  std::string(R"({"value":")") + bad + R"("})");
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+    }
+    CHECK(h.cfg.session_timeout.count() == 86400); // the last accepted write
+}
+
+TEST_CASE("config_routes: the v1 PUT takes a string or a JSON scalar, not null, an array or an object",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+    for (const char* bad : {R"({"value":null})", R"({"value":[1]})", R"({"value":{"a":1}})"}) {
+        INFO(bad);
+        h.audits.clear();
+        auto res = h.sink.Put("/api/v1/config/oidc_issuer", bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(body(res->body)["error"]["message"].get<std::string>().find("string, number or boolean") !=
+              std::string::npos);
+        CHECK(h.audits.empty());
+        CHECK(w.store.get_value("oidc_issuer").empty());
+    }
+    for (const char* ok : {R"({"value":"x"})", R"({"value":true})", R"({"value":7})"}) {
+        INFO(ok);
+        auto res = h.sink.Put("/api/v1/config/oidc_issuer", ok);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+}
+
+TEST_CASE("config_routes: log_level reads back in the spelling the write accepts",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+    const auto before = spdlog::default_logger()->level();
+    REQUIRE(h.sink.Put("/api/v1/config/log_level", R"({"value":"warn"})")->status == 200);
+    for (const char* path : {"/api/config", "/api/v1/config"}) {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        auto data = body(res->body);
+        if (data.contains("data"))
+            data = data["data"];
+        CHECK(data["config"]["log_level"] == "warn");
+        // and the value read is accepted by the write
+        REQUIRE(h.sink.Put("/api/v1/config/log_level",
+                           json({{"value", data["config"]["log_level"]}}).dump())
+                    ->status == 200);
+    }
+    spdlog::default_logger()->set_level(before);
 }
 
 TEST_CASE("config_routes: the v1 PUT refuses the change when the attempted row cannot be written, "
