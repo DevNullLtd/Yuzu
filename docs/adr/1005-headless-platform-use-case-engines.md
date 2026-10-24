@@ -878,9 +878,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        deliberate.
      - **Acceptance.** Accepted by the ADR owner (Dave Rae) on 2026-10-23, as
        a session statement like the entries above and not a signed decision.
-       It has no revisit date. Issue #6359 carries the conditions for
-       revisiting it: an agentic worker shown to need guide text the default
-       document lacks, or the first release that ships the `/swagger` page.
+       Revisit by 2026-12-19, eight weeks after acceptance, as the ADR owner
+       directed on 2026-10-24 (a session statement). Issue #6359 carries the
+       conditions for revisiting it: an agentic worker shown to need guide
+       text the default document lacks, or the first release that ships the
+       `/swagger` page. The date is not machine-checked.
 
 ## Interim rules (until the named follow-ups ship)
 
