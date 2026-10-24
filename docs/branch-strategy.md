@@ -1,9 +1,10 @@
 # Branches, releases and hotfixes
 
 How work moves from a branch to a tagged release in this repository, as it is actually done
-today. Every statement below was checked against the tooling or the pull-request history on
-the date in the final section; nothing here is a proposal. Where the answer is "whoever decides,
-decides", §5 names who that is rather than inventing a rule.
+today. It describes practice, not a proposal: each section's claims were checked against the
+tooling or the pull-request history on the date given in §6, and where the tooling's own
+instructions and the observed practice differ, both are stated. Where the answer is "whoever
+decides, decides", §5 names who that is rather than inventing a rule.
 
 Companion documents: `CONTRIBUTING.md` (contributor onboarding, including branch naming),
 `.claude/skills/release/SKILL.md` (the step-by-step release procedure the `/release` skill runs),
@@ -24,16 +25,23 @@ The two rulesets are identical in substance: changes arrive only by pull request
 review is required; a review is dismissed when the author pushes again, and the last push must
 itself be approved; non-fast-forward pushes and branch deletion are refused; and six status
 checks must pass — *Linux gcc-15 debug*, *Windows MSVC debug*, *macOS debug*, *Proto
-backward-compat*, *Preflight (runner health)*, *CHANGELOG order*. Neither ruleset has bypass
-actors, so nothing — not a maintainer, not a workflow token — pushes to either branch directly.
+backward-compat*, *Preflight (runner health)*, *CHANGELOG order*.
+
+**Those rules are not absolute.** Which actors may bypass a ruleset is visible only to
+repository administrators (the API omits `bypass_actors` for everyone else, so a non-admin
+cannot confirm the list is empty), and the history shows that at least one account can: of the
+28 pull requests merged to `main` between 29 September and 24 October 2026, five merged with no
+approving review, and the 21 October back-merge into `dev` (#6271) merged with none, 61 seconds
+after its last commit. Read "one approving review is required" as the rule that applies to an
+ordinary contributor, not as a guarantee about every merge.
 
 > The rulesets live in the repository settings, not in git. Nothing in this repository can detect
 > a change to them, so the sentences above can drift silently. Re-check them against *Settings →
-> Rules* when you rely on them.
+> Rules* when you rely on them; only an administrator can see the bypass list.
 
 ### Branch naming in practice
 
-Prefixes used on the 730 pull requests merged between 24 August and 24 October 2026:
+Prefixes used on the 672 pull requests merged between 24 August and 24 October 2026:
 
 | Prefix | Count | Used for | Cut from | Merged to |
 |---|---|---|---|---|
@@ -45,6 +53,7 @@ Prefixes used on the 730 pull requests merged between 24 August and 24 October 2
 | `ci/` | 16 | workflow and runner changes | `dev` | `dev` |
 | `refactor/`, `test/`, `perf/` | 23 | as named | `dev` | `dev` |
 | `release/` | 2 | the version-bump and promotion PRs (§3) | `dev` | `main` |
+| other | 64 | `dependabot/` 39 (bot), `pg/` 13 and `po/` 4 (older workstream prefixes), 8 one-offs | `dev` | `dev` |
 
 `CONTRIBUTING.md` lists the prefixes a contributor should choose from; this table records what
 is actually used.
@@ -169,7 +178,7 @@ The sequence, as practised:
    carry every unreleased commit with it; a real hotfix PR has had between 2 and 8 commits
    (#5311, #6245, #5447), with one deliberate 29-commit stability bundle (#5493).
 2. **Fix, with a `changelog.d/` fragment**, and open the PR against `main`. The same six checks
-   and one approval apply as on `dev`.
+   and review rule apply as on `dev` (and the same bypass caveat, §1).
 3. **Merge**, then **fold the fragment** into the released section with
    `promote X.Y.Z --append` before the next tag (§3.4). The hotfix ships in the next candidate or
    patch release — 0.14.1 was the patch that carried the post-0.14.0 hotfixes.
@@ -184,8 +193,9 @@ to the release machinery itself (`release.yml`, `pre-release.yml`, packaging) go
 ## 5. Who decides
 
 Three questions are settled by current practice rather than by a written policy. This is the
-practice as confirmed by the repository owner on 2026-10-24; it may change, and this section is
-where the change should be recorded.
+practice as confirmed on 2026-10-24 and recorded on the originating issue
+([#119, comment](https://github.com/DevNullLtd/Yuzu/issues/119#issuecomment-6385608102)); it
+may change, and this section is where the change should be recorded.
 
 - **Whether a change is a hotfix is the PR author's call.** The author decides whether a fix goes
   to `main` now (§4) or waits for the next promotion (§3). There is no qualifying list; the
@@ -195,9 +205,10 @@ where the change should be recorded.
   that has meant only the latest tagged line: every hotfix since 29 September 2026 targeted
   0.14.x, and nothing has been ported to an older tag.
 - **Releases are cut by @fjarvis and @Tr3kkR.** They are the release authorities today: they
-  decide the version, run the promotion and the tag, and own the `main`→`dev` back-merge.
-  Hotfixes themselves are merged by any maintainer under the ordinary one-approval rule (four
-  different people did so in October 2026).
+  decide the version, run the promotion and the tag, and own the `main`→`dev` back-merge. In
+  the 0.14.0 and 0.14.1 cycles that was one person in practice: all 28 pull requests merged to
+  `main` between 29 September and 24 October 2026 were authored and merged by @fjarvis, with
+  approving reviews from two other maintainers on 23 of them and none on five (§1).
 
 ## 6. Verified against
 
@@ -208,13 +219,13 @@ touch this document or state why it needn't.
 | Section | Source |
 |---|---|
 | §1 roles, §3.3 trigger and gates | `.github/workflows/release.yml` (`on:`, `release-guard`, `docker-publish` tag rules), `.github/workflows/pre-release.yml` (`on: workflow_run`), `.github/workflows/ci.yml` (`on:`) |
-| §3.2–3.3 preflight and version sites | `scripts/release-preflight.sh` (checks 1–9), `scripts/check-compose-versions.sh` (`FILES`), `meson.build` (`version:`) |
+| §3.2–3.3 preflight and version sites | `scripts/release-preflight.sh` (checks 1–10, including 4b; 10 is the optional `--full` build), `scripts/check-compose-versions.sh` (`FILES`), `meson.build` (`version:`) |
 | §2 step 4, §3.2, §3.4 fragments | `scripts/assemble-changelog.py` (`promote`, `promote --append`, `--check`), `changelog.d/README.md` |
 | §3 procedure | `.claude/skills/release/SKILL.md` (pre-conditions, Phases 0–6); Phase 0.5 was rewritten in the same change as this document to match the PR-only rulesets; its Phase 6 immediate version bump is the step §3.5 notes was not done after 0.14.1 |
-| §1 rulesets, §2 step 6 merge methods | Repository settings: rulesets *Protect Dev* (id 15845250) and *Protect Main* (id 13631572), `allow_merge_commit`/`allow_squash_merge`/`allow_rebase_merge`, `delete_branch_on_merge` — **not in git** |
-| §1 naming table | head-branch names of the 730 PRs merged 2026-08-24 → 2026-10-24 |
+| §1 rulesets, §2 step 6 merge methods | Repository settings: rulesets *Protect Dev* (id 15845250) and *Protect Main* (id 13631572), `allow_merge_commit`/`allow_squash_merge`/`allow_rebase_merge`, `delete_branch_on_merge` — **not in git**. Checked with a non-admin token, which cannot see `bypass_actors`; the bypass statement rests on the review state of the 28 `main` PRs and of #6271 |
+| §1 naming table | head-branch names of the 672 PRs merged 2026-08-24 → 2026-10-24 (`gh pr list --state merged --search "merged:2026-08-24..2026-10-24"`) |
 | §2 step 3 governance fragment | `.claude/skills/governance/SKILL.md` Gate 8 step 3; `.github/workflows/docs-lint.yml` "Governance-ledger linter self-test" comment |
 | §2 long-lived branches | #6123→#6143, #6078→#6146, #6145→#6126 |
 | §3 worked example | #5113, #5299, #5318, #5540, #6264, #6271; tags `v0.14.0-rc1` (2026-09-29) … `v0.14.0` (2026-10-03), `v0.14.1` (2026-10-07) |
 | §4 hotfix sample | the 28 PRs merged to `main` 2026-09-29 → 2026-10-24; #5199, #5255, #5311, #5326, #5447, #5490, #5493, #6245 |
-| §5 who decides | stated by the repository owner on 2026-10-24 while this document was reviewed (#119); the observed figures from the §3–§4 PR samples |
+| §5 who decides | the 2026-10-24 comment on #119 linked from §5; the merger/approver figures from the 28 `main` PRs (`gh pr list --base main --search "merged:>=2026-09-29" --json author,mergedBy,reviewDecision`) |
