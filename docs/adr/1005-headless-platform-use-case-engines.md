@@ -904,17 +904,25 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      self-description with no per-resource authority, so there is nothing to
      gate on. The tool's `Infrastructure:Read` row drives MCP tier
      classification only. Reason: adding an artificial REST gate would invent
-     an authority the route does not have, and would break every session that
-     reads its own identity. One entry, `("GET", "/api/v1/me", "get_me")`, is
-     added to `GATE_PARITY_NO_GATE_ALLOWED` and `GATE_PARITY_NO_GATE_MAX` rises
-     from 12 to 13. Third, the one asymmetry this leaves: REST lets a
-     service-scoped token describe itself, while `get_me` has service-scope
-     class `denied` and refuses it. That is the safe default for a new tool, and
-     it is a documented difference rather than a defect; an explicit self-only
-     service-scope policy that would let both transports agree is the dated
-     follow-up (2026-10-24). Tracking issue: to be filed before merge. As with
-     the entries above, this is a session statement pending the ADR owner's
-     confirmation, not a signed decision.
+     an authority the route does not have. The legacy `GET /api/me` was already
+     reviewed as a document-only disposition (it returns only the caller's own
+     identity metadata; `service-scope-flip-route-inventory-2026-08.md`, the
+     "Document-only dispositions" table); `GET /api/v1/me` shares the same
+     builder (`me_response.hpp`) but the inventory does not list it. One entry,
+     `("GET", "/api/v1/me", "get_me")`, is added to
+     `GATE_PARITY_NO_GATE_ALLOWED` and `GATE_PARITY_NO_GATE_MAX` rises from 12
+     to 13. Third, the one asymmetry this leaves: REST lets a service-scoped
+     token describe itself, while `get_me` has service-scope class `denied` and
+     refuses it. That is the conservative default for a new tool, and it is a
+     documented difference rather than a defect; a self-only service-scope
+     policy that would let both transports agree is the follow-up, proposed as
+     `exception:#TBD-FILE-BEFORE-PUSH revisit:2026-11-30` (proposed, owner to
+     confirm; the issue number is a placeholder to replace once the issue is
+     filed). Scope of the twin: `rbac_enabled` is the server's cached view of
+     the RBAC switch and does not report the degraded state in which
+     enforcement fails closed; that bit is owned by #6033, not by this twin.
+     As with the entries above, this is a session statement pending the ADR
+     owner's confirmation, not a signed decision.
 
 ## Interim rules (until the named follow-ups ship)
 

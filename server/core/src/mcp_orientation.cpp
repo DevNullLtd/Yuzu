@@ -248,12 +248,12 @@ constexpr std::string_view kExecutionStatistics[] = {"get_execution_statistics",
 // agents" (a machine/process/socket topology snapshot is a different data
 // model from an agent roster row).
 constexpr std::string_view kFleetVisualization[] = {"get_fleet_topology", "get_host_topology"};
-// get_me (twin of GET /api/v1/me) joins this family: it is the same kind of read, a
-// self-description of the CALLING principal that cannot name another one.
 // B4 (#2146 API-parity) — no existing family covers a self-check "can I do X"
 // RBAC read; own family, distinct from Discovery's discover_permissions (the
 // whole catalog + role grid) and from Engine principals' assign/unassign/
-// list_engine_roles (grant AUTHORING, not a self-check).
+// list_engine_roles (grant AUTHORING, not a self-check). get_me (twin of
+// GET /api/v1/me) joins it: the same kind of read, a self-description of the
+// CALLING principal that cannot name another one.
 constexpr std::string_view kRbacCheck[] = {"check_permission", "get_me"};
 // A2 (delivery plan §2) — global human role assignment/unassignment. Own
 // family, distinct from RBAC self-check above (a read, not an authoring

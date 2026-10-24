@@ -222,10 +222,11 @@ inline constexpr TwinRow kExpectedTwins[] = {
     {"get_crypto_dashboard_layout", "Infrastructure", "Read", true},
     {"set_crypto_dashboard_layout", "Infrastructure", "Write", false},
     {"get_crypto_ca_stats", "Inventory", "Read", true},
-    // get_me, the twin of GET /api/v1/me (ledger row get.api-me). The REST route is gate-less
-    // (auth_fn only); Infrastructure:Read drives MCP tier classification only, with no RBAC check
-    // behind it (the check_permission pattern). No arguments, so it is a kNoArgTools entry in
-    // test_operator_surface_twins.cpp.
+    // get_me, the twin of GET /api/v1/me (ledger row get.api-me). The REST route has no
+    // permission gate (auth_fn only), so this row pins the MCP side alone:
+    // Infrastructure:Read drives MCP tier classification only, with no RBAC check behind it
+    // (the check_permission pattern), and a service-scoped token is refused at the generic
+    // MCP gate. No arguments, so it is a kNoArgTools entry in test_operator_surface_twins.cpp.
     {"get_me", "Infrastructure", "Read", true},
 };
 

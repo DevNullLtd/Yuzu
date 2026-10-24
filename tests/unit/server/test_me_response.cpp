@@ -208,6 +208,94 @@ TEST_CASE("me_response: the principal namespace comes from the session kind, nev
         REQUIRE(r.calls.size() == 1);
         CHECK(r.calls[0].first == "engine");
     }
+    SECTION("auth_source alone marks an engine (the converse)") {
+        auto s = human(auth::Role::user, "engine:solo");
+        s.auth_source = "engine_token"; // principal_kind left at its default ("human")
+        const auto j = build(s, r.view());
+        REQUIRE(r.calls.size() == 1);
+        CHECK(r.calls[0].first == "engine");
+        CHECK(r.calls[0].second == "engine:solo");
+        CHECK(j["principal_kind"] == "human"); // reported as stored, not normalised
+        CHECK_FALSE(j.contains("rbac_role"));  // no grant: never a fabricated Viewer
+    }
+}
+
+TEST_CASE("me_response: engine RBAC matrix records (type, id) on every read",
+          "[server][me_response]") {
+    // A reader that counts calls and answers per call number, so the matrix can include a
+    // grant revoked between two requests.
+    struct Counting {
+        std::vector<std::pair<std::string, std::string>> calls;
+        std::vector<std::expected<std::vector<std::string>, std::string>> answers;
+        me_response::RbacView view(bool enabled) {
+            me_response::RbacView v;
+            v.enabled = enabled;
+            v.read_roles = [this](std::string_view type, std::string_view id)
+                -> std::expected<std::vector<std::string>, std::string> {
+                calls.emplace_back(std::string(type), std::string(id));
+                const std::size_t n = calls.size() - 1;
+                return n < answers.size() ? answers[n] : std::vector<std::string>{};
+            };
+            return v;
+        }
+    };
+    const auto session = engine("engine:matrix");
+    Counting c;
+
+    SECTION("RBAC off: no read, no rbac_role") {
+        const auto j = build(session, c.view(false));
+        CHECK(c.calls.empty());
+        CHECK_FALSE(j.contains("rbac_role"));
+        CHECK(j["rbac_roles_resolved"] == true);
+    }
+    SECTION("RBAC on, no grant: read once, no rbac_role") {
+        const auto j = build(session, c.view(true));
+        REQUIRE(c.calls.size() == 1);
+        CHECK(c.calls[0] == std::pair<std::string, std::string>{"engine", "engine:matrix"});
+        CHECK_FALSE(j.contains("rbac_role"));
+        CHECK(j["rbac_roles"].empty());
+    }
+    SECTION("RBAC on, grant: rbac_role is the grant") {
+        c.answers = {std::vector<std::string>{"EngineReader"}};
+        const auto j = build(session, c.view(true));
+        REQUIRE(c.calls.size() == 1);
+        CHECK(j["rbac_role"] == "EngineReader");
+    }
+    SECTION("a grant revoked between two calls: the second call omits rbac_role") {
+        c.answers = {std::vector<std::string>{"EngineReader"}, std::vector<std::string>{}};
+        const auto v = c.view(true);
+        const auto first = build(session, v);
+        const auto second = build(session, v);
+        REQUIRE(c.calls.size() == 2);
+        for (const auto& call : c.calls)
+            CHECK(call == std::pair<std::string, std::string>{"engine", "engine:matrix"});
+        CHECK(first["rbac_role"] == "EngineReader");
+        CHECK_FALSE(second.contains("rbac_role"));
+        CHECK(second["rbac_roles"].empty());
+        CHECK(second["rbac_roles_resolved"] == true);
+    }
+}
+
+TEST_CASE("me_response: invalid UTF-8 in username / display_name is replaced, never thrown",
+          "[server][me_response]") {
+    auto s = human(auth::Role::user, std::string("ab\xC3\x28"));
+    s.display_name = std::string("\xFF\xFE");
+    std::string body;
+    REQUIRE_NOTHROW(body = me_response::build_me_body(s, me_response::RbacView{}));
+    const auto j = json::parse(body); // the output itself is valid JSON/UTF-8
+    // U+FFFD is EF BF BD. "ab\xC3(" -> "ab" + U+FFFD + "(" ; "\xFF\xFE" -> two U+FFFD.
+    CHECK(j["username"].get<std::string>() == "ab\xEF\xBF\xBD(");
+    CHECK(j["display_name"].get<std::string>() == "\xEF\xBF\xBD\xEF\xBF\xBD");
+    // The sibling overload and the shared dump helper agree.
+    CHECK(me_response::build_me_body(s, static_cast<RbacStore*>(nullptr)) == body);
+    REQUIRE_NOTHROW((void)me_response::dump_me_json(me_response::build_me_json(s, {})));
+}
+
+TEST_CASE("me_response: valid UTF-8 is byte-identical to a plain dump", "[server][me_response]") {
+    auto s = human(auth::Role::user, "alice");
+    s.display_name = "Zo\xC3\xAB \xE2\x9C\x93"; // "Zoe" with diaeresis, check mark
+    const auto j = me_response::build_me_json(s, {});
+    CHECK(me_response::dump_me_json(j) == j.dump());
 }
 
 TEST_CASE("me_response: session self-description keys per persona", "[server][me_response]") {

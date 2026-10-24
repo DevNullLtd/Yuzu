@@ -4226,20 +4226,25 @@ static const ToolDef kTools[] = {
      "legacy role and effective role, whether it is a human or an engine principal "
      "(principal_kind), how it authenticated (auth_source), its MCP tier, whether JIT admin "
      "elevation is active, and its RBAC role names. Takes no arguments and cannot name another "
-     "principal: the answer is always about the caller. rbac_enabled says whether RBAC "
-     "enforcement is on; rbac_roles lists the caller's DIRECT role assignments only, so roles "
-     "granted through group membership are NOT included and an empty rbac_roles is not proof "
-     "of no access (call check_permission to ask about one specific permission). rbac_role is "
-     "the alphabetically first direct role, kept for dashboard compatibility and deprecated: "
-     "use role and effective_role as the authority summary. rbac_roles_resolved:false means "
-     "the RBAC store could not be read; rbac_role and rbac_roles are then omitted, never "
-     "guessed, so retry later. An engine principal never receives a fabricated role: with "
-     "RBAC off, or with no engine grant, rbac_role is omitted. For an MCP bearer token "
-     "(non-empty mcp_tier) can_access_settings is always false, because the admin gate denies "
-     "any MCP tier before it tests the role, and effective_role equals role because token "
-     "sessions are never elevated. Read-only, available at every MCP tier, no RBAC permission "
-     "required. A service-scoped token is refused. Audited as mcp.get_me; audit_persisted:false "
-     "is returned when that row is dropped. Mirrors REST GET /api/v1/me.",
+     "principal: the answer is always about the caller. role and effective_role are the legacy "
+     "session view only and are NOT an authority summary: with RBAC on, authority is decided per "
+     "permission, so call check_permission for a specific permission; for an engine principal "
+     "read rbac_roles. rbac_enabled is the server's cached view of the RBAC switch, can lag, and "
+     "does not report the degraded state in which enforcement fails closed (tracked in #6033); "
+     "rbac_roles_resolved reports only whether the role-store read succeeded, and false means "
+     "rbac_role and rbac_roles are omitted, never guessed, so retry later. rbac_roles lists the "
+     "caller's DIRECT role assignments only: roles granted through group membership are NOT "
+     "included, an empty list is not proof of no access, and it is not access-review evidence "
+     "(the AccessReview export is). rbac_role is deprecated: the first direct role by role_name "
+     "order, or for a human with no direct role a legacy Administrator/Viewer label that is not "
+     "a grant. An engine principal never receives a fabricated role: with RBAC off, or with no "
+     "engine grant, rbac_role is omitted. For an MCP bearer token (non-empty mcp_tier) "
+     "can_access_settings is always false, because the admin gate denies any MCP tier before it "
+     "tests the role, and effective_role equals role because token sessions are never elevated. "
+     "Read-only, available at every MCP tier, no RBAC permission required. A service-scoped "
+     "token is refused; use REST GET /api/v1/me instead, which a service-scoped token may call. "
+     "Audited as mcp.get_me; audit_persisted:false is returned when that row is dropped. "
+     "Mirrors REST GET /api/v1/me.",
      R"j({"type":"object","properties":{},"additionalProperties":false})j",
      R"j({"type":"object","properties":{)j"
      R"j("username":{"type":"string","description":"Stable principal id: the login name, an opaque oidc:<iss>#<sub> id for SSO sessions, or engine:<slug> for an engine principal"},)j"
@@ -4249,16 +4254,16 @@ static const ToolDef kTools[] = {
      R"j("auth_source":{"type":"string","description":"How the caller authenticated: local, oidc, saml, api_token, mcp_token or engine_token"},)j"
      R"j("mcp_tier":{"type":"string","description":"readonly, operator or supervised; empty for a non-MCP session"},)j"
      R"j("scope_service":{"type":"string","description":"Service the token is scoped to; empty when unscoped. Always empty over MCP because a service-scoped token is refused"},)j"
-     R"j("rbac_enabled":{"type":"boolean","description":"Whether RBAC enforcement is on"},)j"
-     R"j("rbac_role":{"type":"string","description":"Deprecated display field: the alphabetically first DIRECT role, or for a human with none the legacy mapping (Administrator or Viewer). Omitted for an engine principal with RBAC off or no engine grant, and when rbac_roles_resolved is false. Use role and effective_role as the authority summary"},)j"
-     R"j("rbac_roles":{"type":"array","items":{"type":"string"},"description":"DIRECT role assignments for this principal only; roles granted through group membership are NOT included. Empty when RBAC is off. Omitted when rbac_roles_resolved is false"},)j"
-     R"j("rbac_roles_resolved":{"type":"boolean","description":"False when the RBAC store could not be read; rbac_role and rbac_roles are then omitted"},)j"
+     R"j("rbac_enabled":{"type":"boolean","description":"The server's cached view of the RBAC switch; can lag and does not report the degraded fail-closed state (#6033)"},)j"
+     R"j("rbac_role":{"type":"string","description":"Deprecated display field: the first DIRECT role by role_name order, or for a human with none a legacy Administrator/Viewer label that is not a grant. Omitted for an engine principal with RBAC off or no engine grant, and when rbac_roles_resolved is false. Not an authority summary: call check_permission"},)j"
+     R"j("rbac_roles":{"type":"array","items":{"type":"string"},"description":"DIRECT role assignments for this principal only; roles granted through group membership are NOT included and this is not access-review evidence. Empty when RBAC is off. Omitted when rbac_roles_resolved is false"},)j"
+     R"j("rbac_roles_resolved":{"type":"boolean","description":"Whether the role-store read succeeded; false means rbac_role and rbac_roles are omitted"},)j"
      R"j("effective_role":{"type":"string","description":"Role the server will honour (admin while JIT elevation is active)"},)j"
      R"j("elevated":{"type":"boolean","description":"Whether JIT admin elevation is active"},)j"
      R"j("elevated_until":{"type":"string","description":"ISO 8601 UTC end of the elevation window; present only while elevated"},)j"
      R"j("can_access_settings":{"type":"boolean","description":"Whether the admin-only settings pages admit this session; always false for an MCP tier or service-scoped token"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
-     R"j(},"required":["username","display_name","role","rbac_enabled","effective_role","elevated","can_access_settings","principal_kind","mcp_tier","scope_service","rbac_roles_resolved"],"additionalProperties":false})j"},
+     R"j(},"required":["username","display_name","role","principal_kind","auth_source","mcp_tier","scope_service","rbac_enabled","rbac_roles_resolved","effective_role","elevated","can_access_settings"],"additionalProperties":false})j"},
 };
 
 // The audit-detail tag of a /crypto layout failure (never the username), shared by the two
@@ -28639,6 +28644,10 @@ McpServer::HandlerFn McpServer::build_handler(
             // generic mcp_audit; the generic helper does not itself report a dropped
             // row, so audit_persisted:false is added here.
             if (tool_name == "get_me") {
+                // The generic C8 gate has already run (and audited a denial) before this
+                // branch; this in-handler check mirrors check_permission's and is kept as
+                // defence in depth, so removing it would only be correct if C8 were
+                // proven to subsume it.
                 if (!tier_allows(tier, "Infrastructure", "Read")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
@@ -28646,9 +28655,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto me_json = me_response::build_me_json(*session, me_response::rbac_view(rbac_store));
-                if (!mcp_audit("success"))
+                // Serialise BEFORE the audit row: the replace handler degrades invalid
+                // UTF-8 in username/display_name to U+FFFD instead of throwing, and a
+                // serialisation failure must never leave a success audit row behind.
+                std::string me_body = me_response::dump_me_json(me_json);
+                if (!mcp_audit("success")) {
                     me_json["audit_persisted"] = false;
-                res.set_content(success_response(id, tool_result(me_json.dump(), kObjectOutputSchema)),
+                    me_body = me_response::dump_me_json(me_json);
+                }
+                res.set_content(success_response(id, tool_result(me_body, kObjectOutputSchema)),
                                 "application/json");
                 return;
             }

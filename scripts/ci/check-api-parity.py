@@ -476,8 +476,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # `exception:#520` (its REST twin is MCP-free by decision); both count untwinned: +2 on the 225 of dev, 227.
 #
 # 227 (origin/dev) -> 228 (Users and roles page): GET /fragments/access/enforcement has only the REST twin
-# GET /api/v1/me, which omits the unconfirmed (degraded) bit, and no MCP twin
-# (`twinned-rest-only`); the missing REST/MCP read is tracked in #6033.
+# GET /api/v1/me, which omits the unconfirmed (degraded) bit (`twinned-rest-only`). The MCP tool
+# get_me is the twin of the raw flag only, so this row still needs the degraded-bit read tracked in
+# #6033.
 #
 # 228 -> 225 (Seam PR2): the three hardware rows (get.fragments-hardware-list, -hardware-ci,
 # -hardware-quarantine) gained MCP twins (list_hardware_ci, get_hardware_ci, list_quarantined_devices).
@@ -2380,7 +2381,8 @@ GATE_PARITY_NO_GATE_ALLOWED = {
         "authority; the tool is gated at Infrastructure:Read for the MCP tier ladder only. REST "
         "permits a service-scoped token to describe itself while get_me is service-scope class "
         "`denied`, a documented asymmetry; an explicit self-only service-scope policy is a "
-        "follow-up dated 2026-10-24 (ADR-1005 2026-10-24 entry)"),
+        "follow-up proposed as exception:#TBD-FILE-BEFORE-PUSH revisit:2026-11-30, owner to "
+        "confirm (ADR-1005 2026-10-24 entry)"),
     ("GET", "/api/v1/result-sets", "list_result_sets"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
         "call (result-set precedent)"),

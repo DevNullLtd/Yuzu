@@ -27,6 +27,7 @@
 #include "rbac_store.hpp"
 
 #include "test_analytics_pg_helper.hpp"
+#include "test_principal_lock_gate.hpp" // yuzu::test::GrantReadFault (/api/me real-store fault)
 
 #include "../test_helpers.hpp"
 
@@ -35,6 +36,7 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <regex>
 #include <stdexcept>
@@ -58,6 +60,7 @@ struct Harness {
 
     bool session_present{true};
     std::string session_username{"alice"};
+    std::string session_display_name;
     auth::Role session_role{auth::Role::user};
     std::string session_mcp_tier;
     std::string session_scope_service;
@@ -103,6 +106,7 @@ struct Harness {
             }
             auth::Session s;
             s.username = session_username;
+            s.display_name = session_display_name;
             s.role = session_role;
             s.mcp_tier = session_mcp_tier;
             s.token_scope_service = session_scope_service;
@@ -263,6 +267,23 @@ TEST_CASE("dashboard_api_routes: /api/me human keeps every legacy key and adds t
     CHECK(j["principal_kind"] == "human");
     CHECK(j["mcp_tier"] == "readonly");
     CHECK(j["scope_service"] == "finance");
+}
+
+TEST_CASE("dashboard_api_routes: /api/me with invalid UTF-8 in the session answers 200 with U+FFFD, "
+          "never a throw",
+          "[server][routes][dashboard_api_routes]") {
+    Harness h;
+    h.session_username = std::string("ab\xC3\x28");
+    h.session_display_name = std::string("\xFF\xFE");
+    h.wire();
+
+    std::unique_ptr<httplib::Response> r;
+    REQUIRE_NOTHROW(r = h.sink.Get("/api/me"));
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    const auto j = json::parse(r->body); // the body itself is valid JSON/UTF-8
+    CHECK(j["username"].get<std::string>() == "ab\xEF\xBF\xBD(");
+    CHECK(j["display_name"].get<std::string>() == "\xEF\xBF\xBD\xEF\xBF\xBD");
 }
 
 // ── GET /api/agents: perm_fn(Infrastructure, Read) THEN auth_fn ────────────
@@ -688,6 +709,43 @@ TEST_CASE("dashboard_api_routes: /api/me reads grants under the namespace of the
         CHECK(j["rbac_roles"].empty());
         CHECK(j["rbac_roles_resolved"] == true);
     }
+}
+
+TEST_CASE("dashboard_api_routes: /api/me with a REAL store fault (principal_roles unreadable) is a "
+          "200 with rbac_roles_resolved:false and no invented role",
+          "[pg][server][routes][dashboard_api_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dashapi_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    REQUIRE(rbac.assign_role({"user", "alice", "Operator"}).has_value());
+
+    Harness h;
+    h.session_role = auth::Role::admin;
+    h.rbac_store = &rbac;
+    h.wire();
+
+    // GrantReadFault moves rbac_store.principal_roles aside: the REAL
+    // get_principal_roles_checked fails while is_rbac_enabled() (rbac_meta) still answers.
+    yuzu::test::GrantReadFault fault(pool);
+    fault.arm();
+    auto r = h.sink.Get("/api/me");
+    fault.repair();
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    auto j = json::parse(r->body);
+    CHECK(j["rbac_enabled"] == true);
+    CHECK(j["rbac_roles_resolved"] == false);
+    CHECK_FALSE(j.contains("rbac_role")); // not even the legacy Administrator label
+    CHECK_FALSE(j.contains("rbac_roles"));
+    CHECK(j["role"] == "admin");
+
+    // Repaired: the same route resolves the real grant again.
+    auto again = json::parse(h.sink.Get("/api/me")->body);
+    CHECK(again["rbac_roles_resolved"] == true);
+    CHECK(again["rbac_role"] == "Operator");
 }
 
 TEST_CASE("dashboard_api_routes: /api/audit queries a real store and reports events, count, and "

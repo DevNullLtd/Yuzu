@@ -25,9 +25,14 @@
 ///    fallback is for human sessions only.
 ///  - `rbac_roles` are DIRECT assignments only (principal_roles rows for this
 ///    principal). Roles granted through group membership are not included.
-///  - `rbac_role` is the alphabetically first direct role (the store orders by
-///    role_name). It is a deprecated display field kept for dashboard
-///    compatibility; `effective_role` / `role` are the authority summary.
+///  - `rbac_role` is the first direct role by role_name order (the store's ORDER BY,
+///    so database collation decides). It is a deprecated display field kept for
+///    dashboard compatibility. `role` / `effective_role` are the legacy session
+///    view, not an authority summary: with RBAC on, authority is decided per
+///    permission (check_permission).
+///  - Serialisation never throws on invalid UTF-8: `dump_me_json` uses the
+///    replace error handler, so a malformed username or display_name becomes
+///    U+FFFD instead of a bodyless 500 (the old inline REST route never threw).
 
 #include <yuzu/server/auth.hpp>
 
@@ -149,9 +154,15 @@ struct RbacView {
     return j;
 }
 
+/// Compact dump that degrades invalid UTF-8 to U+FFFD instead of throwing. Every
+/// transport (REST, legacy, MCP) serialises through this, never a bare `dump()`.
+[[nodiscard]] inline std::string dump_me_json(const nlohmann::ordered_json& j) {
+    return j.dump(-1, ' ', false, nlohmann::ordered_json::error_handler_t::replace);
+}
+
 /// The same object as a serialized JSON string, for the REST/legacy transports.
 [[nodiscard]] inline std::string build_me_body(const auth::Session& s, const RbacView& rbac) {
-    return build_me_json(s, rbac).dump();
+    return dump_me_json(build_me_json(s, rbac));
 }
 
 [[nodiscard]] inline std::string build_me_body(const auth::Session& s, RbacStore* store) {

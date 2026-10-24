@@ -2,20 +2,29 @@
  * test_rest_me.cpp — session self-description on GET /api/v1/me and the pure
  * admin-gate verdict it reports as `can_access_settings`.
  *
- * No store, no process: routes are registered with every store null and an
- * injected auth_fn, so a case runs in microseconds on any host.
+ * Most cases need no store and no process: routes are registered with every store null
+ * and an injected auth_fn, so a case runs in microseconds on any host. The [pg] cases at
+ * the end wire a real RbacStore to exercise the principal-namespace choice and the checked
+ * read against the real accessor.
  */
 #include "admin_gate.hpp"
 #include "dashboard_api_routes.hpp"
+#include "pg/pg_pool.hpp"
+#include "rbac_store.hpp"
 #include "rest_api_v1.hpp"
+#include "test_principal_lock_gate.hpp" // yuzu::test::GrantReadFault (real-store fault)
 #include "test_route_sink.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <regex>
+#include <stdexcept>
 #include <string>
 
 using namespace yuzu::server;
@@ -46,7 +55,8 @@ auth::Session make_engine_session() {
     return s;
 }
 
-json get_me(const auth::Session& session, std::string* cache_control = nullptr) {
+json get_me(const auth::Session& session, std::string* cache_control = nullptr,
+            RbacStore* rbac = nullptr) {
     yuzu::server::test::TestRouteSink sink;
     RestApiV1 api;
     auto auth_fn = [&](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
@@ -56,7 +66,7 @@ json get_me(const auth::Session& session, std::string* cache_control = nullptr) 
                       const std::string&) { return true; };
     auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
                        const std::string&, const std::string&, const std::string&) { return true; };
-    api.register_routes(sink, auth_fn, perm_fn, audit_fn, nullptr, nullptr, nullptr, nullptr,
+    api.register_routes(sink, auth_fn, perm_fn, audit_fn, rbac, nullptr, nullptr, nullptr,
                         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     auto r = sink.Get("/api/v1/me");
     REQUIRE(r);
@@ -64,6 +74,24 @@ json get_me(const auth::Session& session, std::string* cache_control = nullptr) 
     if (cache_control)
         *cache_control = r->get_header_value("Cache-Control");
     return json::parse(r->body)["data"];
+}
+
+/// Legacy GET /api/me (raw body, no envelope) for the same session and store.
+json get_legacy_me(const auth::Session& session, RbacStore* rbac = nullptr) {
+    yuzu::server::test::TestRouteSink sink;
+    yuzu::server::dashboard_api::register_dashboard_api_routes(
+        sink, yuzu::server::dashboard_api::Deps{
+                  .auth_fn = [&session](const httplib::Request&, httplib::Response&)
+                      -> std::optional<auth::Session> { return session; },
+                  .perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                const std::string&) { return true; },
+                  .visible_agents_json_fn = [](const std::string&) { return json::array(); },
+                  .rbac_store = rbac,
+              });
+    auto r = sink.Get("/api/me");
+    REQUIRE(r);
+    REQUIRE(r->status == 200);
+    return json::parse(r->body);
 }
 
 } // namespace
@@ -140,26 +168,25 @@ TEST_CASE("GET /api/v1/me: MCP-tier and service-scoped tokens cannot access sett
 
 TEST_CASE("GET /api/me and GET /api/v1/me carry identical keys and values (the twin cannot drift)",
           "[server][routes][rest_me]") {
-    const auto legacy = [](const auth::Session& session) {
-        yuzu::server::test::TestRouteSink sink;
-        yuzu::server::dashboard_api::register_dashboard_api_routes(
-            sink, yuzu::server::dashboard_api::Deps{
-                      .auth_fn = [&session](const httplib::Request&, httplib::Response&)
-                          -> std::optional<auth::Session> { return session; },
-                      .perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                                    const std::string&) { return true; },
-                      .visible_agents_json_fn = [](const std::string&) { return json::array(); },
-                  });
-        auto r = sink.Get("/api/me");
-        REQUIRE(r);
-        return json::parse(r->body);
-    };
     for (const auto& session :
          {make_session(auth::Role::admin), make_session(auth::Role::user, true),
           make_session(auth::Role::user), make_session(auth::Role::admin, false, "readonly"),
           make_session(auth::Role::user, false, "", "finance"), make_engine_session()}) {
-        CHECK(legacy(session) == get_me(session));
+        CHECK(get_legacy_me(session) == get_me(session));
     }
+}
+
+TEST_CASE("GET /api/v1/me and GET /api/me: invalid UTF-8 in the session is replaced, status 200",
+          "[server][routes][rest_me]") {
+    auto session = make_session(auth::Role::user);
+    session.username = std::string("ab\xC3\x28");
+    session.display_name = std::string("\xFF\xFE");
+    // get_me / get_legacy_me REQUIRE status 200 and parse the body, so a throwing dump (a
+    // bodyless 500) or an invalid-UTF-8 body fails here rather than being swallowed.
+    const auto v1 = get_me(session);
+    CHECK(v1["username"].get<std::string>() == "ab\xEF\xBF\xBD(");
+    CHECK(v1["display_name"].get<std::string>() == "\xEF\xBF\xBD\xEF\xBF\xBD");
+    CHECK(get_legacy_me(session) == v1);
 }
 
 TEST_CASE("GET /api/v1/me: reports the principal and credential facts", "[server][routes][rest_me]") {
@@ -188,4 +215,86 @@ TEST_CASE("GET /api/v1/me: an engine principal is not labelled Viewer or Adminis
     CHECK(d["rbac_roles"].is_array());
     CHECK(d["rbac_roles"].empty());
     CHECK(d["rbac_roles_resolved"] == true);
+}
+
+// ── Real RbacStore ([pg]) ──────────────────────────────────────────────────
+namespace {
+// Pre-migrated RbacStore template; unique key, nothing else needs this exact single-store setup.
+yuzu::test::PgTestTemplate rest_me_rbac_tpl{"restmerbac", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    RbacStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("restmerbac template: store failed to migrate");
+}};
+} // namespace
+
+// Every case above passes a null store, so none exercises the principal-namespace choice or the
+// checked read against the real accessor.
+
+TEST_CASE("GET /api/v1/me: reads grants under the namespace of the session kind, not the "
+          "username prefix",
+          "[pg][server][routes][rest_me]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rest_me_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    // Engines cannot hold built-in roles, so the engine grant is a custom role. RbacStore
+    // refuses a ('user', 'engine:...') row, so this is the only row carrying the id.
+    REQUIRE(rbac.create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(rbac.assign_role({"engine", "engine:shared", "EngineReader"}).has_value());
+
+    SECTION("a human named engine:shared is a user lookup and does not see the engine grant") {
+        auto s = make_session(auth::Role::user);
+        s.username = "engine:shared";
+        const auto d = get_me(s, nullptr, &rbac);
+        CHECK(d["rbac_enabled"] == true);
+        CHECK(d["rbac_role"] == "Viewer"); // legacy fallback for a human with no user grant
+        CHECK(d["rbac_roles"].empty());
+        CHECK(d["rbac_roles_resolved"] == true);
+        CHECK(get_legacy_me(s, &rbac) == d);
+    }
+    SECTION("an engine principal is an engine lookup") {
+        auto s = make_engine_session();
+        s.username = "engine:shared";
+        const auto d = get_me(s, nullptr, &rbac);
+        CHECK(d["rbac_role"] == "EngineReader");
+        CHECK(d["rbac_roles"] == json::array({"EngineReader"}));
+        CHECK(d["rbac_roles_resolved"] == true);
+        CHECK(get_legacy_me(s, &rbac) == d);
+    }
+    SECTION("an engine with no engine grant gets no rbac_role, not Viewer") {
+        auto s = make_engine_session();
+        s.username = "engine:ungranted";
+        const auto d = get_me(s, nullptr, &rbac);
+        CHECK(d["rbac_enabled"] == true);
+        CHECK_FALSE(d.contains("rbac_role"));
+        CHECK(d["rbac_roles"].empty());
+        CHECK(d["rbac_roles_resolved"] == true);
+        CHECK(get_legacy_me(s, &rbac) == d);
+    }
+    SECTION("a human with direct roles reports them; rbac_role is the role_name-first") {
+        // Viewer is assigned first so insertion order differs from role_name order.
+        REQUIRE(rbac.assign_role({"user", "alice", "Viewer"}).has_value());
+        REQUIRE(rbac.assign_role({"user", "alice", "PlatformEngineer"}).has_value());
+        const auto s = make_session(auth::Role::user);
+        const auto d = get_me(s, nullptr, &rbac);
+        CHECK(d["rbac_role"] == "PlatformEngineer");
+        CHECK(d["rbac_roles"] == json::array({"PlatformEngineer", "Viewer"}));
+        CHECK(get_legacy_me(s, &rbac) == d);
+    }
+    SECTION("real store fault: principal_roles unreadable is a 200 with rbac_roles_resolved:false") {
+        const auto s = make_session(auth::Role::admin);
+        yuzu::test::GrantReadFault fault(pool);
+        fault.arm();
+        const auto d = get_me(s, nullptr, &rbac);
+        const auto legacy = get_legacy_me(s, &rbac);
+        fault.repair();
+        CHECK(d["rbac_enabled"] == true);
+        CHECK(d["rbac_roles_resolved"] == false);
+        CHECK_FALSE(d.contains("rbac_role"));
+        CHECK_FALSE(d.contains("rbac_roles"));
+        CHECK(legacy == d);
+    }
 }

@@ -15,6 +15,8 @@
 #include "secure_random.hpp" // test_hooks: force the next CSPRNG failure
 #include "mcp_orientation.hpp" // 2g PR 1: shared orientation source + tool_families()
 #include "test_json_schema_subset.hpp" // yuzu::test::schema_violation (get_me output-schema conformance)
+#include "test_principal_lock_gate.hpp" // yuzu::test::GrantReadFault (get_me real-store fault)
+#include "dashboard_api_routes.hpp"     // get_me parity against legacy GET /api/me
 #include "mcp_policy.hpp"
 #include "../test_log_capture.hpp"
 #include "execution_event_bus.hpp" // 2f PR 3a: progress-bridge integration tests
@@ -116,6 +118,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <shared_mutex>
 #include <span>
@@ -7799,6 +7802,8 @@ nlohmann::json get_me_output_schema(McpTestServer& ts) {
     for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"])
         if (t["name"] == "get_me")
             schema = t["outputSchema"];
+    // A missing schema must fail here, never let schema_violation pass vacuously.
+    REQUIRE(schema.is_object());
     return schema;
 }
 
@@ -7820,8 +7825,17 @@ TEST_CASE("MCP get_me: describes the caller and conforms to the served output sc
     const auto schema = get_me_output_schema(ts);
     REQUIRE(schema.is_object());
     // Every key the builder can emit is declared; the required set is exactly the
-    // always-present keys.
-    CHECK(schema["required"].size() == 11);
+    // always-emitted keys, compared by NAME (a count alone passes a swapped key).
+    std::set<std::string> required;
+    for (const auto& k : schema["required"])
+        required.insert(k.get<std::string>());
+    CHECK(required == std::set<std::string>{"username", "display_name", "role", "principal_kind",
+                                            "auth_source", "mcp_tier", "scope_service",
+                                            "rbac_enabled", "rbac_roles_resolved",
+                                            "effective_role", "elevated", "can_access_settings"});
+    CHECK(schema["additionalProperties"] == false);
+    for (const auto& k : required)
+        CHECK(schema["properties"].contains(k));
 
     const auto body = call_get_me(ts);
     REQUIRE(body.contains("result"));
@@ -7897,11 +7911,16 @@ TEST_CASE("MCP get_me: available at every MCP tier, refused for an unknown tier"
     REQUIRE(res);
     const auto body = nlohmann::json::parse(res->body, nullptr, /*allow_exceptions=*/false);
     REQUIRE_FALSE(body.is_discarded());
-    CHECK(body.contains("error"));
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
     CHECK_FALSE(body.contains("result"));
+    // The generic gate audits the refusal; the handler never ran, so no success row.
+    REQUIRE_FALSE(bad.audit_log.empty());
+    CHECK(bad.audit_log.back() == "mcp.get_me|denied");
+    CHECK(std::count(bad.audit_log.begin(), bad.audit_log.end(), "mcp.get_me|success") == 0);
 }
 
-TEST_CASE("MCP get_me: a service-scoped token is refused (default denied class)",
+TEST_CASE("MCP get_me: a service-scoped token is refused (default denied class) and audited",
           "[mcp][get_me]") {
     McpTestServer ts;
     ts.mock_token_scope_service = "printers";
@@ -7910,6 +7929,43 @@ TEST_CASE("MCP get_me: a service-scoped token is refused (default denied class)"
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
     CHECK_FALSE(body.contains("result"));
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.get_me|denied");
+}
+
+TEST_CASE("MCP get_me: invalid UTF-8 in the session is replaced, succeeds, and audits after "
+          "serialisation",
+          "[mcp][get_me]") {
+    McpTestServer ts;
+    ts.mock_username = std::string("ab\xC3\x28");
+    ts.start("readonly");
+    const auto schema = get_me_output_schema(ts);
+    const auto body = call_get_me(ts);
+    REQUIRE(body.contains("result"));
+    REQUIRE_FALSE(body.contains("error"));
+    const auto& sc = body["result"]["structuredContent"];
+    // U+FFFD is EF BF BD; the stray lead byte is replaced, the following "(" is kept.
+    CHECK(sc["username"].get<std::string>() == "ab\xEF\xBF\xBD(");
+    CHECK(sc["display_name"].get<std::string>() == "ab\xEF\xBF\xBD(");
+    CHECK(yuzu::test::schema_violation(schema, sc) == "");
+    CHECK_FALSE(sc.contains("audit_persisted"));
+    // Exactly one success row, written (last) after the body was built.
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.get_me|success");
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(), "mcp.get_me|success") == 1);
+}
+
+TEST_CASE("MCP get_me: invalid UTF-8 with a dropped audit row still returns audit_persisted:false",
+          "[mcp][get_me]") {
+    McpTestServer ts;
+    ts.mock_username = std::string("\xFF\xFE");
+    ts.audit_succeeds_ = false;
+    ts.start("readonly");
+    const auto body = call_get_me(ts);
+    REQUIRE(body.contains("result"));
+    const auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["username"].get<std::string>() == "\xEF\xBF\xBD\xEF\xBF\xBD");
+    CHECK(sc["audit_persisted"] == false);
 }
 
 TEST_CASE("MCP get_me: an engine principal with RBAC off carries no fabricated rbac_role",
@@ -7940,12 +7996,14 @@ TEST_CASE("MCP get_me: RBAC on reads the caller's direct roles under the session
     yuzu::server::RbacStore rbac{rbac_pool};
     REQUIRE(rbac.is_open());
     rbac.set_rbac_enabled(true);
-    REQUIRE(rbac.assign_role({"user", "test-user", "PlatformEngineer"}).has_value());
+    // Insertion order (Viewer first) deliberately differs from role_name order, so the
+    // rbac_role assertion below proves the store's ORDER BY, not insertion order.
     REQUIRE(rbac.assign_role({"user", "test-user", "Viewer"}).has_value());
+    REQUIRE(rbac.assign_role({"user", "test-user", "PlatformEngineer"}).has_value());
     REQUIRE(rbac.create_role({.name = "EngineReader", .description = "d"}).has_value());
     REQUIRE(rbac.assign_role({"engine", "engine:indexer", "EngineReader"}).has_value());
 
-    SECTION("human: direct roles, rbac_role is the alphabetically first") {
+    SECTION("human: direct roles, rbac_role is the role_name-first") {
         McpTestServer ts;
         ts.rbac_store_for_test = &rbac;
         ts.start("readonly");
@@ -7985,6 +8043,73 @@ TEST_CASE("MCP get_me: RBAC on reads the caller's direct roles under the session
         CHECK_FALSE(sc.contains("rbac_role"));
         CHECK(sc["rbac_roles"].empty());
         CHECK(sc["rbac_roles_resolved"] == true);
+    }
+    SECTION("real store fault: principal_roles unreadable is a 200 with rbac_roles_resolved:false") {
+        // GrantReadFault moves rbac_store.principal_roles aside, so the REAL
+        // RbacStore::get_principal_roles_checked fails while is_rbac_enabled() (rbac_meta)
+        // still answers true. Nothing is faked through the injected reader.
+        McpTestServer ts;
+        ts.rbac_store_for_test = &rbac;
+        ts.start("readonly");
+        const auto schema = get_me_output_schema(ts);
+        yuzu::test::GrantReadFault fault(rbac_pool);
+        fault.arm();
+        const auto body = call_get_me(ts);
+        fault.repair();
+        REQUIRE(body.contains("result"));
+        REQUIRE_FALSE(body.contains("error"));
+        const auto& sc = body["result"]["structuredContent"];
+        CHECK(sc["rbac_enabled"] == true);
+        CHECK(sc["rbac_roles_resolved"] == false);
+        CHECK_FALSE(sc.contains("rbac_role"));
+        CHECK_FALSE(sc.contains("rbac_roles"));
+        CHECK(yuzu::test::schema_violation(schema, sc) == "");
+        CHECK(ts.audit_log.back() == "mcp.get_me|success");
+        // Repaired: the same call resolves again.
+        const auto again = call_get_me(ts);
+        CHECK(again["result"]["structuredContent"]["rbac_roles_resolved"] == true);
+    }
+    SECTION("parity: MCP get_me, REST /api/v1/me data and legacy /api/me are field-equal") {
+        McpTestServer ts;
+        ts.rbac_store_for_test = &rbac;
+        ts.start("readonly");
+        auto mcp_sc = call_get_me(ts)["result"]["structuredContent"];
+        REQUIRE(mcp_sc.contains("rbac_roles"));
+        mcp_sc.erase("audit_persisted"); // MCP-only, present only when the audit row dropped
+
+        yuzu::server::auth::Session session;
+        session.username = "test-user";
+        session.role = yuzu::server::auth::Role::admin;
+        session.mcp_tier = "readonly";
+        const auto auth_fn = [&session](const httplib::Request&, httplib::Response&)
+            -> std::optional<yuzu::server::auth::Session> { return session; };
+        const auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                const std::string&) { return true; };
+
+        yuzu::server::test::TestRouteSink v1_sink;
+        yuzu::server::RestApiV1 api;
+        const auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                                 const std::string&, const std::string&, const std::string&) {
+            return true;
+        };
+        api.register_routes(v1_sink, auth_fn, perm_fn, audit_fn, &rbac, nullptr, nullptr, nullptr,
+                            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        auto v1 = v1_sink.Get("/api/v1/me");
+        REQUIRE(v1);
+        REQUIRE(v1->status == 200);
+        CHECK(nlohmann::json::parse(v1->body)["data"] == mcp_sc);
+
+        yuzu::server::test::TestRouteSink legacy_sink;
+        yuzu::server::dashboard_api::Deps deps;
+        deps.auth_fn = auth_fn;
+        deps.perm_fn = perm_fn;
+        deps.visible_agents_json_fn = [](const std::string&) { return nlohmann::json::array(); };
+        deps.rbac_store = &rbac;
+        yuzu::server::dashboard_api::register_dashboard_api_routes(legacy_sink, deps);
+        auto legacy = legacy_sink.Get("/api/me");
+        REQUIRE(legacy);
+        REQUIRE(legacy->status == 200);
+        CHECK(nlohmann::json::parse(legacy->body) == mcp_sc);
     }
 }
 
