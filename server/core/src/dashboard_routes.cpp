@@ -708,7 +708,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      // shown; the operator sees the refusal through the page's toast channel
                      // (an HX-Trigger showToast event, rendered with textContent). The message is
                      // a constant: no caller or plugin data. Answered 200 (htmx drops a 4xx/5xx
-                     // body); the body repeats the notice for a non-htmx caller.
+                     // body); the body carries the same text for every caller, htmx simply
+                     // does not display it.
                      res.set_header(
                          "HX-Trigger",
                          R"({"showToast":{"message":"The permission check for this action could )"
