@@ -44,8 +44,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <optional>
+#include <regex>
+#include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -81,6 +86,7 @@ struct MockHarness {
     auth::Role session_role{auth::Role::admin};
     bool session_elevated{false};  // a real, active JIT elevation on the session
     std::string session_mcp_tier;  // non-empty models an MCP-tier bearer token
+    std::string session_token_scope_service; // non-empty models a service-scoped token
     /// Token callers are exempt from the same-site gate, so the existing cases keep working;
     /// the cross-site cases set a cookie source ("local") explicitly.
     std::string auth_source{"api_token"};
@@ -91,6 +97,8 @@ struct MockHarness {
     bool audit_succeeds{true};
     /// 0-based index of the one audit call that fails (-1: none); independent of audit_succeeds.
     int audit_fails_at{-1};
+    /// The audit sink throws instead of returning (a store fault surfacing as an exception).
+    bool audit_throws{false};
     std::vector<AuditRow> audits;
 
     yuzu::server::test::TestRouteSink sink;
@@ -112,6 +120,7 @@ struct MockHarness {
             s.username = auth_username;
             s.role = session_role;
             s.mcp_tier = session_mcp_tier;
+            s.token_scope_service = session_token_scope_service;
             if (session_elevated)
                 s.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
             s.auth_source = auth_source;
@@ -128,9 +137,11 @@ struct MockHarness {
             }
             return true;
         };
-        deps.audit_fn = [this](const httplib::Request&, const std::string& a,
-                               const std::string& r, const std::string& tt,
-                               const std::string& ti, const std::string& d) -> bool {
+        deps.audit_fn = [this](const httplib::Request&, const std::string& a, const std::string& r,
+                               const std::string& tt, const std::string& ti,
+                               const std::string& d) -> bool {
+            if (audit_throws)
+                throw std::runtime_error("audit sink fault");
             const int idx = static_cast<int>(audits.size());
             audits.push_back({a, r, tt, ti, d});
             return audit_succeeds && idx != audit_fails_at;
@@ -856,7 +867,11 @@ TEST_CASE("config_routes: a non-administrator Infrastructure:Write holder and an
     res = h.sink.Put("/api/config/oidc_admin_group", R"({"value":"g"})");
     REQUIRE(res);
     CHECK(res->status == 403);
+    CHECK(res->body.find("administrator account is required") != std::string::npos);
     CHECK(w.store.get_value("oidc_admin_group").empty());
+    // The token class has its own detail, not the missing-role one: the role was fine.
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].detail == "token_session_oidc_setting_blocked");
 }
 
 TEST_CASE("config_routes: an elevated-only session can still write non-oidc keys; an "
@@ -896,6 +911,302 @@ TEST_CASE("config_routes: an elevated-only session can still write non-oidc keys
     res = h.sink.Put("/api/config/oidc_client_secret", R"({"value":"s3cret"})");
     REQUIRE(res);
     CHECK(res->status == 200);
+}
+
+// ── Keys whose own settings route is administrator-only ──────────────────────
+//
+// The settings routes for these keys are `require_admin`: they refuse a service-scoped token, an
+// MCP-tier token and a non-admin effective role. The generic PUT admits the same callers on
+// Infrastructure:Write alone, so it applies the same verdict (RuntimeConfigStore::write_class).
+//
+// Reachability, so these cases are not read as more than they are: these tests give the route
+// whatever session `auth_fn` returns and a `perm_fn` that admits, which isolates the route's own
+// rule. In production `perm_fn` refuses a service-scoped token and a readonly or operator MCP
+// tier first (`auth.permission_required`); the sessions that reach this rule are a
+// supervised-tier MCP token and, with RBAC on, a non-admin role holding Infrastructure:Write.
+
+namespace {
+std::vector<std::string> admin_route_keys() {
+    std::vector<std::string> keys;
+    for (const auto& k : RuntimeConfigStore::allowed_keys())
+        if (RuntimeConfigStore::write_class(k) == ConfigWriteClass::AdminRoute)
+            keys.push_back(k);
+    return keys;
+}
+
+// One refused PUT: 403, the A4 envelope without a `permission` field, exactly one denied row
+// carrying `detail`, and nothing stored.
+void check_refused(MockHarness& h, const std::string& key, const std::string& message_part,
+                   const std::string& detail) {
+    INFO(key);
+    h.audits.clear();
+    auto res = h.sink.Put("/api/config/" + key, R"({"value":"true"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find(message_part) != std::string::npos);
+    const auto err = body(res->body)["error"];
+    CHECK(err.contains("correlation_id"));
+    CHECK(err.contains("remediation"));
+    CHECK_FALSE(err.contains("permission"));
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "config.update");
+    CHECK(h.audits[0].result == "denied");
+    CHECK(h.audits[0].target_id == key);
+    CHECK(h.audits[0].detail == detail);
+}
+} // namespace
+
+TEST_CASE("config_routes: the administrator-only keys refuse a supervised MCP-tier token and a "
+          "non-administrator before the store is consulted (no store, no PostgreSQL)",
+          "[server][routes][config_routes][elevation]") {
+    MockHarness h; // runtime_config_store left null: the refusal must not need it
+    h.session_role = auth::Role::admin; // an admin-minted token carries its creator's role
+    h.session_mcp_tier = "supervised";
+    h.wire();
+
+    const auto keys = admin_route_keys();
+    REQUIRE(keys.size() == 7);
+    for (const auto& key : keys)
+        check_refused(h, key, "administrator account is required",
+                      "token_session_admin_setting_blocked");
+
+    // Defence in depth: a service-scoped session is refused by the same rule if it ever reaches it.
+    h.session_mcp_tier.clear();
+    h.session_token_scope_service = "svc-a";
+    for (const auto& key : keys)
+        check_refused(h, key, "administrator account is required",
+                      "token_session_admin_setting_blocked");
+
+    // A non-administrator role (an engine-principal-like session) holding Infrastructure:Write.
+    h.session_token_scope_service.clear();
+    h.session_role = auth::Role::user;
+    for (const auto& key : keys)
+        check_refused(h, key, "own administrator role", "admin_role_required_setting_blocked");
+
+    // The oidc_* keys refuse a service-scoped session too, with the token wording and detail.
+    h.session_role = auth::Role::admin;
+    h.session_token_scope_service = "svc-a";
+    check_refused(h, "oidc_admin_group", "administrator account is required",
+                  "token_session_oidc_setting_blocked");
+
+    // An admin with a null store is still answered 503 for a key the class lets through, and the
+    // route-owned key keeps its 400: the class lookup did not change either answer.
+    h.session_token_scope_service.clear();
+    auto res = h.sink.Put("/api/config/plugin_signing_required", R"({"value":"true"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    res = h.sink.Put("/api/config/dex_score_policy", R"({"value":"{}"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
+TEST_CASE("config_routes: a failing or throwing audit sink never turns a refusal into a 5xx",
+          "[server][routes][config_routes][elevation]") {
+    MockHarness h; // no store: the 403 holds without one, so this isolates the audit sink
+    h.session_role = auth::Role::admin;
+    h.session_mcp_tier = "supervised";
+    h.wire();
+
+    for (const bool throws : {false, true}) {
+        h.audit_succeeds = throws; // false: returns false; true: unused, the sink throws instead
+        h.audit_throws = throws;
+        for (const auto& key : admin_route_keys()) {
+            INFO(key << " throws=" << throws);
+            auto res = h.sink.Put("/api/config/" + key, R"({"value":"true"})");
+            REQUIRE(res);
+            CHECK(res->status == 403); // the refusal holds without its evidence row
+        }
+    }
+}
+
+TEST_CASE("config_routes: a denied caller gets 403 before the body is parsed",
+          "[server][routes][config_routes][elevation]") {
+    MockHarness h;
+    h.session_role = auth::Role::admin;
+    h.session_mcp_tier = "supervised";
+    h.wire();
+
+    // Malformed JSON and a missing value would each be a 400 for an admitted caller; the class
+    // refusal precedes both.
+    for (const auto& [key, payload] : std::vector<std::pair<std::string, std::string>>{
+             {"dex_blast_min_devices", "not json"},
+             {"dex_blast_min_devices", R"({"nope":1})"},
+             {"oidc_issuer", "not json"}}) {
+        INFO(key << " " << payload);
+        auto res = h.sink.Put("/api/config/" + key, payload);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+}
+
+TEST_CASE("config_routes: a supervised MCP-tier token is refused for every administrator-only "
+          "key with one denied row and nothing stored",
+          "[pg][server][routes][config_routes][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.session_role = auth::Role::admin;
+    h.session_mcp_tier = "supervised";
+    h.wire();
+
+    const auto keys = admin_route_keys();
+    REQUIRE(keys.size() == 7);
+    for (const auto& key : keys) {
+        check_refused(h, key, "administrator account is required",
+                      "token_session_admin_setting_blocked");
+        CHECK(w.store.get_value(key).empty());
+    }
+}
+
+TEST_CASE("config_routes: a non-administrator Infrastructure:Write holder is refused for "
+          "every administrator-only key; an administrator account and an elevated "
+          "session are admitted, as on the settings routes",
+          "[pg][server][routes][config_routes][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.session_role = auth::Role::user; // perm_fn admits (Infrastructure:Write), own role is user
+    h.wire();
+
+    const auto keys = admin_route_keys();
+    REQUIRE(keys.size() == 7);
+    for (const auto& key : keys) {
+        check_refused(h, key, "own administrator role", "admin_role_required_setting_blocked");
+        CHECK(w.store.get_value(key).empty());
+    }
+
+    // Effective role counts (require_admin): an active elevation is admin for its window.
+    h.session_elevated = true;
+    auto res = h.sink.Put("/api/config/plugin_signing_required", R"({"value":"true"})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(w.store.get_value("plugin_signing_required") == "true");
+
+    // An administrator account writes every one of them: attempted, then success, and the
+    // value is stored.
+    h.session_elevated = false;
+    h.session_role = auth::Role::admin;
+    for (const auto& [key, value] :
+         std::vector<std::pair<std::string, std::string>>{{"plugin_signing_required", "false"},
+                                                          {"dex_alert_routing", "[]"},
+                                                          {"dex_blast_min_devices", "5"},
+                                                          {"dex_blast_window_seconds", "300"},
+                                                          {"dex_blast_cooldown_seconds", "600"},
+                                                          {"dex_cohort_export_key", "team"},
+                                                          {"audit_retention_days", "400"}}) {
+        INFO(key);
+        h.audits.clear();
+        res = h.sink.Put("/api/config/" + key, R"({"value":")" + value + R"("})");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        REQUIRE(h.audits.size() == 2);
+        CHECK(h.audits[0].result == "attempted");
+        CHECK(h.audits[1].result == "success");
+        CHECK(w.store.get_value(key) == value);
+    }
+}
+
+TEST_CASE("config_routes: an MCP-tier token can still write the general keys",
+          "[pg][server][routes][config_routes][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.session_role = auth::Role::admin;
+    h.session_mcp_tier = "supervised";
+    h.wire();
+
+    auto res = h.sink.Put("/api/config/response_retention_days", R"({"value":"120"})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    res = h.sink.Put("/api/config/log_level", R"({"value":"info"})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    // A plain (unelevated) non-administrator is not refused by the class for a general key either.
+    h.session_mcp_tier.clear();
+    h.session_role = auth::Role::user;
+    res = h.sink.Put("/api/config/log_level", R"({"value":"warn"})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
+// Drift tripwire (source scan; no PostgreSQL). The class table is only as good as its fit to the
+// writers: a Settings route that writes a runtime-config key through
+// `runtime_config_store_->set("key", ...)` is an administrator route by construction, so the
+// generic PUT must not let a weaker caller write the same key. This fails when a settings writer
+// names a key classified General. It names literal keys and `plugin_signing::
+// kPluginSigningRequiredKey` only; a `set(` call with any other first argument fails the call
+// count below, so a key built at runtime cannot slip past it unseen.
+TEST_CASE("config_routes: every key a Settings route writes is not classified General",
+          "[server][routes][config_routes]") {
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    static const std::regex kSet(
+        R"re(runtime_config_store_->set\(\s*(?:"([a-z_]+)"|plugin_signing::(kPluginSigningRequiredKey)))re");
+    static const std::regex kAnySet(R"re(runtime_config_store_?->set\()re");
+
+    std::set<std::string> written;
+    std::set<std::string> other_writers; // route files besides these two that write the store
+    for (const auto& entry : std::filesystem::directory_iterator(YUZU_SERVER_SRC_DIR)) {
+        const auto name = entry.path().filename().string();
+        if (!name.ends_with("_routes.cpp"))
+            continue;
+        std::ifstream in(entry.path());
+        REQUIRE(in.is_open());
+        const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+        if (name == "settings_routes.cpp") {
+            std::size_t recognised = 0;
+            for (auto it = std::sregex_iterator(src.begin(), src.end(), kSet);
+                 it != std::sregex_iterator(); ++it, ++recognised)
+                written.insert((*it)[1].matched ? (*it)[1].str()
+                                                : std::string("plugin_signing_required"));
+            // Every set() call must be one the scan can name. A call whose key is computed
+            // (a variable, a constant other than the one above, a formatted string) matches
+            // kAnySet but not kSet, so it fails here instead of slipping past the class check.
+            const auto any = static_cast<std::size_t>(std::distance(
+                std::sregex_iterator(src.begin(), src.end(), kAnySet), std::sregex_iterator()));
+            INFO("settings_routes.cpp has "
+                 << any
+                 << " runtime_config_store_->set( calls and the "
+                    "scan names the key of "
+                 << recognised
+                 << ": use a string literal or "
+                    "plugin_signing::kPluginSigningRequiredKey, or extend kSet");
+            CHECK(any == recognised);
+        } else if (name != "config_routes.cpp" && std::regex_search(src, kAnySet)) {
+            other_writers.insert(name);
+        }
+    }
+
+    // A new route file that writes runtime config is outside this scan: classify its keys and
+    // extend the scan (and route the write through the shared class rule) before adding it.
+    for (const auto& name : other_writers)
+        FAIL_CHECK(name << " writes runtime_config_store_ but this scan only covers "
+                           "settings_routes.cpp; extend the scan and classify its keys");
+
+    // Guard against the scan rotting into a vacuous pass: the six administrator keys and the
+    // oidc keys are all written by settings_routes.cpp today.
+    // (audit_retention_days is administrator-only too but has no Settings writer, so it is not
+    // here.)
+    for (const char* key :
+         {"plugin_signing_required", "dex_alert_routing", "dex_blast_min_devices",
+          "dex_blast_window_seconds", "dex_blast_cooldown_seconds", "dex_cohort_export_key"}) {
+        INFO(key << ": settings_routes.cpp changed shape? update this scan or classify the key");
+        CHECK(written.count(key) == 1);
+    }
+    CHECK(written.count("oidc_admin_group") == 1);
+    CHECK(written.size() >= 12);
+
+    for (const auto& key : written) {
+        INFO(key << " is written by a Settings route but classified General");
+        const auto cls = RuntimeConfigStore::write_class(key);
+        REQUIRE(cls.has_value());
+        CHECK(*cls != ConfigWriteClass::General);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
