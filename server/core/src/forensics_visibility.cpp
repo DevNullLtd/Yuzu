@@ -59,9 +59,12 @@ ForensicsVisibility resolve_forensics_visible(const ForensicsVisibilityDeps& dep
     // 1. Global proof. Quiet (no cookie-session denial row), but it IS the gate's own decision:
     //    elevation, engine principals, MCP tier, service scope, RBAC and the RBAC-off admin-only
     //    floor are all decided inside it. The gate's response is kept in a scratch object only to
-    //    tell an unavailable authorization store (503) from a definitive refusal (401/403).
+    //    tell an unavailable authorization store (503) from a definitive refusal (401/403). The
+    //    unavailable-aware variant answers 503 for an RBAC read that could not be completed (breaker
+    //    open, pool timeout, a failed role or permission query), where `probe_permission` would
+    //    collapse it into the 403 of a definitive denial.
     httplib::Response gate_response;
-    if (deps.auth_routes->probe_permission(req, gate_response, securable, "Read"))
+    if (deps.auth_routes->probe_permission_unavailable_aware(req, gate_response, securable, "Read"))
         return ForensicsVisibility{std::in_place, std::nullopt}; // Granted, global
     if (gate_response.status == 503)
         return note_unknown(deps, ForensicsUnknown::RbacUnavailable);

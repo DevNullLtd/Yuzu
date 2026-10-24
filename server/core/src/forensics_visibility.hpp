@@ -21,8 +21,9 @@
 /// off: right for `Response:Read` (an unconfined read), wrong here, where a global grant is the only
 /// thing that may admit, and with RBAC off `Forensics:Read` is floored to administrators
 /// (`authz_topology_floor.hpp`). The global proof therefore goes through
-/// `AuthRoutes::has_permission` (the quiet twin of `require_permission`, the only gate family that
-/// carries the floor) and NEVER through `require_fleet_read` / `probe_fleet_read` /
+/// `AuthRoutes::probe_permission_unavailable_aware` (the quiet twin of `require_permission`, the
+/// only gate family that carries the floor, with an unavailable RBAC read answered 503 rather than
+/// collapsed into the 403 of a denial) and NEVER through `require_fleet_read` / `probe_fleet_read` /
 /// `authorize_list_read`, which admit every authenticated caller when enforcement is off.
 ///
 /// Unwired means present-empty: `tier_filter_for` turns a missing resolver into `deny_all()`, and a
@@ -108,12 +109,15 @@ inline constexpr const char* kForensicsTierWithheldMetric =
 void seed_forensics_tier_metrics(yuzu::MetricsRegistry& metrics);
 
 /// The production resolver. Order is load-bearing:
-///   1. `AuthRoutes::probe_permission(req, scratch, "Forensics", "Read")` true => `nullopt`
-///      (global). It is `has_permission` with the gate's own response kept in a scratch object, so
-///      it decides the same things (JIT elevation, engine principals (RBAC-only), MCP tier, service
-///      scope (a service-scoped token never proves Forensics), the RBAC-off legacy floor), writes no
-///      denial row for a cookie session, and lets a 503 (an unavailable authorization store) be told
-///      apart from a 403. A 503 => Unknown(RbacUnavailable).
+///   1. `AuthRoutes::probe_permission_unavailable_aware(req, scratch, "Forensics", "Read")` true =>
+///      `nullopt` (global). It is `has_permission` with the gate's own response kept in a scratch
+///      object, so it decides the same things (JIT elevation, engine principals (RBAC-only), MCP
+///      tier, service scope (a service-scoped token never proves Forensics), the RBAC-off legacy
+///      floor) and writes no denial row for a cookie session. It differs from `probe_permission`
+///      in ONE way: an RBAC read that could not be completed (store not open, breaker open, pool
+///      acquire timeout, a failed role or permission query) answers 503 instead of the 403 of a
+///      definitive refusal, so the two can be told apart. A 503 => Unknown(RbacUnavailable), for
+///      every caller class. A definitive 401/403 falls through to step 2.
 ///   2. else, only when RBAC enforcement is in effect and the caller is an ordinary session (not a
 ///      service-scoped token, not an engine principal, not an MCP-tier token):
 ///      `RbacStore::visible_agents_for_permission` => that subset. A lookup failure =>
@@ -121,11 +125,8 @@ void seed_forensics_tier_metrics(yuzu::MetricsRegistry& metrics);
 ///   3. else Denied (present-empty).
 /// Step 2 skips caller classes the global probe treats specially because their authority is not
 /// "the minting user's grants": using the owner's scoped grants for them would widen them.
-/// Known limit: `require_permission`'s RBAC branch answers a degraded `check_permission` with a 403,
-/// not a 503, so for a caller other than an engine principal a degrade that hits only step 1 and
-/// not step 2 classifies as Denied; the `yuzu_server_rbac_read_degrade_total` series is the signal
-/// for that case. (An engine principal alone answers 503 when the RBAC store is not open, which is
-/// Unknown(RbacUnavailable); a query-level degrade is a 403, Denied, for every caller class.)
+/// An unavailable global read is therefore never collapsed into Denied: no Forensics row is
+/// served and the caller gets the retryable answer, whatever the caller class.
 [[nodiscard]] ForensicsVisibility resolve_forensics_visible(const ForensicsVisibilityDeps& deps,
                                                             const httplib::Request& req);
 
