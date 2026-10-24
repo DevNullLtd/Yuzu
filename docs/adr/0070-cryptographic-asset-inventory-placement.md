@@ -1527,3 +1527,53 @@ certificate to any `Security:Read` holder, a confined one included (owner decisi
 rows, without the dashboard's windows)". That sentence entered with commit 95486afc2, whose
 message lists two owner decisions (layout saves; keyset drill paging) and not this one, and no ADR
 records it. On 2026-10-23 the maintainer, Dave Rae, authorised reversing that statement: the unfiltered list is confined, as recorded in "What changed". He also ruled that a caller the standing check refuses without a 503 (kRefused) is served and the behaviour disclosed, with the failed-read exception tracked in #6382 and the no-grant question in #6383, and he approved this Update. He reports that the author of this ADR approved it offline before it was committed; that approval is not recorded elsewhere in the repository.
+
+## Update (2026-10-24): the issued-certificate list is served only to an affirmatively unconfined caller
+
+**Status of the 2026-10-23 Update.** It stays on record as history. Its "kRefused is served" row and
+its "A read failure partway through the access check" exception are **superseded by this Update**;
+the maintainer's 2026-10-23 ruling to keep serving was reviewed by an independent adjudicator on
+2026-10-24 and was not upheld (see "Why", below). Nothing in the 2026-10-23 Update is deleted.
+
+**What changed.** The standing table for `GET /api/v1/ca/issued` (both forms), MCP `list_issued_certs`,
+the `/crypto` drill and the Settings certificate panel's inventory is now:
+
+| Standing | Answer |
+|---|---|
+| kAvailable (a global `Inventory:Read`, an elevated session, or RBAC enforcement off) | served; success row ends `standing=available` |
+| kConfined (`Inventory:Read` granted only through management groups) | withheld: 403 / permission denied; `denied` row ending `withheld=confined` |
+| kRefused (no `Inventory:Read` grant at all) | **withheld**: 403 / permission denied; `denied` row ending `withheld=refused` |
+| kDegraded (the access check could not complete, **including a read failure inside it**) | 503, `retry_after_ms` 5000; `failure` row; never the list |
+
+1. **A read failure inside the access check is a 503, never the list.** `ListReadAuthorization` gains
+   `bool read_failed`, set when the global-grant read, the permission-group resolution or the
+   visible-set expansion fails, or the management-group store is not wired (not for an empty
+   `allow_groups`). When the global-grant read fails nothing further is read. An engine principal's
+   grant read is checked the same way. The fleet-read gate (`authz_gates.cpp`) and the list-read
+   gate (`auth_routes.cpp`) answer 503 on it instead of a 403, so `crypto_access_for` already maps
+   it to kDegraded. ADR-0017 INV-1 (any error is deny) and INV-5 (a partial failure never includes)
+   hold again for these reads; the exception recorded on 2026-10-23 is closed. Every fleet-gated
+   read now answers 503 rather than 403 on a mid-query failure; both still deny.
+2. **No grant is not an affirmative admission.** A `Security:Read` holder with no `Inventory:Read`
+   grant is refused the list. R2's reading that confinement is a property of a scoped grant remains
+   true, but the converse does not follow: removing a caller's last scoped grant must not widen what
+   it can see. #6383 is decided by this Update.
+3. **Corrections to the 2026-10-23 text.** (a) The slice withholds a confined caller's whole
+   inventory; it does not filter it per device (`list_issued` has no scope parameter). (b) "Adding a
+   deny" does not by itself widen the list: a global deny does not erase a group allow. The widening
+   was the loss of the last scoped allow. (c) The two "KNOWN RESIDUAL" tests injected kRefused; they
+   did not reproduce an authorization query failure. They are replaced by tests that run the real
+   access check against a broken management-group store and against grant removal.
+
+**Why.** The governance rules do not let an author defer a CRITICAL or HIGH finding, and an
+adjudication is not a waiver. The adjudicator (a second model, read-only, 2026-10-24) derived the
+failed-read disclosure as CRITICAL (impact I1, exposure E2: an authenticated `Security:Read` holder
+with only group-scoped inventory access receives out-of-scope device-certificate metadata: serial,
+subject which is the agent id, SAN, status, dates, issuer) and the no-grant widening as HIGH.
+
+**Consequence for operators.** Breaking for a custom role that holds `Security:Read` and no
+`Inventory:Read`; the seeded Administrator, PlatformEngineer and Operator roles hold an
+`Inventory:Read` and the seeded Viewer role a global one, per `seed_defaults()`. See
+`docs/user-manual/upgrading.md`.
+
+**Approval.** The maintainer, Dave Rae, approved applying this Update on 2026-10-24. The ADR author's confirmation is not recorded in the repository.
