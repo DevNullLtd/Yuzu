@@ -876,6 +876,18 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
     return html;
 }
 
+namespace {
+// In-page retry for a degraded Engine Principals fragment. A plain inline onclick (the dashboard
+// CSP blocks hx-on) fires the event the section already listens for. The page itself must not be
+// reloaded to retry: a freshly minted or rotated secret is shown outside this section and a
+// reload discards it.
+constexpr const char* kEngineRetryControl =
+    "<button class=\"btn btn-secondary\" type=\"button\" "
+    "onclick=\"htmx.trigger(document.body,'refreshEnginePrincipals')\">Retry</button> "
+    "<span class=\"hint\">Retry here instead of reloading the page, which would discard a "
+    "credential secret shown above.</span>";
+} // namespace
+
 std::string SettingsRoutes::render_engine_principals_fragment() {
     if (!engine_principal_store_ || !engine_principal_store_->is_open()) {
         return "<span class=\"muted\">Engine Principals store unavailable "
@@ -900,7 +912,7 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
     if (!principals_res) {
         spdlog::warn("settings engine-principals: roster read failed: {}", principals_res.error());
         return "<div class=\"muted\">Engine principals unavailable: the list could not be "
-               "read. Reload to retry.</div>";
+               "read. " + std::string(kEngineRetryControl) + "</div>";
     }
     const auto& principals = *principals_res;
 
@@ -924,9 +936,10 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
             // principal that holds a live credential. A read that cannot answer says so in
             // the cell and leaves the rest of the row (read from the principal store) intact.
             // After the first failed read the remaining rows are marked unavailable without
-            // another read: each failing read waits out the store's read timeout, so retrying
-            // per row would hold this request for roughly N x that timeout. A store that was
-            // never wired reads the same way.
+            // another credential read (and without the revoke-detail audit lookup below, which
+            // waits on the same pool): each failing read waits out its store's lease timeout, so
+            // retrying per row would hold this request for roughly N x that timeout. A store
+            // that was never wired reads the same way.
             std::size_t active_creds = 0;
             bool creds_known = false;
             if (api_token_store_ && !credentials_unreadable) {
@@ -965,7 +978,11 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                         ? "<em class=\"muted\">no successor recorded</em>"
                         : ("superseded by <code>" + html_escape(p.superseded_by) + "</code>");
                 std::string audit_detail = "(not recorded)";
-                if (audit_store_) {
+                if (credentials_unreadable) {
+                    // The pool is already failing reads; do not queue another lease wait per
+                    // revoked row (revoked rows are never pruned, so they only accumulate).
+                    audit_detail = "(unavailable)";
+                } else if (audit_store_) {
                     AuditQuery q;
                     q.target_type = "EnginePrincipal";
                     q.target_id = p.principal_id;
@@ -1044,7 +1061,7 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                     // The credential store could not answer, so neither "Mint" (no live
                     // credential) nor "Rotate" (exactly one) can be offered truthfully.
                     html += "<span class=\"hint\">Credential state unavailable; "
-                            "reload to retry.</span> ";
+                            "use Retry below.</span> ";
                 } else if (active_creds == 0) {
                     // No live credential yet — this principal needs an
                     // initial mint (POST .../credentials), not a rotate
@@ -1107,6 +1124,8 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
     }
 
     html += "  </tbody></table>";
+    if (credentials_unreadable)
+        html += "<p>" + std::string(kEngineRetryControl) + "</p>";
 
     // NOTE: the one-time-reveal target (#engine-principal-reveal) is
     // DELIBERATELY NOT emitted here — it lives in the static page shell

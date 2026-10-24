@@ -2542,7 +2542,8 @@ static const ToolDef kTools[] = {
      "List engine principals with each principal's active-credential count (admin/auditor "
      "surface). Mirrors GET /api/v1/engine-principals. Requires EnginePrincipal:Read. Fails "
      "closed: if the principal list or the credential counts cannot be read the tool returns a "
-     "retryable internal error (retry_after_ms 2000), never count 0 or a credential count of 0.",
+     "retryable internal error (retry_after_ms 2000) instead of reporting 0 for something it could "
+     "not read.",
      R"j({"type":"object","properties":{)j"
      R"j("include_revoked":{"type":"boolean","default":true,"description":"false restricts to lifecycle_state=active only"})j"
      R"j(}})j",
@@ -2552,8 +2553,8 @@ static const ToolDef kTools[] = {
      "Get one engine principal's identity row plus its active-credential count (an integer here; "
      "the REST twin returns an array of credential objects under the same name). Mirrors GET "
      "/api/v1/engine-principals/{id}. Requires EnginePrincipal:Read. Fails closed: if the "
-     "credential read fails the tool returns a retryable internal error (retry_after_ms 2000), "
-     "never active_credentials 0.",
+     "credential read fails the tool returns a retryable internal error (retry_after_ms 2000) "
+     "instead of reporting active_credentials 0 for credentials it could not read.",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"})j"
      R"j(},"required":["principal_id"]})j",

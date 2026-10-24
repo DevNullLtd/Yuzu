@@ -45,7 +45,14 @@ denial belt.
 ### 1. Create the principal
 
 Dashboard: Settings → **Engine Principals** → fill in Slug, Display Name,
-Owner, Classification, Justification → Create. When the list or an engine principal's credentials cannot be read (for example while the database connection pool is exhausted), the panel says so: an "unavailable" notice replaces the table, or the Active Creds cell shows "unavailable" and the row offers neither Mint nor Rotate. Reload once the store recovers.
+Owner, Classification, Justification → Create.
+
+If the list or an engine principal's credentials cannot be read (for example
+while the database connection pool is exhausted), the panel says so: an
+"unavailable" notice replaces the table, or the Active Creds cell shows
+"unavailable" and the row offers neither Mint nor Rotate. Use the panel's
+**Retry** button rather than reloading the page; a reload discards a credential
+secret that is still shown above the panel.
 
 REST:
 

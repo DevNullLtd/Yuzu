@@ -298,8 +298,9 @@ public:
     /// OR expires_at>now). `token_hash` is masked ('') same as `list_tokens`.
     /// Used to enforce the design doc §7 "at most two active credentials"
     /// ceiling and to drive `rotate_engine_credential`'s state machine. A caller
-    /// that DISPLAYS or DECIDES on the result must use the checked twin below: this
-    /// accessor reads a store fault as an empty vector.
+    /// that DISPLAYS or DECIDES on the result must use the checked twin below, unless
+    /// it deliberately treats an empty vector as "could not read" (as the two token
+    /// rotate routes do): this accessor reads a store fault as an empty vector.
     [[nodiscard]] std::vector<ApiToken>
     list_active_for_principal(const std::string& principal_id) const;
 

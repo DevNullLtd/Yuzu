@@ -3577,6 +3577,9 @@ TEST_CASE("MCP list_engine_principals: a saturated shared pool is a retryable er
         CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
               mcp::kMcpStoreFaultShortRetryMs);
         CHECK(r->body.find("\"count\"") == std::string::npos);
+        // The store's own error text never reaches the response.
+        CHECK(r->body.find("database unavailable") == std::string::npos);
+        CHECK(r->body.find("pool lease") == std::string::npos);
     }
     REQUIRE(ts.audit_log.size() == ts.audit_details.size());
     REQUIRE(!ts.audit_log.empty());
