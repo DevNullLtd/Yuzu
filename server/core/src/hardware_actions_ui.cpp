@@ -380,8 +380,9 @@ std::string render_hardware_action_result(const std::string& plugin, const std::
             break;
         case HwActionResultView::Phase::PermissionUnconfirmed:
             h += "<div class=\"gp-placeholder\" data-permission-unconfirmed=\"true\">"
-                 "The permission check for this result could not be completed. Try again "
-                 "shortly.</div>";
+                 "The permission check for this result could not be completed. Open the "
+                 "execution results to see it; running the action again starts a new "
+                 "collection.</div>";
             break;
     }
     h += "</div>";
