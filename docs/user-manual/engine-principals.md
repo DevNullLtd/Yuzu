@@ -4,9 +4,9 @@ Engine principals are the durable identities behind autonomous use-case-engine
 modules (ADR-1005 item 2b) — a third principal class alongside human users and
 human-created API tokens. Each engine principal has a named responsible human
 owner, a grant justification captured at creation, and a required
-`internal`/`external` classification, and it can never be granted the
-admin/wildcard role: least privilege is enforced structurally, not merely
-asserted by policy.
+`internal`/`external` classification, and it cannot be granted the admin
+role or any other built-in role. A custom role that grants every permission is
+not refused when it is assigned; the no-admin audit reports it afterwards.
 
 This page is an operator walkthrough. Full API reference:
 [REST API — Engine Principals](rest-api.md#engine-principals);
@@ -51,6 +51,13 @@ denial belt.
 Dashboard: Settings → **Engine Principals** → fill in Slug, Display Name,
 Owner, Classification, Justification → Create.
 
+If the list or an engine principal's credentials cannot be read (for example
+while the database connection pool is exhausted), the panel says so: an
+"unavailable" notice replaces the table, or the Active Creds cell shows
+"unavailable" and the row offers neither Mint nor Rotate. Use the panel's
+**Retry** button rather than reloading the page; a reload discards a credential
+secret that is still shown above the panel.
+
 REST:
 
 ```bash
@@ -84,7 +91,22 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
 
 The response carries the raw secret **exactly once**, under
 `Cache-Control: no-store` — copy it immediately into the consuming module's
-secret store. It cannot be retrieved again; only rotated or revoked.
+secret store. It cannot be retrieved again; only rotated or revoked. If the
+server cannot read the token store to check that the principal has no
+credential yet, it answers `503` with `Retry-After: 2` and mints nothing, so
+retrying after that `503` is safe. The MCP tool `mint_engine_credential` does the
+same (a retryable error with a `retry_after_ms` hint, nothing minted). If the
+credential is minted but the server then cannot read it back, it answers `503`
+with the secret withheld and the audit row `engine_principal.credential.mint`
+with `result=partial`; the credential exists but its secret was never shown, so
+do **not** retry the mint (that is a `409`): rotate it to obtain a secret.
+The same `503` and `partial` row apply when the read-back **answers but finds no
+active credential** (the new credential was revoked out of band between the
+insert and the read-back): the secret is withheld rather than delivered with an
+empty `token_id`. Check the principal's credentials, and rotate only if one is
+listed. Mint does not take a lock between the check and the insert, so two mint
+requests in flight at the same moment can both pass the check. Send them one at
+a time.
 
 ### 3. Rotate the credential (overlap-pair model)
 
@@ -108,6 +130,51 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
   or minting a second successor — safe to retry a dropped response. Every
   successful return, original or replay, is independently audited under
   `engine_principal.credential.reveal`.
+- If the rotation commits but the server then cannot read the new credential
+  back to build the response, it answers `503` with `Retry-After: 2` and
+  **withholds the secret**; the audit row is
+  `engine_principal.credential.rotate` with `result=partial`, with no reveal
+  row. Retry inside the same ~120-second grace window, as the same operator
+  and against the same server replica, to receive the same successor secret.
+  The grace window is held in that replica's memory: after a restart, on a
+  different replica, or once the window has ended, the retry is a `409`. The
+  MCP tool `rotate_engine_credential` behaves the same way (a retryable error,
+  secret withheld, `result=partial`). A `result=partial` row is the operator
+  signal that a successor exists whose secret was never delivered.
+- If the rotation committed and the read-back **answered but found no linked
+  successor** (the successor was revoked or confirmed out of band in between),
+  the response is also `503` with the secret withheld and `result=partial`, but
+  with **no retry hint**: there is no pending pair to re-serve, and an automatic
+  retry would perform a *new* rotation you did not ask for. The message says
+  "A successor may exist; inspect the principal's credentials
+  (`GET /api/v1/engine-principals/{id}`), then rotate again if needed." Do that,
+  then rotate again only if the principal needs a new credential. The MCP tool
+  `rotate_engine_credential` answers the same way, also without a retry hint.
+- **If the secret is lost** (the grace window passed, or the replica changed),
+  the pair is stuck with a successor nobody holds. Recover in three steps:
+  1. Find the successor with `GET /api/v1/engine-principals/{id}`. In its
+     `active_credentials` list a stuck pair is two credentials sharing a
+     `rotation_group`; the successor is the one whose `overlap_expires_at` is
+     `0` while the predecessor's is non-zero. That read fails closed: when the
+     token store cannot answer, the route returns `503` with `Retry-After: 2`
+     instead of an empty `active_credentials` list, so repeat it after the `503`
+     clears.
+     (`GET /api/v1/tokens` does not list it: that route is scoped to the
+     caller's own tokens, and an engine credential is owned by the engine
+     principal.)
+  2. Revoke the successor with `DELETE /api/v1/tokens/{token_id}`. This is a
+     REST call only (the MCP tools have no per-credential revoke). It needs
+     `ApiToken:Delete`, a fresh MFA step-up, and an **effective administrator**,
+     because only the token's owner or an administrator may revoke it and the
+     owner here is the engine principal, not a person. Any other caller gets
+     `404 token not found`.
+  3. Rotate again. After the successor is revoked the predecessor is the sole
+     credential, and rotating it starts a fresh pair.
+
+  Do **not** revoke only the predecessor: that leaves the principal holding a
+  single credential whose secret no one has. Do **not** revoke the principal
+  itself (`DELETE /api/v1/engine-principals/{id}`) as a recovery step: that is
+  terminal and destroys the identity and every credential.
 - If the consuming module updates the secret and you never call `confirm`
   (next step), a **60-second background sweep** enforces predecessor
   auto-revoke on your behalf, with this SLA: **a predecessor is revoked
@@ -154,7 +221,8 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
   that warning has fired for the elapsed state, do not assume the sweep will
   eventually clean it up (it will not — see the "never presented" case
   above) — either confirm once the successor genuinely is in use, or revoke
-  the *specific* credential you no longer trust via
+  the *specific* credential you no longer trust (the successor, if its secret
+  was never picked up) via
   `DELETE /api/v1/tokens/{token_id}` (never
   `DELETE /api/v1/engine-principals/{id}` — see step 4's callout below for
   why).
@@ -287,14 +355,38 @@ is enforced in two modes, chosen by whether an operator is in the loop:
 ## The no-admin auditor
 
 `GET /api/v1/engine-principals/audit/no-admin` (REST) and `audit_engine_no_admin`
-(MCP, available on every MCP tier) are an independently-runnable proof that
-"no admin, ever" actually holds across every engine principal — not just a
-claim about the write-path guard that creates and grants them. It resolves
-each engine principal's real role assignments and effective permissions
-against the live RBAC tables and reports three kinds of violation: a literal
-`admin`/`Administrator` role grant, any role flagged `is_system`, or a granted
-`securable × operation` set large enough to be functionally admin-equivalent
-even under an innocuous custom role name.
+(MCP, available on every MCP tier) are an independently-runnable **check** of
+the "no admin" rule across every engine principal, rather than a claim about the
+write-path guard that creates and grants them. They read every grant held by an
+`engine:` id from the grant table, with each role's permissions, and report
+three kinds of detected grant: a literal `admin`/`Administrator` role
+(`admin_role`), a role flagged `is_system` (`system_role`), and a
+`wildcard_grant`, meaning a role (or, with an empty `role`, the union of a
+principal's roles) that allows every `securable x operation` pair of the grid as
+it is at run time. Grants are read by principal id, whatever their principal
+type, so a grant of type `user` on an `engine:` id is reported too, and `role`
+carries the role's name. Only `admin_role` and `system_role` mean the
+assignment check was bypassed; a `wildcard_grant` is permitted by design and is
+reported for review (the Tokens page words the two differently).
+
+The MCP tool also takes `include_revoked` (default `true`, MCP only). `false`
+is a different report, not a subset of the default run. It skips principals the
+engine-principal roster lists as **revoked**, and it also reports
+`orphan_grant` for every `engine:` grant whose principal has no roster row at
+all (a stale or out-of-band grant that a walk over the roster would hide). The
+default run and the REST route never report `orphan_grant`, so a grant of a
+harmless role to a principal with no roster row is `ok:true` there and a
+finding on the narrowed run. Use the default run for the full-population
+answer. The success audit row records `scope=active` for a narrowed run and
+`scope=all` otherwise, so a narrowed `violations=0` is not mistaken for a
+full-population result.
+
+**What assignment refuses, and what it does not.** Assigning a role to an engine
+principal refuses the `admin` and `Administrator` role names and every built-in
+(`is_system`) role. It does **not** refuse a custom role that covers the whole
+grid: that is permitted by design (maintainer ruling 2026-10-23, #2485) and is
+**detected afterwards** by this auditor. Role permissions can also be edited
+after the role was assigned, which is why the check is run against live data.
 
 ```bash
 curl -sk https://localhost:8080/api/v1/engine-principals/audit/no-admin \
@@ -305,14 +397,39 @@ curl -sk https://localhost:8080/api/v1/engine-principals/audit/no-admin \
 { "data": { "ok": true, "violations": [] } }
 ```
 
-An empty `violations` array is the positive evidence, not the absence of a
-check. If the RBAC reference data needed to compute the wildcard bound can't
-be resolved, the route returns `503` ("cannot verify") rather than a false
-`ok:true` — treat that response as "run again," never as "clean." This
-auditor is gated on `AuditLog:Read`, not `Security`, deliberately (with RBAC
-enabled; admin-only while RBAC is off, #5771): a
-read-only auditor role can run it without holding engine-principal write
-access.
+What `ok:true` means, and what it does not:
+
+- It means no role held by an engine principal, and no engine principal's union
+  of roles, allows every pair of the current grid **at the moment of the run**.
+  A role that grants every pair but one is **not** reported, and a role that
+  covered the grid before an upgrade added a new securable stops being reported
+  until it is granted the new pair. `deny` rows are ignored (over-reporting is
+  the safe direction).
+- It is a point-in-time, pull-only check. Nothing runs it on a schedule and
+  nothing alerts on a `wildcard_grant`; the cadence is the operator's. Each run
+  writes an `engine_principal.audit.no_admin` audit row
+  (`violations=N scope=all|active`, then up to ten detected
+  `principal_id:reason` pairs), and those rows are the evidence the control
+  operated. The Tokens page also runs the check incidentally, in the browser,
+  whenever a viewer who holds `AuditLog:Read` loads the principals panel; that
+  is not a schedule and not a control (other viewers see a note that the check
+  needs `AuditLog:Read`, and a deployment nobody opens in a browser never
+  triggers it). A success row whose write was dropped is signalled only by
+  `Sec-Audit-Failed` on REST (the MCP tool gives no signal). A period with no
+  rows is therefore not evidence that the check ran or that it passed; absence
+  of rows shows at most that no recorded run exists. The grants, the roles and the role permissions are three separate
+  reads, not one snapshot: a role granted or edited between them is picked up by
+  the next run. Run it after every role assignment to an engine principal
+  and periodically as part of a machine-identity access review.
+- It fails closed. If any read it depends on cannot be answered (the grants,
+  the roles, the role permissions, or the RBAC reference data), the route returns
+  `503` ("rbac resolution unavailable - cannot verify", `Retry-After: 2`; the MCP
+  tool returns a retryable error with `retry_after_ms`), with no partial list and
+  an `engine_principal.audit.no_admin` row with `result=failure`. Treat that as
+  "run again," never as "clean." This auditor is gated on `AuditLog:Read`, not
+  `Security`, deliberately (with RBAC enabled; admin-only while RBAC is off,
+  #5771): a read-only auditor role can run it without holding engine-principal
+  write access.
 
 ## Per-principal quota cap (PR 4.4)
 
