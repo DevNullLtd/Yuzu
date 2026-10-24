@@ -5340,13 +5340,17 @@ groups:
     # in-process cmd_execution_ids_ map). Mirrors yuzu-auth-sessions'
     # YuzuSessionReapClockAnomaly shape: a reap pass declines when its
     # DB-primary now() read is implausibly ahead of, or behind, the
-    # persisted anchor. Lower stakes than the session case (this table is a
-    # regenerable observability aid, not compliance evidence — see
-    # docs/executions-history-ladder.md), so a single reap-clock-anomaly
-    # alert is the whole ask here; the write/store-degrade counters are
-    # deferred (no comparable existing shape to adapt, best-effort
-    # observability rather than an integrity signal). Zero-seeded at boot,
-    # so increase() > 0 is meaningful.
+    # persisted anchor. A decline here un-expires nothing (rows only age past
+    # the window), so a single reap-clock-anomaly alert is the whole ask for
+    # the reap; see docs/executions-history-ladder.md. Since #4990 the table
+    # is also the server's dispatch record, the source of a stored response's
+    # plugin label: a missing record means the response is stored
+    # `~unverified` (Forensics-tier, withheld from callers without
+    # Forensics:Read). The write/store-degrade counters and the
+    # yuzu_server_response_provenance_total outcomes `unrecorded` and
+    # `lookup_degraded` are therefore signals of responses being stored
+    # unverified, and have no alert rule yet. Zero-seeded at boot, so
+    # increase() > 0 is meaningful.
     rules:
       - alert: YuzuExecCorrelationReapClockAnomaly
         expr: |
