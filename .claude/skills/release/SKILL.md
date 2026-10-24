@@ -71,39 +71,41 @@ Optional `--full` adds a local C++ + Erlang compile (~2 min).
 
 **Stop** if preflight fails. Surface the failures and ask the operator how to proceed (commit fixes? bump versions? abort?).
 
-## Phase 0.5 — Branch reconciliation (only when preflight check #8 fails)
+## Phase 0.5 — Branch reconciliation (only when preflight check #9 fails)
 
-Releases tag from `main`, but ongoing development happens on `dev`. Every prior release has hit the same trap: `dev` accumulates dozens of merged commits, and the prior release's prep commits (CHANGELOG bump, version stamp) land directly on `main` without being cherry-picked back to `dev`. By the time the next release is cut, both branches are diverged in both directions and the operator has to remember to reconcile.
+Releases tag from `main`, but ongoing development happens on `dev`. Every prior release has hit the same trap: `dev` accumulates dozens of merged commits, and the prior release's prep commits (CHANGELOG promotion, version stamp) and any hotfixes land on `main` without being carried back to `dev`. By the time the next release is cut, both branches are diverged in both directions and the operator has to remember to reconcile.
 
-The preflight's check #8 surfaces this as a hard FAIL with the exact ahead/behind counts. Reconciliation flow:
+The preflight's check #9 surfaces this as a hard FAIL with the exact ahead/behind counts.
+
+**Both directions go through a pull request.** The *Protect Main* and *Protect Dev* rulesets accept changes only by PR, require one approving review, and have no bypass actors, so a direct `git push` to either branch — including a fast-forward — is refused. Reconciliation flow:
 
 ```bash
 # Diagnose what's where
-git log --oneline origin/dev..origin/main    # commits on main, not on dev (usually 1-3 release-prep commits)
+git log --oneline origin/dev..origin/main    # commits on main, not on dev (release prep, hotfixes)
 git log --oneline origin/main..origin/dev    # commits on dev, not on main (usually all the merged work)
 
-# Step 1 — apply main's missing commits to dev (cherry-pick or merge).
-# Cherry-pick is usually right when main only has a CHANGELOG bump from the prior release:
-git checkout dev
-git cherry-pick origin/dev..origin/main
-# Resolve any CHANGELOG conflicts; commit; push:
-git push origin dev
+# Step 1 — carry main's missing commits back to dev, as a PR into dev.
+# A merge is usually right (it keeps the hotfix history); cherry-pick only when main
+# holds nothing but a CHANGELOG/version commit that would conflict anyway.
+git switch -c chore/back-merge-main-into-dev origin/dev
+git merge origin/main            # resolve any CHANGELOG / meson.build conflicts; commit
+git push -u origin chore/back-merge-main-into-dev
+gh pr create --base dev --title "chore: back-merge main into dev after the <release> promotion"
+# Get it approved and merged.
 
-# Step 2 — fast-forward main to the new dev tip (now contains both halves).
-# This is the safer path than `git checkout main && git merge dev` because it
-# refuses if main ever diverges from dev again. After step 1, the FF should
-# succeed cleanly:
-git checkout main
-git merge --ff-only origin/dev
-git push origin main
+# Step 2 — promote the reconciled dev to main, as a PR into main.
+# Base the PR on dev itself or on a release/vX.Y.Z-prep branch cut from it that also carries
+# the CHANGELOG promotion and the version bump (pre-conditions above).
+gh pr create --base main --head dev --title "release: dev → main sync (X.Y.Z)"
+# Get it approved and merged (a merge commit; the ruleset forbids a force or direct push).
 
-# Step 3 — re-run preflight. Check #8 should now PASS.
+# Step 3 — re-run preflight. Check #9 should now PASS.
 bash scripts/release-preflight.sh vX.Y.Z
 ```
 
-If step 2's `--ff-only` refuses, check #1 was incomplete — there are still commits on dev that aren't on main, OR the cherry-picks on dev didn't apply cleanly. Inspect with `git log --oneline origin/main..origin/dev` and resolve before continuing. Don't fall back to a non-FF merge; keeping `main` strictly fast-forward off `dev` is the invariant that keeps future releases honest.
+If check #9 still fails after step 2, something merged to `dev` or `main` between the two PRs; diagnose with the two `git log` lines above and repeat the direction that is behind. Recent instances of both steps: #6271 (back-merge, 2026-10-21) and #6264 (promotion, 2026-10-21); #5113 was the 0.14.0-rc1 promotion.
 
-After both branches are reconciled, the operator tags from `main` (which is now the same SHA as `dev` plus the prior release prep) and Phase 1 proceeds normally.
+After both branches are reconciled, the operator tags `main`'s tip and Phase 1 proceeds normally.
 
 ## Phase 1 — Tag and push (~5 sec)
 
