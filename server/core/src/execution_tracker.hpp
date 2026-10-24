@@ -135,6 +135,9 @@ struct AgentExecStatus {
     int64_t first_response_at{0};
     int64_t completed_at{0};
     int exit_code{0};
+    /// Precondition (#4990): must already be reduced via the Forensics error sanitizer at ingest
+    /// (`AgentServiceImpl::failure_text_for_sinks`); `update_agent_status` does not re-reduce a
+    /// value equal to the persisted text.
     std::string error_detail;
     /// CC-07 plugin→host typed result status (agent.proto CommandResponse
     /// .plugin_result_status, mirrors YuzuResultStatus from
@@ -326,7 +329,10 @@ public:
     /// from the `command_execution` correlation (command id prefix), so an execution whose
     /// mapping has aged out (24h) or was never recorded is not recognised. Borrowed; set before
     /// the listener starts. Unset = reads are returned as stored (a test harness; production boot
-    /// refuses without the set and the write side fails closed).
+    /// refuses without the set). The write path (`update_agent_status`) relies on its caller
+    /// having reduced the incoming text already; it re-reduces only a PERSISTED text that differs
+    /// from the incoming one, under a savepointed lookup (see the precondition on
+    /// `update_agent_status`).
     void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
 
     /// ADR-1007 — optional observability sink for the per-device
@@ -464,6 +470,12 @@ public:
 
     // Mutation
     std::expected<std::string, std::string> create_execution(const Execution& exec);
+    /// Precondition (#4990): `status.error_detail` must already be reduced via the Forensics
+    /// error sanitizer at ingest (`AgentServiceImpl::failure_text_for_sinks`). The write path does
+    /// not re-reduce a value equal to the persisted text, so a caller that passes raw Forensics
+    /// text publishes it to the outbox and the bus on its first write. A lexical gate
+    /// (`tests/test_forensics_tier_wiring_lexical.py`) pins exactly one caller; a second caller
+    /// needs a reviewed edit there.
     void update_agent_status(const std::string& execution_id, const AgentExecStatus& status);
     void refresh_counts(const std::string& execution_id);
 

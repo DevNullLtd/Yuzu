@@ -169,6 +169,37 @@ def main() -> int:
            "replacing the tracker status text reduction was NOT detected")
     expect("tracker-status-text-reduced" in ids(g.agent_service_problems(asrc.replace(sinks, "// " + sinks, 1))),
            "a commented-out tracker status text reduction must not count")
+    # The reduced status text is not rewritten afterwards, and update_agent_status has one caller.
+    for rewrite in ("s.error_detail = resp.error().message();", "s.error_detail += extra;",
+                    "s.error_detail.clear();", "s.error_detail.append(extra);",
+                    "s.error_detail=\n  other;"):
+        expect("tracker-status-text-not-rewritten" in ids(g.agent_service_problems(asrc + "\n" + rewrite + "\n")),
+               f"a rewrite of the reduced status text was NOT detected: {rewrite!r}")
+    expect("tracker-status-text-not-rewritten" not in ids(g.agent_service_problems(
+               asrc + "\n// s.error_detail = x;\n if (s.error_detail == y) {}\n sr.error_detail = z;\n")),
+           "a comment, a comparison or another variable is not a rewrite of the status text")
+    tree = g.read_src_tree()
+    expect(g.tracker_caller_problems(tree) == [], "the real tree must have exactly one tracker caller")
+    expect(g.TRACKER_CALLER_FILE in tree, "selftest anchor moved: the tracker caller file")
+    for fname, extra in (("other_routes.cpp", "tracker->update_agent_status(id, s);"),
+                         ("other_routes.cpp", "execution_tracker_.update_agent_status(id, s);"),
+                         ("other_routes.cpp", "tracker_ptr_\n   ->update_agent_status(id, s);"),
+                         ("other_routes.cpp", "auto f = &ExecutionTracker::update_agent_status;"),
+                         (g.TRACKER_CALLER_FILE, "tracker->update_agent_status(id, s);")):
+        crafted = dict(tree)
+        crafted[fname] = crafted.get(fname, "") + "\n" + extra + "\n"
+        expect("tracker-update-agent-status-callers" in ids(g.tracker_caller_problems(crafted)),
+               f"a second tracker caller was NOT detected: {extra!r} in {fname}")
+    crafted = dict(tree)
+    crafted["other_routes.cpp"] = ("// tracker->update_agent_status(id, s);\n"
+                                   "d_.policy_store->update_agent_status(p, a, st, r, gen);\n"
+                                   "deployment_store_->update_agent_status(d, s);\n")
+    expect(g.tracker_caller_problems(crafted) == [],
+           "a comment, a PolicyStore call or a deployment-store call is not a tracker caller")
+    crafted = dict(tree)
+    crafted[g.TRACKER_CALLER_FILE] = crafted[g.TRACKER_CALLER_FILE].replace("tracker->update_agent_status(", "tracker->noop(", 1)
+    expect("tracker-update-agent-status-callers" in ids(g.tracker_caller_problems(crafted)),
+           "removing the only tracker caller was NOT detected")
     expect(g.agent_service_problems(asrc.replace(stored, "// " + stored, 1)) != [],
            "a commented-out stored-row read must not count")
     expect(g.agent_service_problems(asrc + "\n// resp.error().message() is only mentioned here\n") == [],

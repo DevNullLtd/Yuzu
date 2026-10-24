@@ -305,6 +305,14 @@ EXACT_AGENT_SERVICE: list[tuple[str, str, int, str]] = [
      "notify_exec_tracker must reduce the status text with failure_text_for_sinks: the tracker "
      "write path relies on the incoming text already being reduced (it skips the lookup when the "
      "persisted text equals it)"),
+    # The pinned assignment above is only meaningful if nothing rewrites the field afterwards in
+    # the same function. Every write to `s.error_detail` in this file (assignment, compound
+    # assignment, or a mutating string call) is counted; the one allowed is the reduction itself.
+    ("tracker-status-text-not-rewritten",
+     r"\bs\.error_detail(?:=(?!=)| ?\+=|\.(?:append|assign|clear|swap|push_back|insert|replace|resize|erase)\()",
+     1,
+     "the status text must not be written again after the failure_text_for_sinks reduction: the "
+     "tracker write path trusts it as already reduced"),
 ]
 
 
@@ -319,6 +327,53 @@ FORBIDDEN_AGENT_SERVICE: list[tuple[str, str, str]] = [
     ("raw-failure-text-mutable-error", r"(?:\.|->)mutable_error\(\)",
      "mutable_error() hands out the error submessage; no ingest path needs it"),
 ]
+
+
+# ExecutionTracker::update_agent_status trusts its caller to have reduced the failure text at
+# ingest (see the precondition on its declaration). Exactly one production caller exists, in
+# agent_service_impl.cpp; a second caller, in any file under server/core/src, is a new writer of
+# that text and fails here until it is reviewed and counted. Receivers that are the policy or
+# deployment stores (unrelated classes with a same-named method) are not tracker calls.
+SRC_DIR = os.path.join("server", "core", "src")
+TRACKER_CALLER_FILE = "agent_service_impl.cpp"
+_TRACKER_CALL = re.compile(r"(?:->|\.)update_agent_status\(")
+_TRACKER_PMF = re.compile(r"&ExecutionTracker::update_agent_status\b")
+_OTHER_RECEIVERS = ("policy_store", "deployment_store")
+
+
+def tracker_caller_problems(sources: dict[str, str]) -> list[tuple[str, str]]:
+    """(id, message) when ExecutionTracker::update_agent_status is not called from exactly one site.
+
+    `sources` maps a file name (base name) to its text. Comments are stripped first.
+    """
+    sites: list[str] = []
+    for name in sorted(sources):
+        t = canonical(sources[name])
+        for m in _TRACKER_CALL.finditer(t):
+            if any(r in t[max(0, m.start() - 40):m.start()] for r in _OTHER_RECEIVERS):
+                continue
+            sites.append(name)
+        # A pointer to member (`&ExecutionTracker::update_agent_status`) also reaches it.
+        sites.extend(name for _ in _TRACKER_PMF.finditer(t))
+    out: list[tuple[str, str]] = []
+    if sites != [TRACKER_CALLER_FILE]:
+        out.append(("tracker-update-agent-status-callers",
+                    f"tracker-update-agent-status-callers: ExecutionTracker::update_agent_status must have "
+                    f"exactly one call site, in {TRACKER_CALLER_FILE} (the ingest that reduces the failure "
+                    f"text); found {len(sites)}: {sites}. A new caller must reduce the text with "
+                    f"failure_text_for_sinks first and be reviewed, then be counted here"))
+    return out
+
+
+def read_src_tree() -> dict[str, str]:
+    root = os.path.join(REPO_ROOT, SRC_DIR)
+    out: dict[str, str] = {}
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            if f.endswith((".cpp", ".hpp", ".h", ".cc")):
+                with open(os.path.join(dirpath, f), encoding="utf-8", errors="replace") as fh:
+                    out[os.path.relpath(os.path.join(dirpath, f), root).replace(os.sep, "/")] = fh.read()
+    return out
 
 
 def agent_service_problems(src: str) -> list[tuple[str, str]]:
@@ -375,10 +430,14 @@ def main() -> int:
     afound = agent_service_problems(asrc)
     for _rid, msg in afound:
         print(f"::error::{TAG}: {AGENT_SERVICE_CPP}: {msg}{HINT}", file=sys.stderr)
-    if found or afound:
+    tfound = tracker_caller_problems(read_src_tree())
+    for _rid, msg in tfound:
+        print(f"::error::{TAG}: {SRC_DIR}: {msg}{HINT}", file=sys.stderr)
+    if found or afound or tfound:
         return 1
     print(f"OK: {len(REQUIRED)} wiring statements, {len(COUNTED)} counted sites, "
           f"{len(FORBIDDEN)} forbidden hatches, {len(EXACT_AGENT_SERVICE)} exact counts, "
+          f"1 tracker-caller pin, "
           f"{len(FORBIDDEN_AGENT_SERVICE)} forbidden dumps checked")
     return 0
 
