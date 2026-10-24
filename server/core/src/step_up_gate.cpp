@@ -602,12 +602,12 @@ void emit_step_up_refusal_effects(const httplib::Request& req, const StepUpVerdi
             if (verdict.reason.empty())
                 spdlog::error("require_mfa_step_up: mfa_status({}) failed: failing closed "
                               "(1 log per {} refusals; the counter records all)",
-                              verdict.user, kStepUpLogSample);
+                              yuzu::log_token(verdict.user), kStepUpLogSample);
             else
                 spdlog::error("require_mfa_step_up: the MFA proof binding of {} could not be "
                               "decided ({}): failing closed (1 log per {} refusals; the counter "
                               "records all)",
-                              verdict.user, verdict.reason, kStepUpLogSample);
+                              yuzu::log_token(verdict.user), verdict.reason, kStepUpLogSample);
         }
     }
     // kEvaluationFailed logs nothing here: `note_chokepoint_exception` already wrote the one

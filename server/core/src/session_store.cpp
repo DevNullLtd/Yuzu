@@ -152,9 +152,14 @@ AuthoredTimes authored_from(PGresult* res, int i) {
 }
 
 // Body of the rebind-guard trigger function. ONE constant shared by the migration
-// (below) and the effective-firing validation (md5 of pg_proc.prosrc), so the two
-// cannot drift. A write of a proof or identity column that does not advance the bind
-// sequence leaves the proof UNBOUND (factor generation 0), whatever the new values.
+// (below) and the effective-firing validation (`pg_proc.prosrc` compared by plain text
+// equality, no md5: md5() is refused on a FIPS-mode server, and AuthDB's check does the
+// same), so the two cannot drift. A write of a proof or identity column that
+// does not advance the bind sequence leaves the proof UNBOUND (factor generation 0),
+// whatever the new values.
+// FROZEN: shipped in migration v2 and pinned byte-for-byte by the boot check; changing it
+// needs a NEW migration (CREATE OR REPLACE) and an accepted (old,new) pair in the check, or
+// every migrated replica refuses to boot.
 constexpr std::string_view kRebindGuardBody =
     "\nBEGIN\n"
     "  IF NOT (NEW.mfa_bind_seq > OLD.mfa_bind_seq) THEN\n"
@@ -205,7 +210,7 @@ GuardCheck check_rebind_guard(PGconn* conn) {
         "'principal_kind')) "
         "  AND p.proname = 'sessions_mfa_rebind_guard' AND p.pronamespace = c.relnamespace "
         "  AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql') "
-        "  AND md5(p.prosrc) = md5($1::text), false) "
+        "  AND p.prosrc = $1::text, false) "
         "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
         "LEFT JOIN pg_trigger t ON t.tgrelid = c.oid AND t.tgname = 'sessions_mfa_rebind_guard' "
         "  AND NOT t.tgisinternal "
@@ -312,7 +317,9 @@ const std::vector<pg::PgMigration>& migrations() {
 
 } // namespace
 
-SessionStore::SessionStore(pg::PgPool& pool) : pool_(pool) {
+SessionStore::SessionStore(pg::PgPool& pool) : SessionStore(pool, MfaBindingCheck::kEnforce) {}
+
+SessionStore::SessionStore(pg::PgPool& pool, MfaBindingCheck binding_check) : pool_(pool) {
     auto lease = pool_.acquire(); // unbounded — construction ONLY
     if (!lease) {
         spdlog::error("SessionStore: no database connection at construction ({})",
@@ -325,7 +332,21 @@ SessionStore::SessionStore(pg::PgPool& pool) : pool_(pool) {
     }
     // The binding is only as good as the trigger that unbinds legacy writes: refuse to
     // open (fail closed, like a failed migration) if it is not provably in force.
-    if (check_rebind_guard(lease.get()) != GuardCheck::kOk) {
+    const GuardCheck boot_check = check_rebind_guard(lease.get());
+    if (binding_check == MfaBindingCheck::kBypassForRecovery) {
+        // Host-CLI recovery one-shot (--mfa-reset): the store opens whatever the guard state so
+        // the operator can still end the account's sessions. `rebind_guard_ok_` stays false (its
+        // default) for the life of this instance, so any binding decision through it fails
+        // closed; the one-shot makes none.
+        spdlog::warn("SessionStore: recovery bypass of the rebind-guard check (guard state: {}); "
+                     "this one-shot process does not enforce session proof binding",
+                     boot_check == GuardCheck::kOk       ? "in force"
+                     : boot_check == GuardCheck::kFailed ? "missing, not ENABLE ALWAYS, or altered"
+                                                         : "unreadable");
+        open_ = true;
+        return;
+    }
+    if (boot_check != GuardCheck::kOk) {
         spdlog::error("SessionStore: sessions_mfa_rebind_guard is missing, not ENABLE ALWAYS, "
                       "or altered; refusing to open (local MFA binding cannot be trusted)");
         return;

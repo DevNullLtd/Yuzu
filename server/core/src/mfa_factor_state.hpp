@@ -87,7 +87,9 @@ struct LocalMfaBindingJudgement {
 /// `binding_enforced` the same read's `MfaStatus::binding_enforced`. Precedence is fixed:
 /// an unusable read (including a row whose database clock is non-positive) and an
 /// unenforced trigger both make the proof undecidable, before any statement about the proof
-/// itself; then absence, then missing binding, then inequality. Equality is the only
+/// itself (`kUnenforced` keeps priority over what follows); then an account generation that is
+/// not positive (an enrolled account always has one: also undecidable, `kUnavailable`); then
+/// absence, then missing binding, then inequality. Equality is the only
 /// `kBound`; a generation is never ordered (a proof bound to a higher value than the
 /// account's is as foreign as a lower one).
 [[nodiscard]] constexpr LocalMfaBindingJudgement
@@ -99,11 +101,16 @@ judge_local_mfa_binding(const auth::DurableMfaProof& durable, std::int64_t curre
         return {LocalMfaBinding::kUnavailable, "mfa_proof_unavailable"};
     if (!binding_enforced)
         return {LocalMfaBinding::kUnenforced, "mfa_binding_unenforced"};
+    // An enrolled account always has a positive generation (the trigger advances it on enrolment),
+    // so a non-positive one is a read that cannot be trusted, not a statement about the proof:
+    // undecidable, answered as unavailable (503) rather than a 401 the caller can never clear.
+    if (current_factor_gen <= 0)
+        return {LocalMfaBinding::kUnavailable, "mfa_proof_unavailable"};
     if (durable.source != Source::kRow || durable.mfa_verified_ms <= 0)
         return {LocalMfaBinding::kNoProof, "mfa_proof_missing"};
     if (durable.mfa_factor_gen <= 0)
         return {LocalMfaBinding::kUnbound, "proof_factor_unbound"};
-    if (current_factor_gen <= 0 || durable.mfa_factor_gen != current_factor_gen)
+    if (durable.mfa_factor_gen != current_factor_gen)
         return {LocalMfaBinding::kMismatch, "proof_factor_mismatch"};
     return {LocalMfaBinding::kBound, {}};
 }
@@ -165,6 +172,11 @@ struct ApproverMfaOutcome {
     };
     Kind kind{Kind::kRefuse};
     MfaFactorState factor{MfaFactorState::kNotEnrolled};
+    /// Only with `kStoreUnavailable`: the cause is PERSISTENT (the factor-generation trigger is
+    /// not observed in force, `mfa_binding_unenforced`), so a retry cannot succeed until an
+    /// operator repairs it and restarts. False for the transient causes (an unreadable enrolment
+    /// or durable-proof read), where a short retry is honest.
+    bool persistent{false};
 };
 
 static_assert(ApproverMfaOutcome{}.kind == ApproverMfaOutcome::Kind::kRefuse,

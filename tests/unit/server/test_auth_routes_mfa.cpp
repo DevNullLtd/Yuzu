@@ -41,6 +41,7 @@
 #include "pg/pg_raii.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/server.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -2195,8 +2196,8 @@ TEST_CASE("a factor replaced between step-up verification and the stamp clears t
     CHECK(binding_of(h, token, "admin") != LocalMfaBinding::kBound);
 }
 
-TEST_CASE("a session-store error while recording a valid step-up is a retryable 503, and "
-          "admits nothing (#6079)",
+TEST_CASE("a session-store error while recording a valid step-up is a 503 with no retry hint, "
+          "and admits nothing (#6079)",
           "[pg][mfa][stepup][routes][binding]") {
     AuthRoutesHarness h;
     auto secret = h.enroll_mfa("admin");
@@ -2224,7 +2225,14 @@ TEST_CASE("a session-store error while recording a valid step-up is a retryable 
     yuzu::server::pg::exec_params(holder.get(), "ROLLBACK", std::vector<std::string>{});
     REQUIRE(res);
     CHECK(res->status == 503); // an outage is not a bad credential
-    CHECK(res->body.find("retry_after_ms") != std::string::npos);
+    // The code is already spent, so a retry with the same code is a replay: the envelope says
+    // to wait for the next code and carries NO retry hint (a null retry_after_ms).
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"]["message"].get<std::string>() ==
+          "Your code was accepted but could not be recorded. Wait for the next code and try again.");
+    CHECK(body["error"]["retry_after_ms"].is_null());
+    CHECK(res->body.find("MFA step-up failed") == std::string::npos);
     CHECK(res->body.find("Invalid verification code") == std::string::npos);
     CHECK(h.count_audits("mfa.step_up.passed", "admin") == 0);
     AuditQuery q;
@@ -2279,6 +2287,83 @@ TEST_CASE("AuthRoutes::durable_mfa_proof_for reads the request's own local sessi
         httplib::Request bare;
         CHECK(h.auth_routes->durable_mfa_proof_for(bare, *session).source ==
               auth::DurableMfaProof::Source::kAbsent);
+    }
+}
+
+// A latched rebind guard is a LOCAL-binding fault: `durable_mfa_proof_for` (the local read the
+// generic gates and the local approver use) answers unavailable and counts the degrade, while the
+// raw `read_durable_mfa_proof` (the OIDC approver arm in server.cpp) still hands back the row, so
+// an SSO approver with a fresh IdP proof is not refused for it (the binding does not apply to SSO).
+TEST_CASE("a latched rebind guard makes the local proof read unavailable and leaves the raw read "
+          "(the OIDC approver arm) alone (#6079 K1)",
+          "[pg][mfa][routes][auth_routes][binding][approval_routes]") {
+    AuthRoutesHarness h;
+    yuzu::MetricsRegistry metrics;
+    h.auth_mgr.set_metrics_registry(&metrics);
+    auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+    const std::string token = cookie.substr(std::string("yuzu_session=").size());
+    httplib::Request req;
+    req.set_header("Cookie", cookie);
+    const auto session = h.auth_mgr.validate_session(token);
+    REQUIRE(session.has_value());
+
+    // Production-shaped read, as server.cpp binds it: an OIDC session reads the row directly, a
+    // local one through the chokepoint.
+    auto fx_for = [&](bool oidc_arm) {
+        return std::make_unique<yuzu::test::ApproverRouteFixture>(
+            h.auth_mgr, *h.auth_db.get(),
+            [&h, oidc_arm](const httplib::Request& r, const auth::Session& s) {
+                return oidc_arm ? h.auth_mgr.read_durable_mfa_proof(
+                                      AuthRoutes::extract_session_cookie(r), s.username)
+                                : h.auth_routes->durable_mfa_proof_for(r, s);
+            });
+    };
+
+    // Latch it: validate on every read, then take the trigger away.
+    h.sessions->set_binding_validation_memo_for_test(std::chrono::milliseconds{0});
+    {
+        auto lease = h.auth_db.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(),
+            "ALTER TABLE session_store.sessions DISABLE TRIGGER sessions_mfa_rebind_guard",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+
+    // The raw read (what the OIDC arm calls) still returns the row: not refused for the guard.
+    const auto raw = h.auth_mgr.read_durable_mfa_proof(token, "admin");
+    CHECK(raw.source == auth::DurableMfaProof::Source::kRow);
+    CHECK(raw.mfa_verified_ms > 0);
+    CHECK_FALSE(h.sessions->rebind_guard_ok());
+
+    const auto degrade = [&] {
+        return metrics.counter("yuzu_auth_session_store_degrade_total", {{"op", "rebind_guard"}})
+            .value();
+    };
+    const double before = degrade();
+    CHECK(h.auth_routes->durable_mfa_proof_for(req, *session).source ==
+          auth::DurableMfaProof::Source::kUnavailable);
+    CHECK(degrade() == before + 1.0); // counted once, at the one site that counts it
+
+    // Through the real approver gate: the local arm is a 503 (mfa_proof_unavailable), the
+    // direct-read arm decides the ticket.
+    {
+        auto fx = fx_for(false);
+        const auto ticket = fx->submit();
+        auto res = fx->decide("approve", ticket, token);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(fx->status_of(ticket) == "pending");
+    }
+    {
+        auto fx = fx_for(true);
+        const auto ticket = fx->submit();
+        auto res = fx->decide("approve", ticket, token);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(fx->status_of(ticket) == "approved");
     }
 }
 

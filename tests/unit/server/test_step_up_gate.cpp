@@ -457,11 +457,13 @@ TEST_CASE("decide_step_up (binding): a refused proof names its cause", "[stepup]
             CHECK_FALSE(v.is_oidc);
         }
     }
-    SECTION("an unreadable current generation never matches a bound proof") {
-        int calls = 0;
-        const auto v = decide_with(s, status_enrolled(0), fresh, calls, 300);
-        CHECK(v.decision == StepUpDecision::kChallenge);
-        CHECK(v.reason == "proof_factor_mismatch");
+    SECTION("an unreadable current generation is undecidable: a 503, not a re-prove loop") {
+        for (const std::int64_t current : {0, -1}) {
+            int calls = 0;
+            const auto v = decide_with(s, status_enrolled(current), fresh, calls, 300);
+            CHECK(v.decision == StepUpDecision::kStoreUnavailable);
+            CHECK(v.reason == "mfa_proof_unavailable");
+        }
     }
     SECTION("no stored session, or a stored row with no proof: mfa_proof_missing, age -1") {
         int calls = 0;

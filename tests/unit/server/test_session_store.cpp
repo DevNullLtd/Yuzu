@@ -22,10 +22,13 @@
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
 
+#include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1055,6 +1058,42 @@ TEST_CASE("SessionStore v3: the store refuses to open when the guard is not prov
     }
 }
 
+TEST_CASE("SessionStore v3: the recovery bypass opens past a tampered guard and never reports it "
+          "in force",
+          "[session_store][pg][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    {
+        SessionStore intact{pool};
+        REQUIRE(intact.is_open());
+    }
+    REQUIRE(exec_ok(
+        pool, "ALTER TABLE session_store.sessions DISABLE TRIGGER sessions_mfa_rebind_guard"));
+
+    // The default refuses; the bypass opens, serves, and reports the guard NOT in force.
+    SessionStore refused{pool};
+    CHECK_FALSE(refused.is_open());
+    SessionStore bypassed{pool, MfaBindingCheck::kBypassForRecovery};
+    REQUIRE(bypassed.is_open());
+    CHECK_FALSE(bypassed.rebind_guard_ok());
+    REQUIRE(bypassed.create(make_params("r1", "ned")).has_value());
+    auto inv = bypassed.invalidate_user("ned"); // what --mfa-reset does with it
+    REQUIRE(inv.has_value());
+    CHECK(*inv == 1);
+    CHECK_FALSE(bypassed.rebind_guard_ok()); // find()'s re-validation never re-admits it
+    REQUIRE(bypassed.find("r1").has_value());
+    CHECK_FALSE(bypassed.rebind_guard_ok());
+
+    // Intact guard: the bypass still never vouches for it; the default is unchanged.
+    REQUIRE(repair_guard(pool));
+    SessionStore bypassed_intact{pool, MfaBindingCheck::kBypassForRecovery};
+    REQUIRE(bypassed_intact.is_open());
+    CHECK_FALSE(bypassed_intact.rebind_guard_ok());
+    SessionStore normal{pool};
+    REQUIRE(normal.is_open());
+    CHECK(normal.rebind_guard_ok());
+}
+
 TEST_CASE("SessionStore v3: a failure observed by find is sticky until restart",
           "[session_store][pg][mfa_binding]") {
     YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
@@ -1086,6 +1125,82 @@ TEST_CASE("SessionStore v3: a failure observed by find is sticky until restart",
     SessionStore fresh{pool};
     REQUIRE(fresh.is_open());
     CHECK(fresh.rebind_guard_ok());
+}
+
+TEST_CASE("SessionStore v3: concurrent validation with the trigger disabled half-way latches the "
+          "flag and never un-latches",
+          "[session_store][pg][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    constexpr int kThreads = 8;
+    constexpr int kCalls = 50;
+    PgPool pool{{.conninfo = db.dsn(), .size = kThreads + 2}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_binding_validation_memo_for_test(std::chrono::milliseconds{0}); // every find validates
+
+    std::barrier start(kThreads);
+    std::atomic<int> calls{0};
+    std::atomic<int> find_failures{0};
+    std::atomic<int> unlatched_after_seen_false{0};
+    std::atomic<bool> disable_failed{false};
+    {
+        std::vector<std::jthread> threads;
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&] {
+                start.arrive_and_wait();
+                bool seen_false = false;
+                for (int i = 0; i < kCalls; ++i) {
+                    // Exactly one call, the middle one, takes the trigger away.
+                    if (calls.fetch_add(1) + 1 == kThreads * kCalls / 2 &&
+                        !exec_ok(pool, "ALTER TABLE session_store.sessions DISABLE TRIGGER "
+                                       "sessions_mfa_rebind_guard"))
+                        disable_failed = true;
+                    if (!store.find("none").has_value())
+                        ++find_failures;
+                    const bool ok = store.rebind_guard_ok();
+                    if (!ok)
+                        seen_false = true;
+                    else if (seen_false)
+                        ++unlatched_after_seen_false; // a latched flag must never read true again
+                }
+            });
+        }
+    } // jthreads join here
+    REQUIRE_FALSE(disable_failed.load());
+    CHECK(find_failures.load() == 0);
+    CHECK(unlatched_after_seen_false.load() == 0);
+    // Every call that starts after the join sees the same answer.
+    CHECK_FALSE(store.rebind_guard_ok());
+    REQUIRE(store.find("none").has_value());
+    CHECK_FALSE(store.rebind_guard_ok());
+}
+
+TEST_CASE("SessionStore v3: a validation that cannot run is not sticky, and the row is still "
+          "served",
+          "[session_store][pg][mfa_binding]") {
+    // The documented asymmetry: BOOT refuses on an inconclusive check, a RUNNING store does not
+    // flip the flag on one (the query failing is not evidence about the trigger) and retries on
+    // the next find rather than waiting out the memo.
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create(make_params("h1", "mia")).has_value());
+    store.set_binding_validation_memo_for_test(std::chrono::milliseconds{0});
+
+    // The catalog join finds no sessions table: inconclusive. (find itself fails on the missing
+    // table, so the sticky flag is the observable here.)
+    REQUIRE(exec_ok(pool, "ALTER TABLE session_store.sessions RENAME TO sessions_moved"));
+    CHECK_FALSE(store.find("h1").has_value()); // the row read fails: not "absent", not "invalid"
+    CHECK(store.rebind_guard_ok());            // not latched by an inconclusive check
+    REQUIRE(exec_ok(pool, "ALTER TABLE session_store.sessions_moved RENAME TO sessions"));
+
+    // Repaired: the next find validates afresh (the memo was cleared, not consumed), passes, and
+    // serves the row.
+    auto found = store.find("h1");
+    REQUIRE(found.has_value());
+    REQUIRE(found->has_value());
+    CHECK(store.rebind_guard_ok());
 }
 
 TEST_CASE("SessionStore v3: a tamper that is undone between two validations is not observable",

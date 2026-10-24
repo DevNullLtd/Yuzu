@@ -282,7 +282,16 @@ auth::DurableMfaProof AuthRoutes::durable_mfa_proof_for(const httplib::Request& 
     // resolves to an API-token session, never a local one).
     if (session.auth_source != "local")
         return auth::DurableMfaProof{.source = auth::DurableMfaProof::Source::kAbsent};
-    return auth_mgr_.read_durable_mfa_proof(extract_session_cookie(req), session.username);
+    const auto durable =
+        auth_mgr_.read_durable_mfa_proof(extract_session_cookie(req), session.username);
+    // A local binding decision needs the stored generation to be trustworthy; while the rebind
+    // guard is not observed in force the row is unavailable, never a bound proof. Not applied
+    // in `read_durable_mfa_proof` itself: the OIDC approver reads that directly and a binding
+    // does not apply to an SSO session.
+    if (durable.source == auth::DurableMfaProof::Source::kRow &&
+        !auth_mgr_.stored_binding_trustworthy())
+        return auth::DurableMfaProof{.source = auth::DurableMfaProof::Source::kUnavailable};
+    return durable;
 }
 
 std::string AuthRoutes::session_correlator(const httplib::Request& req) {
@@ -3637,9 +3646,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
 
-        // Success — stamp `mfa_verified_at = system_clock::now()` on the
-        // existing session row (wall-clock since HA WS-1/1a). The cookie itself
-        // does NOT rotate — the
+        // Success: stamp the proof on the existing session row. The stamp stores the verifier's
+        // own carried database instant and factor generation, not `system_clock::now()`
+        // (HA WS-1/1a, #6079). The cookie itself does NOT rotate: the
         // step-up refreshes a session attribute, it does not mint a new
         // session (which would break in-flight HTMX requests from the
         // same browser tab).
@@ -3647,8 +3656,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         if (mfa_verify_barrier_for_test_) // test seam, empty in production
             mfa_verify_barrier_for_test_("/login/mfa/stepup", proof);
         // #6079: the stamp stores the verifier's own generation and instant. Anything but
-        // kStamped admits nothing (the clear, where one was needed, is the primitive's): the
-        // session keeps whatever proof it had, the answer is the uniform 401 (503 for a store
+        // kStamped admits nothing (the clear, where one was needed, is the primitive's): for
+        // kFutureDated and kFactorChanged the session holds no proof (mark_mfa already wrote 0,
+        // or the factor recheck cleared it), the answer is the uniform 401 (503 for a store
         // error), and the audit detail says why. kNoSession keeps the pre-binding wording.
         const auto stamp = auth_mgr_.stamp_session_mfa_proof(token, proof);
         if (stamp != auth::AuthManager::MfaStampOutcome::kStamped) {
@@ -3672,13 +3682,18 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 break;
             }
             if (stamp == O::kStoreError) {
-                // The code was valid; the session store could not record it, so nothing was
-                // admitted. That is an outage, not a bad credential: a retryable 503.
+                // The code was valid and is ALREADY consumed (the TOTP counter or recovery code
+                // is spent), but the session store could not record it, so nothing was admitted.
+                // An outage, not a bad credential, yet a retry with the SAME code is a 401 replay:
+                // so no retry_after_ms (an immediate retry cannot succeed) and a message that
+                // tells the operator to wait for the next code.
                 res.status = 503;
-                res.set_content(detail::a4_denial(res, 503,
-                                                  "step-up verification could not be recorded",
-                                                  detail::A4ErrorOpts{.retry_after_ms = 5000}),
-                                "application/json");
+                res.set_content(
+                    detail::a4_denial(res, 503,
+                                      "Your code was accepted but could not be recorded. Wait for "
+                                      "the next code and try again.",
+                                      detail::A4ErrorOpts{}),
+                    "application/json");
             } else {
                 res.status = 401;
                 res.set_content(kFailureBody(res), "application/json");

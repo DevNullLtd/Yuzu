@@ -958,14 +958,26 @@ TEST_CASE("POST /api/settings/mfa/disable clears state + emits mfa.disabled",
     CHECK(status->recovery_codes_remaining == 0);
 }
 
+namespace {
+
+struct StoreScope {
+    SessionStore sessions;
+    auth::AuthManager& mgr;
+    explicit StoreScope(MfaSettingsHarness& h) : sessions{h.auth_db.pool()}, mgr(h.auth_mgr) {
+        REQUIRE(sessions.is_open());
+        mgr.set_session_store(&sessions);
+    }
+    ~StoreScope() { mgr.set_session_store(nullptr); }
+};
+
+} // namespace
+
 TEST_CASE("POST /api/settings/mfa/disable ends EVERY session of the account, the caller's included "
           "(#6079)",
           "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
-    yuzu::server::SessionStore sessions{h.auth_db.pool()};
-    REQUIRE(sessions.is_open());
-    h.auth_mgr.set_session_store(&sessions);
-    SessionStoreDetach detach{h.auth_mgr};
+    StoreScope scope(h);
+    auto& sessions = scope.sessions;
 
     auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
@@ -1043,10 +1055,8 @@ TEST_CASE("POST /api/settings/mfa/disable reports a failed session delete and au
           "(#6079)",
           "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
-    yuzu::server::SessionStore sessions{h.auth_db.pool()};
-    REQUIRE(sessions.is_open());
-    h.auth_mgr.set_session_store(&sessions);
-    SessionStoreDetach detach{h.auth_mgr};
+    StoreScope scope(h);
+    auto& sessions = scope.sessions;
 
     auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
@@ -1086,10 +1096,8 @@ TEST_CASE("POST /api/settings/mfa/disable cancelling an unfinished enrolment kee
           "(#6079)",
           "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
-    yuzu::server::SessionStore sessions{h.auth_db.pool()};
-    REQUIRE(sessions.is_open());
-    h.auth_mgr.set_session_store(&sessions);
-    SessionStoreDetach detach{h.auth_mgr};
+    StoreScope scope(h);
+    auto& sessions = scope.sessions;
     // A provisional secret that was never verified: no usable factor exists.
     REQUIRE(h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt).has_value());
     const auto mine = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
@@ -1113,10 +1121,8 @@ TEST_CASE("POST /api/settings/mfa/disable still ends the sessions when the clear
           "(#6079)",
           "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
-    yuzu::server::SessionStore sessions{h.auth_db.pool()};
-    REQUIRE(sessions.is_open());
-    h.auth_mgr.set_session_store(&sessions);
-    SessionStoreDetach detach{h.auth_mgr};
+    StoreScope scope(h);
+    auto& sessions = scope.sessions;
     auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     auto bytes = mfa::base32_decode(init->secret_base32);
@@ -1184,10 +1190,8 @@ TEST_CASE("POST /api/settings/mfa/disable says the state is unknown when neither
           "the delete is confirmed (#6079)",
           "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
-    yuzu::server::SessionStore sessions{h.auth_db.pool()};
-    REQUIRE(sessions.is_open());
-    h.auth_mgr.set_session_store(&sessions);
-    SessionStoreDetach detach{h.auth_mgr};
+    StoreScope scope(h);
+    auto& sessions = scope.sessions;
     auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     auto bytes = mfa::base32_decode(init->secret_base32);
@@ -1796,16 +1800,6 @@ std::int64_t current_gen(MfaSettingsHarness& h) {
 std::int64_t factor_changed_count(MfaSettingsHarness& h, const char* route) {
     return h.metrics.counter("yuzu_auth_mfa_factor_changed_total", {{"route", route}}).value();
 }
-
-struct StoreScope {
-    SessionStore sessions;
-    auth::AuthManager& mgr;
-    explicit StoreScope(MfaSettingsHarness& h) : sessions{h.auth_db.pool()}, mgr(h.auth_mgr) {
-        REQUIRE(sessions.is_open());
-        mgr.set_session_store(&sessions);
-    }
-    ~StoreScope() { mgr.set_session_store(nullptr); }
-};
 
 } // namespace
 

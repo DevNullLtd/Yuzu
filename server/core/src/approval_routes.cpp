@@ -216,6 +216,16 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
         (void)detail::emit_behavioral_audit(deps.audit_fn, req, res, audit_action, "error",
                                             "approval", audit_id,
                                             "approver_assurance:mfa_store_unavailable");
+        if (mfa.persistent) {
+            // The factor-generation trigger is not in force: no retry can succeed until an
+            // operator repairs it and restarts, so no retry hint and no "retry the request".
+            write_a4(res, 503,
+                     "the approver's MFA binding cannot be verified, so the decision was not "
+                     "recorded",
+                     "ask an operator to restore the auth store's MFA trigger and restart the "
+                     "server; the approval ticket is unchanged and still pending");
+            return;
+        }
         write_a4(res, 503,
                  "the approver's MFA state could not be read, so the decision was not recorded",
                  "retry the request; the approval ticket is unchanged and still pending",

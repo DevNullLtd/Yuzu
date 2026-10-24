@@ -37,6 +37,7 @@
 
 #include "yuzu/server/auth.hpp"  // For Role, UserEntry, PendingAgent, etc.
 #include "yuzu/server/enrollment_cfg_import.hpp" // legacy-import row/result types (pure)
+#include "yuzu/server/mfa_binding_check.hpp"     // MfaBindingCheck (recovery one-shots only)
 
 namespace yuzu::server::pg {
 class PgPool;
@@ -236,6 +237,15 @@ public:
     /// callers use the two-argument overload and inherit the 60-second
     /// default.
     AuthDB(pg::PgPool& pool, pg::SecretCodec& secret_codec, int cleanup_interval_secs);
+
+    /// As above, with an explicit treatment of the MFA factor-generation trigger check (#6079).
+    /// `MfaBindingCheck::kEnforce` is what the two overloads above do. `kBypassForRecovery` is
+    /// for the host-CLI recovery one-shots ONLY (`--mfa-reset`, `--break-glass-arm`): the store
+    /// opens even when the trigger is not provably in force, logs a WARN naming the state found,
+    /// and `mfa_binding_enforced()` / `MfaStatus::binding_enforced` read false for the life of the
+    /// instance. The serving binary never passes it.
+    AuthDB(pg::PgPool& pool, pg::SecretCodec& secret_codec, int cleanup_interval_secs,
+           MfaBindingCheck binding_check);
 
     ~AuthDB();
 

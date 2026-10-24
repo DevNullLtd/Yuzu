@@ -16923,6 +16923,8 @@ private:
             // session reads through `durable_mfa_proof_for`, the one site the generic gates use;
             // an SSO session (kAbsent there, because the generic gate never reads for it) keeps
             // the direct read, since this gate applies the durable ceiling to its IdP-seeded proof.
+            // The direct read deliberately skips the local rebind-guard check
+            // (`stored_binding_trustworthy`): the binding does not apply to an SSO session.
             const auto durable =
                 session.auth_source == "oidc"
                     ? auth_mgr_.read_durable_mfa_proof(AuthRoutes::extract_session_cookie(req),

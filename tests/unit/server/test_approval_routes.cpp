@@ -1118,6 +1118,36 @@ TEST_CASE("approval_routes: an SSO proof dated after the database clock is a 503
     }
 }
 
+TEST_CASE("approval_routes: a persistent MFA binding fault is a 503 with no retry hint and no "
+          "\"retry the request\" advice, and the ticket stays pending",
+          "[server][routes][approval_routes][pg]") {
+    for (const char* verb : {"approve", "reject"}) {
+        INFO(verb);
+        Pending p;
+        Harness h;
+        h.approval_manager = p.mgr.get();
+        h.mfa_outcome = {Kind::kStoreUnavailable, MfaFactorState::kStoreUnavailable,
+                         /*persistent=*/true};
+        h.wire();
+
+        auto res = h.sink.Post("/api/approvals/" + p.id + "/" + verb, "{}");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        auto j = body(res->body);
+        CHECK(j["error"]["code"] == 503);
+        // It cannot succeed before an operator repairs the trigger and restarts the server.
+        CHECK(j["error"]["retry_after_ms"].is_null());
+        CHECK(j["error"]["remediation"].get<std::string>().find("retry the request") ==
+              std::string::npos);
+        CHECK(j["error"]["remediation"].get<std::string>().find("restart") != std::string::npos);
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].result == "error");
+        CHECK(h.audits[0].detail == "approver_assurance:mfa_store_unavailable");
+        CHECK(h.events.empty());
+        p.check_pending();
+    }
+}
+
 TEST_CASE("approval_routes: a stale MFA proof keeps the gate's 401 untouched and adds a "
           "mfa_proof_stale denied row, before any attempted row",
           "[server][routes][approval_routes][approver_mfa][pg]") {
@@ -2144,11 +2174,27 @@ TEST_CASE("approval_routes: wiring -- server.cpp passes approver_mfa_fn and csrf
     // principal-checked) and hands it to the gate. Dropping it, or passing "no store
     // attached", would put production back on the suspend-blind cached clock while every
     // unit fixture (whose default is a kRow built from the session) stayed green.
+    // The read is a ternary on the session's auth_source: a LOCAL session reads through
+    // `durable_mfa_proof_for` (the chokepoint that also applies the rebind-guard check to a
+    // stored binding), an SSO session takes the raw read (no binding applies to it, so a latched
+    // guard must not refuse it). Each arm appears exactly once.
+    const auto count_in = [&](std::string_view needle) {
+        std::size_t n = 0;
+        for (auto at = closure.find(needle); at != std::string::npos;
+             at = closure.find(needle, at + needle.size()))
+            ++n;
+        return n;
+    };
+    CHECK(count_in("auth_source == \"oidc\"") == 1);
+    CHECK(count_in("auth_mgr_.read_durable_mfa_proof(") == 1);
+    CHECK(count_in("auth_routes_->durable_mfa_proof_for(") == 1);
     const auto read = closure.find("auth_mgr_.read_durable_mfa_proof(");
     REQUIRE(read != std::string::npos);
+    CHECK(closure.find("auth_source == \"oidc\"") < read);
+    CHECK(read < closure.find("auth_routes_->durable_mfa_proof_for("));
     CHECK(closure.find("AuthRoutes::extract_session_cookie(req)", read) != std::string::npos);
     CHECK(closure.find("session.username", read) != std::string::npos);
-    CHECK(read < closure.find("require_enrolled_fresh_mfa("));
+    CHECK(closure.find("auth_routes_->durable_mfa_proof_for(") < closure.find("require_enrolled_fresh_mfa("));
     CHECK(closure.find("action_label, durable,") != std::string::npos);
     // The route="approval" 503 counter depends on the registry being handed to the gate: a
     // nullptr here compiles and silently loses the series.

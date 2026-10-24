@@ -154,7 +154,7 @@ public:
 
     /// Test seam like `set_cert_dir_for_test`; null in production, and server.cpp never sets it.
     /// When set, POST /api/settings/mfa/verify calls it inside the step-up stamp block,
-    /// immediately before `mark_session_mfa_verified`, so a test can make the stamp throw
+    /// immediately before `stamp_session_mfa_proof`, so a test can make the stamp throw
     /// (`AuthManager` is non-virtual). No effect when empty. Set before requests are served.
     void set_stamp_fault_hook_for_test(std::function<void()> hook) {
         stamp_fault_hook_ = std::move(hook);

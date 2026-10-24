@@ -253,6 +253,9 @@ constexpr std::chrono::milliseconds kAcquireRetryTimeout{150};
 // other body is reported as tampering. Application code never writes `mfa_factor_gen`; the trigger
 // advances it on EVERY change of `mfa_enrolled_at`, whichever binary issued the UPDATE. The strict
 // `OLD + 1` form keeps two updates of one row in one transaction distinct.
+// FROZEN: shipped in migration v3 and pinned byte-for-byte by the boot check; changing it needs a
+// NEW migration (CREATE OR REPLACE) and an accepted (old,new) pair in the check, or every migrated
+// replica refuses to boot.
 constexpr std::string_view kUsersMfaFactorGenBody =
     "\n"
     "BEGIN\n"
@@ -615,8 +618,9 @@ decrypt_mfa_secret(pg::SecretCodec& codec, const LoadedMfaRow& row) {
 
 // #6079: is the factor-generation trigger EFFECTIVELY in force? Reads the catalog, not the
 // migration history: the trigger must exist, be ENABLE ALWAYS (tgenabled = 'A', so it also fires
-// under `session_replication_role = replica`), be a BEFORE UPDATE row trigger over both columns
-// and nothing else (INSERT/DELETE/TRUNCATE bits clear, no WHEN clause), and call a function whose
+// under `session_replication_role = replica`), be a BEFORE UPDATE row trigger whose column list
+// contains both columns (a superset passes: the `@>` test; it still fires on every change to
+// either), with the INSERT/DELETE/TRUNCATE bits clear and no WHEN clause, and call a function whose
 // body is byte-identical to the pinned constant. `tgtype` bits (pg_trigger.h): ROW 1, BEFORE 2,
 // INSERT 4, DELETE 8, UPDATE 16, TRUNCATE 32, INSTEAD 64.
 enum class BindingCheck : std::uint8_t {
@@ -708,6 +712,10 @@ AuthDB::AuthDB(pg::PgPool& pool, pg::SecretCodec& secret_codec)
     : AuthDB(pool, secret_codec, /*cleanup_interval_secs=*/60) {}
 
 AuthDB::AuthDB(pg::PgPool& pool, pg::SecretCodec& secret_codec, int cleanup_interval_secs)
+    : AuthDB(pool, secret_codec, cleanup_interval_secs, MfaBindingCheck::kEnforce) {}
+
+AuthDB::AuthDB(pg::PgPool& pool, pg::SecretCodec& secret_codec, int cleanup_interval_secs,
+               MfaBindingCheck binding_check)
     : impl_(std::make_unique<Impl>(pool, secret_codec)) {
     impl_->cleanup_interval_secs = cleanup_interval_secs;
 
@@ -728,7 +736,20 @@ AuthDB::AuthDB(pg::PgPool& pool, pg::SecretCodec& secret_codec, int cleanup_inte
     // after the migration ran leaves the version table untouched. A failure (or a query that
     // cannot run) leaves the store closed, the same fail-closed posture as a failed migration,
     // so the server refuses to start rather than serving MFA decisions it cannot bind.
-    if (check_factor_trigger(lease.get()) != BindingCheck::Valid) {
+    const BindingCheck boot_check = check_factor_trigger(lease.get());
+    if (binding_check == MfaBindingCheck::kBypassForRecovery) {
+        // Host-CLI recovery one-shot (--mfa-reset, --break-glass-arm): a locked-out operator must
+        // still be able to clear a factor or arm the break-glass account, so the store opens
+        // whatever the trigger state. The binding is reported NOT enforced for the life of this
+        // instance (sticky, like an observed tamper), so any binding decision made through it
+        // fails closed; the one-shots make none.
+        spdlog::warn("AuthDB: recovery bypass of the MFA factor-generation trigger check "
+                     "(trigger state: {}); this one-shot process does not enforce factor binding",
+                     boot_check == BindingCheck::Valid     ? "in force"
+                     : boot_check == BindingCheck::Invalid ? "missing, not ENABLE ALWAYS, or altered"
+                                                           : "unreadable");
+        impl_->binding_ok.store(false);
+    } else if (boot_check != BindingCheck::Valid) {
         spdlog::error("AuthDB: the MFA factor-generation trigger (auth.users_mfa_factor_gen) is "
                       "missing, not ENABLE ALWAYS, or altered - auth store disabled");
         impl_->binding_ok.store(false);

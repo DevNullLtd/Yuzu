@@ -1437,7 +1437,9 @@ constexpr char kDashJs8[] = R"HTM(
         body: form.toString()
       }).then(function(resp) {
         if (!resp.ok) {
-          alert('MFA step-up failed — verify your code and try again.');
+          alert(resp.status === 503
+            ? 'Your code was accepted but could not be recorded. Wait for the next code and try again.'
+            : 'MFA step-up failed: verify your code and try again.');
           return;
         }
         /* Replay the original request via htmx.ajax. The original

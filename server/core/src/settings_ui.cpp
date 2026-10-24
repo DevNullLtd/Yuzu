@@ -886,7 +886,9 @@ const char* const kSettingsPageTemplate =
             body: form.toString()
           }).then(function(sr) {
             if (!sr.ok) {
-              showToast('MFA step-up failed — verify your code and try again.', 'error');
+              showToast(sr.status === 503
+                ? 'Your code was accepted but could not be recorded. Wait for the next code and try again.'
+                : 'MFA step-up failed: verify your code and try again.', 'error');
               done(false, { cancelled: true });
               return;
             }

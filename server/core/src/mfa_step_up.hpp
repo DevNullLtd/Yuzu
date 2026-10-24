@@ -151,8 +151,8 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
 /// pass. A local proof must belong to the factor enrolled now: a proof bound to a factor
 /// generation is judged by equality with the account's current generation
 /// (`judge_local_mfa_binding`; a mismatch is a 401 with `reason=proof_factor_mismatch`, an
-/// unreadable read or an unenforced binding trigger a 503). Transitional: a proof with no
-/// generation keeps the instant rule (stamped before the current enrolment does not count).
+/// unreadable read or an unenforced binding trigger a 503). A proof with no generation is
+/// refused too (a 401 with `reason=proof_factor_unbound`): there is no instant rule.
 ///
 /// The ceiling is hard and measured on the database clock. `durable` is the caller's
 /// authoritative read of the session's stored proof (`AuthManager::read_durable_mfa_proof`):
@@ -210,9 +210,7 @@ struct ProofAge {
     long long age_secs{-1}; ///< whole seconds on the monotonic anchor; -1 when `no_proof`
     /// Milliseconds on the monotonic anchor; -1 when `no_proof`. `fresh` compares the
     /// whole-second age (a proof 300.5 s old is still fresh in a 300 s window); a caller
-    /// needing a hard ceiling compares this instead. The approver gate compares it (with
-    /// `no_proof`) and adds its own durable, database-clock ceiling; it does not consult
-    /// `wall_stale`.
+    /// needing a hard ceiling compares this instead, as the approver gate does.
     long long age_ms{-1};
     bool wall_stale{false}; ///< the absolute (wall) proof age is grossly past the window
 };

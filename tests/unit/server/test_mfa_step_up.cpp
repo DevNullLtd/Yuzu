@@ -1137,9 +1137,8 @@ TEST_CASE_METHOD(ApproverFixture,
     }
 }
 
-TEST_CASE_METHOD(ApproverFixture,
-                 "require_enrolled_fresh_mfa: a future-dated or wall-stale proof "
-                 "is not fresh",
+TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: a future-dated proof, or one past "
+                                  "the durable ceiling, is not fresh",
                  "[pg][mfa][stepup][approver]") {
     // R18: a proof stamped in the future derives to "no proof".
     {
@@ -1161,14 +1160,10 @@ TEST_CASE_METHOD(ApproverFixture,
         check_untouched(r);
     }
     audits.clear();
-    // R19: the monotonic anchor reads fresh (a host suspend freezes it) but the proof instant
-    // is an hour old. The approver gate does not consult the wall figure (`wall_stale`); what
-    // challenges here is the durable ceiling: `durable_row_for` builds the stored row from the
-    // same hour-old instant, so the database-clock age is an hour, past the 300 s window.
+    // R19: the cached monotonic anchor reads fresh (a host suspend freezes it) but the durable
+    // proof, an hour old on the database clock, is past the ceiling. The 401 comes from the
+    // durable ceiling, with no `reason=` token because the proof is bound (it is only old).
     {
-        // The enrolment is two hours old, so the one-hour-old proof is strictly NEWER than it:
-        // the pre-enrolment rule cannot be what challenges (it would otherwise pass this test
-        // for the wrong reason).
         backdate_enrolment("alice", seconds(7200));
         auto s = with_wall_proof(*this, "alice", "local", seconds(10));
         s.mfa_verified_at = system_clock::now() - std::chrono::hours(1);
@@ -1202,9 +1197,8 @@ TEST_CASE("judge_local_mfa_binding: every arm, its reason token and its preceden
         CHECK(j.reason.empty());
         CHECK(judge_local_mfa_binding(proof_row(1, 2, 1), 1, true).kind == LocalMfaBinding::kBound);
     }
-    // kMismatch: neither a lower nor a higher generation is "close enough", and an unreadable
-    // current generation never matches a bound proof.
-    for (const std::int64_t current : {6, 8, 100, 0, -1}) {
+    // kMismatch: neither a lower nor a higher generation is "close enough".
+    for (const std::int64_t current : {6, 8, 100}) {
         INFO("current=" << current);
         const auto j = judge_local_mfa_binding(proof_row(1'000, 2'000, 7), current, true);
         CHECK(j.kind == LocalMfaBinding::kMismatch);
@@ -1213,7 +1207,7 @@ TEST_CASE("judge_local_mfa_binding: every arm, its reason token and its preceden
     // kUnbound: a proof with no generation, whatever the account's generation is.
     for (const std::int64_t gen : {0, -1}) {
         INFO("gen=" << gen);
-        for (const std::int64_t current : {0, 1, 7}) {
+        for (const std::int64_t current : {1, 7}) {
             const auto j = judge_local_mfa_binding(proof_row(1'000, 2'000, gen), current, true);
             CHECK(j.kind == LocalMfaBinding::kUnbound);
             CHECK(j.reason == "proof_factor_unbound");
@@ -1246,6 +1240,22 @@ TEST_CASE("judge_local_mfa_binding: every arm, its reason token and its preceden
         CHECK(judge_local_mfa_binding({Source::kAbsent, 0, 0, 0}, 7, true).kind ==
               LocalMfaBinding::kNoProof);
     }
+    // kUnavailable, third cause: an enrolled account always has a positive generation, so a
+    // non-positive one is an untrustworthy read. It is undecidable BEFORE any statement about the
+    // proof (never a 401 re-prove loop), whatever the row holds.
+    for (const std::int64_t current : {0, -1}) {
+        INFO("current=" << current);
+        for (const auto& row :
+             {proof_row(1'000, 2'000, 7), proof_row(1'000, 2'000, 0), proof_row(0, 2'000, 0),
+              auth::DurableMfaProof{Source::kAbsent, 0, 2'000, 0}}) {
+            const auto j = judge_local_mfa_binding(row, current, true);
+            CHECK(j.kind == LocalMfaBinding::kUnavailable);
+            CHECK(j.reason == "mfa_proof_unavailable");
+        }
+        // ...but an unenforced trigger keeps its priority over it.
+        CHECK(judge_local_mfa_binding(proof_row(1'000, 2'000, 7), current, false).kind ==
+              LocalMfaBinding::kUnenforced);
+    }
     // kUnenforced: the trigger is not observed in force, so even a perfect proof is undecidable.
     {
         const auto j = judge_local_mfa_binding(proof_row(1'000, 2'000, 7), 7, false);
@@ -1265,6 +1275,8 @@ TEST_CASE("judge_local_mfa_binding: every arm, its reason token and its preceden
     static_assert(judge_local_mfa_binding(proof_row(1'000, 2'000, 2), 2, true).kind ==
                   LocalMfaBinding::kBound);
     static_assert(judge_local_mfa_binding(auth::DurableMfaProof{}, 2, true).kind ==
+                  LocalMfaBinding::kUnavailable);
+    static_assert(judge_local_mfa_binding(proof_row(1'000, 2'000, 2), 0, true).kind ==
                   LocalMfaBinding::kUnavailable);
 }
 
@@ -1474,7 +1486,6 @@ TEST_CASE_METHOD(BindingFixture,
             CHECK(r.res.status == 401);
             REQUIRE(audits.size() == 1);
             CHECK(detail_has(audits[0], "reason=proof_factor_unbound"));
-            CHECK_FALSE(detail_has(audits[0], "proof_predates_enrolment"));
         }
     }
 }
@@ -1512,6 +1523,7 @@ TEST_CASE_METHOD(BindingFixture,
         auto r = run(cached, 300, &metrics, d);
         CHECK(r.outcome.kind == Kind::kStoreUnavailable);
         CHECK(r.outcome.factor == MfaFactorState::kStoreUnavailable);
+        CHECK_FALSE(r.outcome.persistent); // transient: a short retry is honest
         check_untouched(r);
         CHECK(audits.empty());
         CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}})
@@ -1535,6 +1547,7 @@ TEST_CASE_METHOD(BindingFixture,
         yuzu::MetricsRegistry metrics;
         auto r = run(cached, 300, &metrics, durable_aged(5'000, gen));
         CHECK(r.outcome.kind == Kind::kStoreUnavailable);
+        CHECK(r.outcome.persistent); // an operator must repair the trigger: no retry hint
         check_untouched(r);
         CHECK(audits.empty());
         CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}})

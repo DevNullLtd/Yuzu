@@ -990,28 +990,36 @@ TEST_CASE("AuthManager+SessionStore: stamping a carried proof stores it; a futur
           AuthManager::MfaStampOutcome::kNoSession);
 }
 
-TEST_CASE(
-    "AuthManager+SessionStore: read_durable_mfa_proof is unavailable once the rebind guard is gone",
-    "[auth][session_store][pg][mfa_binding]") {
+TEST_CASE("AuthManager+SessionStore: once the rebind guard is gone the stored binding is "
+          "untrustworthy, the raw row read is not refused",
+          "[auth][session_store][pg][mfa_binding]") {
     YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     SessionStore store{pool};
     REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
     auto mgr = make_mgr(store);
+    mgr->set_metrics_registry(&metrics);
 
     auto token = mgr->create_local_session("alice", Role::admin, "",
                                            LocalMfaProof{4, pg_now_ms(pool) - 1'000});
     REQUIRE_FALSE(token.empty());
     CHECK(mgr->read_durable_mfa_proof(token, "alice").source == DurableMfaProof::Source::kRow);
+    CHECK(mgr->stored_binding_trustworthy());
 
-    // The binding cannot be trusted once the guard is observed to be off: unavailable, not a
-    // bound proof and not "no proof" (both would be a wrong answer).
+    // The binding cannot be trusted once the guard is observed to be off. The raw read still
+    // returns the row (an SSO approver reads it and no binding applies to it); a local binding
+    // decision asks `stored_binding_trustworthy`, which refuses and counts the degrade once.
     store.set_binding_validation_memo_for_test(std::chrono::milliseconds{0});
     exec_sql(pool, "ALTER TABLE session_store.sessions DISABLE TRIGGER sessions_mfa_rebind_guard");
     const auto durable = mgr->read_durable_mfa_proof(token, "alice");
-    CHECK(durable.source == DurableMfaProof::Source::kUnavailable);
-    CHECK(durable.mfa_factor_gen == 0);
+    CHECK(durable.source == DurableMfaProof::Source::kRow);
     CHECK_FALSE(store.rebind_guard_ok());
+    const double before =
+        counter_value(metrics, "yuzu_auth_session_store_degrade_total", {{"op", "rebind_guard"}});
+    CHECK_FALSE(mgr->stored_binding_trustworthy());
+    CHECK(counter_value(metrics, "yuzu_auth_session_store_degrade_total",
+                        {{"op", "rebind_guard"}}) == before + 1.0);
 }
 
 TEST_CASE("AuthManager legacy path: a carried proof is stored, a future one refused",

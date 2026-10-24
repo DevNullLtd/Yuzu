@@ -354,9 +354,9 @@ struct FallbackFixture {
         const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
                                      std::chrono::system_clock::now().time_since_epoch())
                                      .count();
-        AuthManager::derive_session_deadlines(s, now, now + 3600'000, now,
-                                              with_proof ? now - age_ms : 0, /*elevated_until*/ 0,
-                                              /*issued*/ 0, now);
+        (void)AuthManager::derive_session_deadlines(s, now, now + 3600'000, now,
+                                                    with_proof ? now - age_ms : 0,
+                                                    /*elevated_until*/ 0, /*issued*/ 0, now);
         return s;
     }
 

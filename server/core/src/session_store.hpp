@@ -90,6 +90,8 @@
 // Real header, not a forward-declare of PGconn (see pg_migration_runner.hpp).
 #include <libpq-fe.h>
 
+#include "yuzu/server/mfa_binding_check.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -199,6 +201,14 @@ public:
     /// is_open() is false if the lease was empty or the migration failed —
     /// fail-closed, no fallback (ADR-0007).
     explicit SessionStore(pg::PgPool& pool);
+
+    /// As above, with an explicit treatment of the rebind-guard check (#6079). The one-argument
+    /// form is `MfaBindingCheck::kEnforce`: a guard not provably in force leaves the store
+    /// closed. `kBypassForRecovery` is for the `--mfa-reset` host-CLI one-shot ONLY: the store
+    /// opens whatever the guard state, logs a WARN naming it, and `rebind_guard_ok()` reads false
+    /// for the life of the instance (so every binding decision through it fails closed). The
+    /// serving binary never passes it.
+    SessionStore(pg::PgPool& pool, MfaBindingCheck binding_check);
 
     SessionStore(const SessionStore&) = delete;
     SessionStore& operator=(const SessionStore&) = delete;

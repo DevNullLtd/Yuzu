@@ -354,9 +354,11 @@ inline constexpr auto kWallSanitySkew = std::chrono::minutes(5);
 /// `kUnavailable`: a caller that forgets to fill it fails closed. So does an `AuthManager` with
 /// no SessionStore attached: a serving process always has one (the server refuses to boot
 /// without Postgres), so that shape is a wiring fault and is reported as an unavailable read,
-/// never aged on a replica clock. It is also `kUnavailable` while the session store's rebind
-/// guard is not observed in force (`SessionStore::rebind_guard_ok()`): a binding that cannot be
-/// trusted is never read as one.
+/// never aged on a replica clock. A LOCAL session's read is also turned `kUnavailable` by
+/// `AuthRoutes::durable_mfa_proof_for` while the session store's rebind guard is not observed in
+/// force (`AuthManager::stored_binding_trustworthy`): a binding that cannot be trusted is never
+/// read as one. The raw `read_durable_mfa_proof` does not apply that, because an SSO session
+/// carries no binding.
 struct DurableMfaProof {
     enum class Source {
         kUnavailable, ///< read degraded or no store attached: fail closed, never "no proof"
@@ -1036,6 +1038,13 @@ public:
     /// no mutation, no cache write.
     [[nodiscard]] DurableMfaProof read_durable_mfa_proof(const std::string& token,
                                                          std::string_view expected_username) const;
+
+    /// Whether a `kRow` read's stored factor generation may be judged as a binding: true only
+    /// while the session store's rebind guard is observed in force (`rebind_guard_ok()`). The
+    /// binding applies to LOCAL sessions, so only `AuthRoutes::durable_mfa_proof_for` asks; an
+    /// SSO approver reading its IdP-seeded proof does not. A false answer is logged and counted
+    /// here (`yuzu_auth_session_store_degrade_total{op="rebind_guard"}`), the one site that does.
+    [[nodiscard]] bool stored_binding_trustworthy() const;
 
 private:
     /// Store-backed validate path (HA WS-1/1a): cache-first, then authoritative

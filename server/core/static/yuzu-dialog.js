@@ -154,7 +154,12 @@
         nested: true,
         submit: function (v) {
           return rawRequest('POST', challenge, { form: { code: v.code.trim() } }).then(function (r) {
-            return r.ok ? null : 'That code was not accepted. Check it and try again.';
+            if (r.ok) return null;
+            // 503: the code was valid and is spent, but could not be recorded; a retry with the
+            // same code would be refused as a replay.
+            return r.status === 503
+              ? 'Your code was accepted but could not be recorded. Wait for the next code and try again.'
+              : 'That code was not accepted. Check it and try again.';
           });
         }
       }).then(function (ok) {

@@ -152,12 +152,15 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
     using Kind = ApproverMfaOutcome::Kind;
     using Source = auth::DurableMfaProof::Source;
     const auto probe = probe_mfa_factor(session, auth_db);
-    const auto unavailable = [&]() -> ApproverMfaOutcome {
+    const auto store_unavailable = [&](const char* what,
+                                       bool persistent = false) -> ApproverMfaOutcome {
+        spdlog::error("require_enrolled_fresh_mfa: {}({}) unavailable - failing closed", what,
+                      log_safe(session.username));
         if (metrics) {
             metrics->counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}})
                 .increment();
         }
-        return {Kind::kStoreUnavailable, MfaFactorState::kStoreUnavailable};
+        return {Kind::kStoreUnavailable, MfaFactorState::kStoreUnavailable, persistent};
     };
     const auto store_unavailable = [&](const char* what) -> ApproverMfaOutcome {
         spdlog::error("require_enrolled_fresh_mfa: {}({}) unavailable - failing closed", what,
@@ -250,7 +253,7 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
         case LocalMfaBinding::kUnavailable:
             return store_unavailable("durable mfa proof");
         case LocalMfaBinding::kUnenforced:
-            return store_unavailable("mfa factor binding");
+            return store_unavailable("mfa factor binding", /*persistent=*/true);
         case LocalMfaBinding::kNoProof:
         case LocalMfaBinding::kUnbound:
         case LocalMfaBinding::kMismatch:

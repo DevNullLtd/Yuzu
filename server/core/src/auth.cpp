@@ -1147,13 +1147,17 @@ AuthManager::StampRecheck AuthManager::post_stamp_factor_recheck(const std::stri
             ->counter("yuzu_auth_mfa_stamp_denied_total",
                       {{"reason", unverifiable ? "unverifiable" : "factor_changed"}})
             .increment();
-    // Cleanup, after the lock. A failure is logged and counted; the row stays bound to the
-    // OLD generation (refused by equality) and this replica's cache is dropped regardless.
+    // Cleanup, after the lock. A failure is logged and counted; this replica's cache is dropped
+    // regardless. After a CHANGED factor the row stays bound to the old generation (refused by
+    // equality); after an UNVERIFIABLE recheck the stamp holds the verifier's generation, which
+    // is the current one unless a change raced, so a failed clear leaves a proof a binding gate
+    // would admit.
     auto cleared = session_store_->clear_mfa_proof(token_hash);
     if (!cleared) {
         spdlog::error("post_stamp_factor_recheck: clearing the stamped proof failed ({}) - the "
-                      "stored proof stays bound to the previous factor generation, which a "
-                      "binding gate refuses",
+                      "stored proof stays: after a changed factor it is bound to the previous "
+                      "generation (a binding gate refuses it), after an unverifiable recheck it "
+                      "is bound to the current one",
                       cleared.error().message);
         note_session_store_degrade("clear_mfa_proof");
         drop_cached_mfa_proof(token_hash);
@@ -2013,17 +2017,24 @@ DurableMfaProof AuthManager::read_durable_mfa_proof(const std::string& token,
     const auto& f = found->value();
     if (f.row.username != expected_username)
         return {DurableMfaProof::Source::kAbsent, 0, 0};
-    // The stored generation is only trustworthy while the rebind guard is observed to be in
-    // force (find() re-validates it behind a memo). Once it is not, a legacy writer could have
-    // carried a binding the guard would have cleared: unavailable, never a bound proof.
-    if (!session_store_->rebind_guard_ok()) {
-        spdlog::warn("read_durable_mfa_proof: the session store's rebind guard is not in force - "
-                     "failing closed");
-        note_session_store_degrade("rebind_guard");
-        return {DurableMfaProof::Source::kUnavailable, 0, 0};
-    }
+    // The row is returned as read. Whether its stored generation may be trusted as a binding
+    // is the caller's decision (`stored_binding_trustworthy`): the binding applies to a local
+    // session only, so an OIDC approver reading its IdP-seeded proof is not refused for it.
     return {DurableMfaProof::Source::kRow, f.row.mfa_verified_ms, f.db_now_ms,
             f.row.mfa_factor_gen};
+}
+
+bool AuthManager::stored_binding_trustworthy() const {
+    // The stored generation is only trustworthy while the rebind guard is observed to be in
+    // force (find() re-validates it behind a memo). Once it is not, a legacy writer could have
+    // carried a binding the guard would have cleared: untrustworthy, never a bound proof. This
+    // is the one place that logs and counts that degrade.
+    if (session_store_ && session_store_->rebind_guard_ok())
+        return true;
+    spdlog::warn("stored_binding_trustworthy: the session store's rebind guard is not in force - "
+                 "failing closed");
+    note_session_store_degrade("rebind_guard");
+    return false;
 }
 
 std::optional<Session> AuthManager::validate_session_durable(const std::string& token,
