@@ -194,6 +194,17 @@ def main() -> int:
         expect(any_mentions(idiom(f"{using}\nauto f = ResponseTierFilter::exclude(*set, {spelling});"),
                             "idiom.cpp"),
                f"after '{using}', exclude(set, {spelling}) must fail")
+    # The two features together: a using-declaration AND whitespace around `::`.
+    for using in ("using std::nullopt;", "using namespace std;"):
+        for spelling in ("std :: nullopt", "std:: nullopt", "std ::nullopt", "std::\nnullopt",
+                         "static_cast<authz::VisibleSet>(std :: nullopt)",
+                         "static_cast<authz :: VisibleSet>(std:: nullopt)",
+                         "std :: optional<std::unordered_set<std::string>>{}"):
+            expect(any_mentions(idiom(f"{using}\nauto f = ResponseTierFilter::exclude(*set, {spelling});"),
+                                "idiom.cpp"),
+                   f"after '{using}', exclude(set, {spelling!r}) must fail")
+    expect(idiom("using namespace std;\nauto f = ResponseTierFilter::exclude(*set, std :: nullopt_like);") == [],
+           "a using-declaration with spaced `::` does not turn an unrelated name into the literal")
     expect(idiom("auto f = ResponseTierFilter::exclude(*set, nullopt);") == [],
            "a bare nullopt WITHOUT a using-declaration is some other symbol, not flagged")
     expect(idiom("using std::nullopt;\nauto f = ResponseTierFilter::exclude(*set, nullopt_like);") == [],

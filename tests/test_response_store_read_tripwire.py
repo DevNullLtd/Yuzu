@@ -516,7 +516,10 @@ def _unrestricted_in_file(rel: str, text: str) -> tuple[str, ...]:
             args = _call_args(code, m.end() - 1)
             if len(args) < 2:
                 continue
-            arg = _requalify_std(args[1]) if bare_std else args[1]
+            # Close the whitespace around every `::` BEFORE re-qualifying: `std :: nullopt` has a
+            # space before the bare name, so the re-qualifier would otherwise turn it into
+            # `std :: std::nullopt`, which no literal spelling matches.
+            arg = _requalify_std(_close_scope_ws(args[1])) if bare_std else args[1]
             if _is_unrestricted_visible(arg):
                 found.append(f"{rel}: {name}::exclude(..., {' '.join(args[1].split())})")
     for m in re.finditer(r"for_fixed_plugin_poll\s*\(", code):
