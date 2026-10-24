@@ -16016,11 +16016,7 @@ private:
         yuzu::server::ForensicsVisibilityFn forensics_visibility_fn =
             [this](const httplib::Request& req) -> yuzu::server::ForensicsVisibility {
             return yuzu::server::resolve_forensics_visible(
-                {.auth_routes = auth_routes_.get(),
-                 .rbac_store = rbac_store_.get(),
-                 .mgmt_store = mgmt_group_store_.get(),
-                 .metrics = &metrics_},
-                req);
+                {.auth_routes = auth_routes_.get(), .metrics = &metrics_}, req);
         };
         // #4035 review fix's bespoke `dex_visible_fn` resolver (a global-Read
         // bypass + `RbacStore::visible_agents_for_permission` join) is

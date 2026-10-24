@@ -818,8 +818,9 @@ void append_scope_clause(std::string& sql, std::vector<std::string>& binds, int&
 // predicate is evaluated against an aliased `responses` row (the facet EXISTS); "" otherwise.
 //   * unrestricted / global Forensics:Read -> nothing appended
 //   * refuse_unwired (no plugin set wired) -> AND 1=0
-//   * no per-agent exemption               -> AND lower(plugin COLLATE "C") <> ALL($n::text[])
-//   * per-agent exemption                  -> AND (lower(plugin COLLATE "C") <> ALL($n) OR agent_id = ANY($m))
+//   * otherwise                            -> AND lower(plugin COLLATE "C") <> ALL($n::text[])
+// There is no per-agent exemption arm: no scoped Forensics read tier exists (a present subset is
+// treated like present-empty in `ResponseTierFilter::exclude`), so the clause never names an agent.
 // `plugin` is stored as the agent sent it, so it is compared lowercased against the lowercase
 // excluded set. COLLATE "C" makes the fold ASCII-only whatever the database's LC_CTYPE, matching
 // `ascii_lower` (ascii_fold.hpp) on the C++ side; a locale-aware lower() could fold a non-ASCII
@@ -833,19 +834,10 @@ void append_tier_clause(std::string& sql, std::vector<std::string>& binds, int& 
         return;
     }
     const std::string plugin_col = std::string(col_prefix) + "plugin";
-    const std::string agent_col = std::string(col_prefix) + "agent_id";
-    const auto to_views = [](const std::vector<std::string>& v) {
-        return std::vector<std::string_view>(v.begin(), v.end());
-    };
-    sql += " AND ";
-    if (!tier.exempt_agents().empty())
-        sql += "(";
-    sql += "lower(" + plugin_col + " COLLATE \"C\") <> ALL($" + std::to_string(idx++) + "::text[])";
-    binds.push_back(pg::to_text_array(to_views(tier.excluded_plugins())));
-    if (!tier.exempt_agents().empty()) {
-        sql += " OR " + agent_col + " = ANY($" + std::to_string(idx++) + "::text[]))";
-        binds.push_back(pg::to_text_array(to_views(tier.exempt_agents())));
-    }
+    const auto& excluded = tier.excluded_plugins();
+    sql += " AND lower(" + plugin_col + " COLLATE \"C\") <> ALL($" + std::to_string(idx++) +
+           "::text[])";
+    binds.push_back(pg::to_text_array(std::vector<std::string_view>(excluded.begin(), excluded.end())));
 }
 
 // #4990: the facet tables carry no `plugin`, so the tier is tested on the owning `responses` row.

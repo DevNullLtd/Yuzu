@@ -1,7 +1,6 @@
 #include "forensics_visibility.hpp"
 
 #include <string>
-#include <unordered_set>
 
 #include <spdlog/spdlog.h>
 
@@ -10,8 +9,6 @@
 
 #include "auth_routes.hpp"
 #include "dispatch_destructive_gate.hpp" // kForensicsSecurable
-#include "management_group_store.hpp"
-#include "rbac_store.hpp"
 #include "refusal_log_throttle.hpp"
 
 namespace yuzu::server {
@@ -20,7 +17,6 @@ void seed_forensics_tier_metrics(yuzu::MetricsRegistry& metrics) {
     metrics.describe(kForensicsTierWithheldMetric,
                      "Reads whose Forensics-tier visibility could not be resolved, by reason "
                      "(rbac_unavailable = the authorization read answered unavailable; "
-                     "scope_read_failed = the management-group scoped-visibility lookup failed; "
                      "unwired = a dependency of the resolver was never wired). The read is refused "
                      "with a retryable 503 or shows a notice; no Forensics row is served. A "
                      "definitive refusal is not counted.",
@@ -56,43 +52,21 @@ ForensicsVisibility resolve_forensics_visible(const ForensicsVisibilityDeps& dep
         return note_unknown(deps, ForensicsUnknown::Unwired); // nothing may be proven
 
     const std::string securable{kForensicsSecurable};
-    // 1. Global proof. Quiet (no cookie-session denial row), but it IS the gate's own decision:
-    //    elevation, engine principals, MCP tier, service scope, RBAC and the RBAC-off admin-only
-    //    floor are all decided inside it. The gate's response is kept in a scratch object only to
-    //    tell an unavailable authorization store (503) from a definitive refusal (401/403). The
-    //    unavailable-aware variant answers 503 for an RBAC read that could not be completed (breaker
-    //    open, pool timeout, a failed role or permission query), where `probe_permission` would
-    //    collapse it into the 403 of a definitive denial.
+    // Global proof. Quiet (no cookie-session denial row), but it IS the gate's own decision:
+    // elevation, engine principals, MCP tier, service scope, RBAC and the RBAC-off admin-only
+    // floor are all decided inside it. The gate's response is kept in a scratch object only to
+    // tell an unavailable authorization store (503) from a definitive refusal (401/403). The
+    // unavailable-aware variant answers 503 for an RBAC read that could not be completed (breaker
+    // open, pool timeout, a failed role or permission query), where `probe_permission` would
+    // collapse it into the 403 of a definitive denial.
     httplib::Response gate_response;
     if (deps.auth_routes->probe_permission_unavailable_aware(req, gate_response, securable, "Read"))
         return ForensicsVisibility{std::in_place, std::nullopt}; // Granted, global
     if (gate_response.status == 503)
         return note_unknown(deps, ForensicsUnknown::RbacUnavailable);
 
-    // 2. A management-group-scoped grant, only meaningful while enforcement is in effect (with it
-    //    off there are no scoped grants, and Forensics:Read is admin-only through step 1).
-    if (!deps.rbac_store)
-        return note_unknown(deps, ForensicsUnknown::Unwired);
-    if (!rbac_enforcement_in_effect(deps.rbac_store))
-        return ForensicsVisibility{std::in_place, authz::deny_all()}; // Denied
-    if (!deps.mgmt_store)
-        return note_unknown(deps, ForensicsUnknown::Unwired);
-    const auto session = deps.auth_routes->resolve_session(req);
-    if (!session)
-        return ForensicsVisibility{std::in_place, authz::deny_all()}; // Denied
-    // These callers' authority is not "the user's own scoped grants": a service-scoped token is
-    // default-denied fleet data, an engine principal resolves RBAC-only against global grants, and
-    // an MCP-tier token is bounded by its tier before RBAC. Reading the owner's scoped grants for
-    // them would widen them, so they get nothing beyond the global proof above.
-    if (!session->token_scope_service.empty() || session->is_engine() || !session->mcp_tier.empty())
-        return ForensicsVisibility{std::in_place, authz::deny_all()}; // Denied
-
-    auto visible = deps.rbac_store->visible_agents_for_permission(session->username, securable,
-                                                                   "Read", deps.mgmt_store);
-    if (!visible)
-        return note_unknown(deps, ForensicsUnknown::ScopeReadFailed); // never nullopt, never "none"
-    return ForensicsVisibility{
-        std::in_place, authz::VisibleSet{std::unordered_set<std::string>(visible->begin(), visible->end())}};
+    // Definitive refusal (401/403): Denied. No scoped grant is consulted for any caller class.
+    return ForensicsVisibility{std::in_place, authz::deny_all()};
 }
 
 } // namespace yuzu::server

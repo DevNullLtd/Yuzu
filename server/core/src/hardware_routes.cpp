@@ -944,7 +944,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // AdminOrApproval and the read gate is Forensics:Read, which can differ (RBAC enforced, a
         // legacy-admin role without the RBAC grant); no row ever reaches the page either way.
         if (deps_.forensics_plugins && deps_.forensics_plugins->contains(plugin) &&
-            !tier.admits(plugin, id)) {
+            !tier.admits(plugin)) {
             HwActionResultView notice;
             notice.attempt = attempt;
             notice.phase = HwActionResultView::Phase::NeedsForensicsRead;

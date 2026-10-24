@@ -11,8 +11,11 @@
 ///
 /// Semantics of the `forensics_visible` argument follow ADR-0033 (`authz::VisibleSet`):
 ///   * `nullopt`        = the caller may read every Forensics row (a global `Forensics:Read`).
-///   * present subset   = only Forensics rows whose `agent_id` is in the subset.
-///   * present EMPTY    = no Forensics row (also the fail-closed sink: unwired, degraded, no grant).
+///   * present value   = no Forensics row (the fail-closed sink: unwired, degraded, no grant).
+/// Per-agent subsets are intentionally UNSUPPORTED: there is no scoped Forensics read tier, so a
+/// present non-empty subset is treated exactly like present-empty (fail closed), never as an
+/// exemption for the agents it names. Adding a subset tier needs an authoring path, a fresh
+/// review and end-to-end tests first.
 /// Spell the empty case with `authz::deny_all()`, never `VisibleSet{}` (that is `nullopt`).
 ///
 /// This header holds only types: no store, no lock, no SQL. The plugin set is derived from the
@@ -72,15 +75,15 @@ class ResponseTierFilter {
 public:
     ResponseTierFilter() = delete;
 
-    /// Operator-facing read: Forensics-plugin rows are excluded unless `forensics_visible` admits them.
+    /// Operator-facing read: Forensics-plugin rows are excluded unless `forensics_visible` is
+    /// `nullopt` (a global grant). ANY present value, empty or not, excludes every Forensics row:
+    /// a non-empty subset is unsupported and fails closed (see the header comment).
     [[nodiscard]] static ResponseTierFilter exclude(const ForensicsPluginSet& plugins,
                                                     authz::VisibleSet forensics_visible) {
         ResponseTierFilter f{Key{}};
         if (!forensics_visible)
             return f; // global Forensics:Read: no clause
         f.excluded_ = plugins.names();
-        f.exempt_agents_.assign(forensics_visible->begin(), forensics_visible->end());
-        std::ranges::sort(f.exempt_agents_);
         return f;
     }
 
@@ -115,38 +118,33 @@ public:
         return f;
     }
 
-    /// Whether this filter lets a stored row of `plugin` from `agent_id` through: the same decision
-    /// the SQL predicate makes, for a surface that must know BEFORE it reads (a result poll that
-    /// would otherwise wait on a row it can never be shown). A plugin outside the Forensics set is
-    /// admitted by every filter except `refuse_unwired()`.
-    [[nodiscard]] bool admits(std::string_view plugin, std::string_view agent_id) const {
+    /// Whether this filter lets a stored row of `plugin` through: the same decision the SQL
+    /// predicate makes, for a surface that must know BEFORE it reads (a result poll that would
+    /// otherwise wait on a row it can never be shown). A plugin outside the Forensics set is
+    /// admitted by every filter except `refuse_unwired()`; a Forensics-tier plugin only by an
+    /// unrestricted filter. The decision does not depend on the agent.
+    [[nodiscard]] bool admits(std::string_view plugin) const {
         if (refuse_all_)
             return false;
         if (excluded_.empty())
             return true; // unrestricted: a global Forensics:Read, or an internal consumer
-        if (!std::binary_search(excluded_.begin(), excluded_.end(), ascii_lower(plugin)))
-            return true; // not a Forensics-tier plugin
-        return std::binary_search(exempt_agents_.begin(), exempt_agents_.end(), agent_id,
-                                  [](std::string_view a, std::string_view b) { return a < b; });
+        return !std::binary_search(excluded_.begin(), excluded_.end(), ascii_lower(plugin));
     }
 
     // -- Accessors for response_store.cpp (the SQL builder); not a policy surface. -----------------
 
-    /// True when a SQL clause is needed: the filter excludes plugins for at least some agents.
+    /// True when a SQL clause is needed: the filter excludes plugins.
     [[nodiscard]] bool restricts() const noexcept { return refuse_all_ || !excluded_.empty(); }
     /// True for `refuse_unwired()`: the read matches no row at all (`AND 1=0`).
     [[nodiscard]] bool refuses_every_row() const noexcept { return refuse_all_; }
     /// Lowercase plugin names to exclude (empty iff `!restricts()`).
     [[nodiscard]] const std::vector<std::string>& excluded_plugins() const noexcept { return excluded_; }
-    /// Sorted agent ids whose Forensics rows are still readable; empty = none.
-    [[nodiscard]] const std::vector<std::string>& exempt_agents() const noexcept { return exempt_agents_; }
 
 private:
     struct Key {};
     explicit ResponseTierFilter(Key) {}
 
     std::vector<std::string> excluded_;
-    std::vector<std::string> exempt_agents_;
     bool refuse_all_{false};
 };
 

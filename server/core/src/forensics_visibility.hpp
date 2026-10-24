@@ -7,10 +7,9 @@
 /// ForensicsUnknown>`.
 ///   * Granted  (value, an ADR-0033 `authz::VisibleSet`):
 ///       `nullopt`      = the caller holds a global `Forensics:Read` (may read every Forensics row)
-///       present subset = RBAC enforcement is on and the caller holds a management-group-scoped
-///                        `Forensics:Read`: only those agents' Forensics rows
-///   * Denied   (value, present EMPTY): a DEFINITIVE answer, there is no grant (also a caller class
-///                        that never carries per-agent authority here). Correct behavior, silent.
+///   * Denied   (value, present EMPTY): a DEFINITIVE answer, there is no global grant. Correct
+///                        behavior, silent. There is no scoped (management-group) Forensics read
+///                        tier: the answer is only ever `nullopt` or `deny_all()`.
 ///   * Unknown  (error, `ForensicsUnknown`): the question could not be answered (a store degrade or
 ///                        an unwired dependency). Never admits a Forensics row. A surface that
 ///                        hands a machine caller rows must answer a retryable 503 rather than a 200
@@ -44,8 +43,6 @@
 namespace yuzu::server {
 
 class AuthRoutes;
-class ManagementGroupStore;
-class RbacStore;
 } // namespace yuzu::server
 
 namespace yuzu {
@@ -58,7 +55,6 @@ namespace yuzu::server {
 /// `yuzu_server_forensics_tier_withheld_total` (seeded from `kForensicsUnknownReasons`).
 enum class ForensicsUnknown : std::uint8_t {
     RbacUnavailable, ///< the authorization read answered 503 (an unavailable authorization store)
-    ScopeReadFailed, ///< the management-group scoped-visibility lookup failed
     Unwired,         ///< a dependency the resolver needs was never wired (impossible in production)
 };
 
@@ -67,8 +63,6 @@ enum class ForensicsUnknown : std::uint8_t {
     switch (u) {
     case ForensicsUnknown::RbacUnavailable:
         return "rbac_unavailable";
-    case ForensicsUnknown::ScopeReadFailed:
-        return "scope_read_failed";
     case ForensicsUnknown::Unwired:
         return "unwired";
     }
@@ -76,7 +70,7 @@ enum class ForensicsUnknown : std::uint8_t {
 }
 
 inline constexpr ForensicsUnknown kForensicsUnknownReasons[] = {
-    ForensicsUnknown::RbacUnavailable, ForensicsUnknown::ScopeReadFailed, ForensicsUnknown::Unwired};
+    ForensicsUnknown::RbacUnavailable, ForensicsUnknown::Unwired};
 
 /// The resolver's tri-state answer (see the header comment).
 using ForensicsVisibility = std::expected<authz::VisibleSet, ForensicsUnknown>;
@@ -84,21 +78,19 @@ using ForensicsVisibility = std::expected<authz::VisibleSet, ForensicsUnknown>;
 /// Per-request resolver wired once in `server.cpp` and passed to each surface.
 using ForensicsVisibilityFn = std::function<ForensicsVisibility(const httplib::Request&)>;
 
-/// The stores the production resolver reads. Borrowed; a null auth/RBAC/management-group member
-/// makes the answer Unknown (never "unrestricted"). `metrics` is optional: unset (a harness) the
-/// resolver counts nothing.
+/// What the production resolver reads. Borrowed; a null `auth_routes` makes the answer Unknown
+/// (never "unrestricted"). `metrics` is optional: unset (a harness) the resolver counts nothing.
+/// There is deliberately NO RBAC store or management-group store here: a definitive global denial
+/// performs no group lookup because the resolver has nothing to look one up with.
 struct ForensicsVisibilityDeps {
     AuthRoutes* auth_routes{nullptr};
-    const RbacStore* rbac_store{nullptr};
-    const ManagementGroupStore* mgmt_store{nullptr};
     yuzu::MetricsRegistry* metrics{nullptr};
 };
 
 /// `yuzu_server_forensics_tier_withheld_total{reason}`: one increment per resolver call that
 /// answered Unknown, i.e. a read whose Forensics rows were withheld because the caller's authority
 /// could not be determined (the read was refused with a 503 or showed a notice). `reason` is the
-/// CLOSED set `kForensicsUnknownReasons` (`to_string`): `rbac_unavailable`, `scope_read_failed`,
-/// `unwired`. A definitive refusal (Denied) is correct behavior and is never counted, so the
+/// CLOSED set `kForensicsUnknownReasons` (`to_string`): `rbac_unavailable`, `unwired`. A definitive refusal (Denied) is correct behavior and is never counted, so the
 /// series stays flat on a healthy server whatever the callers' roles. Operational, not
 /// `event="security"`.
 inline constexpr const char* kForensicsTierWithheldMetric =
@@ -108,25 +100,20 @@ inline constexpr const char* kForensicsTierWithheldMetric =
 /// server and `increase()` sees the first event. Called once at server start.
 void seed_forensics_tier_metrics(yuzu::MetricsRegistry& metrics);
 
-/// The production resolver. Order is load-bearing:
-///   1. `AuthRoutes::probe_permission_unavailable_aware(req, scratch, "Forensics", "Read")` true =>
-///      `nullopt` (global). It is `has_permission` with the gate's own response kept in a scratch
-///      object, so it decides the same things (JIT elevation, engine principals (RBAC-only), MCP
-///      tier, service scope (a service-scoped token never proves Forensics), the RBAC-off legacy
-///      floor) and writes no denial row for a cookie session. It differs from `probe_permission`
-///      in ONE way: an RBAC read that could not be completed (store not open, breaker open, pool
-///      acquire timeout, a failed role or permission query) answers 503 instead of the 403 of a
-///      definitive refusal, so the two can be told apart. A 503 => Unknown(RbacUnavailable), for
-///      every caller class. A definitive 401/403 falls through to step 2.
-///   2. else, only when RBAC enforcement is in effect and the caller is an ordinary session (not a
-///      service-scoped token, not an engine principal, not an MCP-tier token):
-///      `RbacStore::visible_agents_for_permission` => that subset. A lookup failure =>
-///      Unknown(ScopeReadFailed).
-///   3. else Denied (present-empty).
-/// Step 2 skips caller classes the global probe treats specially because their authority is not
-/// "the minting user's grants": using the owner's scoped grants for them would widen them.
-/// An unavailable global read is therefore never collapsed into Denied: no Forensics row is
-/// served and the caller gets the retryable answer, whatever the caller class.
+/// The production resolver. One global proof, nothing else:
+///   `AuthRoutes::probe_permission_unavailable_aware(req, scratch, "Forensics", "Read")` true =>
+///   `nullopt` (global). It is `has_permission` with the gate's own response kept in a scratch
+///   object, so it decides the same things (JIT elevation, engine principals (RBAC-only), MCP
+///   tier, service scope (a service-scoped token never proves Forensics), the RBAC-off legacy
+///   floor) and writes no denial row for a cookie session. It differs from `probe_permission`
+///   in ONE way: an RBAC read that could not be completed (store not open, breaker open, pool
+///   acquire timeout, a failed role or permission query) answers 503 instead of the 403 of a
+///   definitive refusal, so the two can be told apart. A 503 => Unknown(RbacUnavailable), for
+///   every caller class. A definitive 401/403 => Denied (present-empty).
+/// There is no second step: no scoped (management-group) grant is ever consulted, for any caller
+/// class, and a definitive denial performs no group lookup (the dependency does not exist).
+/// An unavailable global read is never collapsed into Denied: no Forensics row is served and the
+/// caller gets the retryable answer, whatever the caller class.
 [[nodiscard]] ForensicsVisibility resolve_forensics_visible(const ForensicsVisibilityDeps& deps,
                                                             const httplib::Request& req);
 
