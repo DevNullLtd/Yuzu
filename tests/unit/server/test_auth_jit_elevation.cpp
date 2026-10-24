@@ -430,6 +430,23 @@ struct JitHarness {
         INFO(PQresultErrorMessage(r.get()));
         REQUIRE(r.status() == PGRES_COMMAND_OK);
     }
+    /// Move `token`'s elevation window `elapsed_ms` into the past so it has lapsed. With a durable
+    /// store the window is authored (and reaped) from the stored row, so the row is moved as well as
+    /// the cache deadline: `lapse_elevation_for_test` alone is cache-only and a store-backed reap
+    /// would still see a live window.
+    void lapse_elevation(const std::string& token, long long elapsed_ms) {
+        auto lease = auth_db.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(),
+            "UPDATE session_store.sessions SET elevated_until_ms = elevated_until_ms - $2::bigint, "
+            "elevation_issued_ms = elevation_issued_ms - $2::bigint WHERE token_hash = $1",
+            std::vector<std::string>{auth::AuthManager::sha256_hex(token),
+                                     std::to_string(elapsed_ms)});
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+        auth_mgr.lapse_elevation_for_test(token, std::chrono::milliseconds(elapsed_ms));
+    }
     JitHarness(const JitHarness&) = delete;
     JitHarness& operator=(const JitHarness&) = delete;
 
@@ -1019,7 +1036,7 @@ TEST_CASE("role.elevation.expired is audited lazily on the next authenticated "
     // UP-1/UP-4) REJECTS a request that would clamp to `until <= now` rather
     // than granting a zero-length window.
     REQUIRE(h.auth_mgr.elevate_session(token, std::chrono::seconds(1)).has_value());
-    h.auth_mgr.lapse_elevation_for_test(token, std::chrono::milliseconds(2000));
+    h.lapse_elevation(token, 2000);
     CHECK(h.count_audits("role.elevation.expired", "alice") == 0);
 
     // The next authenticated request through resolve_session (the cookie
@@ -1059,7 +1076,7 @@ TEST_CASE("a reap that fires within a request leaves THAT request's session "
     JitHarness h;
     auto token = h.session_for("alice");
     REQUIRE(h.auth_mgr.elevate_session(token, std::chrono::seconds(1)).has_value());
-    h.auth_mgr.lapse_elevation_for_test(token, std::chrono::milliseconds(2000));
+    h.lapse_elevation(token, 2000);
 
     // The lazy reap fires INSIDE resolve_session, on this very request — the
     // request must be evaluated against the now-lapsed (base) role, not the
@@ -1083,7 +1100,7 @@ TEST_CASE("a lazy role.elevation.expired reap survives an unwritable audit store
     JitHarness h(/*audit_store_broken=*/true);
     auto token = h.session_for("alice");
     REQUIRE(h.auth_mgr.elevate_session(token, std::chrono::seconds(1)).has_value());
-    h.auth_mgr.lapse_elevation_for_test(token, std::chrono::milliseconds(2000));
+    h.lapse_elevation(token, 2000);
 
     // The AuditStore can't persist (unopenable path, db_==nullptr) — the
     // lazy reap at the resolve_session chokepoint must not crash or throw,

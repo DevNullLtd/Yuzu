@@ -92,6 +92,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <map>
 #include <optional>
@@ -661,15 +662,23 @@ TEST_CASE("step-up route inventory (lexical): kRequired labels equal the in-hand
 TEST_CASE("step-up route inventory (lexical): only the two kFactorCredential handlers mutate a "
           "second factor",
           "[stepup][inventory][factor_credential]") {
-    static const std::regex mutation(
-        R"regex((?:->|\.)\s*(mfa_regenerate_recovery_codes|mfa_disable_report)\s*\()regex");
-    static const std::regex registration(
-        R"regex(\bsink\.(?:Post|Put|Delete|Patch)\(\s*"([^"]+)")regex");
+    namespace text_scan = ::yuzu::test::source_scan;
+    namespace linear = ::yuzu::test::route_scan;
+    constexpr std::array<std::string_view, 2> kMutations{"mfa_regenerate_recovery_codes",
+                                                         "mfa_disable_report"};
 
-    const auto line_of = [](const std::string& text, std::size_t pos) {
-        return static_cast<int>(std::count(text.begin(),
-                                           text.begin() + static_cast<std::ptrdiff_t>(pos), '\n')) +
-               1;
+    // A call spelled `->name(` or `.name(`, spaces allowed on either side of the name; true when
+    // `name` starts at `at` in `text`.
+    const auto is_member_call = [](std::string_view text, std::size_t at, std::string_view name) {
+        std::size_t before = at;
+        while (before > 0 && linear::is_space(text[before - 1]))
+            --before;
+        const bool member = (before >= 1 && text[before - 1] == '.') ||
+                            (before >= 2 && text[before - 1] == '>' && text[before - 2] == '-');
+        std::size_t after = at + name.size();
+        while (after < text.size() && linear::is_space(text[after]))
+            ++after;
+        return member && after < text.size() && text[after] == '(';
     };
 
     std::vector<std::string> not_a_factor_credential_row;
@@ -678,21 +687,25 @@ TEST_CASE("step-up route inventory (lexical): only the two kFactorCredential han
          scan::read_all_cpp_files(std::filesystem::path(YUZU_SERVER_SRC_DIR))) {
         if (file == "auth_db.cpp" || file.ends_with("/auth_db.cpp"))
             continue;
-        for (auto it = std::sregex_iterator(text.begin(), text.end(), mutation);
-             it != std::sregex_iterator(); ++it) {
-            const auto pos = static_cast<std::size_t>(it->position(0));
-            const std::string where =
-                file + ":" + std::to_string(line_of(text, pos)) + " " + (*it)[1].str();
-            callers.push_back(where);
-            // The route this call sits in: the nearest registration before it.
-            std::string pattern;
-            const std::string before = text.substr(0, pos);
-            for (auto r = std::sregex_iterator(before.begin(), before.end(), registration);
-                 r != std::sregex_iterator(); ++r)
-                pattern = (*r)[1].str();
-            const auto* row = pattern.empty() ? nullptr : step_up_policy_for("POST", pattern);
-            if (row == nullptr || row->cls != StepUpClass::kFactorCredential)
-                not_a_factor_credential_row.push_back(where + " (route '" + pattern + "')");
+        const auto registrations = linear::find_route_registrations(text, linear::kMutatingMethods);
+        for (const std::string_view name : kMutations) {
+            for (std::size_t pos = text.find(name); pos != std::string::npos;
+                 pos = text.find(name, pos + 1)) {
+                if (!is_member_call(text, pos, name))
+                    continue;
+                const std::string where = file + ":" + std::to_string(text_scan::line_of(text, pos)) +
+                                          " " + std::string(name);
+                callers.push_back(where);
+                // The route this call sits in: the nearest registration before it.
+                std::string pattern;
+                for (const auto& r : registrations) {
+                    if (r.pos < pos)
+                        pattern = r.raw_path;
+                }
+                const auto* row = pattern.empty() ? nullptr : step_up_policy_for("POST", pattern);
+                if (row == nullptr || row->cls != StepUpClass::kFactorCredential)
+                    not_a_factor_credential_row.push_back(where + " (route '" + pattern + "')");
+            }
         }
     }
     INFO("calls found:\n" << join(callers));
