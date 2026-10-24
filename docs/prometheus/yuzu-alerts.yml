@@ -6177,9 +6177,13 @@ groups:
             and YuzuMfaBindingNotEnforced{store="session"} co-fires with this alert
             (see docs/ops-runbooks/auth-db-recovery.md "MFA binding enforcement
             failed"). `op=clear_mfa_proof` means a proof that had to be withdrawn
-            could not be cleared; the stored proof stays bound to the previous
-            factor generation, which the binding refuses. Usually PostgreSQL pool
-            saturation / failover; correlate with the pool metrics.
+            could not be cleared. After a changed factor the stored proof stays
+            bound to the previous generation, which the binding refuses; after an
+            unverifiable recheck it stays bound to the verifier's current
+            generation, so a binding gate would admit that genuine proof (benign:
+            it was earned with a valid code, and the withdrawal is best-effort).
+            Usually PostgreSQL pool saturation / failover; correlate with the
+            pool metrics.
       - alert: YuzuEnrollmentStoreDegraded
         expr: |
           increase(yuzu_auth_enrollment_store_degrade_total[10m]) > 0
@@ -6202,7 +6206,9 @@ groups:
       # chokepoint"). `unavailable` is a 503 on a step-up route: the auth store
       # could not be read, an enrolled account's second factor could not be
       # decrypted, the server has no usable auth store, an enrolled local session's
-      # stored proof could not be read (mfa_proof_unavailable) or the MFA binding
+      # stored proof could not be read, the session rebind guard is not in force, or
+      # the account is enrolled with a non-positive factor generation (all
+      # mfa_proof_unavailable) or the MFA binding
       # trigger is not observed in force (mfa_binding_unenforced, which persists
       # until repaired and restarted and co-fires YuzuMfaBindingNotEnforced), or the
       # check itself threw or could not fingerprint the session (chokepoint_exception). The counter is
@@ -6225,7 +6231,9 @@ groups:
             The central MFA step-up check refused at least three requests in
             ten minutes with 503 because it could not establish the caller's MFA
             state (auth store unreadable, stored second factor undecryptable,
-            no usable auth store, a stored proof that cannot be read, a binding
+            no usable auth store, a stored proof that cannot be read or an
+            enrolled account whose factor generation is not positive
+            (reason=mfa_proof_unavailable), a binding
             trigger not observed in force (reason=mfa_binding_unenforced; also
             fires YuzuMfaBindingNotEnforced), or an unexpected exception inside
             the check). The gated routes stay closed until the cause is fixed; re-entering a

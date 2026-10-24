@@ -739,7 +739,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        window and bound to the account's current factor generation, so disabling and re-enrolling
        replaces the factor and earlier proofs stop counting; OIDC: an MFA-method `amr` on a token issued within the
        window; SAML: refused). The approver window is `min(--mfa-step-up-window-secs, 300)`, and 300
-       when that is `0`, so `0` no longer disables it. The text above is kept as the record of what
+       when that is `0` or negative, so `0` no longer disables it. The text above is kept as the record of what
        was accepted on 2026-10-18; see `docs/auth-architecture.md`, "Approver assurance".
      - **Acceptance.** Acceptor: Dave Rae (maintainer). Date: 2026-10-18. Ruling
        source: the maintainer ruling in the #6061 work session (epic #6060) to

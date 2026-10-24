@@ -785,8 +785,9 @@ by each handler.
   rendered for the request's surface like any other refusal, with
   `reason=chokepoint_exception` in a best-effort audit row and the session's
   own source on the metric (`other` only when no session resolved). A local
-  enrolled session whose stored proof cannot be read, or whose binding trigger is
-  not observed in force, is the same `503` with `reason=mfa_proof_unavailable` or
+  enrolled session whose stored proof cannot be read (a degraded read, or the session store's
+  rebind guard not in force), whose account's factor generation is not positive, or whose binding
+  trigger is not observed in force, is the same `503` with `reason=mfa_proof_unavailable` or
   `reason=mfa_binding_unenforced`, counted
   `yuzu_auth_secret_unavailable_total{route="mfa_binding"}`; a chokepoint built
   without the stored-proof reader answers such a session `503` with
@@ -806,7 +807,12 @@ by each handler.
   `meta.mfa_step_up_required` and the `/login/mfa/stepup` challenge the dialog
   opens a nested "Confirm it is you" modal and replays the original request
   once on a valid code; a wrong code shows "That code was not accepted. Check
-  it and try again." in the modal, and Cancel returns to the outer dialog with
+  it and try again." in the modal, a `503` from `POST /login/mfa/stepup` shows the server's own
+  `error.message` instead (before verification, "authentication store is temporarily unavailable" or
+  "auth_db unavailable": the code was not checked and an immediate retry is fine; after it, "Your code was
+  accepted but could not be recorded. Wait for the next code and try again.": the code is spent, so the
+  same code is refused as a replay and the response carries no `retry_after_ms`; the dashboard and Settings
+  prompts show the same text), and Cancel returns to the outer dialog with
   the envelope message ("MFA step-up required"). A `403` or `503` is shown by
   the dialog as the envelope's `error.message`, with no toast and no prompt;
   the OIDC challenge, like any `401` without a step-up envelope, sends the
@@ -1006,8 +1012,9 @@ gate applied.
 
   | Condition | Answer | `reason` |
   |---|---|---|
-  | stored proof unreadable (degraded read, row unusable) | `503` | `mfa_proof_unavailable` |
-  | binding trigger not observed in force | `503` | `mfa_binding_unenforced` |
+  | stored proof unreadable (degraded read, row unusable, or the session store's rebind guard not in force) | `503` | `mfa_proof_unavailable` |
+  | binding trigger not observed in force (or a recovery bypass) | `503` | `mfa_binding_unenforced` |
+  | enrolled account whose factor generation is not positive (a tampered row, or a data-only restore of a pre-v3 dump); decided after the unenforced arm | `503` | `mfa_proof_unavailable` |
   | no stored proof (row absent, another principal's, or no instant) | `401` | `mfa_proof_missing` |
   | proof has no generation | `401` | `proof_factor_unbound` |
   | proof generation differs from the account's | `401` | `proof_factor_mismatch` |
@@ -1026,8 +1033,12 @@ gate applied.
   `post_stamp_factor_recheck` runs after the stamp commits; if the generation moved, the proof just
   stamped is cleared and the route answers `401` `factor_changed_during_step_up`
   (`yuzu_auth_mfa_stamp_denied_total`); a Settings enrolment confirm records
-  `step_up_proof=not_stamped;factor_changed` and the enrolment still stands. A clear that fails leaves
-  the stored proof bound to the old generation, which every gate refuses by equality.
+  `step_up_proof=not_stamped;factor_changed` and the enrolment still stands. A clear that fails after the
+  recheck is logged and counted (`yuzu_auth_session_store_degrade_total{op="clear_mfa_proof"}`) and has two
+  arms. After a CHANGED factor the stored proof stays bound to the old generation, which every gate refuses
+  by equality. After an UNVERIFIABLE recheck (the generation could not be read) it stays bound to the
+  verifier's own generation, which is the current one unless a change raced, so a binding gate would admit
+  that proof: benign, because it was earned with a valid code, and the withdrawal is best-effort.
 - **Credential-issuing rows carry the admitted generation to the mutation.** `kFactorCredential` rows
   (`POST /api/settings/mfa/recovery-codes`, `POST /api/settings/mfa/disable`) admit only a local session,
   use the approver window and are never hatch-exempt. The gate hands the generation it judged to the
@@ -1043,20 +1054,34 @@ gate applied.
   gated; `--mfa-reset` and tests pass no generation (break-glass, no gate).
 - **Enforcement of the triggers is checked, not assumed.** At boot each store verifies that its trigger
   exists, is `ENABLE ALWAYS`, fires per row `BEFORE UPDATE` on the watched columns, and that the function
-  body equals the pinned text; if not, the store does not open and the server refuses to start. After
-  boot the same check re-runs only when a request needs it (`AuthDB::mfa_status`, `SessionStore::find`),
+  body equals the pinned text; if not, the store does not open and the server refuses to start. The one
+  exception is the two host recovery one-shots: `--mfa-reset` (which opens the auth store and then the
+  session store) and `--break-glass-arm` (which opens only the auth store) pass
+  `MfaBindingCheck::kBypassForRecovery`, log a WARN naming the trigger state they found, and report the
+  binding as not enforced for the life of that process, so any binding decision made through them fails
+  closed (login still requires the TOTP code; it is not an MFA bypass). Serving and every other mode
+  that opens the bootstrap store, `--generate-tokens` for example, still refuse. After boot the same
+  check re-runs only when a request needs it (`AuthDB::mfa_status`, `SessionStore::find`),
   behind a 60 second steady-clock memo; the cleanup cadence and the session reap pass play no part. A
   query that could not run does not set the flag and is retried on the next read (the `auth` side fails
-  that one read closed). A query that ran and found the
-  trigger not in force sets a sticky flag: every local binding decision answers `503` until the server
-  restarts and its boot check passes, because generation changes made while the trigger was not firing
-  cannot be reconstructed. The token differs by store: `mfa_binding_unenforced` for the account-store
-  trigger (no retry hint, since it persists until repaired), and `mfa_proof_unavailable` (with
+  that one read closed: it reports the binding not enforced for that read alone and the next read
+  passes). A query that ran and found the trigger not in force sets a sticky flag: every local binding
+  decision answers `503` until the server restarts and its boot check passes, because generation changes
+  made while the trigger was not firing cannot be reconstructed. The token differs by store:
+  `mfa_binding_unenforced` for the account-store trigger, and `mfa_proof_unavailable` (with
   `yuzu_auth_session_store_degrade_total{op="rebind_guard"}`) for the session store's rebind guard, which
   reaches a local session as an unreadable stored proof; SSO sessions are not affected by the
-  session-store case. A SIEM rule must key on both tokens. Sign-in and step-up proving keep
-  working. `yuzu_auth_mfa_binding_enforcement_ok{store="auth"|"session"}` drops to `0` and
-  `YuzuMfaBindingNotEnforced` fires; the operator procedure is
+  session-store case, because `AuthManager::read_durable_mfa_proof` returns the row as read and only
+  `AuthRoutes::durable_mfa_proof_for` applies `AuthManager::stored_binding_trustworthy()` to a local
+  session. A SIEM rule must key on both tokens. **Sticky versus transient at the approver:** the approver
+  `503` carries no `retry_after_ms` and a remediation that points at the MFA binding enforcement runbook
+  for the three causes that do not clear by themselves, namely an auth trigger observed not in force (or
+  a recovery bypass), the session store's rebind guard latched not in force, and an enrolled row whose
+  factor generation is not positive; every transient cause (an unreadable enrolment or stored-proof read,
+  or a single catalog check that could not run) keeps `retry_after_ms` 5000. At the central gate the
+  not-positive generation is a `503` `mfa_proof_unavailable`, decided after the unenforced arm. Sign-in
+  and step-up proving keep working. `yuzu_auth_mfa_binding_enforcement_ok{store="auth"|"session"}` drops
+  to `0` and `YuzuMfaBindingNotEnforced` fires; the operator procedure is
   `docs/ops-runbooks/auth-db-recovery.md` "MFA binding enforcement failed". What this does not cover: a
   tampering that is in place when a validation runs makes every local binding decision fail closed until
   the server restarts, and the boot check must pass before it serves again. A disable, change and
@@ -1072,7 +1097,7 @@ gate applied.
 | Mixed replicas during a rolling upgrade | A login or step-up on a replica without this change leaves the proof unbound, so an upgraded replica's gates answer `401` until the user re-proves through an upgraded replica. Gated mutations and approvals need an upgraded replica until the rollout completes; the cost is availability, never admission. A replica without this change still applies the weaker rule on its own gates, so roll the replicas that serve these routes first. |
 | Rollback to a binary without it (schema left in place) | The old binary ignores the new columns. Its enrolment and clear still advance the generation (the trigger is `ENABLE ALWAYS`); its stamps and `ON CONFLICT` writes unbind the proofs; its own gates apply the earlier, weaker rule. |
 | Re-upgrade after rollback | No reseed; generations are consistent. |
-| Trigger dropped, disabled, replica-only or body replaced | Boot refuses. While running, a validation that observes it fails every local binding decision closed (sticky). Changes made while it was not firing are not reconstructable: end the affected accounts' sessions (runbook). |
+| Trigger dropped, disabled, replica-only or body replaced | Boot refuses (only `--mfa-reset` and `--break-glass-arm` open past it, and report the binding not enforced). While running, a validation that observes it fails every local binding decision closed (sticky). Changes made while it was not firing are not reconstructable: end the affected accounts' sessions (runbook). |
 | Coherent offline restore | The accepted ADR-2002 checkpoint class. |
 
 ### Approver assurance (maker-checker, #6061)
@@ -1132,19 +1157,23 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   database clock: the gate reads the row and `db_now_ms` in one SELECT and requires `0 <= db_now_ms - mfa_verified_ms <= window`,
   with no `kWallSanitySkew` allowance, in addition to the cached monotonic check. A suspended host or paused VM freezes the
   monotonic anchor, so the cached check alone is not a ceiling; the replica's own `system_clock` is never the authority.
-  A degraded read is `503`; so is a binding trigger that is not observed in force (the answer cannot be
+  A degraded read is `503`; so is a binding trigger that is not observed in force, the session store's rebind guard
+  not in force, or an enrolled account whose factor generation is not positive (the answer cannot be
   decided); a missing or future-dated proof is a step-up `401` for a local session (an SSO session with no usable cached proof is refused earlier, `mfa_proof_missing`). With no SessionStore attached (a wiring fault: a serving process always has one) the
   gate answers `503` and nothing is decided; the replica's wall clock never stands in for the database clock.
   Once the central check has passed (or with the window at `0`), a refusal for an unenrolled or proof-less caller is a `403`
   (`approver_assurance_required:mfa_not_enrolled`, `mfa_proof_missing`, `saml_mfa_unsupported`,
   `account_unavailable`), not a step-up prompt; a stale, missing, unbound or other-factor proof is the step-up `401`; and when the
   approver rule's own read fails (an unreadable stored proof or an MFA-store fault at its own read) the answer is a
-  `503` with `retry_after_ms` and `yuzu_auth_secret_unavailable_total{route="approval"}`; a binding trigger not observed
-  in force is the same `503` and counter but carries no `retry_after_ms`, because it persists until an operator repairs
-  the trigger and restarts. With the window above `0`
+  `503` with `retry_after_ms` 5000 and `yuzu_auth_secret_unavailable_total{route="approval"}`; the three causes that do
+  not clear by themselves (a binding trigger observed not in force, the session store's rebind guard latched not in force,
+  and an enrolled row whose factor generation is not positive) are the same `503` and counter but carry no
+  `retry_after_ms`, and their remediation points at the MFA binding enforcement runbook, because they persist until an
+  operator repairs the trigger or the account's MFA state (and restarts, for the triggers). A single catalog check that
+  could not run is not one of them: it keeps the transient answer. With the window above `0`
   the central check answers first for a SAML session (generic `403`), for a stale, missing, unbound or other-factor
   proof of a local session (`401`, with the reason token on its `mfa.step_up.required` row) and for an unreadable
-  stored proof, an unreadable local MFA store or an unenforced binding (`503` without `retry_after_ms`, counted
+  stored proof, an unreadable local MFA store, an unenforced binding or a non-positive factor generation (`503` without `retry_after_ms`, counted
   `route="mfa_binding"` or `route="mfa_stepup"`). For a local session both gates apply the same millisecond
   database-clock ceiling, so the ticket-specific `approver_assurance:mfa_proof_stale` row exists only when the
   configured window exceeds 300 (or is `0` or less, where the central check is off); an OIDC session is still

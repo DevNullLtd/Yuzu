@@ -36,7 +36,7 @@ the Windows event log shows one of these, and they mean different things:
 |---|---|---|
 | `[PG] Refusing to start: no PostgreSQL DSN` | `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset | [Config](#no-dsn-configured) |
 | `[PG] Refusing to start: cannot reach PostgreSQL substrate: …` | Postgres down, wrong DSN, network/auth failure | [Substrate down](#postgres-substrate-unreachable) |
-| `[PG] Refusing to start: auth store (AuthDB) migration/open failed` | Database reachable, `auth` schema could not be created/opened | [Migration failure](#auth-schema-migration-failure) |
+| `[PG] Refusing to start: auth store (AuthDB) migration/open failed` | Database reachable, `auth` schema could not be created/opened. In practice `main()` opens its own bootstrap `AuthDB` first and exits with `Failed to open the Postgres auth store (migration or MFA trigger check failed; see the preceding AuthDB log line)`, so you normally see that line instead and this one only when the bootstrap open succeeded and the server's own open then failed. Read the `AuthDB:` line before either one: it says whether the migration failed or the MFA trigger check did | [Migration failure](#auth-schema-migration-failure), or [MFA binding enforcement failed](#mfa-binding-enforcement-failed) when the `AuthDB:` line names the MFA trigger |
 | `SecretCodec::init() failed for the auth store bootstrap — …` or `[PG] Refusing to start: SecretCodec::init() failed — …` | The secrets seam could not initialise — usually a missing or unreadable KEK | [KEK problems](#kek-missing-or-unreadable) |
 | `SecretCodec::init() failed` … `kek_orphaned: stored secret blobs reference KEK version(s) […] absent from kek_meta` | A stored secret blob (for example one account's TOTP secret) names a key-encryption-key version that is not registered in `secrets.kek_meta` | [Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version) |
 | `AuthDB: the MFA factor-generation trigger (auth.users_mfa_factor_gen) is missing, not ENABLE ALWAYS, or altered - auth store disabled`, followed by `Failed to open the Postgres auth store (migration or MFA trigger check failed; see the preceding AuthDB log line)` | The trigger that binds an MFA proof to the account's factor generation is not in force | [MFA binding enforcement failed](#mfa-binding-enforcement-failed) |
@@ -47,7 +47,8 @@ A server that refuses to start serves no `/metrics`, so the two binding gauges b
 state: alert on the unit being `failed` or on `up == 0` for the instance. The one-shot modes
 `--mfa-reset` and `--break-glass-arm` open the stores **without** the binding refusal and print a loud
 `WARN` naming the bypass and the trigger state, so they remain usable while the serving process refuses
-to start; only serving mode refuses.
+to start; only those two recovery one-shots open without the refusal, and serving and every other mode
+that opens the bootstrap store (for example `--generate-tokens`) still refuse.
 
 If the shipped systemd unit is in use it retries `StartLimitBurst=3` times
 within `StartLimitIntervalSec=60`, then enters `failed`:
@@ -124,7 +125,9 @@ opened. Usual causes, in likelihood order:
    The migration runner refuses to proceed on drift rather than guessing —
    that refusal is the fail-closed behaviour working, not a bug. Resolve by
    restoring from backup (preferred) or, on a deployment with no auth data
-   worth keeping, dropping the schema so it rebuilds from the seed config:
+   worth keeping, dropping the schema so it rebuilds from the seed config.
+   **If the preceding `AuthDB:` log line names the MFA trigger, do NOT drop the schema:**
+   go to [MFA binding enforcement failed](#mfa-binding-enforcement-failed).
    ```bash
    # DESTRUCTIVE — every local account, MFA enrolment and enrollment token in
    # this schema is discarded. Take a dump first even if you think it is empty.
@@ -136,8 +139,9 @@ opened. Usual causes, in likelihood order:
    On restart the server re-seeds the admin account from `yuzu-server.cfg`.
 3. **A migration that timed out on a lock.** The `auth` v3 and `session_store` v2 migrations
    (#6079) each take a brief `ACCESS EXCLUSIVE` lock on `auth.users` and `session_store.sessions`
-   with a `lock_timeout` of 30 seconds; the log reads `AuthDB: schema migration failed - auth store
-   disabled` or `SessionStore: schema migration failed`. While the `ALTER TABLE` is queued behind a
+   with a `lock_timeout` of 30 seconds; the log line contains `schema migration failed` (`AuthDB: schema migration failed ...
+   auth store disabled`, or `SessionStore: schema migration failed`; search the journal for that fragment, the
+   dash in the `AuthDB` line is not a hyphen). While the `ALTER TABLE` is queued behind a
    long transaction, every other query on that table waits behind it, so a replica that keeps being
    restarted keeps re-queueing it for up to 30 seconds per attempt. Stop the failing unit first
    (`sudo systemctl stop yuzu-server`), then look for what holds the lock:
@@ -416,6 +420,30 @@ curl -fsS http://127.0.0.1:8080/metrics | grep yuzu_auth_mfa_binding_enforcement
 Step 3 is the one people skip. It is the only cheap check that distinguishes
 "restored correctly" from "restored, and every MFA user will be locked out the
 moment they try to log in".
+
+**Restoring a dump taken before the binding (#6079).** A data-only restore of a dump from a release
+older than the `auth` v3 migration inserts enrolled accounts with `mfa_factor_gen` at its column default
+of `0`, because the trigger fires on `UPDATE` only and the v3 seed of `1` ran at migration time, not at
+restore time. An enrolled account at generation `0` is not a usable binding: its approve and reject
+and its requests on the 34 ordinary step-up routes answer `503` `mfa_proof_unavailable` (sticky; no
+`retry_after_ms`) while its TOTP sign-in still works. Look for such accounts after every restore:
+
+```bash
+psql "$YUZU_POSTGRES_DSN" -c "SELECT username FROM auth.users
+    WHERE mfa_enrolled_at IS NOT NULL AND mfa_factor_gen <= 0;"
+```
+
+Recover with `yuzu-server --mfa-reset <user>` per account (the account then re-enrols and ends its
+sessions), or, to keep the enrolled factor, move the enrolment instant by one microsecond so the trigger
+advances the generation to `1`:
+
+```bash
+psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" -c "UPDATE auth.users
+    SET mfa_enrolled_at = mfa_enrolled_at + interval '1 microsecond'
+    WHERE mfa_factor_gen = 0 AND mfa_enrolled_at IS NOT NULL;"
+```
+
+Existing session proofs stay unbound, so each affected session re-proves once.
 
 ## Sessions are durable
 
@@ -831,9 +859,12 @@ factor binding`, and, for `--mfa-reset` only, `SessionStore: recovery bypass of 
 they stay usable when the serving process refuses to start. While the factor
 trigger is absent a clear made here does not advance the factor generation; repair the trigger
 afterwards ([MFA binding enforcement failed](#mfa-binding-enforcement-failed)) and keep the
-account's sessions ended. Serving mode still refuses to start. Started from a new binary before the
-serving replicas are upgraded, a one-shot also runs the additive `auth` and `session_store`
-migrations.
+account's sessions ended. A bypassed process reports the binding as not enforced for its whole life; it
+is not an MFA bypass for login (login still requires the TOTP code). Serving mode, and every other
+mode that opens the bootstrap store (for example `--generate-tokens`), still refuses to start on a missing
+or altered trigger; only these two one-shots bypass. Started from a new binary before the serving
+replicas are upgraded, `--mfa-reset` runs both additive migrations (it opens the `auth` store and then
+the `session_store`), while `--break-glass-arm` runs the `auth` migration only (it opens no session store).
 
 **Re-running `--mfa-reset`.** Running it again after a `sessions_ended=failed`
 is safe for sessions (the delete is idempotent), but it also clears any factor
@@ -1587,15 +1618,20 @@ them. A gated route answers **`503`** and does not run in four cases:
   before any store read, OIDC sessions are judged on the identity provider's
   assertion, SAML sessions get their `403`, and engine principals get `403`;
 - for a local session with an **enrolled** factor, the proof stored with its session **cannot be
-  read or trusted** (reason `mfa_proof_unavailable`: an ordinary session-store read fault, or the
-  session store's rebind guard not in force, which also counts
-  `yuzu_auth_session_store_degrade_total{op="rebind_guard"}`), or the database trigger that binds a
-  proof to the factor generation is **not observed in force** on the account store (reason
-  `mfa_binding_unenforced`). The second, and the rebind-guard form of the first, are sticky and are the
-  incident in [MFA binding enforcement failed](#mfa-binding-enforcement-failed); a SIEM rule for that
-  incident must key on both tokens. Both are counted
+  read or trusted**. Reason `mfa_proof_unavailable`: an ordinary session-store read fault, the
+  session store's rebind guard not in force (which also counts
+  `yuzu_auth_session_store_degrade_total{op="rebind_guard"}`), or the account is enrolled but its factor
+  generation is not positive (a tampered row, or a data-only restore of a pre-v3 dump, see
+  [Post-restore verification](#post-restore-verification)). Reason `mfa_binding_unenforced`: the
+  database trigger that binds a proof to the factor generation is **not observed in force** on the
+  account store. The ordinary read fault is transient. The other causes are sticky and do not clear by
+  themselves: the two trigger failures are the incident in
+  [MFA binding enforcement failed](#mfa-binding-enforcement-failed) (a SIEM rule for it must key on both
+  tokens, and `mfa_proof_unavailable` also covers the ordinary read fault, so read the gauges before
+  concluding), and a non-positive generation is repaired per account as described under
+  Post-restore verification. All are counted
   `yuzu_auth_secret_unavailable_total{route="mfa_binding"}`, and the window lever below does not
-  repair either (see its limits);
+  repair them (see its limits);
 - the check itself **threw an unexpected exception**, or could not fingerprint the session
   (reason `chokepoint_exception` for both). An exception can arise for any caller class; a
   fingerprint failure is reached only after the decision has passed, so an engine principal or a
@@ -1627,14 +1663,18 @@ authentication store is unavailable; it is counted as `refused`, not
 `unavailable`, so the alert below does not see it. A `503` is never a pass: the
 gated route stays closed until the cause is fixed. Approve and reject add their own
 check after this one. An approver whose stored session proof cannot be read, whose binding trigger
-is not observed in force, or a local
+is not observed in force, whose account's factor generation is not positive, or a local
 approver whose MFA state cannot be read at that check (the window is `0` or less, or the
 fault falls between the two reads), can still receive a `503` from that check (A4 envelope,
 counted `route="approval"` on `yuzu_auth_secret_unavailable_total`, audit
 `approval.approve` or `approval.reject` with `result=error` and `detail`
 `approver_assurance:mfa_store_unavailable`). The envelope carries `retry_after_ms: 5000` for the
-transient causes (`mfa_proof_unavailable`, an unreadable MFA state) and **no** retry hint for
-`mfa_binding_unenforced`, which persists until an operator repairs the trigger and restarts.
+transient causes (an unreadable enrolment or stored-proof read, or a single catalog check that could
+not run) and **no** retry hint for the three sticky causes, whose remediation points at the MFA binding
+enforcement procedure below: the account-store trigger observed not in force
+(`mfa_binding_unenforced`), the session store's rebind guard latched not in force
+(`mfa_proof_unavailable`), and an enrolled account whose factor generation is not positive
+(`mfa_proof_unavailable`). None of them clears by retrying.
 
 **The alert is slow by design.** `YuzuStepUpGateUnavailable` fires when the
 `unavailable` outcome counts at least **3** refusals in a 10-minute window for one
@@ -1777,8 +1817,8 @@ keeps the [direct SQL fallback](#fallback-direct-sql) for a corrupt blob header.
 ### Last resort: disable the proof requirement fleet-wide
 
 `--mfa-step-up-window-secs 0` (or less) makes the check pass without reading the
-enrollment, so a gated route runs again for a local session. It is a deliberate
-security reduction for **every** gated route and every account (see
+enrollment, so one of the 34 ordinary gated routes runs again for a local session. It is a deliberate
+security reduction for those 34 routes and every account (see
 [Locked out by MFA enforcement misconfiguration](#locked-out-by-mfa-enforcement-misconfiguration)
 for the other recovery lever), so use it only when you cannot restore the
 authentication store or reset the affected account. Know its limits:
@@ -1851,10 +1891,15 @@ not enough; the restart is the gate back in.
 alongside `YuzuMfaBindingNotEnforced`. SSO sessions are not affected by the session-store case. The
 gauge and its alert cover both stores, so use them as the signal; a SIEM rule on the audit rows must
 key on **both** tokens (`mfa_binding_unenforced` and `mfa_proof_unavailable`), and
-`mfa_proof_unavailable` also covers an ordinary session-store read fault. The approver routes treat
-the two differently when they answer: `mfa_proof_unavailable` keeps `retry_after_ms: 5000`;
-`mfa_binding_unenforced` persists until an operator repairs the trigger and restarts, so it carries
-no retry hint.
+`mfa_proof_unavailable` also covers an ordinary session-store read fault and an enrolled account whose
+factor generation is not positive (see [Post-restore verification](#post-restore-verification)), so a rise with both gauges at `1` is not by itself a session-store read fault:
+check the gauges, then the generation query there. The approver routes answer these differently:
+three causes are sticky and carry no `retry_after_ms` (the remediation points here): the account-store
+trigger observed not in force (`mfa_binding_unenforced`), the session store's rebind guard latched not in
+force (`mfa_proof_unavailable`), and an enrolled row whose factor generation is not positive
+(`mfa_proof_unavailable`). A transient cause (an unreadable enrolment or stored-proof read, or a
+single catalog query that could not run, which reports the binding not enforced for that one read and
+passes on the next) keeps `retry_after_ms: 5000`.
 
 **What the gauge can and cannot tell you.** It reads an in-process flag that a request-driven
 validation sets (at most one catalog query per minute per process while checks succeed, on an MFA
@@ -1918,10 +1963,12 @@ alert on the unit being `failed` or on `up == 0` as well.
    window cannot be bounded, end every operator's sessions with the emergency procedure in the same
    section.
 
-   Revoking sessions needs an administrator **API token** or the SQL in that section, because while the
-   binding is not enforced a cookie operator's session revoke (a step-up-gated route) is itself
-   refused `503`. Mint a token before the incident if you can; the SQL path writes no audit row, so
-   record it manually.
+   Revoking sessions needs an administrator **API token**, a session that the binding decision does not
+   apply to, or the SQL in that section, because while the binding is not enforced a local cookie
+   session with an enrolled factor is refused `503` on the step-up-gated session revoke whatever proof it
+   holds. A session the binding decision does not apply to is an SSO session holding a fresh proof, or a
+   local session of an account with no enrolled factor. Mint a token before the incident if you can; the
+   SQL path writes no audit row, so record it manually.
 4. **Restart one replica first.** Restart a single replica and wait for it to report Ready
    (`/readyz`) before restarting the others. The boot check re-validates the trigger and the pinned
    function body for each store. If it still fails, the process refuses to start with `Failed to open
@@ -1953,10 +2000,13 @@ SQL
 
 Run as the table owner, only for the store that failed. These are the statements of `migration_v3_sql()` (`server/core/src/auth_db.cpp`) and `migration_v2_sql()` (`server/core/src/session_store.cpp`), schema-qualified, with the `DROP TRIGGER` added. Copy them from this file's source rather than from a rendering that may strip the trailing space after `END` in the session function.
 
+Start each block with `SET lock_timeout = '10s';` (already in the blocks below). `DROP TRIGGER` and `ALTER TABLE ... ENABLE ALWAYS TRIGGER` queue behind a long transaction such as a running `pg_dump`, and without a timeout the repair waits silently while every other query on the table queues behind it; with it the statement fails after 10 seconds, `ON_ERROR_STOP` rolls the transaction back and nothing has changed, so retry once the backup has finished.
+
 For `store="auth"`:
 
 ```bash
 psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" <<'SQL'
+SET lock_timeout = '10s';
 BEGIN;
 CREATE OR REPLACE FUNCTION auth.users_mfa_factor_gen() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -1980,6 +2030,7 @@ For `store="session"`:
 
 ```bash
 psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" <<'SQL'
+SET lock_timeout = '10s';
 BEGIN;
 CREATE OR REPLACE FUNCTION session_store.sessions_mfa_rebind_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN

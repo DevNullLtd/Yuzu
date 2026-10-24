@@ -203,7 +203,11 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   of the statement that LOADED the secret or candidates (before any crypto
   check) and `ok` is published only after COMMIT (a failed or unacknowledged
   COMMIT is `WriteFailed`, never a proof). The constructor validates the
-  trigger and does not open if it fails; `mfa_status` re-validates behind a
+  trigger and does not open if it fails (the two host recovery one-shots,
+  `--mfa-reset` and `--break-glass-arm`, may open with
+  `MfaBindingCheck::kBypassForRecovery`: warn, binding reported not enforced
+  for the process life; the serving binary never passes it, any other use is
+  CRITICAL); `mfa_status` re-validates behind a
   request-driven 60 s memo and a failure is STICKY
   (`MfaStatus::binding_enforced == false`), which every gate must answer `503`
   through the one `judge_local_mfa_binding` (a second copy of that decision is

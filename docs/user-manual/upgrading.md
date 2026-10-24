@@ -527,9 +527,12 @@ of 30 seconds, the same shape as the internal-CA migrations
 While the `ALTER TABLE` is queued behind another transaction, every other query on that table waits
 behind it. Do not run `pg_dump` or hold a long transaction against those two schemas during the first
 start of the new version (schedule the upgrade outside the backup window). A timeout makes that start
-fail, and the migration is retried on the next start. `yuzu-server --mfa-reset` and `--break-glass-arm`
-run the same additive migrations if you start them from the new binary before the serving replicas are
-upgraded.
+fail, and the migration is retried on the next start. If you start `yuzu-server --mfa-reset`
+from the new binary before the serving replicas are upgraded it runs both additive migrations (it opens the `auth`
+store and then the `session_store`); `--break-glass-arm` runs the `auth` migration only (it opens no session
+store). These two one-shots are also the only modes that open past a missing or altered binding trigger (with a loud
+`WARN`; see [MFA binding enforcement failed](../ops-runbooks/auth-db-recovery.md#mfa-binding-enforcement-failed)):
+serving and every other mode, `--generate-tokens` for example, refuse to start.
 
 **What you will see.**
 
@@ -560,7 +563,10 @@ upgraded.
   local binding decision then answers `503` until a restart, and the shipped `YuzuMfaBindingNotEnforced`
   alert fires. The reason token depends on the store: `mfa_binding_unenforced` for `store="auth"`, but
   `mfa_proof_unavailable` (plus `yuzu_auth_session_store_degrade_total{op="rebind_guard"}`) for
-  `store="session"`, which SSO sessions do not see; key SIEM rules on both. The alert does not exist
+  `store="session"`, which SSO sessions do not see; key SIEM rules on both (`mfa_proof_unavailable` is also the
+  answer for an enrolled account whose factor generation is not positive, for example after a data-only restore of a
+  pre-upgrade dump, see
+  [Post-restore verification](../ops-runbooks/auth-db-recovery.md#post-restore-verification)). The alert does not exist
   until you re-import `docs/prometheus/yuzu-alerts.yml`. The procedure is
   [MFA binding enforcement failed](../ops-runbooks/auth-db-recovery.md#mfa-binding-enforcement-failed).
 
@@ -1040,7 +1046,7 @@ principal and not an engine principal. The existing rule that the reviewer canno
     approver achieves nothing until RBAC enforcement is turned on.
   - **When the approver rule's own read fails** (an unreadable stored session proof for any approver, or, for a local
     approver, an MFA-store fault at the approver's own read: with the step-up window at `0` or negative, or a fault
-    between the central check's read and that one; or a binding trigger that is not observed in force), the answer is `503` with `retry_after_ms` (except for a binding trigger not observed in force, `mfa_binding_unenforced`, which persists until an operator repairs it and carries none), counted as
+    between the central check's read and that one; or a binding condition), the answer is `503` with `retry_after_ms: 5000` for the transient causes, and with **no** `retry_after_ms` for the three persistent ones, which no retry clears until an operator repairs them (the account-store binding trigger observed not in force, `mfa_binding_unenforced`; the session store's rebind guard latched not in force, `mfa_proof_unavailable`; and an enrolled account whose factor generation is not positive, `mfa_proof_unavailable`), counted as
     `yuzu_auth_secret_unavailable_total{route="approval"}`; nothing is decided. While step-up is on, a local approver
     whose MFA store is unreadable is refused first by the central check: `503` without `retry_after_ms`, counted as
     `yuzu_auth_secret_unavailable_total{route="mfa_stepup"}` and
