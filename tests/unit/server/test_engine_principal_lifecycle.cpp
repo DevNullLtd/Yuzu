@@ -2354,6 +2354,12 @@ TEST_CASE("SettingsRoutes engine-principals fragment: a credential read that can
     // A second principal with NO credential, so the recovery phase pins the Mint form too.
     REQUIRE(engine_store->create("Idle", "bob", "j", "internal", "admin", "engine:panel-none")
                 .has_value());
+    // A revoked principal: its "Detail:" cell is the revoke-detail audit lookup, which is
+    // skipped once a credential read has failed. (No audit store is wired in this harness, so a
+    // healthy render says "(not recorded)" and a skipped one says "(unavailable)".)
+    REQUIRE(engine_store->create("Gone", "bob", "j", "internal", "admin", "engine:panel-gone")
+                .has_value());
+    REQUIRE(engine_store->revoke("engine:panel-gone"));
     SettingsOwnerDeleteHarness h(engine_store.get());
     // One live credential on the first principal, so a "0" with a Mint button would be false.
     h.token_store->set_engine_referent_check(
@@ -2371,24 +2377,30 @@ TEST_CASE("SettingsRoutes engine-principals fragment: a credential read that can
             REQUIRE(res);
             CHECK(res->status == 200);
             // Both the cell and the row hint, asserted as their own markup.
-            // Both principals' cells: the second one is marked without a second read.
+            // All three principals' cells (including the revoked one) are marked after one failed read.
             std::size_t cells = 0;
             for (auto pos = res->body.find("<span class=\"muted\">unavailable</span>");
                  pos != std::string::npos;
                  pos = res->body.find("<span class=\"muted\">unavailable</span>", pos + 1))
                 ++cells;
-            CHECK(cells == 2);
+            CHECK(cells == 3);
             CHECK(res->body.find("Credential state unavailable") != std::string::npos);
             // The in-page retry, not a page reload that would discard a displayed secret.
-            CHECK(res->body.find("refreshEnginePrincipals") != std::string::npos);
+            CHECK(res->body.find("onclick=\"htmx.trigger(document.body,'refreshEnginePrincipals')\"") !=
+                  std::string::npos);
+            CHECK(res->body.find("use Retry below") != std::string::npos);
             CHECK(res->body.find("data-engine-action=\"mint\"") == std::string::npos);
             CHECK(res->body.find("data-engine-action=\"rotate\"") == std::string::npos);
             // The principal rows, read from the principal store, are still shown.
             CHECK(res->body.find("engine:panel-deg") != std::string::npos);
             CHECK(res->body.find("engine:panel-none") != std::string::npos);
+            // The revoked row's revoke-detail lookup was skipped, not attempted.
+            CHECK(res->body.find("Detail: (unavailable)") != std::string::npos);
+            CHECK(res->body.find("Detail: (not recorded)") == std::string::npos);
         }
         auto res = h.sink.Get("/fragments/settings/engine-principals");
         REQUIRE(res);
+        CHECK(res->body.find("Detail: (not recorded)") != std::string::npos);
         CHECK(res->body.find("unavailable") == std::string::npos);
         CHECK(res->body.find("data-engine-action=\"rotate\"") != std::string::npos);
         CHECK(res->body.find("data-engine-action=\"mint\"") != std::string::npos);
@@ -2430,6 +2442,9 @@ TEST_CASE("SettingsRoutes engine-principals fragment: a token store that was nev
     CHECK(res->body.find("<span class=\"muted\">unavailable</span>") != std::string::npos);
     CHECK(res->body.find("data-engine-action=\"mint\"") == std::string::npos);
     CHECK(res->body.find("data-engine-action=\"rotate\"") == std::string::npos);
+    // The row hint points at a Retry control, so the control must exist.
+    CHECK(res->body.find("use Retry below") != std::string::npos);
+    CHECK(res->body.find("refreshEnginePrincipals") != std::string::npos);
 }
 
 TEST_CASE("SettingsRoutes owner-delete guard: blocks deleting a user who owns an "

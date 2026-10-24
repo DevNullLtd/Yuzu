@@ -922,7 +922,10 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                        "  <th>Revocation</th><th></th></tr></thead>"
                        "  <tbody>";
 
-    bool credentials_unreadable = false;
+    // True once a credential read has failed, or from the start when no token store was ever
+    // wired: either way no row can show a credential count, the row hint points at the Retry
+    // control, and the revoke-detail lookups below are skipped.
+    bool credentials_unreadable = (api_token_store_ == nullptr);
     if (principals.empty()) {
         html += "<tr><td colspan=\"8\" class=\"muted\">No engine principals</td></tr>";
     } else {
@@ -939,10 +942,10 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
             // another credential read (and without the revoke-detail audit lookup below, which
             // waits on the same pool): each failing read waits out its store's lease timeout, so
             // retrying per row would hold this request for roughly N x that timeout. A store
-            // that was never wired reads the same way.
+            // that was never wired is treated the same way from the first row.
             std::size_t active_creds = 0;
             bool creds_known = false;
-            if (api_token_store_ && !credentials_unreadable) {
+            if (!credentials_unreadable) {
                 auto checked = api_token_store_->list_active_for_principal_checked(p.principal_id);
                 if (checked) {
                     active_creds = checked->size();
@@ -981,6 +984,8 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                 if (credentials_unreadable) {
                     // The pool is already failing reads; do not queue another lease wait per
                     // revoked row (revoked rows are never pruned, so they only accumulate).
+                    // "(unavailable)" here means "not looked up", not "the audit store failed":
+                    // rows rendered before the first failed read still show their real detail.
                     audit_detail = "(unavailable)";
                 } else if (audit_store_) {
                     AuditQuery q;
