@@ -719,11 +719,19 @@ if _gw_otp_bin != ''
   # by the upper bound. The previous 120s landed at exactly 120.03s on
   # nightly Coverage and killed the suite by SIGTERM; gateway eunit is
   # only reached during nightly anyway, so a generous bound is free.
+  # priority 120 (approximately its measured seconds, the convention the server
+  # shards use in tests/meson.build): this is the longest entry of the Linux
+  # cheap-suites invocation (117.8 to 121.6 s on the self-hosted runner, three
+  # runs) and, defined last, it used to start last. With nothing else in those
+  # suites setting a priority, 120 starts it first, so its 120 s overlaps the
+  # other entries instead of trailing them. Priority only orders starts: it
+  # moves no case and changes nothing at --num-processes 1.
   test('gateway eunit',
     _python3,
     args: [_gw_test_script, _gw_src, 'eunit'],
     suite: 'gateway',
     timeout: 600,
+    priority: 120,
     env: {'REBAR_BASE_DIR': _gw_src / '_build_eunit', 'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
   )
   # Timeout 600s — must stay ABOVE test_gateway.py's per-suite
