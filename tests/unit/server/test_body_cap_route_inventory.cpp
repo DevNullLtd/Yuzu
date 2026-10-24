@@ -24,8 +24,9 @@
  * exactly like the thing it's testing. This test opens every `*.cpp` AND
  * `*.inc` file under `server/core/src` (recursively, via
  * `YUZU_SERVER_SRC_DIR`, injected by tests/meson.build from
- * `meson.project_source_root()`) AT TEST RUN TIME and regex-scans the raw
- * source text for every `Post`/`Put`/`Patch`/`Delete` call on one of THREE
+ * `meson.project_source_root()`) AT TEST RUN TIME and scans the raw
+ * source text (route_registration_scan.hpp: a literal find per method name, no
+ * regular-expression library) for every `Post`/`Put`/`Patch`/`Delete` call on one of THREE
  * receiver spellings actually used in this codebase (verified against the
  * full source tree, not recalled):
  *   - `sink.Post(...)` / `sink.Put(...)` / ... — the `HttpRouteSink` seam
@@ -70,8 +71,9 @@
  * placeholder segment ("X") to build a representative concrete PROBE path —
  * this codebase's httplib capture groups are a single level, never nested
  * (verified against every registration extant at the time of writing), so a
- * non-nested `\([^()]*\)` replacement is exact. Replacing in place (rather
- * than truncating at the first capture group) preserves every literal
+ * non-nested parenthesised-group replacement (route_scan::probe_path) is exact.
+ * Replacing in place (rather than truncating at the first capture group)
+ * preserves every literal
  * segment BEFORE *and* AFTER the capture, which matters: an entry that is
  * only distinguishable by a literal suffix after an id segment (there is
  * none in `kBodyCapTable` today, but nothing stops one being added) would be
@@ -97,41 +99,64 @@
  * CACHING. The file corpus (`read_all_cpp_files`) and the extracted
  * mutating-route list (`discover_mutating_routes`) are each memoized behind
  * a function-local `static const`, computed once per test PROCESS rather
- * than once per `TEST_CASE` — this file has four `TEST_CASE`s and three of
- * them call `discover_mutating_routes()`, so the un-cached scan (a full
- * `std::regex` pass over every server source file) used to run 3-4x per
- * process for no reason: measured 8.2-8.5 s wall on Linux at `-O2` before
- * caching (worse under MSVC's slower `std::regex`, and worse again as the
- * source tree grows — this cost is O(tree size) and was unbounded). Both
- * caches assume every call in this TU passes the same `YUZU_SERVER_SRC_DIR`
- * directory, which is true today (there is exactly one call site for each
- * with a hard-coded argument) — do not reuse either helper with a different
+ * than once per `TEST_CASE` — this file has four inventory `TEST_CASE`s and
+ * three of them call `discover_mutating_routes()`, so the un-cached scan used
+ * to run 3-4x per process for no reason. Every source file is read once per
+ * binary run: the GET-span case below walks the same memoized corpus (by
+ * reference, no copy) instead of re-reading it. The scans are linear finds, not
+ * pattern passes: the former `std::regex` passes cost 24 s (registrations) and
+ * 10 s (GET spans) on macOS debug (the MSVC debug cost was not measured, and is
+ * expected to be far larger), and this cost is O(tree size). Both caches live in
+ * route_inventory_scan.hpp and are shared by every test case in the binary. They
+ * assume every call passes the same `YUZU_SERVER_SRC_DIR` directory, which is true
+ * today (every caller passes it) — do not reuse either helper with a different
  * directory without splitting the cache key.
  */
 
 #include "body_cap_policy.hpp"
+#include "route_registration_scan.hpp"
+#include "source_scan.hpp"
 #include "route_inventory_scan.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
-#include <cctype>
 #include <cstddef>
 #include <filesystem>
-#include <fstream>
-#include <regex>
 #include <set>
-#include <sstream>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 using yuzu::server::resolve_body_cap;
+namespace route_scan = yuzu::test::route_scan;
+namespace source_scan = yuzu::test::source_scan;
 
 namespace {
 
 namespace fs = std::filesystem;
+
+/// Line of every `sink.Get(`/`svr.Get(` registration in `text` whose handler span
+/// references `req.body`. The span runs from the registration to the NEXT
+/// `sink.`/`svr.` registration call of ANY verb (one position-sorted list across all
+/// verbs, so an earlier Post can never land after a later Get), or to the end of the
+/// text. A substring heuristic over that span, not a parse.
+std::vector<int> get_handlers_reading_req_body(const std::string& text) {
+    const auto calls = route_scan::find_receiver_calls(text, route_scan::kAllVerbs);
+    std::vector<int> lines;
+    for (std::size_t i = 0; i < calls.size(); ++i) {
+        if (calls[i].verb != "Get")
+            continue;
+        const auto start = calls[i].pos;
+        const auto end = (i + 1 < calls.size()) ? calls[i + 1].pos : text.size();
+        if (text.find("req.body", start) < end) {
+            lines.push_back(source_scan::line_of(text, start));
+        }
+    }
+    return lines;
+}
 
 using namespace yuzu::server::test::route_scan;
 
@@ -535,28 +560,13 @@ TEST_CASE("body-cap route inventory: no GET registration's handler references re
     // default, neither of which was sized with a GET body in mind. Zero
     // hits as of this writing; a hit here is a prompt to go read the route
     // by hand, not an automatic verdict — see the file header.
-    static const std::regex reg_re(R"(\b(sink|svr)\.(Get|Post|Put|Patch|Delete|Options)\()");
-
-    auto files = read_all_cpp_files(fs::path(YUZU_SERVER_SRC_DIR));
+    const auto& files = read_all_cpp_files(fs::path(YUZU_SERVER_SRC_DIR));
     REQUIRE_FALSE(files.empty());
 
     std::vector<std::string> suspects;
     for (const auto& [file, text] : files) {
-        std::vector<std::pair<std::string, std::size_t>> matches; // (verb, position)
-        for (auto it = std::sregex_iterator(text.begin(), text.end(), reg_re);
-             it != std::sregex_iterator(); ++it) {
-            matches.emplace_back((*it)[2].str(), static_cast<std::size_t>(it->position(0)));
-        }
-        for (std::size_t i = 0; i < matches.size(); ++i) {
-            if (matches[i].first != "Get")
-                continue;
-            const auto start = matches[i].second;
-            const auto end = (i + 1 < matches.size()) ? matches[i + 1].second : text.size();
-            if (text.find("req.body", start) < end) {
-                int line = static_cast<int>(std::count(text.begin(), text.begin() + start, '\n')) + 1;
-                suspects.push_back(file + ":" + std::to_string(line));
-            }
-        }
+        for (const auto& hit : get_handlers_reading_req_body(text))
+            suspects.push_back(file + ":" + std::to_string(hit));
     }
 
     INFO("GET registration(s) whose handler span references req.body — verify by hand whether "
@@ -568,4 +578,234 @@ TEST_CASE("body-cap route inventory: no GET registration's handler references re
                 return joined;
             }());
     CHECK(suspects.empty());
+}
+
+// ── 5. The route-registration matcher, on engineered input ───────────────
+
+TEST_CASE("route_registration_scan: accepts sink./svr. and web_server_-> with "
+          "Post/Put/Patch/Delete with raw-string and quoted first arguments",
+          "[body_cap][inventory]") {
+    const std::string text =
+        "sink.Post(\"/a\", h);\n"
+        "svr.Put(R\"(/b/([a-f0-9]+))\", h);\n"
+        "web_server_->Patch( \"/c\", h);\n"
+        "sink.Delete(\n    \"/d\\\"quoted\", h);\n";
+    const auto regs = route_scan::find_route_registrations(text, route_scan::kMutatingMethods);
+    REQUIRE(regs.size() == 4);
+    CHECK(regs[0].method == "Post");
+    CHECK(regs[0].raw_path == "/a");
+    CHECK(regs[0].pos == 0);
+    CHECK(regs[1].method == "Put");
+    CHECK(regs[1].raw_path == "/b/([a-f0-9]+)");
+    CHECK(regs[2].method == "Patch");
+    CHECK(regs[2].raw_path == "/c");
+    CHECK(regs[3].method == "Delete");
+    // The escaped quote is kept verbatim and does not end the literal.
+    CHECK(regs[3].raw_path == "/d\\\"quoted");
+    // The reported position is the receiver's start, so a line number counted from it
+    // is the line the registration begins on.
+    CHECK(text.compare(regs[2].pos, 11, "web_server_") == 0);
+}
+
+TEST_CASE("route_registration_scan: rejects client receivers and a non-boundary receiver "
+          "and Get for the mutating set and a non-literal first argument",
+          "[body_cap][inventory]") {
+    const std::string text =
+        "cli.Post(\"/x\", b);\n"
+        "client.Post(\"/x\", b);\n"
+        "mysink.Post(\"/x\", h);\n"
+        "sink.Get(\"/x\", h);\n"
+        "sink.Post(path_var, h);\n"
+        "sink.Post(\"/unterminated, h);\n";
+    CHECK(route_scan::find_route_registrations(text, route_scan::kMutatingMethods).empty());
+    // The same text with a Get request yields the one Get with a literal argument.
+    const auto gets = route_scan::find_route_registrations(text, {"Get"});
+    REQUIRE(gets.size() == 1);
+    CHECK(gets[0].raw_path == "/x");
+}
+
+TEST_CASE("route_registration_scan: a registration inside a matched literal is not a "
+          "second registration and unterminated raw literals match nothing",
+          "[body_cap][inventory]") {
+    // The former single pass consumed the outer match, so the route-looking text in its
+    // raw argument was not a registration. Across methods too: the Put sits inside the Post's
+    // literal.
+    const std::string nested =
+        "sink.Post(R\"(/outer/sink.Post(\"/inner\", h))\", h);\n"
+        "sink.Post(R\"(/q/sink.Put(\"/inner2\", h))\", h);\n";
+    const auto regs = route_scan::find_route_registrations(nested, route_scan::kMutatingMethods);
+    REQUIRE(regs.size() == 2);
+    CHECK(regs[0].raw_path == "/outer/sink.Post(\"/inner\", h)");
+    CHECK(regs[1].raw_path == "/q/sink.Put(\"/inner2\", h)");
+
+    // A candidate inside a consumed literal advances nothing: the real registration
+    // after it is still found, whatever method either one is.
+    const std::string hidden = "svr.Put(\"sink.Post(\", h);\nsink.Post(\"/real\", h);\n";
+    const auto h = route_scan::find_route_registrations(hidden, route_scan::kMutatingMethods);
+    REQUIRE(h.size() == 2);
+    CHECK(h[0].method == "Put");
+    CHECK(h[0].raw_path == "sink.Post(");
+    CHECK(h[1].method == "Post");
+    CHECK(h[1].raw_path == "/real");
+
+    // Many candidates, none with a closing `)"`: no match.
+    std::string unterminated;
+    for (int i = 0; i < 2000; ++i)
+        unterminated += "sink.Post(R\"(/x" + std::to_string(i) + "\n";
+    CHECK(route_scan::find_route_registrations(unterminated, route_scan::kMutatingMethods).empty());
+}
+
+TEST_CASE("route_registration_scan: an unterminated raw literal is remembered and not rescanned",
+          "[body_cap][inventory]") {
+    // first_argument records the first raw body with no closing `)"` after it; a later
+    // body can have none either, so it is refused without another search. The second
+    // call below uses a text that DOES close: only the remembered offset refuses it,
+    // which is what makes the skip observable (the control call proves it would match).
+    std::string out;
+    std::size_t end = 0;
+    std::size_t memo = std::string::npos;
+    const std::string unclosed = "R\"(abc";
+    CHECK_FALSE(route_scan::detail::first_argument(unclosed, 0, out, end, memo));
+    CHECK(memo == 3);
+
+    const std::string closed = "R\"(abc)\"";
+    CHECK_FALSE(route_scan::detail::first_argument(closed, 0, out, end, memo));
+
+    std::size_t fresh = std::string::npos;
+    CHECK(route_scan::detail::first_argument(closed, 0, out, end, fresh));
+    CHECK(out == "abc");
+    CHECK(end == closed.size());
+}
+
+TEST_CASE("route_registration_scan: find_receiver_calls returns one position-sorted list "
+          "across verbs so Post / Get / Get(req.body) / Post flags exactly the second Get",
+          "[body_cap][inventory]") {
+    const std::string text =
+        "sink.Post(\"/p1\", [](auto& req, auto&) { use(req.body); });\n"
+        "sink.Get(\"/g1\", [](auto&, auto&) { /* no body */ });\n"
+        "svr.Get(\"/g2\", [](auto& req, auto&) { use(req.body); });\n"
+        "sink.Post(\"/p2\", [](auto& req, auto&) { use(req.body); });\n"
+        "web_server_->Get(\"/not-a-receiver-call\", h);\n";
+    const auto calls = route_scan::find_receiver_calls(text, route_scan::kAllVerbs);
+    REQUIRE(calls.size() == 4); // web_server_-> is not a receiver for this finder
+    CHECK(calls[0].verb == "Post");
+    CHECK(calls[1].verb == "Get");
+    CHECK(calls[2].verb == "Get");
+    CHECK(calls[3].verb == "Post");
+    for (std::size_t i = 1; i < calls.size(); ++i)
+        CHECK(calls[i - 1].pos < calls[i].pos);
+    // The first Post's own req.body (before the first Get) and the last Post's (after the
+    // second Get's span) are not attributed to a Get; only the second Get flags, on line 3.
+    CHECK(get_handlers_reading_req_body(text) == std::vector<int>{3});
+}
+
+TEST_CASE("route_registration_scan: find_step_up_calls reads the label of a literal call and names "
+          "every other shape",
+          "[body_cap][inventory]") {
+    const std::string text =
+        "step_up_fn(req, res, *session, \"a.b\");\n"
+        "  step_up_fn_(req ,\n res , *session ,\n \"c\" ) ;\n"
+        "step_up_fn(req, res, *session, \"d\\\"e\");\n"
+        "step_up_fn(req, res, *session, label);\n"
+        "step_up_fn(req, res, session, \"x\");\n"
+        "step_up_fn(req, res, *session, R\"(raw)\");\n"
+        "step_up_fn(req, res, *session, \"unterminated);\n";
+    const auto calls = route_scan::find_step_up_calls(text);
+    REQUIRE(calls.size() == 7);
+    CHECK(calls[0].readable);
+    CHECK(calls[0].label == "a.b");
+    CHECK(calls[0].pos == 0);
+    CHECK(calls[1].readable);
+    CHECK(calls[1].label == "c");
+    CHECK(text.compare(calls[1].pos, 12, "step_up_fn_(") == 0);
+    CHECK(calls[2].readable);
+    // The escaped quote is kept verbatim and does not end the literal.
+    CHECK(calls[2].label == "d\\\"e");
+    for (std::size_t i = 3; i < calls.size(); ++i) {
+        INFO("call " << i);
+        CHECK_FALSE(calls[i].readable);
+        CHECK(calls[i].label.empty());
+    }
+}
+
+TEST_CASE("route_registration_scan: find_step_up_calls skips a longer name and a longer first "
+          "argument and a non-boundary prefix",
+          "[body_cap][inventory]") {
+    CHECK(route_scan::find_step_up_calls("mystep_up_fn(req, res, *session, \"x\");").empty());
+    CHECK(route_scan::find_step_up_calls("step_up_fn_x(req, res, *session, \"x\");").empty());
+    CHECK(route_scan::find_step_up_calls("step_up_fn__(req, res, *session, \"x\");").empty());
+    CHECK(route_scan::find_step_up_calls("step_up_fn(request, res, *session, \"x\");").empty());
+    CHECK(route_scan::find_step_up_calls("step_up_fn(").empty());
+    CHECK(route_scan::find_step_up_calls("step_up_fn (req, res, *session, \"x\");").empty());
+    CHECK(route_scan::find_step_up_calls("step_up_fn(req").size() == 1);
+    CHECK_FALSE(route_scan::find_step_up_calls("step_up_fn(req")[0].readable);
+}
+
+TEST_CASE("route_registration_scan: find_step_up_calls reports every other argument shape as "
+          "unreadable",
+          "[body_cap][inventory]") {
+    // Each is one `step_up_fn(req` call that is NOT exactly `req, res, *session, "<literal>")`.
+    const char* const shapes[] = {
+        "step_up_fn(req, res, *session, \"x\", y);",       // an extra argument
+        "step_up_fn(req, other, *session, \"x\");",        // a different second argument
+        "step_up_fn(req, *session, \"x\");",               // the second argument missing
+        "step_up_fn(req, res, *session, \"x\" \"y\");",  // concatenated literals
+        "step_up_fn(req, res, *session, \"x\" + s);",     // a computed label
+        "step_up_fn(req, res, *session, \"a\\\nb\");",    // backslash then LF inside the literal
+        "step_up_fn(req, res, *session, \"a\\\rb\");",    // backslash then CR inside the literal
+    };
+    for (const char* shape : shapes) {
+        INFO(shape);
+        const auto calls = route_scan::find_step_up_calls(shape);
+        REQUIRE(calls.size() == 1);
+        CHECK_FALSE(calls[0].readable);
+        CHECK(calls[0].label.empty());
+    }
+}
+
+TEST_CASE("route_inventory_scan: extract_routes keeps the file and the receiver line and the "
+          "upper-cased method and the literal bytes",
+          "[body_cap][inventory]") {
+    const std::string text =
+        "\n\n  sink.Post(\n \"/a\", h);\n"
+        "svr.Put(R\"(/b/([x]+))\", h);\n"
+        "sink.Patch(\"/c\", h);\n"
+        "web_server_->Delete(\"/d\", h);\n";
+    const auto routes = extract_routes("fixture.cpp", text);
+    REQUIRE(routes.size() == 4);
+    CHECK(routes[0].file == "fixture.cpp");
+    CHECK(routes[0].line == 3);
+    CHECK(routes[0].method == "POST");
+    CHECK(routes[0].raw_path == "/a");
+    CHECK(routes[1].file == "fixture.cpp");
+    CHECK(routes[1].line == 5);
+    CHECK(routes[1].method == "PUT");
+    CHECK(routes[1].raw_path == "/b/([x]+)");
+    CHECK(routes[2].method == "PATCH");
+    CHECK(routes[2].line == 6);
+    CHECK(routes[3].method == "DELETE");
+    CHECK(routes[3].line == 7);
+}
+
+TEST_CASE("route_inventory_scan: the corpus readers return the one memoised copy by reference",
+          "[body_cap][inventory]") {
+    using Corpus = std::vector<std::pair<std::string, std::string>>;
+    static_assert(std::is_same_v<decltype(read_all_cpp_files(std::declval<const fs::path&>())),
+                                 const Corpus&>);
+    static_assert(std::is_same_v<decltype(read_all_header_files(std::declval<const fs::path&>())),
+                                 const Corpus&>);
+    const fs::path dir(YUZU_SERVER_SRC_DIR);
+    CHECK(&read_all_cpp_files(dir) == &read_all_cpp_files(dir));
+    CHECK(&read_all_header_files(dir) == &read_all_header_files(dir));
+}
+
+TEST_CASE("probe_path: non-nested groups become X while nested and unbalanced input keeps "
+          "the inner span",
+          "[body_cap][inventory]") {
+    CHECK(probe_path("/api/v1/tags/([^/]+)/([^/]+)") == "/api/v1/tags/X/X");
+    CHECK(probe_path("/api/x/(\\d+)/y") == "/api/x/X/y");
+    CHECK(probe_path("/plain") == "/plain");
+    CHECK(probe_path("/api/(a(b)c)") == "/api/(aXc)");
+    CHECK(probe_path("/api/(a") == "/api/(a");
+    CHECK(probe_path("/api/a)") == "/api/a)");
 }

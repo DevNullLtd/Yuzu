@@ -1472,6 +1472,32 @@ void AuthManager::expire_session_for_test(const std::string& token, std::chrono:
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(offset);
 }
 
+void AuthManager::idle_session_for_test(const std::string& token,
+                                        std::chrono::milliseconds elapsed) {
+    // CACHE-ONLY, same contract as expire_session_for_test above (store-less callers).
+    const std::string key = session_store_ ? hash_token(token) : token;
+    std::unique_lock lock(mu_);
+    auto it = sessions_.find(key);
+    if (it == sessions_.end())
+        return;
+    it->second.last_activity_at -= elapsed;
+    it->second.steady_last_activity -=
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(elapsed);
+}
+
+void AuthManager::lapse_elevation_for_test(const std::string& token,
+                                           std::chrono::milliseconds elapsed) {
+    // CACHE-ONLY, same contract as expire_session_for_test above (store-less callers).
+    const std::string key = session_store_ ? hash_token(token) : token;
+    std::unique_lock lock(mu_);
+    auto it = sessions_.find(key);
+    if (it == sessions_.end())
+        return;
+    it->second.elevated_until -= elapsed;
+    it->second.steady_elevated_until -=
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(elapsed);
+}
+
 void AuthManager::set_role_recheck_race_hook_for_test(std::function<void()> hook) {
     role_recheck_race_hook_for_test_ = std::move(hook);
 }

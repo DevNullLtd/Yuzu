@@ -1419,6 +1419,39 @@ runs were on a shared box, so treat the ordering among the top shards as
 noise-level. Re-measure on the first CI run. Priorities are now merged M
 185 and merged I 245 (all 14 distinct); see `tests/meson.build`.
 
+**2026-10-22: test hot spots (#4882, #2600) — shard re-cuts after removing the
+cost, not just moving it.** Two avoidable costs were found by measurement
+(braga, macOS debug, one shard at a time) and removed before any rebalancing.
+Non-pg shard D was 39.5 s, of which 34 s were two regular-expression passes
+over every server source file (the route inventory); linear `find` scans now
+do the same work (D 5.6 s, and 7.9 s once the dev merge had added dev's step-up inventory
+cases, whose own pattern pass is linear too), and the three private copies of the `//`-comment
+stripper are one helper. Several pg and non-pg cases slept through 1 s to 6 s
+store deadlines; per-store `*_for_test` seams now age the local deadline
+instead (about 99 s of sleeping removed; the two Postgres-authored deadlines,
+lockout and break-glass, are rewound in SQL). With those gone: non-pg B moves
+its four heaviest independent tags (`[oidc]`, `[retention]`, `[readyz]`,
+`[tls]`) to C (B 77.5 s -> 38.4 s, C 4.8 s -> 37.9 s) and pg shard M's
+`[pg][readyz]` clause (about 65 s of connect-deadline cases) moves to B (M 208
+s -> 119.8 s, B 109 s -> 135.0 s). The pg move departs from the "move a TAG
+between P and C, M and N, or O and F" rule above on purpose: B lost about 42 s of
+sleeping, which the 2026-10-11 pairings could not foresee, so it became the
+natural receiver for M's heaviest clause, a pairing that rule does not name.
+No shard count changes (14 pg, 4 non-pg), the `[pg]` and non-pg populations
+are exact partitions before and after (5792 and 6732 cases on the binary measured
+before dev was merged; 5832 and 6867 after), and pg B's priority is now 186. Windows MSVC measurements of this
+change (kingsley, one process per shard, one sample, not a like-for-like
+comparison with the CI shard times): non-pg A 67.0 s, B 142.2 s, C 91.1 s,
+D 0.55 s (D was 124-131 s on the Windows build host before the scan change, per #4882); `[oidc]` alone is 61.5 s
+there, five times its macOS cost, and is most of C. pg B 120.7 s, M 386.1 s.
+Candidate re-cuts were measured and not adopted, because each cuts the longest
+shard by under the 25% bar (a re-cut must cut the longest shard by more than a quarter): moving `[rest]` from non-pg B to C gives B 121.2 s
+and C 110.5 s (-15%), and moving `[pg][auth_db]` from pg M to B gives B 205.4 s
+and M 319.0 s (-17%). The pre-move shards were not re-run on Windows, so the
+pg move's own Windows effect is not measured; re-cut from the per-case
+durations the CI job summary now carries. The tar writer and drain spin bounds were not
+measured on Windows either, and nothing here claims it.
+
 **Drift risk — automated (#3443 Phase 1, 2026-08-26):** this used to hardcode
 the 10 pg shard names and the 3 non-pg server test names directly in `ci.yml`,
 hand-synced against `tests/meson.build`'s own tag filters and
@@ -2077,6 +2110,25 @@ or the two symmetric matrix-include guards catching a broken mapping. It
 does NOT check DSN *parseability* — a syntactically malformed but
 non-empty DSN clears this step and only fails later, at the first actual
 libpq connection attempt inside a PG-tagged test.
+
+**Connect cap on the Linux and Windows test legs.** The
+`Resolve pg_mode + assert Postgres DSN` step in each of those two jobs appends
+`PGCONNECT_TIMEOUT=30` to `$GITHUB_ENV`, so every connect libpq makes in the
+later steps has a bound, including a connect to a backend that accepts the TCP
+connection and then never answers (libpq has no connect timeout by default).
+30 s is deliberately looser than `PgPool`'s own 10 s default: the pool lets the
+variable win over that default and over an Options-level `connect_timeout_s`, so
+in these steps the pool's connect bound is 30 s unless the DSN itself carries a
+`connect_timeout`, which wins over the variable. A test that needs a short bound
+must therefore put it in the DSN.
+A 10 s cap failed a fixture connect on a heavily loaded dev box, which is why
+the value is not 10. `scripts/ci/sweep-test-databases.sh` exports its own 10 s
+for itself. macOS is not given the variable: that leg exports no DSN, so no
+`[pg]` test connects. On POSIX the `[pg_reachability]` unit tests unset the
+variable for the duration of each case (`test_pg_reachability_probe.cpp`),
+because the probe lets it override the 3 s deadline those tests bound; the
+timing-sensitive cases are compiled out on Windows. A case that needs another
+value sets it itself.
 
 ## PG coverage by platform
 
