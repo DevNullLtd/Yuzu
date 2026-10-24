@@ -280,7 +280,6 @@ def main() -> int:
                                                 "publish_output_rows(agent_id, plugin, resp.output());"),
         "prov-chokepoint-records-once": ("server.cpp", "agent_service_.record_command_dispatch(c, p, e);"),
         "prov-no-old-record-api": ("server.cpp", "agent_service_.record_execution_id(c, e);"),
-        "prov-test-seam-unused": ("server.cpp", "agent_service_.override_command_record_lookup(fn);"),
         "prov-plugin-immutable": ("execution_tracker.cpp", 'const char* kSql = "SET plugin = EXCLUDED.plugin";'),
         "prov-tracker-scrub-by-recorded-plugin": ("execution_tracker.cpp",
                                                   'const char* kSql = "split_part(command_id, 1)";'),
@@ -292,6 +291,30 @@ def main() -> int:
         else:
             s2[fname] = s2[fname] + "\n" + extra + "\n"
         expect(rid in ids(g.provenance_problems(a2, s2)), f"{rid}: a violating spelling was NOT detected")
+    # The tree-wide absence pins: the real tree is clean, and a use in ANY production file is seen.
+    expect(g.provenance_tree_problems(tree) == [], "the real tree must satisfy the tree-wide provenance pins")
+    expect("agent_service_impl.hpp" in tree, "selftest anchor moved: the seam's declaring header")
+    expect(any(rid == "prov-test-seam-unused" for rid, *_ in g.PROVENANCE_TREE_ABSENT),
+           "the seam pin must be a tree-wide row")
+    tree_spell = {
+        "prov-no-extract-plugin-tree": ("hardware_routes.cpp", "auto p = extract_plugin(command_id);"),
+        "prov-test-seam-unused": ("hardware_routes.cpp", "svc.override_command_record_lookup(fn);"),
+    }
+    expect(set(tree_spell) == {rid for rid, *_ in g.PROVENANCE_TREE_ABSENT},
+           "every tree-wide provenance pin has a selftest spelling")
+    for rid, (fname, extra) in tree_spell.items():
+        for target in (fname, "server.cpp", "agent_service_impl.cpp"):
+            crafted = dict(tree)
+            crafted[target] = crafted[target] + "\n" + extra + "\n"
+            expect(rid in ids(g.provenance_tree_problems(crafted)),
+                   f"{rid}: a use in {target} was NOT detected")
+    crafted = dict(tree)
+    crafted["agent_service_impl.hpp"] += "\nvoid override_command_record_lookup(CommandRecordLookupFn fn);\n"
+    expect(g.provenance_tree_problems(crafted) == [], "the declaring header is the one exempt file")
+    crafted = dict(tree)
+    crafted["hardware_routes.cpp"] += "\n// extract_plugin(x) override_command_record_lookup(y)\n"
+    expect(g.provenance_tree_problems(crafted) == [], "a comment mentioning a tree-banned spelling is not one")
+
     # Deleting a required statement is seen too: each exact-count row with a positive count.
     for fname, rows in g.PROVENANCE_EXACT.items():
         for rid, pat, want, _why in rows:

@@ -481,8 +481,6 @@ PROVENANCE_EXACT: dict[str, list[tuple[str, str, int, str]]] = {
         ("prov-no-old-record-api",
          r"\brecord_execution_id\b|\brecord_command_execution\b|\blookup_execution_id\b|\bresolve_execution_id\b",
          0, "the pre-provenance record/lookup API is gone"),
-        ("prov-test-seam-unused", r"override_command_record_lookup", 0,
-         "ServerImpl must never install a record source: it is a unit-harness seam only"),
     ],
     "forensics_plugin_set.hpp": [
         ("prov-sentinel-in-set", r"names\.emplace_back\(kUnverifiedProvenanceLabel\);", 1,
@@ -503,6 +501,32 @@ PROVENANCE_EXACT: dict[str, list[tuple[str, str, int, str]]] = {
          "the tracker's Forensics execution lookup uses the recorded plugin, not the id's prefix"),
     ],
 }
+
+
+# Tree-wide absence pins (every file under server/core/src; comments are stripped first). Each row is
+# (id, pattern, files exempt from the pin, why). A single-file pin cannot see a new caller in another
+# file, so these two are scanned across the whole production tree: the exempt file is the declaring
+# header only.
+PROVENANCE_TREE_ABSENT: list[tuple[str, str, frozenset[str], str]] = [
+    ("prov-no-extract-plugin-tree", r"\bextract_plugin\(", frozenset(),
+     "no production file may parse a plugin out of a command id (the helper was deleted; the stored "
+     "plugin is the server's dispatch record)"),
+    ("prov-test-seam-unused", r"\boverride_command_record_lookup\b", frozenset({"agent_service_impl.hpp"}),
+     "no production file may install a record source: it is a unit-harness seam only, declared in "
+     "agent_service_impl.hpp and called from tests"),
+]
+
+
+def provenance_tree_problems(tree: dict[str, str]) -> list[tuple[str, str]]:
+    """(id, message) per production file under server/core/src that uses a tree-banned spelling."""
+    out: list[tuple[str, str]] = []
+    for rid, pat, exempt, why in PROVENANCE_TREE_ABSENT:
+        for name, text in sorted(tree.items()):
+            if name in exempt:
+                continue
+            if re.search(pat, canonical(text), re.S):
+                out.append((rid, f"{rid}: {name}: {why}"))
+    return out
 
 
 def provenance_problems(asrc: str, sources: dict[str, str] | None = None) -> list[tuple[str, str]]:
@@ -597,12 +621,15 @@ def main() -> int:
     kfound = tier_token_problems(tree)
     for _rid, msg in kfound:
         print(f"::error::{TAG}: {SRC_DIR}: {msg}{HINT}", file=sys.stderr)
-    if found or afound or tfound or kfound:
+    pfound = provenance_tree_problems(tree)
+    for _rid, msg in pfound:
+        print(f"::error::{TAG}: {SRC_DIR}: {msg}{HINT}", file=sys.stderr)
+    if found or afound or tfound or kfound or pfound:
         return 1
     print(f"OK: {len(REQUIRED)} wiring statements, {len(COUNTED)} counted sites, "
           f"{len(FORBIDDEN)} forbidden hatches, {len(EXACT_AGENT_SERVICE)} exact counts, "
           f"1 tracker-caller pin, {sum(len(v) for v in FORBIDDEN_TIER_TOKENS.values())} "
-          f"scoped-branch absence checks, "
+          f"scoped-branch absence checks, {len(PROVENANCE_TREE_ABSENT)} tree-wide provenance absence pins, "
           f"{len(FORBIDDEN_AGENT_SERVICE)} forbidden dumps checked")
     return 0
 
