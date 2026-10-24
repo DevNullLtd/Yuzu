@@ -544,17 +544,18 @@ unclamped.
 
 | Table | Key | Columns (beyond the key) |
 |---|---|---|
-| `agent_state` | `agent_id` | `content_hash`, `blob_version`, `first_seen`, `last_seen` (receipt of any report, full or skip), `last_full_at` (receipt of the last full report) |
+| `agent_state` | `agent_id` | `content_hash`, `blob_version`, `first_seen`, `last_seen` (receipt of any report, full or skip), `last_full_at` (receipt of the last full report), `sample_key` (server-assigned random 64-bit from the CSPRNG at first ingest; never taken from the wire, never exposed, never changed) |
 | `store_state` | (`agent_id`, `store_id`, `user_ref`) | `scope`, `status`, `reason`, `observed_at` (receipt of the last report in which the store read `ok` or `absent`), `status_at` (receipt of the last report that carried this store), `cert_count` |
 | `cert_location` | (`agent_id`, `store_id`, `user_ref`, `path_md5`, `sha256`); `path_md5` is a generated column, `md5(path)`, and the full `path` is stored beside it (as built in 2a-2a; keeps the key short for long paths) | `first_seen`, `last_seen`, `full_report_at` (the `last_full_at` of the full report that last carried it) |
 | `decommission_tombstone` | `agent_id` | `decommissioned_at` |
-| `cert_fact` | (`agent_id`, `sha256`) | every field in the field table, `der` (nullable), `server_parsed` (bool), `constrained_fields` |
+| `cert_fact` | (`agent_id`, `sha256`) | every field in the field table, `der` (nullable), `server_parsed` (bool), `constrained_fields`, `sample_key` (copy of the agent's, `NOT NULL`) |
 | `cert_san` | (`agent_id`, `sha256`, `ord`) | `san_type`, `value` |
 | `cert_eku` | (`agent_id`, `sha256`, `ord`) | `oid` |
 | `cert_cdp` | (`agent_id`, `sha256`, `ord`) | `uri` |
 
 **Indexes:** `cert_fact (not_after)`, `(not_before)`, `(issuer_name_sha256, serial)`,
-`(sig_alg_oid, pss_hash_oid)`, `(key_alg_oid, rsa_modulus_bits)`, `(ec_order_bits)`, `(sha256)`,
+`(sig_alg_oid, pss_hash_oid)`, `(key_alg_oid, rsa_modulus_bits)`, `(ec_order_bits)`,
+`(sha256, sample_key, agent_id)` (the CBOM agreement sample order; also serves `sha256` lookups),
 `(spki_sha256)`, `(aki_key_id)` (see [Finding one CA's certificates](#finding-one-cas-certificates));
 `store_state (status, observed_at)` for the prune; every table has `agent_id` leading its key, for
 decommission and confinement.
@@ -1272,6 +1273,16 @@ certificate (`sha256`), with `assetType: certificate`:
   algorithm OID and one `related-crypto-material` public-key component per distinct `spki_sha256`
   (with its size), never the deprecated `signatureAlgorithmRef` / `subjectPublicKeyRef`;
 - `yuzu:` properties: device count, store ids, `key_association`.
+
+**Agreement sample (as built in 2a-4; the key itself is created by 2a-2a).** Agent-claimed facts are
+published as agreed only when the devices examined agree and every emitted value matches them.
+Under 64 reporters every reporter is examined; at 64 or more the first 64 in `(sample_key,
+agent_id)` order are examined and the component says `reporters_sampled`. Because the key is
+assigned by the server and cannot be chosen by the agent, a device cannot place itself in the
+sample by its id; an actor that controls many enrolments still has influence in proportion to the
+number of enrolments it controls (re-enrolling under a new id draws a new key). Large confined
+scopes are cut to a bounded number of lowest-keyed devices, disclosed per component; an unexamined
+certificate's claimed facts are withheld. The exact bounds are stated in `crypto.md`.
 
 **Left empty:** `classicalSecurityLevel`, `nistQuantumSecurityLevel` and `certificateState`
 (lifecycle state is derived against "now"). `revocationDate` is also left empty in 2a-4. Filling it
