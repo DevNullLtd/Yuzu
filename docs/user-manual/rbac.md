@@ -132,8 +132,8 @@ Recommended order for a fresh install:
 > whether the caller may read Forensics-tier rows (#4990), `group-from-results` creates nothing and
 > answers `200`; the operator sees a constant error toast ("The permission check for this action
 > could not be completed. Nothing was created. Retry shortly."), delivered in an `HX-Trigger`
-> `showToast` header because the create-group form swaps no response body into the page (the body
-> repeats the text only for a caller that is not htmx). The store-degraded case above answers `503`
+> `showToast` header because the create-group form swaps no response body into the page (the response
+> body carries the same text for every caller, but htmx does not display it for this form). The store-degraded case above answers `503`
 > with its own error toast ("Agent count unavailable. The response store could not be read. Nothing
 > was created. Retry shortly.") on the same channel, and also creates nothing.
 >
