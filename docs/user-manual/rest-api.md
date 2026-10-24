@@ -2331,32 +2331,27 @@ confined (management-group confinement) is refused `403` with no `permission` na
 the refusal is written as a `denied` `crypto.ca.certificates.view` row (target `inventory`,
 detail `cid=<cid> ws=crypto_widget_windows_v1 withheld=confined`). A served page is
 written as a `success` row (target `inventory`, detail `cid=<cid> inventory rows=<n> limit=<n>
-offset=<n> has_more=<bool> standing=<available|refused>`), set-and-proceed: if the row cannot be
+offset=<n> has_more=<bool> standing=available`), set-and-proceed: if the row cannot be
 written the page is still served, with `Sec-Audit-Failed: true` and `audit_persisted: false` in
 the body. The confinement check reporting itself unavailable is `503` + `retry_after_ms: 5000`
 (`access check unavailable`, also written as a `failure` row), a store that cannot be read is `503`
 + `retry_after_ms: 5000` (`CA store unavailable`, also a `failure` row), and a server built
 without the check is `503` with no `retry_after_ms` (`certificate list unavailable`).
 
-**Who is "confined".** The test is the caller's `Inventory:Read` standing, not `Security:Read`.
-A caller whose `Inventory:Read` is granted only for management groups is confined and is
-refused. A caller holding `Security:Read` and **no** `Inventory:Read` grant at all is **not**
-confined and is served the list (`standing=refused` in the success row): removing a scoped
-`Inventory:Read` grant does **not** confine a caller, and granting a global `Inventory:Read`
-removes the confinement. With RBAC enforcement off nothing changes: every `Security:Read` session is
-served, as before.
+**Who is served.** The list is served only to a caller whose `Inventory:Read` is granted without
+a management-group restriction (a global grant). A caller whose `Inventory:Read` is granted only
+for management groups is confined and is refused (`403`, a `denied` row ending
+`withheld=confined`). A caller holding `Security:Read` and **no** `Inventory:Read` grant at all is
+refused too (`403`, `withheld=refused`): holding no grant is not an affirmative admission to a
+fleet-wide list. Granting a global `Inventory:Read` removes the restriction, and removing a
+caller's last scoped `Inventory:Read` grant never widens what it can see. With RBAC enforcement
+off nothing changes: every `Security:Read` session is served, as before.
 
-**A read failure inside the access check fails open.** If a store behind the check
-(permissions, management groups) cannot be read partway through, the check answers as for a
-caller with no grant, so the list is **served** rather than refused with `503` (the success row
-carries `standing=refused`, the same token as the no-grant case, because the answer cannot tell
-them apart). The same holds for the filtered list below and the `/crypto` drill; the drill's
-success rows carry no standing token, so only this route and the MCP tool mark such pages. It is
-narrower than the behaviour before this change, when every confined caller was served
-unconditionally. It is tracked by #6382. Review
-`standing=refused` success rows, remembering that the audit row can be missing during the same
-outage (correlate with `yuzu_server_audit_emit_failed_total`) and that no alert fires on this
-path.
+**A read failure inside the access check is a retryable `503`, never the list.** If a store
+behind the check (permissions, management groups) cannot be read, the route answers
+`503 access check unavailable` with `retry_after_ms: 5000` and writes a `failure` row. The same
+holds for the filtered list below and the `/crypto` drill (a banner with Retry). The audit row can
+be missing during the same outage (correlate with `yuzu_server_audit_emit_failed_total`).
 
 `meta.has_more` is `true` when more rows exist beyond the current page; when it is,
 `meta.next_offset` carries the `offset` to pass for the next page. Iterate until
