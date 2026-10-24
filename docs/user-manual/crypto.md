@@ -37,7 +37,7 @@ each widget then needs its own permission:
   unconfined `Inventory:Read` holders;
 - the **certificates behind a Yuzu-issued count** (the drill) need **`Security:Read`**, the same
   permission as `GET /api/v1/ca/issued` ([PKI](server-admin.md)), and are withheld from a
-  confined caller too: the drill shows the note "Yuzu-issued certificate figures are not
+  confined caller, and from one holding no `Inventory:Read` grant, too: the drill shows the note "Yuzu-issued certificate figures are not
   available to this account ..." in place of the list. A caller who can see a count but does not hold
   `Security:Read` sees the count, and a click shows "the certificate list needs Security:Read"
   in the drill panel. The withholding covers the drill, both forms of
@@ -445,7 +445,7 @@ permissions, through REST and MCP.
 | `GET /api/v1/crypto/dashboard/layout` | Your own layout (`widgets`, `is_default`, `version`, `preserved_unknown`). Authentication only; refused to service-scoped tokens. The dashboard page answers such a token, or an MCP token whose tier does not allow the read, with the default layout, read-only, and never reads or shows the minting operator's saved layout. |
 | `PUT /api/v1/crypto/dashboard/layout` | Replace your own layout: body `{"widgets":[ids], "expected_version": n}`, at most 64 catalogue ids, no repeats; `expected_version` names the version you read (omit it only for a first save). A stale version, or none while a layout is stored, is `409`. Same-site browser writes only; audited `crypto.dashboard.layout.update`. |
 | `GET /api/v1/crypto/ca/stats` | Every Yuzu-issued count against one `as_of`. `Inventory:Read`, withheld from a confined caller (`403`). |
-| `GET /api/v1/ca/issued?kind=...` | The Yuzu-issued certificates behind one count: `kind` (required in this form), `days`, `week`, `bucket`, `as_of`, `limit` (1 to 500, default 100), `cursor` (the previous page's `next_cursor`; no `offset`). `Security:Read`, withheld from a confined caller. Without any of `kind`, `days`, `week`, `bucket`, `as_of` or `cursor` the route lists the inventory with `offset` paging (see [PKI](server-admin.md)). That unfiltered list is held to the same rules: it is withheld from a confined caller (`403`, no permission named), it is audited `crypto.ca.certificates.view`, and it answers `503` when the confinement check cannot be made. |
+| `GET /api/v1/ca/issued?kind=...` | The Yuzu-issued certificates behind one count: `kind` (required in this form), `days`, `week`, `bucket`, `as_of`, `limit` (1 to 500, default 100), `cursor` (the previous page's `next_cursor`; no `offset`). `Security:Read`, withheld from a confined caller and from one holding no `Inventory:Read` grant. Without any of `kind`, `days`, `week`, `bucket`, `as_of` or `cursor` the route lists the inventory with `offset` paging (see [PKI](server-admin.md)). That unfiltered list is held to the same rules: it is withheld from a confined caller (`403`, no permission named), it is audited `crypto.ca.certificates.view`, and it answers `503` when the confinement check cannot be made. |
 
 `version` and `ecosystem` are matched **exactly**, and a parameter that is present but empty is
 the exact empty value (some rows genuinely carry no version or no ecosystem); an absent parameter
@@ -693,7 +693,8 @@ an empty list, because an empty list would read as "no library installed".
 - **The Settings certificate panel, told apart by its note.** The panel always shows the CA
   details, the root, signing-request and CRL downloads and the import form to a `Security:Read`
   holder; only the issued-certificate list changes. A confined caller sees "Yuzu-issued
-  certificate figures are not available to this account ..." in its place; a caller whose access
+  certificate figures are not available to this account ..." in its place, and a caller with no
+  `Inventory:Read` grant sees a note saying it holds no read access to the fleet inventory; a caller whose access
   check failed sees "Certificate inventory unavailable (access check failed)."; a server built
   without the check shows "Certificate inventory unavailable (access check not configured)."; a
   store read failure shows "Certificate inventory unavailable (store error)." A revoke or import
@@ -752,7 +753,7 @@ message and the counter, and check `yuzu_server_audit_emit_failed_total`:
 | The concurrent-read bound was full | `crypto read capacity in use; retry` | `capacity in use` | `reason="admission_full"` |
 | The same `crypto library read degraded` while `YuzuInventoryCatalogRollupStale` or `YuzuInventoryCatalogRollupFailing` is firing | `crypto library read degraded` | `store degraded` | `reason="query_error"` (the 5 s statement timeout) |
 | CBOM export only: the process could not mint the BOM serial number (CSPRNG failure) | `service unavailable` (REST, `retry_after_ms` 5000); a retryable internal error on MCP | none: this is checked before any inventory read, so no read slot is taken and nothing is audited; the server log carries `CSPRNG failure minting the BOM serial number` | not moved |
-| The access gate could not complete its check (RBAC, management-group or tag store) | REST and MCP: the gate's own `503` A4 envelope (on MCP too, not a JSON-RPC error); on the page the banner "The access check could not be completed: one of its stores (permissions, management groups or tags) could not be read" | none here; the gate writes its own `auth.fleet_read_required` `denied` row, whose detail names the store that failed (for example `fleet read blocked: management-group store unavailable`) | not moved; `yuzu_server_rbac_read_degrade_total` moves only when an RBAC read itself fails, not for an unavailable RBAC store or a management-group or tag store failure |
+| The access gate could not complete its check (RBAC, management-group or tag store) | REST and MCP: the gate's own `503` A4 envelope (on MCP too, not a JSON-RPC error); on the page the banner "The access check could not be completed: one of its stores (permissions, management groups or tags) could not be read" | none here; the gate writes its own `auth.fleet_read_required` row: `denied` for an unwired or unopened store, with a detail naming it (for example `fleet read blocked: management-group store unavailable`), and `failure` for a read that failed inside the check, with no store named | not moved; `yuzu_server_rbac_read_degrade_total` moves only when an RBAC read itself fails, not for an unavailable RBAC store or a management-group or tag store failure |
 
 The last row most likely means the live name scan exceeded its 5 s bound: there are too many
 distinct package names for a live read, and retrying will not help (a Postgres overload also

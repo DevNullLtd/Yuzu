@@ -1085,7 +1085,7 @@ TEST_CASE("require_fleet_read — engine principal with an explicit global RBAC 
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 6d. A FAILED engine grant read is a retryable 503, never the 403 of "no grant"
-//     (CA fix round 2). Both engine arms read the grant with check_permission_checked.
+//     Both engine arms read the grant with check_permission_checked.
 // ═══════════════════════════════════════════════════════════════════════════
 
 namespace {

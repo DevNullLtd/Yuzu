@@ -460,6 +460,7 @@ TEST_CASE("authorize_list_read: read_failed is false for a genuine no-grant and 
 TEST_CASE("authorize_list_read: read_failed is true for each failed-read arm, and DenyAll holds",
           "[list_read][rbac][read_failed][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    yuzu::MetricsRegistry metrics; // declared before the Rig so the store never outlives it
     Rig r{rbac_db_.dsn()};
     r.group_assign(r.gP, "alice", "RespReader");
     r.group_assign(r.gP, "bob", "RespReader");
@@ -495,7 +496,6 @@ TEST_CASE("authorize_list_read: read_failed is true for each failed-read arm, an
         // two failed reads open the breaker (threshold 2), and a breaker shed would then deny
         // the call whether or not authorize_list_read tells a failed read from "no grant".
         r.group_assign(r.gP, "carol", "RespReader");
-        yuzu::MetricsRegistry metrics;
         r.rbac.set_metrics(&metrics);
         // The role lookup is the global read's alone: group names, assignments and role effects
         // do not read principal_roles, so with the early return reverted the later reads
@@ -607,9 +607,10 @@ TEST_CASE("every live is_rbac_enabled() call site is display-only "
              "if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {",
              // The engine-principal arm of require_list_read: still deny-first (RBAC off is a
              // 403 with no read at all; RBAC on reads through check_permission_checked, whose
-             // failure is a 503 and whose refusal is a 403). A stale raw view here is bounded by the
-             // enforcement-view refresh (a few seconds) and the read that follows decides. The shape changed from the compound `!is_rbac_enabled() ||`
-             // above only to carry the checked read's failure.
+             // failure is a 503 and whose refusal is a 403). A stale raw view cannot admit by
+             // itself: stale false denies, and stale true still needs an explicit engine grant
+             // from the read that follows. The shape changed from the compound
+             // `!is_rbac_enabled() ||` above only to carry the checked read's failure.
              "const auto engine_grant = rbac_store_->is_rbac_enabled()",
          }},
     };

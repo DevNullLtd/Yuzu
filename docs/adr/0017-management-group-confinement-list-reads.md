@@ -164,7 +164,7 @@ RbacStore::authorize_list_read(user, securable, op) -> DenyAll | AdmitAll | Admi
   403 / audit envelope: `AuthRoutes::require_list_read` (REST, sibling to `require_scoped_permission`
   and to the `rest_audit.hpp` #1647 chokepoint precedent), the MCP equivalent, the dashboard
   equivalent.
-- `DenyAll` → 403 (REST) / empty (dashboard). `AdmitAll` → unfiltered read (global holder).
+- `DenyAll` → 403 (REST) / empty (dashboard); since 2026-10-24 a `DenyAll` carrying `read_failed` (a read inside the check failed) is a retryable 503 on the shared gates (see the CA bullet below). `AdmitAll` → unfiltered read (global holder).
   `AdmitScoped(set)` → the route reads **only** `set` (preferably pushed into SQL `WHERE agent_id IN
   (...)`).
 - For **aggregates** (`aggregate_responses`) and **paginated** reads (#1550), the visible set MUST be

@@ -624,7 +624,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
     // -- Fragment: the Yuzu-issued certificate drill (a continuation page when it has a cursor) -
     // the dashboard twin of the filtered GET /api/v1/ca/issued. perm_fn Security:Read, withheld
-    // from a confined caller (R2); audited crypto.ca.certificates.view; always 200.
+    // from a confined caller or one with no Inventory:Read grant (R2); audited crypto.ca.certificates.view; always 200.
     sink.Get("/fragments/crypto/ca/certificates", [this](const httplib::Request& req,
                                                           httplib::Response& res) {
         set_private_no_store(res);

@@ -384,8 +384,8 @@ struct LayoutRequest {
 /// value renders as `withheld=unexpected` (a defect, never a false `confined`).
 [[nodiscard]] std::string audit_detail_ca_withheld(std::string_view cid, Access standing);
 /// The refusal message for a withheld standing: kRefusedWithheldMessage for kRefused,
-/// kConfinedWithheldMessage otherwise. One place for REST and MCP; the Settings panel and the
-/// drill render their own constants.
+/// kConfinedWithheldMessage otherwise. REST and MCP choose their message here; the Settings panel and the
+/// drill pick the same two shared constants in their own switch.
 [[nodiscard]] std::string_view withheld_message(Access standing);
 /// `[cid=<cid> ]widgets=<n>[ expected_version=<v>]` (crypto.dashboard.layout.update).
 [[nodiscard]] std::string audit_detail_layout(std::string_view cid, std::size_t widgets,

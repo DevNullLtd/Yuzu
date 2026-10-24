@@ -237,7 +237,7 @@ uninstall removes the program but **keeps `%ProgramData%\Yuzu`**, which holds
 the agent's identity and its mTLS private key; an interactive uninstall asks. To
 decommission a device, revoke its certificate on the server (find its serial in
 `GET /api/v1/ca/issued` with an unconfined account, because a management-group-confined
-account is refused that list, though a confined `Security:Delete` holder can revoke a serial it
+account, or one with no `Inventory:Read` grant, is refused that list, though a confined `Security:Delete` holder can revoke a serial it
 already knows; then `POST /api/v1/ca/revoke`; see `docs/user-manual/device-management.md`) and
 delete that directory. Revocation
 alone does not disconnect an agent that reaches the server through a gateway;

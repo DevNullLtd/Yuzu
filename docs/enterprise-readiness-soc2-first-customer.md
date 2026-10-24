@@ -377,7 +377,7 @@ four-eyes feature is a separate, postponed decision (epic #6060).
 inventory (`GET /api/v1/ca/issued`, filtered or not, MCP `list_issued_certs`, and the list in the
 Settings certificate panel) carries every enrolled agent's subject, SAN and issuing identity. Before
 this change any `Security:Read` holder was served it, a management-group-confined one included. It is
-now withheld from a confined caller, and every API and MCP call is audited as `crypto.ca.certificates.view`.
+now withheld from a confined caller and from one with no `Inventory:Read` grant, and every API and MCP call is audited as `crypto.ca.certificates.view`.
 Who is served, stated plainly so a questionnaire answer is not rounded up: with RBAC enforcement off
 (the shipped default), every `Security:Read` session, unchanged; with RBAC on, a caller with a global
 `Inventory:Read` grant or an elevated (JIT) session. Refused (`403`): a caller whose `Inventory:Read`
@@ -389,8 +389,10 @@ on the route and the MCP tool each success row ends `standing=available`, each r
 row ending `withheld=confined` or `withheld=refused`, and each failed check is a `failure` row; the
 drill's success rows carry no standing token, the audit row can be missing during the same outage
 (correlate with `yuzu_server_audit_emit_failed_total`), and no certificate-specific alert fires on a failed check:
-the only signals are the shared RBAC read-degrade counter and breaker (`YuzuRbacReadDegraded`,
-`YuzuRbacBreakerOpen`). The Settings
+the only signals are the shared read-degrade counters and breaker (`YuzuRbacReadDegraded`,
+`YuzuRbacBreakerOpen` for RBAC reads; `yuzu_server_mgmt_group_read_degrade_total` and
+`YuzuMgmtGroupReadDegraded` for management-group reads); a management-group store that is not
+wired or not open raises no counter at all. The Settings
 panel and the `/crypto` drill write no row for a refused caller (confined or holding no grant). Do not state that confined
 operators cannot read the certificate inventory without these qualifications.
 

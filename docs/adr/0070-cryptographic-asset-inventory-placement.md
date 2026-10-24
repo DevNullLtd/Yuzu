@@ -1533,7 +1533,7 @@ records it. On 2026-10-23 the maintainer, Dave Rae, authorised reversing that st
 **Status of the 2026-10-23 Update.** It stays on record as history. Its "kRefused is served" row and
 its "A read failure partway through the access check" exception are **superseded by this Update**;
 the maintainer's 2026-10-23 ruling to keep serving was reviewed by an independent adjudicator on
-2026-10-24 and was not upheld (see "Why", below). Nothing in the 2026-10-23 Update is deleted.
+2026-10-24 and was not upheld (see "Why", below). Its "Detective control until then" paragraph and its statement about the Settings panel are superseded too: success rows now carry only `standing=available`, `refused` is a withheld standing with its own `denied` row, and the panel withholds the list for a refused caller. Nothing in the 2026-10-23 Update is deleted.
 
 **What changed.** The standing table for `GET /api/v1/ca/issued` (both forms), MCP `list_issued_certs`,
 the `/crypto` drill and the Settings certificate panel's inventory is now:
@@ -1553,7 +1553,9 @@ the `/crypto` drill and the Settings certificate panel's inventory is now:
    gate (`auth_routes.cpp`) answer 503 on it instead of a 403, so `crypto_access_for` already maps
    it to kDegraded. ADR-0017 INV-1 (any error is deny) and INV-5 (a partial failure never includes)
    hold again for these reads; the exception recorded on 2026-10-23 is closed. Every fleet-gated
-   read now answers 503 rather than 403 on a mid-query failure; both still deny.
+   and list-gated read now answers 503 rather than 403 on a mid-query failure; both still deny.
+   The front `Security:Read` gate and the other plain `require_permission` sites still answer 403
+   on a failed first read (ADR-0041 deny-on-degrade); that is unchanged and is tracked as #6437.
 2. **No grant is not an affirmative admission.** A `Security:Read` holder with no `Inventory:Read`
    grant is refused the list. R2's reading that confinement is a property of a scoped grant remains
    true, but the converse does not follow: removing a caller's last scoped grant must not widen what
@@ -1572,8 +1574,8 @@ with only group-scoped inventory access receives out-of-scope device-certificate
 subject which is the agent id, SAN, status, dates, issuer) and the no-grant widening as HIGH.
 
 **Consequence for operators.** Breaking for a custom role that holds `Security:Read` and no
-`Inventory:Read`; the seeded Administrator, PlatformEngineer and Operator roles hold an
-`Inventory:Read` and the seeded Viewer role a global one, per `seed_defaults()`. See
+`Inventory:Read`; the seeded Administrator and Viewer roles, the only seeded roles that hold
+`Security:Read`, also hold a global `Inventory:Read`, per `seed_defaults()`. See
 `docs/user-manual/upgrading.md`.
 
 **Approval.** The maintainer, Dave Rae, approved applying this Update on 2026-10-24. The ADR author's confirmation is not recorded in the repository.
