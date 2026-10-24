@@ -635,10 +635,11 @@ TEST_CASE("consume_ticket(PGconn*): a transaction begun before expiry whose cons
     // was approved misreading it as future-dated, would need a transaction older than five
     // minutes, so it rests on the predicate's text (pinned by the source tripwire) instead.
     //
-    // Live for about one more second of database time. The premise below fails loudly, never
-    // green, if the lease and BEGIN after this UPDATE take longer than that (a very loaded
-    // runner); the sleep must outlast the lifetime by more than the one-second rounding of
-    // the epoch (`::bigint` rounds), hence 2300 ms. The database clock cannot be injected.
+    // Live for one to two more seconds of database time, depending on where the sub-second
+    // phase falls (`::bigint` rounds to the nearest second). The premise below fails loudly,
+    // never green, if the lease and BEGIN after this UPDATE take longer than that (a very
+    // loaded runner). The sleep must outlast the longest case, two seconds, hence 2300 ms.
+    // The database clock cannot be injected.
     REQUIRE(run_sql(bundle.pool(),
                     "UPDATE approval_manager.approvals SET reviewed_at = "
                     "extract(epoch from now())::bigint - " +

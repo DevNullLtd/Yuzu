@@ -1377,12 +1377,15 @@ TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL fro
         REQUIRE(arg != std::string::npos);
         CHECK(stmt->compare(arg, 5, "true)") == 0);
     }
-    // The predicate itself: the parameter really selects the wall clock, and the default is
-    // the transaction-start clock. Without this a swapped or ignored ternary would pass
-    // everything above on a machine with no Postgres (the behavioural test is PG-gated).
+    // The predicate itself: the parameter really selects the wall clock, the default is the
+    // transaction-start clock, and BOTH bounds are measured on the selected clock. Without
+    // this a swapped ternary, or a bound rewritten to name kDbNowEpochSql directly, would pass
+    // everything above on a machine with no Postgres (the behavioural test is PG-gated and
+    // covers only the lower bound).
     CHECK(count_occurrences(code, "std::string ticket_live_sql(bool wall_clock = false) {") == 1);
     CHECK(live_now.find("wall_clock ? kDbWallEpochSql : kDbNowEpochSql") != std::string::npos);
     CHECK(count_occurrences(code, "kDbWallEpochSql") == 2); // its definition and that one use
+    CHECK(count_occurrences(code, "+ now +") == 2);         // the lower and the upper bound
     CHECK(is_live.find("ticket_live_sql()") != std::string::npos); // ticket_is_live()
     CHECK(db_now.find("kDbNowEpochSql") != std::string::npos);   // the pending-sweep cutoff
     CHECK(sweep_pending.find("db_now") != std::string::npos);

@@ -446,17 +446,19 @@ keep them green and extend them to the new surface. Test names are the case titl
   today is a store error flagged `binding_check_unevaluated` and not a `kForeignOrigin` at all),
   and MUST decide the client text in the same change (today a caller is told
   "already used" for an intact approved ticket). When the first `guardian_deploy` redeemer lands,
-  that cause becomes reachable, so the same change MUST add it to the operator-facing cause lists
-  (`upgrading.md`, `metrics.md`, `mcp.md` and the changelog fragment). Proof: `consume: an
-  integrity failure is counted and audited under its own kind and cause`, in
-  `test_approval_manager_bound.cpp`.
-- **Approve-side origin check** (`sec-r11-2`, `up-r11-1`): `approve()` and the dashboard Approve
-  predicate (`approval_state_is_approvable`) do not know a ticket's origin, so a hand-set pending
-  row of an origin that requires a bound request, with no request, can be approved and is then
-  refused at redemption for ever (the next `submit()` sweep retires it). The PR MUST give both the
-  same origin-aware refusal as redemption, from one shared predicate, so a reviewer is never
-  offered Approve on a ticket that cannot be redeemed. Proof: `approve: a bound-origin ticket
-  with no frozen request is refused and not offered`, in `test_approval_manager_bound.cpp`.
+  the seventh cause (bound origin without a frozen request) becomes reachable, so the same change
+  MUST add it to the operator-facing cause lists (`upgrading.md`, `metrics.md`, `mcp.md` and the
+  changelog fragment), and the sixth where a list omits it (`upgrading.md`, the changelog
+  fragment). Proof: `consume: an integrity failure is counted and audited under its own kind and
+  cause`, in `test_approval_manager_bound.cpp`.
+- **Approve-side origin check** (`r11-approve-side-origin-gap`): `approve()` and the dashboard
+  Approve predicate (`approval_state_is_approvable`) do not consult a ticket's origin, so a
+  hand-set pending row of an origin that requires a bound request, with no request, can be
+  approved and is then refused at every redemption until it leaves its 7-day lifetime, when the
+  first `submit()` sweep after that retires it. The PR MUST give both the same origin-aware
+  refusal as redemption, from one shared predicate, so a reviewer is never offered Approve on a
+  ticket that cannot be redeemed. Proof: `approve: a bound-origin ticket with no frozen request
+  is refused and not offered`, in `test_approval_manager_bound.cpp`.
 - **Narrow list projection** (`sre-4`): a list read that elides `request_json` MUST return a
   distinct type, never an `Approval` whose empty `request_json` reads as unbound. Today
   `schedule_runner` and the Home panel fetch the column and ignore it, and a 100-row list carries

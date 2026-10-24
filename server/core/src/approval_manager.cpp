@@ -112,9 +112,12 @@ constexpr const char* kDbWallEpochSql = "EXTRACT(EPOCH FROM clock_timestamp())::
 // `reviewed_at` was stamped would see the ticket as dated in the future and misreport it as
 // expired (#6062 sg-6). The consume CAS and its diagnostic read therefore ask for the wall
 // clock, and any new caller that evaluates liveness on a caller-held connection MUST pass
-// true. The sweep and `ticket_is_live()` keep `now()`: the sweeps run inside the mint's own
-// transaction (opened in submit_impl, never a caller's, and bounded by the pool's
-// statement and lock timeouts, 30 s and 10 s by default, far under the 300 s slack), and
+// true. The sweep and `ticket_is_live()` keep `now()`: the sweeps run first inside the mint's
+// own transaction (opened in submit_impl, never a caller's; under the default pool
+// settings each statement is bounded by a 30 s statement timeout and a 10 s lock timeout,
+// but nothing bounds the whole transaction or a DSN that sets its own options, so a stale
+// `now()` here is tolerated rather than excluded: it can only under-expire a ticket, which
+// consume refuses anyway, or expire one early, which a resubmit recovers), and
 // `ticket_is_live()` is one statement, so neither can age the way a caller-held
 // transaction does.
 std::string ticket_live_sql(bool wall_clock = false) {
