@@ -290,8 +290,9 @@ Recover in three steps:
 1. Find the successor with `GET /api/v1/engine-principals/{id}`. In its
    `active_credentials` list a stuck pair is two credentials sharing a
    `rotation_group`; the successor is the one whose `overlap_expires_at` is `0`
-   while the predecessor's is non-zero. That read is fail-soft, so an empty list
-   during an incident is not authoritative: repeat it once the store is healthy.
+   while the predecessor's is non-zero. That read fails closed: when the token
+   store cannot answer, the route returns `503` with `Retry-After: 2` instead of
+   an empty list, so repeat it after the `503` clears.
    (`GET /api/v1/tokens` is scoped to the caller's own tokens and does not list
    an engine credential.)
 2. Revoke the successor with `DELETE /api/v1/tokens/{token_id}`. REST only: the

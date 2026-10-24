@@ -3522,6 +3522,16 @@ TEST_CASE("MCP list_engine_principals and get_engine_principal: fail with a retr
           1);
     CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(), "mcp.get_engine_principal|failure") ==
           1);
+    // The failure rows carry the checked read's own reason, and the get row names the principal.
+    {
+        std::vector<std::string> details;
+        for (std::size_t i = 0; i < ts.audit_log.size() && i < ts.audit_details.size(); ++i)
+            if (ts.audit_log[i].ends_with("|failure"))
+                details.push_back(ts.audit_details[i]);
+        REQUIRE(details.size() == 2);
+        CHECK(details[0] == "pool lease timed out");
+        CHECK(details[1] == "principal_id=engine:mcp-read-degraded pool lease timed out");
+    }
 
     // Leases back: both now report the credential that was there all along.
     for (const auto& call : {list_call, get_call}) {
@@ -3532,6 +3542,54 @@ TEST_CASE("MCP list_engine_principals and get_engine_principal: fail with a retr
         const auto text = j["result"]["content"][0]["text"].get<std::string>();
         CHECK(text.find("\"active_credentials\":1") != std::string::npos);
     }
+}
+
+TEST_CASE("MCP list_engine_principals: a saturated shared pool is a retryable error, not "
+          "count 0 (the principal and token stores draw from one pool in production)",
+          "[mcp][pg][engine_principal][read][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    yuzu::server::EnginePrincipalStore eps{pool}; // the SAME pool, as server.cpp builds it
+    REQUIRE(eps.is_open());
+    REQUIRE(eps.create("mcp shared", "alice", "j", "internal", "alice", "engine:mcp-shared")
+                .has_value());
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.engine_principal_store_for_test = &eps;
+    ts.start("readonly");
+    const std::string list_call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"list_engine_principals","arguments":{}}})";
+
+    {
+        auto held = hold_all_leases(pool);
+        auto r = ts.call(list_call);
+        REQUIRE(r);
+        auto body = nlohmann::json::parse(r->body);
+        REQUIRE(body.contains("error"));
+        REQUIRE_FALSE(body.contains("result"));
+        CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+              mcp::kMcpStoreFaultShortRetryMs);
+        CHECK(r->body.find("\"count\"") == std::string::npos);
+    }
+    REQUIRE(ts.audit_log.size() == ts.audit_details.size());
+    REQUIRE(!ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.list_engine_principals|failure");
+    // A fixed string: the store's own error can carry database driver text.
+    CHECK(ts.audit_details.back() == "engine principal roster could not be read");
+
+    auto ok = ts.call(list_call);
+    REQUIRE(ok);
+    auto j = nlohmann::json::parse(ok->body);
+    REQUIRE(j.contains("result"));
+    CHECK(j["result"]["content"][0]["text"].get<std::string>().find("\"count\":1") !=
+          std::string::npos);
 }
 
 TEST_CASE("MCP mint_engine_credential: withholds the secret with a partial audit when the "

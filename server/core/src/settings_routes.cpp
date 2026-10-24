@@ -894,7 +894,15 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
     // Admin/auditor list surface — every engine principal, any lifecycle
     // state, so revoked rows stay visible (never quietly dropped from the
     // console — design doc §3.1 / §12 decision 1).
-    auto principals = engine_principal_store_->list_all(/*include_revoked=*/true);
+    // CHECKED roster read: the plain `list_all` returns an empty vector on a pool-lease
+    // timeout or query failure, which would render "No engine principals" during an outage.
+    auto principals_res = engine_principal_store_->list_all_checked(/*include_revoked=*/true);
+    if (!principals_res) {
+        spdlog::warn("settings engine-principals: roster read failed: {}", principals_res.error());
+        return "<div class=\"muted\">Engine principals unavailable: the list could not be "
+               "read. Reload to retry.</div>";
+    }
+    const auto& principals = *principals_res;
 
     std::string html = "<table class=\"user-table\">"
                        "  <thead><tr><th>Principal ID</th><th>Display Name</th><th>Owner</th>"
@@ -902,6 +910,7 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                        "  <th>Revocation</th><th></th></tr></thead>"
                        "  <tbody>";
 
+    bool credentials_unreadable = false;
     if (principals.empty()) {
         html += "<tr><td colspan=\"8\" class=\"muted\">No engine principals</td></tr>";
     } else {
@@ -914,19 +923,24 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
             // query failure into an empty vector, which this cell would show as "0" for a
             // principal that holds a live credential. A read that cannot answer says so in
             // the cell and leaves the rest of the row (read from the principal store) intact.
+            // After the first failed read the remaining rows are marked unavailable without
+            // another read: each failing read waits out the store's read timeout, so retrying
+            // per row would hold this request for roughly N x that timeout. A store that was
+            // never wired reads the same way.
             std::size_t active_creds = 0;
-            bool creds_known = true;
-            std::string active_creds_cell = "0";
-            if (api_token_store_) {
+            bool creds_known = false;
+            if (api_token_store_ && !credentials_unreadable) {
                 auto checked = api_token_store_->list_active_for_principal_checked(p.principal_id);
                 if (checked) {
                     active_creds = checked->size();
-                    active_creds_cell = std::to_string(active_creds);
+                    creds_known = true;
                 } else {
-                    creds_known = false;
-                    active_creds_cell = "<span class=\"muted\">unavailable</span>";
+                    credentials_unreadable = true;
                 }
             }
+            const std::string active_creds_cell =
+                creds_known ? std::to_string(active_creds)
+                            : std::string("<span class=\"muted\">unavailable</span>");
 
             // Revoked rows MUST surface the `superseded_by` linkage AND the
             // recorded revoke detail explicitly (design doc §3.1 / §12

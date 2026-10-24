@@ -1054,10 +1054,10 @@ const std::string& openapi_spec() {
         R"json(,
     "/engine-principals": {
       "post": {"summary": "Create a new engine-principal identity", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["slug", "display_name", "owner_username", "justification", "classification"], "properties": {"slug": {"type": "string", "description": "Reserved 'engine:<slug>' namespace suffix — lowercase letters, digits, '.', '_', '-' only, max 128 chars"}, "display_name": {"type": "string"}, "owner_username": {"type": "string", "description": "Must reference an existing user (owner-FK)"}, "justification": {"type": "string"}, "classification": {"type": "string", "enum": ["internal", "external"]}}}}}}, "responses": {"201": {"description": "Created; {principal_id}"}, "400": {"description": "Bad JSON, invalid/duplicate slug, missing justification, unknown owner_username, or invalid classification"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "503": {"description": "Engine-principal store, or owner-lookup, unavailable"}}},
-      "get": {"summary": "List every engine principal", "tags": ["Security"], "responses": {"200": {"description": "List of engine principals with active_credential_count"}, "403": {"description": "Requires EnginePrincipal:Read"}, "503": {"description": "Engine-principal store unavailable"}}}
+      "get": {"summary": "List every engine principal", "tags": ["Security"], "responses": {"200": {"description": "List of engine principals with active_credential_count"}, "403": {"description": "Requires EnginePrincipal:Read"}, "503": {"description": "Engine-principal store unavailable, or the principal list or the credential counts could not be read (Retry-After: 2, retry_after_ms 2000); no list is served"}}}
     },
     "/engine-principals/{id}": {
-      "get": {"summary": "Get one engine principal and its active credentials", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "responses": {"200": {"description": "Engine principal detail + active_credentials[] (secrets masked; each entry carries token_id, rotation_group and overlap_expires_at, which identify a stuck rotation successor). Fail-soft: a credential-store fault returns an empty list"}, "403": {"description": "Requires EnginePrincipal:Read"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal store unavailable"}}},
+      "get": {"summary": "Get one engine principal and its active credentials", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "responses": {"200": {"description": "Engine principal detail + active_credentials[] (secrets masked; each entry carries token_id, rotation_group and overlap_expires_at, which identify a stuck rotation successor)"}, "403": {"description": "Requires EnginePrincipal:Read"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal store unavailable, or the credential store could not be read (Retry-After: 2, retry_after_ms 2000); no active_credentials list is served"}}},
       "delete": {"summary": "Revoke an engine principal (terminal) and its active credentials", "tags": ["Security"], "description": "Cross-store ordering invariant: credentials are revoked FIRST (ApiTokenStore::revoke_for_principal), the identity SECOND — never the reverse.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"superseded_by": {"type": "string"}}}}}}, "responses": {"200": {"description": "Revoked (idempotent — success even if already revoked); {revoked, credentials_revoked}"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal or credential store unavailable"}}}
     },
     "/engine-principals/{id}/credentials": {
@@ -5176,7 +5176,30 @@ void RestApiV1::register_routes(
                  if (deny_engine_session(*session, req, res, audit_fn, "engine_principal.list",
                                          "EnginePrincipal"))
                      return;
-                 auto principals = eps->list_all();
+                 // CHECKED roster read. The plain `list_all` turns a closed store, a
+                 // pool-lease timeout or a query failure into an empty vector, and the
+                 // engine-principal and token stores share ONE pool in production, so a
+                 // saturated pool would answer 200 "no engine principals" here before the
+                 // per-principal credential read below is ever reached.
+                 auto principals_res = eps->list_all_checked();
+                 if (!principals_res) {
+                     // The store's error can carry the database driver's text, so it goes to
+                     // the log only; the audit detail and the response use fixed strings.
+                     spdlog::warn("engine_principal.list: roster read failed: {}",
+                                  principals_res.error());
+                     res.status = 503;
+                     res.set_header("Retry-After", "2");
+                     res.set_content(
+                         detail::a4_error(res, "could not read the engine principals; retry",
+                                          detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                         "application/json");
+                     (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                         "engine_principal.list", "failure",
+                                                         "EnginePrincipal", "",
+                                                         "engine principal roster could not be read");
+                     return;
+                 }
+                 const auto& principals = *principals_res;
                  JArr arr;
                  for (const auto& p : principals) {
                      std::int64_t active_creds = 0;

@@ -2540,15 +2540,20 @@ static const ToolDef kTools[] = {
 
     {"list_engine_principals",
      "List engine principals with each principal's active-credential count (admin/auditor "
-     "surface). Mirrors GET /api/v1/engine-principals. Requires EnginePrincipal:Read.",
+     "surface). Mirrors GET /api/v1/engine-principals. Requires EnginePrincipal:Read. Fails "
+     "closed: if the principal list or the credential counts cannot be read the tool returns a "
+     "retryable internal error (retry_after_ms 2000), never count 0 or a credential count of 0.",
      R"j({"type":"object","properties":{)j"
      R"j("include_revoked":{"type":"boolean","default":true,"description":"false restricts to lifecycle_state=active only"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{"count":{"type":"integer"},"principals":{"type":"array","items":{"type":"object","additionalProperties":true}}},"required":["count","principals"]})j"},
 
     {"get_engine_principal",
-     "Get one engine principal's identity row plus its active-credential count. Mirrors GET "
-     "/api/v1/engine-principals/{id}. Requires EnginePrincipal:Read.",
+     "Get one engine principal's identity row plus its active-credential count (an integer here; "
+     "the REST twin returns an array of credential objects under the same name). Mirrors GET "
+     "/api/v1/engine-principals/{id}. Requires EnginePrincipal:Read. Fails closed: if the "
+     "credential read fails the tool returns a retryable internal error (retry_after_ms 2000), "
+     "never active_credentials 0.",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"})j"
      R"j(},"required":["principal_id"]})j",
@@ -26447,7 +26452,24 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const bool include_revoked = *include_revoked_opt;
-                auto principals = engine_principal_store_->list_all(include_revoked);
+                // CHECKED roster read (see the REST twin): the plain `list_all` returns an empty
+                // vector on a pool-lease timeout or query failure, and the principal and token
+                // stores share one pool, so a saturated pool would answer `count: 0` before the
+                // per-principal credential read below is reached. The store's error can carry
+                // driver text, so it is logged; the audit detail and response are fixed strings.
+                auto principals_res = engine_principal_store_->list_all_checked(include_revoked);
+                if (!principals_res) {
+                    spdlog::warn("list_engine_principals: roster read failed: {}",
+                                 principals_res.error());
+                    mcp_audit("failure", "engine principal roster could not be read");
+                    res.set_content(
+                        a4_error(kInternalError, "could not read the engine principals; retry",
+                                 "retry the request",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
+                const auto& principals = *principals_res;
                 JArr arr;
                 for (const auto& p : principals) {
                     JObj row;
@@ -26545,7 +26567,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     auto active =
                         engine_credential_store_->list_active_for_principal_checked(principal_id);
                     if (!active) {
-                        mcp_audit("failure", active.error());
+                        mcp_audit("failure", "principal_id=" + audit_caller_id(principal_id) + " " +
+                                          active.error());
                         res.set_content(
                             a4_error(kInternalError,
                                      "could not read the principal's credentials; retry",

@@ -853,6 +853,18 @@ std::vector<TokenPoolLease> hold_all_token_pool_leases() {
     }
     return held;
 }
+
+/// Takes every lease of the engine-principal store's pool, so its roster read cannot answer. In
+/// production that pool IS the token store's pool; holding both here reproduces its exhaustion.
+std::vector<TokenPoolLease> hold_all_engine_pool_leases() {
+    auto& pool = *ep_lc_shared().pool;
+    std::vector<TokenPoolLease> held;
+    for (std::size_t i = 0; i < pool.size(); ++i) {
+        held.push_back(pool.acquire());
+        REQUIRE(held.back());
+    }
+    return held;
+}
 } // namespace
 
 TEST_CASE("Engine-principal REST: mint fails closed with 503 when the active-credential guard "
@@ -943,6 +955,51 @@ TEST_CASE("Engine-principal REST: GET list and GET one answer 503, not zero cred
     REQUIRE(one);
     REQUIRE(one->status == 200);
     CHECK(nlohmann::json::parse(one->body)["data"]["active_credentials"].size() == 1);
+}
+
+TEST_CASE("Engine-principal REST: GET list answers 503, not an empty 200, when the principal "
+          "roster cannot be read (the shared-pool exhaustion case)",
+          "[pg][rest][engine_principal][read][degraded]") {
+    RestEngineHarness h;
+    auto [pid, raw] = h.create_and_mint("roster-degraded");
+    (void)raw;
+
+    {
+        // In production both stores draw from ONE pool, so exhaustion denies the roster read
+        // first; hold both pools to reproduce that.
+        auto held_engine = hold_all_engine_pool_leases();
+        auto held_token = hold_all_token_pool_leases();
+        auto list = h.list();
+        REQUIRE(list);
+        CHECK(list->status == 503);
+        CHECK(list->get_header_value("Retry-After") == "2");
+        CHECK(list->body.find("\"data\"") == std::string::npos);
+        CHECK(nlohmann::json::parse(list->body)["error"]["retry_after_ms"].get<int>() == 2000);
+        REQUIRE(!h.audit_log.empty());
+        CHECK(h.audit_log.back().action == "engine_principal.list");
+        CHECK(h.audit_log.back().result == "failure");
+        // A fixed string: the store's own error can carry database driver text.
+        CHECK(h.audit_log.back().detail == "engine principal roster could not be read");
+        // No success row was written for the failed read.
+        for (const auto& a : h.audit_log)
+            CHECK_FALSE((a.action == "engine_principal.list" && a.result == "success"));
+    }
+
+    // A failure row whose own write drops still sets the header on the (data-less) 503.
+    {
+        auto held_engine = hold_all_engine_pool_leases();
+        h.audit_allow = false;
+        auto list = h.list();
+        REQUIRE(list);
+        CHECK(list->status == 503);
+        CHECK(list->get_header_value("Sec-Audit-Failed") == "true");
+        h.audit_allow = true;
+    }
+
+    auto list = h.list();
+    REQUIRE(list);
+    CHECK(list->status == 200);
+    CHECK(nlohmann::json::parse(list->body)["data"].size() == 1);
 }
 
 TEST_CASE("Engine-principal REST: rotate withholds the secret with 503 and a partial audit when "
@@ -2273,13 +2330,16 @@ struct SettingsOwnerDeleteHarness {
 } // namespace
 
 TEST_CASE("SettingsRoutes engine-principals fragment: a credential read that cannot answer "
-          "says unavailable and offers neither Mint nor Rotate",
+          "says unavailable, stops reading, and offers neither Mint nor Rotate",
           "[pg][settings][engine_principal][read][degraded]") {
     EnginePrincipalStorePg engine_store;
     REQUIRE(engine_store->create("Vuln Sync", "bob", "j", "internal", "admin", "engine:panel-deg")
                 .has_value());
+    // A second principal with NO credential, so the recovery phase pins the Mint form too.
+    REQUIRE(engine_store->create("Idle", "bob", "j", "internal", "admin", "engine:panel-none")
+                .has_value());
     SettingsOwnerDeleteHarness h(engine_store.get());
-    // One live credential, so a "0" with a Mint button would be the false reading.
+    // One live credential on the first principal, so a "0" with a Mint button would be false.
     h.token_store->set_engine_referent_check(
         [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
     const auto now = static_cast<int64_t>(std::time(nullptr));
@@ -2288,22 +2348,44 @@ TEST_CASE("SettingsRoutes engine-principals fragment: a credential read that can
                                "readonly", "engine")
                 .has_value());
 
-    {
-        auto held = hold_all_token_pool_leases();
+    SECTION("a credential read that cannot answer") {
+        {
+            auto held = hold_all_token_pool_leases();
+            auto res = h.sink.Get("/fragments/settings/engine-principals");
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            // Both the cell and the row hint, asserted as their own markup.
+            CHECK(res->body.find("<span class=\"muted\">unavailable</span>") != std::string::npos);
+            CHECK(res->body.find("Credential state unavailable") != std::string::npos);
+            CHECK(res->body.find("data-engine-action=\"mint\"") == std::string::npos);
+            CHECK(res->body.find("data-engine-action=\"rotate\"") == std::string::npos);
+            // The principal rows, read from the principal store, are still shown.
+            CHECK(res->body.find("engine:panel-deg") != std::string::npos);
+            CHECK(res->body.find("engine:panel-none") != std::string::npos);
+        }
         auto res = h.sink.Get("/fragments/settings/engine-principals");
         REQUIRE(res);
-        CHECK(res->status == 200);
-        CHECK(res->body.find("unavailable") != std::string::npos);
-        CHECK(res->body.find("data-engine-action=\"mint\"") == std::string::npos);
-        CHECK(res->body.find("data-engine-action=\"rotate\"") == std::string::npos);
-        // The principal row itself, read from the principal store, is still shown.
-        CHECK(res->body.find("engine:panel-deg") != std::string::npos);
+        CHECK(res->body.find("unavailable") == std::string::npos);
+        CHECK(res->body.find("data-engine-action=\"rotate\"") != std::string::npos);
+        CHECK(res->body.find("data-engine-action=\"mint\"") != std::string::npos);
     }
 
-    auto res = h.sink.Get("/fragments/settings/engine-principals");
-    REQUIRE(res);
-    CHECK(res->body.find("unavailable") == std::string::npos);
-    CHECK(res->body.find("data-engine-action=\"rotate\"") != std::string::npos);
+    SECTION("a roster that cannot be read") {
+        {
+            auto held = hold_all_engine_pool_leases();
+            auto res = h.sink.Get("/fragments/settings/engine-principals");
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(res->body.find("Engine principals unavailable") != std::string::npos);
+            // Not the empty-table text that reads as "no engine principals exist".
+            CHECK(res->body.find("No engine principals") == std::string::npos);
+            CHECK(res->body.find("<table") == std::string::npos);
+        }
+        auto res = h.sink.Get("/fragments/settings/engine-principals");
+        REQUIRE(res);
+        CHECK(res->body.find("Engine principals unavailable") == std::string::npos);
+        CHECK(res->body.find("engine:panel-deg") != std::string::npos);
+    }
 }
 
 TEST_CASE("SettingsRoutes owner-delete guard: blocks deleting a user who owns an "
