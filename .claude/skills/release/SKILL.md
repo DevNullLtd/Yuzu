@@ -28,7 +28,7 @@ Default mode (no flag): full pipeline from preflight → tag push → workflow m
 ## Pre-conditions the operator must confirm
 
 Before invoking the skill, the operator should already have:
-- All commits intended for this release merged to `main` (releases tag from main, not dev — confirm `git log origin/main..origin/dev` is empty; preflight check #9 hard-fails on any divergence in either direction, so "intentional dev-only changes" are not an option — reconcile per Phase 0.5).
+- All commits intended for this release merged to `main` (releases tag from main, not dev — confirm `git log origin/main..origin/dev` shows nothing you meant to ship; preflight check #9 reports divergence in either direction and, under the PR-only rulesets, will report at least the promotion merge commit — see Phase 0.5 for what it can and cannot resolve).
 - CHANGELOG promoted: `python3 scripts/assemble-changelog.py promote X.Y.Z` run and committed — it assembles all `changelog.d/` fragments (plus any legacy `[Unreleased]` content) into `## [X.Y.Z] - YYYY-MM-DD` and deletes the fragment files. Never hand-move `[Unreleased]` content. Preflight check 4b fails while unpromoted fragments remain. **Later RCs and the final release:** the version was promoted at its first RC, so hotfix fragments added since then are folded in with `python3 scripts/assemble-changelog.py promote X.Y.Z --append` before each later RC tag, and with `--append --date <final-date>` before the final tag; run that even if no fragment landed since the last RC: with no fragments it only re-dates the header (#5221). Convention: `changelog.d/README.md`.
 - `meson.build` `version: 'X.Y.Z'` updated.
 - The six required checks green on the commit being tagged (`main`'s tip). **Skipped counts as passing; absent, failed or cancelled do not.** A docs/changelog-only push to `main` (the final `promote --append --date` commit is one only when it touches `CHANGELOG.md` alone; folding fragments also deletes `changelog.d/*.md`, which are nested markdown and so build) skips the build legs via preflight's `code_changed=false` (#5320): `Proto backward-compat` shows `skipped`, and the `Linux gcc-15 debug` / `Windows MSVC debug` / `macOS debug` names come from the `docs-required-checks` stub as `success`. That skip only happens when the previous commit's push run succeeded, so a green docs-only commit never hides a red or unbuilt code commit. `success` on those three names for a docs-only commit means *inherited from the predecessor's build*, not *built*; the run's summary says so. A context that is missing entirely is a stop: wait for the run, or find out why it did not start. Check it with:
@@ -67,49 +67,86 @@ Preflight checks (numbered as `scripts/release-preflight.sh` numbers them):
 6. `Dockerfile.server` includes `--data-dir`
 7. release.yml uses `actions/cache/restore@` ONLY — never `actions/cache@` (save). Release
    builds consume cache and never produce it; a `save-always: true` here is the defect, not the
-   requirement (see the CI-cache row in `.claude/routed-concerns.md`)
+   requirement (see the CI-cache row in `.claude/routed-concerns.md`). Today release.yml has no
+   cache step at all, so this passes vacuously
 8. `docker-compose.full-uat.yml` includes `--data-dir`
-9. `origin/dev` and `origin/main` are reconciled (no divergence either direction) — hard FAIL,
-   see Phase 0.5
+9. `origin/dev` and `origin/main` have IDENTICAL tips (both `rev-list --count`s zero) — hard
+   FAIL otherwise, except that it PASSes as "skipping" when either branch is missing on
+   `origin`. **Under the PR-only rulesets this check cannot be made to pass** — read Phase 0.5
+   before acting on it
 10. (`--full` only) local C++ + Erlang compile (~2 min)
 
 **Stop** if preflight fails. Surface the failures and ask the operator how to proceed (commit fixes? bump versions? abort?).
 
-## Phase 0.5 — Branch reconciliation (only when preflight check #9 fails)
+## Phase 0.5 — Branch reconciliation (what preflight check #9 is telling you)
 
 Releases tag from `main`, but ongoing development happens on `dev`. Every prior release has hit the same trap: `dev` accumulates dozens of merged commits, and the prior release's prep commits (CHANGELOG promotion, version stamp) and any hotfixes land on `main` without being carried back to `dev`. By the time the next release is cut, both branches are diverged in both directions and the operator has to remember to reconcile.
 
 The preflight's check #9 surfaces this as a hard FAIL with the exact ahead/behind counts.
 
+**Check #9 cannot be made to PASS by any PR-based step, so do not loop on it.** It demands
+identical tips. A PR merge — merge commit, squash or rebase — always creates a commit on the
+target branch only, so after the promotion PR `main` is ahead by that commit and after the
+back-merge PR `dev` is. The tips have only ever coincided after a direct fast-forward push, which
+the rulesets allow for bypass actors alone. Every 0.14.x tag points at a PR merge commit on
+`main`; at `v0.14.0` and `v0.14.1` the check would have read `main` 5 ahead, `dev` 529 and 1058
+ahead — the releases were cut with #9 red and the operator reading the counts rather than
+waiting for zero. Do the same: after the two PRs below, re-run preflight, confirm that
+`origin/dev..origin/main` is nothing but release prep, hotfixes and merge commits that the
+back-merge will carry, and proceed. Making the check merge-aware is a tooling change tracked
+separately (see `docs/branch-strategy.md` §3.3).
+
 **Both directions go through a pull request.** The *Protect Main* and *Protect Dev* rulesets accept changes only by PR and require one approving review, so for an ordinary contributor a direct `git push` to either branch — including a fast-forward — is refused. (Which accounts may bypass is visible only to repository administrators; the history shows at least one can, since five `main` PRs and the #6271 back-merge merged without an approving review. Use the PR path regardless — it is what leaves the review trail.) Reconciliation flow:
 
 ```bash
+git fetch origin                             # every command below reads origin/*; a stale
+                                             # remote-tracking ref cuts branches in the past
 # Diagnose what's where
 git log --oneline origin/dev..origin/main    # commits on main, not on dev (release prep, hotfixes)
 git log --oneline origin/main..origin/dev    # commits on dev, not on main (usually all the merged work)
 
-# Step 1 — carry main's missing commits back to dev, as a PR into dev.
+# Step 1 — carry main's missing commits back to dev, as a PR into dev. Skip if
+# `git merge-base --is-ancestor origin/main origin/dev` already succeeds (nothing to carry).
 # A merge is usually right (it keeps the hotfix history); cherry-pick only when main
 # holds nothing but a CHANGELOG/version commit that would conflict anyway.
 git switch -c chore/back-merge-main-into-dev origin/dev
-git merge origin/main            # resolve any CHANGELOG / meson.build conflicts; commit
+git merge origin/main            # resolve any CHANGELOG / meson.build conflicts; commit.
+                                 # If a fix was cherry-picked dev->main, delete its changelog.d
+                                 # fragment here: main's copy was folded and removed, dev's copy
+                                 # survives the merge and would be released twice.
 git push -u origin chore/back-merge-main-into-dev
-gh pr create --base dev --title "chore: back-merge main into dev after the <release> promotion"
+gh pr create --base dev \
+  --title "chore: back-merge main into dev after the <release> promotion" \
+  --body "Carries the <release> promotion, folds and hotfixes back to dev. Closes nothing."
 # Get it approved and merged.
 
-# Step 2 — promote the reconciled dev to main, as a PR into main.
-# Base the PR on dev itself or on a release/vX.Y.Z-prep branch cut from it that also carries
-# the CHANGELOG promotion and the version bump (pre-conditions above).
-gh pr create --base main --head dev --title "release: dev → main sync (X.Y.Z)"
+# Step 2 — promote dev to main, as a PR into main, from a release/vX.Y.Z-prep branch cut from
+# the reconciled dev that ALSO carries the release commit (CHANGELOG promotion, meson.build
+# bump, compose defaults — pre-conditions above). `--head dev` is the exception, not the rule:
+# a branch ref keeps moving while the PR is open, so anything merged to dev in the meantime
+# rides into the release unreviewed-for-release (#6264 used it for a no-release-commit sync).
+git switch -c release/vX.Y.Z-prep origin/dev
+python3 scripts/assemble-changelog.py promote X.Y.Z   # or `promote X.Y.Z --append` for a later RC
+# edit meson.build version and the compose ${YUZU_VERSION:-X.Y.Z} defaults; commit
+git push -u origin release/vX.Y.Z-prep
+gh pr create --base main --head release/vX.Y.Z-prep \
+  --title "release: vX.Y.Z — promote changelog, bump version" \
+  --body "dev -> main promotion for vX.Y.Z. Tag follows once merged."
 # Get it approved and merged (a merge commit; the ruleset forbids a force or direct push).
 
-# Step 3 — re-run preflight. Check #9 should now PASS.
+# Step 3 — re-run preflight. Expect check #9 to report main ahead by the step-2 merge commit
+# (and dev ahead by anything merged since); confirm the dev..main list is only release prep,
+# hotfixes and merges, then proceed to Phase 1.
 bash scripts/release-preflight.sh vX.Y.Z
 ```
 
-If check #9 still fails after step 2, something merged to `dev` or `main` between the two PRs; diagnose with the two `git log` lines above and repeat the direction that is behind. Recent instances of both steps: #6271 (back-merge, 2026-10-21) and #6264 (promotion, 2026-10-21); #5113 was the 0.14.0-rc1 promotion.
+`gh pr create` needs `--body` (or `--fill`) when run non-interactively — with `--title` alone it
+exits with "must provide --title and --body". Recent instances of the two PRs: #6271
+(back-merge, 2026-10-21) and #6264 (promotion with `--head dev`, 2026-10-21); #5113 and #5540
+were promotions from `release/*` branches carrying the release commit.
 
-After both branches are reconciled, the operator tags `main`'s tip and Phase 1 proceeds normally.
+The operator then tags `main`'s tip (Phase 1). The back-merge of the step-2 merge commit itself
+happens after the release (Phase 6 step 1).
 
 ## Phase 1 — Tag and push (~5 sec)
 
@@ -362,14 +399,13 @@ If the wizard zip is **missing**, two causes are likely:
 
 After all verification passes:
 
-1. **Carry `main` back to `dev`.** Always, not only when something looks out of place: the
-   promotion commit, every hotfix and every `promote --append` fold exist only on `main` until
-   this happens, and the next release's preflight check #9 hard-fails on the divergence. Open
-   the back-merge PR described in Phase 0.5 step 1 (#6271 is the 2026-10-21 instance).
-2. **Bump dev branch to next dev version**, as a PR into `dev` (the ruleset refuses a direct
-   push; this can ride in the back-merge PR from step 1):
+1. **Carry `main` back to `dev`, and bump `dev`'s version in the same PR.** The promotion
+   merge commit, every hotfix and every `promote --append` fold exist only on `main` until this
+   happens. Open the back-merge PR described in Phase 0.5 step 1 (skip only if
+   `git merge-base --is-ancestor origin/main origin/dev` already holds), and before pushing it
+   add one more commit on the same branch:
    ```bash
-   git switch -c chore/post-release-bump origin/dev
+   # on chore/back-merge-main-into-dev, after `git merge origin/main` has been committed:
    # Update meson.build version to X.Y.(Z+1) or (X+1).Y.0 (operator's call).
    # PLAIN version only — never a -dev/-rcN suffix. The suffix convention was
    # tried at 0.13.1-dev and rejected (operator ruling 2026-07-13): it
@@ -377,16 +413,16 @@ After all verification passes:
    # the entire C++ matrix on dev + every open PR (fixed in fca69e34).
    # (No CHANGELOG step: the promote already left the ## [Unreleased] header +
    # do-not-edit note in place; new entries arrive as changelog.d/ fragments.)
-   git commit -m "chore(post-release): bump dev to X.Y.Z+1"
-   git push -u origin chore/post-release-bump
-   gh pr create --base dev --title "chore(post-release): bump dev to X.Y.Z+1"
+   git commit -am "chore(post-release): bump dev to X.Y.Z+1"
    ```
-   Observed practice has lagged this step: after v0.14.1 (2026-10-07) `dev` still read `0.14.1`
-   on 2026-10-24, and the bump happened at the next promotion instead
-   (`docs/branch-strategy.md` §3.5).
-3. **Close any release-blocker issues** in the milestone.
-4. **Update the rollout doc** if relevant (`docs/dependency-rollout-*.md`, `docs/roadmap.md`).
-5. **Announce.** Yuzu doesn't (currently) have an automated announcement channel. If applicable, post the release URL.
+   One PR, not two: a separate bump branch cut from `origin/dev` before the back-merge has
+   merged lacks `main`'s commits and conflicts with the promotion's version stamp. #6271 is the
+   2026-10-21 back-merge; observed practice has lagged the bump half — after v0.14.1
+   (2026-10-07) `dev` still read `0.14.1` on 2026-10-24, and the bump happened at the next
+   promotion instead (`docs/branch-strategy.md` §3.5).
+2. **Close any release-blocker issues** in the milestone.
+3. **Update the rollout doc** if relevant (`docs/dependency-rollout-*.md`, `docs/roadmap.md`).
+4. **Announce.** Yuzu doesn't (currently) have an automated announcement channel. If applicable, post the release URL.
 
 ## Phase 7 — Produce the release report
 
