@@ -37,11 +37,20 @@
 
 namespace yuzu::test {
 
+/// Tag for the ScopedEnv constructor that REMOVES the variable for the scope
+/// and restores whatever it held (including "did not exist") on destruction.
+struct unset_tag {};
+
 class ScopedEnv {
 public:
     ScopedEnv(std::string name, const std::string& value) : name_(std::move(name)) {
         capture_prev();
         set(value);
+    }
+
+    ScopedEnv(std::string name, unset_tag) : name_(std::move(name)) {
+        capture_prev();
+        unset();
     }
 
     ~ScopedEnv() {

@@ -13,6 +13,8 @@
 #include "pg/multi_host_dsn.hpp"
 #include "pg/pg_raii.hpp"
 
+#include "../scoped_env.hpp"
+
 #include <libpq-fe.h>
 
 #include <catch2/catch_test_macros.hpp>
@@ -139,52 +141,55 @@ int wait_for_backends(const std::string& admin_dsn, const std::string& app, int 
 } // namespace
 
 #ifndef _WIN32
+namespace {
+
 /// Runs every `[pg_reachability]` test with PGCONNECT_TIMEOUT unset.
 ///
 /// The probe lets the environment variable win over the pool default it is
 /// handed (probe_conninfo: `!env_set("PGCONNECT_TIMEOUT")`), and the host-list
-/// tests above bound their waits by that 3s test default. A CI step that exports
+/// tests below bound their waits by that 3s test default. A CI step that exports
 /// PGCONNECT_TIMEOUT for the rest of the suite (so a stalled backend fails fast
 /// instead of wedging a shard until its meson timeout) would otherwise stretch
 /// those waits to the exported value and fail the bounds. The tag, not a list of
 /// test names, selects the tests: a new `[pg_reachability]` test is covered
 /// without anyone remembering to opt in. The one test that exercises the variable
 /// sets it itself and restores what it found, which is the unset state here.
+///
+/// POSIX only: the timing-sensitive host-list tests are themselves compiled out
+/// on Windows, so an exported value cannot reach them there.
 class ReachabilityConnectTimeoutEnvListener : public Catch::EventListenerBase {
 public:
     using Catch::EventListenerBase::EventListenerBase;
 
     void testCaseStarting(Catch::TestCaseInfo const& info) override {
-        active_ = false;
-        saved_.reset();
+        guard_.reset();
         for (auto const& tag : info.tags) {
             if (tag.original == "pg_reachability") {
-                active_ = true;
+                guard_.emplace("PGCONNECT_TIMEOUT", yuzu::test::unset_tag{});
                 break;
             }
         }
-        if (!active_)
-            return;
-        if (const char* v = std::getenv("PGCONNECT_TIMEOUT"))
-            saved_ = v;
-        ::unsetenv("PGCONNECT_TIMEOUT");
     }
 
-    void testCaseEnded(Catch::TestCaseStats const& /*stats*/) override {
-        if (!active_)
-            return;
-        if (saved_)
-            ::setenv("PGCONNECT_TIMEOUT", saved_->c_str(), 1);
-        active_ = false;
-        saved_.reset();
-    }
+    // Catch2 runs a case's SECTIONs between these two events, so the variable
+    // stays unset across section re-entry and is restored once per case.
+    void testCaseEnded(Catch::TestCaseStats const& /*stats*/) override { guard_.reset(); }
 
 private:
-    bool active_{false};
-    std::optional<std::string> saved_;
+    std::optional<yuzu::test::ScopedEnv> guard_;
 };
 
+} // namespace
+
 CATCH_REGISTER_LISTENER(ReachabilityConnectTimeoutEnvListener)
+
+// Proves the tag selects this case and the listener ran. Only meaningful when the
+// runner exports PGCONNECT_TIMEOUT (the CI step that motivates the listener); with
+// it unexported the check passes trivially, never falsely red.
+TEST_CASE("pg_reachability env guard: PGCONNECT_TIMEOUT is unset inside the case",
+          "[server][readyz][pg_reachability]") {
+    CHECK(std::getenv("PGCONNECT_TIMEOUT") == nullptr);
+}
 #endif
 
 // ---------------------------------------------------------------------------
