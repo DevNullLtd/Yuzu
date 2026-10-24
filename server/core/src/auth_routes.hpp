@@ -295,6 +295,22 @@ public:
                                         const std::string& securable_type,
                                         const std::string& operation);
 
+    /// `probe_permission` with ONE difference: an RBAC read that could not be completed (store not
+    /// open, circuit breaker open, pool acquire timeout, a failed role or permission query) is
+    /// answered with a retryable 503 (`retry_after_ms`, no `permission` field) instead of the
+    /// fail-closed 403 that `require_permission` gives every route (ADR-0041). Same decision path
+    /// otherwise (elevation, engine principals, MCP tier, service scope, RBAC, legacy floor), same
+    /// `AuditProbeScope`. NOT a parallel evaluator and NOT a gate: it exists for the one consumer
+    /// whose correctness depends on telling "could not determine" from "definitively denied", the
+    /// Forensics-tier resolver (`resolve_forensics_visible`), where a collapsed answer would
+    /// silently serve a 200 with the Forensics rows missing. A new caller needs the same
+    /// justification; do not switch `require_permission` itself (about a hundred routes document
+    /// the 403).
+    [[nodiscard]] bool probe_permission_unavailable_aware(const httplib::Request& req,
+                                                          httplib::Response& res,
+                                                          const std::string& securable_type,
+                                                          const std::string& operation);
+
     /// `require_list_read` for a resource that is NOT agent-scoped (plugin configuration): the same
     /// decision (ADR-0017 admit-then-filter, elevation, engine principals, MCP tier, service
     /// scope, RBAC, legacy), except that a management-group-CONFINED admission is refused here as
@@ -1037,6 +1053,24 @@ public:
     }
 
 private:
+    /// How `require_permission_impl` answers an RBAC read that could not be completed.
+    enum class RbacDegradeMapping : std::uint8_t {
+        DenyAs403,       ///< ADR-0041 default: fail closed with the 403 every route documents
+        UnavailableAs503 ///< opt-in (`probe_permission_unavailable_aware`): retryable 503
+    };
+
+    /// The body of `require_permission`. `degrade` only changes the answer for an RBAC read that
+    /// could not be completed (the engine branch and the ordinary RBAC branch); the service-scoped
+    /// branch, the legacy fallback and every definitive outcome are identical in both modes.
+    bool require_permission_impl(const httplib::Request& req, httplib::Response& res,
+                                 const std::string& securable_type, const std::string& operation,
+                                 RbacDegradeMapping degrade);
+
+    /// Write the audit row and the retryable 503 for an unavailable RBAC read (opt-in mode only).
+    void respond_rbac_unavailable(const httplib::Request& req, httplib::Response& res,
+                                  const std::string& securable_type, const std::string& operation,
+                                  const char* who);
+
     std::function<void()> after_first_provider_check_for_test_;
 
     /// Whether `(securable_type, operation)` clears the service-scope
