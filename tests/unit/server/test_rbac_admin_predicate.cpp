@@ -194,7 +194,7 @@ TEST_CASE("is_rbac_administrator: RBAC-on branch reached via a DEGRADED "
 
     // Clear the 1s refresh-stampede gate so the next call genuinely attempts
     // a durable re-read instead of serving the just-constructed cache.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
 
     // Starve replica_b's own pool: every maybe_refresh_generation() call
     // from here on cannot acquire a connection and must fail.
@@ -207,7 +207,7 @@ TEST_CASE("is_rbac_administrator: RBAC-on branch reached via a DEGRADED "
 
     // Push wall time past the bound, still starved — this failed attempt is
     // the one that finally exceeds the bound and clears generation_valid_.
-    std::this_thread::sleep_for(std::chrono::milliseconds(4200));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(4200));
     REQUIRE(rbac_enforcement_in_effect(&replica_b));
     REQUIRE(rbac_enforcement_label(&replica_b) == RbacEnforcementLabel::kDegraded);
 

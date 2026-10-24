@@ -155,7 +155,7 @@ TEST_CASE("build_profile_list: system SIDs are filtered out", "[profiles]") {
 TEST_CASE("build_profile_list: duplicate SIDs keep only the first occurrence", "[profiles]") {
     std::vector<RawProfileRecord> records{
         {std::string{kAliceSid}, "C:\\Users\\alice"},
-        {std::string{kAliceSid}, "C:\\Users\\alice-stale-duplicate"},
+        {std::string{kAliceSid}, "C:\\Users\\alice-stale-duplicate"},  // personal-data-ok: synthetic test path
     };
     std::vector<std::string> hku{};
     auto profiles = build_profile_list(records, hku);
@@ -283,10 +283,10 @@ TEST_CASE("render_profile_row: a value containing '|' cannot forge a column", "[
     // covered the unknown-action error string, so a profile name/path
     // containing '|' could inject a synthetic column into the pipe-delimited
     // output. Every field this renderer emits must be sanitised.
-    ProfileInfo info{std::string{kAliceSid}, "ali|ce", "C:\\Users\\a|b", HiveState::loaded};
+    ProfileInfo info{std::string{kAliceSid}, "ali|ce", "C:\\Users\\a|b", HiveState::loaded};  // personal-data-ok: synthetic test path
     auto row = render_profile_row(info);
     CHECK(row.find("ali|ce") == std::string::npos);
-    CHECK(row == std::string{kAliceSid} + "|ali_ce|C:\\Users\\a_b|loaded");
+    CHECK(row == std::string{kAliceSid} + "|ali_ce|C:\\Users\\a_b|loaded");  // personal-data-ok: synthetic test path
 }
 
 TEST_CASE("render_profile_row: exhaustive over every HiveState", "[profiles]") {
@@ -365,6 +365,69 @@ TEST_CASE("render_hive_access_lines: warning precedes the error on a failed moun
     REQUIRE(lines.size() == 2);
     CHECK(lines[0].starts_with("warning|hive_unload_failed: HKU\\MNT "));
     CHECK(lines[1] == "error|failed to load hive for sid '" + std::string{kAliceSid} + "'");
+}
+
+// ── hive_access_token (related issue #5291) ────────────────────────────────
+
+TEST_CASE("hive_access_token: ok/not_found/privilege_missing/mount_failed render their literals "
+          "regardless of refusal",
+          "[profiles]") {
+    CHECK(hive_access_token(HiveAccessStatus::ok, "ignored") == "ok");
+    CHECK(hive_access_token(HiveAccessStatus::not_found, "ignored") == "not_found");
+    CHECK(hive_access_token(HiveAccessStatus::privilege_missing, "ignored") == "privilege_missing");
+    CHECK(hive_access_token(HiveAccessStatus::mount_failed, "ignored") == "mount_failed");
+    CHECK(hive_access_token(HiveAccessStatus::ok, "") == "ok");
+}
+
+TEST_CASE("hive_access_token: file_refused renders the guard token verbatim, or the generic "
+          "literal when empty",
+          "[profiles]") {
+    CHECK(hive_access_token(HiveAccessStatus::file_refused, "hive_owner_unexpected") ==
+          "hive_owner_unexpected");
+    CHECK(hive_access_token(HiveAccessStatus::file_refused, "timeout") == "timeout");
+    CHECK(hive_access_token(HiveAccessStatus::file_refused, "hive_stat_failed:win32_5") ==
+          "hive_stat_failed:win32_5");
+    CHECK(hive_access_token(HiveAccessStatus::file_refused, "") == "file_refused");
+}
+
+// ── render_hive_access_lines: the refusal token (fifth, defaulted argument) ─
+
+TEST_CASE("render_hive_access_lines: file_refused with a token names it on the error line",
+          "[profiles]") {
+    const std::string sid{kAliceSid};
+    const auto lines = render_hive_access_lines(HiveAccessStatus::file_refused, false, "",
+                                                 kAliceSid, "hive_owner_unexpected");
+    REQUIRE(lines.size() == 1);
+    CHECK(lines[0] ==
+          "error|hive file refused for sid '" + sid + "': hive_owner_unexpected");
+}
+
+TEST_CASE("render_hive_access_lines: file_refused with no token keeps the pre-existing wording",
+          "[profiles]") {
+    // The default empty `refusal` makes every pre-existing four-argument call site (registry,
+    // installed_apps) compile and behave unchanged.
+    const auto lines = render_hive_access_lines(HiveAccessStatus::file_refused, false, "",
+                                                 kAliceSid);
+    REQUIRE(lines.size() == 1);
+    CHECK(lines[0] == "error|hive file refused for sid '" + std::string{kAliceSid} + "'");
+}
+
+TEST_CASE("render_hive_access_lines: a pipe in the refusal token is sanitised", "[profiles]") {
+    const std::string sid{kAliceSid};
+    const auto lines = render_hive_access_lines(HiveAccessStatus::file_refused, false, "",
+                                                 kAliceSid, "bad|token");
+    REQUIRE(lines.size() == 1);
+    CHECK(lines[0] == "error|hive file refused for sid '" + sid + "': bad_token");
+}
+
+TEST_CASE("render_hive_access_lines: the unload warning still precedes a tokened refusal",
+          "[profiles]") {
+    const std::string sid{kAliceSid};
+    const auto lines = render_hive_access_lines(HiveAccessStatus::file_refused, true, "MNT",
+                                                 kAliceSid, "timeout");
+    REQUIRE(lines.size() == 2);
+    CHECK(lines[0].starts_with("warning|hive_unload_failed: HKU\\MNT "));
+    CHECK(lines[1] == "error|hive file refused for sid '" + sid + "': timeout");
 }
 
 TEST_CASE("render_hive_access_lines: all 8 status x unload combinations, exact strings",

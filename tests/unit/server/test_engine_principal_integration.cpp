@@ -225,6 +225,9 @@ TEST_CASE("Engine session synthesis: active principal + engine token -> engine s
         CHECK(session->auth_source == "engine_token");
         CHECK(session->role == auth::Role::user);
         CHECK(session->principal_kind == "engine");
+        // The two engine markers are set together; routes that key on `is_engine()` (the
+        // upload-grants list gate) and gates that key on `principal_kind` must agree.
+        CHECK(session->is_engine());
     }
 
     SECTION("revoked engine principal -> no session (fail-closed, terminal)") {
@@ -953,6 +956,8 @@ TEST_CASE("require_list_read — engine principal denied (503) when the RBAC sto
     auto gate = ar.require_list_read(req, res, "GuaranteedState", "Read");
     CHECK_FALSE(gate.admitted);
     CHECK(res.status == 503);
+    // A5: a transient store outage tells an agent when to retry.
+    CHECK(res.body.find("\"retry_after_ms\":5000") != std::string::npos);
 }
 
 TEST_CASE("require_list_read — engine principal with an explicit global RBAC assignment "

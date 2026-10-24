@@ -30,8 +30,9 @@ namespace yuzu::server::instruction {
 
 namespace {
 /// Cookie-authorised writes need a same-site Origin/Referer (token callers are exempt); see
-/// `browser_write_is_cross_site`. Runs AFTER the permission gate so an unauthenticated or
-/// unauthorised caller still gets the 401/403 it always did. Refusals are audited.
+/// `browser_write_is_cross_site`. Defence in depth: the server-wide pre-routing gate answers a
+/// cookie-session write first; this copy serves callers that bypass pre-routing (unit tests) and
+/// runs AFTER the permission gate. Refusals are audited.
 bool refuse_cross_site_write(const Deps& deps, const httplib::Request& req, httplib::Response& res) {
     std::string source;
     if (deps.resolve_session_fn)

@@ -48,6 +48,7 @@
 #include "capability_decls/core_dispatch_capabilities.hpp"
 #include "capability_decls/plugin_action_catalogue_a.hpp"
 #include "command_capability.hpp"
+#include "dispatch_denial_text.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "mcp_server_testonly.hpp"
@@ -58,6 +59,7 @@
 #include "schedule_engine.hpp"
 #include "schedule_runner.hpp"
 #include "test_auth_db_pg_helper.hpp" // AuthDbPg — the last-admin guard's auth.users JOIN (BLOCKING #1)
+#include "test_expected_twins.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -65,6 +67,7 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <expected>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -205,6 +208,17 @@ TEST_CASE("arming_check composition: a system_reserved capability is refused to 
     CHECK(compose_arming_check(registry, &rbac, "alice", "filesystem", "exists"));
 }
 
+TEST_CASE("arming_check composition: RBAC off arms for a human but never for an engine principal "
+          "(#6204)",
+          "[server][routes][mcp][pg]") {
+    CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
+    TWINS_RBAC(rbac);
+    rbac.set_rbac_enabled(false);
+    REQUIRE_FALSE(rbac.is_rbac_enabled());
+    CHECK(compose_arming_check(registry, &rbac, "alice", "filesystem", "exists"));
+    CHECK_FALSE(compose_arming_check(registry, &rbac, "engine:vuln", "filesystem", "exists"));
+}
+
 TEST_CASE("arming_check composition: RBAC legacy-open (disabled) admits regardless of grant",
           "[server][routes][mcp][pg]") {
     CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
@@ -290,6 +304,15 @@ struct Harness {
                         const std::string& action) {
                       return compose_arming_check(registry, &rbac, principal, plugin, action);
                   },
+              // #6096: the outbox spent-ticket ledger. This harness's enqueue_fn writes no
+              // outbox row, so the ledger is empty and no occurrence has run.
+              .outbox_occurrences_fn = [](const std::string&)
+                  -> std::expected<std::vector<std::string>, std::string> {
+                  return std::vector<std::string>{};
+              },
+              .outbox_exists_fn = [](const std::string&) -> std::expected<bool, std::string> {
+                  return false;
+              },
           }) {
         tracker.create_tables();
         approvals.create_tables();
@@ -429,197 +452,7 @@ TEST_CASE("arming_check (approval path): a schedule whose creator lost the requi
 // MCP/REST twin parity — same securable, same operation, per pair
 // ═════════════════════════════════════════════════════════════════════════
 
-namespace {
-
-struct TwinRow {
-    std::string_view tool;
-    std::string_view securable;
-    std::string_view operation;
-    bool is_read;
-};
-
-// Pinned against plugin_config_routes.hpp's / file_retrieval_routes.hpp's
-// documented REST route tables — the SAME (securable, operation) each REST
-// handler gates on (see those headers' file-header route tables).
-constexpr TwinRow kExpectedTwins[] = {
-    {"get_plugin_config", "PluginConfig", "Read", true},
-    {"list_plugin_config", "PluginConfig", "Read", true},
-    {"set_plugin_config", "PluginConfig", "Write", false},
-    {"delete_plugin_config", "PluginConfig", "Delete", false},
-    {"set_plugin_secret", "PluginSecret", "Write", false},
-    {"delete_plugin_secret", "PluginSecret", "Delete", false},
-    {"get_plugin_kill_switch", "PluginConfig", "Read", true},
-    {"set_plugin_kill_switch", "PluginConfig", "Write", false},
-    {"mint_upload_grant", "UploadGrant", "Write", false},
-    {"list_upload_grants", "UploadGrant", "Read", true},
-    {"revoke_upload_grant", "UploadGrant", "Delete", false},
-    // #4036 (api-parity Batch A) — pinned against preflight_routes.cpp's /
-    // deployment_routes.cpp's new GET /api/v1/preflight/runs / GET
-    // /api/v1/deployments/preview handlers (same (securable, operation) each
-    // REST twin gates on).
-    {"list_preflight_runs", "Infrastructure", "Read", true},
-    {"get_deployment_preview", "SoftwareDeployment", "Read", true},
-    {"list_deployments", "SoftwareDeployment", "Read", true},
-    {"get_deployment", "SoftwareDeployment", "Read", true},
-    // Estate E-2: the discovered-devices read twin, pinned against the REST
-    // GET /api/v1/network/discovered-devices gate in network_routes.cpp.
-    {"list_discovered_devices", "Infrastructure", "Read", true},
-    // The MCP twin of POST /api/v1/hardware/sync (same Execution:Execute gate).
-    {"sync_hardware_software", "Execution", "Execute", false},
-    // #4030: executions/workflows/schedules read-twin programme.
-    {"list_workflows", "Workflow", "Read", true},
-    {"get_workflow", "Workflow", "Read", true},
-    {"get_workflow_execution", "Workflow", "Read", true},
-    {"list_workflow_executions", "Workflow", "Read", true},
-    // #2146 A2-R1 - pinned against the new GET /api/v1/executions/{id}/children
-    // (rest_api_v1.cpp) and legacy GET /api/executions/{id}/children
-    // (execution_routes.cpp) handlers' shared (securable, operation) gate.
-    {"get_execution_children", "Execution", "Read", true},
-    // #4029 (api-parity Batch A content/catalog half): instruction-definition
-    // read twins, pinned against instruction_definition_model.hpp / the new
-    // GET /api/v1/instructions* routes (rest_api_v1.cpp).
-    {"list_definitions", "InstructionDefinition", "Read", true},
-    {"get_definition", "InstructionDefinition", "Read", true},
-    {"export_definition", "InstructionDefinition", "Read", true},
-    // #4029: product-pack read twins, pinned against product_pack_model.hpp /
-    // the new GET /api/v1/product-packs* routes.
-    {"list_product_packs", "ProductPack", "Read", true},
-    {"get_product_pack", "ProductPack", "Read", true},
-    // #4027 — TAR process-tree/capture-sources/retention-paused read twins.
-    // Same Infrastructure:Read gate as GET /fragments/tar/process-tree,
-    // .../capture-sources, .../retention-paused (tar_tree_routes.cpp /
-    // dashboard_routes.cpp).
-    {"list_tar_process_tree_devices", "Infrastructure", "Read", true},
-    {"list_tar_capture_sources_devices", "Infrastructure", "Read", true},
-    {"list_tar_retention_paused", "Infrastructure", "Read", true},
-    // #4031: directory-sync (AD/Entra) read twin — parity with GET
-    // /api/v1/directory/users. The OIDC-config, auto-approve-rules, and
-    // pending-agents read twins are REST-only per #520 (see
-    // docs/mcp-server.md) and so carry no MCP tool, no row here.
-    //
-    // get_directory_status (the /directory/status twin) is deliberately NOT
-    // listed here even though it shares Directory:Read: it takes no input
-    // parameters, so its schema is the honest, bounded
-    // {"type":"object","properties":{}} shape — same precedent as
-    // get_guardian_schemas above, also absent from this array for the same
-    // reason (the A5 sweep below asserts every LISTED tool's schema differs
-    // from that literal, which is correct for this curated list but not a
-    // universal rule; validate_tool_security_registration's boot-time check
-    // is what proves get_directory_status's own table entries are
-    // consistent, and test_mcp_server.cpp exercises its dispatch directly).
-    {"list_directory_users", "Directory", "Read", true},
-    // #4033 (#2146 Batch A) — pinned against
-    // /fragments/create-group-form's own ManagementGroup:Write gate
-    // (dashboard_routes.cpp) and its REST twin GET /api/v1/management-groups/
-    // agent-count-preview (rest_api_v1.cpp).
-    {"preview_management_group_agent_count", "ManagementGroup", "Write", false},
-    // #4034 — compliance/policy REST v1 read twins.
-    {"get_policy", "Policy", "Read", true},
-    {"list_policy_fragments", "Policy", "Read", true},
-    {"get_policy_agent_statuses", "Policy", "Read", true},
-    // #4035 (api-parity #2146 Batch A): MCP-only gaps closing the REST-only
-    // twins for /fragments/device/dex and /fragments/dex/device/app-perf —
-    // see docs/api-twin-recipe.md §6/§7/§8, which directs a twin PR to extend
-    // this array (not only the plugin-config/upload-grant families the
-    // header comment above was originally pinned against).
-    {"get_dex_device_score", "GuaranteedState", "Read", true},
-    {"get_dex_device_app_perf", "GuaranteedState", "Read", true},
-    // #4035: the 8 genuinely-new REST+MCP twins from the same issue.
-    {"get_dex_app", "GuaranteedState", "Read", true},
-    {"list_dex_apps", "GuaranteedState", "Read", true},
-    // ADR-0031 WS-A4 PR-1: the Catalogue View 1 REST+MCP
-    // twin, pinned against GET /api/v1/dex/catalogue (rest_api_v1.cpp).
-    {"get_dex_catalogue", "GuaranteedState", "Read", true},
-    {"get_dex_catalogue_group", "GuaranteedState", "Read", true},
-    {"get_dex_device_history", "GuaranteedState", "Read", true},
-    {"get_dex_observation", "GuaranteedState", "Read", true},
-    {"get_dex_health", "GuaranteedState", "Read", true},
-    {"get_dex_trends", "GuaranteedState", "Read", true},
-    {"get_dex_overview", "GuaranteedState", "Read", true},
-    // #4037 — Guardian read twins (api-parity #2146 Batch A). Pinned against
-    // rest_api_v1.cpp's /api/v1/guaranteed-state/{status,rules,events,
-    // rules/{id}/status,agents/{id}/rules} routes.
-    {"get_guardian_status", "GuaranteedState", "Read", true},
-    {"list_guardian_rules", "GuaranteedState", "Read", true},
-    {"list_guardian_events", "GuaranteedState", "Read", true},
-    {"get_guardian_rule_status", "GuaranteedState", "Read", true},
-    {"get_guardian_device_guards", "GuaranteedState", "Read", true},
-    // #2146 Batch B2 — result-set MCP twins, pinned against rest_api_v1.cpp's
-    // 12-operation REST v1 result-set API (docs/scope-walking-design.md).
-    // The three async dispatch producers + reevaluate share
-    // execute_instruction's own Execution:Execute pair; the rest are owner-
-    // scoped, no RBAC gate in the handler (Infrastructure:Read/Write/Delete
-    // drive MCP tier classification only, matching validate_scope's own
-    // precedent of a registered pair with no backing perm_fn call).
-    //
-    // create_result_set_from_inventory_query is DELIBERATELY NOT listed here:
-    // its real RBAC gate is a genuine perm_fn(Inventory, Read) call (matching
-    // the REST twin exactly — see that tool's own permission-denied test),
-    // but its kToolSecurityRows/kWriteTools registration is Inventory:WRITE,
-    // because the tool genuinely creates a new result set (a write) and
-    // readOnlyHint/kWriteTools classification must stay truthful regardless
-    // of which permission happens to gate the read half of the work. This
-    // array's contract ("REST and MCP gate on the SAME securable/operation")
-    // does not hold for this one tool by design, so pinning it here would
-    // assert something false in one direction or fail in the other.
-    {"list_result_sets", "Infrastructure", "Read", true},
-    {"create_result_set", "Infrastructure", "Write", false},
-    {"create_result_set_from_tar_query", "Execution", "Execute", false},
-    {"create_result_set_from_instruction_result", "Execution", "Execute", false},
-    {"reevaluate_result_set", "Execution", "Execute", false},
-    {"get_result_set", "Infrastructure", "Read", true},
-    {"get_result_set_members", "Infrastructure", "Read", true},
-    {"get_result_set_lineage", "Infrastructure", "Read", true},
-    {"pin_result_set", "Infrastructure", "Write", false},
-    {"unpin_result_set", "Infrastructure", "Write", false},
-    {"delete_result_set", "Infrastructure", "Delete", false},
-    // #2146 Batch B3 (api-parity programme) — execution/fleet statistics +
-    // fleet visualization read twins. Pinned against rest_api_v1.cpp's
-    // GET /api/v1/execution-statistics{,/agents,/definitions} + GET
-    // /api/v1/statistics, and viz_routes.cpp's GET /api/v1/viz/fleet/topology
-    // + GET /api/v1/viz/host/{id}/topology — the SAME (securable, operation)
-    // each REST twin gates on.
-    {"get_execution_statistics", "Execution", "Read", true},
-    {"get_execution_statistics_by_agent", "Execution", "Read", true},
-    {"get_execution_statistics_by_definition", "Execution", "Read", true},
-    {"get_fleet_statistics", "Infrastructure", "Read", true},
-    {"get_fleet_topology", "Response", "Read", true},
-    {"get_host_topology", "Response", "Read", true},
-    // #2146 Batch B5 - offload targets, CA root-CSR export/subordinate-chain
-    // import, platform license, and software deployments. Pinned against
-    // offload_routes.cpp / ca_routes.cpp / rest_api_v1.cpp's own gates.
-    {"list_offload_targets", "Infrastructure", "Read", true},
-    {"create_offload_target", "Infrastructure", "Write", false},
-    {"get_offload_target", "Infrastructure", "Read", true},
-    {"delete_offload_target", "Infrastructure", "Write", false},
-    {"list_offload_target_deliveries", "Infrastructure", "Read", true},
-    {"export_ca_root_csr", "Security", "Read", true},
-    {"import_ca_chain", "Security", "Write", false},
-    {"get_platform_license", "License", "Read", true},
-    {"activate_platform_license", "License", "Write", false},
-    {"list_license_alerts", "License", "Read", true},
-    {"list_software_deployments", "SoftwareDeployment", "Read", true},
-    {"create_software_deployment", "SoftwareDeployment", "Execute", false},
-    {"rollback_software_deployment", "SoftwareDeployment", "Execute", false},
-    {"cancel_software_deployment", "SoftwareDeployment", "Execute", false},
-    // Wave 7 PR7.2 — app-usage read surface. Pinned against
-    // app_usage_routes.cpp's own gate (GET /api/v1/forensics/agents/{id}/
-    // app-usage), same (securable, operation) the MCP twin enforces.
-    {"get_agent_app_usage", "Forensics", "Read", true},
-    // #2146 A2-R4 (review finding, PR #4656) — approval-review read twins.
-    // Pinned against rest_api_v1.cpp's GET /api/v1/approvals and GET
-    // /api/v1/approvals/pending/count, same Approval:Read gate the MCP
-    // twins' tier_allows/perm_fn calls enforce.
-    {"list_pending_approvals", "Approval", "Read", true},
-    {"get_pending_approval_count", "Approval", "Read", true},
-    // M.9 software catalogue twins, pinned against
-    // GET /api/v1/inventory/software/catalogue{,/versions} (rest_api_v1.cpp): the same
-    // Inventory:Read gate the REST routes take through require_fleet_read.
-    {"query_software_catalogue", "Inventory", "Read", true},
-    {"get_software_versions", "Inventory", "Read", true},
-};
-
-} // namespace
+using yuzu::server::twin_table::kExpectedTwins;
 
 TEST_CASE("operator surface MCP twins: securable/operation parity with the REST routes",
           "[server][routes][mcp]") {
@@ -685,7 +518,11 @@ TEST_CASE("operator surface MCP twins: every tool satisfies the A5 contract",
             "list_tar_retention_paused",
             "get_guardian_status",
             "list_guardian_rules",
+            "get_guardian_policy_generation",
             "get_pending_approval_count",
+            "list_crypto_widgets",
+            "get_crypto_dashboard_layout",
+            "get_crypto_ca_stats",
         };
         if (!kNoArgTools.contains(expected.tool))
             CHECK(schema_it->schema_json != R"({"type":"object","properties":{}})");
@@ -720,5 +557,101 @@ TEST_CASE("operator surface MCP twins: no MCP tool exists for any agent-authenti
         CHECK(name.find("commit_upload") == std::string::npos);
         CHECK(name.find("cancel_upload") == std::string::npos);
         CHECK(name.find("open_upload") == std::string::npos);
+    }
+}
+
+// ── #6065 PR-Q: the shared dispatch-denial wording ────────────────────────
+//
+// `describe_dispatch_denial` (dispatch_denial_text.hpp) is the ONE helper both
+// POST /api/v1/quarantine (kRest) and MCP's pre-dispatch dry run (kMcp) render
+// a chokepoint denial through. Today the surface argument is accepted and
+// unused, so the two surfaces must agree byte for byte; a later change that
+// differentiates the wording must update this pin deliberately.
+
+namespace {
+
+constexpr detail::DispatchDenialReason kAllDenialReasons[] = {
+    detail::DispatchDenialReason::Unclassified,      detail::DispatchDenialReason::Ambiguous,
+    detail::DispatchDenialReason::AnonymousOperator, detail::DispatchDenialReason::Forbidden,
+    detail::DispatchDenialReason::ApprovalRequired,  detail::DispatchDenialReason::KillSwitched,
+};
+
+detail::DispatchDenial denial_for(detail::DispatchDenialReason reason) {
+    return detail::DispatchDenial{reason, "Security", authz::Operation::Execute};
+}
+
+} // namespace
+
+TEST_CASE("describe_dispatch_denial: REST and MCP wording is byte-identical for every reason "
+          "(#6065 PR-Q)",
+          "[server][routes][mcp][quarantine]") {
+    for (const auto reason : kAllDenialReasons) {
+        CAPTURE(detail::to_string(reason));
+        const auto denial = denial_for(reason);
+        const auto rest = describe_dispatch_denial(reason, "quarantine", "quarantine", denial,
+                                                   DenialSurface::kRest);
+        const auto mcp = describe_dispatch_denial(reason, "quarantine", "quarantine", denial,
+                                                  DenialSurface::kMcp);
+        CHECK(rest.cls == mcp.cls);
+        CHECK(rest.message == mcp.message);
+        CHECK(rest.remediation == mcp.remediation);
+        CHECK_FALSE(rest.message.empty());
+    }
+}
+
+// Pure-move pin: the six strings below are the ones the helper carried while it was an
+// anonymous-namespace local of mcp_server.cpp (origin/dev), copied from THAT source and not
+// from dispatch_denial_text.hpp, so a drift introduced by the move shows up here.
+TEST_CASE("describe_dispatch_denial: the six pre-existing MCP strings are preserved verbatim "
+          "(#6065 PR-Q pure move)",
+          "[server][routes][mcp][quarantine]") {
+    using Reason = detail::DispatchDenialReason;
+    const auto text = [](Reason reason) {
+        return describe_dispatch_denial(reason, "quarantine", "quarantine", denial_for(reason),
+                                        DenialSurface::kMcp);
+    };
+
+    for (const auto reason : {Reason::Unclassified, Reason::Ambiguous}) {
+        CAPTURE(detail::to_string(reason));
+        const auto t = text(reason);
+        CHECK(t.cls == DispatchDenialClass::kInvalidParams);
+        CHECK(t.message == "unknown or ambiguous plugin.action");
+        CHECK(t.remediation == "confirm the plugin/action name via discover_plugins or "
+                               "discover_instructions and re-call");
+    }
+    {
+        const auto t = text(Reason::AnonymousOperator);
+        CHECK(t.cls == DispatchDenialClass::kPermissionDenied);
+        CHECK(t.message ==
+              "dispatch denied: the caller has no resolved identity for Security:Execute");
+        CHECK(t.remediation == "this indicates a server-side identity-derivation fault, not a "
+                               "caller mistake; contact an administrator");
+    }
+    {
+        const auto t = text(Reason::Forbidden);
+        CHECK(t.cls == DispatchDenialClass::kPermissionDenied);
+        CHECK(t.message == "permission denied: Security:Execute");
+        CHECK(t.remediation == "the dispatching caller lacks this grant; request it, or dispatch "
+                               "as a caller who holds it");
+    }
+    {
+        const auto t = text(Reason::ApprovalRequired);
+        CHECK(t.cls == DispatchDenialClass::kPermissionDenied);
+        // The em dash (U+2014, UTF-8 E2 80 94) is part of the pre-existing wire string.
+        CHECK(t.message == "approval required for quarantine.quarantine \xE2\x80\x94 this action "
+                           "requires either an admin caller or a redeemed approval ticket that "
+                           "this dispatch does not carry");
+        CHECK(t.remediation == "re-call using a supervised-tier MCP token, which mints and polls "
+                               "an approval ticket for this class of call, or dispatch as an "
+                               "admin caller");
+    }
+    {
+        const auto t = text(Reason::KillSwitched);
+        CHECK(t.cls == DispatchDenialClass::kPermissionDenied);
+        CHECK(t.message ==
+              "dispatch denied: the per-action kill switch is OFF for quarantine.quarantine");
+        CHECK(t.remediation == "an operator has thrown an emergency stop for this plugin.action "
+                               "(set_plugin_kill_switch / PUT .../kill-switch); it must be "
+                               "re-enabled before this call can dispatch");
     }
 }

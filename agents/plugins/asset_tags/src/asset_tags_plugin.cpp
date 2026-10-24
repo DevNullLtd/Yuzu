@@ -53,11 +53,33 @@ std::atomic<bool> g_shutdown{false};
 std::mutex g_stop_mu;
 std::condition_variable g_stop_cv;
 std::thread g_check_thread;
-std::atomic<int> g_check_interval_s{300}; // default 5 minutes
+constexpr int kDefaultCheckIntervalS = 300; // 5 minutes
+std::atomic<int> g_check_interval_s{kDefaultCheckIntervalS};
 // Process-lifetime persist-failure visibility (guarded by g_mu; not persisted,
 // reset on restart). The last message is a write error or a write warning.
 std::uint64_t g_persist_failures = 0;
 std::string g_last_persist_error;
+
+// Return the per-lifecycle globals to their first-load values: the store path, the cache and the
+// check interval. Called from init() only. A loader can keep a plugin image mapped across
+// dlclose (the sanitizer runtimes do, and so does glibc for an image that exports unique
+// symbols), so a second init() in the same process would otherwise inherit the first lifecycle's
+// store path, cache and interval: a malformed asset_tags.check_interval would keep the PREVIOUS
+// interval instead of the documented default (#6053). The agent calls init() once per plugin per
+// run, so this changes nothing in production.
+//
+// shutdown() deliberately does NOT reset: when run() exits early (an early return, or an
+// exception escaping it) the agent shuts plugins down BEFORE it drains its command pool, and a
+// sync still queued at that point must keep persisting to the store path rather than report OK
+// having written nothing. (The normal stop path drains the pool first.) The persist-failure
+// counters above are deliberately not reset either: they are process-lifetime by design.
+// Callers must have joined the check thread (or not yet started it); this takes g_mu.
+void reset_lifecycle_state() {
+    std::lock_guard lock(g_mu);
+    g_state = {};
+    g_store_path.clear();
+    g_check_interval_s.store(kDefaultCheckIntervalS, std::memory_order_relaxed);
+}
 
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -163,6 +185,7 @@ public:
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
         yuzu::PluginContext pctx{ctx.raw()};
+        reset_lifecycle_state();
         auto data_dir = pctx.get_config("agent.data_dir");
         if (!data_dir.empty())
             g_store_path = fs::path(std::string{data_dir}) / "asset_tags.json";

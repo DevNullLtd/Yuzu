@@ -1,15 +1,20 @@
 /**
  * test_privacy_permissions_win_internals.cpp -- TU-inclusion seam over privacy_permissions_win.cpp:
- * its production Win32Registry and Win32HiveFileProbe shells (and the internal-linkage
- * StabilityWatch and with_user_hive wiring) driven through the pure walk and guard headers
- * (privacy_permissions_win_walk.hpp, privacy_permissions_hive_guard.hpp). The pure classifiers
- * (classify_stability, classify_hive_file, ...) are covered in
- * test_privacy_permissions_parsers.cpp, and the walk and guard logic (the deadline-first order
- * among it) over fakes in test_privacy_permissions_win_walk.cpp; these cases prove the production
+ * its production Win32Registry and (via agents/shared/win_hive_file_probe.hpp) Win32HiveFileProbe
+ * shells (and the internal-linkage StabilityWatch and with_user_hive wiring) driven through the
+ * pure walk and guard headers (privacy_permissions_win_walk.hpp,
+ * agents/shared/win_hive_file_guard.hpp). The pure classifiers (classify_stability,
+ * classify_hive_file, ...) are covered in test_privacy_permissions_parsers.cpp, and the walk and
+ * guard logic (the deadline-first order among it) over fakes in
+ * test_privacy_permissions_win_walk.cpp; these cases prove the production
  * WIRING around them: that the watch is armed and polled, that the walk decodes a ConsentStore
  * subtree, that the guard verifies the file identity, that with_user_hive reads a loaded hive
  * before ever entering the offline arm, and that the final-path comparison is Windows' own
  * ordinal one. This TU uses no fake: a per-process-salted volatile HKCU key and a TempDir file.
+ *
+ * with_user_hive's offline arm is now guarded by DEFAULT (related issue #5291): a caller passing
+ * no `check` gets the shared default guard, not an unguarded mount. Every case below that needs
+ * the pre-default-on unguarded path passes `&yuzu::win::kOfflineHiveFileUnguarded` explicitly.
  *
  * `#if defined(_WIN32)` guards the WHOLE body -- empty TU elsewhere (the same shape as
  * test_execution_artifacts_win_internals.cpp and test_privacy_permissions_macos_internals.cpp).
@@ -53,6 +58,19 @@ namespace fs = std::filesystem;
 #include <winioctl.h> // FSCTL_SET_SPARSE (the sparse-file oversize fixture)
 
 using namespace yuzu::privacy_permissions;
+
+// The guard lives in yuzu::win; this file spells its names win::X.
+namespace yuzu::privacy_permissions::win {
+using namespace ::yuzu::win;
+}
+
+// The shared hive-file probe, its owners and its helpers (agents/shared/win_hive_file_probe.hpp,
+// pulled in by the plugin TU above), spelled unqualified below.
+using yuzu::win::FindHandle;
+using yuzu::win::LocalFreeGuard;
+using yuzu::win::UniqueHandle;
+using yuzu::win::Win32HiveFileProbe;
+using yuzu::win::final_path_matches;
 
 static_assert(!std::is_copy_constructible_v<UniqueHandle>);
 static_assert(!std::is_copy_constructible_v<FindHandle>);
@@ -704,13 +722,17 @@ TEST_CASE("privacy_permissions win: with_user_hive reports a failed unload even 
 
     bool threw = false;
     try {
+        // The opt-out: this fixture hive is owned by the TEST ACCOUNT (RegSaveKeyExW saves it as
+        // whoever is running the test), not the synthetic profile SID passed below -- under the
+        // new default-on guard this call would be refused as hive_owner_unexpected before ever
+        // reaching the throw this case means to exercise. Every other assertion is unchanged.
         yuzu::win::with_user_hive(
             synthetic_sid(), profile,
             [&](HKEY root) {
                 RegOpenKeyExW(root, nullptr, 0, KEY_READ, held.put());
                 throw std::runtime_error("fn failed");
             },
-            &report);
+            &report, &yuzu::win::kOfflineHiveFileUnguarded);
     } catch (const std::runtime_error&) {
         threw = true;
     }
@@ -720,6 +742,91 @@ TEST_CASE("privacy_permissions win: with_user_hive reports a failed unload even 
     CHECK(report.mounted_offline);
     CHECK_FALSE(report.mount_name.empty());
     CHECK(report.unload_failed); // written by the guard's destructor while unwinding
+    cleanup.run();
+    CHECK_FALSE(synthetic_mount_present());
+}
+
+namespace {
+/// The fixture hive's owner, read back through the real probe -- SKIP when it is in the
+/// hive_owner_allowed allow-set (S-1-5-18 LocalSystem or S-1-5-32-544 Administrators, e.g. an
+/// elevated/SYSTEM test runner), which would make "the default guard refuses this fixture" false
+/// rather than untestable.
+std::string fixture_owner_sid(const std::filesystem::path& ntuser) {
+    Win32HiveFileProbe probe;
+    win::LeafFacts leaf;
+    REQUIRE(probe.leaf_facts(ntuser.wstring(), leaf) == 0);
+    return leaf.owner_sid;
+}
+} // namespace
+
+TEST_CASE("privacy_permissions win: with_user_hive refuses the default fixture hive (owned by "
+          "the test account, not the synthetic profile SID)",
+          "[privacy_permissions][win_internals]") {
+    require_live_arm_missed();
+    TestKey saved(false); // RegSaveKeyExW saves only non-volatile keys
+    set_sz(saved.make(L"k").get(), L"v", L"1");
+    yuzu::test::TempDir tmp("yuzu_test_privperm_hive_");
+    fs::create_directories(tmp.path);
+    const auto ntuser = tmp.path / "NTUSER.DAT";
+    {
+        const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
+        if (!backup.ok()) SKIP("saving a mountable hive needs SeBackupPrivilege: not held here");
+        const LONG rc = RegSaveKeyExW(saved.root, ntuser.c_str(), nullptr, REG_LATEST_FORMAT);
+        if (rc == ERROR_PRIVILEGE_NOT_HELD) SKIP("RegSaveKeyExW: privilege not held");
+        REQUIRE(rc == ERROR_SUCCESS);
+    }
+    const auto owner = fixture_owner_sid(ntuser);
+    if (owner == "S-1-5-18" || owner == "S-1-5-32-544")
+        SKIP("the fixture owner (" << owner << ") is in the default guard's allow-set here "
+             "(an elevated/SYSTEM test run) -- the refusal this case checks cannot occur");
+
+    const std::string profile = yuzu::win::from_wide(tmp.path.c_str());
+    yuzu::win::RegKey no_held;
+    yuzu::win::HiveAccessReport report;
+    const HiveCleanup cleanup{no_held, report};
+
+    int fn_calls = 0;
+    const auto status = yuzu::win::with_user_hive(
+        synthetic_sid(), profile, [&](HKEY) { ++fn_calls; }, &report);
+    if (status == yuzu::win::HiveAccessStatus::privilege_missing)
+        SKIP("the offline arm needs SeBackupPrivilege and SeRestorePrivilege: not held here");
+    CHECK(status == yuzu::win::HiveAccessStatus::file_refused);
+    CHECK(report.refusal == win::kHiveOwnerUnexpected);
+    CHECK(fn_calls == 0);
+    CHECK_FALSE(report.mounted_offline); // before_load refused: no mount was ever attempted
+    CHECK_FALSE(synthetic_mount_present());
+}
+
+TEST_CASE("privacy_permissions win: &kOfflineHiveFileUnguarded mounts the same fixture cleanly",
+          "[privacy_permissions][win_internals]") {
+    require_live_arm_missed();
+    TestKey saved(false);
+    set_sz(saved.make(L"k").get(), L"v", L"1");
+    yuzu::test::TempDir tmp("yuzu_test_privperm_hive_");
+    fs::create_directories(tmp.path);
+    {
+        const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
+        if (!backup.ok()) SKIP("saving a mountable hive needs SeBackupPrivilege: not held here");
+        const LONG rc = RegSaveKeyExW(saved.root, (tmp.path / "NTUSER.DAT").c_str(), nullptr,
+                                      REG_LATEST_FORMAT);
+        if (rc == ERROR_PRIVILEGE_NOT_HELD) SKIP("RegSaveKeyExW: privilege not held");
+        REQUIRE(rc == ERROR_SUCCESS);
+    }
+    const std::string profile = yuzu::win::from_wide(tmp.path.c_str());
+    yuzu::win::RegKey no_held;
+    yuzu::win::HiveAccessReport report;
+    const HiveCleanup cleanup{no_held, report};
+
+    int fn_calls = 0;
+    const auto status = yuzu::win::with_user_hive(
+        synthetic_sid(), profile, [&](HKEY) { ++fn_calls; }, &report,
+        &yuzu::win::kOfflineHiveFileUnguarded);
+    if (status == yuzu::win::HiveAccessStatus::privilege_missing)
+        SKIP("the offline arm needs SeBackupPrivilege and SeRestorePrivilege: not held here");
+    CHECK(status == yuzu::win::HiveAccessStatus::ok);
+    CHECK(fn_calls == 1);
+    CHECK(report.mounted_offline);
+    CHECK_FALSE(report.unload_failed); // clean unload
     cleanup.run();
     CHECK_FALSE(synthetic_mount_present());
 }

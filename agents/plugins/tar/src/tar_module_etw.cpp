@@ -7,8 +7,8 @@
  * Windows section (#ifdef _WIN32): a real-time ETW session on
  * Microsoft-Windows-Kernel-Process with the IMAGE keyword, ProcessTrace on a
  * dedicated thread, TDH decode of image load (5) / unload (6) by property name,
- * signing resolved at drain via WinVerifyTrust + CryptQueryObject. Mirrors
- * tar_proc_etw.cpp.
+ * signing resolved at drain through a no-reparse handle (NtCreateFile +
+ * WinVerifyTrust(hFile) + the provider-chain signer). Mirrors tar_proc_etw.cpp.
  *
  * Off-Windows: every method is a no-op; start() returns false.
  */
@@ -73,15 +73,21 @@ ModuleSignVerdict SigningCache::get(const std::string& full_path, std::int64_t m
 #define NOMINMAX
 #endif
 #include <windows.h>
+// NtCreateFile's UNICODE_STRING / OBJECT_ATTRIBUTES / IO_STATUS_BLOCK / NTSTATUS; must
+// follow windows.h. The function itself is resolved from ntdll at run time (no import lib).
+#include <winternl.h>
 // <evntcons.h>/<evntrace.h> must follow windows.h; <tdh.h> follows those.
 #include <evntcons.h>
 #include <evntrace.h>
 #include <tdh.h>
-// Signing: WinVerifyTrust (softpub action GUID) + CryptQueryObject signer walk.
+// Signing: WinVerifyTrust (softpub action GUID) + the provider-chain signer walk
+// (WTHelper*) and CertGetNameStringW.
 #include <softpub.h>
 #include <wincrypt.h>
 #include <wintrust.h>
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
+
+#include <spdlog/spdlog.h>
 
 #include <atomic>
 #include <cstring> // std::memset (stale-session props reset)
@@ -90,12 +96,19 @@ ModuleSignVerdict SigningCache::get(const std::string& full_path, std::int64_t m
 #include <utility>
 #include <vector>
 
+#include "tar_local_image_path.hpp" // refuse network-path images (see image_path_is_local)
+
 #pragma comment(lib, "tdh.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "crypt32.lib")
 
 namespace yuzu::tar {
+
+static_assert(kDriveTypeFixed == DRIVE_FIXED);
+static_assert(kFileAttributeReparsePoint == FILE_ATTRIBUTE_REPARSE_POINT);
+static_assert(kReparseTagNameSurrogateBit == IsReparseTagNameSurrogate(0xFFFFFFFFU));
+
 namespace {
 
 // Microsoft-Windows-Kernel-Process: {22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}
@@ -133,21 +146,16 @@ std::int64_t filetime_to_unix(LARGE_INTEGER ft) {
 // conversion is behaviour-identical for the (NUL-free) paths this collector handles.
 std::wstring utf8_to_wide(const std::string& s) { return yuzu::win::to_wide(s); }
 
-// The Kernel-Process IMAGE event delivers ImageName as an NT object-manager
-// device path (\Device\HarddiskVolumeN\...). WinVerifyTrust and GetFileAttributesExW
-// both REJECT NT paths, so without this conversion every signing verdict would be
-// kUnknown (governance HIGH). \\?\GLOBALROOT exposes the NT object namespace to the
-// Win32 file APIs: \\?\GLOBALROOT\Device\HarddiskVolumeN\... is accepted by
-// CreateFile and the trust/crypt file readers. Drive-letter and already-\\?\-prefixed
-// paths pass through unchanged. UTF-8 in/out (the verifier widens). Runbook-verified.
-std::string nt_path_to_win32(const std::string& p) {
-    if (p.rfind("\\Device\\", 0) == 0) {
-        return "\\\\?\\GLOBALROOT" + p;
-    }
-    return p;
-}
-
 std::string wide_to_utf8(const std::wstring& w) { return yuzu::win::from_wide(w.c_str()); }
+
+// True when `p` (UTF-8, as delivered) is a local path (an NT volume path, or a drive
+// letter on a fixed drive) and so safe to open; see tar_local_image_path.hpp. The only
+// Windows API here is GetDriveTypeW on the 3-char drive root (drive-letter forms only).
+bool image_path_is_local(const std::string& p) {
+    const std::string root = drive_root_of(p);
+    const unsigned drive_type = root.empty() ? 0U : GetDriveTypeW(utf8_to_wide(root).c_str());
+    return is_local_image_path(p, drive_type);
+}
 
 // Read a named UInt32 property from a decoded event. Returns false if absent.
 bool prop_u32(EVENT_RECORD* rec, const wchar_t* name, std::uint32_t& out) {
@@ -213,73 +221,136 @@ std::string process_basename_for_pid(std::uint32_t pid) {
     return wide_to_utf8(base);
 }
 
-// Last-write time of a file as unix seconds, for the SigningCache key. 0 if the
-// path can't be stat'd (e.g. an NT \Device\... path WinVerifyTrust also rejects).
-std::int64_t file_mtime_unix(const std::wstring& wpath) {
-    WIN32_FILE_ATTRIBUTE_DATA fad{};
-    if (!GetFileAttributesExW(wpath.c_str(), GetFileExInfoStandard, &fad)) {
-        return 0;
+// ── No-reparse image open (NtCreateFile) ─────────────────────────────────────
+// The drain opens each classified-local image ONCE, by the NT path as the IMAGE event
+// delivers it, and derives mtime, verdict and signer from that handle; nothing is re-resolved
+// by name, so a symbolic link or junction planted after the event cannot redirect any step.
+
+using NtCreateFileFn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
+                                         PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG,
+                                         ULONG, PVOID, ULONG);
+
+// Resolved once from the loaded ntdll (as confined_fs_win.cpp does; no import library). A null
+// result makes every open fail closed -- there is no by-name fallback.
+NtCreateFileFn resolve_ntcreatefile() {
+    static const NtCreateFileFn resolved = []() -> NtCreateFileFn {
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll == nullptr)
+            return nullptr;
+        return reinterpret_cast<NtCreateFileFn>(
+            reinterpret_cast<void*>(GetProcAddress(ntdll, "NtCreateFile")));
+    }();
+    return resolved;
+}
+
+// Local NT values (<winternl.h> does not export them reliably; a k-name cannot hit a macro).
+constexpr ULONG kObjCaseInsensitive = 0x00000040UL;       // OBJ_CASE_INSENSITIVE
+constexpr ULONG kObjDontReparse = 0x00001000UL;           // OBJ_DONT_REPARSE (ntifs.h/wdm.h)
+constexpr ULONG kFileOpen = 0x00000001UL;                 // FILE_OPEN
+constexpr ULONG kFileNonDirectoryFile = 0x00000040UL;     // FILE_NON_DIRECTORY_FILE
+constexpr ULONG kFileSynchronousIoNonalert = 0x00000020UL; // FILE_SYNCHRONOUS_IO_NONALERT
+constexpr NTSTATUS kStatusInvalidParameter = static_cast<NTSTATUS>(0xC000000DL);
+
+// Simple display name (the CN where one exists) of a provider-chain certificate; "" on failure.
+std::string cert_simple_display_name(PCCERT_CONTEXT cert) {
+    const DWORD n = CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, nullptr, 0);
+    if (n <= 1)
+        return {};
+    std::wstring name(n - 1, L'\0');
+    CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, name.data(), n);
+    return wide_to_utf8(name);
+}
+
+} // namespace
+
+// The three seams below are declared in the header and linked by the Windows tests, so they
+// sit OUTSIDE the anonymous namespace.
+
+void ImageHandleCloser::operator()(void* h) const noexcept {
+    if (h != nullptr)
+        CloseHandle(static_cast<HANDLE>(h));
+}
+
+ImageHandle open_local_image_no_reparse(const std::string& nt_path) {
+    const NtCreateFileFn nt_create_file = resolve_ntcreatefile();
+    if (nt_create_file == nullptr)
+        return {};
+    const std::wstring wide = utf8_to_wide(nt_path);
+    // UNICODE_STRING::Length is a USHORT byte count: even, and at most 0xFFFE.
+    const std::size_t bytes = wide.size() * sizeof(wchar_t);
+    if (bytes == 0 || bytes > 0xFFFEU)
+        return {};
+
+    UNICODE_STRING name{};
+    name.Length = static_cast<USHORT>(bytes);
+    name.MaximumLength = name.Length;
+    // const_cast proof: as OBJECT_ATTRIBUTES::ObjectName the Buffer is an INPUT NtCreateFile
+    // never writes through (confined_fs_win.cpp make_unicode_string); `wide` outlives the call.
+    name.Buffer = const_cast<PWSTR>(wide.c_str());
+
+    OBJECT_ATTRIBUTES attrs{};
+    attrs.Length = sizeof(attrs);
+    attrs.ObjectName = &name;
+    // OBJ_DONT_REPARSE: the open FAILS on a name-surrogate reparse point (symlink, junction)
+    // instead of following it. A build that rejects the flag returns STATUS_INVALID_PARAMETER,
+    // handled the same way: no handle, the row keeps an unknown verdict.
+    attrs.Attributes = kObjCaseInsensitive | kObjDontReparse;
+
+    HANDLE raw = nullptr;
+    IO_STATUS_BLOCK iosb{};
+    const NTSTATUS status = nt_create_file(
+        &raw, FILE_GENERIC_READ, &attrs, &iosb, /*AllocationSize=*/nullptr, /*FileAttributes=*/0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, kFileOpen,
+        kFileNonDirectoryFile | kFileSynchronousIoNonalert, /*EaBuffer=*/nullptr, /*EaLength=*/0);
+    if (status < 0) {
+        static std::atomic_flag warned;
+        if (status == kStatusInvalidParameter && !warned.test_and_set()) {
+            spdlog::warn("TAR: module image open returned STATUS_INVALID_PARAMETER -- "
+                         "OBJ_DONT_REPARSE unsupported on this Windows build? every module "
+                         "signing verdict stays unknown (not counted risky)");
+        }
+        return {};
     }
+    ImageHandle image{raw}; // own it immediately: no raw HANDLE survives this statement
+
+    // Also refuse a name surrogate at the LEAF, from the open handle -- but only that:
+    // filter-handled tags (WOF/CompactOS, dedup, cloud files) are ordinary images (precedent:
+    // agents/shared/win_hive_file_probe.hpp leaf_facts).
+    FILE_ATTRIBUTE_TAG_INFO tag{};
+    if (!GetFileInformationByHandleEx(raw, FileAttributeTagInfo, &tag, sizeof(tag)))
+        return {};
+    if (reparse_leaf_refused(tag.FileAttributes, tag.ReparseTag))
+        return {};
+    return image;
+}
+
+std::int64_t image_mtime_unix(void* image) noexcept {
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (image == nullptr || !GetFileInformationByHandle(static_cast<HANDLE>(image), &info))
+        return 0;
     LARGE_INTEGER li;
-    li.LowPart = fad.ftLastWriteTime.dwLowDateTime;
-    li.HighPart = static_cast<LONG>(fad.ftLastWriteTime.dwHighDateTime);
+    li.LowPart = info.ftLastWriteTime.dwLowDateTime;
+    li.HighPart = static_cast<LONG>(info.ftLastWriteTime.dwHighDateTime);
     return filetime_to_unix(li);
 }
 
-// Best-effort Authenticode publisher CN for an embedded-signed image. "" on any
-// failure — never throws, never blocks the verdict. All Crypt* handles are freed
-// on every path.
-std::string extract_signer_cn(const std::wstring& wpath) {
-    HCERTSTORE store = nullptr;
-    HCRYPTMSG msg = nullptr;
-    DWORD enc = 0, ctype = 0, fmt = 0;
-    if (!CryptQueryObject(CERT_QUERY_OBJECT_FILE, wpath.c_str(),
-                          CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
-                          CERT_QUERY_FORMAT_FLAG_BINARY, 0, &enc, &ctype, &fmt, &store, &msg,
-                          nullptr)) {
-        return {};
-    }
-    std::string out;
-    DWORD si_size = 0;
-    if (CryptMsgGetParam(msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, nullptr, &si_size) && si_size > 0) {
-        std::vector<BYTE> si_buf(si_size);
-        if (CryptMsgGetParam(msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, si_buf.data(), &si_size)) {
-            auto* signer = reinterpret_cast<CERT_INFO*>(si_buf.data());
-            PCCERT_CONTEXT cert =
-                CertFindCertificateInStore(store, enc, 0, CERT_FIND_SUBJECT_CERT, signer, nullptr);
-            if (cert != nullptr) {
-                DWORD n = CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr,
-                                             nullptr, 0);
-                if (n > 1) {
-                    std::wstring name(n - 1, L'\0');
-                    CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, name.data(),
-                                       n);
-                    out = wide_to_utf8(name);
-                }
-                CertFreeCertificateContext(cert);
-            }
-        }
-    }
-    if (msg != nullptr)
-        CryptMsgClose(msg);
-    if (store != nullptr)
-        CertCloseStore(store, 0);
-    return out;
-}
-
-// The real Windows verifier (the ModuleVerifier the drain injects). Maps the
-// WinVerifyTrust verdict explicitly and NEVER fabricates kSigned: any
+// The real Windows verifier the drain injects. Verifies the OPEN handle (no name is
+// re-resolved), maps the WinVerifyTrust verdict explicitly and NEVER fabricates kSigned: any
 // unrecognised status is kUnknown. Signer is best-effort, only when signed.
-ModuleSignVerdict verify_image_signature_win(const std::string& full_path_utf8) {
+ModuleSignVerdict verify_image_signature_win(void* image, const std::string& nt_path) {
     ModuleSignVerdict out; // {kUnknown, ""}
-    std::wstring wpath = utf8_to_wide(full_path_utf8);
-    if (wpath.empty()) {
+    // The path field is required. Authenticode on a PE reads the handle (the native parity case
+    // passes a bogus name with a real handle and still gets kSigned); the path is a label, the
+    // raw NT path kept alive across both calls.
+    const std::wstring wpath = utf8_to_wide(nt_path);
+    if (image == nullptr || wpath.empty()) {
         return out;
     }
     GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
     WINTRUST_FILE_INFO fi{};
     fi.cbStruct = sizeof(fi);
     fi.pcwszFilePath = wpath.c_str();
+    fi.hFile = static_cast<HANDLE>(image);
     WINTRUST_DATA wd{};
     wd.cbStruct = sizeof(wd);
     wd.dwUIChoice = WTD_UI_NONE;
@@ -294,6 +365,19 @@ ModuleSignVerdict verify_image_signature_win(const std::string& full_path_utf8) 
     wd.pFile = &fi;
     wd.dwStateAction = WTD_STATEACTION_VERIFY;
     const LONG st = WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &wd);
+    // WinVerifyTrust allocates the trust state even when the verdict is bad; free it on every
+    // exit, including a throw from the signer read below (an allocation can throw).
+    struct TrustStateCloser {
+        TrustStateCloser(GUID& a, WINTRUST_DATA& d) noexcept : action_(a), data_(d) {}
+        TrustStateCloser(const TrustStateCloser&) = delete;
+        TrustStateCloser& operator=(const TrustStateCloser&) = delete;
+        ~TrustStateCloser() {
+            data_.dwStateAction = WTD_STATEACTION_CLOSE;
+            WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action_, &data_);
+        }
+        GUID& action_;
+        WINTRUST_DATA& data_;
+    } closer{action, wd};
     switch (st) {
     case ERROR_SUCCESS:
         out.state = ModuleSignedState::kSigned;
@@ -316,16 +400,20 @@ ModuleSignVerdict verify_image_signature_win(const std::string& full_path_utf8) 
         out.state = ModuleSignedState::kUnknown; // unrecognised — never assume signed
         break;
     }
-    wd.dwStateAction = WTD_STATEACTION_CLOSE; // free the trust state
-    WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &wd);
-
     if (out.state == ModuleSignedState::kSigned) {
-        out.signer = extract_signer_cn(wpath);
+        // Signer = chain index 0 (the signing certificate) of the first signer, read BEFORE the
+        // state is closed. A null at any step leaves "".
+        if (CRYPT_PROVIDER_DATA* pd = WTHelperProvDataFromStateData(wd.hWVTStateData)) {
+            if (CRYPT_PROVIDER_SGNR* sg = WTHelperGetProvSignerFromChain(pd, 0, FALSE, 0)) {
+                if (CRYPT_PROVIDER_CERT* pc = WTHelperGetProvCertFromChain(sg, 0)) {
+                    if (pc->pCert != nullptr)
+                        out.signer = cert_simple_display_name(pc->pCert);
+                }
+            }
+        }
     }
     return out;
 }
-
-} // namespace
 
 struct ModuleEtwCollector::Impl {
     TRACEHANDLE session = 0;
@@ -518,15 +606,29 @@ std::vector<ModuleEvent> ModuleEtwCollector::drain() {
             full.push_back('\\');
         }
         full += e.module_name;
-        // Convert the NT device path to a Win32 path the file/trust APIs accept
-        // (governance HIGH) — used for stat, verify, AND the cache key (so the
-        // key is the path actually verified).
-        const std::string vpath = nt_path_to_win32(full);
-        const std::wstring wvpath = utf8_to_wide(vpath);
-        const std::int64_t mtime = wvpath.empty() ? 0 : file_mtime_unix(wvpath);
-        const ModuleSignVerdict v = sign_cache_.get(vpath, mtime, &verify_image_signature_win);
-        e.signed_state = v.state;
-        e.signer = v.signer;
+        // Not a local path (UNC / \Device\Mup / a network drive): the agent runs as LocalSystem,
+        // so opening it would authenticate the machine account to that host and could stall this
+        // drain (it runs under collect_mu_). Open NOTHING. For a local path: ONE open, following
+        // no reparse point, by the NT path as delivered; mtime (cache key), verdict and signer
+        // all come from this handle. No open (network path, vanished file, planted link,
+        // unsupported flag) keeps the row with the unknown verdict the mapped event already
+        // carries, which module_is_risky does not count.
+        try {
+            const ImageHandle img =
+                image_path_is_local(full) ? open_local_image_no_reparse(full) : ImageHandle{};
+            if (img) {
+                const std::int64_t mtime = image_mtime_unix(img.get());
+                const ModuleSignVerdict v = sign_cache_.get(full, mtime, [&](const std::string&) {
+                    return verify_image_signature_win(img.get(), full);
+                });
+                e.signed_state = v.state;
+                e.signer = v.signer;
+            }
+        } catch (...) {
+            // An allocation failure while signing must not unwind drain() after ring_.drain()
+            // emptied the ring, which would lose the whole batch: the verdict stays unknown and
+            // the row is kept (the ETW callback drops the same way).
+        }
         // Privacy edge-drop AFTER signing (governance BLOCKING): the stored dir
         // must never carry a username.
         e.module_dir = redact_module_dir(e.module_dir);

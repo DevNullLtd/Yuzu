@@ -30,41 +30,83 @@ namespace yuzu::server {
 
 // ── Allowed keys (safe for runtime modification) ─────────────────────────────
 
-static const std::vector<std::string> kAllowedKeys = {
-    "heartbeat_timeout",             // seconds before marking agent offline
-    "response_retention_days",       // days to keep instruction responses
-    "audit_retention_days",          // days to keep audit events
-    "guardian_event_retention_days", // days to keep guaranteed-state events
-    "auto_approve_enabled",          // "true" or "false"
-    "log_level",                     // trace|debug|info|warn|error
-    "oidc_issuer",                   // OIDC issuer URL
-    "oidc_client_id",                // OIDC client ID
-    "oidc_client_secret",            // OIDC client secret — SecretCodec-envelope
-                                     // encrypted; see runtime_config_secrets (ADR-0060)
-    "oidc_redirect_uri",             // OIDC redirect URI
-    "oidc_admin_group",              // OIDC admin group ID
-    "oidc_skip_tls_verify",          // "true" or "false"
-    "plugin_signing_required",       // see plugin_signing::kPluginSigningRequiredKey — must match
-    // F1 DEX alerting (Settings → DEX alerts; applied live, no restart)
-    "dex_alert_routing",             // JSON array of routed obs_types
-    "dex_blast_min_devices",         // blast-radius alert shape (clamped on apply)
-    "dex_blast_window_seconds",      //
-    "dex_blast_cooldown_seconds",    //
-    // F2a PR3 cohort metrics export (Settings → DEX alerts; next gauge sweep)
-    "dex_cohort_export_key",         // tag key; "" = export disabled (validated on apply)
-    // Customer score policy (tiers, names, weights, per-app overrides).
-    "dex_score_policy",              // JSON document; route-owned - to be written only through
-                                     // the policy route's writer (a later change), which
-                                     // validates it whole; the generic PUT refuses it. Spelled
-                                     // as kDexScorePolicyKey in dex_score_policy_json.hpp.
+namespace {
+
+struct KeySpec {
+    const char* key;
+    ConfigWriteClass write_class;
 };
 
+// One row per allowed key, and every row names its write class explicitly: the generic
+// PUT /api/config/{key} (config_routes.cpp) applies the class. General means Infrastructure:Write
+// suffices; a key that a Settings route writes must NOT be General (test_config_routes.cpp scans
+// for that). Other keys are classified by maintainer ruling on sensitivity, recorded on the row.
+// test_runtime_config_secret_redaction.cpp pins every key's class, so a new row without a
+// deliberate class fails there.
+constexpr ConfigWriteClass kGeneral = ConfigWriteClass::General;
+constexpr ConfigWriteClass kAdmin = ConfigWriteClass::AdminRoute;
+constexpr ConfigWriteClass kOidc = ConfigWriteClass::AdminRouteInteractiveOnly;
+
+constexpr KeySpec kKeySpecs[] = {
+    {"heartbeat_timeout", kGeneral},       // seconds before marking agent offline
+    {"response_retention_days", kGeneral}, // days to keep instruction responses
+    // days to keep audit events. Administrator-only by maintainer ruling because it is the
+    // stored audit-retention setting (audit evidence), not because a PUT changes the window
+    // applied today: AuditStore copies the window at construction, so a stored value is not
+    // enforced (#483). It has no Settings route; the generic PUT is its only writer.
+    // response_retention_days and guardian_event_retention_days are the same stored-only shape
+    // but operational data, deliberately General for now.
+    {"audit_retention_days", kAdmin},
+    {"guardian_event_retention_days", kGeneral}, // days to keep guaranteed-state events
+    {"auto_approve_enabled", kGeneral},          // "true" or "false"
+    {"log_level", kGeneral},                     // trace|debug|info|warn|error
+    {"oidc_issuer", kOidc},                      // OIDC issuer URL
+    {"oidc_client_id", kOidc},                   // OIDC client ID
+    {"oidc_client_secret", kOidc},               // OIDC client secret: SecretCodec-envelope
+                                                 // encrypted; see runtime_config_secrets (ADR-0060)
+    {"oidc_redirect_uri", kOidc},                // OIDC redirect URI
+    {"oidc_admin_group", kOidc},                 // OIDC admin group ID
+    {"oidc_skip_tls_verify", kOidc},             // "true" or "false"
+    // see plugin_signing::kPluginSigningRequiredKey - must match
+    {"plugin_signing_required", kAdmin},
+    // F1 DEX alerting (Settings -> DEX alerts; applied live, no restart)
+    {"dex_alert_routing", kAdmin},          // JSON array of routed obs_types
+    {"dex_blast_min_devices", kAdmin},      // blast-radius alert shape (clamped on apply)
+    {"dex_blast_window_seconds", kAdmin},   //
+    {"dex_blast_cooldown_seconds", kAdmin}, //
+    // F2a PR3 cohort metrics export (Settings -> DEX alerts; next gauge sweep)
+    {"dex_cohort_export_key", kAdmin}, // tag key; "" = export disabled (validated on apply)
+    // Customer score policy (tiers, names, weights, per-app overrides). JSON document;
+    // route-owned - to be written only through the policy route's writer (a later change),
+    // which validates it whole; the generic PUT refuses it. Spelled as kDexScorePolicyKey in
+    // dex_score_policy_json.hpp.
+    {"dex_score_policy", ConfigWriteClass::RouteOwned},
+};
+
+} // namespace
+
 const std::vector<std::string>& RuntimeConfigStore::allowed_keys() {
-    return kAllowedKeys;
+    static const std::vector<std::string> keys = [] {
+        std::vector<std::string> v;
+        for (const auto& spec : kKeySpecs)
+            v.emplace_back(spec.key);
+        return v;
+    }();
+    return keys;
 }
 
 bool RuntimeConfigStore::is_allowed_key(const std::string& key) {
-    return std::find(kAllowedKeys.begin(), kAllowedKeys.end(), key) != kAllowedKeys.end();
+    for (const auto& spec : kKeySpecs)
+        if (key == spec.key)
+            return true;
+    return false;
+}
+
+std::optional<ConfigWriteClass> RuntimeConfigStore::write_class(const std::string& key) {
+    for (const auto& spec : kKeySpecs)
+        if (key == spec.key)
+            return spec.write_class;
+    return std::nullopt;
 }
 
 bool RuntimeConfigStore::is_secret_key(const std::string& key) {
@@ -176,6 +218,55 @@ std::string sanitize_pg_text(std::string_view s) {
         pos += 3;
     }
     return out;
+}
+
+// True when `expected` is a text a write could ever have stored: every stored text passed
+// through sanitize_pg_text, so one it would change (NUL, invalid UTF-8) can never equal a
+// stored value. compare_and_set/compare_and_remove compare EXACTLY and refuse such an
+// `expected` as caller input -- scrubbing it would alias distinct inputs onto one form, and
+// binding it raw would C-string-truncate at a NUL (pg_exec.hpp).
+bool representable_expected(const std::string& expected) {
+    return sanitize_pg_text(expected) == expected;
+}
+
+// Per-key value validation shared by set() and compare_and_set(). The secret placeholder
+// guard is set()'s alone: conditional writes refuse secret keys outright.
+std::expected<void, std::string> validate_value(const std::string& key, const std::string& value) {
+    if (key == "heartbeat_timeout" || key == "response_retention_days" ||
+        key == "audit_retention_days") {
+        try {
+            int val = std::stoi(value);
+            if (val <= 0)
+                return std::unexpected("value must be a positive integer");
+            if (key == "heartbeat_timeout" && val < kMinHeartbeatTimeoutSeconds)
+                return std::unexpected("heartbeat_timeout must be at least " +
+                                       std::to_string(kMinHeartbeatTimeoutSeconds) +
+                                       " seconds (the default agent heartbeat interval)");
+        } catch (...) {
+            return std::unexpected("value must be a valid integer");
+        }
+    }
+
+    if (key == "auto_approve_enabled" || key == "plugin_signing_required") {
+        if (value != "true" && value != "false")
+            return std::unexpected("value must be 'true' or 'false'");
+    }
+
+    if (key == "log_level") {
+        static const std::vector<std::string> valid_levels = {"trace", "debug", "info", "warn",
+                                                              "error"};
+        if (std::find(valid_levels.begin(), valid_levels.end(), value) == valid_levels.end())
+            return std::unexpected("value must be one of: trace, debug, info, warn, error");
+    }
+    return {};
+}
+
+// The in-process effect of a committed write (set() and compare_and_set()).
+void apply_live_change(const std::string& key, const std::string& value) {
+    if (key == "log_level") {
+        spdlog::set_level(spdlog::level::from_str(value));
+        spdlog::info("Runtime config: log_level changed to '{}'", value);
+    }
 }
 
 RuntimeConfigEntry plain_row(PGresult* r, int i) {
@@ -546,33 +637,8 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
         return std::unexpected("value is the redaction placeholder, not a credential; send the "
                                "real secret, or omit the key to leave it unchanged");
 
-    // Basic validation per key
-    if (key == "heartbeat_timeout" || key == "response_retention_days" ||
-        key == "audit_retention_days") {
-        try {
-            int val = std::stoi(value);
-            if (val <= 0)
-                return std::unexpected("value must be a positive integer");
-            if (key == "heartbeat_timeout" && val < kMinHeartbeatTimeoutSeconds)
-                return std::unexpected("heartbeat_timeout must be at least " +
-                                       std::to_string(kMinHeartbeatTimeoutSeconds) +
-                                       " seconds (the default agent heartbeat interval)");
-        } catch (...) {
-            return std::unexpected("value must be a valid integer");
-        }
-    }
-
-    if (key == "auto_approve_enabled" || key == "plugin_signing_required") {
-        if (value != "true" && value != "false")
-            return std::unexpected("value must be 'true' or 'false'");
-    }
-
-    if (key == "log_level") {
-        static const std::vector<std::string> valid_levels = {"trace", "debug", "info", "warn",
-                                                              "error"};
-        if (std::find(valid_levels.begin(), valid_levels.end(), value) == valid_levels.end())
-            return std::unexpected("value must be one of: trace, debug, info, warn, error");
-    }
+    if (auto v = validate_value(key, value); !v)
+        return std::unexpected(std::move(v.error()));
 
     const std::string sanitized_by = sanitize_pg_text(updated_by);
     const auto now = now_secs();
@@ -679,12 +745,88 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
     }
 
     // Apply the change immediately
-    if (key == "log_level") {
-        spdlog::set_level(spdlog::level::from_str(value));
-        spdlog::info("Runtime config: log_level changed to '{}'", value);
-    }
+    apply_live_change(key, value);
 
     return {};
+}
+
+std::expected<bool, std::string>
+RuntimeConfigStore::compare_and_set(const std::string& key,
+                                    const std::optional<std::string>& expected,
+                                    const std::string& value, const std::string& updated_by) {
+    if (!open_)
+        return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "store not open");
+    if (!is_allowed_key(key))
+        return std::unexpected("key '" + key + "' is not a configurable runtime setting");
+    if (is_secret_key(key))
+        return std::unexpected("conditional writes are for non-secret keys only");
+    if (auto v = validate_value(key, value); !v)
+        return std::unexpected(std::move(v.error()));
+    if (expected && !representable_expected(*expected))
+        return std::unexpected("expected text contains NUL or invalid UTF-8, which no stored "
+                               "text can");
+
+    // `expected` is bound as given, never sanitized (exact comparison).
+    const std::string sanitized_value = sanitize_pg_text(value);
+    const std::string sanitized_by = sanitize_pg_text(updated_by);
+    const std::string now = std::to_string(now_secs());
+
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
+                               "no database connection in time");
+    // ONE statement either way, so no advisory lock (see the file header on a non-secret
+    // write). Under READ COMMITTED a concurrent commit makes PostgreSQL re-evaluate the
+    // UPDATE's WHERE against the new row version, so two replicas cannot both pass.
+    pg::PgResult res =
+        expected ? pg::exec_params(lease.get(),
+                                   "UPDATE runtime_config_store.runtime_config SET value = $2, "
+                                   "updated_by = $3, updated_at = $4::bigint "
+                                   "WHERE key = $1 AND value = $5 RETURNING key",
+                                   std::vector<std::string>{key, sanitized_value, sanitized_by,
+                                                            now, *expected})
+                 : pg::exec_params(lease.get(),
+                                   "INSERT INTO runtime_config_store.runtime_config (key, value, "
+                                   "updated_by, updated_at) VALUES ($1, $2, $3, $4::bigint) "
+                                   "ON CONFLICT (key) DO NOTHING RETURNING key",
+                                   std::vector<std::string>{key, sanitized_value, sanitized_by,
+                                                            now});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
+                               "database write failed");
+    if (PQntuples(res.get()) != 1)
+        return false;
+    lease.reset(); // the pool slot is not held across the live effect (set() scopes its lease)
+    apply_live_change(key, value);
+    return true;
+}
+
+std::expected<bool, std::string>
+RuntimeConfigStore::compare_and_remove(const std::string& key, const std::string& expected) {
+    if (!open_)
+        return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "store not open");
+    if (!is_allowed_key(key))
+        return std::unexpected("key '" + key + "' is not a configurable runtime setting");
+    if (is_secret_key(key))
+        return std::unexpected("conditional writes are for non-secret keys only");
+    if (!representable_expected(expected))
+        return std::unexpected("expected text contains NUL or invalid UTF-8, which no stored "
+                               "text can");
+
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
+                               "no database connection in time");
+    // The secrets table is never touched: a non-secret key has no row there.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "DELETE FROM runtime_config_store.runtime_config WHERE key = $1 AND value = $2 "
+        "RETURNING key",
+        std::vector<std::string>{key, expected});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
+                               "database write failed");
+    return PQntuples(res.get()) == 1;
 }
 
 bool RuntimeConfigStore::remove(const std::string& key) {

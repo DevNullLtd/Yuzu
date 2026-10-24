@@ -25,8 +25,44 @@
 /// internally resolves the session):
 ///   GET  /api/approvals                  (perm_fn Approval:Read)
 ///   GET  /api/approvals/pending/count    (perm_fn Approval:Read)
-///   POST /api/approvals/:id/approve      (perm_fn Approval:Approve)
-///   POST /api/approvals/:id/reject       (perm_fn Approval:Approve)
+///   POST /api/approvals/:id/approve      (perm_fn Approval:Approve + approver assurance)
+///   POST /api/approvals/:id/reject       (perm_fn Approval:Approve + approver assurance)
+///
+/// APPROVER ASSURANCE (#6061, four-eyes MVP PR1) -- approve/reject. Both routes
+/// are kRequired rows in the central step-up table, so the central check runs
+/// in the pre-request stage, before the handler (and after the server-wide
+/// same-site gate, which answers a cross-site cookie write first): a stale or
+/// absent proof is a 401, a SAML session a 403, and an engine principal a 403
+/// (`engine_principal_denied`, audited as `mfa.step_up.required`); the handler
+/// never runs for any of them. API-token and MCP-token sessions pass that check
+/// and are refused by step 3. The handler's own steps below then run in this
+/// order, each failing closed BEFORE anything is mutated:
+///   1. `perm_fn` (Approval:Approve) -- the RBAC gate, unchanged.
+///   2. The session is re-resolved; an unresolvable one is a 503 A4 envelope
+///      (#4128). It used to become reviewer "unknown", which can never equal a
+///      real `submitted_by` and so defeated the separation-of-duties check.
+///   2b. SAME-SITE GATE (`WriteGate`, #6061 SG-1): a cookie-authorised POST
+///      must name this site in Origin/Referer (403, `csrf.denied` row, before
+///      anything else in the handler is touched). This is defence in depth: in
+///      production the server-wide pre-routing gate answers a cross-site cookie
+///      write first, before the central step-up check. Token callers are
+///      exempt from it and are refused by the class check instead.
+///   3. Class check (`approver_assurance.hpp`): interactive local/OIDC/SAML
+///      cookie session, `principal_kind == "human"`, not an engine principal.
+///      A bearer caller gets a 403 A4 envelope whose message is
+///      `approver_assurance_required:<reason>`. (Over REST an engine principal
+///      is already refused by the central check; the `engine_principal` reason
+///      is reachable on the MCP surface.)
+///   4. `deps.step_up_fn` -- the same closure the other step-up-gated routes
+///      use. It consumes the central check's pass for this request (it
+///      evaluates afresh, and writes its own 401, only if no pass was armed).
+///      An UNWIRED `step_up_fn` is a 503, not a skip: this is the one place a
+///      null closure must not read as "no step-up required".
+///   5. AUDIT BEFORE MUTATE (#5823): an `attempted` row is written first; if it
+///      does not persist the response is a 503 (`Sec-Audit-Failed: true`) and
+///      the ticket is left pending. The post-decision `success` / `denied` row
+///      is kept as well, so a decision leaves two rows.
+/// The store's reviewer != submitted_by check is untouched and still runs last.
 ///
 /// STORE-UNAVAILABLE ASYMMETRY (preserved verbatim, not a defect introduced
 /// by this move): GET /api/approvals and both POST routes answer a 503
@@ -38,12 +74,20 @@
 /// AUDIT ASYMMETRY (also preserved verbatim): GET /api/approvals and GET
 /// .../pending/count are both pure reads and unaudited. The store-
 /// unavailable 503 on all three gated-past routes is unaudited (it returns
-/// before `deps.audit_fn` is ever reached). approve/reject audit BOTH
-/// outcomes past that point — a denied review (e.g. the store's
+/// before `deps.audit_fn` is ever reached), as is the unresolvable-session
+/// 503. The same-site refusal writes its own `csrf.denied` row, an assurance
+/// refusal writes a best-effort `"denied"` row (detail
+/// `approver_assurance:<reason>`), and a step-up refusal writes its own
+/// `mfa.step_up.required` row. Past those, approve/reject write an
+/// `"attempted"` row BEFORE the store call (fail closed, see above) and then
+/// audit BOTH outcomes — a denied review (e.g. the store's
 /// self-approval segregation-of-duties block) is audited as `"denied"`
 /// with `result.error()` as the detail, and a successful one as
 /// `"success"` — and additionally emit an `approval.approved`/
-/// `approval.rejected` event on success only (never on denial).
+/// `approval.rejected` event on success only (never on denial). The
+/// post-decision row's persist result is still discarded: the mutation has
+/// happened and cannot be undone, and the pre-mutation row is the evidence
+/// that is guaranteed.
 ///
 /// `log_safe` (used by approve/reject's denial-path log line) reuses the
 /// existing `web_utils.hpp` promotion from #2542 PR-7 (`instruction_routes.cpp`
@@ -52,6 +96,8 @@
 /// collided with PR-7's independent promotion of the identical function into
 /// a different header; reconciled at merge time by dropping this PR's copy.
 
+#include "mfa_step_up.hpp" // StepUpFn
+
 #include <yuzu/server/auth.hpp>
 
 #include <httplib.h>
@@ -59,6 +105,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -83,27 +130,23 @@ struct Deps {
                                        const std::string&, const std::string&)>;
     /// Resolves the caller's session without gating — mirrors
     /// `AuthRoutes::resolve_session`. Returns `std::nullopt` for an
-    /// unauthenticated/unresolvable request; callers here treat that as
-    /// reviewer `"unknown"`, matching the original inline code exactly
-    /// (this is NOT an authorization decision — `perm_fn` already ran
-    /// first and is the actual gate). KNOWN GAP (#4128, pre-existing,
-    /// confirmed byte-identical on origin/dev before this extraction): this
-    /// closure is called a SECOND time, independent of perm_fn's own
-    /// internal session resolution — if this call alone fails (a session
-    /// evicted between the two calls, or a Postgres session-store brownout)
-    /// while perm_fn's gate already passed, the resulting `"unknown"`
-    /// reviewer can bypass the self-approval segregation-of-duties check in
-    /// `ApprovalManager::set_review_status`, since `"unknown"` can never
-    /// equal a real `submitted_by`. Not fixed by this mechanical move; see
-    /// #4128 for the real remedy.
+    /// unauthenticated/unresolvable request. approve/reject treat that as a
+    /// 503 and leave the ticket untouched (#4128): this closure is called a
+    /// SECOND time, independent of perm_fn's own internal session resolution,
+    /// so a session evicted between the two calls (or a Postgres
+    /// session-store brownout) can make it fail after the gate passed, and
+    /// falling back to a placeholder reviewer would defeat the self-approval
+    /// segregation-of-duties check in `ApprovalManager::set_review_status`
+    /// (a placeholder can never equal a real `submitted_by`). The resolved
+    /// session is also what the approver-assurance class check reads.
     using ResolveSessionFn =
         std::function<std::optional<auth::Session>(const httplib::Request&)>;
     /// Bool-returning audit contract, same shape as
     /// `custom_properties::Deps::AuditFn` / server.cpp's hoisted `audit_fn`
-    /// closure. All four call sites here (approve/reject, each on both
-    /// their denial and success path) discard the return value
-    /// (`(void)audit_fn(...)`), matching the original inline code's
-    /// `(void)audit_log(...)`.
+    /// closure. approve/reject FAIL CLOSED on the pre-mutation `attempted` row
+    /// (503, no mutation, #5823); the post-decision `denied`/`success` rows
+    /// discard the return value (`(void)audit_fn(...)`) because the mutation
+    /// has already happened by then.
     using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
@@ -120,6 +163,22 @@ struct Deps {
     ResolveSessionFn resolve_session_fn;
     AuditFn audit_fn;
     EmitEventFn emit_event_fn;
+    /// The shared MFA step-up closure (server.cpp's `step_up_fn`, i.e.
+    /// `require_mfa_step_up` bound to AuthDB + `--mfa-step-up-window-secs` +
+    /// the audit sink). On a stale proof it has already written a 401 and the
+    /// handler must return. Unlike GuardianRoutes' `step_up_fn_`, an EMPTY
+    /// closure is NOT permissive here: approve/reject answer 503 so a wiring
+    /// regression cannot silently drop the freshness requirement of a
+    /// four-eyes control. NOTE the closure itself skips users with no MFA
+    /// enrolled and `--mfa-step-up-window-secs=0` (see mfa_step_up.hpp), so
+    /// "fresh step-up" means exactly what it means on every other gated route.
+    StepUpFn step_up_fn;
+    /// `Config::csrf_trusted_origins` (normalised at boot) for the same-site
+    /// write gate on approve/reject (`WriteGate::refuse_cross_site`,
+    /// `audited_write.hpp`) -- extra origins a cookie-authorised POST may
+    /// legitimately come from (a TLS-terminating reverse proxy). Empty means
+    /// only the request's own Host is same-site.
+    std::vector<std::string> csrf_trusted_origins;
     /// `ServerImpl::approval_manager_`. Null -> every route degrades per the
     /// STORE-UNAVAILABLE ASYMMETRY documented above (this file's header).
     ApprovalManager* approval_manager{nullptr};

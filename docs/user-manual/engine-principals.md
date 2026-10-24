@@ -24,6 +24,10 @@ automation pipeline; engine credentials are hard-locked to MCP tier
 `readonly` and structurally barred from the admin role, which is the wrong
 shape for anything that needs to execute or approve on a human's behalf.
 
+While RBAC is off, the permission checks and the shared per-agent reads refuse an engine credential or
+return it no agents; enable RBAC and grant it a role to give it access. See
+[Upgrading](upgrading.md#behaviour-change-engine-principals-are-default-deny-when-rbac-is-off).
+
 ## Before you start
 
 Every mutating operation on this surface requires:
@@ -51,6 +55,7 @@ REST:
 
 ```bash
 curl -sk -X POST https://localhost:8080/api/v1/engine-principals \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
   -d '{
     "slug": "vuln-uce",
@@ -72,6 +77,7 @@ REST: `POST .../credentials`):
 
 ```bash
 curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce/credentials \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
   -d '{ "ttl_days": 90 }'
 ```
@@ -89,6 +95,7 @@ the consuming module has time to pick up the new secret without a hard cutover:
 
 ```bash
 curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce/credentials/rotate \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
   -d '{ "overlap_secs": 604800 }'
 ```
@@ -159,6 +166,7 @@ loop explicitly instead of waiting for the sweep:
 
 ```bash
 curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce/credentials/confirm \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"token_id": "<token_id from the rotate response>", "secret": "<the raw successor secret from the rotate response>"}'
@@ -224,6 +232,7 @@ engine-principal ownership as a lever to stall its own deprovisioning:
 
 ```bash
 curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce/transfer-owner \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
   -d '{ "new_owner": "bob" }'
 ```
@@ -236,6 +245,7 @@ reference the old one via `superseded_by`:
 
 ```bash
 curl -sk -X DELETE https://localhost:8080/api/v1/engine-principals/engine:vuln-uce \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
   -d '{ "superseded_by": "engine:vuln-uce-2" }'
 ```
@@ -315,20 +325,26 @@ principal may be enabled in production until it exists.
 
 ### Layered limits for engine principals
 
-An engine-principal request on `/mcp/` can be rejected by up to four
-independent caps, evaluated in this order:
+An engine-principal request can be rejected by up to four independent caps,
+evaluated in the order (a), (c), (d), (b): (a), (c) and (d) run in the server's
+pre-routing step, while (b) runs later, in the MCP `initialize` handler, and
+applies only there (the others apply to REST routes and `/mcp/` alike). The
+letters name the rows, not the order:
 
 | # | Cap | Scope | Error / code | Notes |
 |---|---|---|---|---|
 | a | Per-IP rate limiter (existing) | Source IP | HTTP `429` | Applies to every caller, not just engine principals; checked before any principal is resolved. |
 | b | MCP session cap (8 concurrent sessions) | MCP session lifecycle, checked on `initialize` | JSON-RPC `-32010` / HTTP `429` | Rejects a **new session**, never evicts a live one. |
-| c | Per-principal in-flight concurrency (16, PR 4.4) | Per engine principal, every `/mcp/` request | JSON-RPC `-32010` / HTTP `429` | This page's quota cap, concurrency dimension. |
-| d | Per-principal rate (20 rps, PR 4.4) | Per engine principal, every `/mcp/` request | JSON-RPC `-32010` / HTTP `429` | This page's quota cap, rate dimension. |
+| c | Per-principal in-flight concurrency (16, PR 4.4) | Per engine principal, every REST and `/mcp/` request | HTTP `429` with the A4 envelope on REST; JSON-RPC `-32010` / HTTP `429` on MCP | This page's quota cap, concurrency dimension. |
+| d | Per-principal rate (20 rps, PR 4.4) | Per engine principal, every REST and `/mcp/` request | HTTP `429` with the A4 envelope on REST; JSON-RPC `-32010` / HTTP `429` on MCP | This page's quota cap, rate dimension. |
 
-(a) is the only dimension that also applies to REST and non-engine traffic.
+(a) is the only dimension that also applies to non-engine traffic.
 (b) is distinct from (c)/(d): it gates `initialize` only, on the *number of
-open sessions*, while (c)/(d) gate *every* `/mcp/` request on in-flight count
-and request rate regardless of session state. **(b) and (c)/(d) share the
+open sessions*, while (c)/(d) gate *every* REST and `/mcp/` request on
+in-flight count and request rate regardless of session state. The quota runs
+once the engine's credential has resolved: while the database cannot answer, the
+pre-routing authentication resolves no credential and the request is refused
+`401` `unauthorized` before the quota is consulted. **(b) and (c)/(d) share the
 same JSON-RPC error code `-32010`** — disambiguate by `error.message`
 ("session limit" vs "per-principal rate/concurrency cap exceeded") and by
 `retry_after_ms` (always `null` for (b); non-null for (c)/(d) — see

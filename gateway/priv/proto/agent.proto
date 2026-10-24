@@ -229,6 +229,7 @@ message CommandResponse {
   // needs them too. Half B, Guardian gateway fix. See
   // docs/guardian-mvp-contract.md G2.
   string plugin  = 7;
+  // See proto/yuzu/agent/v1/agent.proto CommandResponse.action (also stamped on ordinary frames).
   string action  = 8;
   bytes  payload = 9;
 

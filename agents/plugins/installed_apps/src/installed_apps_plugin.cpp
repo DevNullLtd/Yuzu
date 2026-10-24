@@ -1217,6 +1217,8 @@ private:
             }
             if (status == yuzu::win::HiveAccessStatus::privilege_missing)
                 ++privilege_missing;
+            if (status == yuzu::win::HiveAccessStatus::file_refused)
+                parsers::report_hive_file_refused(ctx, profile.sid, report.refusal);
 
             // ADR-0024 D11: an unresolvable profile name is rendered "-", never
             // the SID. "-" (not "") matches this row's own convention for

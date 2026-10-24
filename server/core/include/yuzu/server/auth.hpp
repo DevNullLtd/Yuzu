@@ -537,6 +537,19 @@ inline constexpr std::size_t kMaxAgentIdLength = 256;
 /// (`sanitize_enrollment_text`), so an over-long hostname never strands an agent.
 inline constexpr std::size_t kMaxEnrollmentTextLength = 256;
 
+/// Defaults for an enrollment-token limit LEFT BLANK on a create surface.
+/// The TTL default applies on every surface: the dashboard form and
+/// `POST /api/settings/enrollment-tokens`, the batch endpoint's `ttl_hours`, and
+/// the server CLI `--generate-tokens --token-ttl-hours`. The max-uses default
+/// applies to the dashboard form and the single-token POST ONLY: the batch
+/// endpoint and `--generate-tokens` keep their own single-use default
+/// (`max_uses` 1). Wherever a default applies, an explicit `0` (including
+/// `-0`/`00` on the surfaces that parse numbers that way) stays unlimited uses /
+/// no expiry. `create_enrollment_token`'s own API is unchanged -- these are the
+/// surfaces' own defaults, applied before the call.
+inline constexpr int kDefaultEnrollmentTokenMaxUses = 100;
+inline constexpr int kDefaultEnrollmentTokenTtlHours = 72;
+
 // ── Pending agents (Tier 1) ─────────────────────────────────────────────────
 
 enum class PendingStatus { pending, approved, denied };
@@ -803,6 +816,26 @@ public:
     /// no-op if `token` is not a live session.
     void expire_session_for_test(const std::string& token, std::chrono::seconds offset);
 
+    /// TEST-ONLY: push `token`'s idle-slide anchor backward by `elapsed` — both
+    /// `last_activity_at` (what the legacy cache-only `validate_session` compares
+    /// against `session_inactivity_`) and `steady_last_activity` — so the session
+    /// reads as idle for `elapsed` longer without sleeping. Acts on the `sessions_`
+    /// cache entry only, exactly like `expire_session_for_test`: a store-backed
+    /// AuthManager re-derives its deadlines from the durable row on a cache miss
+    /// and would lose the shift, so this is for the store-less harness
+    /// (`make_temp_auth`). Production code MUST NOT call this — no caller in
+    /// `server/core/src/**` references it. A no-op if `token` is not a live session.
+    void idle_session_for_test(const std::string& token, std::chrono::milliseconds elapsed);
+
+    /// TEST-ONLY: push `token`'s JIT-elevation deadline backward by `elapsed` — both
+    /// `elevated_until` and the `steady_elevated_until` that `is_elevated` actually
+    /// adjudicates against — so an elevation granted for N seconds lapses after
+    /// `elapsed >= N` without sleeping. Acts on the `sessions_` cache entry only
+    /// (store-less harness, e.g. `JitHarness`), for the same reason as
+    /// `idle_session_for_test`. Production code MUST NOT call this — no caller in
+    /// `server/core/src/**` references it. A no-op if `token` is not a live session.
+    void lapse_elevation_for_test(const std::string& token, std::chrono::milliseconds elapsed);
+
     /// TEST-ONLY: installs a callback fired inside
     /// `recheck_role_after_credential_check`, BEFORE it starts its row-locked
     /// AuthDB re-check (`AuthDB::recheck_role_locked`). Originally fired
@@ -888,7 +921,8 @@ public:
                              std::int64_t elevated_until_ms, std::int64_t elevation_issued_ms,
                              std::int64_t now_ms);
 
-    /// Look up a session by cookie token.
+    /// Look up a session by cookie token. An empty token (no cookie) and an over-long one
+    /// never match; both return nullopt before any cache or store access.
     std::optional<Session> validate_session(const std::string& token) const;
 
 private:

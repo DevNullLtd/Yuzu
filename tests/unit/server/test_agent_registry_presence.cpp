@@ -267,12 +267,9 @@ TEST_CASE("HA WS-5: live_presence() caches within its TTL window", "[pg][ha][pre
     auto ids_second = registry.all_ids();
     CHECK_FALSE(contains(ids_second, "cache-agent-2"));
 
-    // 6s against a 3s TTL — a wider margin than the original 4s (external
-    // review finding, 2026-09-22: 1s of margin is tight under contended CI
-    // load, e.g. the 20-way concurrent-shard contention already observed on
-    // this PR's own CI runs). A fake-clock injection would be the more
-    // robust fix; not done this round — this is a low-risk mitigation.
-    std::this_thread::sleep_for(std::chrono::seconds(6));
+    // Age the presence cache by one full TTL (so the next read sees it at least a
+    // TTL old) instead of sleeping past the window.
+    registry.expire_presence_cache_for_test();
     auto ids_after_ttl = registry.all_ids();
     CHECK(contains(ids_after_ttl, "cache-agent-2"));
 }

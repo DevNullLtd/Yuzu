@@ -3,13 +3,13 @@
 #include "data_export.hpp"
 #include "device_api.hpp"
 #include "list_keyset.hpp"
+#include "model_param_helpers.hpp" // shared param/cursor helpers (one copy, both models)
 #include "software_catalog_rules.hpp"
 #include "utf8_sanitize.hpp"
 
 #include <yuzu/log_token.hpp>
 
 #include <algorithm>
-#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <expected>
@@ -26,28 +26,18 @@ namespace sc = software_catalog;
 
 namespace {
 
-constexpr char kSep = '\x1f';
-
-// True for text Postgres can bind: strict UTF-8 and no NUL. Anything else would surface as a
-// store error (SQLSTATE 22021) and be reported as a retryable 503 instead of a caller 400.
-bool valid_text(std::string_view v) {
-    return v.find('\0') == std::string_view::npos && ::yuzu::server::sanitize_utf8_strict(v) == v;
-}
+// The parameter and cursor-payload helpers are shared with crypto_library_model.cpp.
+using model_detail::find_param;
+using model_detail::fnv1a_hex16;
+using model_detail::is_lower_hex16;
+using model_detail::kSep;
+using model_detail::length_prefixed;
+using model_detail::parse_i64;
+using model_detail::parse_nonneg;
+using model_detail::read_length_prefixed;
+using model_detail::valid_text;
 
 // ── Parameter helpers ────────────────────────────────────────────────────────
-
-// Value of `key`, or nullptr when absent. A repeated key sets `err` (and yields nullptr).
-const std::string* find_param(const Params& p, const std::string& key,
-                              std::optional<std::string>& err) {
-    const auto [lo, hi] = p.equal_range(key);
-    if (lo == hi)
-        return nullptr;
-    if (std::next(lo) != hi) {
-        err = "repeated query parameter " + key;
-        return nullptr;
-    }
-    return &lo->second;
-}
 
 // The raw route's legacy rule: a repeated key keeps the FIRST value. lower_bound is the first equal
 // element (multimap::find may return any of them).
@@ -73,27 +63,6 @@ std::optional<std::string> text_error(Fields text, Fields short_fields, Fields l
     return std::nullopt;
 }
 
-// Length-prefixed so no byte content (incl. the separator) can shift a field boundary.
-std::string length_prefixed(Fields fields) {
-    std::string s;
-    for (const std::string* f : fields) {
-        s += std::to_string(f->size());
-        s += ':';
-        s += *f;
-        s += kSep;
-    }
-    return s;
-}
-
-// Full-consume signed decimal; nullopt on any defect (empty, sign-only, trailing bytes, range).
-std::optional<std::int64_t> parse_i64(std::string_view s) {
-    std::int64_t v = 0;
-    const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
-    if (ec != std::errc{} || ptr != s.data() + s.size())
-        return std::nullopt;
-    return v;
-}
-
 // Shared by the two parsers: reads `limit` (empty == absent) into [1, max].
 std::expected<std::int64_t, std::string> read_limit(const std::string& v, std::int64_t def,
                                                     std::int64_t max) {
@@ -113,21 +82,6 @@ using ::yuzu::server::keyset::b64url_encode;
 
 // ── Fingerprints and tokens ──────────────────────────────────────────────────
 
-std::string fnv1a_hex16(std::string_view s) {
-    std::uint64_t h = 1469598103934665603ULL;
-    for (const char c : s) {
-        h ^= static_cast<std::uint8_t>(c);
-        h *= 1099511628211ULL;
-    }
-    return std::format("{:016x}", h);
-}
-
-bool is_lower_hex16(std::string_view s) {
-    return s.size() == 16 && std::ranges::all_of(s, [](char c) {
-               return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-           });
-}
-
 std::vector<std::string_view> split(std::string_view s, char d) {
     std::vector<std::string_view> out;
     std::size_t start = 0;
@@ -140,39 +94,6 @@ std::vector<std::string_view> split(std::string_view s, char d) {
         out.push_back(s.substr(start, pos - start));
         start = pos + 1;
     }
-}
-
-std::optional<std::int64_t> parse_nonneg(std::string_view s) {
-    if (s.empty() || !std::ranges::all_of(s, [](char c) { return c >= '0' && c <= '9'; }))
-        return std::nullopt;
-    return parse_i64(s);
-}
-
-// Inverse of length_prefixed(): exactly `n` `<len>:<bytes>` + kSep fields, nothing before or
-// after. The length is a full-consume decimal and is checked against what remains before any
-// span is taken, so no field content (the separator included) can move a boundary.
-std::optional<std::vector<std::string_view>> read_length_prefixed(std::string_view in,
-                                                                  std::size_t n) {
-    std::vector<std::string_view> out;
-    std::size_t pos = 0;
-    for (std::size_t i = 0; i < n; ++i) {
-        const auto colon = in.find(':', pos);
-        if (colon == std::string_view::npos)
-            return std::nullopt;
-        const auto len = parse_nonneg(in.substr(pos, colon - pos));
-        const std::size_t remaining = in.size() - (colon + 1);
-        // the field plus its trailing separator must fit
-        if (!len || static_cast<std::uint64_t>(*len) >= remaining)
-            return std::nullopt;
-        const auto end = colon + 1 + static_cast<std::size_t>(*len);
-        if (in[end] != kSep)
-            return std::nullopt;
-        out.push_back(in.substr(colon + 1, static_cast<std::size_t>(*len)));
-        pos = end + 1;
-    }
-    if (pos != in.size())
-        return std::nullopt;
-    return out;
 }
 
 // ── JSON/CSV helpers ─────────────────────────────────────────────────────────

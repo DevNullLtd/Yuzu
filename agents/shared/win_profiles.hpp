@@ -34,6 +34,7 @@
 
 #include "user_profile_model.hpp"
 #include "value_enumeration.hpp"
+#include "win_hive_file_probe.hpp"
 #include "win_reg_handle.hpp"
 #include "win_str.hpp"
 
@@ -446,15 +447,30 @@ struct HiveAccessReport {
     LSTATUS live_open_rc{ERROR_SUCCESS};
 };
 
-/// Opt-in hive-FILE guard for the offline arm of with_user_hive (default: none, so every
-/// existing consumer is unchanged). Each hook returns "" to proceed or a refusal token.
-/// before_load runs after the privileges are enabled, before any RegLoadKeyW; after_load runs
-/// once the hive is mounted, before fn sees it. An after_load refusal skips fn but the mount is
-/// still unloaded and unload_failed still reported.
+/// Hive-FILE guard for the offline arm of with_user_hive. Each hook returns "" to proceed or a
+/// refusal token. before_load runs after the privileges are enabled, before any RegLoadKeyW;
+/// after_load runs once the hive is mounted, before fn sees it. An after_load refusal skips fn
+/// but the mount is still unloaded and unload_failed still reported.
+///
+/// DEFAULT-ON: when a caller passes no `check` (or nullptr), with_user_hive builds its own
+/// deadline-less HiveFileGuard over Win32HiveFileProbe and uses that -- a refused hive file is
+/// reported as file_refused, same as an explicit check would report it. The only opt-out is
+/// `kOfflineHiveFileUnguarded` below; a caller passing it writes a one-line comment naming the
+/// reason -- there is no production user of it today, only test fixtures that need an unguarded
+/// mount of a fixture hive the default would correctly refuse. A consumer with a run deadline
+/// instead builds its own guard (the `expired` callback) and stays guarded throughout, exactly as
+/// privacy_permissions does (see that file's banner) -- its own deadline-bearing check in place
+/// of the deadline-less default, never the opt-out.
 struct OfflineHiveFileCheck {
     std::function<std::string(const std::wstring& ntuser_path)> before_load;
     std::function<std::string(const std::wstring& ntuser_path)> after_load;
 };
+
+/// Both hooks empty = the explicit no-hook path: with_user_hive sees a non-null `check` whose
+/// before_load/after_load are unset function objects, which is exactly the pre-default-on
+/// behaviour (skip the `if (check && check->before_load)` / `if (... check->after_load)` bodies).
+/// Pass this to opt a call OUT of the default guard; name the reason at the call site.
+inline const OfflineHiveFileCheck kOfflineHiveFileUnguarded{};
 
 /// Serialises the OFFLINE arm of with_user_hive across the whole process.
 ///
@@ -519,6 +535,10 @@ using yuzu::agent::offline_hive_mutex;
 //   the pre-#2771 license_scan, which left them enabled for the rest of the
 //   process, but a thread-token-scoped enable (ImpersonateSelf +
 //   OpenThreadToken) would confine this further. Not done here.
+//
+// The default guard's probe and both hooks are built fresh per offline call, inside
+// offline_hive_mutex(), when the caller passes no `check` -- never shared across calls or hoisted
+// out of the lock.
 template <typename Fn>
 HiveAccessStatus with_user_hive(const std::string& sid, const std::string& profile_path_utf8,
                                 Fn&& fn, HiveAccessReport* report = nullptr,
@@ -562,6 +582,18 @@ HiveAccessStatus with_user_hive(const std::string& sid, const std::string& profi
 
     const std::wstring ntuser = to_wide(profile_path_utf8) + L"\\NTUSER.DAT";
     const std::wstring mount = unique_hive_mount_name(wsid);
+
+    // DEFAULT-ON (#5291): no caller-supplied check means the default, deadline-less guard, built
+    // fresh per offline call inside the lock above -- not `kOfflineHiveFileUnguarded`'s no-hook
+    // path. A caller wanting the pre-default-on behaviour passes `&kOfflineHiveFileUnguarded`
+    // explicitly and names the reason.
+    Win32HiveFileProbe default_probe;
+    HiveFileGuard default_guard{default_probe, [] { return false; }, sid, std::nullopt};
+    const OfflineHiveFileCheck default_check{
+        [&](const std::wstring& p) { return default_guard.before_load(p); },
+        [&](const std::wstring& p) { return default_guard.after_load(p); }};
+    if (!check)
+        check = &default_check;
 
     if (check && check->before_load) {
         if (std::string token = check->before_load(ntuser); !token.empty()) {

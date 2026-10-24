@@ -11,6 +11,7 @@
 #include "audit_store.hpp"
 #include "auth_routes.hpp" // #4037: ListReadGate — get_guardian_status's require_list_read confinement seam
 #include "authz_gates.hpp" // #3290 Phase 2: authz::FleetReadGate — query_installed_software's real confinement seam
+#include "mcp_tool_deps.hpp" // ToolDeps: provider closures a registry handler may reach
 #include "authz_model.hpp" // #1788: VisibleSet — MCP dispatch confinement (in_scope/filter_to_scope)
 #include "ca_routes.hpp" // IssueCodeSigningFn/CodeSigningIssuance (free at yuzu::server scope, unlike
                          // CaRoutes::PublishCrlFn below) — reused verbatim by issue_code_signing_cert
@@ -32,6 +33,8 @@
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
 #include "dex_api.hpp"    // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API seam
 #include "dex_perf_api.hpp" // ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-over-time API seam
+#include "crypto_widget_catalogue.hpp" // crypto_widgets::Access / WidgetGate (pure)
+#include "crypto_api.hpp" // ADR-0031 WS-A4 (tenth family): the public in-process crypto-library read API seam
 #include "compliance_api.hpp" // ADR-0031 WS-A4: the public in-process compliance/policy API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "network_perf_model.hpp"
@@ -76,8 +79,11 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <expected>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -183,10 +189,13 @@ namespace detail {
 class McpServer {
 public:
     /// C8 fail-closed boot validator (#2383): throws std::runtime_error naming
-    /// the offenders when the served kTools[] names, the kToolSecurity
-    /// registrations, and the kWriteTools read-only guard set disagree — a
-    /// misregistered build refuses to construct (and therefore to boot) instead
-    /// of silently skipping the generic tier+approval gate for the missing tool.
+    /// the offenders when the served tool names (legacy kTools[] plus the
+    /// registry-resident records, merged by mcp_server.cpp's catalogue()), the
+    /// security registrations (catalogue().security), the --mcp-read-only write set
+    /// (catalogue().writes) and the kToolAnnotation key set (#2422) disagree: a misregistered build
+    /// refuses to construct (and therefore to boot) instead of silently skipping the generic
+    /// tier+approval gate for the missing tool. The message is capped at the first offences
+    /// (sorted) plus a count; all are logged individually.
     McpServer();
 
     using AuthFn =
@@ -246,7 +255,8 @@ public:
     /// fan-out reads (the remaining #1634 work; see rest_api_v1.hpp ResponseScopeFn).
     /// The handler resolves the principal ONCE (it already authed the request) and
     /// passes `username` in, so the predicate does NOT re-resolve the session per
-    /// call. RBAC-off → returns true (legacy-open, matching require_scoped_permission).
+    /// call. RBAC-off → returns true for a human (legacy-open, matching require_scoped_permission), but
+    /// false for an engine principal, whose only authority is an explicit RBAC grant (#6204).
     ///
     /// FAIL-OPEN-WHEN-UNWIRED, deliberately: the default `= {}` means an unset
     /// predicate applies NO filter. This diverges from DeviceRoutes' required
@@ -599,8 +609,18 @@ public:
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
+    /// The provider closures a registry tool handler may reach (mcp_tool_deps.hpp),
+    /// passed to every registry handler as `ctx.deps`. The SAME closure instances
+    /// `HardwareRoutes::Deps` receives, wired beside `set_fleet_read_fn` in the
+    /// ServerImpl constructor, so a twin cannot observe a different composition
+    /// than the REST route. Set once before `build_handler`; the value lives as long
+    /// as this McpServer, which outlives every request. Unset leaves every closure
+    /// empty and the handlers answer an internal error.
+    void set_tool_deps(ToolDeps deps) { tool_deps_ = std::move(deps); }
+
     /// #4037 — the injected-callback twin of `AuthRoutes::require_list_read`
-    /// (ADR-0017), backing `get_guardian_status`'s real confinement. Same
+    /// (ADR-0017), backing `get_guardian_status`'s real confinement and
+    /// `list_plugin_config` (which refuses a scoped admission). Same
     /// shape as `RestApiV1::ListReadFn`/`ListReadGate` (auth_routes.hpp) reused
     /// verbatim, not redefined, so the REST `GET /guaranteed-state/status`
     /// list-read gate and this MCP twin cannot drift — server.cpp wires the
@@ -798,6 +818,24 @@ public:
     /// `!guardian_api_` guard is therefore defense-in-depth only, matching
     /// the pre-seam `!guaranteed_state_store` guard's practical behaviour.
     void set_guardian_api(std::shared_ptr<const GuardianApi> a) { guardian_api_ = std::move(a); }
+
+    /// ADR-0031 WS-A4 (tenth family): the SAME in-process crypto-library read seam the
+    /// `/crypto` page and REST `GET /api/v1/crypto/libraries[/devices]` use - server.cpp wires
+    /// the IDENTICAL instance so `get_crypto_libraries` / `list_crypto_library_devices` can
+    /// never disagree with them. A SETTER, not a `build_handler` parameter, like the sibling
+    /// seams above. Unset (null, no software-inventory store) => the tools answer an internal
+    /// error, never an empty result.
+    void set_crypto_api(std::shared_ptr<const CryptoApi> a) { crypto_api_ = std::move(a); }
+
+    /// The ONE non-auditing /crypto availability callback (server.cpp builds it once and wires
+    /// the SAME function into CryptoRoutes): `list_crypto_widgets`' availability, the R2
+    /// confinement withhold of `get_crypto_ca_stats`' twin answers and of `list_issued_certs`'
+    /// filtered form. It decides what is DRAWN or withheld, never a grant (every data tool keeps
+    /// its own gate). Unset => those paths answer an internal error, never a guessed answer.
+    using CryptoAccessFn = std::function<crypto_widgets::Access(
+        const httplib::Request&, crypto_widgets::WidgetGate, const std::string& securable_type,
+        const std::string& operation)>;
+    void set_crypto_access_fn(CryptoAccessFn fn) { crypto_access_fn_ = std::move(fn); }
 
     /// B4 (#2146 API-parity): mirrors `RestApiV1::LockoutClearFn` (rest_api_v1.hpp)
     /// so the MCP `unlock_account` tool clears an account's lockout counter
@@ -1193,6 +1231,13 @@ public:
                          // (kept last across the device_api merge).
                          AppUsageStore* app_usage_store = nullptr);
 
+    /// Test hook: push the cached `get_security_posture` payload's `generated_at`
+    /// backward by `elapsed`, so a test crosses the `ttl_seconds` cache window
+    /// without sleeping. A no-op while the cache is empty (nothing cached yet).
+    /// Production code MUST NOT call this — no caller in `server/core/src/**`
+    /// references it.
+    void age_posture_cache_for_test(std::chrono::milliseconds elapsed);
+
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──
     // COEXISTENCE (4.2→4.3 rebase): the 4.2 role-assignment handlers use the
@@ -1211,6 +1256,29 @@ private:
     // pre-dispatch dry run in mcp_server.cpp fails closed rather than
     // silently reverting to the pre-#3687 collapsed-envelope behaviour.
     AuthorizeDispatchFn authorize_dispatch_fn_;
+    // Posture cache shared across httplib worker threads (the POST handler lambda
+    // is captured by value, so every worker shares this one object). Reads and
+    // writes of the string fields MUST be serialised — an unsynchronised
+    // std::string read/write across threads is UB (G-S1, #1653 review). The
+    // cached `body` is the full posture payload MINUS the `data_age_seconds`
+    // field; that field is volatile (depends on read time) so it is injected
+    // per-request from the freshly computed age — never baked into the cache
+    // (G-S4: cache hits previously misreported freshness as 0).
+    //
+    // A member, not a build_handler local, so age_posture_cache_for_test can reach
+    // it. The scope widens from "per handler" to "per McpServer", which is benign:
+    // build_handler's one production call site is register_routes' single
+    // registration of its result on the /mcp/v1/ route (written without the call's
+    // quoted path: the header scan in test_step_up_route_inventory.cpp reads comments
+    // as code), so production still has exactly one cache per route (a test that calls
+    // build_handler again on the same McpServer shares this cache). build_handler
+    // copies the shared_ptr into the handler lambda.
+    struct PostureCache {
+        std::mutex mtx;
+        std::chrono::steady_clock::time_point generated_at{};
+        std::string body; // payload JSON object string, WITHOUT data_age_seconds
+    };
+    std::shared_ptr<PostureCache> posture_cache_ = std::make_shared<PostureCache>();
     // Progress bridge core (2f PR 3a) - see set_stream_bridge above.
     McpStreamBridge* stream_bridge_{nullptr};
     // KEK rotation seam (#2395 track C) - see set_kek_ops above. Default-
@@ -1225,6 +1293,8 @@ private:
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.
     FleetReadFn fleet_read_fn_;
+    // See set_tool_deps above; `&tool_deps_` is ToolCallContext::deps.
+    ToolDeps tool_deps_;
     // #4037 — see set_list_read_fn above.
     ListReadFn list_read_fn_;
     // #4036 (api-parity Batch A) — see set_preflight_run_store above.
@@ -1258,6 +1328,10 @@ private:
     std::shared_ptr<const WorkflowApi> workflow_api_;
     // ADR-0031 WS-A4 (ninth family) — see set_guardian_api above.
     std::shared_ptr<const GuardianApi> guardian_api_;
+    // ADR-0031 WS-A4 (tenth family) - see set_crypto_api above.
+    std::shared_ptr<const CryptoApi> crypto_api_;
+    // /crypto widgets - see set_crypto_access_fn above.
+    CryptoAccessFn crypto_access_fn_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here

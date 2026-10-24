@@ -1,0 +1,125 @@
+# identity=NT AUTHORITY\SYSTEM host=KINGSLEY build=26200 date=2026-10-17T21:52:53Z
+# MsiEnumProductsExW per context (machine=4 with null sid; user contexts 1,2 with S-1-1-0); columns: code|ctx|sid|InstalledProductName|VersionString|Publisher|InstallLocation
+{0B1B5000-3C0E-41C0-83C4-4C914420AE93}|4||Python Launcher|3.14.6150.0|Python Software Foundation|
+{49727420-70BA-4495-9405-31F8D711CB5A}|4||Microsoft Visual Studio Setup WMI Provider|3.12.2140.44225|Microsoft Corporation|
+{B7526150-1C45-45B5-932D-A4CF5A23403C}|4||CMake|4.3.4|Kitware|C:\Program Files\CMake\
+{FED10190-CF54-E72D-7A92-E3F9CA9B7950}|4||Windows Desktop Extension SDK|10.1.26100.7705|Microsoft Corporation|
+{AA11F890-8A6F-D292-8A1D-D70710A87852}|4||Windows IoT Extension SDK Contracts|10.1.26100.7705|Microsoft Corporation|
+{0A1B70B0-DD98-1BCC-6958-D5AD8BBAF2B2}|4||Windows SDK Desktop Headers arm64|10.1.26100.7705|Microsoft Corporation|
+{B7BC83B0-1A94-0290-4309-820859276E72}|4||Windows App Certification Kit x64|10.1.26100.7705|Microsoft Corporation|
+{43B0D101-A022-48F4-9D04-BA404CEB1D53}|4||Microsoft Visual C++ 2022 X64 Minimum Runtime - 14.44.35211|14.44.35211|Microsoft Corporation|
+{80F76A51-EAF7-DA8E-C732-B26C591BCC23}|4||Windows SDK OnecoreUap Headers x64|10.1.26100.7705|Microsoft Corporation|
+{20C01991-CCD1-2C06-7A9A-B10A9B4AF807}|4||Windows App Certification Kit Native Components|10.1.26100.7705|Microsoft Corporation|
+{AF4ED0C1-A3D7-450B-A163-62CD3C7BBB27}|4||Python 3.14.6 Add to Path (64-bit)|3.14.6150.0|Python Software Foundation|
+{AA86DFC1-17A2-6133-1D55-92818B9D3082}|4||SDK ARM64 Redistributables|10.1.26100.7705|Microsoft Corporation|
+{B817BAD1-CC9F-940C-FFD8-7543D89B8EB7}|4||Windows App Certification Kit x64 (OnecoreUAP)|10.1.26100.7705|Microsoft Corporation|
+{F9DDDEF1-BCF0-275F-DE29-9332F1149B79}|4||Windows SDK Signing Tools|10.1.26100.7705|Microsoft Corporation|
+{9EE92E02-FA29-DF43-7E45-A256139DEBE4}|4||Windows SDK Desktop Libs x86|10.1.26100.7705|Microsoft Corporation|
+{6C7D0172-7367-4F0C-95DB-6021765B58EA}|4||vs_filehandler_x86|17.14.36024|Microsoft Corporation|
+{E43BDB72-464A-290B-A51D-537CBBE1CAC8}|4||Windows App Certification Kit SupportedApiList x86|10.1.26100.7705|Microsoft Corporation|
+{BC104582-4691-4D4C-8922-C215D941A2EB}|4||Microsoft Visual C++ 2022 X86 Debug Runtime - 14.44.35211|14.44.35211|Microsoft Corporation|
+{13D2A7A2-1B42-4C03-8F0F-697991259AEE}|4||Windows SDK AddOn|10.1.0.0|Microsoft Corporation|
+{CCEEC7A2-2179-C5D0-60E2-2651993A8AD5}|4||Windows SDK Desktop Headers x64|10.1.26100.7705|Microsoft Corporation|
+{C18FB403-1E88-43C8-AD8A-CED50F23DE8B}|4||Microsoft Visual C++ 2022 X86 Additional Runtime - 14.44.35211|14.44.35211|Microsoft Corporation|
+{368E4D03-5983-1C2C-B42E-1C0C51A935A5}|4||Universal CRT Redistributable|10.1.26100.7705|Microsoft Corporation|
+{91306123-946D-452F-3206-A8AB9F8293D6}|4||WinRT Intellisense PPI - en-us|10.1.26100.7705|Microsoft Corporation|
+{F4F63553-2774-41A6-C784-7FAC7DF4CAF3}|4||Windows Desktop Extension SDK Contracts|10.1.26100.7705|Microsoft Corporation|
+{EB8B0E53-980A-E861-DC85-05240EFA888D}|4||WinRT Intellisense IoT - en-us|10.1.26100.7705|Microsoft Corporation|
+{F5796163-6EC6-488A-B2DE-E1E94477F6AD}|4||VS Script Debugging Common|17.0.157.0|Microsoft Corporation|
+{D75B3C63-F3BB-5EC1-45A7-15C00BBB9D3F}|4||Application Verifier x64 External Package (DesktopEditions)|10.1.26100.7705|Microsoft|
+{1F507473-1077-3AB8-2E11-C839AE4E27B8}|4||Windows Team Extension SDK|10.1.26100.7705|Microsoft Corporation|
+{9A2FEE83-D2FB-A48E-52E0-15801042220F}|4||Windows Team Extension SDK Contracts|10.1.26100.7705|Microsoft Corporation|
+{06671634-35F4-43F1-1B57-68B7CE54E5B3}|4||MSI Development Tools|10.1.26100.7705|Microsoft Corporation|
+{99F22654-1EC3-49EE-97CD-5AF20ACABDA3}|4||AMD WVR64|1.0.2|Advanced Micro Devices, Inc.|
+{EA88E7B4-C204-CC0C-FC10-D13FC9C30800}|4||WinRT Intellisense Desktop - Other Languages|10.1.26100.7705|Microsoft Corporation|
+{96B30005-C36E-07FF-DF27-EEB8199694CD}|4||Windows SDK Redistributables|10.1.26100.7705|Microsoft Corporation|
+{4C150435-9153-456C-C0BE-497D89513B18}|4||Windows SDK for Windows Store Apps Tools|10.1.26100.7705|Microsoft Corporation|
+{C7F2EF85-ACD3-0480-6BC2-0C3B45A8F1C1}|4||Universal CRT Tools x64|10.1.26100.7705|Microsoft Corporation|
+{2CAA22A5-36FE-21B0-5A67-3BE172FEFF12}|4||Windows SDK for Windows Store Apps Libs|10.1.26100.7705|Microsoft Corporation|
+{5C8B4DA5-62C6-8D4A-F21A-AD4D66FCA8D9}|4||WinRT Intellisense UAP - en-us|10.1.26100.7705|Microsoft Corporation|
+{922480B5-CAEB-4B1B-AAA4-9716EFDCE26B}|4||Microsoft Visual C++ 2022 X86 Minimum Runtime - 14.44.35211|14.44.35211|Microsoft Corporation|
+{B4B3AA16-E828-4577-A9F2-629E1A95FE4A}|4||vs_vswebprotocolselectormsi|17.14.36323|Microsoft Corporation|
+{A2FDDC26-4232-4287-8839-2F53A01E1E97}|4||vs_minshellinteropmsi|17.14.36015|Microsoft Corporation|
+{2126CF36-9D80-48AC-83E6-F391C7192987}|4||Python 3.14.6 Executables (64-bit)|3.14.6150.0|Python Software Foundation|
+{547DB986-CAD5-49AA-A684-E1600CADA4D7}|4||AMD Install Manager|26.10.26272.1728|Advanced Micro Devices, Inc.|C:\Program Files\AMD\AMDInstallManager\
+{26BD6DC6-3F0F-4C17-A78C-5D06459F39C0}|4||Windows SDK Modern Non-Versioned Developer Tools|10.1.26100.7705|Microsoft Corporation|
+{F251EBD6-9B8C-3876-A422-B4F677BF3766}|4||Windows SDK Modern Versioned Developer Tools|10.1.26100.7705|Microsoft Corporation|
+{71498EE6-F94E-4061-9DD5-55925CA8A74F}|4||vs_communitysharedmsi|17.14.36025|Microsoft Corporation|
+{43506B27-889E-2F0F-F8BE-4AEBE7CC9249}|4||Kits Configuration Installer|10.1.26100.7705|Microsoft|
+{B5534577-4F61-73AC-FFCB-91B0B0674DA4}|4||Windows SDK for Windows Store Apps Headers|10.1.26100.7705|Microsoft Corporation|
+{FB7C4DC7-7641-04B7-6639-589757B86783}|4||Windows SDK DirectX x64 Remote|10.1.26100.7705|Microsoft Corporation|
+{4D8C14D7-C036-33F2-EFA7-C5CC5F73932B}|4||Windows SDK for Windows Store Managed Apps Libs|10.1.26100.7705|Microsoft Corporation|
+{CFEF5BD7-A03F-DEF3-1707-A31C813F6D14}|4||WinAppDeploy|10.1.26100.7705|Microsoft Corporation|
+{41120dd7-deb4-4bca-be34-265fc243d4f3}|4||AMD_Chipset_Drivers|5.11.14.2053|Advanced Micro Devices, Inc.|C:\Chipset_Software\
+{CB91C4E7-9C14-6ABD-566B-DF4593456102}|4||Windows SDK for Windows Store Apps Headers OnecoreUap|10.1.26100.7705|Microsoft Corporation|
+{D331F4E7-BC3B-47BE-BB56-5F33895F9347}|4||vs_FileTracker_Singleton|17.14.36015|Microsoft Corporation|
+{C7FC6DE7-5C06-4311-837A-E0D774618D17}|4||vcpp_crt.redist.clickonce|14.44.35211|Microsoft Corporation|
+{6118E908-9B3B-4258-B7C2-7DEEA5A65A85}|4||AMD Interface Driver|2.0.0.14|Advanced Micro Devices, Inc.|C:\AMD\Chipset_Software\Binaries\Interface_Driver\
+{2C37C218-88FF-9E58-0151-1AF693535792}|4||Windows SDK Desktop Libs arm64|10.1.26100.7705|Microsoft Corporation|
+{EC049978-2176-47C6-B99B-2C64AD6F6828}|4||vs_minshellmsires|17.14.36015|Microsoft Corporation|
+{988F14B8-79A8-475D-BAC7-83F96AD3D821}|4||AMD PSP Driver|5.25.0.0|Advanced Micro Devices, Inc.|C:\AMD\Chipset_Software\Binaries\PSP Driver\
+{1234BCB8-4DB4-4334-8076-D011C34FDA24}|4||Python 3.14.6 Tcl/Tk Support (64-bit)|3.14.6150.0|Python Software Foundation|
+{537F07C8-0EC6-41A5-BB91-750FA3CAA110}|4||vs_minshellinteropsharedmsi|17.14.36015|Microsoft Corporation|
+{F6E69DD8-7652-4CC6-8A4F-485A16012B5B}|4||vs_minshellsharedmsi|17.14.36024|Microsoft Corporation|
+{7C1561F8-C963-0AC7-21BD-EA4DD9633C50}|4||Windows SDK Desktop Tools arm64|10.1.26100.7705|Microsoft Corporation|
+{1A737309-F1BA-492F-8E67-CF02EABA1F32}|4||Python 3.14.6 Standard Library (64-bit)|3.14.6150.0|Python Software Foundation|
+{22EE1419-B47E-44B8-A635-868746946079}|4||vs_filehandler_amd64|17.14.36024|Microsoft Corporation|
+{6F812B39-6738-4CF8-8BA0-19FB99506239}|4||Python 3.14.6 Core Interpreter (64-bit)|3.14.6150.0|Python Software Foundation|
+{FE85AA49-3522-4663-9F52-9CD9E9837189}|4||Microsoft Visual C++ 2022 X64 Debug Runtime - 14.44.35211|14.44.35211|Microsoft Corporation|
+{6B525169-354A-4E66-BEFC-E66789C84315}|4||AMD DVR64|1.0.2|Advanced Micro Devices, Inc.|
+{A224D569-B07A-8178-A1E4-75DC397C06B2}|4||Windows SDK|10.1.26100.7705|Microsoft Corporation|
+{23170F69-40C1-2702-2604-000001000000}|4||7-Zip 26.04 (x64 edition)|26.04.00.0|Igor Pavlov|
+{601DDF69-FCF4-F568-946A-C17046C946E4}|4||Application Verifier x64 External Package (OnecoreUAP)|10.1.26100.7705|Microsoft|
+{FEC52FA9-A866-C884-4AAA-0B15BE793610}|4||Universal CRT Tools x86|10.1.26100.7705|Microsoft Corporation|
+{EB362CC9-F0B3-EDBC-82E8-91F6BBF36F6E}|4||Windows SDK Desktop Tools x64|10.1.26100.7705|Microsoft Corporation|
+{86AB2CC9-08BD-4643-B0F9-F82D006D72FF}|4||Microsoft Visual C++ 2022 X64 Additional Runtime - 14.44.35211|14.44.35211|Microsoft Corporation|
+{E93670D9-924A-7B6F-5F55-AE8E3043BCB0}|4||SDK ARM64 Additions|10.1.26100.7705|Microsoft Corporation|
+{A056CA2A-2AB1-EB1B-1B2E-D49E0C6C8E17}|4||Windows IoT Extension SDK|10.1.26100.7705|Microsoft Corporation|
+{3EEF5F2A-A2A3-89FC-D7DF-CFE8DEFE4A8F}|4||WinRT Intellisense Mobile - en-us|10.1.26100.7705|Microsoft Corporation|
+{E901323A-7A02-50A8-F4E0-95C4AD8A098F}|4||Windows Mobile Extension SDK|10.1.26100.7705|Microsoft Corporation|
+{F40C233A-841D-547B-84E3-ECCD399AC172}|4||Tailscale|1.104.1|Tailscale Inc.|
+{3120663A-4F7D-252C-2829-1B9DBEDFEEED}|4||WinRT Intellisense IoT - Other Languages|10.1.26100.7705|Microsoft Corporation|
+{D0772A8A-6AB2-E6E1-8BEF-29F59AB99893}|4||Windows SDK Desktop Headers x86|10.1.26100.7705|Microsoft Corporation|
+{D07657AA-968C-4629-BD6C-1B52AF825EA7}|4||Microsoft Visual Studio Setup Configuration|3.12.2140.44225|Microsoft Corporation|
+{2817364B-A3DE-472C-BF19-F19B6997061F}|4||vs_communitymsires|17.14.36015|Microsoft Corporation|
+{7A1E2A4B-6DF2-40F6-A825-4216422085F2}|4||Python 3.14.6 Development Libraries (64-bit)|3.14.6150.0|Python Software Foundation|
+{0460C87B-7F4C-3170-FAC9-B7A6AE5CE4E9}|4||Universal CRT Redistributable|10.0.26624|Microsoft Corporation|
+{FB4D4A9B-9E8F-42CB-B08F-AE153FFA31AC}|4||Windows SDK Facade Windows WinMD Versioned|10.1.26100.7705|Microsoft Corporation|
+{0343A2EB-5CCA-79B9-18A4-ABD484A97924}|4||Universal CRT Extension SDK|10.1.26100.7705|Microsoft Corporation|
+{C36029EB-19FF-4462-A283-03B41BE9EFA4}|4||AMD MicroPEP Driver|1.0.42.0|Advanced Micro Devices, Inc.|C:\AMD\Chipset_Software\Binaries\UPEP Driver\
+{12C6754C-2086-9BFC-1292-FA0BE54009E6}|4||Windows SDK Desktop Libs x64|10.1.26100.7705|Microsoft Corporation|
+{099E916C-D17E-7E1A-0046-3AD1D042102F}|4||WinRT Intellisense UAP - Other Languages|10.1.26100.7705|Microsoft Corporation|
+{7D4D186C-70F0-6990-1792-DAA557B1E010}|4||Universal CRT Headers Libraries and Sources|10.1.26100.7705|Microsoft Corporation|
+{C762588C-06DE-496A-8ADF-EBDBD49E37B5}|4||DiagnosticsHub_CollectionService|17.14.36412|Microsoft Corporation|
+{CEC6FB8C-1F94-F7F8-C9F7-EF55CC2A519F}|4||Windows SDK for Windows Store Apps|10.1.26100.7705|Microsoft Corporation|
+{3873679C-FA03-4101-97E9-107D67C568B8}|4||vs_communityx64msi|17.14.36025|Microsoft Corporation|
+{575077AC-CCC1-9943-6F3C-EDB6149964E7}|4||Windows SDK ARM64 Desktop Tools|10.1.26100.7705|Microsoft Corporation|
+{F738E2CC-E003-B601-F38B-4521ED842C98}|4||Windows SDK for Windows Store Apps DirectX x86 Remote|10.1.26100.7705|Microsoft Corporation|
+{213DC4DC-931F-E7FB-A7B2-78D28AFA6F6A}|4||Windows Driver Testing Framework (WDTF) Runtime Libraries|10.1.22000.1|Microsoft Corporation|
+{572C25BD-AB18-B702-9ED7-6F0CC6821847}|4||WinRT Intellisense Desktop - en-us|10.1.26100.7705|Microsoft Corporation|
+{9BA10CCD-7064-7FAB-B48B-C7B2CCFC60FB}|4||WinRT Intellisense PPI - Other Languages|10.1.26100.7705|Microsoft Corporation|
+{6AAEB5DD-FFFE-4CA1-9FE2-38A44B6B4477}|4||vs_minshellmsi|17.14.36301|Microsoft Corporation|
+{AF0CF0ED-D9DA-DFDA-52DD-B3B0FE269640}|4||Windows SDK for Windows Store Apps Metadata|10.1.26100.7705|Microsoft Corporation|
+{015A3DED-40A7-45D3-B59A-444C8C78BCDB}|4||Python 3.14.6 Documentation (64-bit)|3.14.6150.0|Python Software Foundation|
+{1851460E-0E63-4117-B5BA-25A2F045801B}|4||vs_CoreEditorFonts|17.7.40001|Microsoft Corporation|
+{5120ED0E-8B54-B212-15E6-EE404FE83E37}|4||Windows SDK EULA|10.1.26100.7705|Microsoft Corporations|
+{DB72537E-BD30-364B-6A72-09CE78DB8321}|4||Windows SDK Desktop Tools x86|10.1.26100.7705|Microsoft Corporation|
+{4EF7967E-A6AE-4EA6-80F8-448F03B4C0B4}|4||GitHub CLI|2.102.0|GitHub, Inc.|
+{DFE0CDBE-EC8A-48E7-ACBE-893E81FE0169}|4||Python 3.14.6 pip Bootstrap (64-bit)|3.14.6150.0|Python Software Foundation|
+{492AEFBE-1B81-4C20-A111-E6974BB98EC5}|4||Branding64|1.00.0009|Advanced Micro Devices, Inc.|
+{29297AFE-9D24-4DFE-ACAF-D90090D905CF}|4||vs_githubprotocolhandlermsi|17.14.36015|Microsoft Corporation|
+{11C0EB4F-A1BA-2068-49A5-F7C242708BA2}|4||Windows SDK DirectX x86 Remote|10.1.26100.7705|Microsoft Corporation|
+{DC5BBE4F-0668-40DC-A913-83710DA79E35}|4||Node.js|24.20.0|Node.js Foundation|
+{9FA1715F-2809-3C7D-B9BB-17574DA0AED9}|4||Windows Mobile Extension SDK Contracts|10.1.26100.7705|Microsoft Corporation|
+{EFF12E8F-5027-FE5D-6ABF-5F837F3B70F8}|4||Windows SDK OnecoreUap Headers x86|10.1.26100.7705|Microsoft Corporation|
+{E9DD399F-21A3-479E-A7DF-D6CF4B2ADBF3}|4||AMD GPIO2 Driver|2.2.0.130|Advanced Micro Devices, Inc.|C:\AMD\Chipset_Software\Binaries\GPIO2 Driver\
+{7E52FE9F-4D3E-9277-0E37-0014C83D4F5E}|4||Universal General MIDI DLS Extension SDK|10.1.26100.7705|Microsoft Corporation|
+{85F3FF9F-CFBA-AD2F-85E2-90571032D412}|4||Windows SDK OnecoreUap Headers arm64|10.1.26100.7705|Microsoft Corporation|
+{2D92E6AF-35B2-4109-893F-59E4A4F2D550}|4||Windows Subsystem for Linux|3.0.3.0|Microsoft Corporation|
+{E8BE09DF-D93B-AE40-FD63-05E5ABEFB6D9}|4||Windows SDK for Windows Store Apps Contracts|10.1.26100.7705|Microsoft Corporation|
+{08A08BFF-AE66-4C64-9AA2-E027125E05A4}|4||AMD Settings|2025.0526.0334.2068|Advanced Micro Devices, Inc.|
+# ctx=4 enum end rc=259 after 118
+# ctx=1 enum end rc=259 after 0
+{665A0435-D5D5-4A49-9DE0-FBC23C5425ED}|2|S-1-5-21-REDACTED-1001|Python Launcher|3.12.10150.0|Python Software Foundation|
+# ctx=2 enum end rc=259 after 1
+# total=119

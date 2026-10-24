@@ -2,7 +2,10 @@
 
 /// @file software_catalog_rules.hpp
 /// Pure decision core for the Software catalogue rollup (M.9 PR-1): the grain mask,
-/// the OS-family table, the catalogue's own TRANSITIVE version order, the
+/// the OS-family table (and the OpenAPI/MCP ecosystem renderers `ecosystem_json_enum_items()` /
+/// `ecosystem_pipe_list()` generated from it, plus `expand_ecosystem_tokens()`, used by the MCP
+/// tool catalogue; rest_api_v1.cpp keeps its own copy until a REST-only follow-up), the
+/// catalogue's own TRANSITIVE version order, the
 /// streaming fleet-newest fold, search hygiene and the refresh/search bounds. No libpq,
 /// no clock, no I/O — the store (`software_inventory_store.cpp`) owns every statement and
 /// feeds this header plain values, so the unit suite never touches a database for any of it.
@@ -43,9 +46,12 @@ struct EcosystemFamily {
     std::string_view family; ///< windows | macos | linux; any other ecosystem is "other"
 };
 
-inline constexpr std::array<EcosystemFamily, 11> kEcosystemFamilies{{
+/// Row order is the published order of the OpenAPI and MCP ecosystem enums; a mid-table insert
+/// shifts positions, so say so in the changelog.
+inline constexpr std::array<EcosystemFamily, 12> kEcosystemFamilies{{
     {"windows", "windows"},
     {"optional_feature", "windows"},
+    {"msi", "windows"},
     {"macos", "macos"},
     {"macos_pkgutil", "macos"},
     {"brew", "macos"},
@@ -56,6 +62,43 @@ inline constexpr std::array<EcosystemFamily, 11> kEcosystemFamilies{{
     {"snap", "linux"},
     {"flatpak", "linux"},
 }};
+
+/// The table is non-empty, every ecosystem is `[a-z_]+` and every family `[a-z]+` (so none is
+/// empty), and no ecosystem repeats. A row commented out of the initializer while the declared
+/// size is kept leaves a value-initialised (empty) row, which every consumer of the table would
+/// otherwise carry silently. The charset is what the renderers below splice unescaped into SQL
+/// literals, JSON strings and a `|` list; tests/test_software_vocabulary_consistency.py's table
+/// parser (`{"([a-z_]+)", "[a-z]+"}`) is the other side of the same contract: widen both together.
+// ponytail: the duplicate scan is O(n^2) in constexpr steps. MSVC's default /constexpr:steps is
+// 100000 and its step accounting is unmeasured here; re-measure on the Windows leg past ~50 rows,
+// or drop the scan (the vocabulary test already rejects duplicates).
+[[nodiscard]] consteval bool ecosystem_table_well_formed() {
+    constexpr auto name_ok = [](std::string_view s, bool underscore) {
+        if (s.empty())
+            return false;
+        for (const char c : s) {
+            if ((c < 'a' || c > 'z') && !(underscore && c == '_'))
+                return false;
+        }
+        return true;
+    };
+    if (kEcosystemFamilies.empty())
+        return false;
+    for (std::size_t i = 0; i < kEcosystemFamilies.size(); ++i) {
+        if (!name_ok(kEcosystemFamilies[i].ecosystem, true) ||
+            !name_ok(kEcosystemFamilies[i].family, false))
+            return false;
+        for (std::size_t j = i + 1; j < kEcosystemFamilies.size(); ++j) {
+            if (kEcosystemFamilies[i].ecosystem == kEcosystemFamilies[j].ecosystem)
+                return false;
+        }
+    }
+    return true;
+}
+static_assert(ecosystem_table_well_formed(),
+              "kEcosystemFamilies: an empty table, an empty or duplicate row (a commented-out "
+              "entry with the declared size kept?), or a name outside the charset the renderers "
+              "assume (ecosystem [a-z_], family [a-z])");
 
 /// SQL `CASE` over the `ecosystem` column generated from kEcosystemFamilies, so the SQL has
 /// one source of truth. Every literal comes from the constexpr table (never input).
@@ -70,6 +113,73 @@ inline constexpr std::array<EcosystemFamily, 11> kEcosystemFamilies{{
     }
     sql += " ELSE 'other' END";
     return sql;
+}
+
+/// JSON array items (no brackets, table order) for the OpenAPI and MCP `ecosystem` enums. Every
+/// literal comes from the constexpr table (never input).
+[[nodiscard]] inline std::string ecosystem_json_enum_items() {
+    std::string out;
+    for (const auto& e : kEcosystemFamilies) {
+        if (!out.empty())
+            out += ", ";
+        out += '"';
+        out += e.ecosystem;
+        out += '"';
+    }
+    return out;
+}
+
+/// `a|b|c` list (table order) for the OpenAPI /inventory/software and MCP query_installed_software
+/// descriptions.
+[[nodiscard]] inline std::string ecosystem_pipe_list() {
+    std::string out;
+    for (const auto& e : kEcosystemFamilies) {
+        if (!out.empty())
+            out += '|';
+        out += e.ecosystem;
+    }
+    return out;
+}
+
+/// Expands the ecosystem placeholders in a template with values generated from
+/// kEcosystemFamilies: `"@@ECOSYSTEM_ENUM@@"` (quotes included) -> the quoted table items,
+/// `"@@ECOSYSTEM_ENUM_OR_EMPTY@@"` -> `"", ` + the items, `@@ECOSYSTEM_LIST@@` (bare) -> the
+/// pipe list. The quotes belong to the two ENUM tokens, so an unquoted enum token is left intact.
+/// A missing or malformed token is not an error here; the consumer guards its template
+/// (build_catalogue()'s boot refusal in mcp_server.cpp).
+/// One allocation, sized to the largest the string reaches (the final size, the template's when
+/// every substitution shrinks it, or a mid-way peak when substitutions mix growing and
+/// shrinking): reserve() runs on an empty string (no capacity doubling),
+/// so the append and the in-place replaces below never reallocate for any well-formed table.
+[[nodiscard]] inline std::string expand_ecosystem_tokens(std::string_view tmpl) {
+    const std::string items = ecosystem_json_enum_items();
+    const std::pair<std::string_view, std::string> subs[] = {
+        {"\"@@ECOSYSTEM_ENUM@@\"", items},
+        {"\"@@ECOSYSTEM_ENUM_OR_EMPTY@@\"", "\"\", " + items},
+        {"@@ECOSYSTEM_LIST@@", ecosystem_pipe_list()},
+    };
+    // Same token order and counts as the replace loop below, so `peak` is the largest size the
+    // in-place replaces reach (a table whose substitutions mix growing and shrinking ones peaks
+    // mid-way).
+    std::size_t size = tmpl.size();
+    std::size_t peak = size;
+    for (const auto& [tok, val] : subs) {
+        for (std::size_t pos = tmpl.find(tok); pos != std::string_view::npos;
+             pos = tmpl.find(tok, pos + tok.size())) {
+            size = size - tok.size() + val.size();
+            peak = std::max(peak, size);
+        }
+    }
+    std::string out;
+    out.reserve(peak);
+    out.append(tmpl);
+    for (const auto& [tok, val] : subs) {
+        for (std::size_t pos = 0; (pos = out.find(tok, pos)) != std::string::npos;
+             pos += val.size()) {
+            out.replace(pos, tok.size(), val);
+        }
+    }
+    return out;
 }
 
 // ── Version order ────────────────────────────────────────────────────────────

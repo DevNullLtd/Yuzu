@@ -398,6 +398,7 @@ expected schema in the error body.
 
 ```bash
 curl -X POST http://localhost:8080/api/policy-fragments \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -b cookie -d '{
     "yaml_source": "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\nmetadata:\n  name: ssh-disabled\nspec:\n  check:\n    plugin: services\n    action: status\n    parameters: { name: sshd }\n    compliance: \"result.state != \\\"running\\\"\"\n"
@@ -408,6 +409,7 @@ curl -X POST http://localhost:8080/api/policy-fragments \
 
 ```bash
 curl -X POST http://localhost:8080/api/policy-fragments \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/yaml" \
   -b cookie --data-binary @- <<'EOF'
 apiVersion: yuzu.io/v1alpha1

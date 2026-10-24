@@ -120,6 +120,45 @@ TEST_CASE("BaselineStore opens and applies its schema", "[pg][baseline_store]") 
     REQUIRE(store.baseline_count() == 0);
 }
 
+TEST_CASE("BaselineStore::deployed_baseline_count_checked counts only deployed Baselines and "
+          "reports an error on degrade, never 0",
+          "[pg][baseline_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BaselineStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto none = store.deployed_baseline_count_checked();
+    REQUIRE(none.has_value());
+    CHECK(*none == 0);
+
+    auto draft = store.create_baseline(make_baseline("draft-only"));
+    auto live = store.create_baseline(make_baseline("will-deploy"));
+    REQUIRE(draft.has_value());
+    REQUIRE(live.has_value());
+    deploy(store, *live);
+
+    auto one = store.deployed_baseline_count_checked();
+    REQUIRE(one.has_value());
+    CHECK(*one == 1); // the draft is not counted
+    CHECK(store.baseline_count() == 2);
+
+    SECTION("a query-level failure") {
+        exec_sql(db.dsn(), "ALTER TABLE baseline_store.baselines RENAME TO baselines_broken");
+        auto degraded = store.deployed_baseline_count_checked();
+        REQUIRE_FALSE(degraded.has_value());
+        CHECK_FALSE(degraded.error().empty());
+        exec_sql(db.dsn(), "ALTER TABLE baseline_store.baselines_broken RENAME TO baselines");
+    }
+    SECTION("a closed store") {
+        PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+        BaselineStore bad(bad_pool);
+        auto degraded = bad.deployed_baseline_count_checked();
+        REQUIRE_FALSE(degraded.has_value());
+        CHECK_FALSE(degraded.error().empty());
+    }
+}
+
 TEST_CASE("Baseline CRUD round-trip", "[pg][baseline_store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -403,19 +442,28 @@ TEST_CASE("set_members/set_assignment advance the parent baseline's updated_at",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     BaselineStore store{pool};
     const std::string id = *store.create_baseline(make_baseline("touch"));
-    const int64_t created_updated_at = store.get_baseline(id)->updated_at;
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // now_epoch() is second-granular
+    // updated_at is a stored second-granular epoch bigint, so two writes inside one
+    // second would store the same value. Rewind the stored row 2 s in SQL (no
+    // production change, no sleeping) so the next write must land strictly later.
+    const auto rewind_updated_at = [&] {
+        exec_sql(db.dsn(), "UPDATE baseline_store.baselines SET updated_at = updated_at - 2 "
+                           "WHERE baseline_id = '" + id + "'");
+    };
+
+    rewind_updated_at();
+    const int64_t created_updated_at = store.get_baseline(id)->updated_at;
 
     REQUIRE(store.set_members(id, {"r1"}).has_value());
     const int64_t after_members = store.get_baseline(id)->updated_at;
     CHECK(after_members > created_updated_at);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    rewind_updated_at();
+    const int64_t before_assignment = store.get_baseline(id)->updated_at;
 
     REQUIRE(store.set_assignment(id, {{"g1", kAssignInclude}}).has_value());
     const int64_t after_assignment = store.get_baseline(id)->updated_at;
-    CHECK(after_assignment > after_members);
+    CHECK(after_assignment > before_assignment);
 }
 
 TEST_CASE("delete_baseline cascades members and assignment", "[pg][baseline_store]") {

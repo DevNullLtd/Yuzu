@@ -66,6 +66,7 @@ section is maintained manually; see `vcpkg.json` and
   HTMX (vendored) ....................... 0BSD
   htmx-ext-sse (vendored) ............... 0BSD
   Apache ECharts (vendored) ............. Apache-2.0
+  CycloneDX JSON schemas (vendored) ..... Apache-2.0
   Three.js r168 (vendored) .............. MIT
   Three.js OrbitControls (vendored) ..... MIT
   Nayuki QR-Code-generator (vendored) ... MIT

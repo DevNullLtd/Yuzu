@@ -31,10 +31,14 @@
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <libpq-fe.h>
 
 #include <chrono>
+#include <expected>
 #include <functional>
+#include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -127,6 +131,24 @@ struct Harness {
     // construction time, since Deps is copied into the runner once and
     // there's no other way to change should_stop's behavior per-test.
     std::function<bool()> should_stop_hook;
+    // #6096: when set, the fake enqueue_fn models the real outbox's idempotence on the
+    // occurrence key (a repeat is AlreadyEnqueued and adds no row). `outbox_rows` is then the
+    // number of durable occurrences, i.e. the number of times the schedule actually RAN.
+    bool model_outbox{false};
+    // occurrence_id -> approval_id of the durable outbox rows (the spent-ticket ledger).
+    std::map<std::string, std::string> outbox_rows;
+    // Error injection for the ledger reads (the runner must HOLD, never read it as empty).
+    bool outbox_read_error{false};
+    bool outbox_read_throws{false};
+    bool outbox_exists_error{false};              // only the occurrence_exists read fails
+    std::set<std::string> outbox_error_ids;       // only the ledger read for these approval ids fails
+    std::map<std::string, int> ledger_calls;      // ledger reads per approval id
+    int exists_calls{0};
+    // Runs inside the ledger read, i.e. AFTER the runner took its ticket snapshot (races a
+    // concurrent settle in deterministically).
+    std::function<void(const std::string&)> on_ledger_read;
+    // Runs inside enqueue_fn, i.e. AFTER the runner took its ticket snapshot.
+    std::function<void()> on_enqueue_hook;
 
     ScheduleRunner runner;
 
@@ -155,11 +177,43 @@ struct Harness {
                   enqueues.push_back({req.occurrence_id, req.plugin, req.action, req.scope_expr,
                                      req.execution_id, req.principal, req.approval_id,
                                      req.parameters});
+                  if (on_enqueue_hook)
+                      on_enqueue_hook();
                   if (throw_on_enqueue)
                       throw std::runtime_error("enqueue boom");
+                  if (model_outbox) {
+                      return outbox_rows.emplace(req.occurrence_id, req.approval_id).second
+                                 ? yuzu::server::OutboxEnqueueOutcome::Enqueued
+                                 : yuzu::server::OutboxEnqueueOutcome::AlreadyEnqueued;
+                  }
                   return enqueue_result;
               },
               .arming_check = std::move(arming),
+              .outbox_occurrences_fn =
+                  [this](const std::string& approval_id)
+                  -> std::expected<std::vector<std::string>, std::string> {
+                  ++ledger_calls[approval_id];
+                  if (on_ledger_read)
+                      on_ledger_read(approval_id);
+                  if (outbox_read_throws)
+                      throw std::runtime_error("ledger boom");
+                  if (outbox_read_error || outbox_error_ids.contains(approval_id))
+                      return std::unexpected("ledger unavailable");
+                  std::vector<std::string> out;
+                  for (const auto& [occ, appr] : outbox_rows)
+                      if (appr == approval_id)
+                          out.push_back(occ);
+                  return out;
+              },
+              .outbox_exists_fn = [this](const std::string& occurrence_id)
+                  -> std::expected<bool, std::string> {
+                  ++exists_calls;
+                  if (outbox_read_throws)
+                      throw std::runtime_error("ledger boom");
+                  if (outbox_read_error || outbox_exists_error)
+                      return std::unexpected("ledger unavailable");
+                  return outbox_rows.contains(occurrence_id);
+              },
               .should_stop = [this] { return should_stop_hook && should_stop_hook(); },
           }) {
         INFO("[schedrunner instr] fixture status (blank == database came up OK): "
@@ -221,6 +275,88 @@ struct Harness {
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
         auto sql =
             "UPDATE schedule_engine.schedules SET next_execution_at = 1 WHERE id = '" + id + "'";
+        yuzu::server::pg::PgResult res{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    // Run raw SQL on a second connection (fixtures that put rows at chosen stamps, and the
+    // trigger that makes the retire UPDATE fail while every read still works).
+    void exec_sql(const std::string& sql) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(instr_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult res{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    // #6096: occurrence N is due with a DISTINCT stamp, because the outbox key is
+    // `schedule_id:next_execution_at` and force_due()'s constant 1 would collide.
+    void force_due_at(const std::string& id, int64_t t) {
+        exec_sql("UPDATE schedule_engine.schedules SET next_execution_at = " + std::to_string(t) +
+                 " WHERE id = '" + id + "'");
+    }
+    // Skew fixtures: there is no clock-injection seam, so move the stamps in the tables.
+    void set_submitted_at(const std::string& approval_id, int64_t v) {
+        exec_sql("UPDATE approval_manager.approvals SET submitted_at = " + std::to_string(v) +
+                 " WHERE id = '" + approval_id + "'");
+    }
+    void set_last_executed_at(const std::string& id, int64_t v) {
+        exec_sql("UPDATE schedule_engine.schedules SET last_executed_at = " + std::to_string(v) +
+                 " WHERE id = '" + id + "'");
+    }
+    // Make every UPDATE of consumed_at fail (reads keep working): a retire store failure.
+    void block_retire() {
+        exec_sql("CREATE FUNCTION approval_manager.test_block_retire() RETURNS trigger AS $$ "
+                 "BEGIN RAISE EXCEPTION 'retire blocked'; END $$ LANGUAGE plpgsql;"
+                 "CREATE TRIGGER test_block_retire BEFORE UPDATE OF consumed_at ON "
+                 "approval_manager.approvals FOR EACH ROW EXECUTE FUNCTION "
+                 "approval_manager.test_block_retire();");
+    }
+    void unblock_retire() {
+        exec_sql("DROP TRIGGER test_block_retire ON approval_manager.approvals");
+    }
+    // Like block_retire(), but lets the ledger-spent settle through: fails every settle whose
+    // consumed_by is not the `schedule:ledger-spent:` form (so the SECOND retire of a tick fails).
+    void block_retire_except_ledger() {
+        exec_sql("CREATE FUNCTION approval_manager.test_block_retire() RETURNS trigger AS $$ "
+                 "BEGIN IF NEW.consumed_by NOT LIKE 'schedule:ledger-spent:%' THEN "
+                 "RAISE EXCEPTION 'retire blocked'; END IF; RETURN NEW; END $$ LANGUAGE plpgsql;"
+                 "CREATE TRIGGER test_block_retire BEFORE UPDATE OF consumed_at ON "
+                 "approval_manager.approvals FOR EACH ROW EXECUTE FUNCTION "
+                 "approval_manager.test_block_retire();");
+    }
+    // Make the schedule's advance (the UPDATE of last_executed_at) fail.
+    void block_advance() {
+        exec_sql("CREATE FUNCTION schedule_engine.test_block_advance() RETURNS trigger AS $$ "
+                 "BEGIN RAISE EXCEPTION 'advance blocked'; END $$ LANGUAGE plpgsql;"
+                 "CREATE TRIGGER test_block_advance BEFORE UPDATE OF last_executed_at ON "
+                 "schedule_engine.schedules FOR EACH ROW EXECUTE FUNCTION "
+                 "schedule_engine.test_block_advance();");
+    }
+    void unblock_advance() {
+        exec_sql("DROP TRIGGER test_block_advance ON schedule_engine.schedules");
+    }
+    // The single pending ticket (REQUIREd) for the schedule's current ask.
+    std::string only_pending() {
+        auto pending = approvals.query({.status = "pending"});
+        REQUIRE(pending.size() == 1);
+        return pending[0].id;
+    }
+    int enqueue_count_for(const std::string& approval_id) const {
+        int n = 0;
+        for (const auto& e : enqueues)
+            if (e.approval_id == approval_id)
+                ++n;
+        return n;
+    }
+
+    // Age an approval's review stamp by `seconds` (negative = into the future), directly in
+    // the table: the sweep and liveness check run on database time, so a fixture row is the
+    // only way to put a ticket at a chosen age.
+    void age_review(const std::string& approval_id, int64_t seconds) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(instr_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto sql = "UPDATE approval_manager.approvals SET reviewed_at = reviewed_at - (" +
+                   std::to_string(seconds) + ") WHERE id = '" + approval_id + "'";
         yuzu::server::pg::PgResult res{PQexec(conn.get(), sql.c_str())};
         REQUIRE(res.status() == PGRES_COMMAND_OK);
     }
@@ -467,13 +603,85 @@ TEST_CASE("ScheduleRunner: approving the ticket fires the held occurrence exactl
     CHECK(h.enqueues[0].approval_id == pending[0].id);
 
     // One-approval == one-run: force the next occurrence due — the spent
-    // (still 'approved') ticket must be stale under the occurrence anchor,
-    // so the runner submits a FRESH ask instead of re-firing.
+    // (still 'approved') ticket was retired (consumed_at) when its occurrence
+    // settled, so the runner submits a FRESH ask instead of re-firing.
     h.force_due(id);
     h.runner.tick();
 
     CHECK(h.enqueues.size() == 1); // no second fire
     CHECK(h.approvals.query({.status = "pending"}).size() == 1);
+}
+
+// #6061 (governance SG-2): the runner retires a ticket via retire_schedule_tickets (before #6096,
+// by advancing the schedule), never by consume_ticket(), so it did not see the 7-day lifetime
+// consume enforces: an approved ticket older than the TTL fired unattended as the schedule's
+// creator. The fire path now asks ApprovalManager::ticket_is_live (the consume CAS
+// predicate, database time). No submit() sweep runs between the aging and the tick
+// that fires, so only the liveness check can refuse it.
+TEST_CASE("ScheduleRunner: an approved ticket past its lifetime does not fire; a fresh ask is "
+          "raised instead (#6061)",
+          "[schedule][runner][approval][pg][6061]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick(); // submits
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 1);
+    const std::string stale_id = pending[0].id;
+    REQUIRE(h.approvals.approve(stale_id, "boss", "ok").has_value());
+    h.age_review(stale_id, kApprovalTicketTtlSeconds + 60);
+
+    auto before = h.approvals.get(stale_id);
+    REQUIRE(before);
+    REQUIRE(before->status == "approved"); // not swept: the runner's own check must refuse it
+
+    h.runner.tick();
+
+    CHECK(h.enqueues.empty()); // nothing fired under the expired approval
+    CHECK(h.get(id).execution_count == 0);
+    CHECK(h.get(id).next_execution_at == 1); // occurrence held, not advanced
+    auto fresh = h.approvals.query({.status = "pending"});
+    REQUIRE(fresh.size() == 1); // a new ask replaced it
+    CHECK(fresh[0].id != stale_id);
+    auto stale_after = h.approvals.get(stale_id);
+    REQUIRE(stale_after);
+    CHECK(stale_after->consumed_at == 0);
+}
+
+TEST_CASE("ScheduleRunner: an approved ticket just inside its lifetime still fires (#6061)",
+          "[schedule][runner][approval][pg][6061]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick(); // submits
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 1);
+    REQUIRE(h.approvals.approve(pending[0].id, "boss", "ok").has_value());
+    // 60s inside the window: off the inter-clock knife edge, still unambiguously live.
+    h.age_review(pending[0].id, kApprovalTicketTtlSeconds - 60);
+
+    h.runner.tick();
+
+    REQUIRE(h.enqueues.size() == 1);
+    CHECK(h.enqueues[0].approval_id == pending[0].id);
+    CHECK(h.get(id).execution_count == 1);
+}
+
+TEST_CASE("ScheduleRunner: an approved ticket reviewed in the far future does not fire (#6061)",
+          "[schedule][runner][approval][pg][6061]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick();
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 1);
+    REQUIRE(h.approvals.approve(pending[0].id, "boss", "ok").has_value());
+    h.age_review(pending[0].id, -10 * 365 * 24 * 3600); // reviewed ten years from now
+
+    h.runner.tick();
+
+    CHECK(h.enqueues.empty());
+    CHECK(h.get(id).execution_count == 0);
 }
 
 // #1398 hardening (governance Gate 4 unhappy-path CRITICAL finding): a
@@ -545,7 +753,7 @@ TEST_CASE("ScheduleRunner: rejecting the ticket skips the occurrence and re-asks
     CHECK(h.enqueues.empty());
     CHECK(h.get(id).next_execution_at > 1);
 
-    // Next occurrence: the rejected ticket is stale — a fresh ask goes out.
+    // Next occurrence: the rejected ticket was retired when it skipped; a fresh ask goes out.
     h.force_due(id);
     h.runner.tick();
     CHECK(h.enqueues.empty());
@@ -609,6 +817,788 @@ TEST_CASE("ScheduleRunner: two schedules sharing (creator,definition,scope) get 
     REQUIRE(still_pending.size() == 1);
     CHECK(still_pending[0].id == pending_b_id);
     CHECK(still_pending[0].schedule_id == id_b);
+}
+
+// ---------------------------------------------------------------------------
+// #6096: one approval == one run is a STATE transition (consumed_at, database time), not a
+// comparison between a database-authored ticket stamp and the engine's process-clock
+// last_executed_at. There is no clock-injection seam, so skew is simulated the way
+// age_review() does it: by moving the stamps in the tables.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ScheduleRunner: one approval is exactly one run under clock skew between submit, "
+          "fire and the next occurrence (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    // A: the skew applied to the ticket's submitted_at between submit and fire. B: where the
+    // schedule's last_executed_at sits relative to that ticket's stamp, before the fire (the
+    // old rule refused a ticket with B >= 0 as 'spent') and again after it (the old rule re-fired
+    // the spent ticket with B < 0).
+    const int64_t submit_skew = GENERATE(as<int64_t>{}, -3600, -5, 5, 3600);
+    const int64_t le_skew = GENERATE(as<int64_t>{}, -3600, -5, 5, 3600);
+    CAPTURE(submit_skew, le_skew);
+
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick(); // submits P1
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+
+    // Skew between submit and fire.
+    const int64_t stamp1 = h.approvals.get(p1)->submitted_at + submit_skew;
+    h.set_submitted_at(p1, stamp1);
+    h.set_last_executed_at(id, stamp1 + le_skew);
+
+    h.runner.tick(); // must fire P1 exactly once whatever the stamps say
+    REQUIRE(h.enqueues.size() == 1);
+    CHECK(h.enqueues[0].approval_id == p1);
+    CHECK(h.outbox_rows.size() == 1);
+    CHECK(h.get(id).execution_count == 1);
+    auto spent = h.approvals.get(p1);
+    REQUIRE(spent.has_value());
+    CHECK(spent->consumed_at != 0);          // retired by the fire
+    CHECK(spent->consumed_by == "schedule:" + id + ":1");
+
+    // Skew after the fire, in the direction that made the old rule re-fire the spent ticket
+    // (schedule 'behind' the ticket) and in the direction that did not.
+    h.set_last_executed_at(id, stamp1 - 3600);
+    int64_t next_due = 10;
+    for (int occ = 2; occ <= 3; ++occ, next_due += 10) {
+        h.force_due_at(id, next_due);
+        for (int i = 0; i < 3; ++i)
+            h.runner.tick(); // the spent ticket is never selected again; one fresh ask only
+        CHECK(h.enqueue_count_for(p1) == 1);
+        CHECK(h.outbox_rows.size() == static_cast<std::size_t>(occ - 1));
+        const std::string pn = h.only_pending();
+        REQUIRE(h.approvals.approve(pn, "boss", "ok").has_value());
+        h.set_submitted_at(pn, h.approvals.get(pn)->submitted_at + submit_skew);
+        h.set_last_executed_at(id, h.approvals.get(pn)->submitted_at + le_skew);
+        h.runner.tick();
+        CHECK(h.enqueue_count_for(pn) == 1);
+        CHECK(h.outbox_rows.size() == static_cast<std::size_t>(occ));
+        CHECK(h.approvals.get(pn)->consumed_at != 0);
+    }
+    // Exactly one run per approval, across all three occurrences.
+    std::map<std::string, int> per_approval;
+    for (const auto& e : h.enqueues)
+        ++per_approval[e.approval_id];
+    CHECK(per_approval.size() == 3);
+    for (const auto& [approval, n] : per_approval) {
+        CAPTURE(approval);
+        CHECK(n == 1);
+    }
+}
+
+TEST_CASE("ScheduleRunner: a rejected ticket skips exactly one occurrence and is then retired "
+          "(#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    const int64_t skew = GENERATE(as<int64_t>{}, -3600, 3600);
+    CAPTURE(skew);
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.reject(p1, "boss", "no").has_value());
+    h.runner.tick(); // occurrence skipped and advanced; the rejected ticket is retired
+    CHECK(h.enqueues.empty());
+    CHECK(h.get(id).next_execution_at > 1);
+    auto rejected = h.approvals.get(p1);
+    REQUIRE(rejected.has_value());
+    CHECK(rejected->status == "rejected");
+    CHECK(rejected->consumed_at != 0);
+
+    // Skew the retired ticket and the schedule so the old clock rule would treat the rejection
+    // as current for the NEXT occurrence too (skipping it a second time).
+    h.set_submitted_at(p1, rejected->submitted_at + skew);
+    h.set_last_executed_at(id, rejected->submitted_at + skew - 3600);
+    h.force_due_at(id, 10);
+    h.runner.tick();
+    CHECK(h.enqueues.empty());
+    const std::string p2 = h.only_pending(); // a fresh ask, not a second skip
+    REQUIRE(h.approvals.approve(p2, "boss", "ok").has_value());
+    h.runner.tick();
+    REQUIRE(h.enqueues.size() == 1);
+    CHECK(h.enqueues[0].approval_id == p2);
+}
+
+TEST_CASE("ScheduleRunner: a crash between the enqueue and the retire replays to one run "
+          "(#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+
+    // State left by a process that enqueued and died before retiring/advancing: the outbox
+    // already holds the occurrence, the ticket is unretired and the schedule not advanced.
+    h.outbox_rows[id + ":1"] = p1;
+
+    h.runner.tick();
+    CHECK(h.outbox_rows.size() == 1); // AlreadyEnqueued: no second row
+    CHECK(h.approvals.get(p1)->consumed_at != 0); // retired by the replay
+    CHECK(h.get(id).execution_count == 1);         // and advanced
+    CHECK(h.get(id).next_execution_at > 1);
+
+    h.force_due_at(id, 10);
+    h.runner.tick();
+    CHECK(h.outbox_rows.size() == 1); // the retired ticket does not fire the next occurrence
+    CHECK(h.approvals.query({.status = "pending"}).size() == 1);
+}
+
+TEST_CASE("ScheduleRunner: a retire store failure holds the occurrence and the retry retires "
+          "without a second run (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+
+    h.block_retire();
+    h.runner.tick();
+    h.runner.tick();
+    CHECK(h.outbox_rows.size() == 1);            // enqueued once, replayed as AlreadyEnqueued
+    CHECK(h.get(id).execution_count == 0);       // held: not advanced
+    CHECK(h.get(id).next_execution_at == 1);
+    CHECK(h.approvals.get(p1)->consumed_at == 0); // still unretired
+
+    h.unblock_retire();
+    h.runner.tick();
+    CHECK(h.outbox_rows.size() == 1);             // still exactly one run
+    CHECK(h.approvals.get(p1)->consumed_at != 0);
+    CHECK(h.get(id).execution_count == 1);
+    CHECK(h.get(id).next_execution_at > 1);
+}
+
+TEST_CASE("ScheduleRunner: a failed enqueue leaves the approved ticket unretired so the fire is "
+          "not lost (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+
+    for (auto failing : {OutboxEnqueueOutcome::Degraded, OutboxEnqueueOutcome::FencedOut}) {
+        // model_outbox bypasses enqueue_result, so switch it off for the failing outcomes.
+        h.model_outbox = false;
+        h.enqueue_result = failing;
+        h.runner.tick();
+        CHECK(h.approvals.get(p1)->consumed_at == 0); // spending it here would lose the fire
+        CHECK(h.get(id).execution_count == 0);
+        CHECK(h.get(id).next_execution_at == 1);
+    }
+
+    h.model_outbox = true; // the store recovers
+    h.runner.tick();
+    CHECK(h.outbox_rows.size() == 1);
+    CHECK(h.approvals.get(p1)->consumed_at != 0);
+    CHECK(h.get(id).execution_count == 1);
+}
+
+TEST_CASE("ScheduleRunner: a retire failure on a rejected ticket holds the occurrence (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.reject(p1, "boss", "no").has_value());
+
+    h.block_retire();
+    h.runner.tick();
+    CHECK(h.get(id).next_execution_at == 1); // held, not advanced
+    CHECK(h.approvals.get(p1)->consumed_at == 0);
+
+    h.unblock_retire();
+    h.runner.tick();
+    CHECK(h.get(id).next_execution_at > 1);
+    CHECK(h.approvals.get(p1)->consumed_at != 0);
+    CHECK(h.enqueues.empty());
+}
+
+// #6096: a ticket the runner skipped for a target mismatch must be settled with the one that
+// fires, or it could fire a LATER occurrence once the definition is reverted.
+TEST_CASE("ScheduleRunner: a mismatch-skipped approved ticket does not fire after the "
+          "definition is reverted (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick();
+    const std::string p1 = h.only_pending(); // reviewed for procs.list
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+
+    // Occurrence 1: the definition now points elsewhere, so p1 is skipped (mismatch) and a
+    // fresh ask p2 is raised for the new content; approve and fire it.
+    auto def = h.is.get_definition("test.def");
+    REQUIRE((def.has_value() && def->has_value()));
+    InstructionDefinition mutated = **def;
+    mutated.plugin = "script_exec";
+    mutated.action = "bash";
+    REQUIRE(h.is.update_definition(mutated).has_value());
+    h.runner.tick();
+    const std::string p2 = h.only_pending();
+    REQUIRE(h.approvals.approve(p2, "boss", "ok").has_value());
+    h.runner.tick();
+    REQUIRE(h.enqueues.size() == 1);
+    CHECK(h.enqueues[0].approval_id == p2);
+    // Firing settled the schedule's other unsettled approved ticket too.
+    CHECK(h.approvals.get(p1)->consumed_at != 0);
+    CHECK(h.approvals.get(p2)->consumed_at != 0);
+
+    // Revert the definition and run the next occurrence: the old approval must NOT fire.
+    mutated.plugin = "procs";
+    mutated.action = "list";
+    REQUIRE(h.is.update_definition(mutated).has_value());
+    h.force_due_at(id, 10);
+    h.runner.tick();
+    CHECK(h.enqueues.size() == 1);
+    CHECK(h.outbox_rows.size() == 1);
+    (void)h.only_pending(); // a fresh ask instead
+}
+
+// #2760: a settled (consumed) ticket never fires, whatever its other fields say.
+TEST_CASE("ScheduleRunner: a consumed approved ticket never fires (#2760, #6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+    REQUIRE(h.approvals.retire_schedule_tickets(id, id + ":1", {p1}).value() == 1);
+
+    h.runner.tick();
+    h.runner.tick();
+    CHECK(h.enqueues.empty());
+    CHECK(h.get(id).next_execution_at == 1); // held on a fresh ask
+    CHECK(h.only_pending() != p1);
+}
+
+// #6096: retire succeeded but the schedule's advance failed. The occurrence is already in the
+// outbox, so the next tick advances WITHOUT raising a fresh ask (the stuck-ask fix); the burnt
+// ticket is simply spent, and the outbox key prevents a double run.
+TEST_CASE("ScheduleRunner: retire ok but advance failing runs once and advances without a "
+          "fresh ask (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+
+    h.block_advance();
+    h.runner.tick(); // enqueued, retired, advance failed: still due at the same occurrence
+    CHECK(h.outbox_rows.size() == 1);
+    CHECK(h.approvals.get(p1)->consumed_at != 0);
+    CHECK(h.get(id).next_execution_at == 1);
+
+    h.runner.tick(); // advance still failing: no fresh ask, no second run
+    CHECK(h.outbox_rows.size() == 1);
+    CHECK(h.approvals.query({.status = "pending"}).empty());
+    CHECK(h.get(id).next_execution_at == 1);
+
+    h.unblock_advance();
+    h.runner.tick(); // the occurrence is already in the outbox: advance, nothing else
+    CHECK(h.outbox_rows.size() == 1);
+    CHECK(h.enqueues.size() == 1);
+    CHECK(h.approvals.query({.status = "pending"}).empty());
+    CHECK(h.get(id).next_execution_at > 1);
+}
+
+// #6096 outbox guard: a ticket the outbox shows was used by an EARLIER occurrence is never
+// fired, whatever consumed_at says (an old-binary leader fired it without settling it). It is
+// settled on the FIRST tick it is seen (marker "ledger-spent:"), so it neither lingers nor
+// costs a ledger read and a log line on every later tick.
+TEST_CASE("ScheduleRunner: an approved ticket already used by an earlier occurrence is settled "
+          "once, never fired (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+    h.outbox_rows["earlier:occurrence"] = p1; // spent by another occurrence, consumed_at still 0
+
+    h.runner.tick();
+    CHECK(h.enqueues.empty()); // not fired
+    CHECK(h.outbox_rows.size() == 1);
+    CHECK(h.get(id).next_execution_at == 1);
+    auto spent = h.approvals.get(p1);
+    REQUIRE(spent.has_value());
+    CHECK(spent->consumed_at != 0); // settled on the first tick
+    CHECK(spent->consumed_by == "schedule:ledger-spent:" + id + ":1");
+    const std::string p2 = h.only_pending(); // a fresh ask, raised once
+    CHECK(p2 != p1);
+    const int reads_after_first = h.ledger_calls[p1];
+    CHECK(reads_after_first >= 1);
+
+    h.runner.tick();
+    h.runner.tick();
+    CHECK(h.ledger_calls[p1] == reads_after_first); // not re-queried on later ticks
+    CHECK(h.approvals.query({.status = "pending"}).size() == 1); // still the one ask
+
+    REQUIRE(h.approvals.approve(p2, "boss", "ok").has_value());
+    h.runner.tick();
+    REQUIRE(h.enqueues.size() == 1);
+    CHECK(h.enqueues[0].approval_id == p2);
+    CHECK(h.approvals.get(p2)->consumed_at != 0);
+}
+
+// The ledger-settle retire failing holds the occurrence: no fresh ask, no advance.
+TEST_CASE("ScheduleRunner: a failed ledger-spent settle holds the occurrence (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    yuzu::MetricsRegistry metrics;
+    Harness h([](const std::string&, const std::string&, const std::string&) { return true; },
+              nullptr, &metrics);
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+    h.outbox_rows["earlier:occurrence"] = p1;
+
+    h.block_retire();
+    const double before = metrics.counter("yuzu_schedule_fire_failures_total").value();
+    h.runner.tick();
+    CHECK(metrics.counter("yuzu_schedule_fire_failures_total").value() == before + 1.0);
+    CHECK(h.enqueues.empty());
+    CHECK(h.get(id).next_execution_at == 1);
+    CHECK(h.approvals.query({.status = "pending"}).empty()); // no fresh ask while it holds
+    CHECK(h.approvals.get(p1)->consumed_at == 0);
+
+    h.unblock_retire();
+    h.runner.tick();
+    CHECK(h.approvals.get(p1)->consumed_at != 0);
+    (void)h.only_pending();
+}
+
+// A ledger error on a SECOND candidate still holds (the first candidate was fine).
+TEST_CASE("ScheduleRunner: a ledger error on a second candidate holds (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+    // A second approved ticket for the same schedule. Whichever the list returns second must
+    // still be read, and its failure holds the whole occurrence.
+    auto p2 = h.approvals.submit("test.def", "admin", "", id, ApprovalOrigin::kSchedule, "procs",
+                                 "list");
+    REQUIRE(p2.has_value());
+    REQUIRE(h.approvals.approve(*p2, "boss", "ok").has_value());
+    h.outbox_rows["earlier:occurrence"] = p1; // p1 is spent; p2 is the fireable candidate
+    h.outbox_error_ids.insert(*p2);
+    // Make p1 the NEWER ticket so it is read first and p2 is genuinely the second candidate.
+    h.set_submitted_at(p1, h.approvals.get(*p2)->submitted_at + 100);
+
+    h.runner.tick();
+    CHECK(h.enqueues.empty());
+    CHECK(h.get(id).next_execution_at == 1);
+    // Both candidates were really read, the error held without a fresh ask, and the spent
+    // ticket read first was NOT settled (the hold returns before the ledger settle).
+    CHECK(h.ledger_calls[p1] >= 1);
+    CHECK(h.ledger_calls[*p2] >= 1);
+    CHECK(h.approvals.query({.status = "pending"}).empty());
+    CHECK(h.approvals.get(p1)->consumed_at == 0);
+}
+
+// A4: the occurrence key is already in the outbox and nothing is eligible. The observed tickets
+// are settled BEFORE the advance, and a failure to read the outbox or to settle holds.
+TEST_CASE("ScheduleRunner: an unreadable outbox on the already-ran check holds and is counted "
+          "(#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    yuzu::MetricsRegistry metrics;
+    Harness h([](const std::string&, const std::string&, const std::string&) { return true; },
+              nullptr, &metrics);
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    (void)h.only_pending(); // the ask exists; no approved ticket yet
+
+    h.outbox_exists_error = true;
+    const double before = metrics.counter("yuzu_schedule_fire_failures_total").value();
+    h.runner.tick();
+    CHECK(h.exists_calls >= 2);
+    CHECK(metrics.counter("yuzu_schedule_fire_failures_total").value() == before + 1.0);
+    CHECK(h.get(id).next_execution_at == 1);                  // held
+    CHECK(h.approvals.query({.status = "pending"}).size() == 1); // no second ask
+}
+
+TEST_CASE("ScheduleRunner: the already-ran branch settles observed tickets before it advances, "
+          "and a settle failure holds (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    yuzu::MetricsRegistry metrics;
+    Harness h([](const std::string&, const std::string&, const std::string&) { return true; },
+              nullptr, &metrics);
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+    h.age_review(p1, kApprovalTicketTtlSeconds + 60); // observed, but not live: never eligible
+    h.outbox_rows[id + ":1"] = ""; // this occurrence already ran (a direct fire has no ticket)
+
+    h.block_retire();
+    const double before = metrics.counter("yuzu_schedule_fire_failures_total").value();
+    h.runner.tick(); // A4 reached; the settle fails, so the occurrence is held
+    CHECK(metrics.counter("yuzu_schedule_fire_failures_total").value() == before + 1.0);
+    CHECK(h.get(id).next_execution_at == 1);
+    CHECK(h.approvals.get(p1)->consumed_at == 0);
+
+    h.unblock_retire();
+    h.runner.tick();
+    CHECK(h.approvals.get(p1)->consumed_at != 0); // settled BEFORE the advance
+    CHECK(h.approvals.get(p1)->consumed_by == "schedule:" + id + ":1");
+    CHECK(h.get(id).next_execution_at > 1);
+    CHECK(h.enqueues.empty());
+    CHECK(h.approvals.query({.status = "pending"}).empty()); // no fresh ask
+}
+
+// T1: a ledger-spent ticket and a live fireable one in the same snapshot. The live one fires, and
+// BOTH are settled by the single settle after the enqueue (the spent one is not settled
+// separately, because the fire returns first).
+TEST_CASE("ScheduleRunner: a spent ticket and a fireable one in one tick settle together "
+          "(#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    const bool spent_read_first = GENERATE(true, false);
+    CAPTURE(spent_read_first);
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+    auto p2 = h.approvals.submit("test.def", "admin", "", id, ApprovalOrigin::kSchedule, "procs",
+                                 "list");
+    REQUIRE(p2.has_value());
+    REQUIRE(h.approvals.approve(*p2, "boss", "ok").has_value());
+    h.outbox_rows["earlier:occurrence"] = p1; // p1 was used by an earlier occurrence
+    const int64_t base = h.approvals.get(*p2)->submitted_at;
+    h.set_submitted_at(p1, spent_read_first ? base + 100 : base - 100);
+
+    h.runner.tick();
+    REQUIRE(h.enqueues.size() == 1);
+    CHECK(h.enqueues[0].approval_id == *p2);
+    CHECK(h.outbox_rows.size() == 2);
+    for (const std::string& t : {p1, *p2}) {
+        auto row = h.approvals.get(t);
+        REQUIRE(row.has_value());
+        CHECK(row->consumed_at != 0);
+        CHECK(row->consumed_by == "schedule:" + id + ":1"); // one settle, no ledger-spent marker
+    }
+    CHECK(h.get(id).next_execution_at > 1);
+}
+
+// T2: the ledger settle succeeds, then the A4 settle fails and holds. The spent ticket stays
+// settled (with its marker) and is not read again; the next tick converges once the block lifts.
+TEST_CASE("ScheduleRunner: ledger settle ok then an A4 settle failure holds and converges "
+          "(#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    yuzu::MetricsRegistry metrics;
+    Harness h([](const std::string&, const std::string&, const std::string&) { return true; },
+              nullptr, &metrics);
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+    // An unrelated approved ticket that is observed but never eligible (past its lifetime).
+    auto p3 = h.approvals.submit("test.def", "admin", "", id, ApprovalOrigin::kSchedule, "procs",
+                                 "list");
+    REQUIRE(p3.has_value());
+    REQUIRE(h.approvals.approve(*p3, "boss", "ok").has_value());
+    h.age_review(*p3, kApprovalTicketTtlSeconds + 60);
+    h.outbox_rows["earlier:occurrence"] = p1; // p1 is ledger-spent
+    h.outbox_rows[id + ":1"] = "";            // this occurrence already ran: the A4 branch
+
+    h.block_retire_except_ledger();
+    const double before = metrics.counter("yuzu_schedule_fire_failures_total").value();
+    h.runner.tick();
+    CHECK(metrics.counter("yuzu_schedule_fire_failures_total").value() == before + 1.0);
+    CHECK(h.get(id).next_execution_at == 1);                     // held
+    auto spent = h.approvals.get(p1);
+    REQUIRE(spent.has_value());
+    CHECK(spent->consumed_at != 0);                              // the ledger settle went through
+    CHECK(spent->consumed_by == "schedule:ledger-spent:" + id + ":1");
+    CHECK(h.approvals.get(*p3)->consumed_at == 0);               // the A4 settle did not
+    const int reads = h.ledger_calls[p1];
+
+    h.runner.tick(); // still blocked: held again, and the settled ticket is not re-read
+    CHECK(h.ledger_calls[p1] == reads);
+    CHECK(h.get(id).next_execution_at == 1);
+
+    h.unblock_retire();
+    h.runner.tick();
+    CHECK(h.get(id).next_execution_at > 1);                      // converged: advanced
+    CHECK(h.approvals.get(*p3)->consumed_at != 0);
+    CHECK(h.approvals.query({.status = "pending"}).empty());     // and no fresh ask
+    CHECK(h.enqueues.empty());
+}
+
+// T4: the ledger-spent settle matches no row because a concurrent retire settled the ticket
+// between the snapshot and the settle. 0 rows is success (the ticket IS settled), not a hold.
+TEST_CASE("ScheduleRunner: a spent settle that finds the ticket already settled is a success "
+          "(#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+    h.outbox_rows["earlier:occurrence"] = p1;
+    bool raced = false;
+    h.on_ledger_read = [&](const std::string& approval_id) {
+        if (approval_id != p1 || raced)
+            return;
+        raced = true; // the racer settles it once, after the snapshot was taken
+        REQUIRE(h.approvals.retire_schedule_tickets(id, "racer:1", {p1}).value() == 1);
+    };
+
+    h.runner.tick();
+    CHECK(h.enqueues.empty());
+    CHECK(h.approvals.get(p1)->consumed_by == "schedule:racer:1"); // the racer's, untouched
+    (void)h.only_pending(); // not held: the fresh ask was raised
+}
+
+// A rejected skip settles the observed approved tickets too, so a mismatch-skipped approval
+// cannot outlive the skip and fire after the definition is reverted.
+TEST_CASE("ScheduleRunner: a rejected skip also settles an observed approved ticket (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+
+    auto def = h.is.get_definition("test.def");
+    REQUIRE((def.has_value() && def->has_value()));
+    InstructionDefinition mutated = **def;
+    mutated.plugin = "script_exec";
+    mutated.action = "bash";
+    REQUIRE(h.is.update_definition(mutated).has_value());
+    h.runner.tick(); // p1 is a mismatch: a fresh ask p2 for the new content
+    const std::string p2 = h.only_pending();
+    REQUIRE(h.approvals.reject(p2, "boss", "no").has_value());
+
+    h.runner.tick(); // the rejection skips the occurrence
+    CHECK(h.enqueues.empty());
+    CHECK(h.get(id).next_execution_at > 1);
+    CHECK(h.approvals.get(p2)->consumed_at != 0);
+    CHECK(h.approvals.get(p1)->consumed_at != 0); // the mismatch-skipped approval, too
+    CHECK(h.approvals.get(p1)->status == "approved");
+}
+
+TEST_CASE("ScheduleRunner: an outbox row for THIS occurrence is the legitimate retry (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+    h.outbox_rows[id + ":1"] = p1; // enqueued by an earlier attempt of THIS occurrence
+
+    h.runner.tick();
+    CHECK(h.enqueues.size() == 1);        // enqueue was attempted again (AlreadyEnqueued)
+    CHECK(h.outbox_rows.size() == 1);     // and added no row
+    CHECK(h.approvals.get(p1)->consumed_at != 0);
+    CHECK(h.get(id).next_execution_at > 1);
+}
+
+TEST_CASE("ScheduleRunner: an unreadable outbox ledger holds the occurrence (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    const bool throws = GENERATE(false, true);
+    CAPTURE(throws);
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+
+    (throws ? h.outbox_read_throws : h.outbox_read_error) = true;
+    h.runner.tick();
+    CHECK(h.enqueues.empty());
+    CHECK(h.get(id).next_execution_at == 1);                      // held
+    CHECK(h.approvals.query({.status = "pending"}).empty());      // no fresh ask either
+    CHECK(h.approvals.get(p1)->consumed_at == 0);
+
+    h.outbox_read_error = false;
+    h.outbox_read_throws = false;
+    h.runner.tick();
+    REQUIRE(h.enqueues.size() == 1);
+    CHECK(h.enqueues[0].approval_id == p1);
+}
+
+// An unwired ledger is not an empty one: an approval-gated schedule holds.
+TEST_CASE("ScheduleRunner: an unwired outbox ledger holds an approval-gated occurrence (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+
+    std::vector<EnqueueRecord> enqueues;
+    ScheduleRunner bare(ScheduleRunner::Deps{
+        .schedule_engine = &h.engine,
+        .instruction_store = &h.is,
+        .execution_tracker = &h.tracker,
+        .approval_manager = &h.approvals,
+        .enqueue_fn = [&](const yuzu::server::OutboxEnqueueRequest& req)
+            -> yuzu::server::OutboxEnqueueOutcome {
+            enqueues.push_back({req.occurrence_id, req.plugin, req.action, req.scope_expr,
+                               req.execution_id, req.principal, req.approval_id, req.parameters});
+            return yuzu::server::OutboxEnqueueOutcome::Enqueued;
+        },
+        .arming_check = [](const std::string&, const std::string&, const std::string&) {
+            return true;
+        },
+    });
+    bare.tick();
+    CHECK(enqueues.empty());
+    CHECK(h.get(id).next_execution_at == 1);
+    CHECK(h.approvals.get(p1)->consumed_at == 0);
+}
+
+// The compound that motivated the guard: enqueue ok, retire fails, the schedule then ADVANCES
+// through a skip branch (disabled definition), and the next occurrence must not reuse the ticket.
+TEST_CASE("ScheduleRunner: a skip-advance past a failed retire cannot let the ticket fire later "
+          "(#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string a = h.only_pending();
+    REQUIRE(h.approvals.approve(a, "boss", "ok").has_value());
+
+    h.block_retire();
+    h.runner.tick(); // enqueue N with ticket a, retire fails: held
+    REQUIRE(h.outbox_rows.size() == 1);
+    CHECK(h.approvals.get(a)->consumed_at == 0);
+    CHECK(h.get(id).next_execution_at == 1);
+
+    // The definition is disabled: the next tick takes the skip branch and advances.
+    auto def = h.is.get_definition("test.def");
+    REQUIRE((def.has_value() && def->has_value()));
+    InstructionDefinition d = **def;
+    d.enabled = false;
+    REQUIRE(h.is.update_definition(d).has_value());
+    h.runner.tick();
+    CHECK(h.get(id).next_execution_at > 1); // advanced past the unsettled ticket
+
+    d.enabled = true;
+    REQUIRE(h.is.update_definition(d).has_value());
+    h.unblock_retire();
+    h.force_due_at(id, 10); // occurrence N+1
+    h.runner.tick();
+    CHECK(h.enqueues.size() == 1);    // the ticket did NOT fire again
+    CHECK(h.outbox_rows.size() == 1);
+    (void)h.only_pending();           // a fresh ask instead
+}
+
+// The retire is scoped to the ids the runner OBSERVED: a ticket approved after the snapshot
+// (here, inside the enqueue call) is not settled by an occurrence that never saw it.
+TEST_CASE("ScheduleRunner: a ticket approved after the snapshot is not settled by this "
+          "occurrence (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+    // A second ask for the same schedule that is still pending when the tick snapshots.
+    auto p2 = h.approvals.submit("test.def", "admin", "", id, ApprovalOrigin::kSchedule, "procs",
+                                 "list");
+    REQUIRE(p2.has_value());
+    h.on_enqueue_hook = [&] {
+        h.on_enqueue_hook = nullptr;
+        REQUIRE(h.approvals.approve(*p2, "boss", "ok").has_value());
+    };
+
+    h.runner.tick();
+    REQUIRE(h.enqueues.size() == 1);
+    CHECK(h.enqueues[0].approval_id == p1);
+    CHECK(h.approvals.get(p1)->consumed_at != 0);
+    CHECK(h.approvals.get(*p2)->status == "approved");
+    CHECK(h.approvals.get(*p2)->consumed_at == 0); // never observed, never settled
+}
+
+// A ticket whose status is 'expired' is never eligible, however its other fields look.
+TEST_CASE("ScheduleRunner: an expired-status ticket never fires (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+    h.exec_sql("UPDATE approval_manager.approvals SET status = 'expired' WHERE id = '" + p1 + "'");
+    h.runner.tick();
+    CHECK(h.enqueues.empty());
+    CHECK(h.get(id).next_execution_at == 1);
+    CHECK(h.only_pending() != p1); // a fresh ask
+}
+
+// The rejected path records what settled the skipped occurrence.
+TEST_CASE("ScheduleRunner: a rejected skip records the occurrence key as the settler (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.reject(p1, "boss", "no").has_value());
+    h.runner.tick();
+    auto row = h.approvals.get(p1);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "rejected");
+    CHECK(row->consumed_at != 0);
+    CHECK(row->consumed_by == "schedule:" + id + ":1");
+}
+
+// #6096: nothing in the decision reads the schedule's created_at / last_executed_at.
+TEST_CASE("ScheduleRunner: schedule stamps far in the past or future still give one run per "
+          "approval (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    const int64_t stamp = GENERATE(as<int64_t>{}, 1, 4'102'444'800); // 1970 and 2100
+    CAPTURE(stamp);
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.exec_sql("UPDATE schedule_engine.schedules SET created_at = " + std::to_string(stamp) +
+               " WHERE id = '" + id + "'");
+    h.set_last_executed_at(id, stamp);
+
+    int64_t next_due = 1;
+    for (int occ = 1; occ <= 3; ++occ, next_due += 10) {
+        if (occ > 1)
+            h.force_due_at(id, next_due);
+        h.set_last_executed_at(id, stamp);
+        h.runner.tick();
+        const std::string p = h.only_pending();
+        REQUIRE(h.approvals.approve(p, "boss", "ok").has_value());
+        h.set_last_executed_at(id, stamp);
+        h.runner.tick();
+        h.runner.tick();
+        CHECK(h.enqueue_count_for(p) == 1);
+        CHECK(h.outbox_rows.size() == static_cast<std::size_t>(occ));
+    }
 }
 
 TEST_CASE("ScheduleEngine: interval floor rejected at create, clamped on legacy advance",
