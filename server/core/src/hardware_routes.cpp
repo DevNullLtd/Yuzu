@@ -928,8 +928,9 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 : std::expected<ResponseTierFilter, ForensicsUnknown>{
                       ResponseTierFilter::exclude(*deps_.forensics_plugins, authz::deny_all())};
         if (!tier_resolved) {
-            // Unknown: end the poll with a retry notice. Polling on would end in a false "timed
-            // out" for a device that did answer, and the rows can never be shown from here.
+            // Unknown: end the poll with a notice that points to the execution results. Polling
+            // on would end in a false "timed out" for a device that did answer, and the rows can
+            // never be shown from here.
             HwActionResultView notice;
             notice.attempt = attempt;
             notice.phase = HwActionResultView::Phase::PermissionUnconfirmed;

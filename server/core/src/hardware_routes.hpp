@@ -187,7 +187,8 @@ std::string render_hardware_actions_lens(const std::string& agent_id, const std:
 struct HwActionResultView {
     /// `NeedsForensicsRead` / `PermissionUnconfirmed` (#4990) end the poll with a notice: the caller
     /// cannot read this Forensics-tier plugin's reply for this device (a permission, not a timeout),
-    /// or the permission check itself could not be completed (try again). Appended last: the phase
+    /// or the permission check itself could not be completed (the notice points to the execution
+    /// results; running the action again starts a new collection). Appended last: the phase
     /// number is part of the `hardware.action.result` audit detail.
     enum class Phase {
         Pending,

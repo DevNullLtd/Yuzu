@@ -1482,8 +1482,9 @@ TEST_CASE("result poll: a grant withdrawn between two polls of the same command 
     }
 }
 
-TEST_CASE("result poll: an Unknown Forensics decision ends a Forensics poll with a retry notice, never a "
-          "timeout or rows; an ordinary plugin's poll does not depend on it",
+TEST_CASE("result poll: an Unknown Forensics decision ends a Forensics poll with a notice pointing "
+          "to the execution results, never a timeout or rows; an ordinary plugin's poll does not "
+          "depend on it",
           "[pg][hardware][route][security][forensics]") {
     YUZU_REQUIRE_PG_DB_TPL(db, hw_responsestore_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1503,6 +1504,10 @@ TEST_CASE("result poll: an Unknown Forensics decision ends a Forensics poll with
         CHECK(res->status == 200);
         CHECK(contains(res->body, "data-permission-unconfirmed"));
         CHECK(contains(res->body, "could not be completed"));
+        // The notice points to the execution results; it must not invite a second collection.
+        CHECK(contains(res->body, "execution results"));
+        CHECK_FALSE(contains(res->body, "Try again"));
+        CHECK_FALSE(contains(res->body, "try again"));
         CHECK_FALSE(contains(res->body, "Timed out"));
         CHECK_FALSE(contains(res->body, "Waiting"));
         CHECK_FALSE(contains(res->body, "hx-get"));
