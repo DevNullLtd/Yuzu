@@ -473,6 +473,129 @@ TEST_CASE("provenance ingest: a recorded ordinary dispatch is unchanged end to e
     CHECK(statuses[0].error_detail == kFreeText);
 }
 
+// The tracker classifies an execution by the plugin the server RECORDED for its commands, never by
+// the prefix of the command id. Every other tracker case records plugin == id prefix, so a
+// regression to a prefix parse (in the sink text or in the SQL read) would pass them all; these two
+// give the recorded plugin and the prefix different values.
+namespace {
+std::string make_execution(Harness& h, const std::string& definition) {
+    Execution e;
+    e.definition_id = definition;
+    e.dispatched_by = "tester";
+    e.status = "running";
+    e.agents_targeted = 2;
+    auto id = h.tracker->create_execution(e);
+    REQUIRE(id.has_value());
+    return *id;
+}
+
+/// An agent-status row whose text is stored RAW, standing in for a row written before the text was
+/// reduced at ingest. Only the read paths can reduce it, and they decide by the recorded plugin.
+void store_raw_status(Harness& h, const std::string& exec, const std::string& agent) {
+    AgentExecStatus raw;
+    raw.agent_id = agent;
+    raw.status = "failure";
+    raw.dispatched_at = 1;
+    raw.first_response_at = 2;
+    raw.completed_at = 4102444800; // later than the ingested frame, so it is the latest error
+    raw.exit_code = 3;
+    raw.error_detail = kFreeText;
+    h.tracker->update_agent_status(exec, raw);
+}
+
+/// The error text exactly as persisted, bypassing the tracker's read-time reduction.
+std::string persisted_error_detail(Harness& h, const std::string& exec, const std::string& agent) {
+    auto lease = h.pool.acquire();
+    REQUIRE(lease);
+    auto r = pg::exec_params(
+        lease.get(),
+        "SELECT error_detail FROM execution_tracker.agent_exec_status "
+        "WHERE execution_id = $1 AND agent_id = $2",
+        std::vector<std::string>{exec, agent});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(r.get()) == 1);
+    return PQgetvalue(r.get(), 0, 0);
+}
+
+const AgentExecStatus* status_of(const std::vector<AgentExecStatus>& all, const std::string& agent) {
+    for (const auto& a : all)
+        if (a.agent_id == agent)
+            return &a;
+    return nullptr;
+}
+} // namespace
+
+TEST_CASE("provenance tracker: a Forensics plugin recorded under an ordinary-looking id is a "
+          "Forensics execution",
+          "[pg][server][forensics_tier][provenance][tracker][security]") {
+    const bool direct = GENERATE(false, true);
+    INFO((direct ? "direct Subscribe path" : "gateway path"));
+    YUZU_REQUIRE_PG_DB_TPL(db, provenance_tpl);
+    Harness h(db.dsn(), direct);
+    h.tracker->set_forensics_plugin_set(&test::forensics_plugin_set());
+
+    const auto exec = make_execution(h, "def-prov-recorded-forensics");
+    const std::string id = std::string{test::kOrdinaryPlugin} + "-aa550001"; // prefix: ordinary
+    h.dispatched(id, test::kForensicsPlugin, exec);                          // recorded: Forensics
+    h.ingest(failed(id, kFreeText));
+
+    // The sink text written by notify_exec_tracker comes from the recorded plugin.
+    auto statuses = h.tracker->get_agent_statuses(exec);
+    const auto* ingested = status_of(statuses, h.agent());
+    REQUIRE(ingested != nullptr);
+    CHECK(ingested->status == "failure");
+    CHECK(ingested->error_detail == "forensics_error");
+    // ...and it is the PERSISTED text (the value the outbox and the bus carry), not only the
+    // reduction a read applies afterwards.
+    CHECK(persisted_error_detail(h, exec, h.agent()) == "forensics_error");
+    const auto notes = h.notification_messages();
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0] == "Command " + id + " on agent " + h.agent() + " failed: forensics_error");
+
+    // The SQL read decides by the recorded plugin too: a raw row on the same execution is reduced
+    // by every tracker read.
+    store_raw_status(h, exec, "agent-raw");
+    statuses = h.tracker->get_agent_statuses(exec);
+    const auto* raw = status_of(statuses, "agent-raw");
+    REQUIRE(raw != nullptr);
+    CHECK(raw->error_detail == "forensics_error");
+    const auto one = h.tracker->get_execution(exec);
+    REQUIRE(one.has_value());
+    CHECK(one->last_error_detail == "forensics_error");
+}
+
+TEST_CASE("provenance tracker: a Forensics-looking id recorded as an ordinary plugin is not reduced",
+          "[pg][server][forensics_tier][provenance][tracker][security]") {
+    const bool direct = GENERATE(false, true);
+    INFO((direct ? "direct Subscribe path" : "gateway path"));
+    YUZU_REQUIRE_PG_DB_TPL(db, provenance_tpl);
+    Harness h(db.dsn(), direct);
+    h.tracker->set_forensics_plugin_set(&test::forensics_plugin_set());
+
+    const auto exec = make_execution(h, "def-prov-recorded-ordinary");
+    const std::string id = std::string{test::kForensicsPlugin} + "-aa550002"; // prefix: Forensics
+    h.dispatched(id, test::kOrdinaryPlugin, exec);                            // recorded: ordinary
+    h.ingest(failed(id, kFreeText));
+
+    auto statuses = h.tracker->get_agent_statuses(exec);
+    const auto* ingested = status_of(statuses, h.agent());
+    REQUIRE(ingested != nullptr);
+    CHECK(ingested->error_detail == kFreeText);
+    CHECK(persisted_error_detail(h, exec, h.agent()) == kFreeText);
+    const auto notes = h.notification_messages();
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0] == "Command " + id + " on agent " + h.agent() + " failed: " + kFreeText);
+
+    store_raw_status(h, exec, "agent-raw");
+    statuses = h.tracker->get_agent_statuses(exec);
+    const auto* raw = status_of(statuses, "agent-raw");
+    REQUIRE(raw != nullptr);
+    CHECK(raw->error_detail == kFreeText);
+    const auto one = h.tracker->get_execution(exec);
+    REQUIRE(one.has_value());
+    CHECK(one->last_error_detail == kFreeText);
+}
+
 TEST_CASE("provenance ingest: the server's own correlation-id families keep their plugin and their "
           "consumers",
           "[pg][server][forensics_tier][provenance]") {
