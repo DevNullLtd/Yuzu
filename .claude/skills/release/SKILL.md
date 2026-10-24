@@ -28,7 +28,7 @@ Default mode (no flag): full pipeline from preflight → tag push → workflow m
 ## Pre-conditions the operator must confirm
 
 Before invoking the skill, the operator should already have:
-- All commits intended for this release merged to `main` (releases tag from main, not dev — confirm `git log origin/main..origin/dev` is empty or only contains intentional dev-only changes).
+- All commits intended for this release merged to `main` (releases tag from main, not dev — confirm `git log origin/main..origin/dev` is empty; preflight check #9 hard-fails on any divergence in either direction, so "intentional dev-only changes" are not an option — reconcile per Phase 0.5).
 - CHANGELOG promoted: `python3 scripts/assemble-changelog.py promote X.Y.Z` run and committed — it assembles all `changelog.d/` fragments (plus any legacy `[Unreleased]` content) into `## [X.Y.Z] - YYYY-MM-DD` and deletes the fragment files. Never hand-move `[Unreleased]` content. Preflight check 4b fails while unpromoted fragments remain. **Later RCs and the final release:** the version was promoted at its first RC, so hotfix fragments added since then are folded in with `python3 scripts/assemble-changelog.py promote X.Y.Z --append` before each later RC tag, and with `--append --date <final-date>` before the final tag; run that even if no fragment landed since the last RC: with no fragments it only re-dates the header (#5221). Convention: `changelog.d/README.md`.
 - `meson.build` `version: 'X.Y.Z'` updated.
 - The six required checks green on the commit being tagged (`main`'s tip). **Skipped counts as passing; absent, failed or cancelled do not.** A docs/changelog-only push to `main` (the final `promote --append --date` commit is one only when it touches `CHANGELOG.md` alone; folding fragments also deletes `changelog.d/*.md`, which are nested markdown and so build) skips the build legs via preflight's `code_changed=false` (#5320): `Proto backward-compat` shows `skipped`, and the `Linux gcc-15 debug` / `Windows MSVC debug` / `macOS debug` names come from the `docs-required-checks` stub as `success`. That skip only happens when the previous commit's push run succeeded, so a green docs-only commit never hides a red or unbuilt code commit. `success` on those three names for a docs-only commit means *inherited from the predecessor's build*, not *built*; the run's summary says so. A context that is missing entirely is a stop: wait for the run, or find out why it did not start. Check it with:
@@ -57,17 +57,21 @@ bash scripts/release-preflight.sh vX.Y.Z          # CRLF, version, CHANGELOG, co
 bash scripts/check-compose-versions.sh X.Y.Z      # explicit compose check (preflight wraps this too)
 ```
 
-Preflight checks:
+Preflight checks (numbered as `scripts/release-preflight.sh` numbers them):
 1. No CRLF in scripts or gateway config
 2. `meson.build` version matches the base version of the tag (rc/beta suffix stripped)
-3. CHANGELOG has a `## [X.Y.Z]` section with non-empty content
-4. Working tree is clean
-5. `Dockerfile.server` includes `--data-dir`
-6. All `actions/cache@v*` steps in release.yml have `save-always: true`
-7. `docker-compose.full-uat.yml` includes `--data-dir`
-8. `origin/dev` and `origin/main` are reconciled (no divergence either direction)
-
-Optional `--full` adds a local C++ + Erlang compile (~2 min).
+3. CHANGELOG has a `## [X.Y.Z]` section
+4. Changelog extraction for that section produces non-empty content (same AWK as release.yml)
+4b. No unpromoted `changelog.d/` fragments remain
+5. Working tree is clean
+6. `Dockerfile.server` includes `--data-dir`
+7. release.yml uses `actions/cache/restore@` ONLY — never `actions/cache@` (save). Release
+   builds consume cache and never produce it; a `save-always: true` here is the defect, not the
+   requirement (see the CI-cache row in `.claude/routed-concerns.md`)
+8. `docker-compose.full-uat.yml` includes `--data-dir`
+9. `origin/dev` and `origin/main` are reconciled (no divergence either direction) — hard FAIL,
+   see Phase 0.5
+10. (`--full` only) local C++ + Erlang compile (~2 min)
 
 **Stop** if preflight fails. Surface the failures and ask the operator how to proceed (commit fixes? bump versions? abort?).
 
@@ -77,7 +81,7 @@ Releases tag from `main`, but ongoing development happens on `dev`. Every prior 
 
 The preflight's check #9 surfaces this as a hard FAIL with the exact ahead/behind counts.
 
-**Both directions go through a pull request.** The *Protect Main* and *Protect Dev* rulesets accept changes only by PR, require one approving review, and have no bypass actors, so a direct `git push` to either branch — including a fast-forward — is refused. Reconciliation flow:
+**Both directions go through a pull request.** The *Protect Main* and *Protect Dev* rulesets accept changes only by PR and require one approving review, so for an ordinary contributor a direct `git push` to either branch — including a fast-forward — is refused. (Which accounts may bypass is visible only to repository administrators; the history shows at least one can, since five `main` PRs and the #6271 back-merge merged without an approving review. Use the PR path regardless — it is what leaves the review trail.) Reconciliation flow:
 
 ```bash
 # Diagnose what's where
@@ -358,8 +362,14 @@ If the wizard zip is **missing**, two causes are likely:
 
 After all verification passes:
 
-1. **Bump dev branch to next dev version.** On `dev`:
+1. **Carry `main` back to `dev`.** Always, not only when something looks out of place: the
+   promotion commit, every hotfix and every `promote --append` fold exist only on `main` until
+   this happens, and the next release's preflight check #9 hard-fails on the divergence. Open
+   the back-merge PR described in Phase 0.5 step 1 (#6271 is the 2026-10-21 instance).
+2. **Bump dev branch to next dev version**, as a PR into `dev` (the ruleset refuses a direct
+   push; this can ride in the back-merge PR from step 1):
    ```bash
+   git switch -c chore/post-release-bump origin/dev
    # Update meson.build version to X.Y.(Z+1) or (X+1).Y.0 (operator's call).
    # PLAIN version only — never a -dev/-rcN suffix. The suffix convention was
    # tried at 0.13.1-dev and rejected (operator ruling 2026-07-13): it
@@ -368,9 +378,12 @@ After all verification passes:
    # (No CHANGELOG step: the promote already left the ## [Unreleased] header +
    # do-not-edit note in place; new entries arrive as changelog.d/ fragments.)
    git commit -m "chore(post-release): bump dev to X.Y.Z+1"
-   git push origin dev
+   git push -u origin chore/post-release-bump
+   gh pr create --base dev --title "chore(post-release): bump dev to X.Y.Z+1"
    ```
-2. **Reconcile main → dev** if the release tag was on a main commit not yet merged into dev (rare on this project — usually dev → main first).
+   Observed practice has lagged this step: after v0.14.1 (2026-10-07) `dev` still read `0.14.1`
+   on 2026-10-24, and the bump happened at the next promotion instead
+   (`docs/branch-strategy.md` §3.5).
 3. **Close any release-blocker issues** in the milestone.
 4. **Update the rollout doc** if relevant (`docs/dependency-rollout-*.md`, `docs/roadmap.md`).
 5. **Announce.** Yuzu doesn't (currently) have an automated announcement channel. If applicable, post the release URL.
