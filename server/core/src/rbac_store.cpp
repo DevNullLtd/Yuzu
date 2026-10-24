@@ -2720,7 +2720,8 @@ std::expected<ReconcileResult, std::string> RbacStore::reconcile_idp_memberships
 
 // ── Authorization check ──────────────────────────────────────────────────────
 
-std::vector<std::string> RbacStore::collect_roles(void* conn, const std::string& username) const {
+std::expected<std::vector<std::string>, std::string>
+RbacStore::collect_roles(void* conn, const std::string& username) const {
     std::vector<std::string> roles;
     auto* c = static_cast<PGconn*>(conn);
     // Three-way UNION: direct user grant, group-membership grant, and (§4.1)
@@ -2737,10 +2738,30 @@ std::vector<std::string> RbacStore::collect_roles(void* conn, const std::string&
         "SELECT role_name FROM rbac_store.principal_roles "
         "WHERE principal_type = 'engine' AND principal_id = $1",
         std::vector<std::string>{username});
+    // A failed read is an ERROR, never an empty role set: "this principal holds no role" (the
+    // healthy, common least-privilege answer) and "the role query failed" must stay apart, or a
+    // store fault reads as a definitive denial. The caller owns the accounting
+    // (`collect_roles_accounted`).
     if (r.status() != PGRES_TUPLES_OK)
-        return roles; // fail-closed: empty role set → deny
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(c));
     for (int i = 0; i < PQntuples(r.get()); ++i)
         roles.push_back(text_col(r.get(), i, 0));
+    return roles;
+}
+
+std::expected<std::vector<std::string>, std::string>
+RbacStore::collect_roles_accounted(void* conn, const std::string& username) const {
+    auto roles = collect_roles(conn, username);
+    if (!roles) {
+        // A real role-read failure is the same degrade as every sibling query error: counted
+        // under the `query_error` reason and fed to the breaker as a FAILURE. (A healthy empty
+        // result is NOT this branch; the caller books it as a breaker success.) The accounting
+        // lives here, not at the call sites, so a future caller cannot skip the metric.
+        breaker_note_result(false);
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("RbacStore: role read failed: {} — DENY", roles.error());
+    }
     return roles;
 }
 
@@ -2751,8 +2772,16 @@ std::string RbacStore::perm_cache_key(const std::string& user, const std::string
 
 bool RbacStore::check_permission(const std::string& username, const std::string& securable_type,
                                  const std::string& operation) const {
+    // The Boolean compatibility wrapper: every unavailable outcome (store not open, breaker open,
+    // pool timeout, a failed read) is the same fail-closed `false` it always was.
+    return check_permission_checked(username, securable_type, operation).value_or(false);
+}
+
+std::expected<bool, std::string>
+RbacStore::check_permission_checked(const std::string& username, const std::string& securable_type,
+                                    const std::string& operation) const {
     if (!open_)
-        return false; // fail-closed
+        return std::unexpected(std::string(kRbacErrStoreNotOpen)); // fail-closed
 
     // #2703 Gate 7 item 1 commit C: observes on every exit below, whichever
     // return statement fires — excludes the trivial !open_ short-circuit
@@ -2791,7 +2820,7 @@ bool RbacStore::check_permission(const std::string& username, const std::string&
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
             spdlog::warn(
                 "RbacStore::check_permission: circuit breaker open — DENY without pool touch");
-        return false; // fail-closed
+        return std::unexpected(std::string(kRbacErrCircuitBreakerOpen)); // fail-closed
     }
 
     auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
@@ -2800,19 +2829,20 @@ bool RbacStore::check_permission(const std::string& username, const std::string&
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
             spdlog::warn("RbacStore::check_permission: pool acquire timed out — DENY");
-        return false; // fail-closed
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout)); // fail-closed
     }
     PGconn* conn = lease.get();
 
-    const auto roles = collect_roles(conn, username);
-    if (roles.empty()) {
-        // collect_roles() cannot distinguish "genuinely no roles" (the
-        // common case for any least-privilege user) from "the query
-        // failed" — both return empty. Recording this as a breaker SUCCESS
-        // is the deliberate, safer default: treating it as a failure would
-        // trip the breaker on ordinary confined-user traffic while Postgres
-        // is perfectly healthy, which is worse than under-counting the
-        // narrower same-shape connection-failure case this leaves uncovered.
+    const auto roles = collect_roles_accounted(conn, username);
+    if (!roles) {
+        // A failed role read: already counted and booked as a breaker failure by the helper. It is
+        // an unavailable outcome, NOT a denial.
+        return std::unexpected(roles.error());
+    }
+    if (roles->empty()) {
+        // A healthy, genuinely empty role set (the common case for any least-privilege user) is a
+        // definitive denial and a breaker SUCCESS: it must not trip the breaker on ordinary
+        // confined-user traffic while Postgres is healthy. A failed read never reaches here.
         breaker_note_result(true);
         return false;
     }
@@ -2820,9 +2850,9 @@ bool RbacStore::check_permission(const std::string& username, const std::string&
     std::string sql = "SELECT effect FROM rbac_store.role_permissions "
                       "WHERE securable_type = $1 AND operation = $2 AND role_name IN (";
     std::vector<std::string> params{securable_type, operation};
-    for (size_t i = 0; i < roles.size(); ++i) {
+    for (size_t i = 0; i < roles->size(); ++i) {
         sql += (i == 0 ? "$" : ",$") + std::to_string(3 + i);
-        params.push_back(roles[i]);
+        params.push_back((*roles)[i]);
     }
     sql += ")";
 
@@ -2833,7 +2863,7 @@ bool RbacStore::check_permission(const std::string& username, const std::string&
         if (note_read_degrade(metrics_, kReasonQueryError, sampler))
             spdlog::warn("RbacStore::check_permission: query failed: {} — DENY",
                          PQerrorMessage(conn));
-        return false; // fail-closed
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(conn)); // fail-closed
     }
     breaker_note_result(true);
     bool has_allow = false;
@@ -2865,17 +2895,17 @@ std::vector<Permission> RbacStore::get_effective_permissions(const std::string& 
         return result;
     PGconn* conn = lease.get();
 
-    const auto roles = collect_roles(conn, username);
-    if (roles.empty())
-        return result;
+    const auto roles = collect_roles_accounted(conn, username);
+    if (!roles || roles->empty())
+        return result; // a failed read was counted by the helper; the display list is empty
 
     std::string sql =
         "SELECT role_name, securable_type, operation, effect FROM rbac_store.role_permissions "
         "WHERE role_name IN (";
     std::vector<std::string> params;
-    for (size_t i = 0; i < roles.size(); ++i) {
+    for (size_t i = 0; i < roles->size(); ++i) {
         sql += (i == 0 ? "$" : ",$") + std::to_string(1 + i);
-        params.push_back(roles[i]);
+        params.push_back((*roles)[i]);
     }
     sql += ") ORDER BY securable_type, operation";
 

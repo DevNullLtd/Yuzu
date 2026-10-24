@@ -640,9 +640,27 @@ public:
                               const std::vector<std::pair<std::string, std::string>>& asserted);
 
     // ── Authorization check ──────────────────────────────────────────────
-    /// FAIL-CLOSED: false (deny) on store-not-open / pool timeout / query error.
+    /// FAIL-CLOSED: false (deny) on store-not-open / pool timeout / query error. This is the
+    /// Boolean compatibility wrapper over `check_permission_checked` (`value_or(false)`), so every
+    /// existing caller keeps the same fail-closed answer.
     bool check_permission(const std::string& username, const std::string& securable_type,
                           const std::string& operation) const;
+
+    /// The same decision with an unavailable authorization read told apart from a definitive
+    /// denial: `true` = granted, `false` = definitively denied (no allow, an explicit deny, or a
+    /// healthy EMPTY role set), `unexpected(msg)` = the answer could not be determined (extend,
+    /// never fork; mirrors `role_permission_allowed_checked`). The error text is
+    /// `kRbacErrStoreNotOpen`, `kRbacErrCircuitBreakerOpen`, `kRbacErrPoolAcquireTimeout`, or
+    /// `"query failed: ..."` (the role read or the permission read). A cache hit is answered first,
+    /// before the breaker, exactly as for `check_permission`. A real role-query failure is counted
+    /// under `yuzu_server_rbac_read_degrade_total{reason="query_error"}` and booked as a breaker
+    /// FAILURE; a healthy empty role set is neither. Only a caller that can act on "unavailable"
+    /// differently from "denied" (the Forensics-tier resolver through
+    /// `AuthRoutes::probe_permission_unavailable_aware`) should use this; every other caller uses
+    /// the Boolean wrapper.
+    [[nodiscard]] std::expected<bool, std::string>
+    check_permission_checked(const std::string& username, const std::string& securable_type,
+                             const std::string& operation) const;
 
     /// Scoped permission check: first tries global, then checks group-scoped
     /// roles. FAIL-CLOSED: false on any store error.
@@ -758,9 +776,17 @@ private:
     [[nodiscard]] bool load_enabled_flag();
 
     /// Collect all role names for a principal (direct user grant + via group
-    /// membership + direct engine-principal grant, §4.1) using `conn`. Returns
-    /// empty on a query error (fail-closed: an empty role set denies).
-    std::vector<std::string> collect_roles(void* conn, const std::string& username) const;
+    /// membership + direct engine-principal grant, §4.1) using `conn`. A healthy query that finds
+    /// no role is `expected(empty)`; a failed query is `unexpected("query failed: ...")`, never
+    /// an empty set. Does no accounting: use `collect_roles_accounted`.
+    std::expected<std::vector<std::string>, std::string> collect_roles(void* conn,
+                                                                        const std::string& username) const;
+
+    /// `collect_roles` plus the failure accounting every caller needs: a failed read bumps
+    /// `yuzu_server_rbac_read_degrade_total{reason="query_error"}`, logs (sampled) and is noted as
+    /// a breaker failure. The success (including an empty set) is left for the caller to book.
+    std::expected<std::vector<std::string>, std::string>
+    collect_roles_accounted(void* conn, const std::string& username) const;
 
     // ── ADR-0017 shared list-gate resolver (INV-7) ───────────────────────
     struct PermGroups {

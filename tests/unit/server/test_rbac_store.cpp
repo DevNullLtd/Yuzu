@@ -5083,3 +5083,176 @@ TEST_CASE("RbacStore::provision_first_admin fails closed — ok=false with a "
     // test still passed on the error check alone.
     CHECK(auth_db->get_user("failadmin").error() == AuthDBError::UserNotFound);
 }
+
+// ── check_permission_checked: unavailable is not denied (#4990) ──────────────────────────────
+// `check_permission` collapses every unavailable outcome into the same `false` a definitive denial
+// gives. `check_permission_checked` keeps them apart so the Forensics-tier resolver can answer a
+// retryable error instead of a 200 with rows silently missing. The Boolean wrapper must stay
+// byte-for-byte the old fail-closed answer, so every case also asserts
+// `check_permission == checked.value_or(false)`.
+namespace {
+double rbac_degrade_count(yuzu::MetricsRegistry& metrics, const char* reason) {
+    return metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}}).value();
+}
+} // namespace
+
+TEST_CASE("RbacStore: check_permission_checked tells a grant, a definitive denial and a healthy "
+          "empty role set from an unavailable read",
+          "[rbac_store][pg][forensics]") {
+    RBAC_STORE(store);
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    REQUIRE(store.assign_role({"user", "bob", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "vera", "Viewer"}).has_value());
+
+    SECTION("a grant is expected(true)") {
+        const auto r = store.check_permission_checked("bob", "Forensics", "Read");
+        REQUIRE(r.has_value());
+        CHECK(*r);
+        CHECK(store.check_permission("bob", "Forensics", "Read") == *r);
+    }
+
+    SECTION("a role set without the pair, and an explicit deny, are expected(false)") {
+        const auto no_pair = store.check_permission_checked("vera", "Forensics", "Read");
+        REQUIRE(no_pair.has_value());
+        CHECK_FALSE(*no_pair);
+
+        REQUIRE(store.set_permission({"Viewer", "Response", "Read", "deny"}).has_value());
+        const auto denied = store.check_permission_checked("vera", "Response", "Read");
+        REQUIRE(denied.has_value());
+        CHECK_FALSE(*denied);
+        CHECK_FALSE(store.check_permission("vera", "Response", "Read"));
+
+        // Neither is a degrade: the counters stay flat.
+        CHECK(rbac_degrade_count(metrics, "query_error") == 0.0);
+        CHECK(rbac_degrade_count(metrics, "pool_acquire_timeout") == 0.0);
+    }
+
+    SECTION("a healthy EMPTY role set is a definitive denial: no error, no metric, breaker stays "
+            "closed") {
+        // "nobody" holds no role at all: the common least-privilege answer, not a failure. Several
+        // distinct pairs (every one a cache miss) are more than the breaker's trip threshold, so a
+        // regression that booked an empty set as a failure would open it here.
+        for (const char* op : {"Read", "Write", "Delete", "Execute", "Approve"}) {
+            const auto r = store.check_permission_checked("nobody", "Forensics", op);
+            REQUIRE(r.has_value());
+            CHECK_FALSE(*r);
+            CHECK_FALSE(store.check_permission("nobody", "Forensics", op));
+        }
+        CHECK(rbac_degrade_count(metrics, "query_error") == 0.0);
+        CHECK(rbac_degrade_count(metrics, "pool_acquire_timeout") == 0.0);
+        CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
+        // The breaker really is closed: a granted user still gets through afterwards.
+        CHECK(store.check_permission_checked("bob", "Forensics", "Read").value_or(false));
+    }
+}
+
+TEST_CASE("RbacStore: a role-query failure is a typed error, is counted as query_error and is "
+          "noted as a breaker failure",
+          "[rbac_store][pg][forensics]") {
+    RBAC_STORE(store);
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    REQUIRE(store.assign_role({"user", "bob", "Administrator"}).has_value());
+    REQUIRE(store.check_permission_checked("bob", "Forensics", "Read").value_or(false)); // healthy
+
+    // The role read is the first query of the miss path; moving its table aside fails it for real.
+    exec_on_test_db(rbac_db_fx_.dsn(),
+                    "ALTER TABLE rbac_store.principal_roles RENAME TO principal_roles_gone");
+
+    // Call 1: a cache miss (unique pair), the role read fails. Typed error, counted, streak 0->1.
+    const auto r1 = store.check_permission_checked("bob", "Forensics", "Write");
+    REQUIRE_FALSE(r1.has_value());
+    CHECK(r1.error().starts_with("query failed: "));
+    CHECK(rbac_degrade_count(metrics, "query_error") == 1.0);
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
+    // The Boolean wrapper is the unchanged fail-closed answer, and counts the same way.
+    CHECK_FALSE(store.check_permission("bob", "Forensics", "Delete"));
+    CHECK(rbac_degrade_count(metrics, "query_error") == 2.0);
+
+    // The second consecutive failure tripped the breaker: that is "noted as a breaker failure"
+    // (a failure booked as a success would have reset the streak and left the gauge at 0).
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
+
+    // Call 3: the breaker is open and inside its cooldown, so the error is the breaker's, with no
+    // pool touch; it lands on the pool_acquire_timeout label like every breaker denial.
+    const auto r3 = store.check_permission_checked("bob", "Forensics", "Execute");
+    REQUIRE_FALSE(r3.has_value());
+    CHECK(std::string_view{r3.error()} == kRbacErrCircuitBreakerOpen);
+    CHECK(rbac_degrade_count(metrics, "pool_acquire_timeout") == 1.0);
+    CHECK(rbac_degrade_count(metrics, "query_error") == 2.0);
+    CHECK_FALSE(store.check_permission("bob", "Forensics", "Execute"));
+
+    // The display accessor shares the role read, so its failure is counted too (the helper owns
+    // the accounting; no caller can skip it).
+    exec_on_test_db(rbac_db_fx_.dsn(),
+                    "ALTER TABLE rbac_store.principal_roles_gone RENAME TO principal_roles");
+    exec_on_test_db(rbac_db_fx_.dsn(),
+                    "ALTER TABLE rbac_store.principal_roles RENAME TO principal_roles_gone");
+    const double before = rbac_degrade_count(metrics, "query_error");
+    CHECK(store.get_effective_permissions("bob").empty());
+    CHECK(rbac_degrade_count(metrics, "query_error") == before + 1.0);
+
+    // Recovery: put the table back, wait out the cooldown, and the half-open probe succeeds.
+    exec_on_test_db(rbac_db_fx_.dsn(),
+                    "ALTER TABLE rbac_store.principal_roles_gone RENAME TO principal_roles");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    const auto ok = store.check_permission_checked("bob", "Forensics", "Read");
+    REQUIRE(ok.has_value());
+    CHECK(*ok);
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
+}
+
+TEST_CASE("RbacStore: a starved pool, an open breaker and a store that is not open are typed "
+          "errors, and a cache hit still wins over them",
+          "[rbac_store][pg][forensics]") {
+    RBAC_STORE(replica_a);
+    REQUIRE(replica_a.assign_role({"user", "bob", "Administrator"}).has_value());
+
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+    yuzu::MetricsRegistry metrics;
+    replica_b.set_metrics(&metrics);
+
+    // Warm the cache for one pair while the pool is free.
+    const auto warm = replica_b.check_permission_checked("bob", "Forensics", "Read");
+    REQUIRE(warm.has_value());
+    REQUIRE(*warm);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // clear the refresh gate
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+
+    // Pool acquire timeout: a cache miss cannot get a connection.
+    const auto timed_out = replica_b.check_permission_checked("bob", "Forensics", "Write");
+    REQUIRE_FALSE(timed_out.has_value());
+    CHECK(std::string_view{timed_out.error()} == kRbacErrPoolAcquireTimeout);
+    CHECK_FALSE(replica_b.check_permission("bob", "Forensics", "Write"));
+    CHECK(rbac_degrade_count(metrics, "pool_acquire_timeout") >= 1.0);
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
+
+    // Breaker open (inside its cooldown): denied WITHOUT a pool touch, with the breaker's text.
+    const auto open = replica_b.check_permission_checked("bob", "Forensics", "Delete");
+    REQUIRE_FALSE(open.has_value());
+    CHECK(std::string_view{open.error()} == kRbacErrCircuitBreakerOpen);
+    CHECK_FALSE(replica_b.check_permission("bob", "Forensics", "Delete"));
+
+    // The cache lookup runs before the breaker: the warmed pair is still answered, as before.
+    const auto cached = replica_b.check_permission_checked("bob", "Forensics", "Read");
+    REQUIRE(cached.has_value());
+    CHECK(*cached);
+    CHECK(replica_b.check_permission("bob", "Forensics", "Read"));
+
+    SECTION("a store that is not open") {
+        PgPool bad{{.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1",
+                    .size = 1}};
+        RbacStore broken{bad};
+        REQUIRE_FALSE(broken.is_open());
+        const auto r = broken.check_permission_checked("bob", "Forensics", "Read");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(std::string_view{r.error()} == kRbacErrStoreNotOpen);
+        CHECK_FALSE(broken.check_permission("bob", "Forensics", "Read"));
+    }
+}
