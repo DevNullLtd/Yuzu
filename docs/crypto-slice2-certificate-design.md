@@ -513,18 +513,18 @@ unclamped.
 
 | Table | Key | Columns (beyond the key) |
 |---|---|---|
-| `agent_state` | `agent_id` | `content_hash`, `blob_version`, `first_seen`, `last_seen` (receipt of any report, full or skip), `last_full_at` (receipt of the last full report) |
+| `agent_state` | `agent_id` | `content_hash`, `blob_version`, `first_seen`, `last_seen` (receipt of any report, full or skip), `last_full_at` (receipt of the last full report), `sample_key` (server-assigned random 64-bit, set at first ingest, never exposed) |
 | `store_state` | (`agent_id`, `store_id`, `user_ref`) | `scope`, `status`, `reason`, `observed_at` (receipt of the last report in which the store read `ok` or `absent`), `status_at` (receipt of the last report that carried this store), `cert_count` |
 | `cert_location` | (`agent_id`, `store_id`, `user_ref`, `path`, `sha256`) | `first_seen`, `last_seen`, `full_report_at` (the `last_full_at` of the full report that last carried it) |
 | `decommission_tombstone` | `agent_id` | `decommissioned_at` |
-| `cert_fact` | (`agent_id`, `sha256`) | every field in the field table, `der` (nullable), `server_parsed` (bool), `constrained_fields` |
+| `cert_fact` | (`agent_id`, `sha256`) | every field in the field table, `der` (nullable), `server_parsed` (bool), `constrained_fields`, `sample_key` (copy of the agent's, `NOT NULL`) |
 | `cert_san` | (`agent_id`, `sha256`, `ord`) | `san_type`, `value` |
 | `cert_eku` | (`agent_id`, `sha256`, `ord`) | `oid` |
 | `cert_cdp` | (`agent_id`, `sha256`, `ord`) | `uri` |
 
 **Indexes:** `cert_fact (not_after)`, `(not_before)`, `(issuer_name_sha256, serial)`,
 `(sig_alg_oid, pss_hash_oid)`, `(key_alg_oid, rsa_modulus_bits)`, `(ec_order_bits)`, `(sha256)`,
-`(spki_sha256)`, `(aki_key_id)` (see [Finding one CA's certificates](#finding-one-cas-certificates));
+`(spki_sha256)`, `(aki_key_id)`, `(sha256, sample_key, agent_id)` (the CBOM agreement sample order) (see [Finding one CA's certificates](#finding-one-cas-certificates));
 `store_state (status, observed_at)` for the prune; every table has `agent_id` leading its key, for
 decommission and confinement.
 

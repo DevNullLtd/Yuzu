@@ -11,6 +11,10 @@
 /// device: status, reason, `observed_at`, `status_at`), `cert_location` (where a
 /// certificate was seen), `cert_fact` (one row per (device,
 /// certificate): the X.509 facts), and the `cert_san` / `cert_eku` / `cert_cdp` children.
+/// `agent_state.sample_key` is a random 64-bit value the SERVER assigns at first ingest (stable
+/// after), copied onto the agent's `cert_fact` rows and indexed (`cert_fact_sample_idx`) so a
+/// later CBOM agreement sample is ordered by a key an agent cannot choose; it is never sent to
+/// an agent and no read column list includes it.
 /// A `cert_fact` row exists while at least one `cert_location` row references it; the
 /// ingest transaction deletes the orphans.
 ///

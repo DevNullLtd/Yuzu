@@ -5,6 +5,7 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "secure_random.hpp"
 
 #include <libpq-fe.h>
 #include <openssl/evp.h>
@@ -14,6 +15,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <functional>
 #include <array>
 #include <charconv>
@@ -99,10 +102,11 @@ const std::string& fact_upsert_sql() {
                 exc += std::string(exc.empty() ? "" : ", ") + "EXCLUDED." + c.name;
             }
         }
-        return "INSERT INTO certificate_inventory_store.cert_fact (" + cols + ", server_parsed) SELECT " + sel +
-               ", false FROM jsonb_to_recordset($2::jsonb) AS t(" + rec +
+        return "INSERT INTO certificate_inventory_store.cert_fact (" + cols + ", server_parsed, sample_key) SELECT " + sel +
+               ", false, (SELECT a.sample_key FROM certificate_inventory_store.agent_state a WHERE a.agent_id = $1)"
+               " FROM jsonb_to_recordset($2::jsonb) AS t(" + rec +
                ") ON CONFLICT (agent_id, sha256) DO UPDATE SET " + upd +
-               ", server_parsed = false WHERE (" + cur + ", cert_fact.server_parsed) IS DISTINCT FROM (" +
+               ", server_parsed = false, sample_key = EXCLUDED.sample_key WHERE (" + cur + ", cert_fact.server_parsed) IS DISTINCT FROM (" +
                exc + ", false) RETURNING sha256";
     }();
     return sql;
@@ -122,7 +126,12 @@ const std::vector<pg::PgMigration>& build_migrations() {
          "  blob_version  TEXT NOT NULL,"
          "  first_seen    TIMESTAMPTZ NOT NULL,"
          "  last_seen     TIMESTAMPTZ NOT NULL,"
-         "  last_full_at  TIMESTAMPTZ NOT NULL);"
+         "  last_full_at  TIMESTAMPTZ NOT NULL,"
+         // A random 64-bit value the SERVER assigns the first time it ingests an agent (stable
+         // after that), copied onto the agent's cert_fact rows. The CBOM agreement sample orders
+         // reporters by it, which an agent can neither choose nor predict (its agent_id is its
+         // own choice at enrolment). Never sent to an agent, never on a read/export/audit surface.
+         "  sample_key    BIGINT NOT NULL);"
          // One row per store per device (user_ref is '' for the machine scope; slice 2 reads no
          // per-user store). observed_at is the receipt of the last report in which the store
          // read ok or absent (NULL until there has been one); status_at is the receipt of the
@@ -179,7 +188,9 @@ const std::vector<pg::PgMigration>& build_migrations() {
          // Digest of the SAN/EKU/CDP child set: part of the unchanged-fact guard, so a child-only
          // change (the facts equal, the children differ) is never skipped and never goes stale.
          "  child_digest         TEXT NOT NULL DEFAULT '',"
+         "  sample_key           BIGINT NOT NULL,"
          "  PRIMARY KEY (agent_id, sha256));"
+         "CREATE INDEX cert_fact_sample_idx ON cert_fact (sha256, sample_key, agent_id);"
          "CREATE INDEX cert_fact_not_after_idx ON cert_fact (not_after);"
          "CREATE INDEX cert_fact_not_before_idx ON cert_fact (not_before);"
          "CREATE INDEX cert_fact_issuer_serial_idx ON cert_fact (issuer_name_sha256, serial);"
@@ -353,6 +364,21 @@ Json fact_json(const CertFactRow& f, const std::string& child_digest) {
     return j;
 }
 
+/// A fresh 64-bit sample key from the process CSPRNG (the server's own, unpredictable to agents).
+/// A CSPRNG failure falls back to a time-derived value: the key only orders a sample, it is never an
+/// authenticator, and ingest must not fail for it.
+std::int64_t random_sample_key() {
+    std::array<std::uint8_t, 8> b{};
+    if (fill_random(b)) {
+        std::uint64_t v = 0;
+        for (const auto x : b)
+            v = (v << 8) | x;
+        return static_cast<std::int64_t>(v);
+    }
+    return static_cast<std::int64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count() * 0x9E3779B97F4A7C15ULL);
+}
+
 std::int64_t result_i64(const pg::PgResult& res, int row, int col) {
     const char* txt = PQgetvalue(res.get(), row, col);
     const auto len = static_cast<std::size_t>(PQgetlength(res.get(), row, col));
@@ -506,13 +532,15 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
         pg::PgResult as = pg::exec_params(
             c,
             "INSERT INTO certificate_inventory_store.agent_state "
-            "(agent_id, content_hash, blob_version, first_seen, last_seen, last_full_at) "
-            "VALUES ($1, $2, $3, $4::timestamptz, $4::timestamptz, $4::timestamptz) "
+            "(agent_id, content_hash, blob_version, first_seen, last_seen, last_full_at, sample_key) "
+            "VALUES ($1, $2, $3, $4::timestamptz, $4::timestamptz, $4::timestamptz, $5::bigint) "
             "ON CONFLICT (agent_id) DO UPDATE SET content_hash = EXCLUDED.content_hash, "
             "  first_seen = LEAST(certificate_inventory_store.agent_state.first_seen, EXCLUDED.first_seen), "
             "  blob_version = EXCLUDED.blob_version, last_seen = EXCLUDED.last_seen, "
-            "  last_full_at = EXCLUDED.last_full_at",
-            std::vector<std::string>{id, std::string(content_hash), report.blob_version, T});
+            "  last_full_at = EXCLUDED.last_full_at, "
+            "  sample_key = COALESCE(certificate_inventory_store.agent_state.sample_key, EXCLUDED.sample_key)",
+            std::vector<std::string>{id, std::string(content_hash), report.blob_version, T,
+                                     std::to_string(random_sample_key())});
         if (!cmd_ok(as))
             return false;
 
