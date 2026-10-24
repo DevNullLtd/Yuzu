@@ -5350,7 +5350,8 @@ groups:
     # yuzu_server_response_provenance_total outcomes `unrecorded` and
     # `lookup_degraded` are therefore signals of responses being stored
     # unverified. Rules exist for: failed record writes
-    # (YuzuDispatchRecordWriteFailing). DELIBERATELY no rule on `unrecorded`
+    # (YuzuDispatchRecordWriteFailing) and the `lookup_degraded` outcome
+    # (YuzuResponseProvenanceLookupDegraded). DELIBERATELY no rule on `unrecorded`
     # (it is non-zero on a healthy fleet: an id the server never issued, a
     # record reaped after 24 hours, an empty id; a failed write that causes it is
     # already covered by the write rule), on read_degrade_total (a first-attempt
@@ -5418,6 +5419,41 @@ groups:
             exhausted for command_id" (at most one per minute per cause). The responses
             already stored unverified are not repaired when the store recovers; re-run the
             affected commands.
+
+      # #4990: the READ side of the same record. A response frame whose record lookup
+      # fails twice (one retry) is stored `~unverified` with the same consequences. Only
+      # outcome="lookup_degraded" is a fault signal. Do NOT widen this to `unrecorded`:
+      # that outcome also counts an id the server never issued (a forged or echoed id), a
+      # record reaped after its 24 hour window and an empty id, none of which is a store
+      # fault, so it is non-zero on a healthy fleet. Do not use
+      # yuzu_exec_correlation_read_degrade_total either: it also counts a first-attempt
+      # failure that the retry recovers, which unverifies nothing. Keepalive frames are
+      # never counted in the provenance family, which is intended. Same shape and
+      # boundary as the write rule above (`for: 10m` over a 5m rate window), but the
+      # trigger is response traffic, which is usually denser than dispatch traffic, so the
+      # sparse-failure boundary is rarely the limiting case here.
+      - alert: YuzuResponseProvenanceLookupDegraded
+        expr: |
+          sum by (instance) (rate(yuzu_server_response_provenance_total{outcome="lookup_degraded"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dispatch-record lookups are failing on {{ $labels.instance }}, so responses are being stored unverified"
+          description: >-
+            Looking up the dispatch record of an incoming command response has failed twice
+            for responses repeatedly over at least 10 minutes on {{ $labels.instance }}.
+            Each such response is stored `~unverified`, which is Forensics-tier:
+            legitimate responses of any plugin are withheld from callers without
+            Forensics:Read (a normal 200 with the rows missing) and hidden from fixed-plugin
+            polls such as DEX, TAR and hardware. First check PostgreSQL health and the
+            yuzu_pg_* pool and lock metrics, then
+            yuzu_server_response_provenance_total{outcome="lookup_degraded"} and
+            yuzu_exec_correlation_read_degrade_total{reason} (pool_exhausted or
+            query_failed), and the server log line "response provenance unresolved" (at most
+            one per minute per outcome). Responses already stored unverified are not
+            repaired when the store recovers; re-run the affected commands. A rise in
+            outcome="unrecorded" alone is not this alert (see the group comment).
 
   - name: yuzu-enablement
     # ADR-3006 — the durable plugin-enablement store (EnablementStore). Every closed-label
