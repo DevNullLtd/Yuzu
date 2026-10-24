@@ -2111,6 +2111,25 @@ does NOT check DSN *parseability* — a syntactically malformed but
 non-empty DSN clears this step and only fails later, at the first actual
 libpq connection attempt inside a PG-tagged test.
 
+**Connect cap on the Linux and Windows test legs.** The
+`Resolve pg_mode + assert Postgres DSN` step in each of those two jobs appends
+`PGCONNECT_TIMEOUT=30` to `$GITHUB_ENV`, so every connect libpq makes in the
+later steps has a bound, including a connect to a backend that accepts the TCP
+connection and then never answers (libpq has no connect timeout by default).
+30 s is deliberately looser than `PgPool`'s own 10 s default: the pool lets the
+variable win over that default and over an Options-level `connect_timeout_s`, so
+in these steps the pool's connect bound is 30 s unless the DSN itself carries a
+`connect_timeout`, which wins over the variable. A test that needs a short bound
+must therefore put it in the DSN.
+A 10 s cap failed a fixture connect on a heavily loaded dev box, which is why
+the value is not 10. `scripts/ci/sweep-test-databases.sh` exports its own 10 s
+for itself. macOS is not given the variable: that leg exports no DSN, so no
+`[pg]` test connects. On POSIX the `[pg_reachability]` unit tests unset the
+variable for the duration of each case (`test_pg_reachability_probe.cpp`),
+because the probe lets it override the 3 s deadline those tests bound; the
+timing-sensitive cases are compiled out on Windows. A case that needs another
+value sets it itself.
+
 ## PG coverage by platform
 
 | Platform | pg shards | Migration-DDL tests | Notes |
