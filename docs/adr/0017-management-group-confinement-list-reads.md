@@ -64,7 +64,7 @@ attempts, all failed:
   step 1 returns true for **every** agent → the per-row filter is a no-op → sees the whole fleet.
   *(UAT: admin saw agent-1 + agent-2.)*
 - **Confined operator** (`Operator@G1`): the global gate is `check_permission`, which consults only
-  `principal_roles` (user) ∪ RBAC `group_members` (`collect_roles_locked`, `rbac_store.cpp:930-952`)
+  `principal_roles` (user) ∪ RBAC `group_members` (`collect_roles_locked`, `rbac_store.cpp:930-952`; since renamed `collect_roles_accounted`, which counts a failed role query as a read degrade, #4990)
   — **never** the management-group `GroupRoleAssignment`s. So the confined operator is **403'd at the
   gate** and never reaches the filter. *(UAT: opA → 403 on `/api/responses/*`, `/api/agents`,
   `/fragments/devices/list`.)*
