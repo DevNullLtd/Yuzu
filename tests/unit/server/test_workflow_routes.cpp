@@ -1334,12 +1334,11 @@ TEST_CASE("executions drawer: Forensics rows follow the caller's Forensics visib
     CHECK(has(admin->body, "TOKEN-FORENSICS-B"));
     CHECK(has(admin->body, "Show responses (4)"));
 
-    h.forensics.scoped({"agent-B"});
+    h.forensics.unsupported_subset({"agent-B"}); // unsupported: fails closed like a viewer
     auto scoped = h.sink.Get(url);
     REQUIRE(scoped);
-    CHECK(has(scoped->body, "TOKEN-FORENSICS-B"));
-    CHECK_FALSE(has(scoped->body, "TOKEN-FORENSICS-A"));
-    CHECK(has(scoped->body, "Show responses (3)"));
+    CHECK_FALSE(has(scoped->body, "TOKEN-FORENSICS"));
+    CHECK(has(scoped->body, "Show responses (2)"));
 }
 
 TEST_CASE("executions page detail: Forensics rows follow the caller's Forensics visibility, and the "
@@ -1412,14 +1411,12 @@ TEST_CASE("executions drawer and page detail: response.forensics.read is written
             CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory surface=" + surface);
         }
 
-        h.forensics.scoped({"agent-B"});
+        h.forensics.unsupported_subset({"agent-B"}); // unsupported: fails closed like a viewer
         h.audit_calls.clear();
         {
             auto res = h.sink.Get(url);
             REQUIRE(res);
-            const auto rows = verb_rows();
-            REQUIRE(rows.size() == 1);
-            CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory surface=" + surface);
+            CHECK(verb_rows().empty());
         }
 
         // The drawer proceeds on a persist failure and says so in the header.

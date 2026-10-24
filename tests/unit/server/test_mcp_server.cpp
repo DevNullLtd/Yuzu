@@ -26597,12 +26597,15 @@ TEST_CASE("MCP assign_management_group_role: role_name outside {Operator,Viewer}
 }
 
 // Companion of the REST allow-list case in test_rest_mgmt_group_roles_floor.cpp. The group-scope
-// allow-list is the only thing keeping the dormant management-group-scoped Forensics:Read branch of
-// the permission resolver unreachable (#4990). The role names come from the real seeded role list
-// and the answer from the real handler.
+// allow-list is the only thing keeping a management-group-scoped Forensics:Read grant from being
+// authored through these surfaces. The Forensics response-read resolver has no scoped branch
+// (#4990), so this pin guards the older per-device scoped Forensics gate (app_usage_routes.cpp and
+// the MCP get_agent_app_usage tool), a different consumer outside that finding: widening the list
+// would make that gate reachable by a role it was not reviewed for. The role names come from the
+// real seeded role list and the answer from the real handler.
 TEST_CASE("MCP assign_management_group_role: the group-scope allow-list is exactly "
-          "{Operator, Viewer}; widening it makes the scoped Forensics:Read branch reachable "
-          "(re-review the resolver's scoped branch, #4990)",
+          "{Operator, Viewer}; widening it makes the per-device scoped Forensics:Read gate reachable "
+          "(re-review that gate, #4990)",
           "[mcp][pg][management_group][forensics_analyst]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -27797,9 +27800,9 @@ TEST_CASE("MCP query_responses: Forensics rows follow the caller's Forensics vis
         ts.forensics_for_test.admin();
         CHECK(response_outputs(query_responses_result(ts, args)) ==
               TierOutputs{"forensics-A", "forensics-B", "ordinary-A", "ordinary-C"});
-        ts.forensics_for_test.scoped({"agent-B"});
+        ts.forensics_for_test.unsupported_subset({"agent-B"}); // unsupported: fails closed
         CHECK(response_outputs(query_responses_result(ts, args)) ==
-              TierOutputs{"forensics-B", "ordinary-A", "ordinary-C"});
+              TierOutputs{"ordinary-A", "ordinary-C"});
     }
 }
 
@@ -27974,17 +27977,13 @@ TEST_CASE("MCP query_responses: response.forensics.read is written only when For
                                  "forensics_rows=2 plugins=browser_inventory surface=mcp"});
         }
 
-        ts.forensics_for_test.scoped({"agent-B"});
+        ts.forensics_for_test.unsupported_subset({"agent-B"});
         ts.audit_log.clear();
         ts.audit_details.clear();
         ts.audit_target_ids.clear();
         ts.audit_target_types.clear();
         (void)query_responses_result(ts, args);
-        {
-            const auto rows = verb_rows();
-            REQUIRE(rows.size() == 1);
-            CHECK(rows[0][3] == "forensics_rows=1 plugins=browser_inventory surface=mcp");
-        }
+        CHECK(verb_rows().empty()); // unsupported subset: no Forensics row served, no verb row
 
         // The verb row alone does not persist: the data is still served, the gap is surfaced.
         ts.forensics_for_test.admin();
@@ -28048,8 +28047,8 @@ TEST_CASE("MCP aggregate_responses: totals are computed from the permitted rows 
     CHECK(counts() == M{{"agent-A", 1}, {"agent-C", 1}});
     ts.forensics_for_test.admin();
     CHECK(counts() == M{{"agent-A", 2}, {"agent-B", 1}, {"agent-C", 1}});
-    ts.forensics_for_test.scoped({"agent-B"});
-    CHECK(counts() == M{{"agent-A", 1}, {"agent-B", 1}, {"agent-C", 1}});
+    ts.forensics_for_test.unsupported_subset({"agent-B"}); // unsupported: fails closed
+    CHECK(counts() == M{{"agent-A", 1}, {"agent-C", 1}});
 }
 
 TEST_CASE("MCP preview_management_group_agent_count: only readable rows make an agent count",
@@ -28090,8 +28089,8 @@ TEST_CASE("MCP preview_management_group_agent_count: only readable rows make an 
     CHECK(count() == 1); // agent-c only
     ts.forensics_for_test.admin();
     CHECK(count() == 3);
-    ts.forensics_for_test.scoped({"agent-a"});
-    CHECK(count() == 2); // agent-a (Forensics, in scope) + agent-c
+    ts.forensics_for_test.unsupported_subset({"agent-a"}); // unsupported: fails closed
+    CHECK(count() == 1); // agent-c only
 }
 
 TEST_CASE("MCP aggregate_responses: aggregate wrong JSON type is rejected -- not silently "

@@ -7,7 +7,9 @@
 // caller between the three states the production resolver can return:
 //   * admin()   = a global Forensics:Read          (VisibleSet nullopt)
 //   * viewer()  = no Forensics:Read at all         (present-empty, also the unwired answer)
-//   * scoped(a) = Forensics:Read on those agents   (present subset)
+//   * unsupported_subset(a) = a present non-empty subset. NO production resolver returns one (there
+//     is no scoped Forensics read tier, #4990 W1); a surface must treat it exactly like viewer()
+//     (fail closed), so the cases using it pin "a subset can never admit a Forensics row".
 //   * unknown() = the resolver could not answer    (the tri-state's Unknown, `ForensicsUnknown`)
 // The resolver itself is exercised against the real RbacStore in test_authz_topology_floor.cpp;
 // these tests pin what each SURFACE renders for each answer, against a real store.
@@ -51,7 +53,7 @@ struct ForensicsCaller {
 
     void admin() { set(std::nullopt); }
     void viewer() { set(authz::deny_all()); }
-    void scoped(const std::vector<std::string>& agents) {
+    void unsupported_subset(const std::vector<std::string>& agents) {
         set(authz::VisibleSet{std::unordered_set<std::string>(agents.begin(), agents.end())});
     }
     void unknown(ForensicsUnknown why = ForensicsUnknown::RbacUnavailable) {

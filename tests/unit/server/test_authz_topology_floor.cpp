@@ -51,6 +51,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <memory>
+#include <set>
 #include <thread>
 #include <optional>
 #include <shared_mutex>
@@ -1074,8 +1075,8 @@ std::int64_t forensics_vis_now() {
         .count();
 }
 
-// The resolver's tri-state answer (forensics_visibility.hpp): Granted global / Granted subset /
-// Denied (present-empty) are values, Unknown is the error.
+// The resolver's tri-state answer (forensics_visibility.hpp): Granted global / Denied
+// (present-empty) are values, Unknown is the error. There is no subset answer.
 bool is_present_empty(const ForensicsVisibility& r) {
     return r.has_value() && r->has_value() && (*r)->empty();
 }
@@ -1117,7 +1118,9 @@ struct ForensicsVisRig {
         api_tokens->set_engine_referent_check(
             [this](const std::string& id) { return engines->get_for_auth(id).status; });
 
-        // A custom role holding Forensics:Read, granted on one management group below.
+        // A custom role holding Forensics:Read, granted on one management group below. It exists to
+        // prove a group-scoped Forensics:Read is NEVER consulted by the resolver (W1, #4990): the
+        // store layer can still author one (create_role/set_permission), the resolver ignores it.
         REQUIRE(rbac.create_role({"ForensicsScoped", "", false, 0}).has_value());
         REQUIRE(rbac.set_permission({"ForensicsScoped", "Forensics", "Read", "allow"}).has_value());
         ManagementGroup g;
@@ -1131,7 +1134,7 @@ struct ForensicsVisRig {
     }
 
     ForensicsVisibilityDeps deps() {
-        return {.auth_routes = ar.get(), .rbac_store = &rbac, .mgmt_store = &mgmt, .metrics = &metrics};
+        return {.auth_routes = ar.get(), .metrics = &metrics};
     }
 
     // The withheld counter for `reason` (0 when the series was never created).
@@ -1221,27 +1224,69 @@ TEST_CASE("forensics visibility: RBAC on - Viewer none, Administrator and JIT el
     CHECK(is_global(resolve_forensics_visible(rig.deps(), elevated)));
 }
 
-TEST_CASE("forensics visibility: RBAC on - a group-scoped Forensics:Read grant resolves to that group's agents",
+TEST_CASE("forensics visibility: RBAC on - a group-scoped Forensics:Read grant is Denied, never rows "
+          "and never a group lookup",
           "[pg][auth_routes][authz_topology_floor][forensics]") {
     ForensicsVisRig rig;
     rig.rbac.set_rbac_enabled(true);
 
     auto scoped = rig.cookie_request("scoped1", auth::Role::user);
     REQUIRE(rig.mgmt.assign_role({rig.group_id, "user", "scoped1", "ForensicsScoped"}).has_value());
-    // Not a global grant, so the global probe says no and the resolver composes the scoped set.
+    // Not a global grant, so the global probe says no...
     CHECK_FALSE(rig.rbac.check_permission("scoped1", "Forensics", "Read"));
-    auto v = resolve_forensics_visible(rig.deps(), scoped);
-    REQUIRE(v.has_value());
-    REQUIRE(v->has_value()); // a subset, not the global nullopt
-    CHECK(**v == std::unordered_set<std::string>{"agent-1", "agent-2"});
+    // ...and the grant is real: the store-level scoped lookup still resolves it to the group's
+    // agents. The resolver must not use it (there is no scoped Forensics read tier).
+    auto lookup = rig.rbac.visible_agents_for_permission("scoped1", "Forensics", "Read", &rig.mgmt);
+    REQUIRE(lookup.has_value());
+    CHECK(std::set<std::string>(lookup->begin(), lookup->end()) ==
+          std::set<std::string>{"agent-1", "agent-2"});
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), scoped)));
 
-    // A user with no grant on the group gets nothing (present-empty), not the group's agents.
+    // A user with no grant on the group gets the same answer.
     auto other = rig.cookie_request("scoped2", auth::Role::user);
     CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), other)));
 
-    // The same grant with enforcement OFF is not honored (no scoped grants exist in that world).
+    // With enforcement OFF it is Denied too (the floor is administrator-only).
     rig.rbac.set_rbac_enabled(false);
     CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), scoped)));
+
+    // A definitive denial is correct behavior, never counted.
+    for (const auto why : kForensicsUnknownReasons)
+        CHECK(rig.withheld(std::string(to_string(why))) == 0.0);
+}
+
+TEST_CASE("forensics visibility: the resolver's dependencies are the auth routes and a metrics sink only",
+          "[pg][auth_routes][authz_topology_floor][forensics]") {
+    ForensicsVisRig rig;
+    rig.rbac.set_rbac_enabled(true);
+    // Spelled out with ONLY these two members: a definitive global denial performs no
+    // management-group (or other store) lookup because the resolver has no store to look in.
+    const ForensicsVisibilityDeps deps{.auth_routes = rig.ar.get(), .metrics = &rig.metrics};
+
+    auto viewer = rig.cookie_request("viewer20", auth::Role::user);
+    REQUIRE(rig.rbac.assign_role({"user", "viewer20", "Viewer"}).has_value());
+    CHECK(is_present_empty(resolve_forensics_visible(deps, viewer)));
+
+    auto admin = rig.cookie_request("admin20", auth::Role::admin);
+    REQUIRE(rig.rbac.assign_role({"user", "admin20", "Administrator"}).has_value());
+    CHECK(is_global(resolve_forensics_visible(deps, admin)));
+
+    // An unreachable management-group store behind the auth routes does not turn a definitive
+    // denial into Unknown: the resolver never reads it.
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    ManagementGroupStore bad_mgmt(bad_pool);
+    REQUIRE_FALSE(bad_mgmt.is_open());
+    AuthRoutes ar_bad_mgmt(rig.cfg, rig.auth_mgr, &rig.rbac, rig.api_tokens.get(),
+                           /*audit_store=*/nullptr, &bad_mgmt, /*tag_store=*/nullptr,
+                           /*analytics_store=*/nullptr, rig.oidc_mu, rig.oidc_provider);
+    const ForensicsVisibilityDeps bad_deps{.auth_routes = &ar_bad_mgmt, .metrics = &rig.metrics};
+    auto scoped = rig.cookie_request("scoped20", auth::Role::user);
+    REQUIRE(rig.mgmt.assign_role({rig.group_id, "user", "scoped20", "ForensicsScoped"}).has_value());
+    CHECK(is_present_empty(resolve_forensics_visible(bad_deps, scoped)));
+    CHECK(is_present_empty(resolve_forensics_visible(bad_deps, viewer)));
+    for (const auto why : kForensicsUnknownReasons)
+        CHECK(rig.withheld(std::string(to_string(why))) == 0.0);
 }
 
 TEST_CASE("forensics visibility: a service-scoped token never inherits its minter's Forensics authority",
@@ -1366,31 +1411,9 @@ TEST_CASE("forensics visibility: a degraded or unwired input is Unknown, a defin
     REQUIRE(rig.mgmt.assign_role({rig.group_id, "user", "scoped3", "ForensicsScoped"}).has_value());
     auto healthy = resolve_forensics_visible(rig.deps(), scoped);
     REQUIRE(healthy.has_value());
-    REQUIRE(healthy->has_value()); // healthy baseline: a subset
+    REQUIRE(healthy->has_value());
+    CHECK((*healthy)->empty()); // healthy baseline: a scoped-only holder is Denied (present-empty)
 
-    SECTION("management-group store unreachable: the scoped lookup failed, so Unknown") {
-        yuzu::server::pg::PgPool bad_pool{
-            {.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
-        ManagementGroupStore bad_mgmt(bad_pool);
-        REQUIRE_FALSE(bad_mgmt.is_open());
-        ForensicsVisibilityDeps d = rig.deps();
-        d.mgmt_store = &bad_mgmt;
-        CHECK(is_unknown(resolve_forensics_visible(d, scoped), ForensicsUnknown::ScopeReadFailed));
-        CHECK(rig.withheld("scope_read_failed") == 1.0);
-        CHECK(rig.withheld("rbac_unavailable") == 0.0);
-        CHECK(rig.withheld("unwired") == 0.0);
-    }
-    SECTION("management-group store not wired") {
-        ForensicsVisibilityDeps d = rig.deps();
-        d.mgmt_store = nullptr;
-        CHECK(is_unknown(resolve_forensics_visible(d, scoped), ForensicsUnknown::Unwired));
-        CHECK(rig.withheld("unwired") == 1.0);
-    }
-    SECTION("rbac store not wired") {
-        ForensicsVisibilityDeps d = rig.deps();
-        d.rbac_store = nullptr;
-        CHECK(is_unknown(resolve_forensics_visible(d, scoped), ForensicsUnknown::Unwired));
-    }
     SECTION("auth routes not wired (even for an administrator)") {
         ForensicsVisibilityDeps d = rig.deps();
         d.auth_routes = nullptr;
@@ -1417,11 +1440,9 @@ TEST_CASE("forensics visibility: a degraded or unwired input is Unknown, a defin
         AuthRoutes bad_ar(rig.cfg, rig.auth_mgr, &bad_rbac, rig.api_tokens.get(),
                           /*audit_store=*/nullptr, &rig.mgmt, /*tag_store=*/nullptr,
                           /*analytics_store=*/nullptr, rig.oidc_mu, rig.oidc_provider);
-        ForensicsVisibilityDeps d{.auth_routes = &bad_ar, .rbac_store = &bad_rbac, .mgmt_store = &rig.mgmt,
-                                  .metrics = &rig.metrics};
+        ForensicsVisibilityDeps d{.auth_routes = &bad_ar, .metrics = &rig.metrics};
         CHECK(is_unknown(resolve_forensics_visible(d, scoped), ForensicsUnknown::RbacUnavailable));
         CHECK(rig.withheld("rbac_unavailable") == 1.0);
-        CHECK(rig.withheld("scope_read_failed") == 0.0);
     }
     SECTION("an unavailable authorization store answers 503 to an engine principal: Unknown") {
         REQUIRE(rig.auth_mgr.upsert_user("owner2", "password1234", auth::Role::admin));
@@ -1440,11 +1461,9 @@ TEST_CASE("forensics visibility: a degraded or unwired input is Unknown, a defin
                           /*audit_store=*/nullptr, &rig.mgmt, /*tag_store=*/nullptr,
                           /*analytics_store=*/nullptr, rig.oidc_mu, rig.oidc_provider);
         bad_ar.set_engine_principal_store(rig.engines.get());
-        ForensicsVisibilityDeps d{.auth_routes = &bad_ar, .rbac_store = &bad_rbac, .mgmt_store = &rig.mgmt,
-                                  .metrics = &rig.metrics};
+        ForensicsVisibilityDeps d{.auth_routes = &bad_ar, .metrics = &rig.metrics};
         CHECK(is_unknown(resolve_forensics_visible(d, req), ForensicsUnknown::RbacUnavailable));
         CHECK(rig.withheld("rbac_unavailable") == 1.0);
-        CHECK(rig.withheld("scope_read_failed") == 0.0);
     }
 }
 
@@ -1476,8 +1495,7 @@ struct DegradedReplica {
             .value();
     }
     ForensicsVisibilityDeps deps(ForensicsVisRig& rig) {
-        return {.auth_routes = &ar, .rbac_store = &store, .mgmt_store = &rig.mgmt,
-                .metrics = &rig.metrics};
+        return {.auth_routes = &ar, .metrics = &rig.metrics};
     }
 };
 
@@ -1681,7 +1699,6 @@ TEST_CASE("forensics visibility: an unavailable global proof is Unknown for ever
         fault.arm();
         CHECK(is_unknown(resolve_forensics_visible(deps, ana), ForensicsUnknown::RbacUnavailable));
         CHECK(rig.withheld("rbac_unavailable") == 1.0);
-        CHECK(rig.withheld("scope_read_failed") == 0.0);
         CHECK(d.degrade("query_error") >= 1.0);
         fault.repair();
         CHECK(is_global(resolve_forensics_visible(deps, ana)));
@@ -1715,15 +1732,16 @@ TEST_CASE("forensics visibility: an unavailable global proof is Unknown for ever
     }
 }
 
-// ── Resolver skip rules (#4990) ──────────────────────────────────────────────────────
-// Step 2 of resolve_forensics_visible (the scoped composition) deliberately skips three caller
-// classes whose authority is not "the user's own scoped grants". Each of these cases gives the
-// OWNER a scoped-only Forensics:Read grant (no global one), so deleting the skip rule would widen
-// the caller to that subset, and asserts the skipped class gets nothing while the ordinary
-// session with the same owner gets the subset. A Denied answer is silent: no counter moves.
+// ── A scoped grant is never consulted, for any caller class (#4990, W1) ───────────────
+// There is no scoped Forensics read tier: the resolver has one global proof and nothing else.
+// Each of these cases gives the OWNER a scoped-only Forensics:Read grant (no global one) and
+// asserts that NO caller class derived from that owner (cookie session, plain token, service-scoped
+// token, MCP-tier token, engine principal) is handed a subset: every one is Denied (present-empty).
+// A Denied answer is silent: no counter moves. These are regression pins against a future change
+// that reintroduces a per-caller-class scoped composition.
 
-TEST_CASE("forensics visibility: a service-scoped token minted by a scoped-grant holder gets nothing, "
-          "its plain sibling gets the subset",
+TEST_CASE("forensics visibility: a scoped-grant holder gets nothing on any session or token, including "
+          "a service-scoped token",
           "[pg][auth_routes][authz_topology_floor][forensics][service_scope]") {
     ForensicsVisRig rig;
     rig.rbac.set_rbac_enabled(true);
@@ -1731,18 +1749,12 @@ TEST_CASE("forensics visibility: a service-scoped token minted by a scoped-grant
     REQUIRE(rig.mgmt.assign_role({rig.group_id, "user", "sk1", "ForensicsScoped"}).has_value());
 
     auto cookie = rig.cookie_request("sk1", auth::Role::user);
-    auto base = resolve_forensics_visible(rig.deps(), cookie);
-    REQUIRE(base.has_value());
-    REQUIRE(base->has_value());
-    CHECK(**base == std::unordered_set<std::string>{"agent-1", "agent-2"});
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), cookie)));
 
     auto plain = rig.api_tokens->create_token("plain", "sk1", forensics_vis_now() + 3600);
     REQUIRE(plain.has_value());
     auto plain_req = rig.bearer_request(*plain);
-    auto plain_v = resolve_forensics_visible(rig.deps(), plain_req);
-    REQUIRE(plain_v.has_value());
-    REQUIRE(plain_v->has_value());
-    CHECK(**plain_v == std::unordered_set<std::string>{"agent-1", "agent-2"});
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), plain_req)));
 
     auto svc = rig.api_tokens->create_token("svc", "sk1", forensics_vis_now() + 3600, "billing");
     REQUIRE(svc.has_value());
@@ -1795,7 +1807,8 @@ TEST_CASE("forensics visibility: an engine principal holding only a scoped grant
                 .has_value());
     // The store API refuses a scoped engine grant ("engine principals cannot hold scoped role
     // assignments"), so the only way such a row can exist is direct SQL. Insert one and prove the
-    // resolver still gives the engine nothing: the skip rule, not the store guard, is the bar.
+    // resolver still gives the engine nothing: the resolver never reads scoped grants, so the store
+    // guard is not what this case depends on.
     auto refused = rig.mgmt.assign_role({rig.group_id, "engine", "engine:vuln3", "ForensicsScoped"});
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().find("cannot hold scoped") != std::string::npos);

@@ -280,14 +280,16 @@ TEST_CASE("POST /management-groups/{id}/roles: ForensicsAnalyst is refused at gr
     CHECK(ok->status == 201);
 }
 
-// The group-scope allow-list is the ONLY thing keeping the dormant management-group-scoped
-// Forensics:Read branch of the permission resolver unreachable (#4990): nothing else can author a
-// group-scoped grant of a role that holds it. This case derives the answer from the real handler
-// and the real seeded role list, so widening the list fails here by name rather than passing
-// because a hand-copied list in a test moved with it.
+// The group-scope allow-list is the ONLY thing keeping a management-group-scoped Forensics:Read
+// grant from being authored through this route: nothing else can author a group-scoped grant of a
+// role that holds it. The Forensics response-read resolver has no scoped branch (#4990), so this
+// pin guards the older per-device scoped Forensics gate (app_usage_routes.cpp and the MCP
+// get_agent_app_usage tool), a different consumer outside that finding. This case derives the
+// answer from the real handler and the real seeded role list, so widening the list fails here by
+// name rather than passing because a hand-copied list in a test moved with it.
 TEST_CASE("POST /management-groups/{id}/roles: the group-scope allow-list is exactly "
-          "{Operator, Viewer}; widening it makes the scoped Forensics:Read branch reachable "
-          "(re-review the resolver's scoped branch, #4990)",
+          "{Operator, Viewer}; widening it makes the per-device scoped Forensics:Read gate reachable "
+          "(re-review that gate, #4990)",
           "[pg][rest][mgmt_group][authz][security_scope][forensics_analyst]") {
     GroupRolesHarness h;
     ManagementGroup g;

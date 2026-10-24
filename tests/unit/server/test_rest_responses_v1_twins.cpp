@@ -568,7 +568,6 @@ Outputs data_outputs(const std::unique_ptr<httplib::Response>& res) {
 
 const Outputs kAllFour{"forensics-A", "forensics-B", "ordinary-A", "ordinary-C"};
 const Outputs kOrdinaryOnly{"ordinary-A", "ordinary-C"};
-const Outputs kScopedA{"forensics-A", "ordinary-A", "ordinary-C"};
 } // namespace
 
 TEST_CASE("GET /api/v1/responses/:id: Forensics rows follow the caller's Forensics visibility",
@@ -582,8 +581,8 @@ TEST_CASE("GET /api/v1/responses/:id: Forensics rows follow the caller's Forensi
     CHECK(data_outputs(h.sink.Get("/api/v1/responses/instr-tier-get")) == kOrdinaryOnly);
     h.forensics.admin();
     CHECK(data_outputs(h.sink.Get("/api/v1/responses/instr-tier-get")) == kAllFour);
-    h.forensics.scoped({"agent-A"});
-    CHECK(data_outputs(h.sink.Get("/api/v1/responses/instr-tier-get")) == kScopedA);
+    h.forensics.unsupported_subset({"agent-A"}); // unsupported: fails closed like a viewer
+    CHECK(data_outputs(h.sink.Get("/api/v1/responses/instr-tier-get")) == kOrdinaryOnly);
 }
 
 TEST_CASE("v1 response reads: an Unknown Forensics decision is a retryable 503, never a partial 200",
@@ -704,8 +703,8 @@ TEST_CASE("GET /api/v1/responses/:id/aggregate: counts come from the permitted r
     CHECK(counts() == M{{"agent-A", 1}, {"agent-C", 1}});
     h.forensics.admin();
     CHECK(counts() == M{{"agent-A", 2}, {"agent-B", 1}, {"agent-C", 1}});
-    h.forensics.scoped({"agent-A"});
-    CHECK(counts() == M{{"agent-A", 2}, {"agent-C", 1}});
+    h.forensics.unsupported_subset({"agent-A"}); // unsupported: fails closed like a viewer
+    CHECK(counts() == M{{"agent-A", 1}, {"agent-C", 1}});
 }
 
 TEST_CASE("GET /api/v1/responses/:id/export: json and csv rows and the cap flag come from the "
@@ -809,15 +808,14 @@ TEST_CASE("v1 response row reads: response.forensics.read is written only when F
             CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory surface=rest");
         }
 
-        h.forensics.scoped({"agent-A"});
+        h.forensics.unsupported_subset({"agent-A"});
         h.audit_log.clear();
         {
             auto res = h.sink.Get(path);
             REQUIRE(res);
             CHECK(res->status == 200);
-            const auto rows = forensics_audits(h);
-            REQUIRE(rows.size() == 1);
-            CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory surface=rest");
+            // Unsupported subset: no Forensics row served, so no verb row (as for a viewer).
+            CHECK(forensics_audits(h).empty());
         }
 
         // The verb row alone does not persist: fail closed, no data, the header says why.

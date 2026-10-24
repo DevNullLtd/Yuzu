@@ -1569,10 +1569,9 @@ TEST_CASE("GET /api/responses/:id (catch-all): Forensics rows follow the caller'
         h.forensics.admin();
         CHECK(served_outputs(h.sink.Get("/api/responses/instr-tier")) == kAllFour);
     }
-    SECTION("a scoped Forensics:Read gets only that agent's Forensics rows plus every ordinary row") {
-        h.forensics.scoped({"agent-A"});
-        CHECK(served_outputs(h.sink.Get("/api/responses/instr-tier")) ==
-              Outputs{"forensics-A", "ordinary-A", "ordinary-C"});
+    SECTION("a per-agent subset is unsupported and fails closed: no Forensics row, named agent or not") {
+        h.forensics.unsupported_subset({"agent-A"});
+        CHECK(served_outputs(h.sink.Get("/api/responses/instr-tier")) == kOrdinaryOnly);
     }
     SECTION("an unwired resolver behaves as present-empty") {
         PgHarness unwired(/*wire_fn=*/false, /*wire_set=*/true);
@@ -1627,9 +1626,8 @@ TEST_CASE("GET /api/responses/:id/aggregate: counts are computed from the permit
     h.forensics.admin();
     CHECK(counts_by_agent("agent_id") ==
           std::map<std::string, int>{{"agent-A", 2}, {"agent-B", 1}, {"agent-C", 1}});
-    h.forensics.scoped({"agent-B"});
-    CHECK(counts_by_agent("agent_id") ==
-          std::map<std::string, int>{{"agent-A", 1}, {"agent-B", 1}, {"agent-C", 1}});
+    h.forensics.unsupported_subset({"agent-B"}); // unsupported: fails closed like a viewer
+    CHECK(counts_by_agent("agent_id") == std::map<std::string, int>{{"agent-A", 1}, {"agent-C", 1}});
 }
 
 TEST_CASE("GET /api/responses/:id/export: rows and the truncation flag come from the permitted set",
@@ -1756,17 +1754,8 @@ TEST_CASE("legacy row reads: response.forensics.read is written only when Forens
             CHECK(rows[0].target_id == "instr-faud");
             CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory surface=legacy");
         }
-        SECTION(std::string(route.name) + ": a scoped grant counts only the rows it was served") {
-            h.forensics.scoped({"agent-A"});
-            auto res = h.sink.Get(path);
-            REQUIRE(res);
-            CHECK(res->status == 200);
-            const auto rows = forensics_audits(h);
-            REQUIRE(rows.size() == 1);
-            CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory surface=legacy");
-        }
-        SECTION(std::string(route.name) + ": a scoped grant that matches no Forensics row writes none") {
-            h.forensics.scoped({"agent-C"});
+        SECTION(std::string(route.name) + ": a per-agent subset (unsupported) serves no Forensics row and writes none") {
+            h.forensics.unsupported_subset({"agent-A"});
             auto res = h.sink.Get(path);
             REQUIRE(res);
             CHECK(res->status == 200);

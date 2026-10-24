@@ -3242,14 +3242,16 @@ std::vector<TierCase> tier_cases() {
          sorted({kK1, kK2, kK3, kK4, kK5, kK6})},
         {"exclude+present-empty", ResponseTierFilter::exclude(set, authz::deny_all()),
          sorted({kK1, kK2})},
-        {"exclude+subset{A}",
+        // #4990 (W1): per-agent subsets are unsupported and fail closed, so a non-empty subset
+        // reads exactly what present-empty reads: no Forensics row of ANY agent, named or not.
+        {"exclude+subset{A} (unsupported: fails closed)",
          ResponseTierFilter::exclude(
              set, authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}}),
-         sorted({kK1, kK2, kK3, kK5})},
-        {"exclude+subset{A,C}",
+         sorted({kK1, kK2})},
+        {"exclude+subset{A,C} (unsupported: fails closed)",
          ResponseTierFilter::exclude(
              set, authz::VisibleSet{std::unordered_set<std::string>{"agent-A", "agent-C"}}),
-         sorted({kK1, kK2, kK3, kK5, kK6})},
+         sorted({kK1, kK2})},
     };
 }
 
@@ -3599,7 +3601,7 @@ TEST_CASE("ResponseStore tier: facet reads never surface a withheld row's output
     }
 }
 
-TEST_CASE("ResponseStore tier: plugin names and agent ids are bound, never interpolated",
+TEST_CASE("ResponseStore tier: plugin names are bound, never interpolated",
           "[pg][response_store][security][forensics]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -3608,9 +3610,7 @@ TEST_CASE("ResponseStore tier: plugin names and agent ids are bound, never inter
     seed_tier_matrix(store);
 
     const auto hostile_set = *ForensicsPluginSet::from_names({"o'brien", "x\"; DROP TABLE y; --"});
-    const auto f = ResponseTierFilter::exclude(
-        hostile_set,
-        authz::VisibleSet{std::unordered_set<std::string>{"a'b", "c\\d", "{e,f}"}});
+    const auto f = ResponseTierFilter::exclude(hostile_set, authz::deny_all());
     // Nothing in the store matches those names, so everything is permitted; the point is that the
     // statement parsed and ran (nullopt would mean a SQL error / degrade).
     auto rows = store.query(kTierInstr, f);

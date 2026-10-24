@@ -412,13 +412,13 @@ TEST_CASE("group-from-results: agents matched only through Forensics rows the ca
         CHECK(member_ids_of(h.mg, group->id) ==
               std::set<std::string>{"agent-A", "agent-B", "agent-C"});
     }
-    SECTION("a scoped Forensics:Read adds only that agent's Forensics match") {
-        h.forensics.scoped({"agent-B"});
-        auto res = h.post(GroupFromResultsHarness::form_body("tier-scoped-group"));
+    SECTION("a per-agent subset is unsupported and fails closed: no Forensics match is materialized") {
+        h.forensics.unsupported_subset({"agent-B"});
+        auto res = h.post(GroupFromResultsHarness::form_body("tier-subset-group"));
         CHECK(res->status == 200);
-        auto group = h.mg.find_group_by_name("tier-scoped-group");
+        auto group = h.mg.find_group_by_name("tier-subset-group");
         REQUIRE(group.has_value());
-        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-B", "agent-C"});
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-C"});
     }
 }
 

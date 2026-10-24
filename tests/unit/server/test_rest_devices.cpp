@@ -657,6 +657,6 @@ TEST_CASE("agent-count-preview: Forensics rows are not counted for a caller with
     CHECK(count() == 1); // agent-c only
     h.forensics.admin();
     CHECK(count() == 3);
-    h.forensics.scoped({"agent-a"});
-    CHECK(count() == 2); // agent-a (Forensics, in scope) + agent-c
+    h.forensics.unsupported_subset({"agent-a"}); // unsupported: fails closed like a viewer
+    CHECK(count() == 1); // agent-c only
 }

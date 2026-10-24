@@ -157,20 +157,34 @@ TEST_CASE("ResponseTierFilter::exclude follows the ADR-0033 VisibleSet semantics
         const auto f = ResponseTierFilter::exclude(set, std::nullopt);
         CHECK_FALSE(f.restricts());
         CHECK(f.excluded_plugins().empty());
-        CHECK(f.exempt_agents().empty());
     }
     SECTION("present-empty excludes every Forensics plugin for every agent") {
         const auto f = ResponseTierFilter::exclude(set, authz::deny_all());
         CHECK(f.restricts());
         CHECK(f.excluded_plugins() == set.names());
-        CHECK(f.exempt_agents().empty());
     }
-    SECTION("a present subset exempts only those agents, sorted") {
+    // #4990 (W1): per-agent subsets are intentionally unsupported. A resolver that ever handed over
+    // a non-empty subset (no production resolver does: there is no scoped Forensics read tier) must
+    // fail closed exactly like present-empty, never exempt the agents it names.
+    SECTION("a present non-empty subset is unsupported and fails closed like present-empty") {
         const auto f = ResponseTierFilter::exclude(
             set, authz::VisibleSet{std::unordered_set<std::string>{"agent-b", "agent-a"}});
+        const auto deny = ResponseTierFilter::exclude(set, authz::deny_all());
+        CHECK(f.restricts());
+        CHECK_FALSE(f.refuses_every_row());
+        CHECK(f.excluded_plugins() == set.names());
+        CHECK(f.excluded_plugins() == deny.excluded_plugins());
+        // A Forensics row of a named agent is still excluded; an ordinary plugin is untouched.
+        CHECK_FALSE(f.admits("app_usage"));
+        CHECK_FALSE(f.admits("execution_artifacts"));
+        CHECK(f.admits("shellexec"));
+    }
+    SECTION("a single named agent is not exempted either") {
+        const auto f = ResponseTierFilter::exclude(
+            set, authz::VisibleSet{std::unordered_set<std::string>{"a1"}});
         CHECK(f.restricts());
         CHECK(f.excluded_plugins() == set.names());
-        CHECK(f.exempt_agents() == std::vector<std::string>{"agent-a", "agent-b"});
+        CHECK_FALSE(f.admits("app_usage"));
     }
     SECTION("a default-spelled VisibleSet is nullopt, not deny-all") {
         // The trap authz::deny_all() exists for: this is unfiltered.
@@ -231,9 +245,11 @@ TEST_CASE("the Forensics plugin set is derived from the catalogue, not a hand-ke
     REQUIRE(set.has_value());
     // Pinned exactly. A NEW Forensics plugin changes this set: acknowledge it here AND in
     // test_capability_catalogue.cpp, and confirm its stored rows are Forensics-tier on purpose.
+    // `~unverified` (kUnverifiedProvenanceLabel, #4990) sorts last: the stored label of a
+    // response whose command id has no server dispatch record is Forensics-tier by construction.
     CHECK(set->names() == std::vector<std::string>{"app_usage", "browser_inventory",
                                                    "execution_artifacts", "privacy_permissions",
-                                                   "remote_access_audit"});
+                                                   "remote_access_audit", "~unverified"});
 }
 
 TEST_CASE("an empty derivation is refused, never an empty exclusion set",
@@ -364,7 +380,6 @@ TEST_CASE("tier_filter_for fails closed on unwired inputs",
         CHECK(f.restricts());
         CHECK_FALSE(f.refuses_every_row());
         CHECK(f.excluded_plugins() == set.names());
-        CHECK(f.exempt_agents().empty());
     }
     SECTION("no plugin set wired: every row is refused, never admitted") {
         const auto r = tier_filter_for(
@@ -393,12 +408,12 @@ TEST_CASE("tier_filter_for fails closed on unwired inputs",
         const auto fr = tier_filter_for(req, subset, &set);
         REQUIRE(fr.has_value());
         CHECK(fr->restricts());
-        CHECK(fr->exempt_agents() == std::vector<std::string>{"agent-a"});
+        CHECK(fr->excluded_plugins() == set.names()); // a subset is unsupported: fail closed
+        CHECK_FALSE(fr->admits("app_usage"));
         CHECK(calls == 2);
     }
     SECTION("an Unknown resolver answer is returned as the error, never as a filter") {
-        for (const auto why : {ForensicsUnknown::RbacUnavailable, ForensicsUnknown::ScopeReadFailed,
-                               ForensicsUnknown::Unwired}) {
+        for (const auto why : {ForensicsUnknown::RbacUnavailable, ForensicsUnknown::Unwired}) {
             const ForensicsVisibilityFn unknown = [why](const httplib::Request&) {
                 return ForensicsVisibility{std::unexpected(why)};
             };
@@ -406,11 +421,12 @@ TEST_CASE("tier_filter_for fails closed on unwired inputs",
             REQUIRE_FALSE(r.has_value());
             CHECK(r.error() == why);
         }
-        // The closed reason set: three spellings, all distinct, none empty.
+        // The closed reason set: two spellings, both distinct, none empty (no scope_read_failed:
+        // there is no scoped lookup to fail).
         std::set<std::string_view> names;
         for (const auto u : kForensicsUnknownReasons)
             names.insert(to_string(u));
-        CHECK(names == std::set<std::string_view>{"rbac_unavailable", "scope_read_failed", "unwired"});
+        CHECK(names == std::set<std::string_view>{"rbac_unavailable", "unwired"});
     }
 }
 
@@ -418,43 +434,36 @@ TEST_CASE("ResponseTierFilter::admits answers as the SQL predicate does",
           "[server][responses][security][forensics]") {
     const auto set = make_set({"app_usage"});
     const auto deny = ResponseTierFilter::exclude(set, authz::deny_all());
-    const auto scoped = ResponseTierFilter::exclude(
+    const auto subset = ResponseTierFilter::exclude(
         set, authz::VisibleSet{std::unordered_set<std::string>{"agent-a"}});
     const auto global = ResponseTierFilter::exclude(set, std::nullopt);
 
-    // A Forensics plugin: refused for Denied, admitted only for a scoped agent, admitted for global.
-    CHECK_FALSE(deny.admits("app_usage", "agent-a"));
-    CHECK(scoped.admits("app_usage", "agent-a"));
-    CHECK_FALSE(scoped.admits("app_usage", "agent-b"));
-    CHECK(scoped.admits("APP_USAGE", "agent-a")); // ASCII case folded, like the SQL predicate
-    CHECK(global.admits("app_usage", "agent-b"));
+    // A Forensics plugin: refused for Denied and for an (unsupported) subset, admitted for global.
+    CHECK_FALSE(deny.admits("app_usage"));
+    CHECK_FALSE(subset.admits("app_usage")); // the named agent is NOT exempt
+    CHECK_FALSE(subset.admits("APP_USAGE")); // ASCII case folded, like the SQL predicate
+    CHECK(global.admits("app_usage"));
+    CHECK(global.admits("APP_USAGE"));
     // An ordinary plugin is admitted by every filter that is not refuse_unwired.
-    CHECK(deny.admits("shellexec", "agent-a"));
-    CHECK(scoped.admits("shellexec", "agent-b"));
-    CHECK(ResponseTierFilter::unrestricted_internal_consumer().admits("app_usage", "agent-a"));
-    CHECK_FALSE(ResponseTierFilter::refuse_unwired().admits("shellexec", "agent-a"));
+    CHECK(deny.admits("shellexec"));
+    CHECK(subset.admits("shellexec"));
+    CHECK(ResponseTierFilter::unrestricted_internal_consumer().admits("app_usage"));
+    CHECK_FALSE(ResponseTierFilter::refuse_unwired().admits("shellexec"));
 }
 
-// A larger exempt set than the case above, so the binary search over the sorted agent ids is
-// exercised on every side of its midpoints: members, non-members between and beyond them, and ids
-// that are a prefix of a member.
-TEST_CASE("ResponseTierFilter::admits searches a multi-agent exempt set by exact id",
+// A large named subset exempts none of its members, nor any id near them: the old per-agent search
+// is gone and every Forensics row stays excluded whatever the subset names.
+TEST_CASE("ResponseTierFilter::exclude: a multi-agent subset exempts no agent",
           "[server][responses][security][forensics]") {
     const auto set = make_set({"app_usage"});
     const std::vector<std::string> members{"agent-b", "agent-d", "agent-f", "agent-h", "agent-j",
                                            "agent-l", "agent-n"};
     const auto f = ResponseTierFilter::exclude(
         set, authz::VisibleSet{std::unordered_set<std::string>(members.begin(), members.end())});
-    for (const auto& m : members) {
-        INFO(m);
-        CHECK(f.admits("app_usage", m));
-    }
-    for (const char* non_member : {"agent-a", "agent-c", "agent-e", "agent-g", "agent-i", "agent-k",
-                                   "agent-m", "agent-o", "agent-", "agent-bb", "agent", "", "zzz"}) {
-        INFO(non_member);
-        CHECK_FALSE(f.admits("app_usage", non_member));
-    }
-    CHECK(f.admits("shellexec", "agent-a")); // not a Forensics plugin: no agent test at all
+    CHECK(f.restricts());
+    CHECK(f.excluded_plugins() == set.names());
+    CHECK_FALSE(f.admits("app_usage"));
+    CHECK(f.admits("shellexec")); // not a Forensics plugin
 }
 
 // The retry hint the Unknown refusal advertises is the one shared transient-fault floor.
@@ -528,7 +537,6 @@ TEST_CASE("ResponseTierFilter::refuse_unwired and for_fixed_plugin_poll",
     const auto poll = ResponseTierFilter::for_fixed_plugin_poll(&set);
     CHECK(poll.restricts());
     CHECK(poll.excluded_plugins() == set.names());
-    CHECK(poll.exempt_agents().empty());
     // ...and an unwired surface (no set) refuses every row: a fixed plugin does not make an
     // unwired poll safe to run unfiltered.
     const auto unwired = ResponseTierFilter::for_fixed_plugin_poll(nullptr);

@@ -1040,11 +1040,11 @@ TEST_CASE("/fragments/results: Forensics rows follow the caller's Forensics visi
         CHECK(contains(res->body, "TOKEN-ORDINARY-C"));
         CHECK(contains(res->body, "4 agents"));
     }
-    SECTION("a scoped Forensics:Read sees only that agent's Forensics rows") {
-        h.forensics.scoped({"agent-b"});
+    SECTION("a per-agent subset is unsupported and sees no Forensics row, named agent or not") {
+        h.forensics.unsupported_subset({"agent-b"});
         auto res = h.get(url);
         REQUIRE(res);
-        CHECK(contains(res->body, "TOKEN-FORENSICS-B"));
+        CHECK_FALSE(contains(res->body, "TOKEN-FORENSICS-B"));
         CHECK_FALSE(contains(res->body, "TOKEN-FORENSICS-A"));
         CHECK(contains(res->body, "TOKEN-ORDINARY-A"));
         CHECK(contains(res->body, "TOKEN-ORDINARY-C"));

@@ -548,8 +548,8 @@ TEST_CASE("GET /api/v1/executions/:id/responses: Forensics rows follow the calle
     CHECK(outputs() == Outputs{"ordinary-A", "ordinary-B"});
     h.forensics.admin();
     CHECK(outputs() == Outputs{"forensics-A", "forensics-B", "ordinary-A", "ordinary-B"});
-    h.forensics.scoped({"agent-B"});
-    CHECK(outputs() == Outputs{"forensics-B", "ordinary-A", "ordinary-B"});
+    h.forensics.unsupported_subset({"agent-B"}); // unsupported: fails closed like a viewer
+    CHECK(outputs() == Outputs{"ordinary-A", "ordinary-B"});
 
     // A confined caller (gate scope engaged): the in-scope agent set is derived from the
     // permitted rows, so an agent that answered only with a Forensics row is not even enumerated.
@@ -581,8 +581,7 @@ TEST_CASE("GET /api/v1/executions/:id/responses through the REAL resolver: a For
     AuthRoutes ar(cfg, auth_mgr, &rbac, api_tokens.get(), /*audit_store=*/nullptr, &mgmt,
                   /*tag_store=*/nullptr, /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
 
-    ForensicsVisibilityDeps deps{
-        .auth_routes = &ar, .rbac_store = &rbac, .mgmt_store = &mgmt, .metrics = nullptr};
+    ForensicsVisibilityDeps deps{.auth_routes = &ar, .metrics = nullptr};
     ExecV1Harness h(pool, true, {}, true, [&deps](const httplib::Request& req) {
         return resolve_forensics_visible(deps, req);
     });
@@ -691,8 +690,7 @@ TEST_CASE("GET /api/v1/executions/:id/responses through the REAL resolver: a fai
     std::unique_ptr<oidc::OidcProvider> oidc_provider;
     AuthRoutes ar(cfg, auth_mgr, &rbac, api_tokens.get(), /*audit_store=*/nullptr, &mgmt,
                   /*tag_store=*/nullptr, /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
-    ForensicsVisibilityDeps deps{
-        .auth_routes = &ar, .rbac_store = &rbac, .mgmt_store = &mgmt, .metrics = &metrics};
+    ForensicsVisibilityDeps deps{.auth_routes = &ar, .metrics = &metrics};
     ExecV1Harness h(pool, true, {}, true, [&deps](const httplib::Request& req) {
         return resolve_forensics_visible(deps, req);
     });
@@ -845,14 +843,13 @@ TEST_CASE("GET /api/v1/executions/:id/responses: response.forensics.read is writ
         CHECK(rows[0].target_id == exec_id);
         CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory surface=rest");
     }
-    h.forensics.scoped({"agent-B"});
+    h.forensics.unsupported_subset({"agent-B"}); // unsupported: fails closed like a viewer
     h.audit_log.clear();
     {
         auto res = h.sink.Get(path);
         REQUIRE(res);
-        const auto rows = verb_rows();
-        REQUIRE(rows.size() == 1);
-        CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory surface=rest");
+        // No Forensics row was served, so no verb row is written (as for a viewer).
+        CHECK(verb_rows().empty());
     }
     h.forensics.admin();
     h.audit_log.clear();

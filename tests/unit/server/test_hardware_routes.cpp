@@ -1388,16 +1388,15 @@ TEST_CASE("result poll: a Forensics-plugin reply is rendered only for a caller w
         REQUIRE(res);
         CHECK(contains(res->body, "TOKEN-HW-FORENSICS"));
     }
-    SECTION("a scoped Forensics:Read is limited to its own agents") {
-        h.forensics.scoped({"agent-other"});
-        auto denied = h.sink.Get(poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory"));
-        REQUIRE(denied);
-        CHECK_FALSE(contains(denied->body, "TOKEN-HW-FORENSICS"));
-        CHECK(contains(denied->body, "data-forensics-read-required"));
-        h.forensics.scoped({"agent-1"});
-        auto ok = h.sink.Get(poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory"));
-        REQUIRE(ok);
-        CHECK(contains(ok->body, "TOKEN-HW-FORENSICS"));
+    SECTION("a subset naming the device's own agent still fails closed (no scoped read tier)") {
+        for (const char* agent : {"agent-other", "agent-1"}) {
+            h.forensics.unsupported_subset({agent});
+            auto denied =
+                h.sink.Get(poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory"));
+            REQUIRE(denied);
+            CHECK_FALSE(contains(denied->body, "TOKEN-HW-FORENSICS"));
+            CHECK(contains(denied->body, "data-forensics-read-required"));
+        }
     }
     SECTION("an ordinary plugin's reply is unaffected for every caller") {
         for (int i = 0; i < 2; ++i) {
@@ -1439,21 +1438,22 @@ TEST_CASE("result poll: a caller who lacks the Forensics read proof gets a permi
     REQUIRE(timeout);
     CHECK(contains(timeout->body, "Timed out"));
 
-    // A holder is polled normally (pending until a reply lands), a scoped holder only for its own
-    // device.
+    // A holder is polled normally (pending until a reply lands); a subset (unsupported, fails
+    // closed) is refused for every device, its own included.
     h.forensics.admin();
     auto holder = h.sink.Get(url);
     REQUIRE(holder);
     CHECK(contains(holder->body, "Waiting"));
     CHECK_FALSE(contains(holder->body, "data-forensics-read-required"));
-    h.forensics.scoped({"agent-other"});
+    h.forensics.unsupported_subset({"agent-other"});
     auto other_device = h.sink.Get(url);
     REQUIRE(other_device);
     CHECK(contains(other_device->body, "data-forensics-read-required"));
-    h.forensics.scoped({"agent-1"});
+    h.forensics.unsupported_subset({"agent-1"});
     auto own_device = h.sink.Get(url);
     REQUIRE(own_device);
-    CHECK(contains(own_device->body, "Waiting"));
+    CHECK(contains(own_device->body, "data-forensics-read-required"));
+    CHECK_FALSE(contains(own_device->body, "Waiting"));
 }
 
 TEST_CASE("result poll: a grant withdrawn between two polls of the same command ends the poll with the "
@@ -1632,17 +1632,14 @@ TEST_CASE("result poll: response.forensics.read is recorded only when a Forensic
         // The page's own row is still written.
         CHECK(std::ranges::count(h.audits, "hardware.action.result|success") == 1);
     }
-    SECTION("a scoped Forensics:Read leaves a row only for the device it is scoped to") {
-        h.forensics.scoped({"agent-other"});
-        auto denied = h.sink.Get(forensics_url);
-        REQUIRE(denied);
-        CHECK_FALSE(contains(denied->body, "TOKEN-HW-FORENSICS"));
-        CHECK(forensics_audit_rows(h).count == 0);
-        h.forensics.scoped({"agent-1"});
-        auto ok = h.sink.Get(forensics_url);
-        REQUIRE(ok);
-        CHECK(contains(ok->body, "TOKEN-HW-FORENSICS"));
-        CHECK(forensics_audit_rows(h).count == 1);
+    SECTION("a subset (unsupported) leaves no row, even for the device it names") {
+        for (const char* agent : {"agent-other", "agent-1"}) {
+            h.forensics.unsupported_subset({agent});
+            auto denied = h.sink.Get(forensics_url);
+            REQUIRE(denied);
+            CHECK_FALSE(contains(denied->body, "TOKEN-HW-FORENSICS"));
+            CHECK(forensics_audit_rows(h).count == 0);
+        }
     }
     SECTION("a rendered Forensics failure text is also a served row") {
         h.forensics.admin();

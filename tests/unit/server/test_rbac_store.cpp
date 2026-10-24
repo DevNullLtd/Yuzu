@@ -598,22 +598,23 @@ TEST_CASE("RbacStore: ForensicsAnalyst is seed-only - assigned to nobody and par
         CHECK(pr.role_name != "ForensicsAnalyst");
 }
 
-// The management-group-scoped arm of `resolve_forensics_visible` (step 2, `visible_agents_for_permission`
-// for the "Forensics" securable) and the `exempt_agents` subset arm of `ResponseTierFilter::exclude`
-// consume a scoped Forensics:Read grant that no production route can author today: the scoped
-// (group) assignment surfaces accept only Operator and Viewer, and neither holds Forensics:Read.
-// That branch is dormant on purpose and fails closed. This case pins the SEED half of that
+// The Forensics response-read resolver (`resolve_forensics_visible`) has no management-group-scoped
+// branch (#4990): a global Forensics:Read is the only thing that admits Forensics rows. A scoped
+// Forensics:Read grant is still consumed by the older per-device scoped gate (app_usage_routes.cpp
+// and the MCP get_agent_app_usage tool), a different consumer outside that finding, and no
+// production route can author one today: the scoped (group) assignment surfaces accept only
+// Operator and Viewer, and neither holds Forensics:Read. This case pins the SEED half of that
 // statement against the real store, over every role the seed pass creates, so a change that makes
-// the branch reachable cannot do so silently.
+// a scoped grant authorable cannot do so silently.
 TEST_CASE("RbacStore: no role assignable at management-group scope holds Forensics:Read "
-          "(the resolver's scoped Forensics branch is dormant)",
+          "(the per-device scoped Forensics gate stays unreachable from production)",
           "[rbac_store][pg][forensics_analyst][security]") {
     RBAC_STORE(store);
     const char* const why =
         "A role that can be assigned at management-group scope now holds Forensics:Read, or a "
-        "further role holds it fleet-wide. That makes the resolver's scoped Forensics branch "
-        "(forensics_visibility.cpp, step 2, and ResponseTierFilter's exempt_agents arm) reachable "
-        "from production, where it has had no review. Re-review that branch, then update this pin.";
+        "further role holds it fleet-wide. That makes the per-device scoped Forensics gate "
+        "(app_usage_routes.cpp, the MCP get_agent_app_usage tool) reachable by a role it was not "
+        "reviewed for. Re-review that gate, then update this pin.";
 
     // Exactly the seeded roles that hold the grant today.
     std::vector<std::string> holders;
