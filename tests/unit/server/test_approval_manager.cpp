@@ -1286,7 +1286,8 @@ const std::vector<std::string_view>& schedule_path_banned_needles() {
 // above run both clocks on one host), so this pins the CAUSE at the source: EVERY stamp and
 // cutoff -- submitted_at, reviewed_at, consumed_at (consume CAS and the schedule-origin
 // retire), the consume expiry diagnostic, ticket_is_live(), the shared liveness predicate and
-// both submit() sweeps -- is authored in-SQL from kDbNowEpochSql, and approval_manager.cpp
+// both submit() sweeps -- is authored in-SQL from the database clock (kDbNowEpochSql, except
+// the consume liveness test, which uses kDbWallEpochSql: #6062 sg-6), and approval_manager.cpp
 // reads NO process clock at all. Adding a clock read of ANY spelling fails here.
 TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL from the database "
           "clock; approval_manager.cpp reads no process clock (UP-3/UP-4/#6096 source tripwire)",
@@ -1309,7 +1310,7 @@ TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL fro
         INFO("banned clock API: " << banned);
         CHECK(std::none_of(banned.begin(), banned.end(),
                            [](unsigned char ch) { return std::isupper(ch) != 0; }));
-        // The one exemption (#6062 sg-6): the DATABASE's wall clock, read once, in
+        // The one exemption (#6062 sg-6): the DATABASE's wall clock, spelled once, in
         // kDbWallEpochSql, for the consume liveness test on a caller-held transaction, where
         // `now()` is the transaction start. It is the same clock, not a per-replica one.
         if (banned == "clock_timestamp")
@@ -1366,11 +1367,22 @@ TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL fro
     }
     // The consume CAS and its diagnostic read test liveness on the wall clock (#6062 sg-6):
     // both pass `true` to the shared predicate, so they cannot drift apart or back to `now()`.
+    constexpr std::string_view kLiveCall = "ticket_live_sql(";
     for (const auto* stmt : {&consume, &why}) {
-        const auto at = stmt->find("ticket_live_sql(");
+        const auto at = stmt->find(kLiveCall);
         REQUIRE(at != std::string::npos);
-        CHECK(stmt->substr(at, 40).find("true") != std::string::npos);
+        // The comment stripper leaves blanks where `/*wall_clock=*/` was; the first real
+        // token of the argument list must be `true`, not merely a `true` nearby.
+        const auto arg = stmt->find_first_not_of(" \t\r\n", at + kLiveCall.size());
+        REQUIRE(arg != std::string::npos);
+        CHECK(stmt->compare(arg, 5, "true)") == 0);
     }
+    // The predicate itself: the parameter really selects the wall clock, and the default is
+    // the transaction-start clock. Without this a swapped or ignored ternary would pass
+    // everything above on a machine with no Postgres (the behavioural test is PG-gated).
+    CHECK(count_occurrences(code, "std::string ticket_live_sql(bool wall_clock = false) {") == 1);
+    CHECK(live_now.find("wall_clock ? kDbWallEpochSql : kDbNowEpochSql") != std::string::npos);
+    CHECK(count_occurrences(code, "kDbWallEpochSql") == 2); // its definition and that one use
     CHECK(is_live.find("ticket_live_sql()") != std::string::npos); // ticket_is_live()
     CHECK(db_now.find("kDbNowEpochSql") != std::string::npos);   // the pending-sweep cutoff
     CHECK(sweep_pending.find("db_now") != std::string::npos);

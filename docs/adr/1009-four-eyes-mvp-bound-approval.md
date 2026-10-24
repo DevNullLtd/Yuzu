@@ -296,17 +296,20 @@ conditions (security-guardian `sec-1`, with the architect's five conditions):
 ### PR3 entry conditions
 
 Open findings that become conditions on the PR that first wires a producer or redeemer (#6063).
-The consume-time recheck is in PR2 (`up-2`, `g8-sg-1`, `g10-redeem-does-not-recheck-bound-origin`),
-and so is a liveness test on the wall clock rather than the transaction-start `now()`, so a
-caller-held transaction cannot redeem a ticket after its lifetime ended (`sg-6`; proof
-`consume_ticket(PGconn*): a transaction begun before expiry whose consume happens after it is
-refused as expired and the ticket is not spent`). Every read a consume makes before its
-consuming statement runs the origin and submitter checks, and, for a row that is approved and not yet consumed, the integrity
-checks (reviewer is not the submitter or an excluded root, an approved ticket names a reviewer,
-excluded roots readable, request matches its digest, and an origin that requires a bound request
-has one: an empty request with an empty digest on such a row is refused, not read as a legacy
-row); a pending, rejected, expired or already
-consumed row keeps reading as the ordinary refusal it is. The consuming statement is pinned to the
+The consume-time recheck is in PR2 (`up-2`, `g8-sg-1`, `g10-redeem-does-not-recheck-bound-origin`).
+So is a liveness test on the wall clock rather than the transaction-start `now()`: a caller-held
+transaction cannot redeem a ticket after its lifetime ended (`sg-6`; proof `consume_ticket(PGconn*):
+a transaction begun before expiry whose consume happens after it is refused as expired and the
+ticket is not spent`). That proof covers the over-grant half. The other half, an old transaction
+misreading a freshly approved ticket as dated in the future, would need a transaction older than
+the 300 second slack, so it rests on the predicate's source text, which the clock tripwire pins.
+Every read a consume makes before its consuming statement runs the origin and submitter checks,
+and, for a row that is approved and not yet consumed, the integrity checks (reviewer is not the
+submitter or an excluded root, an approved ticket names a reviewer, excluded roots readable,
+request matches its digest, and an origin that requires a bound request has one: an empty request
+with an empty digest on such a row is refused, not read as a legacy row; proof `consume: a
+bound-origin ticket with no frozen request refuses, even with an empty digest`). A pending,
+rejected, expired or already consumed row keeps reading as the ordinary refusal it is. The consuming statement is pinned to the
 row VERSION of the last row examined, which is two values: `xmin` (the transaction that wrote the
 version) and `ctid` (its tuple position). An update of the row by ANOTHER transaction between the
 checks and the statement, in any column (`consumed_at`, `reviewed_at`, `definition_id` and the
@@ -369,7 +372,9 @@ keep them green and extend them to the new surface. Test names are the case titl
   sweep does not stall other mints`, in `test_approval_manager_bound.cpp`.
 - **Audit evidence** (`co-1`, `co-2`): the redeemer MUST write its own spend audit row on the held
   connection (`AuditStore::log_in_txn`, so it commits or rolls back with the spend), and the
-  decision audit row MUST carry the request digest. Proof: `consume_ticket(PGconn*): the spend
+  decision audit row MUST carry the request digest. The spend row MUST also carry its own
+  wall-clock time: `consumed_at` is stamped at transaction start, so on a held transaction it can
+  precede `reviewed_at` and is not evidence of when the spend happened. Proof: `consume_ticket(PGconn*): the spend
   audit row is written on the held connection and rolls back with it`, in
   `test_approval_manager_bound.cpp`, and `approve: the decision audit row carries the request
   digest`, in `test_approval_routes.cpp`.
@@ -436,12 +441,22 @@ keep them green and extend them to the new surface. Test names are the case titl
   only in the server log. The PR MUST add a server-side-only kind (`kIntegrityFault`) with its own
   counter and an audit row carrying a closed cause token (reviewer is the submitter, reviewer is
   an excluded root, approved with no recorded reviewer, excluded roots unreadable, digest
-  mismatch, digest without a request: SIX tokens, plus the seventh cause the code also treats as
-  a refusal, a digest that could not be computed, which today is a store error flagged
-  `binding_check_unevaluated` and not a `kForeignOrigin` at all), and MUST decide the client text
-  in the same change (today a caller is told
-  "already used" for an intact approved ticket). Proof: `consume: an integrity failure is counted
-  and audited under its own kind and cause`, in `test_approval_manager_bound.cpp`.
+  mismatch, digest without a request, bound origin without a frozen request: SEVEN tokens, plus
+  the eighth cause the code also treats as a refusal, a digest that could not be computed, which
+  today is a store error flagged `binding_check_unevaluated` and not a `kForeignOrigin` at all),
+  and MUST decide the client text in the same change (today a caller is told
+  "already used" for an intact approved ticket). When the first `guardian_deploy` redeemer lands,
+  that cause becomes reachable, so the same change MUST add it to the operator-facing cause lists
+  (`upgrading.md`, `metrics.md`, `mcp.md` and the changelog fragment). Proof: `consume: an
+  integrity failure is counted and audited under its own kind and cause`, in
+  `test_approval_manager_bound.cpp`.
+- **Approve-side origin check** (`sec-r11-2`, `up-r11-1`): `approve()` and the dashboard Approve
+  predicate (`approval_state_is_approvable`) do not know a ticket's origin, so a hand-set pending
+  row of an origin that requires a bound request, with no request, can be approved and is then
+  refused at redemption for ever (the next `submit()` sweep retires it). The PR MUST give both the
+  same origin-aware refusal as redemption, from one shared predicate, so a reviewer is never
+  offered Approve on a ticket that cannot be redeemed. Proof: `approve: a bound-origin ticket
+  with no frozen request is refused and not offered`, in `test_approval_manager_bound.cpp`.
 - **Narrow list projection** (`sre-4`): a list read that elides `request_json` MUST return a
   distinct type, never an `Approval` whose empty `request_json` reads as unbound. Today
   `schedule_runner` and the Home panel fetch the column and ignore it, and a 100-row list carries

@@ -86,3 +86,21 @@ Gate 4 reviewer notes), not the full suite. MSVC and
 Apple Clang were not run: the code uses no POSIX-only calls, designated initialisers or
 `std::jthread`, which is an argument, not evidence. The three SAML ACS test cases that skip
 unconditionally are unrelated to this diff.
+
+## Addendum, 2026-10-24 (rounds 10 and 11)
+
+**Coverage statement above is superseded.** At `07cf67812` the author ran, locally and against
+Postgres 18: the Linux focus group and `--suite server` (27/27), MSVC (0 errors, approval filter
+403 cases, server suite 24/24, docs suite with two load-only lint timeouts that pass alone),
+Apple Clang (server, tar and agent suites), ASan+UBSan over the whole server suite (13,058
+cases, no reports) and TSan over the whole server suite (no ThreadSanitizer reports; one
+unrelated timing flake in `test_rbac_account_lifecycle_guard.cpp`, which passes alone and which
+this branch does not touch). The TSan binary leaves out `test_same_site_write_gate.cpp`, which
+does not compile under TSan on dev (#6419). CI has not run on this branch.
+
+**What the round-10 and round-11 diffs added to the resource picture.** Nothing. The consume
+fix (`a8b130b16`) adds one `constexpr const char*` SQL fragment (`kDbWallEpochSql`) and a `bool`
+parameter to `ticket_live_sql`, and one in-memory refusal in `approval_integrity_fault`. No new
+fd, handle, lease, transaction scope, lock, thread or callback; SQL text is built from integer
+constants only, with every caller-supplied value a `$n` parameter. The round-11 fix commit is
+comments, a stronger source tripwire, test comments and documentation.

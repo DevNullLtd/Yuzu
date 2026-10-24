@@ -405,7 +405,8 @@ enum class ConsumeFailure {
                     ///< ticket that fails the redemption integrity re-check (#6062): its stored
                     ///< reviewer is the submitter or an excluded root, an approved ticket records
                     ///< no reviewer, its excluded roots cannot be read, or its stored request_json
-                    ///< no longer hashes to request_digest (or is a digest with no request).
+                    ///< no longer hashes to request_digest (or is a digest with no request), or
+                    ///< its origin requires a bound request and it has none.
                     ///< Same forgery class, same uniform message, no new audit/metric label value.
                     ///< (A digest that cannot be COMPUTED is a kStoreError instead.)
     kForeignSubmitter, ///< recalled by a principal other than the ticket's submitter (#2442)
@@ -813,8 +814,9 @@ public:
     /// has swept it yet. The refusal leaves the row untouched.
 
     /// Is `id` an approved, unconsumed ticket still inside its lifetime, by DATABASE time?
-    /// This is the one liveness predicate (`ticket_live_sql()` in the .cpp): the same text
-    /// gates the consume CAS and submit()'s approved-ticket sweep, so an approved ticket
+    /// This is the one liveness predicate (`ticket_live_sql()` in the .cpp): the same window
+    /// gates the consume CAS (measured on the wall clock) and submit()'s approved-ticket
+    /// sweep (measured at transaction start), so an approved ticket
     /// that consume would refuse as expired is never fired by ScheduleRunner either
     /// (#6061, governance SG-2). A store failure is an error, not `false`: the caller
     /// (the scheduler) holds the occurrence rather than treating an unreadable ticket as
@@ -884,7 +886,8 @@ public:
     /// approved, unconsumed row whose stored reviewer is the submitter, an excluded
     /// root or EMPTY, whose excluded_roots cannot be read, or whose non-empty request_json no
     /// longer hashes to request_digest is refused as kForeignOrigin with the uniform
-    /// message; a legacy row with no request and no roots is unaffected) → match the
+    /// message, as is a row whose origin requires a bound request but has none; a legacy
+    /// unbound row with no request and no roots is unaffected) → match the
     /// row → reject a non-consumable one → evaluate `precondition` → CAS.
     /// A precondition denial returns ConsumeFailure::kPrecondition and leaves
     /// the row untouched, so the same ticket is still recallable once the

@@ -71,7 +71,8 @@ std::string redact_id(const std::string& id) {
 // approval already past its TTL, and a far-future `reviewed_at` was never swept and
 // stayed consumable. Postgres `now()` is the one authority all replicas share (the
 // same direction as SessionStore, ADR-2002 s4 / #3715). `now()` is fixed for a
-// transaction, so a statement or sweep sees one reading.
+// transaction, so a statement or sweep sees one reading. The one deliberate exception is
+// the consume liveness test, which reads `clock_timestamp()` (see ticket_live_sql).
 //
 // `submitted_at` is database time too (#6096): submit() authors it in-SQL from the same
 // expression, so every stamp this store writes and every comparison it makes (the
@@ -81,13 +82,16 @@ std::string redact_id(const std::string& id) {
 // scheduled run is now a guarded STATE transition (retire_schedule_tickets), not a clock
 // comparison, so no reader needs the two clocks to agree.
 constexpr const char* kDbNowEpochSql = "EXTRACT(EPOCH FROM now())::bigint";
-// The same database clock, read at the moment the statement executes (see ticket_live_sql).
+// The same database clock, read each time the expression is evaluated rather than fixed at
+// transaction start (see ticket_live_sql).
 constexpr const char* kDbWallEpochSql = "EXTRACT(EPOCH FROM clock_timestamp())::bigint";
 
-// THE ticket-liveness predicate, as a SQL boolean over `reviewed_at`. ONE definition,
-// used by the consume CAS, its diagnostic read, submit()'s approved-ticket sweep and
-// `ticket_is_live()` (which ScheduleRunner calls), so those four can never disagree
-// about when an approved ticket may still be redeemed or fired.
+// THE ticket-liveness predicate, as a SQL boolean over `reviewed_at`. ONE definition of the
+// window, used by the consume CAS, its diagnostic read, submit()'s approved-ticket sweep and
+// `ticket_is_live()` (which ScheduleRunner calls), so those four cannot drift apart about
+// the bounds of when an approved ticket may still be redeemed or fired. The clock the bounds
+// are measured on is chosen by the caller (`wall_clock`, below): the consume statements read
+// the wall clock, the other two sites the transaction start.
 //   lower bound: reviewed_at >= now - kApprovalTicketTtlSeconds   (the 7-day lifetime)
 //   upper bound: reviewed_at <= now + kApprovalReviewedAtSlackSeconds
 // The upper bound is what makes the lower one safe: a `reviewed_at` far in the future
@@ -104,12 +108,15 @@ constexpr const char* kDbWallEpochSql = "EXTRACT(EPOCH FROM clock_timestamp())::
 // `wall_clock` reads `clock_timestamp()` instead of `now()`. `now()` is the START of the
 // transaction, so on the held-connection consume path (a caller's long transaction) it is
 // frozen at BEGIN: a transaction begun before the ticket's TTL ran out would still see it
-// live after (an over-grant), and one begun before `reviewed_at` was stamped would see the
-// ticket as dated in the future and misreport it as expired (#6062 sg-6). The consume
-// CAS and its diagnostic read therefore ask for the wall clock; the sweep and
-// `ticket_is_live()` keep `now()`: the sweep runs first inside the mint's own short
-// transaction (opened and bounded here, never a caller's) and `ticket_is_live()` is one
-// statement, so neither can age the way a caller-held transaction does.
+// live after (an over-grant), and one begun more than kApprovalReviewedAtSlackSeconds before
+// `reviewed_at` was stamped would see the ticket as dated in the future and misreport it as
+// expired (#6062 sg-6). The consume CAS and its diagnostic read therefore ask for the wall
+// clock, and any new caller that evaluates liveness on a caller-held connection MUST pass
+// true. The sweep and `ticket_is_live()` keep `now()`: the sweeps run inside the mint's own
+// transaction (opened in submit_impl, never a caller's, and bounded by the pool's
+// statement and lock timeouts, 30 s and 10 s by default, far under the 300 s slack), and
+// `ticket_is_live()` is one statement, so neither can age the way a caller-held
+// transaction does.
 std::string ticket_live_sql(bool wall_clock = false) {
     const std::string now = wall_clock ? kDbWallEpochSql : kDbNowEpochSql;
     return "(reviewed_at >= (" + now + " - " + std::to_string(kApprovalTicketTtlSeconds) +
@@ -1570,10 +1577,14 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
     // submit()'s lazy sweep, so an approved ticket past its TTL stayed
     // redeemable until some unrelated submit() happened to run. The predicate
     // lives in the CAS itself so there is no window between "expired" and
-    // "swept". It is the shared `ticket_live_sql()` predicate, on DATABASE time
-    // (see kDbNowEpochSql): the lower bound stops a leaked capability outliving
+    // "swept". It is the shared `ticket_live_sql()` predicate, on DATABASE time read
+    // when the statement runs (kDbWallEpochSql, so a caller-held transaction cannot
+    // redeem past the lifetime): the lower bound stops a leaked capability outliving
     // its lifetime, the upper bound refuses a `reviewed_at` stamped in the
     // future (UP-3), which the lower bound alone would honour indefinitely.
+    // `consumed_at` keeps the transaction-start `now()`: eligibility reads it only as zero
+    // or non-zero, so on a held transaction it can precede `reviewed_at`; a spend audit
+    // must carry its own wall-clock time (ADR-1009 PR3 conditions).
     const std::string consume_sql =
         std::string("UPDATE approval_manager.approvals SET consumed_at = ") + kDbNowEpochSql +
         ", consumed_by = $1 "

@@ -630,7 +630,15 @@ TEST_CASE("consume_ticket(PGconn*): a transaction begun before expiry whose cons
     yuzu::test::ApprovalManagerPg bundle;
     ApprovalManager& mgr = *bundle;
     const auto id = approved_ticket(mgr, ApprovalOrigin::kMcp);
-    // Live for about one more second of database time.
+    // Covers the over-grant half of sg-6 (a transaction begun before expiry redeeming after
+    // it). The other half, a transaction begun more than the 300 s slack before the ticket
+    // was approved misreading it as future-dated, would need a transaction older than five
+    // minutes, so it rests on the predicate's text (pinned by the source tripwire) instead.
+    //
+    // Live for about one more second of database time. The premise below fails loudly, never
+    // green, if the lease and BEGIN after this UPDATE take longer than that (a very loaded
+    // runner); the sleep must outlast the lifetime by more than the one-second rounding of
+    // the epoch (`::bigint` rounds), hence 2300 ms. The database clock cannot be injected.
     REQUIRE(run_sql(bundle.pool(),
                     "UPDATE approval_manager.approvals SET reviewed_at = "
                     "extract(epoch from now())::bigint - " +
