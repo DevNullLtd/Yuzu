@@ -1704,8 +1704,14 @@ TEST_CASE("CertificateInventoryStore: every agent gets a server-assigned random 
 
     // A hash-skip report leaves every key unchanged.
     const auto b = blob(store_rec("S", "ok", "", "1"), {cert(3, {{"S", ""}})});
-    for (const auto& a : agents)
-        ingest(store, a, hash_only(raw_hash(b)));
+    yuzu::MetricsRegistry m;
+    cert_ingest_metric::register_metrics(m);
+    for (const auto& a : agents) {
+        // Each was last fully reported with exactly this blob, so the claim matches: a touch.
+        CHECK_FALSE(nacked(ingest(store, a, hash_only(raw_hash(b)), &m)));
+    }
+    CHECK(metric_count(m, "touched", "none") == 16);
+    CHECK(metric_count(m, "need_full", "hash_mismatch") == 0);
     CHECK(scalar(pool, "SELECT string_agg(sample_key::text, ',' ORDER BY agent_id) FROM "
                        "certificate_inventory_store.agent_state") == before);
 }
@@ -1713,9 +1719,17 @@ TEST_CASE("CertificateInventoryStore: every agent gets a server-assigned random 
 TEST_CASE("CertificateInventoryStore: a CSPRNG failure fails the first ingest and stores nothing",
           "[certinv][pg][samplekey]") {
     CERT_SHARED(store, pool);
+    // Whatever happens, the thread-local force flag never outlives this test.
+    struct ClearForced {
+        ~ClearForced() {
+            if (test_hooks::is_failure_forced_for_this_thread())
+                (void)random_hex(1); // consumes (and so clears) the pending forced failure
+        }
+    } clear_forced;
     const auto rpt = full_report(blob(store_rec("S", "ok", "", "1"), {cert(1, {{"S", ""}})}));
     test_hooks::force_next_failure_for_this_thread();
     const auto ack = ingest(store, "agent-e", rpt);
+    CHECK_FALSE(test_hooks::is_failure_forced_for_this_thread()); // the ingest drew, and consumed it
     CHECK(nacked(ack));
     CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.agent_state") == "0");
     CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.cert_fact") == "0");
