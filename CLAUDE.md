@@ -106,6 +106,7 @@ Read the named doc **first** when the work touches that surface.
 | Guardian / Guaranteed State | `docs/yuzu-guardian-design-v1.1.md` §24 (standing invariants), §9.1 (store schema) |
 | Instruction Engine content plane | `docs/Instruction-Engine.md`; DSL `docs/yaml-dsl-spec.md`; tutorial `docs/getting-started.md` |
 | CI matrix and gates | `docs/ci-architecture.md` |
+| Branching, the `dev`→`main` release lifecycle, hotfixes | `docs/branch-strategy.md` — hotfixes branch from `main`, everything else from `dev`; procedure in `.claude/skills/release/SKILL.md` |
 | Enterprise / SOC 2 scope | `docs/enterprise-readiness-soc2-first-customer.md` (7 workstreams; Gate 6 agents evaluate every change against it) |
 | Roadmap and capability map | `docs/roadmap.md`, `docs/capability-map.md` (headline progress figure is overstated) |
 | Issues, labels, ADRs | `docs/agents/issue-standard.md`, `docs/agents/triage-labels.md`, `docs/adr/README.md` |
