@@ -5176,12 +5176,24 @@ TEST_CASE("RbacStore: a role-query failure is a typed error, is counted as query
     CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
 
     // Call 3: the breaker is open and inside its cooldown, so the error is the breaker's, with no
-    // pool touch; it lands on the pool_acquire_timeout label like every breaker denial.
-    const auto r3 = store.check_permission_checked("bob", "Forensics", "Execute");
+    // pool touch; it lands on the pool_acquire_timeout label like every breaker denial. The
+    // cooldown is one second of wall time: if this thread stalls past it between the trip and this
+    // call, the call is the half-open probe instead (a real query failure that re-arms the
+    // cooldown), so the call is repeated, bounded, until the breaker answers, and each probe is
+    // accounted for below.
+    const auto is_breaker_denial = [](const std::expected<bool, std::string>& r) {
+        return !r.has_value() && std::string_view{r.error()} == kRbacErrCircuitBreakerOpen;
+    };
+    auto r3 = store.check_permission_checked("bob", "Forensics", "Execute");
+    int probes = 0;
+    while (probes < 4 && !is_breaker_denial(r3)) {
+        ++probes;
+        r3 = store.check_permission_checked("bob", "Forensics", "Execute");
+    }
     REQUIRE_FALSE(r3.has_value());
     CHECK(std::string_view{r3.error()} == kRbacErrCircuitBreakerOpen);
     CHECK(rbac_degrade_count(metrics, "pool_acquire_timeout") == 1.0);
-    CHECK(rbac_degrade_count(metrics, "query_error") == 2.0);
+    CHECK(rbac_degrade_count(metrics, "query_error") == 2.0 + probes);
     CHECK_FALSE(store.check_permission("bob", "Forensics", "Execute"));
 
     // The display accessor shares the role read, so its failure is counted too (the helper owns
@@ -5235,7 +5247,13 @@ TEST_CASE("RbacStore: a starved pool, an open breaker and a store that is not op
     CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
 
     // Breaker open (inside its cooldown): denied WITHOUT a pool touch, with the breaker's text.
-    const auto open = replica_b.check_permission_checked("bob", "Forensics", "Delete");
+    // A stall past the one-second cooldown turns the call into the half-open probe (a pool timeout
+    // that re-arms the cooldown), so it is repeated, bounded, until the breaker answers.
+    auto open = replica_b.check_permission_checked("bob", "Forensics", "Delete");
+    for (int i = 0; i < 4 && (open.has_value() ||
+                              std::string_view{open.error()} != kRbacErrCircuitBreakerOpen);
+         ++i)
+        open = replica_b.check_permission_checked("bob", "Forensics", "Delete");
     REQUIRE_FALSE(open.has_value());
     CHECK(std::string_view{open.error()} == kRbacErrCircuitBreakerOpen);
     CHECK_FALSE(replica_b.check_permission("bob", "Forensics", "Delete"));
