@@ -849,11 +849,23 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                               " agents from " + command_id + ")");
 
                  // Response: no body, side-effects via HX-Trigger headers
+                 // The header is built with the JSON library, never by concatenation: the
+                 // operator-supplied name may hold a quote, a backslash, a control character,
+                 // a CR/LF (httplib drops a header value carrying one) or non-ASCII bytes,
+                 // any of which would otherwise leave the group created but the operator
+                 // with no confirmation and no list refresh. `ensure_ascii` keeps the header
+                 // 7-bit, `replace` turns invalid UTF-8 into U+FFFD instead of throwing, and
+                 // the ordered type keeps the key order of the hand-built header.
+                 // The toast renders its message with textContent, so no HTML escaping.
+                 const nlohmann::ordered_json trigger = {
+                     {"showToast",
+                      {{"message", "Group '" + group_name + "' created with " +
+                                       std::to_string(agent_ids.size()) + " agents"},
+                       {"level", "success"}}},
+                     {"agentChanged", true}};
                  res.set_header("HX-Trigger",
-                     R"({"showToast":{"message":"Group ')" +
-                     html_escape(group_name) + "' created with " +
-                     std::to_string(agent_ids.size()) +
-                     R"( agents","level":"success"},"agentChanged":true})");
+                                trigger.dump(-1, ' ', true,
+                                             nlohmann::ordered_json::error_handler_t::replace));
                  res.set_content("", "text/html; charset=utf-8");
              });
 

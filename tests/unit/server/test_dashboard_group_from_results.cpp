@@ -67,6 +67,7 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <libpq-fe.h>
 
@@ -752,4 +753,88 @@ TEST_CASE("group-from-results: a configured trusted origin is accepted "
                       {{"Host", kHost}, {"Origin", "https://proxy.example"}});
     CHECK(res->status == 200);
     CHECK(h.mg.find_group_by_name("csrf-trusted-group").has_value());
+}
+
+// ── Success toast: the HX-Trigger header is always valid, single-line, ASCII JSON ───────────
+
+namespace {
+
+/// Percent-encode every byte that is not an unreserved URL character, so a test can put any
+/// byte (quote, backslash, CR/LF, tab, UTF-8) into the urlencoded `group_name` field.
+std::string percent_encode(std::string_view in) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    for (const unsigned char c : in) {
+        const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+        if (unreserved) {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[c >> 4]);
+            out.push_back(kHex[c & 0x0F]);
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("group-from-results: the success toast is valid single-line ASCII JSON whatever the "
+          "group name holds",
+          "[pg][server][dashboard][group_from_results][toast]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+
+    const auto run = [&](const std::string& name) {
+        auto res = h.post(GroupFromResultsHarness::form_body(percent_encode(name)));
+        REQUIRE(res->status == 200);
+        const std::string trigger = res->get_header_value("HX-Trigger");
+        // A header dropped by the transport (CR/LF in the value) leaves the operator with no
+        // confirmation and no list refresh, so its absence is itself the failure.
+        REQUIRE_FALSE(trigger.empty());
+        for (const unsigned char c : trigger) {
+            INFO("byte " << static_cast<int>(c) << " in the HX-Trigger header");
+            REQUIRE((c >= 0x20 && c < 0x7F));
+        }
+        const auto j = nlohmann::json::parse(trigger, nullptr, /*allow_exceptions=*/false);
+        REQUIRE_FALSE(j.is_discarded());
+        REQUIRE(j.is_object());
+        // Event structure is unchanged: the toast plus the list-refresh trigger, nothing else.
+        CHECK(j.size() == 2);
+        REQUIRE(j.contains("showToast"));
+        REQUIRE(j["showToast"].is_object());
+        CHECK(j["showToast"].size() == 2);
+        CHECK(j["showToast"].value("level", "") == "success");
+        REQUIRE(j.contains("agentChanged"));
+        CHECK(j["agentChanged"] == true);
+        // The message round-trips the name byte for byte.
+        CHECK(j["showToast"].value("message", "") == "Group '" + name + "' created with 1 agents");
+    };
+
+    SECTION("an ordinary name is unchanged") {
+        run("plain-group");
+        CHECK(h.mg.find_group_by_name("plain-group").has_value());
+    }
+    SECTION("a double quote") {
+        run("say \"hi\"");
+    }
+    SECTION("a backslash") {
+        run("a\\b");
+    }
+    SECTION("a newline") {
+        run("line1\nline2");
+    }
+    SECTION("a carriage return and line feed") {
+        run("line1\r\nline2");
+    }
+    SECTION("a tab") {
+        run("col1\tcol2");
+    }
+    SECTION("a non-ASCII name") {
+        run("Gr\xC3\xBC" "ppe \xE2\x9C\x93 \xE6\x97\xA5\xE6\x9C\xAC");
+    }
+    SECTION("markup characters travel as text, not HTML entities") {
+        run("R&D <team> 'north'");
+    }
 }
