@@ -432,6 +432,109 @@ def read_src_tree() -> dict[str, str]:
     return out
 
 
+# -- #4990 (UP-7): server-authored response provenance ---------------------------------------------
+# A response's stored plugin decides its read tier and the treatment of every derived sink, so it
+# must come from the SERVER's dispatch record (resolve_response_provenance), never from the command
+# id an agent echoes. Lexical pins, per file under server/core/src (canonical text: comments out,
+# whitespace collapsed). Each row is (id, pattern, exact count, why). GREP LIMIT: lexical only. It
+# cannot see a classification reached through a differently-spelt parse of the id (the first row
+# bans the spellings this file has used); the unit tests assert the behavior on both ingest paths.
+PROVENANCE_EXACT: dict[str, list[tuple[str, str, int, str]]] = {
+    "agent_service_impl.cpp": [
+        ("prov-no-extract-plugin", r"\bextract_plugin\(", 0,
+         "the stored plugin must not be parsed from the command id the agent echoes"),
+        ("prov-no-id-parse", r"command_id(?:\(\))?\.(?:find|rfind|substr)\(", 0,
+         "an ingest path must not split the command id to classify a response"),
+        ("prov-no-second-lookup", r"\bresolve_execution_id\b|\blookup_execution_id\b", 0,
+         "the old per-site execution-id lookups are gone: one provenance lookup per frame"),
+        ("prov-one-record-read", r"->lookup_command_record\(", 1,
+         "the dispatch record is read in exactly one place (resolve_response_provenance)"),
+        ("prov-resolved-once-per-frame", r"=resolve_response_provenance\(resp\.command_id\(\)\)", 4,
+         "each ingest path (direct Subscribe, gateway proxy) resolves provenance once per frame: "
+         "RUNNING and terminal branch, two paths"),
+        ("prov-notify-sites", r"(?<![:\w])notify_exec_tracker\(", 6,
+         "notify_exec_tracker is called at exactly six sites (keepalive, RUNNING, terminal on each path)"),
+        ("prov-notify-carries-provenance",
+         r"(?<![:\w])notify_exec_tracker\(resp\.command_id\(\),agent_id,resp,prov\)", 6,
+         "every notify_exec_tracker call passes the frame's already-resolved provenance"),
+        ("prov-plugin-aliases", r"const std::string&(?:plugin|plugin_name|gw_plugin)=prov\.plugin;", 4,
+         "the plugin used by the stored row, the live output and the registry audit is the resolved one"),
+        ("prov-no-call-in-plugin-assign", r"\b(?:sr|ae)\.plugin=[^;]*\(", 0,
+         "a stored row's or analytics event's plugin is assigned from the resolved label, never from a call"),
+        ("prov-sinks-reduce-by-resolved-plugin", r"failure_text_for_sinks\(prov\.plugin,resp\)", 3,
+         "the failure text of every sink is reduced by the resolved plugin (terminal x2, tracker status)"),
+        ("prov-audit-by-resolved-plugin",
+         r"audit_registry_frame\(agent_id,resp,(?:plugin|prov\.plugin)\)", 4,
+         "the registry audit decides by the resolved plugin"),
+        ("prov-live-output-by-resolved-plugin", r"publish_output_rows\(agent_id,plugin,resp\.output\(\)\)", 2,
+         "the live output stream decides by the resolved plugin"),
+    ],
+    "server.cpp": [
+        ("prov-chokepoint-records-once", r"agent_service_\.record_command_dispatch\(", 1,
+         "the dispatch record is written at exactly one place: build_classified_command"),
+        ("prov-record-after-finalize",
+         r"if\(!finalized\)\{.{0,1500}?\}agent_service_\.record_command_dispatch\(command_id,"
+         r"finalized->wire\(\)\.plugin\(\),execution_id\);return\*finalized;", 1,
+         "the record is written after classification, authorization and the kill switch (a denied "
+         "dispatch records nothing), with the wire plugin, just before the command is handed back"),
+        ("prov-no-old-record-api",
+         r"\brecord_execution_id\b|\brecord_command_execution\b|\blookup_execution_id\b|\bresolve_execution_id\b",
+         0, "the pre-provenance record/lookup API is gone"),
+        ("prov-test-seam-unused", r"override_command_record_lookup", 0,
+         "ServerImpl must never install a record source: it is a unit-harness seam only"),
+    ],
+    "forensics_plugin_set.hpp": [
+        ("prov-sentinel-in-set", r"names\.emplace_back\(kUnverifiedProvenanceLabel\);", 1,
+         "the unresolved-provenance label must be a member of the Forensics plugin set"),
+    ],
+    "response_provenance.hpp": [
+        ("prov-sentinel-literal",
+         r'inline constexpr std::string_view kUnverifiedProvenanceLabel="~unverified";', 1,
+         "the unresolved-provenance label is `~unverified` (a character no plugin name can contain)"),
+    ],
+    "execution_tracker.cpp": [
+        ("prov-migration-plugin-column",
+         r"\{6,\"ALTER TABLE command_execution ADD COLUMN plugin TEXT NOT NULL DEFAULT ''; ?\"\}", 1,
+         "the dispatch record carries the plugin (migration 6)"),
+        ("prov-plugin-immutable", r"plugin=EXCLUDED\.plugin", 0,
+         "the first writer's plugin wins: a later write must not relabel a recorded command"),
+        ("prov-tracker-scrub-by-recorded-plugin", r"split_part\(command_id", 0,
+         "the tracker's Forensics execution lookup uses the recorded plugin, not the id's prefix"),
+    ],
+}
+
+
+def provenance_problems(asrc: str, sources: dict[str, str] | None = None) -> list[tuple[str, str]]:
+    """(id, message) per violated provenance pin; [] when clean.
+
+    `asrc` is agent_service_impl.cpp's text; `sources` maps a base name under server/core/src to its
+    text (read from disk when None). A file that is missing is itself a problem.
+    """
+    if sources is None:
+        sources = {}
+        for name in PROVENANCE_EXACT:
+            if name == "agent_service_impl.cpp":
+                continue
+            try:
+                with open(os.path.join(REPO_ROOT, SRC_DIR, name), encoding="utf-8") as fh:
+                    sources[name] = fh.read()
+            except OSError:
+                pass
+    out: list[tuple[str, str]] = []
+    for name, rows in PROVENANCE_EXACT.items():
+        text = asrc if name == "agent_service_impl.cpp" else sources.get(name)
+        if text is None:
+            out.append((f"missing-{name}", f"missing-{name}: {name} not found under {SRC_DIR}; its "
+                        f"provenance pins would pass vacuously (renamed? update this gate)"))
+            continue
+        t = canonical(text)
+        for rid, pat, want, why in rows:
+            got = len(re.findall(pat, t, re.S))
+            if got != want:
+                out.append((rid, f"{rid}: {name}: expected exactly {want} occurrences, found {got}: {why}"))
+    return out
+
+
 def agent_service_problems(src: str) -> list[tuple[str, str]]:
     """(id, message) per violated exact count in agent_service_impl.cpp; [] when clean."""
     t = canonical(src)
@@ -483,7 +586,7 @@ def main() -> int:
     except OSError as e:
         print(f"::error::{TAG}: cannot read {AGENT_SERVICE_CPP}: {e}", file=sys.stderr)
         return 1
-    afound = agent_service_problems(asrc)
+    afound = agent_service_problems(asrc) + provenance_problems(asrc)
     for _rid, msg in afound:
         print(f"::error::{TAG}: {AGENT_SERVICE_CPP}: {msg}{HINT}", file=sys.stderr)
     tree = read_src_tree()

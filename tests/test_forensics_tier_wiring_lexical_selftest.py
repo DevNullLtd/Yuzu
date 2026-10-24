@@ -187,7 +187,7 @@ def main() -> int:
     expect(asrc.count(helper) == 1, "selftest anchor moved: the helper's read")
     expect("raw-failure-text-helper" in ids(g.agent_service_problems(asrc.replace(helper, "std::string text;", 1))),
            "deleting the helper's raw read was NOT detected")
-    sinks = "s.error_detail = failure_text_for_sinks(command_id, resp);"
+    sinks = "s.error_detail = failure_text_for_sinks(prov.plugin, resp);"
     expect(asrc.count(sinks) == 1, "selftest anchor moved: the tracker status text reduction")
     expect("tracker-status-text-reduced" in ids(g.agent_service_problems(
                asrc.replace(sinks, "s.error_detail = resp.error().message();", 1))),
@@ -257,6 +257,67 @@ def main() -> int:
     del crafted["forensics_visibility.cpp"]
     expect("missing-forensics_visibility.cpp" in ids(g.tier_token_problems(crafted)),
            "a missing resolver source must be named, not pass vacuously")
+
+    # #4990 (UP-7): the provenance pins. The real tree is clean, and each pin is seen to fire.
+    psources = {n: open(os.path.join(g.REPO_ROOT, g.SRC_DIR, n), encoding="utf-8").read()
+                for n in g.PROVENANCE_EXACT if n != "agent_service_impl.cpp"}
+    expect(g.provenance_problems(asrc, psources) == [], "the real tree must satisfy the provenance pins")
+    spell = {
+        "prov-no-extract-plugin": ("agent_service_impl.cpp", "auto p = extract_plugin(resp.command_id());"),
+        "prov-no-id-parse": ("agent_service_impl.cpp", "auto d = command_id.find('-');"),
+        "prov-no-second-lookup": ("agent_service_impl.cpp", "auto e = resolve_execution_id(command_id);"),
+        "prov-one-record-read": ("agent_service_impl.cpp", "auto r = tracker->lookup_command_record(id, &d);"),
+        "prov-resolved-once-per-frame": ("agent_service_impl.cpp",
+                                         "const ResponseProvenance again = resolve_response_provenance(resp.command_id());"),
+        "prov-notify-sites": ("agent_service_impl.cpp", "notify_exec_tracker(id, a, resp, prov);"),
+        "prov-plugin-aliases": ("agent_service_impl.cpp", "const std::string& plugin = prov.plugin;"),
+        "prov-no-call-in-plugin-assign": ("agent_service_impl.cpp", "sr.plugin = parse(resp.command_id());"),
+        "prov-sinks-reduce-by-resolved-plugin": ("agent_service_impl.cpp",
+                                                 "auto m = failure_text_for_sinks(prov.plugin, resp);"),
+        "prov-audit-by-resolved-plugin": ("agent_service_impl.cpp",
+                                          "(void)audit_registry_frame(agent_id, resp, plugin);"),
+        "prov-live-output-by-resolved-plugin": ("agent_service_impl.cpp",
+                                                "publish_output_rows(agent_id, plugin, resp.output());"),
+        "prov-chokepoint-records-once": ("server.cpp", "agent_service_.record_command_dispatch(c, p, e);"),
+        "prov-no-old-record-api": ("server.cpp", "agent_service_.record_execution_id(c, e);"),
+        "prov-test-seam-unused": ("server.cpp", "agent_service_.override_command_record_lookup(fn);"),
+        "prov-plugin-immutable": ("execution_tracker.cpp", 'const char* kSql = "SET plugin = EXCLUDED.plugin";'),
+        "prov-tracker-scrub-by-recorded-plugin": ("execution_tracker.cpp",
+                                                  'const char* kSql = "split_part(command_id, 1)";'),
+    }
+    for rid, (fname, extra) in spell.items():
+        a2, s2 = asrc, dict(psources)
+        if fname == "agent_service_impl.cpp":
+            a2 = asrc + "\n" + extra + "\n"
+        else:
+            s2[fname] = s2[fname] + "\n" + extra + "\n"
+        expect(rid in ids(g.provenance_problems(a2, s2)), f"{rid}: a violating spelling was NOT detected")
+    # Deleting a required statement is seen too: each exact-count row with a positive count.
+    for fname, rows in g.PROVENANCE_EXACT.items():
+        for rid, pat, want, _why in rows:
+            if want == 0:
+                continue
+            text = asrc if fname == "agent_service_impl.cpp" else psources[fname]
+            m = re.search(pat, g.canonical(text), re.S)
+            expect(m is not None, f"{rid}: pattern no longer matches the real source (stale pattern)")
+    for rid, pat, want, _why in g.PROVENANCE_EXACT["server.cpp"]:
+        if rid == "prov-record-after-finalize":
+            moved = g.canonical(psources["server.cpp"])
+            expect(re.search(pat, moved, re.S) is not None, "the record-after-finalize pin must match")
+            broken = psources["server.cpp"].replace(
+                "agent_service_.record_command_dispatch(command_id, finalized->wire().plugin(),", 
+                "agent_service_.record_command_dispatch(command_id, plugin,", 1)
+            sc = dict(psources)
+            sc["server.cpp"] = broken
+            expect("prov-record-after-finalize" in ids(g.provenance_problems(asrc, sc)),
+                   "recording the caller's raw plugin string instead of the wire plugin was NOT detected")
+    # A comment mentioning a pinned token is not a use of it; a missing file is named.
+    expect(g.provenance_problems(asrc + "\n// extract_plugin(x) resolve_execution_id(y)\n", psources) == [],
+           "a comment mentioning a banned spelling is not one")
+    crafted = dict(psources)
+    del crafted["response_provenance.hpp"]
+    expect("missing-response_provenance.hpp" in ids(g.provenance_problems(asrc, crafted)),
+           "a missing provenance source must be named, not pass vacuously")
 
     if FAILURES:
         print(f"{len(FAILURES)} selftest failure(s)", file=sys.stderr)
