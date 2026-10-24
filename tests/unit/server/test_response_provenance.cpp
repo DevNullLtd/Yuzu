@@ -40,6 +40,7 @@
 #include "test_auth_db_pg_helper.hpp"
 #include "test_forensics_tier_fixture.hpp"
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 #include <libpq-fe.h>
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -691,6 +692,61 @@ TEST_CASE("provenance ingest: a gateway-forwarded solicited __guard__ reply keep
     const auto stored = h.all_rows(id);
     REQUIRE(stored.size() == 1);
     CHECK(stored[0].plugin == "__guard__");
+}
+
+TEST_CASE("provenance ingest: a keepalive heartbeat renews its claim but labels nothing",
+          "[pg][server][forensics_tier][provenance]") {
+    const bool direct = GENERATE(false, true);
+    INFO((direct ? "direct Subscribe path" : "gateway path"));
+    YUZU_REQUIRE_PG_DB_TPL(db, provenance_tpl);
+    Harness h(db.dsn(), direct);
+
+    // A heartbeat for a recorded command and one for a command the server never issued: neither
+    // is a response row, so neither moves the per-response outcome counter nor stores anything.
+    const std::string known = std::string{test::kOrdinaryPlugin} + "-1ee70001";
+    h.dispatched(known, test::kOrdinaryPlugin);
+    h.ingest(running(known, "__keepalive__"));
+    h.ingest(running(std::string{test::kOrdinaryPlugin} + "-1ee70002", "__keepalive__"));
+
+    for (const char* outcome : {"verified", "unrecorded", "lookup_degraded"})
+        CHECK(h.metrics.counter("yuzu_server_response_provenance_total", {{"outcome", outcome}})
+                  .value() == 0.0);
+    CHECK(h.all_rows(known).empty());
+
+    // A real response still counts, so the zero above is not a dead counter.
+    h.ingest(running(known, kMarker));
+    CHECK(h.metrics.counter("yuzu_server_response_provenance_total", {{"outcome", "verified"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("provenance record: a failing record store is counted for every dispatch but logs once",
+          "[pg][server][forensics_tier][provenance]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, provenance_tpl);
+    Harness h(db.dsn(), /*use_direct=*/false);
+    {
+        auto lease = h.pool.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(), "DROP TABLE execution_tracker.command_execution",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    std::string logs;
+    {
+        yuzu::test::LogCapture capture;
+        for (int i = 0; i < 5; ++i)
+            h.dispatched(std::string{test::kOrdinaryPlugin} + "-0ee0000" + std::to_string(i),
+                         test::kOrdinaryPlugin);
+        capture.stop();
+        logs = capture.text();
+    }
+    // Every failure is counted; the line is throttled (at most one per 60 s per cause, and an
+    // earlier case in this process may already have spent this cause's slot).
+    CHECK(h.metrics.counter("yuzu_exec_correlation_write_degrade_total").value() == 5.0);
+    std::size_t lines = 0;
+    for (std::size_t at = logs.find("record_command_dispatch: write failed"); at != std::string::npos;
+         at = logs.find("record_command_dispatch: write failed", at + 1))
+        ++lines;
+    CHECK(lines <= 1);
 }
 
 TEST_CASE("provenance ingest: failure to record fails safe, and a reaped record is unverified",

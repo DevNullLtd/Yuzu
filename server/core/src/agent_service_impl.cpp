@@ -1556,7 +1556,8 @@ grpc::Status AgentServiceImpl::Subscribe(
             // #4990: provenance is decided ONCE for this frame, from the server's dispatch
             // record. It is resolved before the keepalive branch because the keepalive needs
             // the recorded execution id to renew its claim.
-            const ResponseProvenance prov = resolve_response_provenance(resp.command_id());
+            const ResponseProvenance prov =
+                resolve_response_provenance(resp.command_id(), resp.output() == "__keepalive__");
             if (resp.output() == "__keepalive__") {
                 notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
                 continue;
@@ -1843,7 +1844,8 @@ bool AgentServiceImpl::discard_send_time(const std::string& command_id) {
 
 // -- resolve_response_provenance (#4990 UP-7; HA WS-1(1b), ADR-2002 section 5) ---
 
-ResponseProvenance AgentServiceImpl::resolve_response_provenance(const std::string& command_id) const {
+ResponseProvenance AgentServiceImpl::resolve_response_provenance(const std::string& command_id,
+                                                                 bool keepalive) const {
     // Atomic snapshot — see notify_exec_tracker's identical load for the
     // detached gateway-forward-thread rationale (governance UAT 2026-05-06
     // Gate 7 re-review HIGH).
@@ -1867,6 +1869,13 @@ ResponseProvenance AgentServiceImpl::resolve_response_provenance(const std::stri
     for (const auto& reason : prov.degrade_reasons)
         metrics_.counter("yuzu_exec_correlation_read_degrade_total", {{"reason", reason}})
             .increment();
+    // A `__keepalive__` frame is a claim-renewal heartbeat the agent repeats on a fixed interval
+    // for a long-running command: it is never stored, published or audited, so it labels no
+    // response. It still needs the recorded execution id (resolved above, and any store degrade it
+    // hit is counted above), but it must not move the per-response outcome counter or raise the
+    // "response stored as unverified" line, or a heartbeat rate would swamp both.
+    if (keepalive)
+        return prov;
     const char* outcome = prov.outcome == ProvenanceOutcome::kVerified     ? "verified"
                           : prov.outcome == ProvenanceOutcome::kUnrecorded ? "unrecorded"
                                                                            : "lookup_degraded";
@@ -1922,7 +1931,8 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         // (this function's own doc comment names it "the gateway-streamed
         // RUNNING" path); same sentinel, same reasoning.
         // #4990: provenance is decided ONCE for this frame (see the direct-Subscribe twin).
-        const ResponseProvenance prov = resolve_response_provenance(resp.command_id());
+        const ResponseProvenance prov =
+            resolve_response_provenance(resp.command_id(), resp.output() == "__keepalive__");
         if (resp.output() == "__keepalive__") {
             notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
             return;

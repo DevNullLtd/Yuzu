@@ -449,7 +449,8 @@ PROVENANCE_EXACT: dict[str, list[tuple[str, str, int, str]]] = {
          "the old per-site execution-id lookups are gone: one provenance lookup per frame"),
         ("prov-one-record-read", r"->lookup_command_record\(", 1,
          "the dispatch record is read in exactly one place (resolve_response_provenance)"),
-        ("prov-resolved-once-per-frame", r"=resolve_response_provenance\(resp\.command_id\(\)\)", 4,
+        ("prov-resolved-once-per-frame",
+         r"=resolve_response_provenance\(resp\.command_id\(\)(?:,resp\.output\(\)==\"__keepalive__\")?\)", 4,
          "each ingest path (direct Subscribe, gateway proxy) resolves provenance once per frame: "
          "RUNNING and terminal branch, two paths"),
         ("prov-notify-sites", r"(?<![:\w])notify_exec_tracker\(", 6,

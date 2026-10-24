@@ -755,8 +755,11 @@ private:
     /// (`yuzu_server_response_provenance_total`) and any read degrade
     /// (`yuzu_exec_correlation_read_degrade_total`). A second hand-rolled lookup, or a plugin
     /// parsed from the command id, at a new call site is the defect this function exists to
-    /// prevent (the wiring gate pins both).
-    [[nodiscard]] ResponseProvenance resolve_response_provenance(const std::string& command_id) const;
+    /// prevent (the wiring gate pins both). `keepalive` is true only for a `__keepalive__`
+    /// heartbeat frame: it is resolved (the claim renewal needs the recorded execution id) but
+    /// labels no response, so it is not counted in the outcome metric and raises no unverified line.
+    [[nodiscard]] ResponseProvenance resolve_response_provenance(const std::string& command_id,
+                                                                 bool keepalive = false) const;
 };
 
 } // namespace yuzu::server::detail

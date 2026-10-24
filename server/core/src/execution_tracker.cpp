@@ -2574,12 +2574,19 @@ bool ExecutionTracker::record_command_dispatch(const std::string& command_id,
     // (2*kWriteTimeout) under sustained pool contention. update_agent_status's retry lives on the
     // async gateway-response path, where that tradeoff is free.
     auto lease = pool_.try_acquire_for(kWriteTimeout);
+    // Every failed record is counted by the caller (`yuzu_exec_correlation_write_degrade_total`);
+    // the line is for a human, and a pool or database outage fails EVERY dispatch, so it is
+    // throttled per cause (one line a minute each) instead of one ERROR per command.
+    static RefusalLogThrottle record_failure_throttle;
     if (!lease) {
-        spdlog::error("ExecutionTracker::record_command_dispatch: pool exhausted for "
-                      "command_id={} - this command's responses will be labelled unverified "
-                      "(withheld from readers without the Forensics grant) and will not correlate "
-                      "to an execution_id on any replica; dispatch itself is unaffected",
-                      command_id);
+        if (record_failure_throttle.should_warn("record_command_dispatch_pool_exhausted"))
+            spdlog::error("ExecutionTracker::record_command_dispatch: pool exhausted for "
+                          "command_id={} - this command's responses will be labelled unverified "
+                          "(withheld from readers without the Forensics grant) and will not "
+                          "correlate to an execution_id on any replica; dispatch itself is "
+                          "unaffected (first of a series; at most one log per 60 s per cause, the "
+                          "write-degrade counter records every failure)",
+                          command_id);
         return false;
     }
     // created_at is authored from Postgres now() IN-SQL, not the calling replica's app clock
@@ -2602,11 +2609,14 @@ bool ExecutionTracker::record_command_dispatch(const std::string& command_id,
         "created_at = EXCLUDED.created_at",
         std::vector<std::string>{command_id, plugin, execution_id});
     if (res.status() != PGRES_COMMAND_OK) {
-        spdlog::error("ExecutionTracker::record_command_dispatch: write failed for "
-                      "command_id={} - this command's responses will be labelled unverified "
-                      "(withheld from readers without the Forensics grant) and will not correlate "
-                      "to an execution_id on any replica; dispatch itself is unaffected",
-                      command_id);
+        if (record_failure_throttle.should_warn("record_command_dispatch_write_failed"))
+            spdlog::error("ExecutionTracker::record_command_dispatch: write failed for "
+                          "command_id={} - this command's responses will be labelled unverified "
+                          "(withheld from readers without the Forensics grant) and will not "
+                          "correlate to an execution_id on any replica; dispatch itself is "
+                          "unaffected (first of a series; at most one log per 60 s per cause, the "
+                          "write-degrade counter records every failure)",
+                          command_id);
         return false;
     }
     return true;
