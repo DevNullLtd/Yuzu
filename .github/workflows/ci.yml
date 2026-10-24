@@ -1229,7 +1229,7 @@ jobs:
         # meson pool sized from cpu_count() on a job confined to 16 logical CPUs;
         # 4 workers is not that oversubscription, but the timing-assertion flakes
         # that cap was meant to stop were never isolated, so watch for them.
-        # Baseline at 2 (single-source: PR #6425's run, head a264c1e59): this
+        # Baseline at 2 (single-source: a PR #6425 run on commit a264c1e59): this
         # invocation took ~340 s wall for 610 serial-s (agent 239, gateway 158 of
         # which eunit alone is 122, docs 116, platform 96); the whole non-pg step
         # ran 6.6-7.0 min over 12 recent dev runs. One axis only: the second

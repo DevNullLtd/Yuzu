@@ -1756,9 +1756,9 @@ samples, median, stop on rule (b) or (c), keep only a ≥10% gain); it is not
 restated here. At np=4 rule (c) is already cleared by the baseline (244 s is
 far under 560 s).
 
-The change lands on one PR branch as a **push ladder**, each push taking two
-same-SHA samples before the next, so a wall-time delta is attributable to one
-axis ("never bundled with a topology change"):
+The change lands as a **push ladder** (the pushes may be separate PRs; 2a is its
+own), each push taking two same-SHA samples before the next, so a wall-time
+delta is attributable to one axis ("never bundled with a topology change"):
 
 | Push | Change | Axis | Run (id/attempt) | Samples (s) | Median pg step (s) | Median non-pg step (s) | Worst shard (s, % of timeout) | Verdict |
 |---|---|---|---|---|---|---|---|---|
@@ -1781,8 +1781,8 @@ second `Test (non-pg suites)` invocation (server shards) and the pg step stay at
 
 *Baseline at np=2.* Step median over the 12 successful `gcc-15`/`debug` push
 runs on `dev` between 2026-10-22 and 2026-10-24: `Test (non-pg suites)` 6.7 min
-(range 6.6 to 7.0). Per-entry times come from one run only (the PR #6425 run,
-head `a264c1e59`): the cheap-suites invocation took about 340 s of wall time
+(range 6.6 to 7.0). Per-entry times come from one run only (a PR #6425 run on
+commit `a264c1e59`): the cheap-suites invocation took about 340 s of wall time
 for 610 serial-s (agent 239 s, gateway 158 s of which `gateway eunit` alone is
 122 s, docs 116 s, platform 96 s). All of these figures are single-source
 measurements, and "both workers busy" is inferred from sum/wall. The older
@@ -1793,18 +1793,26 @@ platform suites.
 is about 153 s, and `gateway eunit` (122 s) is the floor for any single worker.
 Meson starts entries in definition order (these suites set no `priority:`), and
 `gateway eunit` and `gateway ct` are defined last, so the wall time is closer to
-the other entries draining plus 122 s. Expect roughly 100 to 170 s saved on the
-invocation, and less on the job, where the pg step dominates.
+the other entries draining plus 122 s (about 115 s for the other work at four
+wide, so a wall time near 235 s). Expect roughly 100 s saved on the invocation,
+and less on the job, where the pg step dominates. Reaching 170 s would need a
+`priority:` on `gateway eunit` so it starts first, which is a second axis and
+not part of this push. A saving of about 100 s makes rule (a) near-certain, so
+the decision content is rules (b) and (c) and the revert triggers.
 
-*How to measure.* The cheap-suites per-entry times are in the step summaries
-only ("Test durations - Linux non-pg (cheap suites)" and "Suite durations vs
-meson budgets", plus the `Test (non-pg suites)` step duration from the jobs
-API). The runner telemetry database does not carry them: the junit import runs
-once at job end and reads the last invocation's file. Take the np=2 comparison
-from recent `gcc-15`/`debug` PR runs, not push runs: a push runs the whole
-four-leg matrix and saturates the box, a PR run does not, and comparing a quiet
-np=4 run against busy np=2 runs would flatter 4. Take two same-SHA samples:
-the first run of the PR plus a re-run of the same SHA.
+*How to measure.* Read the job log: `gh run view <run> --job <id> --log`, then
+filter the meson lines (`N/105 ... - yuzu:...`) for the per-entry times, and take
+the `Test (non-pg suites)` step duration from the jobs API. The step summaries
+("Test durations - Linux non-pg (cheap suites)", "Suite durations vs meson
+budgets") are not exposed by the jobs API, the meson-logs artifact uploads only
+on failure, and the runner telemetry database does not carry these entries (the
+junit import runs once at job end and reads the last invocation's file). The
+np=2 comparator is the two PR runs of #6425 on `gcc-15`/`debug` (step 6.8 min in
+both; the first has the per-entry table above), not push runs: a push runs the
+whole four-leg matrix and saturates the box, whereas these PR runs do not.
+Take two same-SHA samples: the first run of the PR plus a re-run of the same
+SHA. A PR run checks out the merge commit, which `gh run rerun` reuses; a fresh
+trigger after `dev` moved does not, and counts as a new sample.
 
 *Decision rule.* The one under "Windows test-phase concurrency gate" above,
 applied to this step: (a) the `Test (non-pg suites)` median improves by 10% or
@@ -1813,7 +1821,8 @@ reaches 80% of its own meson timeout (timeouts differ per entry, from 10 s up
 to 1500 s; read each from the "Suite durations vs meson budgets" table); and
 entry count and skip count are unchanged. Revert at once on any
 of: a spark or guardian case failing (a `spin_until` that never resolves, an
-`ArmOutcomeKind`/`ReceiptStatus` mismatch), even if later retried green; the
+`ArmOutcomeKind`/`ReceiptStatus` mismatch), even if a manual re-run is green (`tests/known-flaky.json` is empty, so
+flake-retry retries nothing); the
 `blocked log sink SIGTERM harness` failing (it asserts a fixed 8 s exit after
 SIGTERM and is not scaled for load); a `gateway eunit` or `gateway ct` failure;
 any red cheap-suites invocation. Before the next rung, add a flake-rate check:
@@ -1826,9 +1835,11 @@ the BEAM are multi-threaded, so load follows threads, not entries. With four
 runner agents, Linux can now have 16 concurrent entries box-wide (up from 8).
 The Linux non-pg step has no `with-test-slot.sh` gate, whereas the Windows
 non-pg step runs a similar set (it adds the server non-pg entries and drops
-docs) at 4 behind a slot of 2. Both self-hosted boxes have 256 GB of RAM
-(reported by the box owner, not measured here), and no per-runner memory limit
-is documented, so one runaway job is bounded only by the box.
+docs) at 4 behind a slot of 2. Both boxes have 256 GB of RAM (owner-reported)
+and no per-runner memory limit is documented. This was measured on one leg
+(`gcc-15`/`debug`) but ships on all four: the clang-21 and release legs run only
+on a push, where all four non-pg steps can overlap at four wide on the box, so
+the 10-push-run check above is the only coverage for them.
 
 *Samples:* pending.
 
