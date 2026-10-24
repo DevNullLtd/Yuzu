@@ -1826,8 +1826,9 @@ the BEAM are multi-threaded, so load follows threads, not entries. With four
 runner agents, Linux can now have 16 concurrent entries box-wide (up from 8).
 The Linux non-pg step has no `with-test-slot.sh` gate, whereas the Windows
 non-pg step runs a similar set (it adds the server non-pg entries and drops
-docs) at 4 behind a slot of 2. No per-runner
-memory limit is documented, and host RAM is not stated here.
+docs) at 4 behind a slot of 2. Both self-hosted boxes have 256 GB of RAM
+(reported by the box owner, not measured here), and no per-runner memory limit
+is documented, so one runaway job is bounded only by the box.
 
 *Samples:* pending.
 
