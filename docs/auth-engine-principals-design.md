@@ -290,24 +290,33 @@ until real data says otherwise.)
 
 - **Default-deny per securable.** An engine principal with no assignments
   can do nothing.
-- **No admin, ever.** Assignment APIs *reject* (not merely omit in UI)
-  granting an engine principal the `admin` legacy role, any built-in
-  wildcard role, or elevation eligibility. The ServiceNow-integration
-  admin-token pattern must be unconstructable through any surface.
+- **No admin, ever, by name or built-in role.** Assignment APIs *reject*
+  (not merely omit in UI) granting an engine principal the `admin` /
+  `Administrator` role names, any built-in (`is_system`) role, or elevation
+  eligibility. The ServiceNow-integration admin-token pattern must be
+  unconstructable through any surface. **Amended by design doc decision log #15:** a custom
+  role whose permissions cover the whole grid is NOT rejected at assignment; it
+  is detected afterwards by the fail-closed no-admin auditor.
 - **No "all permissions" toggle** exists for engine principals on any
-  surface (plan PR 4.3's explicit requirement).
+  surface (plan PR 4.3's explicit requirement). There is also no production
+  route that authors a custom role's permissions today, and role permissions
+  can change after a role was assigned, so the control over a wildcard custom
+  role is the detective check below, run against live data.
 - Engine principals are excluded from JIT elevation, MFA enrollment, login
   surfaces, and password paths — they are not users; they only ever
   authenticate by credential (§6).
-- **Named PR-4.3/4.4 deliverable — auditor-runnable proof, not just a
-  write-path claim.** "No admin, ever" and "no all-permissions toggle" are
-  enforced at the write path, which is a claim about code behavior an
-  auditor cannot verify by reading a policy doc. A query or report —
-  joining `principal_type='engine'` against resolved effective role/scope
-  and asserting zero admin/wildcard/unscoped-fleet-wide-by-accident rows —
+- **Named PR-4.3/4.4 deliverable — auditor-runnable check, not just a
+  write-path claim.** The name and built-in-role bars are enforced at the write
+  path, which is a claim about code behavior an auditor cannot verify by
+  reading a policy doc. A query or report, reading every `engine:` grant
+  against resolved role permissions and listing admin/system/wildcard grants,
   must exist as an independent check, the same way the sampled-auth-log
   export independently evidences auth-surface behavior rather than asking
-  an auditor to trust the login code.
+  an auditor to trust the login code. Since design doc decision log #15 it is also the ONLY
+  control over a wildcard custom role, so it fails closed: a read it cannot
+  answer is a `503`, never `ok:true`. `ok:true` means no role (and no
+  principal's union of roles) covers the whole grid at run time; it is
+  point-in-time and pull-only, not a proof.
 
 ### 4.3 ADR-0017 is hereby on the critical path — named dependency
 
@@ -594,8 +603,11 @@ for non-HTTP writers is unaffected).
      audited secret-disclosure event**, not folded into one "rotation
      succeeded" row. Once the grace window lapses, a `rotate` call against
      an unconfirmed successor errors rather than re-serving — the caller
-     must fall back to the compromise runbook (principal-level revoke) or
-     an explicit re-mint, not an indefinite retry loop. The
+     must resolve the stuck pair by revoking the SUCCESSOR credential
+     (`DELETE /api/v1/tokens/{token_id}`, admin) and rotating again from the
+     sole remaining credential, not by an indefinite retry loop. Revoking the
+     principal itself is terminal and is the compromise runbook, not the
+     stuck-pair remedy. The
      one-time-reveal contract's "once" means once per grace-bounded
      rotation attempt, never once per rotation lifetime and never
      unboundedly;
@@ -878,8 +890,9 @@ ladder sequencing + #1715 deny-precedence decision (maintainer).
     itself audited and metered when exercised.
 13. "No admin, ever" and "no all-permissions toggle" get a named
     auditor-runnable verification query (PR 4.3/4.4), not just trust in
-    the write path — an auditor should never have to take enforcement code
-    on faith when a report can prove the zero-admin invariant directly.
+    the write path. Scoped by design doc decision log #15: the query is auditor-runnable
+    and detective for a custom wildcard role; assignment itself only bars
+    the admin names and built-in roles.
 14. Compliance/enterprise hand-offs named explicitly rather than left
     implicit: periodic-access-review export must enumerate the `engine`
     principal type once built; the SKILL.md gap-matrix rows this design
@@ -888,3 +901,16 @@ ladder sequencing + #1715 deny-precedence decision (maintainer).
     parity-plan both consume this design as their technical basis; an
     engine-principal onboarding walkthrough is named as a user-manual
     deliverable distinct from this internal design doc.
+15. **A custom wildcard role is permitted at assignment and detected afterwards**
+    (Dave Rae, maintainer, 2026-10-23, #2485). Assignment refuses the `admin` /
+    `Administrator` names and every built-in role only; a custom role whose
+    permissions cover the whole securable x operation grid is not blocked,
+    because role permissions are editable after assignment and a write-time
+    bar would be a snapshot. The control is the shared no-admin auditor
+    (`engine_no_admin_audit.hpp`, REST + MCP), detective only, pull-only and
+    point-in-time, failing closed on any unanswered read. This records the
+    behaviour the code already had (no assignment path ever rejected a full-grid
+    custom role) and corrects the earlier "never wildcard" wording; it changes
+    no behaviour. Accepted residuals: a role granting all but one pair is not
+    reported, there is no scheduled run or alert, and a hand-written
+    database change leaves no audit row.
