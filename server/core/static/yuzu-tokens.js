@@ -66,8 +66,12 @@
   var REASONS = {
     admin_role: 'holds the Administrator role',
     system_role: 'holds a built-in role',
-    wildcard_grant: 'holds every permission'
+    wildcard_grant: 'holds every permission (a permitted custom role)',
+    orphan_grant: 'holds a grant but has no active principal record'
   };
+  // Only these two reasons mean the write-path guard was bypassed. A wildcard or orphan
+  // grant is reported for review and is not an incident on its own.
+  var INCIDENT_REASONS = { admin_role: true, system_role: true };
 
   function noteBox(text) {
     var n = el('div', 'note');
@@ -107,15 +111,28 @@
         var box = el('div', 'failbox');
         box.setAttribute('role', 'alert');
         var body = el('div');
-        body.appendChild(el('b', null, d.violations.length + ' principal(s) hold administrator-class authority.'));
+        var incident = d.violations.some(function (v) { return INCIDENT_REASONS[v.reason] === true; });
+        body.appendChild(el('b', null, incident
+          ? d.violations.length + ' finding(s), including administrator-class authority.'
+          : d.violations.length + ' finding(s) to review.'));
         d.violations.forEach(function (v) {
           var line = el('div', 'guard');
           line.textContent = String(v.principal_id) + ' ' + (REASONS[v.reason] || 'violates the no-admin rule') +
             (v.role ? ' (' + String(v.role) + ')' : '');
           body.appendChild(line);
         });
-        body.appendChild(el('div', 'guard',
-          'This means the write-path guard was bypassed. Treat it as a security incident.'));
+        if (incident) {
+          body.appendChild(el('div', 'guard',
+            'This means the write-path guard was bypassed. Treat it as a security incident.'));
+        }
+        if (d.violations.some(function (v) { return v.reason === 'wildcard_grant'; })) {
+          body.appendChild(el('div', 'guard',
+            'A wildcard custom role is permitted by design under the maintainer ruling. Review whether each such grant is intended.'));
+        }
+        if (d.violations.some(function (v) { return v.reason === 'orphan_grant'; })) {
+          body.appendChild(el('div', 'guard',
+            'A grant with no active principal record is unexpected. Find out how it was created.'));
+        }
         box.appendChild(body);
         setNote([box]);
       })
