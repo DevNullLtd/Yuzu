@@ -15,8 +15,10 @@
  * MUTATING actions. A read action's output can never mint a row, and an agent that stamps no action
  * (every agent that predates the stamp) produces none: fail-closed, documented. A read action's
  * output is never parsed for `audit|` lines, so the action gate is the control, not the content.
- * The rows stay ASSERTED BY THE ENDPOINT: the server checks the shape of the id and the stamped
- * action, not a dispatch record.
+ * The plugin that gates the rows is the one the SERVER recorded when it dispatched the command
+ * (the caller passes it; it is never parsed from the id), so a response with no dispatch record,
+ * which is stored `~unverified`, mints no row here. The LINES stay data the endpoint produced, and
+ * an endpoint can replay a registry id the server issued to it.
  *
  * BOUNDS. At most kMaxRegistryAuditLinesPerFrame lines per frame, each cut to
  * kMaxRegistryAuditLineBytes on a UTF-8 character boundary (bytes that are not UTF-8 are cut at the
@@ -139,7 +141,8 @@ make_registry_audit_budget(DenialAuditBudget::NowMsFn now = {}) {
 /// it, `-`, then lowercase hex of 8 bytes (command_routes.cpp, the legacy forwarder in server.cpp)
 /// or 16 bytes (dispatch_confined and the scheduled enqueue in server.cpp). Anything else did not
 /// come from a server dispatch of the registry plugin. A valid shape is still forgeable by an
-/// endpoint (it is only a shape): the rows are asserted by the agent.
+/// endpoint (it is only a shape), which is why the plugin comes from the server's dispatch record;
+/// the line content remains the agent's.
 [[nodiscard]] constexpr bool is_minted_registry_command_id(std::string_view id) noexcept {
     constexpr std::string_view kName = "registry";
     const std::size_t tail = id.size() > kName.size() + 1 ? id.size() - kName.size() - 1 : 0;
