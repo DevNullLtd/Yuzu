@@ -11,18 +11,28 @@ document holds the hard invariants every successor PR in the ladder must check.
 (HA WS-1(1b), ADR-2002 section 5 — migrated off the former in-process
 `AgentServiceImpl::cmd_execution_ids_` map, which was replica-local and could
 not resolve a response landing on a different server instance than the one
-that dispatched it). `ExecutionTracker::record_command_execution` /
-`::lookup_execution_id` are the store's write/read entry points;
-`AgentServiceImpl::record_execution_id` / `::resolve_execution_id` are the
-corresponding `AgentServiceImpl`-side wrappers, with `resolve_execution_id`
-the single chokepoint every response-receipt read goes through. The mapping is registered at dispatch
-time INSIDE `cmd_dispatch` BEFORE any RPC is sent — closes the FAST-agent race
+that dispatched it). Since #4990 the table is the server's record of EVERY
+dispatch: one row per command id, carrying the `plugin` the command was
+dispatched as and the `execution_id` (the empty string for an untracked
+dispatch). `ExecutionTracker::record_command_dispatch` /
+`::lookup_command_record` are the store's write/read entry points;
+`AgentServiceImpl::record_command_dispatch` / `::resolve_response_provenance`
+are the corresponding `AgentServiceImpl`-side wrappers, with
+`resolve_response_provenance` the single chokepoint every response-receipt read
+goes through (it decides the stored plugin label as well as the execution id;
+see "The Forensics tier on stored-response reads" below). The record is written
+by the one shared dispatch builder (`ServerImpl::build_classified_command`), after
+classification and authorization and BEFORE any RPC is sent — closes the FAST-agent race
 where a sub-millisecond loopback agent could reply before a post-dispatch
 registration. The `CommandDispatchFn` typedef carries `execution_id` as its
 sixth parameter; pass empty to opt out (out-of-band dispatch / no-tracker
-callers).
+callers): the dispatch is still recorded, with an empty execution id.
 
 ### Known coverage gap (every PR in this ladder must check this)
+
+Provenance is not part of this gap: since #4990 every dispatch writes its `command_execution` row (plugin
+and, when tracked, execution id) at the shared dispatch builder, so a response always has a server
+record to be labelled from. What follows concerns only the EXECUTION ID the record carries.
 
 Only `/api/instructions/:id/execute` (`workflow_routes.cpp`) creates an
 execution row AND threads `execution_id` into `cmd_dispatch`. The following
@@ -48,12 +58,15 @@ A single `command_id` is dispatched to N agents; each agent sends its own
 response with the same `command_id`. Terminal-status branches in
 `agent_service_impl.cpp` do NOT delete the `command_execution` row — deleting
 on the first agent's terminal would leave agents 2..N stamping empty
-`execution_id`. The row ages out via
+`execution_id` and labelling their responses `~unverified`. The row ages out via
 `ExecutionTracker::reap_command_execution_mappings` instead (HA WS-1(1b)) — a
 clock-guarded retention sweep on a ~60m cadence
 (`yuzu_exec_correlation_reap_total` / `_reap_clock_anomaly_total` /
-`_store_degrade_total`), not an unbounded in-process leak. The dispatch-time
-write (`record_command_execution`, single attempt, no retry — deliberately
+`_store_degrade_total`), not an unbounded in-process leak. The window is 24 hours from the
+row's last write (a re-driven command refreshes its record) and a pass deletes at most 50,000 rows:
+the cap was re-decided for the one-row-per-dispatch inflow (reasoning in
+`docs/clock-guarded-retention.md`). The dispatch-time
+write (`record_command_dispatch`, single attempt, no retry — deliberately
 bounded to `kWriteTimeout` since it sits on the synchronous pre-RPC dispatch
 path) has its own counter on failure, `yuzu_exec_correlation_write_degrade_total`,
 distinct from the reap counters above.
@@ -77,7 +90,9 @@ instance"). A mapping still does not survive its own retention window (see
 the fan-out section above) or a degraded/unreachable Postgres — either
 produces a response tagged `execution_id=''` that uses the legacy
 timestamp-window fallback in the drawer, the same degrade path an unmapped
-out-of-band dispatch already takes.
+out-of-band dispatch already takes, and a response labelled `~unverified`
+(it is withheld from callers without `Forensics:Read`; see the Forensics
+section below).
 
 ### Non-tracked correlation-id prefixes (`polchk-`, `bundle-`, `preflight-`, `deployment-`)
 
@@ -207,16 +222,16 @@ required parameter with no default (`response_tier_filter.hpp`), and the filter 
 SQL beside the agent scope, before `ORDER BY`/`LIMIT`/`GROUP BY`, so the cap flags, counts, facet
 options and aggregates are computed over the rows the caller may read. A filtered row is simply
 absent: there is no marker or field, so an empty result no longer implies that no data exists. The
-one error is an unresolved decision: when the caller's authority cannot be determined (one disclosed exception: a degrade of
-only the global permission read for a caller other than an engine principal is answered `403` and classifies as Denied, a `200` with the
-Forensics rows absent; an engine principal is answered `503` when the RBAC store is not open, while a failed permission query is a `403` (Denied) for every caller class;
-`yuzu_server_rbac_read_degrade_total` and the `YuzuRbacReadDegraded` alert are the signal, see
-`docs/authz-model.md`) the REST routes
+one error is an unresolved decision: when the caller's authority cannot be determined (the global `Forensics:Read` check
+is unavailable, for any caller class; `yuzu_server_rbac_read_degrade_total` and the `YuzuRbacReadDegraded` alert
+correlate, see `docs/authz-model.md`) the REST routes
 answer a retryable `503` (`retry_after_ms`), MCP a retryable `kInternalError`, and an HTML surface a
 notice, and
 `yuzu_server_forensics_tier_withheld_total{reason}` counts it (see `docs/observability-conventions.md`).
 The plugin set comes from the capability catalogue
-(`forensics_plugin_set.hpp`), never a hand-kept list, and boot refuses an empty set. Only `plugin` is
+(`forensics_plugin_set.hpp`), never a hand-kept list, and boot refuses an empty set; it also carries the
+`~unverified` provenance sentinel (below). Only a global `Forensics:Read` admits a row: there is no scoped
+(management-group) read tier, and a hand-authored scoped grant reads nothing. Only `plugin` is
 stored with a row, so the filter is per plugin; a plugin that mixed tiers would be excluded wholesale
 until `action` is stored too. The exact set of read methods and the exact set of call sites that opt
 out through `unrestricted_internal_consumer()` are frozen by
@@ -233,17 +248,38 @@ materializes empty for every creator), and bundle collation applies the caller's
 `tests/test_forensics_tier_wiring_lexical.py` pins that `server.cpp`
 wires the plugin set and the resolver into each of these.
 
+**Provenance: the plugin label is server-authored (UP-7).** The plugin of a stored response decides its tier and the
+treatment of every derived sink, so it comes from the SERVER's dispatch record, never from the command id an agent
+echoes. `response_provenance.hpp` holds the one pure decision (`resolve_response_provenance`), called once per response
+frame on each ingest path (direct Subscribe and gateway proxy) through `AgentServiceImpl::resolve_response_provenance`;
+the result (plugin, execution id, outcome) is handed to every consumer of the frame (the stored row, the live output,
+the failure text, analytics, the tracker, the audit hook), and the id's text is never parsed
+(`tests/test_forensics_tier_wiring_lexical.py` pins the single call per path and the absence of a second lookup or of
+the retired record API). A record with a plugin is `verified`; no record, a record without a plugin, or a degraded read
+that failed twice (one retry) yields the label `~unverified`, a character no plugin name contains, which
+`derive_forensics_plugin_set` adds to the Forensics set once at boot, so unresolved provenance is Forensics-tier in every
+SQL filter and every sink with no per-consumer code. `yuzu_server_response_provenance_total{outcome}` counts
+`verified`, `unrecorded` and `lookup_degraded`. What it does NOT prove: the record shows the server issued that command
+id for that plugin, not who sent the frame. An endpoint that was legitimately sent a command (or was inside a broadcast
+of it) can replay that id on a frame of its own and so label that frame with the command's plugin; the content of a
+frame is not validated; a single execution that outlives the 24 hour record window is stored `~unverified`; a failed
+record write (`yuzu_exec_correlation_write_degrade_total`) hides that dispatch's responses from readers that exclude the
+Forensics set (the Hardware Actions-lens poll never finds them); an unrecorded `registry` command id mints no
+`registry.write` audit row (those are minted only for a response labelled `registry`); and the live output for an
+`~unverified` frame publishes nothing.
+
+**Deployment boundary.** This tier is specified for a deployment created under the hard-cutover contract in
+`docs/user-manual/upgrading.md`: a fresh database, no data imported from earlier builds, every server writer and serving
+replica on this build, earlier binaries excluded. The executable does not enforce it. Data written by earlier builds is
+outside the supported population; this document makes no claim about it. Within the contract, failure text is reduced at
+ingest before it reaches the execution record, the notification, the analytics event and the webhook and offload payload,
+and a Forensics policy check never stores check output. The reduction applied when the execution record is read is
+defense in depth: it covers a row only while the execution's dispatch record (24 hours) is still held
+(`ExecutionTracker::get_execution()` applies the same reduction as its siblings), and a failed record lookup reduces the
+text rather than showing it, with one warning per 60 seconds.
+
 **Not covered by this tier.** A separate follow-up (#6065) tracks the dispatch-side authorization of policy
-checks. Failure text stored before the sanitizer is reduced on read only
-while the execution's command correlation (24 hours) is still held (`ExecutionTracker::get_execution()`
-applies the same reduction as its siblings; a failed correlation lookup reduces the text rather than
-showing it, with one warning per 60 seconds). The same bounded token is what the failure
-notification, the analytics event and the webhook and offload payload carry for a Forensics-tier
-command; rows written to those sinks before the upgrade keep their original text and are not
-rewritten, and they have no age limit: `agent_exec_status` has no retention sweep, notification rows
-have no reaper and no delete endpoint, analytics buffer rows are never reaped, and webhook and
-offload delivery rows go only when their webhook or target is deleted. A `check_result` stored by a
-policy before the upgrade stays until that (policy, agent) pair is next written by an evaluation; for a disabled policy, a decommissioned agent or an agent no longer in the policy's scope it is never overwritten, and it has no age limit. Deleting the policy removes it (see the Policy Engine guide). This is a documented residual of this release, tracked in the project's governance record; the new build never stores check output for such a policy again. A user holding only `ForensicsAnalyst` cannot dispatch: the `Execution:Execute` gate of
+checks. A user holding only `ForensicsAnalyst` cannot dispatch: the `Execution:Execute` gate of
 `POST /api/command` refuses, and on the MCP `execute_instruction` tool at the supervised tier the
 approval step runs before the tool's own permission check (an ordering that already applied to any
 caller lacking that permission).
@@ -267,7 +303,7 @@ payload carry; the stored response row keeps the plugin's own message and is rea
 the tracker publishes is built from the error text persisted on the row, which can be older than the write (a terminal row
 is sticky), so that text is reduced again for a Forensics execution before it reaches the outbox or the bus
 (`ExecutionTracker`'s agent-status upsert in `execution_tracker.cpp`); within the same 24 hour correlation limit a late
-`running` frame therefore cannot republish a pre-upgrade raw value. The lookup that decides whether the execution is a
+`running` frame therefore cannot republish a raw value. The lookup that decides whether the execution is a
 Forensics one runs on the write path only when the persisted text differs from the incoming text and is not already a
 bounded token, and it runs under a SAVEPOINT: if the lookup fails, the text is reduced to the fixed value
 `forensics_error`, and the status write, the outbox row and the bus event still commit (a failed lookup statement never costs the
@@ -275,8 +311,7 @@ agent's status; a lost connection is not a failed statement and follows the writ
 (`notify_exec_tracker` calls `AgentServiceImpl::failure_text_for_sinks`; `tests/test_forensics_tier_wiring_lexical.py`
 pins that call), which is why an ordinary frame, whose persisted text equals the incoming text, costs no lookup. An unwired tracker (a test harness only; production
 boot refuses an unwired plugin set) publishes the text as stored. The durable event outbox (24 hours; other replicas re-publish its rows onto their own stream) is
-not reduced on read, so text written by a replica that predates the change can reach another
-replica's stream until it expires. The live `output` event stream publishes nothing for a
+not reduced on read: it carries the text as persisted, which is the reduced form. The live `output` event stream publishes nothing for a
 Forensics-tier frame: no row and no notice, because a notice would itself be an event every subscriber of the
 shared stream could see. It likewise publishes nothing when the plugin set is unwired or the frame carries no
 output. The timing and command-status events carry no plugin output and are plugin-agnostic, so they still go out,

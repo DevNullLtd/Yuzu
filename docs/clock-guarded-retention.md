@@ -390,14 +390,37 @@ once for cutoff/anchor-compare/anchor-update, persisted+sanitised `reap_meta` an
 forward/backward-anomaly decline, unconditional cap) and makes the SAME two carve-out choices
 `SessionStore` made, for the SAME reason:
 1. **NO would-wipe probe** — the `command_execution` table drains to 100% expiry as routine behaviour
-   (every mapping is consumed once, response-side, well before the 24h window), so a would-wipe
-   verdict cannot separate a true from a false positive.
+   (every dispatch record ages out 24h after it was last written; a read never consumes or deletes
+   one), so a would-wipe verdict cannot separate a true from a false positive.
 4. **NO fact-set anomaly dedup** — a declined pass is `spdlog::warn`'d and surfaced via
    `yuzu_exec_correlation_reap_clock_anomaly_total` rather than deduped by fact identity.
 
-Part (6)'s missing-anchor decision is **PROCEED** (`ResultSetStore`'s answer): a mapping is a
-regenerable observability aid, not compliance evidence, so a from-boot skewed clock deleting a batch
-of already-consumed mappings is an acceptable worst case.
+Part (6)'s missing-anchor decision is **PROCEED** (`ResultSetStore`'s answer). What an early deletion
+costs changed with #4990: a row is no longer only a correlation aid, it is the server's dispatch
+record, the source of the plugin label a response is stored under (`response_provenance.hpp`). A
+command whose record is deleted early answers as `~unverified`: its responses are withheld from
+callers without `Forensics:Read`. That fails closed, never toward disclosure, and it is the cost this
+decision accepts; it no longer rests on the record being regenerable (it is not).
+
+**The per-pass cap is RE-DECIDED to 50,000 (#4990), recorded reasoning rather than a copied
+number.** The table held one row per TRACKED execution; it now holds one row per DISPATCH, including
+per-agent system pushes (`__guard__` policy pushes, `asset_tags` sync), so inflow can reach one row
+per connected agent per fleet-wide event, and the old cap (5000 per pass, 120k rows/day of reclaim at
+a ~60 minute cadence) would let the table grow without bound once inflow exceeded that. The sizing
+assumptions are stated in the code and not measured on a fleet: a short-term target of about 5,000
+agents (about 1e4 rows/day organically, a few 5,000-row bursts per fleet event) and a long-term
+target of 500,000 agents (one fleet-wide push event = 500,000 rows, a few events a day = low
+millions/day). 50,000 rows x 24 passes = 1.2M rows/day of reclaim covers the short-term target by two
+orders of magnitude and the long-term steady state, and drains a 500,000-row burst past the window in
+ten passes. Measured on a synthetic 1M-row table (PostgreSQL 16, the same
+`DELETE .. IN (SELECT .. LIMIT n)` shape, rolled back and repeated): about 0.13 s for 5,000 rows,
+0.28 s for 50,000, 0.38 s for 100,000, so one 50,000-row pass is a sub-second transaction that holds
+row locks only on rows already past the window. The cap stays an UNCONDITIONAL bound on the work one
+pass (and one skewed-clock pass) can do, and saturation is observable: a pass that deletes exactly
+the cap moves `yuzu_exec_correlation_reap_total` by the cap every hour. The ~60 minute cadence is not
+shortened, because the clock-anomaly threshold is sized against it. The sibling event-outbox reap
+keeps its own cap; its window and skew values stay identical to this table's on purpose, its cap does
+not (`execution_tracker.cpp`, beside `kCmdExecutionReapCap`).
 
 ### `ExecutionTracker::reap_stuck_running_executions` (#4982 Part B, fix round 2)
 
