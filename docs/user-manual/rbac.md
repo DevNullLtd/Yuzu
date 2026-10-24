@@ -509,7 +509,7 @@ Settings uses, so the two stay equivalent.
   persist, the page says so and waits for you to choose to continue instead of redirecting at once.
   "Sign out all other sessions" is shown as not available yet.
 - **Turning enforcement on or off.** The **RBAC enforcement** panel shows the current setting to
-  every signed-in user (the same value `GET /api/v1/me` reports) and gives an administrator
+  every signed-in user (the cached view `GET /api/v1/me` reports as `rbac_enabled`; the panel can additionally show an unconfirmed state, which `/me` cannot) and gives an administrator
   account an **Enforce roles** switch. The switch always shows what the server holds: clicking it
   asks for confirmation, then (when your second-factor check is stale) for an MFA code, and then the panel is redrawn from the server, so a
   cancelled confirmation or a refusal leaves it where it was. The server's refusals (you would

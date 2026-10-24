@@ -7933,8 +7933,8 @@ TEST_CASE("MCP get_me: a service-scoped token is refused (default denied class) 
     CHECK(ts.audit_log.back() == "mcp.get_me|denied");
 }
 
-TEST_CASE("MCP get_me: invalid UTF-8 in the session is replaced, succeeds, and audits after "
-          "serialisation",
+TEST_CASE("MCP get_me: invalid UTF-8 in the session is replaced and the call succeeds with "
+          "one success audit row",
           "[mcp][get_me]") {
     McpTestServer ts;
     ts.mock_username = std::string("ab\xC3\x28");
@@ -7949,7 +7949,7 @@ TEST_CASE("MCP get_me: invalid UTF-8 in the session is replaced, succeeds, and a
     CHECK(sc["display_name"].get<std::string>() == "ab\xEF\xBF\xBD(");
     CHECK(yuzu::test::schema_violation(schema, sc) == "");
     CHECK_FALSE(sc.contains("audit_persisted"));
-    // Exactly one success row, written (last) after the body was built.
+    // Exactly one success row, and it is the last audit entry.
     REQUIRE_FALSE(ts.audit_log.empty());
     CHECK(ts.audit_log.back() == "mcp.get_me|success");
     CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(), "mcp.get_me|success") == 1);
@@ -8067,6 +8067,7 @@ TEST_CASE("MCP get_me: RBAC on reads the caller's direct roles under the session
         CHECK(ts.audit_log.back() == "mcp.get_me|success");
         // Repaired: the same call resolves again.
         const auto again = call_get_me(ts);
+        REQUIRE(again.contains("result"));
         CHECK(again["result"]["structuredContent"]["rbac_roles_resolved"] == true);
     }
     SECTION("parity: MCP get_me, REST /api/v1/me data and legacy /api/me are field-equal") {

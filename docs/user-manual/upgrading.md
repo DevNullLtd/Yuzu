@@ -1166,14 +1166,14 @@ the old shell until reloaded. No configuration change is needed.
 
 ## Behaviour change: `GET /api/v1/me` and `GET /api/me` no longer invent a role (#2146)
 
-This is listed as a behaviour change rather than a break because the value that goes away was fabricated and the key is optional.
+This is listed as a behaviour change rather than a break because the value that goes away was fabricated, never a documented contract for an engine principal; `rbac_role` is now documented as an optional key.
 
 - An engine principal's `rbac_role` is now absent where it used to read `Viewer` (or `Administrator`, taken from its legacy session role). The endpoints now look an engine principal up under its own RBAC principal type.
 - With RBAC on, an engine principal's grants now appear in `rbac_roles`. An engine principal with no grant has no `rbac_role`.
 - If the role store cannot be read, the call answers `200` with `rbac_roles_resolved: false` and neither `rbac_role` nor `rbac_roles`, instead of a made-up role. Treat an absent list as unknown, not as "no roles".
 - `rbac_role` is deprecated. Read `rbac_roles` (direct assignments only; group grants are not listed) instead.
-- Browser users: no action is needed.
-- New keys are additive: `principal_kind` now reads `human` or `engine`, and `auth_source`, `mcp_tier`, `scope_service`, `rbac_roles` and `rbac_roles_resolved` are added. `GET /api/me` now emits its keys in insertion order rather than alphabetically; a JSON consumer must not depend on key order.
+- Browser users: no action is needed. If the role store cannot be read during a page load, the navigation badge shows the lowercase legacy `role` (`admin` or `user`) instead of `Administrator` or `Viewer`; the Settings link is unaffected.
+- New keys are additive: `principal_kind` (`human` or `engine`), `auth_source`, `mcp_tier`, `scope_service`, `rbac_roles` and `rbac_roles_resolved`. `GET /api/me` now emits its keys in insertion order rather than alphabetically; a JSON consumer must not depend on key order.
 - A new MCP tool, `get_me`, is the twin of `GET /api/v1/me`.
 - During a rolling upgrade an older replica omits the new keys, still reports `Viewer` for an engine principal, and has no `get_me` tool (it answers unknown-tool).
 

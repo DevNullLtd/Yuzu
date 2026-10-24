@@ -4257,7 +4257,7 @@ static const ToolDef kTools[] = {
      R"j("rbac_enabled":{"type":"boolean","description":"The server's cached view of the RBAC switch; can lag and does not report the degraded fail-closed state (#6033)"},)j"
      R"j("rbac_role":{"type":"string","description":"Deprecated display field: the first DIRECT role by role_name order, or for a human with none a legacy Administrator/Viewer label that is not a grant. Omitted for an engine principal with RBAC off or no engine grant, and when rbac_roles_resolved is false. Not an authority summary: call check_permission"},)j"
      R"j("rbac_roles":{"type":"array","items":{"type":"string"},"description":"DIRECT role assignments for this principal only; roles granted through group membership are NOT included and this is not access-review evidence. Empty when RBAC is off. Omitted when rbac_roles_resolved is false"},)j"
-     R"j("rbac_roles_resolved":{"type":"boolean","description":"Whether the role-store read succeeded; false means rbac_role and rbac_roles are omitted"},)j"
+     R"j("rbac_roles_resolved":{"type":"boolean","description":"Whether the role-store read succeeded; false means rbac_role and rbac_roles are omitted. Also true when no read was needed because RBAC reads as off (the cached view), so true is not proof that enforcement is off"},)j"
      R"j("effective_role":{"type":"string","description":"Role the server will honour (admin while JIT elevation is active)"},)j"
      R"j("elevated":{"type":"boolean","description":"Whether JIT admin elevation is active"},)j"
      R"j("elevated_until":{"type":"string","description":"ISO 8601 UTC end of the elevation window; present only while elevated"},)j"
@@ -28656,8 +28656,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 auto me_json = me_response::build_me_json(*session, me_response::rbac_view(rbac_store));
                 // Serialise BEFORE the audit row: the replace handler degrades invalid
-                // UTF-8 in username/display_name to U+FFFD instead of throwing, and a
-                // serialisation failure must never leave a success audit row behind.
+                // UTF-8 in username/display_name to U+FFFD instead of throwing; serialising
+                // first is defence in depth so a serialisation failure cannot leave a
+                // success audit row behind.
                 std::string me_body = me_response::dump_me_json(me_json);
                 if (!mcp_audit("success")) {
                     me_json["audit_persisted"] = false;
