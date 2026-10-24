@@ -260,8 +260,8 @@ status, exit code and a failure text (`error_detail`). For a command of a Forens
 text is reduced, when it is stored and again when the tracker reads it, to a bounded machine token
 (`^[a-z0-9_]{1,32}(:[a-z0-9_.-]{1,48}){1,3}$`, at most 96 bytes) or to the fixed `forensics_error`
 (`forensics_error_detail.hpp`); status and exit code are unchanged, and other plugins' text is not
-touched. The same value, computed once at ingest on both the Subscribe and the gateway path
-(`AgentServiceImpl::failure_text_for_sinks`), is what the failure notification (listed at
+touched. The same pure function (`AgentServiceImpl::failure_text_for_sinks`), evaluated once per frame on each ingest path
+(Subscribe and gateway) for these sinks and once more by `notify_exec_tracker` for the tracker status text, yields what the failure notification (listed at
 `Infrastructure:Read`), the analytics event `error_message` and the webhook and offload `error`
 payload carry; the stored response row keeps the plugin's own message and is read through the tier. The transition event
 the tracker publishes is built from the error text persisted on the row, which can be older than the write (a terminal row
