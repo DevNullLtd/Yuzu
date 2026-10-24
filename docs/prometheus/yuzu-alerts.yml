@@ -2238,8 +2238,10 @@ groups:
       # YuzuResponseReadDegrade): one refusal keeps the expression true for under 5 minutes, so
       # it never fires, and neither does a burst shorter than about 5 minutes; a failure that
       # keeps recurring (an event every few minutes) fires after about 10 minutes. BOUNDARY, by
-      # design: a refusal that recurs only at intervals of about 6 minutes or longer leaves the
-      # 5m rate false between events, never holds for 10 consecutive minutes, and does not fire.
+      # design: with the 5m rate window, a refusal that recurs only every 5 minutes or longer
+      # leaves the rate false between events, never holds for 10 consecutive minutes, and does not
+      # fire (measured with promtool: an event every 285 seconds still fires at minute 12, every
+      # 300 seconds does not).
       - alert: YuzuForensicsTierUnresolved
         expr: |
           sum by (instance, reason) (rate(yuzu_server_forensics_tier_withheld_total[5m])) > 0
