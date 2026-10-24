@@ -894,6 +894,28 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `STRICT_EXCEPTION_PINS`; like the 2026-10-22 entry this is a session
      statement by the ADR owner, not a signed decision.
 
+   - **2026-10-24 - `get_me` as the MCP twin of `GET /api/v1/me`, and one
+     `GATE_PARITY_NO_GATE_ALLOWED` entry. Proposed 2026-10-24, pending owner
+     confirmation (a DRAFT ruling, not yet a ruling of record).** Three parts.
+     First, `get.api-me` flips from `planned:#2146` to `twinned` (untwinned 215
+     to 214, generic `planned:#2146` 86 to 85). Second, the gate-parity check
+     reads `GET /api/v1/me` as a route with no gate call it can read: the
+     handler calls `auth_fn` alone, because the route is session-only
+     self-description with no per-resource authority, so there is nothing to
+     gate on. The tool's `Infrastructure:Read` row drives MCP tier
+     classification only. Reason: adding an artificial REST gate would invent
+     an authority the route does not have, and would break every session that
+     reads its own identity. One entry, `("GET", "/api/v1/me", "get_me")`, is
+     added to `GATE_PARITY_NO_GATE_ALLOWED` and `GATE_PARITY_NO_GATE_MAX` rises
+     from 12 to 13. Third, the one asymmetry this leaves: REST lets a
+     service-scoped token describe itself, while `get_me` has service-scope
+     class `denied` and refuses it. That is the safe default for a new tool, and
+     it is a documented difference rather than a defect; an explicit self-only
+     service-scope policy that would let both transports agree is the dated
+     follow-up (2026-10-24). Tracking issue: to be filed before merge. As with
+     the entries above, this is a session statement pending the ADR owner's
+     confirmation, not a signed decision.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

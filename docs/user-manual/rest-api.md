@@ -392,8 +392,11 @@ All endpoints are under the `/api/v1/` prefix.
 #### `GET /api/v1/me`
 
 Returns the authenticated user's identity, role and what the server will honour for this session.
+The MCP twin is `get_me`.
 
-**Permission:** Authenticated session (no specific RBAC permission required).
+**Permission:** Authenticated session (no specific RBAC permission required). The route is
+session-only self-description and writes no audit row. A service-scoped token may call it and
+describe itself; the MCP twin `get_me` refuses service-scoped tokens (a documented asymmetry).
 
 **Response:**
 
@@ -405,6 +408,9 @@ Returns the authenticated user's identity, role and what the server will honour 
     "role": "user",
     "rbac_enabled": false,
     "rbac_role": "Viewer",
+    "rbac_roles": ["Viewer"],
+    "rbac_roles_resolved": true,
+    "principal_kind": "user",
     "effective_role": "admin",
     "elevated": true,
     "elevated_until": "2026-10-13T22:31:54Z",
@@ -417,14 +423,21 @@ Returns the authenticated user's identity, role and what the server will honour 
 | Field | Meaning |
 |---|---|
 | `role` | The persisted legacy role (`admin` or `user`). Never the elevated view. |
+| `rbac_role` | Deprecated display field: the alphabetically first DIRECT role assignment. Omitted for an engine principal while RBAC is off, and when the role read failed (see `rbac_roles_resolved`). Read `rbac_roles` instead. |
+| `rbac_roles` | The principal's DIRECT role assignments only; roles held through a group grant are not listed, so this is not the set of roles the principal can exercise. Omitted when the role read failed. |
+| `rbac_roles_resolved` | `false` when the role-store read failed. The route still answers `200` and omits `rbac_role` and `rbac_roles`; an absent list is evidence of "no roles" only when this is `true`. |
+| `principal_kind` | What kind of principal the session belongs to (for example a user or an engine principal). An engine principal is looked up under principal type `engine`; it was previously mislabelled `user`, which fabricated a `Viewer` role. |
+| `auth_source` | How the session authenticated: `local`, `oidc`, `saml`, `api_token`, `mcp_token` or `engine_token`. |
+| `mcp_tier` | The MCP authorization tier of an MCP token; an empty string for any other session. |
+| `scope_service` | The service tag of a service-scoped token; an empty string for any other session. |
 | `effective_role` | The role the server enforces now: `admin` while a just-in-time elevation is active, otherwise `role`. |
 | `elevated` | `true` while a just-in-time elevation is active. Always `false` for API, MCP and service-scoped tokens. |
 | `elevated_until` | End of the elevation window, ISO-8601 UTC. Present only when `elevated` is `true`. |
 | `can_access_settings` | `true` when `GET /settings` would render for this session. MCP-tier and service-scoped tokens are always `false`. A display hint only: every route is still gated server-side. |
 
 The response is sent with `Cache-Control: no-store, private`. During a rolling
-upgrade an older replica omits the four new fields; clients should treat a
-missing `can_access_settings` as `false`. `GET /api/me` returns the same keys
+upgrade an older replica omits the four new fields (and the principal-context fields
+above); clients should treat a missing `can_access_settings` as `false`. `GET /api/me` returns the same keys
 without the `data` envelope.
 
 ---

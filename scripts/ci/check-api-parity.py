@@ -490,7 +490,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # so only the flips move this number; they left the generic placeholder (see BASELINE_GENERIC_PLANNED).
 # 214 -> 215 (MCP twin completeness tooling, ADR-1005 2026-10-23 entry): get.fragments-devices-list moved from twinned
 # to the #4041 exception, because its MCP tool list_agents is unconfined; see get.api-agents.
-BASELINE_UNTWINNED = 215
+# 215 -> 214 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me flipped from planned to twinned
+# (GET /api/v1/me + the get_me MCP tool).
+BASELINE_UNTWINNED = 214
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
@@ -499,7 +501,8 @@ BASELINE_UNTWINNED = 215
 # 87 -> 86 (MCP twin completeness tooling, ADR-1005 2026-10-23 entry): get.api-agents became a dated exception.
 GENERIC_PLANNED_STATUS = "planned:#2146"
 GENERIC_PLANNED_ISSUE = 2146
-BASELINE_GENERIC_PLANNED = 86
+# 86 -> 85 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me became twinned.
+BASELINE_GENERIC_PLANNED = 85
 
 # A revisit date outside this window is a typo (9999-12-31), a shape error. A date at or before
 # today + REVISIT_WARN_DAYS only produces ONE aggregated warning, never a failure.
@@ -2356,7 +2359,7 @@ GATE_PARITY_KNOWN_MISMATCHES = {
 # holds no gate call this script recognises (owner-only reads that call auth_fn alone, helper
 # gates such as sw_admit, member-function gates) cannot be compared, so it fails closed unless it
 # is named here.
-GATE_PARITY_NO_GATE_MAX = 12
+GATE_PARITY_NO_GATE_MAX = 13
 GATE_PARITY_NO_GATE_ALLOWED = {
     ("DELETE", "/api/v1/result-sets/{param}", "delete_result_set"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
@@ -2372,6 +2375,12 @@ GATE_PARITY_NO_GATE_ALLOWED = {
     ("GET", "/api/v1/inventory/software/catalogue/versions", "get_software_versions"): (
         "gated by the sw_admit helper closure (Inventory:Read confined read), not a recognised "
         "gate call"),
+    ("GET", "/api/v1/me", "get_me"): (
+        "session-only self-description: the route calls auth_fn alone and reads no per-resource "
+        "authority; the tool is gated at Infrastructure:Read for the MCP tier ladder only. REST "
+        "permits a service-scoped token to describe itself while get_me is service-scope class "
+        "`denied`, a documented asymmetry; an explicit self-only service-scope policy is a "
+        "follow-up dated 2026-10-24 (ADR-1005 2026-10-24 entry)"),
     ("GET", "/api/v1/result-sets", "list_result_sets"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
         "call (result-set precedent)"),
