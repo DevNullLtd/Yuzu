@@ -1722,6 +1722,7 @@ if build_server
       'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
       'unit/server/test_rest_rbac_role_reads.cpp', # PR-0b: GET /rbac/roles + /rbac/roles/{role}/permissions fail closed (503) and 404 an unknown role
       'unit/server/test_rest_management_group_detail_degrade.cpp', # #1762 governance round-1: GET /management-groups/{id} fails closed on a degraded member read
+      'unit/server/test_engine_aware_visibility.cpp', # #6204: the engine rule in the username-keyed visibility/dispatch resolvers, against real stores
       'unit/server/test_authz_model.cpp', # PR1.4: registry-independent authz model + #1788 per-device visibility (all four arms)
       'unit/server/test_authz_gates.cpp', # service-scope-confinement PR2: require_fleet_read / confine_agent_target
       'unit/server/test_fleet_read_ceiling_routes_authz.cpp', # #3526: ITServiceOwner ceiling through real fleet-read routes (Execution x3, Enrollment, a four-securable table, and the Policy and Workflow sites)

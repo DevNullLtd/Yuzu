@@ -31,6 +31,21 @@ Two limits. The stored audit events carry `principal`, `principal_role`, `princi
 
 **Config-as-code replay.** Replaying the whole `GET /api/config` `overrides` map with a caller that is not an administrator account (for example an MCP-tier token) stops with `403` at the first administrator-only key it reaches, so keys written before that point stay applied and the rest are not (a half-applied configuration). The server returns `overrides` as a name-sorted object, so which keys are written first depends on the order the client replays them in. `GET /api/config` does not yet list which keys are administrator-only. Replay with an administrator API token that is not MCP-tier, or write the seven keys separately (the Settings pages for the six that have one, `PUT /api/config/audit_retention_days` with an administrator account for the seventh).
 
+## Behaviour change: engine principals are default-deny when RBAC is off
+
+**What changed.** An engine principal's only authority is an explicit RBAC grant. With RBAC off, the
+legacy-open fallback that admits every authenticated human no longer applies to an engine
+credential: `GET /api/v1/upload-grants` answers it `403` (`503` when the RBAC store is
+unavailable), and the shared per-agent list reads, device visibility, scheduled arming and
+dispatch-permission checks return no agents or refuse it instead of treating it as legacy-open.
+
+**Who is affected.** Only deployments whose engine credentials ran with RBAC disabled (the default)
+and relied on that fallback. Human sessions are unchanged.
+
+**What to do.** Enable RBAC and assign the engine principal the grants it needs (for example
+`UploadGrant:Read` to list upload grants). Enabling RBAC applies to every operator, so assign the
+human roles first and follow the prerequisites in [Role-Based Access Control](rbac.md).
+
 ## Behaviour change: every TAR capture source is on by default; stored opt-outs reset once (tar.db schema v8)
 
 **What changed.** All 16 TAR capture sources now ship enabled on every OS. Eight of them were off by default before: `procperf`, `netqual`, `module`, `software`, `arp`, `dns`, `netconn` and `mapdrive`. A fresh agent now reports `<source>_enabled|true` in `tar.status` for all of them.

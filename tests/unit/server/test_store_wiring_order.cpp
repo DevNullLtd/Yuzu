@@ -69,7 +69,8 @@
  * be very slow on MSVC debug depending on the pattern's shape -- one with an
  * optional capture group at its head took 231 s there (about 1.5 s on libc++),
  * while the plain patterns in this file cost a few seconds per pass. Literal anchors
- * use std::string_view::find (the four in the #1712 and HA WS-5 cases). The setter and
+ * use std::string_view::find (the anchors in the #1712 and HA WS-5 cases, and the bounded
+ * window find after the #1712 resolver definition). The setter and
  * construction scans and the `wired_re`, `occurrence_re`, `construct_re`, `wire_re` and
  * `null_wire_re` anchors are structural and still use the pattern library. For a
  * new scan prefer std::string_view::find plus a small matcher (see
@@ -135,6 +136,7 @@
 #include <cctype>
 #include <filesystem>
 #include <map>
+#include <iterator>
 #include <regex>
 #include <string>
 #include <string_view>
@@ -313,15 +315,18 @@ TEST_CASE("server.cpp: response_visible_set_fn is both defined and passed to "
     // empty or mangled, not that the file legitimately shrank.
     REQUIRE(text.size() > 100000);
 
-    // POSITIVE anchor 1: the resolver is defined, and its body is the real
-    // decision ladder -- not a stub that always returns nullopt/fleet-wide.
-    // Requiring both calls it actually makes (not just its name) means a
-    // resolver silently downgraded to "return std::nullopt;" still fails
-    // this, even though `response_visible_set_fn` itself would still exist.
-    CHECK(text.find("auto response_visible_set_fn =") != std::string::npos);
-    CHECK(text.find(R"(check_permission(username, "Response", "Read"))") != std::string::npos);
-    CHECK(text.find(R"(visible_agents_for_permission(username, "Response", "Read")") !=
-          std::string::npos);
+    // POSITIVE anchor 1: the resolver is defined, and its body DELEGATES to the real decision
+    // ladder (engine_aware_visibility.hpp's response_visible_set, which holds the
+    // check_permission / visible_agents_for_permission calls and is tested behaviourally against
+    // real stores in test_engine_aware_visibility.cpp, #6204). A resolver silently downgraded to
+    // "return std::nullopt;" no longer contains the delegation, so it still fails here. Literal
+    // anchors only: the delegation is looked for in a bounded window after the definition, not
+    // by a pattern over the whole stripped file.
+    const std::size_t resolver_def = text.find("auto response_visible_set_fn =");
+    CHECK(resolver_def != std::string::npos);
+    CHECK((resolver_def != std::string::npos &&
+           text.substr(resolver_def, 800).find("visibility::response_visible_set(") !=
+               std::string::npos));
 
     // POSITIVE anchor 2: the resolver is actually PASSED to
     // register_routes, not merely defined and left unused. This is what
@@ -731,5 +736,161 @@ TEST_CASE("find_confined_dispatch_sink_sites recognises the documented construct
         CHECK(find_confined_dispatch_sink_sites(std::string_view(b).substr(0, 23)).empty());
         CHECK(find_confined_dispatch_sink_sites(std::string_view(c).substr(0, 24)).empty());
         CHECK(find_confined_dispatch_sink_sites(std::string_view(d).substr(0, 27)).empty());
+    }
+}
+
+// #6204: ServerImpl must keep BINDING the engine-aware resolvers. The resolver logic itself lives in
+// engine_aware_visibility.hpp and is tested behaviourally against real stores in
+// test_engine_aware_visibility.cpp; ServerImpl is not unit-constructible, so this source scan pins
+// the WIRING. Each seam is matched as a whole: the enclosing member or lambda, then the single
+// delegation with its store arguments in order (rbac, then management groups, then the username).
+// That catches a seam rebound to inline logic, a dropped call, a swapped or wrong store, and a
+// delegation moved into dead code. It does not prove the seam is the one the routes receive; the
+// response-visible-set seam is checked here and again by the [1712] case above; the use-site
+// counts below cover the rest.
+TEST_CASE("server.cpp: every username-keyed resolver seam delegates to the engine-aware "
+          "resolver (#6204)",
+          "[wiring_order][6204]") {
+    const std::string& text = stripped_source("server.cpp");
+    const auto count = [&text](std::string_view needle) {
+        std::size_t n = 0;
+        for (auto pos = text.find(needle); pos != std::string::npos;
+             pos = text.find(needle, pos + needle.size()))
+            ++n;
+        return n;
+    };
+    // A seam matches when its anchor literal is followed, at that exact position, by the pattern.
+    // Anchoring first keeps the regex off the whole stripped file (the banner above records what a
+    // whole-file std::regex costs on MSVC debug).
+    const auto seam = [&text](std::string_view anchor, const char* pattern) {
+        const std::regex re(pattern);
+        std::size_t n = 0;
+        for (auto pos = text.find(anchor); pos != std::string::npos;
+             pos = text.find(anchor, pos + anchor.size())) {
+            const std::string window = text.substr(pos, 800);
+            if (std::regex_search(window, re, std::regex_constants::match_continuous))
+                ++n;
+        }
+        return n;
+    };
+    CHECK(count("yuzu::server::visibility::dispatch_permission(") == 1);
+    CHECK(count("yuzu::server::visibility::response_agent_in_scope(") == 1);
+    CHECK(count("yuzu::server::visibility::visible_agents_json(") == 1);
+    CHECK(count("yuzu::server::visibility::infrastructure_visible_set(") == 1);
+    CHECK(count("yuzu::server::visibility::response_visible_set(") == 1);
+    // Each delegation sits directly inside its seam, with the right stores in the right order.
+    {
+        INFO("seam: dispatch_has_permission");
+        CHECK(seam("dispatch_has_permission(",
+                   R"(dispatch_has_permission\(\s*std::string_view principal,)"
+                   R"(\s*std::string_view securable,\s*yuzu::server::authz::Operation op\s*\)\s*const\s*\{)"
+                   R"(\s*return yuzu::server::visibility::dispatch_permission\(\s*rbac_store_\.get\(\),)"
+                   R"(\s*principal,\s*securable,\s*op\s*\);)") == 1);
+    }
+    {
+        INFO("seam: response_agent_in_scope");
+        CHECK(seam("response_agent_in_scope(const",
+                   R"(response_agent_in_scope\(\s*const std::string& username,)"
+                   R"(\s*const std::string& agent_id\s*\)\s*const\s*\{)"
+                   R"(\s*return yuzu::server::visibility::response_agent_in_scope\(\s*rbac_store_\.get\(\),)"
+                   R"(\s*mgmt_group_store_\.get\(\),\s*username,\s*agent_id\s*\);)") == 1);
+    }
+    {
+        INFO("seam: get_visible_agents_json");
+        CHECK(seam("get_visible_agents_json(const",
+                   R"(get_visible_agents_json\(\s*const std::string& username\s*\)\s*\{)"
+                   R"(\s*return yuzu::server::visibility::visible_agents_json\(\s*registry_\.to_json_obj\(\),)"
+                   R"(\s*rbac_store_\.get\(\),\s*mgmt_group_store_\.get\(\),\s*username\s*\);)") == 1);
+    }
+    {
+        INFO("seam: visible_set_fn");
+        CHECK(seam("auto visible_set_fn",
+                   R"(auto\s+visible_set_fn\s*=\s*\[this\]\(const std::string& username\))"
+                   R"(\s*->\s*std::optional<std::set<std::string>>\s*\{)"
+                   R"(\s*return yuzu::server::visibility::infrastructure_visible_set\(\s*rbac_store_\.get\(\),)"
+                   R"(\s*mgmt_group_store_\.get\(\),\s*username\s*\);)") == 1);
+    }
+    {
+        INFO("seam: response_visible_set_fn");
+        CHECK(seam("auto response_visible_set_fn",
+                   R"(auto\s+response_visible_set_fn\s*=\s*\[this\]\(const std::string& username\))"
+                   R"(\s*->\s*std::optional<std::set<std::string>>\s*\{)"
+                   R"(\s*return yuzu::server::visibility::response_visible_set\(\s*rbac_store_\.get\(\),)"
+                   R"(\s*mgmt_group_store_\.get\(\),\s*username\s*\);)") == 1);
+    }
+    // The seams are handed on: visible_set_fn to the two route registrations that take it, and the
+    // dispatch binder to both classify_and_authorize_dispatch lambdas. (The response-visible-set seam
+    // is also covered by the [1712] case above.)
+    {
+        INFO("use sites of visible_set_fn");
+        std::size_t uses = 0;
+        const std::regex use_re(R"([^_A-Za-z0-9]visible_set_fn\s*,)");
+        for (auto it = std::sregex_iterator(text.begin(), text.end(), use_re);
+             it != std::sregex_iterator(); ++it)
+            ++uses;
+        CHECK(uses == 2);
+    }
+    {
+        INFO("use sites of dispatch_has_permission");
+        CHECK(count("return dispatch_has_permission(principal, securable, op);") == 2);
+    }
+    // The exec-visible derivations (session-keyed and headless username-keyed) feed the composer.
+    CHECK(count("facts.principal_is_engine = sess.is_engine();") == 1);
+    CHECK(count("facts.principal_is_engine = yuzu::server::authz::is_engine_principal_name(username);") == 1);
+    // No resolver was re-inlined: server.cpp holds no engine-prefix test of its own besides the one above.
+    CHECK(count("authz::is_engine_principal_name(") == 1);
+}
+
+// #6204: ONE enforcement snapshot per decision. Two enforcement reads in one resolver can disagree
+// across a concurrent toggle and let an engine fall through both branches. The header holds only
+// these five resolvers, so the read count is pinned per function: a second read added to any of
+// them fails here, with no store or thread timing involved. The scan counts the three ways to read
+// the flag (`rbac_enforcement_in_effect`, `rbac_enforcement_label`, `is_rbac_enabled`); a read
+// through some other helper is not seen, so this is a tripwire for the obvious regression, not a
+// proof of one snapshot. A concurrent-toggle stress test was tried and dropped: with the second
+// read reintroduced it still passed 3 of 3 runs, because the window between two reads
+// (nanoseconds) is far narrower than a toggle (a Postgres write), so it could not fail on the
+// defect it named.
+namespace {
+std::size_t count_enforcement_reads(const std::string& body) {
+    static const std::regex re(R"(\b(?:rbac_enforcement_in_effect|rbac_enforcement_label|is_rbac_enabled)\s*\()");
+    std::size_t n = 0;
+    for (auto it = std::sregex_iterator(body.begin(), body.end(), re); it != std::sregex_iterator();
+         ++it)
+        ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("the enforcement-read counter sees each spelling and ignores look-alikes (#6204)",
+          "[wiring_order][6204][snapshot]") {
+    CHECK(count_enforcement_reads("a = rbac_enforcement_in_effect(rbac);") == 1);
+    CHECK(count_enforcement_reads("a = rbac_enforcement_in_effect (rbac);") == 1);
+    CHECK(count_enforcement_reads("a = rbac_enforcement_in_effect\n    (rbac);") == 1);
+    CHECK(count_enforcement_reads("a = rbac->is_rbac_enabled();") == 1);
+    CHECK(count_enforcement_reads("a = rbac_enforcement_label(rbac);") == 1);
+    CHECK(count_enforcement_reads("x = rbac_enforcement_in_effect(r); y = rbac->is_rbac_enabled();") == 2);
+    CHECK(count_enforcement_reads("a = my_rbac_enforcement_in_effect_cached(rbac);") == 0);
+    CHECK(count_enforcement_reads("a = rbac->check_permission(u, s, o);") == 0);
+}
+
+TEST_CASE("engine_aware_visibility.hpp: each resolver reads enforcement exactly once (#6204)",
+          "[wiring_order][6204][snapshot]") {
+    const std::string text =
+        strip_line_comments(read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / "engine_aware_visibility.hpp"));
+    const std::string marker = "[[nodiscard]] inline";
+    std::vector<std::size_t> starts;
+    for (auto pos = text.find(marker); pos != std::string::npos;
+         pos = text.find(marker, pos + marker.size()))
+        starts.push_back(pos);
+    REQUIRE(starts.size() == 5);
+    starts.push_back(text.size());
+    const char* names[] = {"dispatch_permission", "response_agent_in_scope", "visible_agents_json",
+                           "infrastructure_visible_set", "response_visible_set"};
+    for (std::size_t i = 0; i < std::size(names); ++i) {
+        const std::string body = text.substr(starts[i], starts[i + 1] - starts[i]);
+        INFO("resolver: " << names[i]);
+        CHECK(body.find(names[i]) != std::string::npos);
+        CHECK(count_enforcement_reads(body) == 1);
     }
 }

@@ -710,7 +710,7 @@ TEST_CASE("#3265: a stored kill-switch row for __guard__.push_rules is informati
 
 TEST_CASE("A degraded/unopened store makes action_allowed return false, never true",
           "[server][config][killswitch]") {
-    PgPool bad_pool{{.conninfo = "host=127.0.0.1 port=1 dbname=nonexistent",
+    PgPool bad_pool{{.conninfo = "host=127.0.0.1 port=1 dbname=nonexistent connect_timeout=1",
                      .size = 1,
                      .connect_timeout_s = 1}};
     yuzu::test::TempDir keys{"yuzu_test_keys_"};
@@ -981,7 +981,7 @@ TEST_CASE("PluginConfigStore: an invalid os is refused and writes no row",
 
 TEST_CASE("PluginConfigStore: a degraded store yields no kill-switch decision (fail closed)",
           "[server][config][killswitch]") {
-    PgPool bad_pool{{.conninfo = "host=127.0.0.1 port=1 dbname=nonexistent",
+    PgPool bad_pool{{.conninfo = "host=127.0.0.1 port=1 dbname=nonexistent connect_timeout=1",
                      .size = 1,
                      .connect_timeout_s = 1}};
     yuzu::test::TempDir keys{"yuzu_test_keys_"};

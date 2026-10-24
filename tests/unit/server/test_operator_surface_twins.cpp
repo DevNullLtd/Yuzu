@@ -208,6 +208,17 @@ TEST_CASE("arming_check composition: a system_reserved capability is refused to 
     CHECK(compose_arming_check(registry, &rbac, "alice", "filesystem", "exists"));
 }
 
+TEST_CASE("arming_check composition: RBAC off arms for a human but never for an engine principal "
+          "(#6204)",
+          "[server][routes][mcp][pg]") {
+    CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
+    TWINS_RBAC(rbac);
+    rbac.set_rbac_enabled(false);
+    REQUIRE_FALSE(rbac.is_rbac_enabled());
+    CHECK(compose_arming_check(registry, &rbac, "alice", "filesystem", "exists"));
+    CHECK_FALSE(compose_arming_check(registry, &rbac, "engine:vuln", "filesystem", "exists"));
+}
+
 TEST_CASE("arming_check composition: RBAC legacy-open (disabled) admits regardless of grant",
           "[server][routes][mcp][pg]") {
     CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
