@@ -519,38 +519,27 @@ token issued within the window; a SAML session is refused (#4935; with the step-
 central check answers it first with its generic `403`, otherwise the approver rule answers with the typed
 refusal; a SAML-only deployment has no working approver path until that is decided, tracked in #6098). The window is `min(--mfa-step-up-window-secs, 300)`
 and 300 when that is `0` or negative, independent of `--mfa-enforcement`, so neither a mode nor
-`--mfa-step-up-window-secs=0` removes the requirement. Break-glass accounts get no exemption. On a
-default install (RBAC enforcement off, `--mfa-enforcement=optional`) the only approvers are
-administrators and none is forced to enrol, so every administrator who has not enrolled a factor in
-Settings is refused until it does.
-**Residual risks:** (a) an OIDC "fresh proof" means the provider issued an ID token with an MFA-method `amr`
-within the window; the MFA itself may predate the token, because the provider can reuse its own
-session (the server sends no `prompt=login` or `max_age`), and no second factor is presented again
-at approval time; any single MFA-method `amr` value the gate accepts counts; real re-authentication (`auth_time` with `max_age`) is a planned
-follow-up; (b) clearing an account's MFA factor ends that account's dashboard sessions, in a second database
-commit and not for API tokens. `yuzu-server --mfa-reset` and an administrator's own Disable in Settings
-(which needs a fresh step-up proof and signs the caller out too, except when it only cancels an
-enrolment that was never verified) clear the factor in one commit and delete the account's sessions in
-another, so the pair is not atomic. If the delete fails the factor stays cleared and the sessions stay
-live until an operator ends them: Settings records `mfa.disabled` with `result=partial` (or
-`result=error` with `sessions_ended=failed`) and the page offers no retry control (an administrator
-calls `DELETE /api/v1/sessions?username=`; the recovery runbook has a single-transaction SQL fallback),
-and `--mfa-reset` exits non-zero and records `sessions_ended=failed` in its `mfa.reset.breakglass` row.
-A session that survives a failed or interrupted clear is treated as an account with no enrolled factor: it keeps its role's reach until ended, and because the Settings enrolment init and verify routes are step-up exempt and ask for no password, a session that passes the Settings administrator check can enrol its own authenticator and then satisfy the approver rule (the real user's next sign-in then asks for the other authenticator). Remedy: end the account's sessions with `DELETE /api/v1/sessions?username=<name>` (needs an administrator API token; the recovery runbook has the SQL), and if the authenticator may have been enrolled by someone else run `yuzu-server --mfa-reset`. A single transaction that clears the factor, deletes the sessions, writes the audit row and bumps the generation is a planned follow-up.
-A process that dies between the two commits leaves the factor cleared, the sessions live and no audit
-row; a sign-in in flight when the delete runs can leave a session the delete did not cover; and a
-replica or CLI image still on an older build ends none. `sessions_ended` counts the durable session
-rows deleted, expired rows not yet reaped included. Other replicas drop their cached sessions within
-about one second in normal operation and within 30 seconds while a replica's session-generation poll
-is failing; neither bound holds after a database restore or a failover to a lagging standby (runbook,
-"Sessions are durable"). The Settings audit row is written after the changes and its write is best
-effort: if the audit store cannot be written the request still completes and only a server WARN line
-records it, whereas `yuzu-server --mfa-reset` verifies the audit store is writable before it clears
-anything (use it when the evidence must exist). The comparison of the proof's factor generation with the account's
+`--mfa-step-up-window-secs=0` removes the requirement. Break-glass accounts get no exemption.
+**Residual risks:** (a) an OIDC "fresh proof" means the provider asserted MFA on a recently issued
+token, not that a second factor was presented again at approval time, and any single MFA-method
+`amr` value the gate accepts counts; real re-authentication (`auth_time` with `max_age`) is a planned
+follow-up; (b) clearing an account's MFA factor ends all of that account's dashboard sessions, but not its API tokens.
+`yuzu-server --mfa-reset` and an administrator's own Disable in Settings (which needs a fresh step-up proof
+and signs the caller out too, except when it only cancels an enrolment that was never verified) clear the factor,
+delete the account's recovery codes and durable sessions and write the audit row in ONE database transaction
+(`MfaDisableOwner`, `docs/auth-architecture.md`), so there is no state with the factor cleared and a session
+still alive, and no partial outcome to repair. If any step fails, the audit INSERT included, the whole clear
+rolls back: Settings shows an inline error (and records an `error` row, unless the audit store itself was the failure), and `--mfa-reset` exits non-zero saying
+nothing was changed (the one exception is a connection lost at COMMIT, when every effect landed together and a
+re-run confirms it). The Settings audit row is therefore fail-closed: if the audit store cannot be written the
+factor is not cleared. `sessions_ended` counts the durable session rows deleted, expired rows not yet reaped
+included. Other replicas drop their cached sessions within about one second in normal operation and within 30
+seconds while a replica's session-generation poll is failing; neither bound holds after a database restore or a
+failover to a lagging standby (runbook, "Sessions are durable"). The comparison of the proof's factor generation with the account's
 current one (a proof of a replaced factor is refused after re-enrolment, `proof_factor_mismatch`) is the
 second line of defence: it reads no clock, so it stops a proof being reused after re-enrolment even when
 the database primary clock steps; the proof's age ceiling does assume that clock does not step backward.
-The binding is enforced by two database triggers (`users_mfa_factor_gen` on `auth.users`, `sessions_mfa_rebind_guard` on `session_store.sessions`), checked at boot and re-validated while serving. If the application observes a trigger not in force it fails every local binding decision closed (a sticky `503`) until a restart whose boot check passes, and the server refuses to start with a missing or altered trigger (only the `--mfa-reset` and `--break-glass-arm` host recovery one-shots open past it, with a warning). A database role that can alter those triggers or write `auth.users` directly bypasses the binding with no audit row; the application cannot see that, and the recovery runbook ("MFA binding enforcement failed") says so.
+The binding is enforced by two database triggers (`users_mfa_factor_gen` on `auth.users`, `sessions_mfa_rebind_guard` on `session_store.sessions`), checked at boot and re-validated while serving. If the application observes a trigger not in force it fails every local binding decision closed (a sticky `503`) until a restart whose boot check passes, and the server refuses to start with a missing or altered trigger (only the bootstrap `AuthDB` of the `--mfa-reset` and `--break-glass-arm` host recovery one-shots opens past it, with a warning; the session store has no such bypass). A database role that can alter those triggers or write `auth.users` directly bypasses the binding with no audit row; the application cannot see that, and the recovery runbook ("MFA binding enforcement failed") says so.
 ADR-2002 section 4 treats that clock as a security dependency,
 and keeping the primary's time source correct is the customer's responsibility; the shipped detector
 is the `YuzuSessionReapClockAnomaly` alert, which sees a backward step only when it exceeds the time
@@ -572,9 +561,7 @@ the change ticket; an administrator who enrols itself in Settings is in the same
 exempt from step-up and asks for no password, so a stolen session of an administrator who has never enrolled
 could enrol an attacker-held authenticator and then satisfy the approver rule; `--mfa-enforcement=admin-only`
 or `required` makes sign-in enrol administrators, which narrows this to sessions that already exist when the
-mode is switched on; (d) the control is active
-only while every replica serving `/api/approvals/*` runs a build that has it, a rollback is a
-security-policy downgrade, and tickets decided before the upgrade gain no retroactive assurance; the Yuzu project maintainer accepted mixed-version admission during a rolling upgrade as inherent to it (2026-10-19, in the #6079 working session; a working-session statement, not a signed decision, and the acceptor is also the author of the change, so independent review of the acceptance rests on the pull request review, expected but not enforced by tooling), with the change ticket's per-replica upgrade timestamps, the marker-query extract with its positive control (`docs/user-manual/upgrading.md`, "Mixed-version admission") and the load balancer log excerpt as the compensating record; (e) the reviewer check compares account names only, so one person who holds two identities (a local and an SSO account, or two SSO identities) counts as two reviewers; this is a maintainer-accepted exception (ADR-1005 addendum of 2026-10-19; the acceptor is also the author of the change, so independent review rests on the pull request review, expected but not enforced by tooling), not a four-eyes guarantee across identities, and the compensating controls are narrowing the identity sources in use, an identity-to-HR-record check at the access review, and periodic sampling of reviewer and submitter pairs.
+mode is switched on; (d) the control exists only in builds that carry it, and tickets decided before this build gain no retroactive assurance; this build is a hard cutover from a fresh database with no upgrade or mixed-version path (`docs/user-manual/upgrading.md`), so there is no per-replica admission window to evidence; (e) the reviewer check compares account names only, so one person who holds two identities (a local and an SSO account, or two SSO identities) counts as two reviewers; this is a maintainer-accepted exception (ADR-1005 addendum of 2026-10-19; the acceptor is also the author of the change, so independent review rests on the pull request review, expected but not enforced by tooling), not a four-eyes guarantee across identities, and the compensating controls are narrowing the identity sources in use, an identity-to-HR-record check at the access review, and periodic sampling of reviewer and submitter pairs.
 Running `--mfa-enforcement=required` is no longer needed to enforce the approver factor, but it remains
 the only built-in way to enrol non-admin approvers without promoting them, so note its
 fleet-wide cost if you choose it for the enrolment window: the identity provider must assert an
@@ -604,25 +591,17 @@ proof, a SAML session, an engine principal or a deleted or deactivated account i
 ticket id, so they show who was refused, when and on which route, but not which ticket; only the
 `approver_assurance:` rows and the decision rows name the ticket; the `user=` value of every
 `mfa.step_up.required` row is neutralised, a space, `=`, `,` or control byte written as `_`, so a name cannot add a
-`reason=` token), `result=error` rows with `detail=approver_assurance:mfa_store_unavailable` (the approver's MFA state or stored proof could not be read) or `approver_assurance:mfa_proof_clock_skew` (an OIDC proof dated after the database clock), each written before any `attempted` row, and `mcp.approve_request` / `mcp.reject_request` refusals (during a mixed-version window, also `result=success` rows for those actions from a replica not yet upgraded).
+`reason=` token), and `mcp.approve_request` / `mcp.reject_request` refusals.
 The `attempted` and `success` rows of a decision made under the control carry
-`detail=approver_assurance:enrolled_fresh_mfa`, which marks a decision made by a replica that had the control (it
-dates the first upgraded replica, not the last old one, so keep per-replica upgrade timestamps in the change
-ticket); it records that the check
+`detail=approver_assurance:enrolled_fresh_mfa`, which marks a decision made under the control; it records that the check
 passed, not the factor type, the proof age or the factor generation. The generation comparison is enforced at decision time and cannot be reconstructed from the log; the type and age are evidenced by the adjacent `mfa.login.verified` /
 `mfa.step_up.passed` / `auth.oidc_login` rows, or, for a proof stamped by a Settings enrolment confirm, by
-`mfa.enroll.verified` with `step_up_proof=stamped`. Evidence for residual (b) is a pair of rows per clear, ordered by the audit `id`: an `attempted`
-intent row written before the factor is touched, then an outcome row. The `mfa.disabled` rows carry the
-acting session's principal, role and session id; `partial` or `sessions_ended=failed` marks an incomplete
-clear, and `error` marks a clear whose state is unknown. The `mfa.reset.breakglass` rows carry the OS
-identity that ran the command as principal; its outcome is `success`, `partial` (the session delete
-failed, detail `sessions_ended=failed`) or `error`. Both are inside the `auth-sample` export. An
-`attempted` row with no outcome row marks a clear that was requested and whose outcome is unknown: the
-process died, or the outcome write failed, after the factor was cleared, or the process died before the
-clear and the factor is intact. The reconciliation query that lists them is under "Finding a clear whose
-outcome is unknown" in `docs/ops-runbooks/auth-db-recovery.md`, which also has the query for outcome rows
-that ended `error` or `partial`; the row definitions are in
-`docs/user-manual/audit-log.md`.
+`mfa.enroll.verified` with `step_up_proof=stamped`. Evidence for residual (b) is the `mfa.disabled` rows (the
+acting session's principal, role and session id; `result=ok` with `sessions_ended=<n>` is a committed clear,
+written by the clear's own transaction, while `denied` and `error` rows record a clear that changed nothing) and
+the `mfa.reset.breakglass` rows (principal is the OS identity that ran the command; written in the same
+transaction as the clear, so a row exists exactly when the clear committed); both are inside the
+`auth-sample` export (`docs/user-manual/audit-log.md`).
 
 ---
 

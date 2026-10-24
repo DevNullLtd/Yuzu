@@ -625,8 +625,7 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
     request returns `401` with `meta.mfa_step_up_required: true`; the dashboard prompts for the code
     inline, and a script posts the code to `/login/mfa/stepup` and retries (see
     [Step-up on high-risk surfaces](authentication.md#step-up-on-high-risk-surfaces-pr-2)). A proof
-    must belong to the factor enrolled now: if MFA was disabled and enrolled again, or the session predates
-    the upgrade that introduced this check, the request returns the same `401` and you enter a fresh code. If the account itself has been deleted or deactivated while you were signed in,
+    must belong to the factor enrolled now: if MFA was disabled and enrolled again, the request returns the same `401` and you enter a fresh code. If the account itself has been deleted or deactivated while you were signed in,
     the decision is refused with `403` and `approver_assurance_required:account_unavailable`; sign in
     again or contact an administrator.
   - **OIDC single sign-on.** There is no local factor to check. The sign-in must have carried an MFA
@@ -691,8 +690,8 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   tracked in #6098 (the SAML step-up decision is #4935).
 - **`--mfa-step-up-window-secs=0` no longer lowers approval assurance.** The setting turns the step-up
   gate off for the other step-up endpoints, but approve and reject keep their enrolled-factor and
-  300-second proof requirement. A decision made before the upgrade gains no retroactive assurance;
-  see [Upgrading](upgrading.md) for how to review those.
+  300-second proof requirement. A decision made before this control existed gains no retroactive assurance;
+  see [Upgrading](upgrading.md).
 
 **MCP clients cannot approve.** MCP callers authenticate with a bearer token and the MCP transport runs no MFA step-up, so the MCP tools
 `approve_request` and `reject_request` always return a typed refusal, whatever credential the caller used

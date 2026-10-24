@@ -204,17 +204,27 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   check) and `ok` is published only after COMMIT (a failed or unacknowledged
   COMMIT is `WriteFailed`, never a proof). The constructor validates the
   trigger and does not open if it fails (the two host recovery one-shots,
-  `--mfa-reset` and `--break-glass-arm`, may open with
-  `MfaBindingCheck::kBypassForRecovery`: warn, binding reported not enforced
-  for the process life; the serving binary never passes it, any other use is
-  CRITICAL); `mfa_status` re-validates behind a
+  `--mfa-reset` and `--break-glass-arm`, may open their bootstrap `AuthDB`
+  with `MfaBindingCheck::kBypassForRecovery`: warn, binding reported not
+  enforced for the process life; it exists ONLY on the `AuthDB` constructor,
+  `SessionStore` has no bypass, the serving binary never passes it, any other
+  use is CRITICAL); `mfa_status` re-validates behind a
   request-driven 60 s memo and a failure is STICKY
   (`MfaStatus::binding_enforced == false`), which every gate must answer `503`
   through the one `judge_local_mfa_binding` (a second copy of that decision is
-  a defect). `mfa_regenerate_recovery_codes` and `mfa_disable_report` take a
-  REQUIRED `expected_factor_gen` and compare it under the `auth.users` row lock
+  a defect). `mfa_regenerate_recovery_codes` takes a REQUIRED
+  `expected_factor_gen` and compares it under the `auth.users` row lock
   before writing (`FactorChanged`, deliberately NOT a store-unavailable error);
-  a new factor mutation does the same. **A PR that writes `mfa_factor_gen`,
+  a new factor mutation does the same. **The production factor CLEAR is
+  `MfaDisableOwner` (`mfa_disable_owner.{hpp,cpp}`): ONE transaction on one
+  lease (lock the `auth.users` row, compare the admitted generation, clear the
+  factor, delete the recovery codes and every durable session, insert the
+  audit row, bump the session write-generation LAST), where any failure, the
+  audit INSERT included, rolls everything back. A second clear path, or a
+  clear split across transactions, is CRITICAL; `AuthDB::mfa_disable` is a
+  test-fixture un-enrol with no route or CLI caller.** The auth v3 migration
+  seeds nothing (a hard cutover from a fresh database): every existing row
+  starts at generation `0`. **A PR that writes `mfa_factor_gen`,
   weakens the trigger or its pinned-body check, publishes a verifier's success
   before COMMIT, takes the verification instant after the crypto check, or
   adds a proof decision (admit or refuse on a stored MFA proof) that
@@ -235,10 +245,11 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   session-persistence method on `AuthDB` is a design regression** — raise it
   as a HIGH finding requiring an explicit decision (this was a deliberate
   drop, not an oversight; see `docs/auth-architecture.md` "AuthDB —
-  persistent authentication store"). The one cross-store writer is the
+  persistent authentication store"). The cross-store writers are the
   credential-change owner (`CredentialChangeOwner`, #5342), which deletes a
   user's `session_store` rows in the same transaction as its `auth.users`
-  credential write — through `session_store_sql_helpers.hpp`, never an
+  credential write, and `MfaDisableOwner` (#6079), which does the same for a
+  factor clear — through `session_store_sql_helpers.hpp`, never an
   `AuthDB` method.
 
 - **Cleanup thread now sweeps ONLY stale provisional MFA enrollments** (the

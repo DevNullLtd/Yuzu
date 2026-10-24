@@ -6160,13 +6160,7 @@ groups:
             A durable session-store operation ({{ $labels.op }}) hit a degraded
             PostgreSQL read/write for 10m. A `validate` degrade fails requests
             closed (401; the approve and reject routes answer 503 when they cannot read
-            the session's stored MFA proof). `validate` also counts a local MFA binding read
-            refused with `mfa_proof_unavailable` (503, `retry_after_ms` 5000) because the
-            session rebind guard's catalog check could not run on that read: session
-            validation still succeeds and both YuzuMfaBindingNotEnforced gauges stay at 1;
-            the server log line `SessionStore: the rebind-guard check could not run` names
-            the cause (see docs/ops-runbooks/auth-db-recovery.md "MFA binding enforcement
-            failed"); `create`/`elevate`/`mark_mfa`/`invalidate`/
+            the session's stored MFA proof); `create`/`elevate`/`mark_mfa`/`invalidate`/
             `invalidate_user` degrades fail the privileged op closed; a single
             event does not hold this alert's 10m condition (the Settings MFA
             disable and `--mfa-reset` do not use `invalidate_user`: their session

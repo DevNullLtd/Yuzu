@@ -363,7 +363,7 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   signed-in local session can use them (an API token, an SSO identity or an engine principal is
   refused `403`; neither route has a REST v1 or MCP twin, so no documented automation is affected);
   and a request whose account factor changed after the step-up check admitted it is refused `409`
-  with nothing written. See "Behaviour change: MFA proofs are bound to the factor they were earned
+  with nothing written. See "Breaking: MFA proofs are bound to the factor they were earned
   with" below.
 - **What is newly gated, measured against the last release (v0.14.1).** Only the two Settings MFA
   routes above are gated for the first time by this change. Of the other 35, 25 already called the
@@ -504,7 +504,15 @@ unwired-store refusals still apply and are still recorded. The JIT-elevation rou
 window when it is positive, else 300 s). The new alert `YuzuStepUpWindowDisabled` fires while the
 window is 0 or less. This release has no supported return to v0.14.1 (see "Deployment contract (hard cutover)"). v0.14.1 does not gate the two Settings routes or the four existing routes listed under "What is newly gated" above in their handlers, and it does not have the six routes that are new in this release. A server whose `/metrics` lacks `yuzu_auth_mfa_step_up_gate_total` and `yuzu_auth_mfa_step_up_window_seconds` has no step-up gate on these routes at all, and `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled` cannot fire there: their silence is not evidence that the gate is on.
 
-## Behaviour change: MFA proofs are bound to the factor they were earned with; one re-prove after upgrade (#6079)
+## ⚠️ Breaking: MFA proofs are bound to the factor they were earned with; hard cutover from a fresh database (#6079)
+
+**This build is a hard cutover from a fresh auth and session database.** It has no upgrade path, no
+rolling or mixed-version window and no rollback guarantee: start it against a new database. On a
+database carried over from an earlier build, the `auth` v3 migration starts every existing row at factor
+generation `0` and the trigger advances it only from the next enrolment change, so an account that was
+already enrolled reads generation `0`, is refused `503` `mfa_proof_unavailable` (sticky, no
+`retry_after_ms`) on approve and reject and on the 34 ordinary step-up routes, and stays refused until
+`yuzu-server --mfa-reset <user>` re-enrols it.
 
 **What changed.** A step-up proof of a local, MFA-enrolled account now counts only for the factor
 that was enrolled when the code was verified. The central step-up check (the 34 ordinary rows), JIT
@@ -512,48 +520,24 @@ elevation and approve and reject all compare a generation stored with the sessio
 account's current one, so disabling MFA and enrolling again, or an administrator resetting the factor
 with `yuzu-server --mfa-reset`, makes every earlier proof stop counting. The generic check also holds a
 local proof to the window on the database clock, to the millisecond, as well as on the server's own
-clock. Two additive schema migrations run at the first start of the new version: `auth` v3 adds
-`users.mfa_factor_gen` and a trigger that advances it, and `session_store` v2 adds two columns and a
-trigger that unbinds a proof written without a generation. The `auth` migration only seeds the generation
-(`1`) on accounts that are already enrolled, the `session_store` migration rewrites no row, and both triggers are
-checked at every start: a server whose database does not have them in force refuses to start (the log
-says `Failed to open the Postgres auth store (migration or MFA trigger check failed; see the preceding
-AuthDB log line)` or `session store migration/open failed`).
-
-**Migration lock window (first start).** The `auth` v3 migration (`auth.users`) and the `session_store`
-v2 migration (`session_store.sessions`) each take a brief `ACCESS EXCLUSIVE` lock with a `lock_timeout`
-of 30 seconds, the same shape as the internal-CA migrations
-(see the migration v3/v4 lock-window paragraph under "Informational: internal-CA CRL publish/audit/observability follow-ups" below).
-While the `ALTER TABLE` is queued behind another transaction, every other query on that table waits
-behind it. Do not run `pg_dump` or hold a long transaction against those two schemas during the first
-start of the new version (schedule the upgrade outside the backup window). A timeout makes that start
-fail, and the migration is retried on the next start. If you start `yuzu-server --mfa-reset`
-from the new binary before the serving replicas are upgraded it runs both additive migrations (it opens the `auth`
-store and then the `session_store`); `--break-glass-arm` runs the `auth` migration only (it opens no session
-store). These two one-shots are also the only modes that open past a missing or altered binding trigger (with a loud
-`WARN`; see [MFA binding enforcement failed](../ops-runbooks/auth-db-recovery.md#mfa-binding-enforcement-failed)):
-serving and every other mode, `--generate-tokens` for example, refuse to start.
+clock. Two schema migrations run at the first start: `auth` v3 adds `users.mfa_factor_gen` (every row
+starts at `0`) and a trigger that advances it, and `session_store` v2 adds two columns and a trigger that
+unbinds a proof written without a generation. Both triggers are checked at every start: a server whose
+database does not have them in force refuses to start (the log says `Failed to open the Postgres auth
+store (migration or MFA trigger check failed; see the preceding AuthDB log line)` or `session store
+migration/open failed`). Only the two host-CLI one-shots `yuzu-server --mfa-reset` and
+`--break-glass-arm` open their bootstrap `AuthDB` past a missing or altered binding trigger (with a loud
+`WARN`; see [MFA binding enforcement failed](../ops-runbooks/auth-db-recovery.md#mfa-binding-enforcement-failed));
+serving and every other mode, `--generate-tokens` for example, refuse to start, and the session store has no
+such bypass.
 
 **What you will see.**
 
-- **Each operator session is asked to prove again once.** Sessions that exist when the new version
-  starts serving hold proofs with no generation, so the first gated request or approval on each is a
-  `401` step-up (audit `mfa.step_up.required`, `reason=proof_factor_unbound`) until the operator posts
-  a code to `/login/mfa/stepup`. Accounts with no enrolled factor, API tokens and SSO sessions are
-  unaffected. A script that holds a session cookie must repeat its step-up once.
-- **A rolling upgrade costs availability on upgraded replicas and does not strengthen un-upgraded ones.** A sign-in or step-up served by a replica
-  that has not been upgraded yet leaves an unbound proof, and an upgraded replica refuses it with the
-  same `401` until the operator proves again through an upgraded replica; a replica that has not been
-  upgraded still applies the earlier, weaker rule on its own gates. Upgrade the replicas that serve the
-  step-up-gated routes and approvals first, or expect repeated prompts until the rollout completes.
-- **Before you upgrade for #6079.** (1) Enrol at least two approvers, so each request has an approver who is
-  not its submitter (see the non-admin enrolment bullet under "Breaking: approving or rejecting a request now needs an interactive session..." below). (2) Upgrade the replicas that serve approvals first. (3) Record
-  each replica's upgrade time in UTC in the change ticket. (4) Keep the first start away from your backup
-  window (the migration lock window above). (5) Re-import `docs/prometheus/yuzu-alerts.yml`: the new
-  `YuzuMfaBindingNotEnforced` alert does not exist until you do. (6) Expect one re-prove per open session.
-- **Rolling back is safe for the schema.** The old binary ignores the new columns, and the triggers stay
-  and keep advancing the generation; its own stamps unbind proofs, and its gates apply the earlier rule.
-  Nothing needs undoing, and upgrading again needs no reseeding.
+- **Clearing a factor is one transaction.** `yuzu-server --mfa-reset` and Disable in Settings clear the
+  factor, delete the recovery codes, end every session of the account and write the audit row together
+  (`MfaDisableOwner`); a failed audit write rolls the whole clear back, so the Settings Disable is
+  fail-closed on its audit row. `--mfa-reset` constructs no session store; it applies the
+  `session_store` schema migrations first, and if that step fails it exits `1` with nothing changed.
 - **Regenerating recovery codes and disabling MFA are local-session-only.** An API token or an SSO
   session that reached these two Settings routes before now gets `403`, and `--mfa-step-up-window-secs=0`
   no longer switches their step-up off (they use a window of at most 300 seconds). A request whose factor
@@ -564,10 +548,9 @@ serving and every other mode, `--generate-tokens` for example, refuse to start.
   alert fires. The reason token depends on the store: `mfa_binding_unenforced` for `store="auth"`, but
   `mfa_proof_unavailable` (plus `yuzu_auth_session_store_degrade_total{op="rebind_guard"}`) for
   `store="session"`, which SSO sessions do not see; key SIEM rules on both (`mfa_proof_unavailable` is also the
-  answer for an enrolled account whose factor generation is not positive, for example after a data-only restore of a
-  pre-upgrade dump, see
-  [Post-restore verification](../ops-runbooks/auth-db-recovery.md#post-restore-verification)). The alert does not exist
-  until you re-import `docs/prometheus/yuzu-alerts.yml`. The procedure is
+  answer for an enrolled account whose factor generation is not positive, see
+  [Post-restore verification](../ops-runbooks/auth-db-recovery.md#post-restore-verification)). The alert
+  ships in `docs/prometheus/yuzu-alerts.yml`. The procedure is
   [MFA binding enforcement failed](../ops-runbooks/auth-db-recovery.md#mfa-binding-enforcement-failed).
 
 ## Behaviour change: /health and /api/health per-source budget
@@ -1024,11 +1007,11 @@ principal and not an engine principal. The existing rule that the reviewer canno
   - **A non-admin cannot enrol itself** under `--mfa-enforcement=optional` or `admin-only` (login enrols only the
     accounts the mode protects, and the Settings enrolment routes are administrator-only). The seeded `Operator`
     role holds `Approval:Approve`, so with RBAC enforcement on, every such approver is refused `mfa_not_enrolled`
-    after the upgrade until an administrator enrols them, either with a temporary enrolment sign-in window or by promoting each account to
+    until an administrator enrols them, either with a temporary enrolment sign-in window or by promoting each account to
     administrator just long enough to enrol and then demoting it; see
     [Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver),
     including the identity-proofing step (under the window, whoever signs in first with the password enrols the
-    factor) and each path's consequences. Plan this **before** upgrading, and make sure at least two
+    factor) and each path's consequences. Plan this before the first decision is needed, and make sure at least two
     enrolled, authorised approvers exist, so that for each request you expect to be decided one of them is not its
     submitter: until then nothing can be approved. A seeded administrator that has never enrolled is in the same position. Self-service
     enrolment for non-admins is a planned follow-up and is not part of this change. `yuzu-server --mfa-reset`
@@ -1257,145 +1240,12 @@ dispatches.
    being refused `503` because their proof is dated after the database clock; the fix is clock synchronisation (see
    [OIDC approvers refused with a clock-skew 503](../ops-runbooks/auth-db-recovery.md#oidc-approvers-refused-with-a-clock-skew-503)).
 
-**Rolling back, or running mixed versions.** The approver-assurance change adds two additive schema migrations, in
-the `auth` schema (a `users.mfa_factor_gen` column and a trigger that advances it) and in the session store (the
-`mfa_factor_gen` and `mfa_bind_seq` columns on `sessions` and a guard trigger). Neither drops or rewrites existing
-data, and an older binary does not read the new columns; it also does not maintain the binding (see the warning
-below). The separate scheduled-approval change (#6096, below) adds a data-only approvals step and a command-outbox
-index, both of which an older binary ignores. What changes is which checks run.
+**Schema and agents.** The approver-assurance change adds two schema migrations, in the `auth` schema (a
+`users.mfa_factor_gen` column and a trigger that advances it) and in the session store (the `mfa_factor_gen`
+and `mfa_bind_seq` columns on `sessions` and a guard trigger). Neither drops or rewrites existing data. The
+separate scheduled-approval change (#6096, below) adds a data-only approvals step and a command-outbox index.
 
-> **Warning: mixed versions silently weaken the approver control.** The enrolled-factor and fresh-proof
-> requirement (#6079) is in force **only while every replica that serves `/api/approvals/*` runs a build that
-> has it.** Behind one load balancer, an old replica keeps the weaker gate: it passes an approver who has no
-> enrolled factor, and a build that predates #6061 also accepts bearer and MCP approvals. The same person can
-> therefore get `403` `mfa_not_enrolled` from one replica and succeed on the next request, and nothing in the
-> response says which replica answered. Rolling those replicas first shortens the exposure window; the gap closes
-> only when approval traffic reaches upgraded replicas only (pin or drain approvals), and stop-all, upgrade, start-all is
-> the default recommendation. Running more than one server replica is unsupported today (the safe-to-scale gate,
-> `docs/ha-delivery-matrix.md`), so this describes a rolling upgrade and is not a statement that a multi-replica
-> deployment is supported. **Rolling back to an
-> older build is a security-policy downgrade**, not only a convenience: it re-opens the weaker gate, and tickets
-> decided before the upgrade gain no retroactive assurance.
->
-> If you are about to roll, write down each replica's upgrade time (in UTC) in the change ticket as you go; see
-> "Mixed-version admission" below for why it matters and for the queries that use it.
-
-- A replica or a rolled-back binary that predates this change still accepts bearer and MCP approvals, and does
-  not check an approved ticket's age when it is consumed or when `ScheduleRunner` fires it. While any such
-  replica serves traffic, the assurance is only as strong as that replica; drain it, or send approval traffic
-  to upgraded replicas only.
 - Endpoint agents need no change.
-- An older binary does not write the `result=attempted` row, and does not read it. Rows written by the new
-  binary stay in the audit store and are ignored by the old one; a `denied` row with
-  `detail=approver_assurance:<reason>` simply stops appearing.
-- **Telling old and new rows apart.** The `attempted` and `success` rows of an approve or reject written by a
-  build with #6079 carry `detail=approver_assurance:enrolled_fresh_mfa`. A row without it was written before
-  the control, or by a replica that does not have it. Use that token as the cutover marker when sampling
-  decisions, and to spot an old replica still serving approvals during a roll. The audit row does not name the
-  replica; your load balancer's access log is the place to find which one answered.
-- **Mixed versions and clearing a factor.** Until every replica and the CLI image run this build, an old binary's
-  `--mfa-reset` or Settings disable clears the factor without ending the account's sessions, so its existing
-  sessions stay live. Afterwards run the new
-  binary's `--mfa-reset` (before the user enrols again, because it clears the factor) or
-  `DELETE /api/v1/sessions?username=<name>`. To find the accounts cleared during the mixed window, list the
-  `mfa.disabled` and `mfa.reset.breakglass` rows in it. The bounds follow the same rules as the approval query below
-  (UTC, an explicit `+00` on each, widened by a margin for clock skew). A row written by an old binary has no
-  `sessions_ended=` in its `detail`; every `ok` or `success` outcome row from this build has one, except `no verified factor to clear`
-  (a cancelled, unfinished enrolment, which cleared nothing); an `error` row from the CLI has none. This build also writes an `attempted` intent row before it
-  clears anything, and that row has no `sessions_ended=` either; the `result IN ('ok', 'success')` filter is what keeps
-  those rows out of the list, so do not drop it.
-
-  ```bash
-  psql -q "$YUZU_POSTGRES_DSN" -c \
-    "SET TIME ZONE 'UTC';
-     SELECT to_timestamp(timestamp) AS at, principal, action, result, target_id, detail
-       FROM audit_store.audit_events
-      WHERE action IN ('mfa.disabled', 'mfa.reset.breakglass')
-        AND result IN ('ok', 'success')
-        AND COALESCE(detail, '') NOT LIKE '%sessions_ended=%'
-        AND COALESCE(detail, '') <> 'no verified factor to clear'
-        AND timestamp >= extract(epoch FROM timestamptz '<first replica upgraded, minus margin, UTC with +00>')
-        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded, plus margin, UTC with +00>')
-      ORDER BY timestamp;"
-  ```
-
-  Each row's `target_id` is an account whose sessions were left live. End them as above. An empty list is not
-  evidence that none were cleared: it has the same blind spots as the approval query below (bounds that miss the
-  window, an audit store restored or purged, a lost audit write), so run the same count control over the same bounds.
-- **Mixed-version admission is a documented known limitation of a rolling upgrade.** The approver
-  gate is stateless and no minimum-version check exists, so while a rolling upgrade is in progress an old replica
-  can admit a decision the new gate would refuse. The Yuzu project maintainer accepted this on 2026-10-28 as inherent to
-  the upgrade method, on the condition that the upgrade is controlled; the acceptance is recorded in the ADR-1005
-  exception ledger (`docs/adr/1005-headless-platform-use-case-engines.md`, entry of 2026-10-28) as a working-session
-  statement, not a signed decision. The condition is: record each
-  replica's upgrade timestamp (in UTC) in the change ticket (SOC 2 CC8.1) **as you roll**, because the audit row does
-  not name the replica. A decision row **without**
-  `approver_assurance:enrolled_fresh_mfa` was written before the control existed, by a replica that did not have
-  it, or after a rollback. To list the decisions in a window that carry no marker, set the start to the first
-  replica's upgrade time minus a margin and the end to the last replica's upgrade time plus a margin, or to the
-  present time if a rollback happened or a replica may still be old. **Both bounds are UTC.** The command's first
-  statement pins the session to UTC, because `psql` otherwise reads a bare `timestamptz` literal in the session's
-  own time zone (the server default, the role's setting, `PGTZ` or a DSN option), which shifts the window by whole
-  hours and returns no rows without any error; write each bound with an explicit `+00`, for example
-  `2026-10-20 09:55+00`. If the times in your change ticket are local times, convert them to UTC first.
-
-  ```bash
-  psql -q "$YUZU_POSTGRES_DSN" -c \
-    "SET TIME ZONE 'UTC';
-     SELECT to_timestamp(timestamp) AS at, principal, action, target_type, target_id, result, source_ip, detail
-       FROM audit_store.audit_events
-      WHERE (   (action IN ('approval.approve', 'approval.reject')
-                 AND result IN ('attempted', 'success')
-                 AND detail <> 'approver_assurance:enrolled_fresh_mfa')
-             OR (action IN ('mcp.approve_request', 'mcp.reject_request')
-                 AND result = 'success'))
-        AND timestamp >= extract(epoch FROM timestamptz '<first replica upgraded, minus margin, UTC with +00>')
-        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded, plus margin, UTC with +00>')
-      ORDER BY timestamp;"
-  ```
-
-  The `at` column is shown in UTC. Match each row against the ticket's per-replica timestamps and the load balancer
-  log, and review the decision it records. Only `attempted` and `success` rows are listed for the REST actions,
-  because a refusal (`denied`) never carries the marker. Rows before the window are pre-upgrade decisions and gain no
-  retroactive assurance. Rows inside the leading margin, before the first replica was upgraded, are also
-  pre-upgrade decisions: expect them in the list, they are not old-replica admissions.
-
-  **A list with no rows is not evidence of a clean upgrade.** The same output appears when the bounds miss the
-  window, when the audit store is empty or was restored from an earlier copy, and when an audit write was lost (the
-  `success` row of a REST decision is best effort). Run this control over the SAME bounds. It counts every audit row
-  in the window, whatever the action:
-
-  ```bash
-  psql -q "$YUZU_POSTGRES_DSN" -c \
-    "SET TIME ZONE 'UTC';
-     SELECT count(*), to_timestamp(min(timestamp)) AS earliest, to_timestamp(max(timestamp)) AS latest
-       FROM audit_store.audit_events
-      WHERE timestamp >= extract(epoch FROM timestamptz '<first replica upgraded, minus margin, UTC with +00>')
-        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded, plus margin, UTC with +00>');"
-  ```
-
-  For a window in which the deployment was running, `count` must be above zero and `earliest` and `latest` must
-  fall inside the bounds. A `count` of zero means the bounds or the audit store are wrong (check that both bounds
-  are UTC, that the start is earlier than the end, and that the audit store was not restored or purged), not that
-  the upgrade was clean; do not use an empty list as evidence until the control is above zero. A non-zero count shows
-  the bounds select audit rows, not that every decision left a row. Attach both command texts, with the bounds
-  filled in, and their output to the change ticket.
-
-  The `mcp.approve_request` and `mcp.reject_request` rows are listed for a different reason. A decision made
-  over MCP never carries the marker, because the upgraded binaries refuse MCP approvals and rejections, so any
-  `success` row for these actions inside the window came from a replica that had not been upgraded yet, or from
-  a rollback. For those rows `target_type` is `mcp_tool` and `target_id` is the tool name; the approval ticket id
-  is in `detail`. The MCP query in "Find affected automation before you upgrade", above, finds the same actions
-  across the whole retention period; this one limits them to the window.
-
-  The `timestamp` column is written from the clock of the replica that wrote the row, while the bounds you
-  recorded in the change ticket come from wherever you read the time, so widen both bounds by a margin that
-  covers the NTP skew between your replicas (the observed skew, or a few minutes if you have not measured it).
-  The margin covers clock skew only. It does not cover a time-zone offset, which is why the bounds must be UTC
-  and the session is pinned to UTC. A replica that wrote no row is invisible to these queries, so also attach
-  the load balancer log excerpt for the window, together with the per-replica upgrade timestamps.
-  Re-run both commands, with the end bound set to the present time, until every replica is confirmed upgraded and
-  no rollback or re-creation from an old image is possible, and attach the final run.
 - A ticket approved by an older replica carries a `reviewed_at` stamped from that replica's own clock. The new
   binaries judge it against database time, so a replica whose clock runs more than 5 minutes ahead of the
   database produces a ticket the new binaries treat as not yet live (a recall over MCP answers
