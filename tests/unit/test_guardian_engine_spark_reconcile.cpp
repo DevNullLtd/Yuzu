@@ -1412,7 +1412,7 @@ TEST_CASE("#5513 live (prefer_spark=false): a catch-up push the KV refuses leave
 
 TEST_CASE("#5513 live (prefer_spark=false): a catch-up whose generation persist fails clears the "
           "flag but reports the HELD generation, never a newer one",
-          "[spark][guardian][reconcile][boot][5513]") {
+          "[spark][guardian][reconcile][boot][5513][5547]") {
     // The flag clears on a clean APPLICATION; advancing the internal generation is a separate step
     // that needs the generation write to succeed. An empty delta push writes no rule, so the only
     // KV write is that generation persist: dropping the table makes exactly it fail. The agent
@@ -1420,6 +1420,12 @@ TEST_CASE("#5513 live (prefer_spark=false): a catch-up whose generation persist 
     // kGen5513 + 1, so the server's reconcile keeps pushing; reporting the pushed value here
     // would be a false acknowledgment. Once the store is back, the same push persists and
     // advances, and a restart reads it from disk.
+    //
+    // #5547: this case used to clear the boot flag with an EMPTY DELTA, which now carries the boot
+    // debt (an unattributed latch is inherited by every replacing application and discharged only
+    // by a clean full_sync). So the flag is cleared first by a clean full_sync at the held
+    // generation, with the KV intact; only then is the table dropped for the empty delta, which has
+    // nothing left to carry. The next case pins that the delta alone cannot clear the debt.
     BootRig5513 r;
     r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
 
@@ -1428,8 +1434,12 @@ TEST_CASE("#5513 live (prefer_spark=false): a catch-up whose generation persist 
     REQUIRE(r.engine->start_local().has_value());
     REQUIRE(r.engine->boot_rearm_unresolved());
 
+    r.push_ok({make_file_rule("r1")}, kGen5513); // a clean full_sync discharges the boot debt
+    REQUIRE_FALSE(r.engine->boot_rearm_unresolved());
+    REQUIRE(r.engine->policy_generation() == kGen5513);
+
     drop_kv_store_table_for_test(r.db_.path);
-    r.push_ok({}, kGen5513 + 1, /*full_sync=*/false);
+    r.push_ok({}, kGen5513 + 1, /*full_sync=*/false); // nothing carried, tail clean, persist fails
     CHECK_FALSE(r.engine->boot_rearm_unresolved());
     CHECK(r.engine->policy_generation() == kGen5513); // held, below the server's current
 
@@ -1442,6 +1452,408 @@ TEST_CASE("#5513 live (prefer_spark=false): a catch-up whose generation persist 
     REQUIRE(r.engine->start_local().has_value());
     CHECK(r.engine->policy_generation() == kGen5513 + 1); // durable
     CHECK_FALSE(r.engine->boot_rearm_unresolved());
+}
+
+TEST_CASE("#5547 live (prefer_spark=false): boot debt is not cleared by an unrelated empty delta, "
+          "only by a clean full_sync",
+          "[spark][guardian][reconcile][boot][5513][5547]") {
+    // AC-13 (flip gate): an unrelated delta must not clear boot_unresolved_. The boot re-arm
+    // failure is recorded against r1 (tagged boot-origin; the application-wide latch is only the
+    // allocation-failure fallback), and the omitting empty delta carries that record, so the
+    // delta's application is not clean and the flag, and the reported generation 0, stay. A
+    // full_sync at the next generation is the authoritative repair (it carries no per-rule
+    // outcome). Mutation: the carry of sync_failed_ids in begin_delta_application deleted (the
+    // delta clears the flag and reports kGen5513 + 1).
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+
+    r.construct(false, false);
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+
+    r.push_ok({}, kGen5513 + 1, /*full_sync=*/false);
+    CHECK(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == 0); // reported, not the persisted kGen5513
+
+    r.push_ok({make_file_rule("r1")}, kGen5513 + 1); // the authoritative full_sync
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == kGen5513 + 1);
+}
+
+TEST_CASE("#5547 live (prefer_spark=false): a delta that names the failed boot rule as DISABLED "
+          "drops its carried boot failure",
+          "[spark][guardian][reconcile][boot][5513][5547]") {
+    // A rule a push names is covered by it whatever its enabled flag: a disabled rule is disarmed,
+    // not armed, and that is clean, so the record the boot failure left against r1 is dropped with
+    // it (the omitting delta in the case above is the one that carries it). Mutation: the named
+    // set narrowed to enabled rules (the boot record stays carried and the flag stays).
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+    r.construct(false, false);
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+    REQUIRE(r.engine->ack_boot_origin_for_test("r1"));
+
+    r.push_ok({make_file_rule("r1", /*enabled=*/false)}, kGen5513 + 1, /*full_sync=*/false);
+    CHECK_FALSE(r.engine->ack_boot_origin_for_test("r1"));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == kGen5513 + 1);
+}
+
+TEST_CASE("#5547 live (prefer_spark=false): a failed full_sync's latch is carried through deltas, "
+          "including one naming a rule, and a clean full_sync recovers",
+          "[spark][guardian][reconcile][5547]") {
+    // The production configuration has no tick-based advance, so every outcome here is decided in
+    // apply_rules(). The latch is a real KV failure: with the table dropped, a full_sync's rule-key
+    // sweep fails (list_entries), an unattributed failure that latches the application. Before
+    // #5547 the next delta opened a fresh application, forgot the latch and acknowledged
+    // kGen5513 + 1. Mutations: begin_delta_application not inheriting the latch; the discharge
+    // deleted.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+    r.construct(false, false);
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE_FALSE(r.engine->boot_rearm_unresolved());
+
+    drop_kv_store_table_for_test(r.db_.path);
+    r.push_ok({}, kGen5513 + 1); // full_sync: the sweep fails, the application latches
+    recreate_kv_store_table_for_test(r.db_.path);
+    CHECK(r.engine->policy_generation() == kGen5513);
+
+    const auto delta = make_file_rule("r1");
+    r.push_ok({delta}, kGen5513 + 1, /*full_sync=*/false);
+    CHECK(r.engine->policy_generation() == kGen5513);
+    r.push_ok({delta}, kGen5513 + 1, /*full_sync=*/false); // identical: a Reapply, still held
+    CHECK(r.engine->policy_generation() == kGen5513);
+    r.push_ok({}, kGen5513 + 1, /*full_sync=*/false);
+    CHECK(r.engine->policy_generation() == kGen5513);
+
+    r.push_ok({make_file_rule("r1")}, kGen5513 + 1); // a clean full_sync recovers
+    CHECK(r.engine->policy_generation() == kGen5513 + 1);
+    r.shutdown();
+    r.construct(false, false);
+    REQUIRE(r.engine->start_local().has_value());
+    CHECK(r.engine->policy_generation() == kGen5513 + 1); // durable
+}
+
+TEST_CASE("#5547 live (prefer_spark=false): a clean full_sync after a latched one at the same "
+          "generation clears the boot flag and acknowledges in that very call",
+          "[spark][guardian][reconcile][boot][5513][5547]") {
+    // Plan F5. The inherited latch must be discharged BEFORE the tail computes `clean`; discharged
+    // after it, the repairing full_sync is judged unclean, leaves the flag set and does not
+    // advance, and at prefer_spark=false nothing else (no tick) would advance until the next
+    // identical re-push. Mutation: the discharge moved below `const bool clean`.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+    r.construct(false, false);
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+
+    drop_kv_store_table_for_test(r.db_.path);
+    r.push_ok({}, kGen5513 + 1); // a latched full_sync
+    recreate_kv_store_table_for_test(r.db_.path);
+    REQUIRE(r.engine->boot_rearm_unresolved());
+    REQUIRE(r.engine->policy_generation() == 0);
+
+    r.push_ok({make_file_rule("r1")}, kGen5513 + 1); // clean, same generation as the latched one
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == kGen5513 + 1);
+}
+
+TEST_CASE("#5547: a push naming a rule id twice is rejected with no state change",
+          "[spark][guardian][reconcile][5547]") {
+    // Duplicate ids are rejected beside the id-validity check, before the ack application is
+    // replaced, before anything is hashed or written. The server cannot emit one (rule_id is the
+    // primary key and pushes are built from the deployed set), so this is defensive against
+    // hand-built pushes. Mutation: the uniqueness check deleted.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+    r.construct(false, false);
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+    const auto rules_before = r.engine->rule_count();
+    const auto failures_before = r.engine->arm_failure_count();
+    const auto holdoff_failures_before = r.engine->boot_catchup_failures_for_test();
+
+    for (const bool full_sync : {true, false}) {
+        const auto dup = r.push({make_file_rule("r1"), make_file_rule("r2"), make_file_rule("r1")},
+                                kGen5513 + 1, full_sync);
+        CHECK(dup.exit_code != 0);
+        CHECK(dup.output.find("more than once") != std::string::npos);
+        CHECK(r.engine->rule_count() == rules_before); // r1 was neither torn down nor re-persisted
+        CHECK(r.engine->policy_generation() == 0);
+        CHECK(r.engine->boot_rearm_unresolved());
+        CHECK(r.engine->arm_failure_count() == failures_before);
+        CHECK(r.engine->boot_catchup_failures_for_test() == holdoff_failures_before);
+        // The rejection precedes the ack application: the ledger still holds the boot record.
+        CHECK(r.engine->ack_boot_origin_for_test("r1"));
+    }
+    // r2 was not persisted by the rejected pushes: a later valid full_sync still applies cleanly.
+    r.push_ok({make_file_rule("r1")}, kGen5513 + 1);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == kGen5513 + 1);
+    CHECK(r.engine->rule_count() == rules_before);
+}
+
+TEST_CASE("#5547 live (prefer_spark=false): a synchronous boot failure keeps its rule identity "
+          "across unrelated deltas, and only a push naming the rule that arms it cleanly clears it",
+          "[spark][guardian][reconcile][boot][5513][5547]") {
+    // AC-13 (flip gate). The boot failure is recorded against r1 (tagged boot-origin), not as an
+    // application-wide latch. Unrelated deltas carry it (the flag, the reported 0 and the #5513
+    // back-off counters all stay), and a delta naming r1 that arms it cleanly drops exactly that
+    // entry: the gap is closed, so the flag clears in that call. Under the previous rule-less
+    // latch the last step could not clear (the latch is inherited by every later application).
+    // Mutations: note_boot_rearm_failure_locked() calling latch_failure() only (the last step
+    // fails); passing boot_origin=false (the tag assertions fail).
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+    r.construct(false, false);
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->ack_boot_origin_for_test("r1"));
+    CHECK_FALSE(r.engine->ack_latched_for_test()); // identity, not the rule-less latch
+
+    for (int i = 0; i < 3; ++i) {
+        r.push_ok({make_file_rule("r2")}, kGen5513, /*full_sync=*/false); // unrelated, omits r1
+        CHECK(r.engine->boot_rearm_unresolved());
+        CHECK(r.engine->policy_generation() == 0);
+        CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+        CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+        CHECK(r.engine->ack_boot_origin_for_test("r1")); // carried
+    }
+
+    r.push_ok({make_file_rule("r1")}, kGen5513, /*full_sync=*/false); // names r1, arms cleanly
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == kGen5513);
+    CHECK_FALSE(r.engine->ack_boot_origin_for_test("r1"));
+}
+
+TEST_CASE("#5547 live (prefer_spark=false): repeated unrelated deltas neither extend nor "
+          "replenish the #5513 holdoff",
+          "[spark][guardian][reconcile][boot][5513][5547]") {
+    // A failed full_sync catch-up earns the back-off (failure 1, holdoff 1). A delta is never the
+    // catch-up (the server re-pushes full_sync=true), and an unrelated delta now carries the
+    // inherited debt so it is always unclean: without the full_sync gate on the whole holdoff
+    // branch a stream of operator deltas would keep raising the counter and the holdoff.
+    // Mutation: the `&& push.full_sync()` gate removed.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+    r.construct(false, false);
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+
+    drop_kv_store_table_for_test(r.db_.path);
+    r.push_ok({}, kGen5513); // full_sync whose KV sweep fails: unclean, counts
+    recreate_kv_store_table_for_test(r.db_.path);
+    REQUIRE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->boot_catchup_failures_for_test() == 1);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 1);
+
+    for (int i = 0; i < 3; ++i) {
+        r.push_ok({make_file_rule("r2")}, kGen5513, /*full_sync=*/false);
+        CHECK(r.engine->boot_rearm_unresolved());
+        CHECK(r.engine->boot_catchup_failures_for_test() == 1);
+        CHECK(r.engine->boot_report_holdoff_for_test() == 1);
+    }
+    CHECK(r.engine->generation_report().reported == kGen5513); // consumes the one holdoff beat
+    for (int i = 0; i < 3; ++i) {
+        r.push_ok({make_file_rule("r2")}, kGen5513, /*full_sync=*/false);
+        CHECK(r.engine->boot_catchup_failures_for_test() == 1);
+        CHECK(r.engine->boot_report_holdoff_for_test() == 0); // not replenished
+    }
+
+    r.push_ok({make_file_rule("r1")}, kGen5513); // the real catch-up (full_sync) clears it
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+}
+
+namespace {
+
+/// Boots r1 (a Spark arm parked in watch()), then pushes a DELTA naming only `other` so the
+/// replacing application no longer names r1. Leaves the boot receipt carried and pending.
+void boot_hang_then_omitting_delta_5547(BootRig5513& r, const gpb::GuaranteedStateRule& named) {
+    using namespace std::chrono_literals;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+    r.construct(true, true);
+    r.wire(); // production order
+    r.mechanism->hang_next_watch();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.mechanism->wait_entered_hang(30s)); // the boot arm is IN watch()
+    REQUIRE(r.engine->ack_pending_count_for_test() == 1);
+    REQUIRE(r.engine->ack_boot_origin_for_test("r1"));
+    REQUIRE_FALSE(r.engine->boot_rearm_unresolved());
+
+    r.push_ok({named}, kGen5513, /*full_sync=*/false);
+}
+
+} // namespace
+
+TEST_CASE("#5547 dormant (prefer_spark=true): a boot arm that fails late AFTER an omitting delta "
+          "still sets the boot flag, through the carried origin",
+          "[spark][guardian][reconcile][boot][5513][5547][dormant]") {
+    // The delta replaced the boot application, so boot_app_open_ is false when the carried
+    // receipt drains as a failure; only the entry's boot-origin tag can set the flag. Mutation:
+    // the tick's set side reverted to `if (boot_app_open_)` (the flag never sets).
+    BootRig5513 r;
+    boot_hang_then_omitting_delta_5547(r, make_file_rule("r2"));
+    CHECK(r.engine->ack_pending_count_for_test() == 1); // carried, not dropped
+    CHECK(r.engine->ack_boot_origin_for_test("r1"));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+
+    r.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.mechanism->release_hang();
+    REQUIRE(r.tick_until([&] { return r.engine->boot_rearm_unresolved(); }));
+    CHECK(r.engine->policy_generation() == 0);
+
+    // A full_sync naming r1 repairs it: the arm commits and the tick clears the flag.
+    r.push_ok({make_service_rule("r1")}, kGen5513);
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+}
+
+TEST_CASE("#5547 dormant (prefer_spark=true): a delta that names a still-pending boot rule keeps "
+          "the boot tag on the same claim, and the flag sets when it then fails",
+          "[spark][guardian][reconcile][boot][5513][5547][dormant]") {
+    // PR-A returns the existing in-flight claim for an identical re-push, so the replacing
+    // application's add_pending() sees the SAME claim the boot application registered and the
+    // ledger keeps the boot tag (boot_claims). Mutation: add_pending() not given the engine's
+    // boot flag AND the boot_claims identity ignored (the tag assertion and the flag fail).
+    BootRig5513 r;
+    boot_hang_then_omitting_delta_5547(r, make_service_rule("r1")); // names r1 (identical)
+    CHECK(r.engine->ack_pending_count_for_test() == 1);
+    CHECK(r.engine->ack_boot_origin_for_test("r1")); // same claim: tag kept
+
+    r.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.mechanism->release_hang();
+    REQUIRE(r.tick_until([&] { return r.engine->boot_rearm_unresolved(); }));
+    CHECK(r.engine->policy_generation() == 0);
+}
+
+TEST_CASE("#5547 dormant (prefer_spark=true): a drain that throws after committing a boot-origin "
+          "failure still publishes it",
+          "[spark][guardian][reconcile][boot][5513][5547][dormant]") {
+    // The drain commits the failure (counters, boot out-flag) and a later step in the same
+    // receipt throws before the erase from `pending`. The next drain finds the receipt already
+    // counted and reports nothing new, so the engine must consume the outputs the throwing drain
+    // had already produced. Mutation: the tick consuming them only on a normal return (the flag
+    // never sets and the failure is never counted).
+    BootRig5513 r;
+    boot_hang_then_omitting_delta_5547(r, make_file_rule("r2"));
+    const auto failures_before = r.engine->arm_failure_count();
+    const auto maint_before = r.engine->ack_maint_exceptions();
+    int calls = 0;
+    int throws = 0;
+    r.engine->set_ack_drain_after_accounting_hook_for_test([&](std::string_view rule_id) {
+        if (rule_id != "r1")
+            return;
+        ++calls;
+        if (throws == 0) {
+            ++throws;
+            throw std::runtime_error("injected drain fault");
+        }
+    });
+
+    r.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.mechanism->release_hang();
+    REQUIRE(r.tick_until([&] { return r.engine->boot_rearm_unresolved(); }));
+    r.tick_n(3); // re-drain: the receipt is already counted and must not be counted again
+    CHECK(r.engine->policy_generation() == 0);
+    CHECK(throws == 1);
+    CHECK(calls >= 2); // the re-drain reached the same receipt again
+    CHECK(r.engine->ack_maint_exceptions() == maint_before + 1);
+    CHECK(r.engine->arm_failure_count() == failures_before + 1);
+    CHECK(r.engine->boot_rearm_unresolved());
+}
+
+namespace {
+
+/// C3 body. An allocation failure after begin_*_application() has published the new ack
+/// application unwinds out of apply_rules() (dispatch() has no try around it). `full_sync`
+/// selects the push shape. The meaningful assertions are that the heartbeat tick, which
+/// acknowledges any application whose pending set is empty and that holds no failure, does NOT
+/// acknowledge the generation of the application the unwind left behind, and that the ledger holds
+/// a latched failure. (An empty unlatched application already returns Reapply from decide_retry, so
+/// a "next identical push is a Reapply" assertion would pass without the guard.)
+void run_unwind_after_publication_5547(bool full_sync) {
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+    r.construct(true, true);
+    r.wire();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.tick_until([&] { return r.engine->spark_armed_rule_count() == 1; }));
+    r.quiesce();
+    REQUIRE(r.engine->policy_generation() == kGen5513);
+    REQUIRE_FALSE(r.engine->ack_latched_for_test());
+
+    r.engine->set_apply_post_drain_hook_for_test([] { throw std::bad_alloc{}; });
+    CHECK_THROWS_AS(r.push({make_service_rule("r1")}, kGen5513 + 1, full_sync), std::bad_alloc);
+    r.engine->set_apply_post_drain_hook_for_test(nullptr);
+
+    CHECK(r.engine->ack_latched_for_test());
+    r.tick_n(5); // a published, empty, unlatched application would be acknowledged here
+    CHECK(r.engine->policy_generation() == kGen5513);
+    CHECK(r.engine->ack_latched_for_test());
+
+    // An authoritative full_sync repairs it and the generation then advances.
+    r.push_ok({make_service_rule("r1")}, kGen5513 + 1);
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513 + 1; }));
+    CHECK_FALSE(r.engine->ack_latched_for_test());
+}
+
+} // namespace
+
+TEST_CASE("#5547 unwind guard: a throw after the ack application is published latches it, so the "
+          "tick never acknowledges the generation (full_sync)",
+          "[spark][guardian][reconcile][5547][unwind]") {
+    // Mutations: the guard's fn never assigned; the guard never armed (committed left true); the
+    // guard disarmed immediately after arming.
+    run_unwind_after_publication_5547(/*full_sync=*/true);
+}
+
+TEST_CASE("#5547 unwind guard: a throw after the ack application is published latches it, so the "
+          "tick never acknowledges the generation (delta)",
+          "[spark][guardian][reconcile][5547][unwind]") {
+    run_unwind_after_publication_5547(/*full_sync=*/false);
+}
+
+TEST_CASE("#5547 unwind guard: a throw between the guard's assignment and the application's "
+          "publication is a clean abort that leaves the open application untouched and the guard "
+          "disarmed",
+          "[spark][guardian][reconcile][5547][unwind]") {
+    // Plan F7. The hook fires after fn is assigned (step 2) and before begin_*_application()
+    // (step 3). The push returns std::unexpected and never escapes dispatch(), and the
+    // application that is still current (clean here) must not be latched: a guard armed at the
+    // fn assignment would fire during this return. Mutation: `committed = false` moved to
+    // immediately after the fn assignment.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+    r.construct(false, false);
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE_FALSE(r.engine->ack_latched_for_test());
+    const auto failures_before = r.engine->arm_failure_count();
+    const auto rules_before = r.engine->rule_count();
+
+    for (const bool full_sync : {true, false}) {
+        r.engine->set_apply_pre_begin_hook_for_test([] { throw std::bad_alloc{}; });
+        const auto reply = r.push({make_file_rule("r1")}, kGen5513 + 1, full_sync);
+        r.engine->set_apply_pre_begin_hook_for_test(nullptr);
+        CHECK(reply.exit_code != 0);
+        CHECK_FALSE(r.engine->ack_latched_for_test());
+        CHECK(r.engine->policy_generation() == kGen5513);
+        CHECK(r.engine->arm_failure_count() == failures_before);
+        CHECK(r.engine->rule_count() == rules_before);
+    }
+
+    // Nothing was published, so the next clean push applies and advances normally.
+    r.push_ok({make_file_rule("r1")}, kGen5513 + 1);
+    CHECK(r.engine->policy_generation() == kGen5513 + 1);
+    CHECK_FALSE(r.engine->ack_latched_for_test());
 }
 
 TEST_CASE("#5513 dormant (prefer_spark=true): a boot arm that drains as a failure reports 0, and "
@@ -1657,7 +2069,7 @@ TEST_CASE("#5513 dormant (prefer_spark=true): a persistently failing rule holds 
     // asynchronously (drained), and BOTH hold, so the case never depends on which. Each iteration
     // drains to quiescence BEFORE re-arming the single-shot (an arm still in flight would consume
     // it, the flake the boot_inert refusal loop in this file documents). Mutation: a clear fired
-    // by begin_application or by a Reapply flips the reported value to kGen5513 mid-loop.
+    // by begin_*_application or by a Reapply flips the reported value to kGen5513 mid-loop.
     using namespace std::chrono_literals;
     BootRig5513 r;
     r.seed(true, true, {make_service_rule("r1")}, kGen5513);
@@ -2101,7 +2513,7 @@ TEST_CASE("#5513 dormant (prefer_spark=true): a rejected push leaves a set flag 
           "application untouched, and the next clean push clears it",
           "[spark][guardian][reconcile][boot][5513][dormant]") {
     // Flag already set by the synchronous boot throw. The #4665 reject returns before
-    // begin_application(), so nothing about the boot state may change. Mutation: clearing the
+    // begin_*_application(), so nothing about the boot state may change. Mutation: clearing the
     // flag (or the boot application's ledger state) on a rejected push.
     BootRig5513 r;
     const std::vector<gpb::GuaranteedStateRule> rules = {make_service_rule("r2", true, "SvcB")};
@@ -2611,14 +3023,13 @@ TEST_CASE("GuardianEngine::arm_stats(): prefer_spark_=true, Available, not stopp
     // was previously proven only at GuardianArmAckLedger::arm_stats()'s own call
     // site, never through GuardianEngine::arm_stats()'s forwarding.
     //
-    // NOT SparkReconcileFixture: that fixture's constructor calls start_local()
-    // (which unconditionally opens a boot-bookkeeping application, guardian_engine.cpp
-    // ~line 503) BEFORE wire_spark_engine() - so by the time the fixture's own
-    // constructor returns, ack_ledger_ already has a live application and this state
-    // is unreachable through it. Uses the file's own documented PRODUCTION wire order
-    // instead (wire_spark_engine() before start_local() - see "a production-order
-    // restart..." above) and stops BEFORE calling start_local(), so ack_ledger_ has
-    // never had begin_application() called on it at all.
+    // NOT SparkReconcileFixture: that fixture's constructor calls start_local() (which
+    // unconditionally opens a boot-bookkeeping application, in GuardianEngine::start_local()'s
+    // begin_full_application() call) BEFORE wire_spark_engine() - so by the time the fixture's own
+    // constructor returns, ack_ledger_ already has a live application and this state is unreachable
+    // through it. Uses the file's own documented PRODUCTION wire order instead (wire_spark_engine()
+    // before start_local() - see "a production-order restart..." above) and stops BEFORE calling
+    // start_local(), so ack_ledger_ has never had begin_*_application() called on it at all.
     auto opened = KvStore::open(unique_kv_path());
     REQUIRE(opened.has_value());
     KvStore kv{std::move(*opened)};
