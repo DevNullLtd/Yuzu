@@ -2227,8 +2227,7 @@ groups:
 
       # #4990: stored-response reads withhold Forensics-tier rows from a caller without
       # Forensics:Read. When the caller's authority itself cannot be determined (the
-      # authorization read answered unavailable, the scoped-visibility lookup failed, or a
-      # dependency was never wired) the read is refused with a retryable 503 or shows a notice;
+      # authorization read answered unavailable, or a dependency was never wired) the read is refused with a retryable 503 or shows a notice;
       # it is not served as a 200 with the Forensics rows silently missing. The one disclosed
       # exception is a degrade of ONLY the global permission read for a caller other than an
       # engine principal, which classifies as a definitive refusal; YuzuRbacReadDegraded is its signal. A definitive
@@ -2257,8 +2256,7 @@ groups:
             REST and legacy routes, a JSON-RPC internal error carrying retry_after_ms on MCP)
             or show a notice (dashboard); no Forensics row is served and no partial result is
             returned. rbac_unavailable: the authorization store answered
-            unavailable. scope_read_failed: the management-group scoped-visibility lookup
-            failed. unwired: a dependency of the resolver was never wired, which a running
+            unavailable. unwired: a dependency of the resolver was never wired, which a running
             server should not show. Usually PostgreSQL pool saturation or a store outage:
             correlate with yuzu_server_rbac_read_degrade_total, the pool metrics and the
             server log line "Forensics-tier visibility could not be resolved".
