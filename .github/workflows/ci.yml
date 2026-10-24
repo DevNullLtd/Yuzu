@@ -1187,8 +1187,9 @@ jobs:
         # added shard D, carved from B's [body_cap] tests — + the mcp bridge
         # teardown budget test + the pg shard partition invariant, #3443
         # Phase 1 — needs no Postgres DSN,
-        # --list-tests only enumerates TEST_CASE macros). Both now pass
-        # --num-processes 2 (2026-09-18, extends #3443). The old reasoning
+        # --list-tests only enumerates TEST_CASE macros). Both then passed
+        # --num-processes 2 (2026-09-18, extends #3443; the first invocation is
+        # now 4, see 'Width history' below). The old reasoning
         # here ("UNCAPPED since neither touches Postgres") conflated
         # Postgres contention with the WITHIN-job meson fan-out #3443 already
         # proved on the pg shards below: uncapped `meson test` spawns every
@@ -1223,16 +1224,19 @@ jobs:
         # above; do not read it as a fix for the classifier cascade.
         #
         # Width history (the Linux push ladder in docs/ci-architecture.md): the
-        # FIRST invocation below (cheap suites) runs
-        # --num-processes 4; the second (server shards) stays at 2. The cap of 2
-        # was set against an UNCAPPED meson pool sized from cpu_count() on a job
-        # confined to 16 logical CPUs; 4 workers is 4 CPUs each, not the
-        # oversubscription that cap fixed. Baseline at 2 (12 recent dev runs, one
-        # PR run's per-entry times): this invocation ~340 s wall for 610
-        # serial-s (agent 239, gateway 158 of which eunit alone is 122, docs 116,
-        # platform 96), i.e. both workers busy; the whole non-pg step 6.6-7.0
-        # min. One axis only: the second invocation, the pg step and Windows are
-        # unchanged. Revert is this one number.
+        # FIRST invocation below (cheap suites) runs --num-processes 4; the second
+        # (server shards) stays at 2. The cap of 2 was set against an UNCAPPED
+        # meson pool sized from cpu_count() on a job confined to 16 logical CPUs;
+        # 4 workers is not that oversubscription, but the timing-assertion flakes
+        # that cap was meant to stop were never isolated, so watch for them.
+        # Baseline at 2 (single-source: PR #6425's run, head a264c1e59): this
+        # invocation took ~340 s wall for 610 serial-s (agent 239, gateway 158 of
+        # which eunit alone is 122, docs 116, platform 96); the whole non-pg step
+        # ran 6.6-7.0 min over 12 recent dev runs. One axis only: the second
+        # invocation, the pg step and Windows are unchanged. The decision rule,
+        # the measurement sources and the revert triggers are in the docs
+        # paragraph "Push 2a". Revert is this one number.
+        #
         # Cross-job with-test-slot.sh gating is deliberately NOT added here
         # yet: this step's aggregate duration is
         # still short, so the within-job cap is the single-axis fix shipped

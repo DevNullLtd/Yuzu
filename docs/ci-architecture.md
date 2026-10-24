@@ -1746,7 +1746,7 @@ once the actual mechanism is understood.
 
 ### Staged widening — Linux (2026-10-21)
 
-Linux has run `--num-processes 2` on every test invocation since #3443. The
+Until Push 2a (below), Linux ran `--num-processes 2` on every test invocation since #3443. The
 2026-10-20 baseline at that width: the 14 pg shards were 1,778 serial-s over
 907 s wall (sum/wall 1.96, so both workers were busy throughout); the non-pg
 step was 678 serial-s over 5.4 min; the worst shard, M, took 244 s, 35% of its
@@ -1763,7 +1763,8 @@ axis ("never bundled with a topology change"):
 | Push | Change | Axis | Run (id/attempt) | Samples (s) | Median pg step (s) | Median non-pg step (s) | Worst shard (s, % of timeout) | Verdict |
 |---|---|---|---|---|---|---|---|---|
 | 1 | Preflight split, `platform` suite + Linux-only `docs`, `max-parallel` 4, duration summary, PGDATA/RAM probe (np stays 2) | topology | | | | | | |
-| 2 | Linux np 2 → 4 on the three invocations; Windows pg 6 → 8, non-pg 4 → 6 | width | | | | | | |
+| 2a | Linux np 2 → 4 on the cheap-suites invocation only (see Push 2a below) | width | | | | | | |
+| 2 | Linux np 2 → 4 on the remaining two invocations (server shards, pg); Windows pg 6 → 8, non-pg 4 → 6 | width | | | | | | |
 | 3 | tmpfs PGDATA, cap from the push-1 probe (see "Postgres for server tests") | storage | | | | | | |
 | 4 | Linux np 4 → 6, then stop | width | | | | | | |
 
@@ -1771,23 +1772,61 @@ Push 1 is the comparison baseline for the rest: its two samples are the new
 non-pg baselines (the docs suite left the Windows and macOS legs) and its probe
 output fills the line below.
 
-**Push 2a (Linux cheap-suites invocation only, `--num-processes 2 → 4`).** The
-second `Test (non-pg suites)` invocation (server shards) and the pg step stay at
-2, so the delta is attributable to this one invocation. Baseline at np=2, from
-the 12 successful `gcc-15`/`debug` runs on `dev` between 2026-10-22 and
-2026-10-24: the `Test (non-pg suites)` step median is 6.7 min (range 6.6 to
-7.0, so the step is stable enough that two samples show a 10% change). In one of
-those runs the cheap-suites invocation took about 340 s of wall time for 610
-serial-s (agent 239 s, gateway 158 s of which the eunit entry alone is 122 s,
-docs 116 s, platform 96 s), so both workers were busy; the lower bound at np=4
-is the 122 s eunit entry plus the rest spread four ways, about 153 s. Decision
-rule: the one stated under "Windows test-phase concurrency gate" above, applied
-to the non-pg step median (≥10% improvement, no entry past 1.5x its np=2 time,
-none near its timeout). Samples: pending (the first run of the PR plus a re-run
-of the same SHA).
-
 Probe (push 1, `Postgres container footprint (tmpfs sizing probe)` step):
 host RAM: pending (filled by the tmpfs commit from the probe step log); post-run PGDATA per container (residual on-disk size after the pg step, not peak): pending.
+
+**Push 2a (Linux cheap-suites invocation only, `--num-processes 2 → 4`).** The
+second `Test (non-pg suites)` invocation (server shards) and the pg step stay at
+2, so the delta is attributable to this one invocation.
+
+*Baseline at np=2.* Step median over the 12 successful `gcc-15`/`debug` push
+runs on `dev` between 2026-10-22 and 2026-10-24: `Test (non-pg suites)` 6.7 min
+(range 6.6 to 7.0). Per-entry times come from one run only (the PR #6425 run,
+head `a264c1e59`): the cheap-suites invocation took about 340 s of wall time
+for 610 serial-s (agent 239 s, gateway 158 s of which `gateway eunit` alone is
+122 s, docs 116 s, platform 96 s). All of these figures are single-source
+measurements, and "both workers busy" is inferred from sum/wall. The older
+678 serial-s figure above is for the same step before Push 1 added the docs and
+platform suites.
+
+*Expectation (an estimate, not a measurement).* 610 serial-s over four workers
+is about 153 s, and `gateway eunit` (122 s) is the floor for any single worker.
+Meson starts entries in definition order (these suites set no `priority:`), and
+`gateway eunit` and `gateway ct` are defined last, so the wall time is closer to
+the other entries draining plus 122 s. Expect roughly 100 to 170 s saved on the
+invocation, and less on the job, where the pg step dominates.
+
+*How to measure.* The cheap-suites per-entry times are in the step summaries
+only ("Test durations - Linux non-pg (cheap suites)" and "Suite durations vs
+meson budgets", plus the `Test (non-pg suites)` step duration from the jobs
+API). The runner telemetry database does not carry them: the junit import runs
+once at job end and reads the last invocation's file. Take the np=2 comparison
+from recent `gcc-15`/`debug` PR runs, not push runs: a push runs the whole
+four-leg matrix and saturates the box, a PR run does not, and comparing a quiet
+np=4 run against busy np=2 runs would flatter 4. Two same-SHA samples (the first
+run plus a re-run of the same SHA).
+
+*Decision rule.* The one under "Windows test-phase concurrency gate" above,
+applied to this step: (a) the `Test (non-pg suites)` median improves by 10% or
+more (about 40 s); (b) no entry takes more than 1.5x its np=2 time; (c) no entry
+reaches 80% of its own meson timeout (the entries differ: agent shards 240 s,
+tar 90 s, `gateway eunit` and `gateway ct` 600 s, 30 to 180 s for docs, platform
+and proto); and entry count and skip count are unchanged. Revert at once on any
+of: a spark or guardian case failing (a `spin_until` that never resolves, an
+`ArmOutcomeKind`/`ReceiptStatus` mismatch), even if later retried green; the
+`blocked log sink SIGTERM harness` failing (it asserts a fixed 8 s exit after
+SIGTERM and is not scaled for load); a `gateway eunit` or `gateway ct` failure;
+any red cheap-suites invocation. Before the next rung, add a flake-rate check:
+two green samples cannot tell a 10% flake rate from none, so require 10 or more
+push runs on the leg with no non-timing red.
+
+*Capacity.* Each Big Tam runner is confined to 16 logical CPUs (systemd
+`AllowedCPUs`), so four workers get about four CPUs each, but a Catch2 shard and
+the BEAM are multi-threaded, so load follows threads, not entries. With four
+runner agents, Linux can now have 16 concurrent entries box-wide (up from 8).
+The Linux non-pg step has no `with-test-slot.sh` gate, whereas the Windows
+non-pg step runs the same cheap set at 4 behind a slot of 2. No per-runner
+memory limit is documented, and host RAM is not stated here. Samples: pending.
 
 Worst-case ceiling by width (14 pg shards, one shared 700 s timeout, every
 shard at its cap; the degenerate figure, not an expected case): np=2 is 7
