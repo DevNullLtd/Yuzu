@@ -175,7 +175,7 @@ BM_PR=<n>
 #
 # Set BASE once; the single `switch` below reads it. Never write two switch lines.
 BASE=origin/dev        # (a) promotion
-# BASE=origin/main     # (b) patch — uncomment this line and comment out (a)
+# BASE=origin/main     # (b) patch — uncomment this line and comment out the origin/dev line above
 git fetch origin
 git switch -c release/vX.Y.Z-prep "$BASE" \
   || { echo "STOP: could not create release/vX.Y.Z-prep from $BASE"; return 1 2>/dev/null || exit 1; }
@@ -225,8 +225,11 @@ git fetch origin && git switch main && git merge --ff-only origin/main
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" \
   || { echo "STOP: local main != origin/main - do not tag; report to the operator"; return 1 2>/dev/null || exit 1; }
 # The promotion PR's Preflight #9 record must be complete (Phase 0.5 step 3). PROMO_PR = its number.
+# Fail CLOSED: an unreadable body (wrong number, gh error, literal <n>) is a STOP, not a pass.
 PROMO_PR=<n>
-gh pr view "$PROMO_PR" --json body -q .body | grep -qE 'NOT YET RUN|<paste|<name>' \
+BODY=$(gh pr view "$PROMO_PR" --json body -q .body) && test -n "$BODY" \
+  || { echo "STOP: cannot read promotion PR $PROMO_PR body - do not tag"; return 1 2>/dev/null || exit 1; }
+printf '%s' "$BODY" | grep -qE 'NOT YET RUN|<paste|<name>|<sha>|ahead <n>|<k>|<m>' \
   && { echo "STOP: promotion PR $PROMO_PR still carries an unfilled Preflight #9 record"; return 1 2>/dev/null || exit 1; }
 git tag -a vX.Y.Z -m "Release vX.Y.Z"
 git push origin vX.Y.Z
