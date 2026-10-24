@@ -17,6 +17,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
+#include "secure_random.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -1672,19 +1673,19 @@ TEST_CASE("CertificateInventoryStore: every agent gets a server-assigned random 
     CERT_SHARED(store, pool);
     // Agent ids in ascending order: the keys must not follow it.
     std::vector<std::string> agents;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 16; ++i)
         agents.push_back("agent-" + std::to_string(i));
     for (const auto& a : agents)
         ingest(store, a, full_report(blob(store_rec("S", "ok", "", "2"), {cert(1, {{"S", ""}}), cert(2, {{"S", ""}})})));
 
     CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.agent_state WHERE sample_key IS NULL") == "0");
-    CHECK(scalar(pool, "SELECT count(DISTINCT sample_key) FROM certificate_inventory_store.agent_state") == "8");
+    CHECK(scalar(pool, "SELECT count(DISTINCT sample_key) FROM certificate_inventory_store.agent_state") == "16");
     // Every fact row carries its own agent's key.
     CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.cert_fact f JOIN "
                        "certificate_inventory_store.agent_state a USING (agent_id) "
                        "WHERE f.sample_key IS DISTINCT FROM a.sample_key") == "0");
-    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.cert_fact") == "16");
-    // Not monotone in agent_id (8 random keys ascending by chance is 1 in 40320).
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.cert_fact") == "32");
+    // Not monotone in agent_id (16 random keys ascending by chance is 1 in 16!).
     CHECK(scalar(pool, "SELECT (array_agg(sample_key ORDER BY agent_id) = "
                        "array_agg(sample_key ORDER BY sample_key))::text FROM "
                        "certificate_inventory_store.agent_state") == "false");
@@ -1699,7 +1700,28 @@ TEST_CASE("CertificateInventoryStore: every agent gets a server-assigned random 
     CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.cert_fact f JOIN "
                        "certificate_inventory_store.agent_state a USING (agent_id) "
                        "WHERE f.sample_key IS DISTINCT FROM a.sample_key") == "0");
-    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.cert_fact") == "8");
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.cert_fact") == "16");
+
+    // A hash-skip report leaves every key unchanged.
+    const auto b = blob(store_rec("S", "ok", "", "1"), {cert(3, {{"S", ""}})});
+    for (const auto& a : agents)
+        ingest(store, a, hash_only(raw_hash(b)));
+    CHECK(scalar(pool, "SELECT string_agg(sample_key::text, ',' ORDER BY agent_id) FROM "
+                       "certificate_inventory_store.agent_state") == before);
+}
+
+TEST_CASE("CertificateInventoryStore: a CSPRNG failure fails the first ingest and stores nothing",
+          "[certinv][pg][samplekey]") {
+    CERT_SHARED(store, pool);
+    const auto rpt = full_report(blob(store_rec("S", "ok", "", "1"), {cert(1, {{"S", ""}})}));
+    test_hooks::force_next_failure_for_this_thread();
+    const auto ack = ingest(store, "agent-e", rpt);
+    CHECK(nacked(ack));
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.agent_state") == "0");
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.cert_fact") == "0");
+    // The retry (entropy back) stores it with a key.
+    CHECK_FALSE(nacked(ingest(store, "agent-e", rpt)));
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.agent_state WHERE sample_key IS NOT NULL") == "1");
 }
 
 TEST_CASE("CertificateInventoryStore: sample_key is NOT NULL on both tables and indexed for the sample",

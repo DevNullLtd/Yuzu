@@ -523,7 +523,7 @@ unclamped.
 | `cert_cdp` | (`agent_id`, `sha256`, `ord`) | `uri` |
 
 **Indexes:** `cert_fact (not_after)`, `(not_before)`, `(issuer_name_sha256, serial)`,
-`(sig_alg_oid, pss_hash_oid)`, `(key_alg_oid, rsa_modulus_bits)`, `(ec_order_bits)`, `(sha256)`,
+`(sig_alg_oid, pss_hash_oid)`, `(key_alg_oid, rsa_modulus_bits)`, `(ec_order_bits)`,
 `(spki_sha256)`, `(aki_key_id)`, `(sha256, sample_key, agent_id)` (the CBOM agreement sample order) (see [Finding one CA's certificates](#finding-one-cas-certificates));
 `store_state (status, observed_at)` for the prune; every table has `agent_id` leading its key, for
 decommission and confinement.
