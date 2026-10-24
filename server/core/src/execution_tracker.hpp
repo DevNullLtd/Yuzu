@@ -33,6 +33,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "response_provenance.hpp" // CommandRecord
+
 namespace yuzu::server::pg {
 class PgPool;
 } // namespace yuzu::server::pg
@@ -558,51 +560,46 @@ public:
     // response) — exactly the cross-instance correlation hazard ADR-2002
     // section 5 names `cmd_execution_ids_` as a required PG migration to close.
 
-    /// Records (or clears) a command_id -> execution_id mapping. Last-write-
-    /// wins on a repeated command_id, matching the former map's `operator[]=`
-    /// semantics. An empty `execution_id` deletes any existing mapping (the
-    /// former map's explicit-clear branch; no current caller exercises it).
-    /// Best-effort by design: a write failure degrades OBSERVABILITY for
-    /// this one command — the executions drawer misses its agent-transition
-    /// events — it never FAILS the dispatch that is calling this
-    /// (record_execution_id / server.cpp's command_dispatch_fn calls this
-    /// BEFORE the RPC, UP2-4; the return value is best-effort telemetry for
-    /// the caller to count, not a signal to act on).
+    /// Records the SERVER-AUTHORED dispatch record of one command id: the plugin the server
+    /// dispatched it as, and the execution id the responses should be stamped with (empty when the
+    /// dispatch is not a tracked execution). Written once per dispatch at the single chokepoint
+    /// `ServerImpl::build_classified_command`, BEFORE any frame is sent (closes the fast-agent race
+    /// where a sub-millisecond loopback agent replies before a post-dispatch registration). Both
+    /// ingest paths resolve it through `lookup_command_record`; a response whose command id has no
+    /// record is labelled `kUnverifiedProvenanceLabel` (response_provenance.hpp), never trusted
+    /// from the id the agent echoes.
     ///
-    /// It DOES have a bounded worst-case DELAY: a single attempt at
-    /// `kWriteTimeout` (no retry — deliberately NOT `update_agent_status`'s
-    /// retry-once shape, because that call sits on the async gateway-
-    /// response path while this one sits on the SYNCHRONOUS pre-RPC dispatch
-    /// path; a second attempt here would double the worst-case block on the
-    /// calling worker thread — REST/dashboard/MCP dispatch, or a background
-    /// runner such as ScheduleRunner/PreflightRunner/PolicyEvaluator,
-    /// anything feeding the shared CommandDispatchFn closure — under
-    /// sustained pool contention). Returns false on failure so the caller can count a
-    /// degrade metric; a caller MUST NOT fail or delay dispatch on a false
-    /// return (governance Gate 4 unhappy-path UP-1/UP-11, Gate 3 performance
-    /// review — the prior wording here claimed zero delay, which was false).
-    [[nodiscard]] bool record_command_execution(const std::string& command_id,
-                                                const std::string& execution_id);
+    /// ONE upsert, never a DELETE. Semantics on a repeated `command_id` (an outbox re-drive reuses
+    /// the id of the same occurrence; a fan-out shares one id): the PLUGIN IS IMMUTABLE once
+    /// recorded (first writer wins: a later write can never relabel responses already in flight),
+    /// a non-empty `execution_id` replaces the stored one, an empty `execution_id` KEEPS the stored
+    /// one (so a re-drive that does not carry it cannot erase the correlation), and `created_at`
+    /// is refreshed so a re-driven command is not reaped under a live dispatch.
+    ///
+    /// Best-effort by design: a write failure never FAILS the dispatch that is calling this. The
+    /// cost of a failed write is that this command's responses are labelled unverified (stored
+    /// and treated as Forensics-tier, withheld from a reader without the Forensics grant) and are
+    /// not stamped with an execution id; the caller counts it
+    /// (`yuzu_exec_correlation_write_degrade_total`). It DOES have a bounded worst-case DELAY: a
+    /// single attempt at `kWriteTimeout` (no retry; this sits on the SYNCHRONOUS pre-RPC dispatch
+    /// path, where a second attempt would double the worst-case block on the calling worker thread
+    /// under sustained pool contention). Returns false on failure; a caller MUST NOT fail or
+    /// delay dispatch on a false return.
+    ///
+    /// `plugin` must be non-empty (an empty plugin is refused with false): a record without a
+    /// plugin is not a provenance record.
+    [[nodiscard]] bool record_command_dispatch(const std::string& command_id,
+                                               const std::string& plugin,
+                                               const std::string& execution_id);
 
-    /// Resolves a previously-recorded mapping. Returns nullopt for an unknown
-    /// command_id (out-of-band dispatch, a reaped/aged-out mapping, or a
-    /// degraded read) — callers treat nullopt exactly like the former map's
-    /// find()==end() branch: nothing to publish, not an error.
-    /// NON-DESTRUCTIVE: a lookup never deletes the row. HF-1 (multi-agent
-    /// fan-out): one command_id is dispatched to N agents, each sending its
-    /// own response against the same command_id — deleting on the first
-    /// response would strand agents 2..N with no execution_id to stamp.
-    /// `degrade_reason`, when non-null, is set to "pool_exhausted" or
-    /// "query_failed" iff the nullopt return is a STORE DEGRADE rather than
-    /// a genuine miss (adversarial review Should-fix, PR #3780: previously
-    /// indistinguishable from an ordinary out-of-band-dispatch/aged-out
-    /// miss, which is the common case on every CommandResponse — a
-    /// sustained pool-exhaustion degrade on this hot path had no signal
-    /// pointing at it specifically). Left untouched on success or a
-    /// genuine miss; callers should only inspect it when the return is
-    /// nullopt.
-    [[nodiscard]] std::optional<std::string>
-    lookup_execution_id(const std::string& command_id, std::string* degrade_reason = nullptr) const;
+    /// Resolves a previously recorded dispatch. Returns nullopt for an unknown command id (a
+    /// forged or never-issued id, a failed record write, a reaped record) AND for a degraded read;
+    /// `degrade_reason`, when non-null, is set to "pool_exhausted" or "query_failed" iff the
+    /// nullopt is a STORE DEGRADE rather than a genuine miss, and is left untouched otherwise.
+    /// NON-DESTRUCTIVE: a lookup never deletes the row. HF-1 (multi-agent fan-out): one command_id
+    /// is dispatched to N agents, each sending its own response against the same command_id.
+    [[nodiscard]] std::optional<CommandRecord>
+    lookup_command_record(const std::string& command_id, std::string* degrade_reason = nullptr) const;
 
     /// Clock-guarded retention sweep for the `command_execution` table
     /// (routed concern "Clock-guarded retention", CLAUDE.md). Mirrors
@@ -731,7 +728,7 @@ public:
     /// Fallback for `release_concurrency_claim` keyed on `command_id` alone
     /// (UP-1, unhappy-path Gate 4 finding, PR #3784 fix round), called by
     /// `notify_exec_tracker` whenever it cannot resolve `execution_id` via
-    /// `resolve_execution_id`/`lookup_execution_id` (the PG-backed
+    /// `resolve_response_provenance`/`lookup_command_record` (the PG-backed
     /// `command_execution` correlation table, HA WS-1(1b) above — this
     /// fallback predates that migration and originally covered a server
     /// restart losing the then-in-process `cmd_execution_ids_` map; that
@@ -739,11 +736,11 @@ public:
     /// fallback's help). What's still genuinely unreached by the normal
     /// path: (1) every workflow-step dispatch (`workflow_routes.cpp`),
     /// whose `execution_id` is always empty (CONSIST-2/sec-M2) and which
-    /// `record_execution_id` therefore never records a mapping for at all
+    /// `record_command_dispatch` therefore records an empty execution id for
     /// — this is the ONLY release path workflow-step per-device claims
     /// ever reach; (2) a genuine degrade on the correlation table's
-    /// own write or read side (`record_command_execution`/
-    /// `lookup_execution_id` returning false/nullopt under pool exhaustion
+    /// own write or read side (`record_command_dispatch`/
+    /// `lookup_command_record` returning false/nullopt under pool exhaustion
     /// or a query failure), which this fallback also transparently covers
     /// as a side effect of matching on `command_id` alone rather than
     /// needing the table to have succeeded; and (3) the correlation

@@ -3472,19 +3472,20 @@ public:
         for (const char* outcome : {"ok", "ok_capped", "recovered", "declined", "skipped", "error"})
             metrics_.counter("yuzu_server_gateway_route_reap_total", {{"outcome", outcome}});
         // Distinct from the reap-only counter above: this fires on the
-        // WRITE path (AgentServiceImpl::record_execution_id, dispatch-time),
+        // WRITE path (AgentServiceImpl::record_command_dispatch, dispatch-time),
         // not the retention sweep. Governance Gate 4/6 finding: previously
         // log-only, no counter, so a sustained write-side degrade (unlike a
         // reap failure) was invisible to Prometheus.
         metrics_.describe("yuzu_exec_correlation_write_degrade_total",
-                          "Command-dispatch-time command_id -> execution_id correlation writes "
-                          "that failed (pool exhausted or query error) - the executions drawer "
-                          "misses these commands' agent-transition events; dispatch itself is "
+                          "Command-dispatch-time command_id -> (plugin, execution_id) record "
+                          "writes that failed (pool exhausted or query error) - these commands' "
+                          "responses are stored as unverified (Forensics-tier) and the executions "
+                          "drawer misses their agent-transition events; dispatch itself is "
                           "unaffected",
                           "counter");
         metrics_.counter("yuzu_exec_correlation_write_degrade_total");
         // Distinct from both counters above: this fires on the READ path
-        // (AgentServiceImpl::resolve_execution_id, hit on every
+        // (AgentServiceImpl::resolve_response_provenance, hit on every
         // CommandResponse) — adversarial review Should-fix, PR #3780: a
         // degraded lookup was previously indistinguishable from the common
         // "out-of-band dispatch" nullopt case, so a sustained pool/query
@@ -3497,6 +3498,20 @@ public:
                           "counter");
         for (auto reason : {"pool_exhausted", "query_failed"})
             metrics_.counter("yuzu_exec_correlation_read_degrade_total", {{"reason", reason}});
+        // #4990 (UP-7): every response frame's provenance outcome, decided once per frame by
+        // AgentServiceImpl::resolve_response_provenance. Closed label set, seeded so absent()
+        // means "no frame yet", not "nobody looked". `unrecorded` and `lookup_degraded` frames are
+        // stored and treated as unverified (Forensics-tier): a sustained rate means failed
+        // dispatch-record writes, a record reaped under a long-running command, or an endpoint
+        // echoing ids the server never issued.
+        metrics_.describe("yuzu_server_response_provenance_total",
+                          "Command response frames by provenance outcome (verified: the server's "
+                          "dispatch record was found; unrecorded: no record, so the response is "
+                          "stored and treated as unverified/Forensics-tier; lookup_degraded: the "
+                          "record read failed twice, same treatment)",
+                          "counter");
+        for (auto outcome : {"verified", "unrecorded", "lookup_degraded"})
+            metrics_.counter("yuzu_server_response_provenance_total", {{"outcome", outcome}});
         // #4982: ExecutionTracker::set_agents_targeted / ::mark_cancelled were
         // log-only on failure at every REST/MCP call site — a sustained
         // pool/query degrade on either had no Prometheus signal, only an
@@ -13015,6 +13030,26 @@ private:
             return std::unexpected(finalized.error());
         }
 
+        // #4990 (UP-7): the SERVER's record of this dispatch, written once, here, at the one
+        // chokepoint every operator, background and system dispatch passes through (REST
+        // /api/command, dispatch_confined, the scheduler/outbox/workflow/policy/preflight/
+        // deployment/bundle/quarantine/TAR/DEX callers, the viz fetcher, the __guard__ push, the
+        // asset-tag and __sync__ pushes, the legacy forwarder), AFTER classification,
+        // authorization and the kill switch (a denied dispatch records nothing and sends
+        // nothing) and BEFORE any frame is sent (a sub-millisecond loopback agent can reply
+        // before any later registration). Both ingest paths label a response with the RECORDED
+        // plugin and stamp the recorded execution id; a response whose command id has no record
+        // (a forged or never-issued id, a failed write, a reaped record) is stored and treated as
+        // unverified, i.e. Forensics-tier (response_provenance.hpp). The plugin is the wire
+        // plugin the agent will be sent (the catalogue's canonical spelling), not the caller's raw
+        // string. One upsert, at most one `kWriteTimeout` of added latency, never refuses or
+        // delays the dispatch beyond that bound (a failure is counted:
+        // yuzu_exec_correlation_write_degrade_total). Honest limit: the record proves the server
+        // issued this command id for this plugin; an endpoint it was sent to can still replay
+        // that id on a frame of its own, and the content of a frame is not validated.
+        agent_service_.record_command_dispatch(command_id, finalized->wire().plugin(),
+                                               execution_id);
+
         return *finalized;
     }
 
@@ -13329,10 +13364,8 @@ private:
             return yuzu::server::ConfinedDispatchOutcome{.command_id = command_id};
 
         agent_service_.record_send_time(command_id);
-        // PR 2 / UP2-4: register command_id -> execution_id BEFORE any RPC.
-        if (!execution_id.empty()) {
-            agent_service_.record_execution_id(command_id, execution_id);
-        }
+        // PR 2 / UP2-4: command_id -> (plugin, execution_id) was recorded BEFORE any RPC, inside
+        // build_classified_command above (#4990).
 
         if (arm == DispatchArm::None && !broadcast_on_none) {
             // Shared closure: NO TARGET NAMED AT ALL — reach NOBODY, not
@@ -22083,7 +22116,7 @@ private:
                 // #1088 — execution_id parameter added so the MCP tool's
                 // pre-created execution row is bridged into the
                 // command_id -> execution_id correlation (HA WS-1(1b):
-                // ExecutionTracker::record_command_execution) BEFORE any
+                // ExecutionTracker::record_command_dispatch) BEFORE any
                 // RPC fires (UP2-4 race close from PR 2). Empty
                 // execution_id is the legacy untracked path.
                 [this](const std::string& plugin, const std::string& action,

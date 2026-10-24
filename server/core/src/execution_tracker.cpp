@@ -180,9 +180,9 @@ const char* kSelectErrorDetailExpr =
 const char* kSelectErrorDetailEmpty = ", '' AS last_error_detail";
 
 // #4990: the executions, among `ids`, that ran at least one command of a Forensics-tier plugin.
-// The plugin is the command-id prefix recorded in `command_execution` (the same first-`-` split
-// the ingest stores in `responses.plugin`), folded to ASCII lowercase in SQL with COLLATE "C" so it
-// agrees with `ForensicsPluginSet`. A failed read returns nullopt; the caller then treats EVERY
+// The plugin is the one the server RECORDED at dispatch in `command_execution.plugin` (the same
+// value the ingest stores in `responses.plugin`), folded to ASCII lowercase in SQL with COLLATE "C"
+// so it agrees with `ForensicsPluginSet`. A failed read returns nullopt; the caller then treats EVERY
 // candidate as Forensics (the safe reading: a bounded token or the placeholder is shown instead of
 // free text). `command_execution` has no `execution_id` index (a plain CREATE INDEX on an existing
 // table is barred by the store playbook), so this is a scan of at most 24h of mappings; it runs
@@ -196,7 +196,7 @@ forensics_executions_among(PGconn* conn, const ForensicsPluginSet& set,
         conn,
         "SELECT DISTINCT execution_id FROM execution_tracker.command_execution "
         "WHERE execution_id = ANY($1::text[]) "
-        "AND lower(split_part(command_id, '-', 1) COLLATE \"C\") = ANY($2::text[])",
+        "AND lower(plugin COLLATE \"C\") = ANY($2::text[])",
         std::vector<std::string>{pg::to_text_array(idv), pg::to_text_array(names)});
     if (res.status() != PGRES_TUPLES_OK)
         return std::nullopt;
@@ -388,7 +388,7 @@ const std::vector<pg::PgMigration>& migrations() {
          // (notify_exec_tracker's `execution_id.empty()` early-return).
          // `cmd_execution_ids_` no longer exists: it was replaced by a
          // PG-backed, replica-safe correlation table
-         // (`ExecutionTracker::record_command_execution`/`lookup_execution_id`,
+         // (`ExecutionTracker::record_command_dispatch`/`lookup_command_record`,
          // HA WS-1(1b)), which now handles that restart case on its own.
          // `command_id` still rides on every CommandResponse (including
          // `__keepalive__`) independent of any server-side cache, and is
@@ -528,6 +528,19 @@ const std::vector<pg::PgMigration>& migrations() {
         // increasing, not contiguous, so the next migration added here
         // simply takes whatever the next free version number is at that
         // time.
+        //
+        // #4990 (UP-7), server-authored response provenance: `command_execution` becomes the
+        // server's record of every dispatch, not only the tracked ones. `plugin` is the plugin
+        // the server dispatched the command as (written at the dispatch chokepoint); a response
+        // whose command id has no row is labelled unverified at ingest. A constant default makes
+        // the ADD COLUMN metadata-only (no rewrite); the table was created in v2 and a fresh
+        // database runs v2 and v6 back to back. `execution_id` stays NOT NULL: an untracked
+        // dispatch (e.g. `/api/command`) now records the empty string, which readers treat as "no
+        // execution". No index is added (store playbook: a plain CREATE INDEX on an existing
+        // table is barred); the one reader by `plugin`, `forensics_executions_among`, already
+        // scans a bounded window.
+        {6,
+         "ALTER TABLE command_execution ADD COLUMN plugin TEXT NOT NULL DEFAULT '';"},
     };
     return kMigrations;
 }
@@ -550,7 +563,7 @@ const std::vector<pg::PgMigration>& migrations() {
 // counter, see the bus publish body). `created_at` is authored from Postgres
 // now() IN-SQL, so
 // the reap cutoff and the row share one DB clock domain (the same
-// DB-clock-authority reason record_command_execution authors created_at
+// DB-clock-authority reason record_command_dispatch authors created_at
 // in-SQL).
 //
 // ID-ORDERING CONTRACT for future consumers (HA WS-2a-2 forward poll): an
@@ -2457,7 +2470,11 @@ namespace {
 // constants (clock-guarded-retention routed concern: "never copy the
 // numbers"). A command's realistic in-flight lifetime is seconds to a few
 // minutes; 24h is generous headroom over any documented per-command
-// timeout, so a mapping this old is stale by construction, not merely idle.
+// timeout, so a record this old is stale by construction, not merely idle.
+// KNOWN LIMIT (#4990): a command that has no wire expiry runs until finished (ADR-1007), and a
+// response arriving more than 24h after the dispatch record was last written finds no record and
+// is stored unverified (response_provenance.hpp). Re-driven commands refresh the record
+// (record_command_dispatch), so this bites only a single execution that outlives the window.
 constexpr std::int64_t kCmdExecutionReapWindowSecs = 24 * 3600;
 constexpr int kCmdExecutionReapCap = 5000;
 // A DB `now()` reading more than this far ahead of the persisted anchor is
@@ -2500,70 +2517,66 @@ std::optional<std::int64_t> parse_reap_i64(const std::string& val) {
 }
 } // namespace
 
-bool ExecutionTracker::record_command_execution(const std::string& command_id,
-                                                const std::string& execution_id) {
+bool ExecutionTracker::record_command_dispatch(const std::string& command_id,
+                                               const std::string& plugin,
+                                               const std::string& execution_id) {
     if (!open_)
         return false;
+    // A record without a plugin is not a provenance record (the reader treats one as absent), and
+    // an empty command id can never be looked up. Refuse both rather than store a row that cannot
+    // mean anything.
+    if (command_id.empty() || plugin.empty())
+        return false;
 
-    // SINGLE attempt, no retry — deliberately NOT update_agent_status's
-    // retry-once shape (governance Gate 4 unhappy-path/Gate 3 performance
-    // finding). This call sits on the SYNCHRONOUS pre-RPC dispatch path
-    // (record_execution_id / server.cpp's command_dispatch_fn calls this
-    // BEFORE the RPC, UP2-4); a retry-once here would double the worst-case
-    // block on the calling worker thread (REST/dashboard/MCP dispatch, or a
-    // background runner such as ScheduleRunner/PreflightRunner/
-    // PolicyEvaluator — anything feeding the shared CommandDispatchFn
-    // closure) (2*kWriteTimeout)
-    // under sustained pool contention. update_agent_status's retry lives on
-    // the async gateway-response path, where that tradeoff is free.
+    // SINGLE attempt, no retry (governance Gate 4 unhappy-path/Gate 3 performance finding). This
+    // call sits on the SYNCHRONOUS pre-RPC dispatch path (server.cpp's build_classified_command
+    // calls it BEFORE any frame is sent); a retry-once here would double the worst-case block on
+    // the calling worker thread (REST/dashboard/MCP dispatch, or a background runner such as
+    // ScheduleRunner/PreflightRunner/PolicyEvaluator, anything feeding the dispatch chokepoint)
+    // (2*kWriteTimeout) under sustained pool contention. update_agent_status's retry lives on the
+    // async gateway-response path, where that tradeoff is free.
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease) {
-        spdlog::error("ExecutionTracker::record_command_execution: pool exhausted for "
-                      "command_id={} — this command's responses will not correlate to an "
-                      "execution_id on any replica (executions-drawer/SSE degraded for it, "
-                      "dispatch itself is unaffected)",
+        spdlog::error("ExecutionTracker::record_command_dispatch: pool exhausted for "
+                      "command_id={} - this command's responses will be labelled unverified "
+                      "(withheld from readers without the Forensics grant) and will not correlate "
+                      "to an execution_id on any replica; dispatch itself is unaffected",
                       command_id);
         return false;
     }
-    pg::PgResult res =
-        execution_id.empty()
-            ? pg::exec_params(lease.get(),
-                              "DELETE FROM execution_tracker.command_execution "
-                              "WHERE command_id = $1",
-                              std::vector<std::string>{command_id})
-            // created_at is authored from Postgres now() IN-SQL, not the
-            // calling replica's app clock (adversarial review Should-fix,
-            // PR #3780): reap_command_execution_mappings compares created_at
-            // against its own DB `now()` reading, so authoring created_at
-            // from a different (app) clock domain means a replica whose
-            // local clock lags the DB primary by more than the reap window
-            // can write a mapping that reads as already-expired the moment
-            // another replica's sweep runs -- silently dropping the exact
-            // correlation this migration exists to preserve, in the exact
-            // multi-replica scenario it targets. Matches session_store's
-            // DB-clock-authority precedent (#3715).
-            : pg::exec_params(
-                  lease.get(),
-                  "INSERT INTO execution_tracker.command_execution "
-                  "(command_id, execution_id, created_at) "
-                  "VALUES ($1, $2, extract(epoch FROM now())::bigint) "
-                  "ON CONFLICT (command_id) DO UPDATE SET "
-                  "execution_id = EXCLUDED.execution_id, created_at = EXCLUDED.created_at",
-                  std::vector<std::string>{command_id, execution_id});
+    // created_at is authored from Postgres now() IN-SQL, not the calling replica's app clock
+    // (adversarial review Should-fix, PR #3780): reap_command_execution_mappings compares
+    // created_at against its own DB `now()` reading, so authoring created_at from a different
+    // (app) clock domain means a replica whose local clock lags the DB primary by more than the
+    // reap window could write a record that reads as already-expired the moment another replica's
+    // sweep runs, silently dropping the exact provenance this table exists to carry. Matches
+    // session_store's DB-clock-authority precedent (#3715).
+    //
+    // ON CONFLICT: the PLUGIN is deliberately NOT updated (first writer wins; see the declaration).
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO execution_tracker.command_execution "
+        "(command_id, plugin, execution_id, created_at) "
+        "VALUES ($1, $2, $3, extract(epoch FROM now())::bigint) "
+        "ON CONFLICT (command_id) DO UPDATE SET "
+        "execution_id = CASE WHEN EXCLUDED.execution_id = '' "
+        "THEN execution_tracker.command_execution.execution_id ELSE EXCLUDED.execution_id END, "
+        "created_at = EXCLUDED.created_at",
+        std::vector<std::string>{command_id, plugin, execution_id});
     if (res.status() != PGRES_COMMAND_OK) {
-        spdlog::error("ExecutionTracker::record_command_execution: write failed for "
-                      "command_id={} — this command's responses will not correlate to an "
-                      "execution_id on any replica (executions-drawer/SSE degraded for it, "
-                      "dispatch itself is unaffected)",
+        spdlog::error("ExecutionTracker::record_command_dispatch: write failed for "
+                      "command_id={} - this command's responses will be labelled unverified "
+                      "(withheld from readers without the Forensics grant) and will not correlate "
+                      "to an execution_id on any replica; dispatch itself is unaffected",
                       command_id);
         return false;
     }
     return true;
 }
 
-std::optional<std::string>
-ExecutionTracker::lookup_execution_id(const std::string& command_id,
-                                      std::string* degrade_reason) const {
+std::optional<CommandRecord>
+ExecutionTracker::lookup_command_record(const std::string& command_id,
+                                        std::string* degrade_reason) const {
     if (!open_)
         return std::nullopt; // not a runtime degrade -- construction already failed loudly
     auto lease = pool_.try_acquire_for(kReadTimeout);
@@ -2572,18 +2585,19 @@ ExecutionTracker::lookup_execution_id(const std::string& command_id,
             *degrade_reason = "pool_exhausted";
         return std::nullopt;
     }
-    pg::PgResult res = pg::exec_params(lease.get(),
-                                       "SELECT execution_id FROM execution_tracker.command_execution "
-                                       "WHERE command_id = $1",
-                                       std::vector<std::string>{command_id});
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT plugin, execution_id FROM execution_tracker.command_execution "
+        "WHERE command_id = $1",
+        std::vector<std::string>{command_id});
     if (res.status() != PGRES_TUPLES_OK) {
         if (degrade_reason)
             *degrade_reason = "query_failed";
         return std::nullopt;
     }
     if (PQntuples(res.get()) == 0)
-        return std::nullopt; // genuine miss -- out-of-band dispatch or an aged-out mapping
-    return col_str(res.get(), 0, 0);
+        return std::nullopt; // genuine miss -- a forged or never-issued id, or a reaped record
+    return CommandRecord{col_str(res.get(), 0, 0), col_str(res.get(), 0, 1)};
 }
 
 std::expected<CommandExecutionReapOutcome, std::string>

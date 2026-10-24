@@ -2762,7 +2762,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // Dispatch via gRPC. PR 2: workflow-step dispatch path
             // does not yet wire execution_id correlation (CONSIST-2 /
             // sec-M2 — PR 2.x will close); pass empty execution_id so
-            // record_execution_id is skipped and responses arrive with
+            // the dispatch record carries an empty execution id and responses arrive with
             // the legacy sentinel (legacy fallback in detail handler
             // covers the rendering).
             // ADR-1007: per-device concurrency gate, when wired — falls back
@@ -3737,7 +3737,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // loopback agent could reply before a post-dispatch
         // register-mapping call landed. cmd_dispatch registers the
         // mapping (HA WS-1(1b): PG-backed via
-        // `ExecutionTracker::record_command_execution`) BEFORE any RPC is
+        // `ExecutionTracker::record_command_dispatch`) BEFORE any RPC is
         // sent so the response handler always finds the entry.
         // agents_targeted is updated below once dispatch confirms `sent`.
         std::string execution_id;

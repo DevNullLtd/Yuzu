@@ -746,7 +746,10 @@ TEST_CASE("capability catalogue: every Forensics-securable plugin is in the resp
     // A NEW Forensics plugin must be acknowledged HERE (and in test_response_tier_filter.cpp):
     // its stored rows become Forensics-tier on every operator read, which is a user-visible
     // change for anyone who holds Response:Read but not Forensics:Read.
+    // Plus the unresolved-provenance sentinel (#4990): a response whose command id has no server
+    // dispatch record is stored under it and is Forensics-tier everywhere.
     CHECK(set->names() == std::vector<std::string>{"app_usage", "browser_inventory",
                                                    "execution_artifacts", "privacy_permissions",
-                                                   "remote_access_audit"});
+                                                   "remote_access_audit", "~unverified"});
+    CHECK(set->contains(kUnverifiedProvenanceLabel));
 }

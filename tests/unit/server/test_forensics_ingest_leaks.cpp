@@ -36,6 +36,7 @@
 #include "test_auth_db_pg_helper.hpp"
 #include "test_forensics_tier_fixture.hpp"
 #include "test_principal_lock_gate.hpp" // SqlFault
+#include "test_provenance_fake.hpp"
 #include "test_offload_target_store_pg_helper.hpp"
 #include "test_tracker_scope.hpp"
 #include "test_webhook_store_pg_helper.hpp"
@@ -80,6 +81,10 @@ struct LiveBusHarness {
 
     LiveBusHarness() {
         sub = bus.subscribe([this](const SseEvent& e) { seen.push_back(e); });
+        // #4990: a frame's plugin comes from a dispatch record. No tracker here, so the harness
+        // answers with the id's prefix, as if the server had dispatched that plugin; a TrackerScope
+        // clears it and reads real records.
+        yuzu::test::use_prefix_provenance(svc);
     }
     ~LiveBusHarness() { bus.unsubscribe(sub); }
 
@@ -97,6 +102,14 @@ struct LiveBusHarness {
         return n;
     }
 };
+
+/// Records a dispatch for `command_id` as the plugin its own prefix names (the shape the server
+/// mints), so a test can drive a recorded Forensics or ordinary command through the real tracker.
+void record_for_prefix(AgentServiceImpl& svc, const std::string& command_id,
+                       const std::string& execution_id) {
+    svc.record_command_dispatch(command_id, command_id.substr(0, command_id.find('-')),
+                                execution_id);
+}
 
 } // namespace
 
@@ -285,7 +298,7 @@ TEST_CASE("tracker error_detail: a Forensics plugin's free-text failure is store
     const auto run = [&](const std::string& command_id, const std::string& message,
                          std::vector<std::string>* bus_frames = nullptr) {
         const auto exec_id = ts.make_exec();
-        h.svc.record_execution_id(command_id, exec_id);
+        record_for_prefix(h.svc, command_id, exec_id);
         std::size_t sub = 0;
         if (bus_frames)
             sub = exec_bus.subscribe(exec_id, [bus_frames](const ExecutionEvent& e) {
@@ -333,7 +346,7 @@ TEST_CASE("tracker error_detail: an unwired plugin set sanitizes every plugin's 
     LiveBusHarness h; // plugin set deliberately not wired
     yuzu::test::TrackerScope ts{h.svc, pool};
     const auto exec_id = ts.make_exec();
-    h.svc.record_execution_id("shellexec-0001", exec_id);
+    record_for_prefix(h.svc, "shellexec-0001", exec_id);
     h.svc.process_gateway_response("agent-1", failure_frame("shellexec-0001", kFreeText));
     const auto statuses = ts.tracker->get_agent_statuses(exec_id);
     REQUIRE(statuses.size() == 1);
@@ -356,7 +369,7 @@ TEST_CASE("tracker error_detail: a later RUNNING frame never republishes a store
     // from the persisted row is published on the bus and appended to the durable outbox.
     const auto seed_raw_terminal = [&](const std::string& command_id) {
         const auto exec_id = ts.make_exec();
-        h.svc.record_execution_id(command_id, exec_id);
+        record_for_prefix(h.svc, command_id, exec_id);
         AgentExecStatus s;
         s.agent_id = "agent-1";
         s.status = "failure";
@@ -404,7 +417,7 @@ TEST_CASE("tracker error_detail: a later RUNNING frame never republishes a store
     SECTION("a token-shaped stored value is published as stored") {
         const auto exec_id = ts.make_exec();
         const std::string cmd = std::string{test::kForensicsPlugin} + "-0r2";
-        h.svc.record_execution_id(cmd, exec_id);
+        record_for_prefix(h.svc, cmd, exec_id);
         AgentExecStatus s;
         s.agent_id = "agent-1";
         s.status = "failure";
@@ -460,7 +473,7 @@ TEST_CASE("tracker error_detail: rows written before the sanitizer are reduced o
         auto id = tracker.create_execution(e);
         REQUIRE(id.has_value());
         if (map_command)
-            REQUIRE(tracker.record_command_execution(command_id, *id));
+            REQUIRE(tracker.record_command_dispatch(command_id, command_id.substr(0, command_id.find('-')), *id));
         AgentExecStatus s; // the pre-upgrade write: raw text, straight to the tracker
         s.agent_id = "agent-1";
         s.status = "failure";
@@ -564,7 +577,7 @@ TEST_CASE("tracker error_detail: a failed Forensics execution lookup withholds t
     e.agents_targeted = 1;
     const auto id = tracker.create_execution(e);
     REQUIRE(id.has_value());
-    REQUIRE(tracker.record_command_execution(std::string{test::kOrdinaryPlugin} + "-0g", *id));
+    REQUIRE(tracker.record_command_dispatch(std::string{test::kOrdinaryPlugin} + "-0g", std::string{test::kOrdinaryPlugin}, *id));
     AgentExecStatus s;
     s.agent_id = "agent-1";
     s.status = "failure";
@@ -631,7 +644,7 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
         e.agents_targeted = 1;
         const auto id = tracker.create_execution(e);
         REQUIRE(id.has_value());
-        REQUIRE(tracker.record_command_execution(command_id, *id));
+        REQUIRE(tracker.record_command_dispatch(command_id, command_id.substr(0, command_id.find('-')), *id));
         return *id;
     };
     const auto frame = [](const char* status, const char* error_detail) {
@@ -862,6 +875,7 @@ struct SinkHarness {
         REQUIRE(notifications.is_open());
         REQUIRE(analytics->is_open());
         auth_mgr.set_auth_db(auth_db.get());
+        yuzu::test::use_prefix_provenance(svc); // #4990: see LiveBusHarness
         if (wire_set)
             svc.set_forensics_plugin_set(&test::forensics_plugin_set());
         svc.set_notification_store(&notifications);
