@@ -2117,8 +2117,10 @@ libpq connection attempt inside a PG-tagged test.
 later steps has a bound, including a connect to a backend that accepts the TCP
 connection and then never answers (libpq has no connect timeout by default).
 30 s is deliberately looser than `PgPool`'s own 10 s default: the pool lets the
-variable win over that default, so in these steps the pool's connect bound is
-30 s too, while a `connect_timeout` set in a DSN still wins over the variable.
+variable win over that default and over an Options-level `connect_timeout_s`, so
+in these steps the pool's connect bound is 30 s unless the DSN itself carries a
+`connect_timeout`, which wins over the variable. A test that needs a short bound
+must therefore put it in the DSN.
 A 10 s cap failed a fixture connect on a heavily loaded dev box, which is why
 the value is not 10. `scripts/ci/sweep-test-databases.sh` exports its own 10 s
 for itself. macOS is not given the variable: that leg exports no DSN, so no

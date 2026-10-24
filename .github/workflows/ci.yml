@@ -1156,9 +1156,11 @@ jobs:
           # each connect attempt (per host), including a backend that accepts
           # the TCP connection and then never answers, which has no bound
           # otherwise. 30 s is deliberately looser than PgPool's own 10 s
-          # default: pg_pool.cpp lets the variable win over that default, so the
-          # pool's connect bound in these steps is 30 s too (a DSN-level
-          # connect_timeout still wins over the variable). A 10 s cap failed a
+          # default: pg_pool.cpp lets the variable win over that default AND
+          # over an Options-level connect_timeout_s, so the pool's connect bound
+          # in these steps is 30 s unless the DSN itself carries a
+          # connect_timeout (a DSN-level value wins over the variable; tests
+          # that need a short bound must put it in the DSN). A 10 s cap failed a
           # fixture connect on a heavily loaded dev box, and a stalled backend
           # still fails in 30 s instead of at the shard's meson timeout. On
           # POSIX the [pg_reachability] tests unset it for the duration of each
@@ -2002,18 +2004,10 @@ jobs:
             exit 1
           fi
           echo "pg_mode=$PG_MODE"
-          # Bound every libpq connect in the later steps. libpq applies this to
-          # each connect attempt (per host), including a backend that accepts
-          # the TCP connection and then never answers, which has no bound
-          # otherwise. 30 s is deliberately looser than PgPool's own 10 s
-          # default: pg_pool.cpp lets the variable win over that default, so the
-          # pool's connect bound in these steps is 30 s too (a DSN-level
-          # connect_timeout still wins over the variable). A 10 s cap failed a
-          # fixture connect on a heavily loaded dev box, and a stalled backend
-          # still fails in 30 s instead of at the shard's meson timeout. On
-          # POSIX the [pg_reachability] tests unset it for the duration of each
-          # case (test_pg_reachability_probe.cpp), because the probe lets the
-          # variable override the 3 s deadline those tests bound.
+          # Bound every libpq connect in the later steps: same export and
+          # rationale as the Linux job's Resolve step above, and the "Connect
+          # cap on the Linux and Windows test legs" paragraph in
+          # docs/ci-architecture.md.
           echo "PGCONNECT_TIMEOUT=30" >> "$GITHUB_ENV"
           echo "PGCONNECT_TIMEOUT=30 appended to GITHUB_ENV for the later steps"
 

@@ -137,7 +137,9 @@ int wait_for_backends(const std::string& admin_dsn, const std::string& app, int 
     int n = -1;
     // ≤5s when the admin host answers: backend exit after a client close is
     // asynchronous. The wall-clock deadline keeps a stalled admin host (each
-    // attempt can take the full connect_timeout) from consuming the shard budget.
+    // attempt can take the full 30 s connect_timeout) from consuming the shard
+    // budget: 90 s is three stalled attempts, and the iteration cap alone would
+    // allow 50 x 30 s. Whichever bound is reached first ends the wait.
     const auto deadline = std::chrono::steady_clock::now() + 90s;
     for (int i = 0; i < 50; ++i) {
         n = count_backends(admin_dsn, app);
