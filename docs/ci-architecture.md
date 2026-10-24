@@ -1779,8 +1779,8 @@ host RAM: pending (filled by the tmpfs commit from the probe step log); post-run
 second `Test (non-pg suites)` invocation (server shards) and the pg step stay at
 2, so the delta is attributable to this one invocation.
 
-*Baseline at np=2.* Step median over the 12 successful `gcc-15`/`debug` push
-runs on `dev` between 2026-10-22 and 2026-10-24: `Test (non-pg suites)` 6.7 min
+*Baseline at np=2.* Step median over the 12 most recent `dev` push runs in which
+the `gcc-15`/`debug` job succeeded (2026-10-22 to 2026-10-24): `Test (non-pg suites)` 6.7 min
 (range 6.6 to 7.0). Two PR runs of #6425 on `gcc-15`/`debug` (job 120892371842
 on commit `a264c1e59`, job 120898156494 on commit `2c6b3a120`) took 6.8 min in
 both. In them the cheap-suites invocation took about 340 s of wall time for about
