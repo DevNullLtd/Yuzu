@@ -21,7 +21,8 @@ Required statements (each is one requirement id below):
     for_fixed_plugin_poll(forensics_plugins());
   * the visibility resolver is wired into the response routes, hardware routes, dashboard routes,
     workflow routes, REST v1 and MCP, and is built with every dependency it needs
-    (auth routes, RBAC store, management-group store, metrics);
+    (auth routes, metrics; it deliberately holds NO RBAC or management-group store, so a definitive
+    global denial performs no group lookup: there is no scoped Forensics read tier);
   * the withheld-read counter family is pre-seeded (seed_forensics_tier_metrics);
   * the drawer's Response:Read probe is the QUIET draw-time fleet-read probe, and the drawer's
     audit row is persisted through a real audit sink;
@@ -208,12 +209,6 @@ REQUIRED: list[tuple[str, str, str]] = [
     ("resolver-auth-routes",
      r"resolve_forensics_visible\(\{[^}]*?(?P<k>\.auth_routes=auth_routes_\.get\(\))",
      "the resolver needs the auth routes (the global Forensics:Read proof)"),
-    ("resolver-rbac-store",
-     r"resolve_forensics_visible\(\{[^}]*?(?P<k>\.rbac_store=rbac_store_\.get\(\))",
-     "the resolver needs the RBAC store (the scoped grant)"),
-    ("resolver-mgmt-store",
-     r"resolve_forensics_visible\(\{[^}]*?(?P<k>\.mgmt_store=mgmt_group_store_\.get\(\))",
-     "the resolver needs the management-group store (the scoped grant)"),
     ("resolver-metrics",
      r"resolve_forensics_visible\(\{[^}]*?(?P<k>\.metrics=&metrics_)\}",
      "the resolver needs the metrics registry (the withheld-read counter)"),
@@ -275,7 +270,45 @@ FORBIDDEN: list[tuple[str, str, str]] = [
      "a Deps field handed a null plugin set"),
     ("null-fixed-poll", r"for_fixed_plugin_poll\((nullptr|NULL|0)\)",
      "for_fixed_plugin_poll handed a null plugin set"),
+    # There is no scoped Forensics read tier (W1): the resolver has one global proof and no store of
+    # its own, so a definitive global denial cannot perform a management-group lookup. Handing it a
+    # store again would reopen that branch.
+    ("resolver-rbac-store-dep", r"resolve_forensics_visible\(\{[^}]*?\.rbac_store=",
+     "the resolver must not be handed an RBAC store (there is no scoped Forensics read tier)"),
+    ("resolver-mgmt-store-dep", r"resolve_forensics_visible\(\{[^}]*?\.mgmt_store=",
+     "the resolver must not be handed a management-group store (there is no scoped Forensics read tier)"),
 ]
+
+# Tokens that must NOT appear (comments stripped) in the files that implement the Forensics read
+# tier, keyed by base name under server/core/src. The resolver holds no store, so a definitive global
+# denial performs no management-group lookup; the filter and the SQL builder have no per-agent
+# exemption. GREP LIMIT: lexical only. It cannot see a lookup reached through a new dependency spelt
+# some other way (for example a new Deps member of another type), nor a SQL arm that names the agent
+# column through a different variable; the unit tests assert the behavior (a group-scoped grant and
+# an unsupported subset both read no Forensics row) and review covers the rest.
+FORBIDDEN_TIER_TOKENS: dict[str, list[tuple[str, str, str]]] = {
+    "forensics_visibility.cpp": [
+        ("resolver-no-scoped-lookup", r"visible_agents_for_permission",
+         "the resolver must not look up scoped visibility (no scoped Forensics read tier)"),
+        ("resolver-no-mgmt-store-token", r"mgmt_store|ManagementGroupStore|management_group_store",
+         "the resolver must not reference a management-group store"),
+        ("resolver-no-rbac-store-token", r"rbac_store|RbacStore|rbac_enforcement_in_effect",
+         "the resolver must not reference an RBAC store (the global proof goes through AuthRoutes)"),
+    ],
+    "forensics_visibility.hpp": [
+        ("resolver-deps-no-stores", r"mgmt_store|ManagementGroupStore|rbac_store|RbacStore|"
+         r"ScopeReadFailed|scope_read_failed",
+         "ForensicsVisibilityDeps must not hold a store, and the reason set has no scope_read_failed"),
+    ],
+    "response_tier_filter.hpp": [
+        ("filter-no-exempt-agents", r"exempt_agents",
+         "the tier filter has no per-agent exemption (a present subset fails closed)"),
+    ],
+    "response_store.cpp": [
+        ("store-no-exempt-agents", r"exempt_agents|\bagent_col\b",
+         "the tier SQL clause has no per-agent exemption arm"),
+    ],
+}
 
 
 # Patterns over agent_service_impl.cpp whose occurrence count is pinned EXACTLY (a new read is as
@@ -369,6 +402,25 @@ def tracker_caller_problems(sources: dict[str, str]) -> list[tuple[str, str]]:
     return out
 
 
+def tier_token_problems(sources: dict[str, str]) -> list[tuple[str, str]]:
+    """(id, message) per forbidden token found in a Forensics read tier source file.
+
+    `sources` maps a base name (as `read_src_tree` returns, relative to server/core/src) to its text.
+    A file that is missing is itself a problem: a renamed file would otherwise pass vacuously.
+    """
+    out: list[tuple[str, str]] = []
+    for name, rules in FORBIDDEN_TIER_TOKENS.items():
+        if name not in sources:
+            out.append((f"missing-{name}", f"missing-{name}: {name} not found under {SRC_DIR}; the "
+                        f"scoped-branch absence checks would pass vacuously (renamed? update this gate)"))
+            continue
+        t = canonical(sources[name])
+        for rid, pat, why in rules:
+            if re.search(pat, t, re.S):
+                out.append((rid, f"{rid}: {name}: {why}"))
+    return out
+
+
 def read_src_tree() -> dict[str, str]:
     root = os.path.join(REPO_ROOT, SRC_DIR)
     out: dict[str, str] = {}
@@ -434,14 +486,19 @@ def main() -> int:
     afound = agent_service_problems(asrc)
     for _rid, msg in afound:
         print(f"::error::{TAG}: {AGENT_SERVICE_CPP}: {msg}{HINT}", file=sys.stderr)
-    tfound = tracker_caller_problems(read_src_tree())
+    tree = read_src_tree()
+    tfound = tracker_caller_problems(tree)
     for _rid, msg in tfound:
         print(f"::error::{TAG}: {SRC_DIR}: {msg}{HINT}", file=sys.stderr)
-    if found or afound or tfound:
+    kfound = tier_token_problems(tree)
+    for _rid, msg in kfound:
+        print(f"::error::{TAG}: {SRC_DIR}: {msg}{HINT}", file=sys.stderr)
+    if found or afound or tfound or kfound:
         return 1
     print(f"OK: {len(REQUIRED)} wiring statements, {len(COUNTED)} counted sites, "
           f"{len(FORBIDDEN)} forbidden hatches, {len(EXACT_AGENT_SERVICE)} exact counts, "
-          f"1 tracker-caller pin, "
+          f"1 tracker-caller pin, {sum(len(v) for v in FORBIDDEN_TIER_TOKENS.values())} "
+          f"scoped-branch absence checks, "
           f"{len(FORBIDDEN_AGENT_SERVICE)} forbidden dumps checked")
     return 0
 

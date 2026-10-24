@@ -50,7 +50,7 @@ def main() -> int:
     t = g.canonical(raw)
 
     expect(g.problems_canonical(t) == [], "the real server.cpp must pass the gate")
-    expect(len(g.REQUIRED) >= 41, "the required-statement list must not shrink silently")
+    expect(len(g.REQUIRED) >= 39, "the required-statement list must not shrink silently")
 
     # Delete each required statement's key text.
     for rid, pat, _why in g.REQUIRED:
@@ -78,6 +78,10 @@ def main() -> int:
         "null-set-setter": "rest_api_v1_->set_forensics_plugin_set(nullptr);",
         "null-set-field": "wf_deps.forensics_plugins = nullptr;; .forensics_plugins = nullptr,",
         "null-fixed-poll": "auto tier = ResponseTierFilter::for_fixed_plugin_poll(nullptr);",
+        "resolver-rbac-store-dep": "auto v = resolve_forensics_visible({.auth_routes = a, "
+                                   ".rbac_store = rbac_store_.get()}, req);",
+        "resolver-mgmt-store-dep": "auto v = resolve_forensics_visible({.auth_routes = a, "
+                                   ".mgmt_store = mgmt_group_store_.get()}, req);",
     }
     for rid, spelling in hatches.items():
         mutated = g.canonical(raw + "\n" + spelling + "\n")
@@ -225,6 +229,34 @@ def main() -> int:
            "a commented-out stored-row read must not count")
     expect(g.agent_service_problems(asrc + "\n// resp.error().message() is only mentioned here\n") == [],
            "a comment mentioning the accessor is not a read")
+
+    # The scoped-branch absence checks: the real tree is clean, and each forbidden token is named.
+    expect(g.tier_token_problems(tree) == [], "the real tree must carry no scoped Forensics branch")
+    for fname, rules in g.FORBIDDEN_TIER_TOKENS.items():
+        expect(fname in tree, f"selftest anchor moved: {fname}")
+    spellings = {
+        "resolver-no-scoped-lookup": ("forensics_visibility.cpp",
+                                      "auto v = rbac->visible_agents_for_permission(u, s, op, m);"),
+        "resolver-no-mgmt-store-token": ("forensics_visibility.cpp", "if (!deps.mgmt_store) return x;"),
+        "resolver-no-rbac-store-token": ("forensics_visibility.cpp", "if (!deps.rbac_store) return x;"),
+        "resolver-deps-no-stores": ("forensics_visibility.hpp", "const RbacStore* rbac_store{nullptr};"),
+        "filter-no-exempt-agents": ("response_tier_filter.hpp", "std::vector<std::string> exempt_agents_;"),
+        "store-no-exempt-agents": ("response_store.cpp", "const auto& e = tier.exempt_agents();"),
+    }
+    expect(set(spellings) == {rid for rules in g.FORBIDDEN_TIER_TOKENS.values() for rid, _, _ in rules},
+           "every scoped-branch absence rule has a selftest spelling")
+    for rid, (fname, extra) in spellings.items():
+        crafted = dict(tree)
+        crafted[fname] = crafted[fname] + "\n" + extra + "\n"
+        expect(rid in ids(g.tier_token_problems(crafted)),
+               f"{rid}: a scoped-branch spelling was NOT detected in {fname}")
+    crafted = dict(tree)
+    crafted["forensics_visibility.cpp"] += "\n// visible_agents_for_permission, mgmt_store, rbac_store\n"
+    expect(g.tier_token_problems(crafted) == [], "a comment mentioning a scoped lookup is not one")
+    crafted = dict(tree)
+    del crafted["forensics_visibility.cpp"]
+    expect("missing-forensics_visibility.cpp" in ids(g.tier_token_problems(crafted)),
+           "a missing resolver source must be named, not pass vacuously")
 
     if FAILURES:
         print(f"{len(FAILURES)} selftest failure(s)", file=sys.stderr)
