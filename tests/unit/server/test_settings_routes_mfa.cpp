@@ -32,6 +32,7 @@
 #include "session_store.hpp"
 #include "mfa_factor_state.hpp" // judge_local_mfa_binding: is the stored proof bound (#6079)
 #include "step_up_gate.hpp"
+#include "step_up_wiring.hpp" // detail::run_in_handler_step_up: the gate as server.cpp wires it
 #include "test_approver_route_fixture.hpp" // the real approval routes behind the real approver gate
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
@@ -52,12 +53,14 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <regex>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
@@ -103,6 +106,7 @@ struct MfaSettingsHarness {
     auth::AutoApproveEngine auto_approve{};
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
+    yuzu::MetricsRegistry metrics; // before `routes`, which keeps a pointer to it
     SettingsRoutes routes;
 
     yuzu::server::test::TestRouteSink sink;
@@ -111,6 +115,10 @@ struct MfaSettingsHarness {
     auth::Role session_role{auth::Role::admin};
     /// What `auth_fn` reports as the settings session's `auth_source` (the real default is "local").
     std::string session_auth_source{"local"};
+    /// When true, `auth_fn` resolves the request's own session cookie through the AuthManager (the
+    /// production shape: the session carries the cached proof anchor the generic gate ages)
+    /// instead of synthesising a session from `session_user`. Off by default.
+    bool use_cookie_sessions{false};
     std::vector<AuditCall> audit_calls;
 
     explicit MfaSettingsHarness(StepUpFn step_up_fn = {})
@@ -132,10 +140,12 @@ struct MfaSettingsHarness {
         auth_mgr.set_auth_db(auth_db.get());
         session_user = "admin";
 
-        auto auth_fn =
-            [this](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auto auth_fn = [this](const httplib::Request& req,
+                              httplib::Response&) -> std::optional<auth::Session> {
             if (session_user.empty())
                 return std::nullopt;
+            if (use_cookie_sessions)
+                return auth_mgr.validate_session(AuthRoutes::extract_session_cookie(req));
             auth::Session s;
             s.username = session_user;
             s.role = session_role;
@@ -168,9 +178,17 @@ struct MfaSettingsHarness {
                                /*update_registry=*/nullptr,
                                /*runtime_config_store=*/nullptr,
                                /*audit_store=*/nullptr,
-                               /*gateway_enabled=*/false, gateway_count_fn, agents_json_fn,
-                               oidc_mu, oidc_provider, /*metrics_registry=*/nullptr,
-                               std::move(step_up_fn));
+                               /*gateway_enabled=*/false, gateway_count_fn, agents_json_fn, oidc_mu,
+                               oidc_provider, /*metrics_registry=*/&metrics, std::move(step_up_fn));
+        // The recovery-codes and disable routes use the factor-credential gate, not step_up_fn.
+        // Default: admit at the account's CURRENT generation (what the real gate would admit for
+        // a caller holding a fresh bound proof); tests that exercise the gate replace it.
+        routes.set_factor_credential_gate_fn(
+            [this](const httplib::Request&, httplib::Response&, const auth::Session& s,
+                   const std::string&) -> std::optional<StepUpAdmission> {
+                const auto st = auth_db->mfa_status(s.username);
+                return StepUpAdmission{true, st ? st->factor_gen : 0};
+            });
     }
 
     /// True if any captured audit row matches action + result + (optional) target_id.
@@ -342,17 +360,19 @@ bool has_step_up_proof(const MfaSettingsHarness& h, const std::string& token) {
 
 TEST_CASE("an in-handler step-up refusal on an htmx request sends exactly one HX-Trigger toast",
           "[pg][mfa][routes][settings][stepup]") {
-    // step_up_fn_ refuses through the shared renderer (as require_mfa_step_up does); the handler
-    // then calls toast_step_up_refusal, which must not append a second HX-Trigger (httplib's
-    // Response::set_header emplaces into a multimap).
-    MfaSettingsHarness h([](const httplib::Request& req, httplib::Response& res,
-                            const auth::Session& session, const std::string&) {
-        StepUpVerdict v;
-        v.decision = StepUpDecision::kChallenge;
-        v.user = session.username;
-        render_step_up_refusal(req, res, v, StepUpSurface::kRest);
-        return false;
-    });
+    // The factor-credential gate refuses through the shared renderer (as require_mfa_step_up does);
+    // the handler then calls toast_step_up_refusal, which must not append a second HX-Trigger
+    // (httplib's Response::set_header emplaces into a multimap).
+    MfaSettingsHarness h;
+    h.routes.set_factor_credential_gate_fn(
+        [](const httplib::Request& req, httplib::Response& res, const auth::Session& session,
+           const std::string&) -> std::optional<StepUpAdmission> {
+            StepUpVerdict v;
+            v.decision = StepUpDecision::kChallenge;
+            v.user = session.username;
+            render_step_up_refusal(req, res, v, StepUpSurface::kRest);
+            return std::nullopt;
+        });
     for (const char* path : {"/api/settings/mfa/recovery-codes", "/api/settings/mfa/disable"}) {
         CAPTURE(path);
         auto res = h.sink.dispatch("POST", path, {}, "application/x-www-form-urlencoded",
@@ -370,14 +390,16 @@ TEST_CASE("an in-handler step-up refusal on an htmx request sends exactly one HX
 
 TEST_CASE("a step-up refusal that wrote no toast still gets the Settings handler's toast",
           "[pg][mfa][routes][settings][stepup]") {
-    // A step_up_fn that refuses without rendering through the shared renderer (a 401 envelope,
-    // no HX-Trigger): the handler's own toast fills the gap, with the envelope's message.
-    MfaSettingsHarness h([](const httplib::Request&, httplib::Response& res,
-                            const auth::Session&, const std::string&) {
-        res.status = 401;
-        res.set_content(R"({"error":{"message":"custom refusal"}})", "application/json");
-        return false;
-    });
+    // A gate that refuses without rendering through the shared renderer (a 401 envelope, no
+    // HX-Trigger): the handler's own toast fills the gap, with the envelope's message.
+    MfaSettingsHarness h;
+    h.routes.set_factor_credential_gate_fn(
+        [](const httplib::Request&, httplib::Response& res, const auth::Session&,
+           const std::string&) -> std::optional<StepUpAdmission> {
+            res.status = 401;
+            res.set_content(R"({"error":{"message":"custom refusal"}})", "application/json");
+            return std::nullopt;
+        });
     auto res = h.sink.dispatch("POST", "/api/settings/mfa/recovery-codes", {},
                                "application/x-www-form-urlencoded",
                                {{"Host", "yuzu.example"}, {"Origin", "http://yuzu.example"}});
@@ -1686,4 +1708,435 @@ TEST_CASE("a session that survived a factor replacement cannot decide an approva
     REQUIRE(reject2);
     CHECK(reject2->status == 200);
     CHECK(fx.status_of(reject_ticket) == "rejected");
+}
+
+// ---------------------------------------------------------------------------
+// #6079 C5c: the recovery-codes and disable routes call the factor-credential gate and compare the
+// generation it admitted under the users row lock. These cases wire the gate the way server.cpp
+// does (run_in_handler_step_up over the real stores, with the out-parameter) and rotate the factor
+// in the window between the gate and the AuthDB call.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// The factor-credential gate as server.cpp wires it, over the harness's own stores. The session
+/// is the cookie's (so the cached proof anchor is real) unless `cookie_sessions` is false.
+void wire_real_gate(MfaSettingsHarness& h, int window_secs = 300, bool cookie_sessions = true) {
+    h.use_cookie_sessions = cookie_sessions;
+    h.routes.set_factor_credential_gate_fn(
+        [&h, window_secs](const httplib::Request& req, httplib::Response& res,
+                          const auth::Session& s,
+                          const std::string& label) -> std::optional<StepUpAdmission> {
+            const StepUpAuditFn audit = [&h](const httplib::Request&, const std::string& a,
+                                             const std::string& r, const std::string& tt,
+                                             const std::string& ti, const std::string& d) {
+                h.audit_calls.push_back({a, r, tt, ti, d});
+                return true;
+            };
+            const DurableProofFn durable = [&h](const httplib::Request& rq,
+                                                const auth::Session& ss) {
+                return h.auth_mgr.read_durable_mfa_proof(AuthRoutes::extract_session_cookie(rq),
+                                                         ss.username);
+            };
+            StepUpAdmission admitted{};
+            if (!detail::run_in_handler_step_up(req, res, s, label, h.auth_db.get(), window_secs,
+                                                audit, "optional", &h.metrics, &durable, &admitted))
+                return std::nullopt;
+            return admitted;
+        });
+}
+
+std::unique_ptr<httplib::Response> post_with_cookie(MfaSettingsHarness& h, const std::string& path,
+                                                    const std::string& token) {
+    std::unordered_map<std::string, std::string> headers{{"Host", "yuzu.example"},
+                                                         {"Origin", "http://yuzu.example"}};
+    if (!token.empty())
+        headers["Cookie"] = "yuzu_session=" + token;
+    return h.sink.dispatch("POST", path, {}, "application/x-www-form-urlencoded", headers);
+}
+
+/// The ids of `user`'s stored recovery codes in order: unchanged iff nothing was regenerated.
+std::string code_ids(MfaSettingsHarness& h, const std::string& user = "admin") {
+    auto lease = h.auth_db.pool().acquire();
+    REQUIRE(lease);
+    auto r = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT COALESCE(string_agg(id::text, ',' ORDER BY id), '') FROM "
+        "auth.mfa_recovery_codes WHERE username = $1",
+        std::vector<std::string>{user});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    return PQgetvalue(r.get(), 0, 0);
+}
+
+std::size_t count_ids(const std::string& ids) {
+    return ids.empty() ? 0 : static_cast<std::size_t>(std::count(ids.begin(), ids.end(), ',')) + 1;
+}
+
+std::int64_t current_gen(MfaSettingsHarness& h) {
+    const auto st = h.auth_db->mfa_status("admin");
+    REQUIRE(st.has_value());
+    return st->factor_gen;
+}
+
+std::int64_t factor_changed_count(MfaSettingsHarness& h, const char* route) {
+    return h.metrics.counter("yuzu_auth_mfa_factor_changed_total", {{"route", route}}).value();
+}
+
+struct StoreScope {
+    SessionStore sessions;
+    auth::AuthManager& mgr;
+    explicit StoreScope(MfaSettingsHarness& h) : sessions{h.auth_db.pool()}, mgr(h.auth_mgr) {
+        REQUIRE(sessions.is_open());
+        mgr.set_session_store(&sessions);
+    }
+    ~StoreScope() { mgr.set_session_store(nullptr); }
+};
+
+} // namespace
+
+TEST_CASE("recovery-codes route: a factor rotated after the gate admitted the request answers 409 "
+          "and regenerates nothing (#6079 T12a)",
+          "[pg][mfa][routes][settings][stepup][binding]") {
+    MfaSettingsHarness h;
+    StoreScope scope(h);
+    // The counter series exists, at zero, before any refusal (increase() sees the first event).
+    CHECK(h.metrics.serialize().find(
+              "yuzu_auth_mfa_factor_changed_total{route=\"recovery_codes\"} 0") !=
+          std::string::npos);
+    enrol_admin_directly(h);
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    REQUIRE_FALSE(token.empty());
+    wire_real_gate(h);
+    const auto admitted_gen = current_gen(h);
+
+    std::string f2_ids;
+    std::string seen_route;
+    h.routes.set_factor_credential_barrier_for_test([&](std::string_view route) {
+        seen_route = std::string(route);
+        replace_factor_keeping_sessions(h); // F2, no session ended
+        f2_ids = code_ids(h);
+    });
+    auto res = post_with_cookie(h, "/api/settings/mfa/recovery-codes", token);
+    REQUIRE(res);
+    CHECK(seen_route == "recovery_codes");
+    CHECK(res->status == 409);
+    CHECK(res->body.find("Your MFA factor changed while this request was in flight. Reload the "
+                         "page; if you are asked to sign in again, do so.") != std::string::npos);
+    CHECK(res->body.find("Store these recovery codes now") == std::string::npos);
+    CHECK(res->get_header_value("HX-Redirect").empty());
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    // F2's ten code rows are the original rows: nothing was deleted or inserted.
+    REQUIRE(count_ids(f2_ids) == 10);
+    CHECK(code_ids(h) == f2_ids);
+    CHECK(h.has_audit("mfa.recovery_codes.generated", "denied", "admin"));
+    CHECK(h.audit_detail("mfa.recovery_codes.generated") ==
+          "reason=factor_changed expected_gen=" + std::to_string(admitted_gen));
+    CHECK_FALSE(h.has_audit("mfa.recovery_codes.generated", "ok"));
+    CHECK(factor_changed_count(h, "recovery_codes") == 1);
+    CHECK(factor_changed_count(h, "disable") == 0);
+    // The session is neither ended nor signed out.
+    CHECK(h.auth_mgr.validate_session(token).has_value());
+}
+
+TEST_CASE("disable route: a factor rotated after the gate admitted the request answers 409, "
+          "clears nothing and ends no session (#6079 T12b)",
+          "[pg][mfa][routes][settings][stepup][binding]") {
+    MfaSettingsHarness h;
+    StoreScope scope(h);
+    enrol_admin_directly(h);
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    const auto other = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    REQUIRE_FALSE(token.empty());
+    REQUIRE_FALSE(other.empty());
+    wire_real_gate(h);
+    const auto admitted_gen = current_gen(h);
+
+    std::string f2_ids;
+    h.routes.set_factor_credential_barrier_for_test([&](std::string_view route) {
+        CHECK(route == "disable");
+        replace_factor_keeping_sessions(h);
+        f2_ids = code_ids(h);
+    });
+    auto res = post_with_cookie(h, "/api/settings/mfa/disable", token);
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->body.find("MFA factor changed while this request was in flight") !=
+          std::string::npos);
+    CHECK(res->get_header_value("HX-Redirect").empty()); // no sign-out
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    // F2 is intact: still enrolled with its ten codes, and no session of the account ended.
+    const auto st = h.auth_db->mfa_status("admin");
+    REQUIRE(st.has_value());
+    CHECK(st->enrolled);
+    CHECK(st->factor_gen == admitted_gen + 2);
+    CHECK(code_ids(h) == f2_ids);
+    CHECK(count_ids(f2_ids) == 10);
+    CHECK(h.auth_mgr.validate_session(token).has_value());
+    CHECK(h.auth_mgr.validate_session(other).has_value());
+    CHECK(scope.sessions.find(auth::AuthManager::sha256_hex(token)).value().has_value());
+    CHECK(scope.sessions.find(auth::AuthManager::sha256_hex(other)).value().has_value());
+    CHECK(h.has_audit("mfa.disabled", "denied", "admin"));
+    CHECK(h.audit_detail("mfa.disabled") ==
+          "reason=factor_changed expected_gen=" + std::to_string(admitted_gen));
+    CHECK_FALSE(h.has_audit("mfa.disabled", "ok"));
+    CHECK(factor_changed_count(h, "disable") == 1);
+}
+
+TEST_CASE("disable route: cancelling an enrolment that completed after the gate admitted the "
+          "request answers 409 and keeps the new factor (#6079 T12c)",
+          "[pg][mfa][routes][settings][stepup][binding]") {
+    MfaSettingsHarness h;
+    StoreScope scope(h);
+    // A provisional secret only: un-enrolled, so the gate admits without a proof.
+    REQUIRE(h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt).has_value());
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    REQUIRE_FALSE(token.empty());
+    wire_real_gate(h);
+    const auto admitted_gen = current_gen(h);
+    REQUIRE_FALSE(h.auth_db->mfa_status("admin")->enrolled);
+
+    h.routes.set_factor_credential_barrier_for_test(
+        [&](std::string_view) { enrol_admin_directly(h); }); // a concurrent enrolment completes
+    auto res = post_with_cookie(h, "/api/settings/mfa/disable", token);
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->get_header_value("HX-Redirect").empty());
+    const auto st = h.auth_db->mfa_status("admin");
+    REQUIRE(st.has_value());
+    CHECK(st->enrolled); // the cancel did not strip a factor that did not exist when admitted
+    CHECK(st->factor_gen == admitted_gen + 1);
+    CHECK(count_ids(code_ids(h)) == 10);
+    CHECK(h.auth_mgr.validate_session(token).has_value());
+    CHECK(h.audit_detail("mfa.disabled") ==
+          "reason=factor_changed expected_gen=" + std::to_string(admitted_gen));
+}
+
+TEST_CASE("the factor-credential routes with no rotation in the window behave as before "
+          "(#6079 T12 control)",
+          "[pg][mfa][routes][settings][stepup][binding]") {
+    MfaSettingsHarness h;
+    StoreScope scope(h);
+    enrol_admin_directly(h);
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    wire_real_gate(h);
+    int fired = 0;
+    h.routes.set_factor_credential_barrier_for_test([&](std::string_view) { ++fired; });
+
+    auto codes = post_with_cookie(h, "/api/settings/mfa/recovery-codes", token);
+    REQUIRE(codes);
+    CHECK(codes->status == 200);
+    CHECK(codes->body.find("Store these recovery codes now") != std::string::npos);
+    CHECK(h.has_audit("mfa.recovery_codes.generated", "ok", "admin"));
+
+    auto disable = post_with_cookie(h, "/api/settings/mfa/disable", token);
+    REQUIRE(disable);
+    CHECK(disable->status == 200);
+    CHECK(disable->get_header_value("HX-Redirect") == "/home"); // every session ended
+    CHECK_FALSE(h.auth_mgr.validate_session(token).has_value());
+    CHECK(fired == 2);
+    CHECK(factor_changed_count(h, "recovery_codes") == 0);
+    CHECK(factor_changed_count(h, "disable") == 0);
+}
+
+TEST_CASE("the factor-credential routes answer 503 and mutate nothing when no gate is wired "
+          "(#6079)",
+          "[pg][mfa][routes][settings][stepup]") {
+    MfaSettingsHarness h;
+    enrol_admin_directly(h);
+    h.routes.set_factor_credential_gate_fn({});
+    bool fired = false;
+    h.routes.set_factor_credential_barrier_for_test([&](std::string_view) { fired = true; });
+    const auto ids = code_ids(h);
+    for (const char* path : {"/api/settings/mfa/recovery-codes", "/api/settings/mfa/disable"}) {
+        CAPTURE(path);
+        auto res = post_same_origin(h.sink, path);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("Store these recovery codes now") == std::string::npos);
+    }
+    CHECK_FALSE(fired);
+    CHECK(code_ids(h) == ids);
+    CHECK(h.auth_db->mfa_status("admin")->enrolled);
+}
+
+TEST_CASE("recovery-codes route: a survivor of a factor replacement is refused before any code is "
+          "regenerated, and only a re-proved session reaches an approval (#6079 T9, T4)",
+          "[pg][mfa][routes][settings][stepup][binding][approval_routes]") {
+    MfaSettingsHarness h;
+    StoreScope scope(h);
+    yuzu::test::ApproverRouteFixture fx(h.auth_mgr, *h.auth_db.get(), durable_from_cookie(h));
+    enrol_admin_directly(h);
+    const auto survivor =
+        h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    REQUIRE_FALSE(survivor.empty());
+    wire_real_gate(h);
+    replace_factor_keeping_sessions(h); // F2; the survivor's session is NOT deleted
+    const auto ids_before = code_ids(h);
+    REQUIRE(count_ids(ids_before) == 10);
+
+    // Step 1 of the chain: refused by the route's own gate, under the default window...
+    auto refused = post_with_cookie(h, "/api/settings/mfa/recovery-codes", survivor);
+    REQUIRE(refused);
+    CHECK(refused->status == 401);
+    CHECK(refused->body.find("Store these recovery codes now") == std::string::npos);
+    bool mismatch = false;
+    for (const auto& a : h.audit_calls)
+        mismatch |= a.detail.find("reason=proof_factor_mismatch") != std::string::npos;
+    CHECK(mismatch);
+    CHECK(code_ids(h) == ids_before); // no code regenerated, none revealed
+    // ...and the survivor decides nothing.
+    for (const char* verb : {"approve", "reject"}) {
+        const auto ticket = fx.submit();
+        auto res = fx.decide(verb, ticket, survivor);
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(fx.status_of(ticket) == "pending");
+    }
+
+    // The control chain from a session bound to F2: regenerate through the route, consume one of
+    // the revealed codes through the step-up verification, and decide an approval.
+    const auto legit = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    auto regen = post_with_cookie(h, "/api/settings/mfa/recovery-codes", legit);
+    REQUIRE(regen);
+    REQUIRE(regen->status == 200);
+    CHECK(code_ids(h) != ids_before);
+    static const std::regex code_re("[A-Z2-7]{4}-[A-Z2-7]{4}-[A-Z2-7]{4}-[A-Z2-7]{4}");
+    std::smatch m;
+    REQUIRE(std::regex_search(regen->body, m, code_re));
+    auto verified = h.auth_db->mfa_consume_recovery_code("admin", m.str());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->ok);
+    REQUIRE(h.auth_mgr.mark_session_mfa_verified(
+        legit,
+        LocalMfaProof{.factor_gen = verified->factor_gen, .verified_ms = verified->verified_ms}));
+    const auto ticket = fx.submit();
+    auto approved = fx.decide("approve", ticket, legit);
+    REQUIRE(approved);
+    CHECK(approved->status == 200);
+    CHECK(fx.status_of(ticket) == "approved");
+}
+
+TEST_CASE("the factor-credential routes ignore the window-0 hatch: a survivor and a password-only "
+          "session are refused, an un-enrolled account still cancels (#6079 T11, T15)",
+          "[pg][mfa][routes][settings][stepup][binding]") {
+    MfaSettingsHarness h;
+    StoreScope scope(h);
+    enrol_admin_directly(h);
+    const auto survivor =
+        h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    const auto password_only =
+        h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    wire_real_gate(h, /*window_secs=*/0);
+    replace_factor_keeping_sessions(h);
+    const auto ids = code_ids(h);
+
+    for (const auto& token : {survivor, password_only}) {
+        for (const char* path : {"/api/settings/mfa/recovery-codes", "/api/settings/mfa/disable"}) {
+            CAPTURE(path);
+            auto res = post_with_cookie(h, path, token);
+            REQUIRE(res);
+            CHECK(res->status == 401);
+            CHECK(res->get_header_value("HX-Redirect").empty());
+        }
+    }
+    CHECK(code_ids(h) == ids);                       // nothing regenerated
+    CHECK(h.auth_db->mfa_status("admin")->enrolled); // nothing cleared
+    CHECK(h.auth_mgr.validate_session(survivor).has_value());
+
+    // A bound fresh session of F2 succeeds on both rows (a window of 0 does not lock it out).
+    const auto legit = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    auto codes = post_with_cookie(h, "/api/settings/mfa/recovery-codes", legit);
+    REQUIRE(codes);
+    CHECK(codes->status == 200);
+    auto disable = post_with_cookie(h, "/api/settings/mfa/disable", legit);
+    REQUIRE(disable);
+    CHECK(disable->status == 200);
+    CHECK_FALSE(h.auth_db->mfa_status("admin")->enrolled);
+
+    // An un-enrolled account still cancels a provisional enrolment at window 0.
+    REQUIRE(h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt).has_value());
+    const auto cancelling =
+        h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    auto cancel = post_with_cookie(h, "/api/settings/mfa/disable", cancelling);
+    REQUIRE(cancel);
+    CHECK(cancel->status == 200);
+    CHECK(h.audit_detail("mfa.disabled") == "no verified factor to clear");
+}
+
+TEST_CASE("recovery-codes route: a cached-fresh proof that is durably old is refused (#6079 T13)",
+          "[pg][mfa][routes][settings][stepup][binding]") {
+    MfaSettingsHarness h;
+    StoreScope scope(h);
+    enrol_admin_directly(h);
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    wire_real_gate(h);
+    // Warm the cache, then move the stored instant 400 s back WITH the bind sequence so the guard
+    // keeps the binding: the cached anchor still reads fresh.
+    REQUIRE(h.auth_mgr.validate_session(token).has_value());
+    {
+        auto lease = h.auth_db.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(),
+            "UPDATE session_store.sessions SET mfa_verified_ms = "
+            "(extract(epoch from now())*1000)::bigint - 400000, mfa_bind_seq = mfa_bind_seq + 1 "
+            "WHERE token_hash = $1",
+            std::vector<std::string>{auth::AuthManager::sha256_hex(token)});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    const auto ids = code_ids(h);
+    auto res = post_with_cookie(h, "/api/settings/mfa/recovery-codes", token);
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(code_ids(h) == ids);
+    std::string detail_text;
+    for (const auto& a : h.audit_calls)
+        if (a.detail.find("age_secs=") != std::string::npos)
+            detail_text = a.detail;
+    const auto pos = detail_text.find("age_secs=");
+    REQUIRE(pos != std::string::npos);
+    CHECK(std::stoi(detail_text.substr(pos + 9)) >= 400);
+}
+
+TEST_CASE("the factor-credential routes refuse every non-local session 403 and mutate nothing "
+          "(#6079 T14)",
+          "[pg][mfa][routes][settings][stepup][binding]") {
+    MfaSettingsHarness h;
+    enrol_admin_directly(h);
+    wire_real_gate(h, /*window_secs=*/300, /*cookie_sessions=*/false);
+    const auto ids = code_ids(h);
+    for (const char* source : {"api_token", "oidc"}) {
+        h.session_auth_source = source;
+        for (const char* path : {"/api/settings/mfa/recovery-codes", "/api/settings/mfa/disable"}) {
+            CAPTURE(source, path);
+            h.audit_calls.clear();
+            auto res = post_same_origin(h.sink, path);
+            REQUIRE(res);
+            CHECK(res->status == 403);
+            bool reason = false;
+            for (const auto& a : h.audit_calls)
+                reason |= a.detail.find("reason=factor_credential_requires_local_session") !=
+                          std::string::npos;
+            CHECK(reason);
+        }
+    }
+    CHECK(code_ids(h) == ids);
+    CHECK(h.auth_db->mfa_status("admin")->enrolled);
+}
+
+TEST_CASE(
+    "settings: server.cpp wires the factor-credential gate to run_in_handler_step_up with the "
+    "admission out-parameter (#6079)",
+    "[mfa][settings]") {
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    const auto wired = src.find("settings_routes_->set_factor_credential_gate_fn(");
+    REQUIRE(wired != std::string::npos);
+    const auto call = src.find("detail::run_in_handler_step_up(", wired);
+    REQUIRE(call != std::string::npos);
+    CHECK(call - wired < 2500);
+    // The out-parameter is a real admission, not the nullptr the 34 kRequired rows pass.
+    const auto args = src.substr(call, 800);
+    CHECK(args.find("&admitted") != std::string::npos);
 }

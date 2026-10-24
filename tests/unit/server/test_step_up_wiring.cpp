@@ -2043,7 +2043,9 @@ TEST_CASE("wiring: server.cpp's in-handler StepUpFn and the pre-request deps nam
           "sources",
           "[stepup][wiring][lexical]") {
     const std::string src = read_server_cpp();
-    // Each needle is a single line, so a CRLF checkout cannot split it.
+    // Each needle is a single line, so a CRLF checkout cannot split it. The `return ` prefix
+    // names the `step_up_fn` call: the Settings factor-credential gate wired further down calls
+    // the same function behind an `if`, with its own label parameter.
     constexpr std::string_view kCall = "return detail::run_in_handler_step_up(";
     REQUIRE(count_of(src, kCall) == 1);
     const auto call = src.find(kCall);
@@ -2077,10 +2079,10 @@ TEST_CASE("wiring: server.cpp's in-handler StepUpFn and the pre-request deps nam
     CHECK(args.find("/*admitted=*/nullptr", durable) != std::string::npos);
 
     // The stored proof is read through ONE extraction site, AuthRoutes::durable_mfa_proof_for:
-    // the chokepoint's provider, the in-handler fallback's and the approver gate's local branch.
-    // The only direct read left is the approver gate's SSO branch (the generic gates never read a
-    // stored proof for an SSO session).
-    CHECK(count_of(src, "auth_routes_->durable_mfa_proof_for(") == 3);
+    // the chokepoint's provider, the in-handler fallback's, the Settings factor-credential gate's
+    // and the approver gate's local branch. The only direct read left is the approver gate's SSO
+    // branch (the generic gates never read a stored proof for an SSO session).
+    CHECK(count_of(src, "auth_routes_->durable_mfa_proof_for(") == 4);
     CHECK(count_of(src, "auth_mgr_.read_durable_mfa_proof(") == 1);
 
     // The pre-request deps block, built per request inside the pre-request handler.
