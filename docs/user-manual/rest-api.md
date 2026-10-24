@@ -396,7 +396,7 @@ The MCP twin is `get_me`.
 
 **Permission:** Authenticated session (no specific RBAC permission required). The route is
 session-only self-description and writes no audit row. A service-scoped token may call it and
-describe itself; the MCP twin `get_me` refuses service-scoped tokens (a documented asymmetry).
+describe itself; the MCP twin `get_me` refuses service-scoped tokens (a documented asymmetry, tracked in #6432).
 
 **Response:**
 

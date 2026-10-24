@@ -916,7 +916,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      refuses it. That is the conservative default for a new tool, and it is a
      documented difference rather than a defect; a self-only service-scope
      policy that would let both transports agree is the follow-up, recorded as
-     `exception:#TBD-FILE-BEFORE-PUSH revisit:2026-11-30` (revisit date
+     `exception:#6432 revisit:2026-11-30` (revisit date
      confirmed by the owner; the issue number is a placeholder to replace once
      the issue is filed). Scope of the twin: `rbac_enabled` is the server's cached view of
      the RBAC switch and does not report the degraded state in which
