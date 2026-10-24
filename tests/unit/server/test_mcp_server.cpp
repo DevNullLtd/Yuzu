@@ -40681,6 +40681,12 @@ TEST_CASE("MCP runtime config: the tier gate, the service-scope gate and the unw
               yuzu::server::mcp::kMcpStoreFaultShortRetryMs);
     }
     {
+        // operator: Infrastructure:Write is not in the operator tier's allow-list.
+        McpTestServer ts;
+        ts.start("operator");
+        CHECK(set_runtime_config_call(ts, "log_level", "info").contains("error"));
+    }
+    {
         // A service-scoped token has no confined view of platform configuration: both refused.
         McpTestServer ts;
         ts.mock_token_scope_service = "svc-a";

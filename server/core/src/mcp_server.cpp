@@ -3431,7 +3431,8 @@ static const ToolDef kTools[] = {
     {"set_runtime_config",
      "Set one runtime configuration override. Mirrors PUT /api/v1/config/{key} (body {value}). "
      "Idempotent: the same key and value converge on the same stored state. Requires "
-     "Infrastructure:Write; not approval-gated. An MCP-tier token can write only these keys: "
+     "Infrastructure:Write; not approval-gated, but the readonly and operator tiers cannot call it "
+     "at all. A supervised-tier token can write only these keys: "
      "heartbeat_timeout (whole seconds, at least 30), response_retention_days and "
      "guardian_event_retention_days (whole days), auto_approve_enabled ('true' or 'false'; stored, "
      "but it changes nothing today because GET reports it from the auto-approve rules), log_level "
