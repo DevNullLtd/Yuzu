@@ -1084,6 +1084,70 @@ TEST_CASE("require_fleet_read — engine principal with an explicit global RBAC 
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 6d. A FAILED engine grant read is a retryable 503, never the 403 of "no grant"
+//     (CA fix round 2). Both engine arms read the grant with check_permission_checked.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+void drop_principal_roles(const std::string& dsn) {
+    yuzu::server::pg::PgConn c{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult dr{PQexec(c.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+    REQUIRE(dr.ok());
+}
+} // namespace
+
+TEST_CASE("engine gates — a failed grant read is 503 without a permission, a genuine no-grant is 403",
+          "[pg][engine_principal][integration][auth_routes][rbac][read_failed]") {
+    EngineRbacGateFixture fix;
+    yuzu::test::RbacStorePg rbac_bundle;
+    RbacStore& rbac_store = *rbac_bundle;
+    REQUIRE(rbac_store.is_open());
+    rbac_store.set_rbac_enabled(true);
+    REQUIRE(rbac_store.create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(
+        rbac_store.set_permission({"EngineReader", "GuaranteedState", "Read", "allow"}).has_value());
+
+    AuthRoutes ar(fix.cfg, fix.auth_mgr, &rbac_store, fix.api_tokens.get(),
+                 /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                 /*analytics_store=*/nullptr, fix.oidc_mu, fix.oidc_provider);
+    ar.set_engine_principal_store(fix.engine_store.get());
+    auto req = fix.request();
+
+    // Genuine no-grant (healthy store, nothing assigned): 403 on both gates.
+    {
+        httplib::Response res;
+        auto result = ar.require_fleet_read(req, res, "GuaranteedState", "Read");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error() == authz::GateFailure::Forbidden);
+        CHECK(res.status == 403);
+        httplib::Response res2;
+        auto gate = ar.require_list_read(req, res2, "GuaranteedState", "Read");
+        CHECK_FALSE(gate.admitted);
+        CHECK(res2.status == 403);
+    }
+
+    // The grant exists but its read fails: nothing was queried for the engine before, so the
+    // first read is the failing one (no cached verdict, no breaker shed).
+    REQUIRE(rbac_store.assign_role({"engine", "engine:vuln", "EngineReader"}).has_value());
+    drop_principal_roles(rbac_bundle.dsn());
+
+    httplib::Response res;
+    auto result = ar.require_fleet_read(req, res, "GuaranteedState", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(res.status == 503);
+    CHECK(res.body.find("\"retry_after_ms\":5000") != std::string::npos);
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+
+    httplib::Response res2;
+    auto gate = ar.require_list_read(req, res2, "GuaranteedState", "Read");
+    CHECK_FALSE(gate.admitted);
+    CHECK(res2.status == 503);
+    CHECK(res2.body.find("\"retry_after_ms\":5000") != std::string::npos);
+    CHECK(res2.body.find("\"permission\"") == std::string::npos);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 7. External-review Blocker 3 — engine actions must audit as
 //    principal_class=="engine", not the credential-presentation-only "agent"
 //    that principal_class_of(req) infers for every bearer token.
