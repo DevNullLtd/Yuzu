@@ -67,6 +67,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -140,10 +141,21 @@ public:
     }
 
     void unwatch(const std::string& key) override {
-        std::lock_guard<std::mutex> lk{mu_};
-        ++counts_[key].unwatch;
-        ++total_unwatch_;
-        watched_.erase(key);
+        bool hang = false;
+        {
+            std::lock_guard<std::mutex> lk{mu_};
+            ++counts_[key].unwatch;
+            ++total_unwatch_;
+            watched_.erase(key);
+            hang = hang_next_unwatch_;
+            hang_next_unwatch_ = false;
+        }
+        if (hang) { // #5547: a compensating teardown that never returns (CompensationPending)
+            std::unique_lock<std::mutex> gate{gate_mu_};
+            entered_unwatch_ = true;
+            gate_cv_.notify_all();
+            gate_cv_.wait(gate, [this] { return unwatch_released_; });
+        }
     }
 
     void stop() override {}
@@ -161,6 +173,22 @@ public:
         hang_ordinal_ = n;
     }
     void set_late_refuse() { late_refuse_.store(true, std::memory_order_relaxed); }
+    /// #5547: the next unwatch() to ENTER this mechanism parks until release_unwatch().
+    void hang_next_unwatch() {
+        std::lock_guard<std::mutex> lk{mu_};
+        hang_next_unwatch_ = true;
+    }
+    bool wait_entered_unwatch(std::chrono::seconds t) {
+        std::unique_lock<std::mutex> gate{gate_mu_};
+        return gate_cv_.wait_for(gate, t, [this] { return entered_unwatch_; });
+    }
+    void release_unwatch() {
+        {
+            std::lock_guard<std::mutex> gate{gate_mu_};
+            unwatch_released_ = true;
+        }
+        gate_cv_.notify_all();
+    }
     bool wait_entered_hang(std::chrono::seconds t) {
         std::unique_lock<std::mutex> gate{gate_mu_};
         return gate_cv_.wait_for(gate, t, [this] { return entered_hang_; });
@@ -231,6 +259,9 @@ private:
     std::condition_variable gate_cv_;
     bool entered_hang_{false};
     bool released_{false};
+    bool hang_next_unwatch_{false};  // guarded by mu_
+    bool entered_unwatch_{false};    // guarded by gate_mu_
+    bool unwatch_released_{false};   // guarded by gate_mu_
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -366,10 +397,14 @@ struct Rig {
     /// claim), waits (bounded, no REQUIRE: this also runs from the destructor) for the workers,
     /// then tears down in production order: engine, SparkEngine, KV.
     void close() {
-        if (fm)
+        if (fm) {
             fm->release_hang();
-        if (sm)
+            fm->release_unwatch();
+        }
+        if (sm) {
             sm->release_hang();
+            sm->release_unwatch();
+        }
         if (engine) {
             if (!yuzu::test::spin_until([&] { return engine->active_io_workers() == 0; }, 10s))
                 FAIL_CHECK("Rig::close: a backend worker was still alive after every gate was released");
@@ -603,6 +638,61 @@ void await_late_result_landed(Rig& r, const std::string& hung_key) {
 }
 
 constexpr int kValve = static_cast<int>(yuzu::agent::kWedgeSuppressMaxDecisions);
+
+/// #5547: counts reconcile_rule_locked's attach step per rule id, and can make it throw once for
+/// one id. The engine's post-attach hook fires once per attach_rule call, so a count that does
+/// not move across a push proves apply_rules did not reconcile the rule (a Suppressed retry),
+/// and one that moves proves it did (a Reapply). A throw there reaches apply_rules' per-rule
+/// firewall exactly like any other reconcile throw. Held by shared_ptr so the engine's copy of
+/// the hook never outlives it.
+struct AttachProbe {
+    std::mutex mu;
+    std::map<std::string, int> calls;
+    std::string throw_for; ///< consumed on first use
+    int count(const std::string& id) {
+        std::lock_guard<std::mutex> lk{mu};
+        const auto it = calls.find(id);
+        return it == calls.end() ? 0 : it->second;
+    }
+    void throw_once(std::string id) {
+        std::lock_guard<std::mutex> lk{mu};
+        throw_for = std::move(id);
+    }
+};
+std::shared_ptr<AttachProbe> install_attach_probe(Rig& r) {
+    auto probe = std::make_shared<AttachProbe>();
+    r.engine->set_post_attach_hook_for_test([probe](const std::string& id) {
+        bool do_throw = false;
+        {
+            std::lock_guard<std::mutex> lk{probe->mu};
+            ++probe->calls[id];
+            if (!probe->throw_for.empty() && probe->throw_for == id) {
+                probe->throw_for.clear();
+                do_throw = true;
+            }
+        }
+        if (do_throw)
+            throw std::runtime_error("injected post-attach throw");
+    });
+    return probe;
+}
+
+/// Ticks until the ledger has nothing pending (every accepted arm has been drained).
+void drain_until_idle(Rig& r) {
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            r.engine->journal_maintenance_tick();
+            return r.engine->ack_pending_count_for_test() == 0;
+        },
+        10s));
+}
+
+/// A bounded COUNT of ticks (not a wait): nothing re-arms or acknowledges on its own, so after
+/// this a held generation has been given every chance to advance.
+void tick_n(Rig& r, int n = 20) {
+    for (int i = 0; i < n; ++i)
+        r.engine->journal_maintenance_tick();
+}
 
 } // namespace
 
@@ -2303,17 +2393,31 @@ TEST_CASE("#4415 PR-A (CH-5): a re-enabled rule behind a retained disarm is driv
 }
 
 // -------------------------------------------------------------------------------------------------
-// CH-7. An arm re-observed by an identical full_sync, then followed by a DELTA that does not name
-//       the rule (a delta has no teardown, so nothing withdraws it, but it opens a new application
-//       that does not track the rule's receipt), which finally REFUSES. KNOWN LOSS, not new in
-//       #4415 (AC-11, #5547, the delta-omission obligation loss): the refusal is NOT visible in the
-//       ledger and the delta already acknowledged the generation, so only the next full_sync
-//       (the server's re-push cadence) repairs the rule. The case pins that state, so a change to
-//       it is noticed, and pins that the repair works.
+// #5547 - a delta push that omits an unresolved rule must not drop that rule's retry obligation.
+//
+// Before the fix GuardianArmAckLedger::begin_application() replaced the open application
+// wholesale, so a delta (additive, no teardown) that did not name a rule with a still-pending arm,
+// a retained wedge, a drained failure or a synchronous failure opened an application that knew
+// nothing of it, was clean, and acknowledged the generation while the rule was unarmed. The cases
+// below drive the REAL engine, runtime and ledger and assert EFFECT SETS: the held generation (in
+// memory and on disk), arm_stats(), and whether apply_rules reconciled a rule (the attach probe).
+// None of them reads ack_failed_receipt_count_for_test() alone as the proof of tracking: it reads
+// 0 both with and without the fix for a receipt that is merely pending.
+//
+// FALSE-GREEN TRAPS avoided here: a synchronous refusal in place of a hang (the refusal is not
+// the unresolved arm), the repairing full_sync pushed BEFORE the hold is asserted, and a default
+// generation-zero push (it can never advance anything).
 // -------------------------------------------------------------------------------------------------
-TEST_CASE("#4415 PR-A (CH-7, #5547): a re-observed arm that a delta then leaves untracked and that later "
-          "refuses is a known silent loss (AC-11) that the next full_sync repairs",
-          "[spark][guardian][reconcile][4415prA]") {
+
+// CH-7 (flipped). An arm re-observed by an identical full_sync, then followed by a DELTA that does
+// not name the rule, which finally REFUSES. A delta has no teardown, so nothing withdraws the
+// rule; the open application's pending receipt for it is CARRIED into the delta's application, so
+// the refusal is counted, the generation is never acknowledged, and the next full_sync repairs it.
+// Mutations: begin_delta_application replaced by begin_full_application (nothing carried); the
+// carry loop for `pending` deleted.
+TEST_CASE("#4415 PR-A (CH-7, #5547): a re-observed arm that a delta leaves unnamed and that later "
+          "refuses holds the generation, and the next full_sync repairs it",
+          "[spark][guardian][reconcile][4415prA][5547]") {
     Rig r;
     r.open();
     const auto p0 = r.make_file("s0");
@@ -2331,19 +2435,372 @@ TEST_CASE("#4415 PR-A (CH-7, #5547): a re-observed arm that a delta then leaves 
     CHECK(r.sm->watch_calls(hk) == 1);
     REQUIRE(r.engine->policy_generation() != kGen); // premise: not yet acknowledged
     r.dispatch(push_bytes({s0}, kGen, /*full_sync=*/false)); // a delta that does not name h
+
+    // The delta did not acknowledge anything, and h's still-pending receipt is tracked by the
+    // application the delta opened (a delta without the carry opens one with pending == 0).
+    r.require_generation_held();
+    {
+        const auto s = r.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->pending == 1);
+        CHECK(s->failed == 0);
+    }
+
     r.sm->set_late_refuse();
     r.sm->release_hang();
     await_late_result_landed(r, hk);
-    for (int i = 0; i < 20; ++i)
-        r.engine->journal_maintenance_tick();
-    // The loss: h is not armed, no failed receipt is recorded, and the generation was acknowledged.
-    CHECK(r.engine->spark_armed_rule_count() == 1);
-    CHECK(r.engine->ack_failed_receipt_count_for_test() == 0);
-    CHECK(r.engine->policy_generation() == kGen);
+    drain_until_idle(r);
+    tick_n(r);
+    CHECK(r.engine->spark_armed_rule_count() == 1); // h is not armed
+    {
+        const auto s = r.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->pending == 0);
+        CHECK(s->failed == 1); // the refusal is counted by the carried receipt
+    }
+    r.require_generation_held(); // the loss CH-7 used to pin: the generation was acknowledged here
 
     r.dispatch(bytes); // the next full_sync repairs it
     CHECK(r.settle());
     CHECK(r.sm->watch_calls(hk) == 2);
     CHECK(r.engine->spark_armed_rule_count() == 2);
     check_untouched(*r.fm, "s0 (healthy sibling)", file_key(p0));
+    CHECK(r.wait_generation(kGen)); // acknowledged only now
+    REQUIRE(r.persisted_generation().has_value());
+    CHECK(*r.persisted_generation() == kGen);
+}
+
+// AC 1 (wedge variant). A retained wedge survives a delta that omits it: the generation stays held,
+// an identical delta re-push is Suppressed (the wedge is outstanding), and when the hung arm finally
+// succeeds the adopted rule is acknowledged without a second arm.
+// Mutations: the carry loop for `failed_receipts` deleted (ack_failed_receipt_count_for_test()
+// reads 0 and the delta acknowledges); begin_delta_application replaced by begin_full_application.
+TEST_CASE("#5547 AC 1: a retained wedge survives a delta that omits it, the identical delta is "
+          "suppressed, and the late success is adopted and then acknowledged",
+          "[spark][guardian][reconcile][5547]") {
+    Rig r;
+    r.open();
+    const auto p0 = r.make_file("s0");
+    const std::string svc = "yuzu-5547-ac1";
+    const std::string hk = service_key(svc);
+    const auto s0 = file_rule("s0", p0);
+    auto probe = install_attach_probe(r);
+
+    r.sm->hang_next_watch();
+    r.dispatch(push_bytes({service_rule("h", svc), s0}, kGen));
+    REQUIRE(park_and_wedge(r, *r.sm, /*expected_armed=*/1) == hk);
+    REQUIRE(r.wait_compliant({"s0"}));
+
+    const std::string delta = push_bytes({s0}, kGen, /*full_sync=*/false);
+    r.dispatch(delta);
+    CHECK(r.engine->ack_failed_receipt_count_for_test() == 1); // h's retained wedge was carried
+    r.engine->journal_maintenance_tick();
+    r.require_generation_held();
+    {
+        const auto s = r.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 1);
+        CHECK(s->pending == 0);
+    }
+
+    // An identical re-push is a Suppress: apply_rules does not reconcile s0 again.
+    const int attaches = probe->count("s0");
+    REQUIRE(attaches >= 2); // the full_sync and the first delta
+    r.dispatch(delta);
+    CHECK(probe->count("s0") == attaches);
+    r.require_generation_held();
+
+    // The hang returns a success the runtime adopts (h is still desired): acknowledged, no re-arm.
+    r.sm->release_hang();
+    await_late_result_landed(r, hk);
+    CHECK(r.wait_generation(kGen));
+    CHECK(r.sm->watch_calls(hk) == 1);
+    CHECK(r.engine->spark_armed_rule_count() == 2);
+    REQUIRE(r.persisted_generation().has_value());
+    CHECK(*r.persisted_generation() == kGen);
+}
+
+// A synchronous refusal (ReconcileOutcome::Failed) is attributed to its rule and survives a delta
+// that omits the rule. The refusal is real: x targets the key a DIFFERENT rule's wedge holds.
+// Sequence: wedge h; delta {x} (x refused); the hang returns a refusal; delta {h} re-arms h cleanly
+// (x is carried by it); the generation is STILL held, now by x's synchronous failure alone; an
+// identical delta is a Reapply; a delta naming x clears it. The last step also pins that the
+// failure was recorded against x and not as an application-wide latch (which would be inherited by
+// every later application and never cleared by a delta).
+// Mutations: the Failed-site note_sync_failure deleted (the {h} delta acknowledges); the tail latch
+// keyed on the TOTAL failure count instead of the unattributed subset (the {x} delta never clears).
+TEST_CASE("#5547: a synchronous per-rule refusal survives a delta that omits the rule, forces a "
+          "Reapply, and is cleared only by a push that names the rule",
+          "[spark][guardian][reconcile][5547]") {
+    Rig r;
+    r.open();
+    const auto p0 = r.make_file("s0");
+    const std::string svc = "yuzu-5547-sx";
+    const std::string hk = service_key(svc);
+    const auto h = service_rule("h", svc);
+    const auto x = service_rule("x", svc); // same service, so the same key as h
+    auto probe = install_attach_probe(r);
+
+    r.sm->hang_next_watch();
+    r.dispatch(push_bytes({h, file_rule("s0", p0)}, kGen));
+    REQUIRE(park_and_wedge(r, *r.sm, /*expected_armed=*/1) == hk);
+
+    const auto refusals = r.rt().wedged_refusals();
+    r.dispatch(push_bytes({x}, kGen, /*full_sync=*/false));
+    REQUIRE(r.rt().wedged_refusals() == refusals + 1); // premise: x was refused synchronously
+    REQUIRE(r.sm->watch_calls(hk) == 1);               // and nothing re-armed the key
+
+    // The hung call returns a refusal: h's wedge pops. Drain it (it settles to an ordinary failure).
+    r.sm->set_late_refuse();
+    r.sm->release_hang();
+    await_late_result_landed(r, hk);
+    tick_n(r);
+    r.require_generation_held();
+
+    // A delta naming h re-arms it; x is omitted and its synchronous failure is carried.
+    r.dispatch(push_bytes({h}, kGen, /*full_sync=*/false));
+    REQUIRE(yuzu::test::spin_until([&] { return r.engine->spark_armed_rule_count() == 2; }, 10s));
+    drain_until_idle(r);
+    tick_n(r);
+    CHECK(r.sm->watch_calls(hk) == 2);
+    {
+        const auto s = r.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 0); // synchronous failures are outside the accepted-receipt gauge
+        CHECK(s->pending == 0);
+    }
+    r.require_generation_held(); // held by x's failure alone
+
+    const std::string delta_h = push_bytes({h}, kGen, /*full_sync=*/false);
+    const int before = probe->count("h");
+    r.dispatch(delta_h); // identical to the delta the open application came from
+    CHECK(probe->count("h") == before + 1); // a Reapply, not a Suppress
+    r.require_generation_held();
+
+    // x joins h's now-healthy key; naming it clears exactly its own failure.
+    r.dispatch(push_bytes({x}, kGen, /*full_sync=*/false));
+    CHECK(r.wait_generation(kGen));
+    REQUIRE(r.persisted_generation().has_value());
+    CHECK(*r.persisted_generation() == kGen);
+}
+
+// The per-rule THROW site of the same obligation (reconcile throws after the attach).
+// Mutations: the throw-site note_sync_failure deleted.
+TEST_CASE("#5547: a per-rule reconcile throw survives a delta that omits the rule and is cleared by "
+          "naming it",
+          "[spark][guardian][reconcile][5547]") {
+    Rig r;
+    r.open();
+    const auto pa = r.make_file("a"), pb = r.make_file("b");
+    const auto a = file_rule("a", pa), b = file_rule("b", pb);
+    auto probe = install_attach_probe(r);
+
+    probe->throw_once("a");
+    r.dispatch(push_bytes({a, b}, kGen, /*full_sync=*/false));
+    tick_n(r);
+    r.require_generation_held();
+
+    const std::string delta_b = push_bytes({b}, kGen, /*full_sync=*/false);
+    r.dispatch(delta_b); // omits a
+    tick_n(r);
+    r.require_generation_held();
+
+    const int before = probe->count("b");
+    r.dispatch(delta_b); // identical: a carried synchronous failure forces a Reapply
+    CHECK(probe->count("b") == before + 1);
+    r.require_generation_held();
+
+    r.dispatch(push_bytes({a}, kGen, /*full_sync=*/false)); // names a; it no longer throws
+    CHECK(r.wait_generation(kGen));
+}
+
+// A wedge whose compensating teardown is outstanding (CompensationPending) is carried too. The
+// withdrawal is injected at the runtime: the production routes that withdraw a rule are a push that
+// NAMES it (its entry is dropped by design) or a full_sync (which carries nothing), neither of
+// which leaves a carried entry to turn compensation-pending.
+// Mutations: the carry loop for `failed_receipts` deleted.
+TEST_CASE("#5547: a wedge that turns compensation-pending after a delta omitted it stays held, "
+          "suppresses the identical delta, then forces a Reapply once the teardown pops it",
+          "[spark][guardian][reconcile][5547]") {
+    Rig r;
+    r.open();
+    const auto p0 = r.make_file("s0");
+    const std::string svc = "yuzu-5547-comp";
+    const std::string hk = service_key(svc);
+    const auto s0 = file_rule("s0", p0);
+    auto probe = install_attach_probe(r);
+
+    r.sm->hang_next_watch();
+    r.dispatch(push_bytes({service_rule("h", svc), s0}, kGen));
+    REQUIRE(park_and_wedge(r, *r.sm, /*expected_armed=*/1) == hk);
+
+    const std::string delta = push_bytes({s0}, kGen, /*full_sync=*/false);
+    r.dispatch(delta); // omits h: its retained wedge is carried
+    REQUIRE(r.engine->ack_failed_receipt_count_for_test() == 1);
+
+    // h is withdrawn while the hung arm is outstanding; the arm then returns, is not adopted, and
+    // its compensating unwatch parks.
+    r.sm->hang_next_unwatch();
+    r.rt().detach_rule("h");
+    r.sm->release_hang();
+    REQUIRE(r.sm->wait_entered_unwatch(10s));
+    tick_n(r);
+    CHECK(r.engine->ack_failed_receipt_count_for_test() == 1); // still retained: compensation outstanding
+    r.require_generation_held();
+
+    const int attaches = probe->count("s0");
+    r.dispatch(delta);
+    CHECK(probe->count("s0") == attaches); // Suppressed while the teardown is outstanding
+    r.require_generation_held();
+
+    // The teardown finishes and pops the claim: the wedge settles to an ordinary failure, which is
+    // still counted (arm_stats) and still holds; the identical delta is now a Reapply.
+    r.sm->release_unwatch();
+    REQUIRE(yuzu::test::spin_until([&] { return r.rt().claim_queue_depth_for_test(hk) == 0; }, 10s));
+    drain_until_idle(r);
+    tick_n(r);
+    CHECK(r.engine->ack_failed_receipt_count_for_test() == 0);
+    {
+        const auto s = r.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 1);
+    }
+    r.require_generation_held();
+    r.dispatch(delta);
+    CHECK(probe->count("s0") == attaches + 1);
+    r.require_generation_held();
+
+    // h is not in the desired set any more: a full_sync without it repairs.
+    r.dispatch(push_bytes({s0}, kGen));
+    CHECK(r.wait_generation(kGen));
+}
+
+// Option A (flip-gate AC-15, deliberately NOT changed by #5547). A Wedged receipt that is drained
+// after its claim already popped (here: the late success was adopted before the first drain) has
+// neither wedge flag, so it is counted as an ordinary failure and its receipt is discarded. That
+// false failure used to cost one avoidable Reapply; it is now CARRIED, so it holds the generation
+// across omitting deltas until a full_sync or a push that names the rule. This case pins that
+// documented behaviour, not a no-hold outcome.
+// Mutations: the carry loop for `failed_ids` deleted.
+TEST_CASE("#5547 (option A): a wedge drained after its claim popped is a carried false failure that "
+          "only a full_sync or a naming push clears",
+          "[spark][guardian][reconcile][5547]") {
+    Rig r;
+    r.open();
+    const auto p0 = r.make_file("s0");
+    const std::string svc = "yuzu-5547-optA";
+    const std::string hk = service_key(svc);
+    const auto h = service_rule("h", svc);
+    const auto s0 = file_rule("s0", p0);
+    auto probe = install_attach_probe(r);
+
+    r.sm->hang_next_watch();
+    r.dispatch(push_bytes({h, s0}, kGen));
+    REQUIRE(r.sm->wait_entered_hang(30s));
+    REQUIRE(yuzu::test::spin_until([&] { return r.engine->spark_armed_rule_count() == 1; }, 10s));
+    // NO tick from here until the claim has popped: the first drain must see it already gone.
+    REQUIRE(r.rt().expire_overdue_claims_at_for_test(std::chrono::steady_clock::now() + 2h) == 1);
+    r.sm->release_hang(); // a late success; h is still desired, so it is adopted
+    await_late_result_landed(r, hk);
+    REQUIRE(r.engine->spark_armed_rule_count() == 2); // h IS armed
+    drain_until_idle(r);
+    REQUIRE(r.engine->ack_failed_receipt_count_for_test() == 0); // not retained: the premise of AC-15
+    {
+        const auto s = r.engine->arm_stats();
+        REQUIRE(s.has_value());
+        REQUIRE(s->failed == 1); // ... yet counted
+    }
+    r.require_generation_held();
+
+    const std::string delta = push_bytes({s0}, kGen, /*full_sync=*/false);
+    r.dispatch(delta); // omits h
+    tick_n(r);
+    r.require_generation_held();
+    {
+        const auto s = r.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 1); // sustained across the omitting delta (it used to reset to 0)
+    }
+    const int before = probe->count("s0");
+    r.dispatch(delta);
+    CHECK(probe->count("s0") == before + 1); // a failure with no wedge to protect: Reapply every time
+    r.require_generation_held();
+
+    // The skip below needs the Service rule to read Known, not Unknown. A host with no system bus
+    // or no service reader (a bare container, macOS) reads it Unknown, so the full_sync rebuilds
+    // it instead; the watch and unwatch counts then say nothing about the carry, and only the
+    // generation is checked there, with a WARN so the run says it skipped them. The poll is
+    // bounded and its result unused (nothing here REQUIREs a verdict, so the bound only limits
+    // the wait): a verdict that never settles keeps the checks on and a slow read fails visibly.
+    bool h_reads_unknown = false;
+    {
+        auto& rt = r.rt(); // once, outside the poll
+        decltype(rt.status_for_rule("h")) verdict;
+        (void)yuzu::test::spin_until(
+            [&] {
+                verdict = rt.status_for_rule("h");
+                return verdict.has_value() &&
+                       (verdict->last_compliant.has_value() || verdict->in_unknown);
+            },
+            5s);
+        h_reads_unknown = verdict.has_value() && verdict->in_unknown;
+    }
+    r.dispatch(push_bytes({h, s0}, kGen)); // a full_sync names h: healthy and unchanged, skipped
+    CHECK(r.wait_generation(kGen));
+    if (h_reads_unknown) {
+        WARN("the Service rule h read Unknown on this host, so the full_sync rebuilt it: the skip "
+             "checks (watch_calls == 1, unwatch_calls == 0) were not run");
+    } else {
+        CHECK(r.sm->watch_calls(hk) == 1);
+        CHECK(r.sm->unwatch_calls(hk) == 0);
+    }
+}
+
+// Astra's scenario (plan section 2). The unattributed debt of a failed full_sync is inherited by
+// every later application. A later full_sync that sweeps fine but fails to reconcile A is NOT a
+// successful authoritative full sync, so the inherited debt survives it, and a delta naming A can
+// clear only A. Only a clean full_sync discharges the debt, and it acknowledges in that same call.
+// The unattributed debt is a teardown throw (the runtime's detach fault).
+// Mutations: the discharge conditioned on full_sync() alone (the second full_sync clears the debt,
+// so the delta naming A acknowledges); the discharge deleted (the last full_sync never clears it);
+// begin_full_application dropping the inherited latch (the debt is forgotten at the second step).
+TEST_CASE("#5547: an inherited latch survives a full_sync that fails to reconcile a rule, and a delta "
+          "naming that rule clears only the rule",
+          "[spark][guardian][reconcile][5547]") {
+    constexpr std::uint64_t kNext = kGen + 1;
+    Rig r;
+    r.open();
+    const auto p1 = r.make_file("r1"), pa = r.make_file("a"), px = r.make_file("x");
+    const auto r1 = file_rule("r1", p1), a = file_rule("a", pa), x = file_rule("x", px);
+    auto probe = install_attach_probe(r);
+
+    r.dispatch(push_bytes({r1}, kGen));
+    REQUIRE(r.wait_armed(1));
+    REQUIRE(r.wait_generation(kGen));
+
+    // Step 1: a full_sync that omits r1 and whose teardown of r1 throws. Unattributed failure.
+    r.rt().set_detach_fault_for_test(true);
+    r.dispatch(push_bytes({x}, kNext));
+    REQUIRE(r.wait_armed(2)); // r1 survived the failed teardown; x armed
+    tick_n(r);
+    REQUIRE(r.engine->policy_generation() == kGen); // premise: held below kNext
+    REQUIRE(r.persisted_generation().value_or(0) == kGen);
+
+    // Step 2: a full_sync that sweeps fine but whose reconcile of a throws.
+    probe->throw_once("a");
+    r.dispatch(push_bytes({x, a}, kNext));
+    tick_n(r);
+    CHECK(r.engine->policy_generation() == kGen);
+
+    // Step 3: a delta naming a (no longer throwing) clears a's own failure but not the debt.
+    r.dispatch(push_bytes({a}, kNext, /*full_sync=*/false));
+    tick_n(r);
+    CHECK(r.engine->policy_generation() == kGen);
+    CHECK(r.persisted_generation().value_or(0) == kGen);
+
+    // Step 4: a clean full_sync discharges the debt and acknowledges in that same call.
+    r.dispatch(push_bytes({x, a}, kNext));
+    CHECK(r.engine->policy_generation() == kNext); // no tick between the dispatch and this read
+    REQUIRE(r.persisted_generation().has_value());
+    CHECK(*r.persisted_generation() == kNext);
 }

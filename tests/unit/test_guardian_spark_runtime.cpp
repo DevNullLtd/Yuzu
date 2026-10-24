@@ -10371,7 +10371,7 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
     // that missing regression test.
     {
         GuardianArmAckLedger ledger;
-        ledger.begin_application(1, std::string(64, 'r'), false, 1);
+        ledger.begin_delta_application(1, std::string(64, 'r'), 1, {"r2"});
         ledger.add_pending("r2", res2->receipt);
         CHECK(ledger.drain_locked(*rt, 10) == 1); // resolved (Wedged), but NOT an outstanding wedge yet
         CHECK(ledger.failed_receipt_count_for_test() == 0); // must NOT be inserted while unsettled
@@ -14458,7 +14458,7 @@ TEST_CASE("#5403: single-rule serialized retries behind a hung Disarm keep the k
 // teardown pops the claim the next retry is a Reapply that arms the rule.
 //
 // Level: a real GuardianSparkRuntime plus a real GuardianArmAckLedger, driven by the test thread
-// in the order GuardianEngine::apply_rules does (begin_application, detach_all, attach_rule,
+// in the order GuardianEngine::apply_rules does (begin_full_application, detach_all, attach_rule,
 // add_pending) and journal_maintenance_tick does (drain_locked, can_advance). The engine fixture
 // cannot park the arm's completion between detach_all and the re-attach (both run inside one
 // apply_rules under mtx_ with no seam between them). What is modelled rather than exercised: the
@@ -14510,7 +14510,7 @@ struct PostK4472Rig {
     /// FREE key may use this: there the fresh arm can complete before attach_rule resumes, so
     /// Armed is as legal as Accepted.
     RT::ArmOutcome reapply_attach_outcome() {
-        ledger.begin_application(1, digest, /*full_sync=*/true, 1);
+        ledger.begin_full_application(1, digest, 1);
         rt->detach_all();
         return attach_r1_outcome();
     }
@@ -14530,7 +14530,7 @@ struct PostK4472Rig {
     /// retry is Suppressed because that wedge is outstanding.
     void establish_wedge() {
         b->hang_next_arm.store(true);
-        ledger.begin_application(1, digest, /*full_sync=*/true, 1);
+        ledger.begin_full_application(1, digest, 1);
         wedge_receipt = attach_r1();
         REQUIRE(b->wait_entered_hang(std::chrono::seconds(10)));
         // A live, un-abandoned ARM head aged past the 30 s pending-Disarm threshold (but not past
@@ -14553,7 +14553,7 @@ struct PostK4472Rig {
     /// it is not adopted) and its compensating disarm parks inside the backend; the re-attach then
     /// re-observes the same claim.
     RT::ArmReceipt reapply_with_compensation_outstanding() {
-        ledger.begin_application(1, digest, /*full_sync=*/true, 1);
+        ledger.begin_full_application(1, digest, 1);
         rt->detach_all();
         b->hang_next_disarm.store(true);
         b->release_hang(); // the hung arm returns its subscription now
@@ -14798,7 +14798,7 @@ TEST_CASE("#4472: a wedge retained in failed_receipts on an earlier drain become
     f.b->release_hang();
     REQUIRE(f.b->wait_entered_disarm_hang(std::chrono::seconds(10)));
 
-    // Drain N+1 WITHOUT begin_application.
+    // Drain N+1 WITHOUT begin_*_application.
     REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 0);
     CHECK(f.rt->receipt_recovery_status(f.wedge_receipt) ==
           PostK4472Rig::RT::RecoveryStatus::CompensationPending);

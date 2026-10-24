@@ -1746,7 +1746,7 @@ once the actual mechanism is understood.
 
 ### Staged widening — Linux (2026-10-21)
 
-Linux has run `--num-processes 2` on every test invocation since #3443. The
+Until Push 2a (below), Linux ran `--num-processes 2` on every test invocation since #3443. The
 2026-10-20 baseline at that width: the 14 pg shards were 1,778 serial-s over
 907 s wall (sum/wall 1.96, so both workers were busy throughout); the non-pg
 step was 678 serial-s over 5.4 min; the worst shard, M, took 244 s, 35% of its
@@ -1756,14 +1756,15 @@ samples, median, stop on rule (b) or (c), keep only a ≥10% gain); it is not
 restated here. At np=4 rule (c) is already cleared by the baseline (244 s is
 far under 560 s).
 
-The change lands on one PR branch as a **push ladder**, each push taking two
-same-SHA samples before the next, so a wall-time delta is attributable to one
-axis ("never bundled with a topology change"):
+The change lands as a **push ladder** (the pushes may be separate PRs; 2a is its
+own), each push taking two same-SHA samples before the next, so a wall-time
+delta is attributable to one axis ("never bundled with a topology change"):
 
 | Push | Change | Axis | Run (id/attempt) | Samples (s) | Median pg step (s) | Median non-pg step (s) | Worst shard (s, % of timeout) | Verdict |
 |---|---|---|---|---|---|---|---|---|
 | 1 | Preflight split, `platform` suite + Linux-only `docs`, `max-parallel` 4, duration summary, PGDATA/RAM probe (np stays 2) | topology | | | | | | |
-| 2 | Linux np 2 → 4 on the three invocations; Windows pg 6 → 8, non-pg 4 → 6 | width | | | | | | |
+| 2a | Linux np 2 → 4 on the cheap-suites invocation only (see Push 2a below) | width | | | | | | |
+| 2 | Linux np 2 → 4 on the remaining two invocations (server shards, pg); Windows pg 6 → 8, non-pg 4 → 6 | width | | | | | | |
 | 3 | tmpfs PGDATA, cap from the push-1 probe (see "Postgres for server tests") | storage | | | | | | |
 | 4 | Linux np 4 → 6, then stop | width | | | | | | |
 
@@ -1773,6 +1774,120 @@ output fills the line below.
 
 Probe (push 1, `Postgres container footprint (tmpfs sizing probe)` step):
 host RAM: pending (filled by the tmpfs commit from the probe step log); post-run PGDATA per container (residual on-disk size after the pg step, not peak): pending.
+
+**Push 2a (Linux cheap-suites invocation only, `--num-processes 2 → 4`).** The
+second `Test (non-pg suites)` invocation (server shards) and the pg step stay at
+2, so the delta is attributable to this one invocation.
+
+*Baseline at np=2.* Step median over the 12 most recent `dev` push runs in which
+the `gcc-15`/`debug` job succeeded (2026-10-22 to 2026-10-24): `Test (non-pg suites)` 6.7 min
+(range 6.6 to 7.0). Two PR runs of #6425 on `gcc-15`/`debug` (job 120892371842
+on commit `a264c1e59`, job 120898156494 on commit `2c6b3a120`) took 6.8 min in
+both. In them the cheap-suites invocation took about 340 s of wall time for about
+610 serial-s (agent about 240 s, gateway 158 s of which `gateway eunit` is 122 s
+and `gateway ct` 36 s, docs 116 s, platform 96 s) and the second invocation about
+66 s; per-entry times of 5 s or more differ by at most 1.09x between the two. The
+older 678 serial-s figure above is for the same step before Push 1 added the
+docs and platform suites. These are measurements from two runs, and "both
+workers busy" is inferred from sum/wall.
+
+*Expectation (an estimate, not a measurement).* About 454 serial-s of work other
+than `gateway eunit` and `gateway ct` over four workers is about 113 s. Meson
+starts entries in definition order (these suites set no `priority:`), and
+`gateway eunit` and `gateway ct` are defined last, so they start after that work
+drains and run side by side: wall time near 235 s, about 100 s saved on the
+invocation and less on the job, where the pg step dominates. That makes rule (a)
+near-certain, so the decision content is rules (b) and (c) and the revert
+triggers. A `priority:` on `gateway eunit` is a separate, later axis.
+
+*How to measure* (read-only `gh`, no runner access):
+
+- Find the job. After a re-run, `gh api repos/DevNullLtd/Yuzu/actions/runs/<run>/attempts/<n>/jobs`
+  gives the new job id.
+- Step duration: `gh api repos/DevNullLtd/Yuzu/actions/jobs/<id>`, the step named
+  `Test (non-pg suites)` (`started_at`, `completed_at`).
+- Per-entry times: `gh run view --repo DevNullLtd/Yuzu --job <id> --log`, then
+  take the lines matching `[0-9]+/[0-9]+ .* - yuzu:` up to the first `Ok:` line
+  (that is the first invocation, 105 entries today; the second prints `N/8`).
+  Do not filter by step name (some logs show `UNKNOWN STEP`). The time is the
+  last column, except on SKIP lines, which end in `exit status 77`. The counts are
+  the `Ok:`, `Fail:` and `Skipped:` lines: Ok 100, Fail 0, Skipped 5 for the first
+  invocation and Ok 8 for the second.
+- Timeouts are not in the log: read `timeout:` in `tests/meson.build`. The ones
+  that matter: agent shards 240 s, `blocked log sink SIGTERM harness` 300 s, tar
+  90 s, `gateway eunit` and `gateway ct` 600 s.
+- Not usable: the step summaries are not exposed by the jobs API, the meson-logs
+  artifact uploads only on failure, and the runner telemetry database does not
+  carry these entries (the junit import runs once at job end and reads the last
+  invocation's file).
+- Comparator: the two PR runs above. Push runs (6.7 min median) agree with them at
+  np=2, so the comparison is not distorted for this step; the PR runs are still
+  the better match for how the new samples run. Take two same-SHA samples: the
+  first run of the PR plus a re-run of the same SHA. A PR run checks out the merge
+  commit, which `gh run rerun` reuses; a fresh trigger after `dev` moved does not,
+  and counts as a new sample.
+
+*Decision rule.* The one under "Windows test-phase concurrency gate" above,
+applied to this step: (a) the `Test (non-pg suites)` median improves by 10% or
+more (about 40 s); (b) no entry of 5 s or more at np=2 takes more than 1.5x the
+mean of its two np=2 times (shorter entries have no stable ratio); (c) no entry
+reaches 80% of its own meson timeout (480 s for `gateway eunit` and `gateway ct`,
+240 s for the harness, 192 s for an agent shard, 72 s for tar); and the entry
+count (105) and skip count (5) are unchanged. Revert at once on any of: a spark or
+guardian case failing (a `spin_until` that never resolves, an
+`ArmOutcomeKind`/`ReceiptStatus` mismatch), even if a manual re-run is green
+(`tests/known-flaky.json` is empty, so flake-retry retries nothing); the
+`blocked log sink SIGTERM harness` failing (it asserts a fixed 8 s exit after
+SIGTERM and is not scaled for load); a `gateway eunit` or `gateway ct` failure;
+any red cheap-suites invocation. To revert, set `--num-processes` on the first
+`flake-retry.py` call of the Linux job's `Test (non-pg suites)` step back to 2.
+Before the next rung, add a flake-rate check: two green samples cannot tell a 10%
+flake rate from none, so require 10 or more push runs on the leg with no
+non-timing red.
+
+*Capacity.* Each Big Tam runner is confined to 16 logical CPUs (systemd
+`AllowedCPUs`), so four workers get about four CPUs each, but a Catch2 shard and
+the BEAM are multi-threaded, so load follows threads, not entries. With four
+runner agents, Linux can now have 16 concurrent entries box-wide (up from 8). The
+Linux non-pg step has no `with-test-slot.sh` gate, whereas the Windows non-pg
+step runs a similar set (it adds the server non-pg entries and drops docs) at 4
+behind a slot of 2. Both boxes have 256 GB of RAM (owner-reported; the probe
+measurement above is still pending) and no per-runner memory limit is documented.
+This was measured on one leg (`gcc-15`/`debug`) but ships on all four: the
+clang-21 and release legs run only on a push, where all four non-pg steps can
+overlap at four wide on the box, so the 10-push-run check above is the only
+coverage for them.
+
+*Samples (measured, 2026-10-24).* Two same-SHA np=4 samples on the PR #6436
+head `df7f2fd93` (run 40118483411, job 120944791805 attempt 1 and job 120949716811
+attempt 2), each with the np=2 baseline above (jobs 120892371842 and 120898156494).
+
+| | np=2 (two PR runs) | np=4 sample 1 | np=4 sample 2 |
+|---|---|---|---|
+| `Test (non-pg suites)` step | 406 s, 405 s | 291 s | 292 s |
+| cheap-suites invocation wall | 340 s, 339 s | 224 s | 224 s |
+| second invocation wall | 66 s | 66 s | 68 s |
+| worst per-entry ratio (entries of 5 s or more) | | 1.12x | 1.12x |
+| entries; Ok / Fail / Skipped | 105; 100 / 0 / 5 | same | same |
+
+Rule (a): the step median fell from about 405 s to about 292 s (-28%), against
+the 10% bar. Rule (b): the worst ratio of an entry of 5 s or more is 1.12x
+(`docs drift gate self-test`, 7.8 s against 7.0 s; `personal data guard`), and
+`gateway eunit`, `gateway ct`, the SIGTERM harness and the agent shards are
+within 1.02x. Rule (c): the largest share of an entry's own timeout is agent
+shard B at 83 s of 240 s (35%). Entry and skip counts are unchanged and no
+revert trigger fired. The invocation saved about 116 s, a little more than the
+estimate above.
+
+One observation outside the rule: the pg-shards step, whose width is unchanged,
+took 511 s and 545 s in these two samples, against 452 s and 453 s in the two
+np=2 PR runs and 451 s to 521 s in the `dev` push runs of the same day (673 s to
+723 s the evening before). Its 14 shards summed to 1005 s and 1079 s against 884
+s and 880 s, with every shard slower. The step runs after the non-pg step and
+shares no code path with this change, so this is most likely box state, but two
+samples cannot rule out a spillover; it is why the job total fell by only about
+50 s. Watch the pg step on the next runs.
+
 
 Worst-case ceiling by width (14 pg shards, one shared 700 s timeout, every
 shard at its cap; the degenerate figure, not an expected case): np=2 is 7
