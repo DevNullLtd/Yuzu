@@ -247,9 +247,18 @@ instances).
 (fresh-start, no SQLite backfill); its `agents_responded`/`agents_success`/`agents_failure` counters
 are recomputed in-transaction from `agent_exec_status` via correlated `COUNT(*)` inside
 `UPDATE ... RETURNING`, never app-side read-modify-write. `cmd_execution_ids_` moved to
-`ExecutionTracker`'s PG-backed `command_execution` table (`record_command_execution`/
-`lookup_execution_id`), closing the cross-replica hazard this prerequisite names — see
+`ExecutionTracker`'s PG-backed `command_execution` table (`record_command_dispatch`/
+`lookup_command_record`), closing the cross-replica hazard this prerequisite names — see
 `docs/executions-history-ladder.md`.
+
+**Update (2026-10-24, #4990).** The table's entry points were renamed from `record_command_execution`/
+`lookup_execution_id` (and `AgentServiceImpl::record_execution_id`/`resolve_execution_id`) to
+`record_command_dispatch`/`lookup_command_record` (and `record_command_dispatch`/
+`resolve_response_provenance`), because the table now holds one row per DISPATCH carrying the
+dispatched `plugin` as well as the (possibly empty) execution id: a stored response's plugin label is
+the server's own record, and a response with no record is labelled `~unverified`. The per-pass reap cap
+was re-decided to 50,000 for the new inflow. The decision recorded above (a PG-backed correlation
+shared across replicas) is unchanged.
 
 ### 6. Background workers — fenced leader + transactional outbox (Q6)
 A single **core** instance holds the **fenced** leader lock and runs the singleton loops. The correctness
