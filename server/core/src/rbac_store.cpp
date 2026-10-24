@@ -3161,13 +3161,19 @@ ListReadAuthorization RbacStore::authorize_list_read(const std::string& username
 
     // #1715(a): additive — a group allow admits even against a global deny/absent.
     auto pg = resolve_perm_groups(username, securable_type, operation, mgmt_store);
-    if (!pg || pg->allow_groups.empty()) {
-        out.decision = ListReadDecision::DenyAll; // INV-1/INV-5: error or no grant → deny
+    if (!pg) {
+        out.decision = ListReadDecision::DenyAll; // INV-1/INV-5: a failed read denies ...
+        out.read_failed = true;                   // ... and says so: it is not "no grant"
+        return out;
+    }
+    if (pg->allow_groups.empty()) {
+        out.decision = ListReadDecision::DenyAll; // INV-1: a genuine "no grant"
         return out;
     }
     auto visible = expand_visible_set(*pg, mgmt_store);
     if (!visible) {
         out.decision = ListReadDecision::DenyAll; // fail-closed on a subtree-read error
+        out.read_failed = true;
         return out;
     }
     out.decision = ListReadDecision::AdmitScoped;

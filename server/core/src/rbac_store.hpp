@@ -127,6 +127,13 @@ struct ListReadAuthorization {
     /// Populated ONLY for `AdmitScoped`; the management-group-visible agent set
     /// (possibly empty ⇒ zero rows, INV-2). Left empty for Deny/AdmitAll.
     std::vector<std::string> visible_agents;
+    /// True ONLY when `decision` is `DenyAll` because a READ failed (the permission-group
+    /// resolution, the subtree expansion, or a store that is not wired), as opposed to a
+    /// genuine "no grant". It is still `DenyAll` (INV-1/INV-5: a failed read never admits); the
+    /// flag lets a caller answer a retryable 503 instead of a 403 it cannot tell from "this
+    /// caller holds no grant" - and, above all, never SERVE a list to a caller the check did
+    /// not clear. A caller that ignores it behaves exactly as before.
+    bool read_failed{false};
 };
 
 /// Result of a successful `RbacStore::set_rbac_enforcement` call.

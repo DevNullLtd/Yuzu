@@ -1529,6 +1529,18 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
 
     auto decision = rbac_store_->authorize_list_read(session->username, securable_type,
                                                       operation, mgmt_group_store_);
+    if (decision.read_failed) {
+        // DenyAll because a READ failed, not because the caller holds no grant: retryable, and
+        // never a 403 a client would read as a permanent "no grant".
+        audit_log(req, "auth.permission_required", "denied", "", "",
+                  "RBAC list read " + perm + " blocked: authorization read failed");
+        res.status = 503;
+        res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                          detail::A4ErrorOpts{.retry_after_ms = 5000,
+                                                              .permission = perm}),
+                        "application/json");
+        return gate;
+    }
     switch (decision.decision) {
     case ListReadDecision::DenyAll:
         audit_log(req, "auth.permission_required", "denied", "", "",
