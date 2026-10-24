@@ -140,7 +140,15 @@ untwinned baseline shrinks as F2+ wires real twins, and rises only when a
 change raises it with a stated reviewed reason - a newly-discovered fragment
 route, or extraction-completeness catching up to a route that already
 existed); this document's generated block going stale relative to a
-fresh render; a dated exception row that is not pinned, or is pinned to a
+fresh render; a twinned row whose REST route and MCP tool disagree on securable,
+operation or confinement kind (check 6, gate parity: the REST gate is compared with the tool's
+declared pair, and for a compared row a derived MCP handler's own gate calls are held to that
+pair too, a label-and-call-site tripwire
+with a size-pinned, shrink-only allowlist, `GATE_PARITY_KNOWN_MISMATCHES`, plus
+`GATE_PARITY_NO_GATE_ALLOWED` for routes whose gate it cannot read); a registry
+tool whose test file does not name it, assert a schema refusal and an audit row, or
+appear in `tests/meson.build` (check 7); a registry file count that is not
+`MIN_REGISTRY_FILES`; a dated exception row that is not pinned, or is pinned to a
 different issue or revisit date (`STRICT_EXCEPTION_PINS` in the script keys
 every dated exception row by `capability_id` to its issue and date, and a pin
 whose row was twinned or retired is stale); and, as a warning only, a revisit
@@ -193,7 +201,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
-| devices | 21 | 11 | 10 |
+| devices | 21 | 10 | 11 |
 | inventory | 4 | 4 | 0 |
 | dex | 27 | 18 | 9 |
 | guardian | 18 | 10 | 8 |
@@ -217,11 +225,11 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | enrollment | 21 | 4 | 17 |
 | crypto | 5 | 5 | 0 |
 | other | 82 | 24 | 58 |
-| **Total** | **344** | **130** | **214** |
+| **Total** | **344** | **129** | **215** |
 
 Registered `/api/vN/*` routes: 260. OpenAPI `paths` entries: 259. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 203.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 214. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 87.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 215. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 86.
 
 <!-- END GENERATED -->
 

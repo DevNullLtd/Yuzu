@@ -13,12 +13,11 @@
 #include "mcp_jsonrpc.hpp"         // kInvalidParams, kInternalError, success_response
 #include "mcp_retry.hpp"           // kMcpStoreFaultRetryMs
 #include "mcp_tool_deps.hpp"       // ToolDeps (provider closures)
+#include "mcp_tool_helpers.hpp"    // answer_unwired (shared by the registry files)
 #include "quarantine_read_model.hpp" // quarantine_list_data_json / quarantine_dump (shared with REST)
 #include "quarantine_visible.hpp"  // quarantine_visible_records (shared admit-then-filter read)
 
 #include <nlohmann/json.hpp>
-
-#include <spdlog/spdlog.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -70,12 +69,9 @@ bool parse_limit(const nlohmann::json& args, std::size_t& limit) {
 void handle_list_quarantined_devices(const ToolCallContext& ctx) {
     const ToolDeps* deps = ctx.deps;
     if (deps == nullptr || !deps->fleet_read_fn || !deps->quarantine_list_fn) {
-        spdlog::error("list_quarantined_devices: ToolDeps or a provider closure unwired - "
-                      "misconfigured call site; failing closed");
-        const bool audit_ok = ctx.audit("failure", "dependency unwired; failing closed");
-        ctx.res.set_content(
-            ctx.a4_error(kInternalError, "service unavailable", {}, -1, {}, audit_ok), // retry-hint-exempt: unwired dependency is a deployment misconfiguration
-            "application/json");
+        answer_unwired(ctx, "service unavailable", "dependency unwired; failing closed", {},
+                       "list_quarantined_devices: ToolDeps or a provider closure unwired - "
+                       "misconfigured call site; failing closed");
         return;
     }
 

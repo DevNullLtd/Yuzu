@@ -63,12 +63,16 @@
  * introduced, not that this file is stale.
  *
  * COST ON WINDOWS. server.cpp is loaded and comment-stripped once, by
- * cached_server_cpp_text() below: take the text from it rather than reading the
- * file in a new case. A whole-text std::regex over the ~0.76 MB stripped file can
+ * stripped_source("server.cpp") (source_scan.hpp): take the text from it rather than
+ * reading the file in a new case. The strip is a linear find-and-copy; the whole-text
+ * std::regex passes below are what is slow. A pattern over the ~0.76 MB stripped file can
  * be very slow on MSVC debug depending on the pattern's shape -- one with an
  * optional capture group at its head took 231 s there (about 1.5 s on libc++),
- * while the plain patterns in this file cost a few seconds per pass. For a new
- * scan prefer std::string_view::find plus a small matcher (see
+ * while the plain patterns in this file cost a few seconds per pass. Literal anchors
+ * use std::string_view::find (the four in the #1712 and HA WS-5 cases). The setter and
+ * construction scans and the `wired_re`, `occurrence_re`, `construct_re`, `wire_re` and
+ * `null_wire_re` anchors are structural and still use the pattern library. For a
+ * new scan prefer std::string_view::find plus a small matcher (see
  * confined_sink_scan.hpp), and time it on a Windows debug build.
  *
  * WHAT THIS SCAN DOES NOT CATCH (governance Gate 3 architect + quality-
@@ -130,24 +134,24 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
-#include <fstream>
 #include <map>
 #include <iterator>
 #include <regex>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "confined_sink_scan.hpp"
-
-#ifndef YUZU_SERVER_SRC_DIR
-#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build (meson.project_source_root() / 'server' / 'core' / 'src') -- see the server_test_exe cpp_args block."
-#endif
+#include "source_scan.hpp"
 
 using yuzu::test::wiring_scan::find_confined_dispatch_sink_sites;
 using yuzu::test::wiring_scan::kFieldWindow;
 using yuzu::test::wiring_scan::kTypeName;
+using yuzu::test::source_scan::line_of;
+using yuzu::test::source_scan::read_text_file;
+using yuzu::test::source_scan::strip_line_comments;
+using yuzu::test::source_scan::stripped_source;
+using yuzu::test::source_scan::stripped_source_loads;
 
 namespace {
 
@@ -159,24 +163,6 @@ struct SetterCall {
     std::string setter;   // e.g. "notification_store"
     std::string member;   // e.g. "notification_store_"
 };
-
-// Times cached_server_cpp_text() has loaded server.cpp. Plain int: Catch2 runs cases serially.
-int g_server_cpp_loads = 0;
-
-std::string read_text_file(const fs::path& path) {
-    INFO("reading " << path.string());
-    REQUIRE(fs::is_regular_file(path));
-    std::ifstream in(path, std::ios::binary);
-    REQUIRE(in.is_open());
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
-}
-
-int line_of(const std::string& text, std::size_t pos) {
-    return static_cast<int>(std::count(text.begin(), text.begin() + static_cast<long>(pos), '\n')) +
-           1;
-}
 
 /// `agent_service_.set_X(member_.get())` / `gateway_service_->set_X(member_.get())`.
 /// Group 1: receiver (the trailing `.`/`->` is stripped off below so both
@@ -211,53 +197,54 @@ std::map<std::string, std::vector<int>> extract_constructions(const std::string&
     return out;
 }
 
-std::string strip_line_comments(const std::string& text) {
-    static const std::regex re(R"(//[^\n]*)");
-    return std::regex_replace(text, re, "");
-}
-
-/// server.cpp, comment-stripped, loaded once per process and shared by every
-/// real-source TEST_CASE: take the text from this accessor rather than reading the
-/// file again (the strip alone is a whole-text regex pass, about 0.5 s on MSVC debug,
-/// and each case used to repeat it). Function-local static: read-only input, and
-/// Catch2 runs the cases serially in one process.
-const std::string& cached_server_cpp_text() {
-    static const std::string text = [] {
-        std::string stripped =
-            strip_line_comments(read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / "server.cpp"));
-        ++g_server_cpp_loads; // a failed read throws first, and the next call retries
-        return stripped;
-    }();
-    return text;
-}
-
 } // namespace
 
 // Only the #1712 case's `== 4` count depends on the strip (unstripped, a `//` mention
 // makes it 5); the other cases pass either way. So pin the content directly: no `//`
-// survives (the naive stripper removes them even inside string literals), and it is
+// survives (the stripper removes them even inside string literals), and it is
 // still server.cpp.
-TEST_CASE("cached_server_cpp_text is server.cpp with every // comment stripped",
+TEST_CASE("stripped_source(\"server.cpp\") is server.cpp with every // comment stripped",
           "[wiring_order]") {
-    const std::string& text = cached_server_cpp_text();
+    const std::string& text = stripped_source("server.cpp");
     CHECK(text.find("//") == std::string::npos);
     CHECK(text.find("ServerImpl") != std::string::npos);
 }
 
-// The count pins the memoisation: an accessor that reloaded on each call would
-// fail. It cannot see a case that reads the file some other way.
-TEST_CASE("cached_server_cpp_text loads server.cpp exactly once per process",
+// The counter pins the memoisation: an accessor that reloaded on each call would bump
+// it. It cannot see a case that reads the file some other way. Other cases (and other
+// translation units) may be the first to load a file, so the pin is "unchanged across
+// repeat calls", not an absolute count.
+TEST_CASE("stripped_source loads server.cpp once per process: repeat calls do not reload it",
           "[wiring_order]") {
-    (void)cached_server_cpp_text();
-    (void)cached_server_cpp_text();
-    (void)cached_server_cpp_text();
-    CHECK(g_server_cpp_loads == 1);
+    (void)stripped_source("server.cpp");
+    const int loads_after_first = stripped_source_loads;
+    (void)stripped_source("server.cpp");
+    (void)stripped_source("server.cpp");
+    (void)stripped_source("server.cpp");
+    CHECK(stripped_source_loads == loads_after_first);
+}
+
+// The stripper's contract, on engineered input: a `//` cuts to the end of its line, the
+// newline survives (line numbers are unchanged), and a `//` inside a string literal is
+// cut too (documented limit in source_scan.hpp -- pinned so a "fix" that makes it
+// string-aware is a deliberate change, not a silent one).
+TEST_CASE("strip_line_comments cuts // to end of line, keeps the newline "
+          "and cuts inside a string literal",
+          "[wiring_order]") {
+    CHECK(strip_line_comments("a // c\nb\n") == "a \nb\n");
+    CHECK(strip_line_comments("x\n// whole line\ny") == "x\n\ny");
+    CHECK(strip_line_comments("no comment") == "no comment");
+    CHECK(strip_line_comments("tail //no newline") == "tail ");
+    CHECK(strip_line_comments("a///b\nc") == "a\nc");
+    CHECK(strip_line_comments("u(\"http://h\"); x\n") == "u(\"http:\n");
+    // Block comments are not understood: the // inside one is cut, the rest survives.
+    CHECK(strip_line_comments("/* a // b */ c\n") == "/* a \n");
 }
 
 TEST_CASE("server.cpp: every agent_service_/gateway_service_ store setter runs after "
           "its member's construction (#3261)",
           "[wiring_order]") {
-    const std::string& text = cached_server_cpp_text();
+    const std::string& text = stripped_source("server.cpp");
     const auto setters = extract_setter_calls(text);
     const auto constructions = extract_constructions(text);
 
@@ -292,7 +279,7 @@ TEST_CASE("server.cpp: the three #3261 setters specifically are still present "
     // floor and pass silently -- exactly the literal symptom #3261 was.
     // Pin presence of these three explicitly so that regression can never
     // hide behind the floor.
-    const std::string& text = cached_server_cpp_text();
+    const std::string& text = stripped_source("server.cpp");
     const auto setters = extract_setter_calls(text);
 
     auto has = [&](const char* receiver, const char* setter, const char* member) {
@@ -320,7 +307,7 @@ TEST_CASE("server.cpp: the three #3261 setters specifically are still present "
 TEST_CASE("server.cpp: response_visible_set_fn is both defined and passed to "
           "DashboardRoutes::register_routes (#1712)",
           "[wiring_order][1712]") {
-    const std::string& text = cached_server_cpp_text();
+    const std::string& text = stripped_source("server.cpp");
 
     // Sanity floor: server.cpp is a six-figure-character file; a
     // suspiciously short read means YUZU_SERVER_SRC_DIR pointed somewhere
@@ -331,12 +318,14 @@ TEST_CASE("server.cpp: response_visible_set_fn is both defined and passed to "
     // ladder (engine_aware_visibility.hpp's response_visible_set, which holds the
     // check_permission / visible_agents_for_permission calls and is tested behaviourally against
     // real stores in test_engine_aware_visibility.cpp, #6204). A resolver silently downgraded to
-    // "return std::nullopt;" no longer contains the delegation, so it still fails here.
-    static const std::regex definition_re(R"(auto response_visible_set_fn =)");
-    CHECK(std::regex_search(text, definition_re));
-    static const std::regex delegation_re(
-        R"(auto response_visible_set_fn =[^;]*visibility::response_visible_set\()");
-    CHECK(std::regex_search(text, delegation_re));
+    // "return std::nullopt;" no longer contains the delegation, so it still fails here. Literal
+    // anchors only: the delegation is looked for in a bounded window after the definition, not
+    // by a pattern over the whole stripped file.
+    const std::size_t resolver_def = text.find("auto response_visible_set_fn =");
+    CHECK(resolver_def != std::string::npos);
+    CHECK((resolver_def != std::string::npos &&
+           text.substr(resolver_def, 800).find("visibility::response_visible_set(") !=
+               std::string::npos));
 
     // POSITIVE anchor 2: the resolver is actually PASSED to
     // register_routes, not merely defined and left unused. This is what
@@ -384,7 +373,7 @@ TEST_CASE("server.cpp: response_visible_set_fn is both defined and passed to "
 TEST_CASE("server.cpp: registry_.configure_presence runs after "
           "offline_endpoint_store_'s construction (HA WS-5)",
           "[wiring_order][ha]") {
-    const std::string& text = cached_server_cpp_text();
+    const std::string& text = stripped_source("server.cpp");
 
     static const std::regex construct_re(
         R"(offline_endpoint_store_\s*=\s*std::make_unique<)");
@@ -415,10 +404,9 @@ TEST_CASE("server.cpp: registry_.configure_presence runs after "
     REQUIRE(std::regex_search(text, null_wire_match, null_wire_re));
     const int null_wire_line = line_of(text, static_cast<std::size_t>(null_wire_match.position(0)));
 
-    static const std::regex reset_re(R"(offline_endpoint_store_\.reset\(\))");
-    std::smatch reset_match;
-    REQUIRE(std::regex_search(text, reset_match, reset_re));
-    const int reset_line = line_of(text, static_cast<std::size_t>(reset_match.position(0)));
+    const auto reset_pos = text.find("offline_endpoint_store_.reset()");
+    REQUIRE(reset_pos != std::string::npos);
+    const int reset_line = line_of(text, reset_pos);
 
     INFO("registry_.configure_presence(nullptr, ...) at server.cpp:" << null_wire_line);
     INFO("offline_endpoint_store_.reset() at server.cpp:" << reset_line);
@@ -445,9 +433,8 @@ TEST_CASE("server.cpp: registry_.configure_presence runs after "
 TEST_CASE("server.cpp + dispatch_scope_ladder.hpp: every production "
           "ConfinedDispatchSink wires has_remote_presence AND prepare_route_fallback (HA WS-5)",
           "[wiring_order][ha]") {
-    const std::string& server_text = cached_server_cpp_text();
-    const std::string ladder_text = strip_line_comments(
-        read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / "dispatch_scope_ladder.hpp"));
+    const std::string& server_text = stripped_source("server.cpp");
+    const std::string& ladder_text = stripped_source("dispatch_scope_ladder.hpp");
 
     int total_sites = 0;
     auto check_file = [&](const std::string& text, const char* label) {
@@ -472,22 +459,34 @@ TEST_CASE("server.cpp + dispatch_scope_ladder.hpp: every production "
     CHECK(total_sites == 3);
 }
 
-// The matcher must not use the C++ regular-expression library: scanning server.cpp
+// The matchers must not use the C++ regular-expression library: scanning server.cpp
 // with it takes minutes on MSVC debug, and nothing else here notices a merely slow
-// scan. Reading the header rather than timing the scan keeps this independent of
-// the machine. It guards that one header only: it cannot see the regexes this file
+// scan. Reading the headers rather than timing the scan keeps this independent of
+// the machine. It guards those files only: it cannot see the regexes this file
 // still uses, another header, a macro, or a slow scan that does not use one.
-TEST_CASE("confined_sink_scan.hpp does not use the regular-expression library",
+TEST_CASE("the source-scan headers and the step-up inventory do not use the regular-expression library",
           "[wiring_order]") {
-    // YUZU_SERVER_SRC_DIR is <repo>/server/core/src, so three `..` reach the repo root.
-    std::string text = read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / ".." / ".." / ".." /
-                                      "tests" / "unit" / "server" / "confined_sink_scan.hpp");
-    // Not vacuous: an empty read must not pass.
-    REQUIRE(text.find("find_confined_dispatch_sink_sites") != std::string::npos);
-    std::transform(text.begin(), text.end(), text.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    INFO("the matcher header must not contain \"regex\" in any case, comments included");
-    CHECK(text.find("regex") == std::string::npos);
+    struct Header {
+        const char* file;
+        const char* marker; // proves the read is the real header, not an empty one
+    };
+    for (const Header& h :
+         {Header{"confined_sink_scan.hpp", "find_confined_dispatch_sink_sites"},
+          Header{"source_scan.hpp", "stripped_source"},
+          Header{"route_registration_scan.hpp", "find_route_registrations"},
+          Header{"route_inventory_scan.hpp", "discover_mutating_routes"},
+          Header{"test_step_up_route_inventory.cpp", "find_step_up_calls"}}) {
+        // YUZU_SERVER_SRC_DIR is <repo>/server/core/src, so three `..` reach the repo root.
+        std::string text = read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / ".." / ".." / ".." /
+                                          "tests" / "unit" / "server" / h.file);
+        INFO(h.file);
+        // Not vacuous: an empty read must not pass.
+        REQUIRE(text.find(h.marker) != std::string::npos);
+        std::transform(text.begin(), text.end(), text.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        INFO("the scan file must not contain \"regex\" in any case, comments included");
+        CHECK(text.find("regex") == std::string::npos);
+    }
 }
 
 // The matcher against small engineered inputs, independent of whatever
@@ -750,7 +749,7 @@ TEST_CASE("find_confined_dispatch_sink_sites recognises the documented construct
 TEST_CASE("server.cpp: every username-keyed resolver seam delegates to the engine-aware "
           "resolver (#6204)",
           "[wiring_order][6204]") {
-    const std::string& text = cached_server_cpp_text();
+    const std::string& text = stripped_source("server.cpp");
     const auto count = [&text](std::string_view needle) {
         std::size_t n = 0;
         for (auto pos = text.find(needle); pos != std::string::npos;

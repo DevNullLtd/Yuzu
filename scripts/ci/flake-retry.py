@@ -1004,10 +1004,14 @@ def _selftest():
     # case the two checks are ever run without each other.
     _NONPG_SPECS = (
         ("~[pg][auth],~[pg][mcp]",),
-        ("~[pg]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]~[body_cap]",),
+        ("~[pg]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]~[body_cap]"
+         "~[oidc]~[retention]~[readyz]~[tls]",),
         ("~[pg]~[auth]~[mcp][cel],~[pg]~[auth]~[mcp][viz],~[pg]~[auth]~[mcp][scope],"
-         "~[pg]~[auth]~[mcp][dispatch],~[pg]~[auth]~[mcp][nvd],~[pg]~[auth]~[mcp][dex]",),
-        ("[body_cap]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]",),
+         "~[pg]~[auth]~[mcp][dispatch],~[pg]~[auth]~[mcp][nvd],~[pg]~[auth]~[mcp][dex],"
+         "~[pg]~[auth]~[mcp][oidc],~[pg]~[auth]~[mcp][retention],~[pg]~[auth]~[mcp][readyz],"
+         "~[pg]~[auth]~[mcp][tls]",),
+        ("[body_cap]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]"
+         "~[oidc]~[retention]~[readyz]~[tls]",),
     )
     _pg_specs = [s for s in _shard_specs if s not in _NONPG_SPECS]
     check(all(spec in _shard_specs for spec in _NONPG_SPECS),
