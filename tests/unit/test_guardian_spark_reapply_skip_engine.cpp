@@ -2726,10 +2726,29 @@ TEST_CASE("#5547 (option A): a wedge drained after its claim popped is a carried
     CHECK(probe->count("s0") == before + 1); // a failure with no wedge to protect: Reapply every time
     r.require_generation_held();
 
+    // The skip below needs the Service rule to read compliant. A host with no system bus (macOS, a
+    // bare container) reads it Unknown, so the full_sync rebuilds it instead; the watch and unwatch
+    // counts then say nothing about the carry, and only the generation is checked there. The
+    // poll is bounded and its result unused: a verdict that never settles keeps the checks on.
+    bool h_reads_unknown = false;
+    {
+        auto& rt = r.rt(); // once, outside the poll
+        decltype(rt.status_for_rule("h")) verdict;
+        (void)yuzu::test::spin_until(
+            [&] {
+                verdict = rt.status_for_rule("h");
+                return verdict.has_value() &&
+                       (verdict->last_compliant.has_value() || verdict->in_unknown);
+            },
+            5s);
+        h_reads_unknown = verdict.has_value() && verdict->in_unknown;
+    }
     r.dispatch(push_bytes({h, s0}, kGen)); // a full_sync names h: healthy and unchanged, skipped
     CHECK(r.wait_generation(kGen));
-    CHECK(r.sm->watch_calls(hk) == 1);
-    CHECK(r.sm->unwatch_calls(hk) == 0);
+    if (!h_reads_unknown) {
+        CHECK(r.sm->watch_calls(hk) == 1);
+        CHECK(r.sm->unwatch_calls(hk) == 0);
+    }
 }
 
 // Astra's scenario (plan section 2). The unattributed debt of a failed full_sync is inherited by
