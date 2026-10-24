@@ -388,8 +388,10 @@ partway through is answered `503` and is never served the list. Detective contro
 on the route and the MCP tool each success row ends `standing=available`, each refusal is a `denied`
 row ending `withheld=confined` or `withheld=refused`, and each failed check is a `failure` row; the
 drill's success rows carry no standing token, the audit row can be missing during the same outage
-(correlate with `yuzu_server_audit_emit_failed_total`), and no alert fires on a failed check. The Settings
-panel and the `/crypto` drill write no row for a refused confined caller. Do not state that confined
+(correlate with `yuzu_server_audit_emit_failed_total`), and no certificate-specific alert fires on a failed check:
+the only signals are the shared RBAC read-degrade counter and breaker (`YuzuRbacReadDegraded`,
+`YuzuRbacBreakerOpen`). The Settings
+panel and the `/crypto` drill write no row for a refused caller (confined or holding no grant). Do not state that confined
 operators cannot read the certificate inventory without these qualifications.
 
 **Addendum: the last-Administrator guard for account lifecycle (CC6.1/CC6.2,

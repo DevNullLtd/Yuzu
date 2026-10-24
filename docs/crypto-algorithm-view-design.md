@@ -1144,13 +1144,13 @@ The list is documentation, not a table column, and the view does not say which o
    failure or timeout. A degraded kind is **never** listed in `kinds_omitted` and never shown as a
    denial. A degraded authorization read must never look like a permission decision, and an
    engine-grain consumer must get complete-or-fail (D9, `0070:819-820`).
-   - **Residual (disclosed).** The gate turns a null or not-open management-group store into a 503,
-     but a fault in the middle of `authorize_list_read`'s query comes back as `DenyAll` and is
-     rendered as a 403 (`server/core/src/authz_gates.cpp:342-357`, `:369-376`). That is the
-     deliberate weakening implementation plan §2c accepts for every `authorize_list_read` caller.
-     Until it is fixed, such a fault shows as a denial on this route too: as a `kinds_omitted`
-     entry with `permission_denied` from AV-2, or as a 403 in AV-1. Coordination item C11 asks the
-     non-rendering gate (C2) to surface that in-query error as degraded, which would close it.
+   - **Closed (2026-10-24).** A fault in the middle of `authorize_list_read`'s own reads (the
+     global-grant read, the permission-group resolution, the subtree expansion) was once rendered as
+     a 403 or as a `kinds_omitted` entry. `ListReadAuthorization::read_failed` now separates it from
+     "no grant", and the gate answers a retryable 503 with a `failure` row. The older text of this
+     bullet described the weakening implementation plan §2c accepted; coordination item C11 is met.
+     Callers that do not use the shared gate (the two upload-grants resolvers) still map a failed
+     read to deny.
 3. **An admitted kind** contributes its rows, confined by **its own** visible-device set. A
    present-empty set means deny-all, never "no filter".
 4. **A denied kind** is listed in `kinds_omitted`. It carries `permission` only when that grant alone
@@ -1825,7 +1825,7 @@ the two differ.
 | CC-CH-1 | On a Linux host, `/etc/crypto-policies` becomes unreadable to the agent account mid-run, and `openssl.cnf` is replaced between two reports. | `crypto_policies` reads `unreadable` and keeps its rows and `observed_at`. `openssl_cnf` is replaced. The blob is never empty. |
 | CC-CH-2 | The agent is killed mid-read, on every leg. | No partial blob is sent. The next run's report is complete or `constrained`. |
 | CC-CH-3 | A JVM home sits on an NFS mount whose server is down. | The home is skipped as a network mount, and the action finishes inside its deadline. |
-| CC-CH-4 | The RBAC store becomes unavailable (null or not open) during a two-kind view read (AV-2). | A 503 with a retry hint. Never a partial 200, never a 403. A mid-query fault is the C11 residual and is not asserted here. |
+| CC-CH-4 | The RBAC store becomes unavailable (null or not open) during a two-kind view read (AV-2). | A 503 with a retry hint. Never a partial 200, never a 403. A mid-query fault in `authorize_list_read` is covered by `read_failed` (2026-10-24) and answers 503 too. |
 | CC-CH-5 | The `crypto_config` store is down for one daily cycle across the fleet. | No source is pinned empty. Re-sends spread over the jittered window, and the ingest alert fires. |
 
 ## Open owner decisions

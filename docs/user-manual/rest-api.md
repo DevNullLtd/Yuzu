@@ -2461,8 +2461,8 @@ offset would). `next_cursor` is `null` on the last page. Order: expiring soonest
 rest newest-issued first. Every filtered call is audited `crypto.ca.certificates.view`, as
 is every unfiltered call (set-and-proceed: `audit_persisted: false` in the body and `Sec-Audit-Failed: true` when the row
 is lost; a confined refusal is a `denied` row, and an unavailable access check a `failure` row).
-Errors: `400` (each malformed parameter, named), `401`, `403` (no `Security:Read`, or a confined
-caller), `503` + `retry_after_ms: 5000` (`Yuzu CA read degraded`, `crypto read capacity in use;
+Errors: `400` (each malformed parameter, named), `401`, `403` (no `Security:Read`, a confined
+caller, or no `Inventory:Read` grant), `503` + `retry_after_ms: 5000` (`Yuzu CA read degraded`, `crypto read capacity in use;
 retry`, or `access check unavailable`; never an empty list), and `503` **without**
 `retry_after_ms` (`filtered certificate list unavailable`: the server was built without the
 `/crypto` seam, a wiring fault that lasts until a restart). MCP twin: `list_issued_certs` with the
