@@ -315,6 +315,14 @@ void AnalyticsEventStore::stop_drain() {
 #endif
 }
 
+void AnalyticsEventStore::drain_once_for_test() {
+    drain_batch();
+}
+
+bool AnalyticsEventStore::drain_running_for_test() const {
+    return drain_thread_.joinable();
+}
+
 #ifdef __cpp_lib_jthread
 void AnalyticsEventStore::run_drain(std::stop_token stop) {
     while (!stop.stop_requested()) {

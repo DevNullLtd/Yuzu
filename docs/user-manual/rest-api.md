@@ -5015,6 +5015,8 @@ Returns current configuration values and any active runtime overrides.
 
 **Permission:** `Infrastructure:Read`
 
+> **Replaying this response.** Writing the `overrides` map back with `PUT /api/config/{key}` stops at the first administrator-only key for a caller that is not an administrator account; see [Replaying `GET /api/config`](#put-apiconfigkey).
+
 > **Secret values are never returned.** For an override whose key holds a credential
 > (today: `oidc_client_secret`) the `value` field is **omitted entirely** and replaced
 > by `"is_set": true|false`. It is not a placeholder string: a placeholder is a legal
@@ -5064,22 +5066,34 @@ keys with a stored override, so a key can appear in `config` without appearing i
 
 Update a single runtime configuration value. The key must be one of the allowed runtime-configurable keys.
 
-**Permission:** `Infrastructure:Write`. Writing an `oidc_*` key also needs the caller's own administrator role (the local account role, or the role mapped from the identity provider) from an interactive session: any session whose own role is not `admin` (an administrator only through a temporary elevation, or a non-administrator holding `Infrastructure:Write`) and any MCP-tier token gets `403` and the audit row `config.update / denied`, detail `elevated_session_oidc_setting_blocked` (elevation) or `admin_role_required_oidc_setting_blocked`. Every other key stays writable under `Infrastructure:Write`.
+**Permission:** `Infrastructure:Write`, plus a caller rule for two groups of keys. A caller the rule refuses gets `403` (A4 error envelope, with a `remediation` field and no `permission` field) and the audit row `config.update / denied`, with nothing stored and no preceding `attempted` row. The refusal happens before the runtime-config store is opened and before the request body is parsed, so a refused caller gets `403` even when the store is unavailable or the body is malformed.
+
+- **`oidc_*` keys:** the caller's OWN role must be `admin` (the local account role, or the role mapped from the identity provider), and the caller must not be an MCP-tier token (an elevation does not count). The handler also refuses a service-scoped token, as defence in depth, because the permission gate already does. A session that is an administrator only through a temporary elevation, a non-administrator holding `Infrastructure:Write` and an MCP-tier token are all refused. The `403` message is "changing sign-in provider settings needs your own administrator role"; `detail` is `elevated_session_oidc_setting_blocked` (elevation) or `admin_role_required_oidc_setting_blocked` (any other non-administrator). An MCP-tier or service-scoped token is refused whatever its creator's role, with the message "an administrator account is required; MCP-tier and service-scoped tokens cannot change sign-in provider settings" and `detail` `token_session_oidc_setting_blocked`.
+- **Administrator-only keys:** `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`, `dex_cohort_export_key` and `audit_retention_days`. The first six apply the same caller rule as their Settings routes, which are administrator-only. `audit_retention_days` has no Settings route (this route is its only writer); it is administrator-only by design because it is the stored audit-retention setting (reported by `GET /api/config`, evidence-bearing, and the lever that will govern enforcement once #483 lands), not because a `PUT` changes the retention applied today: the value is stored only and is not enforced (see [When a change takes effect](#when-a-change-takes-effect); the enforced window is `--audit-retention-days` or `YUZU_AUDIT_RETENTION_DAYS` plus a restart). It is administrator-class while `response_retention_days` and `guardian_event_retention_days` stay on `Infrastructure:Write` because it is audit evidence and the other two are operational data; all three are equally stored only today, and the choice should be revisited if any retention store gains a setter. The Settings pages do not expose it: write it with an administrator API token that is not MCP-tier (exempt from the same-site check), or from an administrator session (a cookie session is a browser write and needs a same-site `Origin` or `Referer`). The rule is the same for all seven: a session with an MCP-tier token or a service-scoped token, or whose EFFECTIVE role is not `admin`, is refused (an active temporary elevation counts as `admin`, exactly as on the Settings routes; this differs from `oidc_*`). The role is the account's legacy role or a live temporary elevation, never an RBAC grant: an RBAC Administrator grant alone does not count, so with RBAC on a user whose only administrator authority is that grant gets `admin_role_required_setting_blocked`; an engine principal is refused too. `detail` is `token_session_admin_setting_blocked` (MCP-tier or service-scoped token) or `admin_role_required_setting_blocked` (effective role not `admin`). The `403` message is "an administrator account is required; MCP-tier and service-scoped tokens cannot change this setting" for a token, and "changing this setting needs your own administrator role" for a non-administrator role. The `remediation` field is "change this setting as an administrator, from the Settings page or with an administrator API token that is not MCP-tier". A plain administrator API token that is not MCP-tier is admitted. Only the caller rule is shared with the Settings routes: the Settings routes also validate and clamp DEX values and tag keys and apply them live, which this generic route does not (see [When a change takes effect](#when-a-change-takes-effect)).
+
+Every other key stays writable under `Infrastructure:Write` alone, including `response_retention_days`, `guardian_event_retention_days`, `log_level`, `heartbeat_timeout` and `auto_approve_enabled`, and that includes a supervised-tier MCP-tier token whose creator is an administrator. That is deliberate for now, pending a maintainer ruling.
+
+In production the permission gate runs first. A service-scoped token, and a `readonly` or `operator` tier MCP token, are refused by that gate with the audit row `auth.permission_required` and never reach this rule, so they do not produce a `config.update / denied` row. The callers that do reach it are a supervised-tier MCP token (even one minted by an administrator) and, with RBAC on, a non-administrator role that holds `Infrastructure:Write`.
+
+**Replaying `GET /api/config`.** Writing the whole `overrides` map back with a caller that is not an administrator account (for example an MCP-tier token) stops with `403` at the first administrator-only key it reaches, so keys written before that point stay applied and the rest are not (a half-applied configuration). `overrides` is a name-sorted object, so which keys come first depends on the order the client replays them in. `GET /api/config` does not yet list which keys are administrator-only, so a config-as-code client should replay with an administrator API token that is not MCP-tier, or write the seven keys separately (the Settings pages for the six that have one, `PUT /api/config/audit_retention_days` with an administrator account for the seventh).
 
 **Audit:** audit-first (ADR-0033 section 9, no audit row, no mutation). An `attempted` `config.update` row is written before anything changes; if it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and the key is neither stored nor applied. A `success` row follows a change, or a `failure` row a store refusal. If only that outcome row is lost the change stays applied and the `200` carries `Sec-Audit-Failed: true` (see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture)). Each accepted call therefore leaves two rows.
+
+**No MCP twin.** `PUT /api/config/{key}` has no MCP tool today (planned under #2146). A twin must apply the same write class (`RuntimeConfigStore::write_class`) and the same caller rule (`authz::admin_gate_verdict`) before it writes, or it reopens the gap this section closes.
 
 **Dangling `attempted` row.** An `attempted` `config.update` row with no `success` or `failure` row after it means the outcome is unknown (the server stopped between the two, or the outcome row was lost); read `GET /api/config` to see what is in force. A `failure` row for a database error records `store error; outcome unknown`, because the write may have committed before the acknowledgement was lost.
 
 **Cross-site writes.** A session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API, MCP and engine token callers are exempt. This is the server-wide rule (see Authentication); this route also keeps its own check, which is defence in depth.
 
-**Allowed keys** (the full set; source of truth is `kAllowedKeys` in
-`server/core/src/runtime_config_store.cpp`):
+**Allowed keys** (the full set; source of truth is the `kKeySpecs` table in
+`server/core/src/runtime_config_store.cpp`, which pairs every key with its write class, that is, who
+may write it through this route; see **Permission** above):
 
 | Key | Type | Takes effect | Description |
 |---|---|---|---|
 | `heartbeat_timeout` | integer | immediately | Seconds before an agent is considered offline. Minimum 30 (the default agent heartbeat interval); a lower value is refused `400`. 30 is a floor, not a recommendation: keep it well above the agents' own `--heartbeat`. A value stored below 30 before the floor existed is raised to 30 at server start (logged), while `GET /api/config` keeps listing the stored override until you replace it |
 | `response_retention_days` | integer | **stored only, not enforced - see note** | Days to retain command response data |
-| `audit_retention_days` | integer | **stored only, not enforced - see note** | Days to retain audit log entries |
+| `audit_retention_days` | integer | **stored only, not enforced - see note** | Days to retain audit log entries. Administrator-only (see **Permission**); no Settings page writes it |
 | `guardian_event_retention_days` | integer | **stored only, not enforced - see note** | Days to retain guaranteed-state events |
 | `log_level` | string | immediately | Server log verbosity (`trace`, `debug`, `info`, `warn`, `error`) |
 | `auto_approve_enabled` | boolean | **never - see note** | Accepted and stored, but no consumer reads it back |
@@ -5196,19 +5210,18 @@ another OIDC field, restart first so the process is not holding the old value.
 > **Two different error sources, two different shapes.** The shared authorization gate in front of
 > this route **does** emit the A4 envelope: a `401`, a `403` permission denial, or a `503`
 > authorization-store failure carries `correlation_id` (echoed on `X-Correlation-Id`) like any other
-> gated route. Most bodies **the handler itself** emits do not (the three A4 refusals named at the end of this note are the exception) — `/api/config` is a legacy
+> gated route. Most bodies **the handler itself** emits do not (the A4 refusals named at the end of this note are the exception) — `/api/config` is a legacy
 > non-`/api/v1` route, and its own errors are either a bare `error` string or a nested
 > `{"error":{"code","message"},"meta":{"api_version"}}` object with no `correlation_id` and no
 > `retry_after_ms`. Besides those shown below, the handler emits nested bodies for `400` "missing
 > 'value' in request body", `400` "invalid JSON body", `400` "request body nests too deeply"
-> (over 32 levels, `kMcpMaxJsonDepth`), a `403` "changing sign-in provider settings needs your own
-> administrator role" (an `oidc_*` key written by a session whose own role is not `admin`), and a `503` "runtime config store unavailable"
+> (over 32 levels, `kMcpMaxJsonDepth`), and a `503` "runtime config store unavailable"
 > when the runtime-config store is unavailable (`GET` and `PUT` now share the identical message; an
 > earlier `GET`-side wording of "runtime configuration store unavailable" was a drift, not a
 > deliberate distinction, and has been unified). Note `503` and `403` are emitted by **both** sources, so status
 > alone does not tell you which shape you have: test for `error.correlation_id` rather than assuming
-> it, on every status. Three refusals use the A4 envelope (`correlation_id` present): `403`
-> `cross-site request refused`, `503` `audit log unavailable; the change was not made`
+> it, on every status. These refusals use the A4 envelope (`correlation_id` present): `403`
+> `cross-site request refused`, the `403` for a refused administrator-class write (see **Permission**; it carries a `remediation` and no `permission` field), `503` `audit log unavailable; the change was not made`
 > (`retry_after_ms: 5000`, a `remediation` hint, header `Sec-Audit-Failed: true`) and the `400` for
 > `dex_score_policy` (written only through its own route, which ships in a later change; no audit
 > row). An unknown key is a bare `400` and writes no audit row.
@@ -5257,7 +5270,7 @@ client secret contains `<redacted>`, rotate it at the IdP to a value that does n
 { "error": "value is the redaction placeholder, not a credential; send the real secret, or omit the key to leave it unchanged" }
 ```
 
-**Audit:** a write emits `config.update` / `RuntimeConfig` with `target_id` = the key: `attempted` (empty `detail`) before the change, then `success` (`detail` is `value=<new value>`, redacted for a secret key) or `failure` (`detail` is the store's refusal text, or `store error; outcome unknown` for a database error). A refused `oidc_*` write (the caller's own role is not `admin`) emits `config.update` / `denied` (detail `elevated_session_oidc_setting_blocked` or `admin_role_required_oidc_setting_blocked`), stores nothing and is not preceded by an `attempted` row.
+**Audit:** a write emits `config.update` / `RuntimeConfig` with `target_id` = the key: `attempted` (empty `detail`) before the change, then `success` (`detail` is `value=<new value>`, redacted for a secret key) or `failure` (`detail` is the store's refusal text, or `store error; outcome unknown` for a database error). A write refused by the caller rule (see **Permission**) emits `config.update` / `denied` on `RuntimeConfig` with `target_id` = the key, and `detail` of `elevated_session_oidc_setting_blocked`, `admin_role_required_oidc_setting_blocked` or `token_session_oidc_setting_blocked` for an `oidc_*` key, `token_session_admin_setting_blocked` or `admin_role_required_setting_blocked` for the other administrator-only keys. It stores nothing and is not preceded by an `attempted` row. The Settings routes audit the equivalent denial as `auth.admin_required`, so a SIEM rule keyed on `auth.admin_required` does not see a refusal on this route.
 See [Audit log](audit-log.md) for the `detail` contract, which differs for secret-valued keys.
 
 ---
@@ -9716,9 +9729,12 @@ and `Pragma: no-cache`.
 
 List upload grants. **Permission:** `UploadGrant:Read`, routed through
 `RbacStore::authorize_list_read` (admit-then-filter — never a bare global
-permission check). A service-scoped API token is refused `403` before any grant is
+permission check for a human caller). A service-scoped API token is refused `403` before any grant is
 read (`service-scoped tokens may not list upload grants`, no `permission` field, audit
 `upload_grant.list.access_denied`), whoever minted it; list with a non-service token.
+An engine principal is admitted only when RBAC is enabled and it holds an explicit `UploadGrant:Read` grant: with RBAC off, or
+with RBAC on and no grant, it gets `403` (`503` when the RBAC store is unavailable), the same answer as
+the MCP `list_upload_grants` tool. The engine denial is audited as `auth.permission_required`.
 
 #### `DELETE /api/v1/upload-grants/{grant_id}`
 
