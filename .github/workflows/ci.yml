@@ -1152,16 +1152,17 @@ jobs:
             exit 1
           fi
           echo "pg_mode=$PG_MODE"
-          # Bound every libpq connect in the test steps below. libpq applies
-          # this to each PQconnectdb, including a backend that accepts the TCP
-          # connection and then never answers, which would otherwise hold a
-          # fixture until the shard's meson timeout. 10 s equals PgPool's own
-          # default (pg_pool.cpp lets the variable win over it), so pool
-          # behaviour is unchanged; scripts/ci/sweep-test-databases.sh exports
-          # the same value for itself. [pg_reachability] tests unset it for the
+          # Bound every libpq connect in the later steps. libpq applies this to
+          # each connect attempt (per host), including a backend that accepts
+          # the TCP connection and then never answers, which has no bound
+          # otherwise. 10 s equals PgPool's own default (pg_pool.cpp lets the
+          # variable win over it), so pool behaviour is unchanged;
+          # scripts/ci/sweep-test-databases.sh exports the same value for
+          # itself. On POSIX the [pg_reachability] tests unset it for the
           # duration of each case (test_pg_reachability_probe.cpp), because the
           # probe lets the variable override the 3 s deadline those tests bound.
           echo "PGCONNECT_TIMEOUT=10" >> "$GITHUB_ENV"
+          echo "PGCONNECT_TIMEOUT=10 appended to GITHUB_ENV for the later steps"
 
       # Verified NOT to select the #3443 Phase 2 'server pg smoke' entry: the
       # --suite list below omits server-pg-smoke, and the by-name line
@@ -1998,16 +1999,17 @@ jobs:
             exit 1
           fi
           echo "pg_mode=$PG_MODE"
-          # Bound every libpq connect in the test steps below. libpq applies
-          # this to each PQconnectdb, including a backend that accepts the TCP
-          # connection and then never answers, which would otherwise hold a
-          # fixture until the shard's meson timeout. 10 s equals PgPool's own
-          # default (pg_pool.cpp lets the variable win over it), so pool
-          # behaviour is unchanged; scripts/ci/sweep-test-databases.sh exports
-          # the same value for itself. [pg_reachability] tests unset it for the
+          # Bound every libpq connect in the later steps. libpq applies this to
+          # each connect attempt (per host), including a backend that accepts
+          # the TCP connection and then never answers, which has no bound
+          # otherwise. 10 s equals PgPool's own default (pg_pool.cpp lets the
+          # variable win over it), so pool behaviour is unchanged;
+          # scripts/ci/sweep-test-databases.sh exports the same value for
+          # itself. On POSIX the [pg_reachability] tests unset it for the
           # duration of each case (test_pg_reachability_probe.cpp), because the
           # probe lets the variable override the 3 s deadline those tests bound.
           echo "PGCONNECT_TIMEOUT=10" >> "$GITHUB_ENV"
+          echo "PGCONNECT_TIMEOUT=10 appended to GITHUB_ENV for the later steps"
 
       # Windows CI test-phase restructuring (#3443, 2026-08-28): mirrors the
       # Linux job's non-pg/pg-shards/pg-smoke split — see docs/ci-architecture.md

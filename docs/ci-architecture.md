@@ -2000,20 +2000,6 @@ narrower, Windows-specific exclusion, not a return to macOS's all-or-nothing
 skip. Re-enabling full macOS `[pg]` coverage requires first solving the
 single-cluster capacity problem (per-shard clusters or a cheaper per-test
 isolation model than database-per-test).
-
-**Connect cap on the Linux and Windows test legs.** The
-`Resolve pg_mode + assert Postgres DSN` step in each of those two jobs appends
-`PGCONNECT_TIMEOUT=10` to `$GITHUB_ENV`, so every libpq connect in the later
-test steps has a bound, including a connect to a backend that accepts the TCP
-connection and then never answers (libpq has no connect timeout of its own).
-10 s is `PgPool`'s own default and the pool lets the variable win over it, so
-pool behaviour is unchanged; `scripts/ci/sweep-test-databases.sh` exports the
-same value for itself. macOS is not given it: that leg exports no DSN, so no
-`[pg]` test connects. The `[pg_reachability]` unit tests unset the variable for
-the duration of each case (`test_pg_reachability_probe.cpp`), because the probe
-lets it override the 3 s deadline those tests bound; a case that needs another
-value sets it itself.
-
 Resolution order inside the script:
 
 1. **Pre-set `YUZU_TEST_POSTGRES_DSN`** (runner-level env) — the escape
@@ -2124,6 +2110,20 @@ or the two symmetric matrix-include guards catching a broken mapping. It
 does NOT check DSN *parseability* — a syntactically malformed but
 non-empty DSN clears this step and only fails later, at the first actual
 libpq connection attempt inside a PG-tagged test.
+
+**Connect cap on the Linux and Windows test legs.** The
+`Resolve pg_mode + assert Postgres DSN` step in each of those two jobs appends
+`PGCONNECT_TIMEOUT=10` to `$GITHUB_ENV`, so every connect libpq makes in the
+later steps has a bound, including a connect to a backend that accepts the TCP
+connection and then never answers (libpq has no connect timeout by default).
+10 s is `PgPool`'s own default and the pool lets the variable win over it, so
+pool behaviour is unchanged; `scripts/ci/sweep-test-databases.sh` exports the
+same value for itself. macOS is not given it: that leg exports no DSN, so no
+`[pg]` test connects. On POSIX the `[pg_reachability]` unit tests unset the
+variable for the duration of each case (`test_pg_reachability_probe.cpp`),
+because the probe lets it override the 3 s deadline those tests bound; the
+timing-sensitive cases are compiled out on Windows. A case that needs another
+value sets it itself.
 
 ## PG coverage by platform
 

@@ -104,10 +104,12 @@ std::string dsn_with(const std::string& dsn, const std::string& key, const std::
 /// Returns the first cell, or nullopt on any failure.
 std::optional<std::string> admin_scalar(const std::string& admin_dsn, const char* sql,
                                         const std::string& param) {
-    // Bound the connect itself: the listener below unsets PGCONNECT_TIMEOUT for
-    // these cases, so the cap CI exports does not reach this helper. libpq takes
-    // the last connect_timeout in a DSN, so this also wins over one already set.
-    const std::string bounded = dsn_with(admin_dsn, "connect_timeout", "3");
+    // Bound the connect itself: on POSIX the listener below unsets
+    // PGCONNECT_TIMEOUT for these cases, so the cap CI exports does not reach this
+    // helper. 10 s matches that export and PgPool's default, so Windows, where the
+    // export still applies, sees the same bound. libpq takes the last
+    // connect_timeout in a DSN, so this also wins over one already set.
+    const std::string bounded = dsn_with(admin_dsn, "connect_timeout", "10");
     yuzu::server::pg::PgConn c{PQconnectdb(bounded.c_str())};
     if (PQstatus(c.get()) != CONNECTION_OK)
         return std::nullopt;
