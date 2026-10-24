@@ -113,6 +113,8 @@ TEST_CASE("live output bus: a Forensics-tier plugin's frames publish nothing to 
         CHECK(out[0].data.find(kMarker) != std::string::npos);
     }
     SECTION("every Forensics plugin, in any ASCII case, publishes nothing at all") {
+        // An empty set would make the loop vacuous (production refuses to boot with one).
+        REQUIRE_FALSE(test::forensics_plugin_set().names().empty());
         for (const auto& plugin : test::forensics_plugin_set().names()) {
             h.svc.process_gateway_response("agent-1", running_frame(plugin + "-0001", kMarker));
             std::string upper = plugin;

@@ -567,6 +567,7 @@ TEST_CASE("group-from-results: a degraded response store 503s with the "
     CHECK(res->get_header_value("HX-Trigger") ==
           R"({"showToast":{"message":"Agent count unavailable. The response store could not be read. )"
           R"(Nothing was created. Retry shortly.","level":"error"}})");
+    CHECK(res->get_header_value("HX-Retarget").empty());
 
     CHECK(h.audits_for("response.read", "denied") == 0);
     CHECK_FALSE(h.mg.find_group_by_name("degrade-group").has_value());
