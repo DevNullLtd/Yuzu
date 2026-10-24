@@ -36,6 +36,14 @@
 ///   kPendingRuling  - not yet classified; treated as kExempt by the chokepoint,
 ///                     but the row count is pinned by `kPendingRulingMax` below,
 ///                     which may only go DOWN, so "pending" is not a free pass.
+///   kFactorCredential - the two rows that ISSUE or RETIRE a second-factor credential (recovery
+///                     codes, disable MFA). Evaluated by `decide_step_up` like kRequired, with
+///                     three differences: the window is the approver window (never the
+///                     window-0 hatch), only a LOCAL interactive session may pass (an API token,
+///                     SSO or engine principal is refused 403), and the factor generation it
+///                     judged travels with the request (`StepUpAdmission`) so the mutation can
+///                     compare it under the account's row lock. The class is closed to those two
+///                     rows (pinned below and in test_step_up_policy.cpp).
 ///
 /// `action_label` is the audit `target_id` of the `mfa.step_up.required` row and
 /// is kept identical to the label the in-handler call has always used, so
@@ -43,7 +51,7 @@
 ///
 /// Self-checks (`consteval`, so a bad edit is a BUILD FAILURE): no duplicate
 /// `(method, pattern)` key, a non-empty `reason` on every kExempt / kOwnGate row,
-/// a non-empty `action_label` on every kRequired row, and the kPendingRuling
+/// a non-empty `action_label` on every kRequired and kFactorCredential row, and the kPendingRuling
 /// ceiling. They are split into several `static_assert`s on purpose; the
 /// "COMPILE-TIME COST" comment near the bottom of this file explains the budget.
 
@@ -55,6 +63,7 @@ enum class StepUpClass : unsigned char {
     kOwnGate,
     kExempt,
     kPendingRuling,
+    kFactorCredential,
 };
 
 struct StepUpPolicyEntry {
@@ -162,8 +171,8 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     {"POST",   R"(/api/settings/users/(.+)/role)",                              StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/settings/users/{username}/role"},
     {"POST",   R"(/api/settings/api-tokens)",                                   StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/settings/api-tokens"},
     {"DELETE", R"(/api/settings/api-tokens/(.+))",                              StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/settings/api-tokens/{id}"},
-    {"POST",   R"(/api/settings/mfa/recovery-codes)",                           StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/settings/mfa/recovery-codes"},
-    {"POST",   R"(/api/settings/mfa/disable)",                                  StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/settings/mfa/disable"},
+    {"POST",   R"(/api/settings/mfa/recovery-codes)",                           StepUpClass::kFactorCredential, step_up_detail::kNoReason, "POST /api/settings/mfa/recovery-codes"},
+    {"POST",   R"(/api/settings/mfa/disable)",                                  StepUpClass::kFactorCredential, step_up_detail::kNoReason, "POST /api/settings/mfa/disable"},
 
     // -- kOwnGate: the handler's own elevation gate is stricter and order-sensitive -----------
     // (auth_routes.cpp `elevation_step_up`; the chokepoint skips these.)
@@ -425,6 +434,21 @@ inline constexpr std::size_t kStepUpPolicyCount = std::size(kStepUpPolicy);
     return nullptr;
 }
 
+/// The first row carrying `action_label`, or nullptr. A linear scan of the whole table, for the
+/// in-handler fallback (`require_mfa_step_up`), which has the label and no route key and must apply
+/// the same class as the chokepoint would. Labels on kRequired and kFactorCredential rows are
+/// unique; the two kOwnGate elevation-eligibility rows share one label and the same class.
+[[nodiscard]] constexpr const StepUpPolicyEntry*
+step_up_policy_for_label(std::string_view action_label) noexcept {
+    if (action_label.empty())
+        return nullptr;
+    for (const auto& e : kStepUpPolicy) {
+        if (e.action_label == action_label)
+            return &e;
+    }
+    return nullptr;
+}
+
 /// True when `method` is one of the verbs the table classifies.
 [[nodiscard]] constexpr bool is_step_up_table_method(std::string_view method) {
     return method == "POST" || method == "PUT" || method == "DELETE" || method == "PATCH";
@@ -461,7 +485,8 @@ namespace step_up_detail {
         return false;
     if ((a.cls == StepUpClass::kExempt || a.cls == StepUpClass::kOwnGate) && a.reason.empty())
         return false;
-    return !(a.cls == StepUpClass::kRequired && a.action_label.empty());
+    return !((a.cls == StepUpClass::kRequired || a.cls == StepUpClass::kFactorCredential) &&
+             a.action_label.empty());
 }
 
 // COMPILE-TIME COST. MSVC budgets each constant evaluation (`/constexpr:steps`, default 100000)
@@ -537,18 +562,23 @@ static_assert(kStepUpPolicyCount * 3 <= step_up_detail::kKeySlots,
               "step_up_policy.hpp: the table outgrew its key index (more than a third full); "
               "raise kKeySlots (a power of two) and re-measure the cost of "
               "keys_are_unique with -fconstexpr-ops-limit");
-static_assert(step_up_detail::rows_are_well_formed<0, 150>(),
-              "step_up_policy.hpp: a row (0-149) has an unlisted verb, an empty pattern, a "
-              "kExempt/kOwnGate row without a reason, or a kRequired row without an action label");
+static_assert(
+    step_up_detail::rows_are_well_formed<0, 150>(),
+    "step_up_policy.hpp: a row (0-149) has an unlisted verb, an empty pattern, a "
+    "kExempt/kOwnGate row without a reason, or a kRequired/kFactorCredential row without an "
+    "action label");
 static_assert(step_up_detail::rows_are_well_formed<150, kStepUpPolicyCount>(),
               "step_up_policy.hpp: a row (150-end) has an unlisted verb, an empty pattern, a "
-              "kExempt/kOwnGate row without a reason, or a kRequired row without an action label");
+              "kExempt/kOwnGate row without a reason, or a kRequired/kFactorCredential row without "
+              "an action label");
 static_assert(step_up_detail::keys_are_unique(),
               "step_up_policy.hpp: duplicate (method, pattern) key");
 static_assert(step_up_detail::count_class(StepUpClass::kPendingRuling) <= kPendingRulingMax,
               "step_up_policy.hpp: more kPendingRuling rows than kPendingRulingMax");
 static_assert(step_up_detail::count_class(StepUpClass::kStrong) == 0,
               "no consumer evaluates kStrong rows yet");
+static_assert(step_up_detail::count_class(StepUpClass::kFactorCredential) == 2,
+              "kFactorCredential is closed to the two rows that issue or retire a second factor");
 static_assert(step_up_detail::count_class(StepUpClass::kOwnGate) == 3,
               "kOwnGate is closed to the three elevation routes");
 

@@ -19,13 +19,27 @@ namespace yuzu::server {
 bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
                          const auth::Session& session, AuthDB& auth_db, int window_secs,
                          const StepUpAuditFn& audit_fn, const std::string& action_label,
-                         std::string_view mfa_enforcement, yuzu::MetricsRegistry* metrics) {
+                         std::string_view mfa_enforcement, yuzu::MetricsRegistry* metrics,
+                         const DurableProofFn* durable_proof, StepUpAdmission* admitted) {
     // Thin wrapper: the decision lives in decide_step_up (step_up_gate.cpp, pure), the wire
     // shape in render_step_up_refusal. The in-handler gate speaks the REST envelope on every
     // surface, and on an htmx request render_step_up_refusal also sets the error toast (every
     // non-MCP surface does). The Settings handlers' own toast call is guarded against setting a
     // second HX-Trigger.
-    const auto verdict = decide_step_up(session, auth_db, window_secs, mfa_enforcement);
+    //
+    // The class comes from the label so this fallback (no reusable pass, an identity mismatch,
+    // a handler reached without the chokepoint) applies the same window, local-session rule and
+    // durable conjunct as the chokepoint for a factor-credential row. A label with no row is an
+    // ordinary kRequired one.
+    const auto* const row = step_up_policy_for_label(action_label);
+    const StepUpClass cls = row != nullptr ? row->cls : StepUpClass::kRequired;
+    DurableProofReadFn proof;
+    if (durable_proof != nullptr && *durable_proof)
+        proof = [&]() {
+            return (*durable_proof)(req, session);
+        };
+    const auto verdict =
+        decide_step_up(session, auth_db, proof, window_secs, mfa_enforcement, cls, admitted);
     if (verdict.passed())
         return true;
     emit_step_up_refusal_effects(req, verdict, audit_fn, action_label, {}, metrics);
@@ -74,24 +88,20 @@ ProofAge mfa_proof_age(const auth::Session& session, std::chrono::seconds effect
 void write_step_up_challenge(const httplib::Request& req, httplib::Response& res,
                              const auth::Session& session, bool is_oidc,
                              const StepUpAuditFn& audit_fn, const std::string& action_label,
-                             long long age_secs, int window_secs, std::string_view extra_detail) {
+                             long long age_secs, int window_secs, std::string_view reason) {
     // The approver gate's challenge speaks the same envelope as the generic gate: one verdict,
     // one renderer (`render_step_up_refusal`, which carries the local-vs-SSO challenge URL and
-    // the correlation id) and one audit writer (`emit_step_up_refusal_effects`). Only the audit
-    // detail suffix is the approver gate's own. The subject is neutralised (CWE-117) by
-    // emit_step_up_refusal_effects for every step-up refusal.
+    // the correlation id) and one audit writer (`emit_step_up_refusal_effects`), which appends the
+    // verdict's reason token exactly as it does for the generic gate. The subject is neutralised
+    // (CWE-117) by emit_step_up_refusal_effects for every step-up refusal.
     StepUpVerdict verdict;
     verdict.decision = StepUpDecision::kChallenge;
     verdict.is_oidc = is_oidc;
     verdict.user = session.username;
     verdict.age_secs = age_secs;
     verdict.window_secs = window_secs;
-    std::string suffix;
-    if (!extra_detail.empty()) {
-        suffix += ' ';
-        suffix += extra_detail;
-    }
-    emit_step_up_refusal_effects(req, verdict, audit_fn, action_label, suffix, nullptr);
+    verdict.reason = reason;
+    emit_step_up_refusal_effects(req, verdict, audit_fn, action_label, {}, nullptr);
     render_step_up_refusal(req, res, verdict, StepUpSurface::kRest);
 }
 
@@ -220,35 +230,21 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
     // read, or no SessionStore attached) was refused above, so only kRow and kAbsent reach
     // here.
     bool within_window = false;
-    std::int64_t proof_ms = 0;
-    bool has_proof = false;
     long long age_secs = proof.age_secs;
     if (durable.source == Source::kRow) {
-        proof_ms = durable.mfa_verified_ms;
-        has_proof = proof_ms > 0;
-        // Subtract only once the instant is known positive: a corrupt negative value would
-        // otherwise overflow the signed difference.
-        if (has_proof) {
-            const long long durable_age_ms = durable.db_now_ms - durable.mfa_verified_ms;
-            const bool durable_fresh = durable_age_ms >= 0 && durable_age_ms <= window_ms;
-            within_window =
-                durable_fresh && !proof.no_proof && proof.age_ms >= 0 && proof.age_ms <= window_ms;
-            if (durable_age_ms >= 0)
-                age_secs = std::max<long long>(proof.age_secs, durable_age_ms / 1000);
-        }
+        const auto durable_age = durable_proof_age(durable, window_ms);
+        within_window = durable_age.fresh && !proof.no_proof && proof.age_ms <= window_ms;
+        if (durable_age.age_secs >= 0)
+            age_secs = std::max<long long>(proof.age_secs, durable_age.age_secs);
     }
 
-    // A local proof is judged against the factor that is enrolled NOW. A proof bound to a
-    // generation (gen > 0) is decided by generation equality (judge_local_mfa_binding), which
-    // no timestamp can forge or skew: a repeated or forward-skewed enrolment instant moves
-    // nothing, a cleared and re-enrolled factor has a new generation. A proof with NO
-    // generation (a legacy row, a row the rebind guard unbound, or a stamp written before the
-    // routes carry the binding) keeps the instant rule for now: stamped before the CURRENT
-    // enrolment means it was made under a factor since cleared or replaced. Equal passes: both
-    // instants are authored by the same database clock at ms resolution. TRANSITIONAL: the
-    // instant rule goes when every stamp site carries a generation; an unbound proof is then a
-    // challenge.
-    std::string refusal_detail;
+    // A local proof is judged against the factor that is enrolled NOW, by generation equality
+    // alone (judge_local_mfa_binding): no timestamp can forge or skew it, so a repeated or
+    // forward-skewed enrolment instant moves nothing and a cleared and re-enrolled factor has a
+    // new generation. A proof with NO generation is not admitted (a legacy row, a row the rebind
+    // guard unbound, or a stamp written outside the binding path): the holder re-proves through
+    // /login/mfa/stepup, which writes a bound one. The challenge names the cause.
+    std::string_view refusal_reason;
     if (probe.state == MfaFactorState::kEnrolledLocal) {
         const auto judgement =
             judge_local_mfa_binding(durable, probe.factor_gen, probe.binding_enforced);
@@ -257,25 +253,21 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
             return store_unavailable("durable mfa proof");
         case LocalMfaBinding::kUnenforced:
             return store_unavailable("mfa factor binding");
-        case LocalMfaBinding::kMismatch:
-            refusal_detail = "reason=";
-            refusal_detail += judgement.reason;
-            break;
-        case LocalMfaBinding::kUnbound:
-            if (has_proof && proof_ms < probe.enrolled_at_ms)
-                refusal_detail = "reason=proof_predates_enrolment";
-            break;
         case LocalMfaBinding::kNoProof:
+        case LocalMfaBinding::kUnbound:
+        case LocalMfaBinding::kMismatch:
+            refusal_reason = judgement.reason;
+            break;
         case LocalMfaBinding::kBound:
             break;
         }
     }
 
-    if (within_window && refusal_detail.empty())
+    if (within_window && refusal_reason.empty())
         return {Kind::kPass, probe.state};
 
     detail::write_step_up_challenge(req, res, session, session.auth_source == "oidc", audit_fn,
-                                    action_label, age_secs, window_secs, refusal_detail);
+                                    action_label, age_secs, window_secs, refusal_reason);
     return {Kind::kChallengeWritten, probe.state};
 }
 

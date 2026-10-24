@@ -76,6 +76,24 @@ using namespace std::chrono_literals;
 
 namespace {
 
+// A stored proof that agrees with `session`'s cached anchor: bound to generation 1 (what the fake
+// MFA status below reports) and aged the same on a synthetic database clock. A session with no
+// cached proof has a stored row with none either.
+auth::DurableMfaProof durable_matching(const auth::Session& s) {
+    constexpr std::int64_t kDbNowMs = 4'000'000'000'000;
+    auth::DurableMfaProof d;
+    d.source = auth::DurableMfaProof::Source::kRow;
+    d.db_now_ms = kDbNowMs;
+    if (s.steady_mfa_verified.time_since_epoch().count() != 0) {
+        const auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - s.steady_mfa_verified)
+                                .count();
+        d.mfa_verified_ms = kDbNowMs - age_ms;
+        d.mfa_factor_gen = 1;
+    }
+    return d;
+}
+
 // A kRequired row whose registered pattern is a regex with a capture group.
 constexpr std::string_view kRotatePattern = R"(/api/v1/tokens/([^/]+)/rotate)";
 constexpr std::string_view kRotateLabel = "POST /api/v1/tokens/{id}/rotate";
@@ -224,7 +242,11 @@ struct WiringServer {
     MfaStatusFn mfa_status = [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
         AuthDB::MfaStatus st;
         st.enrolled = true;
+        st.factor_gen = 1;
         return st;
+    };
+    DurableProofFn durable = [](const httplib::Request&, const auth::Session& s) {
+        return durable_matching(s);
     };
     StepUpSessionFn resolver = [this](const httplib::Request& req) -> std::optional<auth::Session> {
         const int n = resolutions.fetch_add(1);
@@ -262,6 +284,7 @@ struct WiringServer {
                 const StepUpChokepointDeps deps{.resolve_session = &resolver,
                                                 .auth_db = nullptr,
                                                 .mfa_status = &mfa_status,
+                                                .durable_proof = &durable,
                                                 .audit_fn = &audit,
                                                 .metrics = &metrics,
                                                 .window_secs = 300,
@@ -285,7 +308,7 @@ struct WiringServer {
                          handler_consumed_pass.store(
                              handler_session &&
                              detail::consume_step_up_pass(req, *handler_session,
-                                                          std::string(kRotateLabel)));
+                                                          std::string(kRotateLabel), nullptr));
                      }
                      res.status = 200;
                      res.set_content("{\"ok\":true}", "application/json");
@@ -312,15 +335,19 @@ struct WiringServer {
                     return;
                 }
             }
-            const bool consumed =
-                detail::consume_step_up_pass(req, *handler_session, std::string(kRaiseLabel));
+            const bool consumed = detail::consume_step_up_pass(req, *handler_session,
+                                                               std::string(kRaiseLabel), nullptr);
             raise_consumed_pass.store(consumed);
             if (resolve_after_consume.load() && !resolver(req)) {
                 res.status = 401;
                 return;
             }
             if (!consumed) {
-                const auto verdict = decide_step_up(*handler_session, mfa_status, 300, "optional");
+                const DurableProofReadFn read = [&] {
+                    return durable_matching(*handler_session);
+                };
+                const auto verdict = decide_step_up(*handler_session, mfa_status, read, 300,
+                                                    "optional", StepUpClass::kRequired);
                 if (!verdict.passed()) {
                     emit_step_up_refusal_effects(req, verdict, audit, std::string(kRaiseLabel), {},
                                                  &metrics);
@@ -343,7 +370,7 @@ struct WiringServer {
                      unclassified_consumed_rotate_pass.store(
                          handler_session &&
                          detail::consume_step_up_pass(req, *handler_session,
-                                                      std::string(kRotateLabel)));
+                                                      std::string(kRotateLabel), nullptr));
                      res.status = 200;
                      res.set_content("{\"ok\":true}", "application/json");
                  });
@@ -588,7 +615,11 @@ struct ApprovalWiringServer {
     MfaStatusFn mfa_status = [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
         AuthDB::MfaStatus st;
         st.enrolled = true;
+        st.factor_gen = 1;
         return st;
+    };
+    DurableProofFn durable = [](const httplib::Request&, const auth::Session& s) {
+        return durable_matching(s);
     };
     std::optional<auth::Session> resolve_next() {
         const int n = resolutions.fetch_add(1);
@@ -639,6 +670,7 @@ struct ApprovalWiringServer {
                 const StepUpChokepointDeps deps{.resolve_session = &resolver,
                                                 .auth_db = nullptr,
                                                 .mfa_status = &mfa_status,
+                                                .durable_proof = &durable,
                                                 .audit_fn = &audit,
                                                 .metrics = &metrics,
                                                 .window_secs = window_secs,
@@ -676,7 +708,8 @@ struct ApprovalWiringServer {
                 handler_step_up_labels.push_back(label);
             }
             return detail::run_in_handler_step_up(req, res, sess, label, /*auth_db=*/nullptr,
-                                                  window_secs, audit, "optional", &metrics);
+                                                  window_secs, audit, "optional", &metrics,
+                                                  &durable, /*admitted=*/nullptr);
         };
         // The approver gate (#6079) runs after the generic step-up. This harness exercises the
         // central check and the pass; the approver gate has its own tests, so it passes here.
@@ -1341,7 +1374,7 @@ struct RealResolveServer {
                 res.status = 401;
                 return;
             }
-            (void)detail::consume_step_up_pass(req, *first, std::string(kRaiseLabel));
+            (void)detail::consume_step_up_pass(req, *first, std::string(kRaiseLabel), nullptr);
             raise_mutations.fetch_add(1);
             res.status = 200;
             res.set_content("{\"ok\":true}", "application/json");
@@ -1451,7 +1484,7 @@ struct CookieResolveServer {
                 res.status = 401;
                 return;
             }
-            (void)detail::consume_step_up_pass(req, *first, std::string(kRaiseLabel));
+            (void)detail::consume_step_up_pass(req, *first, std::string(kRaiseLabel), nullptr);
             raise_mutations.fetch_add(1);
             res.status = 200;
             res.set_content("{\"ok\":true}", "application/json");
@@ -2036,6 +2069,19 @@ TEST_CASE("wiring: server.cpp's in-handler StepUpFn and the pre-request deps nam
     CHECK(db < window);
     CHECK(window < enforcement);
     CHECK(enforcement < metrics);
+    // ...then the stored-proof read and no out-parameter (the 34 kRequired rows ignore the
+    // admission; the two factor-credential rows get theirs from the pass the chokepoint armed).
+    const auto durable = args.find("&durable,");
+    REQUIRE(durable != std::string::npos);
+    CHECK(metrics < durable);
+    CHECK(args.find("/*admitted=*/nullptr", durable) != std::string::npos);
+
+    // The stored proof is read through ONE extraction site, AuthRoutes::durable_mfa_proof_for:
+    // the chokepoint's provider, the in-handler fallback's and the approver gate's local branch.
+    // The only direct read left is the approver gate's SSO branch (the generic gates never read a
+    // stored proof for an SSO session).
+    CHECK(count_of(src, "auth_routes_->durable_mfa_proof_for(") == 3);
+    CHECK(count_of(src, "auth_mgr_.read_durable_mfa_proof(") == 1);
 
     // The pre-request deps block, built per request inside the pre-request handler.
     const auto pre_request = src.find("web_server_->set_pre_request_handler(");
@@ -2047,8 +2093,9 @@ TEST_CASE("wiring: server.cpp's in-handler StepUpFn and the pre-request deps nam
     const std::string block = src.substr(deps, stage - deps);
     for (const std::string_view needle :
          {".resolve_session = &step_up_resolve,", ".auth_db = auth_mgr_.auth_db_ptr(),",
-          ".audit_fn = &step_up_audit,", ".metrics = &metrics_,",
-          ".window_secs = cfg_.mfa_step_up_window_secs,", ".mfa_enforcement = cfg_.mfa_enforcement"}) {
+          ".durable_proof = &step_up_durable,", ".audit_fn = &step_up_audit,",
+          ".metrics = &metrics_,", ".window_secs = cfg_.mfa_step_up_window_secs,",
+          ".mfa_enforcement = cfg_.mfa_enforcement"}) {
         INFO("missing from the deps block: " << needle);
         CHECK(block.find(needle) != std::string::npos);
     }

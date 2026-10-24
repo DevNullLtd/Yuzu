@@ -477,6 +477,14 @@ TEST_CASE("POST /api/settings/mfa/verify success stamps a step-up proof on the c
     // An admin who enrols in a session and immediately regenerates recovery codes or disables
     // MFA must not be refused for want of a proof: the confirming code IS a fresh proof.
     MfaSettingsHarness h;
+    // The generic gate judges the STORED proof, so the sessions live in a real session store.
+    SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+    struct Detach {
+        auth::AuthManager& m;
+        ~Detach() { m.set_session_store(nullptr); }
+    } detach{h.auth_mgr};
     const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin,
                                                                 /*mfa_verified=*/false);
     REQUIRE_FALSE(token.empty());
@@ -500,9 +508,19 @@ TEST_CASE("POST /api/settings/mfa/verify success stamps a step-up proof on the c
     const auto unstamped = h.auth_mgr.validate_session(other);
     REQUIRE(stamped.has_value());
     REQUIRE(unstamped.has_value());
-    CHECK(decide_step_up(*stamped, *h.auth_db, 300, "optional").passed());
-    CHECK(decide_step_up(*unstamped, *h.auth_db, 300, "optional").decision ==
-          StepUpDecision::kChallenge);
+    // The generic gate also judges the stored proof, so read each session's own from the store.
+    const DurableProofReadFn read_stamped = [&] {
+        return h.auth_mgr.read_durable_mfa_proof(token, "admin");
+    };
+    const DurableProofReadFn read_unstamped = [&] {
+        return h.auth_mgr.read_durable_mfa_proof(other, "admin");
+    };
+    CHECK(
+        decide_step_up(*stamped, *h.auth_db, read_stamped, 300, "optional", StepUpClass::kRequired)
+            .passed());
+    CHECK(decide_step_up(*unstamped, *h.auth_db, read_unstamped, 300, "optional",
+                         StepUpClass::kRequired)
+              .decision == StepUpDecision::kChallenge);
 }
 
 TEST_CASE("POST /api/settings/mfa/verify failure never stamps a step-up proof",

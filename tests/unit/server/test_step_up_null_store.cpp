@@ -16,12 +16,14 @@
  */
 
 #include "../../../server/core/src/step_up_wiring.hpp"
+#include "../../../server/core/src/totp.hpp"
 #include "auth_routes.hpp"
 
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "test_api_token_pg_helper.hpp"
+#include "test_auth_db_pg_helper.hpp"
 #include "test_route_sink.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -37,12 +39,14 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -102,7 +106,7 @@ TEST_CASE("in-handler step-up with no auth store is a 503 for every caller class
 
     const bool allowed = detail::run_in_handler_step_up(req, res, session, "POST /api/v1/tokens",
                                                         /*auth_db=*/nullptr, 300, audit, "optional",
-                                                        &metrics);
+                                                        &metrics, nullptr, nullptr);
 
     CHECK_FALSE(allowed);
     CHECK(res.status == 503);
@@ -144,8 +148,8 @@ TEST_CASE("in-handler step-up with no auth store still consumes a pass the choke
     yuzu::MetricsRegistry metrics;
     const StepUpAuditFn no_audit;
     CHECK(detail::run_in_handler_step_up(req, res, session_of("t", "api_token", Role::admin),
-                                         "POST /api/v1/tokens", nullptr, 300, no_audit,
-                                         "optional", &metrics));
+                                         "POST /api/v1/tokens", nullptr, 300, no_audit, "optional",
+                                         &metrics, nullptr, nullptr));
     CHECK(res.status == -1);
     detail::clear_step_up_pass();
 }
@@ -275,4 +279,204 @@ TEST_CASE("elevation-eligibility: a non-interactive MCP-tier token is refused be
     CHECK(res->status == 403);
     CHECK(h.step_up_audits().empty());
     CHECK(gate_count(h.metrics, "unavailable", "mcp_token") == 0);
+}
+
+// ── the in-handler fallback without a reusable pass (#6079 T15) ────────────────────────────────
+//
+// `run_in_handler_step_up` with an EMPTY stash (no pass for this request: the chokepoint did not
+// run, or the pass was spent or refused for another principal) evaluates the handler's own session.
+// That fallback resolves the row class from the label, so the two factor-credential labels get the
+// approver window with no hatch, the local-session-only rule and the stored-proof binding exactly
+// as the chokepoint gives them. The configured window is 0 throughout (the operator hatch).
+
+namespace {
+
+constexpr std::int64_t kFbDbNowMs = 4'000'000'000'000;
+constexpr std::string_view kRecoveryLabel = "POST /api/settings/mfa/recovery-codes";
+constexpr std::string_view kDisableLabel = "POST /api/settings/mfa/disable";
+
+struct FallbackFixture {
+    yuzu::test::AuthDbPg db;
+    yuzu::MetricsRegistry metrics;
+    struct Row {
+        std::string action, result, target_id, detail;
+    };
+    std::vector<Row> audits;
+    StepUpAuditFn audit;
+    int proof_reads{0};
+    std::int64_t proof_gen{0}; // the generation the stored proof claims
+    std::int64_t proof_age_ms{5'000};
+    bool proof_present{true}; // false: the stored row carries no proof (password-only)
+    DurableProofFn durable;
+
+    FallbackFixture() {
+        auto salt = AuthManager::random_bytes(16);
+        auto hash = AuthManager::pbkdf2_sha256("pw", salt, 1000);
+        REQUIRE(db->upsert_user("alice", hash, AuthManager::bytes_to_hex(salt), Role::admin)
+                    .has_value());
+        REQUIRE(
+            db->upsert_user("bob", hash, AuthManager::bytes_to_hex(salt), Role::user).has_value());
+        auto init = db->mfa_init_enrollment("alice", "Yuzu", std::nullopt);
+        REQUIRE(init.has_value());
+        auto bytes = mfa::base32_decode(init->secret_base32);
+        REQUIRE(bytes.has_value());
+        std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+        auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+        REQUIRE(db->mfa_verify_enrollment("alice", code, std::nullopt).has_value());
+        proof_gen = current_gen();
+
+        audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
+                       const std::string&, const std::string& ti, const std::string& d) {
+            audits.push_back({a, r, ti, d});
+            return true;
+        };
+        durable = [this](const httplib::Request&, const auth::Session&) {
+            ++proof_reads;
+            return auth::DurableMfaProof{auth::DurableMfaProof::Source::kRow,
+                                         proof_present ? kFbDbNowMs - proof_age_ms : 0, kFbDbNowMs,
+                                         proof_gen};
+        };
+    }
+
+    std::int64_t current_gen() {
+        const auto st = db->mfa_status("alice");
+        REQUIRE(st.has_value());
+        return st->factor_gen;
+    }
+
+    // A session whose cached anchor agrees with `proof_age_ms` (none when `with_proof` is false).
+    static auth::Session session(const std::string& user, const std::string& source, Role role,
+                                 bool with_proof, long long age_ms = 5'000) {
+        auth::Session s;
+        s.username = user;
+        s.role = role;
+        s.auth_source = source;
+        const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::system_clock::now().time_since_epoch())
+                                     .count();
+        AuthManager::derive_session_deadlines(s, now, now + 3600'000, now,
+                                              with_proof ? now - age_ms : 0, /*elevated_until*/ 0,
+                                              /*issued*/ 0, now);
+        return s;
+    }
+
+    bool run(const auth::Session& s, std::string_view label, int window, httplib::Response& res,
+             StepUpAdmission* admitted = nullptr) {
+        httplib::Request req;
+        req.method = "POST";
+        req.path = std::string(label.substr(label.find(' ') + 1));
+        return detail::run_in_handler_step_up(req, res, s, std::string(label), db.get(), window,
+                                              audit, "optional", &metrics, &durable, admitted);
+    }
+};
+
+} // namespace
+
+TEST_CASE("in-handler fallback at window 0: a survivor, a password-only session and a bearer are "
+          "refused on both factor-credential rows",
+          "[pg][stepup][null_store][binding][factor_credential]") {
+    FallbackFixture f;
+    const auto label = GENERATE(as<std::string_view>{}, kRecoveryLabel, kDisableLabel);
+    CAPTURE(label);
+    detail::clear_step_up_pass();
+
+    SECTION("a session bound to a factor since replaced: 401, proof_factor_mismatch, window 300") {
+        f.proof_gen = f.current_gen() + 1; // made under a different factor than the enrolled one
+        httplib::Response res;
+        CHECK_FALSE(
+            f.run(FallbackFixture::session("alice", "local", Role::admin, true), label, 0, res));
+        CHECK(res.status == 401);
+        CHECK(f.proof_reads == 1);
+        REQUIRE(f.audits.size() == 1);
+        CHECK(f.audits[0].target_id == label);
+        CHECK(f.audits[0].detail.find("reason=proof_factor_mismatch") != std::string::npos);
+        CHECK(f.audits[0].detail.find("window_secs=300") != std::string::npos);
+    }
+    SECTION("a password-only session (no proof): 401, mfa_proof_missing") {
+        f.proof_present = false;
+        httplib::Response res;
+        CHECK_FALSE(
+            f.run(FallbackFixture::session("alice", "local", Role::admin, false), label, 0, res));
+        CHECK(res.status == 401);
+        REQUIRE(f.audits.size() == 1);
+        CHECK(f.audits[0].detail.find("age_secs=-1") != std::string::npos);
+        CHECK(f.audits[0].detail.find("reason=mfa_proof_missing") != std::string::npos);
+    }
+    SECTION("an administrator API token or MCP token: 403, never the bearer pass") {
+        for (const char* source : {"api_token", "mcp_token"}) {
+            INFO(source);
+            f.audits.clear();
+            httplib::Response res;
+            CHECK_FALSE(
+                f.run(FallbackFixture::session("tok", source, Role::admin, false), label, 0, res));
+            CHECK(res.status == 403);
+            REQUIRE(f.audits.size() == 1);
+            CHECK(f.audits[0].detail.find("reason=factor_credential_requires_local_session") !=
+                  std::string::npos);
+        }
+        CHECK(f.proof_reads == 0);
+    }
+    SECTION("a bound fresh session passes and the admission names the generation") {
+        httplib::Response res;
+        StepUpAdmission admitted;
+        CHECK(f.run(FallbackFixture::session("alice", "local", Role::admin, true), label, 0, res,
+                    &admitted));
+        CHECK(res.status == -1);
+        CHECK(admitted.local);
+        CHECK(admitted.factor_gen == f.current_gen());
+        CHECK(f.audits.empty());
+    }
+    SECTION("an un-enrolled account passes (cancelling a provisional enrolment)") {
+        httplib::Response res;
+        StepUpAdmission admitted;
+        CHECK(f.run(FallbackFixture::session("bob", "local", Role::user, false), label, 0, res,
+                    &admitted));
+        CHECK(admitted.local);
+        CHECK(f.proof_reads == 0);
+    }
+
+    // The fallback ran with no pass: nothing was armed, nothing was bound, nothing was spent.
+    const auto& stash = detail::tls_step_up_pass();
+    CHECK(stash.row == nullptr);
+    CHECK_FALSE(stash.bound);
+}
+
+TEST_CASE("in-handler fallback at window 0: an ordinary kRequired row still passes without a proof "
+          "and reads no stored proof",
+          "[pg][stepup][null_store][binding]") {
+    FallbackFixture f;
+    detail::clear_step_up_pass();
+    httplib::Response res;
+    CHECK(f.run(FallbackFixture::session("alice", "local", Role::admin, false),
+                "POST /api/v1/tokens", 0, res));
+    CHECK(res.status == -1);
+    CHECK(f.proof_reads == 0);
+    CHECK(f.audits.empty());
+    // An unknown label is an ordinary row too.
+    httplib::Response res2;
+    CHECK(f.run(FallbackFixture::session("alice", "local", Role::admin, false),
+                "POST /no/such/label", 0, res2));
+    CHECK(detail::tls_step_up_pass().row == nullptr);
+}
+
+TEST_CASE("in-handler fallback: no stored-proof provider wired is a 503 for a local enrolled "
+          "caller, on an ordinary row and on a factor-credential row",
+          "[pg][stepup][null_store][binding]") {
+    FallbackFixture f;
+    detail::clear_step_up_pass();
+    for (const std::string_view label : {std::string_view("POST /api/v1/tokens"), kRecoveryLabel}) {
+        INFO(label);
+        f.audits.clear();
+        httplib::Request req;
+        req.method = "POST";
+        httplib::Response res;
+        const bool ok = detail::run_in_handler_step_up(
+            req, res, FallbackFixture::session("alice", "local", Role::admin, true),
+            std::string(label), f.db.get(), 300, f.audit, "optional", &f.metrics,
+            /*durable_proof=*/nullptr, /*admitted=*/nullptr);
+        CHECK_FALSE(ok);
+        CHECK(res.status == 503);
+        REQUIRE(f.audits.size() == 1);
+        CHECK(f.audits[0].detail.find("reason=auth_store_unwired") != std::string::npos);
+    }
 }

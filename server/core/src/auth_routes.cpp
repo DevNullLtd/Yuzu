@@ -5075,8 +5075,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                          auth_mgr_.metrics_registry());
             return false;
         }
+        const DurableProofFn durable = [this](const httplib::Request& r, const auth::Session& s) {
+            return durable_mfa_proof_for(r, s);
+        };
         return require_mfa_step_up(req, res, session, *db, window_secs, audit, label,
-                                   cfg_.mfa_enforcement, auth_mgr_.metrics_registry());
+                                   cfg_.mfa_enforcement, auth_mgr_.metrics_registry(), &durable,
+                                   nullptr);
     };
     // Step-up window for the elevation surfaces: the global window when it is
     // positive, else 300 s. So disabling the global gate (<= 0) does not disable

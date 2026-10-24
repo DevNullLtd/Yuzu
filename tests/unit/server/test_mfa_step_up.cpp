@@ -94,6 +94,26 @@ struct StepUpFixture {
         };
     }
 
+    // The stored-proof read the generic gate judges a local enrolled caller on: bound to the
+    // account's CURRENT generation and aged like the session's own cached anchor, on a synthetic
+    // database clock, so the tests below keep asserting the cached-age behaviour they were written
+    // for. A session with no cached proof has a stored row with none either.
+    DurableProofFn durable = [this](const httplib::Request&, const auth::Session& s) {
+        constexpr std::int64_t kDbNowMs = 4'000'000'000'000;
+        auth::DurableMfaProof d;
+        d.source = auth::DurableMfaProof::Source::kRow;
+        d.db_now_ms = kDbNowMs;
+        if (s.steady_mfa_verified.time_since_epoch().count() != 0) {
+            const auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - s.steady_mfa_verified)
+                                    .count();
+            const auto status = db->mfa_status(s.username);
+            d.mfa_verified_ms = kDbNowMs - age_ms;
+            d.mfa_factor_gen = status ? status->factor_gen : 0;
+        }
+        return d;
+    };
+
     auth::Session make_session(const std::string& user, const std::string& source,
                                std::chrono::system_clock::time_point verified_at = {}) {
         auth::Session s;
@@ -133,13 +153,13 @@ TEST_CASE_METHOD(StepUpFixture,
     auto session = make_session("alice", "local");
 
     CHECK(require_mfa_step_up(req, res, session, *db, /*window_secs=*/0, audit_fn,
-                              "POST /api/v1/whatever"));
+                              "POST /api/v1/whatever", "optional", nullptr, &durable, nullptr));
     CHECK(res.status == 200);
     CHECK(res.body.empty());
     CHECK(audits.empty());
 
     CHECK(require_mfa_step_up(req, res, session, *db, /*window_secs=*/-1, audit_fn,
-                              "POST /api/v1/whatever"));
+                              "POST /api/v1/whatever", "optional", nullptr, &durable, nullptr));
     CHECK(audits.empty());
 }
 
@@ -160,7 +180,8 @@ TEST_CASE_METHOD(StepUpFixture,
     auto session = make_session("carol", "saml");
 
     CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
-                                    "DELETE /api/v1/users/carol"));
+                                    "DELETE /api/v1/users/carol", "optional", nullptr, &durable,
+                                    nullptr));
     // Must deny (gate stays CLOSED), not bypass.
     CHECK(res.status == 403);
 
@@ -191,12 +212,12 @@ TEST_CASE_METHOD(StepUpFixture,
 
     auto api = make_session("alice", "api_token");
     CHECK(require_mfa_step_up(req, res, api, *db, /*window_secs=*/300, audit_fn,
-                              "POST /api/v1/tokens"));
+                              "POST /api/v1/tokens", "optional", nullptr, &durable, nullptr));
     CHECK(audits.empty());
 
     auto mcp = make_session("alice", "mcp_token");
     CHECK(require_mfa_step_up(req, res, mcp, *db, /*window_secs=*/300, audit_fn,
-                              "POST /api/v1/tokens"));
+                              "POST /api/v1/tokens", "optional", nullptr, &durable, nullptr));
     CHECK(audits.empty());
 }
 
@@ -209,7 +230,7 @@ TEST_CASE_METHOD(StepUpFixture,
     auto session = make_session("bob", "local");
 
     CHECK(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
-                              "POST /api/v1/tokens"));
+                              "POST /api/v1/tokens", "optional", nullptr, &durable, nullptr));
     CHECK(res.status == 200);
     CHECK(res.body.empty());
     CHECK(audits.empty());
@@ -225,7 +246,7 @@ TEST_CASE_METHOD(StepUpFixture,
     auto session = make_session("alice", "local");
 
     CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
-                                    "POST /api/v1/tokens"));
+                                    "POST /api/v1/tokens", "optional", nullptr, &durable, nullptr));
     CHECK(res.status == 401);
 
     auto body = nlohmann::json::parse(res.body, nullptr, false);
@@ -258,7 +279,7 @@ TEST_CASE_METHOD(StepUpFixture,
     auto session = make_session("alice", "local", std::chrono::system_clock::now());
 
     CHECK(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
-                              "POST /api/v1/tokens"));
+                              "POST /api/v1/tokens", "optional", nullptr, &durable, nullptr));
     CHECK(res.status == 200);
     CHECK(res.body.empty());
     CHECK(audits.empty());
@@ -274,7 +295,7 @@ TEST_CASE_METHOD(StepUpFixture, "require_mfa_step_up: stale proof beyond window 
                                 std::chrono::system_clock::now() - std::chrono::seconds(600));
 
     CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
-                                    "POST /api/v1/tokens"));
+                                    "POST /api/v1/tokens", "optional", nullptr, &durable, nullptr));
     CHECK(res.status == 401);
 
     auto body = nlohmann::json::parse(res.body, nullptr, false);
@@ -307,7 +328,7 @@ TEST_CASE_METHOD(StepUpFixture,
     auto session = make_session("alice", "local",
                                 std::chrono::system_clock::now() - std::chrono::hours(25));
     CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/30 * 3600, audit_fn,
-                                    "POST /api/v1/tokens"));
+                                    "POST /api/v1/tokens", "optional", nullptr, &durable, nullptr));
     CHECK(res.status == 401);
 
     // A proof just INSIDE the ceiling (23h) with the same oversized window passes
@@ -317,7 +338,7 @@ TEST_CASE_METHOD(StepUpFixture,
     auto fresh = make_session("alice", "local",
                               std::chrono::system_clock::now() - std::chrono::hours(23));
     CHECK(require_mfa_step_up(req, res2, fresh, *db, /*window_secs=*/30 * 3600, audit_fn,
-                             "POST /api/v1/tokens"));
+                              "POST /api/v1/tokens", "optional", nullptr, &durable, nullptr));
     CHECK(res2.status == 200);
 }
 
@@ -335,7 +356,7 @@ TEST_CASE_METHOD(StepUpFixture,
                                 std::chrono::system_clock::now() + std::chrono::seconds(600));
 
     CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
-                                    "POST /api/v1/tokens"));
+                                    "POST /api/v1/tokens", "optional", nullptr, &durable, nullptr));
     CHECK(res.status == 401);
     auto body = nlohmann::json::parse(res.body, nullptr, false);
     REQUIRE_FALSE(body.is_discarded());
@@ -360,7 +381,7 @@ TEST_CASE_METHOD(StepUpFixture,
     auto session = make_session("alice", "local", std::chrono::system_clock::now());
 
     CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
-                                    "POST /api/v1/tokens"));
+                                    "POST /api/v1/tokens", "optional", nullptr, &durable, nullptr));
     CHECK(res.status == 401);
     auto body = nlohmann::json::parse(res.body, nullptr, false);
     REQUIRE_FALSE(body.is_discarded());
@@ -387,7 +408,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
     StepUpAuditFn empty_audit; // default-constructed std::function is empty
     CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, empty_audit,
-                                    "POST /api/v1/tokens"));
+                                    "POST /api/v1/tokens", "optional", nullptr, &durable, nullptr));
     CHECK(res.status == 401);
     // Body still constructed correctly.
     auto body = nlohmann::json::parse(res.body, nullptr, false);
@@ -409,7 +430,7 @@ TEST_CASE_METHOD(StepUpFixture,
     auto session = make_session("carol", "oidc", std::chrono::system_clock::now());
 
     CHECK(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
-                              "POST /api/v1/tokens"));
+                              "POST /api/v1/tokens", "optional", nullptr, &durable, nullptr));
     CHECK(res.status == 200);
     CHECK(res.body.empty());
     CHECK(audits.empty());
@@ -434,7 +455,7 @@ TEST_CASE_METHOD(StepUpFixture,
     // Pass "optional" explicitly so the UP-5 invariant is not silently tied
     // to the parameter default (governance qe SHOULD).
     CHECK(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
-                             "DELETE /api/v1/sessions", "optional"));
+                              "DELETE /api/v1/sessions", "optional", nullptr, &durable, nullptr));
     CHECK(res.status == 200);
     CHECK(res.body.empty());
     CHECK(audits.empty());
@@ -456,7 +477,8 @@ TEST_CASE_METHOD(StepUpFixture,
         httplib::Response res;
         res.status = 200;
         auto s = make_session("carol", "oidc"); // no proof
-        CHECK_FALSE(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "required"));
+        CHECK_FALSE(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "required", nullptr,
+                                        &durable, nullptr));
         CHECK(res.status == 401);
         auto body = nlohmann::json::parse(res.body, nullptr, false);
         REQUIRE_FALSE(body.is_discarded());
@@ -468,7 +490,8 @@ TEST_CASE_METHOD(StepUpFixture,
         httplib::Response res;
         res.status = 200;
         auto s = make_session("carol", "oidc"); // user role
-        CHECK(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "admin-only"));
+        CHECK(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "admin-only", nullptr,
+                                  &durable, nullptr));
         CHECK(res.status == 200);
     }
     // …but an admin oidc session under admin-only is gated.
@@ -476,7 +499,8 @@ TEST_CASE_METHOD(StepUpFixture,
         httplib::Response res;
         res.status = 200;
         auto s = make_session("alice", "oidc"); // admin role (make_session maps alice→admin)
-        CHECK_FALSE(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "admin-only"));
+        CHECK_FALSE(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "admin-only", nullptr,
+                                        &durable, nullptr));
         CHECK(res.status == 401);
     }
 
@@ -487,7 +511,8 @@ TEST_CASE_METHOD(StepUpFixture,
         httplib::Response res;
         res.status = 200;
         auto s = make_session("carol", "oidc", std::chrono::system_clock::now());
-        CHECK(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "required"));
+        CHECK(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "required", nullptr,
+                                  &durable, nullptr));
         CHECK(res.status == 200);
     }
 }
@@ -504,13 +529,15 @@ TEST_CASE_METHOD(StepUpFixture,
     httplib::Response res_at;
     res_at.status = 200;
     auto at = make_session("alice", "local", now - std::chrono::seconds(300));
-    CHECK(require_mfa_step_up(req, res_at, at, *db, /*window_secs=*/300, audit_fn, "X"));
+    CHECK(require_mfa_step_up(req, res_at, at, *db, /*window_secs=*/300, audit_fn, "X", "optional",
+                              nullptr, &durable, nullptr));
     CHECK(res_at.status == 200);
 
     httplib::Response res_past;
     res_past.status = 200;
     auto past = make_session("alice", "local", now - std::chrono::seconds(301));
-    CHECK_FALSE(require_mfa_step_up(req, res_past, past, *db, /*window_secs=*/300, audit_fn, "X"));
+    CHECK_FALSE(require_mfa_step_up(req, res_past, past, *db, /*window_secs=*/300, audit_fn, "X",
+                                    "optional", nullptr, &durable, nullptr));
     CHECK(res_past.status == 401);
 }
 
@@ -525,7 +552,7 @@ TEST_CASE_METHOD(StepUpFixture,
                                 std::chrono::system_clock::now() - std::chrono::seconds(600));
 
     CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
-                                    "POST /api/v1/tokens"));
+                                    "POST /api/v1/tokens", "optional", nullptr, &durable, nullptr));
     CHECK(res.status == 401);
     auto body = nlohmann::json::parse(res.body, nullptr, false);
     REQUIRE_FALSE(body.is_discarded());
@@ -592,10 +619,12 @@ TEST_CASE_METHOD(StepUpFixture,
 
     httplib::Response res1;
     res1.status = 200;
-    require_mfa_step_up(req, res1, session, *db, 300, audit_fn, "POST /api/v1/tokens");
+    require_mfa_step_up(req, res1, session, *db, 300, audit_fn, "POST /api/v1/tokens", "optional",
+                        nullptr, &durable, nullptr);
     httplib::Response res2;
     res2.status = 200;
-    require_mfa_step_up(req, res2, session, *db, 300, audit_fn, "POST /api/v1/tokens");
+    require_mfa_step_up(req, res2, session, *db, 300, audit_fn, "POST /api/v1/tokens", "optional",
+                        nullptr, &durable, nullptr);
 
     auto b1 = nlohmann::json::parse(res1.body);
     auto b2 = nlohmann::json::parse(res2.body);
@@ -697,15 +726,18 @@ struct ApproverFixture : StepUpFixture {
     /// database clock reads "now" (plus 5 ms: a proof instant authored by Postgres is rounded
     /// to the millisecond and can sit a hair ahead of this process's clock, which the gate
     /// correctly reads as future-dated; a real read carries the database's own clock and has
-    /// no such skew). The DurableFixture cases below pass a real read instead.
-    static auth::DurableMfaProof durable_row_for(const auth::Session& s) {
+    /// no such skew). The row is BOUND to the account's current factor generation (what
+    /// `POST /login/mfa/stepup` writes); the BindingFixture and DurableFixture cases below pass
+    /// their own rows instead.
+    auth::DurableMfaProof durable_row_for(const auth::Session& s) {
         const auto ms = [](system_clock::time_point t) {
             return t.time_since_epoch().count() == 0
                        ? std::int64_t{0}
                        : std::chrono::duration_cast<milliseconds>(t.time_since_epoch()).count();
         };
+        const auto status = db->mfa_status(s.username);
         return {auth::DurableMfaProof::Source::kRow, ms(s.mfa_verified_at),
-                ms(system_clock::now()) + 5};
+                ms(system_clock::now()) + 5, status ? status->factor_gen : 0};
     }
     Run run(const auth::Session& s, int configured_window = 300,
             yuzu::MetricsRegistry* metrics = nullptr,
@@ -895,6 +927,7 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: no proof at all i
     CHECK(r.res.status == 401);
     REQUIRE(audits.size() == 1);
     CHECK(audits[0].detail.find("age_secs=-1") != std::string::npos);
+    CHECK(audits[0].detail.find("reason=mfa_proof_missing") != std::string::npos);
 }
 
 TEST_CASE_METHOD(ApproverFixture,
@@ -1033,24 +1066,25 @@ TEST_CASE_METHOD(ApproverFixture,
 }
 
 TEST_CASE_METHOD(ApproverFixture,
-                 "require_enrolled_fresh_mfa: a proof that predates the current "
-                 "enrolment is challenged; one made under it passes",
-                 "[pg][mfa][stepup][approver][approver_enrolment_instant]") {
-    // R17: alice proves, then her factor is cleared and re-enrolled.
+                 "require_enrolled_fresh_mfa: a proof made under a factor since "
+                 "replaced is challenged; one made under the new factor passes",
+                 "[pg][mfa][stepup][approver][binding]") {
+    // R17: alice proves under factor 1, then her factor is cleared and re-enrolled. No sleeps: the
+    // old proof is bound to the OLD generation, and generation equality decides it however close
+    // the instants are.
     auto old_proof = with_wall_proof(*this, "alice", "local", seconds(10));
-    REQUIRE(run(old_proof).outcome.kind == Kind::kPass);
+    const auto old_row = durable_row_for(old_proof); // bound to factor 1's generation
+    REQUIRE(run(old_proof, 300, nullptr, old_row).outcome.kind == Kind::kPass);
 
     REQUIRE(db->mfa_disable("alice").has_value());
-    std::this_thread::sleep_for(milliseconds(10)); // ms resolution: re-enrol strictly later
     enroll("alice");
-    std::this_thread::sleep_for(milliseconds(10)); // and the new proof strictly after that
 
     {
-        auto r = run(old_proof);
+        auto r = run(old_proof, 300, nullptr, old_row);
         CHECK(r.outcome.kind == Kind::kChallengeWritten);
         CHECK(r.res.status == 401);
         REQUIRE(audits.size() == 1);
-        CHECK(audits[0].detail.find("reason=proof_predates_enrolment") != std::string::npos);
+        CHECK(audits[0].detail.find("reason=proof_factor_mismatch") != std::string::npos);
     }
     audits.clear();
     {
@@ -1079,19 +1113,31 @@ TEST_CASE_METHOD(ApproverFixture,
 }
 
 TEST_CASE_METHOD(ApproverFixture,
-                 "require_enrolled_fresh_mfa: the enrolment boundary is "
-                 "inclusive to the millisecond",
-                 "[pg][mfa][stepup][approver][approver_enrolment_instant]") {
-    // bob enrols NOW (no backdating), so the boundary is a few ms ago and the proofs are fresh.
+                 "require_enrolled_fresh_mfa: the enrolment instant plays no "
+                 "part: a bound proof passes before, at and after it, an unbound "
+                 "one never does",
+                 "[pg][mfa][stepup][approver][binding]") {
+    // bob enrols NOW (no backdating), so the instant is a few ms ago and the proofs are fresh.
     enroll("bob");
-    const auto at_ms = probe_mfa_factor(make_session("bob", "local"), *db).enrolled_at_ms;
+    const auto probe = probe_mfa_factor(make_session("bob", "local"), *db);
+    REQUIRE(probe.state == MfaFactorState::kEnrolledLocal);
+    const auto at_ms = probe.enrolled_at_ms;
     REQUIRE(at_ms > 0);
     auto at = [&](std::int64_t ms) {
         return make_session("bob", "local", system_clock::time_point{milliseconds(ms)});
     };
-    CHECK(run(at(at_ms)).outcome.kind == Kind::kPass); // equal passes
-    CHECK(run(at(at_ms + 1)).outcome.kind == Kind::kPass);
-    CHECK(run(at(at_ms - 1)).outcome.kind == Kind::kChallengeWritten); // one ms earlier does not
+    for (const std::int64_t ms : {at_ms - 1, at_ms, at_ms + 1}) {
+        INFO("proof instant = enrolment " << (ms - at_ms));
+        const auto session = at(ms);
+        audits.clear();
+        CHECK(run(session, 300, nullptr, durable_row_for(session)).outcome.kind == Kind::kPass);
+        auto unbound = durable_row_for(session);
+        unbound.mfa_factor_gen = 0;
+        auto r = run(session, 300, nullptr, unbound);
+        CHECK(r.outcome.kind == Kind::kChallengeWritten);
+        REQUIRE(audits.size() == 1);
+        CHECK(audits[0].detail.find("reason=proof_factor_unbound") != std::string::npos);
+    }
 }
 
 TEST_CASE_METHOD(ApproverFixture,
@@ -1350,12 +1396,12 @@ TEST_CASE_METHOD(BindingFixture,
         check_untouched(r);
         CHECK(audits.empty());
     }
-    // Control: the SAME instant with no generation is the old instant rule, and it refuses.
+    // Control: the SAME instant with no generation is unbound, and it refuses.
     {
         auto r = run(cached, 300, nullptr, durable_aged(10'000, 0));
         CHECK(r.outcome.kind == Kind::kChallengeWritten);
         REQUIRE(audits.size() == 1);
-        CHECK(detail_has(audits[0], "reason=proof_predates_enrolment"));
+        CHECK(detail_has(audits[0], "reason=proof_factor_unbound"));
     }
     // Equality does not excuse the window: a bound proof past the ceiling is still stale, and
     // a stale proof is not a mismatch (no reason token).
@@ -1409,39 +1455,35 @@ TEST_CASE_METHOD(BindingFixture,
 }
 
 TEST_CASE_METHOD(BindingFixture,
-                 "require_enrolled_fresh_mfa: an unbound proof keeps the instant rule "
-                 "(transitional)",
+                 "require_enrolled_fresh_mfa: an unbound proof is refused whatever its instant",
                  "[pg][mfa][stepup][approver][binding]") {
-    // bob enrols NOW, so the enrolment instant is a few ms ago and the boundary is exact.
+    // bob enrols NOW, so the enrolment instant is a few ms ago. A proof with no generation (a
+    // legacy row, one the rebind guard unbound, a stamp written outside the binding path) is a 401
+    // naming proof_factor_unbound before, at and after that instant, and a negative generation is
+    // as unbound as zero. The instant rule it replaces is gone.
     enroll("bob");
     const auto probe = probe_mfa_factor(make_session("bob", "local"), *db);
     REQUIRE(probe.state == MfaFactorState::kEnrolledLocal);
-    const auto at = [&](std::int64_t verified_ms) -> auth::DurableMfaProof {
-        return {Source::kRow, verified_ms, probe.enrolled_at_ms + 60'000, 0};
-    };
     const auto cached = make_session("bob", "local", system_clock::now());
-    // After the enrolment (or at the same millisecond): passes.
-    CHECK(run(cached, 300, nullptr, at(probe.enrolled_at_ms)).outcome.kind == Kind::kPass);
-    CHECK(run(cached, 300, nullptr, at(probe.enrolled_at_ms + 1)).outcome.kind == Kind::kPass);
-    // One millisecond before: refused, naming the old reason.
-    audits.clear();
-    {
-        auto r = run(cached, 300, nullptr, at(probe.enrolled_at_ms - 1));
-        CHECK(r.outcome.kind == Kind::kChallengeWritten);
-        CHECK(r.res.status == 401);
-        REQUIRE(audits.size() == 1);
-        CHECK(detail_has(audits[0], "reason=proof_predates_enrolment"));
+    for (const std::int64_t gen : {std::int64_t{0}, std::int64_t{-3}}) {
+        for (const std::int64_t delta : {-1, 0, 1}) {
+            INFO("gen=" << gen << " instant=enrolment" << delta);
+            audits.clear();
+            const auth::DurableMfaProof d{Source::kRow, probe.enrolled_at_ms + delta,
+                                          probe.enrolled_at_ms + 60'000, gen};
+            auto r = run(cached, 300, nullptr, d);
+            CHECK(r.outcome.kind == Kind::kChallengeWritten);
+            CHECK(r.res.status == 401);
+            REQUIRE(audits.size() == 1);
+            CHECK(detail_has(audits[0], "reason=proof_factor_unbound"));
+            CHECK_FALSE(detail_has(audits[0], "proof_predates_enrolment"));
+        }
     }
-    // A negative generation is as unbound as zero.
-    CHECK(
-        run(cached, 300, nullptr,
-            auth::DurableMfaProof{Source::kRow, probe.enrolled_at_ms, probe.enrolled_at_ms + 1, -3})
-            .outcome.kind == Kind::kPass);
 }
 
 TEST_CASE_METHOD(BindingFixture,
                  "require_enrolled_fresh_mfa: a row with no proof, or a binding with "
-                 "no instant, is a plain challenge with no reason",
+                 "no instant, is a challenge naming mfa_proof_missing",
                  "[pg][mfa][stepup][approver][binding]") {
     const auto g = gen_of("alice");
     const auto cached = make_session("alice", "local", system_clock::now());
@@ -1454,7 +1496,7 @@ TEST_CASE_METHOD(BindingFixture,
         CHECK(r.outcome.kind == Kind::kChallengeWritten);
         CHECK(r.res.status == 401);
         REQUIRE(audits.size() == 1);
-        CHECK_FALSE(detail_has(audits[0], "reason="));
+        CHECK(detail_has(audits[0], "reason=mfa_proof_missing"));
     }
 }
 
@@ -1534,6 +1576,9 @@ struct DurableFixture : ApproverFixture {
     DurableFixture() {
         REQUIRE(store.is_open());
         mgr.set_session_store(&store);
+        // With the AuthDB attached the minted proof is BOUND to alice's current factor generation
+        // (without it the test mint writes an unbound proof, which no gate admits).
+        mgr.set_auth_db(db.get());
         token = mgr.create_local_session_for_test("alice", Role::admin, /*mfa_verified=*/true);
         REQUIRE_FALSE(token.empty());
         auto s = mgr.validate_session(token);
@@ -1544,15 +1589,20 @@ struct DurableFixture : ApproverFixture {
 
     /// Rewrite the durable proof as `age_ms` old on the DATABASE clock (negative = future).
     /// Raw SQL, so the write generation does not move and `cached` stays "fresh", exactly the
-    /// state a replica is in after its steady clock paused.
-    void set_durable_proof_age(long long age_ms) {
+    /// state a replica is in after its steady clock paused. The bind sequence advances with the
+    /// instant (as an upgraded writer's rebind does): the session store's guard trigger unbinds a
+    /// proof column written without it, which is the unbound case the test below asserts.
+    void set_durable_proof_age(long long age_ms, bool advance_bind_seq = true) {
         auto lease = db.pool().acquire();
         REQUIRE(lease);
-        auto r =
-            yuzu::server::pg::exec_params(lease.get(),
-                                          "UPDATE session_store.sessions SET mfa_verified_ms = "
-                                          "(extract(epoch from now())*1000)::bigint - $1::bigint",
-                                          std::vector<std::string>{std::to_string(age_ms)});
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(),
+            advance_bind_seq ? "UPDATE session_store.sessions SET mfa_verified_ms = "
+                               "(extract(epoch from now())*1000)::bigint - $1::bigint, "
+                               "mfa_bind_seq = mfa_bind_seq + 1"
+                             : "UPDATE session_store.sessions SET mfa_verified_ms = "
+                               "(extract(epoch from now())*1000)::bigint - $1::bigint",
+            std::vector<std::string>{std::to_string(age_ms)});
         INFO(PQresultErrorMessage(r.get()));
         REQUIRE(r.status() == PGRES_COMMAND_OK);
     }
@@ -1587,6 +1637,7 @@ TEST_CASE_METHOD(DurableFixture,
                  "[pg][mfa][stepup][approver][durable]") {
     set_durable_proof_age(299'000);
     auto in = run_durable();
+
     CHECK(in.outcome.kind == Kind::kPass);
     check_untouched(in);
     CHECK(audits.empty());
@@ -1870,18 +1921,37 @@ TEST_CASE_METHOD(DurableFixture,
 }
 
 TEST_CASE_METHOD(DurableFixture,
-                 "require_enrolled_fresh_mfa: the durable proof, not the cached "
-                 "one, is compared with the enrolment instant",
-                 "[pg][mfa][stepup][approver][durable][approver_enrolment_instant]") {
-    // Alice enrolled 10 s ago. The cached session was minted just now (after the enrolment),
-    // so the cached comparison would pass; the durable proof is 100 s old, i.e. made before
-    // the enrolment, and inside the 300 s window, so only the enrolment rule can refuse it.
-    backdate_enrolment("alice", seconds(10));
+                 "require_enrolled_fresh_mfa: the durable proof's binding, not the "
+                 "cached session, is compared with the current factor",
+                 "[pg][mfa][stepup][approver][durable][binding]") {
+    // The cached session was minted a moment ago and is fresh. The factor is then replaced (the
+    // enrolment instant moves, so the generation advances), and the durable proof, 100 s old and
+    // inside the 300 s window, is bound to the factor that is gone: only the binding can refuse it.
     set_durable_proof_age(100'000);
+    REQUIRE(run_durable().outcome.kind == Kind::kPass); // sanity: bound to the current factor
+    backdate_enrolment("alice", seconds(10));
     auto r = run_durable();
     CHECK(r.outcome.kind == Kind::kChallengeWritten);
     REQUIRE(audits.size() == 1);
-    CHECK(audits[0].detail.find("reason=proof_predates_enrolment") != std::string::npos);
+    CHECK(audits[0].detail.find("reason=proof_factor_mismatch") != std::string::npos);
+}
+
+TEST_CASE_METHOD(DurableFixture,
+                 "require_enrolled_fresh_mfa: a proof column written without a "
+                 "rebind is unbound by the session store and refused",
+                 "[pg][mfa][stepup][approver][durable][binding]") {
+    // A writer that moves the proof instant without advancing the bind sequence (the shape of a
+    // legacy replica's stamp) is unbound by the rebind guard trigger. The proof is young and the
+    // cached session fresh; the missing binding alone refuses it.
+    set_durable_proof_age(1'000, /*advance_bind_seq=*/false);
+    const auto durable = mgr.read_durable_mfa_proof(token, cached.username);
+    REQUIRE(durable.source == auth::DurableMfaProof::Source::kRow);
+    CHECK(durable.mfa_factor_gen == 0);
+    auto r = run(cached, 300, nullptr, durable);
+    CHECK(r.outcome.kind == Kind::kChallengeWritten);
+    CHECK(r.res.status == 401);
+    REQUIRE(audits.size() == 1);
+    CHECK(audits[0].detail.find("reason=proof_factor_unbound") != std::string::npos);
 }
 
 TEST_CASE_METHOD(ApproverFixture,
@@ -1916,7 +1986,8 @@ TEST_CASE_METHOD(StepUpFixture,
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
-    CHECK(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "POST /api/v1/tokens"));
+    CHECK(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "POST /api/v1/tokens", "optional",
+                              nullptr, &durable, nullptr));
     CHECK(res.status == 200);
     CHECK(audits.empty());
 }

@@ -21,6 +21,7 @@
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "session_store.hpp"
 #include "test_route_sink.hpp"
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
@@ -39,6 +40,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 using namespace yuzu::server;
@@ -339,6 +341,9 @@ struct JitHarness {
     Config cfg{};
     auth::AuthManager auth_mgr{};
     yuzu::test::AuthDbPg auth_db;
+    // The durable session store on the shared pool, the production shape: the elevation step-up
+    // judges a local enrolled caller on the STORED proof (#6079), so a route test needs it.
+    yuzu::server::SessionStore sessions{auth_db.pool()};
     // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs the current TEST_CASE
     // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken.
     // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
@@ -379,6 +384,8 @@ struct JitHarness {
         seed("bob", "bobpassword1234", Role::user);
         seed("carol", "carolpassword1", Role::user);
         auth_mgr.set_auth_db(auth_db.get());
+        REQUIRE(sessions.is_open());
+        auth_mgr.set_session_store(&sessions);
         enroll_mfa("admin");
         enroll_mfa("alice");
         enroll_mfa("carol");
@@ -404,6 +411,27 @@ struct JitHarness {
                                                    oidc_provider);
         auth_routes->register_routes(sink);
     }
+
+    ~JitHarness() { auth_mgr.set_session_store(nullptr); }
+
+    /// Leave `token`'s durable session `remaining_secs` of absolute lifetime (the store authors
+    /// the elevation window as LEAST(now + duration, expires_at), so this is where a clamp
+    /// is set up now that the harness has a session store; `expire_session_for_test` is
+    /// cache-only).
+    void shrink_session_lifetime(const std::string& token, long long remaining_secs) {
+        auto lease = auth_db.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(),
+            "UPDATE session_store.sessions SET expires_at_ms = "
+            "(extract(epoch from now())*1000)::bigint + $2::bigint WHERE token_hash = $1",
+            std::vector<std::string>{auth::AuthManager::sha256_hex(token),
+                                     std::to_string(remaining_secs * 1000)});
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    JitHarness(const JitHarness&) = delete;
+    JitHarness& operator=(const JitHarness&) = delete;
 
     void seed(const std::string& u, const std::string& pw, Role r) {
         REQUIRE(auth_mgr.upsert_user(u, pw, r));
@@ -503,10 +531,12 @@ TEST_CASE("POST /api/v1/elevate: eligible operator is elevated to admin", "[pg][
     auto body = nlohmann::json::parse(res->body);
     // expires_in is now the TRUE remaining time (follow-up B, computed a
     // moment after the grant) — no clamp applies (the session's absolute
-    // lifetime is 8h, far longer than 600s), and the ceil-based computation
-    // (HIGH, adversarial review) makes a live, unclamped window EXACT.
+    // lifetime is 8h, far longer than 600s). The session store authors the window from the
+    // DATABASE clock and the response ceils the remainder against this process's clock, so the
+    // two clocks' sub-second offset can add the one second the ceiling rounds up to: [600, 601].
     int expires_in = body.value("expires_in", -1);
-    CHECK(expires_in == 600);
+    CHECK(expires_in >= 600);
+    CHECK(expires_in <= 601);
     // expires_at is the wall-clock RFC3339 UTC projection (follow-up B),
     // well-formed "YYYY-MM-DDTHH:MM:SSZ" — not just non-empty (governance
     // hardening round, format assertion).
@@ -590,7 +620,7 @@ TEST_CASE("POST /api/v1/elevate: a session-lifetime clamp keeps the audit "
 
     // Shrink the cookie session to ~120s of remaining lifetime so a full-cap
     // (3600s) elevation request is clamped to the session's own expiry.
-    h.auth_mgr.expire_session_for_test(token, std::chrono::seconds(8 * 3600 - 120));
+    h.shrink_session_lifetime(token, 120);
 
     auto res = h.post("/api/v1/elevate", token,
                       R"({"justification":"clamp-proof","duration_secs":3600})");
@@ -777,6 +807,72 @@ TEST_CASE("POST /api/v1/elevate: a stale MFA proof is challenged, not granted", 
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
 }
 
+// #6079 T10: the elevation step-up judges the STORED proof's binding like every other gate. A proof
+// the session store holds with no factor generation (written by a replica that cannot bind) or
+// bound to a factor since replaced is a 401 that names its cause, however fresh it is.
+TEST_CASE("POST /api/v1/elevate: an unbound stored proof is challenged, then granted once "
+          "re-proved under the current factor",
+          "[pg][jit][routes][binding]") {
+    JitHarness h;
+    auto token = h.session_for("alice"); // minted bound, fresh
+    // A legacy replica's stamp: origin/dev's mark_mfa text names no bind sequence, so the session
+    // store's guard trigger unbinds the proof.
+    {
+        auto lease = h.auth_db.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(),
+            "UPDATE session_store.sessions s SET mfa_verified_ms = n.ms "
+            "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
+            "WHERE s.token_hash = $1",
+            std::vector<std::string>{auth::AuthManager::sha256_hex(token)});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    REQUIRE(h.auth_mgr.read_durable_mfa_proof(token, "alice").mfa_factor_gen == 0);
+
+    auto res = h.post("/api/v1/elevate", token, R"({"justification":"unbound proof"})");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(h.audit_detail("mfa.step_up.required", "alice").find("reason=proof_factor_unbound") !=
+          std::string::npos);
+    CHECK(h.count_audits("role.elevation.granted", "alice") == 0);
+    CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
+
+    // Re-proving writes a bound proof for the current factor: the same route now grants.
+    const auto st = h.auth_db->mfa_status("alice");
+    REQUIRE(st.has_value());
+    REQUIRE(h.auth_mgr.mark_session_mfa_verified(
+        token, LocalMfaProof{.factor_gen = st->factor_gen, .verified_ms = st->db_now_ms}));
+    auto again = h.post("/api/v1/elevate", token, R"({"justification":"re-proved"})");
+    REQUIRE(again);
+    CHECK(again->status == 200);
+    CHECK(auth::is_elevated(*h.auth_mgr.validate_session(token)));
+}
+
+TEST_CASE("POST /api/v1/elevate: a proof bound to a factor since replaced is challenged; a session "
+          "minted under the new factor is granted",
+          "[pg][jit][routes][binding]") {
+    JitHarness h;
+    auto survivor = h.session_for("alice"); // bound to factor 1
+    // The factor is cleared and re-enrolled; no session is ended.
+    REQUIRE(h.auth_db->mfa_disable_report("alice", std::nullopt).has_value());
+    h.enroll_mfa("alice");
+
+    auto res = h.post("/api/v1/elevate", survivor, R"({"justification":"survivor"})");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(h.audit_detail("mfa.step_up.required", "alice").find("reason=proof_factor_mismatch") !=
+          std::string::npos);
+    CHECK(h.count_audits("role.elevation.granted", "alice") == 0);
+    CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(survivor)));
+
+    auto current = h.session_for("alice"); // bound to factor 2
+    auto ok = h.post("/api/v1/elevate", current, R"({"justification":"current factor"})");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(auth::is_elevated(*h.auth_mgr.validate_session(current)));
+}
+
 TEST_CASE("POST /api/v1/elevate: an ineligible operator is denied", "[pg][jit][routes]") {
     JitHarness h;
     REQUIRE(h.auth_db->set_elevation_eligible("alice", false).has_value()); // revoke eligibility
@@ -818,7 +914,8 @@ TEST_CASE("POST /api/v1/elevate: wrong-typed fields are a 400, not a 500", "[pg]
     // cap only (no session-lifetime clamp applies), and EXACT under the
     // ceil-based computation (HIGH, adversarial review).
     int huge_expires_in = nlohmann::json::parse(huge->body).value("expires_in", -1);
-    CHECK(huge_expires_in == h.cfg.jit_max_elevation_secs);
+    CHECK(huge_expires_in >= h.cfg.jit_max_elevation_secs);
+    CHECK(huge_expires_in <= h.cfg.jit_max_elevation_secs + 1); // database vs process clock
 }
 
 TEST_CASE("POST /api/v1/elevate: duration is clamped to the cap", "[pg][jit][routes]") {
@@ -828,10 +925,13 @@ TEST_CASE("POST /api/v1/elevate: duration is clamped to the cap", "[pg][jit][rou
                       R"({"justification":"x","duration_secs":999999})");
     REQUIRE(res);
     CHECK(res->status == 200);
-    // Clamped to the cap only (full-lifetime session) — EXACT under the
-    // ceil-based computation (HIGH, adversarial review).
+    // Clamped to the cap only (full-lifetime session). The window is authored by the session
+    // store from the DATABASE clock and the response ceils the remainder against this process's
+    // clock, so the two clocks' sub-second offset can add the one second the ceiling rounds up
+    // to; anything outside [cap, cap + 1] would be a real clamp error (HIGH, adversarial review).
     int expires_in = nlohmann::json::parse(res->body).value("expires_in", -1);
-    CHECK(expires_in == h.cfg.jit_max_elevation_secs);
+    CHECK(expires_in >= h.cfg.jit_max_elevation_secs);
+    CHECK(expires_in <= h.cfg.jit_max_elevation_secs + 1);
 }
 
 TEST_CASE("POST /api/v1/elevate/revoke reverts the elevation", "[pg][jit][routes]") {

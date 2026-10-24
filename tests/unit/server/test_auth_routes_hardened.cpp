@@ -32,6 +32,7 @@
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "session_store.hpp"
 #include "test_route_sink.hpp"
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
@@ -89,6 +90,9 @@ struct HardenedHarness {
     yuzu::MetricsRegistry metrics; // wired so the CC6.3/CC6.6 SIEM counters fire (review #1735 LOW)
     auth::AuthManager auth_mgr{};
     yuzu::test::AuthDbPg auth_db;
+    // The durable session store on the shared pool, the production shape: the MFA gates judge a
+    // local enrolled caller on the STORED proof (#6079), so a harness that drives one needs it.
+    yuzu::server::SessionStore sessions{auth_db.pool()};
     // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs the current TEST_CASE
     // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken.
     // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
@@ -122,6 +126,8 @@ struct HardenedHarness {
         seed_user("admin", "adminpassword1", auth::Role::admin);
         seed_user("alice", "alicepassword1", auth::Role::user);
         auth_mgr.set_auth_db(auth_db.get());
+        REQUIRE(sessions.is_open());
+        auth_mgr.set_session_store(&sessions);
         auth_mgr.set_metrics_registry(&metrics);
 
         audit_db.emplace(auth_routes_hardened_audit_tpl);
@@ -137,6 +143,10 @@ struct HardenedHarness {
             oidc_provider);
         auth_routes->register_routes(sink);
     }
+
+    ~HardenedHarness() { auth_mgr.set_session_store(nullptr); }
+    HardenedHarness(const HardenedHarness&) = delete;
+    HardenedHarness& operator=(const HardenedHarness&) = delete;
 
     // Seed a user into BOTH AuthManager (in-memory verify) and AuthDB (the
     // is_active gate + mfa/break-glass state) — mirrors test_auth_routes_mfa.

@@ -66,6 +66,15 @@ RefusalText refusal_text(const StepUpVerdict& v) {
                 "this route is not available to engine principals",
                 {},
                 false};
+    case StepUpDecision::kFactorCredentialNonLocal:
+        // Same shape as the engine denial and for the same reason: re-proving cannot help a
+        // bearer, SSO or engine caller, and the remediation names no grant that would admit it.
+        return {403,
+                "managing an account's second factor requires a local interactive session",
+                "sign in to the account with its local credentials in a browser session; an API "
+                "token, an SSO identity or an engine principal cannot manage a second factor",
+                {},
+                false};
     case StepUpDecision::kChallenge:
     case StepUpDecision::kPass:
         break;
@@ -196,6 +205,7 @@ std::string_view outcome_for(StepUpDecision d) noexcept {
     case StepUpDecision::kSamlDenied:
     case StepUpDecision::kStatusFailed:
     case StepUpDecision::kEngineDenied:
+    case StepUpDecision::kFactorCredentialNonLocal:
         return "refused";
     }
     return "refused";
@@ -267,10 +277,13 @@ void seed_step_up_gate_metrics(yuzu::MetricsRegistry& metrics) {
 }
 
 StepUpVerdict decide_step_up(const auth::Session& session, const MfaStatusFn& mfa_status,
-                             int window_secs, std::string_view mfa_enforcement) {
+                             const DurableProofReadFn& durable_proof, int window_secs,
+                             std::string_view mfa_enforcement, StepUpClass cls,
+                             StepUpAdmission* admitted) {
     StepUpVerdict v;
     v.user = session.username;
     v.window_secs = window_secs;
+    const bool factor_credential = cls == StepUpClass::kFactorCredential;
 
     // An engine principal (`session.is_engine()`, the canonical predicate shared with
     // `deny_engine_session` and the engine quota gate) is DENIED on every step-up-gated route,
@@ -286,21 +299,44 @@ StepUpVerdict decide_step_up(const auth::Session& session, const MfaStatusFn& mf
         return v;
     }
 
+    // A factor-credential row (the two that issue or retire a second factor) is never hatch-exempt:
+    // with the gate disabled a password-only or surviving single-factor session could regenerate or
+    // retire the factor and then step up on the new one. Its window is the approver window, so the
+    // hatch below is unreachable for it.
+    if (factor_credential) {
+        window_secs = approver_step_up_window(window_secs);
+        v.window_secs = window_secs;
+    }
+
     // Escape hatch: the operator disabled the gate. Treated as fresh.
     if (window_secs <= 0)
         return v;
 
-    // The other bearer-credential principals are step-up-exempt by design: issuing the token was
-    // the step-up moment.
-    if (session.auth_source == "api_token" || session.auth_source == "mcp_token")
-        return v;
+    if (factor_credential) {
+        // Managing an account's second factor is a local-account act. A bearer passes every other
+        // row because issuing the token was its step-up moment, but that exemption would hand an
+        // administrator token a current-factor recovery set with only a password; an SSO identity
+        // has no local row to manage. So only a local interactive session may pass; everything
+        // else (api_token, mcp_token, oidc, saml, any unknown source) is a 403.
+        if (session.auth_source != "local") {
+            v.decision = StepUpDecision::kFactorCredentialNonLocal;
+            v.reason = "factor_credential_requires_local_session";
+            return v;
+        }
+    } else {
+        // The other bearer-credential principals are step-up-exempt by design: issuing the token
+        // was the step-up moment.
+        if (session.auth_source == "api_token" || session.auth_source == "mcp_token")
+            return v;
 
-    // SAML sessions carry no local `users` row and no MFA attestation in this release. The gate
-    // stays CLOSED with an honest denial rather than falling through to `mfa_status()`, which
-    // would fail with a confusing "auth_db unavailable" message. Do NOT add an exemption here.
-    if (session.auth_source == "saml") {
-        v.decision = StepUpDecision::kSamlDenied;
-        return v;
+        // SAML sessions carry no local `users` row and no MFA attestation in this release. The
+        // gate stays CLOSED with an honest denial rather than falling through to `mfa_status()`,
+        // which would fail with a confusing "auth_db unavailable" message. Do NOT add an
+        // exemption here.
+        if (session.auth_source == "saml") {
+            v.decision = StepUpDecision::kSamlDenied;
+            return v;
+        }
     }
 
     // OIDC sessions carry no local `users` row, so the enrolment lookup is skipped for them and
@@ -310,6 +346,11 @@ StepUpVerdict decide_step_up(const auth::Session& session, const MfaStatusFn& mf
     // presented.
     const bool is_oidc = session.auth_source == "oidc";
     v.is_oidc = is_oidc;
+
+    // Set only for a local enrolled caller, once its stored proof has been read and found bound to
+    // the factor enrolled now.
+    std::optional<auth::DurableMfaProof> durable;
+    StepUpAdmission admission;
 
     if (!is_oidc) {
         // (a) a store error or a user deleted mid-request fails CLOSED: an auth_db transient
@@ -323,8 +364,42 @@ StepUpVerdict decide_step_up(const auth::Session& session, const MfaStatusFn& mf
                                                               : StepUpDecision::kStatusFailed;
             return v;
         }
-        if (!status->enrolled)
+        admission = {true, status->factor_gen};
+        if (!status->enrolled) {
+            if (admitted)
+                *admitted = admission;
             return v;
+        }
+
+        // An enrolled local account: the stored proof must belong to the factor enrolled NOW
+        // (the one binding decision `judge_local_mfa_binding`, shared with the approver gate). The
+        // durable row is read per request and never cached: its presence and binding must be
+        // current, while the age test below also uses the cached monotonic anchor. No provider is
+        // as bad as a missing store: refuse, never judge without the proof.
+        if (!durable_proof) {
+            v.decision = StepUpDecision::kUnwired;
+            return v;
+        }
+        durable = durable_proof();
+        const auto judgement =
+            judge_local_mfa_binding(*durable, status->factor_gen, status->binding_enforced);
+        v.reason = judgement.reason;
+        switch (judgement.kind) {
+        case LocalMfaBinding::kUnavailable:
+        case LocalMfaBinding::kUnenforced:
+            v.decision = StepUpDecision::kStoreUnavailable;
+            return v;
+        case LocalMfaBinding::kNoProof:
+        case LocalMfaBinding::kUnbound:
+        case LocalMfaBinding::kMismatch:
+            v.decision = StepUpDecision::kChallenge;
+            // Report the stored proof's own age where there is one (no proof: -1).
+            v.age_secs = durable_proof_age(*durable, 0).age_secs;
+            return v;
+        case LocalMfaBinding::kBound:
+            v.reason = {};
+            break;
+        }
     }
 
     // Proof age against the LOCAL MONOTONIC anchor derived at cache-populate from the DB clock
@@ -357,20 +432,42 @@ StepUpVerdict decide_step_up(const auth::Session& session, const MfaStatusFn& mf
     const auto wall_age = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now() - session.mfa_verified_at);
     const bool wall_stale = wall_age > effective_window + auth::kWallSanitySkew;
-    if (!no_proof && age <= effective_window && !wall_stale)
+    bool fresh = !no_proof && age <= effective_window && !wall_stale;
+    long long age_secs = no_proof ? -1 : age.count();
+
+    // A local proof must ALSO be inside the window on the DATABASE clock, to the millisecond and
+    // with no skew allowance (the row is already in hand, so this costs no query). The cached
+    // anchor alone is suspend-blind and tolerates kWallSanitySkew, so on its own a proof a few
+    // seconds old on the steady clock and far older in elapsed time would pass. Both must agree;
+    // the reported age is the larger of the two.
+    if (durable) {
+        const auto durable_age = durable_proof_age(
+            *durable,
+            std::chrono::duration_cast<std::chrono::milliseconds>(effective_window).count());
+        fresh = fresh && durable_age.fresh;
+        age_secs = (std::max)(age_secs, durable_age.age_secs);
+    }
+
+    if (fresh) {
+        if (admitted && admission.local)
+            *admitted = admission;
         return v;
+    }
 
     v.decision = StepUpDecision::kChallenge;
-    v.age_secs = no_proof ? -1 : age.count();
+    v.age_secs = age_secs;
     return v;
 }
 
-StepUpVerdict decide_step_up(const auth::Session& session, AuthDB& auth_db, int window_secs,
-                             std::string_view mfa_enforcement) {
+StepUpVerdict decide_step_up(const auth::Session& session, AuthDB& auth_db,
+                             const DurableProofReadFn& durable_proof, int window_secs,
+                             std::string_view mfa_enforcement, StepUpClass cls,
+                             StepUpAdmission* admitted) {
     const MfaStatusFn lookup = [&auth_db](const std::string& username) {
         return auth_db.mfa_status(username);
     };
-    return decide_step_up(session, lookup, window_secs, mfa_enforcement);
+    return decide_step_up(session, lookup, durable_proof, window_secs, mfa_enforcement, cls,
+                          admitted);
 }
 
 std::string step_up_refusal_json_rpc_error(const StepUpVerdict& verdict,
@@ -440,6 +537,12 @@ void emit_step_up_refusal_effects(const httplib::Request& req, const StepUpVerdi
         detail_str = "user=" + user + " reason=saml_session_no_mfa_this_release";
         break;
     case StepUpDecision::kStoreUnavailable:
+        // A binding decision that could not be made names its own token (mfa_proof_unavailable,
+        // mfa_binding_unenforced); an enrolment-status outage keeps the historical one.
+        detail_str = "user=" + user + " reason=" +
+                     std::string(verdict.reason.empty() ? std::string_view("mfa_status_unavailable")
+                                                        : verdict.reason);
+        break;
     case StepUpDecision::kStatusFailed:
         detail_str = "user=" + user + " reason=mfa_status_unavailable";
         break;
@@ -455,10 +558,22 @@ void emit_step_up_refusal_effects(const httplib::Request& req, const StepUpVerdi
     case StepUpDecision::kEngineDenied:
         detail_str = "user=" + user + " reason=engine_principal_denied";
         break;
+    case StepUpDecision::kFactorCredentialNonLocal:
+        detail_str = "user=" + user + " reason=" +
+                     std::string(verdict.reason.empty()
+                                     ? std::string_view("factor_credential_requires_local_session")
+                                     : verdict.reason);
+        break;
     case StepUpDecision::kChallenge:
     case StepUpDecision::kPass:
         detail_str = "user=" + user + " age_secs=" + std::to_string(verdict.age_secs) +
                      " window_secs=" + std::to_string(verdict.window_secs);
+        // Why a proof was refused when it is not simply stale or absent (the approver gate's
+        // extra detail folds into the same field). Always a static token, never caller text.
+        if (!verdict.reason.empty()) {
+            detail_str += " reason=";
+            detail_str += verdict.reason;
+        }
         break;
     }
     detail_str += detail_suffix;
@@ -483,10 +598,17 @@ void emit_step_up_refusal_effects(const httplib::Request& req, const StepUpVerdi
     if (verdict.decision == StepUpDecision::kStoreUnavailable ||
         verdict.decision == StepUpDecision::kStatusFailed) {
         static std::atomic<std::uint64_t> status_failed_hits{0};
-        if (should_log_sampled(status_failed_hits))
-            spdlog::error("require_mfa_step_up: mfa_status({}) failed: failing closed "
-                          "(1 log per {} refusals; the counter records all)",
-                          verdict.user, kStepUpLogSample);
+        if (should_log_sampled(status_failed_hits)) {
+            if (verdict.reason.empty())
+                spdlog::error("require_mfa_step_up: mfa_status({}) failed: failing closed "
+                              "(1 log per {} refusals; the counter records all)",
+                              verdict.user, kStepUpLogSample);
+            else
+                spdlog::error("require_mfa_step_up: the MFA proof binding of {} could not be "
+                              "decided ({}): failing closed (1 log per {} refusals; the counter "
+                              "records all)",
+                              verdict.user, verdict.reason, kStepUpLogSample);
+        }
     }
     // kEvaluationFailed logs nothing here: `note_chokepoint_exception` already wrote the one
     // (sampled) line for the throw, with its what().
@@ -494,7 +616,11 @@ void emit_step_up_refusal_effects(const httplib::Request& req, const StepUpVerdi
         // Same discipline as `count_gate`: observability never decides a security outcome, and the
         // refusal that follows must not be replaced by a metrics-registry throw.
         try {
-            metrics->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_stepup"}})
+            // A binding decision that could not be made has its own series, so an operator can tell
+            // a session-store / trigger problem from an enrolment-status outage.
+            metrics
+                ->counter("yuzu_auth_secret_unavailable_total",
+                          {{"route", verdict.reason.empty() ? "mfa_stepup" : "mfa_binding"}})
                 .increment();
         } catch (...) { // NOLINT(bugprone-empty-catch)
         }
@@ -526,7 +652,8 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
     const StepUpPolicyEntry* row = step_up_policy_for(req.method, req.matched_route);
     if (row == nullptr)
         return StepUpChokepointResult::kNotApplicable;
-    if (row->cls != StepUpClass::kRequired && row->cls != StepUpClass::kStrong)
+    if (row->cls != StepUpClass::kRequired && row->cls != StepUpClass::kStrong &&
+        row->cls != StepUpClass::kFactorCredential)
         return StepUpChokepointResult::kNotApplicable; // kExempt / kOwnGate / kPendingRuling
 
     const StepUpSurface surface = step_up_surface_for_path(req.path);
@@ -618,10 +745,28 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
             return refuse(v, session->auth_source);
         }
 
+        // The stored-proof read, bound to this request and session. EMPTY when no provider is
+        // wired, which `decide_step_up` answers kUnwired for a caller that needs it. One reference
+        // capture keeps the closure inside std::function's small buffer (no allocation per gated
+        // request).
+        struct ProofRead {
+            const DurableProofFn* fn;
+            const httplib::Request* req;
+            const auth::Session* session;
+        } proof_read{deps.durable_proof, &req, &*session};
+        DurableProofReadFn durable_proof;
+        if (deps.durable_proof != nullptr && *deps.durable_proof)
+            durable_proof = [&proof_read]() {
+                return (*proof_read.fn)(*proof_read.req, *proof_read.session);
+            };
+
+        StepUpAdmission admission;
         StepUpVerdict v =
             deps.mfa_status != nullptr
-                ? decide_step_up(*session, *deps.mfa_status, deps.window_secs, deps.mfa_enforcement)
-                : decide_step_up(*session, *deps.auth_db, deps.window_secs, deps.mfa_enforcement);
+                ? decide_step_up(*session, *deps.mfa_status, durable_proof, deps.window_secs,
+                                 deps.mfa_enforcement, row->cls, &admission)
+                : decide_step_up(*session, *deps.auth_db, durable_proof, deps.window_secs,
+                                 deps.mfa_enforcement, row->cls, &admission);
         if (!v.passed())
             return refuse(v, session->auth_source);
 
@@ -642,6 +787,7 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
         stash.surface = surface;
         stash.source = step_up_source_label(session->auth_source);
         stash.identity = identity;
+        stash.admission = admission;
         stash.bound = true;
         return StepUpChokepointResult::kPassed;
     } catch (const std::exception& e) {
@@ -689,7 +835,7 @@ bool step_up_identity_of(const auth::Session& session, StepUpPassIdentity& out) 
 }
 
 bool consume_step_up_pass(const httplib::Request& req, const auth::Session& handler_session,
-                          const std::string& action_label) noexcept {
+                          const std::string& action_label, StepUpAdmission* admitted) noexcept {
     auto& stash = tls_step_up_pass();
     if (stash.req != &req || stash.row == nullptr || stash.row->action_label != action_label)
         return false;
@@ -707,6 +853,10 @@ bool consume_step_up_pass(const httplib::Request& req, const auth::Session& hand
         note_pass_identity_mismatch(action_label);
         return false;
     }
+    // The admission is bound to the pass, which is bound to the identity just matched: only the
+    // principal that earned the pass can receive what it admitted.
+    if (admitted != nullptr)
+        *admitted = stash.admission;
     return true;
 }
 

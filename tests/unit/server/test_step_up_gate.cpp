@@ -22,7 +22,9 @@
 
 #include "auth_routes.hpp"
 #include "oidc_provider.hpp"
+#include "session_store.hpp"
 #include "test_api_token_pg_helper.hpp"
+#include "test_approver_route_fixture.hpp"
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -110,10 +112,11 @@ auth::Session make_session(const std::string& user, const std::string& source, R
     return s;
 }
 
-MfaStatusFn status_enrolled() {
-    return [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
+MfaStatusFn status_enrolled(std::int64_t factor_gen = 1) {
+    return [factor_gen](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
         AuthDB::MfaStatus st;
         st.enrolled = true;
+        st.factor_gen = factor_gen;
         return st;
     };
 }
@@ -126,6 +129,36 @@ MfaStatusFn status_error(AuthDBError e) {
     return [e](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
         return std::unexpected(e);
     };
+}
+
+// The synthetic database clock every stored proof below is read against.
+constexpr std::int64_t kDbNowMs = 4'000'000'000'000;
+
+// A stored proof that agrees with `session`'s cached anchor: bound to `gen` and aged the same on
+// the synthetic database clock. A session with no cached proof has a stored row with none either.
+auth::DurableMfaProof durable_matching(const auth::Session& s, std::int64_t gen = 1) {
+    auth::DurableMfaProof d;
+    d.source = auth::DurableMfaProof::Source::kRow;
+    d.db_now_ms = kDbNowMs;
+    if (s.steady_mfa_verified.time_since_epoch().count() != 0) {
+        const auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - s.steady_mfa_verified)
+                                .count();
+        d.mfa_verified_ms = kDbNowMs - age_ms;
+        d.mfa_factor_gen = gen;
+    }
+    return d;
+}
+
+// decide_step_up over a provider that agrees with the session's own proof (see above): the shape
+// the pre-binding tests were written against, so they keep asserting the cached-age behaviour.
+StepUpVerdict decide_matching(const auth::Session& s, const MfaStatusFn& status, int window,
+                              std::string_view mode, StepUpClass cls = StepUpClass::kRequired,
+                              StepUpAdmission* admitted = nullptr) {
+    const DurableProofReadFn read = [&s] {
+        return durable_matching(s);
+    };
+    return decide_step_up(s, status, read, window, mode, cls, admitted);
 }
 
 // A wired chokepoint over an injected MFA store and a fixed session.
@@ -141,6 +174,12 @@ struct Rig {
     yuzu::MetricsRegistry metrics;
     // Empty means the seam is not wired, as in production.
     std::function<void(StepUpFaultPoint)> fault_hook;
+    // The stored-proof read: by default a bound proof that agrees with the resolved session's own
+    // cached anchor. `wire_durable = false` leaves the provider null, as an unwired server.
+    bool wire_durable = true;
+    DurableProofFn durable = [](const httplib::Request&, const auth::Session& s) {
+        return durable_matching(s);
+    };
 
     // The pass stash is a thread_local shared by every test on this thread. A Rig clears it on the
     // way in and on the way out, so a test that fails (or throws) between arming and consuming
@@ -168,6 +207,7 @@ struct Rig {
         return StepUpChokepointDeps{.resolve_session = wire_resolver ? &resolver : nullptr,
                                     .auth_db = nullptr,
                                     .mfa_status = wire_store ? &mfa_status : nullptr,
+                                    .durable_proof = wire_durable ? &durable : nullptr,
                                     .audit_fn = &audit,
                                     .metrics = &metrics,
                                     .window_secs = window_secs,
@@ -203,16 +243,16 @@ nlohmann::json body_of(const httplib::Response& res) {
 TEST_CASE("decide_step_up: window <= 0, bearer principals and un-enrolled users pass",
           "[stepup][gate]") {
     const auto stale = make_session("alice", "local", Role::admin, ago(1h));
-    CHECK(decide_step_up(stale, status_enrolled(), 0, "optional").passed());
-    CHECK(decide_step_up(stale, status_enrolled(), -1, "optional").passed());
-    CHECK(decide_step_up(make_session("t", "api_token", Role::admin), status_enrolled(), 300,
-                         "optional")
+    CHECK(decide_matching(stale, status_enrolled(), 0, "optional").passed());
+    CHECK(decide_matching(stale, status_enrolled(), -1, "optional").passed());
+    CHECK(decide_matching(make_session("t", "api_token", Role::admin), status_enrolled(), 300,
+                          "optional")
               .passed());
-    CHECK(decide_step_up(make_session("t", "mcp_token", Role::admin), status_enrolled(), 300,
-                         "optional")
+    CHECK(decide_matching(make_session("t", "mcp_token", Role::admin), status_enrolled(), 300,
+                          "optional")
               .passed());
-    CHECK(decide_step_up(make_session("bob", "local", Role::user), status_not_enrolled(), 300,
-                         "optional")
+    CHECK(decide_matching(make_session("bob", "local", Role::user), status_not_enrolled(), 300,
+                          "optional")
               .passed());
 }
 
@@ -223,20 +263,20 @@ TEST_CASE("decide_step_up: window <= 0 does not consult the store at all", "[ste
         called = true;
         return AuthDB::MfaStatus{};
     };
-    CHECK(
-        decide_step_up(make_session("alice", "local", Role::admin), probe, 0, "optional").passed());
+    CHECK(decide_matching(make_session("alice", "local", Role::admin), probe, 0, "optional")
+              .passed());
     CHECK_FALSE(called);
 }
 
 TEST_CASE("decide_step_up: local enrolled session is judged on proof age", "[stepup][gate]") {
     SECTION("fresh proof passes") {
-        CHECK(decide_step_up(make_session("alice", "local", Role::admin, ago(10s)),
-                             status_enrolled(), 300, "optional")
+        CHECK(decide_matching(make_session("alice", "local", Role::admin, ago(10s)),
+                              status_enrolled(), 300, "optional")
                   .passed());
     }
     SECTION("stale proof is a challenge carrying the age and window") {
-        const auto v = decide_step_up(make_session("alice", "local", Role::admin, ago(1h)),
-                                      status_enrolled(), 300, "optional");
+        const auto v = decide_matching(make_session("alice", "local", Role::admin, ago(1h)),
+                                       status_enrolled(), 300, "optional");
         CHECK(v.decision == StepUpDecision::kChallenge);
         CHECK_FALSE(v.is_oidc);
         CHECK(v.age_secs >= 3500);
@@ -244,8 +284,8 @@ TEST_CASE("decide_step_up: local enrolled session is judged on proof age", "[ste
         CHECK(v.user == "alice");
     }
     SECTION("no proof at all is a challenge with age -1") {
-        const auto v = decide_step_up(make_session("alice", "local", Role::admin),
-                                      status_enrolled(), 300, "optional");
+        const auto v = decide_matching(make_session("alice", "local", Role::admin),
+                                       status_enrolled(), 300, "optional");
         CHECK(v.decision == StepUpDecision::kChallenge);
         CHECK(v.age_secs == -1);
     }
@@ -253,8 +293,8 @@ TEST_CASE("decide_step_up: local enrolled session is judged on proof age", "[ste
 
 TEST_CASE("decide_step_up: a proof older than the 24h ceiling never counts", "[stepup][gate]") {
     // window_secs is far above the ceiling; a 25 h old proof must still be refused.
-    const auto v = decide_step_up(make_session("alice", "local", Role::admin, ago(25h)),
-                                  status_enrolled(), 7 * 24 * 3600, "optional");
+    const auto v = decide_matching(make_session("alice", "local", Role::admin, ago(25h)),
+                                   status_enrolled(), 7 * 24 * 3600, "optional");
     CHECK(v.decision == StepUpDecision::kChallenge);
 }
 
@@ -262,14 +302,14 @@ TEST_CASE("decide_step_up: store failures fail closed and are told apart", "[ste
     const auto s = make_session("alice", "local", Role::admin, ago(10s));
     for (const auto e : {AuthDBError::SecretUnavailable, AuthDBError::QueryFailed,
                          AuthDBError::WriteFailed, AuthDBError::StoreBusy}) {
-        CHECK(decide_step_up(s, status_error(e), 300, "optional").decision ==
+        CHECK(decide_matching(s, status_error(e), 300, "optional").decision ==
               StepUpDecision::kStoreUnavailable);
     }
     // Not a store outage: a missing row and a name the store rejects before any read both fail
     // closed as a 401.
     for (const auto e : {AuthDBError::UserNotFound, AuthDBError::InvalidUsername}) {
         CHECK_FALSE(is_store_unavailable(e));
-        CHECK(decide_step_up(s, status_error(e), 300, "optional").decision ==
+        CHECK(decide_matching(s, status_error(e), 300, "optional").decision ==
               StepUpDecision::kStatusFailed);
     }
 }
@@ -293,7 +333,7 @@ TEST_CASE("decide_step_up: an engine principal is denied before any store read",
         by_kind.principal_kind = "engine";
         for (const auto& session : {by_source, by_kind}) {
             for (const int window : {300, 0, -1}) {
-                const auto v = decide_step_up(session, probe, window, mode);
+                const auto v = decide_matching(session, probe, window, mode);
                 CHECK(v.decision == StepUpDecision::kEngineDenied);
                 CHECK_FALSE(v.passed());
                 CHECK_FALSE(v.is_oidc);
@@ -306,8 +346,8 @@ TEST_CASE("decide_step_up: an engine principal is denied before any store read",
 
 TEST_CASE("decide_step_up: SAML is an honest denial in every mode", "[stepup][gate]") {
     for (const char* mode : {"optional", "admin-only", "required"}) {
-        const auto v = decide_step_up(make_session("saml-user", "saml", Role::admin, ago(1s)),
-                                      status_enrolled(), 300, mode);
+        const auto v = decide_matching(make_session("saml-user", "saml", Role::admin, ago(1s)),
+                                       status_enrolled(), 300, mode);
         CHECK(v.decision == StepUpDecision::kSamlDenied);
     }
 }
@@ -319,8 +359,8 @@ TEST_CASE("decide_step_up: OIDC never takes the local lookup", "[stepup][gate]")
         called = true;
         return AuthDB::MfaStatus{.enrolled = true};
     };
-    CHECK(decide_step_up(make_session("oidc:iss#sub", "oidc", Role::admin, ago(10s)), probe, 300,
-                         "optional")
+    CHECK(decide_matching(make_session("oidc:iss#sub", "oidc", Role::admin, ago(10s)), probe, 300,
+                          "optional")
               .passed());
     CHECK_FALSE(called);
 }
@@ -329,28 +369,424 @@ TEST_CASE("decide_step_up: OIDC amr-less session depends on enforcement and role
           "[stepup][gate]") {
     const auto admin = make_session("oidc:iss#a", "oidc", Role::admin);
     const auto user = make_session("oidc:iss#u", "oidc", Role::user);
-    CHECK(decide_step_up(admin, status_enrolled(), 300, "optional").passed());
-    CHECK(decide_step_up(user, status_enrolled(), 300, "optional").passed());
-    CHECK(decide_step_up(admin, status_enrolled(), 300, "admin-only").decision ==
+    CHECK(decide_matching(admin, status_enrolled(), 300, "optional").passed());
+    CHECK(decide_matching(user, status_enrolled(), 300, "optional").passed());
+    CHECK(decide_matching(admin, status_enrolled(), 300, "admin-only").decision ==
           StepUpDecision::kChallenge);
-    CHECK(decide_step_up(user, status_enrolled(), 300, "admin-only").passed());
-    CHECK(decide_step_up(admin, status_enrolled(), 300, "required").decision ==
+    CHECK(decide_matching(user, status_enrolled(), 300, "admin-only").passed());
+    CHECK(decide_matching(admin, status_enrolled(), 300, "required").decision ==
           StepUpDecision::kChallenge);
-    CHECK(decide_step_up(user, status_enrolled(), 300, "required").decision ==
+    CHECK(decide_matching(user, status_enrolled(), 300, "required").decision ==
           StepUpDecision::kChallenge);
-    const auto challenge = decide_step_up(admin, status_enrolled(), 300, "required");
+    const auto challenge = decide_matching(admin, status_enrolled(), 300, "required");
     CHECK(challenge.is_oidc);
 }
 
 TEST_CASE("decide_step_up: OIDC session with a seeded proof takes the freshness check in any mode",
           "[stepup][gate]") {
     for (const char* mode : {"optional", "admin-only", "required"}) {
-        CHECK(decide_step_up(make_session("oidc:iss#a", "oidc", Role::admin, ago(10s)),
-                             status_enrolled(), 300, mode)
+        CHECK(decide_matching(make_session("oidc:iss#a", "oidc", Role::admin, ago(10s)),
+                              status_enrolled(), 300, mode)
                   .passed());
-        CHECK(decide_step_up(make_session("oidc:iss#a", "oidc", Role::admin, ago(1h)),
-                             status_enrolled(), 300, mode)
+        CHECK(decide_matching(make_session("oidc:iss#a", "oidc", Role::admin, ago(1h)),
+                              status_enrolled(), 300, mode)
                   .decision == StepUpDecision::kChallenge);
+    }
+}
+
+// ── decide_step_up: the factor binding of a local enrolled caller (#6079) ───────────────────────
+
+namespace {
+
+// A stored proof built field by field, for the cases that control each input.
+auth::DurableMfaProof proof_row(std::int64_t verified_ms, std::int64_t db_now_ms,
+                                std::int64_t gen) {
+    return {auth::DurableMfaProof::Source::kRow, verified_ms, db_now_ms, gen};
+}
+
+// decide_step_up over a provider that returns `row` and counts its calls.
+StepUpVerdict decide_with(const auth::Session& s, const MfaStatusFn& status,
+                          const auth::DurableMfaProof& row, int& calls, int window,
+                          StepUpClass cls = StepUpClass::kRequired,
+                          StepUpAdmission* admitted = nullptr, std::string_view mode = "optional") {
+    const DurableProofReadFn read = [&] {
+        ++calls;
+        return row;
+    };
+    return decide_step_up(s, status, read, window, mode, cls, admitted);
+}
+
+} // namespace
+
+TEST_CASE("decide_step_up (binding): a bound fresh proof passes and records what it admitted",
+          "[stepup][gate][binding]") {
+    int calls = 0;
+    StepUpAdmission admitted;
+    const auto s = make_session("alice", "local", Role::admin, ago(10s));
+    const auto v = decide_with(s, status_enrolled(7), durable_matching(s, 7), calls, 300,
+                               StepUpClass::kRequired, &admitted);
+    CHECK(v.passed());
+    CHECK(v.reason.empty());
+    CHECK(calls == 1);
+    CHECK(admitted.local);
+    CHECK(admitted.factor_gen == 7);
+}
+
+TEST_CASE("decide_step_up (binding): a refused proof names its cause", "[stepup][gate][binding]") {
+    const auto s = make_session("alice", "local", Role::admin, ago(10s));
+    const auto fresh = durable_matching(s, 4); // bound to generation 4, aged like the session
+    StepUpAdmission admitted;
+
+    SECTION("no generation on the stored proof: proof_factor_unbound") {
+        int calls = 0;
+        auto row = fresh;
+        row.mfa_factor_gen = 0;
+        const auto v =
+            decide_with(s, status_enrolled(4), row, calls, 300, StepUpClass::kRequired, &admitted);
+        CHECK(v.decision == StepUpDecision::kChallenge);
+        CHECK(v.reason == "proof_factor_unbound");
+        CHECK(v.age_secs >= 0); // the stored proof's own age is reported
+        CHECK_FALSE(admitted.local);
+    }
+    SECTION("another generation, lower or higher: proof_factor_mismatch") {
+        for (const std::int64_t current : {3, 5, 400}) {
+            int calls = 0;
+            const auto v = decide_with(s, status_enrolled(current), fresh, calls, 300);
+            CHECK(v.decision == StepUpDecision::kChallenge);
+            CHECK(v.reason == "proof_factor_mismatch");
+            CHECK_FALSE(v.is_oidc);
+        }
+    }
+    SECTION("an unreadable current generation never matches a bound proof") {
+        int calls = 0;
+        const auto v = decide_with(s, status_enrolled(0), fresh, calls, 300);
+        CHECK(v.decision == StepUpDecision::kChallenge);
+        CHECK(v.reason == "proof_factor_mismatch");
+    }
+    SECTION("no stored session, or a stored row with no proof: mfa_proof_missing, age -1") {
+        int calls = 0;
+        auto v = decide_with(
+            s, status_enrolled(4),
+            auth::DurableMfaProof{.source = auth::DurableMfaProof::Source::kAbsent}, calls, 300);
+        CHECK(v.decision == StepUpDecision::kChallenge);
+        CHECK(v.reason == "mfa_proof_missing");
+        CHECK(v.age_secs == -1);
+        v = decide_with(s, status_enrolled(4), proof_row(0, kDbNowMs, 4), calls, 300);
+        CHECK(v.decision == StepUpDecision::kChallenge);
+        CHECK(v.reason == "mfa_proof_missing");
+    }
+}
+
+TEST_CASE("decide_step_up (binding): an undecidable binding is a 503, never a challenge or a pass",
+          "[stepup][gate][binding]") {
+    const auto s = make_session("alice", "local", Role::admin, ago(10s));
+    int calls = 0;
+
+    SECTION("a degraded or absent durable read") {
+        const auto v = decide_with(s, status_enrolled(4), auth::DurableMfaProof{}, calls, 300);
+        CHECK(v.decision == StepUpDecision::kStoreUnavailable);
+        CHECK(v.reason == "mfa_proof_unavailable");
+    }
+    SECTION("a row whose database clock is not positive") {
+        const auto v = decide_with(s, status_enrolled(4), proof_row(1'000, 0, 4), calls, 300);
+        CHECK(v.decision == StepUpDecision::kStoreUnavailable);
+        CHECK(v.reason == "mfa_proof_unavailable");
+    }
+    SECTION("an unenforced generation trigger, bound or not") {
+        const MfaStatusFn unenforced =
+            [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
+            AuthDB::MfaStatus st;
+            st.enrolled = true;
+            st.factor_gen = 4;
+            st.binding_enforced = false;
+            return st;
+        };
+        for (const std::int64_t gen : {4, 0}) {
+            const auto v = decide_with(s, unenforced, durable_matching(s, gen), calls, 300);
+            CHECK(v.decision == StepUpDecision::kStoreUnavailable);
+            CHECK(v.reason == "mfa_binding_unenforced");
+        }
+    }
+    SECTION("no provider wired is the unwired 503, same as a missing store") {
+        const auto v = decide_step_up(s, status_enrolled(4), DurableProofReadFn{}, 300, "optional",
+                                      StepUpClass::kRequired);
+        CHECK(v.decision == StepUpDecision::kUnwired);
+        // ...but a caller that needs no durable read never notices the provider is missing.
+        CHECK(decide_step_up(make_session("bob", "local", Role::user), status_not_enrolled(),
+                             DurableProofReadFn{}, 300, "optional", StepUpClass::kRequired)
+                  .passed());
+        CHECK(decide_step_up(s, status_enrolled(4), DurableProofReadFn{}, 0, "optional",
+                             StepUpClass::kRequired)
+                  .passed());
+        CHECK(decide_step_up(make_session("t", "api_token", Role::admin), status_enrolled(4),
+                             DurableProofReadFn{}, 300, "optional", StepUpClass::kRequired)
+                  .passed());
+    }
+}
+
+TEST_CASE("decide_step_up (binding): only a local enrolled caller reads the stored proof",
+          "[stepup][gate][binding]") {
+    struct Row {
+        const char* what;
+        std::string source;
+        std::string user;
+        Role role;
+        int window;
+        MfaStatusFn status;
+        int expect_calls;
+    };
+    const std::vector<Row> rows = {
+        {"local enrolled", "local", "alice", Role::admin, 300, status_enrolled(1), 1},
+        {"window 0 (the hatch)", "local", "alice", Role::admin, 0, status_enrolled(1), 0},
+        {"negative window", "local", "alice", Role::admin, -1, status_enrolled(1), 0},
+        {"local un-enrolled", "local", "bob", Role::user, 300, status_not_enrolled(), 0},
+        {"api_token", "api_token", "t", Role::admin, 300, status_enrolled(1), 0},
+        {"mcp_token", "mcp_token", "t", Role::admin, 300, status_enrolled(1), 0},
+        {"saml", "saml", "saml-user", Role::admin, 300, status_enrolled(1), 0},
+        {"oidc", "oidc", "oidc:i#a", Role::admin, 300, status_enrolled(1), 0},
+        {"engine_token", "engine_token", "engine:x", Role::user, 300, status_enrolled(1), 0},
+    };
+    for (const auto& r : rows) {
+        INFO(r.what);
+        int calls = 0;
+        const auto s = make_session(r.user, r.source, r.role, ago(10s));
+        (void)decide_with(s, r.status, durable_matching(s, 1), calls, r.window);
+        CHECK(calls == r.expect_calls);
+    }
+}
+
+TEST_CASE("decide_step_up (binding): the durable age is a second, database-clock condition",
+          "[stepup][gate][binding]") {
+    // Cached anchor 10 s old (fresh), stored proof 400 s old on the database clock: the cached
+    // anchor is suspend-blind, so the stored age decides.
+    const auto s = make_session("alice", "local", Role::admin, ago(10s));
+    int calls = 0;
+    SECTION("cached fresh, durable stale: challenged, reporting the larger age") {
+        const auto v = decide_with(s, status_enrolled(1),
+                                   proof_row(kDbNowMs - 400'000, kDbNowMs, 1), calls, 300);
+        CHECK(v.decision == StepUpDecision::kChallenge);
+        CHECK(v.reason.empty()); // stale, not unbound or mismatched
+        CHECK(v.age_secs >= 400);
+        CHECK(v.window_secs == 300);
+    }
+    SECTION("cached stale, durable fresh: challenged (both clocks must agree)") {
+        const auto old = make_session("alice", "local", Role::admin, ago(1h));
+        const auto v = decide_with(old, status_enrolled(1),
+                                   proof_row(kDbNowMs - 5'000, kDbNowMs, 1), calls, 300);
+        CHECK(v.decision == StepUpDecision::kChallenge);
+        CHECK(v.age_secs >= 3500);
+    }
+    SECTION("the window is inclusive to the millisecond on the database clock") {
+        CHECK(decide_with(s, status_enrolled(1), proof_row(kDbNowMs - 300'000, kDbNowMs, 1), calls,
+                          300)
+                  .passed());
+        CHECK(decide_with(s, status_enrolled(1), proof_row(kDbNowMs - 300'001, kDbNowMs, 1), calls,
+                          300)
+                  .decision == StepUpDecision::kChallenge);
+    }
+    SECTION("a future-dated stored proof is not fresh") {
+        const auto v = decide_with(s, status_enrolled(1), proof_row(kDbNowMs + 60'000, kDbNowMs, 1),
+                                   calls, 300);
+        CHECK(v.decision == StepUpDecision::kChallenge);
+    }
+    SECTION("an OIDC session keeps the cached-only check: no stored proof is read") {
+        const auto oidc = make_session("oidc:i#a", "oidc", Role::admin, ago(10s));
+        // A stored row that would fail every durable condition changes nothing for OIDC.
+        CHECK(
+            decide_with(oidc, status_enrolled(1), proof_row(1, kDbNowMs, 0), calls, 300).passed());
+        CHECK(calls == 0);
+    }
+}
+
+// ── decide_step_up: the two factor-credential rows (#6079) ──────────────────────────────────────
+
+TEST_CASE("decide_step_up (kFactorCredential): the window is the approver window and the hatch "
+          "never applies",
+          "[stepup][gate][binding][factor_credential]") {
+    const auto bound = [](const auth::Session& s) {
+        return durable_matching(s, 1);
+    };
+    constexpr auto kFc = StepUpClass::kFactorCredential;
+
+    SECTION("window 0 reads the proof; a bound fresh session passes") {
+        int calls = 0;
+        const auto s = make_session("alice", "local", Role::admin, ago(10s));
+        StepUpAdmission admitted;
+        CHECK(decide_with(s, status_enrolled(1), bound(s), calls, 0, kFc, &admitted).passed());
+        CHECK(calls == 1);
+        CHECK(admitted.local);
+        CHECK(admitted.factor_gen == 1);
+    }
+    SECTION("a survivor of a factor replacement is refused at window 0, -1 and the default") {
+        const auto s = make_session("alice", "local", Role::admin, ago(10s));
+        for (const int window : {0, -1, 300}) {
+            int calls = 0;
+            const auto v = decide_with(s, status_enrolled(3), bound(s), calls, window, kFc);
+            CHECK(v.decision == StepUpDecision::kChallenge);
+            CHECK(v.reason == "proof_factor_mismatch");
+            CHECK(v.window_secs == 300);
+        }
+    }
+    SECTION("a password-only session (no proof) is refused at window 0") {
+        int calls = 0;
+        const auto s = make_session("alice", "local", Role::admin);
+        const auto v = decide_with(s, status_enrolled(1), bound(s), calls, 0, kFc);
+        CHECK(v.decision == StepUpDecision::kChallenge);
+        CHECK(v.reason == "mfa_proof_missing");
+    }
+    SECTION("an un-enrolled account passes at window 0 (cancelling a provisional enrolment) and "
+            "the admission carries the generation as read") {
+        int calls = 0;
+        StepUpAdmission admitted;
+        const MfaStatusFn never_enrolled =
+            [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
+            AuthDB::MfaStatus st;
+            st.factor_gen = 2; // cleared twice, not enrolled now
+            return st;
+        };
+        const auto s = make_session("bob", "local", Role::user);
+        CHECK(decide_with(s, never_enrolled, bound(s), calls, 0, kFc, &admitted).passed());
+        CHECK(calls == 0);
+        CHECK(admitted.local);
+        CHECK(admitted.factor_gen == 2);
+    }
+    SECTION("the window is min(configured, 300): a 400 s old stored proof fails even under a "
+            "day-long window, where an ordinary row passes it") {
+        int calls = 0;
+        const auto s = make_session("alice", "local", Role::admin, ago(10s));
+        const auto old_row = proof_row(kDbNowMs - 400'000, kDbNowMs, 1);
+        CHECK(decide_with(s, status_enrolled(1), old_row, calls, 86400, kFc).decision ==
+              StepUpDecision::kChallenge);
+        CHECK(decide_with(s, status_enrolled(1), old_row, calls, 86400).passed());
+        // A smaller configured window tightens it.
+        CHECK(decide_with(s, status_enrolled(1), proof_row(kDbNowMs - 100'000, kDbNowMs, 1), calls,
+                          60, kFc)
+                  .decision == StepUpDecision::kChallenge);
+    }
+    SECTION("the control: an ordinary row at window 0 passes with no proof and reads nothing") {
+        int calls = 0;
+        const auto s = make_session("alice", "local", Role::admin);
+        CHECK(decide_with(s, status_enrolled(1), bound(s), calls, 0).passed());
+        CHECK(calls == 0);
+    }
+}
+
+TEST_CASE("decide_step_up (kFactorCredential): only a local interactive session may pass",
+          "[stepup][gate][binding][factor_credential]") {
+    struct Row {
+        const char* source;
+        const char* user;
+    };
+    const std::vector<Row> rows = {{"api_token", "t"},
+                                   {"mcp_token", "t"},
+                                   {"oidc", "oidc:i#a"},
+                                   {"saml", "saml-user"},
+                                   {"other", "someone"}};
+    for (const int window : {300, 0}) {
+        for (const auto& r : rows) {
+            INFO(r.source << " window=" << window);
+            int status_reads = 0;
+            const MfaStatusFn counting =
+                [&](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
+                ++status_reads;
+                return AuthDB::MfaStatus{.enrolled = true, .factor_gen = 1};
+            };
+            int calls = 0;
+            const auto s = make_session(r.user, r.source, Role::admin, ago(1s)); // fresh proof
+            StepUpAdmission admitted;
+            const auto v = decide_with(s, counting, durable_matching(s, 1), calls, window,
+                                       StepUpClass::kFactorCredential, &admitted);
+            CHECK(v.decision == StepUpDecision::kFactorCredentialNonLocal);
+            CHECK(v.reason == "factor_credential_requires_local_session");
+            CHECK_FALSE(v.passed());
+            CHECK(status_reads == 0);
+            CHECK(calls == 0);
+            CHECK_FALSE(admitted.local);
+        }
+    }
+    // An engine principal is still the first answer, whatever the class.
+    int calls = 0;
+    const auto engine = make_session("engine:x", "engine_token", Role::user);
+    CHECK(decide_with(engine, status_enrolled(1), durable_matching(engine, 1), calls, 0,
+                      StepUpClass::kFactorCredential)
+              .decision == StepUpDecision::kEngineDenied);
+}
+
+TEST_CASE("kFactorCredentialNonLocal renders a 403 that names no grant and offers no challenge",
+          "[stepup][gate][binding][factor_credential]") {
+    StepUpVerdict v;
+    v.decision = StepUpDecision::kFactorCredentialNonLocal;
+    v.user = "t";
+    v.reason = "factor_credential_requires_local_session";
+    auto req = make_request("POST", "/api/settings/mfa/disable", "/api/settings/mfa/disable");
+    httplib::Response res;
+    render_step_up_refusal(req, res, v, StepUpSurface::kDashboard);
+    CHECK(res.status == 403);
+    const auto body = body_of(res);
+    CHECK(body["error"]["code"] == 403);
+    CHECK(body["error"]["message"] ==
+          "managing an account's second factor requires a local interactive session");
+    CHECK(body["meta"]["mfa_step_up_required"] == false);
+    CHECK_FALSE(body["meta"].contains("challenge_url"));
+    CHECK(body["error"]["remediation"].get<std::string>().find("permission") == std::string::npos);
+
+    std::vector<AuditRow> audits;
+    const StepUpAuditFn audit = [&](const httplib::Request&, const std::string& a,
+                                    const std::string& r, const std::string& tt,
+                                    const std::string& ti, const std::string& d) {
+        audits.push_back({a, r, tt, ti, d});
+        return true;
+    };
+    emit_step_up_refusal_effects(req, v, audit, "POST /api/settings/mfa/disable", {}, nullptr);
+    REQUIRE(audits.size() == 1);
+    CHECK(audits[0].action == "mfa.step_up.required");
+    CHECK(audits[0].detail == "user=t reason=factor_credential_requires_local_session");
+}
+
+TEST_CASE("a store-unavailable refusal counts its own series when it is a binding decision",
+          "[stepup][gate][binding]") {
+    auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+    const StepUpAuditFn no_audit;
+    SECTION("an unreadable stored proof: route=mfa_binding, reason in the audit row") {
+        yuzu::MetricsRegistry metrics;
+        std::vector<AuditRow> audits;
+        const StepUpAuditFn audit = [&](const httplib::Request&, const std::string& a,
+                                        const std::string& r, const std::string& tt,
+                                        const std::string& ti, const std::string& d) {
+            audits.push_back({a, r, tt, ti, d});
+            return true;
+        };
+        StepUpVerdict v;
+        v.decision = StepUpDecision::kStoreUnavailable;
+        v.user = "alice";
+        v.reason = "mfa_proof_unavailable";
+        emit_step_up_refusal_effects(req, v, audit, "POST /api/v1/tokens", {}, &metrics);
+        REQUIRE(audits.size() == 1);
+        CHECK(audits[0].detail == "user=alice reason=mfa_proof_unavailable");
+        CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_binding"}})
+                  .value() == 1.0);
+        CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_stepup"}})
+                  .value() == 0.0);
+    }
+    SECTION("an enrolment-status outage keeps the historical token and series") {
+        yuzu::MetricsRegistry metrics;
+        std::vector<AuditRow> audits;
+        const StepUpAuditFn audit = [&](const httplib::Request&, const std::string& a,
+                                        const std::string& r, const std::string& tt,
+                                        const std::string& ti, const std::string& d) {
+            audits.push_back({a, r, tt, ti, d});
+            return true;
+        };
+        StepUpVerdict v;
+        v.decision = StepUpDecision::kStoreUnavailable;
+        v.user = "alice";
+        emit_step_up_refusal_effects(req, v, audit, "POST /api/v1/tokens", {}, &metrics);
+        REQUIRE(audits.size() == 1);
+        CHECK(audits[0].detail == "user=alice reason=mfa_status_unavailable");
+        CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_stepup"}})
+                  .value() == 1.0);
+        CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_binding"}})
+                  .value() == 0.0);
     }
 }
 
@@ -716,7 +1152,8 @@ TEST_CASE("chokepoint: stale proof on a kRequired row is refused before the hand
         CHECK(rig.gate_count("pass", "local", "rest") == 0);
     }
     SECTION("a refusal arms no pass stash") {
-        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
     }
 }
 
@@ -737,7 +1174,7 @@ TEST_CASE("chokepoint: the audit row carries the response's correlation id, with
         CHECK(cid == body_of(res)["error"]["correlation_id"].get<std::string>());
         CHECK(rig.audits[0].detail.ends_with(" cid=" + cid + " stage=pre_authz"));
     }
-    SECTION("a stale-proof refusal: user, age_secs, window_secs, cid, stage in that order") {
+    SECTION("a no-proof refusal: user, age_secs, window_secs, reason, cid, stage in that order") {
         Rig rig;
         rig.session = make_session("alice", "local", Role::admin, {}); // no proof at all
         httplib::Response res;
@@ -745,8 +1182,9 @@ TEST_CASE("chokepoint: the audit row carries the response's correlation id, with
                 StepUpChokepointResult::kRefused);
         REQUIRE(rig.audits.size() == 1);
         const auto cid = res.get_header_value("X-Correlation-Id");
-        CHECK(rig.audits[0].detail ==
-              "user=alice age_secs=-1 window_secs=300 cid=" + cid + " stage=pre_authz");
+        CHECK(rig.audits[0].detail == "user=alice age_secs=-1 window_secs=300 "
+                                      "reason=mfa_proof_missing cid=" +
+                                          cid + " stage=pre_authz");
     }
     SECTION("an aged proof records its age; the rest of the row is the same exact grammar") {
         Rig rig;
@@ -891,7 +1329,7 @@ TEST_CASE("chokepoint: the MFA recovery-codes and disable routes are gated",
     CAPTURE(route.pattern);
     const auto* row = step_up_policy_for("POST", route.pattern);
     REQUIRE(row != nullptr);
-    CHECK(row->cls == StepUpClass::kRequired);
+    CHECK(row->cls == StepUpClass::kFactorCredential);
     CHECK(row->action_label == route.label);
     CHECK(step_up_surface_for_path(route.pattern) == StepUpSurface::kDashboard);
 
@@ -920,7 +1358,7 @@ TEST_CASE("chokepoint: the MFA recovery-codes and disable routes are gated",
               StepUpChokepointResult::kPassed);
         CHECK(res.status == -1);
         CHECK(rig.gate_count("pass", "local", "dashboard") == 1);
-        CHECK(detail::consume_step_up_pass(req, *rig.session, route.label));
+        CHECK(detail::consume_step_up_pass(req, *rig.session, route.label, nullptr));
     }
     SECTION("an un-enrolled caller passes whatever the proof age") {
         Rig rig;
@@ -931,6 +1369,273 @@ TEST_CASE("chokepoint: the MFA recovery-codes and disable routes are gated",
         CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
               StepUpChokepointResult::kPassed);
         CHECK(rig.audits.empty());
+        detail::clear_step_up_pass();
+    }
+}
+
+// ── the chokepoint over the two factor-credential rows (#6079) ──────────────────────────────────
+
+namespace {
+
+struct FcRoute {
+    const char* pattern;
+    const char* label;
+};
+
+constexpr std::array<FcRoute, 2> kFcRoutes = {
+    FcRoute{"/api/settings/mfa/recovery-codes", "POST /api/settings/mfa/recovery-codes"},
+    FcRoute{"/api/settings/mfa/disable", "POST /api/settings/mfa/disable"}};
+
+bool has(const std::string& text, std::string_view what) {
+    return text.find(what) != std::string::npos;
+}
+
+} // namespace
+
+TEST_CASE("chokepoint (kFactorCredential): the window-0 hatch admits neither a survivor nor a "
+          "password-only session",
+          "[stepup][gate][binding][factor_credential]") {
+    const auto route = GENERATE(values<FcRoute>({kFcRoutes[0], kFcRoutes[1]}));
+    CAPTURE(route.pattern);
+    auto req = make_request("POST", route.pattern, route.pattern);
+
+    SECTION("a session bound to a factor since replaced: 401 proof_factor_mismatch, no pass") {
+        Rig rig;
+        rig.window_secs = 0;
+        rig.mfa_status = status_enrolled(3); // the account is now at generation 3
+        rig.session = make_session("alice", "local", Role::admin, ago(5s));
+        rig.durable = [](const httplib::Request&, const auth::Session& s) {
+            return durable_matching(s, 1); // the proof was made under generation 1
+        };
+        httplib::Response res;
+        CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+              StepUpChokepointResult::kRefused);
+        CHECK(res.status == 401);
+        CHECK(body_of(res)["meta"]["mfa_step_up_required"] == true);
+        REQUIRE(rig.audits.size() == 1);
+        CHECK(rig.audits[0].target_id == route.label);
+        CHECK(has(rig.audits[0].detail, "reason=proof_factor_mismatch"));
+        CHECK(has(rig.audits[0].detail, "window_secs=300")); // the approver window, not 0
+        CHECK(rig.audits[0].detail.ends_with(" stage=pre_authz"));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, route.label, nullptr));
+    }
+    SECTION("a password-only session with no proof: 401 mfa_proof_missing") {
+        Rig rig;
+        rig.window_secs = 0;
+        rig.session = make_session("alice", "local", Role::admin);
+        httplib::Response res;
+        CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+              StepUpChokepointResult::kRefused);
+        CHECK(res.status == 401);
+        REQUIRE(rig.audits.size() == 1);
+        CHECK(has(rig.audits[0].detail, "reason=mfa_proof_missing"));
+    }
+    SECTION("a bound proof outside the approver window is refused whatever the configured window") {
+        Rig rig;
+        rig.window_secs = 86400;
+        rig.session = make_session("alice", "local", Role::admin, ago(10s));
+        rig.durable = [](const httplib::Request&, const auth::Session& s) {
+            auto d = durable_matching(s, 1);
+            d.mfa_verified_ms = kDbNowMs - 400'000;
+            return d;
+        };
+        httplib::Response res;
+        CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+              StepUpChokepointResult::kRefused);
+        CHECK(res.status == 401);
+        REQUIRE(rig.audits.size() == 1);
+        CHECK(has(rig.audits[0].detail, "window_secs=300"));
+    }
+    SECTION("a bound fresh proof passes at window 0 and hands the admission to the earning "
+            "principal only") {
+        Rig rig;
+        rig.window_secs = 0;
+        rig.mfa_status = status_enrolled(6);
+        rig.session = make_session("alice", "local", Role::admin, ago(5s));
+        rig.durable = [](const httplib::Request&, const auth::Session& s) {
+            return durable_matching(s, 6);
+        };
+        httplib::Response res;
+        REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                StepUpChokepointResult::kPassed);
+        CHECK(rig.gate_count("pass", "local", "dashboard") == 1);
+
+        // Another principal presenting the same request gets neither the pass nor the admission,
+        // and the pass is spent doing so.
+        StepUpAdmission stolen{false, 99};
+        CHECK_FALSE(detail::consume_step_up_pass(req, make_session("mallory", "local", Role::admin),
+                                                 route.label, &stolen));
+        CHECK_FALSE(stolen.local);
+        CHECK(stolen.factor_gen == 99);
+
+        // Arm again and consume as the earning principal.
+        detail::clear_step_up_pass();
+        httplib::Response res2;
+        REQUIRE(detail::apply_step_up_chokepoint(req, res2, rig.deps()) ==
+                StepUpChokepointResult::kPassed);
+        StepUpAdmission got;
+        CHECK(detail::consume_step_up_pass(req, *rig.session, route.label, &got));
+        CHECK(got.local);
+        CHECK(got.factor_gen == 6);
+        // A nullptr out-parameter is allowed for the 34 rows that ignore it.
+        detail::clear_step_up_pass();
+        httplib::Response res3;
+        REQUIRE(detail::apply_step_up_chokepoint(req, res3, rig.deps()) ==
+                StepUpChokepointResult::kPassed);
+        CHECK(detail::consume_step_up_pass(req, *rig.session, route.label, nullptr));
+    }
+    SECTION("an un-enrolled account passes at window 0 (it may cancel a provisional enrolment) "
+            "with the generation as read") {
+        Rig rig;
+        rig.window_secs = 0;
+        rig.mfa_status = [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
+            AuthDB::MfaStatus st;
+            st.factor_gen = 2;
+            return st;
+        };
+        rig.session = make_session("bob", "local", Role::user);
+        httplib::Response res;
+        REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                StepUpChokepointResult::kPassed);
+        StepUpAdmission got;
+        CHECK(detail::consume_step_up_pass(req, *rig.session, route.label, &got));
+        CHECK(got.local);
+        CHECK(got.factor_gen == 2);
+    }
+}
+
+TEST_CASE("chokepoint (kFactorCredential): a bearer, SSO or SAML session is a 403 with an audit "
+          "row, and the same principal still passes an ordinary row",
+          "[stepup][gate][binding][factor_credential]") {
+    const auto route = GENERATE(values<FcRoute>({kFcRoutes[0], kFcRoutes[1]}));
+    const std::string source =
+        GENERATE(as<std::string>{}, "api_token", "mcp_token", "oidc", "saml");
+    CAPTURE(route.pattern, source);
+    auto req = make_request("POST", route.pattern, route.pattern);
+
+    Rig rig;
+    // An untiered administrator token (or an SSO admin) with a fresh proof and the gate enabled:
+    // every other row would let the bearer through, or judge the SSO proof; these two do neither.
+    rig.session = make_session(source == "oidc" ? "oidc:i#a" : "tok", source, Role::admin, ago(2s));
+    httplib::Response res;
+    CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+          StepUpChokepointResult::kRefused);
+    CHECK(res.status == 403);
+    const auto body = body_of(res);
+    CHECK(body["meta"]["mfa_step_up_required"] == false);
+    CHECK_FALSE(body["meta"].contains("challenge_url"));
+    REQUIRE(rig.audits.size() == 1);
+    CHECK(rig.audits[0].action == "mfa.step_up.required");
+    CHECK(rig.audits[0].target_id == route.label);
+    CHECK(has(rig.audits[0].detail, "reason=factor_credential_requires_local_session"));
+    CHECK(rig.audits[0].detail.ends_with(" stage=pre_authz"));
+    CHECK(rig.gate_count("refused", source, "dashboard") == 1);
+    CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, route.label, nullptr));
+
+    // No collateral: an ordinary kRequired row decides this principal exactly as before.
+    if (source == "api_token" || source == "mcp_token") {
+        Rig other;
+        other.session = make_session("tok", source, Role::admin);
+        auto tokens = make_request("POST", kTokensPattern, "/api/v1/tokens");
+        httplib::Response ok;
+        CHECK(detail::apply_step_up_chokepoint(tokens, ok, other.deps()) ==
+              StepUpChokepointResult::kPassed);
+        detail::clear_step_up_pass();
+    }
+}
+
+TEST_CASE("chokepoint: a local enrolled caller with no stored-proof provider wired is a 503; a "
+          "caller that needs no stored proof is unaffected",
+          "[stepup][gate][binding]") {
+    auto tokens = make_request("POST", kTokensPattern, "/api/v1/tokens");
+    SECTION("kRequired row, local enrolled, no provider") {
+        Rig rig;
+        rig.wire_durable = false;
+        rig.session = make_session("alice", "local", Role::admin, ago(5s));
+        httplib::Response res;
+        CHECK(detail::apply_step_up_chokepoint(tokens, res, rig.deps()) ==
+              StepUpChokepointResult::kRefused);
+        CHECK(res.status == 503);
+        REQUIRE(rig.audits.size() == 1);
+        CHECK(has(rig.audits[0].detail, "reason=auth_store_unwired"));
+        CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
+    }
+    SECTION("the same wiring passes the hatch, a bearer and an un-enrolled local account") {
+        Rig hatch;
+        hatch.wire_durable = false;
+        hatch.window_secs = 0;
+        hatch.session = make_session("alice", "local", Role::admin);
+        httplib::Response a;
+        CHECK(detail::apply_step_up_chokepoint(tokens, a, hatch.deps()) ==
+              StepUpChokepointResult::kPassed);
+        detail::clear_step_up_pass();
+
+        Rig bearer;
+        bearer.wire_durable = false;
+        bearer.session = make_session("t", "api_token", Role::admin);
+        httplib::Response b;
+        CHECK(detail::apply_step_up_chokepoint(tokens, b, bearer.deps()) ==
+              StepUpChokepointResult::kPassed);
+        detail::clear_step_up_pass();
+
+        Rig fresh;
+        fresh.wire_durable = false;
+        fresh.mfa_status = status_not_enrolled();
+        fresh.session = make_session("bob", "local", Role::user);
+        httplib::Response c;
+        CHECK(detail::apply_step_up_chokepoint(tokens, c, fresh.deps()) ==
+              StepUpChokepointResult::kPassed);
+        detail::clear_step_up_pass();
+    }
+}
+
+TEST_CASE("chokepoint: a kRequired row judges the binding of a local enrolled caller and "
+          "reports an unreadable one as 503",
+          "[stepup][gate][binding]") {
+    auto tokens = make_request("POST", kTokensPattern, "/api/v1/tokens");
+    SECTION("an unbound stored proof: 401 proof_factor_unbound") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(5s));
+        rig.durable = [](const httplib::Request&, const auth::Session& s) {
+            return durable_matching(s, 0);
+        };
+        httplib::Response res;
+        CHECK(detail::apply_step_up_chokepoint(tokens, res, rig.deps()) ==
+              StepUpChokepointResult::kRefused);
+        CHECK(res.status == 401);
+        REQUIRE(rig.audits.size() == 1);
+        CHECK(has(rig.audits[0].detail, "reason=proof_factor_unbound"));
+    }
+    SECTION("a degraded stored-proof read: 503, counted on route=mfa_binding") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(5s));
+        rig.durable = [](const httplib::Request&, const auth::Session&) {
+            return auth::DurableMfaProof{}; // kUnavailable
+        };
+        httplib::Response res;
+        CHECK(detail::apply_step_up_chokepoint(tokens, res, rig.deps()) ==
+              StepUpChokepointResult::kRefused);
+        CHECK(res.status == 503);
+        REQUIRE(rig.audits.size() == 1);
+        CHECK(has(rig.audits[0].detail, "reason=mfa_proof_unavailable"));
+        CHECK(rig.metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_binding"}})
+                  .value() == 1.0);
+    }
+    SECTION("the provider is handed the request and the resolved session") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(5s));
+        const httplib::Request* seen_req = nullptr;
+        std::string seen_user;
+        rig.durable = [&](const httplib::Request& r, const auth::Session& s) {
+            seen_req = &r;
+            seen_user = s.username;
+            return durable_matching(s, 1);
+        };
+        httplib::Response res;
+        REQUIRE(detail::apply_step_up_chokepoint(tokens, res, rig.deps()) ==
+                StepUpChokepointResult::kPassed);
+        CHECK(seen_req == &tokens);
+        CHECK(seen_user == "alice");
         detail::clear_step_up_pass();
     }
 }
@@ -993,7 +1698,8 @@ TEST_CASE("chokepoint: an engine session is refused 403 before the handler and a
                   "engine principals cannot perform this operation");
         }
         // The handler is never reached: no pass stash is armed for it.
-        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
         REQUIRE(rig.audits.size() == 1);
         CHECK(rig.audits[0].action == "mfa.step_up.required");
         CHECK(rig.audits[0].result == "error");
@@ -1142,7 +1848,8 @@ TEST_CASE("chokepoint: no session, an unwired resolver and a throwing resolver a
         CHECK(body_of(res)["meta"]["mfa_step_up_required"] == true);
         // No session resolved, so there is no source to report.
         CHECK(rig.gate_count("unavailable", "other", "rest") == 1);
-        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
         // No session had resolved, so the row has no user; the reason token is still recorded.
         REQUIRE(rig.audits.size() == 1);
         CHECK(rig.audits[0].action == "mfa.step_up.required");
@@ -1170,7 +1877,8 @@ TEST_CASE("chokepoint: no session, an unwired resolver and a throwing resolver a
         CHECK(rig.gate_count("unavailable", "other", "rest") == 0);
         CHECK(rig.gate_count("pass", "local", "rest") == 0);
         // The pass stash is not armed: a handler-side consume finds nothing.
-        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
         REQUIRE(rig.audits.size() == 1);
         CHECK(rig.audits[0].action == "mfa.step_up.required");
         CHECK(rig.audits[0].result == "error");
@@ -1259,7 +1967,8 @@ TEST_CASE("chokepoint: no session, an unwired resolver and a throwing resolver a
         CHECK_NOTHROW(detail::apply_step_up_chokepoint(req, res, rig.deps()));
         CHECK(res.status == 503);
         CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
-        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
     }
 }
 
@@ -1306,7 +2015,8 @@ TEST_CASE("chokepoint: an evaluation that throws after the session resolves keep
     CHECK(rig.gate_count("unavailable", source, "rest") == 1);
     CHECK(rig.gate_count("unavailable", "other", "rest") == 0);
     CHECK(rig.gate_count("pass", source, "rest") == 0);
-    CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+    CHECK_FALSE(
+        detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
     REQUIRE(rig.audits.size() == 1);
     CHECK(rig.audits[0].action == "mfa.step_up.required");
     CHECK(rig.audits[0].result == "error");
@@ -1341,7 +2051,8 @@ TEST_CASE("chokepoint: a refusal renderer that throws still ends in a 503", "[st
         CHECK(result == StepUpChokepointResult::kRefused);
         CHECK(res.status == 503);
         CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
-        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
         REQUIRE(rig.audits.size() == 1);
         CHECK(without_cid(rig.audits[0].detail) ==
               "user=alice reason=chokepoint_exception stage=pre_authz");
@@ -1365,7 +2076,8 @@ TEST_CASE("chokepoint: a refusal renderer that throws still ends in a 503", "[st
         CHECK(result == StepUpChokepointResult::kRefused);
         CHECK(res.status == 503);
         CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
-        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
     }
 }
 
@@ -1613,21 +2325,25 @@ TEST_CASE("pass stash: consumed once, for this request and this label only", "[s
             StepUpChokepointResult::kPassed);
 
     SECTION("a different action label does not consume it") {
-        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, "DELETE /api/v1/tokens/{id}"));
-        CHECK(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, *rig.session, "DELETE /api/v1/tokens/{id}", nullptr));
+        CHECK(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
     }
     SECTION("a different request object does not consume it") {
         auto other = make_request("POST", kTokensPattern, "/api/v1/tokens");
-        CHECK_FALSE(detail::consume_step_up_pass(other, *rig.session, std::string(kTokensLabel)));
-        CHECK(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(other, *rig.session, std::string(kTokensLabel), nullptr));
+        CHECK(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
     }
     SECTION("it is single-use: the second call re-evaluates") {
-        CHECK(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
-        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
     }
     SECTION("a cleared stash (pre-routing / post-routing) is gone") {
         detail::clear_step_up_pass();
-        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
     }
     detail::clear_step_up_pass();
 }
@@ -1656,17 +2372,18 @@ TEST_CASE("pass identity: consumed only by the principal that earned it", "[step
     // either. (That the spent pass is not reported as a skipped gate is pinned separately below,
     // where nothing consumes it before the post-routing report.)
     const auto refused_and_spent = [&](const auth::Session& handler_session) {
-        CHECK_FALSE(detail::consume_step_up_pass(req, handler_session, std::string(kTokensLabel)));
-        CHECK_FALSE(detail::consume_step_up_pass(req, earned, std::string(kTokensLabel)));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, handler_session, std::string(kTokensLabel), nullptr));
+        CHECK_FALSE(detail::consume_step_up_pass(req, earned, std::string(kTokensLabel), nullptr));
     };
 
     SECTION("the same identity consumes it, once") {
-        CHECK(detail::consume_step_up_pass(req, earned, std::string(kTokensLabel)));
-        CHECK_FALSE(detail::consume_step_up_pass(req, earned, std::string(kTokensLabel)));
+        CHECK(detail::consume_step_up_pass(req, earned, std::string(kTokensLabel), nullptr));
+        CHECK_FALSE(detail::consume_step_up_pass(req, earned, std::string(kTokensLabel), nullptr));
     }
     SECTION("an equal-but-distinct session object (same fields) consumes it") {
         auto copy = make_session("alice", "local", Role::user, ago(1h));
-        CHECK(detail::consume_step_up_pass(req, copy, std::string(kTokensLabel)));
+        CHECK(detail::consume_step_up_pass(req, copy, std::string(kTokensLabel), nullptr));
     }
     SECTION("a different username is refused and the pass is spent") {
         refused_and_spent(make_session("bob", "local", Role::admin, ago(10s)));
@@ -1697,7 +2414,7 @@ TEST_CASE("pass identity: consumed only by the principal that earned it", "[step
         // Nothing consumes the pass after the mismatch, so the count below is decided by the
         // refusal alone: an unspent pass on this 2xx would be counted once.
         CHECK_FALSE(detail::consume_step_up_pass(req, make_session("bob", "local", Role::admin),
-                                                 std::string(kTokensLabel)));
+                                                 std::string(kTokensLabel), nullptr));
         httplib::Response done;
         done.status = 200;
         detail::finish_step_up_pass(req, done, &rig.metrics);
@@ -1708,7 +2425,7 @@ TEST_CASE("pass identity: consumed only by the principal that earned it", "[step
         httplib::Response res2;
         REQUIRE(detail::apply_step_up_chokepoint(req, res2, rig.deps()) ==
                 StepUpChokepointResult::kPassed);
-        CHECK(detail::consume_step_up_pass(req, earned, std::string(kTokensLabel)));
+        CHECK(detail::consume_step_up_pass(req, earned, std::string(kTokensLabel), nullptr));
     }
 }
 
@@ -1728,7 +2445,7 @@ TEST_CASE("pass identity: the engine class is an exact compare, never hash-only"
     REQUIRE(detail::step_up_identity_of(engine, stashed));
     stashed.engine = false;
     detail::tls_step_up_pass().identity = stashed;
-    CHECK_FALSE(detail::consume_step_up_pass(req, engine, std::string(kTokensLabel)));
+    CHECK_FALSE(detail::consume_step_up_pass(req, engine, std::string(kTokensLabel), nullptr));
 }
 
 TEST_CASE("pass identity: the fingerprint separates fields and is deterministic",
@@ -1815,7 +2532,7 @@ TEST_CASE("binding: later resolutions for a gated request are admitted only for 
     }
     SECTION("the binding outlives the pass: it holds after the pass is spent") {
         arm();
-        REQUIRE(detail::consume_step_up_pass(req, alice, std::string(kTokensLabel)));
+        REQUIRE(detail::consume_step_up_pass(req, alice, std::string(kTokensLabel), nullptr));
         CHECK(detail::step_up_binding_admits(req, alice));
         CHECK_FALSE(detail::step_up_binding_admits(req, make_session("bob", "local", Role::admin)));
         CHECK_FALSE(detail::step_up_binding_admits(req, engine_session("engine:ci")));
@@ -1823,7 +2540,7 @@ TEST_CASE("binding: later resolutions for a gated request are admitted only for 
     SECTION("the binding also outlives a pass refused for identity") {
         arm();
         CHECK_FALSE(detail::consume_step_up_pass(req, make_session("bob", "local", Role::admin),
-                                                 std::string(kTokensLabel)));
+                                                 std::string(kTokensLabel), nullptr));
         CHECK(detail::step_up_binding_admits(req, alice));
         CHECK_FALSE(detail::step_up_binding_admits(req, make_session("bob", "local", Role::admin)));
     }
@@ -1893,17 +2610,18 @@ TEST_CASE("binding: an identity digest failure fails closed at the chokepoint, c
         CHECK(rig.audits[0].detail.find("reason=chokepoint_exception") != std::string::npos);
         // No pass and no binding: a later resolution is unconstrained, and a consume finds nothing.
         CHECK(detail::step_up_binding_admits(req, make_session("bob", "local", Role::admin)));
-        CHECK_FALSE(detail::consume_step_up_pass(req, alice, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, alice, std::string(kTokensLabel), nullptr));
     }
     SECTION("consume: false, and the pass is spent") {
         REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
                 StepUpChokepointResult::kPassed);
         {
             const IdentityFault fault;
-            CHECK_FALSE(detail::consume_step_up_pass(req, alice, std::string(kTokensLabel)));
+            CHECK_FALSE(
+                detail::consume_step_up_pass(req, alice, std::string(kTokensLabel), nullptr));
         }
         // Spent: the principal that earned it cannot consume it once the digest works again.
-        CHECK_FALSE(detail::consume_step_up_pass(req, alice, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, alice, std::string(kTokensLabel), nullptr));
         // The binding is untouched.
         CHECK(detail::step_up_binding_admits(req, alice));
         CHECK_FALSE(detail::step_up_binding_admits(req, make_session("bob", "local", Role::admin)));
@@ -2100,10 +2818,12 @@ TEST_CASE("pass stash: an unconsumed pass on a 2xx response is counted handler_s
         out.status = 200;
         detail::finish_step_up_pass(req, out, &rig.metrics);
         CHECK(rig.gate_count("handler_skipped", "local", "rest") == 1);
-        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
     }
     SECTION("a consumed pass is not counted") {
-        REQUIRE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        REQUIRE(
+            detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
         httplib::Response out;
         out.status = 200;
         detail::finish_step_up_pass(req, out, &rig.metrics);
@@ -2114,7 +2834,8 @@ TEST_CASE("pass stash: an unconsumed pass on a 2xx response is counted handler_s
         out.status = 403;
         detail::finish_step_up_pass(req, out, &rig.metrics);
         CHECK(rig.gate_count("handler_skipped", "local", "rest") == 0);
-        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
     }
 }
 
@@ -2147,7 +2868,7 @@ TEST_CASE("pass stash lifecycle: a pass armed by request A is not consumable by 
     SECTION("control: with NO clear between them the address and label alone admit B") {
         // This is why the clears exist: nothing in the stash distinguishes A from B.
         become_request_b();
-        CHECK(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
     }
     SECTION("the post-routing handler of A clears it (and reports it once if A skipped its gate)") {
         httplib::Response a_done;
@@ -2155,7 +2876,8 @@ TEST_CASE("pass stash lifecycle: a pass armed by request A is not consumable by 
         detail::finish_step_up_pass(req, a_done, &rig.metrics);
         CHECK(rig.gate_count("handler_skipped", "local", "rest") == 1);
         become_request_b();
-        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
     }
     SECTION("post-routing clears on a non-2xx response too, without reporting it") {
         httplib::Response a_failed;
@@ -2163,14 +2885,16 @@ TEST_CASE("pass stash lifecycle: a pass armed by request A is not consumable by 
         detail::finish_step_up_pass(req, a_failed, &rig.metrics);
         CHECK(rig.gate_count("handler_skipped", "local", "rest") == 0);
         become_request_b();
-        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
     }
     SECTION("the pre-routing top of B clears a pass A left (A's post-routing never ran)") {
         // What the first statements of server.cpp's pre-routing handler do for a request that
         // follows one which bypassed post-routing.
         detail::clear_step_up_pass();
         become_request_b();
-        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
     }
     SECTION("a refused request B does not inherit A's pass, and its post-routing clears it") {
         rig.session = make_session("alice", "local", Role::admin, ago(1h));
@@ -2180,13 +2904,15 @@ TEST_CASE("pass stash lifecycle: a pass armed by request A is not consumable by 
                 StepUpChokepointResult::kRefused);
         // A refused B is Handled, so no handler runs; post-routing must still leave nothing armed.
         detail::finish_step_up_pass(req, res_b, &rig.metrics);
-        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
         CHECK(rig.gate_count("handler_skipped", "local", "rest") == 0);
     }
     SECTION("a different action label at the same address never consumes it, and keeps it") {
-        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, "DELETE /api/v1/tokens/{id}"));
+        CHECK_FALSE(
+            detail::consume_step_up_pass(req, *rig.session, "DELETE /api/v1/tokens/{id}", nullptr));
         // The refused attempt did not burn A's pass: only a matching consume or a clear does.
-        CHECK(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel), nullptr));
     }
 }
 
@@ -2202,7 +2928,7 @@ TEST_CASE("pass stash lifecycle: a Rig leaves no stash behind for the next test"
         // Deliberately neither consumed nor cleared: a failing REQUIRE would leave exactly this.
     }
     const auto alice = make_session("alice", "local", Role::admin, ago(10s));
-    CHECK_FALSE(detail::consume_step_up_pass(req, alice, std::string(kTokensLabel)));
+    CHECK_FALSE(detail::consume_step_up_pass(req, alice, std::string(kTokensLabel), nullptr));
 }
 
 TEST_CASE("pass stash lifecycle: a Rig starts with an empty stash", "[stepup][gate][lifecycle]") {
@@ -2214,7 +2940,7 @@ TEST_CASE("pass stash lifecycle: a Rig starts with an empty stash", "[stepup][ga
     REQUIRE(stash.row != nullptr);
     Rig next;
     const auto alice = make_session("alice", "local", Role::admin, ago(10s));
-    CHECK_FALSE(detail::consume_step_up_pass(req, alice, std::string(kTokensLabel)));
+    CHECK_FALSE(detail::consume_step_up_pass(req, alice, std::string(kTokensLabel), nullptr));
 }
 
 // ── in-handler fail-closed helper ────────────────────────────────────────────
@@ -2372,14 +3098,25 @@ TEST_CASE_METHOD(EquivFixture,
                                << " window=" << c.window) {
             const auto session = make_session(c.user, c.source, c.role, c.verified_at);
 
-            const auto verdict = decide_step_up(session, *db, c.window, c.mode);
+            // A stored proof bound to alice's real generation and aged like the session's own.
+            const auto alice_gen = db->mfa_status("alice").value().factor_gen;
+            const DurableProofReadFn read = [&] {
+                return durable_matching(session, alice_gen);
+            };
+            const DurableProofFn durable_fn = [&](const httplib::Request&, const auth::Session& s) {
+                return durable_matching(s, alice_gen);
+            };
+
+            const auto verdict =
+                decide_step_up(session, *db, read, c.window, c.mode, StepUpClass::kRequired);
 
             httplib::Request req;
             httplib::Response res;
             res.status = 200;
             audits.clear();
-            const bool passed = require_mfa_step_up(req, res, session, *db, c.window, audit_fn,
-                                                    "POST /api/v1/whatever", c.mode);
+            const bool passed =
+                require_mfa_step_up(req, res, session, *db, c.window, audit_fn,
+                                    "POST /api/v1/whatever", c.mode, nullptr, &durable_fn, nullptr);
 
             // Both entry points against the hand-written expectation, never against each other.
             CHECK(verdict.passed() == (c.expected_status == 200));
@@ -2415,10 +3152,15 @@ TEST_CASE_METHOD(EquivFixture,
     const StepUpSessionFn resolver = [&](const httplib::Request&) {
         return session;
     };
+    const auto alice_gen = db->mfa_status("alice").value().factor_gen;
+    const DurableProofFn durable_fn = [alice_gen](const httplib::Request&, const auth::Session& s) {
+        return durable_matching(s, alice_gen);
+    };
     auto make_deps = [&] {
         return StepUpChokepointDeps{.resolve_session = &resolver,
                                     .auth_db = db.get(),
                                     .mfa_status = nullptr,
+                                    .durable_proof = &durable_fn,
                                     .audit_fn = &audit_fn,
                                     .metrics = &metrics,
                                     .window_secs = 300,
@@ -2448,4 +3190,330 @@ TEST_CASE_METHOD(EquivFixture,
     CHECK(detail::apply_step_up_chokepoint(req, bob_res, make_deps()) ==
           StepUpChokepointResult::kPassed);
     detail::clear_step_up_pass();
+}
+
+// ── both gates over real stores: the chain, the legacy interleaving, the mixed version (#6079) ──
+//
+// A real AuthDB, a real SessionStore behind a real AuthManager, the chokepoint wired the way
+// server.cpp wires it (the cookie resolves the session, the stored proof is read through the same
+// cookie), and the REAL approval routes behind the REAL approver gate. The factor-credential
+// handler is a stub that does what the Settings handler does once the gate has admitted it: it
+// regenerates the recovery codes at the admitted generation. Nothing here ends a session, so the
+// survivors are exactly what a partial hygiene delete leaves behind.
+
+namespace {
+
+struct ChainFixture {
+    yuzu::test::AuthDbPg db;
+    SessionStore store{db.pool()};
+    AuthManager mgr;
+    std::vector<AuditRow> audits;
+    StepUpAuditFn audit_fn;
+    yuzu::MetricsRegistry metrics;
+
+    ChainFixture() {
+        REQUIRE(store.is_open());
+        mgr.set_auth_db(db.get());
+        mgr.set_session_store(&store);
+        const auto salt = AuthManager::random_bytes(16);
+        const auto hash = AuthManager::pbkdf2_sha256("pw", salt, 1000);
+        REQUIRE(db->upsert_user("alice", hash, AuthManager::bytes_to_hex(salt), Role::admin)
+                    .has_value());
+        enroll("alice");
+        audit_fn = [this](const httplib::Request&, const std::string& a, const std::string& r,
+                          const std::string& tt, const std::string& ti,
+                          const std::string& d) -> bool {
+            audits.push_back({a, r, tt, ti, d});
+            return true;
+        };
+    }
+    ~ChainFixture() { mgr.set_session_store(nullptr); }
+    ChainFixture(const ChainFixture&) = delete;
+    ChainFixture& operator=(const ChainFixture&) = delete;
+
+    void enroll(const std::string& user) {
+        auto init = db->mfa_init_enrollment(user, "Yuzu", std::nullopt);
+        REQUIRE(init.has_value());
+        auto bytes = mfa::base32_decode(init->secret_base32);
+        REQUIRE(bytes.has_value());
+        std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+        auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+        REQUIRE(db->mfa_verify_enrollment(user, code, std::nullopt).has_value());
+    }
+
+    // The clear + re-enrol of a factor replacement, WITHOUT ending any session.
+    void replace_factor(const std::string& user) {
+        REQUIRE(db->mfa_disable_report(user, std::nullopt).has_value());
+        enroll(user);
+    }
+
+    // A cookie session carrying a proof bound to the account's current factor.
+    std::string session_bound(const std::string& user = "alice") {
+        auto token = mgr.create_local_session_for_test(user, Role::admin, /*mfa_verified=*/true);
+        REQUIRE_FALSE(token.empty());
+        return token;
+    }
+
+    std::int64_t gen_of(const std::string& user) {
+        const auto st = db->mfa_status(user);
+        REQUIRE(st.has_value());
+        return st->factor_gen;
+    }
+
+    yuzu::test::ApproverRouteFixture::DurableFn durable_fn() {
+        return [this](const httplib::Request& req, const auth::Session& s) {
+            return mgr.read_durable_mfa_proof(AuthRoutes::extract_session_cookie(req), s.username);
+        };
+    }
+
+    // The central chokepoint for `pattern`, with the cookie `token`, on the real stores.
+    StepUpChokepointResult gate(const std::string& token, std::string_view pattern,
+                                httplib::Response& res, int window_secs = 300) {
+        // The pass stash is keyed on the request's address, so the request outlives this call.
+        pass_req =
+            std::make_unique<httplib::Request>(make_request("POST", pattern, std::string(pattern)));
+        auto& req = *pass_req;
+        req.set_header("Cookie", "yuzu_session=" + token);
+        const StepUpSessionFn resolver = [this](const httplib::Request& r) {
+            return mgr.validate_session(AuthRoutes::extract_session_cookie(r));
+        };
+        const DurableProofFn durable = durable_fn();
+        const StepUpChokepointDeps deps{.resolve_session = &resolver,
+                                        .auth_db = db.get(),
+                                        .mfa_status = nullptr,
+                                        .durable_proof = &durable,
+                                        .audit_fn = &audit_fn,
+                                        .metrics = &metrics,
+                                        .window_secs = window_secs,
+                                        .mfa_enforcement = "optional"};
+        return detail::apply_step_up_chokepoint(req, res, deps);
+    }
+    std::unique_ptr<httplib::Request> pass_req;
+
+    // What the Settings recovery-codes handler does behind an admitting gate. Returns the new
+    // codes, or nullopt when the gate refused (nothing is written then).
+    std::optional<std::vector<std::string>> regenerate_behind_gate(const std::string& token) {
+        httplib::Response res;
+        const auto result = gate(token, "/api/settings/mfa/recovery-codes", res);
+        if (result != StepUpChokepointResult::kPassed)
+            return std::nullopt;
+        StepUpAdmission admitted;
+        const auto session = mgr.validate_session(token);
+        REQUIRE(session.has_value());
+        REQUIRE(detail::consume_step_up_pass(*pass_req, *session,
+                                             "POST /api/settings/mfa/recovery-codes", &admitted));
+        REQUIRE(admitted.local);
+        auto codes = db->mfa_regenerate_recovery_codes("alice", admitted.factor_gen);
+        REQUIRE(codes.has_value());
+        return *codes;
+    }
+
+    // The ids of alice's stored recovery codes, in order: unchanged iff nothing was regenerated.
+    std::string code_ids(const std::string& user = "alice") {
+        auto lease = db.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(),
+            "SELECT COALESCE(string_agg(id::text, ',' ORDER BY id), '') FROM "
+            "auth.mfa_recovery_codes WHERE username = $1",
+            std::vector<std::string>{user});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return PQgetvalue(r.get(), 0, 0);
+    }
+
+    // origin/dev's SessionStore::mark_mfa text, verbatim: it names no bind sequence, so the
+    // session store's guard trigger unbinds the proof.
+    void legacy_mark_mfa(const std::string& token) {
+        auto lease = db.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(),
+            "UPDATE session_store.sessions s SET mfa_verified_ms = n.ms "
+            "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
+            "WHERE s.token_hash = $1",
+            std::vector<std::string>{AuthManager::sha256_hex(token)});
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+
+    // The upgraded step-up stamp: a proof for the account's current factor, as /login/mfa/stepup
+    // writes it after a recovery-code or TOTP verification.
+    void upgraded_stamp(const std::string& token, const std::string& user = "alice") {
+        const auto st = db->mfa_status(user);
+        REQUIRE(st.has_value());
+        REQUIRE(mgr.mark_session_mfa_verified(
+            token, LocalMfaProof{.factor_gen = st->factor_gen, .verified_ms = st->db_now_ms}));
+    }
+
+    bool audit_has(std::string_view what) const {
+        for (const auto& a : audits)
+            if (a.detail.find(what) != std::string::npos)
+                return true;
+        return false;
+    }
+};
+
+std::string approve_or_reject(yuzu::test::ApproverRouteFixture& fx, const std::string& verb,
+                              const std::string& token, int& status, std::string& ticket) {
+    ticket = fx.submit();
+    auto res = fx.decide(verb, ticket, token);
+    REQUIRE(res);
+    status = res->status;
+    return fx.status_of(ticket);
+}
+
+} // namespace
+
+TEST_CASE("the chain: a survivor of a factor replacement cannot regenerate the recovery codes, so "
+          "it never reaches a bound proof or an approval (#6079 T9)",
+          "[pg][stepup][gate][binding][chain]") {
+    ChainFixture f;
+    yuzu::test::ApproverRouteFixture fx(f.mgr, *f.db.get(), f.durable_fn());
+
+    const auto survivor = f.session_bound(); // proof bound to factor 1
+    f.replace_factor("alice");               // factor 2; the survivor's session is NOT deleted
+    const auto ids_before = f.code_ids();
+    REQUIRE_FALSE(ids_before.empty());
+
+    // Step 1 of the chain: the survivor is refused before the handler, under the default window...
+    {
+        httplib::Response res;
+        CHECK(f.gate(survivor, "/api/settings/mfa/recovery-codes", res) ==
+              StepUpChokepointResult::kRefused);
+        CHECK(res.status == 401);
+        CHECK(f.audit_has("reason=proof_factor_mismatch"));
+        CHECK_FALSE(f.regenerate_behind_gate(survivor).has_value());
+        CHECK(f.code_ids() == ids_before); // no code regenerated, none revealed
+    }
+    // ...and under the operator hatch, which this row ignores.
+    {
+        httplib::Response res;
+        CHECK(f.gate(survivor, "/api/settings/mfa/recovery-codes", res, /*window_secs=*/0) ==
+              StepUpChokepointResult::kRefused);
+        CHECK(res.status == 401);
+        CHECK(f.code_ids() == ids_before);
+    }
+    // The survivor decides nothing: approve and reject both 401, the ticket stays pending.
+    for (const char* verb : {"approve", "reject"}) {
+        int status = 0;
+        std::string ticket;
+        CHECK(approve_or_reject(fx, verb, survivor, status, ticket) == "pending");
+        CHECK(status == 401);
+    }
+
+    // The control chain, from a session bound to factor 2: regenerate, consume one code through
+    // the step-up verification, and decide an approval.
+    const auto legit = f.session_bound();
+    const auto codes = f.regenerate_behind_gate(legit);
+    REQUIRE(codes.has_value());
+    REQUIRE(codes->size() == 10);
+    CHECK(f.code_ids() != ids_before); // a new set exists now
+    auto verified = f.db->mfa_consume_recovery_code("alice", codes->front());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->ok);
+    REQUIRE(f.mgr.mark_session_mfa_verified(
+        legit,
+        LocalMfaProof{.factor_gen = verified->factor_gen, .verified_ms = verified->verified_ms}));
+    int status = 0;
+    std::string ticket;
+    CHECK(approve_or_reject(fx, "approve", legit, status, ticket) == "approved");
+    CHECK(status == 200);
+}
+
+TEST_CASE("the legacy interleaving: a proof written by a replica that cannot bind is refused by "
+          "both gates until the user re-proves (#6079 T7, T8)",
+          "[pg][stepup][gate][binding][chain]") {
+    ChainFixture f;
+    yuzu::test::ApproverRouteFixture fx(f.mgr, *f.db.get(), f.durable_fn());
+    const auto token = f.session_bound(); // bound to the current factor, fresh
+    {
+        httplib::Response res;
+        REQUIRE(f.gate(token, "/api/settings/mfa/recovery-codes", res) ==
+                StepUpChokepointResult::kPassed); // sanity: bound passes the generic gate
+        detail::clear_step_up_pass();
+        int status = 0;
+        std::string ticket;
+        REQUIRE(approve_or_reject(fx, "approve", token, status, ticket) == "approved");
+    }
+
+    // A legacy replica stamps the session: fresh instant, generation 0.
+    f.legacy_mark_mfa(token);
+    const auto stored = f.mgr.read_durable_mfa_proof(token, "alice");
+    REQUIRE(stored.source == auth::DurableMfaProof::Source::kRow);
+    CHECK(stored.mfa_verified_ms > 0);
+    CHECK(stored.mfa_factor_gen == 0);
+
+    f.audits.clear();
+    for (const char* pattern :
+         {"/api/settings/mfa/recovery-codes", "/api/settings/mfa/disable", "/api/v1/tokens"}) {
+        INFO(pattern);
+        httplib::Response res;
+        CHECK(f.gate(token, pattern, res) == StepUpChokepointResult::kRefused);
+        CHECK(res.status == 401);
+    }
+    CHECK(f.audit_has("reason=proof_factor_unbound"));
+    for (const char* verb : {"approve", "reject"}) {
+        int status = 0;
+        std::string ticket;
+        CHECK(approve_or_reject(fx, verb, token, status, ticket) == "pending");
+        CHECK(status == 401);
+    }
+    bool approver_reason = false;
+    for (const auto& a : fx.audits)
+        approver_reason |= a.detail.find("reason=proof_factor_unbound") != std::string::npos;
+    CHECK(approver_reason);
+
+    // Re-proving through the upgraded stamp admits both gates again.
+    f.upgraded_stamp(token);
+    {
+        httplib::Response res;
+        CHECK(f.gate(token, "/api/settings/mfa/recovery-codes", res) ==
+              StepUpChokepointResult::kPassed);
+        detail::clear_step_up_pass();
+        int status = 0;
+        std::string ticket;
+        CHECK(approve_or_reject(fx, "approve", token, status, ticket) == "approved");
+        CHECK(status == 200);
+        CHECK(approve_or_reject(fx, "reject", token, status, ticket) == "rejected");
+    }
+}
+
+TEST_CASE("a proof stamped fresh but durably old is refused by the generic gate even though its "
+          "cached anchor reads fresh (#6079 T13)",
+          "[pg][stepup][gate][binding][chain]") {
+    ChainFixture f;
+    const auto token = f.session_bound();
+    // This replica's cache entry, populated BEFORE the stored instant moves: a raw write does not
+    // advance the session write generation, so the cache keeps serving its seconds-old anchor,
+    // exactly the state of a replica whose monotonic clock paused.
+    const auto cached = f.mgr.validate_session(token);
+    REQUIRE(cached.has_value());
+    REQUIRE(cached->steady_mfa_verified.time_since_epoch().count() != 0);
+    CHECK(std::chrono::steady_clock::now() - cached->steady_mfa_verified < 30s);
+    // Move the stored instant 400 s into the past WITH the bind sequence, so the guard keeps the
+    // binding.
+    {
+        auto lease = f.db.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(),
+            "UPDATE session_store.sessions SET mfa_verified_ms = "
+            "(extract(epoch from now())*1000)::bigint - 400000, mfa_bind_seq = mfa_bind_seq + 1 "
+            "WHERE token_hash = $1",
+            std::vector<std::string>{AuthManager::sha256_hex(token)});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    for (const char* pattern : {"/api/settings/mfa/recovery-codes", "/api/v1/tokens"}) {
+        INFO(pattern);
+        f.audits.clear();
+        httplib::Response res;
+        CHECK(f.gate(token, pattern, res) == StepUpChokepointResult::kRefused);
+        CHECK(res.status == 401);
+        REQUIRE(f.audits.size() == 1);
+        const auto& detail = f.audits[0].detail;
+        const auto pos = detail.find("age_secs=");
+        REQUIRE(pos != std::string::npos);
+        CHECK(std::stoi(detail.substr(pos + 9)) >= 400);
+        CHECK(detail.find("reason=") == std::string::npos); // stale, not unbound or mismatched
+    }
 }

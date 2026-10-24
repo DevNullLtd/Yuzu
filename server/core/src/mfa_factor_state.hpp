@@ -18,7 +18,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <string_view>
+
+namespace httplib {
+struct Request;
+} // namespace httplib
 
 namespace yuzu::server {
 
@@ -128,6 +133,24 @@ struct DurableProofAge {
         return {};
     return {age_ms <= window_ms, age_ms / 1000};
 }
+
+/// The per-request read of the stored MFA proof of the session that authenticated `req`
+/// (`AuthRoutes::durable_mfa_proof_for` in production). The step-up gates take it as an injected
+/// provider, exactly like `MfaStatusFn`, so the decision stays pure and a test supplies a fake.
+using DurableProofFn =
+    std::function<auth::DurableMfaProof(const httplib::Request&, const auth::Session&)>;
+
+/// What the generic step-up gate admitted, for the one handler that mutates a factor under that
+/// admission (the two `kFactorCredential` rows): the account's CURRENT factor generation as the
+/// gate read it, to be compared again inside the mutation's own transaction. `local` is true only
+/// when a local account was judged (enrolled or not); every other principal class leaves it false,
+/// and a value-initialised admission admits nothing. For an enrolled account the bound-proof
+/// judgement made `factor_gen` equal to the proof's; for an un-enrolled one (cancelling a
+/// provisional enrolment) it is the generation as read (0 for a never-enrolled account).
+struct StepUpAdmission {
+    bool local{false};
+    std::int64_t factor_gen{0};
+};
 
 /// What `require_enrolled_fresh_mfa` did. Only `kPass` lets the request
 /// proceed; the zero value is `kRefuse`, so a value-initialised outcome (an

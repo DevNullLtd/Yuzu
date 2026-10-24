@@ -581,7 +581,8 @@ TEST_CASE("step-up route inventory: every kRequired row is registered (its handl
     for (const auto& k : l3_scanned())
         registered.insert(k);
     for (const auto& e : kStepUpPolicy) {
-        if (e.cls != StepUpClass::kRequired && e.cls != StepUpClass::kOwnGate)
+        if (e.cls != StepUpClass::kRequired && e.cls != StepUpClass::kOwnGate &&
+            e.cls != StepUpClass::kFactorCredential)
             continue;
         INFO(std::string(e.method) << " " << std::string(e.pattern));
         CHECK(registered.contains({std::string(e.method), std::string(e.pattern)}));
@@ -616,9 +617,10 @@ TEST_CASE("step-up route inventory (lexical): kRequired labels equal the in-hand
         }
     }
 
-    std::map<std::string, int> table_labels; // label -> kRequired rows carrying it
+    std::map<std::string, int>
+        table_labels; // label -> kRequired / kFactorCredential rows carrying it
     for (const auto& e : kStepUpPolicy) {
-        if (e.cls == StepUpClass::kRequired)
+        if (e.cls == StepUpClass::kRequired || e.cls == StepUpClass::kFactorCredential)
             ++table_labels[std::string(e.action_label)];
     }
     REQUIRE_FALSE(table_labels.empty());
@@ -645,6 +647,60 @@ TEST_CASE("step-up route inventory (lexical): kRequired labels equal the in-hand
     INFO("step_up_fn labels with no kRequired row (the handler drifted from the table):\n"
          << join(handler_only));
     CHECK(handler_only.empty());
+}
+
+// -- Factor-credential coverage (lexical) -----------------------------------------------------
+
+// The only code that may regenerate an account's recovery codes or clear its second factor on a
+// request's behalf is a handler registered on one of the two `kFactorCredential` rows: those are
+// the rows the chokepoint evaluates with the approver window, no hatch, the local-session-only rule
+// and the admitted-generation carry. A third caller (a new route, a refactored helper) would
+// mutate a factor under a weaker gate, so it fails here until it is a kFactorCredential row too.
+// `--mfa-reset` (main.cpp) is break-glass with no session and calls `mfa_disable`, which this scan
+// does not match. LEXICAL: a call spelled `->name(` or `.name(` outside auth_db.cpp.
+TEST_CASE("step-up route inventory (lexical): only the two kFactorCredential handlers mutate a "
+          "second factor",
+          "[stepup][inventory][factor_credential]") {
+    static const std::regex mutation(
+        R"regex((?:->|\.)\s*(mfa_regenerate_recovery_codes|mfa_disable_report)\s*\()regex");
+    static const std::regex registration(
+        R"regex(\bsink\.(?:Post|Put|Delete|Patch)\(\s*"([^"]+)")regex");
+
+    const auto line_of = [](const std::string& text, std::size_t pos) {
+        return static_cast<int>(std::count(text.begin(),
+                                           text.begin() + static_cast<std::ptrdiff_t>(pos), '\n')) +
+               1;
+    };
+
+    std::vector<std::string> not_a_factor_credential_row;
+    std::vector<std::string> callers;
+    for (const auto& [file, text] :
+         scan::read_all_cpp_files(std::filesystem::path(YUZU_SERVER_SRC_DIR))) {
+        if (file == "auth_db.cpp" || file.ends_with("/auth_db.cpp"))
+            continue;
+        for (auto it = std::sregex_iterator(text.begin(), text.end(), mutation);
+             it != std::sregex_iterator(); ++it) {
+            const auto pos = static_cast<std::size_t>(it->position(0));
+            const std::string where =
+                file + ":" + std::to_string(line_of(text, pos)) + " " + (*it)[1].str();
+            callers.push_back(where);
+            // The route this call sits in: the nearest registration before it.
+            std::string pattern;
+            const std::string before = text.substr(0, pos);
+            for (auto r = std::sregex_iterator(before.begin(), before.end(), registration);
+                 r != std::sregex_iterator(); ++r)
+                pattern = (*r)[1].str();
+            const auto* row = pattern.empty() ? nullptr : step_up_policy_for("POST", pattern);
+            if (row == nullptr || row->cls != StepUpClass::kFactorCredential)
+                not_a_factor_credential_row.push_back(where + " (route '" + pattern + "')");
+        }
+    }
+    INFO("calls found:\n" << join(callers));
+    // Both mutations are called, exactly once each, so the scan cannot pass vacuously.
+    CHECK(callers.size() == 2);
+    INFO("mutation call sites that are not inside a kFactorCredential handler:\n"
+         << join(not_a_factor_credential_row));
+    CHECK(not_a_factor_credential_row.empty());
 }
 
 // -- L4: the boot sweep's refusal decision -----------------------------------------------------

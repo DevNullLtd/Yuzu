@@ -51,35 +51,69 @@ TEST_CASE("step-up policy: every row has a verb the table classifies and a patte
     }
 }
 
-TEST_CASE("step-up policy: kExempt and kOwnGate rows carry a reason, kRequired rows a label",
+TEST_CASE("step-up policy: kExempt and kOwnGate rows carry a reason, kRequired and "
+          "kFactorCredential rows a label",
           "[stepup][policy]") {
     for (const auto& e : kStepUpPolicy) {
         INFO(std::string(e.method) << " " << std::string(e.pattern));
         if (e.cls == StepUpClass::kExempt || e.cls == StepUpClass::kOwnGate)
             CHECK_FALSE(e.reason.empty());
-        if (e.cls == StepUpClass::kRequired)
+        if (e.cls == StepUpClass::kRequired || e.cls == StepUpClass::kFactorCredential)
             CHECK_FALSE(e.action_label.empty());
     }
 }
 
-TEST_CASE("step-up policy: the gated set is exactly the 37 routes with an in-handler call",
+TEST_CASE("step-up policy: the gated set is exactly the 35 kRequired and 2 kFactorCredential "
+          "routes with an in-handler call",
           "[stepup][policy]") {
-    CHECK(count_class(StepUpClass::kRequired) == 37);
+    CHECK(count_class(StepUpClass::kRequired) == 35);
+    CHECK(count_class(StepUpClass::kFactorCredential) == 2);
     CHECK(count_class(StepUpClass::kOwnGate) == 3);
     CHECK(count_class(StepUpClass::kStrong) == 0);
 }
 
+TEST_CASE("step-up policy: kFactorCredential is exactly the two factor-credential rows",
+          "[stepup][policy]") {
+    // The routes that issue or retire a second-factor credential. A third row is a security
+    // decision (it gets the approver window, no hatch and the local-session-only rule), not a
+    // routine edit: this list and the constexpr count pin in step_up_policy.hpp move together.
+    const auto* recovery = step_up_policy_for("POST", R"(/api/settings/mfa/recovery-codes)");
+    const auto* disable = step_up_policy_for("POST", R"(/api/settings/mfa/disable)");
+    REQUIRE(recovery != nullptr);
+    REQUIRE(disable != nullptr);
+    CHECK(recovery->cls == StepUpClass::kFactorCredential);
+    CHECK(disable->cls == StepUpClass::kFactorCredential);
+    CHECK(recovery->action_label == "POST /api/settings/mfa/recovery-codes");
+    CHECK(disable->action_label == "POST /api/settings/mfa/disable");
+    std::size_t carriers = 0;
+    for (const auto& e : kStepUpPolicy) {
+        if (e.cls != StepUpClass::kFactorCredential)
+            continue;
+        ++carriers;
+        INFO(std::string(e.method) << " " << std::string(e.pattern));
+        CHECK((&e == recovery || &e == disable));
+    }
+    CHECK(carriers == 2);
+    // The in-handler fallback resolves the class from the label alone.
+    CHECK(step_up_policy_for_label("POST /api/settings/mfa/recovery-codes") == recovery);
+    CHECK(step_up_policy_for_label("POST /api/settings/mfa/disable") == disable);
+    CHECK(step_up_policy_for_label("POST /api/v1/tokens")->cls == StepUpClass::kRequired);
+    CHECK(step_up_policy_for_label("POST /api/v1/elevate")->cls == StepUpClass::kOwnGate);
+    CHECK(step_up_policy_for_label("") == nullptr);
+    CHECK(step_up_policy_for_label("POST /no/such/label") == nullptr);
+}
+
 TEST_CASE("step-up policy: the table's total and per-class row counts are pinned",
           "[stepup][policy]") {
-    // Executable pins for the table counts (235 mutating REST routes: 37 required, 3 own-gate,
-    // 122 exempt, 73 pending). A row added or reclassified without these numbers moving
-    // together fails here.
+    // Executable pins for the table counts (235 mutating REST routes: 35 required, 2
+    // factor-credential, 3 own-gate, 122 exempt, 73 pending). A row added or reclassified
+    // without these numbers moving together fails here.
     CHECK(kStepUpPolicyCount == 235);
     CHECK(count_class(StepUpClass::kExempt) == 122);
     CHECK(count_class(StepUpClass::kPendingRuling) == 73);
-    CHECK(count_class(StepUpClass::kRequired) + count_class(StepUpClass::kOwnGate) +
-              count_class(StepUpClass::kStrong) + count_class(StepUpClass::kExempt) +
-              count_class(StepUpClass::kPendingRuling) ==
+    CHECK(count_class(StepUpClass::kRequired) + count_class(StepUpClass::kFactorCredential) +
+              count_class(StepUpClass::kOwnGate) + count_class(StepUpClass::kStrong) +
+              count_class(StepUpClass::kExempt) + count_class(StepUpClass::kPendingRuling) ==
           kStepUpPolicyCount);
 }
 
