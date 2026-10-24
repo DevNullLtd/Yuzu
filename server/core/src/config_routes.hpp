@@ -26,11 +26,14 @@
 /// Routes (2) — gate in parens:
 ///   GET /api/config             (perm_fn Infrastructure:Read; lists
 ///                                 `read_only_keys`, the allowed keys this route
-///                                 does not write: dex_score_policy)
+///                                 does not write: the route-owned class, today
+///                                 dex_score_policy)
 ///   PUT /api/config/([a-z_]+)   (perm_fn Infrastructure:Write, THEN auth_fn for the
 ///                                 audit-attributed username and the same-site check,
-///                                 THEN the dex_score_policy 400 (that key is written
+///                                 THEN the route-owned 400 (dex_score_policy is written
 ///                                 only through its own route, a later change), THEN the
+///                                 write-class 403 for an administrator-only key (a
+///                                 `config.update`/`denied` row, no attempted row), THEN the
 ///                                 store-open 503, THEN body parsing and integer-key
 ///                                 validation, THEN the unknown-key 400, THEN the
 ///                                 audit-first attempted row)

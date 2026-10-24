@@ -1059,7 +1059,36 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   administrator at SSO login, so it is a standing grant. Audit
   `oidc.configure / denied / elevated_session_oidc_change_blocked` and
   `config.update / denied / elevated_session_oidc_setting_blocked` (or
-  `admin_role_required_oidc_setting_blocked` when the caller was not elevated).
+  `admin_role_required_oidc_setting_blocked` when the caller was not elevated). The
+  `oidc_*` config rule refuses an MCP-tier token whatever its creator's role, audited
+  `token_session_oidc_setting_blocked`; the handler also refuses a
+  service-scoped token the same way (defence in depth; the permission gate already does).
+- **Administrator-only runtime-config keys.** `PUT /api/config/{key}` for
+  `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`,
+  `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`, `dex_cohort_export_key` and
+  `audit_retention_days` applies one caller rule. For the first six it is the rule of the
+  Settings routes that also write them; `audit_retention_days` has no Settings route
+  (the generic PUT is its only writer) and is in the class by design, because
+  it is the stored audit-retention setting (reported by `GET /api/config`, evidence-bearing,
+  and the lever that will govern enforcement once #483 lands); the stored value is not
+  enforced today, the enforced window being `--audit-retention-days` plus a restart. The Settings
+  routes are behind `require_admin`; the generic route uses the same predicate: `authz::admin_gate_verdict` (`admin_gate.hpp`) refuses a
+  service-scoped token and an MCP-tier token whatever the creator's role, and otherwise
+  requires the EFFECTIVE role to be `admin`. That role is the account's legacy
+  `Session::role`, or a live JIT elevation, never an RBAC grant: an RBAC Administrator
+  grant alone does not count, and an engine principal is refused. Any administrator account session passes,
+  including an administrator API token that is not MCP-tier. Unlike the `oidc_*` rule
+  above, an active JIT elevation is admitted, as it is on those Settings routes. `Infrastructure:Write` alone
+  does not suffice. The refusal precedes the store-open check and the body parse and is
+  audited `config.update / denied` on `RuntimeConfig` with `target_id` = the key, no
+  `attempted` row, and `detail` `token_session_admin_setting_blocked` (token) or
+  `admin_role_required_setting_blocked` (effective role not `admin`); the Settings routes
+  audit their denials as `auth.admin_required` instead. In production a service-scoped
+  token and a `readonly` or `operator` MCP token are refused earlier by the permission
+  gate, so the callers that reach this rule are a supervised-tier MCP token and, with RBAC
+  on, a non-administrator holding `Infrastructure:Write`. Every other key
+  (`response_retention_days`, `guardian_event_retention_days`, `log_level`,
+  `heartbeat_timeout`, `auto_approve_enabled`) stays under `Infrastructure:Write`.
 - **OIDC-amr elevation — RESTORED by durable SSO identity (#1852).** As of the
   `oidc:<iss>#<sub>` principal re-key (#1837/#1857), an OIDC session's principal
   is not a local-charset `users` username (it contains `:`/`#`), and before #1852
