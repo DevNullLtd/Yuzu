@@ -839,9 +839,35 @@ TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an SSO or bearer session ne
           MfaFactorState::kIdpAttested);
 }
 
-TEST_CASE_METHOD(ApproverFixture,
-                 "probe_mfa_factor: an unreadable secret is kStoreUnavailable, "
-                 "never kNotEnrolled",
+TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an enrolled row with a non-positive "
+                                  "generation is kStoreUnavailable (#6079)",
+                 "[pg][mfa][stepup][approver][probe]") {
+    // `enrolled` implies a trigger-owned generation >= 1. A row that says otherwise would make
+    // the binding comparison vacuous, so the probe refuses it. The row can only be built by
+    // withdrawing the trigger, which is exactly the tampering this arm exists for.
+    add_user("frank");
+    enroll("frank");
+    REQUIRE(probe_mfa_factor(make_session("frank", "local"), *db).state ==
+            MfaFactorState::kEnrolledLocal);
+    {
+        auto lease = db.pool().acquire();
+        REQUIRE(lease);
+        const auto run = [&](const char* statement, std::vector<std::string> params) {
+            auto r = yuzu::server::pg::exec_params(lease.get(), statement, params);
+            INFO(PQresultErrorMessage(r.get()));
+            REQUIRE(r.status() == PGRES_COMMAND_OK);
+        };
+        run("ALTER TABLE auth.users DISABLE TRIGGER users_mfa_factor_gen", {});
+        run("UPDATE auth.users SET mfa_factor_gen = 0 WHERE username = $1", {"frank"});
+        run("ALTER TABLE auth.users ENABLE ALWAYS TRIGGER users_mfa_factor_gen", {});
+    }
+    const auto frank = probe_mfa_factor(make_session("frank", "local"), *db);
+    CHECK(frank.state == MfaFactorState::kStoreUnavailable);
+    CHECK(frank.factor_gen == 0);
+}
+
+TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an unreadable secret is kStoreUnavailable, "
+                                  "never kNotEnrolled",
                  "[pg][mfa][stepup][approver][probe]") {
     null_secret_keep_enrolled("alice"); // P10
     CHECK(probe_mfa_factor(make_session("alice", "local"), *db).state ==

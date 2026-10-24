@@ -2195,6 +2195,54 @@ TEST_CASE("a factor replaced between step-up verification and the stamp clears t
     CHECK(binding_of(h, token, "admin") != LocalMfaBinding::kBound);
 }
 
+TEST_CASE("a session-store error while recording a valid step-up is a retryable 503, and "
+          "admits nothing (#6079)",
+          "[pg][mfa][stepup][routes][binding]") {
+    AuthRoutesHarness h;
+    auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+    const std::string token = cookie.substr(std::string("yuzu_session=").size());
+    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
+    REQUIRE(codes.has_value());
+
+    // Hold the account's row lock from a separate connection between the verifier and the
+    // stamp: the stamp's factor recheck cannot read the generation inside its lock_timeout,
+    // which is a store error (not a verdict) and fails closed.
+    yuzu::server::pg::PgConn holder{PQconnectdb(h.auth_db.dsn().c_str())};
+    REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+    std::vector<SeenProof> seen;
+    record_proofs(h, seen, [&holder] {
+        REQUIRE(yuzu::server::pg::exec_params(holder.get(), "BEGIN", std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+        REQUIRE(yuzu::server::pg::exec_params(
+                    holder.get(), "SELECT 1 FROM auth.users WHERE username = $1 FOR UPDATE",
+                    std::vector<std::string>{"admin"})
+                    .status() == PGRES_TUPLES_OK);
+    });
+    auto res = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", codes->front()}}),
+                               "application/x-www-form-urlencoded", {{"Cookie", cookie}});
+    yuzu::server::pg::exec_params(holder.get(), "ROLLBACK", std::vector<std::string>{});
+    REQUIRE(res);
+    CHECK(res->status == 503); // an outage is not a bad credential
+    CHECK(res->body.find("retry_after_ms") != std::string::npos);
+    CHECK(res->body.find("Invalid verification code") == std::string::npos);
+    CHECK(h.count_audits("mfa.step_up.passed", "admin") == 0);
+    AuditQuery q;
+    q.action = "mfa.step_up.failed";
+    q.principal = "admin";
+    const auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    bool saw = false;
+    for (const auto& row : *rows)
+        saw = saw || row.detail == "step_up_proof_store_error";
+    CHECK(saw);
+
+    // Nothing was admitted: the stamp is cleared, never a proof a gate accepts.
+    const auto durable = h.auth_mgr.read_durable_mfa_proof(token, "admin");
+    CHECK(durable.mfa_verified_ms == 0);
+    CHECK(binding_of(h, token, "admin") != LocalMfaBinding::kBound);
+}
+
 // `durable_mfa_proof_for` is the one place a gate turns a request into a stored-proof read.
 TEST_CASE("AuthRoutes::durable_mfa_proof_for reads the request's own local session only "
           "(#6079)",

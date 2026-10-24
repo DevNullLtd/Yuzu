@@ -179,6 +179,22 @@ void refuse_factor_credential_gate_unwired(const httplib::Request& req, httplib:
     toast_step_up_refusal(res);
 }
 
+// #6079: the gate hands back an admission only for a local interactive session, so a
+// non-local one here is a gate defect, never a production shape. Re-check it where the
+// admission is consumed (the generation it carries is only meaningful for a local account)
+// and answer the gate's own 403, mutating nothing.
+void refuse_factor_credential_not_local(const httplib::Request& req, httplib::Response& res,
+                                        const auth::Session& session, std::string_view label) {
+    spdlog::error("settings: factor-credential admission is not local; failing closed ({})",
+                  label);
+    StepUpVerdict v;
+    v.decision = StepUpDecision::kFactorCredentialNonLocal;
+    v.reason = "factor_credential_requires_local_session";
+    v.user = session.username;
+    render_step_up_refusal(req, res, v, StepUpSurface::kRest);
+    toast_step_up_refusal(res);
+}
+
 // True when a Content-Type header names application/json (any parameters, any case).
 bool is_json_content_type(std::string_view value) {
     constexpr std::string_view kJson = "application/json";
@@ -7090,6 +7106,11 @@ void SettingsRoutes::register_routes(
                       toast_step_up_refusal(res);
                       return;
                   }
+                  if (!admission->local) {
+                      refuse_factor_credential_not_local(req, res, *session,
+                                                         "POST /api/settings/mfa/recovery-codes");
+                      return;
+                  }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
                   if (!db) {
                       res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
@@ -7151,6 +7172,11 @@ void SettingsRoutes::register_routes(
                       req, res, *session, "POST /api/settings/mfa/disable");
                   if (!admission) {
                       toast_step_up_refusal(res);
+                      return;
+                  }
+                  if (!admission->local) {
+                      refuse_factor_credential_not_local(req, res, *session,
+                                                         "POST /api/settings/mfa/disable");
                       return;
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;

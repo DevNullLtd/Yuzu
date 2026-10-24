@@ -3648,8 +3648,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             mfa_verify_barrier_for_test_("/login/mfa/stepup", proof);
         // #6079: the stamp stores the verifier's own generation and instant. Anything but
         // kStamped admits nothing (the clear, where one was needed, is the primitive's): the
-        // session keeps whatever proof it had, the answer is the uniform 401, and the audit
-        // detail says why. kNoSession keeps the pre-binding wording.
+        // session keeps whatever proof it had, the answer is the uniform 401 (503 for a store
+        // error), and the audit detail says why. kNoSession keeps the pre-binding wording.
         const auto stamp = auth_mgr_.stamp_session_mfa_proof(token, proof);
         if (stamp != auth::AuthManager::MfaStampOutcome::kStamped) {
             using O = auth::AuthManager::MfaStampOutcome;
@@ -3671,8 +3671,18 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             case O::kStamped:
                 break;
             }
-            res.status = 401;
-            res.set_content(kFailureBody(res), "application/json");
+            if (stamp == O::kStoreError) {
+                // The code was valid; the session store could not record it, so nothing was
+                // admitted. That is an outage, not a bad credential: a retryable 503.
+                res.status = 503;
+                res.set_content(detail::a4_denial(res, 503,
+                                                  "step-up verification could not be recorded",
+                                                  detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                                "application/json");
+            } else {
+                res.status = 401;
+                res.set_content(kFailureBody(res), "application/json");
+            }
             audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
                                     auth::role_to_string(session->role), "User", session->username,
                                     why);

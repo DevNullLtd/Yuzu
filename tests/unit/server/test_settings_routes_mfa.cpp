@@ -1809,6 +1809,42 @@ struct StoreScope {
 
 } // namespace
 
+TEST_CASE("the factor-credential routes refuse an admission that is not local and mutate "
+          "nothing (#6079)",
+          "[pg][mfa][routes][settings][stepup][binding]") {
+    // The real gate never hands one back; a gate defect that did must still not reach the
+    // mutation, because the generation it carries is only meaningful for a local account.
+    MfaSettingsHarness h;
+    StoreScope scope(h);
+    enrol_admin_directly(h);
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    REQUIRE_FALSE(token.empty());
+    const auto gen = current_gen(h);
+    h.routes.set_factor_credential_gate_fn(
+        [gen](const httplib::Request&, httplib::Response&, const auth::Session&,
+              const std::string&) -> std::optional<StepUpAdmission> {
+            return StepUpAdmission{false, gen};
+        });
+    const auto ids_before = code_ids(h);
+    for (const char* path : {"/api/settings/mfa/recovery-codes", "/api/settings/mfa/disable"}) {
+        CAPTURE(path);
+        auto res = post_with_cookie(h, path, token);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(res->body.find("Store these recovery codes now") == std::string::npos);
+        CHECK(res->get_header_value("HX-Redirect").empty());
+        CHECK(res->get_header_value("Set-Cookie").empty());
+    }
+    CHECK(code_ids(h) == ids_before);
+    const auto st = h.auth_db->mfa_status("admin");
+    REQUIRE(st.has_value());
+    CHECK(st->enrolled);
+    CHECK(st->factor_gen == gen);
+    CHECK(h.auth_mgr.validate_session(token).has_value());
+    CHECK_FALSE(h.has_audit("mfa.recovery_codes.generated", "ok"));
+    CHECK_FALSE(h.has_audit("mfa.disabled", "ok"));
+}
+
 TEST_CASE("recovery-codes route: a factor rotated after the gate admitted the request answers 409 "
           "and regenerates nothing (#6079 T12a)",
           "[pg][mfa][routes][settings][stepup][binding]") {
