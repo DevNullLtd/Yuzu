@@ -255,7 +255,8 @@ public:
     /// fan-out reads (the remaining #1634 work; see rest_api_v1.hpp ResponseScopeFn).
     /// The handler resolves the principal ONCE (it already authed the request) and
     /// passes `username` in, so the predicate does NOT re-resolve the session per
-    /// call. RBAC-off → returns true (legacy-open, matching require_scoped_permission).
+    /// call. RBAC-off → returns true for a human (legacy-open, matching require_scoped_permission), but
+    /// false for an engine principal, whose only authority is an explicit RBAC grant (#6204).
     ///
     /// FAIL-OPEN-WHEN-UNWIRED, deliberately: the default `= {}` means an unset
     /// predicate applies NO filter. This diverges from DeviceRoutes' required
