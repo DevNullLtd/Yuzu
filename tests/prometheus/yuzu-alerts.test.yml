@@ -4557,3 +4557,146 @@ tests:
       - expr: 'ALERTS{alertname="YuzuForensicsTierUnresolved", alertstate="firing"}'
         eval_time: 30m
         exp_samples: []
+
+  # -- Dispatch-record write failures (group yuzu-executions, #4990) ---------------------------
+  #
+  # yuzu_exec_correlation_write_degrade_total counts dispatch-time command_execution record writes
+  # that failed: every response to such a dispatch is stored `~unverified` (Forensics-tier). It is
+  # pre-seeded to 0 at boot, so a healthy server is flat. The rule is
+  # `sum by (instance) (rate(...[5m])) > 0` with `for: 10m`, the YuzuForensicsTierUnresolved
+  # shape: one failure keeps the expression true for under 5 minutes, so only a failure that keeps
+  # recurring fires, after about 10 minutes. Which case catches which change (each mutation was run
+  # against the pinned promtool image and turned the named case red):
+  #   * `for:` 9m or less (also 2m)                  -> case A (must be quiet at 10m and 11m)
+  #   * `for:` 11m or more (also 15m)                -> case A (must be firing at exactly 12m)
+  #   * the rate window stretched to 7m or more      -> case E (an event every 6 minutes must stay quiet)
+  #   * the rate window shrunk to 3m                 -> case C (the pending sample at 4m)
+  #   * the old `increase(...[10m])` form            -> case D (a short outage would page)
+  #   * `> 0` weakened to `>= 0`                     -> case B (a flat series would fire)
+  #   * the `by (instance)` grouping or the metric name lost -> case A (labels / no sample)
+  # NOT caught: a rate window of 4m or 6m (neither changes any case, as for the Forensics rule).
+  # BOUNDARY, BY DESIGN: dispatch is operator or automation driven, so a store outage with fewer
+  # than one dispatch every ~5 minutes leaves the 5m rate false between failures and does not
+  # fire although each of those commands is unverified (case E pins a 6-minute recurrence as quiet).
+
+  # CASE A -- a recurring failure (one more event every minute from minute 2) fires, labeled with
+  # instance. First true at minute 2, so `for: 10m` fires at minute 12. RED if the rule lost the
+  # metric name or the by (instance).
+  - interval: 1m
+    name: dispatch record write failing - a sustained failure fires
+    input_series:
+      - series: 'yuzu_exec_correlation_write_degrade_total{job="yuzu",instance="s1"}'
+        values: "0 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # CASE B -- a healthy server is quiet: the pre-seeded series never moves. RED if the rule ever fires on a
+  # flat series.
+  - interval: 1m
+    name: dispatch record write failing - a healthy server is quiet
+    input_series:
+      - series: 'yuzu_exec_correlation_write_degrade_total{job="yuzu",instance="s1"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate=~"firing|pending"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE C -- a single blip (one event at minute 2) is pending at most, never firing. The pending
+  # sample at 4m proves the expression IS true (the case is not vacuous).
+  - interval: 1m
+    name: dispatch record write failing - a single event does not page
+    input_series:
+      - series: 'yuzu_exec_correlation_write_degrade_total{job="yuzu",instance="s1"}'
+        values: "0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="pending"}'
+        eval_time: 4m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="pending", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # CASE D -- a short outage (an event at minutes 2, 3 and 4, then recovery) does not page: the rate
+  # is true from minute 2 to about minute 8, under the 10 minutes `for:` needs, and gone by minute
+  # 12. RED if the expression keeps a short outage true for 10 minutes (an `increase(...[10m])`
+  # form would).
+  - interval: 1m
+    name: dispatch record write failing - a short outage that recovers does not page
+    input_series:
+      - series: 'yuzu_exec_correlation_write_degrade_total{job="yuzu",instance="s1"}'
+        values: "0 0 1 2 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="pending"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="pending", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # CASE E -- THE BOUNDARY: a failure that recurs once every 6 minutes (an event at minutes 2, 8,
+  # 14, ...) does NOT fire, by design. Each event keeps the 5m rate true for 4 evaluations and it is
+  # false for the 2 between events, so it never holds for 10 consecutive minutes. RED if the rate
+  # window stretches to 7m (it would then hold continuously and fire at 12m).
+  - interval: 1m
+    name: dispatch record write failing - a failure recurring every 6 minutes does not fire (boundary)
+    input_series:
+      - series: 'yuzu_exec_correlation_write_degrade_total{job="yuzu",instance="s1"}'
+        values: "0 0 1 1 1 1 1 1 2 2 2 2 2 2 3 3 3 3 3 3 4 4 4 4 4 4 5 5 5 5 5"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="pending"}'
+        eval_time: 4m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="pending", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDispatchRecordWriteFailing", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []

@@ -5349,8 +5349,15 @@ groups:
     # Forensics:Read). The write/store-degrade counters and the
     # yuzu_server_response_provenance_total outcomes `unrecorded` and
     # `lookup_degraded` are therefore signals of responses being stored
-    # unverified, and have no alert rule yet. Zero-seeded at boot, so
-    # increase() > 0 is meaningful.
+    # unverified. Rules exist for: failed record writes
+    # (YuzuDispatchRecordWriteFailing). DELIBERATELY no rule on `unrecorded`
+    # (it is non-zero on a healthy fleet: an id the server never issued, a
+    # record reaped after 24 hours, an empty id; a failed write that causes it is
+    # already covered by the write rule), on read_degrade_total (a first-attempt
+    # failure that the retry recovers also counts there and unverifies nothing;
+    # the double failure that does is the `lookup_degraded` outcome), or on
+    # store_degrade_total (a failed hourly reap pass: no response is affected).
+    # Zero-seeded at boot, so increase() > 0 is meaningful.
     rules:
       - alert: YuzuExecCorrelationReapClockAnomaly
         expr: |
@@ -5372,6 +5379,45 @@ groups:
             the DATABASE primary's NTP / clock health; correlate with
             yuzu_exec_correlation_store_degrade_total /
             yuzu_exec_correlation_write_degrade_total.
+
+      # #4990: every dispatch writes one command_execution record, and a response is
+      # labelled from it. A dispatch whose record write fails (pool lease not acquired
+      # within 2 s, lock or statement timeout, query error, tracker not open) still goes
+      # out, but every response to it is stored `~unverified`: Forensics-tier, so it is
+      # withheld from callers without Forensics:Read (an HTTP 200 with no marker) and
+      # hidden from fixed-plugin polls such as DEX, TAR and hardware. One failed write
+      # unverifies one command, which a blip can cause, so only a failure that keeps
+      # recurring pages. Shape of YuzuForensicsTierUnresolved: `for: 10m` over a 5m rate
+      # window; one failure keeps the expression true for under 5 minutes and a burst
+      # shorter than about 5 minutes never reaches 10. BOUNDARY, by design: dispatch is
+      # operator or automation driven, so a store outage with fewer than one dispatch
+      # every ~5 minutes leaves the rate false between failures and does not fire,
+      # although each of those commands is still unverified (the promtool case pins an
+      # event every 6 minutes as quiet). The counter is the complete evidence. The pool
+      # rules (YuzuPgPoolSaturated, YuzuPgAcquireWaitHigh) do not cover a statement-level
+      # failure (lock timeout, query error) with a healthy pool.
+      - alert: YuzuDispatchRecordWriteFailing
+        expr: |
+          sum by (instance) (rate(yuzu_exec_correlation_write_degrade_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dispatch records are failing to write on {{ $labels.instance }}, so responses are being stored unverified"
+          description: >-
+            Writing the per-dispatch command_execution record has failed repeatedly over at
+            least 10 minutes on {{ $labels.instance }}. Dispatch itself is unaffected, but
+            every response to a command whose record was not written is stored
+            `~unverified`, which is Forensics-tier: legitimate responses of any plugin are
+            withheld from callers without Forensics:Read (a normal 200 with the rows
+            missing) and hidden from fixed-plugin polls such as DEX, TAR and hardware, and
+            the executions drawer misses those commands' agent events. First check
+            PostgreSQL health and the yuzu_pg_* pool and lock metrics (the write fails on a
+            pool lease timeout, a lock or statement timeout or a query error), then
+            yuzu_exec_correlation_write_degrade_total and the server log line "pool
+            exhausted for command_id" (at most one per minute per cause). The responses
+            already stored unverified are not repaired when the store recovers; re-run the
+            affected commands.
 
   - name: yuzu-enablement
     # ADR-3006 — the durable plugin-enablement store (EnablementStore). Every closed-label
