@@ -735,8 +735,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        strictly stricter than what it replaces, not a new gap.
      - **Superseded by #6079 (2026-10-19).** The pass-through described in the previous bullet is
        closed: approve and reject now require an enrolled MFA factor with a fresh proof in every
-       `--mfa-enforcement` mode (local: an enrolled TOTP factor and a proof within the approver window
-       that does not predate the enrolment; OIDC: an MFA-method `amr` on a token issued within the
+       `--mfa-enforcement` mode (local: an enrolled TOTP factor and a proof no older than the approver
+       window and bound to the account's current factor generation, so disabling and re-enrolling
+       replaces the factor and earlier proofs stop counting; OIDC: an MFA-method `amr` on a token issued within the
        window; SAML: refused). The approver window is `min(--mfa-step-up-window-secs, 300)`, and 300
        when that is `0`, so `0` no longer disables it. The text above is kept as the record of what
        was accepted on 2026-10-18; see `docs/auth-architecture.md`, "Approver assurance".

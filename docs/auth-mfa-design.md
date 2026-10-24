@@ -769,7 +769,7 @@ regress:
    reads the MFA store). The order is: after the pre-routing
    gates, a null auth store answers `503` for every caller class first, then an engine is `403` with no
    store read, ahead of the window-disabled hatch, which in turn precedes the
-   SAML denial and the store read (so a window of 0 or less lets SAML through);
+   SAML denial and the store read (so a window of 0 or less lets SAML through the 34 `kRequired` rows). A `kFactorCredential` row takes a different order: after the engine denial its window becomes the approver window, so the hatch is unreachable for it, and any non-local session is refused `403` before the store read;
    (g) a gated request authorised by a principal other than the one the check passed:
    the binding removed while handlers still resolve more than once. One principal per request: once the central check passes a gated request,
    every `AuthRoutes::resolve_session` call for that request yields the same principal or
@@ -796,4 +796,4 @@ regress:
    that the decision exempts (both `api_token` and `mcp_token`) before it reads role, scope
    or proof. Chokepoint PR 2: the pass and the in-handler calls may be deleted once handlers
    consume the centrally resolved session or the repeated resolves are removed (#6200); the
-   binding stays until then, and ideally then carries the resolved session itself.
+   binding stays until then, and ideally then carries the resolved session itself. (h) a local enrolled proof judged anywhere but `judge_local_mfa_binding` (`mfa_factor_state.hpp`, shared by the central check and the approver gate); a `kFactorCredential` row made hatch-exempt or admitting a non-local session; a binding read that ignores `binding_enforced`.

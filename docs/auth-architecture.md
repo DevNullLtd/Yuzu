@@ -1048,9 +1048,13 @@ gate applied.
   behind a 60 second steady-clock memo; the cleanup cadence and the session reap pass play no part. A
   query that could not run does not set the flag and is retried on the next read (the `auth` side fails
   that one read closed). A query that ran and found the
-  trigger not in force sets a sticky flag: every local binding decision answers `503`
-  (`mfa_binding_unenforced`) until the server restarts and its boot check passes, because generation
-  changes made while the trigger was not firing cannot be reconstructed. Sign-in and step-up proving keep
+  trigger not in force sets a sticky flag: every local binding decision answers `503` until the server
+  restarts and its boot check passes, because generation changes made while the trigger was not firing
+  cannot be reconstructed. The token differs by store: `mfa_binding_unenforced` for the account-store
+  trigger (no retry hint, since it persists until repaired), and `mfa_proof_unavailable` (with
+  `yuzu_auth_session_store_degrade_total{op="rebind_guard"}`) for the session store's rebind guard, which
+  reaches a local session as an unreadable stored proof; SSO sessions are not affected by the
+  session-store case. A SIEM rule must key on both tokens. Sign-in and step-up proving keep
   working. `yuzu_auth_mfa_binding_enforcement_ok{store="auth"|"session"}` drops to `0` and
   `YuzuMfaBindingNotEnforced` fires; the operator procedure is
   `docs/ops-runbooks/auth-db-recovery.md` "MFA binding enforcement failed". What this does not cover: a
@@ -1134,9 +1138,10 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   Once the central check has passed (or with the window at `0`), a refusal for an unenrolled or proof-less caller is a `403`
   (`approver_assurance_required:mfa_not_enrolled`, `mfa_proof_missing`, `saml_mfa_unsupported`,
   `account_unavailable`), not a step-up prompt; a stale, missing, unbound or other-factor proof is the step-up `401`; and when the
-  approver rule's own read fails (an unreadable stored proof, an MFA-store fault at its own read, or a binding trigger not
-  observed in force) the answer is a
-  `503` with `retry_after_ms` and `yuzu_auth_secret_unavailable_total{route="approval"}`. With the window above `0`
+  approver rule's own read fails (an unreadable stored proof or an MFA-store fault at its own read) the answer is a
+  `503` with `retry_after_ms` and `yuzu_auth_secret_unavailable_total{route="approval"}`; a binding trigger not observed
+  in force is the same `503` and counter but carries no `retry_after_ms`, because it persists until an operator repairs
+  the trigger and restarts. With the window above `0`
   the central check answers first for a SAML session (generic `403`), for a stale, missing, unbound or other-factor
   proof of a local session (`401`, with the reason token on its `mfa.step_up.required` row) and for an unreadable
   stored proof, an unreadable local MFA store or an unenforced binding (`503` without `retry_after_ms`, counted

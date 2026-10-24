@@ -2242,7 +2242,7 @@ before acting on any "open" / "in progress" claim:
    NOT_PLANNED with no delivery (its auth/token substance was absorbed into ADR-1005 engine principals,
    but the issue's own scope was never built); 11.2–11.4 not started.
 7. **Phase 13** — Remaining security hardening & polish: 13.1 (2FA on approval — stale, general MFA
-   step-up exists but isn't wired to approval), 13.3 (monitoring UI), 13.4 (branding). 13.2 and 13.5
+   step-up is wired to approve and reject by #6061 and #6079; the issue is kept open until #6079 merges), 13.3 (monitoring UI), 13.4 (branding). 13.2 and 13.5
    already shipped.
 8. **Phase 14** — Remaining scale items: 14.1 (P2P content), 14.2 (multi-gateway), 14.4–14.5
    (additional connectors — nominally depend on the now-deferred Phase 9). 14.3 Partial (Closed —

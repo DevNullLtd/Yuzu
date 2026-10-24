@@ -517,7 +517,19 @@ clock. Two additive schema migrations run at the first start of the new version:
 trigger that unbinds a proof written without a generation. The `auth` migration only seeds the generation
 (`1`) on accounts that are already enrolled, the `session_store` migration rewrites no row, and both triggers are
 checked at every start: a server whose database does not have them in force refuses to start (the log
-says `auth store (AuthDB) migration/open failed` or `session store migration/open failed`).
+says `Failed to open the Postgres auth store (migration or MFA trigger check failed; see the preceding
+AuthDB log line)` or `session store migration/open failed`).
+
+**Migration lock window (first start).** The `auth` v3 migration (`auth.users`) and the `session_store`
+v2 migration (`session_store.sessions`) each take a brief `ACCESS EXCLUSIVE` lock with a `lock_timeout`
+of 30 seconds, the same shape as the internal-CA migrations
+(see the migration v3/v4 lock-window paragraph under "Informational: internal-CA CRL publish/audit/observability follow-ups" below).
+While the `ALTER TABLE` is queued behind another transaction, every other query on that table waits
+behind it. Do not run `pg_dump` or hold a long transaction against those two schemas during the first
+start of the new version (schedule the upgrade outside the backup window). A timeout makes that start
+fail, and the migration is retried on the next start. `yuzu-server --mfa-reset` and `--break-glass-arm`
+run the same additive migrations if you start them from the new binary before the serving replicas are
+upgraded.
 
 **What you will see.**
 
@@ -526,11 +538,16 @@ says `auth store (AuthDB) migration/open failed` or `session store migration/ope
   `401` step-up (audit `mfa.step_up.required`, `reason=proof_factor_unbound`) until the operator posts
   a code to `/login/mfa/stepup`. Accounts with no enrolled factor, API tokens and SSO sessions are
   unaffected. A script that holds a session cookie must repeat its step-up once.
-- **A rolling upgrade costs availability, never admission.** A sign-in or step-up served by a replica
+- **A rolling upgrade costs availability on upgraded replicas and does not strengthen un-upgraded ones.** A sign-in or step-up served by a replica
   that has not been upgraded yet leaves an unbound proof, and an upgraded replica refuses it with the
   same `401` until the operator proves again through an upgraded replica; a replica that has not been
   upgraded still applies the earlier, weaker rule on its own gates. Upgrade the replicas that serve the
   step-up-gated routes and approvals first, or expect repeated prompts until the rollout completes.
+- **Before you upgrade for #6079.** (1) Enrol at least two approvers, so each request has an approver who is
+  not its submitter (see the non-admin enrolment bullet under "Breaking: approving or rejecting a request now needs an interactive session..." below). (2) Upgrade the replicas that serve approvals first. (3) Record
+  each replica's upgrade time in UTC in the change ticket. (4) Keep the first start away from your backup
+  window (the migration lock window above). (5) Re-import `docs/prometheus/yuzu-alerts.yml`: the new
+  `YuzuMfaBindingNotEnforced` alert does not exist until you do. (6) Expect one re-prove per open session.
 - **Rolling back is safe for the schema.** The old binary ignores the new columns, and the triggers stay
   and keep advancing the generation; its own stamps unbind proofs, and its gates apply the earlier rule.
   Nothing needs undoing, and upgrading again needs no reseeding.
@@ -540,8 +557,11 @@ says `auth store (AuthDB) migration/open failed` or `session store migration/ope
   changed while it was in flight is refused `409`; reload the page and prove again if asked.
 - **New monitoring.** `yuzu_auth_mfa_binding_enforcement_ok{store="auth"|"session"}` should read `1` on
   every replica once it has started; `0` means a validation observed a trigger not in force, every
-  local binding decision then answers `503` (`reason=mfa_binding_unenforced`) until a restart, and the
-  shipped `YuzuMfaBindingNotEnforced` alert fires. The procedure is
+  local binding decision then answers `503` until a restart, and the shipped `YuzuMfaBindingNotEnforced`
+  alert fires. The reason token depends on the store: `mfa_binding_unenforced` for `store="auth"`, but
+  `mfa_proof_unavailable` (plus `yuzu_auth_session_store_degrade_total{op="rebind_guard"}`) for
+  `store="session"`, which SSO sessions do not see; key SIEM rules on both. The alert does not exist
+  until you re-import `docs/prometheus/yuzu-alerts.yml`. The procedure is
   [MFA binding enforcement failed](../ops-runbooks/auth-db-recovery.md#mfa-binding-enforcement-failed).
 
 ## Behaviour change: /health and /api/health per-source budget
@@ -1002,9 +1022,9 @@ principal and not an engine principal. The existing rule that the reviewer canno
     administrator just long enough to enrol and then demoting it; see
     [Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver),
     including the identity-proofing step (under the window, whoever signs in first with the password enrols the
-    factor) and each path's consequences. Plan this **before** upgrading, and make sure at least one
-    enrolled, authorised approver exists who is not the submitter of each request you expect to be decided: until
-    then nothing can be approved. A seeded administrator that has never enrolled is in the same position. Self-service
+    factor) and each path's consequences. Plan this **before** upgrading, and make sure at least two
+    enrolled, authorised approvers exist, so that for each request you expect to be decided one of them is not its
+    submitter: until then nothing can be approved. A seeded administrator that has never enrolled is in the same position. Self-service
     enrolment for non-admins is a planned follow-up and is not part of this change. `yuzu-server --mfa-reset`
     ends the account's sessions, and disabling MFA in Settings ends every session of the account, the one you
     are using included (neither ends API tokens). **`--mfa-reset` now exits non-zero when ending the sessions fails**
@@ -1020,7 +1040,7 @@ principal and not an engine principal. The existing rule that the reviewer canno
     approver achieves nothing until RBAC enforcement is turned on.
   - **When the approver rule's own read fails** (an unreadable stored session proof for any approver, or, for a local
     approver, an MFA-store fault at the approver's own read: with the step-up window at `0` or negative, or a fault
-    between the central check's read and that one; or a binding trigger that is not observed in force), the answer is `503` with `retry_after_ms`, counted as
+    between the central check's read and that one; or a binding trigger that is not observed in force), the answer is `503` with `retry_after_ms` (except for a binding trigger not observed in force, `mfa_binding_unenforced`, which persists until an operator repairs it and carries none), counted as
     `yuzu_auth_secret_unavailable_total{route="approval"}`; nothing is decided. While step-up is on, a local approver
     whose MFA store is unreadable is refused first by the central check: `503` without `retry_after_ms`, counted as
     `yuzu_auth_secret_unavailable_total{route="mfa_stepup"}` and
@@ -1891,8 +1911,10 @@ API-token Create and Revoke buttons) now apply the same step-up check as the RES
   it has not (under `sso-only` it is enrolled by construction), and it must hold an administrator
   role). If a deployment has neither an existing token nor a usable break-glass
   account, the only remaining route is to restart with `--mfa-step-up-window-secs 0` as a
-  temporary measure: it disables the stale-proof requirement on every gated endpoint, not only
-  these two (see [Authentication](authentication.md)), so restore the window afterwards.
+  temporary measure: it disables the stale-proof requirement on every ordinary gated endpoint, not only
+  these two (see [Authentication](authentication.md)), so restore the window afterwards. It does not
+  switch off approval approve/reject or the two factor-credential rows (recovery-code regeneration and
+  MFA disable), which keep a window of at most 300 s.
 - **OIDC sessions** are gated only when the identity provider attests MFA (`amr`) or
   `--mfa-enforcement` protects the role. An OIDC-only `--auth-mode=sso-only` deployment is not
   exempt: with no `amr` claim and `--mfa-enforcement=admin-only` or `required`, the session fails

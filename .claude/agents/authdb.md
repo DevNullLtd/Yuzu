@@ -213,7 +213,9 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   a new factor mutation does the same. **A PR that writes `mfa_factor_gen`,
   weakens the trigger or its pinned-body check, publishes a verifier's success
   before COMMIT, takes the verification instant after the crypto check, or
-  adds an MFA-state read that ignores `binding_enforced` is CRITICAL.**
+  adds a proof decision (admit or refuse on a stored MFA proof) that
+  ignores `binding_enforced` is CRITICAL; the login enrolled-check, Settings view
+  and elevation pre-check read it without that flag legitimately.**
   Runbook: `docs/ops-runbooks/auth-db-recovery.md` "MFA binding enforcement
   failed".
 
