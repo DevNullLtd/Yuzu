@@ -43,6 +43,7 @@
 #include <yuzu/server/server.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 #include <httplib.h>
 
 #include <algorithm>
@@ -50,6 +51,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <memory>
+#include <thread>
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
@@ -1404,9 +1406,10 @@ TEST_CASE("forensics visibility: a degraded or unwired input is Unknown, a defin
             CHECK(rig.withheld(std::string(to_string(why))) == 0.0);
     }
     SECTION("an unavailable authorization store reads Unknown for an ordinary session too") {
-        // The RBAC store behind the gate is not open: the gate fails closed (403 for an ordinary
-        // session), and the scoped lookup that follows cannot read either. Without the Unknown
-        // answer this was a present-empty 200 with the Forensics rows silently missing.
+        // The RBAC store behind the gate is not open. The global Forensics:Read proof cannot be
+        // answered, which is NOT a definitive refusal: the resolver answers Unknown(RbacUnavailable)
+        // for an ordinary session exactly as it does for an engine principal, so a surface shows
+        // the retryable error or notice instead of a 200 with the Forensics rows silently missing.
         yuzu::server::pg::PgPool bad_pool{
             {.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
         RbacStore bad_rbac(bad_pool);
@@ -1416,7 +1419,9 @@ TEST_CASE("forensics visibility: a degraded or unwired input is Unknown, a defin
                           /*analytics_store=*/nullptr, rig.oidc_mu, rig.oidc_provider);
         ForensicsVisibilityDeps d{.auth_routes = &bad_ar, .rbac_store = &bad_rbac, .mgmt_store = &rig.mgmt,
                                   .metrics = &rig.metrics};
-        CHECK(is_unknown(resolve_forensics_visible(d, scoped), ForensicsUnknown::ScopeReadFailed));
+        CHECK(is_unknown(resolve_forensics_visible(d, scoped), ForensicsUnknown::RbacUnavailable));
+        CHECK(rig.withheld("rbac_unavailable") == 1.0);
+        CHECK(rig.withheld("scope_read_failed") == 0.0);
     }
     SECTION("an unavailable authorization store answers 503 to an engine principal: Unknown") {
         REQUIRE(rig.auth_mgr.upsert_user("owner2", "password1234", auth::Role::admin));
@@ -1440,6 +1445,273 @@ TEST_CASE("forensics visibility: a degraded or unwired input is Unknown, a defin
         CHECK(is_unknown(resolve_forensics_visible(d, req), ForensicsUnknown::RbacUnavailable));
         CHECK(rig.withheld("rbac_unavailable") == 1.0);
         CHECK(rig.withheld("scope_read_failed") == 0.0);
+    }
+}
+
+// ── Unavailable is not denied (#4990, typed RBAC outcome) ───────────────────────────────
+namespace {
+
+// A SECOND RbacStore replica over the rig's database, on its own one-connection pool, with its own
+// AuthRoutes. The rig's grants are visible to it (same database); the pool, the permission cache
+// and the breaker are its own, so each case can starve the pool, open the breaker or break the role
+// read on THIS replica without touching the rig's healthy store.
+struct DegradedReplica {
+    yuzu::server::pg::PgPool pool;
+    RbacStore store;
+    yuzu::MetricsRegistry store_metrics;
+    AuthRoutes ar;
+
+    explicit DegradedReplica(ForensicsVisRig& rig)
+        : pool{{.conninfo = rig.rbac_bundle.dsn(), .size = 1}}, store{pool},
+          ar{rig.cfg,           rig.auth_mgr,          &store,        rig.api_tokens.get(),
+             /*audit_store=*/nullptr, &rig.mgmt,       /*tag_store=*/nullptr,
+             /*analytics_store=*/nullptr, rig.oidc_mu, rig.oidc_provider} {
+        REQUIRE(store.is_open());
+        store.set_metrics(&store_metrics);
+        ar.set_engine_principal_store(rig.engines.get());
+    }
+
+    double degrade(const char* reason) {
+        return store_metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}})
+            .value();
+    }
+    ForensicsVisibilityDeps deps(ForensicsVisRig& rig) {
+        return {.auth_routes = &ar, .rbac_store = &store, .mgmt_store = &rig.mgmt,
+                .metrics = &rig.metrics};
+    }
+};
+
+// `rbac_store.principal_roles` moved aside and back: the role read (the first query of a
+// permission-cache miss) genuinely fails while every other read keeps working.
+struct RoleReadFault {
+    std::string dsn;
+    bool armed{false};
+    explicit RoleReadFault(std::string d) : dsn(std::move(d)) {}
+    void run(const char* sql) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(conn.get(), sql)};
+        REQUIRE(r.ok());
+    }
+    void arm() {
+        run("ALTER TABLE rbac_store.principal_roles RENAME TO principal_roles_gone");
+        armed = true;
+    }
+    void repair() noexcept {
+        if (!armed)
+            return;
+        try {
+            yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+            if (PQstatus(conn.get()) == CONNECTION_OK) {
+                yuzu::server::pg::PgResult r{PQexec(
+                    conn.get(), "ALTER TABLE rbac_store.principal_roles_gone RENAME TO principal_roles")};
+                if (r.ok())
+                    armed = false;
+            }
+        } catch (...) {
+        }
+    }
+    ~RoleReadFault() { repair(); }
+};
+
+nlohmann::json gate_body(const httplib::Response& res) { return nlohmann::json::parse(res.body); }
+
+} // namespace
+
+TEST_CASE("AuthRoutes: probe_permission_unavailable_aware answers 503 where an unavailable RBAC read "
+          "is a 403 for require_permission, has_permission and probe_permission",
+          "[pg][auth_routes][authz_topology_floor][forensics]") {
+    ForensicsVisRig rig;
+    rig.rbac.set_rbac_enabled(true);
+    REQUIRE(rig.rbac.assign_role({"user", "ana", "ForensicsAnalyst"}).has_value());
+    REQUIRE(rig.rbac.assign_role({"user", "vic", "Viewer"}).has_value());
+    auto ana = rig.cookie_request("ana", auth::Role::user);
+    auto vic = rig.cookie_request("vic", auth::Role::user);
+
+    // The three entry points that keep ADR-0041's 403 on an unavailable read.
+    auto expect_default_403 = [](DegradedReplica& d, const httplib::Request& req) {
+        httplib::Response probe_res;
+        CHECK_FALSE(d.ar.probe_permission(req, probe_res, "Forensics", "Read"));
+        CHECK(probe_res.status == 403);
+        CHECK_FALSE(d.ar.has_permission(req, "Forensics", "Read"));
+        httplib::Response gate_res;
+        CHECK_FALSE(d.ar.require_permission(req, gate_res, "Forensics", "Read"));
+        CHECK(gate_res.status == 403);
+    };
+    // The opt-in probe: a retryable 503, no `permission` field.
+    auto expect_aware_503 = [](DegradedReplica& d, const httplib::Request& req) {
+        httplib::Response res;
+        CHECK_FALSE(d.ar.probe_permission_unavailable_aware(req, res, "Forensics", "Read"));
+        CHECK(res.status == 503);
+        const auto body = gate_body(res);
+        CHECK(body["error"]["code"] == 503);
+        CHECK(body["error"]["retry_after_ms"] == 5000);
+        CHECK_FALSE(body["error"].contains("permission"));
+    };
+
+    SECTION("healthy store: a grant, a definitive denial and an empty role set are NOT 503") {
+        DegradedReplica d(rig);
+        httplib::Response ok_res;
+        CHECK(d.ar.probe_permission_unavailable_aware(ana, ok_res, "Forensics", "Read"));
+        CHECK(d.ar.probe_permission(ana, ok_res, "Forensics", "Read"));
+        for (const auto* who : {&vic}) {
+            httplib::Response denied;
+            CHECK_FALSE(d.ar.probe_permission_unavailable_aware(*who, denied, "Forensics", "Read"));
+            CHECK(denied.status == 403);
+            httplib::Response plain;
+            CHECK_FALSE(d.ar.probe_permission(*who, plain, "Forensics", "Read"));
+            CHECK(plain.status == 403);
+        }
+        // A user with no role at all is the healthy-empty case: a definitive 403, not a 503.
+        auto nobody = rig.cookie_request("nobody", auth::Role::user);
+        httplib::Response empty_res;
+        CHECK_FALSE(d.ar.probe_permission_unavailable_aware(nobody, empty_res, "Forensics", "Read"));
+        CHECK(empty_res.status == 403);
+        CHECK(d.degrade("query_error") == 0.0);
+    }
+
+    SECTION("a failed role query") {
+        DegradedReplica d(rig);
+        RoleReadFault fault(rig.rbac_bundle.dsn());
+        fault.arm();
+        expect_aware_503(d, ana); // first, so the counter below is this one failure
+        CHECK(d.degrade("query_error") == 1.0);
+        expect_default_403(d, ana);
+        // A non-cookie session takes the same path.
+        auto raw = rig.api_tokens->create_token("t", "ana", forensics_vis_now() + 3600);
+        REQUIRE(raw.has_value());
+        auto bearer = rig.bearer_request(*raw);
+        expect_aware_503(d, bearer);
+    }
+
+    SECTION("a failed role query then recovery: the same caller is granted again") {
+        DegradedReplica d(rig);
+        RoleReadFault fault(rig.rbac_bundle.dsn());
+        fault.arm();
+        expect_aware_503(d, ana); // one failure: the breaker (threshold 2) stays closed
+        fault.repair();
+        httplib::Response res;
+        CHECK(d.ar.probe_permission_unavailable_aware(ana, res, "Forensics", "Read"));
+    }
+
+    SECTION("a starved pool") {
+        DegradedReplica d(rig);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // clear the refresh gate
+        auto held = d.pool.acquire();
+        REQUIRE(held);
+        expect_aware_503(d, ana);
+        expect_default_403(d, ana);
+    }
+
+    SECTION("an open breaker") {
+        DegradedReplica d(rig);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        auto held = d.pool.acquire();
+        REQUIRE(held);
+        // Two uncached misses reach the trip threshold.
+        CHECK_FALSE(d.store.check_permission("ana", "Forensics", "Write"));
+        CHECK_FALSE(d.store.check_permission("ana", "Forensics", "Delete"));
+        REQUIRE(d.store_metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
+        expect_aware_503(d, ana);
+        expect_default_403(d, ana);
+    }
+
+    SECTION("a store that is not open") {
+        yuzu::server::pg::PgPool bad_pool{
+            {.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+        RbacStore bad_rbac(bad_pool);
+        REQUIRE_FALSE(bad_rbac.is_open());
+        AuthRoutes bad_ar(rig.cfg, rig.auth_mgr, &bad_rbac, rig.api_tokens.get(),
+                          /*audit_store=*/nullptr, &rig.mgmt, /*tag_store=*/nullptr,
+                          /*analytics_store=*/nullptr, rig.oidc_mu, rig.oidc_provider);
+        httplib::Response aware;
+        CHECK_FALSE(bad_ar.probe_permission_unavailable_aware(ana, aware, "Forensics", "Read"));
+        CHECK(aware.status == 503);
+        httplib::Response plain;
+        CHECK_FALSE(bad_ar.probe_permission(ana, plain, "Forensics", "Read"));
+        CHECK(plain.status == 403);
+    }
+
+    SECTION("an engine principal: a query-level failure is a 403 by default, a 503 when opted in") {
+        REQUIRE(rig.auth_mgr.upsert_user("owner9", "password1234", auth::Role::admin));
+        REQUIRE(rig.engines->create("Vuln Sync 9", "owner9", "typed unavailable test", "internal",
+                                    "admin", "engine:vuln9")
+                    .has_value());
+        auto raw = rig.api_tokens->create_token("engine-token9", "engine:vuln9",
+                                                forensics_vis_now() + 3600, "", "readonly", "engine");
+        REQUIRE(raw.has_value());
+        auto req = rig.bearer_request(*raw);
+        DegradedReplica d(rig);
+        RoleReadFault fault(rig.rbac_bundle.dsn());
+        fault.arm();
+        expect_aware_503(d, req);
+        expect_default_403(d, req);
+    }
+
+    SECTION("a service-scoped token is unchanged: a degraded read is still a definitive 403") {
+        REQUIRE(rig.auth_mgr.upsert_user("minter", "password1234", auth::Role::admin));
+        REQUIRE(rig.rbac.assign_role({"user", "minter", "Administrator"}).has_value());
+        auto raw = rig.api_tokens->create_token("svc", "minter", forensics_vis_now() + 3600, "billing");
+        REQUIRE(raw.has_value());
+        auto req = rig.bearer_request(*raw);
+        DegradedReplica d(rig);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        auto held = d.pool.acquire();
+        REQUIRE(held);
+        httplib::Response res;
+        CHECK_FALSE(d.ar.probe_permission_unavailable_aware(req, res, "Forensics", "Read"));
+        CHECK(res.status == 403); // the allow-list refuses it whatever the store says
+    }
+}
+
+TEST_CASE("forensics visibility: an unavailable global proof is Unknown for every caller class, "
+          "counted, and recovers; a definitive refusal stays Denied",
+          "[pg][auth_routes][authz_topology_floor][forensics]") {
+    ForensicsVisRig rig;
+    rig.rbac.set_rbac_enabled(true);
+    REQUIRE(rig.rbac.assign_role({"user", "ana", "ForensicsAnalyst"}).has_value());
+    REQUIRE(rig.rbac.assign_role({"user", "vic", "Viewer"}).has_value());
+    auto ana = rig.cookie_request("ana", auth::Role::user);
+    auto vic = rig.cookie_request("vic", auth::Role::user);
+
+    SECTION("a failed role query: the analyst is Unknown, not silently Denied; recovery grants again") {
+        DegradedReplica d(rig);
+        const auto deps = d.deps(rig);
+        RoleReadFault fault(rig.rbac_bundle.dsn());
+        fault.arm();
+        CHECK(is_unknown(resolve_forensics_visible(deps, ana), ForensicsUnknown::RbacUnavailable));
+        CHECK(rig.withheld("rbac_unavailable") == 1.0);
+        CHECK(rig.withheld("scope_read_failed") == 0.0);
+        CHECK(d.degrade("query_error") >= 1.0);
+        fault.repair();
+        CHECK(is_global(resolve_forensics_visible(deps, ana)));
+        CHECK(rig.withheld("rbac_unavailable") == 1.0); // no further movement once healthy
+    }
+
+    SECTION("a starved pool: ordinary cookie session and bearer token are both Unknown") {
+        DegradedReplica d(rig);
+        const auto deps = d.deps(rig);
+        auto raw = rig.api_tokens->create_token("t2", "ana", forensics_vis_now() + 3600);
+        REQUIRE(raw.has_value());
+        auto bearer = rig.bearer_request(*raw);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        auto held = d.pool.acquire();
+        REQUIRE(held);
+        CHECK(is_unknown(resolve_forensics_visible(deps, ana), ForensicsUnknown::RbacUnavailable));
+        CHECK(is_unknown(resolve_forensics_visible(deps, bearer), ForensicsUnknown::RbacUnavailable));
+        CHECK(rig.withheld("rbac_unavailable") == 2.0);
+    }
+
+    SECTION("a healthy store: a Viewer and a role-less user are Denied, never counted") {
+        DegradedReplica d(rig);
+        const auto deps = d.deps(rig);
+        auto nobody = rig.cookie_request("nobody", auth::Role::user);
+        CHECK(is_present_empty(resolve_forensics_visible(deps, vic)));
+        CHECK(is_present_empty(resolve_forensics_visible(deps, nobody)));
+        CHECK(is_global(resolve_forensics_visible(deps, ana)));
+        for (const auto why : kForensicsUnknownReasons)
+            CHECK(rig.withheld(std::string(to_string(why))) == 0.0);
+        CHECK(d.degrade("query_error") == 0.0);
     }
 }
 

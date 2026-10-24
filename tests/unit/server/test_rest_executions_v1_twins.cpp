@@ -27,6 +27,7 @@
 #include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -665,6 +666,92 @@ TEST_CASE("GET /api/v1/executions/:id/responses through the REAL resolver: a For
     // RBAC off: the grant is inert and the floor stands, so a non-admin sees no Forensics row.
     rbac.set_rbac_enabled(false);
     CHECK(outputs(oli) == Outputs{"ordinary-A", "ordinary-B"});
+}
+
+// #4990: the same REAL resolver, with the authorization read genuinely failing. A caller whose
+// global Forensics proof could not be determined gets the retryable 503, never a 200 with the
+// Forensics rows silently missing; once the store recovers the same caller reads again.
+TEST_CASE("GET /api/v1/executions/:id/responses through the REAL resolver: a failed RBAC read is a "
+          "retryable 503 and counted, not a silently filtered 200",
+          "[pg][rest][executions][v1][responses][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    yuzu::MetricsRegistry metrics;
+    seed_forensics_tier_metrics(metrics);
+    RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    yuzu::test::ManagementGroupStorePg mgmt_bundle;
+    ManagementGroupStore& mgmt = *mgmt_bundle;
+    yuzu::test::ApiTokenStorePg api_tokens;
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    AuthRoutes ar(cfg, auth_mgr, &rbac, api_tokens.get(), /*audit_store=*/nullptr, &mgmt,
+                  /*tag_store=*/nullptr, /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+    ForensicsVisibilityDeps deps{
+        .auth_routes = &ar, .rbac_store = &rbac, .mgmt_store = &mgmt, .metrics = &metrics};
+    ExecV1Harness h(pool, true, {}, true, [&deps](const httplib::Request& req) {
+        return resolve_forensics_visible(deps, req);
+    });
+    auto exec_id = h.make_exec_with_agents("def-resp-degraded");
+    StoredResponse r;
+    r.instruction_id = "def-resp-degraded";
+    r.agent_id = "agent-A";
+    r.timestamp = 1735689610;
+    r.status = 0;
+    r.output = "ordinary-A";
+    r.plugin = yuzu::server::test::kOrdinaryPlugin;
+    r.execution_id = exec_id;
+    h.response_store->store(r);
+
+    REQUIRE(auth_mgr.upsert_user("gus", "correct-horse-battery-staple", auth::Role::user));
+    REQUIRE(rbac.assign_role({"user", "gus", "Viewer"}).has_value());
+    const auto token = auth_mgr.create_local_session_for_test("gus", auth::Role::user, true);
+    const std::unordered_map<std::string, std::string> cookie{{"Cookie", "yuzu_session=" + token}};
+    const std::string path = "/api/v1/executions/" + exec_id + "/responses";
+
+    auto withheld = [&] {
+        return metrics.counter(kForensicsTierWithheldMetric, {{"reason", "rbac_unavailable"}}).value();
+    };
+
+    // The role read (the first query of a permission-cache miss) fails for real.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult a{PQexec(conn.get(),
+                              "ALTER TABLE rbac_store.principal_roles RENAME TO principal_roles_gone")};
+        REQUIRE(a.ok());
+    }
+    auto restore = [&] {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult a{PQexec(conn.get(),
+                              "ALTER TABLE rbac_store.principal_roles_gone RENAME TO principal_roles")};
+        REQUIRE(a.ok());
+    };
+
+    auto res = h.sink.Get(path, cookie);
+    if (!res || res->status != 503)
+        restore(); // never leave the schema broken behind a failed REQUIRE
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == 503);
+    CHECK(body["error"]["retry_after_ms"] == 5000);
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK(res->body.find("ordinary-A") == std::string::npos);
+    CHECK(withheld() == 1.0);
+
+    // Recovery: the same caller is answered again (a Viewer: the ordinary row, nothing Forensics).
+    restore();
+    auto ok = h.sink.Get(path, cookie);
+    REQUIRE(ok);
+    REQUIRE(ok->status == 200);
+    CHECK(ok->body.find("ordinary-A") != std::string::npos);
+    CHECK(withheld() == 1.0);
 }
 
 // #4990: an Unknown Forensics decision is a retryable 503 on the machine surface, never a partial 200.
