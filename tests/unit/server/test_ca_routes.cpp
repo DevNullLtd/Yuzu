@@ -1555,11 +1555,12 @@ TEST_CASE("ca_routes: the FILTERED list names its standing on the success row",
     // confined caller, never served (governance adjudication of CA-U2, 2026-10-24).
     CHECK(refused->status == 403);
     CHECK(refused->body.find("agent-C5") == std::string::npos);
+    CHECK(refused->body.find("holds no read access") != std::string::npos); // the refusal text
     REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[0].result == "success");
     CHECK_THAT(h.audits[0].detail, Catch::Matchers::ContainsSubstring("standing=available"));
     CHECK(h.audits[1].result == "denied");
-    CHECK_THAT(h.audits[1].detail, Catch::Matchers::ContainsSubstring("withheld"));
+    CHECK_THAT(h.audits[1].detail, Catch::Matchers::ContainsSubstring("withheld=refused"));
 }
 
 namespace {
@@ -2376,8 +2377,8 @@ TEST_CASE("ca_routes: the unfiltered /ca/issued fails closed when the standing p
     }
 }
 
-TEST_CASE("ca_routes: an unconfined or grant-less caller passes the probe; an unreadable store is "
-          "audited failure",
+TEST_CASE("ca_routes: an unconfined caller passes the probe, a grant-less one stops at it; an "
+          "unreadable store is audited failure",
           "[ca_routes][pki][crypto][security]") {
     using yuzu::server::crypto_widgets::Access;
     {
@@ -2672,7 +2673,7 @@ TEST_CASE("ca_routes: kRefused withholds the unfiltered list and writes a denied
     // all. It is NOT a confined view and it is not an affirmative admission, so the list is
     // withheld exactly as for a confined caller (independent adjudication of CA-U2 / CH-2,
     // 2026-10-24; supersedes the 2026-10-23 "keep serving" ruling). A failed read is answered
-    // 503 before it can become a kRefused (see test_ca_issued_real_standing for the real stack).
+    // 503 before it can become a kRefused (the real stack is exercised by the "real stack" cases below).
     using yuzu::server::crypto_widgets::Access;
     Harness h;
     h.standing = Access::kRefused;
@@ -2685,8 +2686,8 @@ TEST_CASE("ca_routes: kRefused withholds the unfiltered list and writes a denied
     CHECK(res->body.find("\"items\"") == std::string::npos);
     REQUIRE(h.audits.size() == 1);
     CHECK(h.audits[0].result == "denied");
-    CHECK_THAT(h.audits[0].detail, Catch::Matchers::ContainsSubstring("withheld"));
-    CHECK_THAT(h.audits[0].detail, !Catch::Matchers::ContainsSubstring("standing=refused"));
+    CHECK_THAT(h.audits[0].detail, Catch::Matchers::ContainsSubstring("withheld=refused"));
+    CHECK(res->body.find("holds no read access") != std::string::npos);
 
     // The unrestricted standing is served and named on the row.
     h.standing = Access::kAvailable;
@@ -2830,10 +2831,12 @@ TEST_CASE("ca_routes real stack: a failed scope-resolution read is a retryable 5
         CHECK(res->status == 503);
         CHECK(res->body.find("agent-C9") == std::string::npos);
         CHECK(res->body.find("\"items\"") == std::string::npos);
+        CHECK(json::parse(res->body)["error"]["retry_after_ms"].get<int>() == 5000);
     }
-    REQUIRE_FALSE(h.audits.empty());
+    REQUIRE(h.audits.size() == 2);
     for (const auto& a : h.audits) {
-        CHECK(a.result != "success");
+        CHECK(a.result == "failure"); // never a success or a denied row for a failed check
+        CHECK_THAT(a.detail, Catch::Matchers::ContainsSubstring("access check unavailable"));
     }
 }
 
@@ -2853,6 +2856,8 @@ TEST_CASE("ca_routes real stack: removing the last scoped grant never widens the
     REQUIRE(with_deny);
     CHECK(with_deny->status == 403);
     CHECK(with_deny->body.find("agent-C9") == std::string::npos);
+    REQUIRE(h.audits.size() == 1);
+    CHECK_THAT(h.audits.back().detail, Catch::Matchers::ContainsSubstring("withheld=confined"));
 
     // Remove the last scoped allow: no grant is left. It must not become the full list.
     REQUIRE(rig.mgmt.unassign_role(rig.group, "user", "alice", "InvReader").has_value());
@@ -2860,6 +2865,9 @@ TEST_CASE("ca_routes real stack: removing the last scoped grant never widens the
     REQUIRE(after);
     CHECK(after->status == 403);
     CHECK(after->body.find("agent-C9") == std::string::npos);
+    // ... and it is now a no-grant refusal, told apart from the confined one by the row.
+    REQUIRE(h.audits.size() == 2);
+    CHECK_THAT(h.audits.back().detail, Catch::Matchers::ContainsSubstring("withheld=refused"));
 }
 
 TEST_CASE("ca_routes real stack: a Security:Read holder with no Inventory:Read grant at all is "
@@ -2874,8 +2882,10 @@ TEST_CASE("ca_routes real stack: a Security:Read holder with no Inventory:Read g
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(res->body.find("agent-C9") == std::string::npos);
+    CHECK(res->body.find("holds no read access") != std::string::npos);
     REQUIRE(h.audits.size() == 1);
     CHECK(h.audits[0].result == "denied");
+    CHECK_THAT(h.audits[0].detail, Catch::Matchers::ContainsSubstring("withheld=refused"));
 }
 
 TEST_CASE("ca_routes: a sanitised subject is served with exactly one success row",

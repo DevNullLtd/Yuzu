@@ -581,6 +581,21 @@ TEST_CASE("crypto widgets: audit_detail_with_standing - only a served standing i
     CHECK(cw::audit_detail_with_standing("x", cw::Access::kDegraded) == "x standing=unexpected");
 }
 
+TEST_CASE("crypto widgets: the withheld audit token and message tell a confined caller from a "
+          "caller with no grant",
+          "[crypto][widgets]") {
+    namespace cw = yuzu::server::crypto_widgets;
+    CHECK(cw::audit_detail_ca_withheld("", cw::Access::kConfined).ends_with("withheld=confined"));
+    CHECK(cw::audit_detail_ca_withheld("", cw::Access::kRefused).ends_with("withheld=refused"));
+    CHECK(cw::audit_detail_ca_withheld("c-1", cw::Access::kRefused).starts_with("cid=c-1 "));
+    // A standing that is never withheld must not read as a real withheld reason.
+    CHECK(cw::audit_detail_ca_withheld("", cw::Access::kAvailable).ends_with("withheld=unexpected"));
+    CHECK(cw::audit_detail_ca_withheld("", cw::Access::kDegraded).ends_with("withheld=unexpected"));
+    CHECK(cw::withheld_message(cw::Access::kConfined) == cw::kConfinedWithheldMessage);
+    CHECK(cw::withheld_message(cw::Access::kRefused) == cw::kRefusedWithheldMessage);
+    CHECK(cw::kRefusedWithheldMessage != cw::kConfinedWithheldMessage);
+}
+
 TEST_CASE("crypto_access_for: a confined Inventory:Read holder - kConfined for fleet-wide-only, "
           "kAvailable for fleet-read",
           "[crypto][widgets][authz]") {

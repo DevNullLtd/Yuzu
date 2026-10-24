@@ -926,8 +926,24 @@ std::string audit_detail_ca_degraded(std::string_view cid, std::optional<std::in
 }
 
 std::string audit_detail_ca_withheld(std::string_view cid, Access standing) {
-    return std::format("{}ws={} withheld={}", cid_prefix(cid), kWindowSetVersion,
-                       standing == Access::kRefused ? "refused" : "confined");
+    // Exhaustive, no default: a new enumerator must be decided here.
+    std::string_view why = "unexpected";
+    switch (standing) {
+    case Access::kConfined:
+        why = "confined";
+        break;
+    case Access::kRefused:
+        why = "refused";
+        break;
+    case Access::kAvailable:
+    case Access::kDegraded:
+        break;
+    }
+    return std::format("{}ws={} withheld={}", cid_prefix(cid), kWindowSetVersion, why);
+}
+
+std::string_view withheld_message(Access standing) {
+    return standing == Access::kRefused ? kRefusedWithheldMessage : kConfinedWithheldMessage;
 }
 
 std::string audit_detail_layout(std::string_view cid, std::size_t widgets,

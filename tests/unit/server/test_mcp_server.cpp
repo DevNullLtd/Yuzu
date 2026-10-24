@@ -20062,12 +20062,16 @@ TEST_CASE("MCP CA: kRefused is withheld like a confined caller - no row text in 
     CHECK(res->body.find("agent-refused-withheld") == std::string::npos);
     CHECK(res->body.find("A0D2") == std::string::npos);
     CHECK(nlohmann::json::parse(res->body).contains("error"));
+    CHECK(res->body.find("holds no read access") != std::string::npos); // the refusal text
     CHECK(mcp_audit_count(ts, "crypto.ca.certificates.view|denied") == 1);
     CHECK(mcp_audit_count(ts, "crypto.ca.certificates.view|success") == 0);
+    bool saw_refused_token = false;
     for (const auto& d : ts.audit_details) {
         CHECK(d.find("agent-refused-withheld") == std::string::npos);
         CHECK(d.find("standing=refused") == std::string::npos);
+        saw_refused_token = saw_refused_token || d.find("withheld=refused") != std::string::npos;
     }
+    CHECK(saw_refused_token);
 }
 
 TEST_CASE("MCP CA: a confined caller is withheld a populated inventory - no row text in the reply "

@@ -2448,11 +2448,12 @@ static const ToolDef kTools[] = {
      "database clock or more than 300 seconds after it is rejected), a caller whose view is "
      "confined is refused, a degraded store or busy reads are retryable, and the read is audited "
      "as crypto.ca.certificates.view. Without them it lists the inventory with offset paging, with "
-     "the same confinement refusal and the same audit. A confined refusal (permission denied, "
-     "management-group confinement) is permanent for that caller: retrying cannot change it, use an "
-     "account whose Inventory:Read is not management-group-limited. An 'access check unavailable' "
-     "error is retryable (retry_after_ms 5000). A caller with no Inventory:Read grant at all is not "
-     "confined and is served.",
+     "the same confinement refusal and the same audit. A refusal (permission denied) is permanent "
+     "for that caller: retrying cannot change it. It is given to a caller whose Inventory:Read is "
+     "management-group-limited (confined) and to a caller with no Inventory:Read grant at all; use "
+     "an account holding an unrestricted (global) Inventory:Read. An 'access check unavailable' "
+     "error (a store behind the check could not be read) is retryable (retry_after_ms 5000) and "
+     "never returns the list.",
      R"j({"type":"object","properties":{)j"
      R"j("limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Max rows (at most 500, default 100, when filtering)"},)j"
      R"j("offset":{"type":"integer","minimum":0,"maximum":1000000,"description":"Pagination offset; unfiltered calls only, 0 when omitted. A filtered call refuses any offset, 0 included (it pages with cursor)"},)j"
@@ -10594,7 +10595,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // ADR-0070 R2: a confined view never gets a fleet-wide count, nor a narrowed
                     // one. No permission named: none would admit the caller.
                     (void)audit_fn(req, "crypto.ca.stats.view", "denied", "Inventory", "yuzu_ca",
-                                   cw::audit_detail_ca_withheld(""));
+                                   cw::audit_detail_ca_withheld("", cw::Access::kConfined));
                     mcp_audit("denied", "withheld=confined");
                     res.set_content(a4_error(kPermissionDenied, cw::kConfinedWithheldMessage), "application/json"); // retry-hint-exempt: authorization outcome, retrying cannot change it
                     return;
@@ -22156,10 +22157,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                    list_target, cw::audit_detail_ca_withheld("", standing));
                     mcp_audit("denied", standing == cw::Access::kRefused ? "withheld=refused"
                                                                          : "withheld=confined");
-                    res.set_content(a4_error(kPermissionDenied,
-                                             standing == cw::Access::kRefused
-                                                 ? cw::kRefusedWithheldMessage
-                                                 : cw::kConfinedWithheldMessage),
+                    res.set_content(a4_error(kPermissionDenied, cw::withheld_message(standing)),
                                     "application/json"); // retry-hint-exempt: authorization outcome, retrying cannot change it
                     return;
                 case cw::Access::kDegraded:

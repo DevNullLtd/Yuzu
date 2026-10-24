@@ -243,8 +243,8 @@ std::string render_ca_fragment(CaStore* ca_store,
             "<button class=\"btn btn-secondary\" "
             "type=\"submit\">Import signed chain</button></form></details>";
 
-    // A caller who may not list the issued certificates (confined view, degraded or unwired
-    // access check) gets everything above (CA metadata, root/CRL/CSR links, the import form) and
+    // A caller who may not list the issued certificates (confined view, no Inventory grant,
+    // degraded or unwired access check) gets everything above (CA metadata, root/CRL/CSR links, the import form) and
     // a note where the inventory would be. The store is not read for them.
     if (inventory_note) {
         html += "<p class=\"feedback-error\">" + html_escape(std::string(*inventory_note)) +
@@ -456,8 +456,7 @@ bool issued_audit(const CaRoutes::AuditFn& audit_fn, const httplib::Request& req
 /// standing the read may proceed under (only kAvailable: the list is served to an affirmatively
 /// unconfined caller and nobody else); nullopt = the response is written. A confined caller and a
 /// caller with no Inventory grant (kRefused) are withheld (403, denied row); a failed access check
-/// (kDegraded, which now includes a read failure inside it) is a retryable 503. See the ADR-0070
-/// Update (2026-10-24). An
+/// (kDegraded, which includes a read failure inside the check) is a retryable 503. An
 /// unwired probe fails closed (503, no retry hint: a wiring fault lasts until a restart).
 /// `needs_api` is set by the filtered list, which also reads through the CryptoApi seam. Asked
 /// before any parameter is parsed, so the answer does not depend on them. `target` names the
@@ -494,10 +493,7 @@ admit_issued_read(const CaRoutes::FilteredIssuedDeps& filtered, const httplib::R
     case cw::Access::kRefused: // no grant is not an affirmative admission to a fleet-wide list
         (void)issued_audit(audit_fn, req, res, "denied", target,
                            cw::audit_detail_ca_withheld(cid, standing));
-        issued_fail(res, 403,
-                    standing == cw::Access::kRefused ? cw::kRefusedWithheldMessage
-                                                     : cw::kConfinedWithheldMessage,
-                    cid, false);
+        issued_fail(res, 403, cw::withheld_message(standing), cid, false);
         return std::nullopt;
     case cw::Access::kDegraded:
         (void)issued_audit(audit_fn, req, res, "failure", target,
@@ -1358,7 +1354,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                  if (!perm_fn(req, res, "Security", "Read"))
                      return;
                  res.set_header("Cache-Control", "no-store");
-                 // A confined, degraded or unwired caller still gets the CA metadata, the
+                 // A confined, no-grant, degraded or unwired caller still gets the CA metadata, the
                  // root/CSR/CRL links and the import form: only the issued-certificate
                  // inventory is withheld, with a note where it would be.
                  res.set_content(render_ca(ca_store, wants_pki_view(req),

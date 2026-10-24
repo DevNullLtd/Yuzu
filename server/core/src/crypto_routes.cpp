@@ -173,7 +173,7 @@ bool ca_counts_gate(const CryptoRoutes::Deps& d, const httplib::Request& req,
     if (!is_confined(gate))
         return true;
     (void)detail::emit_behavioral_audit(d.audit_fn, req, res, "crypto.ca.stats.view", "denied",
-                                        "Inventory", "yuzu_ca", cw::audit_detail_ca_withheld(cid));
+                                        "Inventory", "yuzu_ca", cw::audit_detail_ca_withheld(cid, cw::Access::kConfined));
     rest_error(res, 403, std::string(cw::kConfinedWithheldMessage));
     return false;
 }
@@ -577,7 +577,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (is_confined(gate)) {
                 (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res,
                                                     "crypto.ca.stats.view", "denied", "Inventory",
-                                                    "yuzu_ca", cw::audit_detail_ca_withheld(cid));
+                                                    "yuzu_ca", cw::audit_detail_ca_withheld(cid, cw::Access::kConfined));
                 send_html(res, crypto_html::render_widget_not_available(*w, cw::Access::kConfined));
                 return;
             }
