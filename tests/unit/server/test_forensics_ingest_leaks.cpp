@@ -213,6 +213,21 @@ std::string outbox_data_after(yuzu::server::pg::PgPool& pool, const std::string&
     return PQgetisnull(res.get(), 0, 0) ? std::string{} : std::string{PQgetvalue(res.get(), 0, 0)};
 }
 
+/// Like `outbox_data_after`, restricted to `agent-transition` rows: one status write also appends
+/// progress and completion events, which carry counts rather than the failure text.
+std::string transition_data_after(yuzu::server::pg::PgPool& pool, const std::string& execution_id,
+                                  long long after_event_id) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT string_agg(data, E'\\n') FROM execution_tracker.event_outbox "
+        "WHERE execution_id = $1 AND event_id > $2::bigint AND event_type = 'agent-transition'",
+        std::vector<std::string>{execution_id, std::to_string(after_event_id)});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    return PQgetisnull(res.get(), 0, 0) ? std::string{} : std::string{PQgetvalue(res.get(), 0, 0)};
+}
+
 std::string stored_error_detail(yuzu::server::pg::PgPool& pool, const std::string& execution_id) {
     auto lease = pool.acquire();
     REQUIRE(lease);
@@ -655,7 +670,8 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
         fault.arm();
         std::vector<std::string> frames;
         const auto sub = exec_bus.subscribe(id, [&frames](const ExecutionEvent& e) {
-            frames.push_back(e.data);
+            if (e.event_type == "agent-transition")
+                frames.push_back(e.data);
         });
         yuzu::test::LogCapture logs{spdlog::level::warn};
         tracker.update_agent_status(id, frame("running", ""));
@@ -665,7 +681,7 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
 
         // The transition event WAS appended and published, with the fail-closed bounded value:
         // exactly one outbox row and one bus frame, carrying the same payload.
-        const auto added = outbox_data_after(pool, id, seeded);
+        const auto added = transition_data_after(pool, id, seeded);
         const auto row = sole_row(added);
         CHECK(row["error_detail"] == "forensics_error");
         CHECK(row["status"] == "failure");
@@ -698,7 +714,8 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
         fault.arm(); // any lookup on this path would fail, abort the transaction and lose the row
         std::vector<std::string> frames;
         const auto sub = exec_bus.subscribe(id, [&frames](const ExecutionEvent& e) {
-            frames.push_back(e.data);
+            if (e.event_type == "agent-transition")
+                frames.push_back(e.data);
         });
         yuzu::test::LogCapture logs{spdlog::level::warn};
         tracker.update_agent_status(id, frame("failure", kFreeText));
@@ -709,7 +726,7 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
         CHECK(logs.text().find("NOT recorded") == std::string::npos);
         CHECK(logs.text().find("Forensics execution lookup failed") == std::string::npos);
         CHECK(stored_error_detail(pool, id) == kFreeText);
-        const auto added = outbox_data_after(pool, id, seeded);
+        const auto added = transition_data_after(pool, id, seeded);
         CHECK(sole_row(added)["error_detail"] == kFreeText);
         REQUIRE(frames.size() == 1);
         CHECK(frames[0] == added);
@@ -727,14 +744,15 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
         fault.arm();
         std::vector<std::string> frames;
         const auto sub = exec_bus.subscribe(id, [&frames](const ExecutionEvent& e) {
-            frames.push_back(e.data);
+            if (e.event_type == "agent-transition")
+                frames.push_back(e.data);
         });
         // Ingest reduces a Forensics plugin's text before the tracker sees it.
         tracker.update_agent_status(id, frame("failure", "forensics_error"));
         exec_bus.unsubscribe(id, sub);
         fault.repair();
         CHECK(stored_error_detail(pool, id) == "forensics_error");
-        const auto added = outbox_data_after(pool, id, seeded);
+        const auto added = transition_data_after(pool, id, seeded);
         CHECK(sole_row(added)["error_detail"] == "forensics_error");
         REQUIRE(frames.size() == 1);
         CHECK(frames[0] == added);
@@ -750,12 +768,13 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
         const auto id = make(std::string{test::kForensicsPlugin} + "-0w5");
         std::vector<std::string> frames;
         const auto sub = exec_bus.subscribe(id, [&frames](const ExecutionEvent& e) {
-            frames.push_back(e.data);
+            if (e.event_type == "agent-transition")
+                frames.push_back(e.data);
         });
         const auto seeded = outbox_high_water(pool, id);
         tracker.update_agent_status(id, frame("failure", kFreeText));
         exec_bus.unsubscribe(id, sub);
-        const auto added = outbox_data_after(pool, id, seeded);
+        const auto added = transition_data_after(pool, id, seeded);
         CHECK(sole_row(added)["error_detail"] == kFreeText);
         REQUIRE(frames.size() == 1);
         CHECK(frames[0] == added);
@@ -777,7 +796,7 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
         logs.stop();
         fault.repair();
         CHECK(logs.text().find("NOT recorded") == std::string::npos);
-        const auto added = outbox_data_after(pool, id, seeded);
+        const auto added = transition_data_after(pool, id, seeded);
         CHECK(sole_row(added)["error_detail"] == kFreeText);
     }
 }
