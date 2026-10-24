@@ -197,6 +197,7 @@ constexpr ExpectedResolution kExpected[] = {
     {"PUT",    "/api/v1/crypto/dashboard/layout",                      16u * 1024, false, "crypto"},
     {"PUT",    "/api/v1/config/log_level",                             16u * 1024, false, "config"},
     {"GET",    "/api/v1/config",                                       16u * 1024, false, "config"},
+    {"PUT",    "/api/v1/configevil/log_level",                         4u * 1024 * 1024, false, "default"},
     {"GET",    "/api/v1/crypto/ca/stats",                              16u * 1024, false, "crypto"},
     {"PUT",    "/api/v1/cryptoevil",                                   4u * 1024 * 1024, false, "default"},
     // Catch-all default — ordinary JSON/form traffic.

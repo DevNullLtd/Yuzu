@@ -13,6 +13,7 @@
 
 #include <charconv>
 #include <chrono>
+#include <set>
 #include <system_error>
 
 namespace yuzu::server::config {
@@ -27,7 +28,8 @@ bool is_int_key(std::string_view key) {
 } // namespace
 
 bool store_ready(const Backing& b) noexcept {
-    return b.store != nullptr && b.store->is_open();
+    return b.store != nullptr && b.cfg != nullptr && b.auto_approve != nullptr &&
+           b.store->is_open();
 }
 
 std::optional<WriteRefusal> write_refusal(const std::string& key, const auth::Session& session) {
@@ -112,6 +114,10 @@ std::expected<int, std::string> validate_value(std::string_view key, std::string
     // RuntimeConfigStore while leaving the live Config at the old value (the earlier
     // `try { stoi } catch (...) {}` was a ghost write: the store persisted, the config ignored it,
     // the operator saw 200 with no effect). UP-R5 from the Guardian PR 2 governance re-run.
+    // A leading '-' is refused outright: from_chars accepts "-0" into an int, which would be
+    // stored (and echoed) as the text "-0" while the live value is 0.
+    if (!value.empty() && value.front() == '-')
+        return std::unexpected("value must be a non-negative integer");
     int parsed = 0;
     const char* first = value.data();
     const char* last = value.data() + value.size();
@@ -171,7 +177,8 @@ nlohmann::json applied_json(const std::string& key, const std::string& value) {
                : nlohmann::json{{"key", key}, {"value", value}, {"applied", true}};
 }
 
-std::expected<nlohmann::json, ViewFault> build_config_view(const Backing& b) {
+std::expected<nlohmann::json, ViewFault> build_config_view(const Backing& b,
+                                                           const auth::Session* viewer) {
     // Checked first: a degraded store must not read as "nothing is configured" (see ViewFault).
     if (!store_ready(b))
         return std::unexpected(ViewFault{});
@@ -182,17 +189,31 @@ std::expected<nlohmann::json, ViewFault> build_config_view(const Backing& b) {
         return std::unexpected(ViewFault{});
     }
 
+    // Keys this viewer may not see (empty for the legacy audience). Only a DENIED key is
+    // withheld: a route-owned key's value is not authority, and it stays listed.
+    std::set<std::string> withheld;
+    if (viewer)
+        for (const auto& k : RuntimeConfigStore::allowed_keys()) {
+            auto refusal = write_refusal(k, *viewer);
+            if (refusal && refusal->kind == WriteRefusal::Kind::Denied)
+                withheld.insert(k);
+        }
+
     nlohmann::json config_obj;
     // Current effective values (from cfg + overrides)
     config_obj["heartbeat_timeout"] = b.cfg->session_timeout.count();
     config_obj["response_retention_days"] = b.cfg->response_retention_days;
-    config_obj["audit_retention_days"] = b.cfg->audit_retention_days;
+    if (!withheld.contains("audit_retention_days"))
+        config_obj["audit_retention_days"] = b.cfg->audit_retention_days;
     config_obj["guardian_event_retention_days"] = b.cfg->guardian_event_retention_days;
     config_obj["auto_approve_enabled"] = !b.auto_approve->list_rules().empty();
     config_obj["log_level"] = spdlog::level::to_string_view(spdlog::default_logger()->level()).data();
 
     // The omission rule for a secret's value lives in build_overrides_json
     // (runtime_config_view.hpp), the site the secret leaked from twice.
+    if (!withheld.empty())
+        std::erase_if(*overrides_result,
+                      [&](const RuntimeConfigEntry& e) { return withheld.contains(e.key); });
     nlohmann::json overrides = build_overrides_json(*overrides_result);
 
     nlohmann::json allowed = nlohmann::json::array();
@@ -207,10 +228,13 @@ std::expected<nlohmann::json, ViewFault> build_config_view(const Backing& b) {
         if (RuntimeConfigStore::write_class(k) == ConfigWriteClass::RouteOwned)
             read_only.push_back(k);
 
-    return nlohmann::json({{"config", config_obj},
-                           {"overrides", overrides},
-                           {"allowed_keys", allowed},
-                           {"read_only_keys", read_only}});
+    nlohmann::json view({{"config", config_obj},
+                         {"overrides", overrides},
+                         {"allowed_keys", allowed},
+                         {"read_only_keys", read_only}});
+    if (viewer)
+        view["withheld_keys"] = withheld; // a std::set serialises as a sorted array
+    return view;
 }
 
 } // namespace yuzu::server::config

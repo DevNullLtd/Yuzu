@@ -62,7 +62,7 @@ TEST_CASE("step-up policy: kExempt and kOwnGate rows carry a reason, kRequired r
     }
 }
 
-TEST_CASE("step-up policy: the gated set is exactly the 36 routes with an in-handler call",
+TEST_CASE("step-up policy: the gated set is exactly the 37 routes with an in-handler call",
           "[stepup][policy]") {
     CHECK(count_class(StepUpClass::kRequired) == 37);
     CHECK(count_class(StepUpClass::kOwnGate) == 3);

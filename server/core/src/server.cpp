@@ -21904,7 +21904,7 @@ private:
             mcp_server_->set_plugin_config_store(plugin_config_store_.get());
             // get_runtime_config / set_runtime_config: the same cfg_, auto_approve_ and
             // runtime_config_store_ the config routes hold.
-            mcp_server_->set_runtime_config(
+            mcp_server_->set_runtime_config_backing(
                 {&cfg_, &auto_approve_, runtime_config_store_.get()});
             // #4036 (api-parity Batch A) — backs list_preflight_runs +
             // get_deployment_preview. Same store PreflightRoutes/

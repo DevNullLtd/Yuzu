@@ -1226,9 +1226,11 @@ TEST_CASE("config_routes: the v1 PUT refuses the administrator-only keys like th
 }
 
 // Differential: the legacy and v1 PUT answer the same status and write the same audit rows for
-// every allowed key under every caller shape. A fix to one that misses the other fails here.
-TEST_CASE("config_routes: the legacy and v1 PUT agree on status and audit rows for every key and "
-          "caller shape",
+// every allowed key under every caller shape, up to the store check (the store is null, so every
+// admitted write ends there; the pg differential below covers validation, audit rows and the
+// success path). A fix to one that misses the other fails here.
+TEST_CASE("config_routes: the legacy and v1 PUT agree on every pre-store gate (csrf, refusals, "
+          "route-owned, store check) for every key and caller shape",
           "[server][routes][config_routes][elevation]") {
     struct Caller {
         const char* name;
@@ -1370,10 +1372,133 @@ TEST_CASE("config_routes: GET /api/v1/config is the legacy body under data, secr
     CHECK(v1->get_header_value("Cache-Control") == "no-store");
     const auto envelope = body(v1->body);
     CHECK(envelope["meta"]["api_version"] == "v1");
-    CHECK(envelope["data"] == body(legacy->body));
+    // The v1 view is the legacy view plus the withheld_keys declaration (empty for an
+    // administrator: nothing is withheld).
+    auto data = envelope["data"];
+    CHECK(data["withheld_keys"] == json::array());
+    data.erase("withheld_keys");
+    CHECK(data == body(legacy->body));
     CHECK(envelope["data"]["overrides"]["response_retention_days"]["value"] == "120");
     CHECK(envelope["data"]["overrides"]["oidc_client_secret"]["is_set"] == true);
     CHECK(v1->body.find("s3cret") == std::string::npos);
+}
+
+// The v1 view is scoped to the caller; the legacy view is not.
+TEST_CASE("config_routes: GET /api/v1/config withholds the overrides a caller could not write; "
+          "the legacy GET still shows them",
+          "[pg][server][routes][config_routes][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h; // an administrator first, to store one override of each class
+    h.runtime_config_store = &w.store;
+    h.wire();
+    REQUIRE(h.sink.Put("/api/config/oidc_admin_group", R"({"value":"grp-admins"})")->status == 200);
+    REQUIRE(h.sink.Put("/api/config/plugin_signing_required", R"({"value":"true"})")->status == 200);
+    REQUIRE(h.sink.Put("/api/config/audit_retention_days", R"({"value":"400"})")->status == 200);
+    REQUIRE(h.sink.Put("/api/config/response_retention_days", R"({"value":"120"})")->status == 200);
+
+    const std::vector<std::string> withheld_for_token{
+        "audit_retention_days",       "dex_alert_routing",
+        "dex_blast_cooldown_seconds", "dex_blast_min_devices",
+        "dex_blast_window_seconds",   "dex_cohort_export_key",
+        "oidc_admin_group",           "oidc_client_id",
+        "oidc_client_secret",         "oidc_issuer",
+        "oidc_redirect_uri",          "oidc_skip_tls_verify",
+        "plugin_signing_required"};
+
+    // An MCP-tier token (and a plain user) sees the general override, not the others.
+    for (const bool token : {true, false}) {
+        MockHarness t;
+        t.runtime_config_store = &w.store;
+        if (token)
+            t.session_mcp_tier = "supervised";
+        else
+            t.session_role = auth::Role::user;
+        t.wire();
+        auto v1 = t.sink.Get("/api/v1/config");
+        REQUIRE(v1);
+        CHECK(v1->status == 200);
+        const auto data = body(v1->body)["data"];
+        CHECK(data["overrides"].contains("response_retention_days"));
+        for (const auto& k : withheld_for_token) {
+            INFO(k);
+            CHECK_FALSE(data["overrides"].contains(k));
+        }
+        CHECK_FALSE(data["config"].contains("audit_retention_days"));
+        CHECK(data["withheld_keys"] == json(withheld_for_token));
+        // The same session on the legacy route is unchanged: every override, no declaration.
+        auto legacy = t.sink.Get("/api/config");
+        REQUIRE(legacy);
+        const auto old = body(legacy->body);
+        CHECK(old["overrides"].contains("oidc_admin_group"));
+        CHECK(old["config"].contains("audit_retention_days"));
+        CHECK_FALSE(old.contains("withheld_keys"));
+    }
+
+    // An administrator sees everything and withholds nothing.
+    auto admin = h.sink.Get("/api/v1/config");
+    REQUIRE(admin);
+    const auto adm = body(admin->body)["data"];
+    CHECK(adm["overrides"].contains("oidc_admin_group"));
+    CHECK(adm["config"].contains("audit_retention_days"));
+    CHECK(adm["withheld_keys"] == json::array());
+}
+
+TEST_CASE("config_routes: an open store is not enough, the live config and the engine must be wired",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    yuzu::server::Config cfg{};
+    auth::AutoApproveEngine engine{};
+    CHECK(config::store_ready({&cfg, &engine, &w.store}));
+    CHECK_FALSE(config::store_ready({nullptr, &engine, &w.store}));
+    CHECK_FALSE(config::store_ready({&cfg, nullptr, &w.store}));
+    CHECK_FALSE(config::build_config_view({nullptr, &engine, &w.store}).has_value());
+}
+
+TEST_CASE("config_routes: the legacy and v1 PUT agree on validation, audit rows and the success "
+          "path with a real store",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+    struct Case {
+        const char* key;
+        const char* req_body;
+    };
+    const Case cases[] = {
+        {"response_retention_days", R"({"value":"125"})"}, // success
+        {"response_retention_days", R"({"value":"abc"})"}, // integer validation
+        {"response_retention_days", R"({"value":"-0"})"},  // leading minus
+        {"response_retention_days", R"({"value":"0"})"},   // store refuses a non-positive window
+        {"log_level", R"({"value":"loud"})"},              // store refuses the value
+        {"log_level", R"({"other":1})"},                   // missing value
+        {"log_level", "{not json"},                        // invalid json
+        {"not_a_setting", R"({"value":"x"})"},             // unknown key
+        {"oidc_client_secret", R"({"value":"s3cret"})"},   // secret: redacted detail
+        {"dex_score_policy", R"({"value":"{}"})"},         // route-owned
+    };
+    for (const auto& c : cases) {
+        INFO(c.key << " " << c.req_body);
+        h.audits.clear();
+        auto legacy = h.sink.Put(std::string("/api/config/") + c.key, c.req_body);
+        REQUIRE(legacy);
+        const auto legacy_audits = h.audits;
+        h.audits.clear();
+        auto v1 = h.sink.Put(std::string("/api/v1/config/") + c.key, c.req_body);
+        REQUIRE(v1);
+        CHECK(v1->status == legacy->status);
+        REQUIRE(h.audits.size() == legacy_audits.size());
+        for (std::size_t i = 0; i < legacy_audits.size(); ++i) {
+            CHECK(h.audits[i].result == legacy_audits[i].result);
+            CHECK(h.audits[i].target_id == legacy_audits[i].target_id);
+            CHECK(h.audits[i].detail == legacy_audits[i].detail);
+        }
+        if (v1->status >= 400)
+            CHECK(body(v1->body)["error"]["code"] == v1->status);
+    }
 }
 
 TEST_CASE("config_routes: PUT /api/v1/config/{param} writes, applies and audits like the legacy PUT",
@@ -1595,6 +1720,16 @@ TEST_CASE("config_routes: wiring -- server.cpp still calls register_config_route
     REQUIRE(in.is_open());
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("register_config_routes(") != std::string::npos);
+    // The v1 PUT is step-up kRequired: its Deps must carry the shared closure. An unwired closure
+    // is skipped silently by design (test below), so only this scan notices a dropped line.
+    const auto cfg_deps = src.find("yuzu::server::config::Deps{");
+    REQUIRE(cfg_deps != std::string::npos);
+    CHECK(src.substr(cfg_deps, 700).find(".step_up_fn = step_up_fn") != std::string::npos);
+    // The MCP tools read and write through the same cfg_, auto_approve_ and store.
+    const auto mcp_wire = src.find("mcp_server_->set_runtime_config_backing(");
+    REQUIRE(mcp_wire != std::string::npos);
+    CHECK(src.substr(mcp_wire, 200).find("&cfg_, &auto_approve_, runtime_config_store_.get()") !=
+          std::string::npos);
     // The boot loader raises a sub-floor stored heartbeat_timeout through the shared helper.
     CHECK(src.find("clamp_heartbeat_timeout(stored)") != std::string::npos);
     CHECK(src.find("cfg_.session_timeout = std::chrono::seconds(applied);") != std::string::npos);

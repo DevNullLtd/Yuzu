@@ -510,7 +510,7 @@ public:
     /// Backs get_runtime_config / set_runtime_config, the MCP twins of GET/PUT /api/v1/config
     /// (api-parity rows get.api-config, put.api-config-param). Same objects the config routes
     /// hold. Unset (all nullptr, the default) => both tools answer "unavailable".
-    void set_runtime_config(config::Backing backing) { runtime_config_ = backing; }
+    void set_runtime_config_backing(config::Backing backing) { runtime_config_ = backing; }
 
     /// ADR-0031 operator surface (PR1.6c) — upload-grant store + the
     /// ADR-0017 list-admit resolver for list_upload_grants, backing

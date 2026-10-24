@@ -153,7 +153,7 @@ TEST_CASE("config_write: integer keys must be non-negative whole numbers; other 
         INFO(key);
         CHECK(config::validate_value(key, "0").value() == 0);
         CHECK(config::validate_value(key, "90").value() == 90);
-        for (const char* bad : {"", "-1", "abc", "9x", " 9", "1.5", "99999999999"}) {
+        for (const char* bad : {"", "-1", "-0", "abc", "9x", " 9", "+5", "1.5", "99999999999"}) {
             INFO(bad);
             auto r = config::validate_value(key, bad);
             REQUIRE_FALSE(r.has_value());
@@ -188,4 +188,6 @@ TEST_CASE("config_write: with no store the view is a fault, never an empty confi
     config::Backing none{};
     CHECK_FALSE(config::store_ready(none));
     CHECK_FALSE(config::build_config_view(none).has_value());
+    const auto viewer = session(auth::Role::admin);
+    CHECK_FALSE(config::build_config_view(none, &viewer).has_value());
 }

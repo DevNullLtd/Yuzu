@@ -3422,11 +3422,16 @@ static const ToolDef kTools[] = {
      "stored overrides (a secret key reports is_set and updated_by, never its value; a store that "
      "cannot be read is an error, never an empty list), allowed_keys (every key set_runtime_config "
      "knows) and read_only_keys (allowed keys with their own writer, today dex_score_policy). "
-     "auto_approve_enabled is derived from whether any auto-approve rule exists. This is "
+     "The result is scoped to the caller: the override of every key this caller could not write "
+     "with set_runtime_config (the administrator-only and oidc_* keys, for an MCP-tier token) is "
+     "withheld, and so is the effective audit_retention_days, and withheld_keys lists them, so "
+     "an absent key means 'not shown to you', not 'not set'. Values shown are what is stored: "
+     "the retention windows are enforced from the server's command-line flags, not from these "
+     "values. auto_approve_enabled is derived from whether any auto-approve rule exists. This is "
      "platform configuration, not agent-scoped data, so there is no per-agent filter to apply; a "
      "service-scoped token is refused. Requires Infrastructure:Read.",
      R"j({"type":"object","properties":{},"additionalProperties":false})j",
-     R"j({"type":"object","properties":{"config":{"type":"object","description":"effective values"},"overrides":{"type":"object","description":"stored overrides by key: value, updated_by, updated_at; a secret key carries is_set instead of value"},"allowed_keys":{"type":"array","items":{"type":"string"}},"read_only_keys":{"type":"array","items":{"type":"string"}}},"required":["config","overrides","allowed_keys","read_only_keys"]})j"},
+     R"j({"type":"object","properties":{"config":{"type":"object","description":"effective values"},"overrides":{"type":"object","description":"stored overrides by key: value, updated_by, updated_at; a secret key carries is_set instead of value; keys in withheld_keys are absent"},"allowed_keys":{"type":"array","items":{"type":"string"}},"read_only_keys":{"type":"array","items":{"type":"string"}},"withheld_keys":{"type":"array","items":{"type":"string"},"description":"keys whose stored override is not shown to this caller, sorted"}},"required":["config","overrides","allowed_keys","read_only_keys","withheld_keys"]})j"},
 
     {"set_runtime_config",
      "Set one runtime configuration override. Mirrors PUT /api/v1/config/{key} (body {value}). "
@@ -3437,15 +3442,17 @@ static const ToolDef kTools[] = {
      "guardian_event_retention_days (whole days), auto_approve_enabled ('true' or 'false'; stored, "
      "but it changes nothing today because GET reports it from the auto-approve rules), log_level "
      "(trace, debug, info, warn or error). Every other key in get_runtime_config's allowed_keys is "
-     "refused with a permission error and an audit row: plugin_signing_required, "
-     "audit_retention_days, dex_alert_routing, dex_blast_min_devices, dex_blast_window_seconds, "
-     "dex_blast_cooldown_seconds, dex_cohort_export_key and the oidc_* keys need an administrator "
-     "account on REST or the Settings page; dex_score_policy has its own route. Values are sent "
-     "as strings, e.g. \"90\". The write is audited before it applies: if the audit row cannot be "
-     "stored the call fails and nothing changes. response_retention_days and "
-     "guardian_event_retention_days update the in-memory config, but the response and "
-     "guardian-event stores copy their retention window when the server starts (#483), so a new "
-     "value changes what they delete only after a restart.",
+     "refused to an MCP-tier token with a permission error and an audit row: "
+     "plugin_signing_required, audit_retention_days, dex_alert_routing, dex_blast_min_devices, "
+     "dex_blast_window_seconds, dex_blast_cooldown_seconds, dex_cohort_export_key and the oidc_* "
+     "keys need an administrator account (an untiered administrator token is admitted, as on "
+     "REST); dex_score_policy has its own route and answers invalid params. Values are sent as "
+     "strings, e.g. \"90\"; key is 1 to 64 characters from a-z and _, value at most 256 bytes. "
+     "The write is audited before it applies: if the audit row cannot be stored the call fails and "
+     "nothing changes. The retention values are stored and shown by get_runtime_config but are "
+     "not enforced, even after a restart: the response and guardian-event stores take their "
+     "window from the server's command-line flags (#483), so this call does not change what "
+     "they delete.",
      R"j({"type":"object","properties":{"key":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[a-z_]+$","description":"Runtime config key, one of get_runtime_config's allowed_keys"},"value":{"type":"string","maxLength":256,"description":"The new value as a string, e.g. \"90\" or \"debug\""}},"required":["key","value"],"additionalProperties":false})j",
      R"j({"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"applied":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"present and false only when the outcome audit row could not be persisted"}},"required":["key","applied"]})j"},
 
@@ -22767,12 +22774,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                auto view = config::build_config_view(runtime_config_);
+                // Scoped to the caller: a key this session could not write has its override
+                // withheld and named in `withheld_keys` (config_write.hpp, build_config_view).
+                auto view = config::build_config_view(runtime_config_, &*session);
                 if (!view) {
                     mcp_audit("failure", "runtime config store unavailable");
                     res.set_content(a4_error(kInternalError, "runtime config store unavailable",
                                              "retry once the server reports ready",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -22798,14 +22807,25 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 const std::string key = args["key"].get<std::string>();
                 const std::string value = args["value"].get<std::string>();
+                // The advertised schema bounds, enforced here: input schemas are validated only
+                // on the approval-gated path, which this tool never takes.
+                if (key.empty() || key.size() > 64 ||
+                    !std::ranges::all_of(key, [](unsigned char c) {
+                        return (c >= 'a' && c <= 'z') || c == '_';
+                    }) ||
+                    value.size() > 256) {
+                    res.set_content(error_response(id, kInvalidParams, "key must be 1 to 64 characters from a-z and _, and value at most 256 bytes"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
                 if (auto refusal = config::write_refusal(key, *session)) {
                     if (refusal->kind == config::WriteRefusal::Kind::RouteOwned) {
                         res.set_content(a4_error(kInvalidParams, refusal->message, refusal->remediation), "application/json"); // retry-hint-exempt: the key has its own route, retrying fails identically
                         return;
                     }
                     // A `denied` row, as the REST routes write, and no `attempted` row.
-                    (void)audit_fn(req, "config.update", "denied", "RuntimeConfig", key,
-                                   refusal->audit_detail);
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "config.update", "denied", "RuntimeConfig", key,
+                        refusal->audit_detail);
                     mcp_audit("denied", refusal->audit_detail);
                     res.set_content(a4_error(kPermissionDenied, refusal->message, refusal->remediation), "application/json"); // retry-hint-exempt: authorization outcome, retrying cannot change it
                     return;
@@ -22814,7 +22834,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_audit("failure", "runtime config store unavailable");
                     res.set_content(a4_error(kInternalError, "runtime config store unavailable",
                                              "retry once the server reports ready",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -22841,8 +22861,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto written = config::write_and_apply(runtime_config_, key, value, *parsed,
                                                        session->username);
                 if (!written) {
-                    (void)audit_fn(req, "config.update", "failure", "RuntimeConfig", key,
-                                   written.error().audit_detail);
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "config.update", "failure", "RuntimeConfig", key,
+                        written.error().audit_detail);
                     mcp_audit("failure", written.error().audit_detail);
                     if (written.error().kind == config::WriteFault::Kind::Rejected) {
                         res.set_content(error_response(id, kInvalidParams, written.error().message), "application/json"); // retry-hint-exempt: the store refused the value, resending it fails identically
@@ -22854,8 +22875,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                const bool audit_ok = audit_fn(req, "config.update", "success", "RuntimeConfig", key,
-                                               config::success_audit_detail(key, value));
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "config.update", "success", "RuntimeConfig", key,
+                    config::success_audit_detail(key, value));
                 mcp_audit("success");
                 auto payload = config::applied_json(key, value);
                 if (!audit_ok)

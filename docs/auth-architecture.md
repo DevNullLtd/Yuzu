@@ -868,19 +868,19 @@ by each handler.
   server's route table is sealed: a later mutating registration through the
   route sink that has no row is not registered, is logged as critical and
   makes the sink throw. Adding a mutating route therefore means adding a row.
-- **Scope.** A fresh MFA proof is required on 36 named high-risk routes (plus
+- **Scope.** A fresh MFA proof is required on 37 named high-risk routes (plus
   the three JIT-elevation routes, whose handlers apply their own gate) for
   MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`;
   un-enrolled accounts and API/MCP tokens pass; engine principals are denied.
-  "High-risk" names these 36 routes; it is not a completeness claim. Other
+  "High-risk" names these 37 routes; it is not a completeness claim. Other
   mutating routes and all MCP tools are not MFA-step-up gated in this release:
   73 REST rows are still `kPendingRuling` (among them CA revoke and
   issue-code-signing, and `PUT /api/config/*`), and MCP is governed by the MCP tier
   and approval ladder (`docs/mcp-server.md`). The MCP tools are classified in
-  a second table, `step_up_mcp_policy.hpp` (64 rows: 19 `kExempt`, 45
+  a second table, `step_up_mcp_policy.hpp` (65 rows: 19 `kExempt`, 46
   `kPendingRuling`, none `kRequired`), which is data only and changes no MCP
   behaviour. The pending rows are a frozen baseline of 44 whose count only goes down,
-  plus a separate list of tools added after it (today one), legal only for a tool
+  plus a separate list of tools added after it (today two), legal only for a tool
   whose REST twin is `kRequired`, which a compile-time check ties to the REST
   table. Every pending tool with a `kRequired` twin is pending because no MCP
   consumer enforces `kRequired` yet. PR 2 promotes pending rows; an MCP `kRequired` row will need a
@@ -1939,7 +1939,7 @@ deploy, approval approve/reject, user delete/role change, MFA recovery-code rege
 JIT elevation)
 receives a `403` with `"MFA step-up is not available for SAML sessions in this
 release"`, regardless of `--mfa-enforcement` mode (the one exception is a disabled window: with
-`--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 36 routes enforced by the
+`--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 37 routes enforced by the
 central check, but not the three JIT-elevation routes, which own their gate and substitute a
 300 s window, so those still deny SAML). The step-up decision
 (`decide_step_up` in `step_up_gate.cpp`, shared by the chokepoint and

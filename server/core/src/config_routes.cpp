@@ -13,13 +13,24 @@
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <string_view>
+#include <utility>
 
 namespace yuzu::server::config {
 
 namespace {
 
-constexpr const char* kStoreUnavailableLegacy =
-    R"({"error":{"code":503,"message":"runtime config store unavailable"},"meta":{"api_version":"v1"}})";
+/// The body shapes the legacy routes answer in. A4 is the envelope every v1 refusal uses; Terse is
+/// the original `{"error":{"code","message"},"meta":{"api_version"}}` form and Flat the original
+/// `{"error": message}` form, both kept byte for byte (the Settings page and scripts parse them).
+enum class Legacy { A4, Terse, Flat };
+
+std::string terse_body(int code, std::string_view message) {
+    // nlohmann sorts object keys, which is the order the literal bodies always had.
+    return nlohmann::json({{"error", {{"code", code}, {"message", std::string(message)}}},
+                           {"meta", {{"api_version", "v1"}}}})
+        .dump();
+}
 
 /// A v1 success body: `{"data": ..., "meta": {"api_version": "v1"}}`.
 std::string ok_json(nlohmann::json data) {
@@ -31,13 +42,16 @@ std::string ok_json(nlohmann::json data) {
 /// answers every refusal in the A4 envelope. The gate order, the checks and the audit rows are
 /// identical, and every decision is `config_write.hpp`'s.
 void handle_put(const Deps& deps, const httplib::Request& req, httplib::Response& res, bool v1) {
-    // A refusal with `status`. The legacy route sends `legacy_body` when it has one (a literal
-    // that predates the A4 envelope); every other case, and the whole v1 route, is A4.
-    auto refuse = [&](int status, std::string_view message, const char* legacy_body = nullptr,
+    // A refusal with `status`. The v1 route answers every refusal in the A4 envelope. The legacy
+    // route answers in `legacy` shape where it always did, and in A4 where it always did.
+    auto refuse = [&](int status, std::string_view message, Legacy legacy = Legacy::A4,
                       detail::A4ErrorOpts opts = {}) {
         res.status = status;
-        if (!v1 && legacy_body)
-            res.set_content(legacy_body, "application/json");
+        if (!v1 && legacy == Legacy::Terse)
+            res.set_content(terse_body(status, message), "application/json");
+        else if (!v1 && legacy == Legacy::Flat)
+            res.set_content(nlohmann::json({{"error", std::string(message)}}).dump(),
+                            "application/json");
         else
             res.set_content(detail::a4_error(res, message, opts), "application/json");
     };
@@ -75,7 +89,7 @@ void handle_put(const Deps& deps, const httplib::Request& req, httplib::Response
     if (auto refusal = write_refusal(key, *session)) {
         if (refusal->kind == WriteRefusal::Kind::RouteOwned) {
             // Refused with no audit row, like the unknown-key refusal below.
-            refuse(400, refusal->message, nullptr,
+            refuse(400, refusal->message, Legacy::A4,
                    detail::A4ErrorOpts{.remediation = refusal->remediation});
             return;
         }
@@ -84,14 +98,14 @@ void handle_put(const Deps& deps, const httplib::Request& req, httplib::Response
         // must not turn the refusal into a 500.
         (void)detail::try_persist_audit(deps.audit_fn, req, "config.update", "denied",
                                         "RuntimeConfig", key, refusal->audit_detail);
-        refuse(403, refusal->message, nullptr,
+        refuse(403, refusal->message, Legacy::A4,
                detail::A4ErrorOpts{.remediation = refusal->remediation});
         return;
     }
 
     const auto backing = deps.backing();
     if (!store_ready(backing)) {
-        refuse(503, "runtime config store unavailable", kStoreUnavailableLegacy,
+        refuse(503, "runtime config store unavailable", Legacy::Terse,
                detail::A4ErrorOpts{.retry_after_ms = 5000,
                                    .remediation = "retry once the server reports ready"});
         return;
@@ -103,40 +117,31 @@ void handle_put(const Deps& deps, const httplib::Request& req, httplib::Response
         // below (j["value"].dump() when it is not a string), so the check has to run on the raw
         // text before any allocation.
         if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
-            refuse(400, "request body nests too deeply",
-                   R"({"error":{"code":400,"message":"request body nests too deeply"},"meta":{"api_version":"v1"}})");
+            refuse(400, "request body nests too deeply", Legacy::Terse);
             return;
         }
         auto j = nlohmann::json::parse(req.body);
         if (j.contains("value")) {
             value = j["value"].is_string() ? j["value"].get<std::string>() : j["value"].dump();
         } else {
-            refuse(400, "missing 'value' in request body",
-                   R"({"error":{"code":400,"message":"missing 'value' in request body"},"meta":{"api_version":"v1"}})");
+            refuse(400, "missing 'value' in request body", Legacy::Terse);
             return;
         }
     } catch (...) {
-        refuse(400, "invalid JSON body",
-               R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})");
+        refuse(400, "invalid JSON body", Legacy::Terse);
         return;
     }
 
     const auto parsed = validate_value(key, value);
     if (!parsed) {
-        refuse(400, parsed.error(),
-               R"({"error":{"code":400,"message":"value must be a non-negative integer"},"meta":{"api_version":"v1"}})");
+        refuse(400, parsed.error(), Legacy::Terse);
         return;
     }
 
     // An unknown key is refused here, before any audit row, so a junk key leaves no
     // attempted/failure pair. The store repeats the check as the authority.
     if (!RuntimeConfigStore::is_allowed_key(key)) {
-        const std::string message = "key '" + key + "' is not a configurable runtime setting";
-        res.status = 400;
-        if (v1)
-            res.set_content(detail::a4_error(res, message), "application/json");
-        else
-            res.set_content(nlohmann::json({{"error", message}}).dump(), "application/json");
+        refuse(400, "key '" + key + "' is not a configurable runtime setting", Legacy::Flat);
         return;
     }
 
@@ -146,7 +151,7 @@ void handle_put(const Deps& deps, const httplib::Request& req, httplib::Response
     // detail; the outcome row redacts it).
     if (!detail::emit_behavioral_audit(deps.audit_fn, req, res, "config.update", "attempted",
                                        "RuntimeConfig", key, "")) {
-        refuse(503, "audit log unavailable; the change was not made", nullptr,
+        refuse(503, "audit log unavailable; the change was not made", Legacy::A4,
                detail::A4ErrorOpts{.retry_after_ms = 5000, .remediation = "retry the request"});
         return;
     }
@@ -159,17 +164,11 @@ void handle_put(const Deps& deps, const httplib::Request& req, httplib::Response
         // A genuine DB/crypto failure is a 503 with a generic message, never the internal
         // detail; a refused value (unknown key, bad shape, the redaction-placeholder guard) is a
         // 400 with the store's own message, which is written for an operator.
-        if (written.error().kind == WriteFault::Kind::StoreFault) {
-            refuse(503, written.error().message, kStoreUnavailableLegacy,
+        if (written.error().kind == WriteFault::Kind::StoreFault)
+            refuse(503, written.error().message, Legacy::Terse,
                    detail::A4ErrorOpts{.retry_after_ms = 5000, .remediation = "retry the request"});
-        } else {
-            res.status = 400;
-            if (v1)
-                res.set_content(detail::a4_error(res, written.error().message), "application/json");
-            else
-                res.set_content(nlohmann::json({{"error", written.error().message}}).dump(),
-                                "application/json");
-        }
+        else
+            refuse(400, written.error().message, Legacy::Flat);
         return;
     }
 
@@ -201,7 +200,7 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
         auto view = build_config_view(deps.backing());
         if (!view) {
             res.status = 503;
-            res.set_content(kStoreUnavailableLegacy, "application/json");
+            res.set_content(terse_body(503, "runtime config store unavailable"), "application/json");
             return;
         }
         res.set_content(view->dump(), "application/json");
@@ -218,8 +217,13 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/api/v1/config", [deps](const httplib::Request& req, httplib::Response& res) {
         if (!deps.perm_fn(req, res, "Infrastructure", "Read"))
             return;
+        // The viewing session scopes what is shown (build_config_view): the legacy route above
+        // shows every override to every reader; this route shows only what the caller could write.
+        auto session = deps.auth_fn(req, res);
+        if (!session)
+            return;
         res.set_header("Cache-Control", "no-store");
-        auto view = build_config_view(deps.backing());
+        auto view = build_config_view(deps.backing(), &*session);
         if (!view) {
             res.status = 503;
             res.set_content(

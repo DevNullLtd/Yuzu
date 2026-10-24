@@ -16,7 +16,9 @@
 ///                       the live `Config` cannot take never lands in the store (no ghost write).
 ///   - `write_and_apply` the store write, then the in-memory apply of the integer keys.
 ///   - `build_config_view` the effective values, the stored overrides (secrets reported as
-///                       `is_set`, never a value), `allowed_keys` and `read_only_keys`.
+///                       `is_set`, never a value), `allowed_keys` and `read_only_keys`. Given a
+///                       viewing session it also withholds the value of every key that session
+///                       could not write (see its comment).
 ///
 /// No httplib, no audit sink, no envelope: the callers shape those.
 
@@ -48,7 +50,8 @@ struct Backing {
     RuntimeConfigStore* store{nullptr};
 };
 
-/// True when the store is wired and open. Every surface answers 503 otherwise.
+/// True when the store, the live config and the auto-approve engine are all wired and the store is
+/// open. Every surface answers 503 otherwise.
 [[nodiscard]] bool store_ready(const Backing& b) noexcept;
 
 /// A refusal of a write that has nothing to do with the value.
@@ -116,6 +119,16 @@ struct ViewFault {};
 
 /// The effective values, the stored overrides, `allowed_keys` and `read_only_keys` (the allowed
 /// keys the generic write refuses because they have their own route).
-[[nodiscard]] std::expected<nlohmann::json, ViewFault> build_config_view(const Backing& b);
+///
+/// `viewer` selects the audience. Null (the legacy `GET /api/config`, kept byte-identical) shows
+/// every override to every caller that passed the `Infrastructure:Read` gate. A session (the v1
+/// route and the MCP tool) is shown only the values it could WRITE: for every key
+/// `write_refusal` would deny it, the stored override is dropped and, for `audit_retention_days`,
+/// so is the effective value; the response then carries `withheld_keys`, the sorted keys withheld
+/// from this caller, so a client can tell "not set" from "not shown to you". This keeps a
+/// readonly-tier MCP token, which `tier_allows` bars from `OidcConfig:Read`, from reading the
+/// `oidc_*` overrides (`oidc_admin_group` is authorization topology) through the generic view.
+[[nodiscard]] std::expected<nlohmann::json, ViewFault> build_config_view(
+    const Backing& b, const auth::Session* viewer = nullptr);
 
 } // namespace yuzu::server::config
