@@ -446,7 +446,17 @@ struct ExecVisibleFacts {
     bool global_grant = false;
     /// The ADR-0017 per-agent visible set. `nullopt` == store error, fail closed.
     std::optional<std::unordered_set<std::string>> scoped_visible;
+    /// The caller is an engine principal (`engine:<slug>`). Its only authority is an explicit
+    /// RBAC grant (docs/auth-engine-principals-design.md §4.2 default-deny): no legacy-open fallback and no JIT elevation.
+    bool principal_is_engine = false;
 };
+
+/// True iff `principal` is in the reserved engine namespace. Structural: the `engine:` prefix
+/// cannot be held by a human account (rejected at user creation, token mint, SAML and RBAC
+/// assignment), so a username-keyed resolver with no Session can use it as the engine fact.
+[[nodiscard]] inline bool is_engine_principal_name(std::string_view principal) noexcept {
+    return principal.starts_with("engine:");
+}
 
 /// Decide a caller's `Execution:Execute` visible set (#1788).
 ///
@@ -458,6 +468,10 @@ struct ExecVisibleFacts {
 /// unfiltered, and reached the whole fleet. Checking the global grant first —
 /// or composing the two branches independently — reintroduces exactly that.
 ///
+/// An ENGINE principal (`principal_is_engine`) is resolved next, RBAC-only: legacy-open yields
+/// present-EMPTY (never `nullopt`), a global grant yields `nullopt`, otherwise its scoped set; JIT
+/// elevation never applies to it (design §4.2 default-deny).
+///
 /// This is a free function rather than a method for one reason: the previous
 /// arrangement, where the decision lived only inside `ServerImpl`, could not be
 /// tested without an `RbacStore`, so its tests re-implemented it. Two
@@ -467,6 +481,15 @@ struct ExecVisibleFacts {
     if (f.service_scoped) {
         // Never unfiltered. Absent tag store -> empty == deny-all.
         return f.service_tagged.value_or(std::unordered_set<std::string>{});
+    }
+    if (f.principal_is_engine) {
+        // RBAC-only authority: with RBAC off an engine is denied outright, never handed the
+        // legacy-open fleet. Present-empty, not nullopt (ADR-0033 §1).
+        if (f.legacy_open)
+            return std::unordered_set<std::string>{};
+        if (f.global_grant)
+            return std::nullopt;
+        return f.scoped_visible.value_or(std::unordered_set<std::string>{});
     }
     if (f.legacy_open || f.elevated || f.global_grant)
         return std::nullopt; // genuinely unfiltered authority

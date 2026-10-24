@@ -101,12 +101,11 @@ struct CaptureSourceDef {
     std::string_view name;        // "process", "tcp", "service", "user"
     std::string_view dollar_name; // "Process", "TCP", "Service", "User"
     // Whether a fresh agent (no `<name>_enabled` config row yet) treats this
-    // source as enabled. Always-on sources keep the default `true`; high-volume
-    // usage-class sources that are opt-in under the works-council posture
-    // (module, procperf, netqual) set this `false` so `tar.status`, retention,
-    // and the paused_at transition all agree the source starts disabled. This is
-    // the single source of truth — `source_default_enabled()` exposes it to the
-    // two call sites that only have the source name (issue #59 follow-up).
+    // source as enabled. Every source ships `true` (a registry-wide test
+    // forbids `false`); `tar.status`, retention, the collect gates and the
+    // paused_at transition all read this one field. This is the single source
+    // of truth — `source_default_enabled()` exposes it to the call sites that
+    // only have the source name (issue #59 follow-up).
     // (Declared before os_support so the designated initialisers in
     // build_sources() stay in member-declaration order.)
     bool default_enabled = true;

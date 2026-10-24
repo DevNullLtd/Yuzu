@@ -44,6 +44,7 @@ struct TestTarDb {
         fs::remove(path, ec);
         fs::remove(fs::path{path.string() + "-wal"}, ec);
         fs::remove(fs::path{path.string() + "-shm"}, ec);
+        fs::remove(fs::path{path.string() + "-journal"}, ec); // pre-created empty on Windows
     }
 };
 
@@ -506,7 +507,7 @@ TEST_CASE("TAR schema registry: power and removable default to ENABLED, live-tie
         else
             saw_removable = true;
 
-        // ALEX RULING 2026-09-04: the first two default-ON sources.
+        // Every source ships default-on.
         CHECK(src.default_enabled);
         CHECK(src.unique_key_column == "record_key");
         REQUIRE(src.granularities.size() == 1);

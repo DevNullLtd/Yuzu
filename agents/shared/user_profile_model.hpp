@@ -289,6 +289,27 @@ enum class UserKeyStatus {
                               // its size.
 };
 
+/// Per-consumer token for one hive-access outcome, reused by every converted plugin so a
+/// refused hive is reported the same way everywhere. `refusal` is the OfflineHiveFileCheck token
+/// (HiveAccessReport::refusal); file_refused renders it verbatim when set, else the generic
+/// "file_refused" literal. Exhaustive switch, no default, like hive_state_name above — -Wswitch
+/// flags enum drift.
+[[nodiscard]] inline std::string hive_access_token(HiveAccessStatus st, std::string_view refusal) {
+    switch (st) {
+    case HiveAccessStatus::ok:
+        return "ok";
+    case HiveAccessStatus::not_found:
+        return "not_found";
+    case HiveAccessStatus::privilege_missing:
+        return "privilege_missing";
+    case HiveAccessStatus::mount_failed:
+        return "mount_failed";
+    case HiveAccessStatus::file_refused:
+        return refusal.empty() ? "file_refused" : std::string{refusal};
+    }
+    return "mount_failed"; // unreachable — cases are exhaustive so -Wswitch flags enum drift
+}
+
 /// Renders the operator-facing lines for one hive-access outcome, in emission
 /// order: the unload warning first (when set), then the terminal error (when
 /// the status is not ok). Returns an empty vector for a clean success.
@@ -302,10 +323,15 @@ enum class UserKeyStatus {
 /// unload_failed can be true even on mount_failed (RegLoadKeyW can succeed
 /// while the subsequent root re-open fails), so a status-first switch that
 /// returned early would drop it.
-[[nodiscard]] inline std::vector<std::string> render_hive_access_lines(HiveAccessStatus status,
-                                                                       bool unload_failed,
-                                                                       std::string_view mount_name,
-                                                                       std::string_view sid) {
+///
+/// `refusal` (defaulted empty, so every pre-existing four-argument call site compiles unchanged)
+/// is the OfflineHiveFileCheck token on a file_refused status; when non-empty it is appended to
+/// the error line as `: <token>` (sanitized — a token embeds no operator-controlled bytes today,
+/// but a future one might).
+[[nodiscard]] inline std::vector<std::string>
+render_hive_access_lines(HiveAccessStatus status, bool unload_failed,
+                         std::string_view mount_name, std::string_view sid,
+                         std::string_view refusal = {}) {
     std::vector<std::string> out;
     const std::string safe_sid = sanitize_field(sid);
 
@@ -337,7 +363,12 @@ enum class UserKeyStatus {
         out.push_back(std::format("error|failed to load hive for sid '{}'", safe_sid));
         break;
     case HiveAccessStatus::file_refused:
-        out.push_back(std::format("error|hive file refused for sid '{}'", safe_sid));
+        if (refusal.empty()) {
+            out.push_back(std::format("error|hive file refused for sid '{}'", safe_sid));
+        } else {
+            out.push_back(std::format("error|hive file refused for sid '{}': {}", safe_sid,
+                                      sanitize_field(refusal)));
+        }
         break;
     case HiveAccessStatus::ok:
         break;
