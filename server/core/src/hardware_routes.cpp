@@ -885,10 +885,12 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         if (!deps_.scoped_perm_fn(req, res, "Inventory", "Read", id)) return;
 
-        // This LAST-dash split agrees with the first-dash split the ingest, the tracker and the
-        // SQL use (`extract_plugin`, `split_part(command_id, '-', 1)`) only because server-minted
-        // ids are `<plugin>-<hex>` and Forensics plugin names are dash-free; the boot soundness
-        // check (`forensics_catalogue_defect`) refuses a catalogue that breaks the second part.
+        // This LAST-dash split recovers the plugin the server recorded at dispatch (the ingest and
+        // the tracker label a response with that record, never with the id) only because
+        // server-minted ids are `<plugin>-<hex>` and Forensics plugin names are dash-free; the boot
+        // soundness check (`forensics_catalogue_defect`) refuses a catalogue that breaks the second
+        // part. A command id the server never issued is stored as unverified and this poll never
+        // finds it (the fixed-plugin tier excludes that label).
         const auto id_dash = command_id.rfind('-');
         const std::string plugin =
             (id_dash == std::string::npos || id_dash == 0) ? std::string{} : command_id.substr(0, id_dash);
