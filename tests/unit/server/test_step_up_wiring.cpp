@@ -2044,7 +2044,7 @@ TEST_CASE("wiring: server.cpp's in-handler StepUpFn and the pre-request deps nam
           "[stepup][wiring][lexical]") {
     const std::string src = read_server_cpp();
     // Each needle is a single line, so a CRLF checkout cannot split it.
-    constexpr std::string_view kCall = "detail::run_in_handler_step_up(req, res, session, action_label,";
+    constexpr std::string_view kCall = "return detail::run_in_handler_step_up(";
     REQUIRE(count_of(src, kCall) == 1);
     const auto call = src.find(kCall);
 
