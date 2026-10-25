@@ -1913,21 +1913,21 @@ single Postgres container, so this doubles that container's concurrent clients.
 
 *Baseline at np=2.* Fourteen successful `gcc-15`/`debug` runs from 2026-10-24
 16:46Z to 2026-10-25 01:22Z (runs 40112522948 to 40149184808, dev pushes and PR
-runs): the pg step took 474 s to 743 s (median 586 s), the 14 shards summed
+runs): the pg step took 474 s to 743 s (median 583 s), the 14 shards summed
 928 to 1,472 serial-s (sum/wall 1.96 to 1.99, so both workers were busy
 throughout) and the longest shard took 99 to 158 s. All 14 acquired their slot
-after 0 s. Step and shard times rose steadily through the window (474 s and 928
+after 0 s. Step and shard times drifted upward through the window, not monotonically (474 s and 928
 serial-s at the start, 743 s and 1,472 at the end), with or without any change
 of ours, and the 2026-10-20 figure above (1,778 serial-s) is higher still, so a
 comparison across time is not evidence; that is why the measurement below is
 interleaved. The Windows precedent went from 602 s at `--num-processes 2` to 358 s
 at 4 (Push 2 under "Windows test-phase concurrency gate" above: -40.5%, worst
-shard 1.16x); the 602 s is a single cold-cache sample, as that section says, on a
-different OS.
+shard 1.16x); the 602 s is a single cold-cache sample, as that section says, and Windows
+is a different OS.
 
 *Expectation (an estimate, not a measurement).* The shard sum divided by four is
 the floor, 232 s to 368 s for these runs. The Windows result suggests a cut of
-30% to 40% of the step, so roughly 140 s to 300 s on a step of 474 s to 743 s. The
+30% to 40% of the step, so a saving of roughly 140 s to 300 s on a step of 474 s to 743 s. The
 unknown is the shared Postgres container: four clients instead of two may slow
 every shard, which rule (b) bounds.
 
@@ -1936,8 +1936,8 @@ concurrent pg shards (up from 6) across three per-agent containers
 (`max_connections=400` each; a job owns its container, so connections do not add
 across jobs). The `ci.yml` comment on the slot count refused a jump to 9 shards
 as having no diagnostic support at that load; this goes past 9, on the strength
-of the measurement below and the post-merge watch. The containers have no CPU,
-memory or shm limit, so their backends are not covered by the runner's
+of the measurement below and the post-merge watch. The containers have no CPU or
+memory limit (`/dev/shm` is Docker's 64 MiB default), so their backends are not covered by the runner's
 `AllowedCPUs` (16 logical CPUs per runner agent), which pins only the test
 processes. Nightly and sanitizer jobs and the fourth runner's non-pg step (np=4
 since Push 2a) are not slot-gated and add to the load. Connection use per shard
@@ -1946,7 +1946,8 @@ has not been measured; the log checks below are the tripwire.
 *Measurement.* Alternate np=4 and np=2 runs back to back so box drift cancels,
 one job at a time, in the order np=4, np=2, np=4, np=2, each finishing before the
 next starts. That samples a lightly loaded box, not the 12-shard regime; the
-post-merge watch covers that. The np=4 side is this PR's `Linux gcc-15 debug` job
+post-merge watch covers that. Pair samples at the same slot number where possible and flag a pair whose slot
+numbers differ (a higher slot means another pg phase was running). The np=4 side is this PR's `Linux gcc-15 debug` job
 (first run plus a re-run). The np=2 side is a re-run of that job from the dev push
 at this branch's merge base (`gh run rerun <run> --job <id>`), so the shard
 population is the same; if the merge base has no such run, use the nearest later
@@ -1962,14 +1963,16 @@ Compare the np=4 median with the np=2 median taken in the same window, not with
 earlier days.
 
 *Decision rule.* The one under "Windows test-phase concurrency gate" above, with
-two differences: (b) compares each shard with its mean in the interleaved np=2
-samples, and the checks below on counts and errors are added. (a) the np=4 median
+two differences: (b) is measured against each shard's own mean in the
+interleaved np=2 samples, and the count and error checks are new. (a) the np=4 median
 is at least 10% below the interleaved np=2 median; (b) no shard takes more than
 1.5x its mean np=2 time; (c) no shard reaches 560 s (80% of its 700 s timeout);
 all 14 shards pass in every sample with Ok/Fail/Skipped counts equal to the np=2
 side; and no shard output contains `sorry, too many clients already`, `remaining
-connection slots are reserved`, `deadlock detected` or a connection or lease
-error (exhaustion may first show as slowness, which (b) catches). If (b) or (c)
+connection slots are reserved`, `deadlock detected`, `could not resize shared memory segment` or a connection
+or lease error. Meson prints and uploads output only for failing tests, so on an
+all-pass sample this check reads nothing and the all-14-pass requirement is the
+real test; exhaustion may also show first as slowness, which (b) catches. If (b) or (c)
 fails, or (a) comes in under 10%, revert to 2 and stop; a failed safety check is
 not "try one more sample".
 
@@ -1977,18 +1980,25 @@ not "try one more sample".
 runner names, slot waits and a rule-by-rule verdict are recorded here (as Push 2a
 did) and (a) to (c) pass. After the merge 2c stays open until the next 10 or more
 dev-push `gcc-15`/`debug` runs show no pg-shard TIMEOUT, no repeated 560 s
-watchdog warning on one shard or scattered across several, and no non-timing red.
+watchdog warning on one shard or scattered across several (two or more in the 10
+runs is repeated), and no non-timing red, and the median step minus slot wait of
+those runs is at or below the interleaved np=2 median. Record each run's slot
+number: the baseline never reached slot 3/3, so at least 3 of the 10 runs must
+have acquired slot 2/3 or higher or waited, or the watch continues.
 `tests/known-flaky.json` is `[]`, so nothing is retried and any np=4 flake turns
 the run red; the #2093 watchdog is reporting-only and gates nothing. Repeated
-warnings or any such red is a revert. That watch is also the flake-rate check
+warnings or any such red during the watch is a revert, not a re-run; the PR
+author watches the dev pushes. That watch is also the flake-rate check
 required before the Linux ladder's row 4 (np 4 → 6).
 
 *Revert.* Set `--num-processes` on the pg-shards `flake-retry.py` call back to 2,
 and in the same commit update the "Width history" comment and the "held at 2 ...
 until Push 2c" sentence in that step, ladder row 2c, the "Until Push 2a"
-sentence and this paragraph's status. A workflow edit also runs the canary job,
-and an in-flight PR's re-run reuses its original merge commit, so it keeps np=4
-until a new push or a sync. *Samples:* pending.
+sentence, this paragraph's status, and every sentence that says the pg step is np=4
+or that Push 2c widened it (grep `Push 2c`). The revert PR runs the full leg and, being a
+workflow edit, the canary job (about 6 minutes warm, much longer cold), so until
+it lands every dev push and new PR still runs np=4; an in-flight PR's re-run
+reuses its original merge commit and keeps np=4 until a new push or a sync. *Samples:* pending.
 
 ### Persistent runner-local test history
 
