@@ -42,11 +42,11 @@
  *     read" note: a paused backend returned after 101 s with neither statement_timeout nor
  *     tcp_user_timeout firing). Even that server-side timeout is in force only when the pool
  *     injects it: a DSN or PGOPTIONS carrying its own `options=` leaves the server's defaults
- *     (pg_pool.cpp), so a transaction-scoped bound on the store compare-and-set is the writer
- *     route's obligation, not this file's. So one stalled initiating request holds the writer
- *     lock and its own request thread for the stall, every other writer fails fast with
- *     WriterBusy, and readers are unaffected -- a stall delays writers, never wedges the
- *     process;
+ *     (pg_pool.cpp). A transaction-scoped bound on the store compare-and-set is not added: the
+ *     writer route (PUT/DELETE /api/v1/dex/score-policy) documents the limit. So one stalled
+ *     initiating request holds the writer lock and its own request thread for the stall, every
+ *     other writer fails fast with WriterBusy, and readers are unaffected -- a stall delays
+ *     writers, never wedges the process;
  *   - readers never take the writer lock: current() is unaffected by a parked writer, and the
  *     install under mu_ touches state, the injected clock and log lines only: no I/O;
  *   - an install serves at once and restarts the refresh window; a successful read that was in

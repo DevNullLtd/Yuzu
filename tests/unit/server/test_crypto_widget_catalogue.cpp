@@ -560,6 +560,42 @@ struct FakeAuth {
 };
 } // namespace
 
+TEST_CASE("crypto widgets: audit_detail_inventory - the unfiltered list's success row",
+          "[crypto][widgets]") {
+    namespace cw = yuzu::server::crypto_widgets;
+    CHECK(cw::audit_detail_inventory("c-1", 3, 200, 0, false) ==
+          "cid=c-1 inventory rows=3 limit=200 offset=0 has_more=false");
+    CHECK(cw::audit_detail_inventory("", 5, 5, 10, true) ==
+          "inventory rows=5 limit=5 offset=10 has_more=true");
+}
+
+TEST_CASE("crypto widgets: audit_detail_with_standing - only a served standing is named, never a "
+          "false available",
+          "[crypto][widgets]") {
+    namespace cw = yuzu::server::crypto_widgets;
+    CHECK(cw::audit_detail_with_standing("x", cw::Access::kAvailable) == "x standing=available");
+    // Only kAvailable is ever served. kRefused, kConfined and kDegraded are answered before any
+    // success row; if one ever reached a row it must not read as the real `available` standing.
+    CHECK(cw::audit_detail_with_standing("x", cw::Access::kRefused) == "x standing=unexpected");
+    CHECK(cw::audit_detail_with_standing("x", cw::Access::kConfined) == "x standing=unexpected");
+    CHECK(cw::audit_detail_with_standing("x", cw::Access::kDegraded) == "x standing=unexpected");
+}
+
+TEST_CASE("crypto widgets: the withheld audit token and message tell a confined caller from a "
+          "caller with no grant",
+          "[crypto][widgets]") {
+    namespace cw = yuzu::server::crypto_widgets;
+    CHECK(cw::audit_detail_ca_withheld("", cw::Access::kConfined).ends_with("withheld=confined"));
+    CHECK(cw::audit_detail_ca_withheld("", cw::Access::kRefused).ends_with("withheld=refused"));
+    CHECK(cw::audit_detail_ca_withheld("c-1", cw::Access::kRefused).starts_with("cid=c-1 "));
+    // A standing that is never withheld must not read as a real withheld reason.
+    CHECK(cw::audit_detail_ca_withheld("", cw::Access::kAvailable).ends_with("withheld=unexpected"));
+    CHECK(cw::audit_detail_ca_withheld("", cw::Access::kDegraded).ends_with("withheld=unexpected"));
+    CHECK(cw::withheld_message(cw::Access::kConfined) == cw::kConfinedWithheldMessage);
+    CHECK(cw::withheld_message(cw::Access::kRefused) == cw::kRefusedWithheldMessage);
+    CHECK(cw::kRefusedWithheldMessage != cw::kConfinedWithheldMessage);
+}
+
 TEST_CASE("crypto_access_for: a confined Inventory:Read holder - kConfined for fleet-wide-only, "
           "kAvailable for fleet-read",
           "[crypto][widgets][authz]") {
