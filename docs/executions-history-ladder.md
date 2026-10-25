@@ -189,8 +189,10 @@ output-carrying frame needs the same hook in the same place.
 Regression pins: `test_plugin_result_audit.cpp` ("the row is written before the
 execution advances ...") pins the gateway RUNNING site at runtime;
 `tests/test_audit_action_stamp_wiring_lexical.py` pins all four sites' order and
-their count (the Subscribe arms and the gateway terminal arm have no runtime
-ordering harness).
+their count, and that each hook's plugin argument is the one the server recorded
+at dispatch (`prov.plugin`, or the alias declared from it), never one parsed from
+the agent-echoed command id (the Subscribe arms and the gateway terminal arm have
+no runtime ordering harness).
 
 ### Partial-index planner contract
 
