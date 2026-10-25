@@ -94,8 +94,8 @@ TEST_CASE("installed_apps rows split as key|remainder (pre-existing server decod
           std::vector<std::string>{"app", "X|-|-|-|a|b|-"});
 }
 
-TEST_CASE("filesystem find_by_hash rows: a path ending in a backslash is folded so the size separator "
-          "stays a delimiter (#5624)",
+TEST_CASE("filesystem find_by_hash rows: a path ending in a backslash is folded so the size "
+          "separator stays a delimiter (#5624)",
           "[result_parsing]") {
     // The decoder undoes exactly one backslash before a pipe. `match|foo\|3` (an unfolded path
     // ending in a backslash) reads as an ESCAPED pipe, gluing the size onto the path; the plugin

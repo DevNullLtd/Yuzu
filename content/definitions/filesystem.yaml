@@ -766,7 +766,8 @@ metadata:
     bounded: it stops after 20 seconds, 50,000 directory entries visited or
     4 GiB hashed, and after 100 matches (a search ordinarily ends within 20
     seconds; a single blocked read or directory listing is not interrupted).
-    A file larger than the remaining byte budget is skipped. Below the
+    A file larger than the remaining byte budget is skipped and the result
+    reports byte_cap. Below the
     search root a symlink is never followed (the whole path on macOS and
     Linux 5.6 or later, the final component only on older Linux kernels and
     on Windows), a file that is not a regular file is never opened, a file

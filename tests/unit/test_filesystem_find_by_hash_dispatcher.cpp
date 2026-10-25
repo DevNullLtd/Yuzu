@@ -22,6 +22,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -33,6 +34,7 @@
 #ifdef __APPLE__
 #include <sys/mount.h> // getmntinfo_r_np
 #include <sys/param.h>
+#include <sys/resource.h> // getiopolicy_np
 #endif
 #endif
 
@@ -250,6 +252,25 @@ TEST_CASE("filesystem find_by_hash: a junction is skipped by design -- trailer, 
     CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
 }
 
+TEST_CASE("filesystem find_by_hash: a non-ASCII file name is reported as UTF-8",
+          "[filesystem][find_by_hash][dispatcher]") {
+    auto plugin = load_or_fail();
+    if (!plugin)
+        return;
+    Tree t;
+    const std::string content = "snow";
+    const fs::path file = t.root / L"\u96ea.txt"; // a name the ANSI code page cannot hold
+    std::ofstream{file, std::ios::binary} << content;
+    const auto result = find_by_hash(*plugin, t.root.string(), yuzu::shared::sha256_hex(content));
+    const auto u8 = file.u8string();
+    CHECK(result.rc == 0);
+    CHECK(captured_rows(result.captured) ==
+          std::vector<std::string>{"match|" + std::string{reinterpret_cast<const char*>(u8.data()),
+                                                          u8.size()} +
+                                       "|" + std::to_string(content.size()),
+                                   "matches_found|1"});
+}
+
 #endif // _WIN32
 
 #ifndef _WIN32
@@ -338,8 +359,8 @@ TEST_CASE("filesystem find_by_hash: an unreadable subdirectory is CONSTRAINED / 
     const auto hit = t.write("hit.txt", content);
     t.write("locked/inside.txt", "hidden");
     REQUIRE(::chmod((t.root / "locked").c_str(), 0) == 0);
+    yuzu::test::ScopeExit restore{[&] { ::chmod((t.root / "locked").c_str(), 0700); }};
     const auto result = find_by_hash(*plugin, t.root.string(), yuzu::shared::sha256_hex(content));
-    ::chmod((t.root / "locked").c_str(), 0700);
     CHECK(result.rc == 0);
     CHECK(captured_rows(result.captured) ==
           std::vector<std::string>{
@@ -364,8 +385,8 @@ TEST_CASE(
     Tree t;
     t.write("f.txt", "x");
     REQUIRE(::chmod(t.root.c_str(), 0) == 0);
+    yuzu::test::ScopeExit restore{[&] { ::chmod(t.root.c_str(), 0700); }};
     const auto result = find_by_hash(*plugin, t.root.string(), std::string(64, '0'));
-    ::chmod(t.root.c_str(), 0700);
     CHECK(result.rc == 0);
     CHECK(captured_rows(result.captured) ==
           std::vector<std::string>{
@@ -376,5 +397,25 @@ TEST_CASE(
     CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(result.result_provenance == "filesystem:skipped_unreadable");
 }
+
+#ifdef __APPLE__
+TEST_CASE("filesystem find_by_hash: the dataless-materialization policy is restored after a run",
+          "[filesystem][find_by_hash][dispatcher]") {
+    // The walk switches this per-THREAD policy off and LocalDispatcher runs it on this thread, so
+    // a missed restore would show here (and leak into every later command on a pool worker). The
+    // OFF-during-walk half needs an evicted CloudStorage item and is unproven by this case.
+    auto plugin = load_or_fail();
+    if (!plugin)
+        return;
+    const auto policy = [] {
+        return ::getiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD);
+    };
+    const int before = policy();
+    Tree t;
+    t.write("a.txt");
+    CHECK(find_by_hash(*plugin, t.root.string(), std::string(64, '0')).rc == 0);
+    CHECK(policy() == before);
+}
+#endif
 
 #endif // !_WIN32

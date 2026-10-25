@@ -19,7 +19,8 @@
 // The three bounds are coupled, not independent: whichever trips first ends the walk. The deadline
 // is polled between system calls, so a search ordinarily ends within 20 seconds; a single blocked
 // read or directory listing is not interrupted (#4875). A file larger than the remaining byte
-// budget is skipped and counted (skipped_oversize), so one big file cannot end the walk.
+// budget is skipped and counted (skipped_oversize), so one big file cannot end the walk; the run
+// then reports byte_cap, because that file went unexamined.
 //
 // An entry below the search root is NEVER followed through a symlink (whole path on macOS and
 // Linux >= 5.6, leaf only on older Linux kernels and on Windows), a non-regular file is never
@@ -28,7 +29,7 @@
 // examine, or stopped short of, is counted and reported by ONE trailing `truncated|...` row; a run
 // that skipped nothing writes exactly the rows it always wrote.
 
-#include "filesystem_acl_parsers.hpp" // yuzu::filesystem::acl::row_field (shared row-field escaping)
+#include "filesystem_acl_parsers.hpp" // yuzu::filesystem::acl::row_field (row-field escaping)
 
 #include <sha256.hpp> // yuzu::shared::Sha256
 
@@ -106,6 +107,8 @@ struct WalkLimits {
 
 // -- Outcome ------------------------------------------------------------------------------------
 
+/// byte_cap is also the outcome of a walk that ran to its end after skipping a file larger than the
+/// remaining byte budget (HashKind::over_budget): the bound kept that file from being examined.
 enum class StopReason { none, deadline, file_cap, byte_cap, cancelled, max_results };
 
 [[nodiscard]] constexpr std::string_view stop_reason_token(StopReason r) noexcept {
@@ -142,7 +145,7 @@ struct WalkOutcome {
     WalkCounters c;
 
     /// True when anything was skipped or the walk stopped early: the one case that writes the
-    /// trailing `truncated|...` row. By-design exclusions (a symlink, a FIFO, an oversize file)
+    /// trailing `truncated|...` row. By-design exclusions (a symlink, a FIFO, a file over 10 GB)
     /// are counted here, so the row is the operator's evidence that they were not examined.
     [[nodiscard]] bool trailer_needed() const noexcept {
         return stop != StopReason::none || c.skipped_unreadable > 0 || c.skipped_symlink > 0 ||
@@ -150,7 +153,7 @@ struct WalkOutcome {
     }
     /// True when something the operator would expect to be examined was not: a tripped bound, an
     /// entry that could not be read, or a network mount that was refused. Drives
-    /// CONSTRAINED/PARTIAL; a by-design exclusion alone (symlink, FIFO, oversize) does not.
+    /// CONSTRAINED/PARTIAL; a by-design exclusion alone (symlink, FIFO, file over 10 GB) does not.
     [[nodiscard]] bool constrained() const noexcept {
         return stop != StopReason::none || c.skipped_unreadable > 0 || c.skipped_network_mount > 0;
     }
@@ -222,8 +225,8 @@ struct WalkOutcome {
 }
 
 /// macOS firmlinked volume: a mount the system creates is listed as `/System/Volumes/Data/<path>`
-/// and is the same object as `/<path>`; a firmlink is not a symlink, so a prefix compare cannot tell
-/// the spellings apart (docs/darwin-compat.md).
+/// and is the same object as `/<path>`; a firmlink is not a symlink, so a prefix compare cannot
+/// tell the spellings apart (docs/darwin-compat.md).
 inline constexpr std::string_view kDataVolume = "/System/Volumes/Data";
 
 /// Adds the other spelling of every mount (stripped / Data-volume form; never "/") so a root
@@ -320,7 +323,9 @@ private:
 
 // -- Walk ---------------------------------------------------------------------------------------
 
-enum class HashKind { hashed, symlink, not_regular, oversize, unreadable, stopped };
+/// oversize: over the 10 GB per-file ceiling (by design). over_budget: within the ceiling but
+/// larger than the byte budget that is left, so the bound kept it from being examined.
+enum class HashKind { hashed, symlink, not_regular, oversize, over_budget, unreadable, stopped };
 
 struct HashOutcome {
     HashKind kind{HashKind::unreadable};
@@ -357,6 +362,7 @@ WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_l
     WalkOutcome out;
     WalkCounters& c = out.c;
     HashBudget budget{limits, env.now, env.cancelled, c};
+    bool over_budget = false; // a file was skipped for want of byte budget
 
     // The root first: a root under a network mount is refused before any syscall names it, and an
     // unreadable root is counted -- skip_permission_denied would otherwise turn it into a clean,
@@ -436,6 +442,10 @@ WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_l
             case HashKind::oversize:
                 ++c.skipped_oversize;
                 break;
+            case HashKind::over_budget:
+                ++c.skipped_oversize;
+                over_budget = true;
+                break;
             case HashKind::unreadable:
                 ++c.skipped_unreadable;
                 break;
@@ -465,6 +475,10 @@ WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_l
             break;
         }
     }
+    // The walk went on past a file the byte cap kept it from examining: that is a tripped bound,
+    // unless an earlier one already ended the walk and named itself.
+    if (over_budget && out.stop == StopReason::none)
+        out.stop = StopReason::byte_cap;
     return out;
 }
 
@@ -613,7 +627,8 @@ template <class ReadChunk>
     struct statfs info{};
     if (::fstatfs(fd.get(), &info) != 0)
         return false;
-    // f_type is signed on some ABIs: widen from its unsigned twin so 0xcafe4a11 does not sign-extend.
+    // f_type is signed on some ABIs: widen from its unsigned twin so 0xcafe4a11 does not
+    // sign-extend.
     using Raw = std::make_unsigned_t<decltype(info.f_type)>;
     if (is_pseudo_fs_magic(static_cast<std::uint64_t>(static_cast<Raw>(info.f_type))))
         return false;
@@ -638,8 +653,10 @@ template <class ReadChunk>
     if (!S_ISREG(st.st_mode))
         return {HashKind::not_regular, {}, 0};
     const auto size = static_cast<std::uintmax_t>(st.st_size);
-    if (size > limits.max_file_bytes || size > budget.remaining())
+    if (size > limits.max_file_bytes)
         return {HashKind::oversize, {}, 0};
+    if (size > budget.remaining())
+        return {HashKind::over_budget, {}, 0};
     return hash_stream(
         [&](unsigned char* buf, std::size_t len) -> long long {
             return static_cast<long long>(::read(fd.get(), buf, len));
@@ -759,8 +776,10 @@ struct BcryptSha256 {
         return {HashKind::not_regular, {}, 0};
     const std::uintmax_t size =
         (static_cast<std::uintmax_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
-    if (size > limits.max_file_bytes || size > budget.remaining())
+    if (size > limits.max_file_bytes)
         return {HashKind::oversize, {}, 0};
+    if (size > budget.remaining())
+        return {HashKind::over_budget, {}, 0};
 
     detail::BcryptSha256 sha;
     if (!sha.ok)

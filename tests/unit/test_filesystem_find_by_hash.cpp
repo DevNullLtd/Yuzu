@@ -387,8 +387,8 @@ TEST_CASE("find_by_hash depth: max_depth matches the old slash-count meaning and
 
 // -- Symlinks, special files, unreadable --------------------------------------------------------
 
-TEST_CASE("find_by_hash hasher verdicts: a symlink or non-regular file found at open time is counted "
-          "and does not constrain",
+TEST_CASE("find_by_hash hasher verdicts: a symlink or non-regular file found at open time is "
+          "counted and does not constrain",
           "[find_by_hash]") {
     // The TOCTOU swap the descriptor-based hashers exist for: the walk's lstat said "regular file",
     // the open found a link (or a FIFO). The walk must count each under its own counter.
@@ -502,8 +502,8 @@ TEST_CASE("find_by_hash unreadable: a file without read permission is counted an
     const auto locked = t.write("locked.txt", "secret");
     t.write("open.txt", "plain");
     REQUIRE(::chmod(locked.c_str(), 0) == 0);
+    yuzu::test::ScopeExit restore{[&] { ::chmod(locked.c_str(), 0600); }};
     const auto w = walk(t, 3, {}, real_env(), yuzu::shared::sha256_hex("plain"));
-    ::chmod(locked.c_str(), 0600);
     CHECK(w.out.c.skipped_unreadable == 1);
     CHECK(w.out.matches == 1);
     CHECK(w.out.constrained());
@@ -534,8 +534,8 @@ TEST_CASE(
     Tree t;
     t.write("locked/inside.txt", "x");
     REQUIRE(::chmod((t.root / "locked").c_str(), 0) == 0);
+    yuzu::test::ScopeExit restore{[&] { ::chmod((t.root / "locked").c_str(), 0700); }};
     const auto w = walk(t, 3, {}, real_env());
-    ::chmod((t.root / "locked").c_str(), 0700);
     CHECK(w.out.c.skipped_unreadable == 1);
     CHECK(w.out.constrained());
 }
@@ -567,8 +567,8 @@ TEST_CASE(
     Tree t;
     t.write("f.txt");
     REQUIRE(::chmod(t.root.c_str(), 0) == 0);
+    yuzu::test::ScopeExit restore{[&] { ::chmod(t.root.c_str(), 0700); }};
     const auto w = walk(t, 3, {}, real_env());
-    ::chmod(t.root.c_str(), 0700);
     CHECK(w.out.c.skipped_unreadable == 1);
     CHECK(w.out.c.visited == 0);
 }
@@ -587,10 +587,10 @@ TEST_CASE("find_by_hash can_enter_posix: a listable directory, and nothing else"
     CHECK_FALSE(fbh::can_enter_posix(t.root / "dirlink")); // a symlink is never entered
     if (!running_as_root()) {
         REQUIRE(::chmod((t.root / "dir").c_str(), 0) == 0);
+        yuzu::test::ScopeExit restore{[&] { ::chmod((t.root / "dir").c_str(), 0700); }};
         CHECK_FALSE(fbh::can_enter_posix(t.root / "dir"));
         REQUIRE(::chmod((t.root / "dir").c_str(), 0400) == 0); // listable names, no search bit
         CHECK_FALSE(fbh::can_enter_posix(t.root / "dir"));
-        ::chmod((t.root / "dir").c_str(), 0700);
     }
 }
 
@@ -618,8 +618,9 @@ TEST_CASE("find_by_hash pseudo-filesystems: /proc is refused as a directory, so 
     std::error_code ec;
     if (!fs::is_directory("/proc/sys", ec))
         SKIP("/proc is not mounted");
-    // Classified on the directory BEFORE the iterator names a child: a /proc/kmsg open (which drains
-    // the kernel log with CAP_SYSLOG) cannot happen, because nothing under /proc is ever listed.
+    // Classified on the directory BEFORE the iterator names a child: a /proc/kmsg open (which
+    // drains the kernel log with CAP_SYSLOG) cannot happen, because nothing under /proc is ever
+    // listed.
     CHECK_FALSE(fbh::can_enter_posix("/proc"));
     CHECK_FALSE(fbh::can_enter_posix("/proc/sys"));
     if (fs::is_directory("/sys/kernel", ec))
@@ -628,7 +629,8 @@ TEST_CASE("find_by_hash pseudo-filesystems: /proc is refused as a directory, so 
     Probe probe;
     auto env = fake_env(probe); // records every hash_entry call: none may happen
     env.can_enter = fbh::can_enter_posix;
-    const auto out = fbh::walk_find_by_hash("/proc", kTarget, 5, {}, env, [](const std::string&) {});
+    const auto out =
+        fbh::walk_find_by_hash("/proc", kTarget, 5, {}, env, [](const std::string&) {});
     CHECK(out.c.visited == 0);
     CHECK(out.c.skipped_unreadable == 1);
     CHECK(probe.hashed.empty());
@@ -671,6 +673,10 @@ TEST_CASE("find_by_hash descriptors: no walk, refusal or mid-file stop leaves a 
             const auto locked = t.write("locked.txt", "secret");
             REQUIRE(::chmod(locked.c_str(), 0) == 0);
         }
+        yuzu::test::ScopeExit restore{[&] {
+            if (!running_as_root())
+                ::chmod((t.root / "locked.txt").c_str(), 0600);
+        }};
         fbh::WalkLimits oversize;
         oversize.max_file_bytes = 4; // huge.bin (5 bytes) and big.bin are oversize
         (void)walk(t, 3, oversize, real_env(), kTarget);
@@ -684,8 +690,6 @@ TEST_CASE("find_by_hash descriptors: no walk, refusal or mid-file stop leaves a 
         // The refusals: a link and a pipe through the real open.
         CHECK(hash_direct(t.root / "link.txt").kind == fbh::HashKind::symlink);
         CHECK(hash_direct(t.root / "pipe").kind == fbh::HashKind::not_regular);
-        if (!running_as_root())
-            ::chmod((t.root / "locked.txt").c_str(), 0600);
     }
     CHECK(open_fd_count() == before);
 }
@@ -781,7 +785,7 @@ TEST_CASE("find_by_hash real hasher: a file larger than the remaining byte budge
           "before a byte is read",
           "[find_by_hash]") {
     // The real per-OS hasher (hash_entry_win on Windows, hash_entry_posix elsewhere), not a fake:
-    // a file that can never fit is skipped up front (oversize), so it cannot end the walk
+    // a file that can never fit is skipped up front (over_budget), so it cannot end the walk
     // part-way through. The per-chunk byte cap itself (a file that grows after it is sized) is
     // pinned on the streaming reader below.
     Tree t;
@@ -789,7 +793,7 @@ TEST_CASE("find_by_hash real hasher: a file larger than the remaining byte budge
     fbh::WalkLimits lim;
     lim.max_bytes_hashed = 2 * fbh::kHashChunk;
     const auto got = hash_run(p, lim);
-    CHECK(got.outcome.kind == fbh::HashKind::oversize);
+    CHECK(got.outcome.kind == fbh::HashKind::over_budget);
     CHECK(got.stop == fbh::StopReason::none);
     CHECK(got.counters.hashed_bytes == 0);
 }
@@ -842,12 +846,12 @@ TEST_CASE("find_by_hash oversize: a file over max_file_bytes is counted but does
     CHECK_FALSE(w.out.constrained());
 }
 
-TEST_CASE("find_by_hash byte budget: a file larger than the remaining budget is skipped, not a "
-          "walk-ender",
+TEST_CASE("find_by_hash byte budget: a file larger than the remaining budget is skipped, the walk "
+          "goes on, and the run is byte_cap",
           "[find_by_hash]") {
     // The "no silent miss" oracle for the byte cap: one big file must not end the scan before a
     // later needle. The 5-byte file can never fit the 4-byte budget, whatever order the directory
-    // lists the two files in.
+    // lists the two files in. It also went unexamined, so the run is constrained, not complete.
     Tree t;
     t.write("big.bin", "12345");
     t.write("needle.bin", "1234");
@@ -855,10 +859,32 @@ TEST_CASE("find_by_hash byte budget: a file larger than the remaining budget is 
     lim.max_bytes_hashed = 4;
     const auto w = walk(t, 3, lim, real_env(), yuzu::shared::sha256_hex("1234"));
     CHECK(w.out.c.skipped_oversize == 1);
-    CHECK(w.out.stop == fbh::StopReason::none); // counted and skipped, not a byte_cap stop
+    CHECK(w.out.stop == fbh::StopReason::byte_cap);
+    CHECK(w.out.constrained());
+    CHECK(fbh::constrained_reason(w.out) == "filesystem:byte_cap");
     CHECK(w.out.matches == 1);
     CHECK(w.out.c.hashed_bytes == 4);
-    CHECK_FALSE(w.out.constrained());
+}
+
+TEST_CASE("find_by_hash byte budget: a bound that already ended the walk keeps its own name",
+          "[find_by_hash]") {
+    Tree t;
+    for (int i = 0; i < 3; ++i)
+        t.write("f" + std::to_string(i));
+    Probe probe;
+    auto env = fake_env(probe);
+    int calls = 0;
+    env.hash_entry = [&calls](const fs::directory_entry&, fbh::HashBudget&,
+                              const fbh::WalkLimits&) {
+        const bool first = calls++ == 0;
+        return fbh::HashOutcome{first ? fbh::HashKind::over_budget : fbh::HashKind::hashed,
+                                std::string{kMiss}, 1};
+    };
+    fbh::WalkLimits lim;
+    lim.max_files_visited = 2; // the second file is hashed, the third entry trips the file cap
+    const auto w = walk(t, 3, lim, env);
+    CHECK(w.out.c.skipped_oversize == 1);
+    CHECK(w.out.stop == fbh::StopReason::file_cap);
 }
 
 // -- Network mounts -----------------------------------------------------------------------------

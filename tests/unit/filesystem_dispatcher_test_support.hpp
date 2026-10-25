@@ -35,6 +35,8 @@
 #endif
 #include <windows.h>
 #include <winioctl.h> // FSCTL_SET_REPARSE_POINT (AFTER windows.h)
+
+#include <yuzu/agent/confined_fs.hpp> // confined_fs::WinHandle, the shared HANDLE owner
 #else
 #include <unistd.h>
 #endif
@@ -149,8 +151,6 @@ inline bool running_as_root() {
 
 /// A junction (NTFS mount point) at `link` -> `target`. `link` must not exist yet.
 inline bool create_junction(const fs::path& link, const fs::path& target) {
-    // Every allocating (throwing) step comes BEFORE the handle is opened: nothing between
-    // CreateFileW and CloseHandle can throw, so the raw HANDLE below cannot leak.
     // Hand-built IO_REPARSE_TAG_MOUNT_POINT buffer: REPARSE_DATA_BUFFER is WDK-only. The
     // substitute name is the NT form of the absolute target (the \??\ prefix), the print name the
     // plain absolute path.
@@ -181,17 +181,14 @@ inline bool create_junction(const fs::path& link, const fs::path& target) {
 
     if (!CreateDirectoryW(link.c_str(), nullptr))
         return false;
-    const HANDLE raw =
+    const yuzu::agent::confined_fs::WinHandle h{
         CreateFileW(link.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
-                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    if (raw == INVALID_HANDLE_VALUE)
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr)};
+    if (!h)
         return false;
     DWORD returned = 0;
-    const bool ok =
-        DeviceIoControl(raw, FSCTL_SET_REPARSE_POINT, buf.data(), static_cast<DWORD>(buf.size()),
-                        nullptr, 0, &returned, nullptr) != 0;
-    CloseHandle(raw);
-    return ok;
+    return DeviceIoControl(h.get(), FSCTL_SET_REPARSE_POINT, buf.data(),
+                           static_cast<DWORD>(buf.size()), nullptr, 0, &returned, nullptr) != 0;
 }
 
 /// Removes the junction ITSELF on destruction (RemoveDirectory on a reparse-point directory never
@@ -208,19 +205,18 @@ struct JunctionCleanup {
 /// handle opened with FILE_FLAG_OPEN_REPARSE_POINT sees the attribute. Returns false if the volume
 /// refuses the fixture.
 inline bool make_file_reparse_point(const fs::path& file) {
-    const HANDLE raw = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
-                                   FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-    if (raw == INVALID_HANDLE_VALUE)
+    const yuzu::agent::confined_fs::WinHandle h{CreateFileW(
+        file.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr)};
+    if (!h)
         return false;
     // The 8-byte header only: ReparseTag, ReparseDataLength = 0, Reserved.
     std::uint8_t buf[8]{};
     const std::uint32_t tag = 0x80000023; // IO_REPARSE_TAG_AF_UNIX
     std::memcpy(buf, &tag, sizeof(tag));
     DWORD returned = 0;
-    const bool ok = DeviceIoControl(raw, FSCTL_SET_REPARSE_POINT, buf, sizeof(buf), nullptr, 0,
-                                    &returned, nullptr) != 0;
-    CloseHandle(raw);
-    return ok;
+    return DeviceIoControl(h.get(), FSCTL_SET_REPARSE_POINT, buf, sizeof(buf), nullptr, 0,
+                           &returned, nullptr) != 0;
 }
 #endif
 

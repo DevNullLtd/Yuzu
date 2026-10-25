@@ -397,8 +397,9 @@ const char* kFindByHashSchema =
     R"({"name":"size","type":"int64"}])";
 
 // The verbatim trailer filesystem_find_by_hash.hpp writes (nine fields).
-const char* kTrailer = "truncated|deadline|visited=5|hashed=9|skipped_unreadable=1|skipped_symlink=0|"
-                       "skipped_not_regular=0|skipped_oversize=0|skipped_network_mount=0";
+const char* kTrailer = "truncated|deadline|visited=5|hashed=9|skipped_unreadable=1|"
+                       "skipped_symlink=0|skipped_not_regular=0|skipped_oversize=0|"
+                       "skipped_network_mount=0";
 
 const char* kHitOutput = "match|/etc/hosts|413\n"
                          "truncated|deadline|visited=5|hashed=9|skipped_unreadable=1|"

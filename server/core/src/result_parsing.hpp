@@ -73,6 +73,11 @@ inline const std::vector<std::string>& columns_for_plugin(const std::string& plu
     return kDefaultColumns;
 }
 
+/// True when the plugin's fixed schema is key + value (Agent, Key, Value).
+inline bool is_key_value_schema(const std::string& plugin) {
+    return columns_for_plugin(plugin).size() == 3;
+}
+
 // -- Per-cell operator hints --------------------------------------------------
 //
 // A rendered cell's raw value can have a non-obvious meaning an operator
@@ -188,8 +193,7 @@ inline std::vector<std::string> split_fields(const std::string& plugin,
         return parts;
     }
     // key|value plugins: split into exactly 2 (key, rest)
-    auto& cols = columns_for_plugin(plugin);
-    if (cols.size() == 3) { // Agent + Key + Value
+    if (is_key_value_schema(plugin)) {
         auto sep = find_unescaped_pipe(line, 0);
         if (sep != std::string::npos)
             return {unescape_pipes(line.substr(0, sep)), unescape_pipes(line.substr(sep + 1))};
@@ -210,7 +214,7 @@ inline std::vector<std::string> split_fields(const std::string& plugin,
 /// not one).
 inline std::vector<std::string> split_fields(const std::string& plugin, const std::string& line,
                                              std::size_t declared_width) {
-    if (declared_width == 2 || columns_for_plugin(plugin).size() != 3) // not the key/value schema
+    if (declared_width == 2 || !is_key_value_schema(plugin))
         return split_fields(plugin, line);
     return split_all_pipes(line);
 }
