@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """test_filesystem_definition.py -- pins the shipped `device.filesystem.find_by_hash` definition
 (content/definitions/filesystem.yaml) to the row contract the plugin writes
-(`match|<path>|<size>`, an optional `truncated|<reason>|visited=N|...` row,
-`matches_found|<count>`), so a reordered, renamed or reverted result column fails here rather than
-only in a dashboard.
+(`match|<path>|<size>`, an optional `network_mount_guard|unavailable` row, an optional
+`truncated|<reason>|visited=N|...` row, `matches_found|<count>`), so a reordered, renamed or
+reverted result column fails here rather than only in a dashboard.
 
 tests/unit/server/test_result_set_matcher.cpp keeps its own copy of the schema (the server test
-binary has no YAML loader); the same column names, types and row_kind values are pinned in both
-places.
+binary has no YAML loader); the same column names, types, row_kind values and `discriminator` are
+pinned in both places.
 
 Runnable standalone: `python3 tests/test_filesystem_definition.py` (how meson runs it; a bare
 pytest-style file with no runner would execute zero assertions and always exit 0).
@@ -47,9 +47,20 @@ class FindByHashDefinition(unittest.TestCase):
         self.assertEqual([c["name"] for c in columns], ["row_kind", "path", "size"])
         self.assertEqual([c["type"] for c in columns], ["string", "string", "int64"])
 
-    def test_row_kind_values_are_the_three_wire_row_kinds(self):
+    def test_row_kind_opts_in_to_the_every_pipe_split(self):
+        # `discriminator: true` on the first column is what makes the server's result-set matcher
+        # split these rows on every pipe (bind_declared_columns stores `row_discriminator`).
+        # Without it a key/value plugin's rows are key + remainder and never match a wider
+        # declaration, so dropping the key silently turns every column matcher on this
+        # instruction into a never-match; it is on the first column only.
+        columns = _find_by_hash()["spec"]["result"]["columns"]
+        self.assertIs(columns[0]["discriminator"], True)
+        self.assertEqual([c["name"] for c in columns if "discriminator" in c], ["row_kind"])
+
+    def test_row_kind_values_are_the_wire_row_kinds(self):
         row_kind = _find_by_hash()["spec"]["result"]["columns"][0]
-        self.assertEqual(row_kind["values"], ["match", "truncated", "matches_found"])
+        self.assertEqual(row_kind["values"],
+                         ["match", "truncated", "matches_found", "network_mount_guard"])
 
 
 if __name__ == "__main__":

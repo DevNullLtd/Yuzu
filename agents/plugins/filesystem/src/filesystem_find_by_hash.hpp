@@ -143,6 +143,9 @@ struct WalkOutcome {
     int matches{0};
     StopReason stop{StopReason::none};
     WalkCounters c;
+    /// The mount table could not be read in full, so the network-mount guard was off for the whole
+    /// walk (WalkEnv::mount_table_complete). Not a skip counter: nothing was refused or counted.
+    bool mount_table_incomplete{false};
 
     /// True when anything was skipped or the walk stopped early: the one case that writes the
     /// trailing `truncated|...` row. By-design exclusions (a symlink, a FIFO, a file over 10 GB)
@@ -152,10 +155,12 @@ struct WalkOutcome {
                c.skipped_not_regular > 0 || c.skipped_oversize > 0 || c.skipped_network_mount > 0;
     }
     /// True when something the operator would expect to be examined was not: a tripped bound, an
-    /// entry that could not be read, or a network mount that was refused. Drives
-    /// CONSTRAINED/PARTIAL; a by-design exclusion alone (symlink, FIFO, file over 10 GB) does not.
+    /// entry that could not be read, a network mount that was refused, or a walk that ran without
+    /// its mount guard. Drives CONSTRAINED/PARTIAL; a by-design exclusion alone (symlink, FIFO,
+    /// file over 10 GB) does not.
     [[nodiscard]] bool constrained() const noexcept {
-        return stop != StopReason::none || c.skipped_unreadable > 0 || c.skipped_network_mount > 0;
+        return stop != StopReason::none || mount_table_incomplete || c.skipped_unreadable > 0 ||
+               c.skipped_network_mount > 0;
     }
 };
 
@@ -163,6 +168,8 @@ struct WalkOutcome {
 [[nodiscard]] inline std::string constrained_reason(const WalkOutcome& o) {
     if (o.stop != StopReason::none)
         return "filesystem:" + std::string{stop_reason_token(o.stop)};
+    if (o.mount_table_incomplete)
+        return "filesystem:mount_table_unreadable";
     if (o.c.skipped_unreadable > 0)
         return "filesystem:skipped_unreadable";
     return "filesystem:skipped_network_mount";
@@ -177,6 +184,23 @@ struct WalkOutcome {
                        stop_reason_token(o.stop), o.c.visited, o.c.hashed_bytes,
                        o.c.skipped_unreadable, o.c.skipped_symlink, o.c.skipped_not_regular,
                        o.c.skipped_oversize, o.c.skipped_network_mount);
+}
+
+/// The row written when the mount table could not be read in full. It has two fields, not the
+/// three of a match row, so it is never a data row to a column matcher; the status number alone is
+/// not visible on REST, MCP or CSV, so this row is the operator-visible signal.
+inline constexpr std::string_view kMountGuardUnavailableRow = "network_mount_guard|unavailable";
+
+/// The rows that close a walk, in order: the guard-off row when the mount table was unreadable,
+/// the `truncated|...` trailer when anything was skipped or stopped short, then `matches_found|N`.
+[[nodiscard]] inline std::vector<std::string> format_outcome_rows(const WalkOutcome& o) {
+    std::vector<std::string> rows;
+    if (o.mount_table_incomplete)
+        rows.emplace_back(kMountGuardUnavailableRow);
+    if (o.trailer_needed())
+        rows.push_back(format_trailer(o));
+    rows.push_back(std::format("matches_found|{}", o.matches));
+    return rows;
 }
 
 /// `match|<path>|<size>`. The path takes the plugin's shared row-field escaping: CR/LF fold to a
@@ -351,6 +375,17 @@ struct WalkEnv {
     };
     /// Mount points whose subtrees are refused. Empty = no guard.
     std::vector<std::string> network_mounts;
+    /// False when the mount table could not be read in full: the list above is then empty or
+    /// partial and the walk runs unguarded, which the outcome reports.
+    bool mount_table_complete{true};
+};
+
+/// The network mount points of this host and whether the table was read in full. `complete` is
+/// false when it could not be (the list is then empty): the walk still runs, reported as
+/// constrained, rather than looking like a clean unguarded success.
+struct MountList {
+    std::vector<std::string> mounts;
+    bool complete{true};
 };
 
 /// Walk `root` to `max_depth` (root's children are depth 1), emitting one `match|...` row per
@@ -360,6 +395,7 @@ template <class Emit>
 WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_lower, int max_depth,
                               const WalkLimits& limits, const WalkEnv& env, Emit emit) {
     WalkOutcome out;
+    out.mount_table_incomplete = !env.mount_table_complete;
     WalkCounters& c = out.c;
     HashBudget budget{limits, env.now, env.cancelled, c};
     bool over_budget = false; // a file was skipped for want of byte budget

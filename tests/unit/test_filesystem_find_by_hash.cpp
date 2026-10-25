@@ -939,6 +939,60 @@ TEST_CASE("find_by_hash mounts: a root on a mount is refused before any hook run
     }
 }
 
+TEST_CASE("find_by_hash mount table: an incomplete read constrains the result on every walk path",
+          "[find_by_hash]") {
+    Tree t;
+    t.write("f.txt");
+    Probe probe;
+    auto env = fake_env(probe);
+    env.mount_table_complete = false;
+
+    // A normal walk: nothing was skipped, but the guard was off, so the result is partial.
+    auto w = walk(t, 3, {}, env);
+    CHECK(w.out.mount_table_incomplete);
+    CHECK(w.out.matches == 1);
+    CHECK(w.out.constrained());
+    CHECK_FALSE(w.out.trailer_needed()); // the guard-off row, not the trailer, says it
+    CHECK(fbh::constrained_reason(w.out) == "filesystem:mount_table_unreadable");
+
+    // The unreadable-root early return carries it too.
+    env.can_enter = [](const fs::path&) {
+        return false;
+    };
+    w = walk(t, 3, {}, env);
+    CHECK(w.out.mount_table_incomplete);
+    CHECK(w.out.c.skipped_unreadable == 1);
+    CHECK(w.out.constrained());
+
+    // The refused-root early return carries it too (a partial list can still name the root).
+    env.network_mounts = {t.str()};
+    w = walk(t, 3, {}, env);
+    CHECK(w.out.mount_table_incomplete);
+    CHECK(w.out.c.skipped_network_mount == 1);
+
+    // A complete table (the default) never sets it.
+    Probe clean_probe;
+    CHECK_FALSE(walk(t, 3, {}, fake_env(clean_probe)).out.mount_table_incomplete);
+}
+
+TEST_CASE("find_by_hash format_outcome_rows: the guard-off row precedes the trailer and the count",
+          "[find_by_hash]") {
+    fbh::WalkOutcome o;
+    o.matches = 2;
+    CHECK(fbh::format_outcome_rows(o) == std::vector<std::string>{"matches_found|2"});
+
+    o.mount_table_incomplete = true;
+    CHECK(fbh::format_outcome_rows(o) ==
+          std::vector<std::string>{"network_mount_guard|unavailable", "matches_found|2"});
+
+    o.c.skipped_symlink = 1;
+    const auto rows = fbh::format_outcome_rows(o);
+    REQUIRE(rows.size() == 3);
+    CHECK(rows[0] == "network_mount_guard|unavailable");
+    CHECK(rows[1] == fbh::format_trailer(o));
+    CHECK(rows[2] == "matches_found|2");
+}
+
 TEST_CASE("find_by_hash is_under_mount: path-boundary matching", "[find_by_hash]") {
     const std::vector<std::string> nfs{"/mnt/nfs"};
     CHECK(fbh::is_under_mount("/mnt/nfs", nfs));
@@ -1071,6 +1125,10 @@ TEST_CASE("find_by_hash trailer_needed / constrained: the two predicates differ 
     o.stop = fbh::StopReason::max_results;
     CHECK(o.trailer_needed());
     CHECK(o.constrained());
+    o = {};
+    o.mount_table_incomplete = true; // the guard was off: partial, but no trailer of its own
+    CHECK_FALSE(o.trailer_needed());
+    CHECK(o.constrained());
 }
 
 TEST_CASE("find_by_hash constrained_reason: the provenance names the first applicable cause",
@@ -1080,7 +1138,9 @@ TEST_CASE("find_by_hash constrained_reason: the provenance names the first appli
     CHECK(fbh::constrained_reason(o) == "filesystem:skipped_network_mount");
     o.c.skipped_unreadable = 1; // unreadable outranks a mount skip
     CHECK(fbh::constrained_reason(o) == "filesystem:skipped_unreadable");
-    o.stop = fbh::StopReason::deadline; // a tripped bound outranks both
+    o.mount_table_incomplete = true; // an unguarded walk outranks a skip counter
+    CHECK(fbh::constrained_reason(o) == "filesystem:mount_table_unreadable");
+    o.stop = fbh::StopReason::deadline; // a tripped bound outranks all of them
     CHECK(fbh::constrained_reason(o) == "filesystem:deadline");
     o.stop = fbh::StopReason::max_results;
     CHECK(fbh::constrained_reason(o) == "filesystem:max_results");

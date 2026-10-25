@@ -19,6 +19,7 @@ namespace {
 
 constexpr const char* kDeclaredColumnsKey = "declared_columns";
 constexpr const char* kPluginKey = "plugin";
+constexpr const char* kRowDiscriminatorKey = "row_discriminator";
 
 // Split `text` on '\n' into non-owning views, dropping a trailing empty
 // fragment. Bounded by the caller's output size (responses are retention-
@@ -150,13 +151,14 @@ bool json_column_match(std::string_view output, const std::string& column, const
 }
 
 // Column matcher over a plugin's plain pipe rows, resolved by the definition's DECLARED column
-// names (stored in the matcher at admission by bind_declared_columns). Rows are split to the
-// DECLARED width (`split_fields(plugin, line, width)`), so the index is the declared column
-// position, not the dashboard cell position: for a key/value plugin the dashboard still shows key
-// + remainder under the declared headers (a pre-existing display gap tracked separately). A row
-// is a data row only when its field count equals the declared width: a line of any other width
-// (status|not_found, not_available|<reason>, a longer trailer, a malformed row) or that equals
-// the header is skipped.
+// names (stored in the matcher at admission by bind_declared_columns). By default rows are split
+// exactly as the dashboard / SSE / facets split them (`split_fields`). A definition that declares
+// a leading row discriminator (`discriminator: true` on its first column, stored as
+// `row_discriminator`) is split on every unescaped pipe instead, so its declared columns are the
+// wire fields in order; without the flag a key/value plugin's rows are key + remainder and never
+// match a wider declaration. Either way a row is a data row only when its field count equals the
+// declared width: a line of any other width (status|not_found, not_available|<reason>, a longer
+// trailer, a malformed row) or that equals the header is skipped.
 bool declared_column_match(std::string_view output, const std::string& column, const std::string& op,
                            const nlohmann::json& matcher) {
     std::vector<std::string> declared;
@@ -172,11 +174,13 @@ bool declared_column_match(std::string_view output, const std::string& column, c
         return false;
     const std::string plugin = matcher.contains(kPluginKey) ? matcher[kPluginKey].get<std::string>()
                                                             : std::string();
+    const bool all_pipes = matcher.value(kRowDiscriminatorKey, false);
     for (const auto& line_view : split_lines(output)) {
         std::string line(line_view);
         if (line.empty())
             continue;
-        const auto cells = yuzu::server::split_fields(plugin, line, declared.size());
+        const auto cells = all_pipes ? yuzu::server::split_all_pipes(line)
+                                     : yuzu::server::split_fields(plugin, line);
         if (cells.size() != declared.size() || cells == declared)
             continue;
         if (cell_satisfies(cells[idx], op, matcher))
@@ -232,7 +236,27 @@ std::optional<std::string> column_shape_defect(const nlohmann::json& m) {
     }
     if (m.contains(kPluginKey) && !m[kPluginKey].is_string())
         return "matcher.plugin must be a string";
+    if (m.contains(kRowDiscriminatorKey) && !m[kRowDiscriminatorKey].is_boolean())
+        return "matcher.row_discriminator must be a boolean";
     return std::nullopt;
+}
+
+// True when the definition's FIRST declared column carries `discriminator: true`: its columns are
+// the wire fields in order, leading row-kind tag included (find_by_hash). Reads the same two
+// shapes as columns_from_result_schema (array, or object with `columns`). Anything else, a stored
+// definition that predates the key included, is false and keeps the plugin's own split.
+bool declares_row_discriminator(const std::string& result_schema_json) {
+    const auto parsed = nlohmann::json::parse(result_schema_json, nullptr, false);
+    const nlohmann::json* cols = nullptr;
+    if (parsed.is_array())
+        cols = &parsed;
+    else if (parsed.is_object() && parsed.contains("columns") && parsed["columns"].is_array())
+        cols = &parsed["columns"];
+    if (!cols || cols->empty() || !(*cols)[0].is_object())
+        return false;
+    const auto& first = (*cols)[0];
+    return first.contains("discriminator") && first["discriminator"].is_boolean() &&
+           first["discriminator"].get<bool>();
 }
 
 } // namespace
@@ -245,7 +269,7 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json) {
         return std::nullopt; // the unrecognised-shape default is unchanged
     if (m.contains("kind") && !m["kind"].is_string())
         return "matcher.kind must be a string";
-    for (const char* key : {kDeclaredColumnsKey, kPluginKey})
+    for (const char* key : {kDeclaredColumnsKey, kPluginKey, kRowDiscriminatorKey})
         if (m.contains(key))
             return std::string("matcher.") + key + " is server-authored and cannot be supplied";
     if (!m.contains("kind"))
@@ -282,6 +306,8 @@ void bind_declared_columns(nlohmann::json& matcher, const std::string& result_sc
         return;
     matcher[kDeclaredColumnsKey] = cols;
     matcher[kPluginKey] = plugin;
+    if (declares_row_discriminator(result_schema_json))
+        matcher[kRowDiscriminatorKey] = true;
 }
 
 int tar_row_count(std::string_view output) {

@@ -355,7 +355,7 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
 // disclosed residuals (#4875): this is a deny-list by filesystem name.
 #if defined(_WIN32)
 
-std::vector<std::string> find_by_hash_network_mounts(const std::string& directory) {
+yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std::string& directory) {
     // The root as the pre-validation guard will judge it (absolute, lexically normalised: a
     // relative root lands on the drive of the agent's working directory; fs::absolute resolves
     // that lexically via GetFullPathNameW and never touches the target). If it cannot, refuse.
@@ -367,22 +367,23 @@ std::vector<std::string> find_by_hash_network_mounts(const std::string& director
     // disk (a mapped network drive, removable, optical, RAM disk, unknown) is refused; a
     // nonexistent drive falls through to the normal "directory is not accessible" error.
     if (ec || where.starts_with("\\\\") || where.starts_with("//"))
-        return {where};
+        return {{where}, true};
     if (judged.has_root_name()) {
         const std::wstring root = judged.root_name().wstring() + L"\\";
         if (yuzu::filesystem::find_by_hash::win_root_drive_refused(GetDriveTypeW(root.c_str())))
-            return {where};
+            return {{where}, true};
     }
     return {};
 }
 
 #elif defined(__linux__)
 
-std::vector<std::string> find_by_hash_network_mounts(const std::string&) {
+yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std::string&) {
     // /proc/self/mountinfo reports st_size 0, so the reader streams to the cap. The 16 MiB cap is
     // a bound (the remote_access_audit / runtimes precedent), not a claim to cover every possible
     // table: fs.mount-max can allow far more mounts than that. When the table cannot be read in
-    // full the walk runs unguarded and says why, once.
+    // full the walk runs unguarded: the list is marked incomplete, so the result is reported
+    // constrained, and the reason is logged once.
     constexpr std::size_t kMountinfoCap = 16 * 1024 * 1024;
     const auto table = yuzu::shared::read_file_no_follow("/proc/self/mountinfo", kMountinfoCap);
     if (!table.ok()) {
@@ -394,21 +395,29 @@ std::vector<std::string> find_by_hash_network_mounts(const std::string&) {
                              ? std::string{"larger than the 16 MiB read bound"}
                              : std::format("errno {}", table.err));
         });
-        return {};
+        return {{}, false};
     }
-    return yuzu::shared::network_mount_points(table.data);
+    return {yuzu::shared::network_mount_points(table.data), true};
 }
 
 #elif defined(__APPLE__)
 
-std::vector<std::string> find_by_hash_network_mounts(const std::string&) {
+yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std::string&) {
     // getmntinfo_r_np(MNT_NOWAIT) answers from the kernel's cache and never calls into a server.
     struct statfs* raw = nullptr;
     const int n = ::getmntinfo_r_np(&raw, MNT_NOWAIT);
     const std::unique_ptr<struct statfs, decltype(&::free)> table{raw, &::free};
+    // The table always holds at least the root mount, so zero entries is a failed read, not an
+    // empty host (remote_access_audit_macos.cpp treats it the same way).
+    if (n <= 0 || raw == nullptr) {
+        static std::once_flag warned;
+        std::call_once(warned, [] {
+            spdlog::warn("filesystem find_by_hash: getmntinfo_r_np returned no mounts; the "
+                         "network-mount guard is off");
+        });
+        return {{}, false};
+    }
     std::vector<std::string> out;
-    if (n <= 0 || raw == nullptr)
-        return out;
     for (int i = 0; i < n; ++i) {
         if (yuzu::shared::is_network_mount_fstype(table.get()[i].f_fstypename))
             out.emplace_back(table.get()[i].f_mntonname);
@@ -416,7 +425,7 @@ std::vector<std::string> find_by_hash_network_mounts(const std::string&) {
     // A mount the system creates is listed as /System/Volumes/Data/<path> (autofs /home): refuse
     // the plain spelling too.
     yuzu::filesystem::find_by_hash::add_data_volume_aliases(out);
-    return out;
+    return {std::move(out), true};
 }
 
 // Dataless (iCloud / File Provider) files and directories must not be materialised by a walk: the
@@ -449,7 +458,7 @@ private:
 
 #else
 
-std::vector<std::string> find_by_hash_network_mounts(const std::string&) {
+yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std::string&) {
     return {};
 }
 
@@ -2367,9 +2376,8 @@ private:
         // The one report of a finished (or refused) walk: the trailer when anything was skipped or
         // stopped short, the count, then the typed status when part of the tree was not examined.
         const auto emit_outcome = [&ctx](const fbh::WalkOutcome& o) {
-            if (o.trailer_needed())
-                ctx.write_output(fbh::format_trailer(o));
-            ctx.write_output(std::format("matches_found|{}", o.matches));
+            for (const auto& row : fbh::format_outcome_rows(o))
+                ctx.write_output(row);
             if (o.constrained())
                 ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
                                       YUZU_RESULT_COMPLETENESS_PARTIAL, fbh::constrained_reason(o));
@@ -2377,7 +2385,7 @@ private:
         };
 
         auto mounts = find_by_hash_network_mounts(std::string{directory});
-        if (fbh::root_lexically_under_mount(directory, mounts)) {
+        if (fbh::root_lexically_under_mount(directory, mounts.mounts)) {
             fbh::WalkOutcome refused;
             refused.c.skipped_network_mount = 1;
             return emit_outcome(refused);
@@ -2426,7 +2434,8 @@ private:
         env.hash_entry = fbh::hash_entry_posix;
         env.can_enter = fbh::can_enter_posix;
         // the core re-checks the canonical root and every entry against this list
-        env.network_mounts = std::move(mounts);
+        env.network_mounts = std::move(mounts.mounts);
+        env.mount_table_complete = mounts.complete;
 #endif
 
         const auto outcome =

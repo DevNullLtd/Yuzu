@@ -73,11 +73,6 @@ inline const std::vector<std::string>& columns_for_plugin(const std::string& plu
     return kDefaultColumns;
 }
 
-/// True when the plugin's fixed schema is key + value (Agent, Key, Value).
-inline bool is_key_value_schema(const std::string& plugin) {
-    return columns_for_plugin(plugin).size() == 3;
-}
-
 // -- Per-cell operator hints --------------------------------------------------
 //
 // A rendered cell's raw value can have a non-obvious meaning an operator
@@ -193,29 +188,14 @@ inline std::vector<std::string> split_fields(const std::string& plugin,
         return parts;
     }
     // key|value plugins: split into exactly 2 (key, rest)
-    if (is_key_value_schema(plugin)) {
+    auto& cols = columns_for_plugin(plugin);
+    if (cols.size() == 3) { // Agent + Key + Value
         auto sep = find_unescaped_pipe(line, 0);
         if (sep != std::string::npos)
             return {unescape_pipes(line.substr(0, sep)), unescape_pipes(line.substr(sep + 1))};
         return {unescape_pipes(line), ""};
     }
     // Default: split on all pipes
-    return split_all_pipes(line);
-}
-
-/// Split a line to a definition's DECLARED column width (the result-set matcher's reader). A
-/// key/value plugin's fixed schema is key + remainder, but its content DEFINITION may declare more
-/// columns (find_by_hash: row_kind, path, size). Width 2 deliberately mirrors the dashboard's key +
-/// remainder, and a non-key/value plugin (vuln_scan and the kSchemas plugins included) keeps its
-/// own schema: both delegate to the 2-argument overload. For a key/value plugin at any OTHER width
-/// the line is split on every unescaped pipe, so the caller's `cells.size() != declared.size()`
-/// check is the whole rule: a row is a data row only when its field count equals the declared
-/// width (a longer row such as a 9-field trailer, or a shorter one such as `matches_found|0`, is
-/// not one).
-inline std::vector<std::string> split_fields(const std::string& plugin, const std::string& line,
-                                             std::size_t declared_width) {
-    if (declared_width == 2 || !is_key_value_schema(plugin))
-        return split_fields(plugin, line);
     return split_all_pipes(line);
 }
 
