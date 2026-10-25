@@ -1,0 +1,1006 @@
+/**
+ * test_tar_registry_source.cpp -- the `registry` cursor-model TAR source
+ * (tar_registry_parsers.hpp pure core + tar_registry_source.{hpp,cpp}).
+ *
+ * Three layers: (1) the pure core -- paths, rendering, baselines, the diff, the
+ * dirty table, record keys and codecs; (2) the collect() state machine over an
+ * injected reader and a real ephemeral TarDatabase, on every platform; (3) the
+ * [windows] live cases (kingsley) that run the real key watch and reader. No test
+ * sleeps: a live notification is awaited on the dirty table's condition variable
+ * with a deadline, and time is the injected clock.
+ */
+
+#include "tar_cursor.hpp"
+#include "tar_db.hpp"
+#include "tar_registry_parsers.hpp"
+#include "tar_registry_source.hpp"
+#include "tar_schema_registry.hpp"
+#include "test_helpers.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
+
+#include <sqlite3.h>
+
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <map>
+#include <optional>
+#include <set>
+#include <string>
+#include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <sddl.h>
+#include <win_str.hpp>
+#endif
+
+namespace fs = std::filesystem;
+using namespace yuzu::tar;
+using Catch::Matchers::ContainsSubstring;
+
+namespace {
+
+constexpr std::int64_t SEC = 10'000'000;           // 100 ns ticks per second
+constexpr std::int64_t T0 = 133'000'000'000'000'000LL; // a plausible FILETIME
+
+// ── builders ────────────────────────────────────────────────────────────────
+
+std::string dword(std::uint32_t v) {
+    std::string b(4, '\0');
+    for (int i = 0; i < 4; ++i)
+        b[static_cast<std::size_t>(i)] = static_cast<char>((v >> (8 * i)) & 0xFF);
+    return b;
+}
+
+std::string utf16(std::string_view ascii, bool nul = true) {
+    std::string b;
+    for (char c : ascii) {
+        b += c;
+        b += '\0';
+    }
+    if (nul)
+        b.append(2, '\0');
+    return b;
+}
+
+RegistryValueRead vread(std::uint32_t type, std::string bytes) {
+    RegistryValueRead v;
+    v.type = type;
+    v.full_size = bytes.size();
+    v.bytes = std::move(bytes);
+    return v;
+}
+
+SubtreeRead complete(std::map<std::string, std::map<std::string, RegistryValueRead>> keys) {
+    SubtreeRead r;
+    r.status = RegistryReadStatus::Complete;
+    r.keys = std::move(keys);
+    return r;
+}
+
+} // namespace
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pure core
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("normalise_registry_path maps only the current control set", "[tar][registry][pure]") {
+    CHECK(normalise_registry_path("HKLM\\SYSTEM\\ControlSet001\\Services", 1) ==
+          "HKLM\\SYSTEM\\CurrentControlSet\\Services");
+    CHECK(normalise_registry_path("HKLM\\SYSTEM\\ControlSet001\\Services", 2) ==
+          "HKLM\\SYSTEM\\ControlSet001\\Services");
+    CHECK(normalise_registry_path("HKLM\\SYSTEM\\controlset002\\Services", 2) ==
+          "HKLM\\SYSTEM\\CurrentControlSet\\Services"); // comparison is case-insensitive
+    CHECK(normalise_registry_path("HKU\\S-1-5-21-1\\Software\\Run", 1) ==
+          "HKU\\S-1-5-21-1\\Software\\Run"); // case and content preserved
+}
+
+TEST_CASE("default_registry_scope: curated roots, per-user roots skip non-profile hives",
+          "[tar][registry][pure]") {
+    const auto scope = default_registry_scope();
+    const auto roots = scope.roots_for({"S-1-5-21-1", ".DEFAULT", "S-1-5-21-1_Classes",
+                                         "S-1-5-21-1_CLASSES", "S-1-5-18"});
+    const std::set<std::string> set(roots.begin(), roots.end());
+    CHECK(set.size() == roots.size()); // every root once
+    CHECK(roots.size() == scope.hklm.size() + 2 * scope.hku_suffix.size());
+    CHECK(set.contains("HKLM\\SYSTEM\\CurrentControlSet\\Services"));
+    CHECK(set.contains("HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"));
+    CHECK(set.contains("HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce"));
+    CHECK(set.contains("HKU\\S-1-5-21-1\\Software\\Policies"));
+    CHECK_FALSE(set.contains("HKU\\.DEFAULT\\Software\\Policies"));
+    CHECK_FALSE(set.contains("HKU\\S-1-5-21-1_Classes\\Software\\Policies"));
+    static_assert(kWatchHandleCap + 2 <= 64);
+}
+
+TEST_CASE("render_reg_data renders each registry type", "[tar][registry][pure]") {
+    namespace P = yuzu::profiles;
+    CHECK(render_reg_data(P::kRegSz, utf16("hello"), 100).text == "hello");
+    CHECK(render_reg_data(P::kRegSz, utf16("hello", false), 100).text == "hello"); // no trailing NUL
+    CHECK(render_reg_data(P::kRegExpandSz, utf16("%SystemRoot%\\x"), 100).text == "%SystemRoot%\\x");
+    CHECK(render_reg_data(P::kRegMultiSz, utf16("a", false) + std::string(2, '\0') +
+                                              utf16("bc", false) + std::string(4, '\0'),
+                          100).text == "a\nbc");
+    CHECK(render_reg_data(P::kRegDword, dword(4294967295u), 100).text == "4294967295");
+    CHECK(render_reg_data(P::kRegQword, std::string("\x01\0\0\0\0\0\0\0", 8), 100).text == "1");
+    CHECK(render_reg_data(P::kRegBinary, std::string("\x00\xAB\xff", 3), 100).text == "00abff");
+    // cap -> truncated flag, on the TEXT
+    const auto cut = render_reg_data(P::kRegSz, utf16("abcdefghij"), 4);
+    CHECK(cut.text == "abcd");
+    CHECK(cut.truncated);
+    CHECK(render_reg_data(P::kRegBinary, std::string(100, 'a'), 10).truncated);
+    // an odd-length UTF-16 payload does not crash
+    CHECK_NOTHROW(render_reg_data(P::kRegSz, std::string("a\0b", 3), 100));
+    // type tokens come from the shared model
+    CHECK(P::reg_type_name(P::kRegDword) == "REG_DWORD");
+    CHECK(P::reg_type_name(P::kRegSz) == "REG_SZ");
+}
+
+TEST_CASE("baseline_entry_from_bytes hashes every byte read (R8)", "[tar][registry][pure]") {
+    namespace P = yuzu::profiles;
+    std::string a(100 * 1024, 'x');
+    std::string b = a;
+    b.back() = 'y'; // changed only in its last byte
+    const auto ea = baseline_entry_from_bytes(P::kRegBinary, a.size(), a, false);
+    const auto eb = baseline_entry_from_bytes(P::kRegBinary, b.size(), b, false);
+    CHECK(ea.h != eb.h);
+    CHECK(ea.s == eb.s);
+    CHECK(ea == baseline_entry_from_bytes(P::kRegBinary, a.size(), a, false)); // identical bytes
+    CHECK(ea.d.size() <= kBaselineRenderCap);
+    const auto big = baseline_entry_from_bytes(P::kRegBinary, 9'000'000, a, true);
+    CHECK(big.dt); // hash covers a prefix only
+    CHECK(big.s == 9'000'000);
+}
+
+TEST_CASE("diff_registry_snapshot: added, changed, removed and the four read statuses",
+          "[tar][registry][pure]") {
+    namespace P = yuzu::profiles;
+    const std::string root = "HKLM\\SOFTWARE\\r";
+    auto read1 = complete({{root + "\\A", {{"ImagePath", vread(P::kRegSz, utf16("c:\\a.exe"))}}},
+                           {root + "\\B", {{"ImagePath", vread(P::kRegSz, utf16("c:\\b.exe"))}}}});
+    const auto first = diff_registry_snapshot({}, read1, "reconcile", 20, /*suppress=*/true);
+    CHECK(first.candidates.empty()); // the first read of a root reports nothing
+    CHECK(first.baseline.keys.size() == 2);
+
+    SECTION("two subkeys holding the same value name are distinct entries; nothing changed") {
+        const auto same = diff_registry_snapshot(first.baseline, read1, "notify", 20);
+        CHECK(same.candidates.empty());
+        CHECK_FALSE(same.changed); // identical snapshots -> no StateWrite
+    }
+
+    SECTION("added / changed / removed value on a Complete read carry prev_*") {
+        auto read2 = complete(
+           {{root + "\\A", {{"ImagePath", vread(P::kRegSz, utf16("c:\\a2.exe"))},
+                            {"Start", vread(P::kRegDword, dword(2))}}},
+            {root + "\\B", {}}}); // B lost ImagePath
+        const auto d = diff_registry_snapshot(first.baseline, read2, "notify", 20);
+        REQUIRE(d.candidates.size() == 3);
+        std::map<std::string, RegistryCandidate> by;
+        for (const auto& c : d.candidates)
+            by[c.action + ":" + c.key.substr(root.size() + 1) + ":" + c.value] = c;
+        const auto& changed = by.at("changed:A:ImagePath");
+        CHECK(changed.data == "c:\\a2.exe");
+        CHECK(changed.has_prev);
+        CHECK(changed.prev_data == "c:\\a.exe");
+        CHECK(by.at("added:A:Start").data == "2");
+        CHECK_FALSE(by.at("added:A:Start").has_prev);
+        CHECK(by.at("removed:B:ImagePath").prev_data == "c:\\b.exe");
+        CHECK(d.changed);
+    }
+
+    SECTION("an Absent root removes every value, then the key") {
+        SubtreeRead gone;
+        gone.status = RegistryReadStatus::Absent;
+        const auto d = diff_registry_snapshot(first.baseline, gone, "reconcile", 20);
+        int removed = 0, key_removed = 0;
+        for (const auto& c : d.candidates) {
+            removed += c.action == "removed";
+            key_removed += c.action == "key_removed";
+        }
+        CHECK(removed == 2);
+        CHECK(key_removed == 2);
+        CHECK(d.baseline.keys.empty());
+    }
+
+    SECTION("Unreadable changes nothing: no candidates, baseline byte-identical") {
+        SubtreeRead bad;
+        bad.status = RegistryReadStatus::Unreadable;
+        const auto d = diff_registry_snapshot(first.baseline, bad, "reconcile", 20);
+        CHECK(d.candidates.empty());
+        CHECK(encode_registry_baseline(d.baseline) == encode_registry_baseline(first.baseline));
+        CHECK_FALSE(d.changed);
+    }
+
+    SECTION("Capped adds and updates what it visited, retains the rest, removes nothing") {
+        SubtreeRead part;
+        part.status = RegistryReadStatus::Capped;
+        part.keys = {{root + "\\A", {{"ImagePath", vread(P::kRegSz, utf16("c:\\a3.exe"))}}}};
+        const auto d = diff_registry_snapshot(first.baseline, part, "reconcile", 20);
+        REQUIRE(d.candidates.size() == 1);
+        CHECK(d.candidates[0].action == "changed");
+        CHECK(d.baseline.keys.contains(root + "\\B")); // unvisited prior entries retained
+        CHECK(d.baseline.keys.at(root + "\\B").contains("ImagePath"));
+    }
+
+    SECTION("new data is truncated at kRegistryDataCap and the stored size is the full size") {
+        RegistryValueRead big;
+        big.type = P::kRegBinary;
+        big.full_size = 10'000;
+        big.bytes = std::string(10'000, 'a');
+        auto read3 = complete({{root + "\\A", {{"Blob", big}}}});
+        const auto d = diff_registry_snapshot(first.baseline, read3, "notify", 20);
+        for (const auto& c : d.candidates)
+            if (c.value == "Blob") {
+                CHECK(c.data.size() <= kRegistryDataCap);
+                CHECK(c.data_truncated);
+                CHECK(c.size == 10'000);
+            }
+    }
+}
+
+TEST_CASE("RegistryReadBudget caps keys, values and bytes (R9)", "[tar][registry][pure]") {
+    {
+        RegistryReadBudget b;
+        bool ok = true;
+        for (std::size_t i = 0; i <= kBaselineKeyCap; ++i)
+            ok = b.admit_key();
+        CHECK_FALSE(ok); // the 20,001st key
+    }
+    {
+        RegistryReadBudget b;
+        CHECK(b.admit_value(kBaselineBytesCap));
+        CHECK_FALSE(b.admit_value(1)); // per-root byte cap exceeded -> the reader returns Capped
+    }
+    CHECK(RegistryReadBudget::depth_ok(kBaselineDepthCap));
+    CHECK_FALSE(RegistryReadBudget::depth_ok(kBaselineDepthCap + 1));
+}
+
+TEST_CASE("RegistryDirtyTable stamps the burst at notify time and its bounded wait sees a mark",
+          "[tar][registry][pure]") {
+    RegistryDirtyTable d;
+    const std::string r = "HKLM\\SOFTWARE\\yuzu_test_r";
+    CHECK_FALSE(d.peek_dirty(r));
+    d.mark_at(r, 5, 9);
+    d.mark_at(r, 7, 12); // a second notify in the same burst moves `last`, never `first`
+    CHECK(d.peek_dirty(r));
+    CHECK(d.last(r) == 12);
+    const auto snap = d.take(r);
+    CHECK(snap.dirty);
+    CHECK(snap.first == 5);
+    CHECK_FALSE(d.peek_dirty(r)); // taken: clean until the next notify
+    d.restore(r, snap);           // a failed commit puts the burst back
+    CHECK(d.peek_dirty(r));
+    CHECK(d.take(r).first == 5);
+
+    // The wait is bounded and never polls: a deadline already past returns false at once ...
+    CHECK_FALSE(d.wait_dirty_for_test(r, std::chrono::steady_clock::now()));
+    // ... and a mark from another thread wakes it, whichever side runs first.
+    std::thread marker([&] { d.mark(r, 20); });
+    CHECK(d.wait_dirty_for_test(r, std::chrono::steady_clock::now() + std::chrono::seconds(30)));
+    marker.join();
+}
+
+TEST_CASE("record keys are length-framed and never carry a NUL", "[tar][registry][pure]") {
+    const auto k1 = registry_diff_record_key("notify", 5, "added", "A:B", "C");
+    const auto k2 = registry_diff_record_key("notify", 5, "added", "A", "B:C");
+    CHECK(k1 != k2);
+    CHECK(registry_diff_record_key("notify", 5, "added", "K", "a\\b") !=
+          registry_diff_record_key("notify", 5, "added", "K", "a\\\\b"));
+    const auto nul = registry_diff_record_key("notify", 5, "added", std::string("K\0x", 3), "v");
+    CHECK(nul.find('\0') == std::string::npos);
+    CHECK(registry_diff_record_key("notify", 5, "added", "K", "v") ==
+          registry_diff_record_key("notify", 5, "added", "K", "v")); // stable, no attribution input
+    CHECK(registry_gap_record_key("restart", "123") == "gap:restart:123");
+    CHECK(registry_gap_record_key("baselinelost", "HKLM\\R:5") !=
+          registry_gap_record_key("restart", "HKLM\\R:5"));
+
+    // The row's key is a function of what changed, never of the actor columns.
+    RegistryCandidate c;
+    c.key = "HKLM\\SOFTWARE\\r\\Svc";
+    c.value = "Start";
+    c.action = "changed";
+    c.source = "notify";
+    c.observed_at = T0;
+    const auto plain = registry_row_from_candidate(c, 0, {}, {}, 1);
+    CHECK(plain.actor_pid == 0);
+    CHECK(plain.actor_image.empty());
+    CHECK(plain.detail.empty());
+    CHECK(plain.record_key == registry_row_from_candidate(c, 812, "p.exe", "note", 1).record_key);
+}
+
+TEST_CASE("cursor and baseline codecs", "[tar][registry][pure]") {
+    RegistryCursor cur;
+    cur.present = true;
+    cur.tick = 7;
+    cur.ccs = "ControlSet001";
+    cur.hku = {"S-1-5-21-1"};
+    cur.roots["HKLM\\R"] = RegistryRootState{true, 110, 120, "complete", false};
+    const auto json = encode_registry_cursor(cur);
+    const auto back = decode_registry_cursor(json);
+    CHECK_FALSE(back.malformed);
+    CHECK(back.tick == 7);
+    CHECK(back.ccs == "ControlSet001");
+    CHECK(back.roots.at("HKLM\\R") == cur.roots.at("HKLM\\R"));
+    CHECK(back.hku == cur.hku);
+    CHECK(encode_registry_cursor(back) == json);
+
+    CHECK_FALSE(decode_registry_cursor(std::nullopt).present); // absent, not malformed
+    CHECK_FALSE(decode_registry_cursor(std::nullopt).malformed);
+    for (const char* bad : {"", "garbage", "{\"v\":2}", "{\"v\":1}", "[]"})
+        CHECK(decode_registry_cursor(std::string(bad)).malformed);
+    // an unknown field is ignored, so a later build can add state to this v1 cursor
+    auto j = nlohmann::json::parse(json);
+    j["later_field"] = nlohmann::json::array({1, 2});
+    CHECK_FALSE(decode_registry_cursor(j.dump()).malformed);
+    // bytes that are not valid UTF-8 must never decide whether the cursor can be written
+    cur.hku.push_back(std::string("S-\xff"));
+    CHECK_NOTHROW(encode_registry_cursor(cur));
+
+    RegistryBaseline b;
+    b.keys["K"]["v"] = baseline_entry_from_bytes(4, 4, dword(1), false);
+    const auto bj = encode_registry_baseline(b);
+    const auto bd = decode_registry_baseline(bj);
+    CHECK_FALSE(bd.malformed);
+    CHECK(bd.baseline == b);
+    CHECK_FALSE(decode_registry_baseline(std::nullopt).malformed);
+    CHECK(decode_registry_baseline(std::string("{\"v\":1")).malformed);
+    CHECK(decode_registry_baseline(std::string("{\"v\":1,\"keys\":{\"K\":{\"v\":{\"t\":\"x\"}}}}")).malformed);
+    b.keys["K"]["v"].d = std::string("a\xff") + "b"; // a rendered prefix that is not valid UTF-8
+    CHECK_NOTHROW(encode_registry_baseline(b));
+}
+
+TEST_CASE("registry schema constants agree with the registry", "[tar][registry][pure]") {
+    const CaptureSourceDef* def = nullptr;
+    for (const auto& s : capture_sources())
+        if (s.name == "registry")
+            def = &s;
+    REQUIRE(def != nullptr);
+    CHECK(def->default_enabled);
+    CHECK(def->unique_key_column == "record_key");
+    REQUIRE(def->granularities.size() == 1);
+    CHECK(def->granularities[0].suffix == "live");
+    CHECK(def->granularities[0].retention_type == RetentionType::kRowCount);
+    CHECK(def->granularities[0].retention_default == kRegistryLiveRowCap);
+    CHECK(generate_warehouse_ddl().find("registry_live_record_key_uq") != std::string::npos);
+}
+
+#ifndef _WIN32
+TEST_CASE("off Windows the production factory is null and the source list is unchanged",
+          "[tar][registry]") {
+    CHECK(make_registry_cursor_source() == nullptr);
+    CHECK(make_cursor_sources().size() == 2);
+}
+#endif
+
+// ═══════════════════════════════════════════════════════════════════════════
+// collect() over an injected reader
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+struct TestDb {
+    TarDatabase db;
+    fs::path path;
+    ~TestDb() {
+        { TarDatabase discard = std::move(db); }
+        std::error_code ec;
+        for (const char* sfx : {"", "-wal", "-shm", "-journal"})
+            fs::remove(fs::path{path.string() + sfx}, ec);
+    }
+};
+
+TestDb make_db() {
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_registry_");
+    auto r = TarDatabase::open(tmp);
+    REQUIRE(r.has_value());
+    return TestDb{std::move(*r), tmp};
+}
+
+const std::string kRoot = "HKLM\\SOFTWARE\\yuzu_test_r";
+const std::string kRoot2 = "HKLM\\SOFTWARE\\yuzu_test_r2";
+
+/// A reader over a scripted "registry". Records the arguments of every call.
+struct Fake {
+    std::map<std::string, SubtreeRead> reads;
+    std::vector<std::string> read_calls;
+    std::vector<std::int64_t> deadlines;
+    std::int64_t clock{T0};
+    std::vector<std::string> sids;
+    int ccs{1};
+    std::set<std::string> unarmed;
+    std::vector<std::vector<std::string>> watch_calls;
+    std::shared_ptr<RegistryDirtyTable> dirty = std::make_shared<RegistryDirtyTable>();
+
+    RegistryReader reader() {
+        RegistryReader r;
+        r.dirty = dirty;
+        r.read_subtree = [this](const std::string& root, std::int64_t deadline) {
+            read_calls.push_back(root);
+            deadlines.push_back(deadline);
+            const auto it = reads.find(root);
+            if (it == reads.end()) {
+                SubtreeRead absent;
+                absent.status = RegistryReadStatus::Absent;
+                return absent;
+            }
+            return it->second;
+        };
+        r.loaded_sids = [this] { return sids; };
+        r.now_ts = [this] { return clock += 1000; }; // strictly increasing
+        r.current_control_set = [this] { return ccs; };
+        r.watch_roots = [this](const std::vector<std::string>& roots) { watch_calls.push_back(roots); };
+        r.root_armed = [this](const std::string& root) { return !unarmed.contains(root); };
+        r.rearm = [this](const std::string& root) { return !unarmed.contains(root); };
+        return r;
+    }
+};
+
+RegistryScope scope1() { return RegistryScope{{"SOFTWARE\\yuzu_test_r"}, {}}; }
+RegistryScope scope2() {
+    return RegistryScope{{"SOFTWARE\\yuzu_test_r", "SOFTWARE\\yuzu_test_r2"}, {}};
+}
+
+SubtreeRead svc(std::uint32_t start) {
+    return complete({{kRoot + "\\Svc", {{"Start", vread(4, dword(start))}}}});
+}
+
+CursorCollectResult tick(TarDatabase& db, CursorSource& src) {
+    const auto cur = db.get_cursor("registry");
+    REQUIRE(cur.has_value());
+    return src.collect(db, *cur);
+}
+
+QueryResult q(TarDatabase& db, const std::string& sql) {
+    auto r = db.execute_query(sql);
+    REQUIRE(r.has_value());
+    return *r;
+}
+
+std::int64_t count_rows(TarDatabase& db) {
+    return std::stoll(q(db, "SELECT COUNT(*) FROM registry_live").rows.at(0).at(0));
+}
+
+RegistryCursor read_cursor(TarDatabase& db) {
+    const auto c = db.get_cursor("registry");
+    REQUIRE(c.has_value());
+    return decode_registry_cursor(*c);
+}
+
+// Fails every INSERT into registry_live from a second connection until released.
+struct InsertTrap {
+    sqlite3* h{nullptr};
+    explicit InsertTrap(const fs::path& p) {
+        REQUIRE(sqlite3_open(p.string().c_str(), &h) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(h,
+                             "CREATE TRIGGER yuzu_test_trap BEFORE INSERT ON registry_live "
+                             "BEGIN SELECT RAISE(ABORT, 'trap'); END",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+    void release() {
+        sqlite3_exec(h, "DROP TRIGGER IF EXISTS yuzu_test_trap", nullptr, nullptr, nullptr);
+    }
+    ~InsertTrap() {
+        release();
+        sqlite3_close(h);
+    }
+};
+
+} // namespace
+
+TEST_CASE("registry source: baseline tick writes baselines and no rows; a change lands in the same tick",
+          "[tar][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto reader = f.reader();
+    auto inner = reader.read_subtree;
+    reader.read_subtree = [&f, inner](const std::string& root, std::int64_t deadline) {
+        auto r = inner(root, deadline);
+        f.clock += 2 * SEC; // the read itself takes two seconds
+        return r;
+    };
+    auto src = make_registry_cursor_source(scope1(), std::move(reader));
+
+    f.reads[kRoot] = svc(1);
+    const auto first = tick(t.db, *src);
+    CHECK(first.outcome == CursorOutcome::Baseline);
+    CHECK(first.events_emitted == 0);
+    REQUIRE(f.read_calls.size() == 1);
+    CHECK(f.read_calls[0] == kRoot); // the normalised root, once
+    CHECK(f.deadlines.at(0) == T0 + 1000 + kSnapshotBudget100ns); // the budget starts at the tick's first reading
+    CHECK(count_rows(t.db) == 0);
+    const auto base_row = t.db.try_get_state("registry:" + kRoot);
+    REQUIRE(base_row.has_value());
+    CHECK(base_row->has_value());
+    CHECK(f.watch_calls.size() == 1);
+
+    // A change under a notify burst lands in THIS tick, stamped with the end of the read
+    // that saw it (not the notify time) and carrying no actor; only that root's baseline
+    // is rewritten.
+    f.clock = T0 + 100 * SEC;
+    f.reads[kRoot] = svc(2);
+    src->mark_dirty_for_test(kRoot, T0 + 97 * SEC, T0 + 98 * SEC);
+    const auto second = tick(t.db, *src);
+    CHECK(second.outcome == CursorOutcome::Advanced);
+    CHECK(second.events_emitted == 1);
+    const std::int64_t read_end = f.clock; // the Fake's last now_ts(): the end of that read
+    const auto after = t.db.try_get_state("registry:" + kRoot);
+    REQUIRE(after.has_value());
+    CHECK(*after != *base_row); // the baseline moved with the change
+
+    const auto rows = q(t.db, "SELECT action, hive, key_path, value_name, data, prev_data, "
+                              "actor_pid, actor_image, detail, observed_at, source FROM registry_live");
+    REQUIRE(rows.rows.size() == 1);
+    const auto& r = rows.rows[0];
+    CHECK(r[0] == "changed");
+    CHECK(r[1] == "HKLM");
+    CHECK(r[2] == "SOFTWARE\\yuzu_test_r\\Svc");
+    CHECK(r[3] == "Start");
+    CHECK(r[4] == "2");
+    CHECK(r[5] == "1");
+    CHECK(r[6] == "0");        // no actor yet
+    CHECK(r[7].empty());       // ... and no image
+    CHECK(r[8].empty());       // ... and no detail on a change row
+    CHECK(r[9] == std::to_string(filetime_to_unix_ms(read_end)));
+    CHECK(r[9] != std::to_string(filetime_to_unix_ms(T0 + 98 * SEC)));  // not the notify time
+    CHECK(r[9] != std::to_string(filetime_to_unix_ms(T0 + 100 * SEC))); // nor the tick's start
+    CHECK(r[10] == "notify");
+
+    f.clock = T0 + 300 * SEC;
+    CHECK(tick(t.db, *src).events_emitted == 0); // nothing dirty, nothing due: nothing more
+    CHECK(count_rows(t.db) == 1);
+}
+
+TEST_CASE("registry source: a failed commit rolls back in memory and replays cleanly (R7)",
+          "[tar][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    f.reads[kRoot] = svc(1);
+    REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
+    const std::string cursor_before = *t.db.get_cursor("registry").value();
+    const std::string baseline_before = *t.db.try_get_state("registry:" + kRoot).value();
+
+    // The next tick reads a change, so it has a row to insert; the commit fails.
+    f.clock = T0 + 300 * SEC;
+    f.reads[kRoot] = svc(2);
+    src->mark_dirty_for_test(kRoot, T0 + 290 * SEC, T0 + 291 * SEC);
+    {
+        InsertTrap trap(t.path);
+        CHECK_THROWS_AS(tick(t.db, *src), IncompleteCaptureError);
+    }
+    CHECK(*t.db.get_cursor("registry").value() == cursor_before); // cursor untouched
+    CHECK(*t.db.try_get_state("registry:" + kRoot).value() == baseline_before); // and the baseline
+    CHECK(count_rows(t.db) == 0);
+    CHECK(f.dirty->peek_dirty(kRoot)); // the root is dirty again (R7)
+    const auto retaken = f.dirty->take(kRoot);
+    CHECK(retaken.first == T0 + 290 * SEC); // with its original burst start
+    f.dirty->restore(kRoot, retaken);
+
+    f.clock += SEC;
+    tick(t.db, *src); // the trap is gone: re-reads, re-diffs against the committed baseline, commits
+    const auto rows = q(t.db, "SELECT action, data, prev_data, source FROM registry_live");
+    REQUIRE(rows.rows.size() == 1);
+    CHECK(rows.rows[0][0] == "changed");
+    CHECK(rows.rows[0][1] == "2");
+    CHECK(rows.rows[0][2] == "1");
+    CHECK(rows.rows[0][3] == "notify");
+}
+
+TEST_CASE("registry source: lost cursor, restart, baseline loss and storage errors",
+          "[tar][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    f.reads[kRoot] = svc(1);
+
+    SECTION("malformed stored cursor -> CursorLost, one gap row, every root re-baselined") {
+        const auto r = src->collect(t.db, std::optional<std::string>{"{not json"});
+        CHECK(r.outcome == CursorOutcome::CursorLost);
+        const auto rows = q(t.db, "SELECT action, detail FROM registry_live");
+        REQUIRE(rows.rows.size() == 1);
+        CHECK(rows.rows[0][0] == "capture_gap");
+        CHECK_THAT(rows.rows[0][1], ContainsSubstring("gap:cursorlost"));
+        CHECK(f.read_calls.size() == 1);
+    }
+
+    SECTION("restart with a valid cursor: Advanced + gap:restart, and a change made while down is found") {
+        REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
+        // A new process: a fresh source over the same database, started against the cursor.
+        Fake f2;
+        f2.clock = T0 + 400 * SEC;
+        f2.reads[kRoot] = svc(2); // changed while the agent was down
+        auto src2 = make_registry_cursor_source(scope1(), f2.reader());
+        src2->start(t.db);
+        f2.clock = T0 + 500 * SEC;
+        const auto r = tick(t.db, *src2);
+        CHECK(r.outcome == CursorOutcome::Advanced);
+        const auto rows = q(t.db, "SELECT action, detail, source FROM registry_live ORDER BY id");
+        REQUIRE(rows.rows.size() == 2);
+        CHECK(rows.rows[0][0] == "capture_gap");
+        CHECK(rows.rows[0][1].find("gap:restart") == 0);
+        CHECK(rows.rows[1][0] == "changed");
+        CHECK(rows.rows[1][1].empty());
+        CHECK(rows.rows[1][2] == "reconcile"); // no notify survives a restart
+        CHECK(f2.read_calls.size() == 1);      // the first tick after a restart reads every root
+    }
+
+    SECTION("a missing baseline for a baselined root -> gap:baselinelost and a fresh baseline") {
+        tick(t.db, *src);
+        REQUIRE(t.db.execute_sql("DELETE FROM tar_state WHERE collector LIKE 'registry:%'"));
+        f.clock = T0 + 100 * SEC;
+        src->mark_dirty_for_test(kRoot, f.clock, f.clock);
+        f.reads[kRoot] = svc(2);
+        tick(t.db, *src);
+        const auto rows = q(t.db, "SELECT detail FROM registry_live");
+        REQUIRE(rows.rows.size() == 1); // the gap only: no change was invented from the lost baseline
+        CHECK_THAT(rows.rows[0][0], ContainsSubstring("gap:baselinelost"));
+        // a malformed baseline is treated the same way
+        REQUIRE(t.db.set_state("registry:" + kRoot, "{\"v\":1"));
+        src->mark_dirty_for_test(kRoot, f.clock + SEC, f.clock + SEC);
+        f.clock += 10 * SEC;
+        tick(t.db, *src);
+        CHECK(count_rows(t.db) == 2);
+    }
+
+    SECTION("an unreadable baseline store is a transient failure, never a re-baseline") {
+        tick(t.db, *src);
+        sqlite3* h = nullptr;
+        REQUIRE(sqlite3_open(t.path.string().c_str(), &h) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(h, "ALTER TABLE tar_state RENAME TO tar_state_away", nullptr, nullptr,
+                             nullptr) == SQLITE_OK);
+        src->mark_dirty_for_test(kRoot, f.clock, f.clock);
+        f.clock += 10 * SEC;
+        CHECK_THROWS_AS(tick(t.db, *src), IncompleteCaptureError);
+        sqlite3_exec(h, "ALTER TABLE tar_state_away RENAME TO tar_state", nullptr, nullptr, nullptr);
+        sqlite3_close(h);
+    }
+}
+
+TEST_CASE("registry source: re-enable re-baselines with a gap; the paused window's change is not reported",
+          "[tar][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    f.reads[kRoot] = svc(1);
+    tick(t.db, *src);
+    src->on_enabled_changed(false);
+    f.reads[kRoot] = svc(9); // changed while paused
+    src->mark_dirty_for_test(kRoot, T0 + 50 * SEC, T0 + 50 * SEC); // the watcher stays warm
+    src->on_enabled_changed(true);
+    f.clock = T0 + 100 * SEC;
+    const auto r = tick(t.db, *src);
+    CHECK(r.outcome == CursorOutcome::CursorLost);
+    const auto rows = q(t.db, "SELECT detail FROM registry_live");
+    REQUIRE(rows.rows.size() == 1); // the gap; the paused-window change is NOT reported
+    CHECK_THAT(rows.rows[0][0], ContainsSubstring("gap:disabled"));
+}
+
+TEST_CASE("registry source: read statuses, status keys and fair root scheduling",
+          "[tar][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope2(), f.reader());
+
+    SECTION("Unreadable root writes nothing and stays due; Capped adds only") {
+        SubtreeRead bad;
+        bad.status = RegistryReadStatus::Unreadable;
+        f.reads[kRoot] = bad;
+        f.reads[kRoot2] = complete({{kRoot2 + "\\S", {{"Count", vread(4, dword(1))}}}});
+        tick(t.db, *src);
+        f.clock = T0 + 100 * SEC;
+        f.reads[kRoot2] = complete({{kRoot2 + "\\S", {{"Count", vread(4, dword(2))}}}});
+        src->mark_dirty_for_test(kRoot2, T0 + 97 * SEC, T0 + 98 * SEC);
+        f.read_calls.clear();
+        tick(t.db, *src);
+        CHECK(std::count(f.read_calls.begin(), f.read_calls.end(), kRoot) == 1); // still due
+        const auto cur = read_cursor(t.db);
+        CHECK_FALSE(cur.roots.at(kRoot).baselined);
+        CHECK(count_rows(t.db) == 1); // a row only for the readable root
+        CHECK(t.db.get_config("registry_roots_unreadable", "") == "1");
+        CHECK(t.db.get_config("registry_capture_method", "") == "notify");
+        CHECK_FALSE(t.db.try_get_state("registry:" + kRoot).value().has_value());
+
+        SubtreeRead capped = complete({{kRoot + "\\A", {{"v", vread(4, dword(1))}}}});
+        capped.status = RegistryReadStatus::Capped;
+        f.reads[kRoot] = capped;
+        f.clock = T0 + 200 * SEC;
+        tick(t.db, *src);
+        CHECK(t.db.get_config("registry_roots_capped", "") == "1");
+        CHECK(t.db.get_config("registry_roots_unreadable", "") == "0");
+        CHECK(t.db.get_config("registry_watch_roots", "") == "2");
+    }
+
+    SECTION("an unarmed root is reported and read every tick (R13)") {
+        f.unarmed.insert(kRoot);
+        f.reads[kRoot] = svc(1);
+        f.reads[kRoot2] = svc(1);
+        tick(t.db, *src);
+        f.read_calls.clear();
+        f.clock = T0 + 50 * SEC;
+        tick(t.db, *src);
+        CHECK(std::count(f.read_calls.begin(), f.read_calls.end(), kRoot) == 1);
+        CHECK(std::count(f.read_calls.begin(), f.read_calls.end(), kRoot2) == 0);
+        CHECK(t.db.get_config("registry_watch_roots_unarmed", "") == "1");
+    }
+}
+
+TEST_CASE("registry source: with a budget admitting one root per tick every root is read within n ticks (R15)",
+          "[tar][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    const std::vector<std::string> roots{"HKLM\\SOFTWARE\\yuzu_test_a", "HKLM\\SOFTWARE\\yuzu_test_b",
+                                         "HKLM\\SOFTWARE\\yuzu_test_c"};
+    auto reader = f.reader();
+    auto inner = reader.read_subtree;
+    reader.read_subtree = [&f, inner](const std::string& root, std::int64_t deadline) {
+        auto r = inner(root, deadline);
+        f.clock += 11 * SEC; // exhausts the 10 s budget after every root
+        return r;
+    };
+    auto src = make_registry_cursor_source(
+       RegistryScope{{"SOFTWARE\\yuzu_test_a", "SOFTWARE\\yuzu_test_b", "SOFTWARE\\yuzu_test_c"}, {}},
+       std::move(reader));
+    SubtreeRead bad;
+    bad.status = RegistryReadStatus::Unreadable; // always due
+    for (const auto& r : roots)
+        f.reads[r] = bad;
+    std::set<std::string> seen;
+    for (int i = 0; i < 3; ++i) {
+        f.read_calls.clear();
+        tick(t.db, *src);
+        REQUIRE(f.read_calls.size() == 1); // the budget admitted exactly one
+        seen.insert(f.read_calls[0]);
+    }
+    CHECK(seen == std::set<std::string>(roots.begin(), roots.end()));
+}
+
+TEST_CASE("registry source: a control-set switch re-baselines CurrentControlSet roots, a failed read does not",
+          "[tar][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    const std::string svc_root = "HKLM\\SYSTEM\\CurrentControlSet\\Services";
+    auto src = make_registry_cursor_source(RegistryScope{{"SYSTEM\\CurrentControlSet\\Services"}, {}},
+                                           f.reader());
+    f.reads[svc_root] = complete({{svc_root + "\\A", {{"Start", vread(4, dword(2))}}}});
+    tick(t.db, *src);
+    CHECK(read_cursor(t.db).ccs == "ControlSet001");
+
+    f.ccs = 0; // Select\Current unreadable this tick: not a switch
+    f.clock = T0 + 100 * SEC;
+    src->mark_dirty_for_test(svc_root, f.clock, f.clock);
+    tick(t.db, *src);
+    CHECK(count_rows(t.db) == 0);
+    CHECK(read_cursor(t.db).ccs == "ControlSet001");
+
+    f.ccs = 2; // the machine now runs from ControlSet002: the same path holds different keys
+    f.reads[svc_root] = complete({{svc_root + "\\B", {{"Start", vread(4, dword(3))}}}});
+    f.clock = T0 + 200 * SEC;
+    src->mark_dirty_for_test(svc_root, f.clock, f.clock);
+    tick(t.db, *src);
+    const auto rows = q(t.db, "SELECT detail FROM registry_live");
+    REQUIRE(rows.rows.size() == 1); // one gap; no removed/added storm
+    CHECK_THAT(rows.rows[0][0], ContainsSubstring("control set changed"));
+    CHECK(read_cursor(t.db).ccs == "ControlSet002");
+}
+
+TEST_CASE("registry source: a logged-off user's roots leave scope without a removal storm",
+          "[tar][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    f.sids = {"S-1-5-21-1"};
+    const std::string user_root = "HKU\\S-1-5-21-1\\Software\\yuzu_test_u";
+    auto src = make_registry_cursor_source(RegistryScope{{}, {"Software\\yuzu_test_u"}}, f.reader());
+    f.reads[user_root] = complete({{user_root, {{"v", vread(4, dword(1))}}}});
+    tick(t.db, *src);
+    CHECK(f.watch_calls.back() == std::vector<std::string>{user_root});
+    const std::string empty_baseline = R"({"v":1,"keys":{}})";
+    CHECK(*t.db.try_get_state("registry:" + user_root).value() != empty_baseline);
+    f.sids.clear();
+    f.clock = T0 + 100 * SEC;
+    f.dirty->mark_hku();
+    f.reads.erase(user_root); // the hive is unloaded: the path reads Absent
+    tick(t.db, *src);
+    CHECK(f.watch_calls.back().empty());
+    CHECK(count_rows(t.db) == 0); // not read, so no mass removal
+    CHECK(*t.db.try_get_state("registry:" + user_root).value() == empty_baseline); // and no values kept
+    CHECK(read_cursor(t.db).roots.empty());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// [windows] live cases: the real key watch and the real reader. Writing HKLM needs an
+// elevated token; each case SKIPs with a named reason otherwise, so a green run under a
+// non-elevated task proves nothing -- check the report says RUN.
+// ═══════════════════════════════════════════════════════════════════════════
+#ifdef _WIN32
+
+namespace {
+
+std::string salt() { return std::to_string(::GetCurrentProcessId()) + "_" + std::to_string(::GetTickCount64()); }
+
+struct TestKey {
+    std::wstring path; // below HKLM
+    HKEY h{nullptr};
+    explicit TestKey(const std::string& leaf) : path(L"SOFTWARE\\" + yuzu::win::to_wide(leaf)) {}
+    LONG create() {
+        return RegCreateKeyExW(HKEY_LOCAL_MACHINE, path.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS,
+                               nullptr, &h, nullptr);
+    }
+    ~TestKey() {
+        if (h != nullptr)
+            RegCloseKey(h);
+        RegDeleteTreeW(HKEY_LOCAL_MACHINE, path.c_str());
+    }
+};
+
+struct LiveRun {
+    TestDb t = make_db();
+    std::shared_ptr<RegistryDirtyTable> dirty;
+    std::string root; // the watched root, as the dirty table names it
+    std::unique_ptr<RegistryCursorSource> src;
+    explicit LiveRun(const std::string& hklm_root) : root("HKLM\\" + hklm_root) {
+        auto reader = make_windows_registry_reader();
+        dirty = reader.dirty;
+        src = make_registry_cursor_source(RegistryScope{{hklm_root}, {}}, std::move(reader));
+        src->start(t.db);
+    }
+    ~LiveRun() { src->stop(); }
+
+    // Write -> await the key-watch notification -> collect.
+    template <class Write> void transition(Write&& write) {
+        write();
+        REQUIRE(dirty->wait_dirty_for_test(root, std::chrono::steady_clock::now() + std::chrono::seconds(15)));
+        tick(t.db, *src);
+    }
+};
+
+} // namespace
+
+TEST_CASE("registry live: set, change and delete through a pre-opened handle land with no actor",
+          "[tar][registry][windows]") {
+    const std::string leaf = "yuzu_test_reg_" + salt();
+    TestKey key(leaf);
+    if (key.create() != ERROR_SUCCESS)
+        SKIP("cannot write HKLM (not elevated)");
+    LiveRun run("SOFTWARE\\" + leaf); // the handle above was opened BEFORE start()
+    tick(run.t.db, *run.src); // baseline
+    if (std::stoi(run.t.db.get_config("registry_watch_roots", "0")) == 0)
+        FAIL("the watch did not arm");
+
+    DWORD one = 1, two = 2;
+    run.transition([&] {
+        RegSetValueExW(key.h, L"LiveVal", 0, REG_DWORD, reinterpret_cast<BYTE*>(&one), 4);
+    });
+    run.transition([&] {
+        RegSetValueExW(key.h, L"LiveVal", 0, REG_DWORD, reinterpret_cast<BYTE*>(&two), 4);
+    });
+    run.transition([&] { RegDeleteValueW(key.h, L"LiveVal"); });
+
+    const auto rows = q(run.t.db, "SELECT action, data, prev_data, actor_pid, actor_image, detail, source "
+                                  "FROM registry_live WHERE value_name = 'LiveVal' ORDER BY id");
+    REQUIRE(rows.rows.size() == 3);
+    CHECK(rows.rows[0][0] == "added");
+    CHECK(rows.rows[0][1] == "1");
+    CHECK(rows.rows[1][0] == "changed");
+    CHECK(rows.rows[1][1] == "2");
+    CHECK(rows.rows[1][2] == "1"); // prev
+    CHECK(rows.rows[2][0] == "removed");
+    CHECK(rows.rows[2][2] == "2");
+    for (const auto& r : rows.rows) {
+        CHECK(r[3] == "0");      // no actor yet
+        CHECK(r[4].empty());
+        CHECK(r[5].empty());
+        CHECK(r[6] == "notify"); // the read was triggered by the key watch
+    }
+}
+
+TEST_CASE("registry live: a deleted and recreated root re-arms (R13)", "[tar][registry][windows]") {
+    const std::string leaf = "yuzu_test_reg_" + salt();
+    TestKey key(leaf);
+    if (key.create() != ERROR_SUCCESS)
+        SKIP("cannot write HKLM (not elevated)");
+    LiveRun run("SOFTWARE\\" + leaf);
+    tick(run.t.db, *run.src); // baseline
+    DWORD v = 1;
+    RegSetValueExW(key.h, L"Seed", 0, REG_DWORD, reinterpret_cast<BYTE*>(&v), 4);
+    tick(run.t.db, *run.src);
+    RegCloseKey(key.h);
+    key.h = nullptr;
+    RegDeleteTreeW(HKEY_LOCAL_MACHINE, key.path.c_str());
+    RegDeleteKeyW(HKEY_LOCAL_MACHINE, key.path.c_str());
+    run.src->mark_dirty_for_test("HKLM\\SOFTWARE\\" + leaf, 0, 0); // the watch may already have said so
+    tick(run.t.db, *run.src); // Absent: values and the key removed
+    const auto removed = q(run.t.db, "SELECT COUNT(*) FROM registry_live WHERE action IN ('removed','key_removed')");
+    CHECK(std::stoi(removed.rows[0][0]) >= 1);
+
+    REQUIRE(key.create() == ERROR_SUCCESS);
+    RegSetValueExW(key.h, L"Again", 0, REG_DWORD, reinterpret_cast<BYTE*>(&v), 4);
+    run.src->mark_dirty_for_test("HKLM\\SOFTWARE\\" + leaf, 1, 1);
+    tick(run.t.db, *run.src);
+    tick(run.t.db, *run.src);
+    CHECK(std::stoi(q(run.t.db, "SELECT COUNT(*) FROM registry_live WHERE value_name = 'Again' AND action = 'added'")
+                       .rows[0][0]) == 1);
+    CHECK(run.t.db.get_config("registry_watch_roots_unarmed", "") == "0"); // armed again
+}
+
+TEST_CASE("registry live: the reader returns Capped, Unreadable and sees a last-byte change (R8/R9)",
+          "[tar][registry][windows]") {
+    const std::string leaf = "yuzu_test_reg_" + salt();
+    TestKey key(leaf);
+    if (key.create() != ERROR_SUCCESS)
+        SKIP("cannot write HKLM (not elevated)");
+    auto reader = make_windows_registry_reader();
+    const std::string root = "HKLM\\SOFTWARE\\" + leaf;
+
+    // A 100 KiB binary changed only in its last byte: the stored size is equal, the hash differs.
+    std::vector<BYTE> blob(100 * 1024, 0x41);
+    RegSetValueExW(key.h, L"Blob", 0, REG_BINARY, blob.data(), static_cast<DWORD>(blob.size()));
+    auto r1 = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+    blob.back() = 0x42;
+    RegSetValueExW(key.h, L"Blob", 0, REG_BINARY, blob.data(), static_cast<DWORD>(blob.size()));
+    auto r2 = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+    REQUIRE(r1.status == RegistryReadStatus::Complete);
+    const auto d = diff_registry_snapshot(baseline_from_read(r1), r2, "notify", 1);
+    REQUIRE(d.candidates.size() == 1);
+    CHECK(d.candidates[0].action == "changed");
+
+    // An ACL-denied subkey makes the whole read Unreadable, never a partial success.
+    HKEY denied = nullptr;
+    PSECURITY_DESCRIPTOR deny = nullptr;
+    REQUIRE(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:PAI(D;;KR;;;WD)(A;;KA;;;SY)(A;;KA;;;BA)",
+                                                                  SDDL_REVISION_1, &deny, nullptr));
+    REQUIRE(RegCreateKeyExW(key.h, L"Denied", 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &denied, nullptr) ==
+            ERROR_SUCCESS);
+    RegSetKeySecurity(denied, DACL_SECURITY_INFORMATION, deny);
+    LocalFree(deny);
+    RegCloseKey(denied);
+    const auto unreadable = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+    // restore access so the cleanup can delete the subtree
+    PSECURITY_DESCRIPTOR allow = nullptr;
+    ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:PAI(A;;KA;;;WD)", SDDL_REVISION_1, &allow,
+                                                          nullptr);
+    HKEY again = nullptr;
+    if (RegOpenKeyExW(key.h, L"Denied", 0, WRITE_DAC, &again) == ERROR_SUCCESS) {
+        RegSetKeySecurity(again, DACL_SECURITY_INFORMATION, allow);
+        RegCloseKey(again);
+    }
+    LocalFree(allow);
+    CHECK(unreadable.status == RegistryReadStatus::Unreadable);
+
+    // More subkeys than the key cap: Capped within the budget, not a stall.
+    RegDeleteTreeW(key.h, L"Denied");
+    for (std::size_t i = 0; i < kBaselineKeyCap + 10; ++i) {
+        HKEY k = nullptr;
+        if (RegCreateKeyExW(key.h, yuzu::win::to_wide("k" + std::to_string(i)).c_str(), 0, nullptr, 0,
+                            KEY_READ, nullptr, &k, nullptr) != ERROR_SUCCESS)
+            break;
+        RegCloseKey(k);
+    }
+    const auto started = std::chrono::steady_clock::now();
+    const auto capped = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+    CHECK(capped.status == RegistryReadStatus::Capped);
+    CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(30));
+}
+
+TEST_CASE("registry live: stop then destruction with no collect is clean, and no session remains",
+          "[tar][registry][windows]") {
+    {
+        auto src = make_registry_cursor_source(RegistryScope{{"SOFTWARE\\yuzu_test_reg_none"}, {}},
+                                         make_windows_registry_reader());
+        TestDb t = make_db();
+        src->start(t.db);
+        src->stop();
+        src->stop(); // idempotent
+    }
+    CHECK(true); // reaching here means stop()/~RegistryCursorSource() neither threw nor hung
+}
+
+#endif // _WIN32

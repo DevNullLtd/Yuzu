@@ -1270,7 +1270,7 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
     // default-enabled core sources (the toggle is locked here; pause/resume uses the
     // configure path, and the State cell still shows the reported <src>_enabled as
     // "always on" or "paused"). is_new/pii drive the badges.
-    static const std::array<Meta, 10> kSources = {{
+    static const std::array<Meta, 11> kSources = {{
         {"process", "$Process", "Processes", true, false, false},
         {"tcp", "$TCP", "Network connections", true, false, false},
         {"service", "$Service", "Services", true, false, false},
@@ -1281,6 +1281,10 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
         {"module", "$Module", "Processes", false, false, false},
         {"arp", "$ARP", "Network connections", false, true, false},
         {"dns", "$DNS", "Network connections", false, true, true},
+        // registry (PR11.8): Windows only, so an older or non-Windows agent never reports
+        // registry_enabled and the row is simply absent. Stored values are unmasked, which
+        // the user manual states; there is deliberately no PII badge (grill r2 mock-up).
+        {"registry", "$Registry", "System", false, true, false},
     }};
 
     auto os_cell = [&](const std::string& src, const char* os) -> std::string {
@@ -1296,12 +1300,13 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
 
     std::string h = "<div class=\"cat-filter\" id=\"capFilter\"><span class=\"filter-label\">"
                     "Category</span><span class=\"tar-seg\"><a class=\"tar-chip on\" onclick=\"filterCap(this,'all')\">All</a>";
-    static const std::array<std::pair<const char*, const char*>, 5> kChips = {
+    static const std::array<std::pair<const char*, const char*>, 6> kChips = {
         {{"Processes", "Processes"},
          {"Network connections", "Network"},
          {"Services", "Services"},
          {"User sessions", "User sessions"},
-         {"Performance", "Performance"}}};
+         {"Performance", "Performance"},
+         {"System", "System"}}};
     for (const auto& [cat, label] : kChips)
         h += std::string("<a class=\"tar-chip\" onclick=\"filterCap(this,'") + cat + "')\">" + label +
              "</a>";

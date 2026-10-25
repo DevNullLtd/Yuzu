@@ -3075,6 +3075,20 @@ private:
             std::format("config|nstat_layout_mismatch|{}",
                         (nstat_client_ && nstat_client_->layout_mismatch()) ? "true" : "false"));
 
+        // registry source (PR11.8) health — emitted UNCONDITIONALLY (key-always-present
+        // contract) from the values the source wrote on its last committed tick. The
+        // defaults read as "not running": capture_method none, every counter 0.
+        {
+            static constexpr std::pair<std::string_view, std::string_view> kRegistryKeys[] = {
+                {"registry_capture_method", "none"},   {"registry_watch_roots", "0"},
+                {"registry_watch_roots_unarmed", "0"}, {"registry_roots_unreadable", "0"},
+                {"registry_roots_capped", "0"},
+            };
+            for (const auto& [key, def] : kRegistryKeys)
+                ctx.write_output(std::format("config|{}|{}", key,
+                                             db_->get_config(std::string(key), std::string(def))));
+        }
+
         // netqual capture method (ADR-0020) — the method actually in effect:
         // "inetdiag" (Linux), "estats" (Windows once the elevation gate latches
         // active), "estats_pending" (Windows, gate not yet tested — or netqual

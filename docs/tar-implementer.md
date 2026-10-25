@@ -349,9 +349,10 @@ header):
    `crossplatform.tar.configure` (the MCP/REST + GUI toggle path) and any canned
    `tar.sql` drill-downs.
 9. **Server GUI** (optional) — the Capture-sources frame
-   (`render_tar_capture_sources`) lists the ten core sources in a static array
+   (`render_tar_capture_sources`) lists the eleven core sources (the original ten plus
+   `registry`, which also adds the sixth `System` category chip) in a static array
    (`kSources` in `tar_process_tree.cpp`, plus the Push allowlist in
-   `tar_tree_routes.cpp`); a new source is toggled through `tar.configure`
+   `tar_tree_routes.cpp` and `kSrc` in `device_routes.cpp`); a new source is toggled through `tar.configure`
    until it is added to both; presentation metadata (category, always-on, `$`-name, badges)
    lives in that render function. Device-level panels (no pid) go in the
    process-tree pane (`render_tar_*_panel` + a `tar_tree_routes` fragment).
@@ -398,6 +399,33 @@ between snapshot and ack cannot destroy an entry that was never committed.
 `EventRing<T>` for a stream whose loss is acceptable and counted; use
 `BoundedPendingQueue` when the events are forensic and the sink is
 transactional. Do not add a fourth.
+
+**The `registry` source (`tar_registry_source.{hpp,cpp}`, pure core in
+`tar_registry_parsers.hpp`) is the third `CursorSource` and the precedent for a
+cursor source whose durable state is a snapshot baseline plus a position
+cursor.** What it adds to the pattern:
+
+- **Two stores, one transaction.** What changed comes from a
+  `RegNotifyChangeKeyValue` subtree watch and a per-root baseline diff; each
+  root's baseline lives in a `tar_state` row (`registry:<root>`) and is written
+  by `insert_registry_events_and_cursor` in the SAME transaction as the rows and
+  the cursor, so a baseline can never advance without the rows that explain it.
+  A baseline read goes through the tri-state `try_get_state`; `get_state`'s
+  empty-on-failure would read a transient SQLite error as "no baseline" and
+  silently re-baseline. The baselines hold rendered (unmasked) values and are
+  readable through `tar.sql` like `registry_live` itself;
+  `purge_source("registry")` erases the table, the cursor row and every
+  `registry:%` baseline in one transaction.
+- **Four read statuses.** Complete, Absent, Unreadable, Capped. Removals are
+  derived only from Complete and Absent reads; an Unreadable read changes
+  nothing and a Capped one only adds and updates, so a partial read can never
+  fabricate a deletion.
+- **Rows land in the tick that observes the change.** A diff row is stamped with
+  the end of the read that saw it and written in that tick's transaction.
+  `actor_pid`/`actor_image` are in the schema but hold `0`/`''` until a later
+  change attributes writers; the row's `record_key` never depends on them.
+- **Windows warehouse columns are NOT NULL.** "Not applicable" is `''`/`0`, and an
+  empty `data_type` distinguishes an absent value from an empty one.
 
 **`NstatClient` (`tar_netqual_nstat.*`) is the second such case and a
 deliberate, documented exception to a literal `ProcStreamCollector` subclass:**

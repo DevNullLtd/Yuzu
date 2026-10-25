@@ -1299,6 +1299,7 @@ tar_test_exe = executable(
     'unit/test_tar_cursor.cpp',                  # Wave 6: cursor-source seam — lifecycle + persistence, atomic event+cursor commit, record_key dedupe, ack-by-sequence incl. the R-005 overflow regression (on-disk TarDb via unique_temp_path)
     'unit/test_tar_power.cpp',                   # Wave 6 PR6.2-b: pmset parser + exact-tail cursor/gap decisions, REAL-CAPTURE fixtures, RunFn-injected
     'unit/test_tar_removable.cpp',               # Wave 6 PR6.3: event-log channel parsers + identity + per-channel cursors, REAL-CAPTURE fixtures
+    'unit/test_tar_registry_source.cpp',         # PR11.8: registry source -- pure core (diff/dirty table/codecs) + injected-reader lifecycle + [windows] live cases
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
@@ -1331,6 +1332,8 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_power_collector.cpp',
     # Wave 6 PR6.3: the TU exercises the real CursorSource via the factory.
     '../agents/plugins/tar/src/tar_removable_collector.cpp',
+    # PR11.8: test_tar_registry_source.cpp drives the real source over an injected reader.
+    '../agents/plugins/tar/src/tar_registry_source.cpp',
   ) + tar_test_removable_darwin_sources,
   include_directories: [
     include_directories('../agents/plugins/tar/src'),
