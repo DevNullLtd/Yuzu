@@ -226,13 +226,12 @@ nlohmann::json build_mcp_settings(const Config& cfg) {
 }
 
 const std::vector<tar_retention::TarRetentionTier>* embedded_tar_retention_tiers() {
-    static const auto parsed = tar_retention::parse_tar_retention_tiers(kTarRetentionTiersTsv);
-    static const bool logged = [] {
-        if (!parsed)
-            spdlog::error("embedded TAR retention tier table is unreadable: {}", parsed.error());
-        return true;
+    static const auto parsed = [] {
+        auto p = tar_retention::parse_tar_retention_tiers(kTarRetentionTiersTsv);
+        if (!p)
+            spdlog::error("embedded TAR retention tier table is unreadable: {}", p.error());
+        return p;
     }();
-    (void)logged;
     return parsed ? &*parsed : nullptr;
 }
 
