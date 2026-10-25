@@ -497,10 +497,14 @@ inline std::atomic<bool>& openat2_unavailable() {
 
 /// Remember that openat2 cannot be used, and say so once: from here on the open is leaf-only
 /// no-follow (a disclosed residual), which an operator debugging a symlink question needs to know.
-inline void latch_openat2_unavailable() {
-    if (!openat2_unavailable().exchange(true, std::memory_order_relaxed))
-        spdlog::debug("filesystem find_by_hash: openat2 is unavailable; the no-follow open is "
-                      "leaf-only from here on");
+inline void latch_openat2_unavailable() noexcept {
+    // noexcept: the caller may hold a bare descriptor, and a logging failure must not leak it.
+    try {
+        if (!openat2_unavailable().exchange(true, std::memory_order_relaxed))
+            spdlog::debug("filesystem find_by_hash: openat2 is unavailable; the no-follow open is "
+                          "leaf-only from here on");
+    } catch (...) {
+    }
 }
 
 /// open(2) that refuses a symlink in ANY path component where the OS offers that as one call:
