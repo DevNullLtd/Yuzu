@@ -1665,7 +1665,7 @@ std::expected<bool, std::string> engine_grant_checked(const RbacStore* store,
     case RbacEnforcementLabel::kDegraded:
         break;
     }
-    return std::unexpected(std::string("rbac enforcement state unconfirmed"));
+    return std::unexpected(std::string(kRbacErrEnforcementUnconfirmed));
 }
 
 // to_string(RbacEnforcementLabel) is constexpr and header-inline (rbac_store.hpp) —

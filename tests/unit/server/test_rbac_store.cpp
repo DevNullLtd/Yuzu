@@ -3174,6 +3174,9 @@ TEST_CASE("RbacStore: every checked read on a store that is not open reports the
     REQUIRE_FALSE(e1.has_value());
     const auto e2 = engine_grant_checked(&broken, "engine:x", "Response", "Read");
     REQUIRE_FALSE(e2.has_value());
+    // The degraded arm's own text, not the not-open text a forbidden grant read would return.
+    CHECK(std::string_view{e2.error()} == kRbacErrEnforcementUnconfirmed);
+    CHECK(std::string_view{e1.error()} == kRbacErrEnforcementUnconfirmed);
     const auto r10 = broken.check_permission_checked("bob", "Response", "Read");
     REQUIRE_FALSE(r10.has_value());
     CHECK(std::string_view{r10.error()} == kRbacErrStoreNotOpen);
@@ -3183,8 +3186,8 @@ TEST_CASE("RbacStore: every checked read on a store that is not open reports the
 TEST_CASE("RbacStore::check_permission_checked: a failed role lookup is an error that counts, "
           "a caller with no roles is a success that does not",
           "[rbac_store][pg][read_failed]") {
+    yuzu::MetricsRegistry metrics; // declared before the store so the store never outlives it
     RBAC_STORE(store);
-    yuzu::MetricsRegistry metrics;
     store.set_metrics(&metrics);
     REQUIRE(store.create_role({.name = "Reader", .description = "d"}).has_value());
     REQUIRE(store.set_permission({"Reader", "Response", "Read", "allow"}).has_value());
@@ -3213,6 +3216,9 @@ TEST_CASE("RbacStore::check_permission_checked: a failed role lookup is an error
               .value() == 1.0);
     CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0); // one failure, threshold 2
     CHECK_FALSE(store.check_permission("bob", "Response", "Read")); // the plain form denies
+    // A second failed read (the failure is not cached) reaches the breaker threshold of 2: the
+    // role-lookup failure moves the breaker, which it did not before this change.
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
 }
 
 TEST_CASE("RbacStore: the checked reads without a breaker report the shared "

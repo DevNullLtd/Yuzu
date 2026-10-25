@@ -75,6 +75,10 @@ class ManagementGroupStore; // forward declaration
 inline constexpr std::string_view kRbacErrStoreNotOpen = "rbac store not open";
 inline constexpr std::string_view kRbacErrPoolAcquireTimeout = "pool acquire timeout";
 inline constexpr std::string_view kRbacErrCircuitBreakerOpen = "circuit breaker open";
+/// `engine_grant_checked`: the enforcement state itself could not be confirmed (a stale
+/// cached-disabled view), so no grant read was attempted.
+inline constexpr std::string_view kRbacErrEnforcementUnconfirmed =
+    "rbac enforcement state unconfirmed";
 
 struct RbacRole {
     std::string name;
@@ -1062,8 +1066,9 @@ enum class RbacEnforcementLabel {
 /// enforcement state could not be confirmed, a stale cached-disabled view included), so the
 /// caller answers a retryable 503 instead of a terminal 403. It admits exactly when the
 /// raw `is_rbac_enabled()` accessor did and the grant read succeeds, so the SET OF INPUTS
-/// THAT ADMIT is unchanged; only which non-admitting answer is given differs (the test
-/// `rbac_enforcement_label()` above sets for a new consumer). Do NOT replace the label with
+/// THAT ADMIT is unchanged; only which non-admitting answer is given differs (the
+/// admission-input-set test that the `RbacEnforcementLabel` doc above sets for a new
+/// consumer). Do NOT replace the label with
 /// `rbac_enforcement_in_effect()` here: that is `true` for a degraded view, and the grant read
 /// would then admit an engine while RBAC may be genuinely off.
 [[nodiscard]] std::expected<bool, std::string>

@@ -556,6 +556,8 @@ TEST_CASE("every live is_rbac_enabled() call site is display-only "
     // keeps the same test-and-branch shape still matches, and any OTHER new
     // call site (different shape, different purpose) does not.
     const std::unordered_map<std::string, std::unordered_set<std::string>> allowlists = {
+        // The fleet-read gate had the raw engine-arm ternary (CDX-1); no live call remains.
+        {"authz_gates.cpp", {}},
         {"server.cpp",
          {
              // The nav-bar/`/api/me`-style session JSON — display-only per

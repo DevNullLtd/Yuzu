@@ -1476,8 +1476,12 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
         const auto engine_grant =
             engine_grant_checked(rbac_store_, session->username, securable_type, operation);
         if (!engine_grant) {
+            // A fixed token, never the error text (a failed read's text carries libpq output).
             audit_log(req, "auth.permission_required", "failure", "", "",
-                      "engine principal: authorization read failed for " + perm);
+                      (engine_grant.error() == kRbacErrEnforcementUnconfirmed
+                           ? "engine principal: RBAC enforcement state unconfirmed for "
+                           : "engine principal: authorization read failed for ") +
+                          perm);
             res.status = 503;
             res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
                                               detail::A4ErrorOpts{.retry_after_ms = 5000}),

@@ -1176,7 +1176,14 @@ TEST_CASE("engine gates - a stale cached-disabled enforcement view is 503, a fre
     ar.set_engine_principal_store(fix.engine_store.get());
     auto req = fix.request();
 
-    // Control: a FRESH disabled view is a genuine "RBAC is off": 403 on both gates, no read.
+    // Replica A grants the engine principal first (a grant can exist while RBAC is off), so the
+    // control below proves a fresh disabled view is 403 even WITH a grant, then enables RBAC.
+    REQUIRE(replica_a.create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(replica_a.set_permission({"EngineReader", "GuaranteedState", "Read", "allow"})
+                .has_value());
+    REQUIRE(replica_a.assign_role({"engine", "engine:vuln", "EngineReader"}).has_value());
+
+    // Control: a FRESH disabled view is a genuine "RBAC is off": 403 on both gates, grant or not.
     {
         httplib::Response res;
         auto result = ar.require_fleet_read(req, res, "GuaranteedState", "Read");
@@ -1188,12 +1195,8 @@ TEST_CASE("engine gates - a stale cached-disabled enforcement view is 503, a fre
         CHECK(res2.status == 403);
     }
 
-    // Replica A durably enables RBAC and grants the engine principal.
+    // Replica A durably enables RBAC.
     replica_a.set_rbac_enabled(true);
-    REQUIRE(replica_a.create_role({.name = "EngineReader", .description = "d"}).has_value());
-    REQUIRE(replica_a.set_permission({"EngineReader", "GuaranteedState", "Read", "allow"})
-                .has_value());
-    REQUIRE(replica_a.assign_role({"engine", "engine:vuln", "EngineReader"}).has_value());
 
     // Starve replica B's pool and age its readings past the stale-serve bound (the same
     // sequence as the rbac_store stale-view test): the first failed refresh is inside the
