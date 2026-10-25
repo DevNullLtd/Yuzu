@@ -375,10 +375,12 @@ public:
     /// filter to `lifecycle_state='active'` only. Bounded (few engine
     /// principals exist), parameterised, read-only. Best-effort: a lease/query
     /// failure is logged at warn and returns an empty vector rather than
-    /// propagating the error — callers (admin list, auditor query) treat this
-    /// as a best-effort read, not an authorization chokepoint (unlike
-    /// `get_for_auth`, which fails closed with a distinct StoreUnreachable
-    /// state).
+    /// propagating the error, so an outage reads as "no engine principals".
+    /// No production caller remains: every display or decision caller (REST
+    /// list, MCP list, the Settings panel, the Tokens page, the no-admin
+    /// auditor, the access review) uses `list_all_checked`, and a new one must
+    /// too. (`get_for_auth` is the authorization read and fails closed with a
+    /// distinct StoreUnreachable state.)
     [[nodiscard]] std::vector<EnginePrincipalRow> list_all(bool include_revoked = true) const;
 
     /// Authoritative variant of `list_all` (ADR-0012 §1 read posture) for

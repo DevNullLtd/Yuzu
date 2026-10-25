@@ -18,6 +18,9 @@
  * so certificates' own two new TUs share one implementation rather than
  * adding a FIFTH hand-copied local struct.
  *
+ * A second constructor taking `unset_tag` removes the variable for the scope
+ * instead of setting it (the pg_reachability listener uses it).
+ *
  * Restores whatever the variable held before construction (including "did
  * not exist", via unsetenv), unconditionally in the destructor -- so a
  * REQUIRE/SKIP/exception unwinding between construction and the end of scope
@@ -37,11 +40,20 @@
 
 namespace yuzu::test {
 
+/// Tag for the ScopedEnv constructor that REMOVES the variable for the scope
+/// and restores whatever it held (including "did not exist") on destruction.
+struct unset_tag {};
+
 class ScopedEnv {
 public:
     ScopedEnv(std::string name, const std::string& value) : name_(std::move(name)) {
         capture_prev();
         set(value);
+    }
+
+    ScopedEnv(std::string name, unset_tag) : name_(std::move(name)) {
+        capture_prev();
+        unset();
     }
 
     ~ScopedEnv() {

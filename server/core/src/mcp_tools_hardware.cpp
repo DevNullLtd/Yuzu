@@ -33,6 +33,7 @@
 #include "mcp_jsonrpc.hpp"         // kInternalError, kInvalidParams, success_response
 #include "mcp_retry.hpp"           // kMcpStoreFaultRetryMs
 #include "mcp_tool_deps.hpp"       // ToolDeps
+#include "mcp_tool_helpers.hpp"    // answer, answer_unwired, dump_replace (shared by the registry files)
 #include "rest_audit.hpp"          // detail::try_persist_audit (the shared audit kernel)
 #include "web_utils.hpp"          // audit_token (CWE-117 neutralisation of caller text in a detail)
 
@@ -67,26 +68,6 @@ constexpr const char* kGetOutputSchema =
 constexpr const char* kNotFoundRemediation =
     "call list_hardware_ci to find the agent_id values you may read";
 
-void answer(const ToolCallContext& ctx, std::string body) {
-    ctx.res.set_content(std::move(body), "application/json");
-}
-
-// A provider the deployment did not wire. REST answers an unhinted 503 for the same
-// case; it is a misconfiguration, not a transient fault, so no retry hint. The generic
-// row is still written (every registry tool call leaves an mcp.<tool> row) and, when the
-// domain sink exists, a failure row under the REST verb too.
-void answer_unwired(const ToolCallContext& ctx, const char* verb, const char* target_type,
-                    const std::string& target_id, const char* what) {
-    const bool domain_ok =
-        ctx.deps == nullptr ||
-        yuzu::server::detail::try_persist_audit(ctx.deps->audit_fn, ctx.req, verb, "failure",
-                                                target_type, target_id, what);
-    const bool generic_ok = ctx.audit("failure", what);
-    // retry-hint-exempt: an unwired provider is a deployment misconfiguration, not a transient fault
-    answer(ctx, ctx.a4_error(kInternalError, "hardware service unavailable", {}, -1, {},
-                             domain_ok && generic_ok));
-}
-
 // A failed roster / identity read: never an empty success (ADR-0016 section 7). Transient,
 // so the caller is told to back off, matching REST's 503 + retry_after_ms 5000.
 void answer_roster_unreadable(const ToolCallContext& ctx, const char* verb, const char* target_type,
@@ -107,14 +88,6 @@ void answer_audit_withheld(const ToolCallContext& ctx) {
                              true));
 }
 
-// Invalid UTF-8 in a roster / CI field (agent-reported text) must degrade to U+FFFD, not
-// throw: the success audit rows are already written by the time the body is dumped, so a
-// throw here would be a bodyless 500 recorded as a success. Byte-identical to a plain dump
-// for valid UTF-8.
-std::string dump_replace(const nlohmann::json& j) {
-    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
-}
-
 std::int64_t now_secs() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -126,7 +99,8 @@ std::int64_t now_secs() {
 void handle_list_hardware_ci(const ToolCallContext& ctx) {
     const ToolDeps* deps = ctx.deps;
     if (deps == nullptr || !deps->fleet_read_fn || !deps->roster_fn || !deps->audit_fn) {
-        answer_unwired(ctx, "inventory.devices", "Inventory", "fleet", "hardware provider unwired");
+        answer_unwired(ctx, "hardware service unavailable", "hardware provider unwired",
+                       {"inventory.devices", "Inventory", "fleet"});
         return;
     }
     // The SOLE gate (confined read, ADR-0017). A refusal has already written its own A4
@@ -197,7 +171,8 @@ void handle_list_hardware_ci(const ToolCallContext& ctx) {
 void handle_get_hardware_ci(const ToolCallContext& ctx) {
     const ToolDeps* deps = ctx.deps;
     if (deps == nullptr || !deps->fleet_read_fn || !deps->ci_detail_fn || !deps->audit_fn) {
-        answer_unwired(ctx, "inventory.device.ci", "Agent", "", "hardware provider unwired");
+        answer_unwired(ctx, "hardware service unavailable", "hardware provider unwired",
+                       {"inventory.device.ci", "Agent", ""});
         return;
     }
     const auto gate = deps->fleet_read_fn(ctx.req, ctx.res, "Inventory", "Read");

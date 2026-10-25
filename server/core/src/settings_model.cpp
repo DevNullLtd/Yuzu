@@ -224,9 +224,9 @@ nlohmann::json build_data_retention_settings(const Config& cfg, const RetentionE
         return v ? nlohmann::json(*v) : nlohmann::json(nullptr);
     };
     nlohmann::json j;
-    j["response_retention_days"] = cfg.response_retention_days;
-    j["audit_retention_days"] = cfg.audit_retention_days;
-    j["guardian_event_retention_days"] = cfg.guardian_event_retention_days;
+    j["response_retention_days"] = cfg.response_retention_days.get();
+    j["audit_retention_days"] = cfg.audit_retention_days.get();
+    j["guardian_event_retention_days"] = cfg.guardian_event_retention_days.get();
     j["enforced"] = {{"response_retention_days", opt(enforced.response_retention_days)},
                      {"audit_retention_days", opt(enforced.audit_retention_days)},
                      {"guardian_event_retention_days", opt(enforced.guardian_event_retention_days)}};

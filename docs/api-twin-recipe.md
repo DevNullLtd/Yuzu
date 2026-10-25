@@ -330,7 +330,11 @@ so the record is not a single point of truth: keep the two in step. (A confined 
    Either kind builds results with `ctx.tool_result`, errors with `ctx.a4_error` and audit rows with
    `ctx.audit`. Those are `std::function`s, so pass every argument: `-1` for `retry_after_ms` when
    there is none, and when it is not `-1` write the `/*retry_after_ms=*/` comment next to the value,
-   because the gate matches that token. The handler must complete synchronously and must never
+   because the gate matches that token. `answer_unwired` in `mcp_tool_helpers.hpp` is the shared
+   unwired-provider answer: it hardwires a non-retryable `kInternalError` by design (the retry-hint
+   gate scans a new or changed `mcp_tool*.hpp` too, as a tripwire for a retryable branch added to a
+   helper), so a fault that is transient needs its own `ctx.a4_error` call with a
+   hint, and it writes a domain audit row only when you pass one. The handler must complete synchronously and must never
    capture or store `ctx` (it borrows request-frame objects). A handler that returns without
    responding is turned into an A4 internal error (-32603) plus a `failure` audit row, never an
    empty 200.
@@ -345,6 +349,17 @@ so the record is not a single point of truth: keep the two in step. (A confined 
 7. **Decide `requires_approval()`.** It lives in `mcp_policy.hpp`, is NOT a `ToolRecord` field and is
    not boot-enforced, so a destructive twin needs it decided here exactly as on the legacy path
    (see "A fifth registration point" below).
+8. **Complete the twin set.** A registry tool also needs a `kExpectedTwins[]` row (the
+   twin-completeness test, `tests/unit/server/test_twin_completeness.cpp`, fails a registry record with
+   no row or no ledger `mcp_twin`), and a domain test file `tests/unit/server/test_mcp_tools_<domain>.cpp`
+   that names the tool, calls `schema_violation(` on a served body and asserts the audit row
+   (string literals do not count as the call and a negative audit assertion such as
+   `audit.empty()` does not count as the row; `check-api-parity.py` check 7 reads it and requires the file to be listed in `tests/meson.build`; the
+   schema pair and the audit pair are each checked inside one `TEST_CASE`, and the two may sit in
+   different cases; a tripwire, not a proof). A brand-new `mcp_tools_<domain>.cpp` also sets
+   `MIN_REGISTRY_FILES` (an exact count) in `scripts/ci/check-api-parity.py` and `kRegistryDomainFiles`
+   in `tests/unit/server/test_mcp_dispatch_coverage.cpp`, and a new `mcp_tool*.hpp` sets
+   `kToolHeaderFiles` there, in the same change.
 
 What rejects a mistake: building the catalogue (first done in the `ServerImpl` constructor, so it
 applies under `--mcp-disable` too) throws `std::logic_error` naming the record for a null handler, a
@@ -666,8 +681,8 @@ TU can assert against them without duplicating the maps: `tool_security_rows_for
 `tool_annotation_names_for_test()`, `write_tool_names_for_test()`, `tool_names_for_test()`, plus
 wrappers running the real C8 dispatch classifier/validator over synthetic tables.
 
-`tests/unit/server/test_operator_surface_twins.cpp`'s `kExpectedTwins[]` array (line 417) is the
-pattern to extend:
+The `kExpectedTwins[]` array in `tests/unit/server/test_expected_twins.hpp` (shared by
+`test_operator_surface_twins.cpp` and `test_twin_completeness.cpp`) is the pattern to extend:
 
 ```cpp
 constexpr TwinRow kExpectedTwins[] = {
@@ -720,10 +735,21 @@ see §5 for which chokepoints apply.
 6. **MCP registration.** `kTools[]`, `kToolSecurityRows[]`, `kWriteToolsRaw[]` (if non-Read),
    `kToolAnnotation`, plus the `if (tool_name == "...")` dispatch branch (§3), all boot-enforced; or
    one `ToolRecord` (§3, "The registry route", which also lists the header declaration, the
-   `registered_tool_records()` entry, the orientation family and the ledger block). Two lexical CI
+   `registered_tool_records()` entry, the orientation family, the ledger block and the completeness
+   inputs). Two lexical CI
    gates read the result: `scripts/ci/check-api-parity.py` (the tool name set, from `kTools[]` and
-   every `kToolRecords[]` slice) and `scripts/ci/check-mcp-retry-hints.py` (a new tool's handler
-   block: a store/query-fault branch needs a retry hint or a `// retry-hint-exempt:` comment).
+   every `kToolRecords[]` slice; its check 6, gate parity, also compares the REST route's first gate
+   call with the tool's `"Securable", "Operation"` pair and confinement class for every ledger row that
+   names both twins, so a twin whose gate differs from its REST route fails unless the pair is
+   listed with a reason in `GATE_PARITY_KNOWN_MISMATCHES`; a REST handler that refuses a service-scoped
+   token before its gate reads as `refused`, an MCP handler whose own fleet read confines is read as
+   confining, and every further REST gate call must agree or be matched, one to one, by a gate call the MCP
+   handler makes, and in the other direction a gate call in a derived MCP handler for a pair other than
+   the tool's declared one is a finding too (for rows with a REST object twin; an MCP-only tool or a
+   handler that shares a dispatch branch is not held to it); a route whose gate the script cannot read
+   fails closed unless it is in `GATE_PARITY_NO_GATE_ALLOWED`; both tables are shrink-only) and `scripts/ci/check-mcp-retry-hints.py` (a new tool's handler
+   block, and a new or changed `mcp_tool*.hpp`: a store/query-fault branch needs a retry hint or a
+   `// retry-hint-exempt:` comment).
    For a destructive action-twin, also decide `requires_approval()` (§3's "fifth registration
    point") explicitly — it is **not** boot-enforced, so a missed decision here fails silently, not
    loudly. Run the server locally after wiring the four tables — `validate_tool_security_registration`
@@ -734,8 +760,9 @@ see §5 for which chokepoints apply.
    string per `docs/observability-conventions.md`'s audit envelope shape. Apply the correct posture
    per surface (§4) — fail-closed REST, set-and-proceed fragment, `audit_persisted:false` MCP, with
    the read-vs-mutate distinction from §4's closing note.
-8. **`kExpectedTwins[]` test row.** Add one row per new tool to
-   `tests/unit/server/test_operator_surface_twins.cpp:417` (§6).
+8. **`kExpectedTwins[]` test row.** Add one row per new tool (legacy or registry) to the shared table in
+   `tests/unit/server/test_expected_twins.hpp` (§6); the twin-completeness test fails a registry tool
+   that has no row or no ledger `mcp_twin`.
 9. **Tests.** A `TestRouteSink` fixture for the REST handler (mind the two gotchas, §6) and an MCP
    round-trip test dispatching the new tool through the JSON-RPC surface.
 10. **Docs.** `docs/user-manual/rest-api.md` entry (§2) + `docs/mcp-server.md` entry (following its
@@ -778,9 +805,10 @@ see §5 for which chokepoints apply.
     a row of any status (the preflight checks only `twinned*` rows), and it counts an empty-string claim
     on every row (the preflight treats it as no twin: it skips it on a non-twinned row, errors on
     `twinned` and `twinned-mcp-only`, and accepts it on `twinned-rest-only`). A `retire` or `exception`
-    row that still names a removed tool must therefore null its `mcp_twin`. The test requires at least
-    `kMinLedgerFiles` ledger files (a constant in the test file): when a domain is added to or removed
-    from `DOMAINS`, move that constant with it (a new domain's file may start as `[]`). The test checks
+    row that still names a removed tool must therefore null its `mcp_twin`. The test requires exactly
+    `kLedgerFiles` ledger files (a constant in the test file, repeated in `test_twin_completeness.cpp`):
+    when a domain is added to or removed from `DOMAINS`, move both constants with it (a new domain's
+    file may start as `[]`). The test checks
     that each claimed name is in the compiled catalogue, which `tools/list` and `resources/list` return in
     full; the `--mcp-*` runtime gates act at call time. It is not evidence of handler, behaviour or
     authorization parity, and it does not check that a dispatch branch exists. It is the

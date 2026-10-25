@@ -70,6 +70,7 @@
 #include "credential_change_owner.hpp" // #5342 — CredentialChangeRequest/Outcome (the one-transaction write)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric
 #include "admin_gate.hpp"
+#include "engine_no_admin_audit.hpp" // the shared no-admin auditor (REST + MCP)
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
 #include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
@@ -386,14 +387,40 @@ static bool refuse_cross_site_cookie_write(const auth::Session& s, const httplib
     return true;
 }
 
+// The apply function's view of a PUT or DELETE /api/v1/dex/score-policy request: the RAW
+// dry_run query value and If-Match header (absent stays absent, so the refusal and its denied
+// row live in apply_dex_score_policy) and the body. A repeated header or parameter is handed
+// over joined with "," so the parsers refuse it exactly as they refuse a one-line list.
+static DexScorePolicyWriteRequest score_policy_write_request(DexScorePolicyWriteRequest::Op op,
+                                                             const httplib::Request& request,
+                                                             const auth::Session& session) {
+    DexScorePolicyWriteRequest out;
+    out.op = op;
+    if (request.has_param("dry_run")) {
+        std::string joined;
+        for (size_t i = 0, n = request.get_param_value_count("dry_run"); i < n; ++i)
+            joined += (i ? "," : "") + request.get_param_value("dry_run", i);
+        out.dry_run = std::move(joined);
+    }
+    if (request.has_header("If-Match")) {
+        std::string joined;
+        for (size_t i = 0, n = request.get_header_value_count("If-Match"); i < n; ++i)
+            joined += (i ? "," : "") + request.get_header_value("If-Match", "", i);
+        out.if_match = std::move(joined);
+    }
+    out.body = request.body;
+    out.actor = session.username;
+    return out;
+}
+
 // Maps an EnginePrincipalStore/ApiTokenStore `std::expected<..., string>`
 // failure message to an HTTP status. The stores are string-typed-error, not
 // exception-typed — this keeps the mapping in one place instead of
 // re-deriving substring checks at every call site (create/mint/rotate/
 // confirm). Store-unavailable / entropy-exhaustion conditions are retryable
-// (503); "grace window elapsed" is a genuine state conflict (409, design §7
-// — the caller must fall back to an explicit re-mint or the compromise
-// runbook, never retry indefinitely); a message this function does NOT
+// (503); "grace window elapsed" is a genuine state conflict (409, design §7:
+// the caller must confirm, or revoke the stuck successor and rotate again
+// (never revoke the principal: that is terminal), never retry indefinitely); a message this function does NOT
 // recognize as one of the store's own hand-authored validation strings is
 // classified 503, not 400 (Hermes/governance finding: a swallowed SELECT
 // failure inside `read_active_for_principal_on_conn` returns an EMPTY vector
@@ -937,6 +964,25 @@ const std::string& openapi_spec() {
           "meta": {"type": "object", "properties": {"api_version": {"type": "string"}}}
         }
       },
+      "DexScorePolicyData": {
+        "type": "object",
+        "description": "Body of every 200 answer of /dex/score-policy (GET, PUT, DELETE): the data envelope plus meta.",
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["document", "revision", "source"],
+            "properties": {
+              "document": {"type": "object", "description": "The policy in force in the stored shape: version, tiers.edges, tiers.names, weights, overrides. Never the Apps tiers.<tier>.{edge,name} projection."},
+              "revision": {"type": "string", "description": "'default' when nothing is stored, else 16 lower-hex digits (FNV-1a 64) of the stored text. For a dry run, the revision the real write WOULD produce."},
+              "source": {"type": "string", "enum": ["custom", "default"]},
+              "fault": {"type": "string", "description": "Present when the stored text is refused and the shipped defaults are in force; says why."},
+              "previous_revision": {"type": "string", "description": "PUT and DELETE only: the revision the store held when the If-Match was checked."},
+              "dry_run": {"type": "boolean", "description": "PUT with dry_run=true only."}
+            }
+          },
+          "meta": {"type": "object"}
+        }
+      },
       "Approval": {
         "type": "object",
         "description": "A queued instruction-approval request. Returned by GET /api/v1/approvals/{id} (the A4 status_url target).",
@@ -1255,8 +1301,13 @@ const std::string& openapi_spec() {
       "DeploymentDevice": {"type": "object", "properties": {"agent_id": {"type": "string"}, "hostname": {"type": "string"}, "os": {"type": "string"}, "step": {"type": "string", "enum": ["pending", "staging", "staged", "executing", "succeeded", "failed", "skipped"]}, "exit_code": {"type": "integer"}, "error": {"type": "string", "description": "Empty when none"}, "updated_at_ms": {"type": "integer", "description": "Epoch milliseconds"}}, "required": ["agent_id", "hostname", "os", "step", "exit_code", "error", "updated_at_ms"]},
 )json"
         R"json(
+      "ConfigState": {"type": "object", "properties": {"data": {"type": "object", "properties": {"config": {"type": "object", "description": "Effective values: heartbeat_timeout, response_retention_days, audit_retention_days (present only when not withheld; the stored value, not the enforced window), guardian_event_retention_days, auto_approve_enabled, log_level.", "additionalProperties": true}, "overrides": {"type": "object", "description": "Stored overrides by key: value, or is_set for a secret key, with updated_by and updated_at.", "additionalProperties": {"type": "object", "additionalProperties": true}}, "allowed_keys": {"type": "array", "items": {"type": "string"}}, "read_only_keys": {"type": "array", "items": {"type": "string"}, "description": "Allowed keys that have their own writer."}, "withheld_keys": {"type": "array", "items": {"type": "string"}, "description": "Keys whose stored override the caller could not write, left out of overrides."}}, "required": ["config", "overrides", "allowed_keys", "read_only_keys", "withheld_keys"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]},
+      "ConfigSetResult": {"type": "object", "properties": {"data": {"type": "object", "properties": {"key": {"type": "string"}, "value": {"type": "string", "description": "A secret key's value is never echoed."}, "applied": {"type": "boolean"}, "effect": {"type": "string", "enum": ["immediate", "deferred", "stored_only"]}, "audit_persisted": {"type": "boolean", "description": "Present, and false, only when the audit row did not persist."}}, "required": ["key", "applied", "effect"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]},
       "DeploymentList": {"type": "object", "properties": {"data": {"type": "array", "items": {"$ref": "#/components/schemas/DeploymentRun"}}, "pagination": {"type": "object", "properties": {"start": {"type": "integer"}, "page_size": {"type": "integer", "description": "The limit applied"}, "truncated": {"type": "boolean", "description": "More deployments exist than were returned; there is no total"}}, "required": ["start", "page_size", "truncated"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "pagination", "meta"]},
       "DeploymentDetail": {"type": "object", "properties": {"data": {"type": "object", "properties": {"deployment_id": {"type": "string"}, "source_run_id": {"type": "string", "description": "The pre-flight run whose go-cohort this targets"}, "name": {"type": "string"}, "artifact_filename": {"type": "string"}, "artifact_sha256": {"type": "string"}, "has_args": {"type": "boolean", "description": "Installer arguments are set; they are never returned"}, "status": {"type": "string", "description": "Store lifecycle token", "enum": ["running", "complete"]}, "state": {"type": "object", "properties": {"code": {"type": "string", "enum": ["running", "complete", "complete_failed", "complete_skipped", "unknown"]}, "label": {"type": "string", "description": "Operator-facing label, may carry a count"}, "tone": {"type": "string", "enum": ["ok", "warn", "info", "idle"]}}, "required": ["code", "label", "tone"]}, "created_at_ms": {"type": "integer", "description": "Epoch milliseconds"}, "completed_at_ms": {"type": "integer", "description": "Epoch milliseconds; 0 while running"}, "total": {"type": "integer", "description": "Devices targeted"}, "succeeded": {"type": "integer"}, "failed": {"type": "integer"}, "skipped": {"type": "integer"}, "active": {"type": "integer", "description": "Devices still in flight"}, "devices": {"type": "array", "items": {"$ref": "#/components/schemas/DeploymentDevice"}}, "device_limit": {"type": "integer", "description": "The device cap applied"}, "truncated": {"type": "boolean", "description": "The device grid is cut: more devices were targeted than listed"}}, "required": ["deployment_id", "source_run_id", "name", "artifact_filename", "artifact_sha256", "has_args", "status", "state", "created_at_ms", "completed_at_ms", "total", "succeeded", "failed", "skipped", "active", "devices", "device_limit", "truncated"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}
+    },
+    "headers": {
+      "ETag": {"schema": {"type": "string"}, "description": "The quoted revision of /dex/score-policy. On a dry run it is the CURRENT stored revision (the resource did not change; it is what the real PUT must send), not data.revision."}
     }
   },
   "security": [{"bearerAuth": []}, {"apiKeyHeader": []}, {"cookieAuth": []}],
@@ -1777,26 +1828,29 @@ const std::string& openapi_spec() {
         R"json(,
     "/engine-principals": {
       "post": {"operationId": "postEnginePrincipals", "summary": "Create a new engine-principal identity", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["slug", "display_name", "owner_username", "justification", "classification"], "properties": {"slug": {"type": "string", "description": "Reserved 'engine:<slug>' namespace suffix — lowercase letters, digits, '.', '_', '-' only, max 128 chars"}, "display_name": {"type": "string"}, "owner_username": {"type": "string", "description": "Must reference an existing user (owner-FK)"}, "justification": {"type": "string"}, "classification": {"type": "string", "enum": ["internal", "external"]}}}}}}, "responses": {"201": {"description": "Created; {principal_id}", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"principal_id": {"type": "string", "description": "engine:<slug>."}}, "required": ["principal_id"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "Bad JSON, invalid/duplicate slug, missing justification, unknown owner_username, or invalid classification"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "503": {"description": "Engine-principal store, or owner-lookup, unavailable"}}},
-      "get": {"operationId": "getEnginePrincipals", "summary": "List every engine principal", "tags": ["Security"], "responses": {"200": {"description": "List of engine principals with active_credential_count", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "array", "items": {"$ref": "#/components/schemas/SecurityEnginePrincipalSummary"}}, "pagination": {"$ref": "#/components/schemas/ApiPagination"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "pagination", "meta"]}}}}, "403": {"description": "Requires EnginePrincipal:Read"}, "503": {"description": "Engine-principal store unavailable"}}}
+      "get": {"operationId": "getEnginePrincipals", "summary": "List every engine principal", "tags": ["Security"], "responses": {"200": {"description": "List of engine principals with active_credential_count", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "array", "items": {"$ref": "#/components/schemas/SecurityEnginePrincipalSummary"}}, "pagination": {"$ref": "#/components/schemas/ApiPagination"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "pagination", "meta"]}}}}, "403": {"description": "Requires EnginePrincipal:Read"}, "503": {"description": "Engine-principal store unavailable, or the principal list or the credential counts could not be read (Retry-After: 2, retry_after_ms 2000); no list is served"}}}
     },
     "/engine-principals/{id}": {
-      "get": {"operationId": "getEnginePrincipalsById", "summary": "Get one engine principal and its active credentials", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "responses": {"200": {"description": "Engine principal detail + active_credentials[] (secrets masked)", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/SecurityEnginePrincipalDetail"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "403": {"description": "Requires EnginePrincipal:Read"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal store unavailable"}}},
+      "get": {"operationId": "getEnginePrincipalsById", "summary": "Get one engine principal and its active credentials", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "responses": {"200": {"description": "Engine principal detail + active_credentials[] (secrets masked; each entry carries token_id, rotation_group and overlap_expires_at, which identify a stuck rotation successor)", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/SecurityEnginePrincipalDetail"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "403": {"description": "Requires EnginePrincipal:Read"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal store unavailable, or the credential store could not be read (Retry-After: 2, retry_after_ms 2000); no active_credentials list is served"}}},
       "delete": {"operationId": "deleteEnginePrincipalsById", "summary": "Revoke an engine principal (terminal) and its active credentials", "tags": ["Security"], "description": "Cross-store ordering invariant: credentials are revoked FIRST (ApiTokenStore::revoke_for_principal), the identity SECOND — never the reverse.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"superseded_by": {"type": "string"}}}}}}, "responses": {"200": {"description": "Revoked (idempotent — success even if already revoked); {revoked, credentials_revoked}", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"revoked": {"type": "boolean", "description": "True also when the principal was already revoked (idempotent)."}, "credentials_revoked": {"type": "integer", "description": "Credentials revoked by this call; 0 on a repeat."}}, "required": ["revoked", "credentials_revoked"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal or credential store unavailable"}}}
     },
     "/engine-principals/{id}/credentials": {
-      "post": {"operationId": "postEnginePrincipalsByIdCredentials", "summary": "Mint the first credential for an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"ttl_days": {"type": "integer", "minimum": 1, "maximum": 90, "default": 90}}}}}}, "responses": {"201": {"description": "Minted; {token, token_id, expires_at} — token is the raw secret, shown once (Cache-Control: no-store)", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/SecurityEngineCredentialMint"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "ttl_days present but of the wrong type (string, float, boolean, null) or out of range (1-90), or a non-empty body that is not a JSON object (malformed, array, string, number, null); nothing is minted. An empty or whitespace-only body still mints the 90-day default"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "409": {"description": "Engine principal is not active, or an active credential already exists — rotate instead of minting a second one"}, "503": {"description": "Store unavailable, or CSPRNG failure"}}}
+      "post": {"operationId": "postEnginePrincipalsByIdCredentials", "summary": "Mint the first credential for an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"ttl_days": {"type": "integer", "minimum": 1, "maximum": 90, "default": 90}}}}}}, "responses": {"201": {"description": "Minted; {token, token_id, expires_at} — token is the raw secret, shown once (Cache-Control: no-store)", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/SecurityEngineCredentialMint"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "ttl_days present but of the wrong type (string, float, boolean, null) or out of range (1-90), or a non-empty body that is not a JSON object (malformed, array, string, number, null); nothing is minted. An empty or whitespace-only body still mints the 90-day default"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "409": {"description": "Engine principal is not active, or an active credential already exists — rotate instead of minting a second one"}, "503": {"description": "Store unavailable, CSPRNG failure, or the check for an existing active credential could not read the store (nothing is minted; Retry-After: 2). Also returned, with the secret withheld and no Retry-After, when the credential was minted but could not be read back, or the read-back found no active credential (audit result partial): list the principal's credentials and rotate if one is listed, a second mint is 409"}}}
     },
     "/engine-principals/{id}/credentials/rotate": {
-      "post": {"operationId": "postEnginePrincipalsByIdCredentialsRotate", "summary": "Overlap-pair rotation of an engine principal's credential (design §7)", "tags": ["Security"], "description": "Mints a successor credential alongside the still-valid predecessor for the overlap window. A retry within the grace window by the SAME operator re-serves the identical raw secret (idempotent); step-up is re-validated on every call, including a re-serve.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days. A non-empty body must be a JSON object and overlap_secs a JSON integer (400 otherwise)"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token is the raw successor secret (Cache-Control: no-store)", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/SecurityEngineCredentialRotation"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, or no active credential to rotate (ambiguous with a transient store read failure — retry, or mint if genuinely absent)"}}}
+      "post": {"operationId": "postEnginePrincipalsByIdCredentialsRotate", "summary": "Overlap-pair rotation of an engine principal's credential (design §7)", "tags": ["Security"], "description": "Mints a successor credential alongside the still-valid predecessor for the overlap window. A retry within the grace window by the SAME operator re-serves the identical raw secret (idempotent); step-up is re-validated on every call, including a re-serve.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days. A non-empty body must be a JSON object and overlap_secs a JSON integer (400 otherwise)"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token is the raw successor secret (Cache-Control: no-store)", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/SecurityEngineCredentialRotation"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, or no active credential to rotate (ambiguous with a transient store read failure — retry, or mint if genuinely absent). Also returned, with Retry-After: 2 and the secret withheld, when the rotation committed but the successor could not be read back; the same operator repeating the call within the grace window (about two minutes, same server replica) gets the same secret, otherwise find the stuck successor with GET /engine-principals/{id}, revoke it with DELETE /tokens/{token_id} (administrator) and rotate from the sole credential. When the read answered but no linked successor was found the secret is also withheld, with NO retry hint: inspect the principal's credentials, then rotate again if needed. Never revoke the principal (terminal)"}}}
     },
     "/engine-principals/{id}/credentials/confirm": {
       "post": {"operationId": "postEnginePrincipalsByIdCredentialsConfirm", "summary": "Confirm receipt of a rotated credential's successor secret (design §7 maker-checker)", "tags": ["Security"], "description": "Pass the successor token_id the rotate response returned (pins the confirm to that exact rotation; a stale or mismatched id is rejected with no state change) AND the raw successor secret (proof of possession, #3015). Confirm revokes the predecessor only after the presented secret verifies against the stored hash.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["token_id", "secret"], "properties": {"token_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "minLength": 24, "maxLength": 24, "description": "Successor token_id returned by the rotate call (24 lowercase hex) — pins the exact rotation being confirmed"}, "secret": {"type": "string", "minLength": 1, "maxLength": 512, "description": "The raw successor secret the rotate call returned — proof of possession (#3015), verified constant-time against the stored hash; checked only after every other admission gate. Missing/empty is 400; wrong is 403"}}}}}}, "responses": {"200": {"description": "Confirmed; predecessor credential revoked", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"confirmed": {"type": "boolean"}}, "required": ["confirmed"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "token_id or secret missing, empty, or not a string; more than two active credentials; or a non-engine active credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write, or the presented secret does not verify against the pending successor (#3015)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry): token_id does not match the pending successor; the rotation was already confirmed or otherwise resolved by cutover/sweep/revoke; the sole active credential has unresolved rotation metadata; the grace window elapsed; or the rotation was initiated by a different operator"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, a confirm/revoke/clear persistence failure, or no in-flight rotation to confirm - the last covers zero active credentials (ambiguous with a transient read failure) and an unrecognized two-credential pair; rotate first if genuinely absent"}}}
     },
     "/engine-principals/{id}/transfer-owner": {
       "post": {"operationId": "postEnginePrincipalsByIdTransferOwner", "summary": "Admin-forced ownership reassignment of an engine principal", "tags": ["Security"], "description": "Never depends on the outgoing owner's cooperation (design §3.1).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["new_owner"], "properties": {"new_owner": {"type": "string", "description": "Must reference an existing user"}}}}}}, "responses": {"200": {"description": "Transferred; {transferred:true}", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"transferred": {"type": "boolean"}}, "required": ["transferred"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "Bad JSON, or new_owner missing/does not reference an existing user"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "409": {"description": "Engine principal is not active"}, "503": {"description": "Store unavailable"}}}
-    },
+    })json"
+        // Split again (MSVC C2026 16,380-byte cap): the engine-principal segment above
+        // grew past the 15,000-byte working ceiling with the dev merge. Byte-identical emit.
+        R"json(,
     "/engine-principals/audit/no-admin": {
-      "get": {"operationId": "getEnginePrincipalsAuditNoAdmin", "summary": "Auditor-runnable proof that no engine principal holds admin/built-in/wildcard access (design §4.2, decision log #13)", "tags": ["Security"], "description": "Read-only evidentiary query, gated on AuditLog:Read rather than Security so a read-only auditor role can run it without engine-principal write access.", "responses": {"200": {"description": "{violations[]} — empty array means the invariant holds", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"ok": {"type": "boolean", "description": "True when violations is empty."}, "violations": {"type": "array", "items": {"$ref": "#/components/schemas/SecurityEngineNoAdminViolation"}}}, "required": ["ok", "violations"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "403": {"description": "Requires AuditLog:Read"}, "503": {"description": "Engine-principal or RBAC reference data unavailable — cannot verify"}}}
+      "get": {"operationId": "getEnginePrincipalsAuditNoAdmin", "summary": "Auditor-runnable check for engine principals holding admin, built-in or wildcard roles (design §4.2, decision log #15)", "tags": ["Security"], "description": "Read-only evidentiary query, gated on AuditLog:Read rather than Security so a read-only auditor role can run it without engine-principal write access. Detective and pull-only: a custom wildcard role is permitted at assignment and reported here as wildcard_grant. ok:true means no role covers the whole current permission grid at run time.", "responses": {"200": {"description": "{ok, violations[]} — empty array means no admin, system or full-grid role was found", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"ok": {"type": "boolean", "description": "True when violations is empty."}, "violations": {"type": "array", "items": {"$ref": "#/components/schemas/SecurityEngineNoAdminViolation"}}}, "required": ["ok", "violations"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "403": {"description": "Requires AuditLog:Read"}, "503": {"description": "A grants, roles or role-permissions read, or the RBAC reference data, could not be read — cannot verify (Retry-After: 2, retry_after_ms 2000); no partial list is returned"}}}
     })json"
         // Split again (MSVC C2026 16,380-byte cap) — the engine-principal
         // lifecycle routes (PR 4.3) get their own segment; concatenated at
@@ -1825,7 +1879,7 @@ const std::string& openapi_spec() {
       "get": {"operationId": "getCaCrl", "security": [], "summary": "Internal CA certificate revocation list (DER, public)", "tags": ["Security"], "responses": {"200": {"description": "DER-encoded CRL", "content": {"application/pkix-crl": {"schema": {"type": "string", "format": "binary"}}}}, "503": {"description": "CRL unavailable"}}}
     },
     "/ca/issued": {
-      "get": {"operationId": "getCaIssued", "summary": "List certificates issued by the internal CA", "tags": ["Security"], "description": "Without kind/days/week/bucket/as_of/cursor: the inventory, newest first (unaudited), offset paging. With any of them: exactly the certificates behind one GET /crypto/ca/stats count (same predicate; valid through notAfter inclusive), strict parameters, a filter object (rule_id, criterion, rule_set_version, as_of, total, scope_note) and next_cursor (keyset paging: pass it back as cursor; null on the last page; offset refused), withheld 403 from a caller whose view is confined (ADR-0070 R2; no permission named), audited crypto.ca.certificates.view set-and-proceed. Twin: MCP list_issued_certs.", "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000}, "description": "Unfiltered: 1..1000, default 200. Filtered: 1..500, default 100 (refused outside)"}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0, "minimum": 0, "maximum": 1000000}, "description": "Unfiltered only; refused (400) with a filter"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["active", "expiring", "expired", "revoked", "issued", "issued_week", "revoked_week"]}}, {"name": "days", "in": "query", "schema": {"type": "integer", "enum": [3, 7, 14, 21, 30, 60, 90]}, "description": "Window; required for expiring/expired/revoked/issued, in that kind's set"}, {"name": "week", "in": "query", "schema": {"type": "string", "maxLength": 8}, "description": "ISO week YYYY-Www; required for issued_week/revoked_week"}, {"name": "bucket", "in": "query", "schema": {"type": "string", "enum": ["superseded", "unpublished", "other"]}, "description": "revoked/revoked_week only"}, {"name": "as_of", "in": "query", "schema": {"type": "integer"}, "description": "First page's epoch seconds; accepted from 7 days before the database clock up to 300 seconds after it, else 400"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 512}, "description": "The previous page's next_cursor (carries its as_of; bound to kind/days/week/bucket; malformed or other-filter is 400)"}], "responses": {"200": {"description": "Unfiltered: the issued-certificate inventory {items, count, meta:{api_version, limit, offset, has_more, next_offset?}}; next_offset is present only when has_more is true. meta also carries the CRL figures crl_version, crl_published_at, crl_next_update, crl_revoked_count and crl_stale (null when it could not be determined; crl_stale is true when the latest list was not built from the current revoked set, including when none is published, and does not reflect expiry, so compare crl_next_update with the current time). Filtered: {items, count, meta:{api_version, limit, has_more}} plus filter, next_cursor and audit_persisted? (no CRL figures). MCP twin: list_issued_certs.", "content": {"application/json": {"schema": {"oneOf": [{"$ref": "#/components/schemas/SecurityCaIssuedPage"}, {"$ref": "#/components/schemas/SecurityCaIssuedFilteredPage"}]}}}}, "400": {"description": "Unfiltered: limit or offset is not a single base-10 integer (an integer outside limit 1..1000 or offset 0..1000000 is clamped, not refused). Filtered: any malformed parameter, an offset, or a bad cursor (the message names it)"}, "401": {"description": "Not authenticated"}, "403": {"description": "Requires Security:Read; when filtered, also refused to a caller whose view is confined"}, "503": {"description": "CA store degraded or crypto reads busy: retry_after_ms 5000; filtered list unwired, or the Postgres pool too small for the filtered read (message names the --postgres-pool-size): no retry hint"}}}
+      "get": {"operationId": "getCaIssued", "summary": "List certificates issued by the internal CA", "tags": ["Security"], "description": "Without kind/days/week/bucket/as_of/cursor: the inventory, newest first, offset paging. With any of them: exactly the certificates behind one GET /crypto/ca/stats count (same predicate; valid through notAfter inclusive), strict parameters, a filter object (rule_id, criterion, rule_set_version, as_of, total, scope_note) and next_cursor (keyset paging: pass it back as cursor; null on the last page; offset refused). Both forms are withheld with 403 from a caller whose view is confined or who holds no Inventory:Read grant (ADR-0070 R2; no permission named); a failed access check is a retryable 503, never the list; both are audited crypto.ca.certificates.view set-and-proceed (a dropped audit row sets Sec-Audit-Failed and audit_persisted false). Twin: MCP list_issued_certs.", "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000}, "description": "Unfiltered: 1..1000, default 200. Filtered: 1..500, default 100 (refused outside)"}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0, "minimum": 0, "maximum": 1000000}, "description": "Unfiltered only; refused (400) with a filter"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["active", "expiring", "expired", "revoked", "issued", "issued_week", "revoked_week"]}}, {"name": "days", "in": "query", "schema": {"type": "integer", "enum": [3, 7, 14, 21, 30, 60, 90]}, "description": "Window; required for expiring/expired/revoked/issued, in that kind's set"}, {"name": "week", "in": "query", "schema": {"type": "string", "maxLength": 8}, "description": "ISO week YYYY-Www; required for issued_week/revoked_week"}, {"name": "bucket", "in": "query", "schema": {"type": "string", "enum": ["superseded", "unpublished", "other"]}, "description": "revoked/revoked_week only"}, {"name": "as_of", "in": "query", "schema": {"type": "integer"}, "description": "First page's epoch seconds; accepted from 7 days before the database clock up to 300 seconds after it, else 400"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 512}, "description": "The previous page's next_cursor (carries its as_of; bound to kind/days/week/bucket; malformed or other-filter is 400)"}], "responses": {"200": {"description": "Unfiltered: the issued-certificate inventory {items, count, meta:{api_version, limit, offset, has_more, next_offset?}}; next_offset is present only when has_more is true; audit_persisted? (present and false only when the audit row failed to persist, also marked by Sec-Audit-Failed). meta also carries the CRL figures crl_version, crl_published_at, crl_next_update, crl_revoked_count and crl_stale (null when it could not be determined; crl_stale is true when the latest list was not built from the current revoked set, including when none is published, and does not reflect expiry, so compare crl_next_update with the current time). Filtered: {items, count, meta:{api_version, limit, has_more}} plus filter, next_cursor and audit_persisted? (no CRL figures). MCP twin: list_issued_certs.", "content": {"application/json": {"schema": {"oneOf": [{"$ref": "#/components/schemas/SecurityCaIssuedPage"}, {"$ref": "#/components/schemas/SecurityCaIssuedFilteredPage"}]}}}}, "400": {"description": "Unfiltered: limit or offset is not a single base-10 integer (an integer outside limit 1..1000 or offset 0..1000000 is clamped, not refused). Filtered: any malformed parameter, an offset, or a bad cursor (the message names it)"}, "401": {"description": "Not authenticated"}, "403": {"description": "Requires Security:Read; either form is also refused to a caller whose view of the fleet is confined or who holds no Inventory:Read grant (no permission named)"}, "503": {"description": "retry_after_ms 5000: access check unavailable, CA store unavailable (unfiltered), CA store degraded or crypto reads busy (filtered). No retry hint: certificate list unavailable (unfiltered) or filtered list unwired, CA not available, or the Postgres pool too small for the filtered read (message names the --postgres-pool-size)"}}}
     },
     "/ca/revoke": {
       "post": {"operationId": "postCaRevoke", "summary": "Revoke a certificate by serial", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["serial_hex"], "properties": {"serial_hex": {"type": "string"}, "reason": {"type": "string"}}}}}}, "responses": {"200": {"description": "Revoked; CRL republished", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SecurityCaRevokeResult"}}}}, "403": {"description": "Requires Security:Delete"}, "404": {"description": "Serial not found or already revoked"}}}
@@ -2082,8 +2136,11 @@ const std::string& openapi_spec() {
 )json"
         R"json(
     "/guaranteed-state/push": {
-      "post": {"operationId": "postGuaranteedStatePush", "summary": "Queue a Guaranteed State rule push to agents", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Push. Returns 202 Accepted — agent delivery is asynchronous. The server resolves the scope and delivers each in-scope agent a per-agent filtered rule set (os_target + scope_expr).", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"scope": {"type": "string", "description": "Scope DSL selector (empty = all agents)"}, "full_sync": {"type": "boolean", "default": false}}}}}}, "responses": {"202": {"description": "Push queued", "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"type": "object", "properties": {"queued": {"type": "boolean", "enum": [true]}, "rules": {"type": "integer", "description": "Rule count in the store at push time."}, "agents": {"type": "integer", "description": "Agents the push was delivered to; 0 when dispatch is not wired."}, "scope": {"type": "string", "description": "The scope expression echoed from the request; empty when none was sent."}}, "required": ["queued", "rules", "agents", "scope"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "400": {"description": "Invalid JSON body"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Service-scoped API token — a full_sync push is fleet-wide by nature and cannot be confined to the token's service; the single most severe instance of this confinement-gap class on this branch."}, "503": {"description": "Guaranteed-state rule store degraded or unreachable — the push is refused rather than fanned out empty (ADR-0038), retryable (A4 envelope, retry_after_ms)"}}}
-    },
+      "post": {"operationId": "postGuaranteedStatePush", "summary": "Queue a Guaranteed State rule push to agents", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Push. Returns 202 Accepted — agent delivery is asynchronous. The server resolves the scope and delivers each in-scope agent a per-agent filtered rule set (os_target + scope_expr).", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"scope": {"type": "string", "description": "Scope DSL selector (empty = all agents)"}, "full_sync": {"type": "boolean", "default": false, "description": "true replaces the agent's rule set; false merges and does not retry a still-unresolved rule the push omits"}}}}}}, "responses": {"202": {"description": "Push queued", "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"type": "object", "properties": {"queued": {"type": "boolean", "enum": [true]}, "rules": {"type": "integer", "description": "Rule count in the store at push time."}, "agents": {"type": "integer", "description": "Agents the push was delivered to; 0 when dispatch is not wired."}, "scope": {"type": "string", "description": "The scope expression echoed from the request; empty when none was sent."}}, "required": ["queued", "rules", "agents", "scope"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "400": {"description": "Invalid JSON body"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Service-scoped API token — a full_sync push is fleet-wide by nature and cannot be confined to the token's service; the single most severe instance of this confinement-gap class on this branch."}, "503": {"description": "Guaranteed-state rule store degraded or unreachable — the push is refused rather than fanned out empty (ADR-0038), retryable (A4 envelope, retry_after_ms)"}}}
+    })json"
+        // Split here (MSVC C2026 16,380-byte cap): keeps the segment above under the
+        // 16,000-byte working ceiling. Byte-identical emit, as for the split above.
+        R"json(,
     "/guaranteed-state/events": {
       "get": {"operationId": "getGuaranteedStateEvents", "summary": "Query Guaranteed State events", "tags": ["Guaranteed State"], "description": "Two gated shapes behind one route. An agent-scoped query (non-empty agent_id, max 256 chars, no control characters) requires per-device-scoped GuaranteedState:Read (management-group aware; a service-scoped token is confined to its own service's agents) and returns that device's individual-identifying behavioural signal history. A fleet-wide query (no agent_id) requires global GuaranteedState:Read AND denies a service-scoped token outright (403) — the fleet fan-out returns every reporting agent's agent_id + detail_json, which the bare service-token role check alone would not confine. BOTH shapes emit a dex.device.view audit (target_type Agent for the per-device shape, GuaranteedState for the fleet shape) and FAIL CLOSED — 503 + Sec-Audit-Failed: true (retryable, A4 envelope with retry_after_ms) — if that audit row cannot persist, parity with GET /api/v1/dex/devices/{id}. Limit is capped at 1000 at the REST boundary.", "parameters": [{"name": "rule_id", "in": "query", "schema": {"type": "string"}}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}}, {"name": "severity", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "{data:[event], pagination, meta}. pagination.start echoes offset and page_size is a fixed 50, not the limit sent.", "content": {"application/json": {"schema": {"type": "object", "required": ["data", "pagination", "meta"], "properties": {"data": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateEvent"}}, "pagination": {"$ref": "#/components/schemas/ApiPagination"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "400": {"description": "Invalid limit/offset, or agent_id too long / contains a control character"}, "403": {"description": "A service-scoped token queried the fleet-wide (no agent_id) shape, or an agent-scoped query named a device outside the caller's scope"}, "503": {"description": "Audit row could not persist — behavioural data withheld on both the agent-scoped and fleet-wide shapes; carries Sec-Audit-Failed: true and is retryable (A4 envelope).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
@@ -2252,7 +2309,14 @@ const std::string& openapi_spec() {
     "/dex/apps": {
       "get": {"operationId": "getDexApps", "summary": "App-centric stability list", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Every application with a Windows crash/hang signal in the window: the 100 applications affecting the most Windows devices (then crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then name in byte order); apps_total counts every application with a Windows crash or hang signal in the window and apps_truncated flags the cut; up to 20 versions each (devices affected descending, then version), versions_truncated flags that cut. Each row carries crashes, hangs and distinct_devices (window-wide), then the figures over one population, the Windows devices online now: distinct_devices_online (the affected devices that are online now; null when no fleet source is wired), share_affected (95 percent Wilson interval of those over the population), rate_per_1000 (their events per 1,000 online devices, exact interval) and the stability score with its decomposition, so a device that crashed and went offline is in the counts but not in the share, and the score is withheld as offline_affected while any affected device is offline. Counts are Windows-scoped (the Apps tab, the Overview top apps and GET /dex/app still count every platform) and the population is Windows devices online now (population: null = no fleet source wired, 0 = no Windows device online now; population_basis names it). No device floor is applied. The version-regression term is not assessed here. No per-agent identity (a distinct-device COUNT per app, never an agent_id) — fleet aggregate, NOT audited. The data.policy block names the score policy every figure was scored under (source default|custom, revision, fault, and the four tier edges and display names; Poor's edge is the fixed 0); fault is a reason string when a stored policy document was refused and the shipped defaults are in force, otherwise null. Each application carries profile (default|override): override means a per-application override shaped its tiers or weights; its versions inherit it. A failed read, an invalid score policy, a stored policy that cannot be read within its staleness bound (60 s) or a read over its concurrency budget (4 at once) returns 503, never an empty list.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Apps list (data.window, data.population, data.population_basis, data.apps_total, data.apps_truncated, data.policy.{source, revision, fault, tiers}, data.apps[].{subject, profile, crashes, hangs, distinct_devices, distinct_devices_online, last_seen, share_affected, rate_per_1000, score, versions[], version_count, versions_truncated})", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/DexAppsList"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "invalid window"}, "503": {"description": "service unavailable, or the application-stability read degraded or over its concurrency budget (retry_after_ms 2000)"}}}
     },
-    "/dex/catalogue": {
+    )json"
+        // Split again (MSVC C2026 ~16 KB per-literal cap); concatenated at compile time.
+        // #6086's score-policy path starts a fresh literal (its trailing "," is its own
+        // separator), and the catalogue entry after it starts another.
+        R"json("/dex/score-policy": {"get": {"operationId": "getDexScorePolicy", "summary": "Read the customer DEX score policy", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The policy in force, read from the store (not this instance's cache): document in the stored shape, its revision, source (custom|default) and, when the stored text is refused and the shipped defaults are served, the fault. The ETag is the revision; send it as If-Match on PUT or DELETE. Not audited (fleet-wide configuration, no per-agent data).", "responses": {"200": {"description": "{data:{document,revision,source,fault?}} with an ETag header", "headers": {"ETag": {"$ref": "#/components/headers/ETag"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DexScorePolicyData"}}}}, "401": {"description": "Unauthenticated", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "403": {"description": "No GuaranteedState:Read grant", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Runtime config store unavailable (retry_after_ms 2000)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}, "put": {"operationId": "putDexScorePolicy", "summary": "Replace the customer DEX score policy", "tags": ["DEX"], "description": "Requires Infrastructure:Write; a cookie session must be same-site. The body is the whole policy document in the stored shape (version, tiers.edges, tiers.names, weights, overrides), at most 256 KiB, validated exactly as the reader validates a stored text; the Apps policy block (tiers.<tier>.{edge,name}, source, revision, fault) is a projection and is refused with a remediation. Requires If-Match (see the header parameter). dry_run=true validates and returns the document and revision a real write would produce, stores nothing and writes one dex.score_policy.validate audit row; any other dry_run value, or a repeat that differs in its raw bytes, is a 400. Every refusal writes a denied audit row, except an unreadable store (503, no row) and a missing permission (the standing auth.permission_required row); a real write writes an attempted row BEFORE touching the store (a refused row is a 503 and nothing changes) and a success or failure row after. Other instances typically converge within 5 seconds. A store error after the statement was sent is resolved by re-reading the store (see the 503).", "parameters": [{"name": "If-Match", "in": "header", "required": true, "schema": {"type": "string"}, "description": "The revision the change is based on: 'default' when no policy was ever written, else the revision GET returned (quoted or bare). A wildcard, a weak validator or a list is refused (400); an absent header is refused (428); a revision that is not the stored one is refused (409)."}, {"name": "dry_run", "in": "query", "required": false, "schema": {"type": "string", "enum": ["true", "false"]}, "description": "true = validate only"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "description": "The policy document: version (1), tiers.edges.{excellent,good,fair}, tiers.names.{excellent,good,fair,poor}, weights.{breadth,crashes,hangs,regression}, overrides[]. Unknown keys are refused."}}}}, "responses": {"200": {"description": "Written (or validated, for a dry run). {data:{document,revision,source,previous_revision,dry_run?}} with an ETag header. A 200 that also carries Sec-Audit-Failed: true means the outcome audit row is missing (only the attempted row stands); the change was applied, and a retry with the old If-Match answers 409. GET to confirm the state, treat the attempted row as the sole evidence and check the audit store", "headers": {"ETag": {"$ref": "#/components/headers/ETag"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DexScorePolicyData"}}}}, "400": {"description": "Malformed If-Match or dry_run value, a document that is not valid JSON, nests too deeply, exceeds 256 KiB, has an unknown key or a value the validator refuses (the message names the field)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "403": {"description": "No Infrastructure:Write grant, or a cross-site browser write", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "409": {"description": "The If-Match revision is not the stored one (the message names the stored revision), or the stored policy changed while this write was being made (no revision is named)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "428": {"description": "If-Match header missing", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Runtime config store unavailable, another score policy write in this process is still running (retry_after_ms 2000), the audit store refused the row so nothing was changed (retry_after_ms 5000, Sec-Audit-Failed: true), or the write's OUTCOME IS UNKNOWN (retry_after_ms 2000): the store reported an error after the statement was sent and a re-read showed a state other than the one requested, or could not be made. The message names the revision now stored (none when the re-read failed); GET the policy and compare its revision: if it is the If-Match revision you sent, the write did not apply; if it is the revision a dry_run=true of your document returns (send the revision GET returned as its If-Match), the write applied; if it is any other revision, review the policy before changing it again. A retry with the old If-Match answers 409 if the write applied. The answer never says the policy was left as it was.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}, "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row did not persist"}}}}}, "delete": {"operationId": "deleteDexScorePolicy", "summary": "Remove the customer DEX score policy (back to the shipped defaults)", "tags": ["DEX"], "description": "Requires Infrastructure:Write; a cookie session must be same-site. Requires If-Match. Idempotent: removing a policy that was never written answers 200 with revision 'default' (attempted and no_change audit rows). dry_run is not supported (400). Same audit order, fail-closed audit and outcome-unknown handling as PUT.", "parameters": [{"name": "If-Match", "in": "header", "required": true, "schema": {"type": "string"}, "description": "The revision the change is based on: 'default' when no policy was ever written, else the revision GET returned (quoted or bare). A wildcard, a weak validator or a list is refused (400); an absent header is refused (428); a revision that is not the stored one is refused (409)."}], "responses": {"200": {"description": "Removed or already absent. {data:{document,revision:'default',source:'default',previous_revision}} with an ETag header. A 200 that also carries Sec-Audit-Failed: true means the outcome audit row is missing (only the attempted row stands). A DELETE that removed a policy was applied and a retry with the old If-Match answers 409; a DELETE of a policy that was never written changed nothing and may be repeated. GET to confirm the state, treat the attempted row as the sole evidence and check the audit store", "headers": {"ETag": {"$ref": "#/components/headers/ETag"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DexScorePolicyData"}}}}, "400": {"description": "Malformed If-Match, or a dry_run parameter", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "403": {"description": "No Infrastructure:Write grant, or a cross-site browser write", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "409": {"description": "The If-Match revision is not the stored one (the message names the stored revision), or the stored policy changed while this removal was being made (no revision is named)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "428": {"description": "If-Match header missing", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Runtime config store unavailable, another score policy write in this process is still running (retry_after_ms 2000), the audit store refused the row so nothing was changed (retry_after_ms 5000, Sec-Audit-Failed: true), or the write's OUTCOME IS UNKNOWN (retry_after_ms 2000): the store reported an error after the statement was sent and a re-read showed a state other than the one requested, or could not be made. The message names the revision now stored (none when the re-read failed); GET the policy and compare its revision: if it is still the If-Match revision you sent, the removal did not apply; if it is any other revision, another writer changed the policy, so review it before changing it again. A retry with the old If-Match answers 409 if the removal applied. The answer never says the policy was left as it was.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}, "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row did not persist"}}}}}},
+    )json"
+        // Split again (MSVC C2026 ~16 KB per-literal cap); concatenated at compile time.
+        R"json("/dex/catalogue": {
       "get": {"operationId": "getDexCatalogue", "summary": "Signal catalogue family cards (Catalogue View 1)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Every catalogued signal family's card: how many of its member types a connected, in-scope platform monitors, the family's own health-score slice, its window event count, its busiest member type, plus an 'Other (uncatalogued)' list of obs_types seen on the wire but not yet in a curated family — the REST twin of the /fragments/dex/catalogue dashboard grid (ADR-0031 WS-A4 PR-1; see docs/dex-signal-catalog.md for the family names). No per-agent identity — fleet aggregate, NOT audited. A degraded fleet signal-summary read (store closed / pool-acquire timeout / query error) 503s (retry_after_ms 2000) rather than rendering a fabricated healthy, zero-event catalogue (WS-A4 PR-1 fix round, closes sec-5).", "parameters": [{"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Catalogue object (os, window, monitored_types, total_types, families[].{name, monitored, total, health_score|null, events, top_obs_type|null}, uncatalogued[].{obs_type, count, distinct_devices, last_seen})", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/DexCatalogue"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "invalid os or window"}, "503": {"description": "service unavailable, or the fleet signal-summary read degraded (retry_after_ms 2000)"}}}
     },
     "/dex/catalogue/group": {
@@ -2364,12 +2428,22 @@ const std::string& openapi_spec() {
       "get": {"operationId": "getPluginConfigByPluginKillSwitch", "summary": "Read a plugin or plugin-action kill-switch's display state", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Read. NOT the dispatch-gating decision (PluginConfigStore::action_allowed fails closed on any store error, which this display accessor deliberately does not) — this is the inspection view. Absence of a prior flip reads as enabled=true. GET without os reports the all-OS layer only and never reflects a per-OS OFF row. For a protective action (the quarantine plugin's quarantine/unquarantine/status/whitelist and __guard__.push_rules) the state shown here is informational only: enabled=false can be displayed while dispatch still proceeds.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "action", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Action name for an action-level switch; omit for the whole-plugin switch"}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["windows", "linux", "darwin"]}, "description": "Agent OS as reported by the agent; omit for the all-OS switch. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer. enabled is the effective state of the switch row (for a protective action that row never gates dispatch) and reason/set_by/source name the row that produced it"}], "responses": {"200": {"description": "{plugin, action, os, enabled, reason, set_by, updated_at_ms, source}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PluginConfigKillSwitchResponse"}}}}, "400": {"description": "Invalid plugin/action/os grammar, or a present-but-empty os"}, "503": {"description": "Plugin config store unavailable"}}},
       "put": {"operationId": "putPluginConfigByPluginKillSwitch", "summary": "Flip a plugin or plugin-action kill switch", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Write. Every dispatch-gating caller that consults this switch fails CLOSED on any store error, so this is a reliable emergency stop for the named plugin/action. Exception: a protective action (the quarantine plugin's quarantine/unquarantine/status/whitelist and __guard__.push_rules) is never refused by this switch; a row for one is stored and echoed but has no dispatch effect; to stop Guardian rule delivery disable or remove the rules instead (disarms them on the agent's next reconcile). Audited (plugin_config.kill_switch.set) before the mutation is attempted. The response echoes the row written, not the effective state.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "action", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Action name for an action-level switch; omit for the whole-plugin switch"}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["windows", "linux", "darwin"]}, "description": "Agent OS as reported by the agent; omit for the all-OS switch. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer. The response echoes the row written, not the effective state"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["enabled"], "properties": {"enabled": {"type": "boolean", "description": "true = allowed (the default/no-row state); false = killed; for a protective action the row is stored but has no dispatch effect"}, "reason": {"type": "string", "maxLength": 512}}}}}}, "responses": {"200": {"description": "{plugin, action, os, enabled, reason, set_by, updated_at_ms, source}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PluginConfigKillSwitchResponse"}}}}, "400": {"description": "Invalid plugin/action/os/reason grammar, a present-but-empty os, or missing/non-boolean enabled"}, "503": {"description": "Plugin config store unavailable, or the pre-mutation audit row could not be persisted"}}}
     },)json"
+        // Fresh literal split (MSVC C2026 ~16 KB per-literal cap): runtime configuration. The
+        // routes live in config_routes.cpp, not this file; the legacy /api/config pair is not in
+        // the v1 spec.
+        R"json(
+    "/config": {
+      "get": {"operationId": "getConfig", "summary": "Read the server's runtime configuration", "tags": ["Settings"], "description": "Requires Infrastructure:Read. The effective values, the stored overrides (a secret key reports is_set, never its value), allowed_keys and read_only_keys (allowed keys with their own writer). A store that is closed or cannot be read answers 503, never an empty list. Not audited. Scoped to the caller: the stored override of every key the caller could not write with PUT /api/v1/config/{key} (and the effective audit_retention_days) is left out and named in withheld_keys. Platform configuration, not agent-scoped data: a service-scoped token is refused.", "responses": {"200": {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/ConfigState"}}}, "description": "{data:{config:{heartbeat_timeout, response_retention_days, audit_retention_days, guardian_event_retention_days, auto_approve_enabled, log_level}, overrides:{<key>:{value|is_set, updated_by, updated_at}}, allowed_keys:[], read_only_keys:[], withheld_keys:[]}, meta:{api_version}}; audit_retention_days is present only when not withheld, and is the stored value, not the enforced window"}, "403": {"description": "Requires Infrastructure:Read, or a service-scoped token"}, "503": {"description": "Runtime config store unavailable or unreadable"}}}
+    },
+    "/config/{key}": {
+      "put": {"operationId": "putConfigByKey", "summary": "Set one runtime configuration override", "tags": ["Settings"], "description": "Requires Infrastructure:Write. An MFA-enrolled local or OIDC cookie session also needs a fresh MFA step-up proof (per --mfa-enforcement), checked by the central step-up check before the route runs, ahead of the permission and caller-rule checks; un-enrolled accounts and API-token and MCP-token callers pass. Audit-first: a config.update attempted row is written before the change and a row that cannot be stored refuses it (503, Sec-Audit-Failed). Seven keys (plugin_signing_required, audit_retention_days, dex_alert_routing, dex_blast_min_devices, dex_blast_window_seconds, dex_blast_cooldown_seconds, dex_cohort_export_key) need an administrator account (effective role admin; MCP-tier and service-scoped tokens are refused whatever their creator's role); the oidc_* keys need the caller's own admin role, so an elevation is refused too. Both answer 403 with a config.update denied audit row. dex_score_policy has its own route and answers 400. The answer carries effect: immediate (heartbeat_timeout, log_level), deferred (the dex_* keys, until the next DEX Alerts save or a restart; oidc_admin_group and oidc_redirect_uri, until a restart) or stored_only (nothing consumes it: the retention values, which are not enforced even after a restart because the stores take their window from the command-line flags (#483), auto_approve_enabled, plugin_signing_required, which records intent and hardens nothing, and the other oidc_* keys). heartbeat_timeout must be 30 to 86400 seconds.", "parameters": [{"name": "key", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[a-z_]+$"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["value"], "properties": {"value": {"description": "A string, or a JSON number or boolean, which is sent to the store as its JSON text; null, an array and an object are refused", "oneOf": [{"type": "string"}, {"type": "integer"}, {"type": "boolean"}]}}}}}}, "responses": {"200": {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/ConfigSetResult"}}}, "description": "{data:{key, value, applied:true, effect:immediate|deferred|stored_only, audit_persisted?:false}, meta:{api_version}}; a secret key's value is never echoed"}, "400": {"description": "Missing or invalid value, unknown key, or a key with its own route"}, "401": {"description": "A fresh MFA step-up proof is required (step-up envelope)"}, "403": {"description": "Requires Infrastructure:Write; an administrator-only key written by a caller who is not allowed to; a cross-site cookie write; or a SAML session or engine principal (step-up)"}, "413": {"description": "Request body over 16 KiB"}, "503": {"description": "Runtime config store unavailable, or the audit row could not be persisted"}}}
+    },)json"
         // Split again (MSVC C2026 16,380-byte cap): the plugin-config segment
         // above sat 12 bytes under it. Upload-grant + chunked-receive paths.
         R"json(
     "/upload-grants": {
       "post": {"operationId": "postUploadGrants", "summary": "Mint a one-time upload-grant credential", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Write. Authorises ONE agent to push ONE file back to the server (CC-06 authenticated chunked-receive protocol, docs/adr/3004-artifact-blob-storage.md). grant_secret is returned EXACTLY ONCE in this response — only its digest is persisted. destination_key is SERVER-DERIVED from retention_class + the freshly-minted grant_id only; source_path is stored as informational metadata and never influences it.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}, "source_path": {"type": "string", "description": "Informational only; never used to derive the destination key"}, "expected_sha256": {"type": "string"}, "retention_class": {"type": "string", "enum": ["standard", "extended", "transient"], "default": "standard"}, "declared_max_size": {"type": "integer"}, "ttl_secs": {"type": "integer", "minimum": 1, "description": "A JSON integer of at least 1, clamped to the 900 s maximum; omit for the default"}}}}}}, "responses": {"201": {"description": "{grant_id, grant_secret, expires_at, destination_key}; grant_secret is shown once (Cache-Control: no-store)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/UploadGrantMinted"}}}}, "400": {"description": "Invalid input (empty agent_id, non-positive declared_max_size, unrecognized retention_class, ttl_secs not a JSON integer of at least 1)"}, "503": {"description": "Upload grant store unavailable, or a CSPRNG/digest failure"}}},
-      "get": {"operationId": "getUploadGrants", "summary": "List upload grants", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Read, routed through the ADR-0017 admit-then-filter list gate: AdmitAll lists every grant; a management-group-confined grant lists only grants for agents in the caller's visible set. No client-selected agent_id filter exists on this surface — the frozen protocol forbids one on every path. A service-scoped API token is refused with 403 whoever minted it (audit action upload_grant.list.access_denied), since the list gate would otherwise evaluate the minter's own grants. Never returns a grant secret or its hash.", "responses": {"200": {"description": "{data: [{grant_id, agent_id, source_path, declared_max_size, expected_sha256, retention_class, destination_key, state, minted_by, created_at, expires_at}]}", "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"type": "array", "items": {"$ref": "#/components/schemas/UploadGrantRow"}}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "403": {"description": "No grant anywhere for UploadGrant:Read, or the caller is a service-scoped API token (refused whoever minted it)"}, "503": {"description": "Upload grant store unavailable"}}}
+      "get": {"operationId": "getUploadGrants", "summary": "List upload grants", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Read, routed through the ADR-0017 admit-then-filter list gate: AdmitAll lists every grant; a management-group-confined grant lists only grants for agents in the caller's visible set. No client-selected agent_id filter exists on this surface — the frozen protocol forbids one on every path. A service-scoped API token is refused with 403 whoever minted it (audit action upload_grant.list.access_denied), since the list gate would otherwise evaluate the minter's own grants. Never returns a grant secret or its hash. An engine principal is admitted only by an explicit UploadGrant:Read RBAC grant.", "responses": {"200": {"description": "{data: [{grant_id, agent_id, source_path, declared_max_size, expected_sha256, retention_class, destination_key, state, minted_by, created_at, expires_at}]}", "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"type": "array", "items": {"$ref": "#/components/schemas/UploadGrantRow"}}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "403": {"description": "No grant anywhere for UploadGrant:Read, the caller is a service-scoped API token (refused whoever minted it), or the caller is an engine principal with RBAC off or no UploadGrant:Read grant"}, "503": {"description": "Upload grant store unavailable, or (engine principal) the RBAC store is unavailable"}}}
     },
     "/upload-grants/{grant_id}": {
       "delete": {"operationId": "deleteUploadGrantsByGrantId", "summary": "Revoke an upload grant", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Delete. Closes the grant's one-time redemption window; has NO effect on a grant already redeemed into a session — an in-flight or completed upload is untouched.", "parameters": [{"name": "grant_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"204": {"description": "Revoked"}, "404": {"description": "No such grant, or it was already redeemed/revoked"}, "503": {"description": "Upload grant store unavailable"}}}
@@ -3565,17 +3639,18 @@ caller_from_session(const auth::Session& sess, const RestApiV1::ExecVisibleFn& e
     };
 }
 
-// The first authentication of a quarantine route, plus the audit writer bound to it. Returns
-// the session, or nullopt once the response is written (401 from `auth_fn`, or the 500 below
-// when the writer is unwired, which is a misconfiguration: the request never falls back to the
-// re-resolving `audit_fn`, and the one `failure` row that records it is the only row written
-// through it).
+// The first authentication of a route whose audit rows are bound to the session it resolved
+// (session-bound audit: the quarantine routes and the DEX score policy writes). Returns the
+// session, or nullopt once the response is written (401 from `auth_fn`, or the 500 below when
+// the session writer is unwired, which is a misconfiguration: the request never falls back to
+// the re-resolving `audit_fn`, and the one `failure` row that records it is the only row
+// written through it).
 [[nodiscard]] std::optional<auth::Session>
-authenticate_for_quarantine_audit(const httplib::Request& req, httplib::Response& res,
-                                  const RestApiV1::AuthFn& auth_fn,
-                                  const RestApiV1::AuditFn& audit_fn,
-                                  const RestApiV1::AuditAsSessionFn& audit_as_session,
-                                  const std::string& audit_action) {
+authenticate_for_session_audit(const httplib::Request& req, httplib::Response& res,
+                               const RestApiV1::AuthFn& auth_fn,
+                               const RestApiV1::AuditFn& audit_fn,
+                               const RestApiV1::AuditAsSessionFn& audit_as_session,
+                               const std::string& audit_action) {
     // CDX-P1-02: authenticate first (401 before any store/body work).
     auto session = auth_fn(req, res);
     if (!session)
@@ -5971,14 +6046,55 @@ void RestApiV1::register_routes(
                  if (deny_engine_session(*session, req, res, audit_fn, "engine_principal.list",
                                          "EnginePrincipal"))
                      return;
-                 auto principals = eps->list_all();
+                 // CHECKED roster read. The plain `list_all` turns a closed store, a
+                 // pool-lease timeout or a query failure into an empty vector, and the
+                 // engine-principal and token stores share ONE pool in production, so a
+                 // saturated pool would answer 200 "no engine principals" here before the
+                 // per-principal credential read below is ever reached.
+                 auto principals_res = eps->list_all_checked();
+                 if (!principals_res) {
+                     // The store's error can carry the database driver's text, so it goes to
+                     // the log only; the audit detail and the response use fixed strings.
+                     spdlog::warn("engine_principal.list: roster read failed: {}",
+                                  principals_res.error());
+                     res.status = 503;
+                     res.set_header("Retry-After", "2");
+                     res.set_content(
+                         detail::a4_error(res, "could not read the engine principals; retry",
+                                          detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                         "application/json");
+                     (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                         "engine_principal.list", "failure",
+                                                         "EnginePrincipal", "",
+                                                         "engine principal roster could not be read");
+                     return;
+                 }
+                 const auto& principals = *principals_res;
                  JArr arr;
                  for (const auto& p : principals) {
-                     std::int64_t active_creds =
-                         token_store
-                             ? static_cast<std::int64_t>(
-                                   token_store->list_active_for_principal(p.principal_id).size())
-                             : 0;
+                     std::int64_t active_creds = 0;
+                     if (token_store) {
+                         // The CHECKED read: the plain accessor turns a pool-lease timeout
+                         // or query failure into an empty vector, which this list would
+                         // show as "0 credentials" for a principal that holds a live one.
+                         // A read that cannot answer fails the whole list (503), so no
+                         // count is ever shown that the store did not confirm.
+                         auto active = token_store->list_active_for_principal_checked(p.principal_id);
+                         if (!active) {
+                             res.status = 503;
+                             res.set_header("Retry-After", "2");
+                             res.set_content(
+                                 detail::a4_error(res,
+                                                  "could not read the credential counts; retry",
+                                                  detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                                 "application/json");
+                             (void)detail::emit_behavioral_audit(
+                                 audit_fn, req, res, "engine_principal.list", "failure",
+                                 "EnginePrincipal", "", active.error());
+                             return;
+                         }
+                         active_creds = static_cast<std::int64_t>(active->size());
+                     }
                      arr.add(JObj()
                                  .add("principal_id", p.principal_id)
                                  .add("display_name", p.display_name)
@@ -6038,7 +6154,23 @@ void RestApiV1::register_routes(
 
                  JArr creds;
                  if (token_store) {
-                     for (const auto& t : token_store->list_active_for_principal(principal_id)) {
+                     // CHECKED read, as on the list route: a degraded read must not render
+                     // as "no active credentials" for a principal that holds one.
+                     auto active = token_store->list_active_for_principal_checked(principal_id);
+                     if (!active) {
+                         res.status = 503;
+                         res.set_header("Retry-After", "2");
+                         res.set_content(
+                             detail::a4_error(res, "could not read the principal's credentials; retry",
+                                              detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                             "application/json");
+                         (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                             "engine_principal.get", "failure",
+                                                             "EnginePrincipal", principal_id,
+                                                             active.error());
+                         return;
+                     }
+                     for (const auto& t : *active) {
                          // token_hash is masked ('') by list_active_for_principal already —
                          // never echo the raw secret on a plain GET.
                          creds.add(JObj()
@@ -6232,7 +6364,27 @@ void RestApiV1::register_routes(
             // rejects a >2-active shape it doesn't recognize). Reject BEFORE
             // create_token so a retry surfaces a clear, actionable 409 instead
             // of a second live credential.
-            if (!token_store->list_active_for_principal(principal_id).empty()) {
+            //
+            // The guard reads through the CHECKED twin: the plain accessor
+            // collapses a pool-lease timeout or query failure into an empty
+            // vector, which would read here as "no credential yet" and let a
+            // retry mint the second live secret this guard exists to prevent.
+            // A read that cannot answer fails closed (503), minting nothing.
+            auto active_before = token_store->list_active_for_principal_checked(principal_id);
+            if (!active_before) {
+                res.status = 503;
+                res.set_header("Retry-After", "2");
+                res.set_content(detail::a4_error(res,
+                                                 "could not confirm the principal has no "
+                                                 "active credential; retry",
+                                                 detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                                "application/json");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.mint", "failure",
+                    "EnginePrincipal", principal_id, active_before.error());
+                return;
+            }
+            if (!active_before->empty()) {
                 res.status = 409;
                 res.set_content(
                     detail::a4_error(res, "engine principal already has an active credential; "
@@ -6297,6 +6449,58 @@ void RestApiV1::register_routes(
                     "EnginePrincipal", principal_id, result.error());
                 return;
             }
+            // create_token returns only the raw secret; look up the freshly
+            // minted row (the newest active credential) for its token_id so a
+            // pure-REST caller can correlate the credential it just minted
+            // without a follow-up GET — mirrors the MCP mint_engine_credential
+            // twin's correlation logic (mcp_server.cpp).
+            //
+            // The read is the CHECKED twin, taken BEFORE the mint audit: the
+            // plain accessor collapses a lease timeout or query failure into
+            // an empty vector, which would deliver the secret with token_id ''.
+            // create_token above has already committed, so a failed read-back
+            // fails CLOSED: 503, secret withheld, audit 'partial' (a credential
+            // exists, so never 'failure'). Unlike rotate there is no grace-window
+            // re-serve for a mint and a second mint is a 409, so the recovery is
+            // to rotate the credential (no Retry-After: a retry of the mint cannot help).
+            std::string minted_token_id;
+            int64_t minted_created_at = -1;
+            auto active_after = token_store->list_active_for_principal_checked(principal_id);
+            if (active_after) {
+                for (const auto& t : *active_after) {
+                    if (t.created_at > minted_created_at) {
+                        minted_created_at = t.created_at;
+                        minted_token_id = t.token_id;
+                    }
+                }
+            }
+            // The read-back must both ANSWER and find the new row. An answered read with
+            // no active row (the credential, or the principal, revoked out of band between
+            // create_token and here) is the same class as a failed read: the secret would
+            // otherwise be delivered with token_id '' under a `success` row for a
+            // credential that is already dead. Same arm: 503, secret withheld, `partial`.
+            if (!active_after || minted_token_id.empty()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res, active_after
+                                 ? "the credential was minted but no active credential was found on "
+                                   "read-back; the secret was withheld. List the principal's "
+                                   "credentials; rotate if one is listed, do not retry the mint"
+                                 : "the credential was minted but could not be read back; the secret "
+                                   "was withheld. The credential exists but is unusable: rotate it "
+                                   "to obtain a secret, do not retry the mint"),
+                    "application/json");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.mint", "partial",
+                    "EnginePrincipal", principal_id,
+                    active_after
+                        ? std::string("credential minted but no active credential row was found on "
+                                      "read-back, secret withheld")
+                        : "credential minted but its secret could not be read back for delivery: " +
+                              active_after.error());
+                return;
+            }
             // #2466/#2406: fail closed — the credential was minted, but an
             // unrecorded mint must not return the one-time secret. On a dropped
             // audit the secret is discarded (never placed in the 503 body). The
@@ -6317,19 +6521,6 @@ void RestApiV1::register_routes(
                 return;
             }
             res.status = 201;
-            // create_token returns only the raw secret; look up the freshly
-            // minted row (the newest active credential) for its token_id so a
-            // pure-REST caller can correlate the credential it just minted
-            // without a follow-up GET — mirrors the MCP mint_engine_credential
-            // twin's correlation logic (mcp_server.cpp).
-            std::string minted_token_id;
-            int64_t minted_created_at = -1;
-            for (const auto& t : token_store->list_active_for_principal(principal_id)) {
-                if (t.created_at > minted_created_at) {
-                    minted_created_at = t.created_at;
-                    minted_token_id = t.token_id;
-                }
-            }
             // G5 (secret hygiene): the response body carries a raw one-time
             // credential — never let a browser cache, a shared/corporate
             // proxy, or a back-button history entry retain it.
@@ -6397,25 +6588,6 @@ void RestApiV1::register_routes(
                     "EnginePrincipal", principal_id, result.error());
                 return;
             }
-            // #2466/#2406: fail closed — the reveal IS this route's success audit
-            // (see the comment above the route registration), so a dropped
-            // reveal-audit would let the raw secret leave the server with no
-            // audit-chain row. Withhold it and 503. Within the overlap window a
-            // re-rotate re-serves the SAME successor (an audited re-serve, not a
-            // new credential) — that is the operator's recovery; once the window
-            // lapses the pair must be revoked instead (recovery detail in rest-api.md).
-            if (!detail::emit_behavioral_audit(audit_fn, req, res,
-                                               "engine_principal.credential.reveal", "success",
-                                               "EnginePrincipal", principal_id, "rotate")) {
-                res.status = 503;
-                res.set_content(
-                    detail::a4_error(res, "the credential was rotated but the reveal audit could "
-                                          "not be persisted; the secret was withheld. Rotate again "
-                                          "within the overlap window to re-serve the same audited "
-                                          "successor secret"),
-                    "application/json");
-                return;
-            }
             // rotate_engine_credential returns only the raw secret; look up
             // the successor for its token_id + expires_at/overlap_expires_at
             // — mirrors the MCP rotate_engine_credential twin's correlation
@@ -6426,10 +6598,43 @@ void RestApiV1::register_routes(
             // second-resolution, so a same-second mint→rotate ties and the
             // newest-scan could return the predecessor's id, which would
             // break the #2384 confirm token_id pin.
+            //
+            // The read is the CHECKED twin, taken BEFORE the reveal audit.
+            // rotate_engine_credential above has already committed, so a
+            // successor and its live secret exist; if this read cannot answer
+            // (the plain accessor would return empty and this route would hand
+            // out the secret with token_id '' that confirm can never pin), fail
+            // CLOSED exactly like the human rotate route: 503, secret withheld,
+            // audit 'partial' (never 'failure', since a credential does exist) and
+            // no reveal row, since no secret left the server. The secret is not
+            // lost: the store cached it for the grace window (kRotationGraceSecs,
+            // 120 s), so the same operator's retry inside it re-serves the same
+            // successor (that retry gets its own reveal audit and its own
+            // step-up). After the window a retry is a 409 and the pair is
+            // resolved by revoke, as for a dropped reveal audit.
             std::string successor_token_id;
             int64_t successor_expires_at = 0;
             int64_t successor_overlap_expires_at = 0;
-            for (const auto& t : token_store->list_active_for_principal(principal_id)) {
+            auto active_after = token_store->list_active_for_principal_checked(principal_id);
+            if (!active_after) {
+                res.status = 503;
+                res.set_header("Retry-After", "2");
+                res.set_content(
+                    detail::a4_error(res,
+                                     "rotation succeeded but the successor could not be "
+                                     "read back; the secret was withheld. Rotate again "
+                                     "within about two minutes to re-serve it",
+                                     detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                    "application/json");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.rotate", "partial",
+                    "EnginePrincipal", principal_id,
+                    "a successor exists (newly minted or re-served) but its secret could not be "
+                    "read back for delivery: " +
+                        active_after.error());
+                return;
+            }
+            for (const auto& t : *active_after) {
                 // At most one active row links (the store clears
                 // supersedes_token_id at cutover, revoke-resolution, and
                 // sweep), so first match is THE successor.
@@ -6439,6 +6644,52 @@ void RestApiV1::register_routes(
                     successor_overlap_expires_at = t.overlap_expires_at;
                     break;
                 }
+            }
+            // The read ANSWERED but no active credential links back to a
+            // predecessor: the successor was revoked, or the rotation confirmed,
+            // between the commit above and this read. The secret in `result`
+            // belongs to a credential that is no longer a pending successor, and
+            // handing it out with token_id '' gives confirm nothing to pin. Same
+            // posture as a failed read: 503, secret withheld, 'partial', no
+            // reveal row. NO retry hint: the pair is gone, so a retry would not
+            // re-serve anything, it would perform a NEW rotation the caller did
+            // not ask for. The remedy is to look first, then rotate if needed.
+            if (successor_token_id.empty()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res,
+                                     "rotation succeeded but no pending successor credential was "
+                                     "found; the secret was withheld. A successor may exist; "
+                                     "inspect the principal's credentials (GET "
+                                     "/api/v1/engine-principals/{id}), then rotate again if needed"),
+                    "application/json");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.rotate", "partial",
+                    "EnginePrincipal", principal_id,
+                    "rotation committed but no active credential links to a predecessor on "
+                    "read-back (revoked or confirmed out of band); secret withheld");
+                return;
+            }
+            // #2466/#2406: fail closed — the reveal IS this route's success audit
+            // (see the comment above the route registration), so a dropped
+            // reveal-audit would let the raw secret leave the server with no
+            // audit-chain row. Withhold it and 503. Within the GRACE window (about
+            // two minutes, same operator, same replica) a re-rotate re-serves the
+            // SAME successor (an audited re-serve, not a new credential) — that is
+            // the operator's recovery; once the window lapses, or on another replica
+            // or after a restart, the retry is a 409 and the successor must be
+            // revoked instead (recovery detail in rest-api.md).
+            if (!detail::emit_behavioral_audit(audit_fn, req, res,
+                                               "engine_principal.credential.reveal", "success",
+                                               "EnginePrincipal", principal_id, "rotate")) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "the credential was rotated but the reveal audit could "
+                                          "not be persisted; the secret was withheld. Rotate again "
+                                          "within about two minutes to re-serve the same audited "
+                                          "successor secret"),
+                    "application/json");
+                return;
             }
             // G5 (secret hygiene) — same no-store contract as the mint route.
             res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
@@ -6677,9 +6928,12 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(JObj().add("transferred", true).str()), "application/json");
         });
 
-    // GET /api/v1/engine-principals/audit/no-admin — auditor-runnable
-    // independent proof of design §4.2's "no admin, ever" / "no
-    // all-permissions toggle" invariants (decision log #13). Gated on
+    // GET /api/v1/engine-principals/audit/no-admin — the auditor-runnable
+    // CHECK of design §4.2's "no admin" rule (decision logs #13 and #15). It
+    // is the detective control for a wildcard custom role, which assignment
+    // permits (maintainer ruling 2026-10-23, #2485), and is point-in-time
+    // and pull-only; see engine_no_admin_audit.hpp for what ok:true means.
+    // Gated on
     // AuditLog:Read, NOT Security — this is a read-only evidentiary query,
     // not part of the write-path bar it verifies, so a read-only auditor
     // role can run it without holding engine-principal write access.
@@ -6709,7 +6963,6 @@ void RestApiV1::register_routes(
                                     "EnginePrincipal"))
                 return;
 
-            auto all_roles = rbac_store->list_roles();
             auto all_securables = rbac_store->list_securable_types();
             auto all_operations = rbac_store->list_operations();
             // G3: list_securable_types()/list_operations() read the
@@ -6718,74 +6971,57 @@ void RestApiV1::register_routes(
             // deployment NEVER legitimately has zero rows in either. Coming
             // back empty therefore means resolution failed (closed
             // connection, corrupt table, etc.), not "there happen to be no
-            // securables" — and a silently-zero `full_grant_size` would make
-            // the wildcard-grant check below vacuously pass every principal.
-            // Fail CLOSED: report this run as unable to verify rather than
-            // certifying `"ok":true` over data we could not actually read.
-            // (list_roles()/get_principal_roles()/get_effective_permissions()
-            // returning empty is not distinguishable from "legitimately no
-            // rows" with the store's current API — same residual noted on
-            // the MCP twin, audit_engine_no_admin, in mcp_server.cpp.)
+            // securables" — and an empty grid would make the wildcard check
+            // vacuously pass every principal. Fail CLOSED: report this run as
+            // unable to verify rather than certifying `"ok":true` over data
+            // we could not actually read.
             if (all_securables.empty() || all_operations.empty()) {
                 res.status = 503;
+                res.set_header("Retry-After", "2");
                 res.set_content(
-                    detail::a4_error(res, "rbac reference data unavailable — cannot verify"),
+                    detail::a4_error(res, "rbac reference data unavailable — cannot verify",
+                                     detail::A4ErrorOpts{.retry_after_ms = 2000}),
                     "application/json");
                 (void)detail::emit_behavioral_audit(
                     audit_fn, req, res, "engine_principal.audit.no_admin", "failure", "AuditLog",
                     "no-admin", "rbac_resolution_failed");
                 return;
             }
-            const std::size_t full_grant_size = all_securables.size() * all_operations.size();
 
-            auto principals = eps->list_all();
-            JArr violations;
-            for (const auto& p : principals) {
-                auto roles = rbac_store->get_principal_roles("engine", p.principal_id);
-                for (const auto& pr : roles) {
-                    if (pr.role_name == "admin" || pr.role_name == "Administrator") {
-                        violations.add(JObj()
-                                          .add("principal_id", p.principal_id)
-                                          .add("role", pr.role_name)
-                                          .add("reason", "admin_role"));
-                        continue;
-                    }
-                    auto it = std::find_if(all_roles.begin(), all_roles.end(),
-                                           [&](const RbacRole& r) { return r.name == pr.role_name; });
-                    if (it != all_roles.end() && it->is_system) {
-                        violations.add(JObj()
-                                          .add("principal_id", p.principal_id)
-                                          .add("role", pr.role_name)
-                                          .add("reason", "system_role"));
-                    }
-                }
-                // "No all-permissions toggle" residual (rbac_store.cpp's
-                // assign_role comment): a custom, non-system role that
-                // happens to be granted a FULL cross-product of every known
-                // securable x operation is functionally admin-equivalent
-                // even though neither the literal-name nor is_system checks
-                // above would catch it.
-                if (full_grant_size > 0) {
-                    auto effective = rbac_store->get_effective_permissions(p.principal_id);
-                    std::unordered_set<std::string> granted;
-                    for (const auto& perm : effective) {
-                        if (perm.effect == "allow")
-                            granted.insert(perm.securable_type + "\x1f" + perm.operation);
-                    }
-                    if (granted.size() >= full_grant_size) {
-                        violations.add(JObj()
-                                          .add("principal_id", p.principal_id)
-                                          .add("role", "")
-                                          .add("reason", "wildcard_grant"));
-                    }
-                }
+            // The grants, roles and role permissions are CHECKED reads
+            // (engine_no_admin_audit.hpp, shared with the MCP twin): a read
+            // that cannot be answered must never read as "no violations".
+            // This auditor is the only control over a wildcard custom role
+            // (maintainer ruling 2026-10-23, #2485), so it fails closed: 503,
+            // no partial list, no `success` audit row.
+            auto inputs = engine_no_admin_audit::read_inputs(*rbac_store);
+            if (!inputs) {
+                res.status = 503;
+                res.set_header("Retry-After", "2");
+                res.set_content(
+                    detail::a4_error(res, std::string(engine_no_admin_audit::kUnavailableMessage),
+                                     detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                    "application/json");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.audit.no_admin", "failure", "AuditLog",
+                    "no-admin", std::string(engine_no_admin_audit::kFailureAuditDetail));
+                return;
             }
 
-            const bool ok = violations.size() == 0;
+            const auto found = engine_no_admin_audit::evaluate(*inputs, all_securables, all_operations);
+            JArr violations;
+            for (const auto& v : found) {
+                violations.add(JObj()
+                                   .add("principal_id", v.principal_id)
+                                   .add("role", v.role)
+                                   .add("reason", v.reason));
+            }
+
+            const bool ok = found.empty();
             std::string data = JObj().add("ok", ok).raw("violations", violations.str()).str();
             (void)detail::emit_behavioral_audit(
                 audit_fn, req, res, "engine_principal.audit.no_admin", "success", "AuditLog",
-                "no-admin", "violations=" + std::to_string(violations.size()));
+                "no-admin", engine_no_admin_audit::audit_detail(found));
             res.set_content(ok_json(data), "application/json");
         });
 
@@ -7168,8 +7404,8 @@ void RestApiV1::register_routes(
         // CDX-P1-02: authenticate first (401 before any store/body work). Every row this
         // handler writes after this point is stamped from the session it resolves here
         // (rebound to the re-resolved one below, which must name the same principal).
-        const auto first = authenticate_for_quarantine_audit(req, res, auth_fn, audit_fn,
-                                                             audit_as_session, "quarantine.enable");
+        const auto first = authenticate_for_session_audit(req, res, auth_fn, audit_fn,
+                                                          audit_as_session, "quarantine.enable");
         if (!first)
             return;
         RestApiV1::AuditFn audit = audit_as(audit_as_session, *first);
@@ -7323,7 +7559,7 @@ void RestApiV1::register_routes(
                                                   httplib::Response& res) {
             // CDX-P1-02: authenticate first (401 before any store work). Every row below is
             // stamped from the session resolved here; see the POST route above.
-            const auto first = authenticate_for_quarantine_audit(
+            const auto first = authenticate_for_session_audit(
                 req, res, auth_fn, audit_fn, audit_as_session, "quarantine.disable");
             if (!first)
                 return;
@@ -19235,6 +19471,113 @@ void RestApiV1::register_routes(
         }
         res.set_content(ok_json(dex_apps_json(model)), "application/json");
     });
+
+    // ── GET / PUT / DELETE /api/v1/dex/score-policy (#6086) ──
+    //
+    // The customer DEX score policy: one JSON document under the runtime-config key
+    // kDexScorePolicyKey. Every write goes through apply_dex_score_policy
+    // (dex_score_policy_writer.hpp), which owns If-Match, dry_run, validation, the
+    // audit-first order and the outcome-unknown handling; these handlers only resolve the
+    // caller and shape the HTTP answer. Registered unconditionally: until
+    // set_dex_score_policy_writer() wires the store they answer 503, like a closed store.
+    // GET is a fleet-wide configuration read (no per-agent data), so it is not audited.
+    auto score_policy_unavailable = [](httplib::Response& res) {
+        res.status = 503;
+        res.set_content(detail::a4_error(res, std::string(kDexScorePolicyStoreUnavailableMessage),
+                                         {.retry_after_ms = kDexScorePolicyRetryMs,
+                                          .remediation = "retry shortly"}),
+                        "application/json");
+    };
+    sink.Get("/api/v1/dex/score-policy",
+             [perm_fn, score_policy_unavailable,
+              writer = dex_score_policy_writer_](const httplib::Request& req,
+                                                 httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 if (!writer || !writer->read_stored) {
+                     score_policy_unavailable(res);
+                     return;
+                 }
+                 const auto stored = writer->read_stored();
+                 if (!stored) {
+                     spdlog::warn("GET /api/v1/dex/score-policy: store read failed: {}",
+                                  ::yuzu::log_key_token(stored.error()));
+                     score_policy_unavailable(res);
+                     return;
+                 }
+                 const auto in_force = dex_policy_in_force_from_stored(*stored);
+                 res.set_header("ETag", "\"" + in_force.revision + "\"");
+                 res.set_content(
+                     ok_json(dex_score_policy_in_force_json(in_force)
+                                 .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)),
+                     "application/json");
+             });
+
+    // PUT and DELETE share this body: permission, then the authenticated session every audit
+    // row is stamped from (an unwired session writer is a 500, never the re-resolving
+    // audit_fn), then the same-site gate, then the apply function.
+    auto score_policy_write =
+        [perm_fn, auth_fn, audit_fn, score_policy_unavailable, writer = dex_score_policy_writer_,
+         audit_as_session = audit_as_session_fn_, trusted = csrf_trusted_origins_](
+            const httplib::Request& req, httplib::Response& res,
+            DexScorePolicyWriteRequest::Op op) {
+            if (!perm_fn(req, res, "Infrastructure", "Write"))
+                return;
+            if (!writer || !writer->read_stored) {
+                score_policy_unavailable(res);
+                return;
+            }
+            const std::string verb(op == DexScorePolicyWriteRequest::Op::Put
+                                       ? kDexScorePolicyUpdateVerb
+                                       : kDexScorePolicyResetVerb);
+            const auto session = authenticate_for_session_audit(req, res, auth_fn, audit_fn,
+                                                                audit_as_session, verb);
+            if (!session)
+                return;
+            const RestApiV1::AuditFn audit = audit_as(audit_as_session, *session);
+            const std::string target(kDexScorePolicyKey);
+            if (refuse_cross_site_cookie_write(*session, req, res, audit, trusted, target))
+                return;
+
+            const DexScorePolicyWriteRequest rq = score_policy_write_request(op, req, *session);
+            DexScorePolicyWriteDeps deps = *writer;
+            deps.audit = [&](std::string_view row_verb, std::string_view result,
+                             const std::string& detail_json) {
+                return detail::emit_behavioral_audit(audit, req, res, std::string(row_verb),
+                                                     std::string(result), "RuntimeConfig", target,
+                                                     detail_json);
+            };
+
+            const auto r = apply_dex_score_policy(rq, deps);
+            res.status = dex_score_policy_http_status(r.status);
+            if (r.status == DexScorePolicyWriteStatus::Ok) {
+                auto data = dex_score_policy_in_force_json(r.in_force);
+                data["previous_revision"] = r.previous_revision;
+                if (r.dry_run)
+                    data["dry_run"] = true;
+                // A dry run changed nothing: its ETag is the CURRENT stored revision (what the
+                // real PUT must send), while data.revision is the revision it would produce.
+                res.set_header("ETag",
+                               "\"" + (r.dry_run ? r.previous_revision : r.in_force.revision) +
+                                   "\"");
+                res.set_content(
+                    ok_json(data.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)),
+                    "application/json");
+                return;
+            }
+            res.set_content(detail::a4_error(res, r.message,
+                                             {.retry_after_ms = r.retry_after_ms,
+                                              .remediation = r.remediation}),
+                            "application/json");
+        };
+    sink.Put("/api/v1/dex/score-policy",
+             [score_policy_write](const httplib::Request& req, httplib::Response& res) {
+                 score_policy_write(req, res, DexScorePolicyWriteRequest::Op::Put);
+             });
+    sink.Delete("/api/v1/dex/score-policy",
+                [score_policy_write](const httplib::Request& req, httplib::Response& res) {
+                    score_policy_write(req, res, DexScorePolicyWriteRequest::Op::Reset);
+                });
 
     // GET /dex/catalogue?os=&window= -- the Catalogue View 1 family cards +
     // fleet coverage + the "Other (uncatalogued)" list (ADR-0031 WS-A4 PR-1 /

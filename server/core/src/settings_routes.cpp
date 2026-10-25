@@ -876,6 +876,18 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
     return html;
 }
 
+namespace {
+// In-page retry for a degraded Engine Principals fragment. A plain inline onclick (the dashboard
+// CSP blocks hx-on) fires the event the section already listens for. The page itself must not be
+// reloaded to retry: a freshly minted or rotated secret is shown outside this section and a
+// reload discards it.
+constexpr const char* kEngineRetryControl =
+    "<button class=\"btn btn-secondary\" type=\"button\" "
+    "onclick=\"htmx.trigger(document.body,'refreshEnginePrincipals')\">Retry</button> "
+    "<span class=\"hint\">Retry here instead of reloading the page, which would discard a "
+    "credential secret shown above.</span>";
+} // namespace
+
 std::string SettingsRoutes::render_engine_principals_fragment() {
     if (!engine_principal_store_ || !engine_principal_store_->is_open()) {
         return "<span class=\"muted\">Engine Principals store unavailable "
@@ -894,7 +906,15 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
     // Admin/auditor list surface — every engine principal, any lifecycle
     // state, so revoked rows stay visible (never quietly dropped from the
     // console — design doc §3.1 / §12 decision 1).
-    auto principals = engine_principal_store_->list_all(/*include_revoked=*/true);
+    // CHECKED roster read: the plain `list_all` returns an empty vector on a pool-lease
+    // timeout or query failure, which would render "No engine principals" during an outage.
+    auto principals_res = engine_principal_store_->list_all_checked(/*include_revoked=*/true);
+    if (!principals_res) {
+        spdlog::warn("settings engine-principals: roster read failed: {}", principals_res.error());
+        return "<div class=\"muted\">Engine principals unavailable: the list could not be "
+               "read. " + std::string(kEngineRetryControl) + "</div>";
+    }
+    const auto& principals = *principals_res;
 
     std::string html = "<table class=\"user-table\">"
                        "  <thead><tr><th>Principal ID</th><th>Display Name</th><th>Owner</th>"
@@ -902,6 +922,10 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                        "  <th>Revocation</th><th></th></tr></thead>"
                        "  <tbody>";
 
+    // True once a credential read has failed, or from the start when no token store was ever
+    // wired: either way no row can show a credential count, the row hint points at the Retry
+    // control, and the revoke-detail lookups below are skipped.
+    bool credentials_unreadable = (api_token_store_ == nullptr);
     if (principals.empty()) {
         html += "<tr><td colspan=\"8\" class=\"muted\">No engine principals</td></tr>";
     } else {
@@ -910,10 +934,29 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
             const std::string status_cls = active ? "role-ok" : "role-user";
             const std::string status_txt = active ? "Active" : "Revoked";
 
+            // CHECKED read: the plain accessor turns a closed store, pool-lease timeout or
+            // query failure into an empty vector, which this cell would show as "0" for a
+            // principal that holds a live credential. A read that cannot answer says so in
+            // the cell and leaves the rest of the row (read from the principal store) intact.
+            // After the first failed read the remaining rows are marked unavailable without
+            // another credential read (and without the revoke-detail audit lookup below, which
+            // waits on the same pool): each failing read waits out its store's lease timeout, so
+            // retrying per row would hold this request for roughly N x that timeout. A store
+            // that was never wired is treated the same way from the first row.
             std::size_t active_creds = 0;
-            if (api_token_store_ && api_token_store_->is_open()) {
-                active_creds = api_token_store_->list_active_for_principal(p.principal_id).size();
+            bool creds_known = false;
+            if (!credentials_unreadable) {
+                auto checked = api_token_store_->list_active_for_principal_checked(p.principal_id);
+                if (checked) {
+                    active_creds = checked->size();
+                    creds_known = true;
+                } else {
+                    credentials_unreadable = true;
+                }
             }
+            const std::string active_creds_cell =
+                creds_known ? std::to_string(active_creds)
+                            : std::string("<span class=\"muted\">unavailable</span>");
 
             // Revoked rows MUST surface the `superseded_by` linkage AND the
             // recorded revoke detail explicitly (design doc §3.1 / §12
@@ -938,7 +981,13 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                         ? "<em class=\"muted\">no successor recorded</em>"
                         : ("superseded by <code>" + html_escape(p.superseded_by) + "</code>");
                 std::string audit_detail = "(not recorded)";
-                if (audit_store_) {
+                if (credentials_unreadable) {
+                    // The pool is already failing reads; do not queue another lease wait per
+                    // revoked row (revoked rows are never pruned, so they only accumulate).
+                    // "(unavailable)" here means "not looked up", not "the audit store failed":
+                    // rows rendered before the first failed read still show their real detail.
+                    audit_detail = "(unavailable)";
+                } else if (audit_store_) {
                     AuditQuery q;
                     q.target_type = "EnginePrincipal";
                     q.target_id = p.principal_id;
@@ -977,7 +1026,7 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                     status_cls + "\">" + status_txt +
                     "</span></td>"
                     "<td>" +
-                    std::to_string(active_creds) +
+                    active_creds_cell +
                     "</td>"
                     "<td>" +
                     revocation_cell +
@@ -1013,7 +1062,12 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                 // htmx's own `hx-confirm` (that only fires for htmx-owned
                 // hx-post/hx-get triggers, which these forms deliberately
                 // are not).
-                if (active_creds == 0) {
+                if (!creds_known) {
+                    // The credential store could not answer, so neither "Mint" (no live
+                    // credential) nor "Rotate" (exactly one) can be offered truthfully.
+                    html += "<span class=\"hint\">Credential state unavailable; "
+                            "use Retry below.</span> ";
+                } else if (active_creds == 0) {
                     // No live credential yet — this principal needs an
                     // initial mint (POST .../credentials), not a rotate
                     // (rotate_engine_credential requires exactly one active
@@ -1075,6 +1129,10 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
     }
 
     html += "  </tbody></table>";
+    // Only with rows: an empty roster has no row hint to point at it, and for a store that was
+    // never wired a retry cannot help.
+    if (credentials_unreadable && !principals.empty())
+        html += "<p>" + std::string(kEngineRetryControl) + "</p>";
 
     // NOTE: the one-time-reveal target (#engine-principal-reveal) is
     // DELIBERATELY NOT emitted here — it lives in the static page shell

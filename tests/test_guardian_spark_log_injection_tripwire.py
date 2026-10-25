@@ -138,14 +138,14 @@ the wrap happens INSIDE the formatter:
 CHECK 2 (#5513): claimed agent ids in seven named files outside the
 Guardian/Spark basename family -- server/core/src/agent_service_impl.cpp,
 gateway_service_impl.cpp, agent_registry.cpp, custom_properties_store.cpp,
-custom_properties_routes.cpp, tag_store.cpp and config_routes.cpp (AGENT_ID_FILES). It flags a
+custom_properties_routes.cpp, tag_store.cpp and config_write.cpp (AGENT_ID_FILES). It flags a
 spdlog:: argument that is a request-derived agent id
 (`info.agent_id()`, `request->agent_id()`, `req->agent_id()`, a local alias bound from
 one of those in the same function, or the bare `agent_id` in the custom-properties
 files and tag_store.cpp, where the bare caller-supplied tag `key` is also matched; the bare `key`
 and `validation_regex` in custom_properties_store.cpp, the bare path parameter `key` in
 custom_properties_routes.cpp (the PUT 503 line) and the bare path parameter `key` in
-config_routes.cpp are matched the same way) and is
+config_write.cpp are matched the same way) and is
 not wholly a log_id_token / log_key_token / audit_token /
 onbehalf::sanitize_for_log call or the local `safe_agent_id`. It is LEXICAL: it reads
 argument text, not data flow, so an id reaching the log through a variable it cannot
@@ -179,7 +179,7 @@ reads argument text only: a value copied into a local under another name first i
 request-metadata session ids printed before their lookup, `sync.error()`-style fixed-text
 errors and member-form session reads other than `.gateway_node` are not tracked (lexical limit).
 
-CHECK 5 (UNSCANNED_LOGGING_FILES, the check 2 files except config_routes.cpp, which
+CHECK 5 (UNSCANNED_LOGGING_FILES, the check 2 files except config_write.cpp, which
 reads the default logger's level without logging through it, plus server/core/src/pg/pg_pool.cpp)
 fails on any
 logging FORM the scanner does not parse: an `SPDLOG_TRACE|DEBUG|INFO|WARN|ERROR|CRITICAL(`
@@ -198,7 +198,7 @@ pool's connection-failure text, which can carry libpq text) in custom_properties
 tag_store.cpp. It matches the call name only, with no data flow: a value copied into a local first
 is not seen, which is why pg_pool.cpp's connect-failure line (it prints a local `err` copied from
 PQerrorMessage) is wrapped by hand but not covered here. The same rule keyed on a store `.error()`
-argument covers config_routes.cpp and custom_properties_routes.cpp (STORE_ERROR_FILES), and the
+argument covers config_write.cpp and custom_properties_routes.cpp (STORE_ERROR_FILES), and the
 store result's `error` MEMBER (`res.error`, not a call) is covered in guardian_ingest.cpp
 (STORE_ERROR_MEMBER_FILES): an spdlog argument containing it must be wrapped.
 
@@ -1090,7 +1090,7 @@ AGENT_ID_FILES: dict[str, tuple[str, ...]] = {
     "server/core/src/custom_properties_routes.cpp": ("agent_id", "key"),
     # `key` is the URL path parameter of PUT /api/config/{key}. The store `.error()` text this
     # file also logs is covered by STORE_ERROR_FILES below, not by this entry.
-    "server/core/src/config_routes.cpp": ("key",),
+    "server/core/src/config_write.cpp": ("key",),
 }
 
 # Any receiver, including a chained one such as `request->info().agent_id()`: the match starts at
@@ -1216,12 +1216,12 @@ PQ_ERROR_FILES: tuple[str, ...] = (
     "server/core/src/pg/pg_pool.cpp",
 )
 
-# Same rule, different marker: in config_routes.cpp the store's `.error()` text (which on the
+# Same rule, different marker: in config_write.cpp the store's `.error()` text (which on the
 # database-failure path carries a kRuntimeConfigDbErrorPrefix plus libpq text) must be wrapped
 # wherever it is an spdlog argument. custom_properties_routes.cpp is listed for the same reason:
 # its PUT 503 line and its POST property-schemas line print the store's `.error()` text.
 STORE_ERROR_FILES: tuple[str, ...] = (
-    "server/core/src/config_routes.cpp",
+    "server/core/src/config_write.cpp",
     "server/core/src/custom_properties_routes.cpp",
 )
 
@@ -1538,14 +1538,14 @@ def _guardian_reconcile_hits(
 # understands `spdlog::<level>(`, `spdlog::get(<name>)-><level>(` and `<logger>-><level>(`; any other form in the files of
 # the second check would print its arguments unexamined. They are absent today, so the guard
 # fails on any occurrence (a mention in a comment too: reword it) rather than trying to scan them.
-# config_routes.cpp is the one AGENT_ID_FILES member left out: it reads the default logger's LEVEL
+# config_write.cpp is the one AGENT_ID_FILES member left out: it reads the default logger's LEVEL
 # (`spdlog::default_logger()->level()`, line 38) to report the effective log level and never logs
 # through it, so the guard would fail on a non-logging use. Its spdlog:: calls are all the
 # `spdlog::<level>(` form the other rules parse.
 # server.cpp (PKI_SIGNER_FILES) is left out for the same reason: its one `default_logger` use is the
 # same kind of level read, not a log call.
 UNSCANNED_LOGGING_FILES: tuple[str, ...] = tuple(
-    f for f in AGENT_ID_FILES if f != "server/core/src/config_routes.cpp"
+    f for f in AGENT_ID_FILES if f != "server/core/src/config_write.cpp"
 ) + ("server/core/src/pg/pg_pool.cpp",)
 
 _UNSCANNED_LOGGING_FORM_RE = re.compile(
@@ -2023,7 +2023,7 @@ def _selfcheck() -> None:
         if find_pq_error_violations_in_text(src, markers):
             raise SystemExit(f"selfcheck: unexpected spaced-marker violation: {src!r}")
 
-    # 9b. The same rule keyed on a store `.error()` (config_routes.cpp).
+    # 9b. The same rule keyed on a store `.error()` (config_write.cpp).
     store_must_match = 'spdlog::error("write failed: {}", result.error());'
     if not find_pq_error_violations_in_text(store_must_match, (".error()",)):
         raise SystemExit(f"selfcheck: expected a store .error() violation: {store_must_match!r}")

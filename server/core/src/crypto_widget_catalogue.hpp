@@ -122,6 +122,12 @@ inline constexpr std::string_view kConfinedWithheldMessage =
     "Yuzu-issued certificate figures are not available to this account: its view of the fleet "
     "is confined, and these are fleet-wide figures.";
 
+/// The refusal a caller with NO Inventory read grant gets for the Yuzu-issued certificate list:
+/// holding no grant is not an affirmative admission to a fleet-wide list. Names no permission.
+inline constexpr std::string_view kRefusedWithheldMessage =
+    "Yuzu-issued certificate figures are not available to this account: it holds no read "
+    "access to the fleet inventory, and these are fleet-wide figures.";
+
 // ── The catalogue ────────────────────────────────────────────────────────────
 
 enum class WidgetKind { kNumber, kBar, kLine, kTable };
@@ -203,9 +209,13 @@ struct MergedLayout {
 
 // ── Availability (drawing only, never a grant) ───────────────────────────────
 
-/// A caller's standing for one gate: kAvailable; kRefused (no grant); kConfined (a
-/// kFleetWideOnly widget and the caller's view is confined); kDegraded (the access check
-/// itself could not be completed - a store behind it could not be read).
+/// A caller's standing for one gate: kAvailable; kRefused (not admitted and the check did not
+/// answer 503: the caller holds no grant. A READ failure inside the check is kDegraded, never
+/// this: the access check reports it separately, `ListReadAuthorization::read_failed`); kConfined
+/// (a kFleetWideOnly widget and the caller's view is confined); kDegraded (the check answered
+/// 503: it could not be completed because a store behind it could not be read). The
+/// issued-certificate LIST is served ONLY to kAvailable: kRefused and kConfined are withheld,
+/// kDegraded is a retryable 503.
 enum class Access { kAvailable, kRefused, kConfined, kDegraded };
 [[nodiscard]] std::string_view access_name(Access a);
 
@@ -295,7 +305,8 @@ inline constexpr std::array<RevokedBucket, 3> kRevokedBuckets{
 parse_cert_params(const crypto_library::Params& p);
 
 /// True when any filter key (kind, days, week, bucket, as_of, cursor) is present: GET
-/// /api/v1/ca/issued then answers the filtered list; without one it answers exactly as before.
+/// /api/v1/ca/issued then answers the filtered list; without one it answers the unfiltered,
+/// offset-paged inventory (which is confinement-gated and audited too).
 [[nodiscard]] bool has_cert_filter_params(const crypto_library::Params& p);
 [[nodiscard]] bool has_cert_filter_args(const nlohmann::json& args);
 
@@ -353,13 +364,29 @@ struct LayoutRequest {
 /// [ bucket=<b>] rows=<n> page=<first|continuation> total=<n>` (crypto.ca.certificates.view,
 /// success).
 [[nodiscard]] std::string audit_detail_certs(std::string_view cid, const CaCertPage& page);
+/// `[cid=<cid> ]inventory rows=<n> limit=<n> offset=<n> has_more=<true|false>`
+/// (crypto.ca.certificates.view, success, for the UNFILTERED offset-paged list: it has no
+/// window set, count or cursor to name, so it records what was served and which page).
+[[nodiscard]] std::string audit_detail_inventory(std::string_view cid, std::size_t rows, int limit,
+                                                 int offset, bool has_more);
+/// `<detail> standing=available`: the success rows of the issued-certificate list name the
+/// standing they were served under. Only kAvailable is ever served; kRefused, kConfined and
+/// kDegraded are answered before any success row and, if one ever reaches here, render as
+/// `standing=unexpected` (never as `available`).
+[[nodiscard]] std::string audit_detail_with_standing(std::string detail, Access standing);
 /// The failure-row twin of both: `[cid=<cid> ]ws=<window set> as_of=<epoch|db_now> <what>`
 /// where `what` is "store degraded", "capacity in use" or "access check unavailable".
 [[nodiscard]] std::string audit_detail_ca_degraded(std::string_view cid,
                                                    std::optional<std::int64_t> as_of,
                                                    CryptoReadCause cause);
-/// `[cid=<cid> ]ws=<window set> withheld=confined` (a denied row: R2).
-[[nodiscard]] std::string audit_detail_ca_withheld(std::string_view cid);
+/// `[cid=<cid> ]ws=<window set> withheld=confined|refused` (a denied row: R2). `refused` names a
+/// caller with no Inventory grant. Only kConfined and kRefused are withheld standings; any other
+/// value renders as `withheld=unexpected` (a defect, never a false `confined`).
+[[nodiscard]] std::string audit_detail_ca_withheld(std::string_view cid, Access standing);
+/// The refusal message for a withheld standing: kRefusedWithheldMessage for kRefused,
+/// kConfinedWithheldMessage otherwise. REST and MCP choose their message here; the Settings panel and the
+/// drill pick the same two shared constants in their own switch.
+[[nodiscard]] std::string_view withheld_message(Access standing);
 /// `[cid=<cid> ]widgets=<n>[ expected_version=<v>]` (crypto.dashboard.layout.update).
 [[nodiscard]] std::string audit_detail_layout(std::string_view cid, std::size_t widgets,
                                               std::optional<std::int64_t> expected_version = std::nullopt);
