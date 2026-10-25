@@ -395,9 +395,10 @@ yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std:
                              ? std::string{"larger than the 16 MiB read bound"}
                              : std::format("errno {}", table.err));
         });
-        return {{}, false};
     }
-    return {yuzu::shared::network_mount_points(table.data), true};
+    return yuzu::filesystem::find_by_hash::mount_list_from(
+        table.ok(), table.ok() ? yuzu::shared::network_mount_points(table.data)
+                               : std::vector<std::string>{});
 }
 
 #elif defined(__APPLE__)
@@ -415,17 +416,16 @@ yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std:
             spdlog::warn("filesystem find_by_hash: getmntinfo_r_np returned no mounts; the "
                          "network-mount guard is off");
         });
-        return {{}, false};
     }
     std::vector<std::string> out;
-    for (int i = 0; i < n; ++i) {
+    for (int i = 0; i < n && raw != nullptr; ++i) {
         if (yuzu::shared::is_network_mount_fstype(table.get()[i].f_fstypename))
             out.emplace_back(table.get()[i].f_mntonname);
     }
     // A mount the system creates is listed as /System/Volumes/Data/<path> (autofs /home): refuse
     // the plain spelling too.
     yuzu::filesystem::find_by_hash::add_data_volume_aliases(out);
-    return {std::move(out), true};
+    return yuzu::filesystem::find_by_hash::mount_list_from(n > 0 && raw != nullptr, std::move(out));
 }
 
 // Dataless (iCloud / File Provider) files and directories must not be materialised by a walk: the
@@ -2434,8 +2434,7 @@ private:
         env.hash_entry = fbh::hash_entry_posix;
         env.can_enter = fbh::can_enter_posix;
         // the core re-checks the canonical root and every entry against this list
-        env.network_mounts = std::move(mounts.mounts);
-        env.mount_table_complete = mounts.complete;
+        env.set_mounts(std::move(mounts));
 #endif
 
         const auto outcome =

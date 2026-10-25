@@ -357,6 +357,23 @@ struct HashOutcome {
     std::uintmax_t size{0}; ///< size of the file as opened, set when kind == hashed
 };
 
+/// The network mount points of this host and whether the table was read in full. `complete` is
+/// false when it could not be (the list is then empty): the walk still runs, reported as
+/// constrained, rather than looking like a clean unguarded success.
+struct MountList {
+    std::vector<std::string> mounts;
+    bool complete{true};
+};
+
+/// The mount list for one table read. A failed read gives an EMPTY, incomplete list whatever
+/// `mounts` holds (the platform glue passes what it parsed), so the walk reports CONSTRAINED
+/// instead of looking like a clean unguarded success.
+[[nodiscard]] inline MountList mount_list_from(bool read_ok, std::vector<std::string> mounts) {
+    if (!read_ok)
+        return {{}, false};
+    return {std::move(mounts), true};
+}
+
 struct WalkEnv {
     std::function<Clock::time_point()> now = [] {
         return Clock::now();
@@ -378,14 +395,11 @@ struct WalkEnv {
     /// False when the mount table could not be read in full: the list above is then empty or
     /// partial and the walk runs unguarded, which the outcome reports.
     bool mount_table_complete{true};
-};
-
-/// The network mount points of this host and whether the table was read in full. `complete` is
-/// false when it could not be (the list is then empty): the walk still runs, reported as
-/// constrained, rather than looking like a clean unguarded success.
-struct MountList {
-    std::vector<std::string> mounts;
-    bool complete{true};
+    /// Adopt a table read: the list AND whether it was read in full.
+    void set_mounts(MountList&& m) {
+        network_mounts = std::move(m.mounts);
+        mount_table_complete = m.complete;
+    }
 };
 
 /// Walk `root` to `max_depth` (root's children are depth 1), emitting one `match|...` row per

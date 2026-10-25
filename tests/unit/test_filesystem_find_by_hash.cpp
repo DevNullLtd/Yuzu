@@ -939,6 +939,30 @@ TEST_CASE("find_by_hash mounts: a root on a mount is refused before any hook run
     }
 }
 
+TEST_CASE("find_by_hash mount list: a failed table read is an empty, incomplete list",
+          "[find_by_hash]") {
+    const auto failed = fbh::mount_list_from(false, {"/mnt/nfs"});
+    CHECK(failed.mounts.empty()); // whatever was parsed is discarded: the table is not trusted
+    CHECK_FALSE(failed.complete);
+    const auto ok = fbh::mount_list_from(true, {"/mnt/nfs"});
+    CHECK(ok.mounts == std::vector<std::string>{"/mnt/nfs"});
+    CHECK(ok.complete);
+    const auto none = fbh::mount_list_from(true, {}); // a host with no network mount is complete
+    CHECK(none.mounts.empty());
+    CHECK(none.complete);
+}
+
+TEST_CASE("find_by_hash WalkEnv::set_mounts adopts both the list and the completeness",
+          "[find_by_hash]") {
+    Probe probe;
+    auto env = fake_env(probe);
+    env.set_mounts(fbh::mount_list_from(false, {}));
+    CHECK_FALSE(env.mount_table_complete);
+    env.set_mounts(fbh::mount_list_from(true, {"/mnt/nfs"}));
+    CHECK(env.mount_table_complete);
+    CHECK(env.network_mounts == std::vector<std::string>{"/mnt/nfs"});
+}
+
 TEST_CASE("find_by_hash mount table: an incomplete read constrains the result on every walk path",
           "[find_by_hash]") {
     Tree t;
