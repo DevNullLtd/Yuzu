@@ -1462,6 +1462,7 @@ if build_server
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
+      'unit/server/test_config_write.cpp', # config_write.hpp: the transport-free core shared by the config routes and the MCP runtime-config tools
       'unit/server/test_config_routes.cpp', # #2542 PR-12: the 2-route Runtime Configuration API (7.3), extracted onto the HttpRouteSink seam
       'unit/server/test_legacy_diagnostic_routes.cpp', # #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API (diagnostics_routes.cpp), extracted onto the HttpRouteSink seam -- named away from test_diagnostics_*/test_chargen_*/test_procfetch_* to avoid a plugin_doc_gen.py filename collision with the agent plugins of those names
       'unit/server/test_legacy_events_routes.cpp', # #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
@@ -1552,6 +1553,7 @@ if build_server
       'unit/server/test_mcp_engine_principal_roles.cpp',
       'unit/server/test_engine_principal_lifecycle.cpp',
       'unit/server/test_engine_store_error_class.cpp',
+      'unit/server/test_engine_no_admin_audit.cpp',
       'unit/server/test_rotation_confirm_state.cpp',
       'unit/server/test_access_review_model.cpp',
       'unit/server/test_access_review_store.cpp',
