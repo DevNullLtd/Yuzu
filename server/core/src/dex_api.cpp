@@ -185,4 +185,16 @@ DexScorePolicyProvider::ReadFn dex_score_policy_store_reader(RuntimeConfigStore&
     };
 }
 
+DexScorePolicyStoreFns dex_score_policy_store_writer(RuntimeConfigStore& store) {
+    return {
+        [&store](const std::optional<std::string>& expected, const std::string& canonical,
+                 const std::string& actor) {
+            return store.compare_and_set(std::string(kDexScorePolicyKey), expected, canonical,
+                                         actor);
+        },
+        [&store](const std::string& expected) {
+            return store.compare_and_remove(std::string(kDexScorePolicyKey), expected);
+        }};
+}
+
 } // namespace yuzu::server

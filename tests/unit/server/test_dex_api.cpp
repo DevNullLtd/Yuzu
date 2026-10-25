@@ -647,6 +647,62 @@ TEST_CASE("DexApi: the stored score policy reaches the Apps read through the pro
     CHECK(expired.apps.empty());
 }
 
+// The production WRITER binding against a real RuntimeConfigStore: the create, replace and
+// remove arms each reach the policy key (observed through the production reader and the row's
+// updated_by), and a stale expected text changes nothing.
+TEST_CASE("DexApi: the production score policy writer binds the conditional writes to the "
+          "policy key",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
+    yuzu::server::FileKeyProvider provider(keys.path);
+    yuzu::server::pg::SecretCodec codec(provider);
+    PgPool rc_pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::RuntimeConfigStore rc{rc_pool, codec};
+    REQUIRE(rc.is_open());
+
+    const auto read = yuzu::server::dex_score_policy_store_reader(rc);
+    const auto writes = yuzu::server::dex_score_policy_store_writer(rc);
+    const std::string key(yuzu::server::kDexScorePolicyKey);
+    auto updated_by = [&] {
+        const auto e = rc.get(key);
+        REQUIRE(e.has_value());
+        REQUIRE(e->has_value());
+        return (*e)->updated_by;
+    };
+    auto stored_text = [&]() -> std::optional<std::string> {
+        const auto r = read();
+        REQUIRE(r.has_value());
+        return *r;
+    };
+    auto canonical_with_excellent = [](double e) {
+        auto p = yuzu::server::dex_default_score_policy();
+        p.tiers.edges.excellent = e;
+        return yuzu::server::dex_score_policy_canonical(p);
+    };
+    const std::string first = canonical_with_excellent(95.0);
+    const std::string second = canonical_with_excellent(96.0);
+
+    // Create: nothing stored; a second create is stale and changes nothing.
+    REQUIRE(writes.compare_and_set(std::nullopt, first, "alice").value());
+    CHECK(stored_text() == first);
+    CHECK(updated_by() == "alice");
+    CHECK_FALSE(writes.compare_and_set(std::nullopt, second, "bob").value());
+    CHECK(stored_text() == first);
+
+    // Replace: only against the exact stored text.
+    CHECK_FALSE(writes.compare_and_set(second, second, "bob").value());
+    REQUIRE(writes.compare_and_set(first, second, "bob").value());
+    CHECK(stored_text() == second);
+    CHECK(updated_by() == "bob");
+
+    // Remove: only the exact stored text; the reader then sees no row.
+    CHECK_FALSE(writes.compare_and_remove(first).value());
+    CHECK(stored_text() == second);
+    REQUIRE(writes.compare_and_remove(second).value());
+    CHECK_FALSE(stored_text().has_value());
+}
+
 // Counts are Windows-scoped: Linux and macOS rows never reach the numerator, and
 // a subject seen only off Windows is not listed at all.
 TEST_CASE("DexApi: apps counts Windows rows only", "[pg][dex][apps_model]") {
