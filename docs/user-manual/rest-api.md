@@ -5534,6 +5534,20 @@ is absent or not open, which is "unknown", not zero. The two differ after a runt
 `PUT /api/config/<key>`, which is stored but not applied (see
 [When a change takes effect](#when-a-change-takes-effect)).
 
+`tar` publishes the TAR warehouse retention tiers: `tick_seconds` (the agent's prune
+tick, 900) and `tiers`, one row per source and tier (`live`, `hourly`, `daily`, `monthly`,
+`boot`). Each row has `limit_kind` (`rows` or `seconds`), `limit`, `bucket_seconds` (the
+roll-up bucket: 0 for `live`/`boot`, 3600, 86400, or 2678400 for a month, the 31-day worst
+case) and `guaranteed_depth_seconds`. Roll-up rows age from the start of their bucket, so
+a time-based tier is guaranteed for `limit - bucket_seconds` (a 365-day monthly tier is
+guaranteed for 334 days). It is `null` for `rows` tiers, whose time depth depends on how
+fast a device writes.
+
+These are the registry **defaults** every agent applies, not per-device readings: TAR
+prunes on the agent, so the server has no live value. A paused source is never pruned;
+rows may outlive their limit by up to `tick_seconds`, and longer when the retention clock
+guard declines a prune. `tar` is `null` only if the server's embedded table cannot be read.
+
 ```json
 {
   "data": {
@@ -5544,6 +5558,15 @@ is absent or not open, which is "unknown", not zero. The two differ after a runt
       "response_retention_days": 90,
       "audit_retention_days": 365,
       "guardian_event_retention_days": 30
+    },
+    "tar": {
+      "tick_seconds": 900,
+      "tiers": [
+        { "source": "process", "tier": "live", "limit_kind": "rows", "limit": 100000,
+          "bucket_seconds": 0, "guaranteed_depth_seconds": null },
+        { "source": "process", "tier": "daily", "limit_kind": "seconds", "limit": 2678400,
+          "bucket_seconds": 86400, "guaranteed_depth_seconds": 2592000 }
+      ]
     }
   },
   "meta": { "api_version": "v1" }

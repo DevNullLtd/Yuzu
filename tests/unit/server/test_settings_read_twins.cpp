@@ -314,6 +314,32 @@ TEST_CASE("data-retention REST twin and fragment report the ENFORCED windows fro
     CHECK(frag->body.find("Unknown") != std::string::npos);
 }
 
+TEST_CASE("GET /api/v1/settings/data-retention carries the TAR tier defaults; fragment does not",
+          "[settings][rest][settings-read-twins][retention][tar]") {
+    SettingsReadTwinsHarness h;
+
+    auto rest = h.sink.Get("/api/v1/settings/data-retention");
+    REQUIRE(rest);
+    auto data = nlohmann::json::parse(rest->body).at("data");
+    CHECK(data.contains("response_retention_days"));
+    CHECK(data.contains("enforced"));
+    CHECK(data.at("tar").at("tick_seconds").get<int>() == 900);
+    const auto& tiers = data.at("tar").at("tiers");
+    REQUIRE(tiers.is_array());
+    bool found = false;
+    for (const auto& t : tiers)
+        found = found || (t.at("source") == "process" && t.at("tier") == "live" &&
+                          t.at("limit").get<long long>() == 100000);
+    CHECK(found);
+
+    auto frag = h.sink.Get("/fragments/settings/data-retention");
+    REQUIRE(frag);
+    CHECK(frag->status == 200);
+    CHECK(frag->body.find("process") == std::string::npos);
+    CHECK(frag->body.find("tier") == std::string::npos);
+    CHECK(frag->body.find("tick") == std::string::npos);
+}
+
 TEST_CASE("data-retention fragment shows Unknown for every window when no reader is wired",
           "[settings][rest][settings-read-twins][retention]") {
     SettingsReadTwinsHarness h;

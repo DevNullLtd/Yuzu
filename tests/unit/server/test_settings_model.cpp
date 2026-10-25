@@ -425,6 +425,53 @@ TEST_CASE("build_data_retention_settings carries Guardian events and the enforce
     CHECK(none.at("enforced").at("audit_retention_days").is_null());
 }
 
+TEST_CASE("build_data_retention_settings publishes the TAR retention tiers",
+          "[settings][settings_model][retention][tar]") {
+    Config cfg;
+    auto j = sm::build_data_retention_settings(cfg);
+
+    REQUIRE(j.at("tar").is_object());
+    CHECK(j.at("tar").at("tick_seconds").get<int>() == 900);
+    const auto& tiers = j.at("tar").at("tiers");
+    REQUIRE(tiers.is_array());
+    CHECK(tiers.size() == 36);
+    for (const auto& t : tiers)
+        CHECK(t.size() == 6);
+
+    const auto find = [&](const char* src, const char* tier) -> const nlohmann::json* {
+        for (const auto& t : tiers)
+            if (t.at("source") == src && t.at("tier") == tier)
+                return &t;
+        return nullptr;
+    };
+    const auto* live = find("process", "live");
+    REQUIRE(live);
+    CHECK(live->at("limit_kind") == "rows");
+    CHECK(live->at("limit").get<long long>() == 100000);
+    CHECK(live->at("bucket_seconds").get<long long>() == 0);
+    CHECK(live->at("guaranteed_depth_seconds").is_null());
+    const auto* daily = find("process", "daily");
+    REQUIRE(daily);
+    CHECK(daily->at("guaranteed_depth_seconds").get<long long>() == 2592000);
+}
+
+TEST_CASE("build_data_retention_settings emits tar:null when no table is available",
+          "[settings][settings_model][retention][tar]") {
+    Config cfg;
+    auto j = sm::build_data_retention_settings(cfg, {}, nullptr);
+    REQUIRE(j.contains("tar"));
+    CHECK(j.at("tar").is_null());
+}
+
+TEST_CASE("render_retention_table ignores the tar block (fragment unchanged)",
+          "[settings][settings_model][retention][tar]") {
+    Config cfg;
+    auto with = sm::build_data_retention_settings(cfg);
+    auto without = with;
+    without.erase("tar");
+    CHECK(sm::render_retention_table(with) == sm::render_retention_table(without));
+}
+
 TEST_CASE("render_retention_table: days, no expiry, unknown, and stored-not-in-force",
           "[settings][settings_model][retention]") {
     Config cfg;
