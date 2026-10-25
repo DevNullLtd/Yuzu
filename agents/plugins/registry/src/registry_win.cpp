@@ -294,9 +294,9 @@ public:
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
+// emit_lines (registry_core.hpp): a sink failure after the real audit line must not add the fixed one.
 int emit(yuzu::CommandContext& ctx, const ActionOutput& out) {
-    for (const auto& line : out.lines) ctx.write_output(line);
-    return out.rc;
+    return emit_lines(ctx, out);
 }
 
 // L7: log access to sensitive registry paths for the agent log. The key is request-supplied and not yet validated,

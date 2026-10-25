@@ -538,7 +538,7 @@ int(result.value) >= 22621
 1. **Instructions > Definitions** > `windows.registry.get_value`
 2. Click **Execute**
 3. Parameters: **Hive** = `HKLM`, **Key** = `SOFTWARE\Microsoft\Windows NT\CurrentVersion`, **Name** = `CurrentBuildNumber`
-4. Scope: `ostype:windows` (the plugin also loads on macOS and Linux agents, where every action answers a `registry|unsupported|...` line instead of reading the registry)
+4. Scope: `ostype == "windows"` (the plugin also loads on macOS and Linux agents, where every action answers a `registry|unsupported|...` line instead of reading the registry)
 5. Click **Run**
 
 ---

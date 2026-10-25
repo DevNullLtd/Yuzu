@@ -266,7 +266,9 @@ spec:
           not already exist beneath an existing top-level key, e.g.
           "Software\\MyApp". At most 255 bytes and 32 components; a hive
           alias, an empty, "." or ".." component and control characters are
-          refused.
+          refused on the instruction and MCP routes; POST /api/command passes
+          an embedded NUL to the plugin as a C string, so the value is cut at
+          it.
       name:
         type: string
         description: >
@@ -302,13 +304,18 @@ spec:
           parameter value to 64 KiB, so through them it carries at most 32 KiB
           of data; the direct command route is not under that cap. Needs
           registry 2.0.0 on the agent: registry 1.x ignores it and writes an
-          EMPTY REG_SZ over the value, answering `status|ok`.
+          EMPTY REG_SZ over the value, answering `status|ok` (with
+          type=REG_DWORD and data_hex only, 1.x throws and writes nothing).
         validation:
           maxLength: 2097152
       type:
         type: string
         description: >
           Registry value type to write. Defaults to REG_SZ when omitted.
+          Mixed fleets: an agent still running registry 1.x stores
+          REG_QWORD, REG_MULTI_SZ, REG_EXPAND_SZ and REG_BINARY values as
+          REG_SZ text and answers `status|ok`, so upgrade the agents to
+          registry 2.0.0 before using them.
         validation:
           enum: ["REG_SZ", "REG_EXPAND_SZ", "REG_BINARY", "REG_DWORD", "REG_MULTI_SZ", "REG_QWORD"]
   result:

@@ -24,7 +24,7 @@
  *    returned Opened (the leaf included) until commit(), which the verified write calls once it is over; its
  *    destructor is the rollback. So a walk that does not hand its leaf over (the name test refuses, or a later
  *    create fails or finds its key already there) and an exception anywhere from the first create to the end of the
- *    verified write both delete every key the walk created, by its own handle, leaf first, after the value the
+ *    verified write both try to delete (best effort) every key the walk created, by its own handle, leaf first, after the value the
  *    write set (when it had landed). A key that still holds a value or a subkey the walk did not put there is
  *    kept, and `created` reports every key that could not be deleted. A key a create merely opened is closed,
  *    never deleted.
@@ -46,7 +46,8 @@
  *  (ii) an ordinary non-link ancestor carrying a decoy VALUE named SymbolicLinkValue: probe_link reports
  *       key_is_link on any successful query whatever the value's type, so the walk refuses, the fast open
  *       accepts.
- * A decoy on the LEAF is refused on both paths (the same probe). A non-ASCII case variant, a failed or
+ * A decoy on the LEAF of a set_value or delete_value is refused on both paths (the same probe); a delete_key
+ * leaf is opened as a possible link (leaf_may_be_link) and is not probed on either path. A non-ASCII case variant, a failed or
  * overflowing final_name and a failed root_name all fall back to the walk (which refuses the non-ASCII variant,
  * its own name tests using the same ASCII-only fold). No handle outlives one command.
  *
@@ -719,6 +720,30 @@ inline void fill_old(AuditRecord& au, const OldValue& old) {
         out.lines.push_back(std::string{"capped|"} + (o.capped ? "1" : "0"));
     }
     return out;
+}
+
+/// Writes an action's lines in order (`Ctx` is yuzu::CommandContext; a template so the pure unit suites can drive it
+/// with a recording fake). Once the call's real `audit|` line is out, a sink failure on a later line must not reach
+/// `report_exception`'s fixed failed audit line: the server would mint a success row and then a failure row for one
+/// command_id. So that failure answers only `error|exception` here (rc 1); a failure before any audit line has gone
+/// out propagates, and the seam's catch leaves its fixed line.
+template <class Ctx>
+int emit_lines(Ctx& ctx, const ActionOutput& out) {
+    bool audit_written = false;
+    for (const auto& line : out.lines) {
+        try {
+            ctx.write_output(line);
+        } catch (...) {
+            if (!audit_written) throw;
+            try {
+                ctx.write_output("error|exception");
+            } catch (...) {
+            }
+            return 1;
+        }
+        audit_written = audit_written || line.starts_with("audit|");
+    }
+    return out.rc;
 }
 
 /// The catch at the plugin ABI seam, both OS legs (`Ctx` is yuzu::CommandContext; a template so the pure unit

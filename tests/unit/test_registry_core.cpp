@@ -1712,6 +1712,74 @@ TEST_CASE("registry core: report_exception leaves a mutator's fixed audit line, 
     }
 }
 
+namespace {
+
+/// The ABI seam's shape (registry_win.cpp execute_guarded): emit the action's lines; whatever escapes goes to
+/// report_exception.
+int seam_emit(RecordingCtx& ctx, std::string_view action, const ActionOutput& out) {
+    try {
+        return emit_lines(ctx, out);
+    } catch (...) {
+        report_exception(ctx, action);
+        return 1;
+    }
+}
+
+std::size_t audit_line_count(const RecordingCtx& ctx) {
+    return static_cast<std::size_t>(std::ranges::count_if(
+        ctx.lines, [](const std::string& l) { return l.rfind("audit|", 0) == 0; }));
+}
+
+} // namespace
+
+TEST_CASE("registry core: a sink failure after the real audit line adds no second audit line",
+          "[registry][core][exception]") {
+    FakeRegistry reg;
+    reg.key("K");
+    const auto ok = render_single_action(AuditRecord{}, delete_key_tree(reg, FakeRegistry::kRoot, "K"), true);
+    REQUIRE(ok.lines.size() == 6);
+    REQUIRE(ok.lines[0].rfind("audit|", 0) == 0);
+    const auto missing = render_single_action(AuditRecord{}, delete_key_tree(reg, FakeRegistry::kRoot, "Gone"), true);
+    REQUIRE(missing.lines.size() == 2);
+    REQUIRE(missing.rc == 1);
+
+    SECTION("no failure: the lines go out as rendered") {
+        RecordingCtx ctx;
+        CHECK(seam_emit(ctx, "delete_key", ok) == ok.rc);
+        CHECK(ctx.lines == ok.lines);
+    }
+    SECTION("the sink fails on any line after the audit line: exactly one audit line, the real one") {
+        // mutant: emit_lines rethrows after the audit line went out, so report_exception adds the fixed line
+        const auto bad = GENERATE(1, 2, 3, 4, 5);
+        INFO("failing line index " << bad);
+        RecordingCtx ctx;
+        ctx.fails = [&ok, bad](std::string_view t) { return t == ok.lines[static_cast<std::size_t>(bad)]; };
+        CHECK(seam_emit(ctx, "delete_key", ok) == 1);
+        CHECK(audit_line_count(ctx) == 1);
+        REQUIRE_FALSE(ctx.lines.empty());
+        CHECK(ctx.lines[0] == ok.lines[0]);
+        CHECK(ctx.lines.back() == "error|exception");
+        CHECK(std::ranges::find(ctx.lines, std::string{exception_audit_line("delete_key")}) == ctx.lines.end());
+    }
+    SECTION("a refused action whose error line fails: still one audit line") {
+        RecordingCtx ctx;
+        ctx.fails = [&missing](std::string_view t) { return t == missing.lines[1]; };
+        CHECK(seam_emit(ctx, "delete_key", missing) == 1);
+        CHECK(audit_line_count(ctx) == 1);
+        CHECK(ctx.lines[0] == missing.lines[0]);
+        CHECK(ctx.lines.back() == "error|exception");
+    }
+    SECTION("the sink fails before any audit line went out: the fixed failed line is left, once") {
+        RecordingCtx ctx;
+        ctx.fails = [n = 0](std::string_view) mutable { return n++ == 0; };
+        CHECK(seam_emit(ctx, "delete_key", ok) == 1);
+        REQUIRE(ctx.lines.size() == 2);
+        CHECK(ctx.lines[0] == exception_audit_line("delete_key"));
+        CHECK(ctx.lines[1] == "error|exception");
+        CHECK(audit_line_count(ctx) == 1);
+    }
+}
+
 // ── the value-count cap ──────────────────────────────────────────────────
 
 TEST_CASE("registry core: delete_key on a leaf with more values than the cap stops counting at the cap and "
