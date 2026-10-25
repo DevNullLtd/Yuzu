@@ -200,6 +200,9 @@ constexpr ExpectedResolution kExpected[] = {
     // body_cap_policy.hpp crypto row - the /crypto REST v1 subtree; PUT dashboard/layout is the
     // only body-bearing route (crypto_widget_catalogue.hpp kLayoutBodyMaxBytes). ANY method.
     {"PUT",    "/api/v1/crypto/dashboard/layout",                      16u * 1024, false, "crypto"},
+    {"PUT",    "/api/v1/config/log_level",                             16u * 1024, false, "config"},
+    {"GET",    "/api/v1/config",                                       16u * 1024, false, "config"},
+    {"PUT",    "/api/v1/configevil/log_level",                         4u * 1024 * 1024, false, "default"},
     {"GET",    "/api/v1/crypto/ca/stats",                              16u * 1024, false, "crypto"},
     {"PUT",    "/api/v1/cryptoevil",                                   4u * 1024 * 1024, false, "default"},
     // Catch-all default — ordinary JSON/form traffic.
@@ -241,8 +244,18 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "users",
     "dex_score_policy",
     "crypto",
+    "config",
     "default",
 };
+
+// Regression guard (#6367): `resolve_body_cap` must stay usable in a constant
+// expression under -fsanitize=undefined. GCC 15 cannot constant-evaluate the
+// UBSan pointer checks, so a `const BodyCapEntry*` best-match inside it breaks
+// every UBSan leg that compiles `crypto_routes.cpp`'s `static_assert`. This
+// TU is built in those legs too, so the guard also covers constexpr use
+// outside `crypto_routes.cpp`.
+static_assert(resolve_body_cap("PUT", "/api/v1/crypto/dashboard/layout").max_body_bytes > 0);
+static_assert(resolve_body_cap("GET", "/no/such/route").path_class == std::string_view{"default"});
 
 } // namespace
 
@@ -387,8 +400,9 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // users(1: the /api/v1/users subtree, #5342 password routes) +
     // dex_score_policy(1: the DEX score policy document) +
     // crypto(1: the /api/v1/crypto subtree, the dashboard layout PUT) +
+    // config(1: the /api/v1/config subtree, the runtime-config PUT) +
     // default(1).
-    CHECK(std::size(kBodyCapTable) == 35);
+    CHECK(std::size(kBodyCapTable) == 36);
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──

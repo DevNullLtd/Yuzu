@@ -879,8 +879,14 @@ ManagementGroupStore::get_visible_agents(const std::string& username) const {
     // back to the full enrolled set in that case ONLY (probe unset / RBAC on →
     // role-scoped semantics preserved; the fallback can never widen visibility
     // while RBAC is on).
-    if (rbac_enabled_probe_ && !rbac_enabled_probe_())
+    if (rbac_enabled_probe_ && !rbac_enabled_probe_()) {
+        // The legacy-open full fleet does not apply to an engine principal (`engine:<slug>`):
+        // its only authority is an explicit RBAC grant, and RBAC is off here. The reserved
+        // namespace is not constructible for a human account.
+        if (username.starts_with("engine:"))
+            return std::vector<std::string>{};
         return all_member_agents();
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         static DegradeSampler sampler;

@@ -136,6 +136,20 @@ public:
     /// Stop the background drain thread.
     void stop_drain();
 
+    /// Test hook: run exactly ONE synchronous drain pass on the calling thread
+    /// (`drain_batch()`), bypassing the drain thread's 1 s sleep loop, so a test
+    /// observes a drain without waiting `drain_interval_seconds_`. Do not call it
+    /// while the drain thread is running. Production code MUST NOT call this — no
+    /// caller in `server/core/src/**` references it.
+    void drain_once_for_test();
+
+    /// Test hook: true while the background drain thread is started and not yet
+    /// stopped (`drain_thread_.joinable()`), so a test can assert the sticky-stop
+    /// latch kept `start_drain()` from restarting it. Call it from the thread that
+    /// called `start_drain()`/`stop_drain()`: the read is unsynchronised. Production
+    /// code MUST NOT call this — no caller in `server/core/src/**` references it.
+    [[nodiscard]] bool drain_running_for_test() const;
+
 private:
     pg::PgPool& pool_;
     bool open_{false};

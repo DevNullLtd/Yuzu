@@ -3,9 +3,12 @@
     "method": "GET",
     "path": "/api/agents",
     "capability_id": "get.api-agents",
-    "rest_v1_twin": null,
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/devices"
+    },
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#4041 revisit:2027-01-31 MCP list_agents is unconfined (known gap, #4041) while GET /api/v1/devices is confined through require_fleet_read; not a twin until list_agents is confined (ADR-1005 2026-10-23 entry)"
   },
   {
     "method": "GET",
@@ -153,17 +156,23 @@
     "method": "GET",
     "path": "/api/config",
     "capability_id": "get.api-config",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/config"
+    },
+    "mcp_twin": "get_runtime_config",
+    "status": "twinned"
   },
   {
     "method": "PUT",
     "path": "/api/config/{param}",
     "capability_id": "put.api-config-param",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "PUT",
+      "path": "/api/v1/config/{key}"
+    },
+    "mcp_twin": "set_runtime_config",
+    "status": "twinned"
   },
   {
     "method": "GET",

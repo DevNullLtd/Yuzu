@@ -227,8 +227,9 @@ TEST_CASE("mcp step-up policy: the pinned baseline list is sorted, unique and mo
 TEST_CASE("mcp step-up policy: every post-baseline (second-list) tool is pending with a kRequired "
           "REST twin and is not in the baseline",
           "[stepup][mcp][policy]") {
-    REQUIRE(kMcpPendingBecauseRestTwinRequired.size() == 1);
+    REQUIRE(kMcpPendingBecauseRestTwinRequired.size() == 2);
     CHECK(kMcpPendingBecauseRestTwinRequired[0] == "raise_guardian_policy_generation");
+    CHECK(kMcpPendingBecauseRestTwinRequired[1] == "set_runtime_config");
     std::set<std::string_view> baseline(std::begin(kBaselineMcpPending),
                                         std::end(kBaselineMcpPending));
     std::set<std::string_view> seen;
@@ -257,13 +258,13 @@ TEST_CASE("mcp step-up policy: the pending rows are the baseline plus the post-b
     // Many baseline tools ALSO have a kRequired twin (they are pending because no MCP consumer
     // enforces kRequired yet), so the second list is not the only such group. What is checked here
     // is the count identity; the second-list case above checks each entry's twin.
-    // 45 pending rows = 44 baseline + 1 second-list.
+    // 46 pending rows = 44 baseline + 2 second-list.
     CHECK(pending_rows() == kMcpPendingBaselineMax + kMcpPendingBecauseRestTwinRequired.size());
-    CHECK(pending_rows() == 45);
+    CHECK(pending_rows() == 46);
     CHECK(baseline_pending_rows() + second_list_pending_rows() == pending_rows());
     CHECK(second_list_pending_rows() == kMcpPendingBecauseRestTwinRequired.size());
-    // The MCP table shape: 64 rows, 19 exempt, 45 pending.
-    CHECK(std::size(kMcpStepUpPolicy) == 64);
+    // The MCP table shape: 65 rows, 19 exempt, 46 pending.
+    CHECK(std::size(kMcpStepUpPolicy) == 65);
     std::size_t exempt = 0;
     for (const auto& e : kMcpStepUpPolicy)
         exempt += (e.cls == StepUpClass::kExempt) ? 1 : 0;

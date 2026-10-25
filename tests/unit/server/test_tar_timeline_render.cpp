@@ -1102,7 +1102,8 @@ TEST_CASE("tar timeline golden: moment exact", "[tar][timeline][golden]") {
     contains(html, "and 2 more");
     contains(html, "2026-10-20T09:30:00Z");
     // previous / next render as links only when the builder is set
-    contains(html, "<a class=\"btn sm\" href=\"/tar/moment?t=" + std::to_string(W0 + 600) + "\">Previous event</a>");
+    contains(html, "<a class=\"btn sm\" href=\"/tar/moment?t=" + std::to_string(W0 + 600) +
+                        "\" data-ts=\"" + std::to_string(W0 + 600) + "\">Previous event</a>");
     contains(html, "Next event</a>");
     const auto bare = render_timeline_moment(m, W0 + 1800, TarTimelineLinks{});
     contains(bare, "<button type=\"button\" class=\"btn sm\" disabled>Previous event</button>");
@@ -1853,4 +1854,102 @@ TEST_CASE("tar timeline css: one .tl- block, tokens only, no text on a filled hi
     CHECK(rules > 100);
     // the two time chips sit on the surface with an --hl border
     CHECK(count_of(block, "background: var(--surface); color: var(--ink); border: 1px solid var(--hl);") == 2);
+
+    // The interaction states yuzu-tar-timeline.js toggles: one bounded block, tokens only, every
+    // rule a .tl rule (the .tl- block above stops where this one starts, so it is pinned here).
+    const std::string open = "/* -- Timeline page interaction states";
+    const auto istart = css.find(open);
+    REQUIRE(istart != std::string::npos);
+    CHECK(count_of(css, open) == 1);
+    const auto iend = css.find("/* -- end Timeline page interaction states", istart);
+    REQUIRE(iend != std::string::npos);
+    const std::string ib = css.substr(istart, iend - istart);
+    // touch-action: pan-y keeps vertical page scroll on touch while the scrub owns the horizontal drag.
+    for (const char* needle : {".tl-ctl .btn.play[aria-pressed=\"true\"]", ".tl-det.busy", ".tl.scrubbing .tl-body",
+                               ".tl-body:focus-visible", ".tl-body { touch-action: pan-y; }", "var(--hl)"})
+        contains(ib, needle);
+    for (const char* banned : {"#", "gradient", "url(", "@import"})
+        CHECK(count_of(ib, banned) == 0);
+    std::size_t ipos = ib.find('\n') + 1;
+    while (ipos < ib.size()) {
+        auto eol = ib.find('\n', ipos);
+        if (eol == std::string::npos)
+            eol = ib.size();
+        const std::string line = ib.substr(ipos, eol - ipos);
+        ipos = eol + 1;
+        INFO("interaction rule: " << line);
+        CHECK((line.empty() || line.rfind(".tl", 0) == 0));
+    }
+}
+
+// ═══ the markup the page script reads ═════════════════════════════════════════════════
+
+TEST_CASE("tar timeline page contract: the window, the moment and the links are numbers in the markup",
+          "[tar][timeline]") {
+    const auto m = base();
+    const auto lanes = render_timeline_lanes(m);
+    contains(lanes, "<div class=\"tl-body\" data-from=\"" + std::to_string(m.window_from_ts) + "\" data-to=\"" +
+                        std::to_string(m.window_to_ts) + "\">");
+    contains(lanes, "<div class=\"tl-ph\" data-ts=\"" + std::to_string(tar_timeline_resolve_moment(m)) + "\" style=");
+    CHECK(count_of(lanes, "data-from=") == 1);
+    CHECK(count_of(lanes, "class=\"tl-ph\"") == 1);
+
+    // A window outside the drawable range keeps the attributes on the body (the script rejects
+    // it by value) but has no playhead, which is the script's own bind signal.
+    auto bad = base();
+    bad.window_to_ts = bad.window_from_ts;
+    const auto none = render_timeline_lanes(bad);
+    contains(none, "data-from=\"" + std::to_string(bad.window_from_ts) + "\" data-to=\"" +
+                       std::to_string(bad.window_to_ts) + "\"");
+    lacks(none, "class=\"tl-ph\"");
+
+    // Moment panel: Previous / Next carry the adjacent times; a missing side is a disabled button.
+    const std::int64_t t = W0 + 1800;
+    const auto adj = tar_timeline_adjacent_events(m, t);
+    REQUIRE(adj.prev > 0);
+    REQUIRE(adj.next > 0);
+    const auto moment = render_timeline_moment(m, t, links_full());
+    contains(moment, "data-ts=\"" + std::to_string(adj.prev) + "\">Previous event</a>");
+    contains(moment, "data-ts=\"" + std::to_string(adj.next) + "\">Next event</a>");
+    const auto edge = render_timeline_moment(m, W0, links_full()); // nothing earlier than the window start
+    contains(edge, "disabled>Previous event</button>");
+    CHECK(count_of(edge, "data-ts=") == 1);
+    const auto bare = render_timeline_moment(m, t, TarTimelineLinks{});
+    lacks(bare, "data-ts=");
+
+    // Selected panel: each linked-item anchor names the item and the moment it was rendered at.
+    const auto sel = render_timeline_selected(m, "P2", W0 + 3300, links_full());
+    contains(sel, "data-ref=\"P1\" data-ts=\"" + std::to_string(W0 + 3300) + "\">proc-a.exe 4120</a>");
+    CHECK(count_of(sel, "data-ref=") == 1); // "gone-id" is not in the read: dropped
+    lacks(render_timeline_selected(m, "P2", W0 + 3300, TarTimelineLinks{}), "data-ref=");
+
+    // A hostile linked id is escaped in the attribute as well as in the href.
+    auto h = base();
+    h.groups[0].lanes[0].items[0].id = "a\"><x>";
+    h.groups[0].lanes[1].items[0].linked_ids = {"a\"><x>"};
+    const auto hs = render_timeline_selected(h, "P2", W0 + 3300, links_full());
+    contains(hs, "data-ref=\"" + escaped("a\"><x>") + "\"");
+    lacks(hs, "<x>");
+}
+
+// yuzu-tar-timeline.js repeats two renderer facts as literals (its playheadLeft and edgeClass); the
+// node test pins the same strings, so a change on either side fails one of the two suites.
+TEST_CASE("tar timeline page contract: the playhead position and the chip edge thresholds",
+          "[tar][timeline]") {
+    auto m = with_lane(lane("l", "process", "p"));
+    m.moment_ts = W0 + 1800; // 50% of the one-hour window
+    const auto mid = render_timeline_lanes(m);
+    contains(mid, "style=\"left:calc(var(--gut) + (100% - var(--gut)) * 0.50000)\"><b>");
+    contains(mid, "style=\"left:calc(var(--gut) + (100% - var(--gut)) * 0.50000 + 1px)\"");
+    // fraction of the window -> chip class: past 90% it hangs left ("e"), before 5% right ("s")
+    struct Edge {
+        std::int64_t at;
+        const char* cls;
+    };
+    for (const auto& e : {Edge{W0 + 3276, " class=\"e\""}, Edge{W0 + 3240, ""}, Edge{W0 + 144, " class=\"s\""},
+                          Edge{W0 + 180, ""}}) {
+        m.moment_ts = e.at;
+        INFO("moment at " << (e.at - W0) << " s of 3600");
+        contains(render_timeline_lanes(m), std::string("\"><b") + e.cls + ">");
+    }
 }

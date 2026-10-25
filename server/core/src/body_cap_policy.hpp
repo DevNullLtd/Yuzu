@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <string_view>
 
 /// @file body_cap_policy.hpp
@@ -564,6 +565,14 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // shares the prefix (rule 4 in the routed-concern row).
     {kBodyCapAnyMethod, "/api/v1/crypto", 16u * 1024, false, "crypto"},
 
+    // /api/v1/config — the runtime-configuration REST v1 twin. The only body-bearing route is
+    // PUT /api/v1/config/{key} {"value": ...}: one scalar (an integer, a flag, a log level, a
+    // tag key, an OIDC client secret or a short JSON array of routed observation types), well
+    // under 16 KiB. The legacy PUT /api/config/{key} keeps the catch-all (kDefaultIsCorrectFor).
+    // ANY method: the sibling GET is bodyless and shares the prefix (rule 4 in the routed-concern
+    // row).
+    {kBodyCapAnyMethod, "/api/v1/config", 16u * 1024, false, "config"},
+
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.
     // Ordinary JSON/form traffic (most REST mutation routes) lands here.
@@ -602,14 +611,24 @@ struct BodyCapMatch {
 /// to report through (mirrors `dispatch_confined_arms.hpp`'s style).
 [[nodiscard]] constexpr BodyCapMatch resolve_body_cap(std::string_view method,
                                                       std::string_view path) noexcept {
-    const BodyCapEntry* best = nullptr;
-    for (const auto& entry : kBodyCapTable) {
+    // Best match is tracked as an INDEX, not a `const BodyCapEntry*` (#6367).
+    // GCC 15 with -fsanitize=undefined cannot constant-evaluate UBSan's null,
+    // nonnull-attribute or returns-nonnull-attribute checks on a
+    // `const BodyCapEntry*`, so a pointer here makes
+    // `static_assert(resolve_body_cap(...))` (crypto_routes.cpp) a non-constant
+    // expression in every UBSan leg. The CI legs disable only `null,alignment`
+    // (#5492), which leaves the other two failing. Do not revert this to a
+    // pointer.
+    constexpr std::size_t kNone = static_cast<std::size_t>(-1);
+    std::size_t best = kNone;
+    for (std::size_t i = 0; i < std::size(kBodyCapTable); ++i) {
+        const auto& entry = kBodyCapTable[i];
         if (entry.method != kBodyCapAnyMethod && entry.method != method)
             continue;
         if (!body_cap_prefix_matches(path, entry.path_prefix))
             continue;
-        if (best == nullptr || entry.path_prefix.size() > best->path_prefix.size())
-            best = &entry;
+        if (best == kNone || entry.path_prefix.size() > kBodyCapTable[best].path_prefix.size())
+            best = i;
     }
     // Unreachable in practice — the catch-all default (empty prefix,
     // kBodyCapAnyMethod) matches every (method, path), so `best` is always
@@ -620,7 +639,7 @@ struct BodyCapMatch {
     // UNREACHABLE BY CONSTRUCTION, not merely by inspection: the
     // `static_assert` below this function proves `kBodyCapTable` contains an
     // any-method empty-prefix row, which `body_cap_prefix_matches` accepts
-    // for every path, so `best` can never be null and this branch can never
+    // for every path, so `best` can never be `kNone` and this branch can never
     // execute. That is deliberate rather than pre-seeding the label: a
     // sentinel that CANNOT occur is stronger than one that is instrumented
     // when it does, and it removes the `yuzu_body_cap_rejected_total`
@@ -636,16 +655,17 @@ struct BodyCapMatch {
     // appear unannounced the first time this sentinel is ever reached.
     // `server.cpp` owns that seeding loop; this header only owns documenting
     // the gap so it is not silently assumed closed.
-    if (best == nullptr)
+    if (best == kNone)
         return {0, true, "unmatched"};
-    return {best->max_body_bytes, best->requires_measurable, best->path_class};
+    const auto& hit = kBodyCapTable[best];
+    return {hit.max_body_bytes, hit.requires_measurable, hit.path_class};
 }
 
 /// True iff `kBodyCapTable` carries an any-method, empty-prefix catch-all row.
 ///
 /// `body_cap_prefix_matches` accepts an empty prefix for every path, and
 /// `kBodyCapAnyMethod` matches every verb, so such a row makes
-/// `resolve_body_cap`'s null-`best` branch unreachable — the `unmatched`
+/// `resolve_body_cap`'s `kNone`-`best` branch unreachable — the `unmatched`
 /// sentinel becomes impossible rather than merely unlikely.
 [[nodiscard]] constexpr bool body_cap_table_has_catch_all() noexcept {
     for (const auto& e : kBodyCapTable)
