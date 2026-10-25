@@ -75,6 +75,14 @@ dispatch records a second, or two fleet-wide per-agent events a day at 500,000 a
 excess grows the table and raises `YuzuExecCorrelationReapSaturated` after a day at the cap. No
 per-principal or per-address limit on dispatch inflow exists yet; a separate follow-up tracks it.
 
+A held command (a delay or stagger) cannot outlive that window. `delay` and `stagger` are each a JSON
+integer from 0 to 300 on `POST /api/command` (anything else is an A4 `400`), the agent clamps each to 300
+again, and the total wait is capped at 600 seconds (`agents/core/src/agent.cpp`). Only that route can express
+them: the MCP tools carry neither, and the server's own dispatchers pass 0. The longest hold, 600 seconds, is
+far inside the 24 hour window (`kCmdExecutionReapWindowSecs`), so no extra bound on the record is needed for
+it. A response that arrives more than 24 hours after its record was written (a single execution that
+outlives the window) is stored `~unverified`.
+
 The dispatch-time write (`record_command_dispatch`) is a single attempt with no retry, on the
 synchronous pre-RPC dispatch path, and it never refuses or delays the dispatch beyond its own
 bound. The bound is two-part: the pool lease is acquired within `kWriteTimeout` (2 seconds), and the
