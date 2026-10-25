@@ -408,8 +408,8 @@ ace|allow_conditional|\Everyone|0x001f01ff|-
 signature_status|unsigned
 [result_status] UNDECLARED / UNKNOWN
 
-== action=find_by_hash directory=C:\Windows\System32\drivers\etc sha256=9321feab332edbba521c7ea3eb978d9844cb4f62a4730dab9cf60fb79649037d
-match|C:\Windows\System32\drivers\etc\hosts|1405
+== action=find_by_hash directory=C:\Windows\System32\drivers\etc sha256=031da282a9436540be78beab34801f32c1429491e881838b0ddf4f8c16e122cc
+match|C:\Windows\System32\drivers\etc\hosts|1224
 matches_found|1
 [result_status] UNDECLARED / UNKNOWN
 
