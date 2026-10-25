@@ -129,6 +129,13 @@ TEST_CASE("registry encode REG_MULTI_SZ: LF-separated records; empty text is the
         // The edge: 524,286 characters encode to exactly kMaxWriteBytes, one more to two bytes over.
         CHECK(encode_value(kRegMultiSz, std::string(524286, 'x'), {}, false).bytes.size() == kMaxWriteBytes);
         CHECK(encode_value(kRegMultiSz, std::string(524287, 'x'), {}, false).error == kTokValueOverflow);
+        // Over the text bound (1,048,578 UTF-8 bytes) yet only 699,056 as UTF-16, so the encoded-size check
+        // alone would accept it: pins the text-size guard independently. 349,526 x U+0800 (E0 A0 80).
+        std::string wide;
+        for (int i = 0; i < 349526; ++i)
+            wide += "\xE0\xA0\x80";
+        CHECK(wide.size() == kMaxWriteBytes + 2);
+        CHECK(encode_value(kRegMultiSz, wide, {}, false).error == kTokValueOverflow);
     }
     SECTION("data_hex") {
         CHECK(encode_value(kRegMultiSz, {}, "610000000000", true).bytes == B({0x61, 0, 0, 0, 0, 0}));

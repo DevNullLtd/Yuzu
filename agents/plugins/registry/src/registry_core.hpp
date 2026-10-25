@@ -157,7 +157,9 @@ template <class Raw>
 /// the same reason, covers the two free functions that sit directly on one raw call: query_value_bounded
 /// (above; it drives the RegQueryValueExW-shaped `raw` callable and fills the seam's QueryResult) and the
 /// shell's query_key_name (registry_win.cpp; one NtQueryKey call). Everything built on the seam returns by
-/// value. Names are UTF-8.
+/// value, with one exception: `write_value_on` takes a `bool* landed` output parameter, because the fact that
+/// the value landed must be published before the read-back can throw so that Opened's destructor can roll the
+/// value back; it is consumed immediately and never retained. Names are UTF-8.
 struct RegistryWriter {
     RegistryWriter() = default;
     RegistryWriter(const RegistryWriter&) = delete;
