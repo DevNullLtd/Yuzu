@@ -48,6 +48,7 @@
                                      // 3 review finding 2; see that field's own doc comment)
 #include "rotation_sweep_naming.hpp"
 #include "rotation_warn_dedup.hpp"
+#include "approval_denial_audit.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "credential_change_owner.hpp" // #5342 — one-transaction local credential change
@@ -1057,13 +1058,30 @@ public:
         metrics_.describe("yuzu_mcp_approval_precondition_denied_total",
                           "MCP approval-ticket recalls refused by a pre-consume precondition "
                           "(#2443) - the ticket matched and was approved, but the underlying "
-                          "operation's live state had already moved on since mint. A subset "
+                          "operation's live state had already moved on since mint, or the "
+                          "ticket's own tool and arguments no longer matched the recall "
+                          "(the request match every approval-gated recall carries). A subset "
                           "of yuzu_mcp_approval_refused_total, broken out separately: unlike "
                           "the masked-denial split above, a precondition denial is already "
                           "distinguishable to the caller from the response body, so this "
                           "carries no anti-oracle restriction - it is not a `reason` label on "
                           "the shared counter because the shared counter's other kinds "
                           "(foreign-origin vs ordinary replay) still must not be",
+                          "counter");
+        metrics_.describe("yuzu_approval_precondition_denied_total",
+                          "Approval-ticket redemptions refused by a pre-consume precondition "
+                          "(#2443/#6062), by the ticket's origin: the ticket matched and was "
+                          "approved, but the state its effect depends on had moved on since "
+                          "mint. The ticket is left UNTOUCHED and still redeemable. Counted at "
+                          "the store for any redeemer that supplies a precondition, so it "
+                          "mirrors yuzu_mcp_approval_precondition_denied_total (which adds the "
+                          "MCP tool); each denial also writes an approval.precondition_denied "
+                          "audit row. TODAY only origin=mcp can move (every MCP "
+                          "approval-gated recall supplies a precondition: the request match, "
+                          "plus the rotation state check for confirm_engine_rotation); the "
+                          "instruction, schedule and guardian_deploy series are "
+                          "pre-seeded at zero and stay there until a redeemer for that surface "
+                          "exists",
                           "counter");
         metrics_.describe("yuzu_mcp_approval_burned_total",
                           "MCP approval-ticket recalls that SUCCESSFULLY consumed a one-time, "
@@ -1414,6 +1432,9 @@ public:
             metrics_.counter("yuzu_mcp_approval_refused_total", {{"tool", tool}});
             // Same closed set again for the #2786 masked-denial counter.
             metrics_.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", tool}});
+            // Every approval-gated recall carries a precondition now (the request match,
+            // g8r7-astra-D), so a precondition denial can reach any tool in the set.
+            metrics_.counter("yuzu_mcp_approval_precondition_denied_total", {{"tool", tool}});
             // #2444 item 3: a HANDLER can only burn a ticket for a tool that is
             // itself approval-gated in the first place, so this is the same
             // closed `tool` set as the three counters above. `reason` is a
@@ -1433,15 +1454,13 @@ public:
                 metrics_.counter(mcp::kMcpPollTotalMetric, {{"tool", tool}, {"result", result}});
             }
         }
-        // yuzu_mcp_approval_precondition_denied_total's reachable label set is
-        // NARROWER than the two above: kPrecondition can only fire for a tool
-        // that actually has a ConsumePrecondition wired, which today is just
-        // confirm_engine_rotation (#2443) — pre-seeding the full
-        // approval-gated set here would claim reachability for tools whose
-        // precondition is always `{}`. Extend this list alongside #2939's
-        // sweep as each tool gets its own precondition wired.
-        metrics_.counter("yuzu_mcp_approval_precondition_denied_total",
-                         {{"tool", "confirm_engine_rotation"}});
+        // #6062: the store-level counter's label is the ticket origin - a CLOSED set of
+        // the four writable surfaces (kUnspecified/kUnrecognised are never written and
+        // can never reach a precondition), so every combination is pre-seeded here.
+        for (const auto origin : {ApprovalOrigin::kInstruction, ApprovalOrigin::kSchedule,
+                                  ApprovalOrigin::kMcp, ApprovalOrigin::kGuardianDeploy})
+            metrics_.counter("yuzu_approval_precondition_denied_total",
+                             {{"origin", to_string(origin)}});
         // #2437 handler-side bound denials. The label set is closed on BOTH
         // axes: `tool` is execute_instruction alone (the only tool that EMITS
         // this counter today; the two kAgenticParamMaxLen read tools bound in
@@ -6590,6 +6609,16 @@ public:
             } else {
                 legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "instructions.db",
                                                          "ApprovalManager", {"approvals"});
+                // #6062: a precondition denial is counted and audited at the store, for
+                // every redeemer. audit_store_ is declared before approval_manager_, so it
+                // outlives every consume. The observer writes through AuditStore::log on
+                // its OWN lease - never the caller's transaction - so the evidence of a
+                // refused redemption survives the caller rolling back. No audit store
+                // (not open) means no row; the counter still counts.
+                approval_manager_->set_metrics(&metrics_);
+                approval_manager_->set_precondition_denial_observer(
+                    make_precondition_denial_audit_observer(
+                        [this]() -> AuditStore* { return audit_store_.get(); }));
             }
         }
 

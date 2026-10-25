@@ -5,11 +5,16 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "refusal_log_throttle.hpp"
 #include "secure_random.hpp"
+#include "sha256_hex.hpp"
 
 #include <libpq-fe.h>
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <yuzu/metrics.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <random>
@@ -19,6 +24,10 @@ namespace yuzu::server {
 namespace {
 
 constexpr const char* kStoreName = "approval_manager";
+
+// Declared in server.cpp (describe + per-origin pre-seed) and documented in
+// docs/user-manual/metrics.md; the name is spelled once here.
+constexpr const char* kPreconditionDeniedMetric = "yuzu_approval_precondition_denied_total";
 
 // query()/query_checked() row cap. No creation-side check enforces this on
 // submit() — a legitimately busy queue can exceed it — query_checked()
@@ -62,7 +71,8 @@ std::string redact_id(const std::string& id) {
 // approval already past its TTL, and a far-future `reviewed_at` was never swept and
 // stayed consumable. Postgres `now()` is the one authority all replicas share (the
 // same direction as SessionStore, ADR-2002 s4 / #3715). `now()` is fixed for a
-// transaction, so a statement or sweep sees one reading.
+// transaction, so a statement or sweep sees one reading. The one deliberate exception is
+// the consume liveness test, which reads `clock_timestamp()` (see ticket_live_sql).
 //
 // `submitted_at` is database time too (#6096): submit() authors it in-SQL from the same
 // expression, so every stamp this store writes and every comparison it makes (the
@@ -72,11 +82,16 @@ std::string redact_id(const std::string& id) {
 // scheduled run is now a guarded STATE transition (retire_schedule_tickets), not a clock
 // comparison, so no reader needs the two clocks to agree.
 constexpr const char* kDbNowEpochSql = "EXTRACT(EPOCH FROM now())::bigint";
+// The same database clock, read each time the expression is evaluated rather than fixed at
+// transaction start (see ticket_live_sql).
+constexpr const char* kDbWallEpochSql = "EXTRACT(EPOCH FROM clock_timestamp())::bigint";
 
-// THE ticket-liveness predicate, as a SQL boolean over `reviewed_at`. ONE definition,
-// used by the consume CAS, its diagnostic read, submit()'s approved-ticket sweep and
-// `ticket_is_live()` (which ScheduleRunner calls), so those four can never disagree
-// about when an approved ticket may still be redeemed or fired.
+// THE ticket-liveness predicate, as a SQL boolean over `reviewed_at`. ONE definition of the
+// window, used by the consume CAS, its diagnostic read, submit()'s approved-ticket sweep and
+// `ticket_is_live()` (which ScheduleRunner calls), so those four cannot drift apart about
+// the bounds of when an approved ticket may still be redeemed or fired. The clock the bounds
+// are measured on is chosen by the caller (`wall_clock`, below): the consume statements read
+// the wall clock, the other two sites the transaction start.
 //   lower bound: reviewed_at >= now - kApprovalTicketTtlSeconds   (the 7-day lifetime)
 //   upper bound: reviewed_at <= now + kApprovalReviewedAtSlackSeconds
 // The upper bound is what makes the lower one safe: a `reviewed_at` far in the future
@@ -89,8 +104,25 @@ constexpr const char* kDbNowEpochSql = "EXTRACT(EPOCH FROM now())::bigint";
 // adjudication"), so a wrong cutoff is recoverable by resubmitting. What remains is the
 // database's own clock, the shared authority every replica already trusts for sessions.
 // Literals are interpolated from the constants (integers, no caller text).
-std::string ticket_live_sql() {
-    const std::string now = kDbNowEpochSql;
+//
+// `wall_clock` reads `clock_timestamp()` instead of `now()`. `now()` is the START of the
+// transaction, so on the held-connection consume path (a caller's long transaction) it is
+// frozen at BEGIN: a transaction begun before the ticket's TTL ran out would still see it
+// live after (an over-grant), and one begun more than kApprovalReviewedAtSlackSeconds before
+// `reviewed_at` was stamped would see the ticket as dated in the future and misreport it as
+// expired (#6062 sg-6). The consume CAS and its diagnostic read therefore ask for the wall
+// clock, and any new caller that evaluates liveness on a caller-held connection MUST pass
+// true. The sweep and `ticket_is_live()` keep `now()`: the sweeps run first inside the mint's
+// own transaction (opened in submit_impl, never a caller's; under the default pool
+// settings each statement is bounded by a 30 s statement timeout and a 10 s lock timeout,
+// but the pool puts no deadline on the whole transaction, and a DSN that sets its own
+// options replaces those defaults). A stale `now()` in the sweeps is therefore tolerated
+// rather than excluded: an older reading can leave an expired ticket approved a little
+// longer, which consume refuses anyway, or, if the transaction is older than the 300 s
+// slack, expire a just-approved ticket as future-dated, which only a fresh request and
+// review recovers. `ticket_is_live()` is one statement and does not age that way.
+std::string ticket_live_sql(bool wall_clock = false) {
+    const std::string now = wall_clock ? kDbWallEpochSql : kDbNowEpochSql;
     return "(reviewed_at >= (" + now + " - " + std::to_string(kApprovalTicketTtlSeconds) +
            ") AND reviewed_at <= (" + now + " + " +
            std::to_string(kApprovalReviewedAtSlackSeconds) + "))";
@@ -122,7 +154,7 @@ std::string result_sqlstate(const pg::PgResult& res) {
 // Guarded the same way as `consume_denial_reason`. A missing arm here falls
 // through to `return ""`, which `approval_origin_from_string` decodes as
 // kUnspecified — refused at redemption since #2442's closing half
-// (declares_non_mcp_surface). That makes an unhandled enumerator fail CLOSED
+// (origin_redeemable_as). That makes an unhandled enumerator fail CLOSED
 // today, which was not always true: before the MCP mint declared kMcp,
 // kUnspecified was the value that granted, and a missing arm here was
 // fail-open. Kept guarded regardless — this function's return value is a
@@ -146,6 +178,8 @@ const char* to_string(ApprovalOrigin origin) {
         return "schedule";
     case ApprovalOrigin::kMcp:
         return "mcp";
+    case ApprovalOrigin::kGuardianDeploy:
+        return "guardian_deploy";
     case ApprovalOrigin::kUnspecified:
     case ApprovalOrigin::kUnrecognised:
         // Neither is written as a surface. kUnrecognised only ever comes OUT of
@@ -169,13 +203,15 @@ ApprovalOrigin approval_origin_from_string(std::string_view text) {
         return ApprovalOrigin::kSchedule;
     if (text == "mcp")
         return ApprovalOrigin::kMcp;
+    if (text == "guardian_deploy")
+        return ApprovalOrigin::kGuardianDeploy;
     // Empty is an UNDECLARED MINT. Since #2442's closing half, no production
     // caller writes it any more — the MCP mint now declares kMcp, and
     // `submit()`'s `origin` parameter is no longer defaulted — so this arm now
     // exists for two things only: a row minted before this change, and a
     // caller that regresses the non-default (which the compiler stops, but a
     // stored row predating the fix is real data, not a hypothetical). Both are
-    // REFUSED at redemption, same as kUnrecognised (declares_non_mcp_surface).
+    // REFUSED at redemption, same as kUnrecognised (origin_redeemable_as).
     // It is NOT the pre-column row: migration v7 rewrote every '' it found to
     // the sentinel, so a row that predates the column decodes below as
     // kUnrecognised, not kUnspecified — kept apart so the two refusal causes
@@ -194,13 +230,14 @@ ApprovalOrigin approval_origin_from_string(std::string_view text) {
 // (`consume_denial_reason` in the header carries the same guard, but over
 // `ConsumeFailure` — a different enum, so it is not part of this set.)
 //
-// The trailing `return true` already fails closed, so a missing arm cannot
-// grant — but it would silently pick the REFUSE side for a surface that may
-// have been added precisely to be redeemable, and the author would never be
-// told. Guarding one of the two was an inconsistency, not a judgement.
+// The trailing `return false` (not a concrete surface) already fails closed, so
+// a missing arm cannot grant — but it would silently pick the REFUSE side for a
+// surface that may have been added precisely to be redeemable, and the author
+// would never be told. Guarding one of the two was an inconsistency, not a
+// judgement.
 //
-// DO NOT ADD A `default:` LABEL HERE. `-Wswitch` only fires while the switch
-// has none, so a defensive `default: return true;` — which looks like
+// DO NOT ADD A `default:` LABEL TO THE SWITCH BELOW. `-Wswitch` only fires while
+// the switch has none, so a defensive `default: return false;` — which looks like
 // belt-and-braces, and does exactly what the statement below already does —
 // silently deletes this guard, with no warning and no failing test. MEASURED
 // on GCC 15.2: with a default label added, a missing enumerator stops erroring
@@ -208,13 +245,18 @@ ApprovalOrigin approval_origin_from_string(std::string_view text) {
 // the switch is what keeps the guard armed, and that is the whole reason it is
 // out there rather than in a default arm.
 //
-// kUnspecified moved from the grant side to the refuse side here (#2442,
-// closing half): the MCP mint now declares ApprovalOrigin::kMcp explicitly
-// (mcp_server.cpp), so kUnspecified is no longer "the MCP gate, undeclared" —
-// it is now indistinguishable from a row this build cannot attribute to any
-// surface, which is exactly the kUnrecognised case one arm below. Grouping
-// them is deliberate, not an oversight.
-bool declares_non_mcp_surface(ApprovalOrigin origin) {
+// kUnspecified moved from the grant side to the refuse side (#2442, closing half):
+// the MCP mint declares ApprovalOrigin::kMcp explicitly (mcp_server.cpp), so
+// kUnspecified is no longer "the MCP gate, undeclared" - it is indistinguishable
+// from a row this build cannot attribute to any surface, which is exactly the
+// kUnrecognised case. Grouping them is deliberate, not an oversight.
+//
+// #6062 split the old one-surface predicate in two: THIS function only says whether
+// a value names a concrete surface (the half the -Wswitch guard protects: a new
+// surface must be classified here or the build fails), and `origin_redeemable_as`
+// below compares two of them. A surface that is not listed as concrete can never
+// redeem or be redeemed, so a missing arm refuses rather than grants.
+static bool names_concrete_surface(ApprovalOrigin origin) {
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic error "-Wswitch"
@@ -226,10 +268,11 @@ bool declares_non_mcp_surface(ApprovalOrigin origin) {
     switch (origin) {
     case ApprovalOrigin::kInstruction:
     case ApprovalOrigin::kSchedule:
+    case ApprovalOrigin::kMcp:
+    case ApprovalOrigin::kGuardianDeploy:
+        return true;
     case ApprovalOrigin::kUnrecognised:
     case ApprovalOrigin::kUnspecified:
-        return true;
-    case ApprovalOrigin::kMcp:
         return false;
     }
 #if defined(__GNUC__) || defined(__clang__)
@@ -237,10 +280,207 @@ bool declares_non_mcp_surface(ApprovalOrigin origin) {
 #elif defined(_MSC_VER)
 #pragma warning(pop)
 #endif
-    return true; // unreachable; fail closed if the enum grows
+    return false; // unreachable; fail closed if the enum grows
+}
+
+bool origin_redeemable_as(ApprovalOrigin stored, ApprovalOrigin expected) {
+    return names_concrete_surface(stored) && names_concrete_surface(expected) &&
+           stored == expected;
+}
+
+// Same -Wswitch guard as `names_concrete_surface`: a surface added later must state
+// whether its tickets bind a request, or the build fails. The trailing return is the
+// SAFE answer (true: must bind) and lives outside the switch so the guard stays armed.
+bool requires_bound_request(ApprovalOrigin origin) {
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(1 : 4062) // off by default; `error:` alone does NOT enable it
+#pragma warning(error : 4062)
+#endif
+    switch (origin) {
+    case ApprovalOrigin::kGuardianDeploy:
+        return true;
+    case ApprovalOrigin::kInstruction:
+    case ApprovalOrigin::kSchedule:
+    case ApprovalOrigin::kMcp:
+    case ApprovalOrigin::kUnspecified:
+    case ApprovalOrigin::kUnrecognised:
+        return false;
+    }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+    return true; // unreachable; fail toward "must bind" if the enum grows
 }
 
 namespace {
+
+// `excluded_roots` is stored as a JSON array of strings; '' (the column default, and
+// every row minted before migration v3) means "none". nullopt == the column holds
+// something else: callers that ENFORCE the list refuse on it, they never read it as
+// empty.
+std::optional<std::vector<std::string>> decode_excluded_roots(const std::string& text) {
+    std::vector<std::string> out;
+    if (text.empty())
+        return out;
+    const auto doc = nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
+    if (!doc.is_array())
+        return std::nullopt;
+    for (const auto& e : doc) {
+        if (!e.is_string())
+            return std::nullopt;
+        out.push_back(e.get<std::string>());
+    }
+    return out;
+}
+
+// The stored form of an excluded-roots list: '' for none, else a compact JSON array of
+// strings. ONE definition, used by submit_bound (to store it) and by redemption (to pin the
+// consuming CAS to the list the integrity check read), so the two cannot drift. STRICT: an
+// invalid-UTF-8 root throws rather than being "replaced" - a replaced root would no longer
+// equal the name it was meant to exclude, and a silently weakened exclusion is the one outcome
+// this must not have. nullopt == not encodable.
+std::optional<std::string> encode_excluded_roots(const std::vector<std::string>& roots) {
+    if (roots.empty())
+        return std::string{};
+    try {
+        return nlohmann::json(roots).dump(-1, ' ', false, nlohmann::json::error_handler_t::strict);
+    } catch (const nlohmann::json::exception&) {
+        return std::nullopt;
+    }
+}
+
+// True when `j` nests containers deeper than `limit` (a scalar is depth 0). Bounded by
+// the limit itself, so the recursion is at most `limit + 1` frames whatever the input.
+bool nests_deeper_than(const nlohmann::json& j, std::size_t limit) {
+    if (!j.is_structured())
+        return false;
+    if (limit == 0)
+        return true;
+    for (const auto& child : j) {
+        if (nests_deeper_than(child, limit - 1))
+            return true;
+    }
+    return false;
+}
+
+} // namespace
+
+bool bound_request_is_readable(std::string_view text) {
+    if (text.empty() || text.size() > kMaxRequestJsonBytes)
+        return false;
+    // Lexical container-depth scan BEFORE parsing: a document nested past the limit is
+    // refused without ever being built, whatever the parser would have done with it.
+    // Brackets inside string literals do not count.
+    // Written as a hex escape: test_approval_manager.cpp's comment-stripping scan of this
+    // file cannot tolerate a double-quote character literal.
+    constexpr char kQuote = '\x22';
+    std::size_t depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (const char c : text) {
+        if (in_string) {
+            if (escaped)
+                escaped = false;
+            else if (c == '\\')
+                escaped = true;
+            else if (c == kQuote)
+                in_string = false;
+            continue;
+        }
+        if (c == kQuote) {
+            in_string = true;
+        } else if (c == '{' || c == '[') {
+            if (++depth > kMaxRequestJsonDepth)
+                return false;
+        } else if ((c == '}' || c == ']') && depth > 0) {
+            --depth;
+        }
+    }
+    const auto doc = nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
+    return doc.is_object() && !nests_deeper_than(doc, kMaxRequestJsonDepth);
+}
+
+namespace {
+
+// THE four-eyes root comparison (#6062): the submitter check and the excluded-root
+// check in set_review_status both go through here, so "is this reviewer the same human
+// as that principal" has one definition. At this layer a root IS the principal name -
+// the approve routes admit only interactive human sessions (approver_assurance.hpp),
+// for which the session username is the human, and ADR-0033 section 7's resolution
+// table (token -> owner, engine -> owner, run -> admitting operator) is applied by the
+// CALLER that builds `excluded_roots` and picks the reviewer, not guessed at here.
+// Byte-for-byte: account names are case-sensitive keys in the auth store, and folding
+// case here would equate two distinct accounts. Deliberately NOT a normalising
+// compare - a fold that is wrong in the permissive direction would let a designer
+// approve their own effect.
+bool same_human_root(const std::string& a, const std::string& b) { return a == b; }
+
+// Why an APPROVED ticket must not be redeemed even though its row says "approved"
+// (#6062): the approval is only worth what produced it. approve() refuses the
+// submitter and every excluded root and mints the digest at mint, but a row written or
+// edited by anything else (a replica running an older build whose approve() ignores
+// excluded_roots, a hand edit, a restored backup) can say "approved" without any of
+// that having held. Redemption therefore re-derives the facts from the stored row
+// instead of trusting the status word. nullopt == the row is sound; otherwise a short
+// cause for the SERVER log only (never sent to a client: for a fault the refusal message is
+// the uniform one, so the redeemer is no oracle for which check fired; the one exception is
+// the digest that could not be COMPUTED, which decided nothing and is reported to the caller
+// as a store error, see integrity_refusal).
+//
+// A legacy row (no request_json, no digest, no excluded roots) passes the digest and
+// roots checks by construction, so every pre-v3 and unbound ticket redeems as before.
+struct IntegrityFault {
+    std::string cause;
+    bool unevaluated{false}; ///< the digest could not be computed: nothing was decided
+};
+// The request half of the integrity check, shared by redemption (digest only) and
+// approve() (digest AND readability, so a reviewer is never asked to approve a request
+// they could not have read). An empty request with an empty digest is an unbound
+// (legacy) ticket and is sound; a digest with no request, or a request that does not
+// hash to its digest, is not.
+std::optional<IntegrityFault> request_binding_fault(const std::string& request_json,
+                                                    const std::string& request_digest,
+                                                    bool require_readable) {
+    if (request_json.empty()) {
+        if (request_digest.empty())
+            return std::nullopt;
+        return IntegrityFault{"digest stored without a request"};
+    }
+    if (require_readable && !bound_request_is_readable(request_json))
+        return IntegrityFault{"stored request is not a readable bounded JSON object"};
+    const auto digest = sha256_hex(request_json);
+    if (!digest)
+        return IntegrityFault{"request digest could not be computed", /*unevaluated=*/true};
+    if (*digest != request_digest)
+        return IntegrityFault{"request digest does not match the stored request"};
+    return std::nullopt;
+}
+
+std::optional<IntegrityFault> approval_integrity_fault(const Approval& a) {
+    // approve() always records its reviewer (it refuses an empty one), so an approved
+    // ticket with none was not produced by it: set by hand, an old build, or a restore.
+    if (a.reviewed_by.empty())
+        return IntegrityFault{"approved with no recorded reviewer"};
+    if (a.excluded_roots_unreadable)
+        return IntegrityFault{"excluded_roots column unreadable"};
+    if (same_human_root(a.reviewed_by, a.submitted_by))
+        return IntegrityFault{"reviewer is the submitter"};
+    if (reviewer_is_excluded(a.reviewed_by, a.excluded_roots))
+        return IntegrityFault{"reviewer is an excluded root"};
+    // A row of an origin whose mint always freezes a request but which has none: submit_bound
+    // cannot have produced it (an unbound submit() refuses such an origin), so it was set by
+    // hand, an old build or a restore, and an empty request with an empty digest would
+    // otherwise pass as a "legacy" row (#6062 g10-redeem-does-not-recheck-bound-origin).
+    if (requires_bound_request(a.origin) && a.request_json.empty())
+        return IntegrityFault{"bound origin without a frozen request"};
+    return request_binding_fault(a.request_json, a.request_digest, /*require_readable=*/false);
+}
 
 Approval row_to_approval(PGresult* r, int i) {
     Approval a;
@@ -259,6 +499,14 @@ Approval row_to_approval(PGresult* r, int i) {
     a.origin = approval_origin_from_string(col_str(r, i, 12));
     a.target_plugin = col_str(r, i, 13);
     a.target_action = col_str(r, i, 14);
+    a.request_json = col_str(r, i, 15);
+    a.request_digest = col_str(r, i, 16);
+    a.row_version = col_str(r, i, 18);
+    a.row_position = col_str(r, i, 19);
+    if (auto roots = decode_excluded_roots(col_str(r, i, 17)))
+        a.excluded_roots = std::move(*roots);
+    else
+        a.excluded_roots_unreadable = true;
     return a;
 }
 
@@ -267,7 +515,8 @@ Approval row_to_approval(PGresult* r, int i) {
 constexpr const char* kSelectAllCols =
     "id, definition_id, status, submitted_by, submitted_at, "
     "reviewed_by, reviewed_at, review_comment, scope_expression, "
-    "consumed_at, consumed_by, schedule_id, origin, target_plugin, target_action";
+    "consumed_at, consumed_by, schedule_id, origin, target_plugin, target_action, "
+    "request_json, request_digest, excluded_roots, xmin::text, ctid::text";
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for
@@ -336,11 +585,40 @@ const std::vector<pg::PgMigration>& migrations() {
                      "UPDATE approvals SET consumed_at = ") + kDbNowEpochSql +
              ", consumed_by = 'schedule:legacy-6096' WHERE schedule_id <> '' AND "
              "consumed_at = 0 AND status IN ('approved','rejected');"},
+        // v3 (#6062, four-eyes MVP PR2): the bound-approval columns. Ordered AFTER #6096's
+        // v2 (a data-only legacy-ticket retire) because that step claimed v2 first; the two
+        // are independent. Additive, with constant defaults (instant on PG11+, no table
+        // rewrite), so every existing row reads as "binds no request, excludes nobody" and keeps working
+        // unchanged. '' rather than NULL, matching every other column in this table
+        // and the store-wide convention: the three are text the reader can always
+        // fetch without a null branch. They are written once, at INSERT, by
+        // submit_bound(); no UPDATE in this file touches them, which is what
+        // "frozen at mint" means here.
+        // IF NOT EXISTS makes the step idempotent on purpose: a development or UAT database
+        // that ran an earlier build of this branch recorded these same columns as version 2,
+        // so it reaches this step already holding them. Nothing else changes for it, and a
+        // database without them gets them exactly as before.
+        {3,
+         "ALTER TABLE approvals ADD COLUMN IF NOT EXISTS request_json   TEXT NOT NULL DEFAULT '';"
+         "ALTER TABLE approvals ADD COLUMN IF NOT EXISTS request_digest TEXT NOT NULL DEFAULT '';"
+         "ALTER TABLE approvals ADD COLUMN IF NOT EXISTS excluded_roots TEXT NOT NULL DEFAULT '';"},
     };
     return kMigrations;
 }
 
 } // namespace
+
+bool reviewer_is_excluded(const std::string& reviewer,
+                          const std::vector<std::string>& excluded_roots) {
+    return std::any_of(excluded_roots.begin(), excluded_roots.end(),
+                       [&](const std::string& root) { return same_human_root(reviewer, root); });
+}
+
+bool approval_state_is_approvable(const Approval& a) {
+    return !a.excluded_roots_unreadable &&
+           !request_binding_fault(a.request_json, a.request_digest, /*require_readable=*/true)
+                .has_value();
+}
 
 ApprovalManager::ApprovalManager(pg::PgPool& pool) : pool_(pool) {
     // Construction-only unbounded acquire (ADR-0012 §2) — every runtime
@@ -376,12 +654,117 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
                         const std::string& scope_expression, const std::string& schedule_id,
                         ApprovalOrigin origin, std::string target_plugin,
                         std::string target_action) {
+    // A surface whose tickets bind a request cannot be minted unbound: the redeemer
+    // would find an empty request_json and nothing for the reviewer to have seen.
+    if (requires_bound_request(origin))
+        return std::unexpected(std::string{kBoundRequestRequiredMessage});
+    auto r = submit_impl(definition_id, submitted_by, scope_expression, schedule_id, origin,
+                         /*bound=*/nullptr, std::move(target_plugin), std::move(target_action));
+    if (!r)
+        return std::unexpected(std::move(r.error().message));
+    return std::move(*r);
+}
+
+std::expected<std::string, SubmitError>
+ApprovalManager::submit_bound(const std::string& definition_id, const std::string& submitted_by,
+                              const std::string& scope_expression, ApprovalOrigin origin,
+                              const BoundRequest& bound, std::string target_plugin,
+                              std::string target_action) {
+    // The schedule id is fixed empty here, not taken from the caller: see the header.
+    return submit_impl(definition_id, submitted_by, scope_expression, std::string{}, origin, &bound,
+                       std::move(target_plugin), std::move(target_action));
+}
+
+std::expected<std::string, SubmitError>
+ApprovalManager::submit_impl(const std::string& definition_id, const std::string& submitted_by,
+                             const std::string& scope_expression, const std::string& schedule_id,
+                             ApprovalOrigin origin, const BoundRequest* bound,
+                             std::string target_plugin, std::string target_action) {
+    const auto fail = [](SubmitFailure kind, std::string message) {
+        return std::unexpected(SubmitError{kind, std::move(message)});
+    };
     if (!open_)
-        return std::unexpected("database not open");
+        return fail(SubmitFailure::kStoreError, "database not open");
     if (definition_id.empty())
-        return std::unexpected("definition_id is required");
+        return fail(SubmitFailure::kInvalidRequest, "definition_id is required");
     if (submitted_by.empty())
-        return std::unexpected("submitted_by is required");
+        return fail(SubmitFailure::kInvalidRequest, "submitted_by is required");
+
+    // Everything that can be decided from the arguments alone is decided BEFORE the
+    // lock, the id draw and the transaction: a refused mint costs nothing and writes
+    // nothing. `request_digest` and `excluded_roots_text` stay empty for an unbound
+    // mint (the column defaults), which is what "binds nothing" means.
+    std::string request_json;
+    std::string request_digest;
+    std::string excluded_roots_text;
+    if (bound != nullptr) {
+        // A gated effect needs a human requester root (ADR-0033 section 7): an
+        // engine principal's root is its owner, and letting it submit would let a
+        // machine identity raise the approval a human then rubber-stamps.
+        if (submitted_by.starts_with("engine:"))
+            return fail(SubmitFailure::kEnginePrincipal, kEnginePrincipalSubmitMessage);
+        if (!names_concrete_surface(origin))
+            return fail(SubmitFailure::kInvalidRequest,
+                        "a bound approval must declare a concrete origin");
+        // Bound and origin are one relation, not two: a bound ticket is minted only for a
+        // surface that requires one (the same predicate `submit()` uses to refuse the
+        // unbound mint). Otherwise a bound kMcp ticket would be redeemable by a recall that
+        // never compares the frozen request, and a bound kSchedule or kInstruction ticket
+        // would be dead or would wait for a redeemer that has not been written.
+        if (!requires_bound_request(origin))
+            return fail(SubmitFailure::kInvalidRequest,
+                        "a bound approval can only be minted for an origin that requires one");
+        if (bound->request_json.empty() || bound->request_json.size() > kMaxRequestJsonBytes)
+            return fail(SubmitFailure::kInvalidRequest,
+                        "request_json is required and at most " +
+                            std::to_string(kMaxRequestJsonBytes) + " bytes");
+        // A NUL byte anywhere is refused BEFORE parsing. nlohmann accepts one after a
+        // complete value (it reads as end of input), the digest below covers every
+        // byte, and pg::exec_params binds the column as a C string - so the row would
+        // keep the prefix while the digest named the full buffer, and a reviewer would
+        // see a request whose digest matches neither it nor any recompute.
+        if (bound->request_json.find('\0') != std::string::npos)
+            return fail(SubmitFailure::kInvalidRequest,
+                        "request_json must not contain a NUL byte");
+        const auto parsed =
+            nlohmann::json::parse(bound->request_json, nullptr, /*allow_exceptions=*/false);
+        if (!parsed.is_object())
+            return fail(SubmitFailure::kInvalidRequest, "request_json must be a JSON object");
+        if (nests_deeper_than(parsed, kMaxRequestJsonDepth))
+            return fail(SubmitFailure::kInvalidRequest,
+                        "request_json is nested more than " +
+                            std::to_string(kMaxRequestJsonDepth) + " levels deep");
+        if (bound->excluded_roots.size() > kMaxExcludedRoots)
+            return fail(SubmitFailure::kInvalidRequest,
+                        "at most " + std::to_string(kMaxExcludedRoots) + " excluded roots");
+        for (const auto& root : bound->excluded_roots) {
+            if (root.empty() || root.size() > kMaxExcludedRootBytes)
+                return fail(SubmitFailure::kInvalidRequest,
+                            "each excluded root must be 1-" +
+                                std::to_string(kMaxExcludedRootBytes) + " bytes");
+            // A principal name carries no control character; one that did could never
+            // equal a reviewer name, so it would be an exclusion that excludes nobody.
+            if (std::any_of(root.begin(), root.end(), [](char c) {
+                    const auto u = static_cast<unsigned char>(c);
+                    return u < 0x20 || u == 0x7F;
+                }))
+                return fail(SubmitFailure::kInvalidRequest,
+                            "an excluded root must not contain a control character");
+        }
+        if (!bound->excluded_roots.empty()) {
+            // STRICT encode: see encode_excluded_roots.
+            auto encoded = encode_excluded_roots(bound->excluded_roots);
+            if (!encoded)
+                return fail(SubmitFailure::kInvalidRequest,
+                            "excluded roots must be valid UTF-8");
+            excluded_roots_text = std::move(*encoded);
+        }
+        auto digest = sha256_hex(bound->request_json);
+        if (!digest)
+            return fail(SubmitFailure::kStoreError, "request digest could not be computed");
+        request_json = bound->request_json;
+        request_digest = std::move(*digest);
+    }
     // NO mint-time refusal for the reserved namespace. #2442 is defended at
     // REDEMPTION (see consume_ticket) instead, deliberately:
     //
@@ -400,13 +783,13 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     //  - Authoring is still refused where authoring happens —
     //    `instruction_yaml.cpp` and `instruction_store.cpp` both call
     //    `is_reserved_definition_id`, and `reserved_definition_id.hpp` warns
-    //    that a further call site is "a fourth chance to diverge". This was it.
+    //    that a further call site is "another chance to diverge". This was it.
 
     std::lock_guard lock(mtx_);
 
     auto id_r = generate_id();
     if (!id_r)
-        return std::unexpected(id_r.error());
+        return fail(SubmitFailure::kStoreError, id_r.error());
     auto id = *id_r;
     // Cutoffs and every stamp, submitted_at included, come from the database clock (see
     // kDbNowEpochSql above), never from this process.
@@ -502,13 +885,14 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
             "INSERT INTO approval_manager.approvals "
             "(id, definition_id, status, submitted_by, submitted_at, "
             " reviewed_by, reviewed_at, review_comment, scope_expression, schedule_id, origin, "
-            " target_plugin, target_action) "
-            "VALUES ($1,$2,'pending',$3," + db_now + ",'',0,'',$4,$5,$6,$7,$8)";
+            " target_plugin, target_action, request_json, request_digest, excluded_roots) "
+            "VALUES ($1,$2,'pending',$3," + db_now + ",'',0,'',$4,$5,$6,$7,$8,$9,$10,$11)";
         pg::PgResult ins = pg::exec_params(
             conn, insert_sql.c_str(),
             std::vector<std::string>{id, definition_id, submitted_by, scope_expression,
                                      schedule_id, to_string(origin), target_plugin,
-                                     target_action});
+                                     target_action, request_json, request_digest,
+                                     excluded_roots_text});
         if (ins.status() != PGRES_COMMAND_OK)
             return false;
         expired_pending_committed = expired_pending;
@@ -518,8 +902,8 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
 
     if (!ok) {
         if (!queue_full_error.empty())
-            return std::unexpected(queue_full_error);
-        return std::unexpected("insert failed (pool degraded or transaction failed)");
+            return fail(SubmitFailure::kQueueFull, queue_full_error);
+        return fail(SubmitFailure::kStoreError, "insert failed (pool degraded or transaction failed)");
     }
     if (expired_pending_committed > 0)
         spdlog::info("ApprovalManager: expired {} stale pending approvals",
@@ -735,14 +1119,20 @@ ApprovalManager::get_checked(const std::string& id) const {
     if (!lease)
         return std::unexpected(StoreReadError{"approval store temporarily unavailable "
                                               "(pool exhausted)"});
+    return read_row(lease.get(), id, /*for_update=*/false);
+}
 
+std::expected<std::optional<Approval>, StoreReadError>
+ApprovalManager::read_row(PGconn* conn, const std::string& id, bool for_update) const {
     std::string sql = std::string("SELECT ") + kSelectAllCols +
                       " FROM approval_manager.approvals WHERE id = $1";
-    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{id});
+    if (for_update)
+        sql += " FOR UPDATE";
+    pg::PgResult res = pg::exec_params(conn, sql.c_str(), std::vector<std::string>{id});
 
-    // A read that FAILED is not a read that found nothing. Collapsing the two
-    // is what let a store error be reported to the operator as "this one-time
-    // capability is spent" — see the pre-consume path in consume_ticket.
+    // A read that FAILED is not a read that found nothing. Collapsing the two is what
+    // let a store error be reported to the operator as "this one-time capability is
+    // spent" - see the pre-consume path in consume_core.
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(StoreReadError{
             std::string("read failed: ") + PQresultErrorMessage(res.get()), result_sqlstate(res)});
@@ -778,10 +1168,10 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
     // administrator reviews and approves a request that can never complete, and
     // a human approval is spent on a flow with no successful outcome.
     //
-    // Filtered in C++ through the SHARED predicate rather than a second,
-    // hand-written SQL copy of the rule. A copy in a WHERE clause is a second
-    // home for `declares_non_mcp_surface`, and the two would drift the first
-    // time the enum grows.
+    // Filtered in C++ through the SHARED predicate (`origin_redeemable_as`, the
+    // one consume_ticket applies) rather than a second, hand-written SQL copy of
+    // the rule. A copy in a WHERE clause is a second home for it, and the two
+    // would drift the first time the enum grows.
     //
     // Walk newest-first and take the first REDEEMABLE candidate, rather than
     // taking the newest and rejecting it — an older undeclared ticket under the
@@ -800,7 +1190,7 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
     const int rows = PQntuples(res.get());
     for (int i = 0; i < rows; ++i) {
         Approval a = row_to_approval(res.get(), i);
-        if (!declares_non_mcp_surface(a.origin))
+        if (origin_redeemable_as(a.origin, ApprovalOrigin::kMcp))
             return a;
     }
     return std::nullopt;
@@ -812,7 +1202,26 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
 
 std::expected<void, ConsumeError>
 ApprovalManager::consume_ticket(const std::string& id, const std::string& consumed_by,
-                                const ConsumePrecondition& precondition) {
+                                ApprovalOrigin expected, const ConsumePrecondition& precondition) {
+    return consume_core(/*held=*/nullptr, id, consumed_by, expected, precondition);
+}
+
+std::expected<void, ConsumeError>
+ApprovalManager::consume_ticket(PGconn* conn, const std::string& id, const std::string& consumed_by,
+                                ApprovalOrigin expected, const ConsumePrecondition& precondition) {
+    // A null connection must NOT fall through to consume_core's `held == nullptr`
+    // meaning ("take your own leases"): that would silently turn a caller's
+    // transaction-joined consume into an autocommit one, the exact thing this
+    // overload exists to rule out.
+    if (conn == nullptr)
+        return std::unexpected(
+            ConsumeError{ConsumeFailure::kStoreError, "a transaction connection is required"});
+    return consume_core(conn, id, consumed_by, expected, precondition);
+}
+
+std::expected<void, ConsumeError>
+ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::string& consumed_by,
+                              ApprovalOrigin expected, const ConsumePrecondition& precondition) {
     // These three guards are NOT store faults — `sqlstate` stays at its
     // default empty. For `!open_`, that default is harmless: `!mgr.is_open()`
     // independently forces `approval_store_error_body`'s PERMANENT arm
@@ -838,6 +1247,17 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     if (consumed_by.empty())
         return std::unexpected(
             ConsumeError{ConsumeFailure::kStoreError, "consumed_by is required"});
+    // #6062: the caller must name a concrete surface. kUnspecified / kUnrecognised as
+    // `expected` ALWAYS refuse - checked here, before any read, so a caller that
+    // declared nothing learns nothing about the row and the row is never touched.
+    // Reported as kForeignOrigin (uniform message) so it lands in the same audit
+    // class as every other origin refusal.
+    if (!origin_redeemable_as(expected, expected)) {
+        spdlog::warn("ApprovalManager: consume of ticket {} refused: the caller declared no "
+                     "concrete surface",
+                     redact_id(id));
+        return std::unexpected(ConsumeError{ConsumeFailure::kForeignOrigin, kNotConsumableMessage});
+    }
 
     // #2442 CROSS-SURFACE + CROSS-SUBMITTER BINDING. Approvals are one shared
     // store with three mint paths, and this recall matches a ticket on its
@@ -866,23 +1286,92 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     // Runs BEFORE the precondition block because that block is conditional —
     // a caller supplying no precondition must not skip this.
     //
-    // TEST DEPENDENCY: with no precondition supplied (today's only production
-    // caller, the MCP recall), this is the 2nd top-level SELECT this call
-    // issues against the store — the 1st is the caller's own pre-consume
-    // lookup (e.g. mcp_server.cpp's rung-1 get_checked). ADR-0065 (governance
-    // adversarial review, 2026-08-31): the SQLite-era MCP integration test
-    // that isolated a fault to THIS read specifically via a countdown
-    // `sqlite3_set_authorizer` has no Postgres analogue and was deleted, not
-    // ported — the equivalent coverage now lives at the store level
-    // (`test_approval_manager.cpp`, asserts `binding_check_unevaluated=true`
-    // + a non-empty `sqlstate` when this read fails), since consume_ticket's
-    // own logic here is unchanged by the migration. A future read added
-    // between the caller's lookup and this one would still need that
-    // store-level test updated to target the right read. The submitter check
-    // below extends this SAME read rather than adding a 3rd SELECT, for
+    // `read_row(held, ..., for_update)` on the caller's own connection, or
+    // `get_checked` (its own bounded lease) on the pooled path. On the held path the
+    // row is locked FOR UPDATE here and stays locked to the end of the caller's
+    // transaction, so the origin/submitter/status facts read below cannot move before
+    // the CAS.
+    //
+    // TEST DEPENDENCY: this read has TWO implementations and each has its own fault
+    // test. Pooled (`get_checked`, its own bounded lease): test_approval_manager.cpp
+    // asserts `binding_check_unevaluated=true` + a non-empty `sqlstate` when it fails.
+    // Held (`read_row` on the caller's connection, FOR UPDATE): test_approval_manager_bound.cpp
+    // fails it with an aborted caller transaction and asserts the same. (ADR-0065: the
+    // SQLite-era countdown-authorizer test that isolated this one read has no Postgres
+    // analogue and was not ported.) A read added before this one, or a change to either
+    // implementation, must keep both tests pointing at THIS read. The submitter and
+    // integrity checks below extend this SAME read rather than adding another, for
     // exactly that reason.
+    //
+    // The redemption integrity re-check (#6062) as a function of one examined row, so it runs
+    // on EVERY read this call makes and not just the first. nullopt == sound. See the comment
+    // at its first use below for the kind it returns and why.
+    const auto integrity_refusal = [&](const Approval& a) -> std::optional<ConsumeError> {
+        if (a.status != "approved" || a.consumed_at != 0)
+            return std::nullopt;
+        const auto fault = approval_integrity_fault(a);
+        if (!fault)
+            return std::nullopt;
+        // A caller retries a refused ticket, so the line is throttled per ticket (one error per
+        // id prefix per minute, repeats at debug) like the other repeated refusal lines. The
+        // refusal itself, and the caller's own audit row, are never throttled.
+        static RefusalLogThrottle integrity_throttle;
+        if (integrity_throttle.should_warn(redact_id(id)))
+            spdlog::error("ApprovalManager: ticket {} failed its redemption integrity "
+                          "check ({}); refusing",
+                          redact_id(id), fault->cause);
+        else
+            spdlog::debug("ApprovalManager: ticket {} still fails its redemption integrity check",
+                          redact_id(id));
+        if (fault->unevaluated)
+            return ConsumeError{ConsumeFailure::kStoreError,
+                                "approval integrity check could not run",
+                                /*sqlstate=*/{}, /*binding_check_unevaluated=*/true};
+        return ConsumeError{ConsumeFailure::kForeignOrigin, kNotConsumableMessage};
+    };
+    // Everything that decides whether THIS row may be redeemed by THIS caller on THIS surface,
+    // as one function of one examined row, applied to EVERY read the call makes (the first,
+    // and the precondition's fresher one). Running only part of it on a later read is how a
+    // row changed between the reads got consumed on the strength of a state never checked
+    // (Gate 8 round 3). nullopt == sound.
+    //
+    //  - #2442 origin: the ticket's recorded surface must be the one the caller declared.
+    //  - #2442 submitter: an approval id disclosed to a third party (e.g. via
+    //    `GET /api/approvals`, gated on `Approval:Read`, seeded to Viewer) must not be
+    //    redeemable by anyone but the principal it was granted to. Same posture as the origin
+    //    check: the uniform message, a distinct KIND for the audit trail only, so the recall
+    //    is no probe for whether a ticket exists versus who owns it. Checked after origin, so
+    //    a foreign-origin ticket reads as that (the more specific fact).
+    //  - #6062 integrity (integrity_refusal above): only for an approved, unconsumed row. A
+    //    replay of a consumed ticket, and a pending, rejected or expired one, keep reading as
+    //    the ordinary refusal they are; a ticket legitimately rejected by an excluded root
+    //    must not look like a forgery.
+    //
+    // Refused as kForeignOrigin (integrity) with the uniform message: the closest EXISTING
+    // kind, so it is counted and audited by every caller like the others, adds no new label
+    // value and is indistinguishable from a replay to the redeemer (a digest that could not be
+    // computed is the exception: a store error, see integrity_refusal). The cause goes to the
+    // server log. A digest that could not be COMPUTED decided nothing, so it is a store
+    // error flagged `binding_check_unevaluated`, like a failed read.
+    const auto check_examined = [&](const Approval& a) -> std::optional<ConsumeError> {
+        if (!origin_redeemable_as(a.origin, expected))
+            return ConsumeError{ConsumeFailure::kForeignOrigin, kNotConsumableMessage};
+        if (a.submitted_by != consumed_by)
+            return ConsumeError{ConsumeFailure::kForeignSubmitter, kNotConsumableMessage};
+        return integrity_refusal(a);
+    };
+    // The row the checks (and, if supplied, the precondition) LAST examined. The consuming CAS
+    // below is pinned to the row's version (and to the columns the checks read), so a decision made on
+    // one state of the row can only be spent against that same state (Gate 8 g8-sg-1).
+    std::optional<Approval> examined;
+    // The window between a caller's own earlier read of this ticket and the read below: a
+    // caller that matched the ticket to its request BEFORE calling here must re-check the row
+    // this function examines (the precondition receives it), not rely on its earlier read.
+    if (consume_test_hook_)
+        consume_test_hook_(ConsumeTestStage::kBeforeFirstRead);
     {
-        auto row = get_checked(id); // takes its own bounded lease
+        auto row = held ? read_row(held, id, /*for_update=*/true)
+                        : get_checked(id); // pooled: takes its own bounded lease
         if (!row) {
             // #2786 arm 1: this read failing means neither the origin nor the
             // submitter comparison below runs, so a foreign-origin OR
@@ -898,35 +1387,34 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
                                                 row.error().sqlstate,
                                                 /*binding_check_unevaluated=*/true});
         }
-        if (*row && declares_non_mcp_surface((*row)->origin))
-            return std::unexpected(
-                ConsumeError{ConsumeFailure::kForeignOrigin, kNotConsumableMessage});
-        // #2442 submitter binding: an approval id disclosed to a third party
-        // (e.g. via `GET /api/approvals`, gated on `Approval:Read` — seeded to
-        // Viewer) must not be redeemable by anyone but the principal it was
-        // granted to. Same posture as the origin check: refused with the
-        // uniform message, distinct KIND for the audit trail only, so the
-        // recall cannot be used to probe whether a ticket exists versus who
-        // owns it. Checked in the SAME block, after the origin check, so a
-        // foreign-origin ticket is always reported as that (the more specific
-        // fact) rather than as foreign-submitter when both are true.
-        if (*row && (*row)->submitted_by != consumed_by)
-            return std::unexpected(
-                ConsumeError{ConsumeFailure::kForeignSubmitter, kNotConsumableMessage});
+        // The binding, submitter and integrity checks, ONE function applied to this read.
+        if (*row)
+            if (auto refusal = check_examined(**row))
+                return std::unexpected(std::move(*refusal));
+        examined = *row;
     }
 
+    if (precondition && consume_test_hook_)
+        consume_test_hook_(ConsumeTestStage::kBetweenReads);
+
     // Pre-consume recheck (#2443). Skipped entirely when no precondition was
-    // supplied, so the two-argument path issues the exact same single statement
-    // it always has.
+    // supplied, so a consume without one issues no second read of the row.
     if (precondition) {
         // get_checked, not get: a FAILED read must not be reported as a row that
         // is not there. Telling the operator a live human-approved ticket is
         // spent, because SQLite was busy for a moment, is the burn class #2443
         // exists to close, re-entered through the taxonomy.
-        auto row = get_checked(id); // takes its own bounded lease
+        auto row = held ? read_row(held, id, /*for_update=*/true)
+                        : get_checked(id); // pooled: takes its own bounded lease
         if (!row)
             return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, row.error().message,
                                                 row.error().sqlstate});
+        // This read is FRESHER than the first: it is what the callback is handed and what the
+        // CAS is pinned to, so every check runs on it too, not just the integrity one. A row
+        // that went bad (or foreign) between the two reads is refused here.
+        if (*row)
+            if (auto refusal = check_examined(**row))
+                return std::unexpected(std::move(*refusal));
         // A row that cannot transition is reported WITHOUT running the
         // precondition: the callback may be costly or emit audit, and the CAS
         // below would decline this row anyway. Same message as the CAS decline,
@@ -936,6 +1424,7 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
             return std::unexpected(ConsumeError{
                 ConsumeFailure::kNotConsumable,
                 kNotConsumableMessage});
+        examined = *row;
         // The callback is caller code. If it throws, that must not escape a
         // store method as an unhandled exception on an httplib worker: the
         // ticket is untouched either way, so report it as a store error and let
@@ -964,6 +1453,34 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
         if (!ok) {
             spdlog::info("ApprovalManager: pre-consume recheck declined ticket {} for {}: {}",
                          redact_id(id), consumed_by, ok.error());
+            // #6062: a precondition denial is counted and audited AT THE STORE, whichever
+            // surface redeems. Only a redeemer that SUPPLIES a precondition can reach
+            // this, and today that is the MCP recall alone (every approval-gated tool, for
+            // the request match; confirm_engine_rotation adds its rotation-state check);
+            // instruction and schedule tickets are never redeemed and the Guardian
+            // surface mints nothing yet, so those labels stay at zero until a redeemer
+            // exists. The label is the ticket's own origin, already known to be
+            // concrete and equal to `expected` by the binding check above, so it is a
+            // closed set.
+            if (metrics_)
+                metrics_
+                    ->counter(kPreconditionDeniedMetric,
+                              {{"origin", to_string((*row)->origin)}})
+                    .increment();
+            if (denial_observer_) {
+                try {
+                    denial_observer_(
+                        PreconditionDenial{id, (*row)->origin, consumed_by, ok.error()});
+                } catch (const std::exception& e) {
+                    spdlog::warn("ApprovalManager: precondition-denial observer threw for "
+                                 "ticket {}: {}",
+                                 redact_id(id), e.what());
+                } catch (...) {
+                    spdlog::warn("ApprovalManager: precondition-denial observer threw for "
+                                 "ticket {}",
+                                 redact_id(id));
+                }
+            }
             return std::unexpected(ConsumeError{ConsumeFailure::kPrecondition, ok.error()});
         }
     }
@@ -976,28 +1493,118 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     // uniform idiom every store in this ladder uses instead of a bare
     // affected-row count. consumed_by rides the same UPDATE so who/when can
     // never disagree.
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
-    if (!lease)
-        return std::unexpected(
-            ConsumeError{ConsumeFailure::kStoreError, "approval store temporarily unavailable "
-                                                       "(pool exhausted)"});
+    if (consume_test_hook_)
+        consume_test_hook_(ConsumeTestStage::kBeforeCas);
+
+    // No row was found to examine: there is nothing to pin the CAS to, and nothing it
+    // could legitimately consume. (The CAS would match no row anyway; stopping here keeps
+    // an UNPINNED consuming statement out of this function altogether.)
+    if (!examined)
+        return std::unexpected(ConsumeError{ConsumeFailure::kNotConsumable, kNotConsumableMessage});
+    // The consuming CAS is PINNED to the row it examined. Two layers:
+    //
+    //  1. The ROW VERSION: `xmin::text` AND `ctid::text`, both taken from the last read. For DML
+    //     (INSERT/UPDATE/DELETE), a statement pinned to the examined pair can only consume the
+    //     tuple the checks saw. `xmin` names the (sub)transaction that wrote the version, so an
+    //     UPDATE by ANOTHER transaction (any column, any values, a no-op rewrite included) moves
+    //     it. A second write at the SAME (sub)transaction level keeps it (every version written
+    //     at one level carries that level's xid), which is the held overload's case when the
+    //     caller's own transaction already wrote the row, or when its precondition or the test
+    //     hook writes it through the held connection; each such write puts the row in a new
+    //     tuple, so `ctid` moves where `xmin` cannot. A write after a SAVEPOINT carries the
+    //     subtransaction's xid and moves `xmin` too, which only refuses more. Neither value
+    //     alone is a version: a plain VACUUM between two other transactions' writes can put the
+    //     new tuple back in the examined slot, and only `xmin` then tells them apart. Together
+    //     they close the classes the per-column pins below cannot enumerate (consumed_at,
+    //     reviewed_at, definition_id, scope_expression, target_*, schedule_id, and any column
+    //     added later).
+    //  2. The explicit columns the checks read - status, reviewer, frozen request, digest,
+    //     excluded roots, origin, submitter - as bound parameters. Implied by (1) for a row that
+    //     is the same tuple, and kept as defence in depth, so a regression in the version pin
+    //     does not silently reopen the classes they cover.
+    //
+    // The pooled overload reads on one lease and updates on another, and a precondition runs
+    // arbitrary caller code between the two, so without a pin a row rewritten after the check
+    // (an old-build replica, a hand edit, a precondition that writes) would be consumed on the
+    // strength of a state it no longer has. The status pin matters as much as the rest: a row
+    // examined as pending, rejected or expired never had its integrity checked, and must not
+    // become spendable by a status-only flip. A pin mismatch matches no row and reads as the
+    // uniform kNotConsumable below, never as a store error.
+    //
+    // WHAT THIS IS NOT. The check and the CAS are still two statements; the pin makes the CAS
+    // refuse a row that moved, it does not make them atomic. It is accident and skew detection
+    // for a row that changed between statements - an old-build replica, a stray UPDATE, a
+    // restore - not a boundary against a principal with database write access: a plain UPDATE
+    // cannot choose the version it writes, but a writer who can replace the row wholesale
+    // (a restore) or work below SQL is outside what it can tell. `xmin` is the raw 32-bit xid
+    // with no epoch, so even the pair is bounded by it: a different writer that received the
+    // very same xid after a wraparound and reused the same slot would match.
+    //
+    // NOT DETECTED, for the HELD overload only: a table-rewriting statement issued by the
+    // holding transaction itself between the read and the CAS - CLUSTER, an ALTER TABLE that
+    // rewrites the table, TRUNCATE followed by a re-insert - can leave a changed row at the
+    // examined (xmin, ctid). A held-overload caller must therefore never run DDL on its
+    // connection inside the redeeming transaction (ADR-1009, PR3 entry conditions). The only
+    // production caller today is the pooled overload, which cannot reach this.
+    //
+    // It also fails CLOSED in two more directions, each a refusal that is wrong about the
+    // ticket: a no-op rewrite (`SET reviewed_by = reviewed_by`) is a new version, and VACUUM FULL
+    // or CLUSTER can move `ctid` of an unchanged row. After either, a retry reads the new
+    // version and succeeds. (When the other writer is a concurrent consume or a real edit, the
+    // refusal is correct and a retry is refused again.) VACUUM FREEZE changes neither
+    // `xmin::text` nor `ctid`, so it refuses nothing.
+    //
+    // Under the held overload's FOR UPDATE inside a real transaction no OTHER transaction can
+    // move the row, but the caller's own transaction can (see layer 1); on an AUTOCOMMIT
+    // connection the lock drops after each statement and the pin is what holds (cs-3: refusing
+    // an autocommit connection outright, via PQTRANS_INTRANS, is deferred to PR3 - see the
+    // ADR-1009 entry conditions).
+    const auto pinned_roots = encode_excluded_roots(examined->excluded_roots);
+    if (!pinned_roots) // cannot happen for a list decoded from JSON; fail closed regardless
+        return std::unexpected(ConsumeError{ConsumeFailure::kNotConsumable, kNotConsumableMessage});
+
+    // Held path: the caller's connection, no lease. Pooled path: one bounded write
+    // lease for the CAS and the diagnostic read below.
+    pg::PgPool::Lease lease;
+    PGconn* conn = held;
+    if (conn == nullptr) {
+        lease = pool_.try_acquire_for(kWriteTimeout);
+        if (!lease)
+            return std::unexpected(
+                ConsumeError{ConsumeFailure::kStoreError, "approval store temporarily unavailable "
+                                                           "(pool exhausted)"});
+        conn = lease.get();
+    }
 
     //
     // EXPIRY AT CONSUME (#6061): the 7-day TTL used to be enforced only by
     // submit()'s lazy sweep, so an approved ticket past its TTL stayed
     // redeemable until some unrelated submit() happened to run. The predicate
     // lives in the CAS itself so there is no window between "expired" and
-    // "swept". It is the shared `ticket_live_sql()` predicate, on DATABASE time
-    // (see kDbNowEpochSql): the lower bound stops a leaked capability outliving
+    // "swept". It is the shared `ticket_live_sql()` predicate, on DATABASE time read
+    // when the statement runs (kDbWallEpochSql, so a caller-held transaction cannot
+    // redeem past the lifetime): the lower bound stops a leaked capability outliving
     // its lifetime, the upper bound refuses a `reviewed_at` stamped in the
     // future (UP-3), which the lower bound alone would honour indefinitely.
+    // `consumed_at` keeps the transaction-start `now()`: eligibility reads it only as zero
+    // or non-zero, so on a held transaction it can precede `reviewed_at`; a spend audit
+    // must carry its own wall-clock time (ADR-1009 PR3 conditions).
     const std::string consume_sql =
         std::string("UPDATE approval_manager.approvals SET consumed_at = ") + kDbNowEpochSql +
         ", consumed_by = $1 "
-        "WHERE id = $2 AND status = 'approved' AND consumed_at = 0 AND " + ticket_live_sql() +
+        "WHERE id = $2 AND status = 'approved' AND consumed_at = 0 AND " +
+        ticket_live_sql(/*wall_clock=*/true) +
+        " AND reviewed_by = $3 AND request_json = $4 AND request_digest = $5"
+        " AND excluded_roots = $6 AND origin = $7 AND submitted_by = $8 AND status = $9"
+        " AND xmin::text = $10 AND ctid::text = $11"
         " RETURNING 1";
-    pg::PgResult res = pg::exec_params(lease.get(), consume_sql.c_str(),
-                                       std::vector<std::string>{consumed_by, id});
+    pg::PgResult res = pg::exec_params(
+        conn, consume_sql.c_str(),
+        std::vector<std::string>{consumed_by, id, examined->reviewed_by, examined->request_json,
+                                 examined->request_digest, *pinned_roots,
+                                 to_string(examined->origin), examined->submitted_by,
+                                 examined->status, examined->row_version,
+                                 examined->row_position});
 
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(ConsumeError{
@@ -1006,7 +1613,11 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
             result_sqlstate(res)});
 
     if (PQntuples(res.get()) > 0) {
-        spdlog::info("ApprovalManager: consumed approval ticket {} by {}", redact_id(id), consumed_by);
+        // On the held path this is a statement inside the CALLER's transaction: the
+        // consume takes effect only if that commits, so the line says so rather than
+        // claim a durable spend that a rollback may still undo.
+        spdlog::info("ApprovalManager: consumed approval ticket {} by {}{}", redact_id(id),
+                     consumed_by, held ? " (inside the caller's transaction)" : "");
         return {};
     }
     // Zero rows matched — already used / not approved / absent / EXPIRED
@@ -1017,10 +1628,14 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     // kNotConsumable and can never turn a refusal into a grant. The binding
     // check (origin + submitter) ran before the CAS, so naming expiry here
     // discloses nothing to a caller who could not already see the ticket.
-    const std::string why_sql = "SELECT status, consumed_at, NOT " + ticket_live_sql() +
-                                " FROM approval_manager.approvals WHERE id = $1";
+    // The pinned columns ride the same read, so a pin mismatch can be named (column NAMES
+    // only, never values) at no extra round trip.
+    const std::string why_sql =
+        "SELECT status, consumed_at, NOT " + ticket_live_sql(/*wall_clock=*/true) +
+        ", reviewed_by, request_json, request_digest, excluded_roots, origin, submitted_by, xmin::text, ctid::text"
+        " FROM approval_manager.approvals WHERE id = $1";
     pg::PgResult why =
-        pg::exec_params(lease.get(), why_sql.c_str(), std::vector<std::string>{id});
+        pg::exec_params(conn, why_sql.c_str(), std::vector<std::string>{id});
     if (why.status() == PGRES_TUPLES_OK && PQntuples(why.get()) == 1) {
         const std::string status = col_str(why.get(), 0, 0);
         const bool unconsumed = to_i64(col(why.get(), 0, 1)) == 0;
@@ -1029,6 +1644,42 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
             spdlog::info("ApprovalManager: refused expired approval ticket {} for {}",
                          redact_id(id), consumed_by);
             return std::unexpected(ConsumeError{ConsumeFailure::kExpired, kTicketExpiredMessage});
+        }
+        // Still approved, unconsumed and in date, yet the pinned CAS matched nothing: the row
+        // differs from the one examined. Refused uniformly; the server log is where it shows,
+        // throttled per ticket like every other repeated refusal line (a stuck ticket is
+        // retried by its caller).
+        if (status == "approved" && unconsumed && !past_ttl) {
+            std::string changed;
+            const auto note = [&](const char* column, bool differs) {
+                if (!differs)
+                    return;
+                if (!changed.empty())
+                    changed += ",";
+                changed += column;
+            };
+            note("status", status != examined->status);
+            note("reviewed_by", col_str(why.get(), 0, 3) != examined->reviewed_by);
+            note("request_json", col_str(why.get(), 0, 4) != examined->request_json);
+            note("request_digest", col_str(why.get(), 0, 5) != examined->request_digest);
+            note("excluded_roots", col_str(why.get(), 0, 6) != *pinned_roots);
+            note("origin", col_str(why.get(), 0, 7) != to_string(examined->origin));
+            note("submitted_by", col_str(why.get(), 0, 8) != examined->submitted_by);
+            // The row version (xmin and tuple position) also moves for a change in a column none
+            // of the checks read (consumed_at, reviewed_at, definition_id, scope, target,
+            // schedule), which is the point of pinning it.
+            note("row version", col_str(why.get(), 0, 9) != examined->row_version ||
+                                    col_str(why.get(), 0, 10) != examined->row_position);
+            static RefusalLogThrottle throttle;
+            const std::string key = redact_id(id);
+            if (throttle.should_warn(key))
+                spdlog::warn("ApprovalManager: ticket {} no longer matches the state examined "
+                             "for it (changed: {}); refusing",
+                             key, changed.empty() ? "none of the pinned columns" : changed);
+            else
+                spdlog::debug("ApprovalManager: ticket {} still does not match its examined "
+                              "state",
+                              key);
         }
     }
     return std::unexpected(ConsumeError{ConsumeFailure::kNotConsumable, kNotConsumableMessage});
@@ -1089,7 +1740,9 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
             return std::unexpected("approval store temporarily unavailable (pool exhausted)");
         pg::PgResult sel = pg::exec_params(
             lease.get(),
-            "SELECT status, submitted_by FROM approval_manager.approvals WHERE id = $1",
+            "SELECT status, submitted_by, excluded_roots, request_json, request_digest "
+            "FROM approval_manager.approvals "
+            "WHERE id = $1",
             std::vector<std::string>{id});
         if (sel.status() != PGRES_TUPLES_OK) {
             // Scrubbed generic string reaching the REST/MCP caller (this
@@ -1113,8 +1766,40 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
             return std::unexpected("approval already reviewed (status: " + current_status + ")");
 
         // Ownership rule: reviewer must not be the submitter
-        if (reviewer == submitted_by)
+        if (same_human_root(reviewer, submitted_by))
             return std::unexpected("reviewer cannot be the same as the submitter");
+
+        // Excluded roots (#6062): the people who designed the effect cannot approve it.
+        // APPROVE only. A non-submitter excluded root may still REJECT: rejecting
+        // grants nothing, so there is nothing to bar, and it is the way a designer
+        // withdraws a request they no longer want (the dashboard offers it too). The
+        // SUBMITTER is barred from both verbs by the check above, so a submitter cannot
+        // withdraw through this store at all - this exemption does not reach them.
+        // Fail CLOSED on an unreadable column: an unparseable list must not read as
+        // "nobody is excluded".
+        if (status == "approved") {
+            const auto roots = decode_excluded_roots(col_str(sel.get(), 0, 2));
+            if (!roots) {
+                spdlog::error("ApprovalManager::set_review_status: excluded_roots of {} is "
+                              "unreadable; refusing the approval",
+                              redact_id(id));
+                return std::unexpected(std::string{kExcludedRootsUnreadableMessage});
+            }
+            if (reviewer_is_excluded(reviewer, *roots))
+                return std::unexpected(std::string{kExcludedReviewerMessage});
+            // A bound request the reviewer could not have read, or that no longer
+            // hashes to its digest, cannot be approved - "approve exactly what you saw"
+            // is only true if what is stored is what can be shown. Reject stays open: it
+            // grants nothing, and it is the only way to clear such a row from the queue.
+            if (const auto fault = request_binding_fault(col_str(sel.get(), 0, 3),
+                                                         col_str(sel.get(), 0, 4),
+                                                         /*require_readable=*/true)) {
+                spdlog::error("ApprovalManager::set_review_status: the bound request of {} "
+                              "failed its check ({}); refusing the approval",
+                              redact_id(id), fault->cause);
+                return std::unexpected(std::string{kBoundRequestUnreadableMessage});
+            }
+        }
     }
 
     // Atomic update; WHERE status = 'pending' prevents TOCTOU double-approve

@@ -1503,6 +1503,8 @@ if build_server
 
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
+      'unit/server/test_approval_manager_bound.cpp', # #6062: origin-declared consume, bound request, excluded roots
+      'unit/server/test_approval_dormant_code_tripwire.cpp', # #6062: lexical tripwire, ADR-1009 accepted dormant code
       'unit/server/test_schedule_engine.cpp',
       'unit/server/test_schedule_routes.cpp',
       'unit/server/test_schedule_runner.cpp',
@@ -2869,7 +2871,7 @@ if build_server
   # skipped" from exit 4 to exit 0. A shard that matches NO case at all still
   # fails check-pg-shard-partition.py loudly. Four more shards in this change
   # (M, N, O here and P below; P has since merged into M) added four more process startups per full
-  # run and, at Linux's --num-processes 2, a longer worst-case round count
+  # run and, at Linux's then-current --num-processes 2, a longer worst-case round count
   # (see the 2026-10-11 paragraph in docs/ci-architecture.md).
   #
   # MERGED 2026-10-11 (maintainer limit: at most 14 pg shards): shard P (see
