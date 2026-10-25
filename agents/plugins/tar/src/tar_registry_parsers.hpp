@@ -9,8 +9,7 @@
 // budgeted subtree read is diffed against the root's persisted BASELINE (tar_state
 // `registry:<root>`), giving added/changed/removed values with old and new data
 // (diff_registry_snapshot). A change becomes a row in the tick that observes it,
-// stamped with that read's end time. Actor attribution follows in a later PR: rows
-// carry actor_pid 0 and an empty actor_image until then.
+// stamped with that read's end time.
 
 #include "tar_db.hpp" // RegistryEvent
 
@@ -34,7 +33,6 @@ namespace yuzu::tar {
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
-inline constexpr std::int64_t kRegistryLiveRowCap = 500000; // registry_live retention (pinned by the schema test)
 inline constexpr std::size_t kRegistryDataCap = 4096;       // rendered new value, bytes of text
 inline constexpr std::size_t kBaselineRenderCap = 512;      // rendered prefix kept in the baseline
 inline constexpr std::size_t kBaselineValueCap = 50000;     // values per root read
@@ -72,17 +70,10 @@ struct RegistryScope {
 [[nodiscard]] inline bool is_user_hive_name(std::string_view n) {
     if (n.empty() || n.front() == '.')
         return false;
-    constexpr std::string_view kClasses = "_classes";
-    if (n.size() >= kClasses.size()) {
-        const auto tail = n.substr(n.size() - kClasses.size());
-        bool eq = true;
-        for (std::size_t i = 0; i < kClasses.size(); ++i)
-            eq = eq && static_cast<char>(std::tolower(static_cast<unsigned char>(tail[i]))) ==
-                          kClasses[i];
-        if (eq)
-            return false;
-    }
-    return true;
+    std::string lower(n);
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return !lower.ends_with("_classes");
 }
 
 inline std::vector<std::string>
@@ -564,9 +555,7 @@ inline std::string rk_escape(std::string_view s) {
 }
 
 [[nodiscard]] inline RegistryEvent
-registry_row_from_candidate(const RegistryCandidate& c, std::uint32_t actor_pid,
-                            const std::string& actor_image, std::string detail,
-                            std::int64_t snapshot_id) {
+registry_row_from_candidate(const RegistryCandidate& c, std::int64_t snapshot_id) {
     RegistryEvent ev;
     const auto ms = filetime_to_unix_ms(c.observed_at);
     ev.ts = ms / 1000;
@@ -588,11 +577,8 @@ registry_row_from_candidate(const RegistryCandidate& c, std::uint32_t actor_pid,
         ev.prev_data_size = static_cast<std::int64_t>(c.prev_size);
         ev.prev_data_truncated = c.prev_truncated ? 1 : 0;
     }
-    ev.actor_pid = actor_pid;
-    ev.actor_image = actor_image;
     ev.source = c.source;
     ev.observed_at = ms;
-    ev.detail = std::move(detail);
     ev.record_key =
        registry_diff_record_key(c.source, c.observed_at, c.action, c.key, c.value);
     return ev;

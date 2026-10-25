@@ -30,36 +30,6 @@ constexpr const char* kEmptyBaselineJson = R"({"v":1,"keys":{}})";
 
 std::string baseline_collector(const std::string& root) { return "registry:" + root; }
 
-std::vector<std::string> unique_in_order(std::vector<std::string> v) {
-    std::vector<std::string> out;
-    for (auto& s : v)
-        if (std::find(out.begin(), out.end(), s) == out.end())
-            out.push_back(std::move(s));
-    return out;
-}
-
-// Fills every optional hook so the state machine never null-checks.
-void fill_defaults(RegistryReader& r) {
-    if (!r.read_subtree)
-        r.read_subtree = [](const std::string&, std::int64_t) { return SubtreeRead{}; };
-    if (!r.loaded_sids)
-        r.loaded_sids = [] { return std::vector<std::string>{}; };
-    if (!r.now_ts)
-        r.now_ts = [] { return std::int64_t{0}; };
-    if (!r.current_control_set)
-        r.current_control_set = [] { return 1; };
-    if (!r.watch_roots)
-        r.watch_roots = [](const std::vector<std::string>&) {};
-    if (!r.root_armed)
-        r.root_armed = [](const std::string&) { return true; };
-    if (!r.rearm)
-        r.rearm = [](const std::string&) { return true; };
-    if (!r.stop)
-        r.stop = [] {};
-    if (!r.dirty)
-        r.dirty = std::make_shared<RegistryDirtyTable>();
-}
-
 // Restores the dirty flags a tick took if the tick does not commit (R7): the next
 // tick must re-read those roots and re-diff against the committed baseline.
 struct DirtyRollback {
@@ -79,9 +49,7 @@ struct DirtyRollback {
 } // namespace
 
 RegistryCursorSource::RegistryCursorSource(RegistryScope scope, RegistryReader reader)
-    : scope_(std::move(scope)), reader_(std::move(reader)) {
-    fill_defaults(reader_);
-}
+    : scope_(std::move(scope)), reader_(std::move(reader)) {}
 
 void RegistryCursorSource::ensure_watch(const std::vector<std::string>& roots) {
     if (roots == armed_roots_)
@@ -100,7 +68,7 @@ void RegistryCursorSource::start(TarDatabase& db) {
         gap_cause_ = GapCause::Restart;
         force_all_ = true;
     }
-    ensure_watch(unique_in_order(scope_.roots_for(reader_.loaded_sids())));
+    ensure_watch(scope_.roots_for(reader_.loaded_sids()));
 }
 
 void RegistryCursorSource::stop() noexcept {
@@ -164,7 +132,7 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
         std::vector<std::string> sids = cur.hku;
         if (hku_changed || reconcile || rebaseline_all || sids.empty())
             sids = reader_.loaded_sids();
-        const std::vector<std::string> roots = unique_in_order(scope_.roots_for(sids));
+        const std::vector<std::string> roots = scope_.roots_for(sids);
         ensure_watch(roots);
 
         // Roots that left scope (a logged-off user): drop their state and shrink the
@@ -255,7 +223,7 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
             DiffResult diff = diff_registry_snapshot(
                base, rd, snap.first != 0 ? "notify" : "reconcile", read_end, fresh_root);
             for (const auto& c : diff.candidates)
-                rows.push_back(registry_row_from_candidate(c, 0, {}, {}, snapshot_id));
+                rows.push_back(registry_row_from_candidate(c, snapshot_id));
             if (rd.status != RegistryReadStatus::Unreadable && (fresh_root || diff.changed))
                 state_writes.push_back({baseline_collector(root),
                                         encode_registry_baseline(diff.baseline)});

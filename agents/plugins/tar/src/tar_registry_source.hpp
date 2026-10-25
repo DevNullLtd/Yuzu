@@ -11,7 +11,6 @@
 #include "tar_cursor.hpp"
 #include "tar_registry_parsers.hpp"
 
-#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -29,8 +28,8 @@ namespace yuzu::tar {
 /// Per-root "something changed" state, written by the key-watch thread and read
 /// by the collect tick. `first` is the FIRST notify since the root was last read
 /// (the start of the burst; non-zero is what makes a read source=notify rather
-/// than reconcile), `last` the most recent one. Both are stamped at notify time:
-/// that moment cannot be recovered after the fact.
+/// than reconcile). It is stamped at notify time: that moment cannot be
+/// recovered after the fact.
 class RegistryDirtyTable {
 public:
     struct Snap {
@@ -39,16 +38,13 @@ public:
     };
 
     /// Watcher side: a notify at `ts`.
-    void mark(const std::string& root, std::int64_t ts) { mark_at(root, ts, ts); }
-
-    void mark_at(const std::string& root, std::int64_t first, std::int64_t last) {
+    void mark(const std::string& root, std::int64_t ts) {
         {
             std::lock_guard lock(mu_);
             auto& e = m_[root];
             if (!e.dirty || e.first == 0)
-                e.first = first;
+                e.first = ts;
             e.dirty = true;
-            e.last = std::max(e.last, last);
         }
         cv_.notify_all();
     }
@@ -80,13 +76,6 @@ public:
         return it != m_.end() && it->second.dirty;
     }
 
-    /// The most recent notify (read AFTER a read completes).
-    [[nodiscard]] std::int64_t last(const std::string& root) const {
-        std::lock_guard lock(mu_);
-        const auto it = m_.find(root);
-        return it == m_.end() ? 0 : it->second.last;
-    }
-
     /// Bounded wait (condition variable, never sleep+poll) until `root` is dirty.
     /// For tests that drive the live key watch.
     [[nodiscard]] bool wait_dirty_for_test(const std::string& root,
@@ -114,7 +103,7 @@ public:
 private:
     struct Entry {
         bool dirty{false};
-        std::int64_t first{0}, last{0};
+        std::int64_t first{0};
     };
     mutable std::mutex mu_;
     std::condition_variable cv_;
@@ -122,8 +111,8 @@ private:
     bool hku_{false};
 };
 
-/// The injected boundary. Every member is optional (defaults below); the source
-/// never touches the OS directly.
+/// The injected boundary. Every member is required; the source never touches
+/// the OS directly.
 struct RegistryReader {
     /// One bounded read of `root`. Must not throw. `deadline` is an absolute now_ts() value.
     std::function<SubtreeRead(const std::string& root, std::int64_t deadline)> read_subtree;
@@ -148,11 +137,6 @@ public:
                                 const std::optional<std::string>& cursor_json) override;
     void stop() noexcept override;
     void on_enabled_changed(bool enabled) override;
-
-    // Test seam -- never called in production.
-    void mark_dirty_for_test(const std::string& root, std::int64_t first_ts, std::int64_t last_ts) {
-        reader_.dirty->mark_at(root, first_ts, last_ts);
-    }
 
 private:
     enum class GapCause { Disabled, Restart };

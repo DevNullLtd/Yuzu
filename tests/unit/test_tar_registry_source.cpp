@@ -119,7 +119,6 @@ TEST_CASE("default_registry_scope: curated roots, per-user roots skip non-profil
     CHECK(set.contains("HKU\\S-1-5-21-1\\Software\\Policies"));
     CHECK_FALSE(set.contains("HKU\\.DEFAULT\\Software\\Policies"));
     CHECK_FALSE(set.contains("HKU\\S-1-5-21-1_Classes\\Software\\Policies"));
-    static_assert(kWatchHandleCap + 2 <= 64);
 }
 
 TEST_CASE("render_reg_data renders each registry type", "[tar][registry][pure]") {
@@ -269,10 +268,9 @@ TEST_CASE("RegistryDirtyTable stamps the burst at notify time and its bounded wa
     RegistryDirtyTable d;
     const std::string r = "HKLM\\SOFTWARE\\yuzu_test_r";
     CHECK_FALSE(d.peek_dirty(r));
-    d.mark_at(r, 5, 9);
-    d.mark_at(r, 7, 12); // a second notify in the same burst moves `last`, never `first`
+    d.mark(r, 5);
+    d.mark(r, 7); // a second notify in the same burst never moves `first`
     CHECK(d.peek_dirty(r));
-    CHECK(d.last(r) == 12);
     const auto snap = d.take(r);
     CHECK(snap.dirty);
     CHECK(snap.first == 5);
@@ -303,18 +301,15 @@ TEST_CASE("record keys are length-framed and never carry a NUL", "[tar][registry
     CHECK(registry_gap_record_key("baselinelost", "HKLM\\R:5") !=
           registry_gap_record_key("restart", "HKLM\\R:5"));
 
-    // The row's key is a function of what changed, never of the actor columns.
+    // The row's key is the diff key of what changed.
     RegistryCandidate c;
     c.key = "HKLM\\SOFTWARE\\r\\Svc";
     c.value = "Start";
     c.action = "changed";
     c.source = "notify";
     c.observed_at = T0;
-    const auto plain = registry_row_from_candidate(c, 0, {}, {}, 1);
-    CHECK(plain.actor_pid == 0);
-    CHECK(plain.actor_image.empty());
-    CHECK(plain.detail.empty());
-    CHECK(plain.record_key == registry_row_from_candidate(c, 812, "p.exe", "note", 1).record_key);
+    CHECK(registry_row_from_candidate(c, 1).record_key ==
+          registry_diff_record_key("notify", T0, "changed", c.key, c.value));
 }
 
 TEST_CASE("cursor and baseline codecs", "[tar][registry][pure]") {
@@ -369,7 +364,6 @@ TEST_CASE("registry schema constants agree with the registry", "[tar][registry][
     REQUIRE(def->granularities.size() == 1);
     CHECK(def->granularities[0].suffix == "live");
     CHECK(def->granularities[0].retention_type == RetentionType::kRowCount);
-    CHECK(def->granularities[0].retention_default == kRegistryLiveRowCap);
     CHECK(generate_warehouse_ddl().find("registry_live_record_key_uq") != std::string::npos);
 }
 
@@ -440,6 +434,7 @@ struct Fake {
         r.watch_roots = [this](const std::vector<std::string>& roots) { watch_calls.push_back(roots); };
         r.root_armed = [this](const std::string& root) { return !unarmed.contains(root); };
         r.rearm = [this](const std::string& root) { return !unarmed.contains(root); };
+        r.stop = [] {};
         return r;
     }
 };
@@ -527,7 +522,7 @@ TEST_CASE("registry source: baseline tick writes baselines and no rows; a change
     // is rewritten.
     f.clock = T0 + 100 * SEC;
     f.reads[kRoot] = svc(2);
-    src->mark_dirty_for_test(kRoot, T0 + 97 * SEC, T0 + 98 * SEC);
+    f.dirty->mark(kRoot, T0 + 97 * SEC);
     const auto second = tick(t.db, *src);
     CHECK(second.outcome == CursorOutcome::Advanced);
     CHECK(second.events_emitted == 1);
@@ -572,7 +567,7 @@ TEST_CASE("registry source: a failed commit rolls back in memory and replays cle
     // The next tick reads a change, so it has a row to insert; the commit fails.
     f.clock = T0 + 300 * SEC;
     f.reads[kRoot] = svc(2);
-    src->mark_dirty_for_test(kRoot, T0 + 290 * SEC, T0 + 291 * SEC);
+    f.dirty->mark(kRoot, T0 + 290 * SEC);
     {
         InsertTrap trap(t.path);
         CHECK_THROWS_AS(tick(t.db, *src), IncompleteCaptureError);
@@ -637,7 +632,7 @@ TEST_CASE("registry source: lost cursor, restart, baseline loss and storage erro
         tick(t.db, *src);
         REQUIRE(t.db.execute_sql("DELETE FROM tar_state WHERE collector LIKE 'registry:%'"));
         f.clock = T0 + 100 * SEC;
-        src->mark_dirty_for_test(kRoot, f.clock, f.clock);
+        f.dirty->mark(kRoot, f.clock);
         f.reads[kRoot] = svc(2);
         tick(t.db, *src);
         const auto rows = q(t.db, "SELECT detail FROM registry_live");
@@ -645,7 +640,7 @@ TEST_CASE("registry source: lost cursor, restart, baseline loss and storage erro
         CHECK_THAT(rows.rows[0][0], ContainsSubstring("gap:baselinelost"));
         // a malformed baseline is treated the same way
         REQUIRE(t.db.set_state("registry:" + kRoot, "{\"v\":1"));
-        src->mark_dirty_for_test(kRoot, f.clock + SEC, f.clock + SEC);
+        f.dirty->mark(kRoot, f.clock + SEC);
         f.clock += 10 * SEC;
         tick(t.db, *src);
         CHECK(count_rows(t.db) == 2);
@@ -657,7 +652,7 @@ TEST_CASE("registry source: lost cursor, restart, baseline loss and storage erro
         REQUIRE(sqlite3_open(t.path.string().c_str(), &h) == SQLITE_OK);
         REQUIRE(sqlite3_exec(h, "ALTER TABLE tar_state RENAME TO tar_state_away", nullptr, nullptr,
                              nullptr) == SQLITE_OK);
-        src->mark_dirty_for_test(kRoot, f.clock, f.clock);
+        f.dirty->mark(kRoot, f.clock);
         f.clock += 10 * SEC;
         CHECK_THROWS_AS(tick(t.db, *src), IncompleteCaptureError);
         sqlite3_exec(h, "ALTER TABLE tar_state_away RENAME TO tar_state", nullptr, nullptr, nullptr);
@@ -674,7 +669,7 @@ TEST_CASE("registry source: re-enable re-baselines with a gap; the paused window
     tick(t.db, *src);
     src->on_enabled_changed(false);
     f.reads[kRoot] = svc(9); // changed while paused
-    src->mark_dirty_for_test(kRoot, T0 + 50 * SEC, T0 + 50 * SEC); // the watcher stays warm
+    f.dirty->mark(kRoot, T0 + 50 * SEC); // the watcher stays warm
     src->on_enabled_changed(true);
     f.clock = T0 + 100 * SEC;
     const auto r = tick(t.db, *src);
@@ -698,7 +693,7 @@ TEST_CASE("registry source: read statuses, status keys and fair root scheduling"
         tick(t.db, *src);
         f.clock = T0 + 100 * SEC;
         f.reads[kRoot2] = complete({{kRoot2 + "\\S", {{"Count", vread(4, dword(2))}}}});
-        src->mark_dirty_for_test(kRoot2, T0 + 97 * SEC, T0 + 98 * SEC);
+        f.dirty->mark(kRoot2, T0 + 97 * SEC);
         f.read_calls.clear();
         tick(t.db, *src);
         CHECK(std::count(f.read_calls.begin(), f.read_calls.end(), kRoot) == 1); // still due
@@ -776,7 +771,7 @@ TEST_CASE("registry source: a control-set switch re-baselines CurrentControlSet 
 
     f.ccs = 0; // Select\Current unreadable this tick: not a switch
     f.clock = T0 + 100 * SEC;
-    src->mark_dirty_for_test(svc_root, f.clock, f.clock);
+    f.dirty->mark(svc_root, f.clock);
     tick(t.db, *src);
     CHECK(count_rows(t.db) == 0);
     CHECK(read_cursor(t.db).ccs == "ControlSet001");
@@ -784,7 +779,7 @@ TEST_CASE("registry source: a control-set switch re-baselines CurrentControlSet 
     f.ccs = 2; // the machine now runs from ControlSet002: the same path holds different keys
     f.reads[svc_root] = complete({{svc_root + "\\B", {{"Start", vread(4, dword(3))}}}});
     f.clock = T0 + 200 * SEC;
-    src->mark_dirty_for_test(svc_root, f.clock, f.clock);
+    f.dirty->mark(svc_root, f.clock);
     tick(t.db, *src);
     const auto rows = q(t.db, "SELECT detail FROM registry_live");
     REQUIRE(rows.rows.size() == 1); // one gap; no removed/added storm
@@ -916,14 +911,14 @@ TEST_CASE("registry live: a deleted and recreated root re-arms (R13)", "[tar][re
     key.h = nullptr;
     RegDeleteTreeW(HKEY_LOCAL_MACHINE, key.path.c_str());
     RegDeleteKeyW(HKEY_LOCAL_MACHINE, key.path.c_str());
-    run.src->mark_dirty_for_test("HKLM\\SOFTWARE\\" + leaf, 0, 0); // the watch may already have said so
+    run.dirty->mark("HKLM\\SOFTWARE\\" + leaf, 0); // the watch may already have said so
     tick(run.t.db, *run.src); // Absent: values and the key removed
     const auto removed = q(run.t.db, "SELECT COUNT(*) FROM registry_live WHERE action IN ('removed','key_removed')");
     CHECK(std::stoi(removed.rows[0][0]) >= 1);
 
     REQUIRE(key.create() == ERROR_SUCCESS);
     RegSetValueExW(key.h, L"Again", 0, REG_DWORD, reinterpret_cast<BYTE*>(&v), 4);
-    run.src->mark_dirty_for_test("HKLM\\SOFTWARE\\" + leaf, 1, 1);
+    run.dirty->mark("HKLM\\SOFTWARE\\" + leaf, 1);
     tick(run.t.db, *run.src);
     tick(run.t.db, *run.src);
     CHECK(std::stoi(q(run.t.db, "SELECT COUNT(*) FROM registry_live WHERE value_name = 'Again' AND action = 'added'")

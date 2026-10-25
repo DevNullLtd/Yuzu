@@ -1067,8 +1067,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // writer attribution, which follows in a later change; until then they
         // hold 0 / ''.
         // Values are stored UNMASKED: `data`/`prev_data` are readable through
-        // tar.sql. Retention is a row count, with the cap named in
-        // tar_registry_parsers.hpp (kRegistryLiveRowCap).
+        // tar.sql. Retention is a row count.
         // Replay idempotence via the UNIQUE record_key index below.
         {
             .name = "registry",
