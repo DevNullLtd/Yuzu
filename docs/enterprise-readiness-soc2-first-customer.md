@@ -392,6 +392,30 @@ until the plugin's own release action runs), and REST has no approval-ticket pat
 refusal, not a four-eyes control; activation of the
 four-eyes feature is a separate, postponed decision (epic #6060).
 
+**Addendum: who can list the issued certificates (CC6.1/CC6.3, 2026-10-23).** The issued-certificate
+inventory (`GET /api/v1/ca/issued`, filtered or not, MCP `list_issued_certs`, and the list in the
+Settings certificate panel) carries every enrolled agent's subject, SAN and issuing identity. Before
+this change any `Security:Read` holder was served it, a management-group-confined one included. It is
+now withheld from a confined caller and from one with no `Inventory:Read` grant, and every API and MCP call is audited as `crypto.ca.certificates.view`.
+Who is served, stated plainly so a questionnaire answer is not rounded up: with RBAC enforcement off
+(the shipped default), every `Security:Read` session, unchanged; with RBAC on, a caller with a global
+`Inventory:Read` grant or an elevated (JIT) session. Refused (`403`): a caller whose `Inventory:Read`
+is granted only for management groups, and a `Security:Read` holder with **no** `Inventory:Read` grant
+at all (holding no grant is not an affirmative admission to a fleet-wide list, and removing a caller's
+last scoped grant never widens what it can see). A caller whose access check hits a read failure
+partway through is answered `503` and is never served the list. Detective control, with its limits:
+on the route and the MCP tool each success row ends `standing=available`, each refusal is a `denied`
+row ending `withheld=confined` or `withheld=refused`, and each failed check is a `failure` row; the
+drill's success rows carry no standing token, the audit row can be missing during the same outage
+(correlate with `yuzu_server_audit_emit_failed_total`), and no certificate-specific alert fires on a failed check:
+the only signals are the shared read-degrade counters and breaker (`YuzuRbacReadDegraded`,
+`YuzuRbacBreakerOpen` for RBAC reads; `yuzu_server_mgmt_group_read_degrade_total` and
+`YuzuMgmtGroupReadDegraded` for management-group reads); a management-group store that is not
+wired raises no counter, and one that is not open raises none on the CA routes (the fleet gate answers
+before reading it) but is counted as `store_not_open` on list-gated routes. The Settings
+panel and the `/crypto` drill write no row for a refused caller (confined or holding no grant). Do not state that confined
+operators cannot read the certificate inventory without these qualifications.
+
 **Addendum: the last-Administrator guard for account lifecycle (CC6.1/CC6.2,
 #4966).** Deactivating, deleting or demoting the last active local administrator
 account is now refused on the Settings user delete and role change and on every SCIM

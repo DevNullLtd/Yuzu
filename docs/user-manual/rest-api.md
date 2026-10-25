@@ -2329,6 +2329,35 @@ Query params `limit` (1–1000, default 200) and `offset` (default 0). The full
 certificate PEM and enrollment reference are intentionally omitted. `503` if
 the CA store is unavailable.
 
+The inventory is fleet-wide data about every enrolled agent (subject, SAN), so it is
+held to the same rules as the filtered list below. A caller whose view of the fleet is
+confined (management-group confinement), or who holds no `Inventory:Read` grant, is refused
+`403` with no `permission` named, and the refusal is written as a `denied`
+`crypto.ca.certificates.view` row (target `inventory`, detail
+`cid=<cid> ws=crypto_widget_windows_v1 withheld=confined` or `withheld=refused`). A served page is
+written as a `success` row (target `inventory`, detail `cid=<cid> inventory rows=<n> limit=<n>
+offset=<n> has_more=<bool> standing=available`), set-and-proceed: if the row cannot be
+written the page is still served, with `Sec-Audit-Failed: true` and `audit_persisted: false` in
+the body. The confinement check reporting itself unavailable is `503` + `retry_after_ms: 5000`
+(`access check unavailable`, also written as a `failure` row), a store that cannot be read is `503`
++ `retry_after_ms: 5000` (`CA store unavailable`, also a `failure` row), and a server built
+without the check is `503` with no `retry_after_ms` (`certificate list unavailable`).
+
+**Who is served.** The list is served only to a caller whose `Inventory:Read` is granted without
+a management-group restriction (a global grant). A caller whose `Inventory:Read` is granted only
+for management groups is confined and is refused (`403`, a `denied` row ending
+`withheld=confined`). A caller holding `Security:Read` and **no** `Inventory:Read` grant at all is
+refused too (`403`, `withheld=refused`): holding no grant is not an affirmative admission to a
+fleet-wide list. Granting a global `Inventory:Read` removes the restriction, and removing a
+caller's last scoped `Inventory:Read` grant never widens what it can see. With RBAC enforcement
+off nothing changes: every `Security:Read` session is served, as before.
+
+**A read failure inside the access check is a retryable `503`, never the list.** If a store
+behind the check (permissions, management groups) cannot be read, the route answers
+`503 access check unavailable` with `retry_after_ms: 5000` and writes a `failure` row. The same
+holds for the filtered list below and the `/crypto` drill (a banner with Retry). The audit row can
+be missing during the same outage (correlate with `yuzu_server_audit_emit_failed_total`).
+
 `meta.has_more` is `true` when more rows exist beyond the current page; when it is,
 `meta.next_offset` carries the `offset` to pass for the next page. Iterate until
 `has_more` is `false` (do **not** infer end-of-list from `count < limit`).
@@ -2369,14 +2398,11 @@ returns the same five fields at the top level of its result.
 
 The MCP `list_issued_certs` tool mirrors this contract (same `has_more` / `next_offset`).
 
-The unfiltered call above is not written to the audit log and is not withheld from a
-management-group-confined caller (a known gap, unchanged by the filtered form below).
-
 **Filtered: the certificates behind one `/crypto` count (ADR-0070 R2, R8).** When any of `kind`,
 `days`, `week`, `bucket`, `as_of` or `cursor` is present, the route lists exactly the certificates behind
 one Yuzu-issued count of [`GET /api/v1/crypto/ca/stats`](#get-apiv1cryptocastats), with the same
-predicate. **Permission:** `Security:Read`, and a caller whose view of the fleet is confined is
-refused `403` with no `permission` field (`Yuzu-issued certificate figures are not available to
+predicate. **Permission:** `Security:Read`, and a caller whose view of the fleet is confined, or who holds
+no `Inventory:Read` grant, is refused `403` with no `permission` field (`Yuzu-issued certificate figures are not available to
 this account: ...`), whatever the parameters. The input is strict, and each malformed parameter is
 a `400` whose message names it:
 
@@ -2436,14 +2462,15 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 the walk's `as_of`, so every page is measured against the same time and starts strictly after
 that certificate: a certificate revoked between pages never makes the walk skip another (an
 offset would). `next_cursor` is `null` on the last page. Order: expiring soonest first, expired and revoked most recent first, the
-rest newest-issued first. Every filtered call is audited `crypto.ca.certificates.view`
-(set-and-proceed: `audit_persisted: false` in the body and `Sec-Audit-Failed: true` when the row
-is lost; a confined refusal is a `denied` row). Errors: `400` (each malformed parameter, named),
-`401`, `403` (no `Security:Read`, or a confined caller), `503` + `retry_after_ms: 5000` (`Yuzu CA
-read degraded`, `crypto read capacity in use; retry`, or `access check unavailable`; never an
-empty list), and `503` **without** `retry_after_ms` (`filtered certificate list unavailable`: the
-server was built without the `/crypto` seam, a wiring fault that lasts until a restart). MCP
-twin: `list_issued_certs` with the same arguments.
+rest newest-issued first. Every filtered call is audited `crypto.ca.certificates.view`, as
+is every unfiltered call (set-and-proceed: `audit_persisted: false` in the body and `Sec-Audit-Failed: true` when the row
+is lost; a confined refusal is a `denied` row, and an unavailable access check a `failure` row).
+Errors: `400` (each malformed parameter, named), `401`, `403` (no `Security:Read`, a confined
+caller, or no `Inventory:Read` grant), `503` + `retry_after_ms: 5000` (`Yuzu CA read degraded`, `crypto read capacity in use;
+retry`, or `access check unavailable`; never an empty list), and `503` **without**
+`retry_after_ms` (`filtered certificate list unavailable`: the server was built without the
+`/crypto` seam, a wiring fault that lasts until a restart). MCP twin: `list_issued_certs` with the
+same arguments.
 
 #### `POST /api/v1/ca/revoke`
 
@@ -8318,7 +8345,7 @@ Per-store outcomes: `deleted` (the DELETE **committed**), `skipped` (store not c
 
 A `200` with `decommissioned: true` is confirmed erasure for the stores in the cascade of the replica that answered (a store reported `skipped` was not erased); deleting an unknown `agent_id` is a no-op `200` (nothing to erase). The `deleted` count reaches 7 (it reached 6 before the `offline_endpoint` store joined the cascade) when every store is configured. During a rolling upgrade, a DELETE served by a replica that has not been upgraded runs the old cascade and returns `200` without erasing the presence row: a response whose `stores` map has no `offline_endpoint` key did not erase it, and the `sle.agent.decommission` success audit row that replica writes lists its own stores (no `offline_endpoint`), so it is not evidence that the presence row was erased. Re-issue the DELETE once every replica runs this version.
 
-Erasure does not unenroll the agent: a still-enrolled device re-syncs on its next daily cycle and re-creates its `offline_endpoint` presence row on its next heartbeat. Erasure is therefore point-in-time; an `offline_endpoint=deleted` entry in the success audit row's store breakdown proves the row was deleted at commit, not that it stayed deleted. Stop or uninstall the agent first: revoking its certificate does not cut off an agent connected through a gateway (#5578), which must be disconnected at the gateway layer as well (see Device Management: [Per-agent mTLS auto-provisioning](device-management.md#per-agent-mtls-auto-provisioning-pki)). If you also revoke its certificate, look up the serial with `GET /api/v1/ca/issued` (needs `Security:Read`), call `POST /api/v1/ca/revoke` (`Security:Delete`), and wait about 15 s for the next revocation sweep to drop a directly connected agent's stream before you issue the DELETE. Revocation cannot be undone through the API: the server refuses to issue a new certificate for that agent id while the revoked certificate is unexpired (audit `ca.cert.reissue_blocked`), so do not revoke a device you intend to re-enrol.
+Erasure does not unenroll the agent: a still-enrolled device re-syncs on its next daily cycle and re-creates its `offline_endpoint` presence row on its next heartbeat. Erasure is therefore point-in-time; an `offline_endpoint=deleted` entry in the success audit row's store breakdown proves the row was deleted at commit, not that it stayed deleted. Stop or uninstall the agent first: revoking its certificate does not cut off an agent connected through a gateway (#5578), which must be disconnected at the gateway layer as well (see Device Management: [Per-agent mTLS auto-provisioning](device-management.md#per-agent-mtls-auto-provisioning-pki)). If you also revoke its certificate, look up the serial with `GET /api/v1/ca/issued` (needs `Security:Read` and an unconfined view; a management-group-confined account is refused), call `POST /api/v1/ca/revoke` (`Security:Delete`), and wait about 15 s for the next revocation sweep to drop a directly connected agent's stream before you issue the DELETE. Revocation cannot be undone through the API: the server refuses to issue a new certificate for that agent id while the revoked certificate is unexpired (audit `ca.cert.reissue_blocked`), so do not revoke a device you intend to re-enrol.
 
 To confirm the erasure, wait at least one heartbeat interval (30 s) with the agent stopped and then read `/hardware`; a still-running agent re-creates the row on its next heartbeat, in which case re-issue the DELETE (it is idempotent). `/hardware` reads the table directly (no cache), but it lists only rows seen in the last 30 days (for a device last seen more than 30 days ago `/hardware` cannot confirm erasure, because the row is hidden both before and after the DELETE, so the response's `offline_endpoint: "deleted"` entry is the only confirmation) and needs fleet-scoped `Inventory:Read`; a management-group-confined operator cannot tell "erased" from "out of scope", so confirm with a fleet-scoped reader. Each replica also keeps a liveness cache of about 3 s (used for scope evaluation and dispatch targeting, not by `/hardware`) that the decommission does not invalidate on any replica, including the one that served the DELETE, so the device may still count as present in scope evaluation for up to about 3 s. The `endpoint_state` row holds a hostname, which can identify a person on a personally-assigned device, so treat its erasure as personal-data erasure.
 

@@ -3168,6 +3168,57 @@ TEST_CASE("RbacStore: every checked read on a store that is not open reports the
     CHECK(std::string_view{r9.error()} == kRbacErrStoreNotOpen);
     // list_roles() is this read with the error collapsed: a closed store is an empty vector.
     CHECK(broken.list_roles().empty());
+    // engine_grant_checked is null-safe like the label it snapshots: a null or not-open store
+    // is an error (a retryable 503 at the gates), never a grant.
+    const auto e1 = engine_grant_checked(nullptr, "engine:x", "Response", "Read");
+    REQUIRE_FALSE(e1.has_value());
+    const auto e2 = engine_grant_checked(&broken, "engine:x", "Response", "Read");
+    REQUIRE_FALSE(e2.has_value());
+    // The degraded arm's own text, not the not-open text a forbidden grant read would return.
+    CHECK(std::string_view{e2.error()} == kRbacErrEnforcementUnconfirmed);
+    CHECK(std::string_view{e1.error()} == kRbacErrEnforcementUnconfirmed);
+    const auto r10 = broken.check_permission_checked("bob", "Response", "Read");
+    REQUIRE_FALSE(r10.has_value());
+    CHECK(std::string_view{r10.error()} == kRbacErrStoreNotOpen);
+    CHECK_FALSE(broken.check_permission("bob", "Response", "Read")); // the plain form denies
+}
+
+TEST_CASE("RbacStore::check_permission_checked: a failed role lookup is an error that counts, "
+          "a caller with no roles is a success that does not",
+          "[rbac_store][pg][read_failed]") {
+    yuzu::MetricsRegistry metrics; // declared before the store so the store never outlives it
+    RBAC_STORE(store);
+    store.set_metrics(&metrics);
+    REQUIRE(store.create_role({.name = "Reader", .description = "d"}).has_value());
+    REQUIRE(store.set_permission({"Reader", "Response", "Read", "allow"}).has_value());
+    REQUIRE(store.assign_role({"user", "alice", "Reader"}).has_value());
+
+    // Healthy: a caller with a grant is true, a caller with no roles is false, both successes.
+    const auto granted = store.check_permission_checked("alice", "Response", "Read");
+    REQUIRE(granted.has_value());
+    CHECK(*granted);
+    const auto none = store.check_permission_checked("nobody", "Response", "Read");
+    REQUIRE(none.has_value());
+    CHECK_FALSE(*none);
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+              .value() == 0.0);
+
+    // The role table cannot be read: an error, counted once, and not cached as a denial.
+    {
+        pg::PgConn c{PQconnectdb(rbac_db_fx_.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        pg::PgResult dr{PQexec(c.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(dr.ok());
+    }
+    const auto failed = store.check_permission_checked("bob", "Response", "Read");
+    REQUIRE_FALSE(failed.has_value());
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+              .value() == 1.0);
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0); // one failure, threshold 2
+    CHECK_FALSE(store.check_permission("bob", "Response", "Read")); // the plain form denies
+    // A second failed read (the failure is not cached) reaches the breaker threshold of 2: the
+    // role-lookup failure moves the breaker, which it did not before this change.
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
 }
 
 TEST_CASE("RbacStore: the checked reads without a breaker report the shared "

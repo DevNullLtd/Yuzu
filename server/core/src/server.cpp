@@ -12494,8 +12494,9 @@ private:
             .increment();
     }
 
-    /// The ONE /crypto availability callback (ADR-0070 R2; fix-spec B1): CryptoRoutes, the
-    /// filtered GET /api/v1/ca/issued and the MCP server all receive THIS function, so the REST
+    /// The ONE /crypto availability callback (ADR-0070 R2; fix-spec B1): CryptoRoutes, both
+    /// forms of GET /api/v1/ca/issued (and the Settings CA panel's inventory) and the MCP server
+    /// all receive THIS function, so the REST
     /// widget list, the dashboard and list_crypto_widgets cannot draw different answers. Fleet
     /// gate classes ask the NON-auditing fleet-read probe (a confined caller has a present
     /// VisibleSet); the global class asks the non-auditing has_permission. Never a grant.
@@ -20172,7 +20173,9 @@ private:
         // copies the list into its handler captures, so it must be set first.
         ca_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
         // ADR-0070 R2-2: the filtered GET /api/v1/ca/issued reads through the SAME CryptoApi
-        // instance and is withheld from a confined caller via the SAME availability callback.
+        // instance; BOTH forms of it (and the Settings CA panel's inventory) are withheld from a
+        // confined caller via the SAME availability callback. This MUST run before
+        // register_routes: the handlers capture a copy, so a later call leaves them unwired.
         ca_routes_->set_filtered_issued(CaRoutes::FilteredIssuedDeps{
             .api = crypto_api_,
             .confinement_fn = [this](const httplib::Request& req) {
@@ -20866,6 +20869,9 @@ private:
                             out.visible_agents = std::move(authz.visible_agents);
                             break;
                         case ListReadDecision::DenyAll:
+                            // Deliberately ignores `authz.read_failed`: this seam's decision
+                            // type has no "degraded" arm, so a failed read maps to deny-all
+                            // (fail closed, nothing served), as before.
                             break; // out already kDenyAll (default)
                         }
                         return out;
@@ -21984,6 +21990,7 @@ private:
                         out.visible_agents = std::move(authz.visible_agents);
                         break;
                     case ListReadDecision::DenyAll:
+                        // Deliberately ignores `authz.read_failed` (see the REST twin above).
                         break; // out already kDenyAll (default)
                     }
                     return out;
