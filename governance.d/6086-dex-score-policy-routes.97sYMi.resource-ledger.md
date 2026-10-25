@@ -1,6 +1,6 @@
 # Resource Ledger: 6086-dex-score-policy-routes (range origin/dev..feat/dex-score-policy-routes)
 
-Every owning boundary and every borrow the diff adds or changes in C++ (server/core/src/dex_score_policy_writer.hpp, rest_api_v1.{hpp,cpp}, dex_api.cpp, server.cpp, runtime_config_store.cpp and the six test files (test_body_cap_policy, test_config_routes, test_dex_api, test_dex_score_policy_routes, test_dex_score_policy_writer, test_runtime_config_store), plus config_routes.{cpp,hpp}, dex_api_local.hpp, dex_score_policy_json.hpp and dex_score_policy_provider.hpp (comment and wording changes, no resource). Each row was checked by `cpp-safety` in governance round 1 and again in the Gate 8 re-review; none is a new owning raw resource.
+Every owning boundary and every borrow the diff adds or changes in C++ (server/core/src/dex_score_policy_writer.hpp, rest_api_v1.{hpp,cpp}, dex_api.cpp, server.cpp, runtime_config_store.cpp and the six test files (test_body_cap_policy, test_config_routes, test_dex_api, test_dex_score_policy_routes, test_dex_score_policy_writer, test_runtime_config_store), plus config_write.cpp, config_routes.hpp, dex_api_local.hpp, dex_score_policy_json.hpp and dex_score_policy_provider.hpp (comment and wording changes, no resource)). Each row was checked by `cpp-safety` in governance round 1 and again in the Gate 8 re-review; none is a new owning raw resource.
 
 | ID | Resource / construct | Owner type | Acquired | Released | Transfer | Failure cleanup |
 |---|---|---|---|---|---|---|
