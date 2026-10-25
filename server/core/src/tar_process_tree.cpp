@@ -1283,7 +1283,8 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
         {"dns", "$DNS", "Network connections", false, true, true},
         // registry (PR11.8): Windows only, so an older or non-Windows agent never reports
         // registry_enabled and the row is simply absent. Stored values are unmasked, which
-        // the user manual states; there is deliberately no PII badge (grill r2 mock-up).
+        // the user manual states. No PII badge: the badge marks usage-class sources like
+        // $DNS, and registry values are machine configuration, not per-user behaviour.
         {"registry", "$Registry", "System", false, true, false},
     }};
 

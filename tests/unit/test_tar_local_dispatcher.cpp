@@ -85,6 +85,11 @@ std::optional<std::string> row_with_prefix(const std::vector<std::string>& rows,
     return std::nullopt;
 }
 
+// Registered capture sources: one `<src>_last_status` health line each. The registry source
+// is the 17th (Windows-only, but its health lines are emitted on every OS). Not derived from
+// capture_sources(): that table lives in a TU this executable does not link.
+constexpr std::size_t kTarSourceCount = 17;
+
 size_t count_containing(const std::vector<std::string>& rows, const std::string& needle) {
     size_t n = 0;
     for (const auto& r : rows)
@@ -180,9 +185,9 @@ TEST_CASE("tar plugin: corrupt boot quarantines, publishes the fleet signal, sta
             const auto epoch = health->substr(std::string{"db_health|quarantined|"}.size());
             CHECK(row_with_prefix(rows, "config|perf_capture_method|").has_value());
             CHECK(row_with_prefix(rows, "config|procperf_procs_seen|").has_value());
-            CHECK(count_containing(rows, "_last_status|") == 16);
-            CHECK(count_containing(rows, "_last_status_at|") == 16);
-            CHECK(count_containing(rows, "_consecutive_failures|") == 16);
+            CHECK(count_containing(rows, "_last_status|") == kTarSourceCount);
+            CHECK(count_containing(rows, "_last_status_at|") == kTarSourceCount);
+            CHECK(count_containing(rows, "_consecutive_failures|") == kTarSourceCount);
 
             CHECK(kv->get("tar", "heartbeat.db_corruption_total") == std::optional<std::string>{"1"});
             const auto last = kv->get("tar", "heartbeat.db_quarantine_last");
@@ -411,6 +416,17 @@ TEST_CASE("tar plugin: every source is enabled by default with no stored flag; a
             CHECK(row_with_prefix(rows, std::format("config|{}_enabled|true", src)).has_value());
         }
         CHECK(count_containing(rows, "source_disabled") == 0);
+
+        // The registry source's five health keys are always present, at their "not
+        // running" defaults before any tick has written them. `registry_enabled` is not
+        // asserted: the source is Windows-only, so its enabled flag is OS-dependent.
+        for (const char* kv : {"registry_capture_method|none", "registry_watch_roots|0",
+                               "registry_watch_roots_unarmed|0", "registry_roots_unreadable|0",
+                               "registry_roots_capped|0"}) {
+            INFO("key=" << kv);
+            const auto expected = std::format("config|{}", kv);
+            CHECK(row_with_prefix(rows, expected) == std::optional<std::string>{expected});
+        }
 
         // The per-app leg of collect_perf is gated on source_enabled("procperf"):
         // with no stored flag it must run (baseline / unsupported_platform /

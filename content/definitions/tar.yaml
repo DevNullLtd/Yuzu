@@ -711,8 +711,8 @@ spec:
           two reads is not recorded.
           Retention is a row count (500000 rows). Setting "false" pauses capture
           and a later "true" re-baselines every watched key (no row is invented
-          for what changed while paused). Requires agent v0.14.1+; older agents
-          silently ignore. Valid: "true" | "false".
+          for what changed while paused). Requires an agent newer than v0.14.1;
+          older agents silently ignore. Valid: "true" | "false".
         validation:
           pattern: "^(true|false)$"
       usage_enabled:

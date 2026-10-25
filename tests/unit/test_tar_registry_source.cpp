@@ -108,17 +108,47 @@ TEST_CASE("normalise_registry_path maps only the current control set", "[tar][re
 TEST_CASE("default_registry_scope: curated roots, per-user roots skip non-profile hives",
           "[tar][registry][pure]") {
     const auto scope = default_registry_scope();
+    // Two profile hives pass the filter (an interactive SID and LocalSystem); the
+    // dot-prefixed default hive and both `_Classes` spellings do not.
     const auto roots = scope.roots_for({"S-1-5-21-1", ".DEFAULT", "S-1-5-21-1_Classes",
                                          "S-1-5-21-1_CLASSES", "S-1-5-18"});
-    const std::set<std::string> set(roots.begin(), roots.end());
-    CHECK(set.size() == roots.size()); // every root once
-    CHECK(roots.size() == scope.hklm.size() + 2 * scope.hku_suffix.size());
-    CHECK(set.contains("HKLM\\SYSTEM\\CurrentControlSet\\Services"));
-    CHECK(set.contains("HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"));
-    CHECK(set.contains("HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce"));
-    CHECK(set.contains("HKU\\S-1-5-21-1\\Software\\Policies"));
-    CHECK_FALSE(set.contains("HKU\\.DEFAULT\\Software\\Policies"));
-    CHECK_FALSE(set.contains("HKU\\S-1-5-21-1_Classes\\Software\\Policies"));
+    const std::set<std::string> got(roots.begin(), roots.end());
+    CHECK(got.size() == roots.size()); // every root once
+
+    // The curated watch scope, spelled out: a silent drop or rename of any entry is a
+    // change to what the source promises to observe (and to what the manual lists).
+    std::set<std::string> want = {
+        "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+        "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+        "HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run",
+        "HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+        "HKLM\\SYSTEM\\CurrentControlSet\\Services",
+        "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options",
+        "HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution "
+        "Options",
+        "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows",
+        "HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Windows",
+        "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+        "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa",
+        "HKLM\\SOFTWARE\\Policies",
+        "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies",
+        "HKLM\\SOFTWARE\\Microsoft\\Windows Defender",
+    };
+    CHECK(want.size() == 14);
+    for (const char* sid : {"S-1-5-21-1", "S-1-5-18"})
+        for (const char* suffix : {
+                 "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                 "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+                 "Software\\Policies",
+                 "Software\\Microsoft\\Windows\\CurrentVersion\\Policies",
+                 "Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+             })
+            want.insert(std::string{"HKU\\"} + sid + "\\" + suffix);
+    CHECK(want.size() == 14 + 2 * 5);
+    CHECK(got == want);
+
+    CHECK_FALSE(got.contains("HKU\\.DEFAULT\\Software\\Policies"));
+    CHECK_FALSE(got.contains("HKU\\S-1-5-21-1_Classes\\Software\\Policies"));
 }
 
 TEST_CASE("render_reg_data renders each registry type", "[tar][registry][pure]") {

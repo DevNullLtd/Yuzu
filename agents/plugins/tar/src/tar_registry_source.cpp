@@ -404,6 +404,24 @@ struct WinWatcher {
         shutdown();
         stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         hku_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (stop_event == nullptr || hku_event == nullptr) {
+            // Without both control events the wait below fails at once and the thread
+            // would exit while every slot still claimed to be armed. Report the truth:
+            // no watch, every root unarmed, so the collect tick reads each one every tick.
+            // shutdown() tolerates the null handles and the never-started thread.
+            if (stop_event != nullptr)
+                CloseHandle(stop_event);
+            if (hku_event != nullptr)
+                CloseHandle(hku_event);
+            stop_event = hku_event = nullptr;
+            std::lock_guard lock(mu);
+            for (const auto& root : roots) {
+                Slot s;
+                s.root = root;
+                slots.push_back(std::move(s));
+            }
+            return;
+        }
         {
             std::lock_guard lock(mu);
             for (std::size_t i = 0; i < roots.size(); ++i) {
