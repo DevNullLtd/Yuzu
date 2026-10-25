@@ -1252,63 +1252,6 @@ else
     fail "Server process died during test"
 fi
 
-# ── Test 19a: MFA step-up chokepoint refuses a session whose MFA proof is stale ──
-# Own-stack only: the admin account is the one this script created, and enrolling
-# TOTP on it would change the login of a shared stack. Confirming the TOTP enrolment in
-# Settings stamps a step-up proof on that session, so the proof is fresh until the window
-# (--mfa-step-up-window-secs, STEPUP_WINDOW_SECS at the server start) passes. The test
-# sleeps past it, so a gated route is answered by the step-up chokepoint before its handler
-# runs: 401, the challenge envelope, an X-Correlation-Id header equal to the body's
-# correlation id, and an audit row `user=<name> age_secs=<n> window_secs=<n> cid=<id>
-# stage=pre_authz` (age_secs is -1 for an absent proof, so a positive age proves a STALE one).
-log "Test: MFA step-up chokepoint refusal"
-if $REUSE_STACK || ! command -v python3 > /dev/null 2>&1; then
-    log "  skipped (reused stack, or python3 unavailable for the TOTP code)"
-else
-    SU_BASE="http://127.0.0.1:$SERVER_WEB_PORT"
-    SU_JAR="$WORK_DIR/stepup-cookies.txt"
-    SU_HDRS="$WORK_DIR/stepup-headers.txt"
-    curl -s -c "$SU_JAR" -H "Origin: $SU_BASE" -o /dev/null "$SU_BASE/login" \
-        -d "username=admin&password=adminpassword1" || true
-    SU_SECRET=$(curl -s -b "$SU_JAR" -H "Origin: $SU_BASE" -X POST "$SU_BASE/api/settings/mfa/init" \
-        | grep -oE '<code>[A-Z2-7]{16,}</code>' | head -1 | sed -E 's/<[^>]+>//g' || true)
-    SU_CODE=$(python3 -c '
-import base64, hashlib, hmac, struct, sys, time
-k = base64.b32decode(sys.argv[1] + "=" * ((8 - len(sys.argv[1]) % 8) % 8))
-h = hmac.new(k, struct.pack(">Q", int(time.time()) // 30), hashlib.sha1).digest()
-o = h[-1] & 15
-print("%06d" % ((struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % 1000000))' "$SU_SECRET" || true)
-    curl -s -b "$SU_JAR" -H "Origin: $SU_BASE" -X POST "$SU_BASE/api/settings/mfa/verify" \
-        -d "code=$SU_CODE" -o /dev/null || true
-    # The enrol-confirm just stamped a fresh proof; let it age past the window.
-    sleep $((STEPUP_WINDOW_SECS + 2))
-    SU_BODY=$(curl -s -D "$SU_HDRS" -b "$SU_JAR" -H "Origin: $SU_BASE" -H "Content-Type: application/json" \
-        -w "\n%{http_code}" -X POST "$SU_BASE/api/v1/tokens" -d '{"name":"stepup-integration"}' || true)
-    assert_eq "POST /api/v1/tokens with a stale MFA proof returns 401" "401" "${SU_BODY##*$'\n'}"
-    assert_contains "  step-up envelope names the challenge" '"mfa_step_up_required":true' "$SU_BODY"
-    SU_HDR_CID=$(grep -i '^x-correlation-id:' "$SU_HDRS" 2>/dev/null | head -1 | tr -d '\r' \
-        | sed -E 's/^[^:]*:[[:space:]]*//' || true)
-    SU_BODY_CID=$(grep -oE '"correlation_id":"[^"]+"' <<< "$SU_BODY" | head -1 \
-        | sed -E 's/^"correlation_id":"([^"]+)"$/\1/' || true)
-    TESTS=$((TESTS + 1))
-    if [[ -n "$SU_HDR_CID" && "$SU_HDR_CID" == "$SU_BODY_CID" ]]; then
-        pass "  X-Correlation-Id header equals the envelope's correlation_id ($SU_HDR_CID)"
-    else
-        fail "  X-Correlation-Id header ('$SU_HDR_CID') must equal the envelope's correlation_id ('$SU_BODY_CID')"
-    fi
-    SU_AUDIT=$(curl -s -b "$SU_JAR" "$SU_BASE/api/v1/audit?action=mfa.step_up.required&limit=5" || true)
-    # A positive age (not -1, which is an absent proof) and the configured window, then the
-    # correlation id the caller was shown, then the chokepoint stage as the LAST token of the
-    # detail. Spaces and `=` are never JSON-escaped; the closing quote proves "last".
-    TESTS=$((TESTS + 1))
-    if grep -qE "age_secs=[0-9]+ window_secs=$STEPUP_WINDOW_SECS cid=[^ \"]+ stage=pre_authz\"" <<< "$SU_AUDIT"; then
-        pass "  audit row records a stale-proof refusal (age_secs, window_secs, cid, stage=pre_authz)"
-    else
-        fail "  audit row must record age_secs=<n, not -1> window_secs=$STEPUP_WINDOW_SECS cid=<id> stage=pre_authz (got: ${SU_AUDIT:0:400})"
-    fi
-    assert_contains "  audit row carries the refusal's correlation id" "cid=$SU_HDR_CID stage=pre_authz" "$SU_AUDIT"
-fi
-
 # ── Test Category: Log Verification ───────────────────────────────────
 
 # ── Test 20: No unexpected errors in logs ─────────────────────────────
@@ -1686,6 +1629,66 @@ if $USE_TLS && ! $REUSE_STACK; then
     else
         fail "A process of the stack died during the management traffic"
     fi
+fi
+
+# ── Test 19a: MFA step-up chokepoint refuses a session whose MFA proof is stale ──
+# Runs after every test that logs in with the admin password (the Phase 5a REST
+# driver above): enrolling TOTP here makes every later password-only login of
+# admin answer 202 mfa_required with no session cookie.
+# Own-stack only: the admin account is the one this script created, and enrolling
+# TOTP on it would change the login of a shared stack. Confirming the TOTP enrolment in
+# Settings stamps a step-up proof on that session, so the proof is fresh until the window
+# (--mfa-step-up-window-secs, STEPUP_WINDOW_SECS at the server start) passes. The test
+# sleeps past it, so a gated route is answered by the step-up chokepoint before its handler
+# runs: 401, the challenge envelope, an X-Correlation-Id header equal to the body's
+# correlation id, and an audit row `user=<name> age_secs=<n> window_secs=<n> cid=<id>
+# stage=pre_authz` (age_secs is -1 for an absent proof, so a positive age proves a STALE one).
+log "Test: MFA step-up chokepoint refusal"
+if $REUSE_STACK || ! command -v python3 > /dev/null 2>&1; then
+    log "  skipped (reused stack, or python3 unavailable for the TOTP code)"
+else
+    SU_BASE="http://127.0.0.1:$SERVER_WEB_PORT"
+    SU_JAR="$WORK_DIR/stepup-cookies.txt"
+    SU_HDRS="$WORK_DIR/stepup-headers.txt"
+    curl -s -c "$SU_JAR" -H "Origin: $SU_BASE" -o /dev/null "$SU_BASE/login" \
+        -d "username=admin&password=adminpassword1" || true
+    SU_SECRET=$(curl -s -b "$SU_JAR" -H "Origin: $SU_BASE" -X POST "$SU_BASE/api/settings/mfa/init" \
+        | grep -oE '<code>[A-Z2-7]{16,}</code>' | head -1 | sed -E 's/<[^>]+>//g' || true)
+    SU_CODE=$(python3 -c '
+import base64, hashlib, hmac, struct, sys, time
+k = base64.b32decode(sys.argv[1] + "=" * ((8 - len(sys.argv[1]) % 8) % 8))
+h = hmac.new(k, struct.pack(">Q", int(time.time()) // 30), hashlib.sha1).digest()
+o = h[-1] & 15
+print("%06d" % ((struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % 1000000))' "$SU_SECRET" || true)
+    curl -s -b "$SU_JAR" -H "Origin: $SU_BASE" -X POST "$SU_BASE/api/settings/mfa/verify" \
+        -d "code=$SU_CODE" -o /dev/null || true
+    # The enrol-confirm just stamped a fresh proof; let it age past the window.
+    sleep $((STEPUP_WINDOW_SECS + 2))
+    SU_BODY=$(curl -s -D "$SU_HDRS" -b "$SU_JAR" -H "Origin: $SU_BASE" -H "Content-Type: application/json" \
+        -w "\n%{http_code}" -X POST "$SU_BASE/api/v1/tokens" -d '{"name":"stepup-integration"}' || true)
+    assert_eq "POST /api/v1/tokens with a stale MFA proof returns 401" "401" "${SU_BODY##*$'\n'}"
+    assert_contains "  step-up envelope names the challenge" '"mfa_step_up_required":true' "$SU_BODY"
+    SU_HDR_CID=$(grep -i '^x-correlation-id:' "$SU_HDRS" 2>/dev/null | head -1 | tr -d '\r' \
+        | sed -E 's/^[^:]*:[[:space:]]*//' || true)
+    SU_BODY_CID=$(grep -oE '"correlation_id":"[^"]+"' <<< "$SU_BODY" | head -1 \
+        | sed -E 's/^"correlation_id":"([^"]+)"$/\1/' || true)
+    TESTS=$((TESTS + 1))
+    if [[ -n "$SU_HDR_CID" && "$SU_HDR_CID" == "$SU_BODY_CID" ]]; then
+        pass "  X-Correlation-Id header equals the envelope's correlation_id ($SU_HDR_CID)"
+    else
+        fail "  X-Correlation-Id header ('$SU_HDR_CID') must equal the envelope's correlation_id ('$SU_BODY_CID')"
+    fi
+    SU_AUDIT=$(curl -s -b "$SU_JAR" "$SU_BASE/api/v1/audit?action=mfa.step_up.required&limit=5" || true)
+    # A positive age (not -1, which is an absent proof) and the configured window, then the
+    # correlation id the caller was shown, then the chokepoint stage as the LAST token of the
+    # detail. Spaces and `=` are never JSON-escaped; the closing quote proves "last".
+    TESTS=$((TESTS + 1))
+    if grep -qE "age_secs=[0-9]+ window_secs=$STEPUP_WINDOW_SECS cid=[^ \"]+ stage=pre_authz\"" <<< "$SU_AUDIT"; then
+        pass "  audit row records a stale-proof refusal (age_secs, window_secs, cid, stage=pre_authz)"
+    else
+        fail "  audit row must record age_secs=<n, not -1> window_secs=$STEPUP_WINDOW_SECS cid=<id> stage=pre_authz (got: ${SU_AUDIT:0:400})"
+    fi
+    assert_contains "  audit row carries the refusal's correlation id" "cid=$SU_HDR_CID stage=pre_authz" "$SU_AUDIT"
 fi
 
 # ══════════════════════════════════════════════════════════════════════
