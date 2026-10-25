@@ -63,6 +63,7 @@ Usage: python3 -I tests/test_forensics_tier_wiring_lexical.py
 """
 from __future__ import annotations
 
+import functools
 import os
 import re
 import sys
@@ -114,6 +115,12 @@ def strip_comments(text: str) -> str:
 _PUNCT = re.compile(r" ?([(){},;=:.&<>*\[\]!?|]|->) ?")
 
 
+# strip_comments is a per-character scan, so canonicalising the ~1400-file production tree costs
+# seconds. The tree-wide pins and the selftest's mutation cases canonicalise the SAME unchanged file
+# texts again and again (a mutated copy of the tree shares every other file's string object), so the
+# result is memoised on the text. The bound holds the whole tree with headroom for the mutated copies
+# of the few large files without growing with the number of cases.
+@functools.lru_cache(maxsize=3072)
 def canonical(src: str) -> str:
     """Comment-free, whitespace-collapsed text with spaces removed around punctuation."""
     t = re.sub(r"\s+", " ", strip_comments(src))
