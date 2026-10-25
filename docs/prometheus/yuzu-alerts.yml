@@ -674,7 +674,8 @@ groups:
           description: >-
             Possible forged or colliding gateway session id, a CC6.6 signal;
             expected rate zero. Likely benign only if a server upgrade to this
-            version started within about the last 6 minutes and the count is
+            version started within about the last 2 minutes (6 minutes plus 20
+            ms per agent if any gateway predates #5695) and the count is
             at most the tombstoned-row count; otherwise treat it as a security
             event and escalate to security.
             A gateway presented one agent a session_id that a different
@@ -687,7 +688,10 @@ groups:
             a presenting agent that has NO directory row; an agent that still
             has a row, including a tombstone, is not covered (its CONNECTED is
             a session_mismatch and does not unpublish: the tombstoned-victim
-            residual, ADR-2002 7f).
+            residual, ADR-2002 7f). The gateway resends a refused CONNECTED
+            for as long as it holds that session (#6059), so an
+            announce_connected refusal keeps this alert active until the
+            presenting agent's session ends.
             FIRST REMEDIATION: rule out the migration artifact. The refusals
             can be the one-time v5 dedup artifact ONLY IF BOTH hold: (a) the
             number of op="proxy_register" refusals since that start, summed
@@ -700,10 +704,13 @@ groups:
             restart); any op="announce_connected" refusal is NOT the
             artifact; and (b) they all occur within that start's window: one
             or two agent heartbeat cycles (30 s by default, --heartbeat
-            changes it), plus up to 300 s of breaker backoff (cap
-            circuit_breaker_max_reset_timeout_ms in gateway/config/sys.config),
-            plus the replay drip (about 20 ms per agent on that gateway):
-            roughly 6 minutes plus 20 ms per agent at the defaults. Refusals
+            changes it), plus the breaker backoff if it opened (up to 30 s on
+            a gateway that includes #5695, cap
+            circuit_breaker_max_reset_timeout_ms; 300 s on an older gateway),
+            plus the replay (up to 1 s start jitter, then up to 24 at once on
+            a #5695 gateway; about 20 ms per agent on an older one): roughly
+            2 minutes at the defaults when every gateway includes #5695,
+            roughly 6 minutes plus 20 ms per agent if any is older. Refusals
             past that window, or more than N, are NOT the artifact. Refusals
             inside the bound and window are NOT proof of benignness (a forged
             presenter could hide inside them): the rule only lets you stop

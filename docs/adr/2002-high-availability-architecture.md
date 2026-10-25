@@ -2139,9 +2139,13 @@ WARN, or the `route_meta` value after a restart), because a tombstoned group of 
 most k-1 refusals (N is a safe upper bound); count the refusal WARN lines rather than the counter if any
 replica restarted since the migrating start (the counter resets on restart); any `op="announce_connected"` refusal is NOT the artifact;
 and (b) they all occur within that start's window: one or two agent heartbeat cycles (30 s by default,
-`--heartbeat` changes it), plus up to 300 s of breaker backoff (cap `circuit_breaker_max_reset_timeout_ms`
-in `gateway/config/sys.config`), plus the replay drip (about 20 ms per agent on that gateway): allow
-roughly 6 minutes plus 20 ms per agent at the defaults. Refusals past that window, or more than N, are
+`--heartbeat` changes it), plus the gateway circuit breaker's backoff if it opened (up to 30 s on a
+gateway that includes #5695, cap `circuit_breaker_max_reset_timeout_ms` in `gateway/config/sys.config`;
+up to 300 s on an older gateway), plus the replay (on a #5695 gateway a random start delay of up to 1 s,
+`registration_replay_start_jitter_ms`, then up to 24 registrations in flight at once,
+`upstream_replay_concurrency`; on an older gateway a drip of about 20 ms per agent): allow roughly 2
+minutes at the defaults when every gateway includes #5695 (plus the replay itself: the gateway's agent count times the server's `ProxyRegister` time, divided by 24; about 10 s for 5,000 agents at 50 ms a call), or roughly 6 minutes plus 20 ms per agent if any gateway is older. Refusals past that window, or
+more than N, are
 NOT the artifact (escalating errs on the safe side): treat them as a forged or colliding id and
 escalate. Refusals inside the bound and the window are still NOT proof of benignness (a forged presenter
 acting at the same time could hide inside them, and a forger that wins the reclaim of a tombstoned id
@@ -2201,7 +2205,7 @@ and the boot warning for a channel with more than one connection (`docs/user-man
    to one upstream endpoint on the gateway side, or it is made safe on any replica on the server side
    (adoption that does not wipe placement; see #5244). Until that is decided and run on two replicas, 7c's
    convergence claim holds for one replica only.
-4. **Herd sizing (#5650).** The breaker's open interval is deterministic (10 s doubling to 300 s) and the
+4. **Herd sizing (#5650).** The breaker's open interval is deterministic (10 s doubling to 30 s by default since #5695; 300 s before) and the
    reconnect jitter is narrow; with hundreds of gateways, probes and reconnects must be spread.
 5. **Defaults and guidance (#5651).** Reference configs, the boot warning, the wizard and the Settings page
    must treat a two-server channel as the standard.

@@ -186,6 +186,14 @@
 %%%       cluster_id ..., which differs from this agent's already-bound cluster
 %%%       affinity -- REFUSING ...", cluster_affinity_violation): DEFINITIVE
 %%%       until the configuration changes.
+%%%     - CONNECTED, the presenting agent has no directory row and another
+%%%       agent's row holds the session ("... presents session ... that another
+%%%       agent's route already holds (#5683)", session_held_by_other_agent,
+%%%       op announce_connected, plus a gateway.session_held_by_other_agent
+%%%       audit row): DEFINITIVE while that row holds it. The ack carries no
+%%%       reason (#6059), so this gateway resends it for as long as it holds
+%%%       the session (the slow phase after 15 minutes), and the server logs
+%%%       and audits each one.
 %%%     - an event that is neither (never sent by this gateway).
 %%%   A failed directory WRITE (announce_connected) is answered true today
 %%%   (fail-open); a server change in review (#5961) answers it UNAVAILABLE,
@@ -219,7 +227,8 @@
 %%%     for, and the alert names it.
 %%%   - Slow phase (a stopgap until the answer carries a refusal reason, #6059):
 %%%     a refusal the server will repeat for as long as the session lives
-%%%     (stale_connected_session, cluster_affinity_violation) looks the same as
+%%%     (stale_connected_session, cluster_affinity_violation,
+%%%     session_held_by_other_agent) looks the same as
 %%%     a transient one. So once notify_unacked_slow_after_ms (900000, 15 min)
 %%%     has passed since a CONNECTED's first refusal without an
 %%%     acknowledgement (time it spends held during an upstream outage counts

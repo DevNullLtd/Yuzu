@@ -272,8 +272,9 @@ validate(_) ->
 %%
 %% Client-initiated renegotiation is refused (`client_renegotiation' false; OTP's
 %% server default is true), so a peer, authenticated or not, cannot make the
-%% gateway run one full ECDHE handshake after another on one connection; the
-%% peer gets a no_renegotiation alert and the connection carries on. Secure
+%% gateway run one full ECDHE handshake after another on one connection. The
+%% peer gets a no_renegotiation warning alert: an OTP client carries on, but an
+%% OpenSSL-family client treats the refusal as fatal and closes. Secure
 %% renegotiation (RFC 5746) stays required, explicitly. Neither is a key of the
 %% `tls' map, and `listen.socket_opts' may not set them (check_socket_opts/1);
 %% these options also come after the socket options in the list, and a later

@@ -943,7 +943,8 @@ is refused (`FAILED_PRECONDITION`, counted as
 - **Existing duplicates are cleared, not kept.** If two rows already shared a session id (expected: none),
   every row of that group is tombstoned, because no row can be shown to be the legitimate owner. Each
   affected agent re-establishes its route through the normal heartbeat replay within one heartbeat cycle
-  or two (up to about 6 minutes if the gateway circuit breaker had opened). The count is logged once as
+  or two (if the gateway circuit breaker had opened: up to about 2 minutes on a gateway that includes
+  #5695, about 6 minutes on an older one). The count is logged once as
   `migration v5 tombstoned N agent_routes row(s)` and exported as
   `yuzu_server_gateway_route_session_dedup_total`. That counter is present whenever `--gateway-upstream`
   is configured (the route store, the migration, the lock and the counter exist only then) and is 0 on
@@ -960,10 +961,14 @@ is refused (`FAILED_PRECONDITION`, counted as
   most k-1 refusals (N is a safe upper bound); count the refusal WARN lines rather than the counter if
   any replica restarted since the migrating start (the counter resets on restart); any
   `op="announce_connected"` refusal is NOT the artifact; and (b) they all occur within that start's
-  window: one or two agent heartbeat cycles (30 s by default, `--heartbeat` changes it), plus up to 300 s
-  of breaker backoff (cap `circuit_breaker_max_reset_timeout_ms` in `gateway/config/sys.config`), plus the
-  replay drip (about 20 ms per agent on that gateway): allow roughly 6 minutes plus 20 ms per agent at the
-  defaults. Refusals past that window, or more than N, are NOT the artifact (escalating errs on the safe
+  window: one or two agent heartbeat cycles (30 s by default, `--heartbeat` changes it), plus the gateway
+  circuit breaker's backoff if it opened (up to 30 s on a gateway that includes #5695, cap
+  `circuit_breaker_max_reset_timeout_ms` in `gateway/config/sys.config`; up to 300 s on an older
+  gateway), plus the replay (on a #5695 gateway a random start delay of up to 1 s,
+  `registration_replay_start_jitter_ms`, then up to 24 registrations in flight at once,
+  `upstream_replay_concurrency`; on an older gateway a drip of about 20 ms per agent): allow roughly 2
+  minutes at the defaults when every gateway includes #5695 (plus the replay itself: the gateway's agent count times the server's `ProxyRegister` time, divided by 24; about 10 s for 5,000 agents at 50 ms a call), or roughly 6 minutes plus 20 ms per agent if any gateway is older. Refusals past that window,
+  or more than N, are NOT the artifact (escalating errs on the safe
   side): treat them as a forged or colliding id. Refusals inside the bound and the window are still NOT
   proof of benignness (a forged presenter acting at the
   same time could hide inside them): re-check the count after the window has passed and do not silence
@@ -6741,6 +6746,7 @@ says what to change for each term.
 | `bad_tls_values` | `verify` is not `verify_peer`/`verify_none`, `fail_if_no_peer_cert` is not a boolean, or `ciphers` is not a proper, non-empty list of strings or tuples. |
 | `auth_fun_on_agent_listener` | An `auth_fun` on a listener that serves the agent service (`agent_pb`, or the AgentService itself in `services`). Remove it: it would cut agent enrollment, and only the management listener authenticates its peer. |
 | `listen_socket_opts_set_the_bind` | `socket_opts` carries `ip`, `ifaddr`, `fd`, `port` or `{local, _}`; the bind is `listen` alone. |
+| `listen_socket_opts_set_tls_policy` | `socket_opts` carries `client_renegotiation` or `secure_renegotiate` (#5695). Remove them: the gateway fixes both on every TLS listener (client renegotiation refused, secure renegotiation required). When `socket_opts` also moves the bind, the bind term is reported instead. |
 | `bad_listen_ip` | `listen.ip` is not an IP address tuple. |
 | `bad_acceptors` | `acceptors` is not a positive integer. |
 | `{unknown_keys, limits, [BadKey], {allowed, [...]}}` | A `limits` key the gateway does not read. Every `unknown_keys` term has this shape, with the map it was found in (`entry`, `tls`, `listen`, `http2` or `limits`; the `origin` map has `unknown_origin_options`) as the second element and the allowed keys last; for `limits` they are `max_connections`, `max_message_bytes` and `send_timeout_ms`. |

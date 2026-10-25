@@ -8,6 +8,8 @@
   inventory on the connection that opened their session, and the agent retries a failed report on
   its next sync tick. Every gateway TLS listener (agent and management) now refuses a
   client-initiated renegotiation (`client_renegotiation` false, `secure_renegotiate` true), so a
-  peer can no longer make the gateway repeat full handshakes on one connection. Neither setting can
+  peer can no longer make the gateway repeat full handshakes on one connection. An OpenSSL-family
+  client that asks to renegotiate now has its connection closed, so a load balancer or proxy that
+  renegotiates toward a gateway listener must stop doing so; agents do not ask to renegotiate. Neither setting can
   be changed in configuration, and a listener whose `listen.socket_opts` sets either one refuses
   to boot.
