@@ -316,7 +316,9 @@ responses from readers that exclude the Forensics set (the Hardware Actions-lens
 **Deployment boundary.** This tier is specified for a deployment created under the hard-cutover contract in
 `docs/user-manual/upgrading.md`: a fresh database, no data imported from earlier builds, every server writer and serving
 replica on this build, earlier binaries excluded. The executable does not enforce it. Data written by earlier builds is
-outside the supported population; this document makes no claim about it. Within the contract, failure text is reduced at
+outside the supported population; this document makes no claim about it, except that notification history is served as stored (no
+read-time scrub, no retention bound), so a carried-forward database would expose earlier failure text through the notification
+list to a holder of `Infrastructure:Read`, and nothing in the executable detects one. Within the contract, failure text is reduced at
 ingest before it reaches the execution record, the notification, the analytics event and the webhook and offload payload,
 and a Forensics policy check never stores check output. The reduction applied when the execution record is read is
 defense in depth: it covers a row only while the execution's dispatch record (24 hours) is still held
