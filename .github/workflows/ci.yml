@@ -1289,7 +1289,7 @@ jobs:
         # record. The decision rule, the interleaved measurement and the revert
         # (this one number) are in the docs paragraph "Push 2c".
         #
-        # --num-processes 2: without a cap, meson fans every test() entry out at
+        # Cap-of-2 history: without a cap, meson fans every test() entry out at
         # once — its default worker count is an uncapped, non-affinity-aware
         # cpu_count() (this runner's job is genuinely confined to execute on 16
         # logical CPUs via cgroup, "Self-hosted runner topology" in
@@ -1321,8 +1321,8 @@ jobs:
         # measurement protocol (docs/ci-architecture.md, current value
         # there, not restated here to avoid this comment going stale every
         # widening round) has moved Windows past 2 on real per-shard
-        # contention data; Linux was held at 2 until Push 2c widened it on
-        # data (samples recorded in docs/ci-architecture.md).
+        # contention data; Linux was held at 2 until Push 2c widened it (the
+        # samples and the verdict are in docs/ci-architecture.md, "Push 2c").
         #
         # with-test-slot.sh (#3443 AC4): --num-processes 2 alone fixed
         # WITHIN-job fan-out but left cross-job contention unmeasured. Now
