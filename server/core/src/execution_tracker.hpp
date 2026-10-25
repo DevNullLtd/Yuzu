@@ -26,6 +26,7 @@
 /// Wave-4 SQLite components — `InstructionDbPool` is deleted once this
 /// store moves.
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -584,17 +585,22 @@ public:
     /// (`yuzu_exec_correlation_write_degrade_total`). It DOES have a bounded worst-case DELAY: a
     /// single attempt (no retry; this sits on the SYNCHRONOUS pre-RPC dispatch path, where a second
     /// attempt would double the worst-case block on the calling worker thread under sustained pool
-    /// contention). `kWriteTimeout` (2 s) bounds only the lease acquire; once the lease is held the
-    /// statement runs under the pool's server-side lock_timeout (10 s) and statement_timeout
-    /// (30 s), so a lock held on the table blocks the write for about 10 s (measured 10.04 s)
-    /// before it fails, and a wedged statement for up to 30 s. Returns false on failure; a caller MUST NOT fail or
-    /// delay dispatch on a false return.
+    /// contention). `lease_timeout` bounds only the lease acquire; it defaults to `kWriteTimeout`
+    /// (2 s), which a single operator dispatch keeps, and a loop that writes ONE record PER TARGET
+    /// passes `kFanOutRecordLeaseTimeout` (dispatch_record_policy.hpp) together with its
+    /// `DispatchRecordLatch`, which skips the remaining writes of that loop after the first
+    /// failure, so an outage costs the loop one short wait instead of N long ones. Once the lease
+    /// is held, the statement runs under the pool's server-side lock_timeout (10 s) and
+    /// statement_timeout (30 s) whichever caller asked: a lock held on the table blocks the write
+    /// for about 10 s (measured 10.04 s) before it fails, and a wedged statement for up to 30 s
+    /// (once per latched loop, per call otherwise). Returns false on failure; a caller MUST NOT
+    /// fail or delay dispatch on a false return.
     ///
     /// `plugin` must be non-empty (an empty plugin is refused with false): a record without a
     /// plugin is not a provenance record.
-    [[nodiscard]] bool record_command_dispatch(const std::string& command_id,
-                                               const std::string& plugin,
-                                               const std::string& execution_id);
+    [[nodiscard]] bool record_command_dispatch(
+        const std::string& command_id, const std::string& plugin, const std::string& execution_id,
+        std::optional<std::chrono::milliseconds> lease_timeout = std::nullopt);
 
     /// Resolves a previously recorded dispatch. Returns nullopt for an unknown command id (a
     /// forged or never-issued id, a failed record write, a reaped record) AND for a degraded read;

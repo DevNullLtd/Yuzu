@@ -2558,7 +2558,8 @@ std::optional<std::int64_t> parse_reap_i64(const std::string& val) {
 
 bool ExecutionTracker::record_command_dispatch(const std::string& command_id,
                                                const std::string& plugin,
-                                               const std::string& execution_id) {
+                                               const std::string& execution_id,
+                                               std::optional<std::chrono::milliseconds> lease_timeout) {
     if (!open_)
         return false;
     // A record without a plugin is not a provenance record (the reader treats one as absent), and
@@ -2577,7 +2578,7 @@ bool ExecutionTracker::record_command_dispatch(const std::string& command_id,
     // table lock blocks this write for about 10 s before it fails (measured 10.04 s), and a retry
     // would double that. update_agent_status's retry lives on the
     // async gateway-response path, where that tradeoff is free.
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    auto lease = pool_.try_acquire_for(lease_timeout.value_or(kWriteTimeout));
     // Every failed record is counted by the caller (`yuzu_exec_correlation_write_degrade_total`);
     // the line is for a human, and a pool or database outage fails EVERY dispatch, so it is
     // throttled per cause (one line a minute each) instead of one ERROR per command.

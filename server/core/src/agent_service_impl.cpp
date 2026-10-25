@@ -18,6 +18,7 @@
 #include "analytics_event_store.hpp"
 #include "audit_store.hpp"
 #include "cidr_match.hpp"
+#include "dispatch_record_policy.hpp"
 #include "enrollment_token_rejection.hpp"
 #include "execution_tracker.hpp"
 #include "fleet_topology_store.hpp"
@@ -1898,19 +1899,39 @@ ResponseProvenance AgentServiceImpl::resolve_response_provenance(const std::stri
 
 void AgentServiceImpl::record_command_dispatch(const std::string& command_id,
                                                const std::string& plugin,
-                                               const std::string& execution_id) {
+                                               const std::string& execution_id,
+                                               DispatchRecordLatch* latch) {
     // Atomic snapshot — see notify_exec_tracker's identical load for the
     // detached gateway-forward-thread rationale (governance UAT 2026-05-06
     // Gate 7 re-review HIGH). A null tracker (not wired, or mid-shutdown) records nothing, which
     // the response side reads as unverified: counted below like any other failed record.
-    auto* tracker = execution_tracker_.load(std::memory_order_acquire);
+    //
     // Best-effort: a false return degrades this one command (its responses are labelled
     // unverified and carry no execution id; see record_command_dispatch's doc comment) and is
     // deliberately not propagated to the dispatch caller — it is counted here so a sustained
     // write-side degrade is visible in Prometheus (governance Gate 4/6 finding: previously
     // log-only, asymmetric with the reap path's yuzu_exec_correlation_store_degrade_total).
-    if (!tracker || !tracker->record_command_dispatch(command_id, plugin, execution_id))
+    //
+    // `latch` (dispatch_record_policy.hpp) is non-null only for a loop that writes one record per
+    // target. Such a write uses the short fan-out lease budget, and once one write in the loop
+    // has failed the rest are SKIPPED: counted as a degrade exactly like a failed write (the
+    // command is still dispatched; its responses are labelled unverified), so an outage costs the
+    // loop one short wait, not N. A null latch is every other caller: the ordinary budget, no skip.
+    if (latch && latch->tripped()) {
+        latch->note_skipped();
         metrics_.counter("yuzu_exec_correlation_write_degrade_total").increment();
+        return;
+    }
+    auto* tracker = execution_tracker_.load(std::memory_order_acquire);
+    const bool recorded =
+        tracker && (latch ? tracker->record_command_dispatch(command_id, plugin, execution_id,
+                                                             latch->lease_timeout())
+                          : tracker->record_command_dispatch(command_id, plugin, execution_id));
+    if (!recorded) {
+        if (latch)
+            latch->trip();
+        metrics_.counter("yuzu_exec_correlation_write_degrade_total").increment();
+    }
 }
 
 // -- process_gateway_response -------------------------------------------------

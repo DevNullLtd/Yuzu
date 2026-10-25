@@ -81,6 +81,7 @@ class SoftwareLicensingStore;
 class AppUsageStore;
 class UpdateRegistry;
 class ExecutionTracker;
+class DispatchRecordLatch; // dispatch_record_policy.hpp (#4990)
 class FleetTopologyStore;
 class HeartbeatIngestion;
 class GuaranteedStateStore;
@@ -406,8 +407,14 @@ public:
     /// responses are labelled unverified. A null tracker records nothing (the same unverified
     /// outcome). An empty `execution_id` records "no execution" and never clears one already
     /// recorded for the same command id.
+    ///
+    /// `latch` is for a loop that writes ONE record PER TARGET (see dispatch_record_policy.hpp):
+    /// with it the write uses the short fan-out lease budget and, after the loop's first failed
+    /// write, the remaining writes are skipped and counted as degrades (the commands are still
+    /// dispatched). Null for every other caller: the ordinary budget, never skipped.
     void record_command_dispatch(const std::string& command_id, const std::string& plugin,
-                                 const std::string& execution_id);
+                                 const std::string& execution_id,
+                                 DispatchRecordLatch* latch = nullptr);
 
     /// Replaces the production command-record lookup (the execution tracker's) with `fn`. FOR UNIT
     /// HARNESSES THAT HAVE NO POSTGRES ONLY: a service without a tracker and without this override
