@@ -715,15 +715,25 @@ if _gw_otp_bin != ''
   # Timeout 600s — upper-bound safety net for the nightly Coverage and
   # sanitizer jobs on slower cloud runners (scw-eager-lumiere) where
   # parallel meson test execution can starve the eunit job of CPU.
-  # Healthy runs finish in ~30-90s on a fast runner and are unaffected
-  # by the upper bound. The previous 120s landed at exactly 120.03s on
-  # nightly Coverage and killed the suite by SIGTERM; gateway eunit is
-  # only reached during nightly anyway, so a generous bound is free.
+  # Healthy runs finish in about 111-122 s on the self-hosted Linux runner
+  # (eleven runs, 2026-10-24) and are unaffected by the upper bound. The
+  # previous 120s landed at exactly 120.03s on nightly Coverage and killed the
+  # suite by SIGTERM; gateway eunit runs in every Linux job's cheap-suites
+  # invocation as well as in nightly, and a generous bound is free.
+  # priority 120: about its measured seconds, between the pg shards (160-260, a
+  # sparse rank scale) and the non-pg shards (10-50) in tests/meson.build. It is
+  # the longest entry of the Linux cheap-suites invocation (about 111 to 122 s
+  # over eleven runs on the self-hosted Linux runner) and, defined last, it used
+  # to start last. Nothing else in those suites sets a priority, so 120 starts it
+  # first and its 120 s overlaps the other entries instead of trailing them.
+  # Priority only orders starts: it moves no case and cannot change the total
+  # work (at --num-processes 1 the order changes, the wall time does not).
   test('gateway eunit',
     _python3,
     args: [_gw_test_script, _gw_src, 'eunit'],
     suite: 'gateway',
     timeout: 600,
+    priority: 120,
     env: {'REBAR_BASE_DIR': _gw_src / '_build_eunit', 'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
   )
   # Timeout 600s — must stay ABOVE test_gateway.py's per-suite
