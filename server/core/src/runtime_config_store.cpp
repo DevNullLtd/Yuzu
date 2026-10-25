@@ -10,6 +10,7 @@
 #include "sqlite_raii.hpp"
 #include "utf8_sanitize.hpp"
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
 
@@ -77,9 +78,9 @@ constexpr KeySpec kKeySpecs[] = {
     // F2a PR3 cohort metrics export (Settings -> DEX alerts; next gauge sweep)
     {"dex_cohort_export_key", kAdmin}, // tag key; "" = export disabled (validated on apply)
     // Customer score policy (tiers, names, weights, per-app overrides). JSON document;
-    // route-owned - to be written only through the policy route's writer (a later change),
-    // which validates it whole; the generic PUT refuses it. Spelled as kDexScorePolicyKey in
-    // dex_score_policy_json.hpp.
+    // route-owned - written only through PUT/DELETE /api/v1/dex/score-policy via
+    // dex_api.cpp's binding, which validates it whole; the generic PUT refuses it. Spelled as
+    // kDexScorePolicyKey in dex_score_policy_json.hpp.
     {"dex_score_policy", ConfigWriteClass::RouteOwned},
 };
 
@@ -242,6 +243,11 @@ std::expected<void, std::string> validate_value(const std::string& key, const st
                 return std::unexpected("heartbeat_timeout must be at least " +
                                        std::to_string(kMinHeartbeatTimeoutSeconds) +
                                        " seconds (the default agent heartbeat interval)");
+            if (key == "heartbeat_timeout" && val > kMaxHeartbeatTimeoutSeconds)
+                return std::unexpected("heartbeat_timeout must be at most " +
+                                       std::to_string(kMaxHeartbeatTimeoutSeconds) +
+                                       " seconds (one day): a longer window leaves a dead agent "
+                                       "reading online");
         } catch (...) {
             return std::unexpected("value must be a valid integer");
         }
@@ -791,9 +797,15 @@ RuntimeConfigStore::compare_and_set(const std::string& key,
                                    "ON CONFLICT (key) DO NOTHING RETURNING key",
                                    std::vector<std::string>{key, sanitized_value, sanitized_by,
                                                             now});
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        // The class of failure is the only thing that tells an operator a constraint from a
+        // dropped connection; the caller is told "database write failed" either way.
+        const char* sqlstate = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+        spdlog::error("runtime_config compare_and_set {}: SQLSTATE {}", ::yuzu::log_key_token(key),
+                      sqlstate ? sqlstate : "none");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
                                "database write failed");
+    }
     if (PQntuples(res.get()) != 1)
         return false;
     lease.reset(); // the pool slot is not held across the live effect (set() scopes its lease)
@@ -823,9 +835,15 @@ RuntimeConfigStore::compare_and_remove(const std::string& key, const std::string
         "DELETE FROM runtime_config_store.runtime_config WHERE key = $1 AND value = $2 "
         "RETURNING key",
         std::vector<std::string>{key, expected});
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        // The class of failure is the only thing that tells an operator a constraint from a
+        // dropped connection; the caller is told "database write failed" either way.
+        const char* sqlstate = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+        spdlog::error("runtime_config compare_and_remove {}: SQLSTATE {}",
+                      ::yuzu::log_key_token(key), sqlstate ? sqlstate : "none");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
                                "database write failed");
+    }
     return PQntuples(res.get()) == 1;
 }
 

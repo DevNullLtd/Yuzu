@@ -222,6 +222,10 @@ inline constexpr TwinRow kExpectedTwins[] = {
     {"get_crypto_dashboard_layout", "Infrastructure", "Read", true},
     {"set_crypto_dashboard_layout", "Infrastructure", "Write", false},
     {"get_crypto_ca_stats", "Inventory", "Read", true},
+    // Runtime configuration: GET/PUT /api/v1/config gate on Infrastructure Read/Write, as the legacy
+    // /api/config routes do. The per-key administrator-only refusal is config::write_refusal's.
+    {"get_runtime_config", "Infrastructure", "Read", true},
+    {"set_runtime_config", "Infrastructure", "Write", false},
 };
 
 } // namespace yuzu::server::twin_table

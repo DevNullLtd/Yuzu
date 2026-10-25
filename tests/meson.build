@@ -1462,6 +1462,7 @@ if build_server
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
+      'unit/server/test_config_write.cpp', # config_write.hpp: the transport-free core shared by the config routes and the MCP runtime-config tools
       'unit/server/test_config_routes.cpp', # #2542 PR-12: the 2-route Runtime Configuration API (7.3), extracted onto the HttpRouteSink seam
       'unit/server/test_legacy_diagnostic_routes.cpp', # #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API (diagnostics_routes.cpp), extracted onto the HttpRouteSink seam -- named away from test_diagnostics_*/test_chargen_*/test_procfetch_* to avoid a plugin_doc_gen.py filename collision with the agent plugins of those names
       'unit/server/test_legacy_events_routes.cpp', # #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
@@ -1554,6 +1555,7 @@ if build_server
       'unit/server/test_mcp_engine_principal_roles.cpp',
       'unit/server/test_engine_principal_lifecycle.cpp',
       'unit/server/test_engine_store_error_class.cpp',
+      'unit/server/test_engine_no_admin_audit.cpp',
       'unit/server/test_rotation_confirm_state.cpp',
       'unit/server/test_access_review_model.cpp',
       'unit/server/test_access_review_store.cpp',
@@ -1664,6 +1666,10 @@ if build_server
       'unit/server/test_dex_score_policy_json.cpp',
       # bounded-refresh score policy provider over injected read/clock fns - no store, no sleeps, no [pg]
       'unit/server/test_dex_score_policy_provider.cpp',
+      # apply_dex_score_policy over fake read/CAS/audit closures and a real provider - no store, no sleeps, no [pg]
+      'unit/server/test_dex_score_policy_writer.cpp',
+      # GET/PUT/DELETE /api/v1/dex/score-policy route shell through TestRouteSink - no store, no [pg]
+      'unit/server/test_dex_score_policy_routes.cpp',
       'unit/server/test_dex_catalogue.cpp', # ADR-0031 WS-A4 PR-1: the Catalogue View 1 read model + FnDexApi double
       'unit/server/test_dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
       'unit/server/test_schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam (schedule read)
@@ -2858,7 +2864,7 @@ if build_server
   # skipped" from exit 4 to exit 0. A shard that matches NO case at all still
   # fails check-pg-shard-partition.py loudly. Four more shards in this change
   # (M, N, O here and P below; P has since merged into M) added four more process startups per full
-  # run and, at Linux's --num-processes 2, a longer worst-case round count
+  # run and, at Linux's then-current --num-processes 2, a longer worst-case round count
   # (see the 2026-10-11 paragraph in docs/ci-architecture.md).
   #
   # MERGED 2026-10-11 (maintainer limit: at most 14 pg shards): shard P (see
@@ -4207,6 +4213,16 @@ test('tier policy wiring lexical gate (#5047)',
 test('guardian/spark log-injection tripwire (#4665)',
   _python3_test,
   args: [files('test_guardian_spark_log_injection_tripwire.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #6086: the DEX score policy has ONE store writer. A write of the key anywhere but
+# dex_api.cpp would skip apply_dex_score_policy's If-Match precondition, audit-first rows and
+# the provider's commit-then-install order. Lexical; the script's docstring states its limits.
+test('dex score-policy single-writer tripwire (#6086)',
+  _python3_test,
+  args: [files('test_dex_score_policy_key_writer_tripwire.py')],
   suite: 'docs',
   timeout: 30,
 )

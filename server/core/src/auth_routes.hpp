@@ -487,10 +487,10 @@ public:
     /// each axis's own infrastructure-unavailable case landing on
     /// `GateFailure::Degraded` (503, retryable): a null/not-open RBAC store
     /// on the management axis, and a null or query-failed tag store on the
-    /// service axis. Only a genuine `ListReadDecision::DenyAll` — real "no
-    /// grant," or an in-query store error surfacing through it, the one
-    /// residual weakening of `authorize_list_read`'s own promise this gate
-    /// does not add a discriminator for (implementation plan §2c) — lands on
+    /// service axis. A read that fails INSIDE `authorize_list_read` (the
+    /// global-grant, permission-group or subtree read: `read_failed`) is
+    /// `GateFailure::Degraded` (503) too. Only a genuine
+    /// `ListReadDecision::DenyAll` (real "no grant") lands on
     /// `GateFailure::Forbidden` (403).
     ///
     /// SELF-SUFFICIENT for the RBAC/management-group authority decision — do
@@ -544,10 +544,11 @@ public:
     /// here: `rbac_enforcement_in_effect()` (`rbac_store.cpp:1608`) returns
     /// `true` for a non-null-but-not-open store, routing both siblings INTO
     /// their RBAC-enforced branch, where `check_permission`/`authorize_list_
-    /// read` fail on the dead handle and 403 (fail CLOSED, matching this
-    /// gate's posture) — the only divergence here is STATUS-CODE
-    /// GRANULARITY: a permanent-looking 403 indistinguishable from "no
-    /// grant" in the siblings vs this gate's correct retryable 503. (c) a
+    /// read` fail on the dead handle (fail CLOSED, matching this gate's
+    /// posture) — the only divergence here is STATUS-CODE GRANULARITY: the
+    /// siblings that do not read `read_failed` answer a permanent-looking 403
+    /// indistinguishable from "no grant", this gate and `require_list_read`
+    /// the correct retryable 503. (c) a
     /// null OR not-open `mgmt_group_store_` — NEITHER sibling distinguishes
     /// null from not-open for this store the way (a)/(b) do for
     /// `rbac_store_`; both already fail CLOSED via `RbacStore::resolve_perm_

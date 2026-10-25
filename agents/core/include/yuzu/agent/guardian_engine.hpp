@@ -287,7 +287,7 @@ public:
     /// own zero-timestamp check would eventually catch even without the flag,
     /// ack_ledger_->arm_stats() alone cannot tell "spark dormant" from "spark live,
     /// currently clean" - GuardianEngine::apply_rules() calls
-    /// GuardianArmAckLedger::begin_application() UNCONDITIONALLY on every push,
+    /// GuardianArmAckLedger::begin_*_application() UNCONDITIONALLY on every push,
     /// regardless of prefer_spark_, so a legacy (non-spark) agent has a live,
     /// empty Application (pending={}, resolved_failed=0) exactly like a spark
     /// agent with nothing currently pending or failed - the ledger's own
@@ -444,8 +444,9 @@ public:
     /// only, never per event.
     [[nodiscard]] GuardianHealthStats spark_claim_health_stats() const;
     /// #5404 (P2): throws caught by the ack-bookkeeping maintenance firewall - the heartbeat
-    /// thread's ack drain / generation advance in journal_maintenance_tick, and the content-id
-    /// hash and begin_application preamble in apply_rules. A throw that recurs every tick
+    /// thread's ack drain / generation advance in journal_maintenance_tick, and in apply_rules the
+    /// content-id hash, the push-rule id indexing (the duplicate-id pre-scan) and the
+    /// begin_*_application preamble. A throw that recurs every tick
     /// repeats the skip of that tick's remaining ack drain. Lock-free; zero is steady state.
     [[nodiscard]] std::uint64_t ack_maint_exceptions() const noexcept {
         return ack_maint_exceptions_.load(std::memory_order_relaxed);
@@ -804,6 +805,32 @@ public:
         apply_post_drain_hook_for_test_ = std::move(hook);
     }
 
+    /// TEST-ONLY (#5547): fires inside apply_rules, with mtx_ HELD, inside the pre-publication
+    /// try, after the unwind guard's callback is assigned and immediately before the ack
+    /// application is begun. A hook that throws is therefore a clean pre-publication abort (the
+    /// push returns std::unexpected, the open application is untouched and the guard stays
+    /// disarmed). Same CONTRACT as set_apply_post_drain_hook_for_test. No production caller.
+    void set_apply_pre_begin_hook_for_test(std::function<void()> hook) {
+        std::lock_guard lock(mtx_);
+        apply_pre_begin_hook_for_test_ = std::move(hook);
+    }
+
+    /// TEST-ONLY (#5547): whether `rule_id` is tagged boot-origin in the CURRENT ack application
+    /// (see GuardianArmAckLedger::boot_origin_for_test). Takes mtx_. No production caller.
+    [[nodiscard]] bool ack_boot_origin_for_test(const std::string& rule_id) const;
+
+    /// TEST-ONLY (#5547): installs a hook on the ack ledger's drain that fires, with the rule id,
+    /// after a failed receipt's insertion and counters are committed and before it is erased from
+    /// `pending` (GuardianArmAckLedger::DrainFaultSite::AfterAccounting) - the exact window a
+    /// mid-drain throw would leave a receipt counted but still pending. Runs under mtx_ (the
+    /// tick drains under it); must not re-enter the engine. Null clears it. No production caller.
+    void set_ack_drain_after_accounting_hook_for_test(std::function<void(std::string_view)> hook);
+
+    /// TEST-ONLY (#5547): whether the CURRENT ack application holds an application-wide latched
+    /// failure (this application's own, not the inherited debt). Defined out-of-line like
+    /// ack_pending_count_for_test(); takes mtx_. No production caller.
+    [[nodiscard]] bool ack_latched_for_test() const;
+
     /// TEST-ONLY (#4045): fires inside stop(), mtx_ HELD, at the START of each stop() stage
     /// ("journal_flush_1", "worker_join", "ledger", "journal_flush_2"), after the stage's start
     /// is read from the persister's clock and before its body runs: a test advances an injected
@@ -1030,7 +1057,8 @@ private:
     /// (policy_generation_ itself is never touched, so the persisted value and the two
     /// `> policy_generation_` advance gates are unchanged). Set by
     /// note_boot_rearm_failure_locked() (start_local's walk) and by the maintenance tick when a
-    /// receipt of the still-open boot application drains as a failure; cleared by any clean
+    /// receipt of the still-open boot application, or one tagged boot-origin that a replacing
+    /// delta carried (#5547), drains as a failure; cleared by any clean
     /// application (apply_rules' tail, or the tick's can_advance() block). Under mtx_, no atomics.
     bool boot_unresolved_{false};
     /// #5513 back-off (governance finding P-1): the number of catch-up applications (apply_rules
@@ -1057,8 +1085,8 @@ private:
     /// boot_unresolved_ (the companion tag stays set during holdoff), nor policy_generation()
     /// (the __guard__ reply text keeps reading 0). Under mtx_, no atomics.
     std::uint32_t boot_report_holdoff_{0};
-    /// #5513: true from the boot application's begin_application() succeeding until
-    /// apply_rules' own begin_application() succeeds (which supersedes it) or stop(). Only the
+    /// #5513: true from the boot application's begin_*_application() succeeding until
+    /// apply_rules' own begin_*_application() succeeds (which supersedes it) or stop(). Only the
     /// SET side (boot_unresolved_ from a drained failure) reads it, so an ordinary held push's
     /// failure never reports 0. Under mtx_, no atomics.
     bool boot_app_open_{false};
@@ -1069,12 +1097,17 @@ private:
     std::atomic<std::uint64_t> arm_failures_{0};
 
     /// #5513: the ONE place a boot re-arm failure is recorded, shared by start_local's
-    /// returned-Failed arm and both catch arms. mtx_ held. noexcept and allocation-free: it
-    /// runs inside the exhaustion catch. Sets boot_unresolved_, counts the failure into
-    /// arm_failures_, and latches the boot application (a no-op when begin_application failed:
-    /// no current application) so the tick's can_advance() cannot clear the flag before the
-    /// server's catch-up push has applied cleanly.
-    void note_boot_rearm_failure_locked() noexcept;
+    /// returned-Failed arm and both catch arms. mtx_ held. noexcept: it runs inside the
+    /// exhaustion catch. Sets boot_unresolved_, counts the failure into arm_failures_, and
+    /// records the failure in the boot application AGAINST `rule_id`, tagged boot-origin
+    /// (#5547; GuardianArmAckLedger::note_sync_failure), so can_advance() cannot clear the flag
+    /// before the server's catch-up push has applied cleanly, a replacing delta that omits the
+    /// rule carries the record, and a push that names the rule and arms it cleanly drops it.
+    /// That call allocates and can throw, so this function CATCHES it and falls back to the
+    /// application-wide latch_failure() (noexcept; strictly more conservative, but without the
+    /// rule's identity). Both are no-ops when the boot begin_full_application() failed: there
+    /// is no current application, identity is lost, and boot_unresolved_ alone remains.
+    void note_boot_rearm_failure_locked(const std::string& rule_id) noexcept;
     bool put_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
     void refresh_count_locked();
     /// Persists `gen` to the policy-generation KV key. Returns kv_->set()'s own
@@ -1364,6 +1397,8 @@ private:
     /// TEST-ONLY (#4045): see set_apply_post_drain_hook_for_test / set_seed_read_hook_for_test.
     /// mtx_-guarded; null = no-op.
     std::function<void()> apply_post_drain_hook_for_test_;
+    /// TEST-ONLY (#5547): see set_apply_pre_begin_hook_for_test. mtx_-guarded; null = no-op.
+    std::function<void()> apply_pre_begin_hook_for_test_;
     std::function<void(const char*)> stop_stage_hook_for_test_;
     /// #5604: the budget stop() lowers kv_ to. Atomic because the seam may be set from a test
     /// thread while stop() reads it before taking mtx_. Production never writes it.

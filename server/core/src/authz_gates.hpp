@@ -99,12 +99,14 @@ enum class GateFailure : std::uint8_t {
     Unauthenticated, ///< 401 — `require_auth` failed and already wrote the
                      ///< response.
     Forbidden,       ///< 403 — a real deny: the management-group axis
-                     ///< returned a genuine `ListReadDecision::DenyAll` (may
-                     ///< still mask an in-query store error —
-                     ///< `authorize_list_read`'s own documented weakening,
-                     ///< see rbac_store.hpp; unchanged here).
+                     ///< returned a genuine `ListReadDecision::DenyAll` (no
+                     ///< grant; a FAILED read is `Degraded`, see below and
+                     ///< `ListReadAuthorization::read_failed` in rbac_store.hpp).
     Degraded,        ///< 503 — infrastructure unavailable, retryable: a
-                     ///< null/not-open RBAC store, or the service-scope
+                     ///< null/not-open RBAC store, a read that failed inside
+                     ///< the list-read check (`read_failed`: the global-grant,
+                     ///< permission-group or subtree read, or an engine
+                     ///< principal's grant read), or the service-scope
                      ///< axis's tag-store lookup failing (null `tag_store_`,
                      ///< or a degraded/failed query), or, for a service-scoped
                      ///< token, the ITServiceOwner ceiling read failing
