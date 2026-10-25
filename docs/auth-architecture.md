@@ -693,7 +693,7 @@ by each handler.
   class (`kPendingRuling`) for routes whose classification is still being
   decided, which the chokepoint treats as exempt: 73 REST rows today, a count
   pinned in a `static_assert` (`kPendingRulingMax`) that can only shrink. The
-  table has 233 REST rows: 37 `kRequired`, 3 `kOwnGate`, 120 `kExempt` and 73
+  table has 235 REST rows: 37 `kRequired`, 3 `kOwnGate`, 122 `kExempt` and 73
   `kPendingRuling`.
 - **Where it runs.** In `run_pre_request_stage` (`step_up_wiring.hpp`), the
   body of the pre-request handler `server.cpp` installs: after the route
