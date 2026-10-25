@@ -177,8 +177,10 @@ alert's trigger). You have time; do not rush a fix that deletes more.
 
 **Action:** address whichever cause step 3's code identified - a clock fault
 on the PostgreSQL host needs time sync there specifically, not necessarily on
-this app server; a recent `audit_retention_days` reduction needs nothing (it
-can also produce `w`). The next identical-fact-set pass then drains, paced by
+this app server; a recent reduction of `--audit-retention-days` (or
+`YUZU_AUDIT_RETENTION_DAYS`) followed by a restart needs nothing (it can also
+produce `w`); a runtime `PUT /api/config/audit_retention_days` does not change
+the window the guard uses. The next identical-fact-set pass then drains, paced by
 the cap — see [Capacity](../user-manual/audit-log.md#capacity) for how fast.
 If the clock was genuinely wrong, decide before it drains whether the
 already-expired rows should be preserved - page the window out through

@@ -235,6 +235,11 @@ TEST_CASE("EventRing<ModuleEvent> is safe under concurrent push/drain",
                 drained.fetch_add(ring.drain().size(), std::memory_order_relaxed);
                 return;
             }
+            // An empty drain re-takes the ring's lock at once; yield so the producers
+            // (and a single-core runner's other jobs) get the CPU instead of being
+            // starved by this spin (#5170).
+            if (batch.empty())
+                std::this_thread::yield();
         }
     });
 

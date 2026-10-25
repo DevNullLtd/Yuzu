@@ -4,6 +4,7 @@
 #include "home_ui.hpp"         // sign_in_location: a signed-out page request goes to the landing page
 #include "http_route_sink.hpp"
 #include "result_sets_ui.hpp" // yuzu::server::kResultSetsPageHtml
+#include "tar_timeline_page_ui.hpp"
 
 #include <string>
 #include <string_view>
@@ -38,6 +39,7 @@ extern const std::string kYuzuVizHostJs; // server/core/src/yuzu_viz_host_js_bun
 extern const std::string kYuzuOperateJs; // server/core/src/yuzu_operate_js_bundle.cpp (Operate O1)
 extern const std::string kYuzuDialogJs;  // server/core/src/yuzu_dialog_js_bundle.cpp (shared dialog)
 extern const std::string kYuzuOperateExtrasJs; // server/core/static/yuzu-operate-extras.js
+extern const std::string kYuzuTarTimelineJs; // yuzu_tar_timeline_js_bundle.cpp (hidden timeline page)
 extern const std::string kYuzuEstateJs;  // server/core/src/yuzu_estate_js_bundle.cpp (containment controls)
 extern const std::string kYuzuDeviceDataJs; // yuzu_device_data_js_bundle.cpp (Hardware record controls)
 extern const std::string kYuzuSystemJs;      // yuzu_system_js_bundle.cpp (System pages write helper)
@@ -315,6 +317,33 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
         }
         res.set_content(kTarPageHtml, "text/html; charset=utf-8");
     });
+
+    // -- TAR timeline page (hidden): not registered at all while the flag is off. --
+    if (deps.tar_timeline_ui) {
+        sink.Get("/tar/timeline", [deps](const httplib::Request& req, httplib::Response& res) {
+            auto session = deps.auth_fn(req, res);
+            if (!session) {
+                // /tar/timeline is not in the nav, so ask for its family screen by route: the
+                // landing page then says "Sign in to open TAR".
+                res.set_redirect(home_ui::sign_in_location("/tar"));
+                return;
+            }
+            res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+            const std::string id = req.get_param_value("id");
+            if (id.empty()) {
+                res.status = 400;
+                res.set_content("missing id", "text/plain; charset=utf-8");
+                return;
+            }
+            res.set_content(render_tar_timeline_page(id, req.get_param_value("at")),
+                            "text/html; charset=utf-8");
+        });
+        // Moves with the page markup, so never cached.
+        sink.Get("/static/yuzu-tar-timeline.js", [](const httplib::Request&, httplib::Response& res) {
+            res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+            res.set_content(yuzu::server::kYuzuTarTimelineJs, "application/javascript; charset=utf-8");
+        });
+    }
 
     // ── Result Sets (scope walking — capability §30) ─────────────────
     // Page shell + HTML fragment routes. Per-operator, owner-scoped: every

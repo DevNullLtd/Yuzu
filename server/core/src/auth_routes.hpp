@@ -228,6 +228,10 @@ public:
     /// provenance (e.g. `created_by`, audit event annotation) on a code path
     /// that has already cleared its authorization gate via require_auth or
     /// require_permission and just needs to know who's calling.
+    ///
+    /// One principal per request: once the step-up chokepoint has passed a gated request, a
+    /// resolution that lands on any other principal returns nullopt (the caller's ordinary
+    /// "no session" answer), on every credential path (`detail::step_up_binding_admits`).
     std::optional<auth::Session> resolve_session(const httplib::Request& req);
 
     /// Re-validate the credential on a HELD-OPEN stream (MCP `GET /mcp/v1/`),
@@ -898,6 +902,10 @@ public:
     static std::string extract_form_value(const std::string& body, const std::string& key);
 
 private:
+    /// The credential walk behind `resolve_session`, before the per-request binding is applied.
+    /// Only `resolve_session` calls it, so no return path can skip the binding.
+    std::optional<auth::Session> resolve_session_unbound(const httplib::Request& req);
+
     /// SHA-256 hex of the `yuzu_session` cookie when the request carries one; empty
     /// when it does not, so cookie-less rows never share the digest of "". Hashed
     /// whether or not the cookie authenticated the request (`resolve_session` falls
@@ -1008,6 +1016,15 @@ public:
     /// impractical to fill in a unit test). Test-only seam — governance
     /// qe-B: the load-shed branch must be exercised.
     void set_mfa_pending_cap_for_test(std::size_t cap) { mfa_pending_cap_ = cap; }
+
+    /// Test hook: push the pending MFA challenge `pending_token`'s steady
+    /// `expires_at` backward by `elapsed`, so the TTL reaper
+    /// (`reap_mfa_pending_locked`) sees it as lapsed after `elapsed` more time
+    /// without sleeping. The map is keyed by the raw pending token. A no-op for an
+    /// unknown token. Production code MUST NOT call this — no caller in
+    /// `server/core/src/**` references it.
+    void expire_mfa_pending_for_test(const std::string& pending_token,
+                                     std::chrono::milliseconds elapsed);
 
     /// Override the service-scope global-safe allow-list for a test
     /// (`kServiceScopeGlobalSafe` is seeded EMPTY in production, #2298 PR 3 —

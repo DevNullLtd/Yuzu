@@ -347,7 +347,7 @@ constexpr char kScript[] = R"HTM(<script>
     var v = hb.value.trim(), loadedHb = f.dataset.loadedHeartbeat, loadedLl = f.dataset.loadedLogLevel;
     var hbChanged = v !== loadedHb, llChanged = ll.value !== loadedLl;
     if (!hbChanged && !llChanged) return;
-    if (hbChanged && (!/^[0-9]+$/.test(v) || parseInt(v, 10) < parseInt(hb.min, 10))) {
+    if (hbChanged && (!/^[0-9]+$/.test(v) || parseInt(v, 10) < parseInt(hb.min, 10) || parseInt(v, 10) > parseInt(hb.max, 10))) {
       var err = $('gen-heartbeat-err');
       if (err) err.hidden = false;
       return;

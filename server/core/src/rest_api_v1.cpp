@@ -69,6 +69,7 @@
 #include "credential_change_owner.hpp" // #5342 — CredentialChangeRequest/Outcome (the one-transaction write)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric
 #include "admin_gate.hpp"
+#include "engine_no_admin_audit.hpp" // the shared no-admin auditor (REST + MCP)
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
 #include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
@@ -359,13 +360,15 @@ static bool deny_mcp_token_session(
     return false;
 }
 
-// Same-site refusal for a privileged write that a cookie session can reach: the cookie is an
-// ambient credential a cross-site page can ride, so a cookie session must name this site in
-// Origin or Referer (token callers are exempt; a cookie session with neither header is
-// refused). Call it AFTER the authorization gates and any step-up, so a caller who is not
-// authorized learns nothing from the refusal, and BEFORE the body is read or anything is
-// mutated. `target_id` names the endpoint on the `csrf.denied` row. Returns true (having
-// written the 403 A4 body and attempted the audit row) when the caller must stop.
+// Same-site refusal for a write that a cookie session can reach: a cookie session must name
+// this site in Origin or Referer (token callers are exempt; a cookie session with neither
+// header is refused). Cookie-session writes require a same-site Origin or Referer; the
+// pre-routing gate (same_site_write_gate.hpp) decides that before this route runs. This copy
+// is defence in depth and serves the TestRouteSink tests, which bypass pre-routing. Keep it
+// after the authorization gates and any step-up so the per-route row ordering is unchanged
+// for the cases it still decides, and before the body is read or anything is mutated.
+// `target_id` names the endpoint on the `csrf.denied` row. Returns true (having written the
+// 403 A4 body and attempted the audit row) when the caller must stop.
 static bool refuse_cross_site_cookie_write(const auth::Session& s, const httplib::Request& req,
                                            httplib::Response& res,
                                            const RestApiV1::AuditFn& audit,
@@ -387,9 +390,9 @@ static bool refuse_cross_site_cookie_write(const auth::Session& s, const httplib
 // exception-typed — this keeps the mapping in one place instead of
 // re-deriving substring checks at every call site (create/mint/rotate/
 // confirm). Store-unavailable / entropy-exhaustion conditions are retryable
-// (503); "grace window elapsed" is a genuine state conflict (409, design §7
-// — the caller must fall back to an explicit re-mint or the compromise
-// runbook, never retry indefinitely); a message this function does NOT
+// (503); "grace window elapsed" is a genuine state conflict (409, design §7:
+// the caller must confirm, or revoke the stuck successor and rotate again
+// (never revoke the principal: that is terminal), never retry indefinitely); a message this function does NOT
 // recognize as one of the store's own hand-authored validation strings is
 // classified 503, not 400 (Hermes/governance finding: a swallowed SELECT
 // failure inside `read_active_for_principal_on_conn` returns an EMPTY vector
@@ -714,7 +717,7 @@ const std::string& openapi_spec() {
   "info": {
     "title": "Yuzu Server REST API",
     "version": "1.0.0",
-    "description": "Enterprise endpoint management REST API. All endpoints require authentication via session cookie, Bearer token, or X-Yuzu-Token header.",
+    "description": "Enterprise endpoint management REST API. All endpoints require authentication via session cookie, Bearer token, or X-Yuzu-Token header. Every request other than GET, HEAD or OPTIONS that is authorised by the session cookie must carry an Origin or Referer header naming this site (or a --csrf-trusted-origin entry); otherwise it is refused 403 (A4ErrorEnvelope, message cross-site request refused) before the body is read. Token callers are not affected, except routes that keep their own check. Cookie-session reads that dispatch work, persist state or refresh server state are held to the same rule: a Sec-Fetch-Site header, if present, must be sent once with the value same-origin or none; if it is absent, a same-site Origin or Referer is required.",
     "contact": {"name": "Yuzu Project"},
     "license": {"name": "AGPL-3.0-or-later", "url": "https://www.gnu.org/licenses/agpl-3.0.html"}
   },
@@ -1051,17 +1054,17 @@ const std::string& openapi_spec() {
         R"json(,
     "/engine-principals": {
       "post": {"summary": "Create a new engine-principal identity", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["slug", "display_name", "owner_username", "justification", "classification"], "properties": {"slug": {"type": "string", "description": "Reserved 'engine:<slug>' namespace suffix — lowercase letters, digits, '.', '_', '-' only, max 128 chars"}, "display_name": {"type": "string"}, "owner_username": {"type": "string", "description": "Must reference an existing user (owner-FK)"}, "justification": {"type": "string"}, "classification": {"type": "string", "enum": ["internal", "external"]}}}}}}, "responses": {"201": {"description": "Created; {principal_id}"}, "400": {"description": "Bad JSON, invalid/duplicate slug, missing justification, unknown owner_username, or invalid classification"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "503": {"description": "Engine-principal store, or owner-lookup, unavailable"}}},
-      "get": {"summary": "List every engine principal", "tags": ["Security"], "responses": {"200": {"description": "List of engine principals with active_credential_count"}, "403": {"description": "Requires EnginePrincipal:Read"}, "503": {"description": "Engine-principal store unavailable"}}}
+      "get": {"summary": "List every engine principal", "tags": ["Security"], "responses": {"200": {"description": "List of engine principals with active_credential_count"}, "403": {"description": "Requires EnginePrincipal:Read"}, "503": {"description": "Engine-principal store unavailable, or the principal list or the credential counts could not be read (Retry-After: 2, retry_after_ms 2000); no list is served"}}}
     },
     "/engine-principals/{id}": {
-      "get": {"summary": "Get one engine principal and its active credentials", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "responses": {"200": {"description": "Engine principal detail + active_credentials[] (secrets masked)"}, "403": {"description": "Requires EnginePrincipal:Read"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal store unavailable"}}},
+      "get": {"summary": "Get one engine principal and its active credentials", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "responses": {"200": {"description": "Engine principal detail + active_credentials[] (secrets masked; each entry carries token_id, rotation_group and overlap_expires_at, which identify a stuck rotation successor)"}, "403": {"description": "Requires EnginePrincipal:Read"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal store unavailable, or the credential store could not be read (Retry-After: 2, retry_after_ms 2000); no active_credentials list is served"}}},
       "delete": {"summary": "Revoke an engine principal (terminal) and its active credentials", "tags": ["Security"], "description": "Cross-store ordering invariant: credentials are revoked FIRST (ApiTokenStore::revoke_for_principal), the identity SECOND — never the reverse.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"superseded_by": {"type": "string"}}}}}}, "responses": {"200": {"description": "Revoked (idempotent — success even if already revoked); {revoked, credentials_revoked}"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal or credential store unavailable"}}}
     },
     "/engine-principals/{id}/credentials": {
-      "post": {"summary": "Mint the first credential for an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"ttl_days": {"type": "integer", "minimum": 1, "maximum": 90, "default": 90}}}}}}, "responses": {"201": {"description": "Minted; {token, token_id, expires_at} — token is the raw secret, shown once (Cache-Control: no-store)"}, "400": {"description": "ttl_days present but of the wrong type (string, float, boolean, null) or out of range (1-90), or a non-empty body that is not a JSON object (malformed, array, string, number, null); nothing is minted. An empty or whitespace-only body still mints the 90-day default"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "409": {"description": "Engine principal is not active, or an active credential already exists — rotate instead of minting a second one"}, "503": {"description": "Store unavailable, or CSPRNG failure"}}}
+      "post": {"summary": "Mint the first credential for an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"ttl_days": {"type": "integer", "minimum": 1, "maximum": 90, "default": 90}}}}}}, "responses": {"201": {"description": "Minted; {token, token_id, expires_at} — token is the raw secret, shown once (Cache-Control: no-store)"}, "400": {"description": "ttl_days present but of the wrong type (string, float, boolean, null) or out of range (1-90), or a non-empty body that is not a JSON object (malformed, array, string, number, null); nothing is minted. An empty or whitespace-only body still mints the 90-day default"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "409": {"description": "Engine principal is not active, or an active credential already exists — rotate instead of minting a second one"}, "503": {"description": "Store unavailable, CSPRNG failure, or the check for an existing active credential could not read the store (nothing is minted; Retry-After: 2). Also returned, with the secret withheld and no Retry-After, when the credential was minted but could not be read back, or the read-back found no active credential (audit result partial): list the principal's credentials and rotate if one is listed, a second mint is 409"}}}
     },
     "/engine-principals/{id}/credentials/rotate": {
-      "post": {"summary": "Overlap-pair rotation of an engine principal's credential (design §7)", "tags": ["Security"], "description": "Mints a successor credential alongside the still-valid predecessor for the overlap window. A retry within the grace window by the SAME operator re-serves the identical raw secret (idempotent); step-up is re-validated on every call, including a re-serve.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days. A non-empty body must be a JSON object and overlap_secs a JSON integer (400 otherwise)"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, or no active credential to rotate (ambiguous with a transient store read failure — retry, or mint if genuinely absent)"}}}
+      "post": {"summary": "Overlap-pair rotation of an engine principal's credential (design §7)", "tags": ["Security"], "description": "Mints a successor credential alongside the still-valid predecessor for the overlap window. A retry within the grace window by the SAME operator re-serves the identical raw secret (idempotent); step-up is re-validated on every call, including a re-serve.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days. A non-empty body must be a JSON object and overlap_secs a JSON integer (400 otherwise)"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, or no active credential to rotate (ambiguous with a transient store read failure — retry, or mint if genuinely absent). Also returned, with Retry-After: 2 and the secret withheld, when the rotation committed but the successor could not be read back; the same operator repeating the call within the grace window (about two minutes, same server replica) gets the same secret, otherwise find the stuck successor with GET /engine-principals/{id}, revoke it with DELETE /tokens/{token_id} (administrator) and rotate from the sole credential. When the read answered but no linked successor was found the secret is also withheld, with NO retry hint: inspect the principal's credentials, then rotate again if needed. Never revoke the principal (terminal)"}}}
     },
     "/engine-principals/{id}/credentials/confirm": {
       "post": {"summary": "Confirm receipt of a rotated credential's successor secret (design §7 maker-checker)", "tags": ["Security"], "description": "Pass the successor token_id the rotate response returned (pins the confirm to that exact rotation; a stale or mismatched id is rejected with no state change) AND the raw successor secret (proof of possession, #3015). Confirm revokes the predecessor only after the presented secret verifies against the stored hash.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["token_id", "secret"], "properties": {"token_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "minLength": 24, "maxLength": 24, "description": "Successor token_id returned by the rotate call (24 lowercase hex) — pins the exact rotation being confirmed"}, "secret": {"type": "string", "minLength": 1, "maxLength": 512, "description": "The raw successor secret the rotate call returned — proof of possession (#3015), verified constant-time against the stored hash; checked only after every other admission gate. Missing/empty is 400; wrong is 403"}}}}}}, "responses": {"200": {"description": "Confirmed; predecessor credential revoked"}, "400": {"description": "token_id or secret missing, empty, or not a string; more than two active credentials; or a non-engine active credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write, or the presented secret does not verify against the pending successor (#3015)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry): token_id does not match the pending successor; the rotation was already confirmed or otherwise resolved by cutover/sweep/revoke; the sole active credential has unresolved rotation metadata; the grace window elapsed; or the rotation was initiated by a different operator"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, a confirm/revoke/clear persistence failure, or no in-flight rotation to confirm - the last covers zero active credentials (ambiguous with a transient read failure) and an unrecognized two-credential pair; rotate first if genuinely absent"}}}
@@ -1070,7 +1073,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Admin-forced ownership reassignment of an engine principal", "tags": ["Security"], "description": "Never depends on the outgoing owner's cooperation (design §3.1).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["new_owner"], "properties": {"new_owner": {"type": "string", "description": "Must reference an existing user"}}}}}}, "responses": {"200": {"description": "Transferred; {transferred:true}"}, "400": {"description": "Bad JSON, or new_owner missing/does not reference an existing user"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "409": {"description": "Engine principal is not active"}, "503": {"description": "Store unavailable"}}}
     },
     "/engine-principals/audit/no-admin": {
-      "get": {"summary": "Auditor-runnable proof that no engine principal holds admin/built-in/wildcard access (design §4.2, decision log #13)", "tags": ["Security"], "description": "Read-only evidentiary query, gated on AuditLog:Read rather than Security so a read-only auditor role can run it without engine-principal write access.", "responses": {"200": {"description": "{violations[]} — empty array means the invariant holds"}, "403": {"description": "Requires AuditLog:Read"}, "503": {"description": "Engine-principal or RBAC reference data unavailable — cannot verify"}}}
+      "get": {"summary": "Auditor-runnable check for engine principals holding admin, built-in or wildcard roles (design §4.2, decision log #15)", "tags": ["Security"], "description": "Read-only evidentiary query, gated on AuditLog:Read rather than Security so a read-only auditor role can run it without engine-principal write access. Detective and pull-only: a custom wildcard role is permitted at assignment and reported here as wildcard_grant. ok:true means no role covers the whole current permission grid at run time.", "responses": {"200": {"description": "{ok, violations[]} — empty array means no admin, system or full-grid role was found"}, "403": {"description": "Requires AuditLog:Read"}, "503": {"description": "A grants, roles or role-permissions read, or the RBAC reference data, could not be read — cannot verify (Retry-After: 2, retry_after_ms 2000); no partial list is returned"}}}
     })json"
         // Split again (MSVC C2026 16,380-byte cap) — the engine-principal
         // lifecycle routes (PR 4.3) get their own segment; concatenated at
@@ -1280,10 +1283,10 @@ const std::string& openapi_spec() {
       "post": {"summary": "Clear a user's account-lockout counter (admin unlock, SOC 2 CC6.3)", "tags": ["Users"], "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Lockout cleared: {username, unlocked, audit_emitted}"}, "400": {"description": "Username empty or malformed"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Requires UserManagement:Write"}, "500": {"description": "Auth store write failed"}, "503": {"description": "Lockout subsystem unavailable (auth store not configured or unreachable \u2014 see --postgres-dsn)"}}}
     },
     "/users/me/password": {
-      "post": {"summary": "Change your own local-account password (#5342)", "tags": ["Users"], "description": "Interactive LOCAL cookie session only (API/MCP/engine/service-scoped tokens 403 token_session; SSO sessions 409 not_local). Same-site Origin/Referer required (403 csrf) and Content-Type: application/json (415). MFA step-up if enrolled. The current password is checked through the SAME lockout-accounted path as POST /login, so a wrong current password counts toward account lockout; a password that could not be verified (auth store unavailable, or the credential changed concurrently) is a retryable 503 and never counts. Under --auth-mode=sso-only only an ARMED break-glass account may change its password (403 sso_only_local_disabled otherwise, with no password evaluated). New password: 12..1024 BYTES (UTF-8). ONE TRANSACTION under the account's row lock: the credential, the deletion of every session of the account (the caller's own included, durable and cross-replica), the wipe of a provisional (un-enrolled) TOTP secret, and the user.password_change audit row commit or abort together. A refusal changes nothing except that a wrong current password counts a lockout strike (the caller's session stays valid). If the audit row cannot be written the whole change is not made: 503 audit_unavailable + Sec-Audit-Failed. No replacement session is issued: on success the response clears the cookie (Set-Cookie Max-Age=0) and the user signs in again with the new password. A 503 changed nothing unless the server lost contact with the database at commit; a successful sign-in with the new password confirms the change, which is audited either way. No MCP twin by design (ADR-1005 parity-ledger exception).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["current_password", "new_password"], "properties": {"current_password": {"type": "string", "description": "Not length-checked as a request field: a value over 1024 bytes is answered as a wrong current password (403 wrong_current, counts toward lockout) without being hashed, as POST /login does"}, "new_password": {"type": "string", "minLength": 12, "maxLength": 1024, "description": "Length is measured in bytes (UTF-8)"}}}}}}, "responses": {"200": {"description": "Changed: {username, password_changed, sessions_revoked, session_reissued (always false), provisional_mfa_cleared, audit_emitted (always true)}; Set-Cookie clears the session cookie (Max-Age=0)"}, "400": {"description": "Malformed body, or new password outside 12..1024 bytes (not audited)"}, "401": {"description": "Unauthenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Wrong current password, including one over 1024 bytes (also returned while the account is locked), token session, cross-origin request, or sso_only_local_disabled"}, "404": {"description": "Account no longer active (nothing changed)"}, "409": {"description": "Not a local account (SSO/SCIM) — not_local; or the password changed concurrently — conflict (nothing changed)"}, "415": {"description": "Content-Type is not application/json"}, "503": {"description": "store_unavailable, audit_unavailable (+ Sec-Audit-Failed), or the password could not be verified (verify_transient); retry_after_ms set. Nothing changed unless the connection was lost at commit"}}}
+      "post": {"summary": "Change your own local-account password (#5342)", "tags": ["Users"], "description": "Interactive LOCAL cookie session only (API/MCP/engine/service-scoped tokens 403 token_session; SSO sessions 409 not_local). Cookie-session writes require a same-site Origin or Referer: the central check answers first (403, message cross-site request refused) and this route keeps its own copy as defence in depth (403 csrf). Content-Type: application/json is required (415). MFA step-up if enrolled. The current password is checked through the SAME lockout-accounted path as POST /login, so a wrong current password counts toward account lockout; a password that could not be verified (auth store unavailable, or the credential changed concurrently) is a retryable 503 and never counts. Under --auth-mode=sso-only only an ARMED break-glass account may change its password (403 sso_only_local_disabled otherwise, with no password evaluated). New password: 12..1024 BYTES (UTF-8). ONE TRANSACTION under the account's row lock: the credential, the deletion of every session of the account (the caller's own included, durable and cross-replica), the wipe of a provisional (un-enrolled) TOTP secret, and the user.password_change audit row commit or abort together. A refusal changes nothing except that a wrong current password counts a lockout strike (the caller's session stays valid). If the audit row cannot be written the whole change is not made: 503 audit_unavailable + Sec-Audit-Failed. No replacement session is issued: on success the response clears the cookie (Set-Cookie Max-Age=0) and the user signs in again with the new password. A 503 changed nothing unless the server lost contact with the database at commit; a successful sign-in with the new password confirms the change, which is audited either way. No MCP twin by design (ADR-1005 parity-ledger exception).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["current_password", "new_password"], "properties": {"current_password": {"type": "string", "description": "Not length-checked as a request field: a value over 1024 bytes is answered as a wrong current password (403 wrong_current, counts toward lockout) without being hashed, as POST /login does"}, "new_password": {"type": "string", "minLength": 12, "maxLength": 1024, "description": "Length is measured in bytes (UTF-8)"}}}}}}, "responses": {"200": {"description": "Changed: {username, password_changed, sessions_revoked, session_reissued (always false), provisional_mfa_cleared, audit_emitted (always true)}; Set-Cookie clears the session cookie (Max-Age=0)"}, "400": {"description": "Malformed body, or new password outside 12..1024 bytes (not audited)"}, "401": {"description": "Unauthenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Wrong current password, including one over 1024 bytes (also returned while the account is locked), token session, cross-origin request, or sso_only_local_disabled"}, "404": {"description": "Account no longer active (nothing changed)"}, "409": {"description": "Not a local account (SSO/SCIM) — not_local; or the password changed concurrently — conflict (nothing changed)"}, "415": {"description": "Content-Type is not application/json"}, "503": {"description": "store_unavailable, audit_unavailable (+ Sec-Audit-Failed), or the password could not be verified (verify_transient); retry_after_ms set. Nothing changed unless the connection was lost at commit"}}}
     },
     "/users/{username}/password": {
-      "post": {"summary": "Reset another user's local-account password (admin, #5342)", "tags": ["Users"], "description": "Gated on the canonical durable-Administrator predicate (the same is_rbac_administrator check as the RBAC role-assignment routes, re-verified against the enforcement regime in effect right now) — NOT an ordinary permission check, and the same rule for every target: RBAC off, the caller's own local account must hold the admin role; RBAC on, the caller must hold a user-principal Administrator grant. A JIT elevation, an IdP-group-derived session role, or a custom role holding UserManagement:Write is refused (403 durable_admin_required); a store that cannot confirm authority is 503 admin_gate_unavailable. Interactive cookie session only (API/MCP/engine/service-scoped tokens 403 token_session). Same-site Origin/Referer required (403 csrf) and Content-Type: application/json (415). Refuses your own account (403 self_target — use POST /users/me/password) and the configured break-glass account (403 break_glass_target), both before MFA step-up. SSO/SCIM accounts 409 not_local; absent/inactive 404. New password: 12..1024 BYTES (UTF-8). ONE TRANSACTION under the target's row lock: the credential, the deletion of every session of the target, the wipe of a provisional (un-enrolled) TOTP secret, the clearing of any lockout, and the user.password_reset audit row (plus auth.lockout.cleared, detail password_reset, when a lockout existed) commit or abort together; an audit failure makes no change (503 audit_unavailable + Sec-Audit-Failed). An ENROLLED second factor is not touched. API tokens are NOT revoked — the response reports api_tokens_active (null + api_tokens_unknown when the token store cannot be read). A 503 changed nothing unless the server lost contact with the database at commit; a successful sign-in with the new password confirms the change, which is audited either way. No MCP twin by design (ADR-1005 parity-ledger exception).", "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["new_password"], "properties": {"new_password": {"type": "string", "minLength": 12, "maxLength": 1024, "description": "Length is measured in bytes (UTF-8)"}}}}}}, "responses": {"200": {"description": "Reset: {username, password_reset, sessions_revoked, lockout_cleared (true iff a lockout existed and was cleared), provisional_mfa_cleared, api_tokens_active (number, or null with api_tokens_unknown: true), remediation}"}, "400": {"description": "Malformed body or username, or new password outside 12..1024 bytes (not audited)"}, "401": {"description": "Unauthenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Not a durable Administrator (durable_admin_required); or token session, cross-origin request, self_target, or break_glass_target"}, "404": {"description": "No active account by that name (nothing changed)"}, "409": {"description": "Not a local account (SSO/SCIM) (nothing changed)"}, "415": {"description": "Content-Type is not application/json"}, "503": {"description": "store_unavailable, audit_unavailable (+ Sec-Audit-Failed), or admin_gate_unavailable; retry_after_ms set. Nothing changed unless the connection was lost at commit"}}}
+      "post": {"summary": "Reset another user's local-account password (admin, #5342)", "tags": ["Users"], "description": "Gated on the canonical durable-Administrator predicate (the same is_rbac_administrator check as the RBAC role-assignment routes, re-verified against the enforcement regime in effect right now) — NOT an ordinary permission check, and the same rule for every target: RBAC off, the caller's own local account must hold the admin role; RBAC on, the caller must hold a user-principal Administrator grant. A JIT elevation, an IdP-group-derived session role, or a custom role holding UserManagement:Write is refused (403 durable_admin_required); a store that cannot confirm authority is 503 admin_gate_unavailable. Interactive cookie session only (API/MCP/engine/service-scoped tokens 403 token_session). Cookie-session writes require a same-site Origin or Referer: the central check answers first (403, message cross-site request refused) and this route keeps its own copy as defence in depth (403 csrf). Content-Type: application/json is required (415). Refuses your own account (403 self_target — use POST /users/me/password) and the configured break-glass account (403 break_glass_target), both before MFA step-up. SSO/SCIM accounts 409 not_local; absent/inactive 404. New password: 12..1024 BYTES (UTF-8). ONE TRANSACTION under the target's row lock: the credential, the deletion of every session of the target, the wipe of a provisional (un-enrolled) TOTP secret, the clearing of any lockout, and the user.password_reset audit row (plus auth.lockout.cleared, detail password_reset, when a lockout existed) commit or abort together; an audit failure makes no change (503 audit_unavailable + Sec-Audit-Failed). An ENROLLED second factor is not touched. API tokens are NOT revoked — the response reports api_tokens_active (null + api_tokens_unknown when the token store cannot be read). A 503 changed nothing unless the server lost contact with the database at commit; a successful sign-in with the new password confirms the change, which is audited either way. No MCP twin by design (ADR-1005 parity-ledger exception).", "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["new_password"], "properties": {"new_password": {"type": "string", "minLength": 12, "maxLength": 1024, "description": "Length is measured in bytes (UTF-8)"}}}}}}, "responses": {"200": {"description": "Reset: {username, password_reset, sessions_revoked, lockout_cleared (true iff a lockout existed and was cleared), provisional_mfa_cleared, api_tokens_active (number, or null with api_tokens_unknown: true), remediation}"}, "400": {"description": "Malformed body or username, or new password outside 12..1024 bytes (not audited)"}, "401": {"description": "Unauthenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Not a durable Administrator (durable_admin_required); or token session, cross-origin request, self_target, or break_glass_target"}, "404": {"description": "No active account by that name (nothing changed)"}, "409": {"description": "Not a local account (SSO/SCIM) (nothing changed)"}, "415": {"description": "Content-Type is not application/json"}, "503": {"description": "store_unavailable, audit_unavailable (+ Sec-Audit-Failed), or admin_gate_unavailable; retry_after_ms set. Nothing changed unless the connection was lost at commit"}}}
     },
     "/users/{username}/elevation-eligibility": {
       "post": {"summary": "Grant or revoke a user's JIT-admin-elevation eligibility (SOC 2 CC6.3/CC6.6)", "tags": ["Users"], "description": "Admin (or an active elevation) + MFA step-up. Sets the per-user users.elevation_eligible flag. Self-grant is blocked. Granting (eligible=true) needs the caller's own administrator role: a session that is administrator only through an elevation gets 403. Setting eligible=false also terminates any in-flight elevation for that user. Errors use the A4 envelope (correlation_id + remediation).", "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["eligible"], "properties": {"eligible": {"type": "boolean"}}}}}}, "responses": {"200": {"description": "{status: ok}"}, "400": {"description": "Invalid username or non-boolean body"}, "401": {"description": "Not authenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Not admin, or self-grant"}, "404": {"description": "User not found"}, "503": {"description": "Auth store not configured or unreachable — see --postgres-dsn"}}}
@@ -1346,8 +1349,11 @@ const std::string& openapi_spec() {
       "get": {"summary": "Per-device all-guards view (#4037)", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (management-group aware) via the SAME scoped_perm_fn gate GET /guaranteed-state/device-compliance uses. Every guard's state for ONE device, unscoped to any Baseline — genuinely distinct from device-compliance, which is scoped to one named Baseline (requires both agent_id AND baseline, and returns a baseline-shaped response). A device with no reported guards returns an empty guards[] array, not an error. MCP twin: get_guardian_device_guards.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Every guard's state for this device", "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "guards": {"type": "array", "items": {"type": "object", "properties": {"rule_id": {"type": "string"}, "name": {"type": "string"}, "state": {"type": "string"}, "updated_at": {"type": "string"}}}}, "total_guards": {"type": "integer"}}}}}}, "503": {"description": "Scoped-permission gate unwired (non-retryable), store degraded (retryable, A4 envelope with retry_after_ms), or the guardian.device.view audit row could not persist (FAIL-CLOSED, Sec-Audit-Failed: true)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}}}}}}
     },
     "/guaranteed-state/push": {
-      "post": {"summary": "Queue a Guaranteed State rule push to agents", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Push. Returns 202 Accepted — agent delivery is asynchronous. The server resolves the scope and delivers each in-scope agent a per-agent filtered rule set (os_target + scope_expr).", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"scope": {"type": "string", "description": "Scope DSL selector (empty = all agents)"}, "full_sync": {"type": "boolean", "default": false}}}}}}, "responses": {"202": {"description": "Push queued"}, "400": {"description": "Invalid JSON body"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Service-scoped API token — a full_sync push is fleet-wide by nature and cannot be confined to the token's service; the single most severe instance of this confinement-gap class on this branch."}, "503": {"description": "Guaranteed-state rule store degraded or unreachable — the push is refused rather than fanned out empty (ADR-0038), retryable (A4 envelope, retry_after_ms)"}}}
-    },
+      "post": {"summary": "Queue a Guaranteed State rule push to agents", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Push. Returns 202 Accepted — agent delivery is asynchronous. The server resolves the scope and delivers each in-scope agent a per-agent filtered rule set (os_target + scope_expr).", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"scope": {"type": "string", "description": "Scope DSL selector (empty = all agents)"}, "full_sync": {"type": "boolean", "default": false, "description": "true replaces the agent's rule set; false merges and does not retry a still-unresolved rule the push omits"}}}}}}, "responses": {"202": {"description": "Push queued"}, "400": {"description": "Invalid JSON body"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Service-scoped API token — a full_sync push is fleet-wide by nature and cannot be confined to the token's service; the single most severe instance of this confinement-gap class on this branch."}, "503": {"description": "Guaranteed-state rule store degraded or unreachable — the push is refused rather than fanned out empty (ADR-0038), retryable (A4 envelope, retry_after_ms)"}}}
+    })json"
+        // Split here (MSVC C2026 16,380-byte cap): keeps the segment above under the
+        // 16,000-byte working ceiling. Byte-identical emit, as for the split above.
+        R"json(,
     "/guaranteed-state/events": {
       "get": {"summary": "Query Guaranteed State events", "tags": ["Guaranteed State"], "description": "Two gated shapes behind one route. An agent-scoped query (non-empty agent_id, max 256 chars, no control characters) requires per-device-scoped GuaranteedState:Read (management-group aware; a service-scoped token is confined to its own service's agents) and returns that device's individual-identifying behavioural signal history. A fleet-wide query (no agent_id) requires global GuaranteedState:Read AND denies a service-scoped token outright (403) — the fleet fan-out returns every reporting agent's agent_id + detail_json, which the bare service-token role check alone would not confine. BOTH shapes emit a dex.device.view audit (target_type Agent for the per-device shape, GuaranteedState for the fleet shape) and FAIL CLOSED — 503 + Sec-Audit-Failed: true (retryable, A4 envelope with retry_after_ms) — if that audit row cannot persist, parity with GET /api/v1/dex/devices/{id}. Limit is capped at 1000 at the REST boundary.", "parameters": [{"name": "rule_id", "in": "query", "schema": {"type": "string"}}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}}, {"name": "severity", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Matching events", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateEvent"}}}}}, "400": {"description": "Invalid limit/offset, or agent_id too long / contains a control character"}, "403": {"description": "A service-scoped token queried the fleet-wide (no agent_id) shape, or an agent-scoped query named a device outside the caller's scope"}, "503": {"description": "Audit row could not persist — behavioural data withheld on both the agent-scoped and fleet-wide shapes; carries Sec-Audit-Failed: true and is retryable (A4 envelope).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
@@ -1626,12 +1632,22 @@ const std::string& openapi_spec() {
       "get": {"summary": "Read a plugin or plugin-action kill-switch's display state", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Read. NOT the dispatch-gating decision (PluginConfigStore::action_allowed fails closed on any store error, which this display accessor deliberately does not) — this is the inspection view. Absence of a prior flip reads as enabled=true. GET without os reports the all-OS layer only and never reflects a per-OS OFF row. For a protective action (the quarantine plugin's quarantine/unquarantine/status/whitelist and __guard__.push_rules) the state shown here is informational only: enabled=false can be displayed while dispatch still proceeds.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "action", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Action name for an action-level switch; omit for the whole-plugin switch"}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["windows", "linux", "darwin"]}, "description": "Agent OS as reported by the agent; omit for the all-OS switch. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer. enabled is the effective state of the switch row (for a protective action that row never gates dispatch) and reason/set_by/source name the row that produced it"}], "responses": {"200": {"description": "{plugin, action, os, enabled, reason, set_by, updated_at_ms, source}"}, "400": {"description": "Invalid plugin/action/os grammar, or a present-but-empty os"}, "503": {"description": "Plugin config store unavailable"}}},
       "put": {"summary": "Flip a plugin or plugin-action kill switch", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Write. Every dispatch-gating caller that consults this switch fails CLOSED on any store error, so this is a reliable emergency stop for the named plugin/action. Exception: a protective action (the quarantine plugin's quarantine/unquarantine/status/whitelist and __guard__.push_rules) is never refused by this switch; a row for one is stored and echoed but has no dispatch effect; to stop Guardian rule delivery disable or remove the rules instead (disarms them on the agent's next reconcile). Audited (plugin_config.kill_switch.set) before the mutation is attempted. The response echoes the row written, not the effective state.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "action", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Action name for an action-level switch; omit for the whole-plugin switch"}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["windows", "linux", "darwin"]}, "description": "Agent OS as reported by the agent; omit for the all-OS switch. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer. The response echoes the row written, not the effective state"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["enabled"], "properties": {"enabled": {"type": "boolean", "description": "true = allowed (the default/no-row state); false = killed; for a protective action the row is stored but has no dispatch effect"}, "reason": {"type": "string", "maxLength": 512}}}}}}, "responses": {"200": {"description": "{plugin, action, os, enabled, reason, set_by, updated_at_ms, source}"}, "400": {"description": "Invalid plugin/action/os/reason grammar, a present-but-empty os, or missing/non-boolean enabled"}, "503": {"description": "Plugin config store unavailable, or the pre-mutation audit row could not be persisted"}}}
     },)json"
+        // Fresh literal split (MSVC C2026 ~16 KB per-literal cap): runtime configuration. The
+        // routes live in config_routes.cpp, not this file; the legacy /api/config pair is not in
+        // the v1 spec.
+        R"json(
+    "/config": {
+      "get": {"summary": "Read the server's runtime configuration", "tags": ["Settings"], "description": "Requires Infrastructure:Read. The effective values, the stored overrides (a secret key reports is_set, never its value), allowed_keys and read_only_keys (allowed keys with their own writer). A store that is closed or cannot be read answers 503, never an empty list. Not audited. Scoped to the caller: the stored override of every key the caller could not write with PUT /api/v1/config/{key} (and the effective audit_retention_days) is left out and named in withheld_keys. Platform configuration, not agent-scoped data: a service-scoped token is refused.", "responses": {"200": {"description": "{data:{config:{heartbeat_timeout, response_retention_days, audit_retention_days, guardian_event_retention_days, auto_approve_enabled, log_level}, overrides:{<key>:{value|is_set, updated_by, updated_at}}, allowed_keys:[], read_only_keys:[], withheld_keys:[]}, meta:{api_version}}; audit_retention_days is present only when not withheld, and is the stored value, not the enforced window"}, "403": {"description": "Requires Infrastructure:Read, or a service-scoped token"}, "503": {"description": "Runtime config store unavailable or unreadable"}}}
+    },
+    "/config/{key}": {
+      "put": {"summary": "Set one runtime configuration override", "tags": ["Settings"], "description": "Requires Infrastructure:Write. An MFA-enrolled local or OIDC cookie session also needs a fresh MFA step-up proof (per --mfa-enforcement), checked by the central step-up check before the route runs, ahead of the permission and caller-rule checks; un-enrolled accounts and API-token and MCP-token callers pass. Audit-first: a config.update attempted row is written before the change and a row that cannot be stored refuses it (503, Sec-Audit-Failed). Seven keys (plugin_signing_required, audit_retention_days, dex_alert_routing, dex_blast_min_devices, dex_blast_window_seconds, dex_blast_cooldown_seconds, dex_cohort_export_key) need an administrator account (effective role admin; MCP-tier and service-scoped tokens are refused whatever their creator's role); the oidc_* keys need the caller's own admin role, so an elevation is refused too. Both answer 403 with a config.update denied audit row. dex_score_policy has its own route and answers 400. The answer carries effect: immediate (heartbeat_timeout, log_level), deferred (the dex_* keys, until the next DEX Alerts save or a restart; oidc_admin_group and oidc_redirect_uri, until a restart) or stored_only (nothing consumes it: the retention values, which are not enforced even after a restart because the stores take their window from the command-line flags (#483), auto_approve_enabled, plugin_signing_required, which records intent and hardens nothing, and the other oidc_* keys). heartbeat_timeout must be 30 to 86400 seconds.", "parameters": [{"name": "key", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[a-z_]+$"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["value"], "properties": {"value": {"description": "A string, or a JSON number or boolean, which is sent to the store as its JSON text; null, an array and an object are refused", "oneOf": [{"type": "string"}, {"type": "integer"}, {"type": "boolean"}]}}}}}}, "responses": {"200": {"description": "{data:{key, value, applied:true, effect:immediate|deferred|stored_only, audit_persisted?:false}, meta:{api_version}}; a secret key's value is never echoed"}, "400": {"description": "Missing or invalid value, unknown key, or a key with its own route"}, "401": {"description": "A fresh MFA step-up proof is required (step-up envelope)"}, "403": {"description": "Requires Infrastructure:Write; an administrator-only key written by a caller who is not allowed to; a cross-site cookie write; or a SAML session or engine principal (step-up)"}, "413": {"description": "Request body over 16 KiB"}, "503": {"description": "Runtime config store unavailable, or the audit row could not be persisted"}}}
+    },)json"
         // Split again (MSVC C2026 16,380-byte cap): the plugin-config segment
         // above sat 12 bytes under it. Upload-grant + chunked-receive paths.
         R"json(
     "/upload-grants": {
       "post": {"summary": "Mint a one-time upload-grant credential", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Write. Authorises ONE agent to push ONE file back to the server (CC-06 authenticated chunked-receive protocol, docs/adr/3004-artifact-blob-storage.md). grant_secret is returned EXACTLY ONCE in this response — only its digest is persisted. destination_key is SERVER-DERIVED from retention_class + the freshly-minted grant_id only; source_path is stored as informational metadata and never influences it.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}, "source_path": {"type": "string", "description": "Informational only; never used to derive the destination key"}, "expected_sha256": {"type": "string"}, "retention_class": {"type": "string", "enum": ["standard", "extended", "transient"], "default": "standard"}, "declared_max_size": {"type": "integer"}, "ttl_secs": {"type": "integer", "minimum": 1, "description": "A JSON integer of at least 1, clamped to the 900 s maximum; omit for the default"}}}}}}, "responses": {"201": {"description": "{grant_id, grant_secret, expires_at, destination_key}; grant_secret is shown once (Cache-Control: no-store)"}, "400": {"description": "Invalid input (empty agent_id, non-positive declared_max_size, unrecognized retention_class, ttl_secs not a JSON integer of at least 1)"}, "503": {"description": "Upload grant store unavailable, or a CSPRNG/digest failure"}}},
-      "get": {"summary": "List upload grants", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Read, routed through the ADR-0017 admit-then-filter list gate: AdmitAll lists every grant; a management-group-confined grant lists only grants for agents in the caller's visible set. No client-selected agent_id filter exists on this surface — the frozen protocol forbids one on every path. A service-scoped API token is refused with 403 whoever minted it (audit action upload_grant.list.access_denied), since the list gate would otherwise evaluate the minter's own grants. Never returns a grant secret or its hash.", "responses": {"200": {"description": "{data: [{grant_id, agent_id, source_path, declared_max_size, expected_sha256, retention_class, destination_key, state, minted_by, created_at, expires_at}]}"}, "403": {"description": "No grant anywhere for UploadGrant:Read, or the caller is a service-scoped API token (refused whoever minted it)"}, "503": {"description": "Upload grant store unavailable"}}}
+      "get": {"summary": "List upload grants", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Read, routed through the ADR-0017 admit-then-filter list gate: AdmitAll lists every grant; a management-group-confined grant lists only grants for agents in the caller's visible set. No client-selected agent_id filter exists on this surface — the frozen protocol forbids one on every path. A service-scoped API token is refused with 403 whoever minted it (audit action upload_grant.list.access_denied), since the list gate would otherwise evaluate the minter's own grants. Never returns a grant secret or its hash. An engine principal is admitted only by an explicit UploadGrant:Read RBAC grant.", "responses": {"200": {"description": "{data: [{grant_id, agent_id, source_path, declared_max_size, expected_sha256, retention_class, destination_key, state, minted_by, created_at, expires_at}]}"}, "403": {"description": "No grant anywhere for UploadGrant:Read, the caller is a service-scoped API token (refused whoever minted it), or the caller is an engine principal with RBAC off or no UploadGrant:Read grant"}, "503": {"description": "Upload grant store unavailable, or (engine principal) the RBAC store is unavailable"}}}
     },
     "/upload-grants/{grant_id}": {
       "delete": {"summary": "Revoke an upload grant", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Delete. Closes the grant's one-time redemption window; has NO effect on a grant already redeemed into a session — an in-flight or completed upload is untouched.", "parameters": [{"name": "grant_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"204": {"description": "Revoked"}, "404": {"description": "No such grant, or it was already redeemed/revoked"}, "503": {"description": "Upload grant store unavailable"}}}
@@ -1724,7 +1740,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Analytics drain + ClickHouse integration settings", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/analytics, sharing its builder (settings_model::build_analytics_settings). Requires AnalyticsConfig:Read (dedicated securable). Audited fail-closed (settings.analytics.read) — mixed, leans high (embedded-credential risk). SECURITY FIX bundled with this twin: clickhouse_url is sanitized of embedded userinfo credentials (settings_model::sanitize_url_userinfo) before being returned — previously the sibling HTML fragment rendered it verbatim, masking only the separate clickhouse_password field. The raw password itself is never returned, only clickhouse_password_set. MCP: deliberately REST-only (#520, see /settings/tls).", "responses": {"200": {"description": "{data: {enabled, drain_interval_seconds, batch_size, clickhouse_configured, clickhouse_url (userinfo-sanitized), clickhouse_database, clickhouse_table, clickhouse_username, clickhouse_password_set, jsonl_export_path}, meta}"}, "403": {"description": "Permission denied (AnalyticsConfig:Read)"}, "503": {"description": "Audit subsystem unavailable — refuses to serve without durable evidence"}}}
     },
     "/tar/retention-paused/purge": {
-      "post": {"summary": "Dispatch a destructive single-device TAR source purge (A1 structured surface)", "tags": ["Dashboard TAR"], "description": "Requires Infrastructure:Delete, enforced per-device and management-group-scoped (fail-closed if the scope gate is unwired). Agentic-first JSON twin of POST /fragments/tar/retention-paused/purge: permanently drops every warehouse row for a paused source on one device while leaving the collector paused. IRREVERSIBLE. Audit (tar.source.purge, result=requested) is written BEFORE dispatch, fail-closed — the purge is never dispatched without durable evidence. Async: agent computes rows_deleted (and the agent-side source_not_paused refusal, if the source was re-enabled between scan and purge) into the command's response record, polled by command_id, not returned in the 202 body. Requires an agent implementing tar.purge_source (v0.14.0+).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["device_id", "source"], "properties": {"device_id": {"type": "string", "description": "Target agent; must be within the caller's management scope."}, "source": {"type": "string", "enum": ["process", "tcp", "service", "user"]}}}}}}, "responses": {"202": {"description": "{command_id, device_id, source, agents_reached}. X-Correlation-Id header on every response."}, "400": {"description": "Invalid JSON, missing device_id/source, or source not one of process|tcp|service|user"}, "403": {"description": "Permission denied (scoped Infrastructure:Delete gate)"}, "404": {"description": "Device out of scope, or dispatch reached zero agents (device offline/quarantined/containment-withheld)"}, "500": {"description": "Scope gate not configured (server misconfiguration)"}, "503": {"description": "Command dispatch unavailable, or the pre-dispatch audit row could not be persisted (Sec-Audit-Failed header; purge not dispatched)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the mutation succeeded but its own audit row failed to persist."}}}}}
+      "post": {"summary": "Dispatch a destructive single-device TAR source purge (A1 structured surface)", "tags": ["Dashboard TAR"], "description": "Requires Infrastructure:Delete, enforced per-device and management-group-scoped (fail-closed if the scope gate is unwired). Agentic-first JSON twin of POST /fragments/tar/retention-paused/purge: permanently drops every warehouse row for a paused source on one device while leaving the collector paused. IRREVERSIBLE. Audit (tar.source.purge, result=requested) is written BEFORE dispatch, fail-closed — the purge is never dispatched without durable evidence. Async: agent computes rows_deleted (and the agent-side source_not_paused refusal, if the source was re-enabled between scan and purge, or config_unreadable if the enable flag could not be read) into the command's response record, polled by command_id, not returned in the 202 body. Requires an agent implementing tar.purge_source (v0.14.0+).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["device_id", "source"], "properties": {"device_id": {"type": "string", "description": "Target agent; must be within the caller's management scope."}, "source": {"type": "string", "enum": ["process", "tcp", "service", "user"]}}}}}}, "responses": {"202": {"description": "{command_id, device_id, source, agents_reached}. X-Correlation-Id header on every response."}, "400": {"description": "Invalid JSON, missing device_id/source, or source not one of process|tcp|service|user"}, "403": {"description": "Permission denied (scoped Infrastructure:Delete gate)"}, "404": {"description": "Device out of scope, or dispatch reached zero agents (device offline/quarantined/containment-withheld)"}, "500": {"description": "Scope gate not configured (server misconfiguration)"}, "503": {"description": "Command dispatch unavailable, or the pre-dispatch audit row could not be persisted (Sec-Audit-Failed header; purge not dispatched)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the mutation succeeded but its own audit row failed to persist."}}}}}
     },
     "/tar/process-tree": {
       "get": {"summary": "TAR process-tree viewer device picker (API-parity read twin, #4027)", "tags": ["Dashboard TAR"], "description": "Requires Infrastructure:Read. JSON twin of the operator-scoped device list GET /fragments/tar/process-tree renders into its host-picker <select>. A service-scoped API token is denied outright (403, tar.device_picker.view denied) -- the fleet-wide device-enumeration guard shared with GET /api/v1/tar/capture-sources below, since neither route names a single agent_id to confine a service-scoped token's own tag against. Unaudited on success -- a device identity/online list, not per-device behavioral content (matches this fragment's own today-unaudited posture). Every row carries online, which is always true today: the sole wired provider sources this list from the live-session registry, so a disconnected enrolled device is not included (#4027 fix round, CDX-P1-02/K1) -- unlike the HTML picker, this list does not additionally hide any row by online status.", "responses": {"200": {"description": "{data: {devices: [{agent_id, hostname, os, arch, agent_version, online}]}}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Service-scoped API token (fleet-wide device list), or RBAC denied (Infrastructure:Read)"}}}
@@ -2129,7 +2145,9 @@ std::atomic<int>& live_poll_interval_ms() {
 //   6. (admin) target == the configured break-glass account → 403
 //      `break_glass_target` (the sealed escape hatch is re-keyed out of band
 //      only — an IdP compromise must not be able to invalidate it).
-//   7. MFA step-up (step_up_fn; skips an un-enrolled user).
+//   7. MFA step-up (step_up_fn; skips an un-enrolled user). The central step-up check
+//      (step_up_gate.hpp) evaluates the same decision before the handler runs, i.e. ahead of
+//      steps 2-6; this in-handler call repeats it from that verdict and stays in the ladder.
 //   8. Body + length policy (password_policy.hpp) → 400, NOT audited.
 //   9. (self) The current password through AuthRoutes'
 //      verify_password_with_lockout (the SAME striped-lock / lockout / sso-only
@@ -5171,14 +5189,55 @@ void RestApiV1::register_routes(
                  if (deny_engine_session(*session, req, res, audit_fn, "engine_principal.list",
                                          "EnginePrincipal"))
                      return;
-                 auto principals = eps->list_all();
+                 // CHECKED roster read. The plain `list_all` turns a closed store, a
+                 // pool-lease timeout or a query failure into an empty vector, and the
+                 // engine-principal and token stores share ONE pool in production, so a
+                 // saturated pool would answer 200 "no engine principals" here before the
+                 // per-principal credential read below is ever reached.
+                 auto principals_res = eps->list_all_checked();
+                 if (!principals_res) {
+                     // The store's error can carry the database driver's text, so it goes to
+                     // the log only; the audit detail and the response use fixed strings.
+                     spdlog::warn("engine_principal.list: roster read failed: {}",
+                                  principals_res.error());
+                     res.status = 503;
+                     res.set_header("Retry-After", "2");
+                     res.set_content(
+                         detail::a4_error(res, "could not read the engine principals; retry",
+                                          detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                         "application/json");
+                     (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                         "engine_principal.list", "failure",
+                                                         "EnginePrincipal", "",
+                                                         "engine principal roster could not be read");
+                     return;
+                 }
+                 const auto& principals = *principals_res;
                  JArr arr;
                  for (const auto& p : principals) {
-                     std::int64_t active_creds =
-                         token_store
-                             ? static_cast<std::int64_t>(
-                                   token_store->list_active_for_principal(p.principal_id).size())
-                             : 0;
+                     std::int64_t active_creds = 0;
+                     if (token_store) {
+                         // The CHECKED read: the plain accessor turns a pool-lease timeout
+                         // or query failure into an empty vector, which this list would
+                         // show as "0 credentials" for a principal that holds a live one.
+                         // A read that cannot answer fails the whole list (503), so no
+                         // count is ever shown that the store did not confirm.
+                         auto active = token_store->list_active_for_principal_checked(p.principal_id);
+                         if (!active) {
+                             res.status = 503;
+                             res.set_header("Retry-After", "2");
+                             res.set_content(
+                                 detail::a4_error(res,
+                                                  "could not read the credential counts; retry",
+                                                  detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                                 "application/json");
+                             (void)detail::emit_behavioral_audit(
+                                 audit_fn, req, res, "engine_principal.list", "failure",
+                                 "EnginePrincipal", "", active.error());
+                             return;
+                         }
+                         active_creds = static_cast<std::int64_t>(active->size());
+                     }
                      arr.add(JObj()
                                  .add("principal_id", p.principal_id)
                                  .add("display_name", p.display_name)
@@ -5238,7 +5297,23 @@ void RestApiV1::register_routes(
 
                  JArr creds;
                  if (token_store) {
-                     for (const auto& t : token_store->list_active_for_principal(principal_id)) {
+                     // CHECKED read, as on the list route: a degraded read must not render
+                     // as "no active credentials" for a principal that holds one.
+                     auto active = token_store->list_active_for_principal_checked(principal_id);
+                     if (!active) {
+                         res.status = 503;
+                         res.set_header("Retry-After", "2");
+                         res.set_content(
+                             detail::a4_error(res, "could not read the principal's credentials; retry",
+                                              detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                             "application/json");
+                         (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                             "engine_principal.get", "failure",
+                                                             "EnginePrincipal", principal_id,
+                                                             active.error());
+                         return;
+                     }
+                     for (const auto& t : *active) {
                          // token_hash is masked ('') by list_active_for_principal already —
                          // never echo the raw secret on a plain GET.
                          creds.add(JObj()
@@ -5432,7 +5507,27 @@ void RestApiV1::register_routes(
             // rejects a >2-active shape it doesn't recognize). Reject BEFORE
             // create_token so a retry surfaces a clear, actionable 409 instead
             // of a second live credential.
-            if (!token_store->list_active_for_principal(principal_id).empty()) {
+            //
+            // The guard reads through the CHECKED twin: the plain accessor
+            // collapses a pool-lease timeout or query failure into an empty
+            // vector, which would read here as "no credential yet" and let a
+            // retry mint the second live secret this guard exists to prevent.
+            // A read that cannot answer fails closed (503), minting nothing.
+            auto active_before = token_store->list_active_for_principal_checked(principal_id);
+            if (!active_before) {
+                res.status = 503;
+                res.set_header("Retry-After", "2");
+                res.set_content(detail::a4_error(res,
+                                                 "could not confirm the principal has no "
+                                                 "active credential; retry",
+                                                 detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                                "application/json");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.mint", "failure",
+                    "EnginePrincipal", principal_id, active_before.error());
+                return;
+            }
+            if (!active_before->empty()) {
                 res.status = 409;
                 res.set_content(
                     detail::a4_error(res, "engine principal already has an active credential; "
@@ -5497,6 +5592,58 @@ void RestApiV1::register_routes(
                     "EnginePrincipal", principal_id, result.error());
                 return;
             }
+            // create_token returns only the raw secret; look up the freshly
+            // minted row (the newest active credential) for its token_id so a
+            // pure-REST caller can correlate the credential it just minted
+            // without a follow-up GET — mirrors the MCP mint_engine_credential
+            // twin's correlation logic (mcp_server.cpp).
+            //
+            // The read is the CHECKED twin, taken BEFORE the mint audit: the
+            // plain accessor collapses a lease timeout or query failure into
+            // an empty vector, which would deliver the secret with token_id ''.
+            // create_token above has already committed, so a failed read-back
+            // fails CLOSED: 503, secret withheld, audit 'partial' (a credential
+            // exists, so never 'failure'). Unlike rotate there is no grace-window
+            // re-serve for a mint and a second mint is a 409, so the recovery is
+            // to rotate the credential (no Retry-After: a retry of the mint cannot help).
+            std::string minted_token_id;
+            int64_t minted_created_at = -1;
+            auto active_after = token_store->list_active_for_principal_checked(principal_id);
+            if (active_after) {
+                for (const auto& t : *active_after) {
+                    if (t.created_at > minted_created_at) {
+                        minted_created_at = t.created_at;
+                        minted_token_id = t.token_id;
+                    }
+                }
+            }
+            // The read-back must both ANSWER and find the new row. An answered read with
+            // no active row (the credential, or the principal, revoked out of band between
+            // create_token and here) is the same class as a failed read: the secret would
+            // otherwise be delivered with token_id '' under a `success` row for a
+            // credential that is already dead. Same arm: 503, secret withheld, `partial`.
+            if (!active_after || minted_token_id.empty()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res, active_after
+                                 ? "the credential was minted but no active credential was found on "
+                                   "read-back; the secret was withheld. List the principal's "
+                                   "credentials; rotate if one is listed, do not retry the mint"
+                                 : "the credential was minted but could not be read back; the secret "
+                                   "was withheld. The credential exists but is unusable: rotate it "
+                                   "to obtain a secret, do not retry the mint"),
+                    "application/json");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.mint", "partial",
+                    "EnginePrincipal", principal_id,
+                    active_after
+                        ? std::string("credential minted but no active credential row was found on "
+                                      "read-back, secret withheld")
+                        : "credential minted but its secret could not be read back for delivery: " +
+                              active_after.error());
+                return;
+            }
             // #2466/#2406: fail closed — the credential was minted, but an
             // unrecorded mint must not return the one-time secret. On a dropped
             // audit the secret is discarded (never placed in the 503 body). The
@@ -5517,19 +5664,6 @@ void RestApiV1::register_routes(
                 return;
             }
             res.status = 201;
-            // create_token returns only the raw secret; look up the freshly
-            // minted row (the newest active credential) for its token_id so a
-            // pure-REST caller can correlate the credential it just minted
-            // without a follow-up GET — mirrors the MCP mint_engine_credential
-            // twin's correlation logic (mcp_server.cpp).
-            std::string minted_token_id;
-            int64_t minted_created_at = -1;
-            for (const auto& t : token_store->list_active_for_principal(principal_id)) {
-                if (t.created_at > minted_created_at) {
-                    minted_created_at = t.created_at;
-                    minted_token_id = t.token_id;
-                }
-            }
             // G5 (secret hygiene): the response body carries a raw one-time
             // credential — never let a browser cache, a shared/corporate
             // proxy, or a back-button history entry retain it.
@@ -5597,25 +5731,6 @@ void RestApiV1::register_routes(
                     "EnginePrincipal", principal_id, result.error());
                 return;
             }
-            // #2466/#2406: fail closed — the reveal IS this route's success audit
-            // (see the comment above the route registration), so a dropped
-            // reveal-audit would let the raw secret leave the server with no
-            // audit-chain row. Withhold it and 503. Within the overlap window a
-            // re-rotate re-serves the SAME successor (an audited re-serve, not a
-            // new credential) — that is the operator's recovery; once the window
-            // lapses the pair must be revoked instead (recovery detail in rest-api.md).
-            if (!detail::emit_behavioral_audit(audit_fn, req, res,
-                                               "engine_principal.credential.reveal", "success",
-                                               "EnginePrincipal", principal_id, "rotate")) {
-                res.status = 503;
-                res.set_content(
-                    detail::a4_error(res, "the credential was rotated but the reveal audit could "
-                                          "not be persisted; the secret was withheld. Rotate again "
-                                          "within the overlap window to re-serve the same audited "
-                                          "successor secret"),
-                    "application/json");
-                return;
-            }
             // rotate_engine_credential returns only the raw secret; look up
             // the successor for its token_id + expires_at/overlap_expires_at
             // — mirrors the MCP rotate_engine_credential twin's correlation
@@ -5626,10 +5741,43 @@ void RestApiV1::register_routes(
             // second-resolution, so a same-second mint→rotate ties and the
             // newest-scan could return the predecessor's id, which would
             // break the #2384 confirm token_id pin.
+            //
+            // The read is the CHECKED twin, taken BEFORE the reveal audit.
+            // rotate_engine_credential above has already committed, so a
+            // successor and its live secret exist; if this read cannot answer
+            // (the plain accessor would return empty and this route would hand
+            // out the secret with token_id '' that confirm can never pin), fail
+            // CLOSED exactly like the human rotate route: 503, secret withheld,
+            // audit 'partial' (never 'failure', since a credential does exist) and
+            // no reveal row, since no secret left the server. The secret is not
+            // lost: the store cached it for the grace window (kRotationGraceSecs,
+            // 120 s), so the same operator's retry inside it re-serves the same
+            // successor (that retry gets its own reveal audit and its own
+            // step-up). After the window a retry is a 409 and the pair is
+            // resolved by revoke, as for a dropped reveal audit.
             std::string successor_token_id;
             int64_t successor_expires_at = 0;
             int64_t successor_overlap_expires_at = 0;
-            for (const auto& t : token_store->list_active_for_principal(principal_id)) {
+            auto active_after = token_store->list_active_for_principal_checked(principal_id);
+            if (!active_after) {
+                res.status = 503;
+                res.set_header("Retry-After", "2");
+                res.set_content(
+                    detail::a4_error(res,
+                                     "rotation succeeded but the successor could not be "
+                                     "read back; the secret was withheld. Rotate again "
+                                     "within about two minutes to re-serve it",
+                                     detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                    "application/json");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.rotate", "partial",
+                    "EnginePrincipal", principal_id,
+                    "a successor exists (newly minted or re-served) but its secret could not be "
+                    "read back for delivery: " +
+                        active_after.error());
+                return;
+            }
+            for (const auto& t : *active_after) {
                 // At most one active row links (the store clears
                 // supersedes_token_id at cutover, revoke-resolution, and
                 // sweep), so first match is THE successor.
@@ -5639,6 +5787,52 @@ void RestApiV1::register_routes(
                     successor_overlap_expires_at = t.overlap_expires_at;
                     break;
                 }
+            }
+            // The read ANSWERED but no active credential links back to a
+            // predecessor: the successor was revoked, or the rotation confirmed,
+            // between the commit above and this read. The secret in `result`
+            // belongs to a credential that is no longer a pending successor, and
+            // handing it out with token_id '' gives confirm nothing to pin. Same
+            // posture as a failed read: 503, secret withheld, 'partial', no
+            // reveal row. NO retry hint: the pair is gone, so a retry would not
+            // re-serve anything, it would perform a NEW rotation the caller did
+            // not ask for. The remedy is to look first, then rotate if needed.
+            if (successor_token_id.empty()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res,
+                                     "rotation succeeded but no pending successor credential was "
+                                     "found; the secret was withheld. A successor may exist; "
+                                     "inspect the principal's credentials (GET "
+                                     "/api/v1/engine-principals/{id}), then rotate again if needed"),
+                    "application/json");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.rotate", "partial",
+                    "EnginePrincipal", principal_id,
+                    "rotation committed but no active credential links to a predecessor on "
+                    "read-back (revoked or confirmed out of band); secret withheld");
+                return;
+            }
+            // #2466/#2406: fail closed — the reveal IS this route's success audit
+            // (see the comment above the route registration), so a dropped
+            // reveal-audit would let the raw secret leave the server with no
+            // audit-chain row. Withhold it and 503. Within the GRACE window (about
+            // two minutes, same operator, same replica) a re-rotate re-serves the
+            // SAME successor (an audited re-serve, not a new credential) — that is
+            // the operator's recovery; once the window lapses, or on another replica
+            // or after a restart, the retry is a 409 and the successor must be
+            // revoked instead (recovery detail in rest-api.md).
+            if (!detail::emit_behavioral_audit(audit_fn, req, res,
+                                               "engine_principal.credential.reveal", "success",
+                                               "EnginePrincipal", principal_id, "rotate")) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "the credential was rotated but the reveal audit could "
+                                          "not be persisted; the secret was withheld. Rotate again "
+                                          "within about two minutes to re-serve the same audited "
+                                          "successor secret"),
+                    "application/json");
+                return;
             }
             // G5 (secret hygiene) — same no-store contract as the mint route.
             res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
@@ -5877,9 +6071,12 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(JObj().add("transferred", true).str()), "application/json");
         });
 
-    // GET /api/v1/engine-principals/audit/no-admin — auditor-runnable
-    // independent proof of design §4.2's "no admin, ever" / "no
-    // all-permissions toggle" invariants (decision log #13). Gated on
+    // GET /api/v1/engine-principals/audit/no-admin — the auditor-runnable
+    // CHECK of design §4.2's "no admin" rule (decision logs #13 and #15). It
+    // is the detective control for a wildcard custom role, which assignment
+    // permits (maintainer ruling 2026-10-23, #2485), and is point-in-time
+    // and pull-only; see engine_no_admin_audit.hpp for what ok:true means.
+    // Gated on
     // AuditLog:Read, NOT Security — this is a read-only evidentiary query,
     // not part of the write-path bar it verifies, so a read-only auditor
     // role can run it without holding engine-principal write access.
@@ -5909,7 +6106,6 @@ void RestApiV1::register_routes(
                                     "EnginePrincipal"))
                 return;
 
-            auto all_roles = rbac_store->list_roles();
             auto all_securables = rbac_store->list_securable_types();
             auto all_operations = rbac_store->list_operations();
             // G3: list_securable_types()/list_operations() read the
@@ -5918,74 +6114,57 @@ void RestApiV1::register_routes(
             // deployment NEVER legitimately has zero rows in either. Coming
             // back empty therefore means resolution failed (closed
             // connection, corrupt table, etc.), not "there happen to be no
-            // securables" — and a silently-zero `full_grant_size` would make
-            // the wildcard-grant check below vacuously pass every principal.
-            // Fail CLOSED: report this run as unable to verify rather than
-            // certifying `"ok":true` over data we could not actually read.
-            // (list_roles()/get_principal_roles()/get_effective_permissions()
-            // returning empty is not distinguishable from "legitimately no
-            // rows" with the store's current API — same residual noted on
-            // the MCP twin, audit_engine_no_admin, in mcp_server.cpp.)
+            // securables" — and an empty grid would make the wildcard check
+            // vacuously pass every principal. Fail CLOSED: report this run as
+            // unable to verify rather than certifying `"ok":true` over data
+            // we could not actually read.
             if (all_securables.empty() || all_operations.empty()) {
                 res.status = 503;
+                res.set_header("Retry-After", "2");
                 res.set_content(
-                    detail::a4_error(res, "rbac reference data unavailable — cannot verify"),
+                    detail::a4_error(res, "rbac reference data unavailable — cannot verify",
+                                     detail::A4ErrorOpts{.retry_after_ms = 2000}),
                     "application/json");
                 (void)detail::emit_behavioral_audit(
                     audit_fn, req, res, "engine_principal.audit.no_admin", "failure", "AuditLog",
                     "no-admin", "rbac_resolution_failed");
                 return;
             }
-            const std::size_t full_grant_size = all_securables.size() * all_operations.size();
 
-            auto principals = eps->list_all();
-            JArr violations;
-            for (const auto& p : principals) {
-                auto roles = rbac_store->get_principal_roles("engine", p.principal_id);
-                for (const auto& pr : roles) {
-                    if (pr.role_name == "admin" || pr.role_name == "Administrator") {
-                        violations.add(JObj()
-                                          .add("principal_id", p.principal_id)
-                                          .add("role", pr.role_name)
-                                          .add("reason", "admin_role"));
-                        continue;
-                    }
-                    auto it = std::find_if(all_roles.begin(), all_roles.end(),
-                                           [&](const RbacRole& r) { return r.name == pr.role_name; });
-                    if (it != all_roles.end() && it->is_system) {
-                        violations.add(JObj()
-                                          .add("principal_id", p.principal_id)
-                                          .add("role", pr.role_name)
-                                          .add("reason", "system_role"));
-                    }
-                }
-                // "No all-permissions toggle" residual (rbac_store.cpp's
-                // assign_role comment): a custom, non-system role that
-                // happens to be granted a FULL cross-product of every known
-                // securable x operation is functionally admin-equivalent
-                // even though neither the literal-name nor is_system checks
-                // above would catch it.
-                if (full_grant_size > 0) {
-                    auto effective = rbac_store->get_effective_permissions(p.principal_id);
-                    std::unordered_set<std::string> granted;
-                    for (const auto& perm : effective) {
-                        if (perm.effect == "allow")
-                            granted.insert(perm.securable_type + "\x1f" + perm.operation);
-                    }
-                    if (granted.size() >= full_grant_size) {
-                        violations.add(JObj()
-                                          .add("principal_id", p.principal_id)
-                                          .add("role", "")
-                                          .add("reason", "wildcard_grant"));
-                    }
-                }
+            // The grants, roles and role permissions are CHECKED reads
+            // (engine_no_admin_audit.hpp, shared with the MCP twin): a read
+            // that cannot be answered must never read as "no violations".
+            // This auditor is the only control over a wildcard custom role
+            // (maintainer ruling 2026-10-23, #2485), so it fails closed: 503,
+            // no partial list, no `success` audit row.
+            auto inputs = engine_no_admin_audit::read_inputs(*rbac_store);
+            if (!inputs) {
+                res.status = 503;
+                res.set_header("Retry-After", "2");
+                res.set_content(
+                    detail::a4_error(res, std::string(engine_no_admin_audit::kUnavailableMessage),
+                                     detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                    "application/json");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.audit.no_admin", "failure", "AuditLog",
+                    "no-admin", std::string(engine_no_admin_audit::kFailureAuditDetail));
+                return;
             }
 
-            const bool ok = violations.size() == 0;
+            const auto found = engine_no_admin_audit::evaluate(*inputs, all_securables, all_operations);
+            JArr violations;
+            for (const auto& v : found) {
+                violations.add(JObj()
+                                   .add("principal_id", v.principal_id)
+                                   .add("role", v.role)
+                                   .add("reason", v.reason));
+            }
+
+            const bool ok = found.empty();
             std::string data = JObj().add("ok", ok).raw("violations", violations.str()).str();
             (void)detail::emit_behavioral_audit(
                 audit_fn, req, res, "engine_principal.audit.no_admin", "success", "AuditLog",
-                "no-admin", "violations=" + std::to_string(violations.size()));
+                "no-admin", engine_no_admin_audit::audit_detail(found));
             res.set_content(ok_json(data), "application/json");
         });
 
@@ -15463,8 +15642,11 @@ void RestApiV1::register_routes(
         // the session up front means a single map lookup and avoids the
         // re-resolve race that the prior order opened up. (The
         // token/session handlers run perm_fn before auth_fn; both
-        // orderings are safe because step_up_fn always runs last, after
+        // orderings are safe because step_up_fn always runs after
         // auth_fn has populated `session` — PR #1199 review LOW.)
+        // The central step-up check (step_up_gate.hpp) evaluates the same
+        // decision before this handler runs; step_up_fn below repeats it
+        // from that verdict within the request.
         auto session = auth_fn(req, res);
         if (!session)
             return;
@@ -16262,9 +16444,9 @@ void RestApiV1::register_routes(
             if (step_up_fn &&
                 !step_up_fn(req, res, *session, "POST /api/v1/guaranteed-state/policy-generation/raise"))
                 return;
-            // A cookie session must name this site in Origin or Referer; it runs after the
-            // administrator gate and step-up so a caller who is not an administrator learns
-            // nothing, and before the body is read.
+            // A cookie session must name this site in Origin or Referer. The pre-routing
+            // gate decides that first; this copy is defence in depth. It stays after the
+            // administrator gate and step-up and before the body is read.
             if (refuse_cross_site_cookie_write(*session, req, res, audit_fn, trusted_origins,
                                                target_id))
                 return;

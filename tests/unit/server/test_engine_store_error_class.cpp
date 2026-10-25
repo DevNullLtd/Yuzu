@@ -42,6 +42,14 @@ TEST_CASE("classify_engine_store_error: transient / conflict / client classes",
     CHECK(classify_engine_store_error("no active credential to rotate — mint one first") ==
           E::Transient);
 
+    // The three strings `ApiTokenStore::list_active_for_principal_checked` can return
+    // (the mint guard and the rotate read-back on both transports): every one is a
+    // retryable read fault, never a client error. Locked so a future needle cannot
+    // silently reclassify them.
+    CHECK(classify_engine_store_error("token store is not open") == E::Transient);
+    CHECK(classify_engine_store_error("pool lease timed out") == E::Transient);
+    CHECK(classify_engine_store_error("query failed") == E::Transient);
+
     // Conflict (don't blindly retry). "rotation confirmation unavailable"
     // contains the broad "unavailable" substring — the ordering must classify
     // it as Conflict, NOT Transient (load-bearing).

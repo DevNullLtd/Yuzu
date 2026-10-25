@@ -18,6 +18,7 @@
                          // rather than re-declared, so the two error-prefix constants stay one copy.
 #include "ca_store.hpp"
 #include "command_capability.hpp" // #3685: CommandCapability / ClassificationError — ClassifyFn's return type
+#include "config_write.hpp" // config::Backing: get/set_runtime_config's backing pointers
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
 // ADR-0031 operator surface (PR1.6c) — MCP twins of the operator
 // mint/list/revoke upload-grant routes. Reuses UploadGrantListAuthorization/
@@ -79,8 +80,11 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <expected>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -252,7 +256,8 @@ public:
     /// fan-out reads (the remaining #1634 work; see rest_api_v1.hpp ResponseScopeFn).
     /// The handler resolves the principal ONCE (it already authed the request) and
     /// passes `username` in, so the predicate does NOT re-resolve the session per
-    /// call. RBAC-off → returns true (legacy-open, matching require_scoped_permission).
+    /// call. RBAC-off → returns true for a human (legacy-open, matching require_scoped_permission), but
+    /// false for an engine principal, whose only authority is an explicit RBAC grant (#6204).
     ///
     /// FAIL-OPEN-WHEN-UNWIRED, deliberately: the default `= {}` means an unset
     /// predicate applies NO filter. This diverges from DeviceRoutes' required
@@ -501,6 +506,11 @@ public:
     /// (`nullptr`, the default) ⇒ every one of those tools answers
     /// "unavailable" rather than crashing or silently no-op'ing.
     void set_plugin_config_store(PluginConfigStore* store) { plugin_config_store_ = store; }
+
+    /// Backs get_runtime_config / set_runtime_config, the MCP twins of GET/PUT /api/v1/config
+    /// (api-parity rows get.api-config, put.api-config-param). Same objects the config routes
+    /// hold. Unset (all nullptr, the default) => both tools answer "unavailable".
+    void set_runtime_config_backing(config::Backing backing) { runtime_config_ = backing; }
 
     /// ADR-0031 operator surface (PR1.6c) — upload-grant store + the
     /// ADR-0017 list-admit resolver for list_upload_grants, backing
@@ -1227,6 +1237,13 @@ public:
                          // (kept last across the device_api merge).
                          AppUsageStore* app_usage_store = nullptr);
 
+    /// Test hook: push the cached `get_security_posture` payload's `generated_at`
+    /// backward by `elapsed`, so a test crosses the `ttl_seconds` cache window
+    /// without sleeping. A no-op while the cache is empty (nothing cached yet).
+    /// Production code MUST NOT call this — no caller in `server/core/src/**`
+    /// references it.
+    void age_posture_cache_for_test(std::chrono::milliseconds elapsed);
+
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──
     // COEXISTENCE (4.2→4.3 rebase): the 4.2 role-assignment handlers use the
@@ -1245,6 +1262,29 @@ private:
     // pre-dispatch dry run in mcp_server.cpp fails closed rather than
     // silently reverting to the pre-#3687 collapsed-envelope behaviour.
     AuthorizeDispatchFn authorize_dispatch_fn_;
+    // Posture cache shared across httplib worker threads (the POST handler lambda
+    // is captured by value, so every worker shares this one object). Reads and
+    // writes of the string fields MUST be serialised — an unsynchronised
+    // std::string read/write across threads is UB (G-S1, #1653 review). The
+    // cached `body` is the full posture payload MINUS the `data_age_seconds`
+    // field; that field is volatile (depends on read time) so it is injected
+    // per-request from the freshly computed age — never baked into the cache
+    // (G-S4: cache hits previously misreported freshness as 0).
+    //
+    // A member, not a build_handler local, so age_posture_cache_for_test can reach
+    // it. The scope widens from "per handler" to "per McpServer", which is benign:
+    // build_handler's one production call site is register_routes' single
+    // registration of its result on the /mcp/v1/ route (written without the call's
+    // quoted path: the header scan in test_step_up_route_inventory.cpp reads comments
+    // as code), so production still has exactly one cache per route (a test that calls
+    // build_handler again on the same McpServer shares this cache). build_handler
+    // copies the shared_ptr into the handler lambda.
+    struct PostureCache {
+        std::mutex mtx;
+        std::chrono::steady_clock::time_point generated_at{};
+        std::string body; // payload JSON object string, WITHOUT data_age_seconds
+    };
+    std::shared_ptr<PostureCache> posture_cache_ = std::make_shared<PostureCache>();
     // Progress bridge core (2f PR 3a) - see set_stream_bridge above.
     McpStreamBridge* stream_bridge_{nullptr};
     // KEK rotation seam (#2395 track C) - see set_kek_ops above. Default-
@@ -1255,6 +1295,7 @@ private:
     // use and answers a clean "unavailable" error, matching
     // engine_principal_store_'s contract above.
     PluginConfigStore* plugin_config_store_{nullptr};
+    config::Backing runtime_config_{};
     UploadGrantStore* upload_grant_store_{nullptr};
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.

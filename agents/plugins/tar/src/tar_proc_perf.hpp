@@ -51,8 +51,7 @@
  * redaction patterns are additionally applied to the name, so a process an
  * operator redacted from the event trail never appears here either. The
  * whole source sits behind its own `procperf_enabled` toggle
- * (works-council: per-app visibility can be disabled while device-level
- * sampling stays on).
+ * (per-app visibility can be disabled while device-level sampling stays on).
  *
  * The derivation + top-N selection is PURE (derive_proc_samples), as is the
  * shared version normalization (yuzu::util::format_file_version /

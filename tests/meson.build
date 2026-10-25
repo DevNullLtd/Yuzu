@@ -118,6 +118,9 @@ elif host_machine.system() == 'windows'
   agent_test_native_deps += cxx.find_library('oleaut32')
   # test_msi_packages_actions.cpp's live per-user cross-check calls MsiEnumProductsExW directly.
   agent_test_native_deps += cxx.find_library('msi')
+  # test_app_usage_local_dispatcher.cpp's foreign-owner case calls SetNamedSecurityInfoW and
+  # AdjustTokenPrivileges directly, as tar_test_deps' Windows block does for its DACL cases.
+  agent_test_native_deps += cxx.find_library('advapi32')
 endif
 
 # ── Test fixture: FROZEN ABI3-layout plugin (PLAN-03 — real backward-compat) ──
@@ -407,6 +410,7 @@ agent_test_exe = executable(
     'unit/test_registry_local_dispatcher.cpp', # PR1.7 remediation fix #3: real registry.dll driven
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
+    'unit/test_agent_command_frames.cpp',     # agents/core/src/command_frames.hpp -- the CommandResponse.action stamp on output + final frames (pure, every host)
     'unit/test_wmi_local_dispatcher.cpp',      # gate-1 remediation: real wmi.dll's query/get_instance
                                                 # actions driven end to end via LocalDispatcher, same
                                                 # pattern as test_registry_local_dispatcher.cpp above
@@ -892,7 +896,7 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
     # the agent suite appends that filter here too, where it never matches —
     # see the cert_store_fallback_test_exe comment below for the full
     # rationale.
-    args: ['--allow-running-no-tests'],
+    args: ['--allow-running-no-tests', '--durations=yes'],
     suite: 'agent',
     timeout: 60,
   )
@@ -923,7 +927,7 @@ if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
   test(
     'plugin ABI containment under allocation failure',
     plugin_abi_oom_exe,
-    args: ['--allow-running-no-tests'],
+    args: ['--allow-running-no-tests', '--durations=yes'],
     suite: 'agent',
     timeout: 30,
   )
@@ -1080,7 +1084,7 @@ foreach shard, spec : agent_shard_specs
   test(
     'agent unit tests shard ' + shard,
     agent_test_exe,
-    args: [spec, '--allow-running-no-tests'],
+    args: [spec, '--allow-running-no-tests', '--durations=yes'],
     suite: ['agent', 'agent-shard'],
     # 240s per shard, unchanged from the old single entry; treat it as conservative
     # headroom, not a measured need. Uncontended Windows is ~75s (a case-sum
@@ -1205,7 +1209,7 @@ if host_machine.system() == 'darwin'
   # what the caller actually meant: "run autoruns's tests", not "fail
   # anything that isn't autoruns's tests".
   test('cert_store macOS honest-unsupported', cert_store_fallback_test_exe,
-       args: ['--allow-running-no-tests'], suite: 'agent', timeout: 30)
+       args: ['--allow-running-no-tests', '--durations=yes'], suite: 'agent', timeout: 30)
 endif
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
@@ -1217,7 +1221,11 @@ if host_machine.system() == 'windows'
   tar_test_deps += cxx.find_library('iphlpapi')
   tar_test_deps += cxx.find_library('tdh') # tar_proc_etw.cpp / tar_module_etw.cpp ETW decode
   tar_test_deps += cxx.find_library('wintrust') # tar_module_etw.cpp WinVerifyTrust
-  tar_test_deps += cxx.find_library('crypt32')  # tar_module_etw.cpp CryptQueryObject
+  tar_test_deps += cxx.find_library('crypt32')  # tar_module_etw.cpp CertGetNameStringW (signer from the WinVerifyTrust chain)
+  # advapi32, declared deliberately: tar_db.cpp's owner-only DACL
+  # (ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo, GetSecurityInfo) and
+  # the test_tar_store.cpp DACL readback/owner calls.
+  tar_test_deps += cxx.find_library('advapi32')
   tar_test_deps += cxx.find_library('version')  # tar_proc_perf.cpp GetFileVersionInfoW
   tar_test_deps += cxx.find_library('wevtapi')  # tar_netconn_win.cpp EvtQuery/EvtRender
   tar_test_deps += cxx.find_library('ws2_32')   # winsock2 symbols the iphlpapi/netioapi headers in tar_netqual_boot.cpp pull in
@@ -1336,7 +1344,7 @@ tar_test_exe = executable(
   link_args: host_machine.system() == 'darwin' ? apple_objcpp_link_args : [],
   dependencies: tar_test_deps,
 )
-test('tar unit tests', tar_test_exe, suite: 'tar', timeout: 90)
+test('tar unit tests', tar_test_exe, args: ['--durations=yes'], suite: 'tar', timeout: 90)
 
 # ── Server unit tests ─────────────────────────────────────────────────────────
 if build_server
@@ -1359,6 +1367,13 @@ if build_server
       'unit/server/test_settings_routes_mfa.cpp',
       'unit/server/test_totp.cpp',
       'unit/server/test_mfa_step_up.cpp',
+      'unit/server/test_step_up_policy.cpp', # MFA step-up policy table self-checks (pure, no PG)
+      'unit/server/test_mcp_step_up_policy.cpp', # MCP step-up policy table vs the real MCP tool catalogue (L2; pure, no PG)
+      'unit/server/test_step_up_route_inventory.cpp', # step-up policy table vs the registered routes: L1 compiled TestRouteSink registrations, L3 lexical source scan (no PG)
+      'unit/server/test_route_inventory.cpp', # HttplibRouteSink records registrations in RouteInventory (bare httplib::Server, no listen)
+      'unit/server/test_step_up_wiring.cpp', # step-up chokepoint wired into the pre-request handler, over a real httplib::Server (no PG)
+      'unit/server/test_step_up_null_store.cpp', # the two unwired-auth-store 503 sites (server.cpp step_up_fn, auth_routes elevation_step_up); [stepup][null_store] pure + [pg] route cases
+      'unit/server/test_step_up_gate.cpp',   # step-up decide/render split + request chokepoint; [stepup][gate] pure, [pg][mfa][stepup] equivalence matrix
       'unit/server/test_mfa_qr.cpp',
       'unit/server/test_mfa_store.cpp',
       'unit/server/test_auth_lockout.cpp',
@@ -1449,6 +1464,7 @@ if build_server
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
+      'unit/server/test_config_write.cpp', # config_write.hpp: the transport-free core shared by the config routes and the MCP runtime-config tools
       'unit/server/test_config_routes.cpp', # #2542 PR-12: the 2-route Runtime Configuration API (7.3), extracted onto the HttpRouteSink seam
       'unit/server/test_legacy_diagnostic_routes.cpp', # #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API (diagnostics_routes.cpp), extracted onto the HttpRouteSink seam -- named away from test_diagnostics_*/test_chargen_*/test_procfetch_* to avoid a plugin_doc_gen.py filename collision with the agent plugins of those names
       'unit/server/test_legacy_events_routes.cpp', # #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
@@ -1539,6 +1555,7 @@ if build_server
       'unit/server/test_mcp_engine_principal_roles.cpp',
       'unit/server/test_engine_principal_lifecycle.cpp',
       'unit/server/test_engine_store_error_class.cpp',
+      'unit/server/test_engine_no_admin_audit.cpp',
       'unit/server/test_rotation_confirm_state.cpp',
       'unit/server/test_access_review_model.cpp',
       'unit/server/test_access_review_store.cpp',
@@ -1550,6 +1567,7 @@ if build_server
       'unit/server/test_capability_catalogue.cpp',
       'unit/server/test_operator_surface_twins.cpp',
       'unit/server/test_api_parity_ledger_catalogue.cpp', # every API-parity ledger mcp_twin claim vs the compiled kTools[]/kResources[]
+      'unit/server/test_twin_completeness.cpp', # every registry MCP tool is a ledger mcp_twin and has a kExpectedTwins row (shrink-only backfill sets)
       'unit/server/test_schedule_params.cpp',
       'unit/server/test_plugin_config_parsers.cpp',
       'unit/server/test_enablement_resolver.cpp',
@@ -1620,6 +1638,8 @@ if build_server
       'unit/server/test_inventory_ci_join.cpp',
       'unit/server/test_software_catalog_rollup.cpp',
       'unit/server/test_tar_process_tree.cpp',
+      'unit/server/test_tar_timeline_render.cpp', # TAR timeline: pure renderer, goldens, CSS pin
+      'unit/server/test_tar_timeline_page.cpp', # TAR timeline page: shell pins, flag default, escaping, script pins
       'unit/server/test_tar_tree_routes.cpp',
       'unit/server/test_dex_perf_model.cpp',
       # #1845 registry tripwire: pins detail::dex_perf_os_collects to the tar plugin's
@@ -1705,6 +1725,7 @@ if build_server
       'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
       'unit/server/test_rest_rbac_role_reads.cpp', # PR-0b: GET /rbac/roles + /rbac/roles/{role}/permissions fail closed (503) and 404 an unknown role
       'unit/server/test_rest_management_group_detail_degrade.cpp', # #1762 governance round-1: GET /management-groups/{id} fails closed on a degraded member read
+      'unit/server/test_engine_aware_visibility.cpp', # #6204: the engine rule in the username-keyed visibility/dispatch resolvers, against real stores
       'unit/server/test_authz_model.cpp', # PR1.4: registry-independent authz model + #1788 per-device visibility (all four arms)
       'unit/server/test_authz_gates.cpp', # service-scope-confinement PR2: require_fleet_read / confine_agent_target
       'unit/server/test_fleet_read_ceiling_routes_authz.cpp', # #3526: ITServiceOwner ceiling through real fleet-read routes (Execution x3, Enrollment, a four-securable table, and the Policy and Workflow sites)
@@ -1713,6 +1734,10 @@ if build_server
       'unit/server/test_authz_topology_floor.cpp', # #2376: the RBAC-off legacy-fallback topology floor (AccessReview/UserManagement/EnginePrincipal Read)
       'unit/server/test_body_cap_policy.cpp', # #2407: pre-auth request-body cap policy table (method+segment-boundary path -> cap/requires_measurable/metric label)
       'unit/server/test_body_cap_route_inventory.cpp', # #2407: architect-mandated route-inventory coverage — every ACTUALLY REGISTERED POST/PUT/PATCH route resolves to a deliberate class, mechanically scanned from server/core/src at test run time
+      'unit/server/test_same_site_write_policy.cpp', # cookie-session writes require a same-site Origin or Referer: pure decision truth table and gate exception-path contract
+      'unit/server/test_same_site_write_gate.cpp', # same-site gate behaviour through the real pre-routing pipeline
+      'unit/server/test_same_site_write_gate_pg.cpp', # same-site gate over the real session resolver (Postgres-gated)
+      'unit/server/test_same_site_exempt_inventory.cpp', # same-site gate exemption inventory, scanned from server/core/src at test run time
       'unit/server/test_mcp_dispatch_coverage.cpp', # Seam PR1: every served MCP tool has a handler; no orphan or dead tool_name branch in mcp_server.cpp (scanned from server/core/src at run time)
       'unit/server/test_mcp_tools_containment.cpp', # Seam PR2: list_quarantined_devices registry tool (gate, scope, degrade, audit, byte identity with the REST body)
       'unit/server/test_store_wiring_order.cpp', # #3261: every agent_service_/gateway_service_ store setter runs after its member's construction, mechanically scanned from server.cpp at test run time
@@ -1721,6 +1746,8 @@ if build_server
       'unit/server/test_store_worker_pool.cpp', # #3261: StoreWorkerPool submit/quiesce/backpressure/exception-firewall, no HTTP (avoids the unrelated TSan/glibc crash #2504)
       'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
       'unit/server/test_dispatch_destructive_gate.cpp', # #3685: Destructive targeting gate — pure verdict + confinement + refusal-string pins
+      'unit/server/test_plugin_result_audit.cpp', # registry.write audit extraction from mutating-action output frames (pure) + live ingest on both frame paths
+      'unit/server/test_rundown_gate.cpp', # the shutdown rundown behind the registry.write hook (pure): enter/close/drain, the wake-up, a latch race against one close
       'unit/server/test_printing_clear_queue_gate.cpp', # Wave 9 PR9.1b: printing.clear_queue against the same Destructive targeting gate + AdminOrApproval chokepoint
       'unit/server/test_dashboard_destructive_gate.cpp', # PR6.0b: the same gate wired into POST /api/dashboard/execute
       'unit/server/test_default_certs.cpp',
@@ -1958,7 +1985,7 @@ if build_server
                (meson.project_source_root() / 'tests' / 'unit' / 'server' / 'golden').replace(
                    '\\', '/') +
                '"',
-               # test_api_parity_ledger_catalogue.cpp reads the committed API-parity
+               # test_api_parity_ledger_catalogue.cpp and test_twin_completeness.cpp read the committed API-parity
                # ledger (scripts/ci/api-parity/*.json) at run time; same
                # backslash-normalisation requirement as YUZU_SERVER_SRC_DIR above.
                '-DYUZU_API_PARITY_LEDGER_DIR="' +
@@ -2149,11 +2176,41 @@ if build_server
   # [mcp], and must not be double-claimed — verified empirically, not shard
   # C, which claims none) — verified 20 + 1949 = 1969, exact partition of
   # B's pre-carve population AT THE TIME OF THIS CARVE.
+  # 2026-10-22 (#4882, #2600; test hot spots): non-pg shards re-cut from MEASURED
+  # per-case time, braga (macOS debug, --durations yes, one shard at a time).
+  # Before: A 27.1 s, B 77.5 s, C 4.8 s, D 39.5 s. Shard D was 34 s of regular-
+  # expression passes over every server source file (the route inventory's two
+  # memoised passes, 24.2 s + 10.1 s); #4882 replaced them with linear finds
+  # (tests/unit/server/route_registration_scan.hpp, source_scan.hpp), so D is
+  # now 5.6 s and no longer a floor. B's four heaviest independent tags move to C
+  # as `~[pg]~[auth]~[mcp][tag]` clauses and B and D gain the matching `~[tag]`
+  # suffix: [oidc] 12.1 s, [retention] 8.0 s, [readyz] 5.6 s, [tls] 5.2 s.
+  # After: A 14.3 s (filter untouched: the 27 s above included about 12 s of the idle, elevation
+  # and posture sleeps that the seams removed), B 38.4 s,
+  # C 37.9 s, D 5.6 s. --list-tests counts on one binary, before -> after this
+  # filter edit: B 4783 -> 4493, C 1139 -> 1429 (+290 = the four tags), D 24, A
+  # 786; the non-pg total (6732) is unchanged, no case lost or duplicated.
+  # D's priority drops 48 -> 10 (now the lightest; A 20, C 45, B 50 stay distinct).
+  # 2026-10-23 (dev merge): dev's step-up route-inventory test brought one case that still ran
+  # two std::regex passes over the source tree ('kRequired labels equal the in-handler
+  # step_up_fn labels', test_step_up_route_inventory.cpp): 19.7 s of D's 25.2 s on braga (macOS
+  # debug, --durations=yes, one process). It now uses find_step_up_calls
+  # (route_registration_scan.hpp, a literal find): 0.08 s. All four non-pg shards run together
+  # (macOS debug, one run): A 17.1 s, D 7.9 s, C 38.2 s, B 46.7 s.
+  # Windows MSVC debug (kingsley, 2026-10-22, one process per shard run back to
+  # back, one sample): A 67.0 s, B 142.2 s, C 91.1 s, D 0.55 s; the four moved tags
+  # alone: [oidc] 61.5 s, [retention] 8.2 s, [readyz] 4.5 s, [tls] 5.9 s (so
+  # [oidc] is 5x its macOS cost and is most of C). D was 124-131 s on the Windows
+  # build host before the scan change (#4882; a different harness, so not a
+  # like-for-like delta). B is still the
+  # non-pg floor. A candidate that also moves [rest] from B to C measured B 121.2 s,
+  # C 110.5 s (max -15%); it is under the 25% bar (a re-cut must cut the longest shard by more than a
+  # quarter to be worth its churn), so the tag set stays.
   test('server unit tests shard A', server_test_exe,
-       args: ['~[pg][auth],~[pg][mcp]'], suite: ['server', 'server-nonpg'], timeout: 600,
+       args: ['~[pg][auth],~[pg][mcp]', '--durations=yes'], suite: ['server', 'server-nonpg'], timeout: 600,
        priority: 20)
   test('server unit tests shard B', server_test_exe,
-       args: ['~[pg]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]~[body_cap]'],
+       args: ['~[pg]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]~[body_cap]~[oidc]~[retention]~[readyz]~[tls]', '--durations=yes'],
        suite: ['server', 'server-nonpg'], timeout: 600, priority: 50)
   # server unit tests shard C — carved from shard B 2026-08-28 (Windows CI
   # test-phase restructuring, #3443): six tags whose combined case count
@@ -2165,7 +2222,7 @@ if build_server
   # (docs/ci-architecture.md "PG coverage by platform") rebalances by
   # measured wall time, never by case count alone.
   test('server unit tests shard C', server_test_exe,
-       args: ['~[pg]~[auth]~[mcp][cel],~[pg]~[auth]~[mcp][viz],~[pg]~[auth]~[mcp][scope],~[pg]~[auth]~[mcp][dispatch],~[pg]~[auth]~[mcp][nvd],~[pg]~[auth]~[mcp][dex]'],
+       args: ['~[pg]~[auth]~[mcp][cel],~[pg]~[auth]~[mcp][viz],~[pg]~[auth]~[mcp][scope],~[pg]~[auth]~[mcp][dispatch],~[pg]~[auth]~[mcp][nvd],~[pg]~[auth]~[mcp][dex],~[pg]~[auth]~[mcp][oidc],~[pg]~[auth]~[mcp][retention],~[pg]~[auth]~[mcp][readyz],~[pg]~[auth]~[mcp][tls]', '--durations=yes'],
        suite: ['server', 'server-nonpg'], timeout: 600, priority: 45)
   # server unit tests shard D — carved from shard B (staged Windows
   # measurement follow-up, see the PR #3677 comment thread): [body_cap]
@@ -2189,6 +2246,7 @@ if build_server
   # CARVE.
   # A DSN-less run needs no --allow-running-no-tests: none of these are
   # [pg]-tagged (confirmed: '[pg][body_cap]' matches zero cases).
+  # (Superseded 2026-10-22: D's priority is now 10, see the re-cut note above shard A.)
   # Priority 48 (between C's 45 and B's 50): even after this carve, B's
   # REMAINING population still measures larger than D (23.02s vs 16.58s,
   # both drawn from the same 39.60s baseline) — D isn't the new floor, B
@@ -2196,9 +2254,15 @@ if build_server
   # any time measurement (case-count only, its own comment says so), and D's
   # 16.58s isn't on the same measured baseline as C's unmeasured population,
   # so this ordering is a reasonable placement, not a claimed comparison.
+  # Shard D also holds six step-up route-inventory cases (test_step_up_route_inventory.cpp) that
+  # carry [body_cap] only as a PLACEMENT tag: each walks the whole route-source tree (cached per
+  # process; a pattern pass of ~10 s on Linux before #4882, a linear scan now, see the 2026-10-23 note
+  # above), which kept them out of the heavier shard B. Tagging them
+  # [body_cap] moves them with no change to either filter, so flake-retry.py's verbatim non-pg
+  # spec pin and this partition are untouched; the file's header comment names them.
   test('server unit tests shard D', server_test_exe,
-       args: ['[body_cap]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]'],
-       suite: ['server', 'server-nonpg'], timeout: 600, priority: 48)
+       args: ['[body_cap]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]~[oidc]~[retention]~[readyz]~[tls]', '--durations=yes'],
+       suite: ['server', 'server-nonpg'], timeout: 600, priority: 10)
   # [audit_store] is in shard A's OR-list because ADR-0040 moved that whole file
   # onto PG in one change: without it, every one of its cases lands in B, which
   # is the heavier half already. MEASURED on Linux at that change's head, same
@@ -2354,12 +2418,12 @@ if build_server
   # F 234s, G 200s, D 194s, O 194s, L 170s, N 168s, H 165s, M 148s, I 136s,
   # J 133s, K 115s, B 113s; P 100s in the final run). Merged priorities
   # (all distinct): A 260, F 250, I 245, E 240, D 230, G 220, O 210, H 200,
-  # L 190, M 185, N 180, C 170, K 160, B 120; the old values 150 (J), 140 (I),
-  # 130 (P) and 110 (M) are gone. Sparse scale, above the non-pg shards'
+  # L 190, B 186, M 185, N 180, C 170, K 160; the old values 150 (J), 140 (I),
+  # 130 (P) and 110 (M) are gone (B moved from 120 to 186 on 2026-10-22, see below). Sparse scale, above the non-pg shards'
   # 20-50. Re-rank from fresh measurements of the merged layout when a shard
   # is rebalanced; priority only orders starts, it moves no case.
   test('server pg unit tests shard A', server_test_exe,
-       args: ['[pg][routes]~[scim]~[dex]~[mfa],[pg][store],[pg][token]~[rotation]'],
+       args: ['[pg][routes]~[scim]~[dex]~[mfa],[pg][store],[pg][token]~[rotation]', '--durations=yes'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 260)
   # H's four clauses each add `~[store]` (fable review, structural hardening):
   # A's own `[pg][store]` clause carries NO exclusions, so any [pg][store]
@@ -2383,7 +2447,7 @@ if build_server
   # tag to any surviving store file.
   test('server pg unit tests shard H', server_test_exe,
        args: ['[pg][routes][scim]~[store],[pg][routes][dex]~[store],[pg][routes][mfa]~[store],[pg][token][rotation]~[store]',
-              '--allow-running-no-tests'],
+              '--allow-running-no-tests', '--durations=yes'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 200)
   # shard B SPLIT into B+D on 2026-08-16 (#2092/#2093): the store-tag half had
   # reached 600/600s (100%) and flaked. BALANCED BY TIME, NOT COUNT — case count
@@ -2417,9 +2481,33 @@ if build_server
   # 31.5s on the same container — D is by far the lighter destination, so
   # [software_deployment] joins D, not B. Also added to shard C's exclusion
   # list per the same instruction (both or neither).
+  # 2026-10-22 (#2600; test hot spots): shard M's `[pg][readyz]` clause moved onto
+  # shard B VERBATIM, every exclusion kept. Measured on braga (macOS debug, one
+  # shard at a time): M 208 s and B 109 s. M's readyz clause alone is about 65 s
+  # (PgReachabilityProbe connect-deadline cases) and about 42 s of B was real sleeping
+  # in [rbac_store] cases, which RbacStore::age_refresh_state_for_test (and the
+  # other *_for_test deadline seams, see the test files) replaced. After: B 135.0 s,
+  # M 119.8 s (A 82.5 s, H 116.6 s, K 32.9 s, N 97.8 s, whose filters are untouched). --list-tests:
+  # B 131 -> 149, M 420 -> 402 (the 18 readyz cases); the [pg] total (5792) is
+  # unchanged, zero duplicates. No new entry (maintainer cap: 14 pg shards). B does
+  # not gain --allow-running-no-tests (it carries non-DSN cases, the reason A/B/C
+  # survive an all-skip); M keeps its own. This departs from the docs'
+  # pairing rule on purpose, see docs/ci-architecture.md (2026-10-22). Priority B
+  # 120 -> 186 (above M's 185; all 14 stay distinct).
+  # Windows MSVC (kingsley, 2026-10-22, one process per shard, one sample): B
+  # 120.7 s, M 386.1 s. The pre-move shards were not re-run in that harness, so
+  # the stated test (B and M within 25% of each other, both under the pre-move
+  # Windows maximum, M 239 s in CI) cannot be passed or failed from this data:
+  # B and M are 3.2x apart and 386 s is a serial wall on a different box than
+  # the CI figure. A candidate that moves the [pg][auth_db] clause from M to B
+  # measured B 205.4 s, M 319.0 s (max -17%, under the 25% bar), so the layout
+  # stays. Priority only orders starts: nine pg shards outrank both B and M, which
+  # start 10th and 11th at width 6, so whether M is the last finisher on Windows is
+  # unmeasured; the per-case durations that PR #6324 added to the job summary are
+  # what to re-cut from next.
   test('server pg unit tests shard B', server_test_exe,
-       args: ['[pg][rbac_store]~[routes]~[store]~[token]'],
-       suite: ['server', 'server-pg'], timeout: 700, priority: 120)
+       args: ['[pg][rbac_store]~[routes]~[store]~[token],[pg][readyz]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]', '--durations=yes'],
+       suite: ['server', 'server-pg'], timeout: 700, priority: 186)
   # --allow-running-no-tests: shard D's tags are ALL DSN-gated store
   # behaviour tests, so on a DSN-less platform (macOS, ADR-0035) every case
   # SKIPs and Catch2 exits 4 on an all-skipped run — reddening the leg (#2092,
@@ -2435,7 +2523,7 @@ if build_server
   # see scripts/ci/flake-retry.py's _cmd_for_case_retry).
   test('server pg unit tests shard D', server_test_exe,
        args: ['[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][software_deployment]~[routes]~[store]~[token]',
-              '--allow-running-no-tests'],
+              '--allow-running-no-tests', '--durations=yes'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 230)
   # 2026-08-17 (PR #3174 CI, run 32004956605): shard C STILL TIMEOUT-ed at
   # 600.07/600s on the real contended Big Tam pool after the [software_deployment]
@@ -2574,7 +2662,7 @@ if build_server
   # "revisit later" with no dated/metric trigger has this file's own track
   # record of being forgotten until the next stale-pin incident forces it.
   test('server pg unit tests shard E', server_test_exe,
-       args: ['[pg][scim]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][guaranteed_state]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][oidc]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][software_inventory]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]'],
+       args: ['[pg][scim]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][guaranteed_state]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][oidc]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp],[pg][software_inventory]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]', '--durations=yes'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 240)
   # 2026-08-26 (#3626): shard I's one non-DSN survivor noted above --
   # NotificationStore's "migrate_from_sqlite returns false on an unopened
@@ -2601,7 +2689,7 @@ if build_server
   # the priorities comment above shard A. Shard J no longer exists as an entry.
   test('server pg unit tests shard I', server_test_exe,
        args: ['[pg][engine_principal]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory],[pg][rbac]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory],[pg][custom_props]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory],[pg][quarantine]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory],[pg][management_group]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory],[pg][notification_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[guaranteed_state]~[oidc]~[software_inventory],[pg][saml]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar],[pg][result_set]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar],[pg][audit]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar],[pg][access_review]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar],[pg][secrets]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar],[pg][discovery]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar]',
-              '--allow-running-no-tests'],
+              '--allow-running-no-tests', '--durations=yes'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 245)
   # G DEFERS TO E's original ten tags (unchanged from the 2026-08-19 split);
   # J additionally DEFERS TO G — see the shard-E comment block above for the
@@ -2609,7 +2697,7 @@ if build_server
   # four of E/I/G/J (J's clauses now live inside shard I's merged entry above).
   test('server pg unit tests shard G', server_test_exe,
        args: ['[pg][auth_routes]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][agent_service]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][authz]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine],[pg][tar]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]',
-              '--allow-running-no-tests'],
+              '--allow-running-no-tests', '--durations=yes'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 220)
   # WS-A4 PR-1 Gate 7 fix round build-ci review (ci-2, 2026-09-28): shard F
   # (dex+mcp) landed at 620/700s (89%) on the Windows MSVC debug leg (run
@@ -2646,7 +2734,7 @@ if build_server
   # state, kept as history.
   test('server pg unit tests shard F', server_test_exe,
        args: ['[pg][mcp]~[dex]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[golden]~[catalogue]',
-              '--allow-running-no-tests'],
+              '--allow-running-no-tests', '--durations=yes'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 250)
   # server pg unit tests shard K — carved from shard C 2026-08-28 (Windows CI
   # test-phase restructuring, #3443): ten named store tags, none claimed by
@@ -2661,7 +2749,7 @@ if build_server
   # re-verified against what actually shipped; the real binary has always
   # partitioned 640 = 320 + 320 for the filters below.)
   test('server pg unit tests shard K', server_test_exe,
-       args: ['[pg][policy_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][instruction_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][ca_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][device_token]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][tag_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][bundle]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][pki]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][offload_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][webhook_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][baseline_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]'],
+       args: ['[pg][policy_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][instruction_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][ca_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][device_token]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][tag_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][bundle]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][pki]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][offload_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][webhook_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][baseline_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]', '--durations=yes'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 160)
   # server pg unit tests shard L — carved from shard C 2026-08-30 (ADR-0065
   # instruction-cluster migration, PR 5): seven tags newly heavy after
@@ -2714,7 +2802,7 @@ if build_server
   # A 692, C 454, L 419, [pg] total 5682 unchanged by the edit. C -12 = the 7 new
   # + the 5 moved [secret] cases; L +12; A set-identical.
   test('server pg unit tests shard L', server_test_exe,
-       args: ['[pg][approval_manager]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][execution_tracker]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][execution_statistics]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][schedule_engine]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][schedule]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][events]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][rest_api_t2]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][golden]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][catalogue]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][password]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][runtime_config]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]'],
+       args: ['[pg][approval_manager]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][execution_tracker]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][execution_statistics]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][schedule_engine]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][schedule]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][events]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][rest_api_t2]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][golden]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][catalogue]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][password]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][runtime_config]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]', '--durations=yes'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 190)
   # 2026-10-11 (Windows pg-shard timeout pressure): shards M and N carved from
   # shard C, shard O carved from shard F. The weecolin Windows runner's old
@@ -2781,16 +2869,16 @@ if build_server
   # proof and the estimates are in the priorities comment above shard A. Shard
   # P no longer exists as an entry.
   test('server pg unit tests shard M', server_test_exe,
-       args: ['[pg][readyz]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password],[pg][auth_db]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password],[pg][analytics_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password],[pg][directory_sync]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password],[pg][rest]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][auth]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][dashboard]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][adversarial]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][authz_model]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][app_perf]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine]',
-              '--allow-running-no-tests'],
+       args: ['[pg][auth_db]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password],[pg][analytics_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password],[pg][directory_sync]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password],[pg][rest]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][auth]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][dashboard]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][adversarial]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][authz_model]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][app_perf]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine]',
+              '--allow-running-no-tests', '--durations=yes'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 185)
   test('server pg unit tests shard N', server_test_exe,
        args: ['[pg][v1]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync],[pg][policy]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync],[pg][product_pack_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync],[pg][rbac_admin_predicate]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync],[pg][cold_cache]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync],[pg][ha]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync],[pg][gateway_route_wiring]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync],[pg][workflow_engine]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]',
-              '--allow-running-no-tests'],
+              '--allow-running-no-tests', '--durations=yes'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 180)
   test('server pg unit tests shard O', server_test_exe,
        args: ['[pg][dex]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[golden]~[catalogue]',
-              '--allow-running-no-tests'],
+              '--allow-running-no-tests', '--durations=yes'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 210)
   # HISTORY: shard P was carved from C in the second Windows rebalance and then
   # MERGED INTO shard M the same day (14-pg-shard limit; see shard M above).
@@ -2842,7 +2930,7 @@ if build_server
   # every other shard is set-identical and the [pg] total (4729) is unchanged.
   test('server pg unit tests shard C', server_test_exe,
        args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine]~[rest]~[auth]~[dashboard]~[adversarial]~[authz_model]~[app_perf]~[runtime_config]',
-              '--allow-running-no-tests'],
+              '--allow-running-no-tests', '--durations=yes'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 170)
 
   # #3443 Phase 2: PG portability smoke subset - runs INSTEAD of the 14 shards
@@ -3008,6 +3096,7 @@ if build_server
     test(
       'mcp bridge teardown allocation budget',
       mcp_bridge_alloc_budget_exe,
+      args: ['--durations=yes'],
       suite: ['server', 'server-checks'],
       timeout: 60,
     )
@@ -3031,6 +3120,7 @@ if build_server
     test(
       'guardian cache allocation-failure sweep',
       guardian_cache_alloc_sweep_exe,
+      args: ['--durations=yes'],
       suite: ['server', 'server-checks'],
       timeout: 60,
     )
@@ -3066,22 +3156,29 @@ test('proto gen_proto version check',
 # measured (Windows and Linux); several cases deliberately wait out a
 # grandchild to prove the whole tree was killed, so the timeout leaves room
 # for a loaded shared runner box.
+# platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21).
 test('gateway build wrapper',
   _python3_test,
   args: [files('test_build_gateway.py')],
-  suite: 'docs',
+  suite: 'platform',
   timeout: 180,
 )
 
 # OTP pin resolution (scripts/erlang_toolchain.py find-otp): the selection
 # rules Meson relies on at configure time, against fake installs. Hermetic.
+# platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21);
+# it pins the `erl.exe` resolution scripts/erlang_toolchain.py branches on for win32.
 test('gateway OTP pin resolution',
   _python3_test,
   args: [files('test_erlang_toolchain_otp.py')],
-  suite: 'docs',
+  suite: 'platform',
   timeout: 120,
 )
 
+# Entries below default to suite 'docs': OS-independent, Linux leg only. One that
+# pins OS behaviour takes suite 'platform' (marked `# platform:`) and runs on every
+# leg; see docs/testing/unit-test-conventions.md.
+#
 # scripts/ensure-erlang.sh sourced under `set -euo pipefail`, as
 # release-preflight.sh and integration-test.sh do. POSIX bash; skips itself on
 # Windows.
@@ -3194,6 +3291,16 @@ test('shell bell script behaviour',
 test('tokens page rotate behaviour',
   _python3_test,
   args: [files('test_access_tokens_rotate_behaviour.py')],
+  suite: ['server', 'docs'],
+  timeout: 60,
+)
+
+# TAR timeline page script: runs server/core/static/yuzu-tar-timeline.js under node (pure helpers as
+# tables; the DOM shell against a fake DOM, a recording fetch and a fake clock, never a sleep).
+# Skips (77) without node.
+test('tar timeline script behaviour',
+  _python3_test,
+  args: [files('test_tar_timeline_script_behaviour.py')],
   suite: ['server', 'docs'],
   timeout: 60,
 )
@@ -3321,10 +3428,11 @@ test('instructions runner explicit target',
 # each POST, proxy bypass, abort and error handling, strict grading. Hermetic; a few tests wait
 # on a 1-2 s timeout, hence the longer limit: about 41 s on Linux, 45 s on Windows and 82 s on a
 # loaded macOS arm64 host, so 300 s keeps a slow runner from reading as a hang.
+# platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21).
 test('instructions runner hardening',
   _python3_test,
   args: [files('test_instructions_runner_hardening.py')],
-  suite: 'docs',
+  suite: 'platform',
   timeout: 300,
 )
 
@@ -3499,7 +3607,7 @@ test('prometheus harness selftest',
 # #4800: pins scripts/test_gateway.py's zero-executed guard, the ct --dir that
 # points at apps/yuzu_gw/test/ct, and each gateway suite's wrapper deadline
 # sitting below its meson timeout. Hermetic (parses sources, runs no
-# rebar3), so it runs on every leg, including ones without Erlang.
+# rebar3), so it needs no Erlang; suite docs, i.e. the Linux leg only.
 test('gateway wrapper guard selftest',
   _python3_test,
   args: [files('test_gateway_test_summary.py')],
@@ -3558,15 +3666,16 @@ test('close automation logic',
 )
 
 # The native Windows runner contract is pure PowerShell with injected fixture
-# probes, so it is safe on every host that has pwsh. Keeping it in the docs
+# probes, so it is safe on every host that has pwsh. Keeping it in the platform
 # suite makes deleted schema/probe coverage fail in CI instead of depending on
 # an operator remembering the standalone command before provisioning.
 _pwsh_test = find_program('pwsh', required: false)
 if _pwsh_test.found()
+  # platform: OS-contract test, runs on every leg with pwsh (docs is OS-independent and Linux-only since 2026-10-21).
   test('Windows toolchain contract',
     _pwsh_test,
     args: ['-NoProfile', '-File', files('../deploy/windows/Test-ToolchainContract.ps1')],
-    suite: 'docs',
+    suite: 'platform',
     timeout: 30,
   )
 endif
@@ -3580,6 +3689,16 @@ test('flake-retry selftest',
   args: [files('../scripts/ci/flake-retry.py'), '--selftest'],
   suite: 'docs',
   timeout: 30,
+)
+
+# test-durations-summary's pure-logic selftest (#4884): Catch2 duration-line
+# parsing, root-case-only aggregation, top-N and timeout-percentage rows. Wired
+# beside flake-retry's selftest so the job-summary report cannot rot unnoticed.
+test('test-durations-summary selftest',
+  _python3_test,
+  args: [files('../scripts/ci/test-durations-summary.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # PR1.2 (ADR-3002 Decision-10a): pure-logic selftest of the lexical spawn gate —
@@ -3599,10 +3718,12 @@ if _bash_test.found()
   # #4262: -Dbuild_examples=false must keep configuring a real build.
   # Configure-only smoke test (no compile) so it stays cheap on every leg;
   # SKIPs cleanly when vcpkg_installed/<triplet> isn't populated yet.
+  # platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21);
+  # it selects the per-OS vcpkg triplet (`uname -s`).
   test('build_examples=false gating smoke test',
     _bash_test,
     args: [files('shell/test_build_examples_gating.sh')],
-    suite: 'docs',
+    suite: 'platform',
     timeout: 120,
   )
   # Registered off Windows only (#5428): both fork hundreds of subshells (about
@@ -3632,10 +3753,12 @@ if _bash_test.found()
     # foreign port holders. Sources the script with kill/ps/pgrep/lsof/docker
     # replaced by functions; spawns and signals nothing. The decoy command line
     # contains yuzu-agent, as the `meson compile` the old pgrep -f killed did.
+    # platform: OS-contract test, runs on every leg that registers it, i.e. Linux and macOS (docs is
+    # OS-independent and Linux-only since 2026-10-21); start-UAT.sh has Darwin-specific branches.
     test('start-UAT.sh kill_stale scoping (#5333)',
       _bash_test,
       args: [files('shell/test_start_uat_kill_stale.sh')],
-      suite: 'docs',
+      suite: 'platform',
       timeout: 60,
     )
   endif
@@ -3670,11 +3793,14 @@ endif
 # deliberately NOT part of this condition (#4262): every real plugin now
 # builds unconditionally under build_agent regardless of build_examples, so
 # capmatrix-gen always has something to inspect once build_agent is on.
+#
+# platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21);
+# it picks .so/.dylib/.dll and loads the real fixture plugins through capmatrix-gen.
 if _bash_test.found() and meson.can_run_host_binaries() and build_agent
   test('capability matrix gate shell tests (#2204 F10)',
     _bash_test,
     args: [files('shell/test_capability_matrix_gate.sh'), meson.project_build_root()],
-    suite: 'docs',
+    suite: 'platform',
     timeout: 120,
     depends: [
       abi3_fixture_plugin,
@@ -3691,6 +3817,17 @@ endif
 test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
   _python3_test,
   args: [files('test_log_handoff_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# #5291 / PR #6311: static lexical gate over TAR's Windows-only bounded hive-mount call site --
+# the module must be pinned before the first mount and the walk must stop mounting after a timeout
+# (a detached mount thread, abandoned or not, keeps running plugin code with nothing joining it).
+# Source text only, so Python, no build needed.
+test('TAR mapdrive hive-mount pin wiring lexical gate (#5291)',
+  _python3_test,
+  args: [files('test_tar_mapdrive_pin_lexical.py')],
   suite: 'agent',
   timeout: 30,
 )
@@ -3729,6 +3866,30 @@ test('access audit production wiring lexical gate',
   timeout: 30,
 )
 
+# Cookie-session writes require a same-site Origin or Referer: pins the one gate call site in the
+# pre-routing lambda in server.cpp (source-text only, so Python; suite 'docs' like the gates above).
+test('same-site gate production wiring lexical gate',
+  _python3_test,
+  args: [files('test_same_site_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('same-site gate production wiring lexical selftest',
+  _python3_test,
+  args: [files('test_same_site_wiring_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
+# Every repository-markdown runbook_url in the shipped alert rules that carries a #fragment names a
+# heading that exists in that file (source-text only, stdlib Python).
+test('alert runbook anchors resolve',
+  _python3_test,
+  args: [files('test_alert_runbook_anchors.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Access reviews: pins the production wiring in server.cpp (the loud perm_fn gate, the scratch-response
 # Attest probe, the fail-closed store reads, the grant-table read). Source-text only, so Python.
 test('access reviews production wiring lexical gate',
@@ -3747,6 +3908,21 @@ test('access reviews production wiring lexical gate',
 test('presence departure wiring lexical gate (#5678)',
   _python3_test,
   args: [files('test_presence_departure_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# registry.write audit wiring: static lexical gate pinning that agent.cpp stamps the dispatched action
+# on every output frame and its terminal frame (the command loop is not constructible from a test), and
+# that each of the four frame-storing sites in agent_service_impl.cpp writes the audit row BEFORE the
+# execution advances (the Subscribe arms and the gateway terminal arm have no runtime ordering test),
+# that the hook reads the store only through its weak reference, and that server.cpp wires it exactly
+# once.
+# Carries its own in-memory mutation self-test. No build required. Suite 'docs' for the same reason as
+# the presence gate above.
+test('audit action stamp wiring lexical gate',
+  _python3_test,
+  args: [files('test_audit_action_stamp_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -3837,13 +4013,15 @@ endif
 # #5906: `yuzu-server --healthcheck` CLI contract against the real binary (no listener, no
 # Postgres): the unit suite covers the probe's rules and transport, only this proves main.cpp
 # runs it before any server init. `yuzu_server_exe` is bound in server/core/meson.build.
-# Suite 'docs': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a
-# gate labelled 'server' fails that check on the Windows legs.
+# platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21);
+# it drives the native binary (`.exe` probe, MSYS2_ARG_CONV_EXCL, cygpath). Suite 'platform', not a bare
+# 'server': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a gate
+# labelled only 'server' fails that check on the Windows legs.
 if _bash_test.found() and meson.can_run_host_binaries() and build_server
   test('healthcheck CLI contract (#5906)',
     _bash_test,
     args: [files('shell/test_healthcheck_cli.sh'), meson.project_build_root()],
-    suite: ['server', 'docs'],
+    suite: ['server', 'platform'],
     timeout: 60,
     depends: [yuzu_server_exe],
   )
@@ -4060,10 +4238,11 @@ test('ci telemetry selftest',
 # Keep them exact and keep the GHA action itself visible to Dependabot.
 # Budget: 4-5 s on a clean Windows runner, 7-8 s when other jobs share the box;
 # the old 10 s limit tripped (#4164, #4171).
+# platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21).
 test('windows sdk contract',
   _python3_test,
   args: [files('test_windows_sdk_contract.py')],
-  suite: 'docs',
+  suite: 'platform',
   timeout: 30,
 )
 

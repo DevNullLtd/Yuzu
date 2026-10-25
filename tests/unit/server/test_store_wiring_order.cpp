@@ -25,11 +25,11 @@
  *     set_X(member_.get())` call (the setter-call regex captures the member
  *     name from its `.get()` argument, so no separate list of members needs
  *     maintaining); and
- *   - every `member_ = std::make_unique<...>` construction.
+ *   - every `member_ = std::make_unique<...>` or `std::make_shared<...>` construction.
  * For each setter call at line L wiring member M, the rule is: some
  * construction of M exists, and the EARLIEST such construction is on a line
  * strictly before L. Every member matched by the setter regex has exactly
- * one `std::make_unique` site today (verified at the time this test was
+ * one `std::make_unique` or `std::make_shared` site today (verified at the time this test was
  * written) -- "earliest" is the chosen semantic for the day a member ever
  * gains a second construction site (e.g. a reconfigure/rebuild path).
  *
@@ -63,12 +63,17 @@
  * introduced, not that this file is stale.
  *
  * COST ON WINDOWS. server.cpp is loaded and comment-stripped once, by
- * cached_server_cpp_text() below: take the text from it rather than reading the
- * file in a new case. A whole-text std::regex over the ~0.76 MB stripped file can
+ * stripped_source("server.cpp") (source_scan.hpp): take the text from it rather than
+ * reading the file in a new case. The strip is a linear find-and-copy; the whole-text
+ * std::regex passes below are what is slow. A pattern over the ~0.76 MB stripped file can
  * be very slow on MSVC debug depending on the pattern's shape -- one with an
  * optional capture group at its head took 231 s there (about 1.5 s on libc++),
- * while the plain patterns in this file cost a few seconds per pass. For a new
- * scan prefer std::string_view::find plus a small matcher (see
+ * while the plain patterns in this file cost a few seconds per pass. Literal anchors
+ * use std::string_view::find (the anchors in the #1712 and HA WS-5 cases, and the bounded
+ * window find after the #1712 resolver definition). The setter and
+ * construction scans and the `wired_re`, `occurrence_re`, `construct_re`, `wire_re` and
+ * `null_wire_re` anchors are structural and still use the pattern library. For a
+ * new scan prefer std::string_view::find plus a small matcher (see
  * confined_sink_scan.hpp), and time it on a Windows debug build.
  *
  * WHAT THIS SCAN DOES NOT CATCH (governance Gate 3 architect + quality-
@@ -130,23 +135,24 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
-#include <fstream>
 #include <map>
+#include <iterator>
 #include <regex>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "confined_sink_scan.hpp"
-
-#ifndef YUZU_SERVER_SRC_DIR
-#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build (meson.project_source_root() / 'server' / 'core' / 'src') -- see the server_test_exe cpp_args block."
-#endif
+#include "source_scan.hpp"
 
 using yuzu::test::wiring_scan::find_confined_dispatch_sink_sites;
 using yuzu::test::wiring_scan::kFieldWindow;
 using yuzu::test::wiring_scan::kTypeName;
+using yuzu::test::source_scan::line_of;
+using yuzu::test::source_scan::read_text_file;
+using yuzu::test::source_scan::strip_line_comments;
+using yuzu::test::source_scan::stripped_source;
+using yuzu::test::source_scan::stripped_source_loads;
 
 namespace {
 
@@ -158,24 +164,6 @@ struct SetterCall {
     std::string setter;   // e.g. "notification_store"
     std::string member;   // e.g. "notification_store_"
 };
-
-// Times cached_server_cpp_text() has loaded server.cpp. Plain int: Catch2 runs cases serially.
-int g_server_cpp_loads = 0;
-
-std::string read_text_file(const fs::path& path) {
-    INFO("reading " << path.string());
-    REQUIRE(fs::is_regular_file(path));
-    std::ifstream in(path, std::ios::binary);
-    REQUIRE(in.is_open());
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
-}
-
-int line_of(const std::string& text, std::size_t pos) {
-    return static_cast<int>(std::count(text.begin(), text.begin() + static_cast<long>(pos), '\n')) +
-           1;
-}
 
 /// `agent_service_.set_X(member_.get())` / `gateway_service_->set_X(member_.get())`.
 /// Group 1: receiver (the trailing `.`/`->` is stripped off below so both
@@ -196,11 +184,11 @@ std::vector<SetterCall> extract_setter_calls(const std::string& text) {
     return out;
 }
 
-/// `member_ = std::make_unique<...>`. Returns every construction line per
-/// member (a member with more than one site keeps every line; the rule
+/// `member_ = std::make_unique<...>` or `std::make_shared<...>`. Returns every construction
+/// line per member (a member with more than one site keeps every line; the rule
 /// checked below uses the earliest).
 std::map<std::string, std::vector<int>> extract_constructions(const std::string& text) {
-    static const std::regex re(R"regex(\b(\w+_)\s*=\s*std::make_unique<)regex");
+    static const std::regex re(R"regex(\b(\w+_)\s*=\s*std::make_(?:unique|shared)<)regex");
     std::map<std::string, std::vector<int>> out;
     for (auto it = std::sregex_iterator(text.begin(), text.end(), re); it != std::sregex_iterator();
          ++it) {
@@ -210,53 +198,54 @@ std::map<std::string, std::vector<int>> extract_constructions(const std::string&
     return out;
 }
 
-std::string strip_line_comments(const std::string& text) {
-    static const std::regex re(R"(//[^\n]*)");
-    return std::regex_replace(text, re, "");
-}
-
-/// server.cpp, comment-stripped, loaded once per process and shared by every
-/// real-source TEST_CASE: take the text from this accessor rather than reading the
-/// file again (the strip alone is a whole-text regex pass, about 0.5 s on MSVC debug,
-/// and each case used to repeat it). Function-local static: read-only input, and
-/// Catch2 runs the cases serially in one process.
-const std::string& cached_server_cpp_text() {
-    static const std::string text = [] {
-        std::string stripped =
-            strip_line_comments(read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / "server.cpp"));
-        ++g_server_cpp_loads; // a failed read throws first, and the next call retries
-        return stripped;
-    }();
-    return text;
-}
-
 } // namespace
 
 // Only the #1712 case's `== 4` count depends on the strip (unstripped, a `//` mention
 // makes it 5); the other cases pass either way. So pin the content directly: no `//`
-// survives (the naive stripper removes them even inside string literals), and it is
+// survives (the stripper removes them even inside string literals), and it is
 // still server.cpp.
-TEST_CASE("cached_server_cpp_text is server.cpp with every // comment stripped",
+TEST_CASE("stripped_source(\"server.cpp\") is server.cpp with every // comment stripped",
           "[wiring_order]") {
-    const std::string& text = cached_server_cpp_text();
+    const std::string& text = stripped_source("server.cpp");
     CHECK(text.find("//") == std::string::npos);
     CHECK(text.find("ServerImpl") != std::string::npos);
 }
 
-// The count pins the memoisation: an accessor that reloaded on each call would
-// fail. It cannot see a case that reads the file some other way.
-TEST_CASE("cached_server_cpp_text loads server.cpp exactly once per process",
+// The counter pins the memoisation: an accessor that reloaded on each call would bump
+// it. It cannot see a case that reads the file some other way. Other cases (and other
+// translation units) may be the first to load a file, so the pin is "unchanged across
+// repeat calls", not an absolute count.
+TEST_CASE("stripped_source loads server.cpp once per process: repeat calls do not reload it",
           "[wiring_order]") {
-    (void)cached_server_cpp_text();
-    (void)cached_server_cpp_text();
-    (void)cached_server_cpp_text();
-    CHECK(g_server_cpp_loads == 1);
+    (void)stripped_source("server.cpp");
+    const int loads_after_first = stripped_source_loads;
+    (void)stripped_source("server.cpp");
+    (void)stripped_source("server.cpp");
+    (void)stripped_source("server.cpp");
+    CHECK(stripped_source_loads == loads_after_first);
+}
+
+// The stripper's contract, on engineered input: a `//` cuts to the end of its line, the
+// newline survives (line numbers are unchanged), and a `//` inside a string literal is
+// cut too (documented limit in source_scan.hpp -- pinned so a "fix" that makes it
+// string-aware is a deliberate change, not a silent one).
+TEST_CASE("strip_line_comments cuts // to end of line, keeps the newline "
+          "and cuts inside a string literal",
+          "[wiring_order]") {
+    CHECK(strip_line_comments("a // c\nb\n") == "a \nb\n");
+    CHECK(strip_line_comments("x\n// whole line\ny") == "x\n\ny");
+    CHECK(strip_line_comments("no comment") == "no comment");
+    CHECK(strip_line_comments("tail //no newline") == "tail ");
+    CHECK(strip_line_comments("a///b\nc") == "a\nc");
+    CHECK(strip_line_comments("u(\"http://h\"); x\n") == "u(\"http:\n");
+    // Block comments are not understood: the // inside one is cut, the rest survives.
+    CHECK(strip_line_comments("/* a // b */ c\n") == "/* a \n");
 }
 
 TEST_CASE("server.cpp: every agent_service_/gateway_service_ store setter runs after "
           "its member's construction (#3261)",
           "[wiring_order]") {
-    const std::string& text = cached_server_cpp_text();
+    const std::string& text = stripped_source("server.cpp");
     const auto setters = extract_setter_calls(text);
     const auto constructions = extract_constructions(text);
 
@@ -291,7 +280,7 @@ TEST_CASE("server.cpp: the three #3261 setters specifically are still present "
     // floor and pass silently -- exactly the literal symptom #3261 was.
     // Pin presence of these three explicitly so that regression can never
     // hide behind the floor.
-    const std::string& text = cached_server_cpp_text();
+    const std::string& text = stripped_source("server.cpp");
     const auto setters = extract_setter_calls(text);
 
     auto has = [&](const char* receiver, const char* setter, const char* member) {
@@ -319,26 +308,25 @@ TEST_CASE("server.cpp: the three #3261 setters specifically are still present "
 TEST_CASE("server.cpp: response_visible_set_fn is both defined and passed to "
           "DashboardRoutes::register_routes (#1712)",
           "[wiring_order][1712]") {
-    const std::string& text = cached_server_cpp_text();
+    const std::string& text = stripped_source("server.cpp");
 
     // Sanity floor: server.cpp is a six-figure-character file; a
     // suspiciously short read means YUZU_SERVER_SRC_DIR pointed somewhere
     // empty or mangled, not that the file legitimately shrank.
     REQUIRE(text.size() > 100000);
 
-    // POSITIVE anchor 1: the resolver is defined, and its body is the real
-    // decision ladder -- not a stub that always returns nullopt/fleet-wide.
-    // Requiring both calls it actually makes (not just its name) means a
-    // resolver silently downgraded to "return std::nullopt;" still fails
-    // this, even though `response_visible_set_fn` itself would still exist.
-    static const std::regex definition_re(R"(auto response_visible_set_fn =)");
-    CHECK(std::regex_search(text, definition_re));
-    static const std::regex global_check_re(
-        R"(check_permission\(username, "Response", "Read"\))");
-    CHECK(std::regex_search(text, global_check_re));
-    static const std::regex scoped_check_re(
-        R"(visible_agents_for_permission\(username, "Response", "Read")");
-    CHECK(std::regex_search(text, scoped_check_re));
+    // POSITIVE anchor 1: the resolver is defined, and its body DELEGATES to the real decision
+    // ladder (engine_aware_visibility.hpp's response_visible_set, which holds the
+    // check_permission / visible_agents_for_permission calls and is tested behaviourally against
+    // real stores in test_engine_aware_visibility.cpp, #6204). A resolver silently downgraded to
+    // "return std::nullopt;" no longer contains the delegation, so it still fails here. Literal
+    // anchors only: the delegation is looked for in a bounded window after the definition, not
+    // by a pattern over the whole stripped file.
+    const std::size_t resolver_def = text.find("auto response_visible_set_fn =");
+    CHECK(resolver_def != std::string::npos);
+    CHECK((resolver_def != std::string::npos &&
+           text.substr(resolver_def, 800).find("visibility::response_visible_set(") !=
+               std::string::npos));
 
     // POSITIVE anchor 2: the resolver is actually PASSED to
     // register_routes, not merely defined and left unused. This is what
@@ -386,7 +374,7 @@ TEST_CASE("server.cpp: response_visible_set_fn is both defined and passed to "
 TEST_CASE("server.cpp: registry_.configure_presence runs after "
           "offline_endpoint_store_'s construction (HA WS-5)",
           "[wiring_order][ha]") {
-    const std::string& text = cached_server_cpp_text();
+    const std::string& text = stripped_source("server.cpp");
 
     static const std::regex construct_re(
         R"(offline_endpoint_store_\s*=\s*std::make_unique<)");
@@ -417,10 +405,9 @@ TEST_CASE("server.cpp: registry_.configure_presence runs after "
     REQUIRE(std::regex_search(text, null_wire_match, null_wire_re));
     const int null_wire_line = line_of(text, static_cast<std::size_t>(null_wire_match.position(0)));
 
-    static const std::regex reset_re(R"(offline_endpoint_store_\.reset\(\))");
-    std::smatch reset_match;
-    REQUIRE(std::regex_search(text, reset_match, reset_re));
-    const int reset_line = line_of(text, static_cast<std::size_t>(reset_match.position(0)));
+    const auto reset_pos = text.find("offline_endpoint_store_.reset()");
+    REQUIRE(reset_pos != std::string::npos);
+    const int reset_line = line_of(text, reset_pos);
 
     INFO("registry_.configure_presence(nullptr, ...) at server.cpp:" << null_wire_line);
     INFO("offline_endpoint_store_.reset() at server.cpp:" << reset_line);
@@ -447,9 +434,8 @@ TEST_CASE("server.cpp: registry_.configure_presence runs after "
 TEST_CASE("server.cpp + dispatch_scope_ladder.hpp: every production "
           "ConfinedDispatchSink wires has_remote_presence AND prepare_route_fallback (HA WS-5)",
           "[wiring_order][ha]") {
-    const std::string& server_text = cached_server_cpp_text();
-    const std::string ladder_text = strip_line_comments(
-        read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / "dispatch_scope_ladder.hpp"));
+    const std::string& server_text = stripped_source("server.cpp");
+    const std::string& ladder_text = stripped_source("dispatch_scope_ladder.hpp");
 
     int total_sites = 0;
     auto check_file = [&](const std::string& text, const char* label) {
@@ -474,22 +460,34 @@ TEST_CASE("server.cpp + dispatch_scope_ladder.hpp: every production "
     CHECK(total_sites == 3);
 }
 
-// The matcher must not use the C++ regular-expression library: scanning server.cpp
+// The matchers must not use the C++ regular-expression library: scanning server.cpp
 // with it takes minutes on MSVC debug, and nothing else here notices a merely slow
-// scan. Reading the header rather than timing the scan keeps this independent of
-// the machine. It guards that one header only: it cannot see the regexes this file
+// scan. Reading the headers rather than timing the scan keeps this independent of
+// the machine. It guards those files only: it cannot see the regexes this file
 // still uses, another header, a macro, or a slow scan that does not use one.
-TEST_CASE("confined_sink_scan.hpp does not use the regular-expression library",
+TEST_CASE("the source-scan headers and the step-up inventory do not use the regular-expression library",
           "[wiring_order]") {
-    // YUZU_SERVER_SRC_DIR is <repo>/server/core/src, so three `..` reach the repo root.
-    std::string text = read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / ".." / ".." / ".." /
-                                      "tests" / "unit" / "server" / "confined_sink_scan.hpp");
-    // Not vacuous: an empty read must not pass.
-    REQUIRE(text.find("find_confined_dispatch_sink_sites") != std::string::npos);
-    std::transform(text.begin(), text.end(), text.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    INFO("the matcher header must not contain \"regex\" in any case, comments included");
-    CHECK(text.find("regex") == std::string::npos);
+    struct Header {
+        const char* file;
+        const char* marker; // proves the read is the real header, not an empty one
+    };
+    for (const Header& h :
+         {Header{"confined_sink_scan.hpp", "find_confined_dispatch_sink_sites"},
+          Header{"source_scan.hpp", "stripped_source"},
+          Header{"route_registration_scan.hpp", "find_route_registrations"},
+          Header{"route_inventory_scan.hpp", "discover_mutating_routes"},
+          Header{"test_step_up_route_inventory.cpp", "find_step_up_calls"}}) {
+        // YUZU_SERVER_SRC_DIR is <repo>/server/core/src, so three `..` reach the repo root.
+        std::string text = read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / ".." / ".." / ".." /
+                                          "tests" / "unit" / "server" / h.file);
+        INFO(h.file);
+        // Not vacuous: an empty read must not pass.
+        REQUIRE(text.find(h.marker) != std::string::npos);
+        std::transform(text.begin(), text.end(), text.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        INFO("the scan file must not contain \"regex\" in any case, comments included");
+        CHECK(text.find("regex") == std::string::npos);
+    }
 }
 
 // The matcher against small engineered inputs, independent of whatever
@@ -738,5 +736,161 @@ TEST_CASE("find_confined_dispatch_sink_sites recognises the documented construct
         CHECK(find_confined_dispatch_sink_sites(std::string_view(b).substr(0, 23)).empty());
         CHECK(find_confined_dispatch_sink_sites(std::string_view(c).substr(0, 24)).empty());
         CHECK(find_confined_dispatch_sink_sites(std::string_view(d).substr(0, 27)).empty());
+    }
+}
+
+// #6204: ServerImpl must keep BINDING the engine-aware resolvers. The resolver logic itself lives in
+// engine_aware_visibility.hpp and is tested behaviourally against real stores in
+// test_engine_aware_visibility.cpp; ServerImpl is not unit-constructible, so this source scan pins
+// the WIRING. Each seam is matched as a whole: the enclosing member or lambda, then the single
+// delegation with its store arguments in order (rbac, then management groups, then the username).
+// That catches a seam rebound to inline logic, a dropped call, a swapped or wrong store, and a
+// delegation moved into dead code. It does not prove the seam is the one the routes receive; the
+// response-visible-set seam is checked here and again by the [1712] case above; the use-site
+// counts below cover the rest.
+TEST_CASE("server.cpp: every username-keyed resolver seam delegates to the engine-aware "
+          "resolver (#6204)",
+          "[wiring_order][6204]") {
+    const std::string& text = stripped_source("server.cpp");
+    const auto count = [&text](std::string_view needle) {
+        std::size_t n = 0;
+        for (auto pos = text.find(needle); pos != std::string::npos;
+             pos = text.find(needle, pos + needle.size()))
+            ++n;
+        return n;
+    };
+    // A seam matches when its anchor literal is followed, at that exact position, by the pattern.
+    // Anchoring first keeps the regex off the whole stripped file (the banner above records what a
+    // whole-file std::regex costs on MSVC debug).
+    const auto seam = [&text](std::string_view anchor, const char* pattern) {
+        const std::regex re(pattern);
+        std::size_t n = 0;
+        for (auto pos = text.find(anchor); pos != std::string::npos;
+             pos = text.find(anchor, pos + anchor.size())) {
+            const std::string window = text.substr(pos, 800);
+            if (std::regex_search(window, re, std::regex_constants::match_continuous))
+                ++n;
+        }
+        return n;
+    };
+    CHECK(count("yuzu::server::visibility::dispatch_permission(") == 1);
+    CHECK(count("yuzu::server::visibility::response_agent_in_scope(") == 1);
+    CHECK(count("yuzu::server::visibility::visible_agents_json(") == 1);
+    CHECK(count("yuzu::server::visibility::infrastructure_visible_set(") == 1);
+    CHECK(count("yuzu::server::visibility::response_visible_set(") == 1);
+    // Each delegation sits directly inside its seam, with the right stores in the right order.
+    {
+        INFO("seam: dispatch_has_permission");
+        CHECK(seam("dispatch_has_permission(",
+                   R"(dispatch_has_permission\(\s*std::string_view principal,)"
+                   R"(\s*std::string_view securable,\s*yuzu::server::authz::Operation op\s*\)\s*const\s*\{)"
+                   R"(\s*return yuzu::server::visibility::dispatch_permission\(\s*rbac_store_\.get\(\),)"
+                   R"(\s*principal,\s*securable,\s*op\s*\);)") == 1);
+    }
+    {
+        INFO("seam: response_agent_in_scope");
+        CHECK(seam("response_agent_in_scope(const",
+                   R"(response_agent_in_scope\(\s*const std::string& username,)"
+                   R"(\s*const std::string& agent_id\s*\)\s*const\s*\{)"
+                   R"(\s*return yuzu::server::visibility::response_agent_in_scope\(\s*rbac_store_\.get\(\),)"
+                   R"(\s*mgmt_group_store_\.get\(\),\s*username,\s*agent_id\s*\);)") == 1);
+    }
+    {
+        INFO("seam: get_visible_agents_json");
+        CHECK(seam("get_visible_agents_json(const",
+                   R"(get_visible_agents_json\(\s*const std::string& username\s*\)\s*\{)"
+                   R"(\s*return yuzu::server::visibility::visible_agents_json\(\s*registry_\.to_json_obj\(\),)"
+                   R"(\s*rbac_store_\.get\(\),\s*mgmt_group_store_\.get\(\),\s*username\s*\);)") == 1);
+    }
+    {
+        INFO("seam: visible_set_fn");
+        CHECK(seam("auto visible_set_fn",
+                   R"(auto\s+visible_set_fn\s*=\s*\[this\]\(const std::string& username\))"
+                   R"(\s*->\s*std::optional<std::set<std::string>>\s*\{)"
+                   R"(\s*return yuzu::server::visibility::infrastructure_visible_set\(\s*rbac_store_\.get\(\),)"
+                   R"(\s*mgmt_group_store_\.get\(\),\s*username\s*\);)") == 1);
+    }
+    {
+        INFO("seam: response_visible_set_fn");
+        CHECK(seam("auto response_visible_set_fn",
+                   R"(auto\s+response_visible_set_fn\s*=\s*\[this\]\(const std::string& username\))"
+                   R"(\s*->\s*std::optional<std::set<std::string>>\s*\{)"
+                   R"(\s*return yuzu::server::visibility::response_visible_set\(\s*rbac_store_\.get\(\),)"
+                   R"(\s*mgmt_group_store_\.get\(\),\s*username\s*\);)") == 1);
+    }
+    // The seams are handed on: visible_set_fn to the two route registrations that take it, and the
+    // dispatch binder to both classify_and_authorize_dispatch lambdas. (The response-visible-set seam
+    // is also covered by the [1712] case above.)
+    {
+        INFO("use sites of visible_set_fn");
+        std::size_t uses = 0;
+        const std::regex use_re(R"([^_A-Za-z0-9]visible_set_fn\s*,)");
+        for (auto it = std::sregex_iterator(text.begin(), text.end(), use_re);
+             it != std::sregex_iterator(); ++it)
+            ++uses;
+        CHECK(uses == 2);
+    }
+    {
+        INFO("use sites of dispatch_has_permission");
+        CHECK(count("return dispatch_has_permission(principal, securable, op);") == 2);
+    }
+    // The exec-visible derivations (session-keyed and headless username-keyed) feed the composer.
+    CHECK(count("facts.principal_is_engine = sess.is_engine();") == 1);
+    CHECK(count("facts.principal_is_engine = yuzu::server::authz::is_engine_principal_name(username);") == 1);
+    // No resolver was re-inlined: server.cpp holds no engine-prefix test of its own besides the one above.
+    CHECK(count("authz::is_engine_principal_name(") == 1);
+}
+
+// #6204: ONE enforcement snapshot per decision. Two enforcement reads in one resolver can disagree
+// across a concurrent toggle and let an engine fall through both branches. The header holds only
+// these five resolvers, so the read count is pinned per function: a second read added to any of
+// them fails here, with no store or thread timing involved. The scan counts the three ways to read
+// the flag (`rbac_enforcement_in_effect`, `rbac_enforcement_label`, `is_rbac_enabled`); a read
+// through some other helper is not seen, so this is a tripwire for the obvious regression, not a
+// proof of one snapshot. A concurrent-toggle stress test was tried and dropped: with the second
+// read reintroduced it still passed 3 of 3 runs, because the window between two reads
+// (nanoseconds) is far narrower than a toggle (a Postgres write), so it could not fail on the
+// defect it named.
+namespace {
+std::size_t count_enforcement_reads(const std::string& body) {
+    static const std::regex re(R"(\b(?:rbac_enforcement_in_effect|rbac_enforcement_label|is_rbac_enabled)\s*\()");
+    std::size_t n = 0;
+    for (auto it = std::sregex_iterator(body.begin(), body.end(), re); it != std::sregex_iterator();
+         ++it)
+        ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("the enforcement-read counter sees each spelling and ignores look-alikes (#6204)",
+          "[wiring_order][6204][snapshot]") {
+    CHECK(count_enforcement_reads("a = rbac_enforcement_in_effect(rbac);") == 1);
+    CHECK(count_enforcement_reads("a = rbac_enforcement_in_effect (rbac);") == 1);
+    CHECK(count_enforcement_reads("a = rbac_enforcement_in_effect\n    (rbac);") == 1);
+    CHECK(count_enforcement_reads("a = rbac->is_rbac_enabled();") == 1);
+    CHECK(count_enforcement_reads("a = rbac_enforcement_label(rbac);") == 1);
+    CHECK(count_enforcement_reads("x = rbac_enforcement_in_effect(r); y = rbac->is_rbac_enabled();") == 2);
+    CHECK(count_enforcement_reads("a = my_rbac_enforcement_in_effect_cached(rbac);") == 0);
+    CHECK(count_enforcement_reads("a = rbac->check_permission(u, s, o);") == 0);
+}
+
+TEST_CASE("engine_aware_visibility.hpp: each resolver reads enforcement exactly once (#6204)",
+          "[wiring_order][6204][snapshot]") {
+    const std::string text =
+        strip_line_comments(read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / "engine_aware_visibility.hpp"));
+    const std::string marker = "[[nodiscard]] inline";
+    std::vector<std::size_t> starts;
+    for (auto pos = text.find(marker); pos != std::string::npos;
+         pos = text.find(marker, pos + marker.size()))
+        starts.push_back(pos);
+    REQUIRE(starts.size() == 5);
+    starts.push_back(text.size());
+    const char* names[] = {"dispatch_permission", "response_agent_in_scope", "visible_agents_json",
+                           "infrastructure_visible_set", "response_visible_set"};
+    for (std::size_t i = 0; i < std::size(names); ++i) {
+        const std::string body = text.substr(starts[i], starts[i + 1] - starts[i]);
+        INFO("resolver: " << names[i]);
+        CHECK(body.find(names[i]) != std::string::npos);
+        CHECK(count_enforcement_reads(body) == 1);
     }
 }
