@@ -35,7 +35,7 @@
 ///   PUT /api/config/([a-z_]+), PUT /api/v1/config/([a-z_]+)   (perm_fn Infrastructure:Write, THEN auth_fn for the
 ///                                 audit-attributed username and the same-site check,
 ///                                 THEN the route-owned 400 (dex_score_policy is written
-///                                 only through its own route, a later change), THEN the
+///                                 only through PUT /api/v1/dex/score-policy), THEN the
 ///                                 write-class 403 for an administrator-only key (a
 ///                                 `config.update`/`denied` row, no attempted row), THEN the
 ///                                 store-open 503, THEN body parsing and integer-key

@@ -192,6 +192,11 @@ constexpr ExpectedResolution kExpected[] = {
     {"POST",   "/api/v1/users/alice/unlock",                           16u * 1024, false, "users"},
     {"POST",   "/api/v1/users/elevation-eligibility",                  16u * 1024, false, "users"},
     {"POST",   "/api/v1/usersevil",                                    4u * 1024 * 1024, false, "default"},
+    // body_cap_policy.hpp dex_score_policy row: the DEX score policy document. ANY method,
+    // measurable; a segment-boundary probe proves "/api/v1/dex/score-policyx" falls to default.
+    {"PUT",    "/api/v1/dex/score-policy",                             320u * 1024, true,  "dex_score_policy"},
+    {"DELETE", "/api/v1/dex/score-policy",                             320u * 1024, true,  "dex_score_policy"},
+    {"PUT",    "/api/v1/dex/score-policyx",                            4u * 1024 * 1024, false, "default"},
     // body_cap_policy.hpp crypto row - the /crypto REST v1 subtree; PUT dashboard/layout is the
     // only body-bearing route (crypto_widget_catalogue.hpp kLayoutBodyMaxBytes). ANY method.
     {"PUT",    "/api/v1/crypto/dashboard/layout",                      16u * 1024, false, "crypto"},
@@ -237,6 +242,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "rbac_enforcement",
     "guardian_policy_generation",
     "users",
+    "dex_score_policy",
     "crypto",
     "config",
     "default",
@@ -326,7 +332,7 @@ TEST_CASE("resolve_body_cap: same prefix, different method -> different entry",
 
 TEST_CASE("resolve_body_cap: longest matching prefix wins over the catch-all default",
           "[body_cap]") {
-    // "/scim/v2/" (64 KiB, method-specific) and "" (the catch-all default,
+    // "/scim/v2/" (64 KiB, any method) and "" (the catch-all default,
     // ANY method, 4 MiB) BOTH match "/scim/v2/Users" for POST — the longer,
     // more specific entry must win.
     const auto got = resolve_body_cap("POST", "/scim/v2/Users");
@@ -374,13 +380,13 @@ TEST_CASE("kBodyCapTable: the path_class label set is exactly the documented, fi
 TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // Independent of the label-set check above: a new row using an EXISTING
     // label (e.g. a second SCIM method already covered) would pass that
-    // check while still silently growing the table. 28 = mcp(1) +
+    // check while still silently growing the table. 36 = mcp(1) +
     // bundles(1) + ota_upload(1) + json_to_csv_export(1) + nvd_match(1) +
     // ca_import_chain(1) + ca_issue_code_signing(1: gap-matrix #10) +
     // ca_revoke(1) +
     // kek_ops(1: one prefix entry covers both rotate and rewrap) +
-    // ca_import_chain_dashboard(1) + plugin_trust_bundle(1) + scim(3:
-    // POST/PUT/PATCH) + saml_acs(1) + response_templates(2: POST/PUT) +
+    // ca_import_chain_dashboard(1) + plugin_trust_bundle(1) + scim(1:
+    // one any-method row) + saml_acs(1) + response_templates(2: POST/PUT) +
     // tar_dashboard_sql(1) + tar_result_set_sql(1) +
     // guardian_rule_authoring(2: POST create + PUT update) +
     // workflow_yaml(1) + product_pack_yaml(1) + instruction_import(1) +
@@ -392,10 +398,11 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // §2) + rbac_enforcement(1: A1 enforcement enable/disable toggle) +
     // guardian_policy_generation(1: the Guardian policy-generation raise) +
     // users(1: the /api/v1/users subtree, #5342 password routes) +
+    // dex_score_policy(1: the DEX score policy document) +
     // crypto(1: the /api/v1/crypto subtree, the dashboard layout PUT) +
     // config(1: the /api/v1/config subtree, the runtime-config PUT) +
     // default(1).
-    CHECK(std::size(kBodyCapTable) == 35);
+    CHECK(std::size(kBodyCapTable) == 36);
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──
@@ -405,8 +412,8 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
 // rest-api.md carried the identical stale claim (both fixed together). A
 // regression on the upload_session opt-in would have shipped with this
 // test green.
-TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/, upload_session, and "
-         "hardware, OFF for every other named class",
+TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/ and upload_session and "
+         "hardware and dex_score_policy and OFF for every other named class",
          "[body_cap]") {
     CHECK(resolve_body_cap("POST", "/mcp/v1/").requires_measurable);
     CHECK(resolve_body_cap("GET", "/mcp/v1/").requires_measurable);
@@ -415,6 +422,8 @@ TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/, upload_session
     CHECK(resolve_body_cap("POST", "/api/v1/hardware/agent-1/sync").requires_measurable);
     CHECK(resolve_body_cap("POST", "/api/v1/hardware/sync").requires_measurable);
     CHECK(resolve_body_cap("GET", "/api/v1/hardware").requires_measurable);
+    CHECK(resolve_body_cap("PUT", "/api/v1/dex/score-policy").requires_measurable);
+    CHECK(resolve_body_cap("GET", "/api/v1/dex/score-policy").requires_measurable);
 
     // Public REST (bundles), SCIM, certificate import (REST + dashboard),
     // product-pack/workflow authoring, OTA upload, and plugin-config all

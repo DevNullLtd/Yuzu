@@ -18,6 +18,7 @@
 
 #include "dex_api.hpp"
 #include "dex_score_policy_provider.hpp" // DexScorePolicyProvider::ReadFn - pure, no store type
+#include "dex_score_policy_writer.hpp"   // the write closure types - pure, no store type
 #include "dex_types.hpp" // DexFleet — a pure POD (the FleetFn return), not a store type
 
 namespace yuzu::server {
@@ -69,5 +70,15 @@ using FleetFn = std::function<DexFleet()>;
 /// `store` is borrowed by reference and MUST outlive the returned function.
 [[nodiscard]] DexScorePolicyProvider::ReadFn
 dex_score_policy_store_reader(RuntimeConfigStore& store);
+
+/// The production store writes for the score policy: the conditional write and the
+/// conditional remove of `kDexScorePolicyKey`. This is the ONLY place a store write names the
+/// key (tests/test_dex_score_policy_key_writer_tripwire.py), so every write reaches the store
+/// through apply_dex_score_policy. `store` is borrowed and MUST outlive the returned functions.
+struct DexScorePolicyStoreFns {
+    DexScorePolicyCasFn compare_and_set;
+    DexScorePolicyCarFn compare_and_remove;
+};
+[[nodiscard]] DexScorePolicyStoreFns dex_score_policy_store_writer(RuntimeConfigStore& store);
 
 } // namespace yuzu::server
