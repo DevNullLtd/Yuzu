@@ -205,9 +205,37 @@ struct ProfileInfo {
     return std::nullopt;
 }
 
+/// Folds ESC and the Unicode line breaks U+0085 (UTF-8 `C2 85`), U+2028 and U+2029 (`E2 80 A8` / `E2 80 A9`) to a
+/// single '_' each, in place. A terminal reads ESC as an escape introducer and a Unicode-aware splitter (Python's
+/// str.splitlines, a log viewer) reads the others as line ends, so none may survive in a rendered field. The same set
+/// as log_key_token (common/include/yuzu/log_token.hpp), which stays its own copy. Other control bytes (a tab in a
+/// process row) are deliberately left alone.
+inline void fold_line_breaks(std::string& s) {
+    std::size_t w = 0;
+    for (std::size_t i = 0; i < s.size(); ++w) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        const auto at = [&](std::size_t k) { return i + k < s.size() ? static_cast<unsigned char>(s[i + k]) : 0; };
+        if (c == 0x1B) {
+            s[w] = '_';
+            i += 1;
+        } else if (c == 0xC2 && at(1) == 0x85) {
+            s[w] = '_';
+            i += 2;
+        } else if (c == 0xE2 && at(1) == 0x80 && (at(2) == 0xA8 || at(2) == 0xA9)) {
+            s[w] = '_';
+            i += 3;
+        } else {
+            s[w] = s[i];
+            i += 1;
+        }
+    }
+    s.resize(w);
+}
+
 /// Replaces '|', '\r', '\n' in a field with '_' before it is written into the
 /// pipe-delimited plugin-output protocol, so a value containing one of those
-/// cannot forge a column or row boundary. Every field this header renders
+/// cannot forge a column or row boundary; ESC and U+0085 / U+2028 / U+2029 are
+/// folded the same way (fold_line_breaks). Every field this header renders
 /// goes through it, and the registry plugin's unknown-action error path
 /// calls it directly.
 [[nodiscard]] inline std::string sanitize_field(std::string_view s) {
@@ -215,6 +243,7 @@ struct ProfileInfo {
     out.reserve(s.size());
     for (char c : s)
         out += (c == '|' || c == '\n' || c == '\r') ? '_' : c;
+    fold_line_breaks(out);
     return out;
 }
 

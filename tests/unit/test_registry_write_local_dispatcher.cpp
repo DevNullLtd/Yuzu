@@ -99,10 +99,11 @@ struct Plugin {
         }
     };
 
-    Out run(const std::string& action, const std::map<std::string, std::string>& params) {
+    Out run(const std::string& action, const std::map<std::string, std::string>& params,
+            std::size_t capture_cap = yuzu::agent::LocalDispatcher::kCaptureMaxBytes) {
         std::vector<YuzuParam> raw;
         for (const auto& [k, v] : params) raw.push_back(YuzuParam{k.c_str(), v.c_str()});
-        const auto r = dispatcher.run(handle->descriptor(), action, raw);
+        const auto r = dispatcher.run(handle->descriptor(), action, raw, capture_cap);
         Out out;
         out.rc = r.rc;
         std::istringstream in(r.captured);
@@ -223,6 +224,35 @@ struct ScratchTree {
     }
     ScratchTree(const ScratchTree&) = delete;
     ScratchTree& operator=(const ScratchTree&) = delete;
+};
+
+/// Removes registry link objects (HKLM-relative `paths`) BY HANDLE on scope exit: a link-opening open with DELETE,
+/// then NtDeleteKey on that handle, which removes the link object and never its target (the shape of
+/// test_registry_win_internals.cpp's LinkSweep, which this TU cannot reuse because it does not include
+/// registry_win.cpp). Independent of the plugin under test, so a failed plugin call cannot leave a link behind
+/// for the ScratchTree's RegDeleteTreeW, which FOLLOWS links. Declare it AFTER the ScratchTree it protects, so it
+/// runs first. A path that is absent (the plugin already removed it) is skipped; never throws.
+struct LinkSweep {
+    std::vector<std::string> paths;
+    ~LinkSweep() {
+        try {
+            using NtDeleteKeyFn = LONG(NTAPI*)(HANDLE);
+            static const NtDeleteKeyFn nt_delete_key = [] {
+                const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+                return ntdll == nullptr ? nullptr
+                                        : reinterpret_cast<NtDeleteKeyFn>(
+                                              reinterpret_cast<void*>(GetProcAddress(ntdll, "NtDeleteKey")));
+            }();
+            if (nt_delete_key == nullptr) return; // leave the link; a by-name delete would follow it
+            for (const auto& path : paths) {
+                yuzu::win::RegKey k;
+                if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, widen(path).c_str(), REG_OPTION_OPEN_LINK, DELETE, k.put()) ==
+                    ERROR_SUCCESS)
+                    nt_delete_key(k.get());
+            }
+        } catch (...) {
+        }
+    }
 };
 
 } // namespace
@@ -395,10 +425,14 @@ TEST_CASE("registry write: a registry value containing a newline and an audit| l
     REQUIRE(put(HKEY_CURRENT_USER, key, "V", REG_SZ, utf16(L"x\naudit|op=set_value|result=ok")));
     REQUIRE(put(HKEY_CURRENT_USER, key, "N|\naudit|op=set_value|result=ok", REG_DWORD, le(1, 4))); // a hostile NAME
     REQUIRE(put(HKEY_CURRENT_USER, key + "\\sub|\nname", "n", REG_DWORD, le(1, 4)));
+    REQUIRE(put(HKEY_CURRENT_USER, key, "U", REG_SZ, utf16(L"a\u2028b\x85" L"c\u2029d"))); // the Unicode line breaks
     const auto out = p.run("get_value", {{"hive", "HKCU"}, {"key", key}, {"name", "V"}});
     CHECK(out.rc == 0);
     CHECK(out.audit_count() == 0);
     CHECK(out.has("value|x_audit_op=set_value_result=ok"));
+    const auto unicode = p.run("get_value", {{"hive", "HKCU"}, {"key", key}, {"name", "U"}});
+    CHECK(unicode.rc == 0);
+    CHECK(unicode.has("value|a_b_c_d")); // U+2028, U+0085 and U+2029 fold to '_' like LF: one row, never split
     const auto subs = p.run("enumerate_keys", {{"hive", "HKCU"}, {"key", key}});
     CHECK(subs.audit_count() == 0);
     for (const auto& l : subs.lines) CHECK(l.find('\n') == std::string::npos);
@@ -408,7 +442,40 @@ TEST_CASE("registry write: a registry value containing a newline and an audit| l
     CHECK(vals.rc == 0);
     CHECK(vals.audit_count() == 0);
     CHECK(vals.has("value|N__audit_op=set_value_result=ok|REG_DWORD"));
-    CHECK(vals.lines.size() == 2);
+    CHECK(vals.has("value|U|REG_SZ"));
+    CHECK(vals.lines.size() == 3);
+}
+
+// #6490: get_value reads at most kMaxWriteBytes (1 MiB, the bound get_user_value and the write path already use) and
+// answers get_user_value's oversized line for a larger value instead of holding the bytes three times (the read, the
+// hex string, the sanitised copy). The boundary is inclusive, as query_value_bounded's own case pins.
+// Mutation: put the bound back to UINT32_MAX -> the 1 MiB + 1 section answers the value.
+TEST_CASE("registry read: get_value answers a value of exactly 1 MiB and refuses one byte more",
+          "[registry][windows][write]") {
+    Plugin p;
+    if (!p.ok()) { skip_or_fail("registry.dll not found"); return; }
+    const std::string key = "Software\\" + scratch_name() + "\\big";
+    ScratchTree cleanup{HKEY_CURRENT_USER, "Software\\" + scratch_name()};
+    constexpr std::size_t kMiB = 1024 * 1024;
+    // The hex of 1 MiB is 2 MiB: past LocalDispatcher's default capture cap, so this case raises it.
+    constexpr std::size_t kCap = 4 * kMiB;
+
+    SECTION("exactly 1 MiB: the value and its type, no audit line") {
+        REQUIRE(put(HKEY_CURRENT_USER, key, "V", REG_BINARY, Bytes(kMiB, 0xaa)));
+        const auto out = p.run("get_value", {{"hive", "HKCU"}, {"key", key}, {"name", "V"}}, kCap);
+        CHECK(out.rc == 0);
+        CHECK(out.has("type|REG_BINARY"));
+        CHECK(out.has("value|" + std::string(2 * kMiB, 'a')));
+        CHECK(out.audit_count() == 0);
+    }
+    SECTION("1 MiB + 1: refused with the shared oversized line, no value, no audit line") {
+        REQUIRE(put(HKEY_CURRENT_USER, key, "V", REG_BINARY, Bytes(kMiB + 1, 0xaa)));
+        const auto out = p.run("get_value", {{"hive", "HKCU"}, {"key", key}, {"name", "V"}}, kCap);
+        CHECK(out.rc == 1);
+        REQUIRE(out.lines.size() == 1);
+        CHECK(out.lines[0] == "error|value exceeds 1 MiB limit");
+        CHECK(out.audit_count() == 0);
+    }
 }
 
 // ── delete_key: a leaf by handle, counts, links, ACLs ──
@@ -455,6 +522,7 @@ TEST_CASE("registry write: a registry link is refused; never followed; and delet
         skip_or_fail("not elevated -- HKLM scratch not writable, registry-link case");
         return;
     }
+    LinkSweep sweep{{root + "\\Link"}};
     if (!make_machine_link(root + "\\Link", root + "\\Target")) {
         skip_or_fail("could not create a registry link here");
         return;
@@ -502,6 +570,7 @@ TEST_CASE("registry write: a registry link whose target does not exist is refuse
         skip_or_fail("not elevated -- HKLM scratch not writable, dangling-link case");
         return;
     }
+    LinkSweep sweep{{root + "\\Link"}};
     if (!make_machine_link(root + "\\Link", root + "\\Target")) { // Target is never created by this case
         skip_or_fail("could not create a registry link here");
         return;
@@ -568,19 +637,9 @@ TEST_CASE("registry write: HKLM verdicts -- a link is refused wherever it sits a
         skip_or_fail("not elevated -- HKLM scratch not writable, verdict-table case");
         return;
     }
-    const std::vector<std::string> links{"Lnk", "LeafLnk", "Dangling", "Self"};
-    // Deletes each link object through the plugin (by handle) before the scratch tree goes: RegDeleteTreeW follows a link.
-    struct LinkSweep {
-        Plugin& plugin;
-        std::string base;
-        std::vector<std::string> names;
-        ~LinkSweep() {
-            try {
-                for (const auto& n : names) plugin.run("delete_key", {{"hive", "HKLM"}, {"key", base + "\\" + n}});
-            } catch (...) {
-            }
-        }
-    } sweep{p, root, links};
+    // Removes each link object by handle before the scratch tree goes: RegDeleteTreeW follows a link.
+    LinkSweep sweep;
+    for (const char* name : {"Lnk", "LeafLnk", "Dangling", "Self"}) sweep.paths.push_back(root + "\\" + name);
     if (!make_machine_link(root + "\\Lnk", root + "\\Real") ||
         !make_machine_link(root + "\\LeafLnk", root + "\\Real\\a") ||
         !make_machine_link(root + "\\Dangling", root + "\\Nowhere") ||
@@ -817,13 +876,13 @@ Executed run_execute(std::string_view action, const char* name_param = nullptr) 
 
 } // namespace
 
-TEST_CASE("registry plugin: version 2.0.0 and the 9 descriptors -- Windows supported; macOS and Linux planned",
+TEST_CASE("registry plugin: version 2.0.1 and the 9 descriptors -- Windows supported; macOS and Linux planned",
           "[registry][descriptors]") {
     auto plugin = load_registry_plugin();
     if (!plugin) return require_plugin_or_skip();
 
     CHECK(std::string_view{plugin->descriptor->name} == "registry");
-    CHECK(std::string_view{plugin->descriptor->version} == "2.0.0");
+    CHECK(std::string_view{plugin->descriptor->version} == "2.0.1");
     REQUIRE(plugin->descriptor->action_descriptor_count == std::size(kExpectedActions));
     REQUIRE(plugin->descriptor->action_descriptors != nullptr);
     std::unordered_set<std::string> seen;

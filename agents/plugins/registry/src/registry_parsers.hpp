@@ -99,6 +99,24 @@ enum class Hive { hklm, hkcu, hkcr, hku };
     return "HKLM";
 }
 
+/// Whether a kernel key name (NtQueryKey's UTF-16, before any conversion) round-trips to UTF-8 exactly: no NUL
+/// unit, no lone surrogate. The canonical-name compare of the fast open runs on the UTF-8 form, and a lossy
+/// conversion would map a lone surrogate to U+FFFD, so a key one code unit away from the requested name could compare
+/// equal; a name that fails this is never compared (the fast open declines and the walk decides).
+[[nodiscard]] inline bool kernel_name_well_formed(std::u16string_view name) noexcept {
+    for (std::size_t i = 0; i < name.size(); ++i) {
+        const char16_t u = name[i];
+        if (u == 0) return false;
+        if (u >= 0xD800 && u <= 0xDBFF) {
+            if (i + 1 >= name.size() || name[i + 1] < 0xDC00 || name[i + 1] > 0xDFFF) return false;
+            ++i; // the pair
+        } else if (u >= 0xDC00 && u <= 0xDFFF) {
+            return false; // a low surrogate with no high before it
+        }
+    }
+    return true;
+}
+
 /// The two refusals every action's hive/key parameters can earn (the shell writes the line verbatim).
 inline constexpr std::string_view kErrMissingHiveKey = "error|missing required parameters: hive, key";
 inline constexpr std::string_view kErrInvalidHive = "error|invalid hive (use HKLM, HKCU, HKCR, or HKU)";
@@ -259,6 +277,9 @@ inline void put_le(std::vector<std::uint8_t>& out, std::uint64_t v, int bytes) {
 /// data_hex is the zero-byte form, valid only for REG_BINARY). Otherwise `value` is the text form:
 /// decimal digits for DWORD / QWORD (overflow -> value_overflow), UTF-8 for SZ / EXPAND_SZ,
 /// LF-separated non-empty records for MULTI_SZ (empty text = the lone double NUL), hex for BINARY.
+/// A missing or misspelt `value` parameter reaches this as an empty text (the caller cannot tell the two apart), so
+/// an empty text is the empty string / empty binary for SZ / EXPAND_SZ / BINARY, the lone double NUL for MULTI_SZ and
+/// invalid_data for DWORD / QWORD; the MULTI_SZ record separator is LF only.
 /// Everything is capped at kMaxWriteBytes.
 [[nodiscard]] inline Encoded encode_value(std::uint32_t type, std::string_view value,
                                           std::string_view data_hex, bool data_hex_present) {
@@ -461,7 +482,7 @@ struct OldValue {
 
 /// Neutralises untrusted text for an `audit|k=v|...` line: invalid UTF-8 -> '?', control bytes,
 /// space, '=' and ',' (yuzu::log_token) -> '_', and '|' -> '_' (log_token does not map the field
-/// separator). A trailing backslash becomes '_' too. Over `cap` bytes it is cut on a character boundary and gets
+/// separator) and U+0085 / U+2028 / U+2029 -> '_' (fold_line_breaks). A trailing backslash becomes '_' too. Over `cap` bytes it is cut on a character boundary and gets
 /// `~<total length>`.
 [[nodiscard]] inline std::string audit_token(std::string_view s, std::size_t cap = kAuditTokenCap) {
     std::string t;
@@ -473,6 +494,7 @@ struct OldValue {
         t = yuzu::log_token(scrubbed);
     }
     std::replace(t.begin(), t.end(), '|', '_');
+    yuzu::profiles::fold_line_breaks(t); // log_token folds ESC but passes U+0085 / U+2028 / U+2029
     // A field that ends in a backslash would make the following separator read as an escaped `|` to the server's
     // splitter (result_parsing.hpp find_unescaped_pipe) and merge two cells.
     if (!t.empty() && t.back() == '\\') t.back() = '_';

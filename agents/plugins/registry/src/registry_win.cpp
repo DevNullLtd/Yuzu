@@ -34,7 +34,6 @@
 #include <cstring>
 #include <format>
 #include <iterator>
-#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -69,6 +68,7 @@ static_assert(yuzu::profiles::kRegBinary == REG_BINARY);
 static_assert(yuzu::profiles::kRegDword == REG_DWORD);
 static_assert(yuzu::profiles::kRegMultiSz == REG_MULTI_SZ);
 static_assert(yuzu::profiles::kRegQword == REG_QWORD);
+static_assert(kMaxWriteBytes == yuzu::win::kMaxRegValueBytes); // one bound for every value read in the plugin
 
 using yuzu::win::from_wide;
 using yuzu::win::to_wide;
@@ -113,6 +113,9 @@ template <class F> [[nodiscard]] F ntdll_proc(const char* symbol) {
 
 /// NtQueryKey(KeyNameInformation) of an open key as UTF-8. A failure of any kind, STATUS_BUFFER_OVERFLOW
 /// (a name past the 4 KiB buffer) included, is non-zero and leaves `out` empty: a half name is never compared.
+/// A name holding a lone surrogate or a NUL fails closed the same way (ERROR_INVALID_DATA): from_wide would convert
+/// it lossily (U+FFFD, one trailing NUL dropped), and the compare against the requested path must never run on an
+/// approximation of the kernel's name.
 [[nodiscard]] long query_key_name(HKEY key, std::string& out) {
     out.clear();
     static const NtQueryKeyFn fn = ntdll_proc<NtQueryKeyFn>("NtQueryKey");
@@ -129,6 +132,8 @@ template <class F> [[nodiscard]] F ntdll_proc(const char* symbol) {
     // needs), and the bytes were written by the kernel, not through another C++ object.
     const auto* name = reinterpret_cast<const wchar_t*>(buf + sizeof name_bytes);
     const std::size_t n = name_bytes / sizeof(wchar_t);
+    static_assert(sizeof(wchar_t) == sizeof(char16_t));
+    if (!kernel_name_well_formed({reinterpret_cast<const char16_t*>(name), n})) return ERROR_INVALID_DATA;
     if (std::all_of(name, name + n, [](wchar_t c) { return c > 0 && c < 0x80; })) { // the usual name: no NLS call
         out.resize(n);
         std::transform(name, name + n, out.begin(), [](wchar_t c) { return static_cast<char>(c); });
@@ -351,13 +356,18 @@ int do_get_value(yuzu::CommandContext& ctx, yuzu::Params params) {
         return 1;
     }
 
-    // The whole value, as before (no size bound: get_value's output for existing callers is unchanged);
-    // only the acquisition is the shared guarded read.
-    constexpr std::size_t kWhole = (std::numeric_limits<std::uint32_t>::max)();
+    // The shared guarded read, bounded at kMaxWriteBytes (the bound get_user_value and the write path use): a larger
+    // value is reported by size alone (q.bytes stays empty) and refused, never read whole into memory three times
+    // (the bytes, the hex string, the sanitised copy).
     const Wide wname{val_name};
     QueryResult q;
-    if (query_value_bounded(kWhole, raw_query(opened.get(), wname.c_str()), q, kWhole) != ERROR_SUCCESS) {
+    if (query_value_bounded(kMaxWriteBytes, raw_query(opened.get(), wname.c_str()), q, kMaxWriteBytes) !=
+        ERROR_SUCCESS) {
         ctx.write_output("error|value not found");
+        return 1;
+    }
+    if (q.size > kMaxWriteBytes) {
+        ctx.write_output(yuzu::profiles::render_user_key_error(yuzu::profiles::UserKeyStatus::value_oversized, t.key));
         return 1;
     }
     const DWORD type = q.type;

@@ -268,6 +268,19 @@ TEST_CASE("sanitize_field: ordinary text passes through unchanged", "[profiles]"
     CHECK(sanitize_field("alice") == "alice");
 }
 
+TEST_CASE("sanitize_field: folds ESC and the Unicode line breaks U+0085 U+2028 U+2029; nothing else", "[profiles]") {
+    CHECK(sanitize_field("a\x1b[31mb") == "a_[31mb");
+    CHECK(sanitize_field("a\xC2\x85" "b") == "a_b");
+    CHECK(sanitize_field("a\xE2\x80\xA8" "b") == "a_b");
+    CHECK(sanitize_field("a\xE2\x80\xA9" "b") == "a_b");
+    CHECK(sanitize_field("\xE2\x80\xA8\xE2\x80\xA9\xC2\x85") == "___"); // adjacent, no sequence swallowed
+    CHECK(sanitize_field("x\xE2\x80") == "x\xE2\x80");                     // a truncated sequence is left alone
+    CHECK(sanitize_field("x\xC2") == "x\xC2");
+    CHECK(sanitize_field("a\tb") == "a\tb");                                 // a tab passes (process rows carry them)
+    CHECK(sanitize_field("Caf\xC3\xA9 \xE2\x80\xA7 \xC2\xA0") == "Caf\xC3\xA9 \xE2\x80\xA7 \xC2\xA0"); // other UTF-8 intact
+    CHECK(sanitize_field("") == "");
+}
+
 TEST_CASE("render_profile_row: ordinary profile", "[profiles]") {
     ProfileInfo info{std::string{kAliceSid}, "alice", "C:\\Users\\alice", HiveState::loaded};
     CHECK(render_profile_row(info) == std::string{kAliceSid} + "|alice|C:\\Users\\alice|loaded");

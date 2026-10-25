@@ -74,6 +74,16 @@ struct Node {
 /// carry a VALUE named SymbolicLinkValue; the probe cannot tell that from a link. A relative open or create from
 /// a handle whose key has BECOME a link (a test hook completes it) is followed to the link's target, so the
 /// walk's check-to-use race is expressible.
+///
+/// Access masks are ENFORCED per handle: a handle answers 5 (ERROR_ACCESS_DENIED) to a call whose right it was not
+/// opened with (set_value / delete_value: KEY_SET_VALUE; query_value / enum_value: KEY_QUERY_VALUE; enum_subkey:
+/// KEY_ENUMERATE_SUB_KEYS; delete_key_by_handle: DELETE), after the deleted-key (1018) answer and before the
+/// per-node fault flags. The two root handles grant everything. create_sub is DELIBERATELY not checked against the
+/// parent handle's mask: RegCreateKeyExW checks key creation against the parent's security descriptor, not the
+/// samDesired the parent was opened with (Microsoft Learn, RegCreateKeyExW: a KEY_READ handle can create when the
+/// descriptor allows), so a refusal here would prove nothing about production; the KEY_CREATE_SUB_KEY the core
+/// asks for on an intermediate create is pinned by the masks case instead. final_name needs no right
+/// (KeyNameInformation).
 class FakeRegistry final : public RegistryWriter {
 public:
     static constexpr Handle kRoot = 1;
@@ -81,7 +91,11 @@ public:
     static constexpr const char* kRootName = "\\REGISTRY\\MACHINE";
     ~FakeRegistry() override { CHECK(open.empty()); } // a leaked handle, whichever test made it
     NodeP root = std::make_shared<Node>();
-    std::map<Handle, NodeP> open;
+    struct Granted {
+        NodeP node;
+        std::uint32_t access = 0;
+    };
+    std::map<Handle, Granted> open;
     Handle next = 0x100;
     std::vector<std::string> log;
     /// "<call>:<name>:<access mask in hex>" of every open_sub / open_path / create_sub, in call order.
@@ -89,7 +103,8 @@ public:
     /// Every call across the seam, and per method: the deterministic stand-in for latency.
     std::size_t seam_calls = 0;
     std::map<std::string, std::size_t> by_method;
-    /// Fired BEFORE create_sub, set_value and final_name ("final_name") and AFTER query_value / delete_value, named
+    /// Fired BEFORE create_sub, set_value, delete_value and final_name ("final_name") and AFTER query_value /
+    /// delete_value (a value erased by the call is gone when `after` runs), named
     /// "<op>:<name>" (e.g. "create_sub:B"), so a test can change the tree at a call boundary (or throw there).
     std::function<void(const std::string&)> before, after;
     std::function<void(Node&, const std::string&)> tamper_after_set;
@@ -102,7 +117,13 @@ public:
     NodeP node(Handle h) const {
         if (h == kRoot || h == kRootNoName) return root;
         const auto it = open.find(h);
-        return it == open.end() ? nullptr : it->second;
+        return it == open.end() ? nullptr : it->second.node;
+    }
+    /// Whether the handle was opened with `right` (the roots grant everything).
+    [[nodiscard]] bool has(Handle h, std::uint32_t right) const {
+        if (h == kRoot || h == kRootNoName) return true;
+        const auto it = open.find(h);
+        return it != open.end() && (it->second.access & right) == right;
     }
     NodeP key(const std::string& path, bool create = true) {
         NodeP cur = root;
@@ -172,7 +193,7 @@ public:
         }
         if (rc == 0) {
             out = next++;
-            open[out] = child;
+            open[out] = {child, access};
         }
         return rc;
     }
@@ -188,7 +209,7 @@ public:
         if (r.rc != 0) return r.rc;
         if (!key_path.empty() && r.node->deny_open) return 5; // the leaf needs real access; an ancestor only traverse
         out = next++;
-        open[out] = r.node;
+        open[out] = {r.node, access};
         return 0;
     }
     long final_name(Handle key_h, std::string& out) override {
@@ -232,11 +253,11 @@ public:
                 auto n = std::make_shared<Node>();
                 p->subkeys[std::string{name}] = n;
                 out = next++;
-                open[out] = n;
+                open[out] = {n, access};
                 created_new = true;
             } else {
                 out = next++;
-                open[out] = it->second;
+                open[out] = {it->second, access};
                 created_new = false; // REG_OPENED_EXISTING_KEY
             }
         }
@@ -265,7 +286,7 @@ public:
         if (const auto inj = take(ev)) return *inj;
         const auto n = node(key_h);
         if (!n || n->deleted) return 1018;
-        if (n->deny_set) return 5;
+        if (!has(key_h, kKeySetValue) || n->deny_set) return 5;
         n->values[std::string{name}] = Val{type, Bytes(data.begin(), data.end())};
         if (tamper_after_set) tamper_after_set(*n, std::string{name});
         return 0;
@@ -274,11 +295,12 @@ public:
         tally("delete_value");
         const std::string ev = "delete_value:" + std::string{name};
         log.push_back(ev);
+        if (before) before(ev);
         long rc = 0;
         const auto n = node(key_h);
         if (const auto inj = take(ev)) rc = *inj;
         else if (!n || n->deleted) rc = 1018;
-        else if (n->deny_delete_value) rc = 5;
+        else if (!has(key_h, kKeySetValue) || n->deny_delete_value) rc = 5;
         else rc = n->values.erase(std::string{name}) ? 0 : 2;
         if (after) after(ev);
         return rc;
@@ -288,6 +310,7 @@ public:
         if (const auto inj = take("enum_value", "enum_value")) return *inj;
         const auto n = node(key_h);
         if (!n || n->deleted) return 1018;
+        if (!has(key_h, kKeyQueryValue)) return 5;
         if (grow_on_enum) grow_on_enum(*n);
         if (index >= n->values.size()) return 259;
         name = std::next(n->values.begin(), index)->first;
@@ -298,6 +321,7 @@ public:
         if (const auto inj = take("enum_subkey", "enum_subkey")) return *inj;
         const auto n = node(key_h);
         if (!n || n->deleted) return 1018;
+        if (!has(key_h, kKeyEnumerateSubKeys)) return 5;
         if (index >= n->subkeys.size()) return 259;
         name = std::next(n->subkeys.begin(), index)->first;
         return 0;
@@ -308,7 +332,7 @@ public:
         if (const auto inj = take("delete_key_by_handle")) return *inj;
         const auto n = node(key_h);
         if (!n || n->deleted) return 1018;
-        if (n->deny_delete_key || !n->subkeys.empty()) return 5; // STATUS_CANNOT_DELETE maps to access denied
+        if (!has(key_h, kAccessDelete) || n->deny_delete_key || !n->subkeys.empty()) return 5; // STATUS_CANNOT_DELETE maps to access denied
         n->deleted = true;
         detach(root, n.get());
         return 0;
@@ -358,6 +382,7 @@ private:
     long do_query(Handle key_h, std::string_view name, std::size_t cap, QueryResult& out) {
         const auto n = node(key_h);
         if (!n || n->deleted) return 1018;
+        if (!has(key_h, kKeyQueryValue)) return 5;
         if (name == "SymbolicLinkValue") {
             if (n->deny_query) return 5;
             if (n->is_link) {
@@ -828,6 +853,88 @@ TEST_CASE("registry core: every open and create asks for the access it needs", "
     REQUIRE(set_value_verified(fast, FakeRegistry::kRoot, "Software\\Acme", "V", kRegDword, dword(3), true).ok());
     const std::vector<std::string> expected_fast{"open_path:Software\\Acme:0x3"};
     CHECK(fast.masks == expected_fast);
+
+    // delete_value needs KEY_SET_VALUE (RegDeleteValueW) and the capture / verify queries KEY_QUERY_VALUE: 0x3.
+    for (const bool is_fast : {false, true}) {
+        FakeRegistry dv;
+        dv.put("A", "V", kRegDword, dword(1));
+        REQUIRE(delete_value_verified(dv, FakeRegistry::kRoot, "A", "V", is_fast).ok());
+        const std::vector<std::string> want{is_fast ? "open_path:A:0x3" : "open_sub:A:0x3"};
+        CHECK(dv.masks == want);
+    }
+    // delete_key: DELETE | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE (0x10009), no KEY_SET_VALUE.
+    for (const bool is_fast : {false, true}) {
+        FakeRegistry dk;
+        dk.key("T");
+        REQUIRE(delete_key_tree(dk, FakeRegistry::kRoot, "T", is_fast).ok());
+        const std::vector<std::string> want{is_fast ? "open_path:T:0x10009" : "open_sub:T:0x10009"};
+        CHECK(dk.masks == want);
+    }
+}
+
+// The fake grants a handle exactly the rights it was opened with, so dropping a right from the mask the core asks
+// for (the line above) turns a green case red instead of passing on a fake that never looked.
+TEST_CASE("registry core: the fake enforces the access a handle was opened with", "[registry][core]") {
+    FakeRegistry reg;
+    reg.put("A", "V", kRegDword, dword(1));
+    reg.key("A\\S");
+    QueryResult q;
+    std::string name;
+    const auto open_a = [&](std::uint32_t access) {
+        Handle h = 0;
+        REQUIRE(reg.open_sub(FakeRegistry::kRoot, "A", access, h) == 0);
+        return Owned{reg, h};
+    };
+    SECTION("each call needs its own right and answers access denied without it") {
+        const auto query_only = open_a(kKeyQueryValue);
+        CHECK(reg.query_value(query_only.get(), "V", 0, q) == 0);
+        CHECK(reg.enum_value(query_only.get(), 0, name) == 0);
+        CHECK(reg.set_value(query_only.get(), "W", kRegDword, dword(2)) == 5);
+        CHECK(reg.delete_value(query_only.get(), "V") == 5);
+        CHECK(reg.enum_subkey(query_only.get(), 0, name) == 5);
+        CHECK(reg.delete_key_by_handle(query_only.get()) == 5);
+        CHECK(reg.get("A", "V") != nullptr);
+        CHECK(reg.get("A", "W") == nullptr);
+
+        const auto set_only = open_a(kKeySetValue);
+        CHECK(reg.query_value(set_only.get(), "V", 0, q) == 5);
+        CHECK(reg.enum_value(set_only.get(), 0, name) == 5);
+        CHECK(reg.set_value(set_only.get(), "W", kRegDword, dword(2)) == 0);
+        CHECK(reg.delete_value(set_only.get(), "W") == 0);
+
+        const auto enum_only = open_a(kKeyEnumerateSubKeys);
+        CHECK(reg.enum_subkey(enum_only.get(), 0, name) == 0);
+        CHECK(reg.query_value(enum_only.get(), "V", 0, q) == 5);
+        CHECK(reg.set_value(enum_only.get(), "W", kRegDword, dword(2)) == 5);
+    }
+    SECTION("delete_key_by_handle needs DELETE") {
+        // A\S through two handles: one without DELETE, one with.
+        Handle no_delete = 0, deletable = 0;
+        REQUIRE(reg.open_path(FakeRegistry::kRoot, "A\\S", kKeyQueryValue | kKeyEnumerateSubKeys, no_delete) == 0);
+        Owned no_delete_owner{reg, no_delete};
+        REQUIRE(reg.open_path(FakeRegistry::kRoot, "A\\S", kAccessDelete, deletable) == 0);
+        Owned deletable_owner{reg, deletable};
+        CHECK(reg.delete_key_by_handle(no_delete_owner.get()) == 5);
+        CHECK(reg.exists("A\\S"));
+        CHECK(reg.delete_key_by_handle(deletable_owner.get()) == 0);
+        CHECK_FALSE(reg.exists("A\\S"));
+        // A deleted key answers 1018 before any access check: a handle lacking the right still sees the deletion.
+        CHECK(reg.set_value(no_delete_owner.get(), "W", kRegDword, dword(2)) == 1018);
+        CHECK(reg.query_value(no_delete_owner.get(), "V", 0, q) == 1018);
+    }
+    SECTION("create_sub is not gated by the parent handle's mask (RegCreateKeyExW checks the security descriptor)") {
+        const auto query_only = open_a(kKeyQueryValue);
+        Handle made = 0;
+        bool created_new = false;
+        REQUIRE(reg.create_sub(query_only.get(), "New", kKeyQueryValue, made, created_new) == 0);
+        Owned made_owner{reg, made};
+        CHECK(created_new);
+        CHECK(reg.exists("A\\New"));
+    }
+    SECTION("the root handles grant everything") {
+        CHECK(reg.set_value(FakeRegistry::kRoot, "R", kRegDword, dword(1)) == 0);
+        CHECK(reg.enum_subkey(FakeRegistry::kRootNoName, 0, name) == 0);
+    }
 }
 
 TEST_CASE("registry core: a missing suffix is created component-wise from the checked handle",
@@ -1074,6 +1181,34 @@ TEST_CASE("registry core: an exception after hand-over rolls back the keys and t
         CHECK_THROWS_AS(write(), std::bad_alloc);
         CHECK(reg.exists("Software\\New\\Deeper")); // a key whose rollback step threw is kept
     }
+    SECTION("the rollback's own value delete throws before it erases: nothing escapes, the value and its keys stay") {
+        // mutant: no try/catch around the value delete (a throw while unwinding ends the process)
+        int reads = 0;
+        reg.after = [&](const std::string& ev) {
+            if (ev == "query_value:V" && ++reads == 2) throw std::bad_alloc{};
+        };
+        reg.before = [&](const std::string& ev) {
+            if (ev == "delete_value:V") throw std::bad_alloc{};
+        };
+        CHECK_THROWS_AS(write(), std::bad_alloc); // the read-back's, not a second one from the rollback
+        CHECK(reg.calls("delete_value:V") == 1);
+        REQUIRE(reg.get("Software\\New\\Deeper", "V") != nullptr); // the delete never ran
+        CHECK(reg.exists("Software\\New\\Deeper")); // a key that holds a value is kept
+        CHECK(reg.exists("Software\\New"));
+    }
+    SECTION("the rollback's own value delete throws after it erased: nothing escapes, the keys are removed") {
+        // mutant: as above; and a value delete that throws must not skip the key loop
+        int reads = 0;
+        reg.after = [&](const std::string& ev) {
+            if (ev == "query_value:V" && ++reads == 2) throw std::bad_alloc{};
+            if (ev == "delete_value:V") throw std::bad_alloc{}; // V is already gone when this fires
+        };
+        CHECK_THROWS_AS(write(), std::bad_alloc);
+        CHECK(reg.calls("delete_value:V") == 1);
+        // The catch around the value delete swallows it and the loop goes on: the value is gone, so both keys are empty.
+        nothing_left();
+        CHECK(reg.method_calls("delete_key_by_handle") == 2);
+    }
     SECTION("a write that creates nothing keeps its value when the read-back throws") {
         // mutant: the rollback owner also removes the value of a write that made no key
         reg.key("Software\\New\\Deeper");
@@ -1128,6 +1263,29 @@ TEST_CASE("registry core: the rollback keeps a key that holds another party's va
         REQUIRE(reg.get("Software\\New", "Foreign") != nullptr);
         CHECK(reg.get("Software\\New", "Foreign")->data == dword(0xF0));
         CHECK(reg.method_calls("delete_key_by_handle") == 0);
+    }
+    SECTION("a foreign value in the MIDDLE key after three creates: only the empty leaf goes, the rest is kept") {
+        // mutant: the rollback deletes without the enum_value check (Mid would lose Foreign); or only the last key made
+        // is considered. All three keys are CREATED (nothing pre-exists, so none is "opened-existing" and none is skipped
+        // as somebody else's); the walk then ends on its leaf-name read, after the creates.
+        reg.before = [&](const std::string& ev) {
+            if (ev != "create_sub:Deeper") return;
+            reg.put("Software\\New\\Mid", "Foreign", kRegDword, dword(0xF0)); // lands after New and Mid are made
+            reg.inject["final_name"] = 5;                                      // the leaf-name read then fails
+        };
+        const auto o = set_value_verified(reg, FakeRegistry::kRoot, "Software\\New\\Mid\\Deeper", "V", kRegDword,
+                                          dword(3), false);
+        CHECK(o.result == "failed");
+        CHECK(o.reason == "access_denied");
+        CHECK(o.created == 2); // New and Mid remain; Deeper was deleted by its own handle
+        CHECK_FALSE(reg.exists("Software\\New\\Mid\\Deeper"));
+        REQUIRE(reg.get("Software\\New\\Mid", "Foreign") != nullptr);
+        CHECK(reg.get("Software\\New\\Mid", "Foreign")->data == dword(0xF0));
+        CHECK(reg.exists("Software\\New"));
+        // Deeper (empty) is deleted; Mid is kept at the enum_value check without a delete call; New has no value, so a
+        // delete is attempted and the key refuses it for its subkey Mid.
+        CHECK(reg.method_calls("delete_key_by_handle") == 2);
+        CHECK(reg.calls("set_value") == 0); // the write never ran
     }
     SECTION("a foreign value planted at the write: our value goes, theirs stays, the key is counted") {
         // mutant: as above, or the owner's own value left in place (the key is then kept as holding it)
@@ -1282,6 +1440,12 @@ TEST_CASE("registry core: delete_key non-recursive refuses a key with subkeys an
         CHECK(o.reason == "access_denied");
         CHECK(reg.exists("T\\C2"));
         CHECK(reg.calls("delete_key_by_handle") == 0);
+        // refused before any value was counted: nothing to report (README audit grammar, counted_values)
+        CHECK(o.counted_keys == 0);
+        CHECK(o.counted_values == 0);
+        CHECK_FALSE(o.capped);
+        CHECK(render_single_action(AuditRecord{}, o, true).lines[0].find("|counted_keys=0|counted_values=0|capped=0|") !=
+              std::string::npos);
     }
     SECTION("a value enumeration that fails is a refusal with its token; nothing is deleted") {
         // mutant: a failed enum_value ends the count as if the values were all listed (capped=0, counts under-reported)
@@ -1292,6 +1456,26 @@ TEST_CASE("registry core: delete_key non-recursive refuses a key with subkeys an
         CHECK_FALSE(o.capped);
         CHECK(reg.exists("T\\C1\\G1"));
         CHECK(reg.calls("delete_key_by_handle") == 0);
+        CHECK(o.counted_keys == 1); // the failure came on the first enumeration call: the key only
+        CHECK(o.counted_values == 0);
+    }
+    SECTION("a value enumeration that fails after two values reports the partial count") {
+        // mutant: the counts are zeroed (or not recorded) on a failed enumeration
+        // G1 holds g1 and g2; the third enum_value call (the one that would answer "no more") fails.
+        int calls = 0;
+        reg.grow_on_enum = [&](Node&) {
+            if (++calls == 2) reg.inject["enum_value"] = 1450; // consumed by the next call
+        };
+        const auto o = delete_key_tree(reg, FakeRegistry::kRoot, "T\\C1\\G1", fast);
+        CHECK(o.result == "refused");
+        CHECK(o.reason == "win32:1450");
+        CHECK(o.counted_keys == 1);
+        CHECK(o.counted_values == 2);
+        CHECK_FALSE(o.capped);
+        CHECK(reg.exists("T\\C1\\G1"));
+        CHECK(reg.calls("delete_key_by_handle") == 0);
+        CHECK(render_single_action(AuditRecord{}, o, true).lines[0].find("|counted_keys=1|counted_values=2|capped=0|") !=
+              std::string::npos);
     }
     SECTION("NtDeleteKey denied: the delete fails access_denied and the key stays") {
         reg.key("T\\C2")->deny_delete_key = true;
@@ -1713,6 +1897,14 @@ TEST_CASE("registry core: report_exception leaves a mutator's fixed audit line, 
             CHECK(ctx.lines[0] == "error|exception");
         }
     }
+    SECTION("an allocation failure on the error line leaves the audit literal alone, and nothing escapes") {
+        // mutant: no try/catch around the second write (the failure escapes the ABI seam)
+        RecordingCtx ctx;
+        ctx.fails = [](std::string_view t) { return t == "error|exception"; };
+        CHECK_NOTHROW(report_exception(ctx, "set_value"));
+        REQUIRE(ctx.lines.size() == 1);
+        CHECK(ctx.lines[0] == exception_audit_line("set_value"));
+    }
     SECTION("an allocation failure on the audit line cannot suppress error|exception, and nothing escapes") {
         RecordingCtx ctx;
         ctx.fails = [](std::string_view t) { return t.rfind("audit|", 0) == 0; };
@@ -1788,6 +1980,37 @@ TEST_CASE("registry core: a sink failure after the real audit line adds no secon
         CHECK(ctx.lines[1] == "error|exception");
         CHECK(audit_line_count(ctx) == 1);
     }
+}
+
+// ── previous-value capture ───────────────────────────────────────────────
+
+TEST_CASE("registry core: capture_old keeps kCaptureValueCap bytes of a bigger value and the full size on the audit "
+          "line",
+          "[registry][core]") {
+    FakeRegistry reg;
+    Bytes big(5000);
+    for (std::size_t i = 0; i < big.size(); ++i) big[i] = static_cast<std::uint8_t>(i % 251);
+    reg.put("A", "Big", kRegBinary, big);
+    Handle h = 0;
+    REQUIRE(reg.open_sub(FakeRegistry::kRoot, "A", kKeyQueryValue, h) == 0);
+    const Owned owner{reg, h};
+
+    const OldValue old = capture_old(reg, owner.get(), "Big");
+    CHECK(old.state == OldState::present);
+    CHECK(old.type == kRegBinary);
+    CHECK(old.bytes.size() == kCaptureValueCap);
+    CHECK(old.total == 5000);
+    CHECK(std::equal(old.bytes.begin(), old.bytes.end(), big.begin()));
+
+    // Through the real capture, not a hand-built record: fill_old copies it, and the line shows the first
+    // kAuditHexCapBytes (256) of it, then ~<the full size>.
+    AuditRecord au;
+    au.op = "set_value";
+    fill_old(au, old);
+    CHECK(au.old_total == 5000);
+    const std::string want =
+        "|old=" + yuzu::profiles::hex_encode(std::span<const std::uint8_t>{big}.first(kAuditHexCapBytes)) + "~5000|new=-";
+    CHECK(render_audit_line(au).ends_with(want));
 }
 
 // ── the value-count cap ──────────────────────────────────────────────────

@@ -46,7 +46,7 @@ spec:
       - name: value
         type: string
         description: >-
-          The value's data, decoded to a display string. Never truncated or fabricated; a value over the registry's own limits fails the action rather than returning a partial string. Values: free text.
+          The value's data, decoded to a display string, for a value of at most 1 MiB (the same bound as get_user_value). Never truncated or fabricated: a larger value fails the action with `error|value exceeds 1 MiB limit` rather than returning a partial string. Values: free text.
         example: "Windows 10 Pro"
         platforms: [windows]
       - name: type

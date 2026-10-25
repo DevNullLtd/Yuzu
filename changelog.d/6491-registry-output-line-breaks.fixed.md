@@ -1,0 +1,1 @@
+- Registry read output, the `registry.write` audit tokens and every plugin row rendered through the shared `sanitize_field` now fold ESC and the Unicode line breaks U+0085, U+2028 and U+2029 to `_`, so a registry name or value cannot split a log line or inject a terminal escape.

@@ -139,7 +139,7 @@ class RegistryDefinitionPins(unittest.TestCase):
             with self.subTest(action=action):
                 self.assertEqual(got[action], version)
         docs = json.loads((REPO_ROOT / "content" / "plugin-docs" / "registry.json").read_text(encoding="utf-8"))
-        self.assertEqual(docs["version"], "2.0.0")
+        self.assertEqual(docs["version"], "2.0.1")
 
     def test_the_writers_are_classified_destructive_for_the_risk_gate(self):
         overrides = json.loads((REPO_ROOT / "scripts" / "test" / "instructions-risk-classification.json")

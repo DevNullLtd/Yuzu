@@ -15,6 +15,7 @@
 #include <string_view>
 #include <vector>
 
+#include "registry_core.hpp" // names_equal_ascii_ci
 #include "registry_parsers.hpp"
 
 using namespace yuzu::registry;
@@ -121,7 +122,7 @@ TEST_CASE("registry encode REG_MULTI_SZ: LF-separated records; empty text is the
         CHECK(encode_value(kRegMultiSz, bad, {}, false).error == kTokInvalidData);
     CHECK(encode_value(kRegMultiSz, std::string_view{"a\0b", 3}, {}, false).error == kTokInvalidData);
     SECTION("the 1 MiB cap holds on the text and on the encoded bytes") {
-        // mutants: the text-size check removed; the encoded-size check removed
+        // mutants: drop the text-size check; drop the encoded-size check
         CHECK(encode_value(kRegMultiSz, std::string(kMaxWriteBytes + 1, 'x'), {}, false).error == kTokValueOverflow);
         // 600,000 ASCII characters are within the text bound but encode to 1,200,004 bytes (UTF-16, a record NUL
         // and the list NUL): over the cap.
@@ -261,6 +262,12 @@ TEST_CASE("registry audit_token: neutralises everything that could forge a field
     CHECK(audit_token("\\") == "_");
     CHECK(audit_token("a\\b\\") == "a\\b_");
     CHECK(audit_token("Caf\xC3\xA9") == "Caf\xC3\xA9");                   // valid UTF-8 survives
+    // ESC and the Unicode line breaks cannot split a line for a Unicode-aware reader either (UP-9).
+    CHECK(audit_token("a\x1b[31mb") == "a_[31mb");
+    CHECK(audit_token("a\xC2\x85" "b") == "a_b");          // U+0085
+    CHECK(audit_token("a\xE2\x80\xA8" "b") == "a_b");      // U+2028
+    CHECK(audit_token("a\xE2\x80\xA9" "b") == "a_b");      // U+2029
+    CHECK(audit_token("a\xE2\x80\xA7" "b") == "a\xE2\x80\xA7" "b"); // U+2027 is not a line break: kept
     SECTION("over the cap: cut on a character boundary, with ~<length>") {
         CHECK(audit_token(std::string(300, 'k')) == std::string(256, 'k') + "~300");
         CHECK(audit_token(std::string(256, 'k')) == std::string(256, 'k')); // exactly the cap: whole
@@ -642,4 +649,25 @@ TEST_CASE("registry is_sensitive_hklm_path: the Run keys and the service tree un
     CHECK_FALSE(is_sensitive_hklm_path("HKLM", "SOFTWARE\\Other"));
     CHECK_FALSE(is_sensitive_hklm_path("HKLM", "SYSTEM\\CurrentControlSet\\Servic")); // shorter than the prefix
     CHECK_FALSE(is_sensitive_hklm_path("HKLM", ""));
+}
+
+// ── kernel_name_well_formed ─────────────────────────────────────────────
+
+TEST_CASE("registry kernel_name_well_formed: no NUL unit, no lone surrogate; a pair and the empty name pass",
+          "[registry][parsers]") {
+    CHECK(kernel_name_well_formed(u""));
+    CHECK(kernel_name_well_formed(u"L"));
+    CHECK(kernel_name_well_formed(u"\\REGISTRY\\MACHINE\\L\\Caf\u00e9"));
+    CHECK(kernel_name_well_formed(u"L\xD800\xDC00")); // a pair
+    CHECK_FALSE(kernel_name_well_formed(u"L\xD800"));  // lone high, at the end
+    CHECK_FALSE(kernel_name_well_formed(u"L\xD800x"));  // lone high, followed by a plain unit
+    CHECK_FALSE(kernel_name_well_formed(u"L\xD800\xD800\xDC00")); // a high before a pair
+    CHECK_FALSE(kernel_name_well_formed(u"L\xDC00"));  // lone low
+    CHECK_FALSE(kernel_name_well_formed(u"\xDC00\xD800")); // reversed pair
+    CHECK_FALSE(kernel_name_well_formed(u"\xD800"));
+    CHECK_FALSE(kernel_name_well_formed(std::u16string_view{u"L\0", 2}));
+    CHECK_FALSE(kernel_name_well_formed(std::u16string_view{u"\0L", 2}));
+    SECTION("the compare never equates a name with the same name plus a NUL") {
+        CHECK_FALSE(names_equal_ascii_ci("L", std::string_view{"L\0", 2}));
+    }
 }

@@ -53,7 +53,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
 class RegistryPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "registry"; }
-    std::string_view version() const noexcept override { return "2.0.0"; }
+    std::string_view version() const noexcept override { return "2.0.1"; }
     std::string_view description() const noexcept override {
         return "Windows Registry -- get, set (six types, verified), delete value, delete key, "
                "enumerate, per-user reads";

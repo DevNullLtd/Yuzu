@@ -1,0 +1,1 @@
+- **`registry` 2.0.1: `get_value` reads at most 1 MiB.** A larger value answers `error|value exceeds 1 MiB limit` (the bound `get_user_value` and the write path already use) instead of being read whole into memory three times; nothing else about the read actions changes.
