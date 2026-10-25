@@ -83,7 +83,23 @@ statement then runs under the pool's server-side `lock_timeout` (10 seconds) and
 (measured at 10.04 seconds against a held table lock), or about 2 seconds plus 30 seconds for a
 statement that wedges for another reason.
 A failed write has its own counter, `yuzu_exec_correlation_write_degrade_total`, distinct from the
-reap counters above, and the alert `YuzuDispatchRecordWriteFailing` fires on a sustained rate.
+reap counters above, and the alert `YuzuDispatchRecordWriteFailing` fires on a sustained rate. A write
+skipped by a tripped per-loop latch (next paragraph) counts there too, so one real write attempt in an
+outage push yields one degrade per target.
+
+A loop that writes one record per target is bounded differently, so that an outage costs the loop one
+short wait instead of one per target. `DispatchRecordLatch` (`dispatch_record_policy.hpp`) is declared
+per loop: its writes use a 250 ms lease budget (`kFanOutRecordLeaseTimeout`), and after the first
+failed or timed-out write in that loop the remaining targets are still dispatched but skip the
+write. Each skipped write is counted in the degrade counter and its responses are labelled
+`~unverified` (fail closed); the loop writes one summary log line. The latch is local to its loop, never
+reused for a second one. Today the only such loop is the operator Guardian rule push. Every other caller
+keeps the 2 second budget and is never skipped: single operator dispatches (REST `/api/command`, MCP,
+dashboard, workflow, scheduler) and the background callers (policy evaluator, preflight, quarantine
+reconciler, `dispatch_confined` background callers). The server-side statement bounds above (10 s lock, 30 s
+statement) are paid once per latched loop, and once per call everywhere else. The heartbeat reconcile
+push also mints one id per agent, but it is one write per call rather than a loop, so it is not given the
+short budget; the pool already clamps an acquire on a saturated pool to 500 ms.
 
 Regression pin: `tests/unit/server/test_agent_service_impl.cpp` (9 cases /
 47 assertions) drives `process_gateway_response` end-to-end into a real
@@ -283,7 +299,8 @@ has no alert by design because it is non-zero on a healthy fleet). What it does 
 id for that plugin, not who sent the frame. An endpoint that was legitimately sent a command (or was inside a broadcast
 of it) can replay that id on a frame of its own and so label that frame with the command's plugin; the content of a
 frame is not validated; a single execution that outlives the 24 hour record window is stored `~unverified`; a failed
-record write (`yuzu_exec_correlation_write_degrade_total`, alert `YuzuDispatchRecordWriteFailing`) hides that dispatch's
+record write, or one skipped by a tripped per-loop latch (`yuzu_exec_correlation_write_degrade_total`, alert
+`YuzuDispatchRecordWriteFailing`), hides that dispatch's
 responses from readers that exclude the Forensics set (the Hardware Actions-lens poll never finds them); an unrecorded `registry` command id mints no
 `registry.write` audit row (those are minted only for a response labelled `registry`); and the live output for an
 `~unverified` frame publishes nothing.

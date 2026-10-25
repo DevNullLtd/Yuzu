@@ -5400,7 +5400,12 @@ groups:
       # although each of those commands is still unverified (the promtool case pins an
       # event every 6 minutes as quiet). The counter is the complete evidence. The pool
       # rules (YuzuPgPoolSaturated, YuzuPgAcquireWaitHigh) do not cover a statement-level
-      # failure (lock timeout, query error) with a healthy pool.
+      # failure (lock timeout, query error) with a healthy pool. COUNTING NOTE: in the one
+      # loop that writes a record per target (the operator Guardian rule push), the first
+      # failed write skips the rest, and each skipped write is counted too. An outage push to
+      # N agents therefore adds N to the counter from ONE real write attempt, so the size of
+      # a jump measures affected commands, not store attempts. The expression only tests
+      # for a non-zero rate, so it is unchanged by this.
       - alert: YuzuDispatchRecordWriteFailing
         expr: |
           sum by (instance) (rate(yuzu_exec_correlation_write_degrade_total[5m])) > 0
