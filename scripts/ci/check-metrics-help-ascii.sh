@@ -129,6 +129,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 
 repo_root = sys.argv[1]
 selftest_flag = sys.argv[2] == "1"
@@ -227,7 +228,9 @@ def string_literals(segment, erlang=False):
     """Every double-quoted string literal in `segment`, as (offset, text).
     With `erlang`, an Erlang `\\^X` escape is three characters and X may be
     `\\` (as in "\\^\\"), matching erl_code_mask's string reader."""
-    pattern = r'"(?:[^"\\]|\\\^.|\\.)*"' if erlang else r'"(?:[^"\\]|\\.)*"'
+    # The escape alternatives are mutually exclusive (\^X, or \ plus any non-^),
+    # so an unterminated literal cannot backtrack exponentially.
+    pattern = r'"(?:[^"\\]|\\(?:\^.|[^^]))*"' if erlang else r'"(?:[^"\\]|\\.)*"'
     return [(m.start(), m.group(0)) for m in re.finditer(pattern, segment, re.S)]
 
 
@@ -356,7 +359,7 @@ def erl_code_mask(text):
                 if escaped:
                     escaped = False
                     if ch == "^" and end < n:
-                        end += 1  # \^X is three characters, and X may be \ or the quote
+                        end += 1  # \^X is three characters; X may be \, never the quote
                 elif ch == "\\":
                     escaped = True
                 elif ch == c:
@@ -449,7 +452,7 @@ def scan_erl_help_surface(root):
         for line, tuple_text in find_erl_help_tuples(strings_only, mask):
             tuple_count += 1
             # No byte offset: non_ascii_findings measures it from the start of
-            # tuple_text (base_offset is unused), and tuple_text is a slice of
+            # tuple_text (base_offset never enters it), and tuple_text is a slice of
             # the strings-only view, where each blanked multi-byte character
             # is one space, so it is neither file- nor tuple-accurate in bytes.
             # The line number is exact.
@@ -822,6 +825,26 @@ def run_selftest():
                      'declare() -> prometheus_counter:declare([{name, a}, {help, ["\\^\\", "bad – x"]}]).\n')
         if not any(ch == "–" for _r, _l, _b, ch in f):
             print(f"SELFTEST FAILED: .erl \"\\^\\\" inside a HELP tuple hid its other literal: {f}")
+            return 1
+        # An escaped backslash followed by a plain ^ is not a \^X escape: "a\\^"
+        # ends at its own quote, so the literal after it must still be scanned.
+        f = erl_case("erl_escaped_backslash_caret", "src",
+                     'declare() -> prometheus_counter:declare([{name, a}, {help, ["a\\\\^", "bad – x"]}]).\n')
+        if not any(ch == "\u2013" for _r, _l, _b, ch in f):
+            print(f"SELFTEST FAILED: .erl \"a\\\\^\" over-ate its closing quote: {f}")
+            return 1
+
+        # Regression for exponential backtracking: an unterminated string made
+        # of a long run of \^ (not valid Erlang; erlc rejects it) must not
+        # stall the scan. With overlapping escape alternatives 42 repeats take
+        # tens of seconds; the mutually exclusive ones take milliseconds, so
+        # the 5 s ceiling only catches the regression, never a slow runner.
+        started = time.monotonic()
+        erl_case("erl_caret_backtrack", "src",
+                 'declare() -> prometheus_counter:declare([{name, a}, {help, "' + '\\^' * 42 + '\n')
+        elapsed = time.monotonic() - started
+        if elapsed > 5.0:
+            print(f"SELFTEST FAILED: .erl unterminated run of \\^ took {elapsed:.1f}s (regex backtracking)")
             return 1
 
         # An unterminated $\x{ must fail loudly, not mask to the next `}`.
