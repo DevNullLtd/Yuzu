@@ -195,6 +195,9 @@ constexpr ExpectedResolution kExpected[] = {
     // body_cap_policy.hpp crypto row - the /crypto REST v1 subtree; PUT dashboard/layout is the
     // only body-bearing route (crypto_widget_catalogue.hpp kLayoutBodyMaxBytes). ANY method.
     {"PUT",    "/api/v1/crypto/dashboard/layout",                      16u * 1024, false, "crypto"},
+    {"PUT",    "/api/v1/config/log_level",                             16u * 1024, false, "config"},
+    {"GET",    "/api/v1/config",                                       16u * 1024, false, "config"},
+    {"PUT",    "/api/v1/configevil/log_level",                         4u * 1024 * 1024, false, "default"},
     {"GET",    "/api/v1/crypto/ca/stats",                              16u * 1024, false, "crypto"},
     {"PUT",    "/api/v1/cryptoevil",                                   4u * 1024 * 1024, false, "default"},
     // Catch-all default — ordinary JSON/form traffic.
@@ -235,8 +238,18 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "guardian_policy_generation",
     "users",
     "crypto",
+    "config",
     "default",
 };
+
+// Regression guard (#6367): `resolve_body_cap` must stay usable in a constant
+// expression under -fsanitize=undefined. GCC 15 cannot constant-evaluate the
+// UBSan pointer checks, so a `const BodyCapEntry*` best-match inside it breaks
+// every UBSan leg that compiles `crypto_routes.cpp`'s `static_assert`. This
+// TU is built in those legs too, so the guard also covers constexpr use
+// outside `crypto_routes.cpp`.
+static_assert(resolve_body_cap("PUT", "/api/v1/crypto/dashboard/layout").max_body_bytes > 0);
+static_assert(resolve_body_cap("GET", "/no/such/route").path_class == std::string_view{"default"});
 
 } // namespace
 
@@ -380,8 +393,9 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // guardian_policy_generation(1: the Guardian policy-generation raise) +
     // users(1: the /api/v1/users subtree, #5342 password routes) +
     // crypto(1: the /api/v1/crypto subtree, the dashboard layout PUT) +
+    // config(1: the /api/v1/config subtree, the runtime-config PUT) +
     // default(1).
-    CHECK(std::size(kBodyCapTable) == 34);
+    CHECK(std::size(kBodyCapTable) == 35);
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──
@@ -456,7 +470,9 @@ TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/, upload_session
 // `enforce_pre_auth_body_cap` is invoked inside server.cpp's probe branch
 // (the shape mirrored here) and again after the on-behalf-of guard and rate
 // limiter for every other route. The second call site is not modelled: those
-// two guards are out of this fixture's scope.
+// two guards are out of this fixture's scope. The probe-branch call in server.cpp is
+// pinned by the source-text wiring case in test_health_routes.cpp; the non-probe call
+// site is pinned by neither file.
 #ifndef YUZU_TSAN_BUILD
 
 namespace {
@@ -743,7 +759,7 @@ TEST_CASE("Pre-routing body cap: a non-chunked Transfer-Encoding does NOT suppre
     //
     // So while the size check was gated on `!unmeasurable`, one header
     // suppressed the cap on all 24 classes that do not set
-    // requires_measurable — including the rate-limit-exempt probe paths —
+    // requires_measurable, including the probe paths,
     // while httplib went on to read the declared body in full. Production now
     // gates the size check on `content_length_is_authoritative` instead, which
     // asks httplib rather than re-deciding the header.

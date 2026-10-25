@@ -97,10 +97,17 @@ versus one that could not be read at all:
   with the specific constraint named rather than folded into one bucket:
   `not_found` (no such profile hive), `privilege_missing`
   (`SeBackupPrivilege`/`SeRestorePrivilege` couldn't be enabled on the
-  process token), or `mount_failed` (`RegLoadKeyW` itself failed for the
-  offline arm). A separate `warning|hive_unload_failed|...` line is
-  emitted if the trailing `RegUnLoadKeyW` fails on the way out -- this is
-  orthogonal to the per-source `source|` line and never folded into it.
+  process token), `mount_failed` (`RegLoadKeyW` itself failed for the
+  offline arm), or a `hive_*` reason from the default offline hive-file guard
+  (`hive_owner_unexpected`, `hive_path_reparse_ancestor`,
+  `hive_path_redirected`, `hive_not_resident`, `hive_oversized`,
+  `hive_sidecar_reparse`, `hive_sidecar_hardlinked`, `hive_sidecar_count`,
+  `hive_identity_changed`, or `hive_stat_failed:win32_<n>`) when the guard
+  refuses the hive file itself (the default guard carries no run deadline,
+  so its `timeout` token is unreachable here). A separate
+  `warning|hive_unload_failed|...` line is emitted if the trailing
+  `RegUnLoadKeyW` fails on the way out -- this is orthogonal to the
+  per-source `source|` line and never folded into it.
 - **`constrained|<n>|malformed`** (launchd plist walk, `mac_emond`,
   `lnx_etc_crontab`, `lnx_cron_d`, `lnx_user_crontabs`, `lnx_anacrontab`,
   `lnx_xdg_autostart_system`, `lnx_xdg_autostart_user`, `win_scheduled_tasks`,
@@ -324,7 +331,10 @@ every reachable user's hive, not just HKLM. Per profile
 1. **Live hive first.** If the user is logged in, its hive is already
    mounted under `HKEY_USERS\<sid>` -- read it directly, no privilege
    elevation, no mount/unmount.
-2. **Offline `RegLoadKeyW` fallback.** If not, the profile's
+2. **Offline `RegLoadKeyW` fallback, behind the default hive-file check.**
+   Before the mount, the NTUSER.DAT file is checked by the shared,
+   default-on hive-file guard (related issue #5291) -- a refused file never
+   gets as far as `RegLoadKeyW` at all. Past that, the profile's
    `NTUSER.DAT` is mounted at a private mount point under
    `SeBackupPrivilege` + `SeRestorePrivilege`, enabled on the *process*
    token only for the duration of the offline arm, and serialised

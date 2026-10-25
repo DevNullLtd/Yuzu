@@ -636,6 +636,11 @@ void AgentRegistry::expire_trusted_gateway_for_test(std::chrono::seconds offset)
         .set(static_cast<double>(trusted_gateway_peer_ips_.size()));
 }
 
+void AgentRegistry::expire_presence_cache_for_test() {
+    std::lock_guard lock(presence_cache_mu_);
+    presence_cache_at_ -= kPresenceCacheTtl;
+}
+
 namespace {
 
 /// PLAN item 3 (belt-and-braces): the TYPE invariant (private

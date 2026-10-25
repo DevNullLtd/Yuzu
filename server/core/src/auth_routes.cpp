@@ -26,6 +26,7 @@
 #include "mcp_policy.hpp"
 #include "mfa_qr.hpp"
 #include "mfa_step_up.hpp"
+#include "step_up_gate.hpp"
 #include "oidc_principal.hpp" // oidc_principal_id — ADR-2001 §5 single principal-string builder
 #include "oidc_scim_link.hpp" // link_oidc_login_to_scim — ADR-2001 §2/D2 login-site orchestration
 #include "password_policy.hpp" // #5342 — password_exceeds_max (the /login max)
@@ -441,6 +442,23 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
 }
 
 std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request& req) {
+    // One principal per request. Once the step-up chokepoint has passed a gated request, every
+    // later resolution for it must yield the same principal or none: the walk below falls through
+    // cookie, Bearer and X-Yuzu-Token, so a later resolution is not guaranteed to land on the
+    // principal the check was made for. The binding is applied here, to whatever the walk
+    // returns, so no path of it can skip it. A request with no binding armed is unaffected.
+    auto session = resolve_session_unbound(req);
+    if (session && !detail::step_up_binding_admits(req, *session))
+        return std::nullopt;
+    return session;
+}
+
+std::optional<auth::Session> AuthRoutes::resolve_session_unbound(const httplib::Request& req) {
+    // The credential sources read here (Cookie, Authorization, X-Yuzu-Token) are mirrored by
+    // health::request_carries_credential (health_routes.hpp), which decides whether /health
+    // and /api/health resolve a session or charge the per-source budget. A new credential
+    // source added below must also be added there.
+    //
     // 1. Try session cookie (existing browser auth)
     auto token = extract_session_cookie(req);
     // Guard against oversized cookie values before passing to validate_session (#630).
@@ -454,7 +472,7 @@ std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request&
         // lapses is where the `role.elevation.expired` audit row is minted.
         // Uses audit_log_for_principal (not audit_log) because audit_log's
         // make_audit_event() itself calls resolve_session(req) — calling that
-        // from inside resolve_session would re-enter this function. `session`
+        // from inside resolve_session would re-enter the resolution. `session`
         // already carries the base role (Session::role is never the elevated
         // view), matching the `role.elevation.revoked` audit's principal_role.
         if (auto expired_user = auth_mgr_.reap_expired_elevation(token)) {
@@ -1572,6 +1590,16 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
         }
     }
     return event;
+}
+
+void AuthRoutes::expire_mfa_pending_for_test(const std::string& pending_token,
+                                             std::chrono::milliseconds elapsed) {
+    std::lock_guard lock(mfa_pending_mu_);
+    const auto it = mfa_pending_.find(pending_token);
+    if (it == mfa_pending_.end())
+        return;
+    it->second.expires_at -=
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(elapsed);
 }
 
 void AuthRoutes::reap_mfa_pending_locked() {
@@ -3295,8 +3323,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 is_oidc ? "OIDC sessions re-prove MFA by re-authenticating with the "
                           "identity provider — start a new SSO sign-in at /auth/oidc/start, "
                           "not local step-up"
-                : is_saml ? "MFA step-up is not available for SAML sessions in this release — "
-                            "re-authenticate via SAML at /auth/saml/start"
+                : is_saml ? "SAML sessions cannot satisfy step-up in this release; "
+                            "re-authenticating does not help"
                 : "step-up is for session-cookie callers only — re-issue the API "
                   "token to refresh MFA proof";
             nlohmann::json envelope = {
@@ -4814,16 +4842,20 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
     auto elevation_step_up = [this](const httplib::Request& req, httplib::Response& res,
                                     const auth::Session& session, const std::string& label,
                                     int window_secs) -> bool {
+        const StepUpAuditFn audit = [this](const httplib::Request& r, const std::string& a,
+                                           const std::string& rs, const std::string& tt,
+                                           const std::string& ti, const std::string& d) {
+            return audit_log(r, a, rs, tt, ti, d);
+        };
         auto* db = auth_mgr_.auth_db_ptr();
-        if (!db)
-            return true; // legacy config-file-only: step-up needs auth.db (fail-open, as elsewhere)
-        return require_mfa_step_up(
-            req, res, session, *db, window_secs,
-            [this](const httplib::Request& r, const std::string& a, const std::string& rs,
-                   const std::string& tt, const std::string& ti, const std::string& d) {
-                return audit_log(r, a, rs, tt, ti, d);
-            },
-            label, cfg_.mfa_enforcement, auth_mgr_.metrics_registry());
+        if (!db) {
+            // Fail closed: the privilege boundary never passes because the store is unwired.
+            refuse_step_up_store_unwired(req, res, session, audit, label,
+                                         auth_mgr_.metrics_registry());
+            return false;
+        }
+        return require_mfa_step_up(req, res, session, *db, window_secs, audit, label,
+                                   cfg_.mfa_enforcement, auth_mgr_.metrics_registry());
     };
     // Step-up window for the elevation surfaces: the global window when it is
     // positive, else 300 s. So disabling the global gate (<= 0) does not disable
@@ -4885,10 +4917,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         auto* db = auth_mgr_.auth_db_ptr();
         if (!db) {
+            // Defensive: the auth store is the PostgreSQL-backed AuthDB wired at boot (the server
+            // refuses to start without its database), so no flag fixes a missing one; the
+            // remediation is the generic retry/contact text, not a startup option.
             res.status = 503;
             res.set_content(detail::error_json_a4(503, "JIT elevation requires the "
                                                        "persistent auth store",
-                                                  cid, "start the server with --data-dir"),
+                                                  cid, "retry shortly or contact an administrator"),
                             "application/json");
             return;
         }
@@ -5031,10 +5066,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
         auto* db = auth_mgr_.auth_db_ptr();
         if (!db) {
+            // Defensive, as above: no startup flag fixes a missing PostgreSQL-backed auth store.
             res.status = 503;
             res.set_content(detail::error_json_a4(503, "JIT elevation requires the persistent auth "
                                                        "store",
-                                                  cid, "start the server with --data-dir"),
+                                                  cid, "retry shortly or contact an administrator"),
                             "application/json");
             return;
         }

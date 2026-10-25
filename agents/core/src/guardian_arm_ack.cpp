@@ -126,30 +126,160 @@ std::string guardian_push_content_id(const gpb::GuaranteedStatePush& push) {
 GuardianArmAckLedger::GuardianArmAckLedger() = default;
 GuardianArmAckLedger::~GuardianArmAckLedger() = default;
 
-void GuardianArmAckLedger::begin_application(std::uint64_t generation, std::string content_id,
-                                             bool full_sync, std::size_t applied) {
-    // Unconditionally replaces whatever was open - Astra opine review: "New
-    // application: stale receipts cannot acknowledge it." The old Application's
-    // pending map (if any) is simply destroyed here; its receipts' claims stay
-    // owned by the runtime's own claims_ registry regardless (ArmReceipt is an
-    // observation handle - see the header). Built LOCALLY and published only at the
-    // end (rung 9c PR-5e, governance finding UP-1's own precedent applied here too):
-    // a make_unique/allocation throw here leaves current_ completely untouched,
-    // matching apply_rules()'s own firewall around this call. A fresh Application also
-    // starts wedge_suppress_count at 0 (#5459): the safety valve's budget is reset ONLY
-    // here and in retire(). Replacing the open application wholesale also drops the
-    // retry obligation of any rule a partial (delta) push omits: a known limit, see the
-    // design doc R5.3 known limits and flip-gate AC-11.
+void GuardianArmAckLedger::begin_full_application(std::uint64_t generation, std::string content_id,
+                                                  std::size_t applied) {
+    // Built LOCALLY and published last (rung 9c PR-5e, governance finding UP-1's precedent: an
+    // allocation throw must leave current_ untouched, matching apply_rules()'s own firewall
+    // around this call; the open application's pending receipts are destroyed only at the
+    // assignment, and their claims stay owned by the runtime's claims_ registry regardless,
+    // ArmReceipt being an observation handle): a throw anywhere below
+    // (including the test hook) leaves current_, its obligations and its suppress budget
+    // exactly as they were.
     auto next = std::make_unique<Application>();
     next->generation = generation;
     next->content_id = std::move(content_id);
-    next->full_sync = full_sync;
+    next->full_sync = true;
     next->applied = applied;
+    if (current_) {
+        // The only OBLIGATION a full sync carries is the unattributed legacy debt; every
+        // per-rule outcome is dropped (the full sync re-arms its named rules and detaches
+        // the rest). boot_claims is claim IDENTITY, not an obligation.
+        next->inherited_latch = current_->inherited_latch || current_->latched_failure;
+        next->boot_claims = current_->boot_claims;
+    }
+    if (begin_fault_hook_)
+        begin_fault_hook_(BeginFaultSite::BeforePublish);
     current_ = std::move(next);
 }
 
+void GuardianArmAckLedger::begin_delta_application(
+    std::uint64_t generation, std::string content_id, std::size_t applied,
+    const std::set<std::string, std::less<>>& named_rules) {
+    auto next = std::make_unique<Application>();
+    next->generation = generation;
+    next->content_id = std::move(content_id);
+    next->full_sync = false;
+    next->applied = applied;
+    if (current_) {
+        const Application& old = *current_;
+        const auto omitted = [&named_rules](const std::string& id) {
+            return !named_rules.contains(id);
+        };
+        // One source per id (a drain that threw between its insert and its erase leaves an id
+        // in two of the old application's sets). Priority sync_failed_ids > failed_ids >
+        // failed_receipts > pending: the most conservative, never-silently-dropped record wins.
+        // The groups below are ordered so the MidCarry hook sits between the copies.
+        for (const auto& id : old.failed_ids) {
+            if (omitted(id) && !old.sync_failed_ids.contains(id))
+                next->failed_ids.insert(id);
+        }
+        for (const auto& [id, receipt] : old.failed_receipts) {
+            if (omitted(id) && !old.sync_failed_ids.contains(id) && !old.failed_ids.contains(id))
+                next->failed_receipts.emplace(id, receipt);
+        }
+        for (const auto& [id, receipt] : old.pending) {
+            if (omitted(id) && !old.sync_failed_ids.contains(id) && !old.failed_ids.contains(id) &&
+                !old.failed_receipts.contains(id))
+                next->pending.emplace(id, receipt);
+        }
+        if (begin_fault_hook_)
+            begin_fault_hook_(BeginFaultSite::MidCarry);
+        for (const auto& id : old.sync_failed_ids) {
+            if (omitted(id))
+                next->sync_failed_ids.insert(id);
+        }
+        // Set from what was actually carried, so the counter agrees with the sets by
+        // construction (never copied from the old application).
+        next->resolved_failed = next->failed_receipts.size() + next->failed_ids.size();
+        // A boot tag rides only with an obligation that was carried.
+        for (const auto& id : old.boot_origin_ids) {
+            if (next->sync_failed_ids.contains(id) || next->failed_ids.contains(id) ||
+                next->failed_receipts.contains(id) || next->pending.contains(id))
+                next->boot_origin_ids.insert(id);
+        }
+        // Claim identity for named AND omitted rules: it is not an obligation, and a named
+        // rule's re-observation of the same claim must keep its boot tag.
+        next->boot_claims = old.boot_claims;
+        next->inherited_latch = old.inherited_latch || old.latched_failure;
+        // latched_failure stays false: this application has raised nothing yet.
+        // wedge_suppress_count stays 0 (AC-11 (4)).
+    }
+    if (begin_fault_hook_)
+        begin_fault_hook_(BeginFaultSite::BeforePublish);
+    current_ = std::move(next);
+}
+
+void GuardianArmAckLedger::note_sync_failure(const std::string& rule_id, bool boot_origin) {
+    if (!current_)
+        return;
+    Application& app = *current_;
+    // The tag first, undone if the failure itself cannot be recorded: a boot tag must never
+    // outlive (or exist without) the obligation it describes.
+    const bool tag_added = boot_origin && app.boot_origin_ids.insert(rule_id).second;
+    try {
+        app.sync_failed_ids.insert(rule_id);
+    } catch (...) {
+        if (tag_added)
+            app.boot_origin_ids.erase(rule_id);
+        throw;
+    }
+}
+
+void GuardianArmAckLedger::discharge_inherited_latch() noexcept {
+    if (current_)
+        current_->inherited_latch = false;
+}
+
+void GuardianArmAckLedger::set_begin_fault_hook_for_test(std::function<void(BeginFaultSite)> hook) {
+    begin_fault_hook_ = std::move(hook);
+}
+
+void GuardianArmAckLedger::set_drain_fault_hook_for_test(
+    std::function<void(DrainFaultSite, std::string_view)> hook) {
+    drain_fault_hook_ = std::move(hook);
+}
+
+GuardianArmAckLedger::ObligationForTest
+GuardianArmAckLedger::obligation_for_test(const std::string& rule_id) const {
+    if (!current_)
+        return ObligationForTest::None;
+    if (current_->sync_failed_ids.contains(rule_id))
+        return ObligationForTest::SyncFailed;
+    if (current_->failed_ids.contains(rule_id))
+        return ObligationForTest::FailedId;
+    if (current_->failed_receipts.contains(rule_id))
+        return ObligationForTest::FailedReceipt;
+    if (current_->pending.contains(rule_id))
+        return ObligationForTest::Pending;
+    return ObligationForTest::None;
+}
+std::size_t GuardianArmAckLedger::failed_id_count_for_test() const {
+    return current_ ? current_->failed_ids.size() : 0;
+}
+std::size_t GuardianArmAckLedger::sync_failed_count_for_test() const {
+    return current_ ? current_->sync_failed_ids.size() : 0;
+}
+std::size_t GuardianArmAckLedger::boot_origin_count_for_test() const {
+    return current_ ? current_->boot_origin_ids.size() : 0;
+}
+std::size_t GuardianArmAckLedger::boot_claim_count_for_test() const {
+    return current_ ? current_->boot_claims.size() : 0;
+}
+bool GuardianArmAckLedger::boot_origin_for_test(const std::string& rule_id) const {
+    return current_ && current_->boot_origin_ids.contains(rule_id);
+}
+bool GuardianArmAckLedger::latched_failure_for_test() const {
+    return current_ && current_->latched_failure;
+}
+bool GuardianArmAckLedger::inherited_latch_for_test() const {
+    return current_ && current_->inherited_latch;
+}
+std::size_t GuardianArmAckLedger::wedge_suppress_count_for_test() const {
+    return current_ ? current_->wedge_suppress_count : 0;
+}
+
 void GuardianArmAckLedger::add_pending(std::string rule_id,
-                                       GuardianSparkRuntime::ArmReceipt receipt) {
+                                       GuardianSparkRuntime::ArmReceipt receipt, bool boot_origin) {
     if (!current_) {
         try {
             spdlog::error("Guardian: add_pending('{}') with no open application - dropped",
@@ -158,7 +288,32 @@ void GuardianArmAckLedger::add_pending(std::string rule_id,
         }
         return;
     }
-    current_->pending.insert_or_assign(std::move(rule_id), std::move(receipt));
+    Application& app = *current_;
+    // Effective boot tag: the caller's say-so, or a re-observation of the SAME claim an
+    // earlier application registered as boot-origin (compared by claim pointer; boot_claims
+    // holds a receipt, so the claim is alive and its address cannot be reused). A different
+    // claim for the same rule id is a genuinely new attempt: not tagged, stale entry dropped.
+    bool tag = boot_origin;
+    if (!tag) {
+        if (const auto it = app.boot_claims.find(rule_id); it != app.boot_claims.end()) {
+            if (it->second.claim == receipt.claim)
+                tag = true;
+            else
+                app.boot_claims.erase(it);
+        }
+    }
+    bool tag_added = false;
+    if (tag) {
+        app.boot_claims.insert_or_assign(rule_id, receipt);
+        tag_added = app.boot_origin_ids.insert(rule_id).second;
+    }
+    try {
+        app.pending.insert_or_assign(rule_id, std::move(receipt));
+    } catch (...) {
+        if (tag_added)
+            app.boot_origin_ids.erase(rule_id);
+        throw;
+    }
 }
 
 void GuardianArmAckLedger::latch_failure() noexcept {
@@ -167,8 +322,8 @@ void GuardianArmAckLedger::latch_failure() noexcept {
 }
 
 std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
-                                               std::size_t max_per_tick,
-                                               std::size_t* failed_out) {
+                                               std::size_t max_per_tick, std::size_t* failed_out,
+                                               bool* boot_origin_failed) {
     // Runtime-wide sweep, not scoped to this application's own pending set -
     // rung 9c PR-2 Unit 2's expire_overdue_claims() abandons any Arm claim
     // whose real deadline has passed regardless of which (if any) ledger is
@@ -212,6 +367,14 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
             // header treats "how many arm failures have ever happened" and "can the
             // CURRENT application's generation advance" as distinct questions;
             // only the latter recovers here).
+            // #5547: the boot tag goes with the last obligation holding the id. Nothing
+            // fallible sits between the counter and the erase (the tag erase is noexcept and
+            // comes first), so an exception can never leave resolved_failed one low with the
+            // entry still retained.
+            if (!current_->pending.contains(it->first) &&
+                !current_->failed_ids.contains(it->first) &&
+                !current_->sync_failed_ids.contains(it->first))
+                current_->boot_origin_ids.erase(it->first);
             if (current_->resolved_failed > 0)
                 --current_->resolved_failed;
             it = current_->failed_receipts.erase(it);
@@ -227,23 +390,35 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
             // can_advance() stays false until the teardown pops the claim.
             ++it;
             break;
-        case GuardianSparkRuntime::RecoveryStatus::Blocking:
+        case GuardianSparkRuntime::RecoveryStatus::Blocking: {
             // This entry has settled to a genuine, non-outstanding failure since it
             // was retained - a Dispatching-window race corrected to a genuine
             // Failed/Stopped/AdmissionRejected outcome, or the claim was popped from
             // its key's FIFO by a real completion nobody adopted (a late failure, or a
-            // compensating teardown that finished). It is an ORDINARY failure now, so
-            // it is dropped from the outstanding-wedge set, but resolved_failed is
-            // deliberately left UNTOUCHED: it is still a genuine, counted failure.
-            // That makes `resolved_failed != failed_receipts.size()`, which is exactly
-            // what forces decide_retry() to Reapply (the rule must be re-armed), and
-            // keeps can_advance() false. The runtime invariant this depends on
-            // (#4472): compensation_finished=true is always written in the same
-            // critical section as the pop of the claim (or the dispatch -> Queued
-            // double-fault hand-back), so a Blocking reading never races a claim that
-            // is finished but still the Dispatched head.
+            // compensating teardown that finished). It is an ORDINARY failure now, so it
+            // leaves the outstanding-wedge set, but it is still a genuine, counted failure:
+            // #5547 keeps its rule id in failed_ids (resolved_failed is unchanged when the
+            // id is new there), so a replacing delta that omits the rule still carries the
+            // obligation. failed_ids != empty is what forces decide_retry() to Reapply
+            // (the rule must be re-armed) and what keeps can_advance() false. The runtime
+            // invariant this depends on (#4472): compensation_finished=true is always
+            // written in the same critical section as the pop of the claim (or the
+            // dispatch -> Queued double-fault hand-back), so a Blocking reading never
+            // races a claim that is finished but still the Dispatched head.
+            //
+            // Ordering: the fallible insertion comes BEFORE the erase, so a throwing insert
+            // leaves the entry exactly where it was (still counted, still retained).
+            if (drain_fault_hook_)
+                drain_fault_hook_(DrainFaultSite::BeforeBlockingInsert, it->first);
+            const bool added = current_->failed_ids.insert(it->first).second;
+            // The id already being in failed_ids means this entry was a second record of
+            // one failure; dropping it must take its count with it to keep
+            // resolved_failed == failed_receipts.size() + failed_ids.size().
+            if (!added && current_->resolved_failed > 0)
+                --current_->resolved_failed;
             it = current_->failed_receipts.erase(it);
             break;
+        }
         }
     }
 
@@ -277,7 +452,8 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
         // rung 9c PR-5c (#4221): CongestionExpired and Wedged both fold into
         // resolved_failed exactly like the pre-split Expired did - neither
         // represents a committed arm. A Wedged receipt counts as an ordinary
-        // resolved failure on every drain, and a repeated
+        // resolved failure - once per rule id within an application (#5547: a
+        // re-drain of the same id is not counted again), while a repeated
         // application can still count the same wedge again - nothing about up-2's
         // re-observation changes that (re-observation exists so a TYPED Wedged
         // status reaches this ledger at all, not to change what it means once it
@@ -290,69 +466,78 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
             continue;
         case S::Committed:
             ++current_->resolved_armed;
+            // Committed: the rule has no obligation left, so its boot tag goes with it. The
+            // id is still in `pending` here, hence the explicit exclusion.
+            if (!current_->failed_receipts.contains(it->first) &&
+                !current_->failed_ids.contains(it->first) &&
+                !current_->sync_failed_ids.contains(it->first))
+                current_->boot_origin_ids.erase(it->first);
             break;
         case S::Wedged:
-            // rung 9c PR-5d (concern 2): retain the receipt itself (not just the
-            // rule_id) BEFORE the shared accounting below erases it from
-            // `pending` - this is the only failure status a later runtime
-            // adoption can retroactively recover (see failed_receipts' own doc
-            // comment on Application). A copy, not a move: `it->second` is read
-            // again below by nothing else in this loop, but keeping the copy
-            // explicit here avoids coupling this case's own lifetime to the
-            // shared fallthrough body's unrelated edits.
-            //
-            // rung 9c PR-5e (#4221), reshaped by #5459 (option D): retain it into the
-            // outstanding-wedge set ONLY if `wedge_aware.wedge_eligible ||
-            // wedge_aware.compensation_pending` ALSO read true in the SAME atomic
-            // read that produced `status == Wedged` above -
-            // NOT unconditionally on every Wedged status, and NOT via a second,
-            // separately-locked call (see this loop's own comment above the
-            // switch for why a second call would reintroduce a TOCTOU).
-            // expire_overdue_claims() just above (this same drain_locked() call)
-            // can itself mint end==WaiterTimedOutDispatched for a claim still
-            // mid-dispatch (the Dispatching-window race's own unsettled window,
-            // dispatch still Dispatching, not yet Dispatched) - without this
-            // check, THIS SAME call would insert a provisional, not-yet-settled
-            // classification straight into failed_receipts, and the recovery-
-            // scan loop above only re-validates EXISTING entries from a PRIOR
-            // drain, so the gap would stand open for one full tick. resolved_failed
-            // still increments below regardless (it is still counted as an
-            // ordinary failure - only its outstanding-wedge-set MEMBERSHIP is gated).
-            // A compensation-pending wedge is retained too (BOTH drain loops, #5459),
-            // so held pushes during a compensating teardown stay suppressed.
-            if (wedge_aware.wedge_eligible || wedge_aware.compensation_pending)
-                current_->failed_receipts.insert_or_assign(it->first, it->second);
-            [[fallthrough]];
         case S::Failed:
         case S::CongestionExpired:
         case S::Withdrawn:
-        case S::Stopped:
-            ++current_->resolved_failed;
-            if (failed_out)
-                ++*failed_out; // UP-3: feeds GuardianEngine::arm_failures_ (see caller)
-            // rung 9c PR-2 Unit 6: the only place this can be logged - reconcile_rule_locked's
-            // own "spark arm failed" warn fires only for a SYNCHRONOUS refusal now; an
-            // Accepted rule that later resolves to anything but Committed would otherwise be
-            // silent on a Guaranteed State product. Heartbeat thread: contained, like every
-            // other log call on this path. Names `status` per governance finding SHOULD-1
-            // (Gate 4, consistency-auditor) - the sync-refusal warn in
-            // reconcile_rule_locked() already names its own failure reason, and this one
-            // silently didn't.
-            try {
-                spdlog::warn("Guardian: spark arm failed for rule '{}' (accepted, resolved "
-                             "asynchronously, status={})",
-                             log_id_token(it->first), receipt_status_name(status));
-            } catch (...) {
+        case S::Stopped: {
+            // Every non-Committed, non-Pending status is a counted failure.
+            //
+            // #5547: TRANSACTIONAL and idempotent. The fallible set insertion comes FIRST;
+            // resolved_failed, *failed_out and *boot_origin_failed move only when it added a
+            // new element, so a receipt a throw left behind in `pending` is not counted a
+            // second time by the next drain. Everything after the insertion is noexcept or
+            // contained (the log and the test diagnostic), and the receipt is erased from
+            // `pending` last.
+            //
+            // Which set records it: a Wedged receipt that is wedge-eligible or compensation-
+            // pending is RETAINED (failed_receipts; rung 9c PR-5d concern 2 - the only status
+            // a later runtime adoption can retroactively recover). Retention is gated on the
+            // flags of the SAME atomic read that produced status == Wedged (rung 9c PR-5e,
+            // #4221; see the comment above the read): expire_overdue_claims() just above can
+            // mint WaiterTimedOutDispatched for a claim still mid-dispatch, and inserting that
+            // provisional classification would open a one-tick gap. Every other failure
+            // (Failed, CongestionExpired, Withdrawn, Stopped, and a Wedged receipt that is
+            // neither flag) keeps only its rule id, in failed_ids; the receipt is discarded.
+            // Only a Wedged receipt can later be adopted by the runtime, and a Wedged one that
+            // reaches here with neither flag stays an ordinary failure (flip-gate AC-15,
+            // unchanged by #5547; retaining it is FU-14, #5548).
+            const std::string& id = it->first;
+            bool added = false;
+            if (status == S::Wedged &&
+                (wedge_aware.wedge_eligible || wedge_aware.compensation_pending)) {
+                const auto [kept, inserted] = current_->failed_receipts.try_emplace(id, it->second);
+                if (!inserted)
+                    kept->second = it->second; // refresh the handle; already counted
+                added = inserted;
+            } else {
+                added = current_->failed_ids.insert(id).second;
             }
-            // Governance follow-up (Gate 3, cpp-safety + cpp-expert; Gate 4,
-            // unhappy-path, 2026-09-16): pushed LAST in this branch, after
-            // resolved_failed/failed_out are already consistent with each other -
-            // a push_back bad_alloc here leaves this receipt un-erased (still in
-            // `pending`, re-drained and re-counted together next tick) rather than
-            // desyncing resolved_failed from failed_out the way an earlier-ordered
-            // push_back could have.
-            current_->resolved_statuses_for_test.push_back(status);
+            if (added) {
+                ++current_->resolved_failed;
+                if (failed_out)
+                    ++*failed_out; // UP-3: feeds GuardianEngine::arm_failures_ (see caller)
+                if (boot_origin_failed && current_->boot_origin_ids.contains(id))
+                    *boot_origin_failed = true;
+                // rung 9c PR-2 Unit 6: the only place this can be logged - reconcile_rule_locked's
+                // own "spark arm failed" warn fires only for a SYNCHRONOUS refusal now; an
+                // Accepted rule that later resolves to anything but Committed would otherwise be
+                // silent on a Guaranteed State product. Heartbeat thread: contained, like every
+                // other log call on this path. Names `status` per governance finding SHOULD-1
+                // (Gate 4, consistency-auditor) - the sync-refusal warn in
+                // reconcile_rule_locked() already names its own failure reason, and this one
+                // silently didn't. Logged once per distinct failure (not on a re-drain).
+                try {
+                    spdlog::warn("Guardian: spark arm failed for rule '{}' (accepted, resolved "
+                                 "asynchronously, status={})",
+                                 log_id_token(id), receipt_status_name(status));
+                } catch (...) {}
+                // Test diagnostic only: best-effort, never allowed to fail the drain.
+                try {
+                    current_->resolved_statuses_for_test.push_back(status);
+                } catch (...) {}
+            }
+            if (drain_fault_hook_)
+                drain_fault_hook_(DrainFaultSite::AfterAccounting, id);
             break;
+        }
         }
         it = current_->pending.erase(it);
         ++resolved;
@@ -369,7 +554,8 @@ bool GuardianArmAckLedger::can_advance() const {
     // full_sync re-push alive; decide_retry() is what stops each held re-push from
     // costing a teardown.
     return current_ && current_->pending.empty() && !current_->latched_failure &&
-           current_->resolved_failed == 0;
+           !current_->inherited_latch && current_->resolved_failed == 0 &&
+           current_->sync_failed_ids.empty();
 }
 
 std::size_t GuardianArmAckLedger::applied_count() const {
@@ -433,14 +619,24 @@ GuardianArmAckLedger::RetryDecision GuardianArmAckLedger::decide_retry(
         return RetryDecision::Reapply;
     if (app.content_id != content_id || app.full_sync != full_sync)
         return RetryDecision::Reapply; // same generation number, changed content underneath it
-    if (app.latched_failure)
-        return RetryDecision::Reapply; // an apply_rules() generation-hold failure - a real re-apply is owed
+    if (app.latched_failure || app.inherited_latch)
+        return RetryDecision::Reapply; // an apply_rules() generation-hold failure (its own, or
+                                       // inherited from an earlier application, #5547) - a real
+                                       // re-apply is owed
+    // #5547: a drained non-wedge failure (failed_ids) or a synchronous per-rule failure
+    // (sync_failed_ids) is a failure the rule must be re-armed for. Checked BEFORE the
+    // count test below because a sync failure is not in resolved_failed at all, so with a
+    // co-held live wedge the counts would be equal and the wedge would Suppress the retry.
+    if (!app.failed_ids.empty() || !app.sync_failed_ids.empty())
+        return RetryDecision::Reapply;
     // Every COUNTED failure must have a retained outstanding-wedge candidate (see
     // Application::failed_receipts). A count with no retained receipt is a genuine
     // non-wedge failure (an ordinary Failed/Congestion/Withdrawn/Stopped, or a wedge
-    // whose claim has since popped) - the rule must be re-armed. Necessary, not
-    // sufficient: each retained candidate is re-read LIVE below, never trusted from
-    // the map (it can be stale between drains).
+    // whose claim has since popped) - the rule must be re-armed. Since #5547 such a
+    // failure is recorded in failed_ids and already answered Reapply above; this test
+    // stays as a second check against a counter that disagrees with the sets.
+    // Necessary, not sufficient: each retained candidate is re-read LIVE below, never
+    // trusted from the map (it can be stale between drains).
     if (app.resolved_failed != app.failed_receipts.size())
         return RetryDecision::Reapply;
 
@@ -511,7 +707,7 @@ GuardianArmAckLedger::RetryDecision GuardianArmAckLedger::decide_retry(
 
     // Safety valve (#5459): a decision-count bound on wedge/compensation suppression.
     // See kWedgeSuppressMaxDecisions for what it does and does not buy. The counter is
-    // incremented ONLY here, and reset only by begin_application()/retire().
+    // incremented ONLY here, and reset only by begin_*_application()/retire().
     if (app.wedge_suppress_count >= kWedgeSuppressMaxDecisions)
         return RetryDecision::Reapply;
     ++app.wedge_suppress_count;
@@ -520,7 +716,7 @@ GuardianArmAckLedger::RetryDecision GuardianArmAckLedger::decide_retry(
 
 void GuardianArmAckLedger::retire() {
     current_.reset(); // §R5.5: in-flight workers finish on their own schedule; this just
-                      // stops watching them, exactly as begin_application() already does
+                      // stops watching them, exactly as begin_*_application() already do
                       // for a superseded application.
 }
 

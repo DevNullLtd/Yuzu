@@ -48,9 +48,10 @@ churns the ledger. Each row records:
   2026-10-17; a few rows with no machine-checked dated revisit are
   grandfathered by `capability_id` in a size-pinned set in the script, named
   in ADR-1005's 2026-10-15 entry - extending it, swapping an id or rebinding
-  an id to another row is caught only in review), or `retire` (the
-  fragment route no longer exists; kept for history until the ledger row
-  itself is deleted).
+  an id to another row is caught only in review), or `retire` (no twin will be built:
+  the route is gone and the row is kept for history, or it is still registered
+  and a tracking issue named in its ADR-1005 entry owns its removal; the gate
+  does not require the route to be absent).
 
 One further row shape exists (#5342): a row keyed on a registered
 `/api/v1/*` route, legal ONLY with an `exception:` status. It records a
@@ -139,7 +140,15 @@ untwinned baseline shrinks as F2+ wires real twins, and rises only when a
 change raises it with a stated reviewed reason - a newly-discovered fragment
 route, or extraction-completeness catching up to a route that already
 existed); this document's generated block going stale relative to a
-fresh render; a dated exception row that is not pinned, or is pinned to a
+fresh render; a twinned row whose REST route and MCP tool disagree on securable,
+operation or confinement kind (check 6, gate parity: the REST gate is compared with the tool's
+declared pair, and for a compared row a derived MCP handler's own gate calls are held to that
+pair too, a label-and-call-site tripwire
+with a size-pinned, shrink-only allowlist, `GATE_PARITY_KNOWN_MISMATCHES`, plus
+`GATE_PARITY_NO_GATE_ALLOWED` for routes whose gate it cannot read); a registry
+tool whose test file does not name it, assert a schema refusal and an audit row, or
+appear in `tests/meson.build` (check 7); a registry file count that is not
+`MIN_REGISTRY_FILES`; a dated exception row that is not pinned, or is pinned to a
 different issue or revisit date (`STRICT_EXCEPTION_PINS` in the script keys
 every dated exception row by `capability_id` to its issue and date, and a pin
 whose row was twinned or retired is stale); and, as a warning only, a revisit
@@ -175,7 +184,7 @@ stays `twinned` on the paged shape; the gap is recorded here so it is not silent
 
 **Known asymmetry on the audit pair.** `GET /api/v1/audit` and `query_audit_log` share one row set, but the MCP tool also publishes `has_more` and refuses a string filter over 1024 characters; the REST route does neither (a short page is its last page, and its filters are unbounded). The row stays `twinned`; the gap is recorded here and tracked by `#5887` (revisit by 2026-11-15).
 
-**Known asymmetry on the dashboard API-token pair.** `POST /api/settings/api-tokens` and `DELETE /api/settings/api-tokens/{id}` apply the same permission, MFA step-up, store-availability, tier/TTL and ownership rules as `POST /api/v1/tokens` and `DELETE /api/v1/tokens/{id}`. They differ in being narrower or in shape: the form has no `scope_service` (no service-scoped minting) and takes `ttl_hours` where the REST route takes `expires_at`; its audit rows are written through `AuditStore::log` and carry no user-agent, principal-class or session-id stamp; and MCP `create_api_token` has no step-up, by design (an MCP-tier token is required, with approval at the supervised tier). The rows stay `twinned`. The Settings page cannot yet prompt for the step-up code, so an MFA-enrolled operator whose proof has expired is refused without feedback and must re-authenticate.
+**Known asymmetry on the dashboard API-token pair.** `POST /api/settings/api-tokens` and `DELETE /api/settings/api-tokens/{id}` apply the same permission, MFA step-up, store-availability, tier/TTL and ownership rules as `POST /api/v1/tokens` and `DELETE /api/v1/tokens/{id}`. They differ in being narrower or in shape: the form has no `scope_service` (no service-scoped minting) and takes `ttl_hours` where the REST route takes `expires_at`; its audit rows are written through `AuditStore::log` and carry no user-agent, principal-class or session-id stamp; and MCP `create_api_token` has no step-up, by design (an MCP-tier token is required, with approval at the supervised tier). The rows stay `twinned`. The Settings page cannot yet prompt for the step-up code, so an MFA-enrolled operator whose proof has expired is refused, sees only the error toast "MFA step-up required" (no prompt) and must re-authenticate.
 
 **Known asymmetry on the discovered-devices pair.** The legacy `GET /api/discovery/results` row is
 `twinned` to `GET /api/v1/network/discovered-devices` / `list_discovered_devices`, but the raw route is
@@ -192,14 +201,14 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
-| devices | 21 | 11 | 10 |
+| devices | 21 | 10 | 11 |
 | inventory | 4 | 4 | 0 |
 | dex | 27 | 18 | 9 |
-| guardian | 18 | 8 | 10 |
+| guardian | 18 | 10 | 8 |
 | tar | 12 | 3 | 9 |
 | auto-preflight | 4 | 1 | 3 |
 | auto-deploy | 6 | 3 | 3 |
-| auto-verify | 3 | 0 | 3 |
+| auto-verify | 3 | 1 | 2 |
 | network | 3 | 2 | 1 |
 | viz | 2 | 2 | 0 |
 | executions | 6 | 0 | 6 |
@@ -209,18 +218,18 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | settings | 30 | 11 | 19 |
 | rbac | 17 | 5 | 12 |
 | auth-mfa | 7 | 0 | 7 |
-| engine-principals | 3 | 0 | 3 |
+| engine-principals | 3 | 1 | 2 |
 | access-reviews | 5 | 3 | 2 |
 | ca-pki | 3 | 2 | 1 |
 | ota | 15 | 1 | 14 |
 | enrollment | 21 | 4 | 17 |
 | crypto | 5 | 5 | 0 |
-| other | 82 | 17 | 65 |
-| **Total** | **344** | **119** | **225** |
+| other | 82 | 26 | 56 |
+| **Total** | **344** | **131** | **213** |
 
-Registered `/api/vN/*` routes: 260. OpenAPI `paths` entries: 259. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 203.
+Registered `/api/vN/*` routes: 262. OpenAPI `paths` entries: 261. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 205.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 225. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 174.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 213. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 84.
 
 <!-- END GENERATED -->
 

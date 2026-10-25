@@ -158,6 +158,8 @@ constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
 
 constexpr std::array<std::string_view, 3> kRecognizedIdpSources = {"entra", "saml", "ad"};
 constexpr std::string_view kLocalPrefix = "local:";
+// Keep in step with `authz::is_engine_principal_name` (authz_model.hpp), the engine-namespace test the
+// username-keyed server resolvers use; rbac_store.cpp does not depend on that header.
 constexpr std::string_view kEnginePrefix = "engine:";
 
 bool has_reserved_idp_prefix(std::string_view name) {
@@ -1502,6 +1504,19 @@ bool RbacStore::generation_view_stale_locked() const {
         return true;
     return rbac_generation::is_stale_beyond_bound(now_ms(), last_successful_refresh_ms_,
                                                    kRbacStaleServeBoundMs);
+}
+
+void RbacStore::age_refresh_state_for_test(std::chrono::milliseconds elapsed) {
+    const std::int64_t ms = elapsed.count();
+    {
+        std::lock_guard lock(cache_mtx_);
+        refresh_started_ms_ -= ms;
+        last_successful_refresh_ms_ -= ms;
+    }
+    {
+        std::lock_guard lock(breaker_mtx_);
+        breaker_last_probe_started_ms_ -= ms;
+    }
 }
 
 bool RbacStore::rbac_enabled_view_degraded() const {
@@ -3131,7 +3146,10 @@ ListReadAuthorization RbacStore::authorize_list_read(const std::string& username
     // null / load-failed store returns true from rbac_enforcement_in_effect and
     // falls through to the RBAC path, which denies (INV-1).
     if (!rbac_enforcement_in_effect(this)) {
-        out.decision = ListReadDecision::AdmitAll;
+        // An engine principal's only authority is an explicit RBAC grant (design §4.2): the
+        // legacy-open full-fleet read does not apply to it, so it stays DenyAll.
+        if (!username.starts_with(kEnginePrefix))
+            out.decision = ListReadDecision::AdmitAll;
         return out;
     }
 

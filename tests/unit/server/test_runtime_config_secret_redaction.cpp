@@ -116,6 +116,43 @@ TEST_CASE("every registered secret key is actually storable", "[runtime_config][
           allowed.end());
 }
 
+TEST_CASE("every allowed key has a write class, and the classes are the reviewed ones",
+          "[runtime_config][write_class]") {
+    // The generic PUT /api/config/{key} applies the class. A key whose own settings route is
+    // administrator-only must not be General. If you are here because this failed, you added a
+    // key to the allow-list: decide its class in runtime_config_store.cpp, then list it here.
+    using C = yuzu::server::ConfigWriteClass;
+    const std::vector<std::pair<std::string, C>> expected = {
+        {"heartbeat_timeout", C::General},
+        {"response_retention_days", C::General},
+        {"audit_retention_days", C::AdminRoute},
+        {"guardian_event_retention_days", C::General},
+        {"auto_approve_enabled", C::General},
+        {"log_level", C::General},
+        {"oidc_issuer", C::AdminRouteInteractiveOnly},
+        {"oidc_client_id", C::AdminRouteInteractiveOnly},
+        {"oidc_client_secret", C::AdminRouteInteractiveOnly},
+        {"oidc_redirect_uri", C::AdminRouteInteractiveOnly},
+        {"oidc_admin_group", C::AdminRouteInteractiveOnly},
+        {"oidc_skip_tls_verify", C::AdminRouteInteractiveOnly},
+        {"plugin_signing_required", C::AdminRoute},
+        {"dex_alert_routing", C::AdminRoute},
+        {"dex_blast_min_devices", C::AdminRoute},
+        {"dex_blast_window_seconds", C::AdminRoute},
+        {"dex_blast_cooldown_seconds", C::AdminRoute},
+        {"dex_cohort_export_key", C::AdminRoute},
+        {"dex_score_policy", C::RouteOwned},
+    };
+    const auto& allowed = RuntimeConfigStore::allowed_keys();
+    REQUIRE(allowed.size() == expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        INFO(expected[i].first);
+        CHECK(allowed[i] == expected[i].first);
+        CHECK(RuntimeConfigStore::write_class(allowed[i]) == expected[i].second);
+    }
+    CHECK_FALSE(RuntimeConfigStore::write_class("not_a_key").has_value());
+}
+
 // ── Store-behaviour tests: pre-migrated template, [pg] ──────────────────────
 
 namespace {

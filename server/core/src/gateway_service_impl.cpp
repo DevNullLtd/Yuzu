@@ -216,7 +216,8 @@ void record_directory_desync(yuzu::MetricsRegistry* metrics, std::string_view op
                      "buggy gateway or an agent sending a malformed session_id",
                      count, outcome);
     } else if (op == "proxy_register" || op == "session_lookup" ||
-               (op == "notify_stream_status" && outcome == "connected_unverified")) {
+               (op == "notify_stream_status" && outcome == "connected_unverified") ||
+               (op == "announce_connected" && outcome == "session_held_by_other_agent")) {
         // The call site logs these itself, naming the sanitized id.
     } else if (op == "proxy_inventory" && outcome == "unknown_session") {
         spdlog::warn("[gateway] ProxyInventory: presented session matched no directory row and no "
@@ -364,7 +365,11 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "\"malformed_session_id\" is a replayed id that is not the gw-session- plus 32 "
             "lowercase hex shape this server mints, and \"session_held_by_other_agent\" is a "
             "replayed id another agent's row already holds (a forged or colliding id); both are "
-            "refused and both expect zero, so any increase is actionable. "
+            "refused and both expect zero, so any increase is actionable. #5683: "
+            "op=\"announce_connected\" outcome \"session_held_by_other_agent\" is the same "
+            "condition caught on the CONNECTED path when the presenting agent has no directory "
+            "row (the unique session index refused the fallback insert); the placement is "
+            "unpublished and the same alert covers it. "
             "op=\"notify_stream_status\" outcome \"connected_unverified\" is a CONNECTED refused "
             "because the directory read degraded and this replica holds no matching local "
             "session (the agent recovers by reconnecting). HA WS-5 lookups: "
@@ -419,6 +424,10 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         // See gateway_route_store.hpp's "AGENT<->CLUSTER AFFINITY" note.
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "announce_connected"}, {"outcome", "cluster_affinity_violation"}});
+        // #5683: a CONNECTED whose session id another agent's row already holds
+        // (the unique index refused the fallback INSERT), refused fail-closed.
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "announce_connected"}, {"outcome", "session_held_by_other_agent"}});
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "notify_stream_status"}, {"outcome", "unknown_session"}});
         // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
@@ -452,7 +461,8 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         // HA WS-5: session-keyed RPCs now resolve against the DIRECTORY.
         // `unknown_session` under op=session_lookup/proxy_inventory means
         // unknown to the directory; `ambiguous_session` is a session_id that
-        // more than one directory row carries (session_id is not unique).
+        // more than one directory row carries (unique since v5, #5683, so this
+        // fires only after a hand-dropped index; every match is still returned).
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "session_lookup"}, {"outcome", "ambiguous_session"}});
         metrics_->counter("yuzu_server_gateway_route_desync_total",
@@ -2229,12 +2239,16 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // RPC now would split the two (memory says connected, directory does
         // not) and risk a routing black hole for no correctness gain. The
         // reader's `routable` trust predicate, not this write, is the integrity
-        // backstop. #4669: the ONE exception is `cluster_affinity_violation`
-        // below — by this point the #4669 pre-check ABOVE has already refused
-        // the common case, so reaching a violation HERE is only the narrow
-        // race window that comment describes; still counted distinctly, but
-        // `set_gateway_route` has already run by then (that race's accepted
-        // cost — see the pre-check's own comment).
+        // backstop. #4669: the exceptions are `cluster_affinity_violation` and
+        // (#5683) `session_held_by_other_agent`, both fail-closed arms
+        // below. They differ in how they are reached. For the AFFINITY arm the
+        // #4669 pre-check ABOVE has already refused the common case, so
+        // reaching it HERE is only the narrow race window that comment
+        // describes (that race's accepted cost: `set_gateway_route` has already
+        // run by then; see the pre-check's own comment). The pre-check does NOT
+        // look at session ownership, so for `session_held_by_other_agent` the
+        // refused no-row fallback insert is the ORDINARY outcome, not a race:
+        // that arm reverts the placement itself (`unpublish_gateway_route`).
         if (gateway_route_store_) {
             // 4.2a #8: a session recorded in lost_race_sessions_ lost its
             // register_fresh epoch race — the durable row already belongs to
@@ -2319,6 +2333,54 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                     if (!audit_store_->log(ev))
                         signal_grpc_audit_failed(context);
                 }
+            } else if (res->session_held_by_other_agent) {
+                // #5683: the unique session index refused the fallback INSERT:
+                // another agent's row holds this id. Same shape as the affinity
+                // branch above: set_gateway_route already published the
+                // placement in memory, so revert it, and leave a best-effort
+                // audit row.
+                //
+                // Scope: this arm fires only when the presenting agent has NO
+                // directory row (the fallback insert is what the unique index
+                // refuses). An agent that still has a row, including a
+                // tombstone, is not covered: its CONNECTED lands as
+                // session_mismatch and does not unpublish (the tombstoned-victim
+                // residual recorded in ADR-2002 7f "Still open", #5685 area).
+                spdlog::warn("[gateway] NotifyStreamStatus: CONNECTED for agent {} presents "
+                             "session {} that another agent's route already holds (#5683) — "
+                             "refusing, not publishing this placement",
+                             ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(session_id));
+                record_directory_desync(metrics_, "announce_connected",
+                                        "session_held_by_other_agent");
+                if (has_local_session && !registry_.unpublish_gateway_route(agent_id, session_id)) {
+                    spdlog::debug("[gateway] NotifyStreamStatus: session_held_by_other_agent "
+                                  "revert no-op for agent {} session {} — session already "
+                                  "superseded",
+                                  ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(session_id));
+                }
+                if (audit_store_ && audit_store_->is_open()) {
+                    AuditEvent ev;
+                    ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                    ev.principal = "gateway_cluster:" + cluster_id;
+                    ev.principal_role = "gateway";
+                    ev.action = "gateway.session_held_by_other_agent";
+                    ev.target_type = "agent";
+                    ev.target_id = agent_id;
+                    // The presented id may be another agent's LIVE session: never
+                    // written into the audit row.
+                    ev.detail = "detected_at=announce_connected_write";
+                    ev.result = "failure";
+                    if (!audit_store_->log(ev))
+                        signal_grpc_audit_failed(context);
+                }
+                // Refused, so say so: not acknowledged, and return before the
+                // common tail logs "stream CONNECTED" for a stream we just
+                // refused (mirrors the pre-check affinity refusal above). The
+                // sibling cluster_affinity_violation arm is #5977's scope.
+                response->set_acknowledged(false);
+                return grpc::Status::OK;
             } else if (!res->matched) {
                 record_directory_desync(metrics_, "announce_connected", "session_mismatch");
             }

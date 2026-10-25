@@ -324,6 +324,20 @@ yuzu_estate_js_embed = custom_target(
   ],
 )
 
+# TAR timeline page (hidden; /static/yuzu-tar-timeline.js). Symbol: kYuzuTarTimelineJs.
+yuzu_tar_timeline_js_embed = custom_target(
+  'yuzu_tar_timeline_js_bundle',
+  input: 'static/yuzu-tar-timeline.js',
+  output: 'yuzu_tar_timeline_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuTarTimelineJs',
+  ],
+)
+
 # Hardware record "Tags and properties" lens controls. Symbol: kYuzuDeviceDataJs.
 yuzu_device_data_js_embed = custom_target(
   'yuzu_device_data_js_bundle',
@@ -583,6 +597,7 @@ yuzu_server_core_lib = static_library(
    yuzu_groups_js_embed,
    yuzu_system_js_embed,
    yuzu_developer_js_embed,
+   yuzu_tar_timeline_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
@@ -602,6 +617,8 @@ yuzu_server_core_lib = static_library(
     'src/auth_routes.cpp',
     'src/authz_gates.cpp',
     'src/mfa_step_up.cpp',
+    'src/route_inventory.cpp', # process-wide record of HttplibRouteSink registrations (boot-time step-up sweep)
+    'src/step_up_gate.cpp', # MFA step-up decide/render split + request chokepoint (policy table: src/step_up_policy.hpp)
     'src/mfa_qr.cpp',
     'src/totp.cpp',
     'src/auto_approve.cpp',
@@ -692,6 +709,7 @@ yuzu_server_core_lib = static_library(
     'src/home_routes.cpp', # Dashboard: GET /fragments/dashboard/summary over injected seams
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
+    'src/tar_timeline_page_ui.cpp', # hidden TAR timeline page shell (flag-gated route)
     'src/result_sets_ui.cpp',
     'src/result_set_extras_render.cpp',
     'src/approvals_page_render.cpp', # Operate O1: the Approvals page's pure list renderer
@@ -840,6 +858,7 @@ yuzu_server_core_lib = static_library(
     'src/dashboard_api_routes.cpp',
     'src/nvd_routes.cpp',
     'src/approval_routes.cpp',
+    'src/config_write.cpp', # the transport-free core shared by the config routes (legacy + v1) and the MCP get/set_runtime_config tools
     'src/config_routes.cpp', # #2542 PR-12: the 2-route Runtime Configuration API (7.3), extracted onto the HttpRouteSink seam
     'src/diagnostics_routes.cpp', # #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API, extracted onto the HttpRouteSink seam
     'src/legacy_events_routes.cpp', # #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam

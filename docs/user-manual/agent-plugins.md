@@ -103,7 +103,7 @@ The following plugins are defined in the roadmap but not yet implemented. They a
 
 | Plugin | Description | Target Phase |
 |---|---|---|
-| `patch` | Patch deployment agent-side automation (scanning, downloading, installing). Server-side patch management is implemented via `PatchManager`. | Phase 7 (7.8) |
+| `patch` | Patch deployment agent-side automation (scanning, downloading, installing). Server-side, `PatchManager` keeps patch and deployment records only: deployment execution was removed (ADR-0062, #3669) and nothing populates patch inventory (#3676), so `GET /api/patches` is always empty and `GET /api/patches/deployments` lists only recorded deployments; removal of those routes is tracked by #6326. | Phase 7 (7.8) |
 
 ---
 
