@@ -891,7 +891,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `get.fragments-devices-list` recorded the same pair as `twinned`; it moves
      to the same exception so the ledger holds one answer for the pair
      (untwinned 214 to 215). The pins are `(4041, "2027-01-31")` for both rows in
-     `STRICT_EXCEPTION_PINS`; like the 2026-10-22 entry this is a session
+     `STRICT_EXCEPTION_PINS`; like the 2026-10-22 API-parity ledger reconcile entry this is a session
      statement by the ADR owner, not a signed decision.
 
    - **2026-10-23 - DEX customer score policy (`GET`, `PUT` and `DELETE
@@ -928,9 +928,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - **Reason.** The guides are prose written for people reading the
        reference page, and the guide text would make the document larger for
        every reader of the MCP resource. The default document does not carry
-       everything the guides carry. Counted by parsing the document, 40 of
-       its 259 operations have no description, and 73 operations in all have
-       descriptions that name no securable permission. The permission and
+       everything the guides carry. Counted by parsing the document when this
+       entry was written (it then had 259 operations), 40 operations have no
+       description, and 73 operations in all have descriptions that name no
+       securable permission. The permission and
        audit prose in each guide's access block is present only in the
        `guides=true` form.
      - **Scope.** The exception covers the guide text only. The operations,

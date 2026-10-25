@@ -28,7 +28,7 @@ void send_html(httplib::Response& res, const std::string& html) {
     res.set_content(html, "text/html; charset=utf-8");
 }
 
-/// The route catalogue parses the compiled-in default OpenAPI document, about 650 KB
+/// The route catalogue parses the compiled-in default OpenAPI document, about 670 KB
 /// (measured as compact JSON of the literal without the guides, before ecosystem
 /// token expansion; it grows as operations are added), so parse it once: the
 /// document cannot change while the process runs. Filtering happens on the
