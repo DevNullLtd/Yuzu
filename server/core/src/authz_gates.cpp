@@ -149,11 +149,10 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
             return std::unexpected(authz::GateFailure::Degraded);
         }
         // The checked read: a failed read is a retryable 503, not the 403 of "no grant".
-        const auto engine_grant = rbac_store_->is_rbac_enabled()
-                                      ? rbac_store_->check_permission_checked(session->username,
-                                                                              securable_type,
-                                                                              operation)
-                                      : std::expected<bool, std::string>(false);
+        // `engine_grant_checked` also answers a retryable error, not a 403, when the enforcement
+        // state itself cannot be confirmed (a stale cached-disabled view).
+        const auto engine_grant =
+            engine_grant_checked(rbac_store_, session->username, securable_type, operation);
         if (!engine_grant) {
             audit_log(req, "auth.fleet_read_required", "failure", "", "",
                       "engine principal: authorization read failed for " + perm);

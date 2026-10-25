@@ -1652,6 +1652,22 @@ bool rbac_enforcement_in_effect(const RbacStore* store) noexcept {
     return rbac_enforcement_label(store) != RbacEnforcementLabel::kDisabled;
 }
 
+std::expected<bool, std::string> engine_grant_checked(const RbacStore* store,
+                                                       const std::string& username,
+                                                       const std::string& securable_type,
+                                                       const std::string& operation) {
+    // ONE label snapshot per decision (see the header): never this call plus a second read.
+    switch (rbac_enforcement_label(store)) {
+    case RbacEnforcementLabel::kEnabled:
+        return store->check_permission_checked(username, securable_type, operation);
+    case RbacEnforcementLabel::kDisabled:
+        return false; // RBAC is off and the view is fresh: an engine holds no authority
+    case RbacEnforcementLabel::kDegraded:
+        break;
+    }
+    return std::unexpected(std::string("rbac enforcement state unconfirmed"));
+}
+
 // to_string(RbacEnforcementLabel) is constexpr and header-inline (rbac_store.hpp) —
 // matches every other enum-to-string mapper in this codebase.
 

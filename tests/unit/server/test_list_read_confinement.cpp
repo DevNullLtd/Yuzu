@@ -605,13 +605,6 @@ TEST_CASE("every live is_rbac_enabled() call site is display-only "
              // sites (2 occurrences each).
              "if (!rbac_store_->is_rbac_enabled() ||",
              "if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {",
-             // The engine-principal arm of require_list_read: still deny-first (RBAC off is a
-             // 403 with no read at all; RBAC on reads through check_permission_checked, whose
-             // failure is a 503 and whose refusal is a 403). A stale raw view cannot admit by
-             // itself: stale false denies, and stale true still needs an explicit engine grant
-             // from the read that follows. The shape changed from the compound
-             // `!is_rbac_enabled() ||` above only to carry the checked read's failure.
-             "const auto engine_grant = rbac_store_->is_rbac_enabled()",
          }},
     };
 

@@ -1049,6 +1049,27 @@ enum class RbacEnforcementLabel {
 /// this reconciliation introduces.
 [[nodiscard]] RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept;
 
+/// The ONE grant decision of the two checked-read engine arms (`AuthRoutes::require_list_read`
+/// and the fleet-read gate): an engine principal's only authority is an explicit RBAC grant,
+/// so it is never admitted on a fresh disabled view. (A cached-ENABLED view that is stale
+/// still reads the grant: the documented fail-closed asymmetry above, not covered here.)
+/// The engine arms of `require_permission` and `require_scoped_permission` are deliberately
+/// plain deny-on-degrade (ADR-0041, #6437) and do not use this.
+///
+/// One `rbac_enforcement_label()` snapshot decides: `kEnabled` returns
+/// `check_permission_checked()` (a failed read is the error); `kDisabled` returns `false`
+/// (a genuine "no": RBAC is off and the view is fresh); `kDegraded` returns an error (the
+/// enforcement state could not be confirmed, a stale cached-disabled view included), so the
+/// caller answers a retryable 503 instead of a terminal 403. It admits exactly when the
+/// raw `is_rbac_enabled()` accessor did and the grant read succeeds, so the SET OF INPUTS
+/// THAT ADMIT is unchanged; only which non-admitting answer is given differs (the test
+/// `rbac_enforcement_label()` above sets for a new consumer). Do NOT replace the label with
+/// `rbac_enforcement_in_effect()` here: that is `true` for a degraded view, and the grant read
+/// would then admit an engine while RBAC may be genuinely off.
+[[nodiscard]] std::expected<bool, std::string>
+engine_grant_checked(const RbacStore* store, const std::string& username,
+                     const std::string& securable_type, const std::string& operation);
+
 /// "enabled" | "disabled" | "degraded" — the wire/DB string form of
 /// `RbacEnforcementLabel`, used verbatim as the access-review export's
 /// `rbac_enforcement` field and the frozen campaign row's column of the same

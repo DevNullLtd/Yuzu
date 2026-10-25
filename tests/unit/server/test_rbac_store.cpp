@@ -3168,6 +3168,12 @@ TEST_CASE("RbacStore: every checked read on a store that is not open reports the
     CHECK(std::string_view{r9.error()} == kRbacErrStoreNotOpen);
     // list_roles() is this read with the error collapsed: a closed store is an empty vector.
     CHECK(broken.list_roles().empty());
+    // engine_grant_checked is null-safe like the label it snapshots: a null or not-open store
+    // is an error (a retryable 503 at the gates), never a grant.
+    const auto e1 = engine_grant_checked(nullptr, "engine:x", "Response", "Read");
+    REQUIRE_FALSE(e1.has_value());
+    const auto e2 = engine_grant_checked(&broken, "engine:x", "Response", "Read");
+    REQUIRE_FALSE(e2.has_value());
     const auto r10 = broken.check_permission_checked("bob", "Response", "Read");
     REQUIRE_FALSE(r10.has_value());
     CHECK(std::string_view{r10.error()} == kRbacErrStoreNotOpen);
