@@ -50,14 +50,21 @@
 #       (#4707, #5177). A non-ASCII binary behaves differently: one whose
 #       bytes include 0x80-0x9F (an em dash's UTF-8 does) is rejected when
 #       the metric is declared, at gateway start, and any other renders its
-#       raw bytes. This lint flags all of them. Scanning it here means the PR
+#       raw bytes. This lint flags every binary whose non-ASCII character is
+#       written inside the quotes (an escape such as `<<"\351">>` is not --
+#       see the residual list). Scanning it here means the PR
 #       fast path catches it without Erlang. Only the tuple's real string
 #       literals are scanned: a `"` in a comment, a quoted atom or a `$"`
-#       literal inside the tuple is never paired with one.
+#       literal inside the tuple is never paired with one. The key may be
+#       quoted (`{'help', ...}`) or split from the `{` by a comment.
 #       OTP 27+ triple-quoted strings and sigils (`~"..."`, `~b(...)`, ...)
 #       are NOT parsed: their delimiter/escape rules are where a lexer this
-#       small would mis-parse silently. A file that contains `{help` and
-#       either construct fails LOUDLY instead; extend erl_code_mask first.
+#       small would mis-parse silently. Nor is an unterminated `$\x{...}`
+#       character literal (erlc rejects it). Any file that contains the
+#       WORD `help` anywhere -- a comment counts -- is lexed, and if it holds
+#       any of these constructs it fails LOUDLY instead; extend erl_code_mask
+#       first. The gate is the bare word, not `{help`, so that no spelling of
+#       the key can make a file skip the scan.
 #       Residual: this lint checks only the characters written inside the
 #       string literals of a `{help, ...}` tuple. It does not see:
 #         - an escape inside a string (`\x{2014}`, octal `\351`), which is
@@ -66,8 +73,8 @@
 #           literal, an integer code point (`[8212]`) or a byte binary
 #           (`<<226,128,148>>`);
 #         - a HELP that is not a literal at the site: a `?MACRO`, a variable,
-#           a helper's argument, the map form `#{help => ...}`, or a
-#           `{'help', ...}` key spelling.
+#           a helper's argument, the map form `#{help => ...}`, or a key
+#           spelled with an escape (`{'\x68elp', ...}`).
 #       All of these pass this lint;
 #       yuzu_gw_telemetry_tests:metrics_scrape_renders_test_ renders the real
 #       registry and remains the backstop for them.
@@ -76,8 +83,11 @@
 #   scripts/ci/check-metrics-help-ascii.sh              # scan the real tree
 #   scripts/ci/check-metrics-help-ascii.sh --selftest    # fixture self-test
 #
-# Exit status: 0 = clean (or selftest passed), 1 = a non-ASCII byte was found
-# in a scanned HELP string (or selftest failed), 2 = usage error.
+# Exit status: 0 = clean (or selftest passed); 1 = at least one finding -- a
+# non-ASCII character in a scanned HELP literal, or a scan error (a missing or
+# unreadable scan target, an unsupported Erlang construct, no gateway
+# {help, ...} tuple found) -- or the selftest failed; 2 = usage error, or no
+# working python interpreter.
 
 set -euo pipefail
 
@@ -292,12 +302,16 @@ def scan_help_table_files(root):
 
 def erl_code_mask(text):
     """Erlang counterpart of cpp_code_mask: blank out `%` comments, "..."
-    strings, '...' quoted atoms and $c / $\\c character literals (so `$"`,
-    `$}` or `$%` can't desync the scan), preserving length and newlines.
+    strings, '...' quoted atoms and $c / $\\c / $\\^c / $\\x{H+} character
+    literals (so `$"`, `$}`, `$\\^]` or `$%` can't desync the scan),
+    preserving length and newlines. The quoted atom 'help' alone is masked
+    to ` help `, so a `{'help', ...}` key is found like `{help, ...}`.
     Also returns the code-level constructs this lexer does NOT parse, as
-    (offset, kind): a triple-quoted string (a `"` followed by `""`) and a
+    (offset, kind): a triple-quoted string (a `"` followed by `""`), a
     sigil (any code-level `~` -- Erlang has no `~` operator, and a format
-    directive like "~s" sits inside a string, which is masked first).
+    directive like "~s" sits inside a string, which is masked first) and a
+    `$\\x{` with no closing hex-digits-then-`}` (erlc rejects it; masking to
+    the next `}` anywhere would swallow real code).
     The third return value keeps ONLY the code-level "..." strings (quotes
     included) and blanks everything else, so a `"` inside a comment, a
     quoted atom or a `$"` literal can never be paired with a real string
@@ -314,17 +328,23 @@ def erl_code_mask(text):
             end = n if end < 0 else end
         elif c == "$":
             if text.startswith("$\\x{", i):
-                close = text.find("}", i)
-                end = n if close < 0 else close + 1
+                hexm = re.compile(r"\$\\x\{[0-9A-Fa-f]+\}").match(text, i)
+                if hexm:
+                    end = hexm.end()
+                else:
+                    unsupported.append((i, "unterminated $\\x{...} character literal"))
+                    end = i + 3
+            elif text.startswith("$\\^", i):
+                end = min(n, i + 4)  # $\^X: the control character X is the 4th
             else:
                 end = min(n, i + (3 if text.startswith("$\\", i) else 2))
         elif c == "~":
-            unsupported.append((i, "sigil"))
+            unsupported.append((i, "OTP 27+ sigil"))
             i += 1
             continue
         elif c in ('"', "'"):
             if text.startswith('"""', i):
-                unsupported.append((i, "triple-quoted string"))
+                unsupported.append((i, "OTP 27+ triple-quoted string"))
             end = i + 1
             escaped = False
             while end < n:
@@ -344,6 +364,8 @@ def erl_code_mask(text):
         for j in range(i, end):
             if out[j] != "\n":
                 out[j] = " "
+        if text[i:end] == "'help'":
+            out[i + 1:end - 1] = "help"
         i = end
     return "".join(out), unsupported, "".join(strings_only)
 
@@ -351,8 +373,7 @@ def erl_code_mask(text):
 def find_erl_help_tuples(text, mask):
     """Every `{help, ...}` tuple in `text`, bracket-balanced against `mask`
     (a HELP routinely spans several lines as adjacent literals). Returns
-    (line_number_of_tuple_start, byte_offset_of_tuple_start, tuple_text),
-    the slice taken from `text`. The caller passes erl_code_mask's
+    (line_number_of_tuple_start, tuple_text), the slice taken from `text`. The caller passes erl_code_mask's
     strings-only view as `text`, so the slice holds the tuple's real string
     literals and nothing a quote in a comment or atom could mis-pair with."""
     tuples = []
@@ -372,8 +393,7 @@ def find_erl_help_tuples(text, mask):
             i += 1
         end = i + 1
         line = text.count("\n", 0, start) + 1
-        byte_offset = len(text[:start].encode("utf-8"))
-        tuples.append((line, byte_offset, text[start:end]))
+        tuples.append((line, text[start:end]))
     return tuples
 
 
@@ -406,22 +426,27 @@ def scan_erl_help_surface(root):
         except (OSError, UnicodeDecodeError) as e:
             findings.append((rel, 0, 0, f"<unreadable: {type(e).__name__}>"))
             continue
-        if not re.search(r"\{\s*help\b", text):
+        # The bare word, not `{help`: a comment between `{` and `help`, or the
+        # quoted key 'help', must still reach the comment-aware tuple finder.
+        if not re.search(r"\bhelp\b", text):
             continue
         mask, unsupported, strings_only = erl_code_mask(text)
         if unsupported:
             # A mis-mask anywhere in the file can shift a tuple's boundaries,
-            # so any unparsed construct in a file holding `{help` fails it.
+            # so any unparsed construct in a file mentioning `help` fails it.
             for off, kind in unsupported:
                 line = text.count("\n", 0, off) + 1
                 findings.append((rel, line, 0,
-                                 f"<unsupported OTP 27+ string syntax ({kind}); "
+                                 f"<unsupported {kind}; "
                                  f"scripts/ci/check-metrics-help-ascii.sh cannot verify HELP "
                                  f"text in this file - extend its erl_code_mask>"))
             continue
-        for line, byte_offset, tuple_text in find_erl_help_tuples(strings_only, mask):
+        for line, tuple_text in find_erl_help_tuples(strings_only, mask):
             tuple_count += 1
-            findings.extend(non_ascii_findings(rel, line, byte_offset, tuple_text))
+            # No byte offset: tuple_text is a slice of the masked view, so an
+            # offset into it is not a file offset. The line number is exact.
+            findings.extend((r, l, None, ch)
+                            for r, l, _b, ch in non_ascii_findings(rel, line, 0, tuple_text))
     if root == repo_root and tuple_count == 0 and not findings:
         # The gateway declares its metrics as {help, ...} proplists; finding none
         # means the declaration shape changed under this lint, not a clean tree.
@@ -440,10 +465,11 @@ def run_full_scan(root):
                 print(f"::error file={rel},line={line}::{ch}")
                 continue
             cp = f"U+{ord(ch):04X}"
+            where = "" if byte_off is None else f" at byte offset {byte_off}"
             print(
-                f"::error file={rel},line={line}::non-ASCII byte at byte offset {byte_off} "
+                f"::error file={rel},line={line}::non-ASCII byte{where} "
                 f"in a HELP string literal: {cp} ({ch!r}). Prometheus HELP text must be ASCII "
-                f"-- see #2128 (gateway .erl: #4845, where it fails every scrape). Normalize this character (e.g. an em dash -> ' - ', an arrow "
+                f"-- see #2128; in a gateway .erl it fails every scrape (#4845). Normalize this character (e.g. an em dash -> ' - ', an arrow "
                 f"-> '->') rather than adding it to any allowlist; this gate has none by design."
             )
         print(f"\n{len(findings)} finding(s) in scanned HELP text (non-ASCII bytes or scan errors).",
@@ -734,6 +760,58 @@ def run_selftest():
             print(f"SELFTEST FAILED: .erl comment/atom quote hid a HELP literal: {f}")
             return 1
 
+        # The next fixtures each hold exactly one HELP tuple, so a sibling
+        # tuple can never stand in for the one the lint failed to see.
+        # A comment between `{` and `help` (valid Erlang) must not hide the tuple.
+        f = erl_case("erl_comment_split", "src",
+                     'declare() -> prometheus_counter:declare([{name, a}, { % key below\n'
+                     '      help, "bad — x"}]).\n')
+        if not flagged_em_dash(f):
+            print(f"SELFTEST FAILED: .erl comment-split {{help key was NOT scanned: {f}")
+            return 1
+
+        # The quoted-atom key 'help' is the same atom as help.
+        f = erl_case("erl_quoted_key", "src",
+                     "declare() -> prometheus_counter:declare([{name, a}, {'help', \"bad — x\"}]).\n")
+        if not flagged_em_dash(f):
+            print(f"SELFTEST FAILED: .erl {{'help', ...}} key was NOT scanned: {f}")
+            return 1
+
+        # $\^X is four characters: a bracket as the X must not leak into the
+        # tuple balancer, either ending the tuple early (a miss) ...
+        f = erl_case("erl_ctrl_escape_fn", "src",
+                     'declare() -> prometheus_counter:declare([{name, a},\n'
+                     '    {help, [$\\^], $\\^], "bad — x"]}]).\n')
+        if not flagged_em_dash(f):
+            print(f"SELFTEST FAILED: .erl $\\^] char literal hid a HELP literal: {f}")
+            return 1
+        # ... or running it on past its end into a non-HELP string (a false positive).
+        f = erl_case("erl_ctrl_escape_fp", "src",
+                     'f() -> _ = {help, [$\\^[]}, "nonhelp — x".\n')
+        if f:
+            print(f"SELFTEST FAILED: .erl $\\^[ char literal extended a tuple into prose: {f}")
+            return 1
+
+        # An unterminated $\x{ must fail loudly, not mask to the next `}`.
+        f = erl_case("erl_unterminated_hex", "src",
+                     'p($\\x{7D) -> 1.\n'
+                     'declare() -> prometheus_counter:declare([{name, a}, {help, "x"}]).\n')
+        if not any(isinstance(ch, str) and ch.startswith("<unsupported unterminated $\\x{")
+                   for _r, _l, _b, ch in f):
+            print(f"SELFTEST FAILED: .erl unterminated $\\x{{ did not fail loudly: {f}")
+            return 1
+
+        # Deliberate: the gate is the bare word `help`, so a file that only
+        # mentions it in a comment is lexed, and an unparsed construct in it
+        # fails loudly (erl_sigil_nohelp above is the no-mention counterpart).
+        f = erl_case("erl_sigil_help_word", "src",
+                     '%% the help text lives elsewhere\n'
+                     'greet() -> ~"hello".\n')
+        if not any(isinstance(ch, str) and ch.startswith("<unsupported OTP 27+ sigil")
+                   for _r, _l, _b, ch in f):
+            print(f"SELFTEST FAILED: .erl sigil in a file mentioning help did not fail loudly: {f}")
+            return 1
+
         # The full scan includes surface (c). Assert on the .erl annotation
         # itself, not on the exit code: in a fixture root surface (b) always
         # reports its two HELP tables missing, so rc is 1 either way.
@@ -746,6 +824,11 @@ def run_selftest():
         if ("file=gateway/apps/yuzu_gw/src/yuzu_gw_telemetry.erl,line=1::non-ASCII"
                 not in full_out.getvalue()):
             print(f"SELFTEST FAILED: run_full_scan did not report the seeded .erl: {full_out.getvalue()!r}")
+            return 1
+        # The gateway annotation carries no byte offset (it would be one into the masked view).
+        erl_lines = [ln for ln in full_out.getvalue().splitlines() if ".erl,line=" in ln]
+        if not erl_lines or any("byte offset" in ln for ln in erl_lines):
+            print(f"SELFTEST FAILED: gateway annotation reported a byte offset: {erl_lines!r}")
             return 1
 
         print("check-metrics-help-ascii --selftest: all fixtures behaved as expected.")
