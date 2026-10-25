@@ -1322,7 +1322,7 @@ jobs:
         # there, not restated here to avoid this comment going stale every
         # widening round) has moved Windows past 2 on real per-shard
         # contention data; Linux was held at 2 until Push 2c widened it on
-        # measured data (docs/ci-architecture.md).
+        # data (samples recorded in docs/ci-architecture.md).
         #
         # with-test-slot.sh (#3443 AC4): --num-processes 2 alone fixed
         # WITHIN-job fan-out but left cross-job contention unmeasured. Now
@@ -1509,7 +1509,7 @@ jobs:
         # slots x 2 = 6; 3 slots x 3 would jump to 9 with no diagnostic
         # support at that load and no way to attribute a regression to either
         # knob. Ship and measure one axis at a time. Push 2c later widened it to 4
-        # on its own measured axis; box-wide that is 3 slots x 4 = 12 concurrent pg
+        # on its own axis; box-wide that is 3 slots x 4 = 12 concurrent pg
         # shards (docs/ci-architecture.md, "Push 2c", Capacity).
         #
         # Acceptance/rollback signal: the #2093 duration watchdog's 560s
