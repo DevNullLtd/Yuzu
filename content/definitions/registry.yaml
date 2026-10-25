@@ -239,8 +239,8 @@ metadata:
     component walk as the fallback) and a registry symbolic link anywhere in
     the path is refused, never followed; a write under HKLM\SYSTEM\CurrentControlSet,
     itself a link, therefore fails as key_is_link. The previous and new values
-    are recorded in a `registry.write` audit row (hex, capped at 256 bytes).
-    Windows-only.
+    are recorded in a `registry.write` audit row (hex, capped at 256 bytes; they can
+    contain secrets, which the owner has accepted). Windows-only.
   tags: [registry, windows, configuration]
 spec:
   type: action
@@ -251,7 +251,7 @@ spec:
     concurrency: per-device
   parameters:
     type: object
-    required: [hive, key, name, value]
+    required: [hive, key, name]
     properties:
       hive:
         type: string
@@ -277,9 +277,17 @@ spec:
         description: >
           The value data to write, as text; interpreted per `type`: decimal
           digits for REG_DWORD / REG_QWORD, literal text for REG_SZ /
-          REG_EXPAND_SZ, LF-separated records for REG_MULTI_SZ (empty text is
-          the empty list), hex digits for REG_BINARY (empty is zero bytes).
-          Leave empty when `data_hex` is given.
+          REG_EXPAND_SZ, LF-separated non-empty records for REG_MULTI_SZ
+          (split on LF only, so a CR stays inside its record; an empty record
+          or a trailing LF is refused as invalid_data; empty text is the empty
+          list), hex digits for REG_BINARY (empty is zero bytes). Send exactly
+          one of `value` and `data_hex`. When neither is sent, or the one sent
+          is empty, the write stores an empty value of the type and answers ok:
+          an empty string, the empty list or zero bytes (REG_DWORD and
+          REG_QWORD refuse it as invalid_data), so a misspelt parameter name
+          writes an empty value instead of failing. Through MCP
+          `execute_instruction` and the result-set execute routes every
+          parameter value is limited to 64 KiB.
       data_hex:
         type: string
         description: >
@@ -287,11 +295,14 @@ spec:
           `value` (both non-empty is refused as invalid_data). Shape
           is checked per type: 4 bytes for REG_DWORD, 8 for REG_QWORD, a
           terminating NUL for the string types, a trailing double NUL for
-          REG_MULTI_SZ. Use it to restore a value captured by an earlier
-          write. An empty `data_hex` is the same as omitting it here. At most
-          1 MiB of data. Needs registry 2.0.0 on the agent: registry 1.x
-          ignores it and writes an EMPTY REG_SZ over the value, answering
-          `status|ok`.
+          REG_MULTI_SZ. Use it for exact bytes you hold from another source. An
+          empty `data_hex` is the same as omitting it here. The plugin takes at
+          most 1 MiB of data (2,097,152 hex characters), but MCP
+          `execute_instruction` and the result-set execute routes limit every
+          parameter value to 64 KiB, so through them it carries at most 32 KiB
+          of data; the direct command route is not under that cap. Needs
+          registry 2.0.0 on the agent: registry 1.x ignores it and writes an
+          EMPTY REG_SZ over the value, answering `status|ok`.
         validation:
           maxLength: 2097152
       type:
@@ -314,7 +325,7 @@ spec:
     executeRoles: [endpoint-admin]
     authorRoles: [content-author]
   compatibility:
-    minAgentVersion: 1.0.0
+    minAgentVersion: 0.15.0
     requiredPlugins: [registry]
 status:
   phase: active
@@ -428,7 +439,7 @@ spec:
     executeRoles: [endpoint-admin]
     authorRoles: [content-author]
   compatibility:
-    minAgentVersion: 0.2.0
+    minAgentVersion: 0.15.0
     requiredPlugins: [registry]
 status:
   phase: active
@@ -449,7 +460,8 @@ metadata:
     confirmed by the handle reading back as deleted. counted_keys is 1 and counted_values is the number
     of values the key held; the count stops at 10,000 nodes (the key plus up to 9,999 values), past which
     capped is 1 and counted_values is a lower bound (the delete still removes the key with all its
-    values). Windows-only.
+    values). A subkey created between the check and the delete makes the delete fail, not key_has_subkeys:
+    the key stays and the action answers a failure token (access_denied or win32:<code>). Windows-only.
   tags: [registry, windows, configuration]
 spec:
   type: action
@@ -508,7 +520,7 @@ spec:
     executeRoles: [endpoint-admin]
     authorRoles: [content-author]
   compatibility:
-    minAgentVersion: 1.0.0
+    minAgentVersion: 0.15.0
     requiredPlugins: [registry]
 status:
   phase: active

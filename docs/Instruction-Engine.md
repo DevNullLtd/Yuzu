@@ -1085,7 +1085,7 @@ The plugin ABI (`plugin.h`) uses a single `abi_version` field, currently `YUZU_P
 During fleet upgrades, older agents coexist with newer agents:
 - Older agents receive ad-hoc `CommandRequest` messages (plugin + action + params) — same as today
 - Newer agents receive the same `CommandRequest` — the wire protocol doesn't change
-- InstructionDefinitions with `minAgentVersion` higher than an agent's version are meant not to be dispatched to that agent (declared and shown today; dispatch does not compare it)
+- InstructionDefinitions with `minAgentVersion` higher than an agent's version are meant not to be dispatched to that agent (declared and exported today; dispatch does not compare it)
 - No forced upgrades; the OTA update mechanism is opt-in per rollout configuration
 
 ### 14.5 OTA Rollback

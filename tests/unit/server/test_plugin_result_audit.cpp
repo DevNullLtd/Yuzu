@@ -393,6 +393,63 @@ TEST_CASE("registry audit: a real rendered line with one trailing CR yields the 
     CHECK(crlf.events[0].detail.ends_with("|new=02000000"));
 }
 
+TEST_CASE("registry audit: the plugin's exception literal mints one failed row per mutating action",
+          "[server][registry_audit]") {
+    // What a mutating action leaves when an exception ends it (execute_guarded's catch): a fixed 19-field line, so
+    // the server records a failed registry.write row for a write whose reply could not be built.
+    unsigned n = 40;
+    for (const std::string_view action : {"set_value", "delete_value", "delete_key"}) {
+        INFO(action);
+        const std::string line{yuzu::registry::exception_audit_line(action)};
+        REQUIRE_FALSE(line.empty());
+        CHECK(registry_audit_result(line) == "failed");
+        const auto frame =
+            registry_audit_events_for_frame("agent-1", rid(n++), "registry", action, line + "\n", 100);
+        REQUIRE(frame.events.size() == 1);
+        CHECK(frame.events[0].result == "failure");
+        CHECK(frame.events[0].action == "registry.write");
+        CHECK(frame.events[0].detail == "agent=agent-1 cut=0 " + line);
+    }
+}
+
+TEST_CASE("registry audit: a string and a binary value reach the row as raw hex, capped with ~<total>",
+          "[server][registry_audit]") {
+    // Owner risk acceptance (2026-10-20): old= and new= are the raw bytes as hex for every type; masking is a later change.
+    yuzu::registry::AuditRecord r;
+    r.op = "set_value";
+    r.hive = "HKLM";
+    r.key = "SOFTWARE\\Acme";
+    r.name = "Secret";
+    r.type_name = "REG_SZ";
+    r.len = 16;
+    r.result = "ok";
+    r.verify = "ok";
+    r.old_state = "present";
+    r.old_type = "REG_SZ";
+    r.old_bytes = {0x61, 0, 0, 0};
+    r.old_total = 4;
+    r.has_old = true;
+    r.new_bytes = {0x68, 0, 0x75, 0, 0x6e, 0, 0x74, 0, 0x65, 0, 0x72, 0, 0x32, 0, 0, 0}; // "hunter2"
+    r.new_total = 16;
+    r.has_new = true;
+    std::string line = yuzu::registry::render_audit_line(r);
+    auto frame = registry_audit_events_for_frame("a1", rid(50), "registry", "set_value", line + "\n", 5);
+    REQUIRE(frame.events.size() == 1);
+    CHECK(frame.events[0].result == "success");
+    CHECK(frame.events[0].detail.ends_with("|old=61000000|new=680075006e0074006500720032000000"));
+
+    r.type_name = "REG_BINARY"; // past the 256-byte cap: 256 bytes as hex, then the total
+    r.old_type = "REG_BINARY";
+    r.old_bytes.assign(4096, 0x11);
+    r.old_total = 1048576;
+    r.new_bytes.assign(300, 0x22);
+    r.new_total = 300;
+    line = yuzu::registry::render_audit_line(r);
+    frame = registry_audit_events_for_frame("a1", rid(51), "registry", "set_value", line + "\n", 5);
+    REQUIRE(frame.events.size() == 1);
+    CHECK(frame.events[0].detail.ends_with("|old=" + std::string(512, '1') + "~1048576|new=" + std::string(512, '2') + "~300"));
+}
+
 // ── the binding ──────────────────────────────────────────────────────────
 
 TEST_CASE("registry audit: only the three mutating actions of the registry plugin mint rows",

@@ -6,8 +6,9 @@
  * value encoders, the key-path / value-name validators (the trust boundary of every mutating action),
  * the error tokens, and the audit-line renderer.
  *
- * Limits come from Microsoft's "Registry Element Size Limits" (key name 255 characters, value name
- * 16,383); RegSetValueExW's cbData must include the terminating NUL of a REG_SZ / REG_EXPAND_SZ /
+ * Limits: Microsoft's "Registry Element Size Limits" allow a key name 255 characters and a value name
+ * 16,383; this plugin also caps a whole key path at 255 bytes and 32 components (kMaxKeyPathBytes,
+ * kMaxKeyComponents). RegSetValueExW's cbData must include the terminating NUL of a REG_SZ / REG_EXPAND_SZ /
  * REG_MULTI_SZ, which is why every string encoder appends it.
  */
 
@@ -428,7 +429,8 @@ struct OldValue {
 
 /// Neutralises untrusted text for an `audit|k=v|...` line: invalid UTF-8 -> '?', control bytes,
 /// space, '=' and ',' (yuzu::log_token) -> '_', and '|' -> '_' (log_token does not map the field
-/// separator). Over `cap` bytes it is cut on a character boundary and gets `~<total length>`.
+/// separator). A trailing backslash becomes '_' too. Over `cap` bytes it is cut on a character boundary and gets
+/// `~<total length>`.
 [[nodiscard]] inline std::string audit_token(std::string_view s, std::size_t cap = kAuditTokenCap) {
     std::string t;
     if (yuzu::shared::count_invalid_wire_bytes(s) == 0) { // well-formed (the usual case): no scrubbed copy
@@ -439,6 +441,9 @@ struct OldValue {
         t = yuzu::log_token(scrubbed);
     }
     std::replace(t.begin(), t.end(), '|', '_');
+    // A field that ends in a backslash would make the following separator read as an escaped `|` to the server's
+    // splitter (result_parsing.hpp find_unescaped_pipe) and merge two cells.
+    if (!t.empty() && t.back() == '\\') t.back() = '_';
     if (t.size() <= cap) return t.empty() ? std::string{"-"} : t;
     std::size_t cut = cap;
     while (cut > 0 && (static_cast<unsigned char>(t[cut]) & 0xC0) == 0x80) --cut;
@@ -511,6 +516,23 @@ namespace detail {
     o += "|new=";
     o += r.has_new ? render_hex(r.new_bytes, kAuditHexCapBytes, r.new_total) : "-";
     return o;
+}
+
+/// The audit line a mutating action leaves when an exception ends it, one fixed literal per action (no allocation,
+/// so it can be written from a catch after an allocation failed): every field the exception leaves unknown is `-`,
+/// all 19 are present, so the server mints a failed `registry.write` row. Empty for any other action. It is the
+/// output of render_audit_line for a record that holds only the op, `result=failed` and `reason=exception`.
+[[nodiscard]] constexpr std::string_view exception_audit_line(std::string_view action) noexcept {
+    if (action == "set_value")
+        return "audit|op=set_value|hive=-|result=failed|reason=exception|verify=-|key=-|name=-|type=-|len=-|dry_run=-|"
+               "counted_keys=-|counted_values=-|capped=-|created=-|sid=-|old_state=-|old_type=-|old=-|new=-";
+    if (action == "delete_value")
+        return "audit|op=delete_value|hive=-|result=failed|reason=exception|verify=-|key=-|name=-|type=-|len=-|dry_run=-|"
+               "counted_keys=-|counted_values=-|capped=-|created=-|sid=-|old_state=-|old_type=-|old=-|new=-";
+    if (action == "delete_key")
+        return "audit|op=delete_key|hive=-|result=failed|reason=exception|verify=-|key=-|name=-|type=-|len=-|dry_run=-|"
+               "counted_keys=-|counted_values=-|capped=-|created=-|sid=-|old_state=-|old_type=-|old=-|new=-";
+    return {};
 }
 
 } // namespace yuzu::registry

@@ -240,22 +240,27 @@ TEST_CASE("registry write: set_value round-trips all six types; each preceded by
         std::map<std::string, std::string> params;
         DWORD type;
         Bytes expect;
+        std::string new_field; ///< when set: what new= carries (raw hex of the bytes, capped at 256 with ~<total>)
     };
     const std::string mib_hex(2 * 1024 * 1024, 'a');
     const std::vector<Case> cases{
-        {"REG_SZ", {{"type", "REG_SZ"}, {"value", "hello"}}, REG_SZ, utf16(L"hello")},
+        {"REG_SZ", {{"type", "REG_SZ"}, {"value", "hello"}}, REG_SZ, utf16(L"hello"),
+         "680065006c006c006f000000"},
         {"empty REG_SZ", {{"type", "REG_SZ"}, {"value", ""}}, REG_SZ, utf16(L"")},
         {"default type is REG_SZ", {{"value", "x"}}, REG_SZ, utf16(L"x")},
         {"REG_EXPAND_SZ", {{"type", "REG_EXPAND_SZ"}, {"value", "%TEMP%\\x"}}, REG_EXPAND_SZ, utf16(L"%TEMP%\\x")},
-        {"REG_DWORD", {{"type", "REG_DWORD"}, {"value", "4294967295"}}, REG_DWORD, le(0xFFFFFFFFu, 4)},
-        {"REG_QWORD", {{"type", "REG_QWORD"}, {"value", "18446744073709551615"}}, REG_QWORD, le(~0ull, 8)},
+        {"REG_DWORD", {{"type", "REG_DWORD"}, {"value", "4294967295"}}, REG_DWORD, le(0xFFFFFFFFu, 4), "ffffffff"},
+        {"REG_QWORD", {{"type", "REG_QWORD"}, {"value", "18446744073709551615"}}, REG_QWORD, le(~0ull, 8),
+         "ffffffffffffffff"},
         {"REG_MULTI_SZ", {{"type", "REG_MULTI_SZ"}, {"value", "a\nb"}}, REG_MULTI_SZ,
          Bytes{0x61, 0, 0, 0, 0x62, 0, 0, 0, 0, 0}},
         {"empty REG_MULTI_SZ", {{"type", "REG_MULTI_SZ"}, {"value", ""}}, REG_MULTI_SZ, Bytes{0, 0, 0, 0}},
         {"REG_BINARY with embedded NULs", {{"type", "REG_BINARY"}, {"value", "00ff0000aa"}}, REG_BINARY, Bytes{0, 0xff, 0, 0, 0xaa}},
         {"empty REG_BINARY", {{"type", "REG_BINARY"}, {"value", ""}}, REG_BINARY, Bytes{}},
         {"data_hex for a string type", {{"type", "REG_SZ"}, {"data_hex", "61000000"}}, REG_SZ, Bytes{0x61, 0, 0, 0}},
-        {"1 MiB REG_BINARY", {{"type", "REG_BINARY"}, {"data_hex", mib_hex}}, REG_BINARY, Bytes(1024 * 1024, 0xaa)},
+        // 256 raw bytes as hex, then the total length.
+        {"1 MiB REG_BINARY", {{"type", "REG_BINARY"}, {"data_hex", mib_hex}}, REG_BINARY, Bytes(1024 * 1024, 0xaa),
+         std::string(512, 'a') + "~1048576"},
     };
     int i = 0;
     for (auto c : cases) {
@@ -269,6 +274,7 @@ TEST_CASE("registry write: set_value round-trips all six types; each preceded by
         CHECK(out.lines[0].rfind("audit|op=set_value|hive=HKCU|", 0) == 0);
         CHECK(out.lines[0].find("|result=ok|reason=-|verify=ok|") != std::string::npos);
         CHECK(out.lines[1] == "status|ok");
+        if (!c.new_field.empty()) CHECK(out.lines[0].ends_with("|new=" + c.new_field)); // raw hex, never masked
         const auto r = read(HKEY_CURRENT_USER, base, c.params["name"]);
         REQUIRE(r.found);
         CHECK(r.type == c.type);
@@ -318,6 +324,25 @@ TEST_CASE("registry write: delete_value; and a value that is not there", "[regis
     CHECK(missing.has("error|value_not_found"));
     const auto nokey = p.run("delete_value", {{"hive", "HKCU"}, {"key", key + "\\nope"}, {"name", "V"}});
     CHECK(nokey.has("error|key_not_found"));
+}
+
+// enumerate_values read value names into a 256-wchar buffer and ended the list at the first name that did not fit
+// (ERROR_MORE_DATA), answering rc 0 with the list cut short; set_value accepts names up to 16,383 characters.
+TEST_CASE("registry write: enumerate_values lists a value name longer than 255 characters and the values after it",
+          "[registry][windows][write]") {
+    Plugin p;
+    if (!p.ok()) { skip_or_fail("registry.dll not found"); return; }
+    const std::string key = "Software\\" + scratch_name() + "\\longname";
+    ScratchTree cleanup{HKEY_CURRENT_USER, "Software\\" + scratch_name()};
+    const std::string name(300, 'n');
+    const auto set = p.run("set_value", {{"hive", "HKCU"}, {"key", key}, {"name", name}, {"type", "REG_DWORD"}, {"value", "1"}});
+    REQUIRE(set.rc == 0);
+    REQUIRE(put(HKEY_CURRENT_USER, key, "after", REG_DWORD, le(2, 4))); // a truncated list ends before this one
+    const auto vals = p.run("enumerate_values", {{"hive", "HKCU"}, {"key", key}});
+    CHECK(vals.rc == 0);
+    CHECK(vals.has("value|" + name + "|REG_DWORD"));
+    CHECK(vals.has("value|after|REG_DWORD"));
+    CHECK(vals.lines.size() == 2);
 }
 
 TEST_CASE("registry write: hostile parameters are refused by name and create nothing",
@@ -456,7 +481,7 @@ TEST_CASE("registry write: a registry link is refused; never followed; and delet
 }
 
 // A link whose TARGET is absent is the shape that matters for a create: a create that follows it makes the
-// target and reports REG_CREATED_NEW_KEY (kingsley probe, 2026-10-18), which the core cannot tell from a
+// target and reports REG_CREATED_NEW_KEY (measured 2026-10-18), which the core cannot tell from a
 // fresh key. Win32Registry::create_sub therefore passes REG_OPTION_OPEN_LINK. A link planted BEFORE the
 // call is caught earlier, by the walk's own link-opening open and SymbolicLinkValue probe (key_is_link), so
 // this case pins that a dangling link is refused and nothing is created through it; the create step's own
@@ -659,9 +684,9 @@ TEST_CASE("registry write: a non-ASCII key and value name reach the registry as 
 // and the macOS / Linux legs PLANNED (naming the mechanism that will carry them), the read action's
 // honest sentinel with rc 0, and every mutator's rc 1 with the same sentinel -- a write that did not
 // happen is never a terminal SUCCESS (BR-03). The last case includes registry_plugin.cpp (the guard macro
-// below drops its C plugin entry point and adds a throwing test-only action) to prove nothing thrown inside
-// execute() crosses the plugin boundary: the Windows leg's twin is execute_guarded in
-// test_registry_win_internals.cpp.
+// below drops its C plugin entry point and makes any action throw when its `name` parameter says so) to prove
+// nothing thrown inside execute() crosses the plugin boundary, and that a mutator leaves its fixed exception audit
+// line: the Windows leg's twin is execute_guarded in test_registry_win_internals.cpp.
 // ═════════════════════════════════════════════════════════════════════════
 
 #include <yuzu/agent/plugin_loader.hpp>
@@ -771,11 +796,14 @@ struct Executed {
     std::vector<std::string> rows;
 };
 
-/// Runs RegistryPlugin::execute(`action`) with no params inside the fake context.
-Executed run_execute(std::string_view action) {
-    g_body = [action](yuzu::CommandContext& ctx) -> int {
+/// Runs RegistryPlugin::execute(`action`) inside the fake context, with the one parameter `name`=`name_param`
+/// (nullptr: no params).
+Executed run_execute(std::string_view action, const char* name_param = nullptr) {
+    g_body = [action, name_param](yuzu::CommandContext& ctx) -> int {
         RegistryPlugin plugin;
-        return plugin.execute(ctx, action, yuzu::Params{std::span<const YuzuParam>{}});
+        const YuzuParam params[] = {{"name", name_param != nullptr ? name_param : ""}};
+        return plugin.execute(
+            ctx, action, yuzu::Params{std::span<const YuzuParam>{params, name_param != nullptr ? 1u : 0u}});
     };
     const auto result = yuzu::agent::LocalDispatcher{}.run(&kFakeDescriptor, "seam");
     g_body = nullptr;
@@ -846,12 +874,34 @@ TEST_CASE("registry plugin: off Windows a read answers the sentinel with rc 0 an
 
 TEST_CASE("registry plugin: an exception inside an off-Windows dispatch is contained as error|exception",
           "[registry][actions]") {
-    SECTION("a dispatch that throws answers rc 1 and one error|exception line; nothing escapes") {
+    SECTION("a read that throws answers rc 1 and one error|exception line; nothing escapes") {
         // mutant: the catch (...) in RegistryPlugin::execute deleted -- the exception reaches the host
-        const auto r = run_execute("__throw_std");
+        const auto r = run_execute("get_value", "__throw_std");
         CHECK(r.rc == 1);
         REQUIRE(r.rows.size() == 1);
         CHECK(r.rows[0] == "error|exception");
+    }
+    SECTION("a value that is not a std::exception is contained too") {
+        // mutant: the catch narrowed to const std::exception&
+        const auto r = run_execute("enumerate_keys", "__throw_other");
+        CHECK(r.rc == 1);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.rows[0] == "error|exception");
+    }
+    for (const std::string_view mutator : kMutators) {
+        for (const char* how : {"__throw_std", "__throw_other"}) {
+            SECTION(std::string{mutator} + " throwing " + how + " leaves its fixed audit line, then error|exception") {
+                // mutant: the catch writes error|exception alone (the server then mints no failed registry.write row)
+                const auto r = run_execute(mutator, how);
+                CHECK(r.rc == 1);
+                REQUIRE(r.rows.size() == 2);
+                CHECK(r.rows[0] == yuzu::registry::exception_audit_line(mutator));
+                CHECK(r.rows[0].rfind(std::string{"audit|op="} + std::string{mutator} +
+                                          "|hive=-|result=failed|reason=exception|verify=-|",
+                                      0) == 0);
+                CHECK(r.rows[1] == "error|exception");
+            }
+        }
     }
     SECTION("an ordinary unknown action still passes through unchanged") {
         const auto r = run_execute("get_vaule");

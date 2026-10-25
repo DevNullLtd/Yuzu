@@ -9,6 +9,10 @@
 
 #include <yuzu/plugin.hpp>
 
+#ifndef _WIN32
+#include <spdlog/spdlog.h> // the off-Windows catch logs; the Windows leg logs from registry_win.cpp
+#endif
+
 #include <algorithm>
 #include <iterator>
 #include <string>
@@ -80,9 +84,11 @@ public:
         // only throw sites are string allocations) crosses the plugin boundary.
         try {
 #if defined(YUZU_REGISTRY_UNIT_TEST_INTERNALS_ONLY)
-            // Test-only (the macro is defined by test_registry_write_local_dispatcher.cpp alone): a dispatch that
-            // throws, so the catch below is pinned. The real build has no such action.
-            if (action == "__throw_std") throw std::runtime_error("registry test: std::exception");
+            // Test-only (the macro is defined by test_registry_write_local_dispatcher.cpp alone): any action whose
+            // `name` parameter says so throws, so the catch below is pinned for a mutator (its audit line) and for a
+            // read. The real build has no such parameter handling.
+            if (params.get("name") == "__throw_std") throw std::runtime_error("registry test: std::exception");
+            if (params.get("name") == "__throw_other") throw 42;
 #endif
             // Unknown actions are refused BEFORE the platform answer, so a misspelled one is never terminal SUCCESS.
             bool known = false;
@@ -107,8 +113,9 @@ public:
             // reporting "unsupported" is itself a successful read (rc 0).
             return is_mutator ? 1 : 0;
         } catch (...) {
+            yuzu::registry::report_exception(ctx, action); // a mutating action's fixed audit line, then error|exception
             try {
-                ctx.write_output("error|exception");
+                spdlog::error("registry: {} raised an exception", yuzu::profiles::sanitize_field(action));
             } catch (...) {
             }
             return 1;

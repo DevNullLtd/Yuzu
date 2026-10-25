@@ -65,11 +65,15 @@ class RegistrySetValue(unittest.TestCase):
         props = _spec("set_value")["parameters"]["properties"]
         self.assertEqual(props["type"]["validation"]["enum"], SIX_TYPES)
 
-    def test_data_hex_is_optional_and_value_text_stays_required_for_compatibility(self):
+    def test_neither_value_nor_data_hex_is_required_because_one_of_them_is_sent(self):
         params = _spec("set_value")["parameters"]
         self.assertIn("data_hex", params["properties"])
         self.assertNotIn("data_hex", params["required"])
-        self.assertEqual(params["required"], ["hive", "key", "name", "value"])
+        self.assertNotIn("value", params["required"])
+        self.assertEqual(params["required"], ["hive", "key", "name"])
+        text = params["properties"]["value"]["description"]
+        self.assertIn("exactly one of `value` and `data_hex`", " ".join(text.split()))
+        self.assertIn("empty value", text)
 
     def test_status_is_the_single_result_column(self):
         cols = _spec("set_value")["result"]["columns"]
@@ -115,6 +119,18 @@ class RegistryDefinitionPins(unittest.TestCase):
     def test_data_hex_carries_one_mebibyte(self):
         limit = _spec("set_value")["parameters"]["properties"]["data_hex"]["validation"]["maxLength"]
         self.assertEqual(limit, 2 * 1024 * 1024)  # hex characters: 1 MiB of data
+
+    def test_data_hex_states_the_limit_of_the_routes_that_cap_a_parameter_at_64_kib(self):
+        text = " ".join(_spec("set_value")["parameters"]["properties"]["data_hex"]["description"].split())
+        self.assertIn("64 KiB", text)
+        self.assertIn("32 KiB of data", text)
+        self.assertNotIn("restore a value captured", text)
+
+    def test_the_writers_declare_the_release_that_first_carries_them(self):
+        # Declared and exported, not compared at dispatch (docs/user-manual/upgrading.md): 1.0.0 named no agent.
+        for action in MUTATING:
+            with self.subTest(action=action):
+                self.assertEqual(_spec(action)["compatibility"]["minAgentVersion"], "0.15.0")
 
     def test_definition_versions_and_the_plugin_doc_version(self):
         want = {"set_value": "1.1.0", "delete_value": "1.1.0", "delete_key": "1.1.0"}

@@ -8,8 +8,9 @@
  *    (key_is_link), so test_registry_write_local_dispatcher.cpp never reaches the create step with a link in
  *    place; calling create_sub on a dangling link here is that swap, deterministically.
  *  - the fast open's two kernel calls, final_name (NtQueryKey) and root_name.
- *  - execute_guarded, the ABI seam: an action that throws (the test-only `__throw_*` actions this TU's guard
- *    macro adds to dispatch) comes out as rc 1 and one `error|exception` line, never as an exception.
+ *  - execute_guarded, the ABI seam: an action that throws (this TU's guard macro makes any action throw when
+ *    its `name` parameter is `__throw_std` or `__throw_other`) comes out as rc 1, the action's fixed exception
+ *    audit line when it is a mutator, and one `error|exception` line, never as an exception.
  * The pure logic is locked on every host by test_registry_core.cpp; the dispatcher cases prove the plugin end
  * to end.
  *
@@ -108,15 +109,18 @@ const YuzuPluginDescriptor kFakeDescriptor = {
     /*sdk_version=*/nullptr,
 };
 
-/// Runs execute_guarded(`action`) with no params inside the fake context; the non-empty output lines.
+/// Runs execute_guarded(`action`) inside the fake context with the one parameter `name`=`name_param` (empty: no
+/// params); the non-empty output lines.
 struct Guarded {
     int rc = 0;
     std::vector<std::string> lines;
 };
 
-Guarded run_guarded(std::string_view action) {
-    g_body = [action](yuzu::CommandContext& ctx) -> int {
-        return yuzu::registry::execute_guarded(ctx, action, yuzu::Params{std::span<const YuzuParam>{}});
+Guarded run_guarded(std::string_view action, const char* name_param = nullptr) {
+    g_body = [action, name_param](yuzu::CommandContext& ctx) -> int {
+        const YuzuParam params[] = {{"name", name_param != nullptr ? name_param : ""}};
+        return yuzu::registry::execute_guarded(
+            ctx, action, yuzu::Params{std::span<const YuzuParam>{params, name_param != nullptr ? 1u : 0u}});
     };
     const auto result = yuzu::agent::LocalDispatcher{}.run(&kFakeDescriptor, "seam");
     g_body = nullptr;
@@ -184,7 +188,7 @@ struct LinkSweep {
 } // namespace
 
 // A link whose TARGET is absent is the shape that matters for a create: a create that follows it makes the
-// target and reports REG_CREATED_NEW_KEY (kingsley probe, MSVC 14.44, 2026-10-18), which the core cannot tell
+// target and reports REG_CREATED_NEW_KEY (measured with MSVC 14.44, 2026-10-18), which the core cannot tell
 // from a fresh key. With REG_OPTION_OPEN_LINK the call opens the link itself: OPENED_EXISTING, nothing
 // created. Mutation: drop `| REG_OPTION_OPEN_LINK` from Win32Registry::create_sub and this case goes red
 // (created_new becomes true, the handle is the Target, and the Target key exists afterwards).
@@ -217,6 +221,7 @@ TEST_CASE("Win32Registry::create_sub opens a dangling registry link as the link 
     const long rc = reg.create_sub(parent_handle, "Link", KEY_READ | KEY_SET_VALUE | DELETE, out, created_new);
     REQUIRE(rc == ERROR_SUCCESS);
     REQUIRE(out != 0);
+    const Owned out_guard{reg, out}; // closes on every exit, a failed CHECK or REQUIRE included
 
     CHECK_FALSE(created_new); // OPENED_EXISTING: the core turns this into concurrent_change
 
@@ -230,7 +235,6 @@ TEST_CASE("Win32Registry::create_sub opens a dangling registry link as the link 
 
     // The link object goes by handle (the NtDeleteKey arm), not its target.
     CHECK(reg.delete_key_by_handle(out) == ERROR_SUCCESS);
-    reg.close(out);
 }
 
 // The fast open's two kernel calls. Win32 semantics relied on: a handle opened with REG_OPTION_OPEN_LINK on a link
@@ -302,22 +306,36 @@ TEST_CASE("Win32Registry::root_name is the kernel name of HKLM and HKU and is re
 }
 
 // The frozen-seam rule: nothing a registry action throws crosses the plugin boundary. dispatch throws a
-// std::exception for `__throw_std` and a non-std value for `__throw_other` in this TU only (the guard macro).
-// Mutation: delete the catch(...) from execute_guarded and the two throwing sections go red (the exception
-// escapes the call). Needs no registry access, so it never skips.
+// std::exception for `name=__throw_std` and a non-std value for `name=__throw_other` in this TU only (the guard
+// macro). A mutating action leaves its fixed audit line first, so the server still mints a failed registry.write row.
+// Mutation: delete the catch(...) from execute_guarded and the throwing sections go red (the exception escapes the
+// call); drop report_exception's audit line and the mutator sections go red. Needs no registry access, so it never
+// skips.
 TEST_CASE("execute_guarded turns a throwing action into rc 1 and one error|exception line",
           "[registry][windows][internals]") {
-    SECTION("a std::exception") {
-        const auto r = run_guarded("__throw_std");
+    SECTION("a std::exception from a read") {
+        const auto r = run_guarded("get_value", "__throw_std");
         CHECK(r.rc == 1);
         REQUIRE(r.lines.size() == 1);
         CHECK(r.lines[0] == "error|exception");
     }
-    SECTION("a value that is not a std::exception") {
-        const auto r = run_guarded("__throw_other");
+    SECTION("a value that is not a std::exception, from a read") {
+        const auto r = run_guarded("enumerate_values", "__throw_other");
         CHECK(r.rc == 1);
         REQUIRE(r.lines.size() == 1);
         CHECK(r.lines[0] == "error|exception");
+    }
+    for (const char* mutator : {"set_value", "delete_value", "delete_key"}) {
+        for (const char* how : {"__throw_std", "__throw_other"}) {
+            SECTION(std::string{mutator} + " throwing " + how + ": the fixed audit line, then error|exception") {
+                const auto r = run_guarded(mutator, how);
+                CHECK(r.rc == 1);
+                REQUIRE(r.lines.size() == 2);
+                CHECK(r.lines[0] == yuzu::registry::exception_audit_line(mutator));
+                CHECK(r.lines[0].rfind(std::string{"audit|op="} + mutator + "|hive=-|result=failed|reason=exception|", 0) == 0);
+                CHECK(r.lines[1] == "error|exception");
+            }
+        }
     }
     SECTION("an ordinary refusal passes through the guard unchanged") {
         const auto r = run_guarded("no_such_action");
@@ -335,18 +353,18 @@ TEST_CASE("Win32Registry::query_value returns a REG_SZ stored without its termin
     const std::string root =
         "SOFTWARE\\YuzuTest-" + std::to_string(yuzu::test::process_random_salt()) + "-unterminated";
     ScratchTree cleanup{root};
-    HKEY raw = nullptr;
+    yuzu::win::RegKey raw; // closes on every exit, a failed REQUIRE included
     if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(root).c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
-                        KEY_SET_VALUE | KEY_QUERY_VALUE, nullptr, &raw, nullptr) != ERROR_SUCCESS) {
+                        KEY_SET_VALUE | KEY_QUERY_VALUE, nullptr, raw.put(), nullptr) != ERROR_SUCCESS) {
         skip_or_fail("not elevated -- HKLM scratch not writable");
         return;
     }
     const wchar_t stored[2] = {L'a', L'b'}; // four bytes, no terminator
-    REQUIRE(RegSetValueExW(raw, L"V", 0, REG_SZ, reinterpret_cast<const BYTE*>(stored), sizeof stored) ==
+    REQUIRE(RegSetValueExW(raw.get(), L"V", 0, REG_SZ, reinterpret_cast<const BYTE*>(stored), sizeof stored) ==
             ERROR_SUCCESS);
     Win32Registry reg;
     yuzu::registry::QueryResult q;
-    REQUIRE(reg.query_value(as_handle(raw), "V", 4096, q) == ERROR_SUCCESS);
+    REQUIRE(reg.query_value(as_handle(raw.get()), "V", 4096, q) == ERROR_SUCCESS);
     CHECK(q.type == REG_SZ);
     CHECK(q.size == 4);
     REQUIRE(q.bytes.size() == 4);
@@ -354,7 +372,6 @@ TEST_CASE("Win32Registry::query_value returns a REG_SZ stored without its termin
     CHECK(q.bytes[1] == 0);
     CHECK(q.bytes[2] == 'b');
     CHECK(q.bytes[3] == 0);
-    RegCloseKey(raw);
 }
 
 #endif // defined(_WIN32)

@@ -89,13 +89,14 @@ public:
     /// Every call across the seam, and per method: the deterministic stand-in for latency.
     std::size_t seam_calls = 0;
     std::map<std::string, std::size_t> by_method;
-    /// Fired BEFORE create_sub and final_name ("final_name") and AFTER query_value / delete_value, named
-    /// "<op>:<name>" (e.g. "create_sub:B"), so a test can change the tree at a call boundary.
+    /// Fired BEFORE create_sub, set_value and final_name ("final_name") and AFTER query_value / delete_value, named
+    /// "<op>:<name>" (e.g. "create_sub:B"), so a test can change the tree at a call boundary (or throw there).
     std::function<void(const std::string&)> before, after;
     std::function<void(Node&, const std::string&)> tamper_after_set;
     /// Fired at the start of every enum_value call: a value set that grows while it is being enumerated.
     std::function<void(Node&)> grow_on_enum;
-    /// "<op>:<name>" -> rc, consumed on use. open_path/final_name/root_name also take the bare method name.
+    /// "<op>:<name>" -> rc, consumed on use. open_path/final_name/root_name/enum_value/enum_subkey also take the bare
+    /// method name.
     std::map<std::string, long> inject;
 
     NodeP node(Handle h) const {
@@ -241,7 +242,7 @@ public:
         }
         return rc;
     }
-    void close(Handle key_h) override {
+    void close(Handle key_h) noexcept override {
         tally("close");
         log.push_back("close");
         open.erase(key_h);
@@ -260,6 +261,7 @@ public:
         tally("set_value");
         const std::string ev = "set_value:" + std::string{name};
         log.push_back(ev);
+        if (before) before(ev);
         if (const auto inj = take(ev)) return *inj;
         const auto n = node(key_h);
         if (!n || n->deleted) return 1018;
@@ -283,6 +285,7 @@ public:
     }
     long enum_value(Handle key_h, std::uint32_t index, std::string& name) override {
         tally("enum_value");
+        if (const auto inj = take("enum_value", "enum_value")) return *inj;
         const auto n = node(key_h);
         if (!n || n->deleted) return 1018;
         if (grow_on_enum) grow_on_enum(*n);
@@ -292,13 +295,14 @@ public:
     }
     long enum_subkey(Handle key_h, std::uint32_t index, std::string& name) override {
         tally("enum_subkey");
+        if (const auto inj = take("enum_subkey", "enum_subkey")) return *inj;
         const auto n = node(key_h);
         if (!n || n->deleted) return 1018;
         if (index >= n->subkeys.size()) return 259;
         name = std::next(n->subkeys.begin(), index)->first;
         return 0;
     }
-    long delete_key_by_handle(Handle key_h) override {
+    long delete_key_by_handle(Handle key_h) noexcept override {
         tally("delete_key_by_handle");
         log.push_back("delete_key_by_handle");
         if (const auto inj = take("delete_key_by_handle")) return *inj;
@@ -834,6 +838,8 @@ TEST_CASE("registry core: a missing suffix is created component-wise from the ch
     const auto o = set_value_verified(reg, FakeRegistry::kRoot, "Software\\New\\Deeper", "V", kRegDword, dword(3), fast);
     CHECK(o.result == "ok");
     CHECK(o.created == 2);
+    // The count is on the wire too, where the server's audit row carries it.
+    CHECK(render_single_action(AuditRecord{}, o, false).lines[0].find("|created=2|") != std::string::npos);
     REQUIRE(reg.get("Software\\New\\Deeper", "V") != nullptr);
     // Walked Software, found New missing, then created New and Deeper (no by-name path anywhere).
     CHECK(reg.calls("create_sub:New") == 1);
@@ -1014,6 +1020,136 @@ TEST_CASE("registry core: a walk that does not hand its leaf over deletes the ke
     }
 }
 
+// The keys a creating write makes stay owned by its Opened (the leaf included) until the verified write is over. An
+// exception at any seam call from the first create to the read-back therefore deletes them again, by handle, leaf
+// first, after the value the write set. The mutant each section turns red is named on its first line.
+TEST_CASE("registry core: an exception after hand-over rolls back the keys and the value a creating write made",
+          "[registry][core][rollback]") {
+    FakeRegistry reg;
+    reg.key("Software");
+    const auto write = [&] {
+        return set_value_verified(reg, FakeRegistry::kRoot, "Software\\New\\Deeper", "V", kRegDword, dword(3), false);
+    };
+    const auto nothing_left = [&] {
+        CHECK_FALSE(reg.exists("Software\\New"));
+        CHECK(reg.exists("Software"));
+    };
+
+    SECTION("the previous-value capture throws: both created keys are removed") {
+        // mutant: the keys are released to the caller at hand-over, so only a returning exit removes them
+        reg.after = [&](const std::string& ev) {
+            if (ev == "query_value:V") throw std::bad_alloc{}; // the first read of V is the capture
+        };
+        CHECK_THROWS_AS(write(), std::bad_alloc);
+        nothing_left();
+        CHECK(reg.calls("set_value") == 0);
+    }
+    SECTION("the write throws before it lands") {
+        // mutant: as above
+        reg.before = [&](const std::string& ev) {
+            if (ev == "set_value:V") throw std::bad_alloc{};
+        };
+        CHECK_THROWS_AS(write(), std::bad_alloc);
+        nothing_left();
+        CHECK(reg.calls("delete_value") == 0); // nothing landed, so there is no value to remove
+    }
+    SECTION("the read-back throws after the value landed: the value goes first, then the keys") {
+        // mutant: the written value is not removed first (the leaf is then kept as holding a value)
+        int reads = 0;
+        reg.after = [&](const std::string& ev) {
+            if (ev == "query_value:V" && ++reads == 2) throw std::bad_alloc{};
+        };
+        CHECK_THROWS_AS(write(), std::bad_alloc);
+        nothing_left();
+        CHECK(reg.calls("delete_value:V") == 1);
+        CHECK(reg.method_calls("delete_key_by_handle") == 2); // the leaf, then New
+    }
+    SECTION("a seam call inside the rollback throws too: nothing escapes the destructor, the key stays") {
+        // mutant: no try/catch around a rollback step (a throw while unwinding ends the process)
+        int reads = 0;
+        reg.after = [&](const std::string& ev) {
+            if (ev == "query_value:V" && ++reads == 2) throw std::bad_alloc{};
+        };
+        reg.grow_on_enum = [](Node&) { throw std::bad_alloc{}; }; // the rollback's enum_value
+        CHECK_THROWS_AS(write(), std::bad_alloc);
+        CHECK(reg.exists("Software\\New\\Deeper")); // a key whose rollback step threw is kept
+    }
+    SECTION("a write that creates nothing keeps its value when the read-back throws") {
+        // mutant: the rollback owner also removes the value of a write that made no key
+        reg.key("Software\\New\\Deeper");
+        int reads = 0;
+        reg.after = [&](const std::string& ev) {
+            if (ev == "query_value:V" && ++reads == 2) throw std::bad_alloc{};
+        };
+        CHECK_THROWS_AS(write(), std::bad_alloc);
+        REQUIRE(reg.get("Software\\New\\Deeper", "V") != nullptr);
+        CHECK(reg.get("Software\\New\\Deeper", "V")->data == dword(3));
+        CHECK(reg.calls("delete_") == 0);
+    }
+    SECTION("an ok write commits: the keys stay and the rollback never runs") {
+        // mutant: commit() missing (the destructor removes what the write just made)
+        const auto o = write();
+        CHECK(o.result == "ok");
+        CHECK(o.created == 2);
+        CHECK(reg.get("Software\\New\\Deeper", "V") != nullptr);
+        CHECK(reg.method_calls("delete_key_by_handle") == 0);
+        CHECK(reg.method_calls("enum_value") == 0);
+    }
+}
+
+// roll_back kept NtDeleteKey unconditional, and NtDeleteKey removes a key that holds VALUES (only a subkey blocks
+// it): a value another party wrote into a key the walk had just made was destroyed with it. The rollback now asks
+// enum_value first and keeps (and counts) a key that holds anything it did not put there.
+TEST_CASE("registry core: the rollback keeps a key that holds another party's value or key",
+          "[registry][core][rollback]") {
+    FakeRegistry reg;
+    reg.key("Software");
+
+    SECTION("a foreign value in a key the walk made: kept and reported, the failure keeps its token") {
+        // mutant: NtDeleteKey is tried without the enum_value check
+        reg.before = [&](const std::string& ev) {
+            if (ev == "create_sub:Deeper") reg.put("Software\\New", "Foreign", kRegDword, dword(0xF0));
+        };
+        reg.inject["create_sub:Deeper"] = 1450;
+        const auto o = set_value_verified(reg, FakeRegistry::kRoot, "Software\\New\\Deeper", "V", kRegDword, dword(3), false);
+        CHECK(o.result == "failed");
+        CHECK(o.reason == "win32:1450");
+        CHECK(o.created == 1);
+        REQUIRE(reg.get("Software\\New", "Foreign") != nullptr);
+        CHECK(reg.get("Software\\New", "Foreign")->data == dword(0xF0));
+        CHECK(reg.method_calls("delete_key_by_handle") == 0);
+    }
+    SECTION("a foreign value planted at the write: our value goes, theirs stays, the key is counted") {
+        // mutant: as above, or the owner's own value left in place (the key is then kept as holding it)
+        Opened op = open_checked(reg, FakeRegistry::kRoot, "Software\\New", kKeySetValue, true);
+        REQUIRE(op.error.empty());
+        REQUIRE(op.created == 1);
+        op.value_name = "V";
+        reg.before = [&](const std::string& ev) {
+            if (ev == "set_value:V") reg.put("Software\\New", "Foreign", kRegDword, dword(0xF0));
+        };
+        REQUIRE(reg.set_value(op.handle(), "V", kRegDword, dword(1)) == 0);
+        op.value_landed = true;
+        op.rollback();
+        CHECK(op.created == 1);
+        CHECK(reg.get("Software\\New", "V") == nullptr);
+        REQUIRE(reg.get("Software\\New", "Foreign") != nullptr);
+        CHECK(reg.method_calls("delete_key_by_handle") == 0);
+        op.rollback(); // idempotent
+        CHECK(op.created == 1);
+    }
+    SECTION("a key whose values cannot be listed is kept: absence of a value is never assumed") {
+        // mutant: any enum_value result but "a value exists" lets the delete go ahead
+        Opened op = open_checked(reg, FakeRegistry::kRoot, "Software\\New", kKeySetValue, true);
+        REQUIRE(op.created == 1);
+        reg.inject["enum_value"] = 5;
+        op.rollback();
+        CHECK(op.created == 1);
+        CHECK(reg.exists("Software\\New"));
+        CHECK(reg.method_calls("delete_key_by_handle") == 0);
+    }
+}
+
 TEST_CASE("registry core: open_checked reports a missing key distinct from a denied one",
           "[registry][core]") {
     const bool fast = GENERATE(false, true);
@@ -1113,6 +1249,9 @@ TEST_CASE("registry core: delete_key non-recursive refuses a key with subkeys an
     }
     SECTION("a leaf: counted, deleted by handle, verified through the deleted handle") {
         const auto o = delete_key_tree(reg, FakeRegistry::kRoot, "T\\C1\\G1", fast);
+        // DELETE | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE: nothing on this path sets a value, so no KEY_SET_VALUE.
+        REQUIRE_FALSE(reg.masks.empty());
+        CHECK(reg.masks.back().ends_with(":0x10009"));
         CHECK(o.result == "ok");
         CHECK(o.verify == "ok");
         CHECK(o.counted_keys == 1);
@@ -1124,6 +1263,25 @@ TEST_CASE("registry core: delete_key non-recursive refuses a key with subkeys an
     }
     SECTION("a missing key") {
         CHECK(delete_key_tree(reg, FakeRegistry::kRoot, "T\\Nope", fast).reason == "key_not_found");
+    }
+    SECTION("a subkey enumeration that fails is a refusal with its token; nothing is deleted") {
+        // mutant: the enum_subkey result other than "found one" / "none" is ignored (the counts are then wrong)
+        reg.inject["enum_subkey"] = 5;
+        const auto o = delete_key_tree(reg, FakeRegistry::kRoot, "T\\C2", fast);
+        CHECK(o.result == "refused");
+        CHECK(o.reason == "access_denied");
+        CHECK(reg.exists("T\\C2"));
+        CHECK(reg.calls("delete_key_by_handle") == 0);
+    }
+    SECTION("a value enumeration that fails is a refusal with its token; nothing is deleted") {
+        // mutant: a failed enum_value ends the count as if the values were all listed (capped=0, counts under-reported)
+        reg.inject["enum_value"] = 1450;
+        const auto o = delete_key_tree(reg, FakeRegistry::kRoot, "T\\C1\\G1", fast);
+        CHECK(o.result == "refused");
+        CHECK(o.reason == "win32:1450");
+        CHECK_FALSE(o.capped);
+        CHECK(reg.exists("T\\C1\\G1"));
+        CHECK(reg.calls("delete_key_by_handle") == 0);
     }
     SECTION("NtDeleteKey denied: the delete fails access_denied and the key stays") {
         reg.key("T\\C2")->deny_delete_key = true;
@@ -1277,6 +1435,23 @@ TEST_CASE("registry core: query_value_bounded honours the cap and the size bound
         CHECK(q.size == 8);
         CHECK(q.bytes.empty());
         CHECK(m.calls.size() == 1);
+    }
+    SECTION("max_read is inclusive: a value of exactly max_read is read, one byte more is size-only") {
+        // mutant: `size > max_read` becomes `size >= max_read` (or the reverse) on either path
+        for (const std::size_t limit : {std::size_t{8}, std::size_t{300}}) { // the first-buffer path, then past it
+            QueryModel at;
+            at.value = ramp(limit);
+            QueryResult q;
+            CHECK(query_value_bounded(4096, std::ref(at), q, limit) == 0);
+            CHECK(q.size == limit);
+            CHECK(q.bytes == ramp(limit));
+            QueryModel over;
+            over.value = ramp(limit + 1);
+            QueryResult r;
+            CHECK(query_value_bounded(4096, std::ref(over), r, limit) == 0);
+            CHECK(r.size == limit + 1);
+            CHECK(r.bytes.empty());
+        }
     }
     SECTION("a value above kMaxWriteBytes is answered size-only without ever reading it") {
         QueryModel m;
@@ -1486,6 +1661,55 @@ TEST_CASE("registry core: a delete_key whose handle does not report ERROR_KEY_DE
     CHECK(o.result == "failed");
     CHECK(o.verify == "mismatch");
     CHECK(o.reason == "verify_mismatch");
+}
+
+// ── the ABI-seam catch ───────────────────────────────────────────────────
+
+namespace {
+
+/// A CommandContext stand-in for report_exception: records every line, and throws on the ones `fails` names.
+struct RecordingCtx {
+    std::vector<std::string> lines;
+    std::function<bool(std::string_view)> fails;
+    void write_output(std::string_view text) {
+        if (fails && fails(text)) throw std::bad_alloc{};
+        lines.emplace_back(text);
+    }
+};
+
+} // namespace
+
+TEST_CASE("registry core: report_exception leaves a mutator's fixed audit line, then error|exception",
+          "[registry][core][exception]") {
+    SECTION("each mutating action: its literal first, so the server mints a failed registry.write row") {
+        // mutant: the audit line is not written, or is written after error|exception
+        for (const std::string_view action : {"set_value", "delete_value", "delete_key"}) {
+            INFO(action);
+            RecordingCtx ctx;
+            report_exception(ctx, action);
+            REQUIRE(ctx.lines.size() == 2);
+            CHECK(ctx.lines[0] == exception_audit_line(action));
+            CHECK(ctx.lines[0].rfind("audit|op=", 0) == 0);
+            CHECK(ctx.lines[0].find("|result=failed|reason=exception|") != std::string::npos);
+            CHECK(ctx.lines[1] == "error|exception");
+        }
+    }
+    SECTION("a read action and an unknown one: only error|exception, no audit row") {
+        for (const std::string_view action : {"get_value", "list_profiles", "__nope", ""}) {
+            INFO(action);
+            RecordingCtx ctx;
+            report_exception(ctx, action);
+            REQUIRE(ctx.lines.size() == 1);
+            CHECK(ctx.lines[0] == "error|exception");
+        }
+    }
+    SECTION("an allocation failure on the audit line cannot suppress error|exception, and nothing escapes") {
+        RecordingCtx ctx;
+        ctx.fails = [](std::string_view t) { return t.rfind("audit|", 0) == 0; };
+        CHECK_NOTHROW(report_exception(ctx, "set_value"));
+        REQUIRE(ctx.lines.size() == 1);
+        CHECK(ctx.lines[0] == "error|exception");
+    }
 }
 
 // ── the value-count cap ──────────────────────────────────────────────────

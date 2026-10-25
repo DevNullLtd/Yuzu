@@ -9,7 +9,7 @@
  * reports REG_CREATED_NEW_KEY / REG_OPENED_EXISTING_KEY; every key is removed by NtDeleteKey on its own
  * handle (ntdll, resolved with GetProcAddress, fail-closed when missing: the
  * agents/core/src/confined_fs_win.cpp precedent), never RegDeleteTreeW, which FOLLOWS a registry link
- * found inside the tree (kingsley probe, 2026-10-19); RegSetValueExW's cbData includes a string type's
+ * found inside the tree (measured 2026-10-19); RegSetValueExW's cbData includes a string type's
  * terminating NUL. The whole dispatch runs in one try/catch(...): this is the frozen plugin ABI seam.
  */
 #include "registry_core.hpp"
@@ -126,6 +126,8 @@ template <class F> [[nodiscard]] F ntdll_proc(const char* symbol) {
     std::memcpy(&name_bytes, buf, sizeof name_bytes);
     if (name_bytes % sizeof(wchar_t) != 0 || sizeof name_bytes + name_bytes > sizeof buf)
         return ERROR_INSUFFICIENT_BUFFER;
+    // Sound: `buf` is alignas(8) and the name starts at offset 4, so the wchar_t array is 2-aligned (all wchar_t
+    // needs), and the bytes were written by the kernel, not through another C++ object.
     const auto* name = reinterpret_cast<const wchar_t*>(buf + sizeof name_bytes);
     const std::size_t n = name_bytes / sizeof(wchar_t);
     if (std::all_of(name, name + n, [](wchar_t c) { return c > 0 && c < 0x80; })) { // the usual name: no NLS call
@@ -140,7 +142,7 @@ template <class F> [[nodiscard]] F ntdll_proc(const char* symbol) {
 /// The kernel name of a predefined root, read once per process (a function-local static per root):
 /// `\REGISTRY\MACHINE` for HKLM, `\REGISTRY\USER` for HKU. The root cannot be asked directly:
 /// RegOpenKeyExW(root, L"") hands back the predefined pseudo-handle, and NtQueryKey refuses it with
-/// STATUS_INVALID_HANDLE (kingsley, 2026-10-22). So a child that exists on every Windows install
+/// STATUS_INVALID_HANDLE (measured 2026-10-22). So a child that exists on every Windows install
 /// (HKLM\SOFTWARE, HKU\.DEFAULT) is opened as a real handle and the root name is its canonical name
 /// minus `\<child>`; a name that does not end that way is refused. Empty when it could not be read,
 /// which disables the fast open for that root for the life of the process (the walk is the fallback).
@@ -233,7 +235,7 @@ public:
         DWORD disposition = 0;
         // REG_OPTION_OPEN_LINK: without it a link whose target is missing is FOLLOWED, the target is created
         // and the disposition reads CREATED_NEW, so the core's concurrent_change check would pass and the
-        // write would land through the link (kingsley probe, MSVC 14.44, 2026-10-18). With it the call
+        // write would land through the link (measured with MSVC 14.44, 2026-10-18). With it the call
         // opens the link itself (OPENED_EXISTING), creates nothing, and the core refuses it
         // (tests/unit/test_registry_win_internals.cpp pins this call on a dangling link).
         const LSTATUS rc = RegCreateKeyExW(as_hkey(parent), to_wide(name).c_str(), 0, nullptr,
@@ -246,7 +248,7 @@ public:
         return rc;
     }
 
-    void close(Handle key) override { RegCloseKey(as_hkey(key)); }
+    void close(Handle key) noexcept override { RegCloseKey(as_hkey(key)); }
 
     long query_value(Handle key, std::string_view name, std::size_t cap, QueryResult& out) override {
         const Wide wname{name};
@@ -282,7 +284,7 @@ public:
         return rc;
     }
 
-    long delete_key_by_handle(Handle key) override {
+    long delete_key_by_handle(Handle key) noexcept override {
         static const NtDeleteKeyFn fn = ntdll_proc<NtDeleteKeyFn>("NtDeleteKey");
         if (fn == nullptr) return ERROR_PROC_NOT_FOUND; // fail closed: never fall back to a by-name delete
         const LONG status = fn(reinterpret_cast<HANDLE>(key));
@@ -437,9 +439,9 @@ int do_enumerate_values(yuzu::CommandContext& ctx, yuzu::Params params) {
         ctx.write_output("error|key not found");
         return 1;
     }
-    wchar_t name[256];
+    wchar_t name[16384]; // a value name is at most 16,383 characters: a smaller buffer ends the list early on a long name
     for (DWORD i = 0;; ++i) {
-        DWORD name_len = 256, type = 0;
+        DWORD name_len = static_cast<DWORD>(std::size(name)), type = 0;
         if (RegEnumValueW(opened.get(), i, name, &name_len, nullptr, &type, nullptr, nullptr) != ERROR_SUCCESS) break;
         ctx.write_output(std::format("value|{}|{}", sanitize_field(from_wide(name, static_cast<int>(name_len))),
                                      reg_type_name(type)));
@@ -673,10 +675,11 @@ int do_delete_key(yuzu::CommandContext& ctx, yuzu::Params params) {
 
 int dispatch(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) {
 #if defined(YUZU_REGISTRY_WIN_UNIT_TEST_INTERNALS_ONLY)
-    // Test-only (the macro is defined by test_registry_win_internals.cpp alone): a dispatch that throws, so the
-    // ABI-containment catch in execute_guarded is pinned. The real build has neither action.
-    if (action == "__throw_std") throw std::runtime_error("registry test: std::exception");
-    if (action == "__throw_other") throw 42;
+    // Test-only (the macro is defined by test_registry_win_internals.cpp alone): any action whose `name` parameter
+    // says so throws, so the ABI-containment catch in execute_guarded is pinned for a mutator (its audit line) and
+    // for a read. The real build has no such parameter handling.
+    if (params.get("name") == "__throw_std") throw std::runtime_error("registry test: std::exception");
+    if (params.get("name") == "__throw_other") throw 42;
 #endif
     if (action == "get_value") return do_get_value(ctx, params);
     if (action == "set_value") return do_set_value(ctx, params);
@@ -697,8 +700,9 @@ int execute_guarded(yuzu::CommandContext& ctx, std::string_view action, yuzu::Pa
     try {
         return dispatch(ctx, action, params);
     } catch (...) {
+        report_exception(ctx, action); // a mutating action's fixed audit line, then error|exception; best effort
         try {
-            ctx.write_output("error|exception");
+            spdlog::error("registry: {} raised an exception", sanitize_field(action));
         } catch (...) {
         }
         return 1;

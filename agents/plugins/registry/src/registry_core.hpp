@@ -7,8 +7,8 @@
  * MUTATION TARGETING (the check-to-use closure): every mutation runs on a CHECKED HANDLE and nothing
  * re-resolves a path by name; keys are deleted by handle (NtDeleteKey), never RegDeleteKeyW(parent, name).
  * Every operation captures the previous value first and reads back on the same handle after mutating.
- * README "How it works"; routed-concerns-security-posture.md, registry row. open_checked obtains the handle
- * one of two ways:
+ * Mechanism and residuals: README "How it works"; the invariants: routed-concerns-security-posture.md, registry
+ * row. open_checked obtains the handle one of two ways:
  *
  *  - the WALK (the reference, and the only path that produces a verdict token or creates a key): the path
  *    component by component, each opened from the previous HANDLE with REG_OPTION_OPEN_LINK and probed for
@@ -20,10 +20,14 @@
  *    required to end in the requested first component) plus the remaining requested components, ASCII
  *    case-insensitively, else `key_is_link`; a name that cannot be read refuses with its win32 token. One
  *    derivation serves every hive, HKCU and HKCR included. A create is relative to a handle the kernel parses
- *    again, so it can land beneath a link completed meanwhile; a walk that does not hand its leaf over (the name
- *    test refuses, or a later create fails or finds its key already there) deletes every key it created, by its
- *    own handle, leaf first, and `created` reports any that could not be. A key a create merely opened is
- *    closed, never deleted.
+ *    again, so it can land beneath a link completed meanwhile. The keys a creating walk made stay owned by the
+ *    returned Opened (the leaf included) until commit(), which the verified write calls once it is over; its
+ *    destructor is the rollback. So a walk that does not hand its leaf over (the name test refuses, or a later
+ *    create fails or finds its key already there) and an exception anywhere from the first create to the end of the
+ *    verified write both delete every key the walk created, by its own handle, leaf first, after the value the
+ *    write set (when it had landed). A key that still holds a value or a subkey the walk did not put there is
+ *    kept, and `created` reports every key that could not be deleted. A key a create merely opened is closed,
+ *    never deleted.
  *  - the FAST open (open_fast; HKLM and HKU only): ONE open_path of the whole path with REG_OPTION_OPEN_LINK,
  *    then final_name -- the kernel's canonical name of the object the handle is bound to -- is compared
  *    with `<root kernel name>\<requested path>` (ASCII case-insensitively, every other byte exactly) and the
@@ -175,7 +179,8 @@ struct RegistryWriter {
     /// `out` and `created_new` are set only on success.
     virtual long create_sub(Handle parent, std::string_view name, std::uint32_t access, Handle& out,
                             bool& created_new) = 0;
-    virtual void close(Handle key) = 0;
+    /// noexcept: Owned and the rollback close handles from destructors.
+    virtual void close(Handle key) noexcept = 0;
     /// `cap` = 0 asks for the size only.
     virtual long query_value(Handle key, std::string_view name, std::size_t cap, QueryResult& out) = 0;
     virtual long set_value(Handle key, std::string_view name, std::uint32_t type,
@@ -185,8 +190,9 @@ struct RegistryWriter {
     virtual long enum_value(Handle key, std::uint32_t index, std::string& name) = 0;
     virtual long enum_subkey(Handle key, std::uint32_t index, std::string& name) = 0;
     /// NtDeleteKey(key): marks the key for deletion by handle. There is NO tree delete here: RegDeleteTreeW
-    /// follows a registry link found inside the tree (kingsley probe K1).
-    virtual long delete_key_by_handle(Handle key) = 0;
+    /// follows a registry link found inside the tree (measured 2026-10-19). noexcept: the rollback calls it from a
+    /// destructor.
+    virtual long delete_key_by_handle(Handle key) noexcept = 0;
 };
 
 /// Closes a non-predefined handle on scope exit (a predefined root is never wrapped).
@@ -228,13 +234,66 @@ private:
     return rc_token(rc, Missing::value);
 }
 
+/// What open_checked returns, and the owner of everything a creating walk made. `made` holds the keys create_sub
+/// reported new, leaf last, open and still undeleted until commit(): the destructor is the rollback (rollback()
+/// below), so an exception between the first create and the end of the verified write cannot strand a key. The
+/// caller commits once the verified write is over, whatever it concluded; a walk that makes nothing owns nothing.
 struct Opened {
-    explicit Opened(RegistryWriter& r) : leaf(r) {}
-    Owned leaf;
-    unsigned created = 0;  ///< keys THIS call created and left behind (a walk that stops deletes them: the residual)
+    explicit Opened(RegistryWriter& r) : reg(&r), leaf(r) {}
+    Opened(const Opened&) = delete;
+    Opened& operator=(const Opened&) = delete;
+    Opened(Opened&&) noexcept = default; // the moved-from `made` is empty, so its destructor has nothing to roll back
+    Opened& operator=(Opened&&) = delete;
+    ~Opened() { rollback(); }
+
+    RegistryWriter* reg;
+    Owned leaf;            ///< the checked handle when the leaf already existed (or the fast open took it); empty when the walk made it
+    unsigned created = 0;  ///< keys THIS call created and left behind: every key made, less each one rollback() deleted
     unsigned missing = 0;  ///< components that did not exist when the walk reached them
     std::string error;     ///< "" or a token
     bool fast = false;     ///< the handle came from open_fast
+    std::vector<Owned> made;          ///< the keys this walk created, leaf last
+    std::string_view value_name;      ///< the value a creating write sets on the leaf (the caller's view, which outlives this)
+    bool value_landed = false;        ///< set_value returned success for `value_name`: rollback() removes it first
+
+    /// The checked handle every mutation runs on.
+    [[nodiscard]] Handle handle() const noexcept { return made.empty() ? leaf.get() : made.back().get(); }
+
+    /// The verified write is over: the keys it made stay (reported in `created`) and their handles close.
+    void commit() noexcept {
+        made.clear();
+        value_landed = false;
+    }
+
+    /// Deletes what this walk made, by its own handles, leaf first: first the value the write set (when it
+    /// landed; best effort), then each key that holds no value (enum_value finds none, so a key that now holds
+    /// another party's value, or one the enumeration cannot rule out, is kept) and has no subkey (NtDeleteKey
+    /// refuses a key with subkeys). `created` is left as the number of keys still present. A deleted key's handle
+    /// is closed before its parent is deleted in turn. Never throws (it runs from the destructor of a frame that
+    /// is already unwinding); a seam call that throws leaves its key in place, counted. Idempotent.
+    void rollback() noexcept {
+        if (made.empty()) return;
+        if (value_landed) {
+            try {
+                (void)reg->delete_value(made.back().get(), value_name);
+            } catch (...) {
+            }
+            value_landed = false;
+        }
+        for (auto it = made.rbegin(); it != made.rend(); ++it) {
+            if (it->get() == 0) continue;
+            try {
+                std::string name;
+                if (reg->enum_value(it->get(), 0, name) != kErrorNoMoreItems) continue;
+                if (reg->delete_key_by_handle(it->get()) == kErrorSuccess) {
+                    it->reset();
+                    --created;
+                }
+            } catch (...) {
+            }
+        }
+        made.clear();
+    }
 };
 
 /// Equal byte for byte except that A-Z fold to a-z: a strict subset of the kernel's case folding, so it never
@@ -292,7 +351,8 @@ struct Opened {
 /// `leaf_may_be_link` (delete_key only): the handle opened with REG_OPTION_OPEN_LINK IS the link object,
 /// so NtDeleteKey on it removes the link, never its target. A creating op refuses a component missing
 /// directly under the hive root as root_level_create (README). `fast_eligible` (HKLM and HKU, decided by the
-/// shell) tries open_fast first; a missing key, a refusal and every doubt fall through to the walk below.
+/// shell) tries open_fast first; a missing key, a refusal and every doubt fall through to the walk below. A
+/// creating walk returns the keys it made inside the Opened (see there): the caller commits them.
 [[nodiscard]] inline Opened open_checked(RegistryWriter& reg, Handle root, std::string_view key_path,
                                          std::uint32_t leaf_access, bool create,
                                          bool leaf_may_be_link = false, bool fast_eligible = false) {
@@ -308,28 +368,20 @@ struct Opened {
     leaf_access |= kKeyQueryValue;
     const std::uint32_t inter_access = kKeyQueryValue | (create ? kKeyCreateSubKey : 0);
     Owned cur{reg};
-    std::vector<Owned> made_keys; // keys create_sub reported new, leaf last; held open so a walk that stops can delete them
     Handle parent = root;
     std::string first_name; // the canonical name of the first component's handle, read right after its open
-    // Every exit that follows a create but does not hand the leaf over deletes what this call created, by its own
-    // handles, leaf first (a create made through a parent that had become a link lands beneath the link's target
-    // before any name can be read); `created` is then what could not be deleted. Only a key create_sub reported
-    // as new is in made_keys: one it merely opened is somebody else's and is closed, never deleted.
-    const auto roll_back = [&] {
-        for (auto it = made_keys.rbegin(); it != made_keys.rend(); ++it)
-            if (reg.delete_key_by_handle(it->get()) == kErrorSuccess) {
-                it->reset(); // a deleted key's handle is closed before its parent is deleted in turn
-                --out.created;
-            }
-    };
+    // Every exit that follows a create but does not hand the leaf over rolls back what this call created (a create
+    // made through a parent that had become a link lands beneath the link's target before any name can be read);
+    // `created` is then what could not be deleted. An exception does the same through ~Opened. Only a key
+    // create_sub reported as new is in out.made: one it merely opened is somebody else's and is closed, never deleted.
     // Hands the leaf over only when its kernel name is the requested path (leaf_name_check); otherwise it rolls back.
     const auto hand_over = [&]() -> Opened {
-        Owned& leaf = made_keys.empty() ? cur : made_keys.back();
-        if (auto why = leaf_name_check(reg, leaf.get(), first_name, parts); !why.empty()) {
+        const Handle leaf = out.made.empty() ? cur.get() : out.made.back().get(); // the key the walk made last, else the last it opened
+        if (auto why = leaf_name_check(reg, leaf, first_name, parts); !why.empty()) {
             out.error = std::move(why);
-            roll_back();
-        } else {
-            out.leaf = std::move(leaf);
+            out.rollback();
+        } else if (out.made.empty()) {
+            out.leaf = std::move(cur);
         }
         return std::move(out);
     };
@@ -349,39 +401,32 @@ struct Opened {
                 out.error = std::string{kTokKeyNotFound};
                 return out;
             }
-            // An exception on any path below (an allocation, a throwing seam) also rolls back before it leaves: the
-            // keys made so far are deleted by their own handles and the exception goes on. push_back cannot throw
-            // once the storage is reserved, so a key create_sub reported new is always in made_keys.
-            made_keys.reserve(parts.size() - i); // (no test can fail this: the fake has no allocation seam)
-            try {
-                for (std::size_t j = i; j < parts.size(); ++j) {
-                    const bool last_j = j + 1 == parts.size();
-                    Handle made = 0;
-                    bool created_new = false;
-                    // kAccessDelete: a walk that stops deletes what it made through this very handle.
-                    const std::uint32_t create_access =
-                        (last_j ? leaf_access : (kKeyQueryValue | kKeyCreateSubKey)) | kAccessDelete;
-                    const long crc = reg.create_sub(parent, parts[j], create_access, made, created_new);
-                    if (crc != kErrorSuccess) {
-                        out.error = rc_token(crc, Missing::key);
-                        roll_back();
-                        return out;
-                    }
-                    Owned made_owner{reg, made}; // closes on the early return below: opened-existing is never deleted
-                    if (!created_new) { // the walk saw it absent a moment ago
-                        out.error = std::string{kTokConcurrentChange};
-                        roll_back();
-                        return out;
-                    }
-                    made_keys.push_back(std::move(made_owner));
-                    ++out.created;
-                    parent = made_keys.back().get(); // the checked parent in `cur` stays open until the walk ends
+            // push_back cannot throw once the storage is reserved, so a key create_sub reported new is always in out.made.
+            out.made.reserve(parts.size() - i); // (no test can fail this: the fake has no allocation seam)
+            for (std::size_t j = i; j < parts.size(); ++j) {
+                const bool last_j = j + 1 == parts.size();
+                Handle made = 0;
+                bool created_new = false;
+                // kAccessDelete: a walk that stops deletes what it made through this very handle.
+                const std::uint32_t create_access =
+                    (last_j ? leaf_access : (kKeyQueryValue | kKeyCreateSubKey)) | kAccessDelete;
+                const long crc = reg.create_sub(parent, parts[j], create_access, made, created_new);
+                if (crc != kErrorSuccess) {
+                    out.error = rc_token(crc, Missing::key);
+                    out.rollback();
+                    return out;
                 }
-                return hand_over();
-            } catch (...) {
-                roll_back();
-                throw;
+                Owned made_owner{reg, made}; // closes on the early return below: opened-existing is never deleted
+                if (!created_new) { // the walk saw it absent a moment ago
+                    out.error = std::string{kTokConcurrentChange};
+                    out.rollback();
+                    return out;
+                }
+                out.made.push_back(std::move(made_owner));
+                ++out.created;
+                parent = out.made.back().get(); // the checked parent in `cur` stays open until the walk ends
             }
+            return hand_over();
         }
         if (rc != kErrorSuccess) {
             out.error = rc_token(rc, Missing::key);
@@ -468,14 +513,18 @@ struct WriteOutcome {
     }
 };
 
-/// Writes `bytes` to `name` on the checked handle `h`, reads it back and compares (type + bytes).
+/// Writes `bytes` to `name` on the checked handle `h`, reads it back and compares (type + bytes). `landed`, when
+/// given, is set the moment set_value succeeds, so a caller whose frame unwinds during the read-back still knows the
+/// value is there.
 [[nodiscard]] inline WriteOutcome write_value_on(RegistryWriter& reg, Handle h, std::string_view name,
-                                                 std::uint32_t type, std::span<const std::uint8_t> bytes) {
+                                                 std::uint32_t type, std::span<const std::uint8_t> bytes,
+                                                 bool* landed = nullptr) {
     WriteOutcome o;
     if (const long rc = reg.set_value(h, name, type, bytes); rc != kErrorSuccess) {
         o.fail(rc_token(rc, Missing::value), true);
         return o;
     }
+    if (landed != nullptr) *landed = true;
     o.mutated = true;
     QueryResult q;
     const long qrc = reg.query_value(h, name, kMaxWriteBytes, q);
@@ -509,8 +558,10 @@ struct WriteOutcome {
         o.fail(op.error, op.created > 0);
         return o;
     }
-    OldValue old = capture_old(reg, op.leaf.get(), name);
-    WriteOutcome o = write_value_on(reg, op.leaf.get(), name, type, bytes);
+    op.value_name = name; // a creating write that unwinds first removes this value again (Opened::rollback)
+    OldValue old = capture_old(reg, op.handle(), name);
+    WriteOutcome o = write_value_on(reg, op.handle(), name, type, bytes, &op.value_landed);
+    op.commit(); // the verified write is over, whatever it concluded: the keys it made stay and are reported
     o.created = op.created;
     o.old = std::move(old);
     o.has_old = true;
@@ -526,12 +577,12 @@ struct WriteOutcome {
         o.fail(op.error, false);
         return o;
     }
-    OldValue old = capture_old(reg, op.leaf.get(), name);
+    OldValue old = capture_old(reg, op.handle(), name);
     WriteOutcome o;
     if (old.state == OldState::absent)
         o.fail(std::string{kTokValueNotFound}, false);
     else
-        o = delete_value_on(reg, op.leaf.get(), name);
+        o = delete_value_on(reg, op.handle(), name);
     o.old = std::move(old);
     o.has_old = true;
     return o;
@@ -589,15 +640,14 @@ struct TreeCount {
 /// opened as the link object, so the delete removes the link and never its target.
 [[nodiscard]] inline WriteOutcome delete_key_tree(RegistryWriter& reg, Handle root, std::string_view key,
                                                   bool fast_eligible = false) {
-    auto op = open_checked(reg, root, key,
-                           kAccessDelete | kKeyEnumerateSubKeys | kKeyQueryValue | kKeySetValue,
+    auto op = open_checked(reg, root, key, kAccessDelete | kKeyEnumerateSubKeys | kKeyQueryValue,
                            /*create=*/false, /*leaf_may_be_link=*/true, fast_eligible);
     if (!op.error.empty()) {
         WriteOutcome o;
         o.fail(op.error, false);
         return o;
     }
-    const Handle h = op.leaf.get();
+    const Handle h = op.handle();
     TreeCount c;
     std::string first;
     const long rc = reg.enum_subkey(h, 0, first);
@@ -638,7 +688,8 @@ inline void fill_old(AuditRecord& au, const OldValue& old) {
 
 /// The wire output of one single mutating action: the audit line, then `status|ok` (and, for
 /// delete_key, the four appended count rows) or `error|<token>` with rc 1. `base` arrives pre-filled
-/// with op, hive, key, name, type, len, sid and the new bytes; the outcome fields are set here.
+/// with op, hive, key, name, type, len and the new bytes (`sid` stays unset: it renders `-`); the outcome fields
+/// are set here.
 [[nodiscard]] inline ActionOutput render_single_action(AuditRecord base, const WriteOutcome& o,
                                                        bool is_delete_key) {
     base.result = o.result;
@@ -668,6 +719,22 @@ inline void fill_old(AuditRecord& au, const OldValue& old) {
         out.lines.push_back(std::string{"capped|"} + (o.capped ? "1" : "0"));
     }
     return out;
+}
+
+/// The catch at the plugin ABI seam, both OS legs (`Ctx` is yuzu::CommandContext; a template so the pure unit
+/// suites can drive it with a recording fake): a mutating action leaves its fixed `exception` audit line first, so
+/// the server still mints a failed `registry.write` row, then every action answers `error|exception`. Each write is
+/// best effort and separate: an allocation failure on one cannot suppress the other, and nothing escapes.
+template <class Ctx>
+void report_exception(Ctx& ctx, std::string_view action) noexcept {
+    try {
+        if (const auto row = exception_audit_line(action); !row.empty()) ctx.write_output(row);
+    } catch (...) {
+    }
+    try {
+        ctx.write_output("error|exception");
+    } catch (...) {
+    }
 }
 
 } // namespace yuzu::registry

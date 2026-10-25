@@ -120,6 +120,16 @@ TEST_CASE("registry encode REG_MULTI_SZ: LF-separated records; empty text is the
     for (const char* bad : {"a\n\nb", "a\n", "\n", "\na"})
         CHECK(encode_value(kRegMultiSz, bad, {}, false).error == kTokInvalidData);
     CHECK(encode_value(kRegMultiSz, std::string_view{"a\0b", 3}, {}, false).error == kTokInvalidData);
+    SECTION("the 1 MiB cap holds on the text and on the encoded bytes") {
+        // mutants: the text-size check removed; the encoded-size check removed
+        CHECK(encode_value(kRegMultiSz, std::string(kMaxWriteBytes + 1, 'x'), {}, false).error == kTokValueOverflow);
+        // 600,000 ASCII characters are within the text bound but encode to 1,200,004 bytes (UTF-16, a record NUL
+        // and the list NUL): over the cap.
+        CHECK(encode_value(kRegMultiSz, std::string(600000, 'x'), {}, false).error == kTokValueOverflow);
+        // The edge: 524,286 characters encode to exactly kMaxWriteBytes, one more to two bytes over.
+        CHECK(encode_value(kRegMultiSz, std::string(524286, 'x'), {}, false).bytes.size() == kMaxWriteBytes);
+        CHECK(encode_value(kRegMultiSz, std::string(524287, 'x'), {}, false).error == kTokValueOverflow);
+    }
     SECTION("data_hex") {
         CHECK(encode_value(kRegMultiSz, {}, "610000000000", true).bytes == B({0x61, 0, 0, 0, 0, 0}));
         CHECK(encode_value(kRegMultiSz, {}, "00000000", true).bytes == B({0, 0, 0, 0}));
@@ -238,7 +248,11 @@ TEST_CASE("registry audit_token: neutralises everything that could forge a field
     CHECK(audit_token("") == "-");
     CHECK(audit_token(std::string_view{"a\0b", 3}) == "a?b");                 // NUL cannot cross the C-string ABI
     CHECK(audit_token("ok\xFF" "bad") == "ok?bad");                       // invalid UTF-8 never reaches the wire
-    CHECK(audit_token("SOFTWARE\\Acme") == "SOFTWARE\\Acme");             // backslash is kept
+    CHECK(audit_token("SOFTWARE\\Acme") == "SOFTWARE\\Acme");             // a backslash inside the token is kept
+    // A trailing backslash would read as an escaped separator to the server's splitter and merge two cells.
+    CHECK(audit_token("dir\\") == "dir_");
+    CHECK(audit_token("\\") == "_");
+    CHECK(audit_token("a\\b\\") == "a\\b_");
     CHECK(audit_token("Caf\xC3\xA9") == "Caf\xC3\xA9");                   // valid UTF-8 survives
     SECTION("over the cap: cut on a character boundary, with ~<length>") {
         CHECK(audit_token(std::string(300, 'k')) == std::string(256, 'k') + "~300");
@@ -316,6 +330,49 @@ TEST_CASE("registry render_audit_line: byte-exact grammar", "[registry][parsers]
         const auto line = render_audit_line(x);
         CHECK(line.find("|old=" + std::string(512, 'a') + "~5000|new=") != std::string::npos);
         CHECK(line.ends_with("~257"));
+    }
+    SECTION("every type carries old= and new= as raw hex of the bytes (owner risk acceptance: no redaction)") {
+        // mutants: a digest or any masking of a string / list / binary value; the hex dropped for one type
+        AuditRecord x = r;
+        x.type_name = "REG_SZ"; // "hunter2" as UTF-16LE with its NUL
+        x.old_type = "REG_SZ";
+        x.old_bytes = B({0x68, 0, 0x75, 0, 0x6e, 0, 0x74, 0, 0x65, 0, 0x72, 0, 0x32, 0, 0, 0});
+        x.old_total = x.old_bytes.size();
+        x.new_bytes = B({0x61, 0, 0, 0});
+        x.new_total = 4;
+        CHECK(render_audit_line(x).ends_with("|old=680075006e0074006500720032000000|new=61000000"));
+        x.type_name = "REG_MULTI_SZ";
+        x.old_type = "REG_MULTI_SZ";
+        x.old_bytes = B({0x61, 0, 0, 0, 0, 0});
+        x.old_total = 6;
+        x.new_bytes = B({0x62, 0, 0, 0, 0, 0});
+        x.new_total = 6;
+        CHECK(render_audit_line(x).ends_with("|old=610000000000|new=620000000000"));
+    }
+    SECTION("a REG_BINARY past the 256-byte cap shows 256 raw bytes and ~<total>, a REG_SZ the same") {
+        AuditRecord x = r;
+        x.type_name = "REG_BINARY";
+        x.old_type = "REG_BINARY";
+        x.old_bytes.assign(kCaptureValueCap, 0x11); // what capture_old keeps of a 1 MiB value
+        x.old_total = 1048576;
+        x.new_bytes.assign(5000, 0x22); // the encoder holds the whole value
+        x.new_total = 5000;
+        CHECK(render_audit_line(x).ends_with("|old=" + std::string(512, '1') + "~1048576|new=" + std::string(512, '2') +
+                                             "~5000"));
+        x.type_name = "REG_SZ";
+        x.old_type = "REG_SZ";
+        CHECK(render_audit_line(x).ends_with("|old=" + std::string(512, '1') + "~1048576|new=" + std::string(512, '2') +
+                                             "~5000"));
+        x.new_bytes.assign(256, 0x22); // exactly the cap: no marker
+        x.new_total = 256;
+        CHECK(render_audit_line(x).ends_with("|new=" + std::string(512, '2')));
+    }
+    SECTION("a value name ending in a backslash cannot read as an escaped separator") {
+        AuditRecord x = r;
+        x.name = "dir\\";
+        const auto line = render_audit_line(x);
+        CHECK(line.find("|name=dir_|type=REG_DWORD|") != std::string::npos);
+        CHECK(line.find("\\|") == std::string::npos);
     }
     SECTION("a 16,383-character name cannot push the mandatory fields past the 4 KiB extractor cap") {
         AuditRecord x = r;
@@ -413,5 +470,27 @@ TEST_CASE("registry audit producer contract: no pipe LF or CR survives and the f
         const std::string big = render_audit_line(x);
         CHECK(big.size() < 2048);
         CHECK(big.find("|key=") < 200);
+    }
+}
+
+TEST_CASE("registry exception_audit_line: one fixed 19-field literal per mutating action", "[registry][parsers]") {
+    // The literal is what render_audit_line makes of a record that knows only the op, the failure and its reason.
+    for (const char* op : {"set_value", "delete_value", "delete_key"}) {
+        INFO(op);
+        AuditRecord x;
+        x.op = op;
+        x.result = "failed";
+        x.reason = "exception";
+        const auto literal = exception_audit_line(op);
+        REQUIRE_FALSE(literal.empty());
+        CHECK(literal == render_audit_line(x));
+        CHECK(std::count(literal.begin(), literal.end(), '|') == 19); // the tag and 19 fields
+        CHECK(literal.starts_with(std::string{"audit|op="} + op + "|hive=-|result=failed|reason=exception|verify=-|key=-|"));
+        CHECK(literal.ends_with("|old_state=-|old_type=-|old=-|new=-"));
+    }
+    SECTION("a read action, an unknown one and the empty name have none") {
+        for (const char* action : {"get_value", "key_exists", "enumerate_keys", "enumerate_values", "get_user_value",
+                                   "list_profiles", "", "Set_Value", "set_value "})
+            CHECK(exception_audit_line(action).empty());
     }
 }

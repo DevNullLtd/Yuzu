@@ -38,8 +38,8 @@
  * backslash-escaped `|` is still a `|` to this parser, so text after it could pick the row's
  * result or forge a second row). Put `result=` before any caller-sized field: it is read from the
  * whole line, but a line over the byte bound loses its tail. At most kMaxRegistryAuditLinesPerFrame
- * lines and kMaxRegistryAuditLineBytes bytes per line. A recursive delete is ONE record per
- * operation (the counts ride in fields): the frame and budget bounds assume it.
+ * lines and kMaxRegistryAuditLineBytes bytes per line. One operation is ONE record (a delete_key
+ * removes one key and the counts ride in fields): the frame and budget bounds assume it.
  *
  * PRODUCER: agents/plugins/registry/README.md ("Audit line grammar and producer contract"), pinned
  * against this parser by the render-pin cases in tests/unit/server/test_plugin_result_audit.cpp.
