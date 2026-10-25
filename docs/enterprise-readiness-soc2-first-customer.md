@@ -411,7 +411,8 @@ drill's success rows carry no standing token, the audit row can be missing durin
 the only signals are the shared read-degrade counters and breaker (`YuzuRbacReadDegraded`,
 `YuzuRbacBreakerOpen` for RBAC reads; `yuzu_server_mgmt_group_read_degrade_total` and
 `YuzuMgmtGroupReadDegraded` for management-group reads); a management-group store that is not
-wired or not open raises no counter at all. The Settings
+wired raises no counter, and one that is not open raises none on the CA routes (the fleet gate answers
+before reading it) but is counted as `store_not_open` on list-gated routes. The Settings
 panel and the `/crypto` drill write no row for a refused caller (confined or holding no grant). Do not state that confined
 operators cannot read the certificate inventory without these qualifications.
 
