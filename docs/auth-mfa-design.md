@@ -75,7 +75,7 @@ cutover changed.**
 | `Session::mfa_verified_at` | `server/core/include/yuzu/server/auth.hpp` | `system_clock::time_point` (wall-clock since HA WS-1/1a, ADR-2002 §4 — see invariant #5); default-constructed = not verified |
 | Login flow | `server/core/src/auth_routes.{cpp,hpp}` | `POST /login` returns 202 + pending token on MFA-enrolled users; new `POST /login/mfa` route; `MfaPending` map with TTL reaper |
 | Login page | `server/core/src/login_ui.cpp` | Hidden MFA form revealed on 202 response |
-| Settings panel | `server/core/src/settings_routes.{cpp,hpp}`, `settings_ui.cpp` | `render_mfa_fragment` + four `/api/settings/mfa/*` POST routes; new "Multi-Factor Authentication" section |
+| Settings panel | `server/core/src/settings_routes.{cpp,hpp}`, `settings_ui.cpp` | `render_mfa_fragment` + four `/api/settings/mfa/*` POST routes; new "Multi-Factor Authentication" section. The two enrolment routes (`init`, `verify`) are step-up exempt and take no password, so each re-confirms the session cookie against its durable row (`durable_session_gate`, #6079): an absent, expired or foreign row is `401` with an empty body, a failed read is the "MFA backend unavailable" fragment (status `200`), and neither mints or writes anything |
 | Config | `server/core/include/yuzu/server/server.hpp` + `main.cpp` | `mfa_enforcement`, `mfa_step_up_window_secs`, `mfa_login_pending_secs` + matching CLI flags |
 | Tests | `tests/unit/server/test_totp.cpp`, `tests/unit/server/test_mfa_store.cpp` | RFC vectors + AuthDB end-to-end |
 

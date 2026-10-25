@@ -224,8 +224,10 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   deleted), where any failure, the
   audit INSERT included, rolls everything back. Account deactivation also clears
   the factor and the recovery codes, through `auth_sql::soft_delete_user_in_txn`,
-  and ends sessions in a separate step (pre-existing, deferred; reactivation wipes no
-  sessions and restores no factor). A NEW factor-clear path outside the owner or the
+  and ends sessions in a separate step (outcome `deactivated_but_session_wipe_failed`);
+  `AuthManager::reactivate_user` ends the account's cached and durable sessions BEFORE
+  it reactivates (a failed durable wipe returns false and leaves the account
+  inactive) and restores no factor. A NEW factor-clear path outside the owner or the
   deactivation helper, or a
   clear split across transactions, is CRITICAL; `AuthDB::mfa_disable` is a
   test-fixture un-enrol with no route or CLI caller.** The auth v3 migration

@@ -609,6 +609,18 @@ reactivated (`active: true`): the account comes back, any lockout state is
 cleared, but **MFA is not restored** — they will re-enroll TOTP the next
 time they sign in.
 
+Reactivation ends the account's sessions first. Before the account becomes
+active again, Yuzu deletes any session it still holds (cached and durable), so
+a session that survived an earlier deactivation whose session wipe failed
+cannot outlive the reactivation. If that durable wipe fails, the account is
+left **inactive** and the call (a `PATCH` or `PUT` with `active:true`, or a
+`POST` that revives a deprovisioned user) answers **`500`**
+(`failed to reactivate the underlying account`, or `failed to revive the
+underlying account` for the `POST`), with an audit failure row
+(`scim.user.reactivated` or `scim.user.provisioned`, `result=failure`). Treat
+it like any other transient `500`: the IdP should retry, and the retry repeats
+the whole reactivation.
+
 ## SCIM ↔ OIDC identity linkage (federated token revocation)
 
 If your users sign in via SSO (OIDC — Okta, Entra, etc.) rather than a
