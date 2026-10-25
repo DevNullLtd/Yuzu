@@ -790,7 +790,8 @@ metadata:
     could not be read, or a network mount was skipped, but only the status
     number is stored on the server: the truncated and network_mount_guard
     rows are the operator-visible signal, and matches_found|0 beside either
-    means not found in the part examined. Only match rows are data rows to a column matcher. Only the
+    means not found in the part examined. Only match rows are data rows to a
+    column matcher. Only the
     shutdown signal cancels a running search; there is no per-command
     cancel. A path whose last character is a backslash is reported with a
     forward slash in its place. An agent older than this release still runs
