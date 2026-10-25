@@ -133,7 +133,8 @@ Open **ALL FOUR** `.claude/routed-concerns.md`, `.claude/routed-concerns-access-
 and walk them row by row against that path list. There are FOUR files — the table was split when
 the first hit CLAUDE.md's 40k-character ceiling and a new catastrophic-invariant row physically
 would not fit (three times: once for access-control/request-admission, again in Wave 8 for the
-read-only security-posture plugin rows, again for Forensics/per-user-software-data). Walking only
+security-posture plugin rows (the read-only posture plugins and the mutating registry row), again for
+Forensics/per-user-software-data). Walking only
 the first silently skips every access-control and request-admission chokepoint, which is where the
 highest-severity rows live: the authz-topology floor, dispatch confinement, dispatch targeting, the
 pre-auth body cap, and the ADR-1005 spine; skipping the third silently skips every read-only
@@ -1444,7 +1445,7 @@ to close rather than a contradiction to adjudicate.
      tables: `.claude/routed-concerns.md`, `.claude/routed-concerns-access-control.md`,
      `.claude/routed-concerns-security-posture.md` AND `.claude/routed-concerns-software-estate.md`.
      Opening only the first misses every auth, access-control and request-admission invariant;
-     skipping the third misses every read-only security-posture invariant; skipping the fourth
+     skipping the third misses every security-posture invariant; skipping the fourth
      misses every Forensics/per-user-software-data invariant.
    - **Gate 2** — `security-guardian` always; `docs-writer` whenever the fix touches
      a doc, a changelog fragment, a user-facing string, or in-code prose.
