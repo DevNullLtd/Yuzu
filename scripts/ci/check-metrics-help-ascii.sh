@@ -223,17 +223,20 @@ def find_describe_calls(text):
     return calls
 
 
-def string_literals(segment):
-    """Every double-quoted string literal in `segment`, as (offset, text)."""
-    return [(m.start(), m.group(0)) for m in re.finditer(r'"(?:[^"\\]|\\.)*"', segment, re.S)]
+def string_literals(segment, erlang=False):
+    """Every double-quoted string literal in `segment`, as (offset, text).
+    With `erlang`, an Erlang `\\^X` escape is three characters and X may be
+    `\\` (as in "\\^\\"), matching erl_code_mask's string reader."""
+    pattern = r'"(?:[^"\\]|\\\^.|\\.)*"' if erlang else r'"(?:[^"\\]|\\.)*"'
+    return [(m.start(), m.group(0)) for m in re.finditer(pattern, segment, re.S)]
 
 
-def non_ascii_findings(rel, base_line, base_offset, segment):
+def non_ascii_findings(rel, base_line, base_offset, segment, erlang=False):
     """Findings for every byte > 0x7F inside a double-quoted literal within
     `segment`, whose first character sits at `base_offset` in the file and
     whose first line is `base_line`."""
     out = []
-    for lit_off, lit in string_literals(segment):
+    for lit_off, lit in string_literals(segment, erlang):
         abs_off = base_offset + lit_off
         for k, ch in enumerate(lit):
             if ord(ch) > 0x7F:
@@ -352,6 +355,8 @@ def erl_code_mask(text):
                 end += 1
                 if escaped:
                     escaped = False
+                    if ch == "^" and end < n:
+                        end += 1  # \^X is three characters, and X may be \ or the quote
                 elif ch == "\\":
                     escaped = True
                 elif ch == c:
@@ -443,10 +448,13 @@ def scan_erl_help_surface(root):
             continue
         for line, tuple_text in find_erl_help_tuples(strings_only, mask):
             tuple_count += 1
-            # No byte offset: tuple_text is a slice of the masked view, so an
-            # offset into it is not a file offset. The line number is exact.
+            # No byte offset: non_ascii_findings measures it from the start of
+            # tuple_text (base_offset is unused), and tuple_text is a slice of
+            # the strings-only view, where each blanked multi-byte character
+            # is one space, so it is neither file- nor tuple-accurate in bytes.
+            # The line number is exact.
             findings.extend((r, l, None, ch)
-                            for r, l, _b, ch in non_ascii_findings(rel, line, 0, tuple_text))
+                            for r, l, _b, ch in non_ascii_findings(rel, line, 0, tuple_text, erlang=True))
     if root == repo_root and tuple_count == 0 and not findings:
         # The gateway declares its metrics as {help, ...} proplists; finding none
         # means the declaration shape changed under this lint, not a clean tree.
@@ -733,7 +741,7 @@ def run_selftest():
         # Narrowness: a sigil in a file with no {help is not this lint's business.
         f = erl_case("erl_sigil_nohelp", "src", 'greet() -> ~"hello".\n')
         if f:
-            print(f"SELFTEST FAILED: .erl sigil without {{help flagged: {f}")
+            print(f"SELFTEST FAILED: .erl sigil in a file not mentioning help flagged: {f}")
             return 1
 
         # A bad character only in the SECOND adjacent literal, in a tuple that
@@ -786,10 +794,34 @@ def run_selftest():
             print(f"SELFTEST FAILED: .erl $\\^] char literal hid a HELP literal: {f}")
             return 1
         # ... or running it on past its end into a non-HELP string (a false positive).
+        # The em dash inside the tuple must be flagged (the tuple was scanned);
+        # the one in the prose string after it must not be.
         f = erl_case("erl_ctrl_escape_fp", "src",
-                     'f() -> _ = {help, [$\\^[]}, "nonhelp — x".\n')
-        if f:
-            print(f"SELFTEST FAILED: .erl $\\^[ char literal extended a tuple into prose: {f}")
+                     'f() -> _ = {help, [$\\^[, "in tuple — x"]}, "nonhelp — y".\n')
+        if sum(1 for _r, _l, _b, ch in f if ch == "—") != 1:
+            print(f"SELFTEST FAILED: .erl $\\^[ char literal mis-bounded a tuple: {f}")
+            return 1
+
+        # Inside a string or a quoted atom, \^X is three characters and X may
+        # be \ : "\^\" is the one-character string [28], so the reader must
+        # not take its closing quote as escaped and hide the tuple after it.
+        f = erl_case("erl_string_ctrl_escape", "src",
+                     'c() -> "\\^\\".\n'
+                     'declare() -> prometheus_counter:declare([{name, a}, {help, "bad – x"}]).\n')
+        if not any(ch == "–" for _r, _l, _b, ch in f):
+            print(f"SELFTEST FAILED: .erl \"\\^\\\" string hid a later HELP literal: {f}")
+            return 1
+        f = erl_case("erl_atom_ctrl_escape", "src",
+                     "c() -> '\\^\\'.\n"
+                     'declare() -> prometheus_counter:declare([{name, a}, {help, "bad – x"}]).\n')
+        if not any(ch == "–" for _r, _l, _b, ch in f):
+            print(f"SELFTEST FAILED: .erl '\\^\\' quoted atom hid a later HELP literal: {f}")
+            return 1
+        # ... and the same rule when the literals are read back out of the tuple.
+        f = erl_case("erl_tuple_ctrl_escape", "src",
+                     'declare() -> prometheus_counter:declare([{name, a}, {help, ["\\^\\", "bad – x"]}]).\n')
+        if not any(ch == "–" for _r, _l, _b, ch in f):
+            print(f"SELFTEST FAILED: .erl \"\\^\\\" inside a HELP tuple hid its other literal: {f}")
             return 1
 
         # An unterminated $\x{ must fail loudly, not mask to the next `}`.
