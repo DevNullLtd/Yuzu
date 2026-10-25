@@ -241,10 +241,7 @@ private:
 /// caller commits once the verified write is over, whatever it concluded; a walk that makes nothing owns nothing.
 struct Opened {
     explicit Opened(RegistryWriter& r) : reg(&r), leaf(r) {}
-    Opened(const Opened&) = delete;
-    Opened& operator=(const Opened&) = delete;
-    Opened(Opened&&) noexcept = default; // the moved-from `made` is empty, so its destructor has nothing to roll back
-    Opened& operator=(Opened&&) = delete;
+    Opened(Opened&&) noexcept = default; // move-construct only; the moved-from `made` is empty, so its destructor has nothing to roll back
     ~Opened() { rollback(); }
 
     RegistryWriter* reg;

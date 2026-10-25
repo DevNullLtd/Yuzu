@@ -1095,6 +1095,16 @@ TEST_CASE("registry core: an exception after hand-over rolls back the keys and t
         CHECK(reg.method_calls("delete_key_by_handle") == 0);
         CHECK(reg.method_calls("enum_value") == 0);
     }
+    SECTION("a creating write that ends verify_mismatch commits too: the keys and the value stay and are reported") {
+        // mutant: commit() only on an ok result (the destructor then removes what the write made)
+        reg.tamper_after_set = [](Node& n, const std::string& name) { n.values[name].data[0] ^= 0xff; };
+        const auto o = write();
+        CHECK(o.reason == "verify_mismatch");
+        CHECK(o.created == 2);
+        CHECK(reg.get("Software\\New\\Deeper", "V") != nullptr);
+        CHECK(reg.method_calls("delete_key_by_handle") == 0);
+        CHECK(render_single_action(AuditRecord{}, o, false).lines[0].find("|created=2|") != std::string::npos);
+    }
 }
 
 // roll_back kept NtDeleteKey unconditional, and NtDeleteKey removes a key that holds VALUES (only a subkey blocks

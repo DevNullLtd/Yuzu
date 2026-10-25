@@ -1923,8 +1923,6 @@ if build_server
       # yuzu_proto_headers_dep - a DOWNWARD edge for both server and agent, no cycle, no
       # new build-graph node. NOT sdk/, which is the public plugin ABI surface.
       include_directories('../agents/core/src'),
-      # Applies to the whole server test exe, not only test_plugin_result_audit.cpp: no header in agents/shared
-      # shares a name with a server one today, so nothing is shadowed; re-check that when adding to either side.
       include_directories('../agents/shared'), # test_plugin_result_audit.cpp: registry_parsers.hpp's OS-free shared includes
     ],
     # httplib.h is header-only and its Client/Server class layout depends on

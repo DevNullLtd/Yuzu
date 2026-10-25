@@ -328,21 +328,25 @@ TEST_CASE("registry write: delete_value; and a value that is not there", "[regis
 
 // enumerate_values read value names into a 256-wchar buffer and ended the list at the first name that did not fit
 // (ERROR_MORE_DATA), answering rc 0 with the list cut short; set_value accepts names up to 16,383 characters.
-TEST_CASE("registry write: enumerate_values lists a value name longer than 255 characters and the values after it",
+TEST_CASE("registry write: enumerate_values lists value names longer than 255 characters up to the 16383 maximum and the values after them",
           "[registry][windows][write]") {
     Plugin p;
     if (!p.ok()) { skip_or_fail("registry.dll not found"); return; }
     const std::string key = "Software\\" + scratch_name() + "\\longname";
     ScratchTree cleanup{HKEY_CURRENT_USER, "Software\\" + scratch_name()};
     const std::string name(300, 'n');
-    const auto set = p.run("set_value", {{"hive", "HKCU"}, {"key", key}, {"name", name}, {"type", "REG_DWORD"}, {"value", "1"}});
-    REQUIRE(set.rc == 0);
+    const std::string longest(16383, 'm'); // the registry maximum: the enumeration buffer must hold all of it
+    for (const auto& n : {name, longest}) {
+        const auto set = p.run("set_value", {{"hive", "HKCU"}, {"key", key}, {"name", n}, {"type", "REG_DWORD"}, {"value", "1"}});
+        REQUIRE(set.rc == 0);
+    }
     REQUIRE(put(HKEY_CURRENT_USER, key, "after", REG_DWORD, le(2, 4))); // a truncated list ends before this one
     const auto vals = p.run("enumerate_values", {{"hive", "HKCU"}, {"key", key}});
     CHECK(vals.rc == 0);
     CHECK(vals.has("value|" + name + "|REG_DWORD"));
+    CHECK(vals.has("value|" + longest + "|REG_DWORD"));
     CHECK(vals.has("value|after|REG_DWORD"));
-    CHECK(vals.lines.size() == 2);
+    CHECK(vals.lines.size() == 3);
 }
 
 TEST_CASE("registry write: hostile parameters are refused by name and create nothing",

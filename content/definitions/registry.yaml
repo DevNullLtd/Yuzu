@@ -240,7 +240,12 @@ metadata:
     the path is refused, never followed; a write under HKLM\SYSTEM\CurrentControlSet,
     itself a link, therefore fails as key_is_link. The previous and new values
     are recorded in a `registry.write` audit row (hex, capped at 256 bytes; they can
-    contain secrets, which the owner has accepted). Windows-only.
+    contain secrets: the product owner accepted this risk on 2026-10-20 and masking
+    is a planned later change). Needs registry 2.0.0 on the agent: an agent still
+    running registry 1.x writes an EMPTY REG_SZ for a data_hex-only write, stores
+    REG_QWORD, REG_MULTI_SZ, REG_EXPAND_SZ and REG_BINARY values as REG_SZ text and
+    follows a write under HKLM\SYSTEM\CurrentControlSet, all answering `status|ok`,
+    so upgrade the agents first. Windows-only.
   tags: [registry, windows, configuration]
 spec:
   type: action
