@@ -1909,7 +1909,7 @@ the 14 shards summed to about 880 s to 1165 s, the longest shard 92 s to 148 s.
 The step drifted upward through 2026-10-24 on every run, with or without any
 change of ours, so a single comparison across time is worthless: this is why the
 measurement below is interleaved. The same step on Windows went from 602 s at
-`--num-processes 2` to 358 s at 4 (Push 2 above: -40.5%, worst shard 1.16x).
+`--num-processes 2` to 358 s at 4 (the Windows pg-shards Push 2 under "Windows test-phase concurrency gate" above: -40.5%, worst shard 1.16x).
 
 *Expectation (an estimate, not a measurement).* The shard sum divided by four is
 the floor (about 220 s to 290 s); the Windows result suggests a cut of 30% to 40%
@@ -1936,7 +1936,7 @@ no `too many clients`, `deadlock detected` or connection error appears in the
 log. If (b) or (c) fails, or (a) comes in under 10%, revert to 2 and stop; a
 failed safety check is not "try one more sample". To revert, set
 `--num-processes` on the pg-shards `flake-retry.py` call back to 2. Before
-Push 4 (np 4 → 6), add a flake-rate check: 10 or more push runs on the leg with
+the Linux ladder's row 4 (np 4 → 6), add a flake-rate check: 10 or more push runs on the leg with
 no non-timing red. *Samples:* pending.
 
 ### Persistent runner-local test history
