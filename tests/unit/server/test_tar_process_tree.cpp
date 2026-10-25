@@ -729,7 +729,7 @@ TEST_CASE("render_tar_capture_sources: the registry source gets the System chip,
         // the sixth chip, filtering to the System category
         CHECK(html.find("filterCap(this,'System')\">System</a>") != npos);
     }
-    SECTION("an older or non-Windows agent does not report it: no row") {
+    SECTION("an older agent that does not report registry_enabled: no row") {
         const std::string html =
             render_tar_capture_sources("agent-123", "config|process_enabled|true\n", compat);
         CHECK(html.find("src-name\">registry<") == npos);

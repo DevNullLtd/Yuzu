@@ -409,17 +409,18 @@ TEST_CASE("tar plugin: every source is enabled by default with no stored flag; a
         // default now supplies "true", so a fresh data dir stores nothing.
         CHECK(enabled_rows_in(db_path) == 0);
 
+        // `registry` is Windows-only, but status lists every registered source's flag on
+        // every OS (unsupported ones record nothing), so it is asserted here everywhere.
         const auto rows = rows_of(d.run(desc, "status").captured);
         for (const char* src :
-             {"module", "software", "netconn", "mapdrive", "netqual", "procperf"}) {
+             {"module", "software", "netconn", "mapdrive", "netqual", "procperf", "registry"}) {
             INFO("source=" << src);
             CHECK(row_with_prefix(rows, std::format("config|{}_enabled|true", src)).has_value());
         }
         CHECK(count_containing(rows, "source_disabled") == 0);
 
         // The registry source's five health keys are always present, at their "not
-        // running" defaults before any tick has written them. `registry_enabled` is not
-        // asserted: the source is Windows-only, so its enabled flag is OS-dependent.
+        // running" defaults before any tick has written them.
         for (const char* kv : {"registry_capture_method|none", "registry_watch_roots|0",
                                "registry_watch_roots_unarmed|0", "registry_roots_unreadable|0",
                                "registry_roots_capped|0"}) {

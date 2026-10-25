@@ -1281,10 +1281,11 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
         {"module", "$Module", "Processes", false, false, false},
         {"arp", "$ARP", "Network connections", false, true, false},
         {"dns", "$DNS", "Network connections", false, true, true},
-        // registry (PR11.8): Windows only, so an older or non-Windows agent never reports
-        // registry_enabled and the row is simply absent. Stored values are unmasked, which
-        // the user manual states. No PII badge: the badge marks usage-class sources like
-        // $DNS, and registry values are machine configuration, not per-user behaviour.
+        // registry (PR11.8): an older agent never reports registry_enabled, so the row is
+        // simply absent; a current agent reports it on every OS, and the OS cells read
+        // unsupported off Windows. Stored values are unmasked, which the user manual
+        // states. No PII badge: the badge marks usage-class sources like $DNS, and
+        // registry values are machine configuration, not per-user behaviour.
         {"registry", "$Registry", "System", false, true, false},
     }};
 

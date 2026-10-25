@@ -696,8 +696,8 @@ spec:
         description: >
           Enable or disable the Windows registry change source (registry →
           $Registry_Live, cursor-model seam). **ON by default ("true")**, like
-          every other capture source. Windows only; Linux and macOS agents do not
-          report the source. A curated watch list (Run and RunOnce, Services,
+          every other capture source. Windows only; on Linux and macOS the source
+          is listed as unsupported and records nothing. A curated watch list (Run and RunOnce, Services,
           Image File Execution Options, AppInit_DLLs, Winlogon, LSA, Policies and
           Defender under HKLM, plus Run, RunOnce, Policies and Winlogon under every
           loaded user hive) is watched for changes; each added, changed or removed

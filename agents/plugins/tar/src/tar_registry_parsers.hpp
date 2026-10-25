@@ -337,8 +337,9 @@ private:
 
 /// What the baseline remembers about a value: type, full stored size, a hash of
 /// every byte read (R8: a change anywhere in the value shows), a rendered prefix
-/// for the old-value column, and `dt` = the hash covers a prefix only because the
-/// value exceeded kBaselineValueReadCap.
+/// for the old-value column, and `dt` = the value exceeded kBaselineValueReadCap, so
+/// `h` covers only what the reader returned (nothing, from the Windows API, which has
+/// no partial read) and a change that keeps the type and size is not detected.
 struct BaselineEntry {
     std::uint32_t t{0};
     std::uint64_t s{0};
