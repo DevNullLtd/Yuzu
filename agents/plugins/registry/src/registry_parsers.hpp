@@ -17,6 +17,7 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <span>
 #include <string>
@@ -121,18 +122,13 @@ enum class Hive { hklm, hkcu, hkcr, hku };
 inline constexpr std::string_view kErrMissingHiveKey = "error|missing required parameters: hive, key";
 inline constexpr std::string_view kErrInvalidHive = "error|invalid hive (use HKLM, HKCU, HKCR, or HKU)";
 
-/// A parsed hive, or (hive unset) `error`: the line to write, a view of a constant.
-struct TargetParse {
-    std::optional<Hive> hive;
-    std::string_view error;
-};
-
 /// Pure front half of every action's parse_target: both parameters present, the hive one of the four names.
-[[nodiscard]] inline TargetParse resolve_target(std::string_view hive, std::string_view key) noexcept {
-    if (hive.empty() || key.empty()) return {std::nullopt, kErrMissingHiveKey};
-    const auto h = parse_hive(hive);
-    if (!h) return {std::nullopt, kErrInvalidHive};
-    return {h, {}};
+/// The error is the line to write, a view of a constant.
+[[nodiscard]] inline std::expected<Hive, std::string_view> resolve_target(std::string_view hive,
+                                                                          std::string_view key) noexcept {
+    if (hive.empty() || key.empty()) return std::unexpected{kErrMissingHiveKey};
+    if (const auto h = parse_hive(hive)) return *h;
+    return std::unexpected{kErrInvalidHive};
 }
 
 /// L7: whether an access names a path the agent log should note (the Run keys and the service tree under HKLM).

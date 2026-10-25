@@ -619,24 +619,24 @@ TEST_CASE("registry prepare_set: an unknown type, a bad key path or value name; 
 TEST_CASE("registry resolve_target: both parameters, then one of the four hive names", "[registry][parsers]") {
     const auto missing = [](std::string_view hive, std::string_view key) {
         const auto p = resolve_target(hive, key);
-        CHECK_FALSE(p.hive.has_value());
-        CHECK(p.error == kErrMissingHiveKey);
+        CHECK_FALSE(p.has_value());
+        CHECK(p.error() == kErrMissingHiveKey);
     };
     missing("", "k");
     missing("HKLM", "");
     missing("", "");
     for (const char* hive : {"HKEY_LOCAL_MACHINE", "hklm", "HKLM "}) {
         const auto p = resolve_target(hive, "k");
-        CHECK_FALSE(p.hive.has_value());
-        CHECK(p.error == kErrInvalidHive);
+        CHECK_FALSE(p.has_value());
+        CHECK(p.error() == kErrInvalidHive);
     }
     CHECK(kErrMissingHiveKey == "error|missing required parameters: hive, key");
     CHECK(kErrInvalidHive == "error|invalid hive (use HKLM, HKCU, HKCR, or HKU)");
-    CHECK(resolve_target("HKLM", "k").hive == Hive::hklm);
-    CHECK(resolve_target("HKCU", "k").hive == Hive::hkcu);
-    CHECK(resolve_target("HKCR", "k").hive == Hive::hkcr);
-    CHECK(resolve_target("HKU", "k").hive == Hive::hku);
-    CHECK(resolve_target("HKU", "k").error.empty());
+    CHECK(*resolve_target("HKLM", "k") == Hive::hklm);
+    CHECK(*resolve_target("HKCU", "k") == Hive::hkcu);
+    CHECK(*resolve_target("HKCR", "k") == Hive::hkcr);
+    CHECK(*resolve_target("HKU", "k") == Hive::hku);
+    CHECK(resolve_target("HKU", "k").has_value());
 }
 
 TEST_CASE("registry is_sensitive_hklm_path: the Run keys and the service tree under HKLM, any ASCII case",

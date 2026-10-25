@@ -172,40 +172,23 @@ struct ScratchTree {
     ScratchTree& operator=(const ScratchTree&) = delete;
 };
 
-/// Deletes the link object at `parent\Link` by handle on scope exit (a link-opening open + NtDeleteKey),
+/// Deletes the link object at `parent\<name>` by handle on scope exit (a link-opening open + NtDeleteKey),
 /// so a failed REQUIRE, or a build without the flag where create_sub followed the link, still leaves no
 /// link behind for RegDeleteTreeW to trip over. Never throws.
 struct LinkSweep {
     Win32Registry& reg;
     Handle parent;
-    ~LinkSweep() {
-        Handle h = 0;
-        if (reg.open_sub(parent, "Link", DELETE, h) == ERROR_SUCCESS) {
-            reg.delete_key_by_handle(h);
-            reg.close(h);
-        }
-    }
-    LinkSweep(Win32Registry& r, Handle p) : reg(r), parent(p) {}
-    LinkSweep(const LinkSweep&) = delete;
-    LinkSweep& operator=(const LinkSweep&) = delete;
-};
-
-/// The same by-handle removal for a link of any name (UTF-8) directly under `parent`. Declared after the
-/// ScratchTree, so the link object is gone before RegDeleteTreeW (which follows a link) walks the parent.
-struct NamedLinkSweep {
-    Win32Registry& reg;
-    Handle parent;
     std::string name;
-    ~NamedLinkSweep() {
+    ~LinkSweep() {
         Handle h = 0;
         if (reg.open_sub(parent, name, DELETE, h) == ERROR_SUCCESS) {
             reg.delete_key_by_handle(h);
             reg.close(h);
         }
     }
-    NamedLinkSweep(Win32Registry& r, Handle p, std::string n) : reg(r), parent(p), name(std::move(n)) {}
-    NamedLinkSweep(const NamedLinkSweep&) = delete;
-    NamedLinkSweep& operator=(const NamedLinkSweep&) = delete;
+    LinkSweep(Win32Registry& r, Handle p, std::string n = "Link") : reg(r), parent(p), name(std::move(n)) {}
+    LinkSweep(const LinkSweep&) = delete;
+    LinkSweep& operator=(const LinkSweep&) = delete;
 };
 
 /// `SOFTWARE\YuzuTest-[<scope>-]<salt>-<tag>`: the scope (YUZU_TEST_REGISTRY_SCOPE, set per job in CI) lets the
@@ -386,7 +369,7 @@ TEST_CASE("Win32Registry::final_name fails closed on a lone-surrogate key name, 
             skip_or_fail("could not create a registry link here");
             return;
         }
-        NamedLinkSweep sweep{reg, as_handle(parent.get()), lookalike_utf8};
+        LinkSweep sweep{reg, as_handle(parent.get()), lookalike_utf8};
         const std::vector<std::uint8_t> value{7, 0, 0, 0};
         // The requested path is plain UTF-8 (valid, passes validate_key_path): `<root>\L<U+FFFD>\Child`. The kernel
         // follows the ancestor link to `L<U+D800>\Child`; only the lone-surrogate rule keeps the fast open from

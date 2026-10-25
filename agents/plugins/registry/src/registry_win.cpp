@@ -314,15 +314,15 @@ std::optional<Target> parse_target(yuzu::CommandContext& ctx, yuzu::Params param
     const auto hive = params.get("hive");
     const auto key = params.get("key");
     const auto p = resolve_target(hive, key);
-    if (!p.hive) {
-        ctx.write_output(p.error);
+    if (!p) {
+        ctx.write_output(p.error());
         return std::nullopt;
     }
     // L7: the key is request-supplied and not yet validated, so it is logged through sanitize_field (a CR or LF in
     // it must not forge an agent-log line).
     if (is_sensitive_hklm_path(hive, key))
         spdlog::info("Registry: accessing sensitive path HKLM\\{}", sanitize_field(key));
-    return Target{*p.hive, key, fast_open_hive(*p.hive)};
+    return Target{*p, key, fast_open_hive(*p)};
 }
 
 /// A refused single action: the audit line and `error|<token>` with rc 1.
