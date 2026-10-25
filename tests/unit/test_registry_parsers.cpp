@@ -501,3 +501,145 @@ TEST_CASE("registry exception_audit_line: one fixed 19-field literal per mutatin
             CHECK(exception_audit_line(action).empty());
     }
 }
+
+// ── prepare_set (the front half of set_value) ────────────────────────────
+
+namespace {
+
+struct Prep {
+    AuditRecord au;
+    PreparedSet p;
+};
+
+Prep prep(std::string_view type, std::string_view value, std::string_view data_hex = {},
+          std::string_view key = "SOFTWARE\\Acme", std::string_view name = "V") {
+    Prep r;
+    r.p = prepare_set(r.au, key, name, type, value, data_hex);
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("registry prepare_set encodes each of the six types from text and records them on the audit record",
+          "[registry][parsers]") {
+    const auto check = [](std::string_view type, std::string_view value, const Bytes& want) {
+        INFO(type);
+        const auto r = prep(type, value);
+        CHECK(r.p.err.empty());
+        REQUIRE(r.p.type.has_value());
+        CHECK(r.p.enc.bytes == want);
+        CHECK(r.au.type_name == type);
+        CHECK(r.au.len == static_cast<long long>(want.size()));
+        CHECK(r.au.new_bytes == want);
+        CHECK(r.au.new_total == want.size());
+        CHECK(r.au.has_new);
+    };
+    check("REG_SZ", "hi", B({0x68, 0, 0x69, 0, 0, 0}));
+    check("REG_EXPAND_SZ", "%P%", B({0x25, 0, 0x50, 0, 0x25, 0, 0, 0}));
+    check("REG_DWORD", "7", B({7, 0, 0, 0}));
+    check("REG_QWORD", "7", B({7, 0, 0, 0, 0, 0, 0, 0}));
+    check("REG_MULTI_SZ", "a\nb", B({0x61, 0, 0, 0, 0x62, 0, 0, 0, 0, 0}));
+    check("REG_BINARY", "0aff", B({0x0a, 0xff}));
+    SECTION("data_hex carries the bytes instead of the text") {
+        const auto r = prep("REG_BINARY", {}, "0AFF");
+        CHECK(r.p.err.empty());
+        CHECK(r.p.enc.bytes == B({0x0a, 0xff}));
+        CHECK(r.au.has_new);
+    }
+}
+
+TEST_CASE("registry prepare_set: an empty type is REG_SZ", "[registry][parsers]") {
+    const auto r = prep({}, "x");
+    CHECK(r.p.err.empty());
+    REQUIRE(r.p.type.has_value());
+    CHECK(*r.p.type == kRegSz);
+    CHECK(r.au.type_name == "REG_SZ");
+}
+
+TEST_CASE("registry prepare_set: an empty value with no data_hex (a missing or misspelt parameter) is the empty "
+          "form, and refused for the numeric types",
+          "[registry][parsers]") {
+    CHECK(prep("REG_SZ", {}).p.enc.bytes == B({0, 0}));
+    CHECK(prep("REG_SZ", {}).p.err.empty());
+    CHECK(prep("REG_BINARY", {}).p.enc.bytes.empty());
+    CHECK(prep("REG_BINARY", {}).p.err.empty());
+    CHECK(prep("REG_DWORD", {}).p.err == kTokInvalidData);
+    CHECK_FALSE(prep("REG_DWORD", {}).au.has_new);
+}
+
+TEST_CASE("registry prepare_set: data_hex that is not hex, or of odd length, is invalid_data with nothing recorded",
+          "[registry][parsers]") {
+    for (const char* bad : {"zz", "abc"}) {
+        INFO(bad);
+        const auto r = prep("REG_BINARY", {}, bad);
+        CHECK(r.p.err == kTokInvalidData);
+        CHECK_FALSE(r.au.has_new);
+        CHECK(r.au.len == -1);
+        CHECK(r.au.type_name == "REG_BINARY");
+    }
+}
+
+TEST_CASE("registry prepare_set: data_hex over 2*kMaxWriteBytes characters and text over the cap are value_overflow",
+          "[registry][parsers]") {
+    const auto hex = prep("REG_BINARY", {}, std::string(kMaxWriteBytes * 2 + 2, 'a'));
+    CHECK(hex.p.err == kTokValueOverflow);
+    CHECK_FALSE(hex.au.has_new);
+    const auto text = prep("REG_SZ", std::string(kMaxWriteBytes + 1, 'x'));
+    CHECK(text.p.err == kTokValueOverflow);
+    CHECK_FALSE(text.au.has_new);
+}
+
+TEST_CASE("registry prepare_set: an unknown type, a bad key path or value name; precedence key path > value name > type",
+          "[registry][parsers]") {
+    const auto link = prep("REG_LINK", "x");
+    CHECK(link.p.err == kTokInvalidType);
+    CHECK_FALSE(link.p.type.has_value());
+    CHECK(link.au.type_name == "REG_LINK");
+    CHECK_FALSE(link.au.has_new);
+
+    const auto bad_key = prep("REG_SZ", "x", {}, std::string(300, 'k'));
+    CHECK(bad_key.p.err == kTokInvalidKeyPath);
+    CHECK(bad_key.au.type_name == "REG_SZ");
+    CHECK_FALSE(bad_key.au.has_new);
+    CHECK(prep("REG_SZ", "x", {}, "SOFTWARE\\Acme", "a\rb").p.err == kTokInvalidValueName);
+
+    CHECK(prep("REG_LINK", "x", {}, std::string(300, 'k'), "a\rb").p.err == kTokInvalidKeyPath);
+    CHECK(prep("REG_LINK", "x", {}, "SOFTWARE\\Acme", "a\rb").p.err == kTokInvalidValueName);
+}
+
+// ── resolve_target / is_sensitive_hklm_path ─────────────────────────────
+
+TEST_CASE("registry resolve_target: both parameters, then one of the four hive names", "[registry][parsers]") {
+    const auto missing = [](std::string_view hive, std::string_view key) {
+        const auto p = resolve_target(hive, key);
+        CHECK_FALSE(p.hive.has_value());
+        CHECK(p.error == kErrMissingHiveKey);
+    };
+    missing("", "k");
+    missing("HKLM", "");
+    missing("", "");
+    for (const char* hive : {"HKEY_LOCAL_MACHINE", "hklm", "HKLM "}) {
+        const auto p = resolve_target(hive, "k");
+        CHECK_FALSE(p.hive.has_value());
+        CHECK(p.error == kErrInvalidHive);
+    }
+    CHECK(kErrMissingHiveKey == "error|missing required parameters: hive, key");
+    CHECK(kErrInvalidHive == "error|invalid hive (use HKLM, HKCU, HKCR, or HKU)");
+    CHECK(resolve_target("HKLM", "k").hive == Hive::hklm);
+    CHECK(resolve_target("HKCU", "k").hive == Hive::hkcu);
+    CHECK(resolve_target("HKCR", "k").hive == Hive::hkcr);
+    CHECK(resolve_target("HKU", "k").hive == Hive::hku);
+    CHECK(resolve_target("HKU", "k").error.empty());
+}
+
+TEST_CASE("registry is_sensitive_hklm_path: the Run keys and the service tree under HKLM, any ASCII case",
+          "[registry][parsers]") {
+    CHECK(is_sensitive_hklm_path("HKLM", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"));
+    CHECK(is_sensitive_hklm_path("HKLM", "software\\MICROSOFT\\windows\\currentversion\\runonce"));
+    CHECK(is_sensitive_hklm_path("HKLM", "System\\CurrentControlSet\\Services"));
+    CHECK(is_sensitive_hklm_path("HKLM", "SYSTEM\\CURRENTCONTROLSET\\SERVICES\\Foo\\Parameters"));
+    CHECK_FALSE(is_sensitive_hklm_path("HKCU", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"));
+    CHECK_FALSE(is_sensitive_hklm_path("HKLM", "SOFTWARE\\Other"));
+    CHECK_FALSE(is_sensitive_hklm_path("HKLM", "SYSTEM\\CurrentControlSet\\Servic")); // shorter than the prefix
+    CHECK_FALSE(is_sensitive_hklm_path("HKLM", ""));
+}

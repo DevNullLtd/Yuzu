@@ -99,6 +99,38 @@ enum class Hive { hklm, hkcu, hkcr, hku };
     return "HKLM";
 }
 
+/// The two refusals every action's hive/key parameters can earn (the shell writes the line verbatim).
+inline constexpr std::string_view kErrMissingHiveKey = "error|missing required parameters: hive, key";
+inline constexpr std::string_view kErrInvalidHive = "error|invalid hive (use HKLM, HKCU, HKCR, or HKU)";
+
+/// A parsed hive, or (hive unset) `error`: the line to write, a view of a constant.
+struct TargetParse {
+    std::optional<Hive> hive;
+    std::string_view error;
+};
+
+/// Pure front half of every action's parse_target: both parameters present, the hive one of the four names.
+[[nodiscard]] inline TargetParse resolve_target(std::string_view hive, std::string_view key) noexcept {
+    if (hive.empty() || key.empty()) return {std::nullopt, kErrMissingHiveKey};
+    const auto h = parse_hive(hive);
+    if (!h) return {std::nullopt, kErrInvalidHive};
+    return {h, {}};
+}
+
+/// L7: whether an access names a path the agent log should note (the Run keys and the service tree under HKLM).
+/// ASCII-case-insensitive prefix match on the raw, not yet validated, key; no copy of it.
+[[nodiscard]] inline bool is_sensitive_hklm_path(std::string_view hive, std::string_view key_path) noexcept {
+    if (hive != "HKLM") return false;
+    const auto starts_ci = [&](std::string_view upper_prefix) {
+        return key_path.size() >= upper_prefix.size() &&
+               std::equal(upper_prefix.begin(), upper_prefix.end(), key_path.begin(), [](char p, char c) {
+                   return p == (c >= 'a' && c <= 'z' ? static_cast<char>(c - 32) : c);
+               });
+    };
+    return starts_ci("SOFTWARE\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\RUN") ||
+           starts_ci("SYSTEM\\CURRENTCONTROLSET\\SERVICES");
+}
+
 // ── value types and encoders ─────────────────────────────────────────────
 
 /// The six writable types, by name (case-sensitive). REG_NONE / REG_LINK / garbage are not writable.
@@ -470,6 +502,40 @@ struct AuditRecord {
     std::size_t new_total = 0;
     bool has_new = false;
 };
+
+/// The front half of set_value: validate, encode, and record the type and new bytes on the audit record.
+/// `err` is empty on success. A missing or misspelt `value` / `data_hex` parameter arrives here as an empty string,
+/// so an empty text is a valid empty REG_SZ / REG_BINARY (and an invalid REG_DWORD); a REG_MULTI_SZ record
+/// separator is LF only (a CR is a control byte the record refuses).
+struct PreparedSet {
+    std::string_view err;
+    std::optional<std::uint32_t> type;
+    Encoded enc;
+};
+
+[[nodiscard]] inline PreparedSet prepare_set(AuditRecord& au, std::string_view key, std::string_view name,
+                                             std::string_view type_str, std::string_view value,
+                                             std::string_view data_hex) {
+    if (type_str.empty()) type_str = "REG_SZ";
+    au.type_name = std::string{type_str};
+    PreparedSet p;
+    p.err = validate_key_path(key);
+    if (p.err.empty()) p.err = validate_value_name(name);
+    p.type = parse_reg_type(type_str);
+    if (p.err.empty() && !p.type) p.err = kTokInvalidType;
+    if (p.err.empty()) {
+        // On the string-map actions an empty data_hex is the same as an absent one.
+        p.enc = encode_value(*p.type, value, data_hex, !data_hex.empty());
+        p.err = p.enc.error;
+    }
+    if (p.err.empty()) {
+        au.len = static_cast<long long>(p.enc.bytes.size());
+        au.new_bytes = p.enc.bytes;
+        au.new_total = p.enc.bytes.size();
+        au.has_new = true;
+    }
+    return p;
+}
 
 namespace detail {
 
