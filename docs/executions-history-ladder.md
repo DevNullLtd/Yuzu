@@ -263,7 +263,7 @@ SQL beside the agent scope, before `ORDER BY`/`LIMIT`/`GROUP BY`, so the cap fla
 options and aggregates are computed over the rows the caller may read. A filtered row is simply
 absent: there is no marker or field, so an empty result no longer implies that no data exists. The
 one error is an unresolved decision: when the caller's authority cannot be determined (the global `Forensics:Read` check
-is unavailable; this covers sessions, API tokens, MCP tokens and engine principals, while a service-scoped token is
+is unavailable; this covers sessions, API tokens, MCP tokens and engine principals (for an engine principal, once its cached RBAC view is older than 5 seconds; the condition is in `docs/authz-model.md`), while a service-scoped token is
 default-denied; `yuzu_server_rbac_read_degrade_total` and the `YuzuRbacReadDegraded` alert
 correlate, see `docs/authz-model.md`, which also says what happens when the surface's earlier admission gate fails
 first) the REST routes

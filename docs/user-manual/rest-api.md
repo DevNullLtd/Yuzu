@@ -6737,7 +6737,7 @@ not marked: there is no extra field or flag, and the row cap, the truncation fla
 counts and the agent counts are all computed over the rows the caller may read, so **an empty or
 short result does not imply that no data exists**. The one error is the unresolved case: if the
 server cannot determine whether the caller may read Forensics rows (the authorization store is
-unavailable; this applies to sessions, API tokens, MCP tokens and engine principals, while a service-scoped token is
+unavailable; this applies to sessions, API tokens, MCP tokens and engine principals (an engine principal once its cached RBAC view is older than 5 seconds: an explicit grant is then admitted and a missing one is `403`; the authorization model reference has the condition), while a service-scoped token is
 default-denied with a definitive `403`), the route answers a retryable A4 `503` (`retry_after_ms` 5000, no
 `permission` field) instead of a result with those rows silently missing; that shape is the Forensics check's own, and
 when a whole-store outage fails the route's earlier `Response:Read` gate first, that gate's own answer is returned
