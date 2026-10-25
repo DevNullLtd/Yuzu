@@ -1,8 +1,8 @@
 // #4990: the caller-keyed fast-fail on the dispatch-record write (dispatch_record_policy.hpp).
 //
 // `ServerImpl::build_classified_command` writes the server's record of every dispatch before the
-// command is sent. A loop that builds one command per target (the operator Guardian push, the
-// heartbeat reconcile push) used to pay the tracker's full lease budget per agent when the record
+// command is sent. A loop that builds one command per target (the operator Guardian push) used to
+// pay the tracker's full lease budget per agent when the record
 // store was degraded. These cases pin the replacement, at the `AgentServiceImpl` seam the
 // chokepoint calls: a loop-local latch selects a short lease budget and skips the rest of THAT
 // loop's writes after the first failure, while an unlatched (operator) write keeps the long

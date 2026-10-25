@@ -84,6 +84,7 @@
 #include "data_export.hpp"
 #include "deployment_store.hpp"
 #include "developer_routes.hpp" // System > Developer and API page + fragments (read-only)
+#include "dispatch_record_policy.hpp" // #4990: per-loop latch + short lease budget for the dispatch-record write
 #include "discover_routes.hpp" // A2 discovery surface: /api/v1/discover/* (roadmap Issue 17.1)
 #include "discovered_devices_reader.hpp" // make_discovered_devices_reader (core wiring)
 #include "discovery_store.hpp"
@@ -12953,7 +12954,8 @@ private:
         const std::string& action, const std::string& command_id,
         const std::unordered_map<std::string, std::string>& parameters = {},
         const std::string& payload = {}, int stagger_seconds = 0, int delay_seconds = 0,
-        const std::string& target_arm = {}, const std::string& execution_id = {}) {
+        const std::string& target_arm = {}, const std::string& execution_id = {},
+        yuzu::server::DispatchRecordLatch* record_latch = nullptr) {
         auto decision = yuzu::server::detail::classify_and_authorize_dispatch(
             capability_registry_, caller, plugin, action,
             [this](std::string_view principal, std::string_view securable,
@@ -13047,16 +13049,25 @@ private:
         // unverified, i.e. Forensics-tier (response_provenance.hpp). The plugin is the wire
         // plugin the agent will be sent (the catalogue's canonical spelling), not the caller's raw
         // string. One upsert, one attempt, never refused or retried on failure (a failure is
-        // counted: yuzu_exec_correlation_write_degrade_total). Its latency is bounded, but not by
-        // `kWriteTimeout`: that bounds only the lease acquire (2 s). Once the lease is held the
-        // statement runs under the pool's server-side lock_timeout (10 s) and statement_timeout
-        // (30 s); a held lock on the table was measured blocking the upsert for 10.04 s before it
-        // failed, so the worst case on the dispatching thread is about 2 s plus 10 s (30 s for a
-        // wedged statement), not 2 s. Honest limit: the record proves the server
-        // issued this command id for this plugin; an endpoint it was sent to can still replay
-        // that id on a frame of its own, and the content of a frame is not validated.
+        // counted: yuzu_exec_correlation_write_degrade_total).
+        //
+        // Its latency is bounded, but only for the lease acquire and only per call. A single
+        // dispatch keeps the tracker's ordinary lease budget (2 s). `record_latch`
+        // (dispatch_record_policy.hpp) is passed ONLY by a loop that builds one command per
+        // target (today only the operator Guardian push): such a write uses the short fan-out
+        // budget (250 ms) and, after the loop's first failed write, the rest of that loop's writes
+        // are skipped and counted, so an outage costs the loop one short wait instead of N long
+        // ones. The latch is a parameter, not a property of the caller:
+        // `DispatchCaller::system` also marks the policy evaluator, the preflight runner and the
+        // reconciler, which write one record per dispatch and keep the ordinary budget. Once a
+        // lease is held, the statement runs under the pool's server-side lock_timeout (10 s) and
+        // statement_timeout (30 s) for every caller (a held lock on the table was measured
+        // blocking the upsert for 10.04 s before it failed): that residual is once per latched
+        // loop, and once per call otherwise. Honest limit: the record proves the server issued
+        // this command id for this plugin; an endpoint it was sent to can still replay that id
+        // on a frame of its own, and the content of a frame is not validated.
         agent_service_.record_command_dispatch(command_id, finalized->wire().plugin(),
-                                               execution_id);
+                                               execution_id, record_latch);
 
         return *finalized;
     }
@@ -21617,6 +21628,11 @@ private:
                 // receives only the enabled rules that target its OS and name it in
                 // scope, so a Linux box is no longer handed Windows registry guards.
                 int sent = 0;
+                // #4990: one dispatch record is written per target below. A degraded record store
+                // costs this loop ONE short wait (the first failed write trips the latch and the
+                // rest are skipped, still dispatched), never one lease wait per agent ahead of
+                // forward_gateway_pending(). Local to this loop: never carried into another push.
+                yuzu::server::DispatchRecordLatch record_latch{"operator Guardian push"};
                 for (const auto& aid : targets) {
                     auto sess = registry_.get_session(aid);
                     const std::string agent_os = sess ? sess->os : std::string{};
@@ -21637,7 +21653,9 @@ private:
                     // `system_reserved` (capdecls::core_dispatch_capabilities.hpp).
                     auto classified = build_classified_command(
                         yuzu::server::DispatchCaller{.system = true}, "__guard__", "push_rules",
-                        push_command_id, /*parameters=*/{}, push.SerializeAsString());
+                        push_command_id, /*parameters=*/{}, push.SerializeAsString(),
+                        /*stagger_seconds=*/0, /*delay_seconds=*/0, /*target_arm=*/{},
+                        /*execution_id=*/{}, &record_latch);
                     // #881: system_reserved internal push (__guard__.push_rules),
                     // not operator instruction dispatch — deliberately NOT
                     // quarantine-gated (see dispatch_confined_arms.hpp).

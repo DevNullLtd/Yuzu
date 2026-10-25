@@ -9,12 +9,15 @@
 /// labelled `~unverified` (response_provenance.hpp, the documented fail-closed outcome) and the
 /// failure is counted (`yuzu_exec_correlation_write_degrade_total`).
 ///
-/// A single operator dispatch pays for that write once, so it keeps the tracker's ordinary lease
-/// budget (`ExecutionTracker`'s `kWriteTimeout`, 2 s). A loop that mints one command per agent
-/// (today: the operator Guardian rule push, one `__guard__` command id per target, and the
-/// heartbeat reconcile push, one per admitted agent) would pay that budget PER AGENT, serialised on
-/// one worker thread, ahead of `forward_gateway_pending()`. During a database or pool outage that
-/// turns a 5,000-agent push into hours.
+/// A single dispatch pays for that write once, so it keeps the tracker's ordinary lease budget
+/// (`ExecutionTracker`'s `kWriteTimeout`, 2 s). A loop that mints one command per agent (today:
+/// the operator Guardian rule push, one `__guard__` command id per target) would pay that budget
+/// PER AGENT, serialised on one worker thread, ahead of `forward_gateway_pending()`. During a
+/// database or pool outage that turns a 5,000-agent push into hours. (The heartbeat reconcile push
+/// and the asset-tag push also mint one id per agent, but they are one write per call, not a
+/// loop, and keep the ordinary budget; the pool already clamps an acquire on a saturated pool to
+/// 500 ms. Every other `build_classified_command` caller builds ONE command and fans that same
+/// object out, so it is one write per dispatch however many agents it reaches.)
 ///
 /// The fix is CALLER-KEYED, not tracker-wide. A loop declares a `DispatchRecordLatch` and passes
 /// its address down to the record write:

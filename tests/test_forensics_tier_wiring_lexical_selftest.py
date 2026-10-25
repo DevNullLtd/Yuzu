@@ -298,12 +298,17 @@ def main() -> int:
            "the seam pin must be a tree-wide row")
     tree_spell = {
         "prov-no-extract-plugin-tree": ("hardware_routes.cpp", "auto p = extract_plugin(command_id);"),
+        "prov-latch-confined-to-loops": ("hardware_routes.cpp",
+                                         'yuzu::server::DispatchRecordLatch l{"x"};'),
         "prov-test-seam-unused": ("hardware_routes.cpp", "svc.override_command_record_lookup(fn);"),
     }
     expect(set(tree_spell) == {rid for rid, *_ in g.PROVENANCE_TREE_ABSENT},
            "every tree-wide provenance pin has a selftest spelling")
     for rid, (fname, extra) in tree_spell.items():
+        exempt = next(e for r, _p, e, _w in g.PROVENANCE_TREE_ABSENT if r == rid)
         for target in (fname, "server.cpp", "agent_service_impl.cpp"):
+            if target in exempt:
+                continue  # an exempt file is guarded by its own exact-count rows (mutated below)
             crafted = dict(tree)
             crafted[target] = crafted[target] + "\n" + extra + "\n"
             expect(rid in ids(g.provenance_tree_problems(crafted)),
@@ -334,6 +339,53 @@ def main() -> int:
             sc["server.cpp"] = broken
             expect("prov-record-after-finalize" in ids(g.provenance_problems(asrc, sc)),
                    "recording the caller's raw plugin string instead of the wire plugin was NOT detected")
+    # #4990: the dispatch-record latch pins. Each is a mutation of the REAL source (a regex
+    # substitution that must match, so a moved statement fails the selftest instead of passing
+    # vacuously), and the pin named must go red on it.
+    latch_mutations = [
+        # (pin id, file, regex over the raw source, replacement, what it models)
+        ("prov-latch-guardian-loop", "server.cpp",
+         r"(push\.SerializeAsString\(\),[^;]*?\{\}, )&record_latch\)", r"\1nullptr)",
+         "the operator Guardian push loop dispatches without its latch"),
+        ("prov-latch-passed-once", "server.cpp",
+         r"build_classified_command\(caller, plugin, action, command_id\);",
+         "build_classified_command(caller, plugin, action, command_id, {}, {}, 0, 0, {}, {}, "
+         "caller.system ? &record_latch : nullptr);",
+         "a dispatch route keyed on the wrong thing (the system flag) passes a latch"),
+        ("prov-latch-passed-once", "server.cpp",
+         r"(std::string\(dispatch_arm_label\(arm\)\), execution_id)\);", r"\1, &record_latch);",
+         "dispatch_confined (every REST/MCP/dashboard/scheduler dispatch) passes a latch"),
+        ("prov-latch-declarations", "server.cpp",
+         r"(yuzu::server::DispatchRecordLatch record_latch\{\"operator Guardian push\"\};)",
+         r'\1 yuzu::server::DispatchRecordLatch record_latch{"third"};',
+         "a third loop declares a latch"),
+        ("prov-latch-param-defaults-null", "server.cpp",
+         r"DispatchRecordLatch\* record_latch = nullptr\)", "DispatchRecordLatch* record_latch)",
+         "the builder's latch parameter loses its null default"),
+        ("prov-record-after-finalize", "server.cpp",
+         r"execution_id, record_latch\);", "execution_id);",
+         "the chokepoint stops handing the latch to the record write"),
+        ("prov-latch-skip-after-trip", "agent_service_impl.cpp",
+         r"if \(latch && latch->tripped\(\)\)", "if (false && latch && latch->tripped())",
+         "a tripped latch no longer skips the later writes"),
+        ("prov-latch-short-budget", "agent_service_impl.cpp",
+         r"latch->lease_timeout\(\)", "std::chrono::milliseconds{2000}",
+         "a latched write keeps the ordinary lease budget"),
+        ("prov-latch-trips-on-failure", "agent_service_impl.cpp",
+         r"if \(latch\)\s+latch->trip\(\);", "",
+         "a failed write never trips the latch"),
+    ]
+    for rid, fname, rx, repl, models in latch_mutations:
+        raw = asrc if fname == "agent_service_impl.cpp" else psources[fname]
+        mutated, n = re.subn(rx, repl, raw, count=1)
+        expect(n == 1, f"{rid}: the mutation for '{models}' no longer matches the real source")
+        a2, s2 = asrc, dict(psources)
+        if fname == "agent_service_impl.cpp":
+            a2 = mutated
+        else:
+            s2[fname] = mutated
+        expect(rid in ids(g.provenance_problems(a2, s2)), f"{rid}: '{models}' was NOT detected")
+
     # A comment mentioning a pinned token is not a use of it; a missing file is named.
     expect(g.provenance_problems(asrc + "\n// extract_plugin(x) resolve_execution_id(y)\n", psources) == [],
            "a comment mentioning a banned spelling is not one")

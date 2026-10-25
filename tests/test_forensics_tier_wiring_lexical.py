@@ -476,15 +476,43 @@ PROVENANCE_EXACT: dict[str, list[tuple[str, str, int, str]]] = {
          "the registry audit decides by the resolved plugin"),
         ("prov-live-output-by-resolved-plugin", r"publish_output_rows\(agent_id,plugin,resp\.output\(\)\)", 2,
          "the live output stream decides by the resolved plugin"),
+        ("prov-latch-skip-after-trip",
+         r"if\(latch&&latch->tripped\(\)\)\{latch->note_skipped\(\);"
+         r"metrics_\.counter\(\"yuzu_exec_correlation_write_degrade_total\"\)\.increment\(\);return;\}", 1,
+         "a write after the loop's first failure is skipped AND counted as a degrade"),
+        ("prov-latch-short-budget",
+         r"latch\?tracker->record_command_dispatch\(command_id,plugin,execution_id,latch->lease_timeout\(\)\)"
+         r":tracker->record_command_dispatch\(command_id,plugin,execution_id\)", 1,
+         "a latched write uses the short fan-out lease budget; an unlatched one the ordinary budget"),
+        ("prov-latch-trips-on-failure", r"if\(!recorded\)\{if\(latch\)latch->trip\(\);", 1,
+         "the first failed write of a latched loop trips the latch"),
     ],
     "server.cpp": [
         ("prov-chokepoint-records-once", r"agent_service_\.record_command_dispatch\(", 1,
          "the dispatch record is written at exactly one place: build_classified_command"),
         ("prov-record-after-finalize",
          r"if\(!finalized\)\{.{0,1500}?\}agent_service_\.record_command_dispatch\(command_id,"
-         r"finalized->wire\(\)\.plugin\(\),execution_id\);return\*finalized;", 1,
+         r"finalized->wire\(\)\.plugin\(\),execution_id,record_latch\);return\*finalized;", 1,
          "the record is written after classification, authorization and the kill switch (a denied "
          "dispatch records nothing), with the wire plugin, just before the command is handed back"),
+        ("prov-latch-param-defaults-null",
+         r"\bDispatchRecordLatch\*record_latch=nullptr\)", 1,
+         "the builder's latch parameter defaults to null: every caller that does not name a latch "
+         "keeps the ordinary lease budget and is never skipped"),
+        ("prov-latch-declarations", r"DispatchRecordLatch record_latch\{", 1,
+         "exactly one loop declares a dispatch-record latch (the operator Guardian push); a second "
+         "needs this pin, the doc and a review"),
+        ("prov-latch-passed-once", r"&record_latch", 1,
+         "a latch is handed to build_classified_command at exactly the one loop site; any other "
+         "dispatch (REST, MCP, dashboard, workflow, scheduler, policy, preflight) keeps the "
+         "ordinary lease budget"),
+        ("prov-latch-guardian-loop",
+         r"int sent=0;yuzu::server::DispatchRecordLatch record_latch\{\"operator Guardian push\"\};"
+         r"for\(const auto&aid:targets\)\{.{0,1500}?build_classified_command\("
+         r"yuzu::server::DispatchCaller\{\.system=true\},\"__guard__\",\"push_rules\",push_command_id,"
+         r"\{\},push\.SerializeAsString\(\),0,0,\{\},\{\},&record_latch\);", 1,
+         "the operator Guardian push declares its latch immediately before the per-target loop, "
+         "inside the scope of that one push, and hands it to every per-target dispatch"),
         ("prov-no-old-record-api",
          r"\brecord_execution_id\b|\brecord_command_execution\b|\blookup_execution_id\b|\bresolve_execution_id\b",
          0, "the pre-provenance record/lookup API is gone"),
@@ -518,6 +546,13 @@ PROVENANCE_TREE_ABSENT: list[tuple[str, str, frozenset[str], str]] = [
     ("prov-no-extract-plugin-tree", r"\bextract_plugin\(", frozenset(),
      "no production file may parse a plugin out of a command id (the helper was deleted; the stored "
      "plugin is the server's dispatch record)"),
+    ("prov-latch-confined-to-loops", r"\bDispatchRecordLatch\b",
+     frozenset({"server.cpp", "agent_service_impl.cpp", "agent_service_impl.hpp",
+                "dispatch_record_policy.hpp"}),
+     "the dispatch-record latch belongs to the one per-target loop in server.cpp and the record "
+     "path in agent_service_impl; no route, MCP, dashboard, workflow or runner file may name it "
+     "(their dispatches keep the ordinary lease budget). The exempt files have exact-count pins "
+     "of their own"),
     ("prov-test-seam-unused", r"\boverride_command_record_lookup\b", frozenset({"agent_service_impl.hpp"}),
      "no production file may install a record source: it is a unit-harness seam only, declared in "
      "agent_service_impl.hpp and called from tests"),
