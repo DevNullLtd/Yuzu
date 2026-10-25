@@ -1958,7 +1958,45 @@ quiet tail, which is the peak-contention wave: a false-red nightly opens
 `nightly-broken` and blocks merges to main, so read eunit's duration on the first
 nightlies after this merges (the wrapper's own deadline is a fixed 540 s, not
 scaled by `--timeout-multiplier 2`, about 4.5 times its healthy 120 s).
-*Samples:* pending.
+*Samples (measured, 2026-10-24).* Two same-SHA samples on the PR #6458 head
+`316123631` (run 40130611655, attempt 1 jobs 120981418470 Linux and 120981418546
+Windows, attempt 2 jobs 121000195367 Linux and 121000195360 Windows), against
+the Push 2a np=4 samples (jobs 120944791805 and 120949716811) and, as a drift
+control, np=4 `dev` pushes without the priority.
+
+| Linux gcc-15 debug | np=4, no priority | priority 120, attempt 1 | priority 120, attempt 2 |
+|---|---|---|---|
+| `Test (non-pg suites)` step | 291 s, 292 s | 249 s | 250 s |
+| cheap-suites invocation wall | 224 s, 224 s | 181 s | 180 s |
+| second invocation wall | 67 s | 67.5 s | 69 s |
+| worst per-entry ratio (5 s or more) | | 1.03x | 1.04x |
+| entries; Ok / Fail / Skipped | 105; 100 / 0 / 5 | same | same |
+
+Rule (a): the step fell about 42 s (-14%) against the Push 2a samples; against
+the np=4 `dev` pushes of the same evening (280 s, 282 s, 288 s, no priority) it is
+about -12%, still above the 10% bar. Rule (b): the worst entry of 5 s or more is
+1.04x; `gateway eunit` 119.0 s (against 120.0 s and 120.9 s), `gateway ct`
+34.7 s, the SIGTERM harness 58.9 s with no `FAIL:` or `still alive`, agent
+shards A, B, C unchanged. Rule (c): the largest share of an entry's own timeout
+is still agent shard B at 35%. Entry and skip counts are unchanged; no revert
+trigger fired. The replay predicted 179 s and a step near 247 s; the runs gave
+181 s and 249 s to 250 s. The serial sums are 618 s against 619 s and 620 s: the
+work is the same, only the order changed.
+
+Windows MSVC debug (first measurement, one baseline job): the same step took 285
+s and 284 s against 341 s in the #6436 job, and the invocation wall 283 s against
+339 s, about 56 s saved (the replay predicted 275 s against 337 s). `gateway
+eunit` took 180 s and 179 s against 171.5 s (1.05x), as the new tail the
+replay expected was `agent unit tests shard C` (145 s of 240 s). The worst
+per-entry ratio is 1.18x (`server unit tests shard A`), none exceeds 1.5x, and
+all 29 entries passed. This was not part of the decision rule.
+
+Outside the rule: the pg-shards step took 604 s and 695 s in these two attempts,
+and 641 s and 662 s in the `dev` pushes at 20:03 and 21:07 without the
+priority (474 s to 521 s that morning): the pg step drifted upward through the
+evening on every run, with or without this change, so it says nothing about the
+priority. Eunit's duration on the first nightlies after merge is still to be
+read (see above).
 
 ### Persistent runner-local test history
 
