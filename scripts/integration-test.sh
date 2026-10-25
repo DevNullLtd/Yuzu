@@ -581,8 +581,10 @@ if ! $REUSE_STACK; then
     # the flag form (not the environment form) is correct.
     #
     # --mfa-step-up-window-secs is short so Test 19a can age an MFA proof past the
-    # window in a few seconds. Nothing else in this script logs in as the admin or
-    # calls a step-up-gated route, so the short window affects no other test.
+    # window in a few seconds. The only other admin login is the Phase 5a REST
+    # driver (--tls), which calls no step-up-gated route, so the short window
+    # affects no other test. 19a runs after that driver because it enrols TOTP on
+    # the admin, after which a password-only login answers 202 mfa_required.
     STEPUP_WINDOW_SECS=3
     # shellcheck disable=SC2086
     "$BUILDDIR/server/core/yuzu-server" "${SERVER_COMMON[@]}" \
