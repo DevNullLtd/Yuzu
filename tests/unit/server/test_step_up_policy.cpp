@@ -71,11 +71,11 @@ TEST_CASE("step-up policy: the gated set is exactly the 37 routes with an in-han
 
 TEST_CASE("step-up policy: the table's total and per-class row counts are pinned",
           "[stepup][policy]") {
-    // Executable pins for the table counts (233 mutating REST routes: 37 required, 3 own-gate,
-    // 120 exempt, 73 pending). A row added or reclassified without these numbers moving
+    // Executable pins for the table counts (235 mutating REST routes: 37 required, 3 own-gate,
+    // 122 exempt, 73 pending). A row added or reclassified without these numbers moving
     // together fails here.
-    CHECK(kStepUpPolicyCount == 233);
-    CHECK(count_class(StepUpClass::kExempt) == 120);
+    CHECK(kStepUpPolicyCount == 235);
+    CHECK(count_class(StepUpClass::kExempt) == 122);
     CHECK(count_class(StepUpClass::kPendingRuling) == 73);
     CHECK(count_class(StepUpClass::kRequired) + count_class(StepUpClass::kOwnGate) +
               count_class(StepUpClass::kStrong) + count_class(StepUpClass::kExempt) +

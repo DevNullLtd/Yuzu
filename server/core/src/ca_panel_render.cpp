@@ -161,9 +161,20 @@ std::string crl_panel(const Crl& c) {
     return h + "</section>";
 }
 
+// Trailing hint of the issued-certificates panel: shown with the inventory and, in its place,
+// with the note a caller who may not list the inventory sees (as the Settings fragment's
+// footer does).
+constexpr const char* kReplaceDefaultsHint =
+    "<div class=\"pb hint\">To replace the default certificates with operator- or "
+    "HSM-issued material, use <a href=\"/settings\">TLS / mTLS Configuration</a> on the "
+    "Settings page.</div>";
+
 std::string issued_panel(const Model& m) {
     std::string h = "<section class=\"panel\" id=\"issued-panel\"><div class=\"hd\"><h2>Issued "
                     "certificates</h2></div>";
+    if (!m.inventory_note.empty())
+        return h + "<div class=\"pb\"><span class=\"feedback-error\">" + esc(m.inventory_note) +
+               "</span></div>" + kReplaceDefaultsHint + "</section>";
     if (m.inventory_error)
         return h + "<div class=\"pb\"><span class=\"feedback-error\">Certificate inventory "
                    "unavailable (store error).</span></div></section>";
@@ -205,9 +216,7 @@ std::string issued_panel(const Model& m) {
              " certificates. To find an older one, page <code>GET /api/v1/ca/issued?offset=</code>; "
              "revoke it with <code>POST /api/v1/ca/revoke</code>.</div>";
     }
-    h += "<div class=\"pb hint\">To replace the default certificates with operator- or "
-         "HSM-issued material, use <a href=\"/settings\">TLS / mTLS Configuration</a> on the "
-         "Settings page.</div>";
+    h += kReplaceDefaultsHint;
     return h + "</section>";
 }
 

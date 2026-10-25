@@ -39,8 +39,9 @@ std::optional<WriteRefusal> write_refusal(const std::string& key, const auth::Se
     if (!write_class)
         return std::nullopt;
 
-    // A route-owned key (today only dex_score_policy: one document that will have its own
-    // writer, which validates it whole; a generic single-value write could leave it half-edited).
+    // A route-owned key (today only dex_score_policy: one document with its own writer,
+    // PUT/DELETE /api/v1/dex/score-policy, which validates it whole; a generic
+    // single-value write could leave it half-edited).
     if (*write_class == ConfigWriteClass::RouteOwned) {
         const bool dex = key == kDexScorePolicyKey;
         return WriteRefusal{
@@ -49,7 +50,7 @@ std::optional<WriteRefusal> write_refusal(const std::string& key, const auth::Se
                                          "PUT /api/v1/dex/score-policy")
                            : key + " is written only through its own route",
             .remediation = dex ? "send the whole policy document to PUT /api/v1/dex/score-policy "
-                                 "with If-Match (not yet available in this release)"
+                                 "with If-Match"
                                : "use the route that owns this key",
             .audit_detail = {}};
     }

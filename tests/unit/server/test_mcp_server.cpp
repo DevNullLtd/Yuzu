@@ -20421,6 +20421,16 @@ yuzu::test::PgTestTemplate mcp_ca_store_tpl{
         if (!store.is_open())
             throw std::runtime_error("ca_store template: store failed to migrate");
     }};
+
+// The unfiltered inventory asks the same standing probe as the filtered form: an unwired probe
+// fails closed, so a test that wants the list wires an "available" caller.
+std::size_t mcp_audit_count(const McpTestServer& ts, const std::string& entry) {
+    return static_cast<std::size_t>(std::ranges::count(ts.audit_log, entry));
+}
+
+yuzu::server::mcp::McpServer::CryptoAccessFn mcp_ca_available =
+    [](const httplib::Request&, yuzu::server::crypto_widgets::WidgetGate, const std::string&,
+       const std::string&) { return yuzu::server::crypto_widgets::Access::kAvailable; };
 } // namespace
 
 TEST_CASE("MCP CA: list_issued_certs returns the CA inventory (Security:Read)",
@@ -20439,6 +20449,7 @@ TEST_CASE("MCP CA: list_issued_certs returns the CA inventory (Security:Read)",
 
     McpTestServer ts;
     ts.ca_store_for_test = &store;
+    ts.crypto_access_fn_for_test = mcp_ca_available; // the inventory asks the standing probe
     ts.start("operator"); // operator tier allows Security:Read
 
     auto res = ts.call(
@@ -20494,6 +20505,7 @@ TEST_CASE("MCP CA: list_issued_certs reports the stored CRL's figures value by v
 
     McpTestServer ts;
     ts.ca_store_for_test = &store;
+    ts.crypto_access_fn_for_test = mcp_ca_available; // the inventory asks the standing probe
     ts.start("operator");
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_issued_certs"}})");
@@ -20527,6 +20539,7 @@ TEST_CASE("MCP CA: list_issued_certs reads limit/offset as 64 bits, saturates, a
     }
     McpTestServer ts;
     ts.ca_store_for_test = &store;
+    ts.crypto_access_fn_for_test = mcp_ca_available; // the inventory asks the standing probe
     ts.start("operator");
 
     const auto call = [&ts](const std::string& args) {
@@ -20583,6 +20596,175 @@ TEST_CASE("MCP CA: list_issued_certs reads limit/offset as 64 bits, saturates, a
     }
 }
 
+TEST_CASE("MCP CA: list_issued_certs unfiltered writes a success audit row; a dropped row is "
+          "reported and not fatal",
+          "[mcp][integration][pki][security][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "A0D1";
+    rec.subject = "agent-audited";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec).has_value());
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.crypto_access_fn_for_test = mcp_ca_available;
+    ts.start("operator");
+    auto body = nlohmann::json::parse(
+        ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_issued_certs"}})")
+            ->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["count"] == 1);
+    CHECK_FALSE(payload.contains("audit_persisted"));
+    CHECK(mcp_audit_count(ts, "crypto.ca.certificates.view|success") == 1);
+    REQUIRE_FALSE(ts.audit_details.empty());
+    CHECK_THAT(ts.audit_details.front(),
+               Catch::Matchers::ContainsSubstring("inventory rows=1 limit=200 offset=0"));
+    // The unrestricted standing is named on the row (kAvailable), not only kRefused.
+    CHECK_THAT(ts.audit_details.front(), Catch::Matchers::ContainsSubstring("standing=available"));
+
+    // The filtered form's policy: a dropped audit row marks the payload and the page is served.
+    ts.audit_succeeds_ = false;
+    body = nlohmann::json::parse(
+        ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"list_issued_certs"}})")
+            ->body);
+    REQUIRE(body.contains("result"));
+    payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["count"] == 1);
+    CHECK(payload["audit_persisted"] == false);
+}
+
+TEST_CASE("MCP CA: kRefused is withheld like a confined caller - no row text in the reply or the "
+          "audit detail, a denied row and never a success row",
+          "[mcp][integration][pki][security][pg]") {
+    // kRefused = the access check admitted nobody and did not answer 503: no Inventory grant at
+    // all. Not an affirmative admission, so not served (independent adjudication of CA-U2 /
+    // CA-U12 / CH-2, 2026-10-24; supersedes the 2026-10-23 "keep serving" ruling). The REST twin
+    // is in test_ca_routes.cpp; a failed read is answered 503 before it can become a kRefused.
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "A0D2";
+    rec.subject = "agent-refused-withheld";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec).has_value());
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.crypto_access_fn_for_test = [](const httplib::Request&, yuzu::server::crypto_widgets::WidgetGate,
+                                      const std::string&, const std::string&) {
+        return yuzu::server::crypto_widgets::Access::kRefused;
+    };
+    ts.start("operator");
+    const auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_issued_certs"}})");
+    REQUIRE(res);
+    CHECK(res->body.find("agent-refused-withheld") == std::string::npos);
+    CHECK(res->body.find("A0D2") == std::string::npos);
+    CHECK(nlohmann::json::parse(res->body).contains("error"));
+    CHECK(res->body.find("holds no read access") != std::string::npos); // the refusal text
+    CHECK(mcp_audit_count(ts, "crypto.ca.certificates.view|denied") == 1);
+    CHECK(mcp_audit_count(ts, "crypto.ca.certificates.view|success") == 0);
+    bool saw_refused_token = false;
+    for (const auto& d : ts.audit_details) {
+        CHECK(d.find("agent-refused-withheld") == std::string::npos);
+        CHECK(d.find("standing=refused") == std::string::npos);
+        saw_refused_token = saw_refused_token || d.find("withheld=refused") != std::string::npos;
+    }
+    CHECK(saw_refused_token);
+}
+
+TEST_CASE("MCP CA: a confined caller is withheld a populated inventory - no row text in the reply "
+          "or the audit detail",
+          "[mcp][integration][pki][security][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "A0D3";
+    rec.subject = "agent-confined-secret";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec).has_value());
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store; // a REAL populated store, unlike the null-store cases
+    ts.crypto_access_fn_for_test = [](const httplib::Request&, yuzu::server::crypto_widgets::WidgetGate,
+                                      const std::string&, const std::string&) {
+        return yuzu::server::crypto_widgets::Access::kConfined;
+    };
+    ts.start("operator");
+    const auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_issued_certs"}})");
+    REQUIRE(res);
+    CHECK(res->body.find("agent-confined-secret") == std::string::npos);
+    CHECK(res->body.find("A0D3") == std::string::npos);
+    CHECK(nlohmann::json::parse(res->body).contains("error"));
+    CHECK(mcp_audit_count(ts, "crypto.ca.certificates.view|denied") == 1);
+    CHECK(mcp_audit_count(ts, "crypto.ca.certificates.view|success") == 0);
+    for (const auto& d : ts.audit_details)
+        CHECK(d.find("agent-confined-secret") == std::string::npos);
+}
+
+TEST_CASE("MCP CA: an unfiltered list_issued_certs store read failure is a retryable error with "
+          "a failure row",
+          "[mcp][integration][pki][security][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "A0D4";
+    rec.subject = "agent-store-down-secret";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec).has_value());
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.crypto_access_fn_for_test = mcp_ca_available;
+    ts.start("operator");
+
+    // Returns false instead of throwing so the restore guard below is safe in a destructor.
+    auto rename_issued = [&](const char* sql) -> bool {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        if (PQstatus(conn.get()) != CONNECTION_OK)
+            return false;
+        yuzu::server::pg::PgResult r{PQexec(conn.get(), sql)};
+        return r.ok();
+    };
+    // Restores the table on every exit from this test (a failed REQUIRE below included), so a
+    // failure here cannot leave the cloned database without ca_issued. CHECK never throws.
+    struct RestoreIssued {
+        decltype(rename_issued)& fn;
+        ~RestoreIssued() {
+            CHECK(fn("ALTER TABLE ca_store.ca_issued_r2_gone RENAME TO ca_issued"));
+        }
+    };
+    REQUIRE(rename_issued("ALTER TABLE ca_store.ca_issued RENAME TO ca_issued_r2_gone"));
+    const RestoreIssued restore{rename_issued};
+    const auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_issued_certs"}})");
+    REQUIRE(res);
+    CHECK(res->body.find("agent-store-down-secret") == std::string::npos);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    // Retryable, as the REST twin's 503 (retry_after_ms 5000).
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(mcp_audit_count(ts, "crypto.ca.certificates.view|failure") == 1);
+    CHECK(mcp_audit_count(ts, "crypto.ca.certificates.view|success") == 0);
+    REQUIRE_FALSE(ts.audit_details.empty());
+    CHECK_THAT(ts.audit_details.front(),
+               Catch::Matchers::ContainsSubstring("inventory store unavailable"));
+}
+
 TEST_CASE("MCP CA: list_issued_certs is allowed on the readonly tier (Security:Read)",
           "[mcp][integration][pki][security][pg]") {
     // #1240 L3: the readonly tier permits ALL Read ops, so a read-only agentic
@@ -20600,6 +20782,7 @@ TEST_CASE("MCP CA: list_issued_certs is allowed on the readonly tier (Security:R
 
     McpTestServer ts;
     ts.ca_store_for_test = &store;
+    ts.crypto_access_fn_for_test = mcp_ca_available; // the inventory asks the standing probe
     ts.start("readonly");
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"list_issued_certs"}})");
@@ -20613,6 +20796,7 @@ TEST_CASE("MCP CA: list_issued_certs is allowed on the readonly tier (Security:R
 TEST_CASE("MCP CA: list_issued_certs without a CA returns an error, not a crash",
           "[mcp][integration][pki]") {
     McpTestServer ts; // ca_store_for_test stays nullptr
+    ts.crypto_access_fn_for_test = mcp_ca_available;
     ts.start("operator");
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"list_issued_certs"}})");
@@ -40815,6 +40999,8 @@ TEST_CASE("MCP list_issued_certs filtered: the rows behind a count, strict, pinn
     CHECK(sc["filter"]["bucket"] == "superseded");
     CHECK(sc["items"][0]["revocation_reason"] == "superseded");
     CHECK(mcp_audits(ts, "crypto.ca.certificates.view|success") == 1);
+    REQUIRE_FALSE(ts.audit_details.empty());
+    CHECK_THAT(ts.audit_details.front(), Catch::Matchers::ContainsSubstring("standing=available"));
 
     // The next page passes the cursor through to the seam (which decodes and binds it).
     auto next = mcp_tool_call(ts, "list_issued_certs",
@@ -40861,6 +41047,69 @@ TEST_CASE("MCP list_issued_certs filtered: a confined Security:Read holder is wi
     CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
     CHECK(fake->cert_queries.empty());
     CHECK(mcp_audits(ts, "crypto.ca.certificates.view|denied") == 1);
+    // The filtered form's denied row names its own target.
+    REQUIRE_FALSE(ts.audit_target_ids.empty());
+    CHECK(ts.audit_target_ids.front() == "filtered");
+}
+
+TEST_CASE("MCP list_issued_certs unfiltered: a confined Security:Read holder is withheld and audited "
+          "denied and no store is read",
+          "[mcp][crypto][widgets][ca][security]") {
+    // ca_store_for_test stays null: a confined caller must be answered before the store is
+    // touched, so no `failure` row for an unavailable store may appear either.
+    McpTestServer ts;
+    ts.crypto_access_fn_for_test = [](const httplib::Request&, cw::WidgetGate, const std::string&,
+                                      const std::string&) { return cw::Access::kConfined; };
+    ts.start();
+    for (const char* args : {"{}", R"({"limit":5,"offset":2})"}) {
+        INFO(args);
+        auto body = mcp_tool_call(ts, "list_issued_certs", args);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK_FALSE(body["error"]["data"].contains("permission"));
+        CHECK_THAT(body["error"]["message"].get<std::string>(),
+                   Catch::Matchers::ContainsSubstring("confined"));
+    }
+    CHECK(mcp_audits(ts, "crypto.ca.certificates.view|denied") == 2);
+    CHECK(mcp_audits(ts, "crypto.ca.certificates.view|failure") == 0);
+    CHECK(mcp_audits(ts, "crypto.ca.certificates.view|success") == 0);
+    // One detail shape (audit_detail_ca_withheld) and a target on the denied row.
+    REQUIRE_FALSE(ts.audit_details.empty());
+    CHECK_THAT(ts.audit_details.front(), Catch::Matchers::ContainsSubstring("ws="));
+    CHECK_THAT(ts.audit_details.front(), Catch::Matchers::ContainsSubstring("withheld=confined"));
+    CHECK(ts.audit_target_ids.front() == "inventory");
+}
+
+TEST_CASE("MCP list_issued_certs unfiltered: a degraded or unwired standing probe fails closed",
+          "[mcp][crypto][widgets][ca][security]") {
+    {
+        McpTestServer ts;
+        ts.crypto_access_fn_for_test = [](const httplib::Request&, cw::WidgetGate,
+                                          const std::string&, const std::string&) {
+            return cw::Access::kDegraded;
+        };
+        ts.start();
+        auto body = mcp_tool_call(ts, "list_issued_certs", "{}");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(mcp_audits(ts, "crypto.ca.certificates.view|success") == 0);
+        // The access check could not be completed: audited failure (as get_crypto_ca_stats).
+        CHECK(mcp_audits(ts, "crypto.ca.certificates.view|failure") == 1);
+        REQUIRE_FALSE(ts.audit_target_ids.empty());
+        CHECK(ts.audit_target_ids.front() == "inventory");
+        CHECK_THAT(ts.audit_details.front(),
+                   Catch::Matchers::ContainsSubstring("access check unavailable"));
+    }
+    {
+        McpTestServer ts; // crypto_access_fn_for_test unset
+        ts.start();
+        auto body = mcp_tool_call(ts, "list_issued_certs", "{}");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(mcp_audits(ts, "crypto.ca.certificates.view|success") == 0);
+    }
 }
 
 // ── M.10b: ecosystem enums and pipe list are generated from kEcosystemFamilies ──────────────
