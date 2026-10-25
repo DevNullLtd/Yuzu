@@ -359,7 +359,9 @@ def erl_code_mask(text):
                 if escaped:
                     escaped = False
                     if ch == "^" and end < n:
-                        end += 1  # \^X is three characters; X may be \, never the quote
+                        # \^X is three characters. X may be \ but never the
+                        # quote (erlc rejects that), so X is skipped unchecked.
+                        end += 1
                 elif ch == "\\":
                     escaped = True
                 elif ch == c:
@@ -452,9 +454,10 @@ def scan_erl_help_surface(root):
         for line, tuple_text in find_erl_help_tuples(strings_only, mask):
             tuple_count += 1
             # No byte offset: non_ascii_findings measures it from the start of
-            # tuple_text (base_offset never enters it), and tuple_text is a slice of
-            # the strings-only view, where each blanked multi-byte character
-            # is one space, so it is neither file- nor tuple-accurate in bytes.
+            # tuple_text (base_offset never reaches the reported byte offset),
+            # and tuple_text is a slice of the strings-only view, where each
+            # blanked multi-byte character is one space, so it is neither
+            # file- nor tuple-accurate in bytes.
             # The line number is exact.
             findings.extend((r, l, None, ch)
                             for r, l, _b, ch in non_ascii_findings(rel, line, 0, tuple_text, erlang=True))
@@ -835,10 +838,11 @@ def run_selftest():
             return 1
 
         # Regression for exponential backtracking: an unterminated string made
-        # of a long run of \^ (not valid Erlang; erlc rejects it) must not
-        # stall the scan. With overlapping escape alternatives 42 repeats take
-        # tens of seconds; the mutually exclusive ones take milliseconds, so
-        # the 5 s ceiling only catches the regression, never a slow runner.
+        # of a long run of \^ (not valid Erlang; erlc rejects it). With
+        # overlapping escape alternatives 42 repeats take tens of seconds; the
+        # mutually exclusive ones take milliseconds. The elapsed time is
+        # checked after the scan returns, so a regression still runs to
+        # completion before failing; 5 s is about 1000x the healthy time.
         started = time.monotonic()
         erl_case("erl_caret_backtrack", "src",
                  'declare() -> prometheus_counter:declare([{name, a}, {help, "' + '\\^' * 42 + '\n')
