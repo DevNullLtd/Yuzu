@@ -18,7 +18,7 @@
  * `..._UNIT_TEST_INTERNALS_ONLY` guard, which drops the one plugin-facing function so the file can be
  * included). `#if defined(_WIN32)` guards the WHOLE body -- empty TU elsewhere. Needs an elevated token
  * (a salted HKLM scratch key); like the dispatcher cases it WARN-skips otherwise, and
- * YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1 (the kingsley evidence jobs) turns that skip into a FAIL.
+ * YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1 (CI's Windows leg, #6488, and the evidence runs) turns that skip into a FAIL.
  */
 #if !defined(_WIN32)
 
@@ -185,6 +185,13 @@ struct LinkSweep {
     LinkSweep& operator=(const LinkSweep&) = delete;
 };
 
+/// `SOFTWARE\YuzuTest-[<scope>-]<salt>-<tag>`: the scope (YUZU_TEST_REGISTRY_SCOPE, set per job in CI) lets the
+/// job's leftover-key check tell its keys from a concurrent job's.
+std::string scratch_root(const char* tag) {
+    return "SOFTWARE\\" + yuzu::test::registry_scratch_prefix() + std::to_string(yuzu::test::process_random_salt()) + "-" +
+           tag;
+}
+
 } // namespace
 
 // A link whose TARGET is absent is the shape that matters for a create: a create that follows it makes the
@@ -194,8 +201,7 @@ struct LinkSweep {
 // (created_new becomes true, the handle is the Target, and the Target key exists afterwards).
 TEST_CASE("Win32Registry::create_sub opens a dangling registry link as the link and creates nothing through it",
           "[registry][windows][internals]") {
-    const std::string root =
-        "SOFTWARE\\YuzuTest-" + std::to_string(yuzu::test::process_random_salt()) + "-internals";
+    const std::string root = scratch_root("internals");
     ScratchTree cleanup{root};
 
     // The scratch parent, opened with the right the create needs. HKLM\SOFTWARE is writable only elevated.
@@ -242,7 +248,7 @@ TEST_CASE("Win32Registry::create_sub opens a dangling registry link as the link 
 // canonical name of what a path through it opens is the target's.
 TEST_CASE("Win32Registry::final_name names the object a handle is bound to and the probe reports a link leaf",
           "[registry][windows][internals]") {
-    const std::string root = "SOFTWARE\\YuzuTest-" + std::to_string(yuzu::test::process_random_salt()) + "-names";
+    const std::string root = scratch_root("names");
     ScratchTree cleanup{root};
     yuzu::win::RegKey sub;
     if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(root + "\\Target\\Sub").c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
@@ -350,8 +356,7 @@ TEST_CASE("Win32Registry::query_value returns a REG_SZ stored without its termin
     // The capture of a pre-existing value feeds the audit row's old= field: it must be the stored bytes. A
     // RegQueryValueExW into a roomy buffer may append a terminator the stored value never had; this pins that
     // the plugin's read does not report one.
-    const std::string root =
-        "SOFTWARE\\YuzuTest-" + std::to_string(yuzu::test::process_random_salt()) + "-unterminated";
+    const std::string root = scratch_root("unterminated");
     ScratchTree cleanup{root};
     yuzu::win::RegKey raw; // closes on every exit, a failed REQUIRE included
     if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(root).c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,

@@ -3,10 +3,11 @@
  * through yuzu::agent::LocalDispatcher against the live Windows registry (the pure logic is locked on
  * every host by test_registry_parsers.cpp / test_registry_core.cpp; this proves the Win32 binding).
  *
- * Every key lives under a salted `YuzuTest-<yuzu::test::process_random_salt()>` (#1871: a fixed registry
- * key is a cross-JOB shared resource) and an RAII guard removes each scratch object. Cases that need
- * elevation WARN and skip, and a skip is NOT evidence: YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1 (the
- * kingsley evidence jobs) turns every skip into a FAIL -- see skip_or_fail(). Off Windows this TU pins
+ * Every key lives under a salted `YuzuTest-[<scope>-]<yuzu::test::process_random_salt()>` (#1871: a fixed
+ * registry key is a cross-JOB shared resource; the optional scope is YUZU_TEST_REGISTRY_SCOPE, which CI sets per
+ * job so its leftover-key check is per job) and an RAII guard removes each scratch object. Cases that need
+ * elevation WARN and skip, and a skip is NOT evidence: YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1 (CI's Windows leg,
+ * #6488, and the evidence runs) turns every skip into a FAIL -- see skip_or_fail(). Off Windows this TU pins
  * the planned-stub contract of the loaded plugin and the ABI-containment catch of its execute() (the #else
  * branch).
  */
@@ -114,8 +115,8 @@ struct Plugin {
 
 /// A case that cannot run (registry.dll missing, the process not elevated, a fixture that could not
 /// be built) WARNs and returns -- unless YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS is set to a non-empty
-/// value other than "0", when it FAILs: a skipped real-registry run proves nothing, so the evidence
-/// runs (kingsley, elevated) set the variable and a skip there is red, never silently green.
+/// value other than "0", when it FAILs: a skipped real-registry run proves nothing, so CI's Windows leg and the
+/// evidence runs (elevated) set the variable and a skip there is red, never silently green.
 /// Callers `return` after calling it; FAIL throws, so that return is only reached on a plain skip.
 void skip_or_fail(const std::string& why) {
     const char* req = std::getenv("YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS");
@@ -129,7 +130,7 @@ const std::string& salt() {
     static const std::string s = std::to_string(yuzu::test::process_random_salt());
     return s;
 }
-std::string scratch_name() { return "YuzuTest-" + salt(); }
+std::string scratch_name() { return yuzu::test::registry_scratch_prefix() + salt(); }
 std::wstring widen(const std::string& s) { return std::wstring(s.begin(), s.end()); } // ASCII only
 
 bool put(HKEY root, const std::string& key, const std::string& name, DWORD type, const Bytes& data) {
