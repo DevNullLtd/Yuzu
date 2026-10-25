@@ -842,7 +842,7 @@ def run_selftest():
         # overlapping escape alternatives 42 repeats take tens of seconds; the
         # mutually exclusive ones take milliseconds. The elapsed time is
         # checked after the scan returns, so a regression still runs to
-        # completion before failing; 5 s is about 1000x the healthy time.
+        # completion before failing; 5 s is far above the healthy time.
         started = time.monotonic()
         erl_case("erl_caret_backtrack", "src",
                  'declare() -> prometheus_counter:declare([{name, a}, {help, "' + '\\^' * 42 + '\n')
