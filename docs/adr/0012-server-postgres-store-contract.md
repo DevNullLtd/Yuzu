@@ -324,3 +324,44 @@ devices reading as a regression. A degraded read returns `std::nullopt` (the typ
 and MCP surfaces turn into a 503 / internal error), distinct from an engaged empty result. Nothing
 about the rule changes: the owner borrows the pool, issues schema-qualified SQL, and no per-store
 class gained a cross-schema method.
+
+## Update (2026-10-25) -- a sixth query owner: MfaDisableOwner
+
+A sixth query owner: `MfaDisableOwner` (`mfa_disable_owner.{hpp,cpp}`, #6079), the ONLY writer of the
+Settings "Disable MFA" clear (including cancelling an unfinished enrolment) and of the break-glass
+`yuzu-server --mfa-reset` clear of a local account's second factor. Account deactivation also clears the
+factor, through `auth_sql::soft_delete_user_in_txn`, and ends the account's sessions in a separate step;
+that lifecycle is pre-existing and outside this owner. The owner is the same shape as
+`CredentialChangeOwner` above: one `pool.with_txn_for(kWriteTimeout)` on one lease, schema-qualified SQL
+across three schemas, no nested acquire. In order: `set_config('lock_timeout', ..., true)` (transaction
+scoped, so it bounds every lock wait that follows and never leaks to the pooled connection; it is a
+per-lock-wait bound, not a bound on the transaction, and no `statement_timeout` is set);
+`SELECT ... FROM auth.users ... FOR UPDATE` (classification under the lock: no active row is not found, and
+an admitted factor generation, passed by Settings and not by the CLI, that is no longer the row's is
+factor changed, with nothing written); the factor `UPDATE` and the `DELETE FROM auth.mfa_recovery_codes`;
+`DELETE FROM session_store.sessions` for the account (the shared `session_sql::delete_user_sessions_in_txn`),
+only when a verified factor was cleared or the CLI asks for the fail-safe; the success row through
+`AuditStore::log_in_txn` into `audit_store.audit_events`; and LAST, and only when sessions were deleted, the
+`session_meta` write-generation bump (`session_sql::bump_generation_in_txn`).
+
+The clear, the recovery codes, the sessions and the audit evidence therefore commit or abort together, and
+the audit is fail-closed: a failed INSERT, or an absent or closed audit store, clears nothing. There is no
+compensating write and no half-done state for an operator to repair. The results are ok, not found, factor
+changed, store unavailable and audit unavailable; store unavailable means nothing was written unless the
+connection was lost at COMMIT, in which case the transaction may have committed with every effect landed
+together.
+
+Why Settings and the CLI share one owner: both are the same clear with different actors. Before this owner
+the CLI cleared the factor and deleted the sessions as separate steps, which left windows (a factor cleared
+with a session made under it still alive, or a cleared factor with no audit row) that only an operator's
+manual repair could close. The CLI is a separate process with its own pool, so its correctness cannot rest on
+anything in the serving process; the invariants therefore live in the database transaction, and the only
+differences between the two callers are the request fields (`kind`, the admitted generation, and whether to
+end sessions of an account with no verified factor) and the audit template.
+
+Lock order (documented in the owner header; a change inverting it can deadlock), identical to
+`CredentialChangeOwner`: the `auth.users` row, then `session_store.sessions` rows, then the
+`audit_store.audit_events` INSERT, then LAST the `session_meta` `write_generation` row. It is acyclic for the
+reasons given above for `CredentialChangeOwner`. Like that owner, and like `RbacAdminAuthorityOwner`, it is
+correct only because `AuthDB`, `SessionStore` and `AuditStore` share ONE pool/database (ADR-0006); a split
+onto separate databases fails every statement closed, never a silent partial write.

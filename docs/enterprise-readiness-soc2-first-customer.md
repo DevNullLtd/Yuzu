@@ -527,15 +527,27 @@ follow-up; (b) clearing an account's MFA factor ends all of that account's dashb
 `yuzu-server --mfa-reset` and an administrator's own Disable in Settings (which needs a fresh step-up proof
 and signs the caller out too, except when it only cancels an enrolment that was never verified) clear the factor,
 delete the account's recovery codes and durable sessions and write the audit row in ONE database transaction
-(`MfaDisableOwner`, `docs/auth-architecture.md`), so there is no state with the factor cleared and a session
-still alive, and no partial outcome to repair. If any step fails, the audit INSERT included, the whole clear
-rolls back: Settings shows an inline error (and records an `error` row, unless the audit store itself was the failure), and `--mfa-reset` exits non-zero saying
-nothing was changed (the one exception is a connection lost at COMMIT, when every effect landed together and a
-re-run confirms it). The Settings audit row is therefore fail-closed: if the audit store cannot be written the
+(`MfaDisableOwner`, `docs/auth-architecture.md`), so in the database there is no state with the factor cleared
+and a session still alive (the in-process caches of other replicas follow within the cache bound below), and no
+partial outcome to repair. If any step fails, the audit INSERT included, the whole clear
+rolls back: Settings shows an inline error (and records an `error` row, unless the audit store itself was the
+failure or the account was not found, which write none), and `--mfa-reset` exits non-zero saying
+nothing was changed. The one exception is a connection lost at COMMIT: the transaction may have committed, in
+which case every effect landed together (the clear, the recovery codes, the session delete and the owner's `ok`
+row) while the handler also writes its `error` row, so both rows can exist for one clear. The
+`--mfa-reset` message for that case says to check the account's MFA status and the `mfa.reset.breakglass` row
+before re-running. The Settings audit row is therefore fail-closed: if the audit store cannot be written the
 factor is not cleared. `sessions_ended` counts the durable session rows deleted, expired rows not yet reaped
 included. Other replicas drop their cached sessions within about one second in normal operation and within 30
 seconds while a replica's session-generation poll is failing; neither bound holds after a database restore or a
-failover to a lagging standby (runbook, "Sessions are durable"). The comparison of the proof's factor generation with the account's
+failover to a lagging standby, although session expiry still applies (runbook, "Sessions are durable").
+During that cache bound a session cached on ANOTHER replica can reach the step-up-exempt enrolment routes
+(`POST /api/settings/mfa/init` and `/verify`, which authenticate from the in-process cache and take no
+password) and enrol an authenticator on the cleared account: the same accepted mechanism as the first-enrolment
+exposure described under (c) below. The approver gate is not reachable that way, because it reads the durable
+proof on every decision. When a clear is made for suspected compromise, end the account's sessions or restart
+the other replicas (runbook, "Ending the sessions by hand"); the Settings replica drops its own cache after the
+commit and the CLI is a one-shot with no cache. The comparison of the proof's factor generation with the account's
 current one (a proof of a replaced factor is refused after re-enrolment, `proof_factor_mismatch`) is the
 second line of defence: it reads no clock, so it stops a proof being reused after re-enrolment even when
 the database primary clock steps; the proof's age ceiling does assume that clock does not step backward.
@@ -561,7 +573,7 @@ the change ticket; an administrator who enrols itself in Settings is in the same
 exempt from step-up and asks for no password, so a stolen session of an administrator who has never enrolled
 could enrol an attacker-held authenticator and then satisfy the approver rule; `--mfa-enforcement=admin-only`
 or `required` makes sign-in enrol administrators, which narrows this to sessions that already exist when the
-mode is switched on; (d) the control exists only in builds that carry it, and tickets decided before this build gain no retroactive assurance; this build is a hard cutover from a fresh database with no upgrade or mixed-version path (`docs/user-manual/upgrading.md`), so there is no per-replica admission window to evidence; (e) the reviewer check compares account names only, so one person who holds two identities (a local and an SSO account, or two SSO identities) counts as two reviewers; this is a maintainer-accepted exception (ADR-1005 addendum of 2026-10-19; the acceptor is also the author of the change, so independent review rests on the pull request review, expected but not enforced by tooling), not a four-eyes guarantee across identities, and the compensating controls are narrowing the identity sources in use, an identity-to-HR-record check at the access review, and periodic sampling of reviewer and submitter pairs.
+mode is switched on; (d) the control exists only in builds that carry it, and tickets decided before this build gain no retroactive assurance; this build is a hard cutover from a fresh auth and session database with no upgrade path, and mixed-version operation is unsupported (`docs/user-manual/upgrading.md`); (e) the reviewer check compares account names only, so one person who holds two identities (a local and an SSO account, or two SSO identities) counts as two reviewers; this is a maintainer-accepted exception (ADR-1005 addendum of 2026-10-19; the acceptor is also the author of the change, so independent review rests on the pull request review, expected but not enforced by tooling), not a four-eyes guarantee across identities, and the compensating controls are narrowing the identity sources in use, an identity-to-HR-record check at the access review, and periodic sampling of reviewer and submitter pairs; (f) account deactivation clears the factor and recovery codes in the account transaction but ends the account's sessions in a separate step (`deactivated_but_session_wipe_failed` when it fails), and reactivation sets the account active again without wiping sessions or restoring any factor, so a surviving session becomes usable again; after reactivating such an account, end its sessions before it is used (runbook, "After reactivating a deactivated account"). This is pre-existing, outside #6079 PR 1, and deferred.
 Running `--mfa-enforcement=required` is no longer needed to enforce the approver factor, but it remains
 the only built-in way to enrol non-admin approvers without promoting them, so note its
 fleet-wide cost if you choose it for the enrolment window: the identity provider must assert an
@@ -598,7 +610,7 @@ passed, not the factor type, the proof age or the factor generation. The generat
 `mfa.step_up.passed` / `auth.oidc_login` rows, or, for a proof stamped by a Settings enrolment confirm, by
 `mfa.enroll.verified` with `step_up_proof=stamped`. Evidence for residual (b) is the `mfa.disabled` rows (the
 acting session's principal, role and session id; `result=ok` with `sessions_ended=<n>` is a committed clear,
-written by the clear's own transaction, while `denied` and `error` rows record a clear that changed nothing) and
+written by the clear's own transaction; a `denied` row records a clear that changed nothing, and an `error` row with no matching `ok` row for the same target also changed nothing, while an `error` row paired with an `ok` row within seconds is a clear that landed with its acknowledgement lost; a not-found account writes no row) and
 the `mfa.reset.breakglass` rows (principal is the OS identity that ran the command; written in the same
 transaction as the clear, so a row exists exactly when the clear committed); both are inside the
 `auth-sample` export (`docs/user-manual/audit-log.md`).

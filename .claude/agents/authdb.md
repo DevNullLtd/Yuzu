@@ -215,15 +215,21 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   a defect). `mfa_regenerate_recovery_codes` takes a REQUIRED
   `expected_factor_gen` and compares it under the `auth.users` row lock
   before writing (`FactorChanged`, deliberately NOT a store-unavailable error);
-  a new factor mutation does the same. **The production factor CLEAR is
-  `MfaDisableOwner` (`mfa_disable_owner.{hpp,cpp}`): ONE transaction on one
+  a new factor mutation does the same. **`MfaDisableOwner`
+  (`mfa_disable_owner.{hpp,cpp}`) is the only writer of the Settings Disable and
+  `--mfa-reset` clear:** ONE transaction on one
   lease (lock the `auth.users` row, compare the admitted generation, clear the
   factor, delete the recovery codes and every durable session, insert the
-  audit row, bump the session write-generation LAST), where any failure, the
-  audit INSERT included, rolls everything back. A second clear path, or a
+  audit row, bump the session write-generation last and only when sessions were
+  deleted), where any failure, the
+  audit INSERT included, rolls everything back. Account deactivation also clears
+  the factor and the recovery codes, through `auth_sql::soft_delete_user_in_txn`,
+  and ends sessions in a separate step (pre-existing, deferred; reactivation wipes no
+  sessions and restores no factor). A NEW factor-clear path outside the owner or the
+  deactivation helper, or a
   clear split across transactions, is CRITICAL; `AuthDB::mfa_disable` is a
   test-fixture un-enrol with no route or CLI caller.** The auth v3 migration
-  seeds nothing (a hard cutover from a fresh database): every existing row
+  seeds nothing (a hard cutover from a fresh auth and session database): every existing row
   starts at generation `0`. **A PR that writes `mfa_factor_gen`,
   weakens the trigger or its pinned-body check, publishes a verifier's success
   before COMMIT, takes the verification instant after the crypto check, or

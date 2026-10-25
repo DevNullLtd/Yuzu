@@ -264,7 +264,8 @@ specific to `remove_user`, not `mfa_disable`.)
 
 `mfa_disable` deletes the user's recovery codes alongside clearing the
 secret — leaving them around would let a disabled user authenticate via
-a stale code after re-enrolling.
+a stale code after re-enrolling. (The production clear, `MfaDisableOwner`, does the
+same inside its one transaction; `mfa_disable` is now a test-fixture un-enrol.)
 
 ---
 
@@ -581,7 +582,7 @@ Every transition writes to `AuditStore` via `AuthRoutes::audit_log`
 | `mfa.enroll.failed` | First code rejected (Settings or login bootstrap); or, detail `credential_changed` (#5342 F4), an enrolment write — Settings init/verify, the `POST /login` bootstrap init, or `POST /login/mfa/enroll` — found the account's password changed since its credential anchor was established (nothing revealed, written or enrolled) |
 | `mfa.enroll.race` | Result `ok` — a concurrent verify already resolved enrollment; the benign loser, kept out of the `mfa.enroll.failed` bad-code population (#3777, CC7.2) |
 | `mfa.enroll.cancelled` | Result `ok` — "benign, nothing enrolled", not "enrollment succeeded". The provisional secret the first code was verified against was no longer the stored one when the enrollment was committed (#3808). The store cannot tell why — a disable, a re-init, the stale-provisional sweep, `--mfa-reset` or an online KEK rewrap all look the same — so the detail states only the fact: `reason=provisional_secret_changed; nothing enrolled`. Not a bad code (`mfa.enroll.failed`) and not a store outage (no 503, no `yuzu_auth_secret_unavailable_total`). `POST /login/mfa/enroll` answers 409 and the pending token is spent (sign in again); Settings shows "Enrollment was cancelled or replaced. Start enrollment again." with the Set-up button |
-| `mfa.disabled` | `POST /api/settings/mfa/disable` (`ok` + `sessions_ended=<n>`; `ok` + `no verified factor to clear` when an unfinished enrolment was cancelled and no session ended; the `ok` rows are written inside the one transaction that clears the factor and ends the sessions, so a clear and its row commit or abort together; `error` + `disable failed` and `denied` + `reason=factor_changed expected_gen=<n>` are handler-written when nothing was changed; `error` + `blocked: mfa_enforcement=<mode>` when the self-target guard fires) |
+| `mfa.disabled` | `POST /api/settings/mfa/disable` (`ok` + `sessions_ended=<n>`; `ok` + `no verified factor to clear` when an unfinished enrolment was cancelled and no session ended; the `ok` rows are written inside the one transaction that clears the factor and ends the sessions, so a clear and its row commit or abort together; `denied` + `reason=factor_changed expected_gen=<n>` is handler-written when nothing was changed; `error` + `disable failed` is handler-written on a storage failure and normally means nothing was changed, but a connection lost at COMMIT may have committed the clear, in which case the owner's `ok` row exists too (an `error` row with no matching `ok` row for the same target means nothing changed; a paired `ok` row within seconds means the clear landed); an account that vanished or was deactivated after the gate answers "the account was not found" and writes no row; `error` + `blocked: mfa_enforcement=<mode>` when the self-target guard fires) |
 | `mfa.login.required` | `POST /login` returned a pending token |
 | `mfa.login.verified` | `POST /login/mfa` TOTP code accepted |
 | `mfa.login.failed` | `POST /login/mfa` rejected (TOTP or recovery) |
@@ -688,11 +689,14 @@ regress:
    requirement.
 2. **Replay protection persists.** `mfa_last_counter` is the floor on
    every accepted code. Step-up verifies must update it too.
-3. **`mfa_disable` is atomic against in-flight verifies.** The
-   destructive UPDATE clears both the secret and all recovery codes;
+3. **The clear is atomic against in-flight verifies.** The production
+   clear is `MfaDisableOwner` (`mfa_disable_owner.{hpp,cpp}`, #6079): one
+   transaction that locks the `auth.users` row, clears the secret, deletes all
+   recovery codes and the account's durable sessions and inserts the audit row;
    any concurrent verify either sees the old state (and matches) or the
    new state (and fails). No half-disabled "secret cleared but
-   recovery codes still active" state. An enroll-verify whose loaded provisional secret is no
+   recovery codes still active" state. 
+An enroll-verify whose loaded provisional secret is no
    longer the stored one returns `MfaEnrollmentCancelled` (#3808): a benign
    outcome outside `is_store_unavailable()` that is audited
    `mfa.enroll.cancelled` and gives no 503. The store cannot tell which of a
@@ -702,6 +706,7 @@ regress:
    explains still fail closed as `WriteFailed` (503). `CredentialChanged` and
    `MfaAlreadyEnrolled` outrank it (a password reset also wipes the provisional
    secret).
+
 4. **`mfa_pending_` token TTL is enforced on every access** via
    `reap_mfa_pending_locked`. A 5-minute window between password
    success and TOTP submission is a credential-stuffing surface — keep
@@ -796,4 +801,4 @@ regress:
    that the decision exempts (both `api_token` and `mcp_token`) before it reads role, scope
    or proof. Chokepoint PR 2: the pass and the in-handler calls may be deleted once handlers
    consume the centrally resolved session or the repeated resolves are removed (#6200); the
-   binding stays until then, and ideally then carries the resolved session itself. (h) a local enrolled proof judged anywhere but `judge_local_mfa_binding` (`mfa_factor_state.hpp`, shared by the central check and the approver gate); a `kFactorCredential` row made hatch-exempt or admitting a non-local session; a binding read that ignores `binding_enforced`; a second-factor clear made anywhere but `MfaDisableOwner` (`mfa_disable_owner.{hpp,cpp}`, one transaction: factor, recovery codes, every durable session of the account and the audit row commit or abort together) or split across transactions.
+   binding stays until then, and ideally then carries the resolved session itself. (h) a local enrolled proof judged anywhere but `judge_local_mfa_binding` (`mfa_factor_state.hpp`, shared by the central check and the approver gate); a `kFactorCredential` row made hatch-exempt or admitting a non-local session; a binding read that ignores `binding_enforced`; the Settings Disable and `--mfa-reset` clear made anywhere but `MfaDisableOwner` (`mfa_disable_owner.{hpp,cpp}`, one transaction: factor, recovery codes, every durable session of the account and the audit row commit or abort together) or split across transactions; account deactivation also clears the factor, through `soft_delete_user_in_txn`, and ends sessions in a separate step (pre-existing, deferred), so a NEW clear path outside the owner or that helper is the defect.

@@ -504,20 +504,35 @@ unwired-store refusals still apply and are still recorded. The JIT-elevation rou
 window when it is positive, else 300 s). The new alert `YuzuStepUpWindowDisabled` fires while the
 window is 0 or less. This release has no supported return to v0.14.1 (see "Deployment contract (hard cutover)"). v0.14.1 does not gate the two Settings routes or the four existing routes listed under "What is newly gated" above in their handlers, and it does not have the six routes that are new in this release. A server whose `/metrics` lacks `yuzu_auth_mfa_step_up_gate_total` and `yuzu_auth_mfa_step_up_window_seconds` has no step-up gate on these routes at all, and `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled` cannot fire there: their silence is not evidence that the gate is on.
 
-## ⚠️ Breaking: MFA proofs are bound to the factor they were earned with; hard cutover from a fresh database (#6079)
+## ⚠️ Breaking: MFA proofs are bound to the factor they were earned with; hard cutover from a fresh auth and session database (#6079)
 
 **This build is a hard cutover from a fresh auth and session database.** It has no upgrade path, no
-rolling or mixed-version window and no rollback guarantee: start it against a new database. On a
-database carried over from an earlier build, the `auth` v3 migration starts every existing row at factor
+rolling or mixed-version window (mixed-version operation is unsupported) and no rollback guarantee. "Fresh
+auth and session database" means the `auth` and `session_store` schemas start empty under this build; it does
+not mean dropping audit or fleet data, which live in other schemas, and a new Postgres database is not
+required. On a database carried over from an earlier build, the `auth` v3 migration starts every existing row at factor
 generation `0` and the trigger advances it only from the next enrolment change, so an account that was
 already enrolled reads generation `0`, is refused `503` `mfa_proof_unavailable` (sticky, no
-`retry_after_ms`) on approve and reject and on the 34 ordinary step-up routes, and stays refused until
-`yuzu-server --mfa-reset <user>` re-enrols it.
+`retry_after_ms`) on the 34 ordinary step-up routes, the 2 factor-credential routes and approve and reject,
+and stays refused until `yuzu-server --mfa-reset <user>` clears its factor (the user enrols again at next
+sign-in). Settings self-disable and recovery-code regeneration are refused for such an account too, and an
+administrator API token still passes step-up.
+
+**Before you cut over.** List the enrolled accounts that will read generation `0` on a carried-over database:
+
+```sql
+SELECT username FROM auth.users WHERE mfa_enrolled_at IS NOT NULL AND mfa_factor_gen <= 0;
+```
+
+Run `yuzu-server --mfa-reset <user>` for each enrolled administrator before you rely on step-up, or keep an
+administrator API token to hand. Recovery needs a host shell on the server, the Postgres DSN and the keys
+directory (`docs/ops-runbooks/auth-db-recovery.md`, "The `--mfa-reset` CLI (audited)"), so an affected user
+cannot recover on their own.
 
 **What changed.** A step-up proof of a local, MFA-enrolled account now counts only for the factor
 that was enrolled when the code was verified. The central step-up check (the 34 ordinary rows), JIT
 elevation and approve and reject all compare a generation stored with the session's proof against the
-account's current one, so disabling MFA and enrolling again, or an administrator resetting the factor
+account's current one, so disabling MFA and enrolling again, or an administrator clearing the factor
 with `yuzu-server --mfa-reset`, makes every earlier proof stop counting. The generic check also holds a
 local proof to the window on the database clock, to the millisecond, as well as on the server's own
 clock. Two schema migrations run at the first start: `auth` v3 adds `users.mfa_factor_gen` (every row
@@ -537,7 +552,11 @@ such bypass.
   factor, delete the recovery codes, end every session of the account and write the audit row together
   (`MfaDisableOwner`); a failed audit write rolls the whole clear back, so the Settings Disable is
   fail-closed on its audit row. `--mfa-reset` constructs no session store; it applies the
-  `session_store` schema migrations first, and if that step fails it exits `1` with nothing changed.
+  `session_store` schema migrations first, and if that step fails it exits `1` with nothing changed. A
+  connection lost at COMMIT may have committed the whole clear: the `--mfa-reset` message then says to check the
+  account's MFA status and the `mfa.reset.breakglass` audit row before re-running, and the Settings page says
+  "Nothing was changed unless you were signed out", with both an `error` and an `ok` audit row possible for one
+  clear.
 - **Regenerating recovery codes and disabling MFA are local-session-only.** An API token or an SSO
   session that reached these two Settings routes before now gets `403`, and `--mfa-step-up-window-secs=0`
   no longer switches their step-up off (they use a window of at most 300 seconds). A request whose factor
@@ -1246,11 +1265,12 @@ and `mfa_bind_seq` columns on `sessions` and a guard trigger). Neither drops or 
 separate scheduled-approval change (#6096, below) adds a data-only approvals step and a command-outbox index.
 
 - Endpoint agents need no change.
-- A ticket approved by an older replica carries a `reviewed_at` stamped from that replica's own clock. The new
-  binaries judge it against database time, so a replica whose clock runs more than 5 minutes ahead of the
-  database produces a ticket the new binaries treat as not yet live (a recall over MCP answers
+- A ticket approved before this upgrade carries a `reviewed_at` stamped from the approving replica's own clock
+  (mixed-version operation is unsupported, so this concerns tickets decided before the cutover, not tickets decided
+  during it). The new binaries judge it against database time, so a replica whose clock ran more than 5 minutes
+  ahead of the database when it approved produced a ticket the new binaries treat as not yet live (a recall over MCP answers
   `approval expired (past its 7-day lifetime)`, although the ticket is in fact ahead of the clock), and a replica
-  running behind shortens the ticket's life by the same amount. Once the next accepted approval submission on any
+  that was running behind shortened the ticket's life by the same amount. Once the next accepted approval submission on any
   replica has run, such a ticket is `expired` for good, with only an info log line as a trace, and correcting the
   clock does not bring it back, so request approval again. Until that submission has run nothing has been
   written, so correcting the clock first makes the ticket live again: if the query in `docs/clock-guarded-retention.md` finds
