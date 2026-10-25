@@ -25,6 +25,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -35,6 +36,10 @@
 #include <vector>
 
 namespace yuzu::server {
+
+/// The enrol-confirm step-up stamp catch logs its warning for the first hit of a process-wide
+/// counter and then once per this many hits, so a failing auth store cannot become a log storm.
+inline constexpr std::uint64_t kStampThrewLogEvery = 100;
 
 struct Config;
 class RbacStore;
@@ -108,6 +113,14 @@ public:
     /// keeps the loud `admin_fn`. Left unset (tests, other callers) those three GETs fall back
     /// to `admin_fn`, so an unwired probe can only be louder, never weaker.
     void set_read_admin_fn(AdminFn fn) { read_admin_fn_ = std::move(fn); }
+
+    /// Test seam like `set_cert_dir_for_test`; null in production, and server.cpp never sets it.
+    /// When set, POST /api/settings/mfa/verify calls it inside the step-up stamp block,
+    /// immediately before `mark_session_mfa_verified`, so a test can make the stamp throw
+    /// (`AuthManager` is non-virtual). No effect when empty. Set before requests are served.
+    void set_stamp_fault_hook_for_test(std::function<void()> hook) {
+        stamp_fault_hook_ = std::move(hook);
+    }
 
     /// Test seam: directory the cert-upload / cert-paste routes write into.
     /// Empty (production) = auth::default_cert_dir().
@@ -198,10 +211,14 @@ public:
     /// avoiding httplib::Server's TSan-hostile acceptor thread (#438).
     ///
     /// `step_up_fn` (PR2, optional) — when present, the 2 user-management
-    /// Settings mutations (DELETE user, POST user role) gate behind it
-    /// after admin_fn passes, and the 2 API-token mutations (POST, DELETE
+    /// Settings mutations (DELETE user, POST user role) and the 2 MFA mutations
+    /// (POST mfa/recovery-codes, POST mfa/disable) gate behind it after admin_fn
+    /// passes, and the 2 API-token mutations (POST, DELETE
     /// /api/settings/api-tokens) gate behind it after perm_fn and auth_fn
-    /// pass. Empty functor disables the gate entirely.
+    /// pass. The MFA step-up chokepoint (`step_up_gate.hpp`) already evaluates
+    /// all six rows before the handler runs and ignores this functor; an empty
+    /// functor only drops the handlers' own second check (defence in depth, which
+    /// PR 2 removes), it does not disable the gate.
     void register_routes(class HttpRouteSink& sink, AuthFn auth_fn, AdminFn admin_fn,
                          PermFn perm_fn, AuditFn audit_fn, Config& cfg, auth::AuthManager& auth_mgr,
                          auth::AutoApproveEngine& auto_approve, ApiTokenStore* api_token_store,
@@ -284,9 +301,12 @@ private:
     /// than denormalised, to avoid drift between disk + DB.
     std::string render_plugin_signing_fragment();
     /// Render the Engine Principals admin-console fragment — a table of
-    /// every engine principal (`EnginePrincipalStore::list_all`, including
+    /// every engine principal (`EnginePrincipalStore::list_all_checked`, including
     /// revoked rows) with owner, classification, lifecycle state, and
-    /// active-credential count (`ApiTokenStore::list_active_for_principal`).
+    /// active-credential count (`ApiTokenStore::list_active_for_principal_checked`).
+    /// A roster that cannot be read renders an "unavailable" notice instead of a
+    /// table; a credential count that cannot be read renders "unavailable" and the
+    /// row offers neither Mint nor Rotate.
     /// Revoked rows surface the `superseded_by` linkage AND the revocation
     /// reason explicitly (design doc §3.1) — never a merged history that
     /// hides that a revocation occurred. Admin-only; a null
@@ -329,6 +349,7 @@ private:
     AuditReadFn audit_read_fn_; // #4028 — fail-closed REST audit hook, see AuditReadFn doc comment
     std::function<void()> dex_alert_apply_fn_; // F1 live-apply hook (may be empty)
     std::filesystem::path cert_dir_override_;  // test seam; empty = auth::default_cert_dir()
+    std::function<void()> stamp_fault_hook_;   // test seam; empty in production
     RetentionEnforcedFn retention_enforced_fn_; // may be empty -> every window "Unknown"
     nlohmann::json retention_view() const;      // build_data_retention_settings + enforced
     /// Same-site gate for a page-called write (`browser_write_is_cross_site`): token callers are

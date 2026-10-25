@@ -21,9 +21,13 @@
 //     synthesized httplib::Request directly into the captured handler.
 //     No socket, no acceptor thread, nothing for TSan to fight with.
 
+#include "route_inventory.hpp"
+
 #include <httplib.h>
 
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace yuzu::server {
@@ -48,18 +52,31 @@ public:
 /// Concrete sink that forwards every registration to a wrapped
 /// httplib::Server. Production callers construct one of these on the
 /// stack at the register_routes call site and pass it through.
+///
+/// Each registration is also recorded in `RouteInventory` (method + pattern, keyed by the wrapped
+/// server) so the boot-time step-up coverage sweep can see every route the server will serve.
+/// Recording is one mutex-guarded set insert at boot and does not change what is registered. After
+/// the boot sweep the server's inventory is sealed (`RouteInventory::seal`); from then on a mutating
+/// registration with no step-up policy row is not registered, and the sink throws
+/// `std::logic_error` naming it.
 class HttplibRouteSink : public HttpRouteSink {
 public:
     explicit HttplibRouteSink(httplib::Server& svr) : svr_(svr) {}
 
-    void Get(const std::string& p, Handler h) override     { svr_.Get(p, std::move(h)); }
-    void Post(const std::string& p, Handler h) override    { svr_.Post(p, std::move(h)); }
-    void Put(const std::string& p, Handler h) override     { svr_.Put(p, std::move(h)); }
-    void Delete(const std::string& p, Handler h) override  { svr_.Delete(p, std::move(h)); }
-    void Patch(const std::string& p, Handler h) override   { svr_.Patch(p, std::move(h)); }
-    void Options(const std::string& p, Handler h) override { svr_.Options(p, std::move(h)); }
+    void Get(const std::string& p, Handler h) override     { record("GET", p);     svr_.Get(p, std::move(h)); }
+    void Post(const std::string& p, Handler h) override    { record("POST", p);    svr_.Post(p, std::move(h)); }
+    void Put(const std::string& p, Handler h) override     { record("PUT", p);     svr_.Put(p, std::move(h)); }
+    void Delete(const std::string& p, Handler h) override  { record("DELETE", p);  svr_.Delete(p, std::move(h)); }
+    void Patch(const std::string& p, Handler h) override   { record("PATCH", p);   svr_.Patch(p, std::move(h)); }
+    void Options(const std::string& p, Handler h) override { record("OPTIONS", p); svr_.Options(p, std::move(h)); }
 
 private:
+    void record(std::string_view method, const std::string& pattern) {
+        if (!RouteInventory::instance().record(&svr_, method, pattern))
+            throw std::logic_error("refused to register " + std::string(method) + " " + pattern +
+                                   ": no MFA step-up policy row and the route table is sealed");
+    }
+
     httplib::Server& svr_;
 };
 

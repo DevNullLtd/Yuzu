@@ -1739,6 +1739,27 @@ TEST_CASE("crypto widgets routes: CA drill - no Security:Read says so; confined 
         CHECK_THAT(res->body, ContainsSubstring(std::string(cw::kConfinedWithheldMessage)));
         CHECK(h.api->cert_calls.empty());
     }
+    {
+        // Security:Read held, NO Inventory:Read grant (the probe answers kRefused): withheld with
+        // the refusal message - not the confined text, and no certificate read.
+        Harness h;
+        h.held = {"Security:Read"};
+        auto res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=active");
+        CHECK(res->status == 200);
+        CHECK_THAT(res->body, ContainsSubstring(std::string(cw::kRefusedWithheldMessage)));
+        CHECK_THAT(res->body, !ContainsSubstring(std::string(cw::kConfinedWithheldMessage)));
+        CHECK(h.api->cert_calls.empty());
+    }
+    {
+        // A failed access check is the unavailable banner (200 so htmx swaps it), never rows.
+        Harness h;
+        h.fleet_wide_access = cw::Access::kDegraded;
+        auto res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=active");
+        CHECK(res->status == 200);
+        CHECK_THAT(res->body, ContainsSubstring("Retry"));
+        CHECK_THAT(res->body, !ContainsSubstring(std::string(cw::kRefusedWithheldMessage)));
+        CHECK(h.api->cert_calls.empty());
+    }
 }
 
 TEST_CASE("crypto widgets routes: the head helper sends the layout version and handles 409",

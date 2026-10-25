@@ -158,6 +158,8 @@ constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
 
 constexpr std::array<std::string_view, 3> kRecognizedIdpSources = {"entra", "saml", "ad"};
 constexpr std::string_view kLocalPrefix = "local:";
+// Keep in step with `authz::is_engine_principal_name` (authz_model.hpp), the engine-namespace test the
+// username-keyed server resolvers use; rbac_store.cpp does not depend on that header.
 constexpr std::string_view kEnginePrefix = "engine:";
 
 bool has_reserved_idp_prefix(std::string_view name) {
@@ -1539,6 +1541,19 @@ bool RbacStore::generation_view_stale_locked() const {
                                                    kRbacStaleServeBoundMs);
 }
 
+void RbacStore::age_refresh_state_for_test(std::chrono::milliseconds elapsed) {
+    const std::int64_t ms = elapsed.count();
+    {
+        std::lock_guard lock(cache_mtx_);
+        refresh_started_ms_ -= ms;
+        last_successful_refresh_ms_ -= ms;
+    }
+    {
+        std::lock_guard lock(breaker_mtx_);
+        breaker_last_probe_started_ms_ -= ms;
+    }
+}
+
 bool RbacStore::rbac_enabled_view_degraded() const {
     std::lock_guard lock(cache_mtx_);
     return generation_view_stale_locked();
@@ -1670,6 +1685,22 @@ RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept {
 
 bool rbac_enforcement_in_effect(const RbacStore* store) noexcept {
     return rbac_enforcement_label(store) != RbacEnforcementLabel::kDisabled;
+}
+
+std::expected<bool, std::string> engine_grant_checked(const RbacStore* store,
+                                                       const std::string& username,
+                                                       const std::string& securable_type,
+                                                       const std::string& operation) {
+    // ONE label snapshot per decision (see the header): never this call plus a second read.
+    switch (rbac_enforcement_label(store)) {
+    case RbacEnforcementLabel::kEnabled:
+        return store->check_permission_checked(username, securable_type, operation);
+    case RbacEnforcementLabel::kDisabled:
+        return false; // RBAC is off and the view is fresh: an engine holds no authority
+    case RbacEnforcementLabel::kDegraded:
+        break;
+    }
+    return std::unexpected(std::string(kRbacErrEnforcementUnconfirmed));
 }
 
 // to_string(RbacEnforcementLabel) is constexpr and header-inline (rbac_store.hpp) —
@@ -3197,25 +3228,42 @@ ListReadAuthorization RbacStore::authorize_list_read(const std::string& username
     // null / load-failed store returns true from rbac_enforcement_in_effect and
     // falls through to the RBAC path, which denies (INV-1).
     if (!rbac_enforcement_in_effect(this)) {
-        out.decision = ListReadDecision::AdmitAll;
+        // An engine principal's only authority is an explicit RBAC grant (design §4.2): the
+        // legacy-open full-fleet read does not apply to it, so it stays DenyAll.
+        if (!username.starts_with(kEnginePrefix))
+            out.decision = ListReadDecision::AdmitAll;
         return out;
     }
 
-    // #1715(b): a global ALLOW overrides any group deny → unfiltered read.
-    if (check_permission(username, securable_type, operation)) {
+    // #1715(b): a global ALLOW overrides any group deny → unfiltered read. This read can FAIL (a
+    // pool timeout, an open breaker, a failed role query): that is a failed read, not "no
+    // global grant", so it denies with `read_failed` and reads nothing further.
+    const auto global = check_permission_checked(username, securable_type, operation);
+    if (!global) {
+        out.decision = ListReadDecision::DenyAll; // INV-1/INV-5: a failed read denies ...
+        out.read_failed = true;                   // ... and says so
+        return out;
+    }
+    if (*global) {
         out.decision = ListReadDecision::AdmitAll;
         return out;
     }
 
     // #1715(a): additive — a group allow admits even against a global deny/absent.
     auto pg = resolve_perm_groups(username, securable_type, operation, mgmt_store);
-    if (!pg || pg->allow_groups.empty()) {
-        out.decision = ListReadDecision::DenyAll; // INV-1/INV-5: error or no grant → deny
+    if (!pg) {
+        out.decision = ListReadDecision::DenyAll; // INV-1/INV-5: a failed read denies ...
+        out.read_failed = true;                   // ... and says so: it is not "no grant"
+        return out;
+    }
+    if (pg->allow_groups.empty()) {
+        out.decision = ListReadDecision::DenyAll; // INV-1: a genuine "no grant"
         return out;
     }
     auto visible = expand_visible_set(*pg, mgmt_store);
     if (!visible) {
         out.decision = ListReadDecision::DenyAll; // fail-closed on a subtree-read error
+        out.read_failed = true;
         return out;
     }
     out.decision = ListReadDecision::AdmitScoped;

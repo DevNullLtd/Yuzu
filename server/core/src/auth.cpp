@@ -1472,6 +1472,32 @@ void AuthManager::expire_session_for_test(const std::string& token, std::chrono:
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(offset);
 }
 
+void AuthManager::idle_session_for_test(const std::string& token,
+                                        std::chrono::milliseconds elapsed) {
+    // CACHE-ONLY, same contract as expire_session_for_test above (store-less callers).
+    const std::string key = session_store_ ? hash_token(token) : token;
+    std::unique_lock lock(mu_);
+    auto it = sessions_.find(key);
+    if (it == sessions_.end())
+        return;
+    it->second.last_activity_at -= elapsed;
+    it->second.steady_last_activity -=
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(elapsed);
+}
+
+void AuthManager::lapse_elevation_for_test(const std::string& token,
+                                           std::chrono::milliseconds elapsed) {
+    // CACHE-ONLY, same contract as expire_session_for_test above (store-less callers).
+    const std::string key = session_store_ ? hash_token(token) : token;
+    std::unique_lock lock(mu_);
+    auto it = sessions_.find(key);
+    if (it == sessions_.end())
+        return;
+    it->second.elevated_until -= elapsed;
+    it->second.steady_elevated_until -=
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(elapsed);
+}
+
 void AuthManager::set_role_recheck_race_hook_for_test(std::function<void()> hook) {
     role_recheck_race_hook_for_test_ = std::move(hook);
 }
@@ -1546,7 +1572,13 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
     // This check intentionally fires BEFORE the mutex acquire below — rejecting
     // obviously invalid tokens without contention reduces lock contention under
     // token-spray attacks.
-    if (token.size() > auth::kMaxSessionTokenLength)
+    //
+    // An empty token is the "request carried no session cookie" value
+    // (AuthRoutes::extract_session_cookie returns ""). It can never match a session:
+    // create_session mints a random token and the store key is its SHA-256, so it is
+    // refused here, before the durable path's generation read, cache probe and
+    // store lookup, none of which can produce a session for it.
+    if (token.empty() || token.size() > auth::kMaxSessionTokenLength)
         return std::nullopt;
 
     const bool idle_enabled = session_inactivity_ > std::chrono::seconds(0);

@@ -52,14 +52,35 @@ handler are not, and re-litigating every historical tool on every unrelated
 touch is exactly the repo-wide-retrofit problem this script avoids. A
 materially-changed EXISTING tool's retry-hint correctness is a governance
 Gate-3/Gate-8 review question, not this script's job.)
+
+HEADERS: the registry seam's shared helpers live in server/core/src/mcp_tool*.hpp
+(mcp_tool_helpers.hpp's answer_unwired, the registry and deps headers). A header holds
+no per-tool handler, so the per-tool scan above cannot reach it. Instead every
+mcp_tool*.hpp that is NEW or whose text DIFFERS between BASE and HEAD is scanned
+whole, with the same guard shape and the same `// retry-hint-exempt: <reason>`
+mechanism. The header scan recognises ONLY the `auto x = call(); if (!x) { ... }` shape
+with an error_response()/a4_error() call in the guard body, so it is a tripwire, not a
+proof: a retryable error returned from a helper written any other way (a ternary, a
+`switch`, a bare `if (!ptr)`, an error built in a callee) is not seen. Findings are
+reported under the header's file name. A header that git lists but cannot show is a
+GateError (fail closed), exactly like a registry file. answer_unwired has no such guard
+and no retry hint by design, so it yields no finding and needs no marker; the marker
+only has an effect INSIDE a guard body.
+
+The OK line names what was scanned: the new tools and the new-or-changed headers (and
+how many headers exist at HEAD), so an empty tool set is never reported as "nothing
+scanned" while headers were read. The BASE/HEAD wiring lives in run(), which the
+selftest drives end to end against a temporary git repository.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -70,6 +91,10 @@ MCP_REGISTRY_DIR = "server/core/src/"
 # mcp_server.cpp: a registry file is `mcp_tools_[a-z0-9_]+\.cpp`, a record name `^[a-z][a-z0-9_]*$`.
 # A file matching the glob `mcp_tools_*.cpp` but not this regex is an error, never a silent skip.
 MCP_REGISTRY_FILE = re.compile(r"mcp_tools_[a-z0-9_]+\.cpp")
+# Registry-seam helper headers: `mcp_tool` + any [a-z0-9_]* stem + `.hpp` (mcp_tool_helpers.hpp,
+# mcp_tool_registry.hpp, mcp_tool_deps.hpp, and a future mcp_tools_<x>.hpp). Scanned whole when
+# new or changed (see HEADERS in the module docstring); a glob match outside the regex is an error.
+MCP_HEADER_FILE = re.compile(r"mcp_tool[a-z0-9_]*\.hpp")
 REGISTRY_ANCHOR = "constexpr ToolRecord kToolRecords[] = {"
 REGISTRY_OPENER = re.compile(r"^ {4}\{", re.MULTILINE)
 REGISTRY_ENTRY = re.compile(r'^ {4}\{"([a-z][a-z0-9_]*)",', re.MULTILINE)
@@ -146,6 +171,44 @@ def registry_sources(ref: str) -> dict[str, str]:
                             f"its tools cannot be scanned (fail closed)")
         files[path] = text
     return files
+
+
+def header_sources(ref: str) -> dict[str, str]:
+    """{path: text} of every mcp_tool*.hpp helper header present at `ref`. A file that matches the
+    glob but not MCP_HEADER_FILE, or one `git ls-tree` lists but `git show` cannot read, is a
+    GateError: the scanned header set must never shrink silently."""
+    files = {}
+    for path in git_ls_files(ref, MCP_REGISTRY_DIR):
+        base = path.rsplit("/", 1)[-1]
+        if not (base.startswith("mcp_tool") and base.endswith(".hpp")):
+            continue
+        if not MCP_HEADER_FILE.fullmatch(base):
+            raise GateError(f"{path} at {ref} matches mcp_tool*.hpp but not "
+                            f"{MCP_HEADER_FILE.pattern}: it would be skipped silently")
+        text = git_show(ref, path)
+        if text is None:
+            raise GateError(f"{path} at {ref} is listed by git ls-tree but git show failed: "
+                            f"it cannot be scanned (fail closed)")
+        files[path] = text
+    return files
+
+
+def changed_headers(base_headers: dict[str, str], head_headers: dict[str, str]) -> list[str]:
+    """Paths of the headers that are new at HEAD or whose text differs from BASE's (the scanned set)."""
+    return [p for p in sorted(head_headers) if base_headers.get(p) != head_headers[p]]
+
+
+def header_findings(base_headers: dict[str, str], head_headers: dict[str, str]) -> list[tuple[str, str, str]]:
+    """(header basename, guard variable, status) for every guarded error branch in each header that
+    is new at HEAD or whose text differs from BASE's. An unchanged header is not re-litigated (the
+    same new-or-changed scope as the tool scan)."""
+    out = []
+    for path in changed_headers(base_headers, head_headers):
+        text = head_headers[path]
+        name = path.rsplit("/", 1)[-1]
+        for varname, status in scan_block(name, text):
+            out.append((name, varname, status))
+    return out
 
 
 def registry_slice(text: str) -> str:
@@ -287,7 +350,7 @@ def gap_report(gaps: list[tuple[str, str, str]], registry_tools: set[str]) -> li
     """The failure text for the unexempted gaps. A registry handler gets the H1 convention
     spelled out: the gate matches the token `retry_after_ms` in the code of the guard body, so a
     bare `-1`/number in the 4th argument of ctx.a4_error(...) is not seen."""
-    lines = ["check-mcp-retry-hints: new tool(s) have a store/query-fault error branch with",
+    lines = ["check-mcp-retry-hints: new tool(s) or changed helper header(s) have a store/query-fault error branch with",
              "no retry_after_ms and no inline `// retry-hint-exempt: <reason>` comment:"]
     for name, varname, _ in gaps:
         lines.append(f"  {name} (guard variable: {varname})")
@@ -308,6 +371,85 @@ def gap_report(gaps: list[tuple[str, str, str]], registry_tools: set[str]) -> li
         lines.append("block comment such as `/*retry_after_ms=*/` is seen by the gate; a bare number")
         lines.append("with no token is reported as a gap even when the value is right.")
     return lines
+
+
+def end_to_end_checks() -> list[tuple[str, object, object]]:
+    """Drive run() against a throwaway git repository, so the BASE/HEAD wiring itself (which ref
+    feeds which scan, the header scan, the pass/fail result) is under test and not only the pure
+    helpers. Kills the mutants base=head, base={}, header scan dropped and header gaps ignored."""
+    tool_src = 'static const ToolDef kTools[] = {\n    {"old_tool", "d"},\n};\n'
+    bad = ("inline void helper(const ToolCallContext& ctx) {\n    auto rows = store->call();\n"
+           "    if (!rows) {\n        ctx.res.set_content(ctx.a4_error(kInternalError, \"x\", {}, -1), \"j\");\n"
+           "        return;\n    }\n}\n")
+    exempt = bad.replace("        ctx.res", "        // retry-hint-exempt: terminal\n        ctx.res")
+    clean = "inline void answer(const ToolCallContext& ctx, std::string b) { ctx.res.set_content(b, \"j\"); }\n"
+    new_tool = ('static const ToolDef kTools[] = {\n    {"old_tool", "d"},\n    {"new_tool", "d"},\n};\n'
+                'void f() {\n    if (tool_name == "new_tool") {\n        auto rows = store->call();\n'
+                '        if (!rows) {\n            return a4_error(kInternalError, "x", {}, -1);\n        }\n    }\n}\n')
+    src_dir = "server/core/src"
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+               GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+
+    def git(root: Path, *args: str) -> str:
+        return subprocess.run(["git", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.devnull, *args],
+                              cwd=root, env=env, capture_output=True, text=True, check=True).stdout.strip()
+
+    def commit(root: Path, parent: str | None, files: dict[str, str]) -> str:
+        """Check out `parent`'s tree, write `files`, commit, return the new commit id."""
+        if parent is not None:
+            git(root, "reset", "--hard", "-q", parent)
+        for rel, text in files.items():
+            f = root / src_dir / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(text)
+        git(root, "add", "-A")
+        git(root, "commit", "-q", "--allow-empty", "-m", "c")
+        return git(root, "rev-parse", "HEAD")
+
+    def go(base: str, head: str) -> tuple[int, str]:
+        lines: list[str] = []
+        return run(base, head, emit=lines.append), "\n".join(lines)
+
+    saved_root = globals()["REPO_ROOT"]
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_retryhints_") as tmp:
+        root = Path(tmp)
+        git(root, "init", "-q")
+        globals()["REPO_ROOT"] = root
+        try:
+            b0 = commit(root, None, {"mcp_server.cpp": tool_src})
+            h_bad = commit(root, b0, {"mcp_tool_x.hpp": bad})
+            h_clean = commit(root, b0, {"mcp_tool_x.hpp": clean})
+            h_exempt = commit(root, b0, {"mcp_tool_x.hpp": exempt})
+            h_touch = commit(root, h_bad, {"mcp_server.cpp": tool_src + "// unrelated edit\n"})
+            h_tool = commit(root, b0, {"mcp_server.cpp": new_tool})
+            rc_bad, out_bad = go(b0, h_bad)
+            rc_clean, out_clean = go(b0, h_clean)
+            rc_exempt, out_exempt = go(b0, h_exempt)
+            rc_same, out_same = go(h_bad, h_touch)
+            rc_tool, out_tool = go(b0, h_tool)
+            rc_nofile, _ = go(b0, "0" * 40)
+        finally:
+            globals()["REPO_ROOT"] = saved_root
+    # The real tree's helper headers (comments included, because the scan reads them) must come up
+    # clean; a header comment that spells out a flagged guard would otherwise only fail in CI.
+    real_findings = []
+    for hdr in sorted((saved_root / src_dir).glob("mcp_tool*.hpp")):
+        real_findings += [(hdr.name, v, st) for v, st in scan_block(hdr.name, hdr.read_text(encoding="utf-8"))]
+    return [
+        ("e2e: the checked-in mcp_tool*.hpp headers scan clean", real_findings, []),
+        ("e2e: a new header with an unhinted guarded error fails", rc_bad, 1),
+        ("e2e: the failure names the header", "mcp_tool_x.hpp" in out_bad, True),
+        ("e2e: a new clean header passes", rc_clean, 0),
+        ("e2e: the OK line says the header was scanned", "1 new or changed header(s)" in out_clean, True),
+        ("e2e: the OK line does not claim no tools were looked at", "no new MCP tools" in out_clean, False),
+        ("e2e: an exempt-marked guard in a new header passes", rc_exempt, 0),
+        ("e2e: an unchanged bad header is not re-litigated", rc_same, 0),
+        ("e2e: the unchanged header is not counted as scanned", "0 new or changed header(s)" in out_same, True),
+        ("e2e: a new tool with an unhinted guarded error fails", rc_tool, 1),
+        ("e2e: the failure names the tool", "new_tool" in out_tool, True),
+        ("e2e: an unreadable HEAD fails closed", rc_nofile, 1),
+    ]
 
 
 def selftest() -> int:
@@ -522,11 +664,131 @@ def selftest() -> int:
         if got != want:
             print(f"selftest FAIL [{label}]: expected {want!r}, got {got!r}")
             failures += 1
-    total = len(cases) + len(shape_checks) + len(robust_checks)
+    # Headers: the helper headers are scanned whole when new or changed, with the same gap/exempt
+    # semantics, and a violation placed in a header must be seen (non-vacuity).
+    hdr_gap = ("inline void helper(const ToolCallContext& ctx) {\n    auto rows = store->call();\n"
+               "    if (!rows) {\n        ctx.res.set_content(ctx.a4_error(kInternalError, \"x\", {}, -1), \"j\");\n"
+               "        return;\n    }\n}\n")
+    hdr_exempt = hdr_gap.replace("        ctx.res", "        // retry-hint-exempt: terminal\n        ctx.res")
+    hdr_hint = hdr_gap.replace("{}, -1)", "{}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs)")
+    hdr_path = "server/core/src/mcp_tool_helpers.hpp"
+    hdr_clean = "inline void answer(const ToolCallContext& ctx, std::string b) { ctx.res.set_content(b, \"j\"); }\n"
+    saved_h = (globals()["git_ls_files"], globals()["git_show"])
+    try:
+        globals()["git_ls_files"] = lambda ref, d: ["server/core/src/mcp_tool_helpers.hpp", "server/core/src/mcp_tool_gone.hpp",
+                                                    "server/core/src/mcp_server.hpp", "server/core/src/mcp_tools_ok.cpp"]
+        globals()["git_show"] = lambda ref, path: hdr_gap if path.endswith("mcp_tool_helpers.hpp") else None
+        h_unreadable = raises(lambda: header_sources("HEAD"), "mcp_tool_gone.hpp", "git show failed")
+        globals()["git_ls_files"] = lambda ref, d: ["server/core/src/mcp_tool_Bad.hpp"]
+        h_badname = raises(lambda: header_sources("HEAD"), "mcp_tool_Bad.hpp", "mcp_tool[a-z0-9_]*")
+        globals()["git_ls_files"] = lambda ref, d: ["server/core/src/mcp_tool_helpers.hpp", "server/core/src/mcp_server.hpp",
+                                                    "server/core/src/mcp_tools_ok.cpp", "server/core/src/mcp_tool_x.cpp"]
+        globals()["git_show"] = lambda ref, path: hdr_gap
+        h_only_hpp = list(header_sources("HEAD")) == [hdr_path]
+    finally:
+        globals()["git_ls_files"], globals()["git_show"] = saved_h
+    header_checks = (
+        ("header: a new header carrying an unhinted guarded error is a gap",
+         header_findings({}, {hdr_path: hdr_gap}), [("mcp_tool_helpers.hpp", "rows", "gap")]),
+        ("header: a changed header is scanned (base text differs)",
+         header_findings({hdr_path: hdr_clean}, {hdr_path: hdr_gap}), [("mcp_tool_helpers.hpp", "rows", "gap")]),
+        ("header: an unchanged header is not re-litigated",
+         header_findings({hdr_path: hdr_gap}, {hdr_path: hdr_gap}), []),
+        ("header: the exempt marker is honoured",
+         header_findings({}, {hdr_path: hdr_exempt}), [("mcp_tool_helpers.hpp", "rows", "exempt")]),
+        ("header: a retry_after_ms hint is ok",
+         header_findings({}, {hdr_path: hdr_hint}), [("mcp_tool_helpers.hpp", "rows", "ok")]),
+        ("header: a clean header yields nothing", header_findings({}, {hdr_path: hdr_clean}), []),
+        ("header: a stray comment mentioning retry_after_ms does not spoof ok",
+         header_findings({}, {hdr_path: hdr_gap.replace("        ctx.res", "        // retry_after_ms\n        ctx.res")}),
+         [("mcp_tool_helpers.hpp", "rows", "gap")]),
+        ("header: git show failure for a listed header is an error", h_unreadable, True),
+        ("header: a glob match outside the regex is an error", h_badname, True),
+        ("header: only mcp_tool*.hpp files are collected", h_only_hpp, True),
+    )
+    for label, got, want in header_checks:
+        if got != want:
+            print(f"selftest FAIL [{label}]: expected {want!r}, got {got!r}")
+            failures += 1
+    e2e = end_to_end_checks()
+    for label, got, want in e2e:
+        if got != want:
+            print(f"selftest FAIL [{label}]: expected {want!r}, got {got!r}")
+            failures += 1
+    total = len(cases) + len(shape_checks) + len(robust_checks) + len(header_checks) + len(e2e)
     if failures:
         print(f"\ncheck-mcp-retry-hints selftest: FAIL ({failures}/{total} case(s))")
         return 1
     print(f"check-mcp-retry-hints selftest: OK ({total}/{total} case(s))")
+    return 0
+
+
+def run(base: str, head: str, summary: bool = False, emit=print) -> int:
+    """The BASE..HEAD gate: returns the process exit code and reports every line through `emit`.
+    Factored out of main() so the selftest can drive the real ref/header wiring."""
+    base_src = git_show(base, MCP_SERVER_CPP)
+    head_src = git_show(head, MCP_SERVER_CPP)
+    if head_src is None:
+        emit(f"check-mcp-retry-hints: {MCP_SERVER_CPP} not found at {head}")
+        emit("check-mcp-retry-hints: FAIL (cannot verify the A5 retry-hint gate -- fail closed;")
+        emit("if the file genuinely moved, update MCP_SERVER_CPP in this script)")
+        return 1  # fail CLOSED: an unreadable target must never look like a clean gate
+
+    try:
+        base_registry = registry_sources(base)
+        head_registry = registry_sources(head)
+        head_owners = validate_registry(head_registry)
+        base_headers = header_sources(base)
+        head_headers = header_sources(head)
+    except GateError as e:
+        emit(f"check-mcp-retry-hints: {e}")
+        emit("check-mcp-retry-hints: FAIL (cannot establish the registry tool set -- fail closed)")
+        return 1
+    base_tools = tool_names(base_src, tuple(base_registry.values())) if base_src is not None else set()
+    head_tools = tool_names(head_src, tuple(head_registry.values()))
+    new_tools = sorted(head_tools - base_tools)
+
+    scanned_headers = changed_headers(base_headers, head_headers)
+    header_gaps = header_findings(base_headers, head_headers)
+
+    total_gaps = 0
+    findings = list(header_gaps)
+    total_gaps += sum(1 for f in header_gaps if f[2] == "gap")
+    try:
+        for name in new_tools:
+            if name in head_owners:
+                block = registry_block_or_fail(head_registry, head_owners, name)
+            else:
+                block = find_tool_block(head_src, name)
+                if block is None:
+                    continue  # inline-builder tool with no dispatch-switch block; not this shape
+            for varname, status in scan_block(name, block):
+                findings.append((name, varname, status))
+                if status == "gap":
+                    total_gaps += 1
+    except GateError as e:
+        emit(f"check-mcp-retry-hints: {e}")
+        emit("check-mcp-retry-hints: FAIL (a registry tool's handler cannot be scanned -- fail closed)")
+        return 1
+
+    if summary:
+        emit(f"New tools in range ({len(new_tools)}): {', '.join(new_tools)}")
+        emit(f"New or changed headers ({len(scanned_headers)}): "
+             f"{', '.join(p.rsplit('/', 1)[-1] for p in scanned_headers)}")
+        for name, varname, status in findings:
+            emit(f"  {name}: var={varname} [{status}]")
+        emit("")
+
+    gaps = [f for f in findings if f[2] == "gap"]
+    if gaps:
+        for line in gap_report(gaps, set(head_owners)):
+            emit(line)
+        emit(f"\ncheck-mcp-retry-hints: FAIL ({len(gaps)} new-tool/header gap(s))")
+        return 1
+
+    emit(f"check-mcp-retry-hints: OK (scanned {len(new_tools)} new tool(s) and "
+         f"{len(scanned_headers)} new or changed header(s) of {len(head_headers)} at {head}; "
+         f"{len(findings)} guarded finding(s), 0 unexempted gaps; between {base} and {head})")
     return 0
 
 
@@ -541,65 +803,7 @@ def main() -> int:
 
     if args.selftest:
         return selftest()
-
-    base_src = git_show(args.base, MCP_SERVER_CPP)
-    head_src = git_show(args.head, MCP_SERVER_CPP)
-    if head_src is None:
-        print(f"check-mcp-retry-hints: {MCP_SERVER_CPP} not found at {args.head}")
-        print("check-mcp-retry-hints: FAIL (cannot verify the A5 retry-hint gate -- fail closed;")
-        print("if the file genuinely moved, update MCP_SERVER_CPP in this script)")
-        return 1  # fail CLOSED: an unreadable target must never look like a clean gate
-
-    try:
-        base_registry = registry_sources(args.base)
-        head_registry = registry_sources(args.head)
-        head_owners = validate_registry(head_registry)
-    except GateError as e:
-        print(f"check-mcp-retry-hints: {e}")
-        print("check-mcp-retry-hints: FAIL (cannot establish the registry tool set -- fail closed)")
-        return 1
-    base_tools = tool_names(base_src, tuple(base_registry.values())) if base_src is not None else set()
-    head_tools = tool_names(head_src, tuple(head_registry.values()))
-    new_tools = sorted(head_tools - base_tools)
-
-    if not new_tools:
-        print(f"check-mcp-retry-hints: OK (no new MCP tools between {args.base} and {args.head})")
-        return 0
-
-    total_gaps = 0
-    findings = []
-    try:
-        for name in new_tools:
-            if name in head_owners:
-                block = registry_block_or_fail(head_registry, head_owners, name)
-            else:
-                block = find_tool_block(head_src, name)
-                if block is None:
-                    continue  # inline-builder tool with no dispatch-switch block; not this shape
-            for varname, status in scan_block(name, block):
-                findings.append((name, varname, status))
-                if status == "gap":
-                    total_gaps += 1
-    except GateError as e:
-        print(f"check-mcp-retry-hints: {e}")
-        print("check-mcp-retry-hints: FAIL (a registry tool's handler cannot be scanned -- fail closed)")
-        return 1
-
-    if args.summary:
-        print(f"New tools in range ({len(new_tools)}): {', '.join(new_tools)}")
-        for name, varname, status in findings:
-            print(f"  {name}: var={varname} [{status}]")
-        print()
-
-    gaps = [f for f in findings if f[2] == "gap"]
-    if gaps:
-        for line in gap_report(gaps, set(head_owners)):
-            print(line)
-        print(f"\ncheck-mcp-retry-hints: FAIL ({len(gaps)} new-tool gap(s))")
-        return 1
-
-    print(f"check-mcp-retry-hints: OK ({len(new_tools)} new tool(s), 0 unexempted gaps)")
-    return 0
+    return run(args.base, args.head, args.summary)
 
 
 if __name__ == "__main__":

@@ -153,7 +153,10 @@ any dispatch arm runs:
   `Execution:Execute` grant the minting username holds (an administrator minting a service-A token
   must still be confined to service A, not reach the whole fleet — CDX-001). The tag store being
   unavailable fails closed to the empty set.
-- Otherwise, if the operator holds `Execution:Execute` **globally** (`RbacStore::check_permission`),
+- An **engine principal** (`ExecVisibleFacts::principal_is_engine`) is resolved next, RBAC-only:
+  with RBAC off the set is present-EMPTY (deny-all, never `nullopt`); with a global grant it is
+  unfiltered; otherwise its ADR-0017 scoped set. JIT elevation does not apply to it.
+- Otherwise, for a non-engine caller, if the operator holds `Execution:Execute` **globally** (`RbacStore::check_permission`),
   or reaches the route via JIT admin elevation (`auth::is_elevated`) — both of which
   `require_permission` above already treats as full access without a matching `principal_roles` row —
   the set is unfiltered. This mirrors `RbacStore::check_scoped_permission`'s own internal order

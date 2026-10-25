@@ -71,6 +71,7 @@
 // overload the way KekRoutes does).
 #include "http_route_sink.hpp"
 #include "pki_routes.hpp"
+#include "route_inventory.hpp"
 #include "plugin_config_routes.hpp"
 #include "settings_plugins_routes.hpp"
 #include "plugin_config_store.hpp"
@@ -102,6 +103,8 @@
 #include "on_behalf_guard.hpp"
 #include "principal_class.hpp"
 #include "principal_quota_gate.hpp"
+#include "step_up_wiring.hpp" // post-read body cap + MFA step-up chokepoint (pre-request handler body)
+#include "step_up_gate.hpp" // MFA step-up chokepoint (policy table: step_up_policy.hpp)
 #include "same_site_write_gate.hpp" // cookie-session writes require a same-site Origin or Referer
 #include "rest_a4_envelope_http.hpp"
 #include "inventory_store.hpp"
@@ -158,6 +161,7 @@
 #include "response_store.hpp"
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_confined
 #include "dispatch_target_shape.hpp" // check_targeting_shape / targeting_supplied (#2500)
+#include "engine_aware_visibility.hpp" // #6204: engine-aware username-keyed resolvers (unit-tested)
 #include "authz_model.hpp" // #1788: per-arm visibility intersection (in_scope/filter_to_scope)
 #include "dispatch_confined_arms.hpp" // the ONE per-arm intersection, shared with /api/command
 #include "dispatch_destructive_gate.hpp" // #3685: the Destructive-class targeting verdict
@@ -743,6 +747,17 @@ public:
         // closed-set combination per docs/observability-conventions.md: the direct Register series
         // carries only `reason`, the gateway path adds source="gateway_proxy".
         seed_register_invalid_agent_id_series(metrics_);
+
+        // MFA step-up chokepoint decisions (step_up_gate.cpp): closed outcome/source/surface sets,
+        // pre-seeded to 0 per docs/observability-conventions.md.
+        seed_step_up_gate_metrics(metrics_);
+        // The configured step-up window (--mfa-step-up-window-secs), set once at boot: a value of
+        // 0 or less means the check is disabled on every kRequired route.
+        metrics_.describe("yuzu_auth_mfa_step_up_window_seconds",
+                          "Configured MFA step-up window in seconds (0 or less: step-up disabled)",
+                          "gauge");
+        metrics_.gauge("yuzu_auth_mfa_step_up_window_seconds")
+            .set(static_cast<double>(cfg_.mfa_step_up_window_secs));
 
         // Agent OTA pull bounds (#913 / #911 / #416). Pre-seeded closed series
         // per docs/observability-conventions.md so absent() alerts stay
@@ -7134,7 +7149,7 @@ public:
                     [this] { invalidate_guardian_reconcile_caches(); });
                 spdlog::info("GuaranteedStateStore initialized (schema guaranteed_state_store; "
                              "retention={}d)",
-                             cfg_.guardian_event_retention_days);
+                             cfg_.guardian_event_retention_days.get());
                 // Step 5: ingest agent `__guard__` events arriving on the Subscribe
                 // stream → guaranteed_state_events. See docs/guardian-mvp-contract.md.
                 agent_service_.set_guaranteed_state_store(guaranteed_state_store_.get());
@@ -8900,8 +8915,9 @@ public:
         // time (same thread, sequential — not a wait).
         if (startup_failed_) {
             spdlog::error("run(): refusing to serve — startup failed in start_web_server() "
-                         "(SCIM boot failure or HTTPS cipher-pin failure — see the preceding "
-                         "error); stopping the already-started agent/management gRPC listeners.");
+                         "(among others: SCIM boot failure, HTTPS cipher-pin failure or the MFA "
+                         "step-up route classification abort; see the preceding critical log); "
+                         "stopping the already-started agent/management gRPC listeners.");
             stop();
             return;
         }
@@ -10627,6 +10643,12 @@ public:
                 std::_Exit(1);
             }
         }
+
+        // The web listener is joined (or was never started), so nothing registers on or reads
+        // from this server's route inventory any more: drop its record so a later server that
+        // reuses the address starts clean. The construction-time `forget` stays as well.
+        if (web_server_)
+            RouteInventory::instance().forget(web_server_.get());
 
         // agent_server_/mgmt_server_->Shutdown(deadline) already ran above
         // (#3495), immediately before the policy-eval/pre-flight/quarantine/
@@ -12519,8 +12541,9 @@ private:
             .increment();
     }
 
-    /// The ONE /crypto availability callback (ADR-0070 R2; fix-spec B1): CryptoRoutes, the
-    /// filtered GET /api/v1/ca/issued and the MCP server all receive THIS function, so the REST
+    /// The ONE /crypto availability callback (ADR-0070 R2; fix-spec B1): CryptoRoutes, both
+    /// forms of GET /api/v1/ca/issued (and the Settings CA panel's inventory) and the MCP server
+    /// all receive THIS function, so the REST
     /// widget list, the dashboard and list_crypto_widgets cannot draw different answers. Fleet
     /// gate classes ask the NON-auditing fleet-read probe (a confined caller has a present
     /// VisibleSet); the global class asks the non-auditing has_permission. Never a grant.
@@ -12582,6 +12605,7 @@ private:
         // so a broken store stays fail-closed (BR-002).
         facts.legacy_open = !rbac_enforcement_in_effect(rbac_store_.get());
         facts.elevated = auth::is_elevated(sess);
+        facts.principal_is_engine = sess.is_engine();
         facts.global_grant =
             rbac_store_ && rbac_store_->check_permission(sess.username, "Execution", "Execute");
         if (rbac_store_) {
@@ -12670,6 +12694,9 @@ private:
 
         yuzu::server::authz::ExecVisibleFacts facts;
         facts.legacy_open = !rbac_enforcement_in_effect(rbac_store_.get());
+        // Tripwire: an engine is not an AuthDB user, so the principal_resolves check above already
+        // denied an `engine:` creator; this keeps the composer correct if that ever changes.
+        facts.principal_is_engine = yuzu::server::authz::is_engine_principal_name(username);
         facts.global_grant =
             rbac_store_ && rbac_store_->check_permission(username, "Execution", "Execute");
         if (rbac_store_) {
@@ -12936,17 +12963,16 @@ private:
     /// Mirrors every other dispatch-adjacent RBAC read in this file (e.g.
     /// derive_exec_visible's own `legacy_open` composition): a
     /// loaded-and-explicitly-disabled store is legacy-open, and legacy-open
-    /// means "RBAC off, everyone may do everything" — the SAME bypass every
-    /// other securable already grants here, not a new one minted for this
-    /// chokepoint.
+    /// means "RBAC off, every HUMAN principal may do everything" — the SAME
+    /// bypass every other securable already grants here, not a new one minted
+    /// for this chokepoint. An ENGINE principal (`engine:<slug>`) is the one
+    /// exclusion: its only authority is an explicit RBAC grant, so under
+    /// legacy-open it is refused, never admitted (#6204).
     [[nodiscard]] bool dispatch_has_permission(std::string_view principal,
                                                std::string_view securable,
                                                yuzu::server::authz::Operation op) const {
-        if (!rbac_enforcement_in_effect(rbac_store_.get()))
-            return true;
-        return rbac_store_ != nullptr &&
-               rbac_store_->check_permission(std::string(principal), std::string(securable),
-                                             std::string(yuzu::server::authz::to_string(op)));
+        return yuzu::server::visibility::dispatch_permission(rbac_store_.get(), principal,
+                                                             securable, op);
     }
 
     std::expected<detail::ClassifiedCommand, detail::DispatchDenial> build_classified_command(
@@ -13510,44 +13536,14 @@ private:
     /// true (enforce), and `check_scoped_permission` then denies on the dead handle —
     /// so a corrupt rbac.db yields zero rows, never the whole fleet (#1498 ruling).
     bool response_agent_in_scope(const std::string& username, const std::string& agent_id) const {
-        if (!rbac_enforcement_in_effect(rbac_store_.get()))
-            return true; // loaded & explicitly disabled → legacy-open
-        return rbac_store_ && rbac_store_->check_scoped_permission(username, "Response", "Read",
-                                                                   agent_id, mgmt_group_store_.get());
+        return yuzu::server::visibility::response_agent_in_scope(
+            rbac_store_.get(), mgmt_group_store_.get(), username, agent_id);
     }
 
     /// Return the agent list as JSON, filtered by RBAC visibility for the given user.
     nlohmann::json get_visible_agents_json(const std::string& username) {
-        auto agents = registry_.to_json_obj();
-        // #1498 — restrict whenever RBAC enforcement is in effect, which includes
-        // a missing/load-failed store (fail closed); only a loaded-and-explicitly-
-        // disabled store skips filtering and returns the full fleet. Shares the
-        // rbac_enforcement_in_effect predicate with the get_visible_agents probe
-        // so /api/agents and the TAR fleet scan can never disagree.
-        if (mgmt_group_store_ && rbac_enforcement_in_effect(rbac_store_.get())) {
-            // A global Infrastructure:Read grant sees the whole fleet even under
-            // RBAC-on. On a load-failed store check_permission is unavailable
-            // (is_open()==false), so this is false and visibility falls to the
-            // role-scoped join, which itself fails closed.
-            bool global_read = rbac_store_ && rbac_store_->is_open() &&
-                               rbac_store_->check_permission(username, "Infrastructure", "Read");
-            if (!global_read) {
-                // ADR-0042: nullopt (store degraded) → empty visible set
-                // (fail-closed: return no agents rather than the full fleet).
-                auto visible = mgmt_group_store_->get_visible_agents(username);
-                std::set<std::string> visible_set;
-                if (visible)
-                    visible_set.insert(visible->begin(), visible->end());
-                nlohmann::json filtered = nlohmann::json::array();
-                for (const auto& a : agents) {
-                    if (a.contains("agent_id") &&
-                        visible_set.count(a["agent_id"].get<std::string>()))
-                        filtered.push_back(a);
-                }
-                return filtered;
-            }
-        }
-        return agents;
+        return yuzu::server::visibility::visible_agents_json(
+            registry_.to_json_obj(), rbac_store_.get(), mgmt_group_store_.get(), username);
     }
 
     /// Auto-create a dynamic management group for a service tag value.
@@ -14559,16 +14555,22 @@ private:
                 spdlog::set_level(spdlog::level::from_str(e.value));
             } else if (e.key == "heartbeat_timeout") {
                 try {
-                    // A value stored before the 30 s floor existed would make every directly
-                    // connected agent flap; raise it to the floor and say how to clear it.
+                    // A value stored before the 30 s floor (or the one-day ceiling) existed would
+                    // make every directly connected agent flap, or stop stale-agent reaping; move it
+                    // to the nearest bound and say how to clear it.
                     const int stored = std::stoi(e.value);
                     const int applied = clamp_heartbeat_timeout(stored);
                     if (applied != stored)
-                        spdlog::warn("Stored heartbeat_timeout {} is below the {} second minimum; "
-                                     "using {} seconds. PUT /api/config/heartbeat_timeout with a "
-                                     "value of {} or more to replace the stored one.",
-                                     stored, kMinHeartbeatTimeoutSeconds, applied,
-                                     kMinHeartbeatTimeoutSeconds);
+                        spdlog::warn("Stored heartbeat_timeout {} is {} the {} second {}; using "
+                                     "{} seconds. PUT /api/config/heartbeat_timeout with a value "
+                                     "from {} to {} to replace the stored one.",
+                                     stored, stored < kMinHeartbeatTimeoutSeconds ? "below" : "above",
+                                     stored < kMinHeartbeatTimeoutSeconds
+                                         ? kMinHeartbeatTimeoutSeconds
+                                         : kMaxHeartbeatTimeoutSeconds,
+                                     stored < kMinHeartbeatTimeoutSeconds ? "minimum" : "maximum",
+                                     applied, kMinHeartbeatTimeoutSeconds,
+                                     kMaxHeartbeatTimeoutSeconds);
                     cfg_.session_timeout = std::chrono::seconds(applied);
                 } catch (...) {}
             } else if (e.key == "response_retention_days") {
@@ -14766,6 +14768,10 @@ private:
         web_server_ = std::make_unique<httplib::Server>();
 #endif
 
+        // A new server can reuse a destroyed one's address, so drop whatever the route inventory
+        // still holds under it before any owner registers (the boot sweep below reads it back).
+        RouteInventory::instance().forget(web_server_.get());
+
         // Disable Nagle — SSE events are small and must reach the browser
         // immediately, not wait 200ms for the TCP send buffer to coalesce.
         web_server_->set_tcp_nodelay(true);
@@ -14931,6 +14937,11 @@ private:
             // comment.
             detail::tls_quota_slot().reset();
 
+            // Step-up chokepoint pass stash: same worker-thread-affinity reasoning as the quota
+            // slot above. A stash left by a prior request on this thread must never be seen by
+            // this one.
+            detail::clear_step_up_pass();
+
             // principal_class metric (PR 4.5) — defensive reset at the TOP of
             // pre-routing, before all early returns, mirroring the quota
             // slot reset immediately above. Set true further down, right
@@ -14954,17 +14965,21 @@ private:
             // /api/health) also skip the 401 gate further down, so before
             // this cap existed they were the last unauthenticated 100 MiB
             // buffer on the server — the cap MUST still reach them even
-            // though they are exempt from on-behalf-of and the rate limiter.
-            // A single unconditional placement cannot satisfy that AND the
-            // separate requirement below, which is why this is a callable,
-            // not an inline block:
+            // though they are exempt from on-behalf-of and the general rate
+            // limiter. A single unconditional placement cannot satisfy that
+            // AND the separate requirement below, which is why this is a
+            // callable, not an inline block:
             //
             //   1. Probes are capped — call site 1, inside the probe branch
-            //      just below: for a probe, this cap is the ONLY gate it
-            //      hits, so it runs immediately, before the Unhandled
-            //      return that skips everything else.
-            //   2. Probes stay exempt from on-behalf-of and rate limiting —
-            //      unchanged: the probe branch returns before either runs.
+            //      just below: for a probe, this cap and the /health +
+            //      /api/health per-source budget (`admit_probe_request`,
+            //      checked first) are the only gates it hits, so they run
+            //      immediately, before the Unhandled return that skips
+            //      everything else.
+            //   2. Probes stay exempt from on-behalf-of and from the general
+            //      rate-limit bucket, unchanged: the probe branch returns
+            //      before either runs. /health and /api/health draw on their
+            //      own bucket instead (see the probe branch).
             //   3. Every NON-probe request hits the on-behalf-of guard and
             //      the rate limiter BEFORE this cap — call site 2, after
             //      both, restores the pre-R3 ordering an earlier version of
@@ -15329,21 +15344,30 @@ private:
                 return false;
             };
 
-            // Lightweight probes — capped (R3, call site 1 of
-            // `enforce_pre_auth_body_cap` above), but otherwise always
-            // allowed: no auth, no rate limit. /health and /api/health are
-            // included here (governance Gate 7, unhappy-path UP-1) so
-            // monitoring integrations behind a NAT or sharing a source-IP
-            // bucket with authed REST traffic cannot 429-starve the health
-            // probe. The endpoints themselves are strictly read-only and
-            // documented as unauthenticated. This is the probes' only gate
-            // on the HTTPS listener (the plaintext redirect listener admits
-            // no body at all: is_plaintext_probe_request, health_routes.hpp):
-            // the cap check runs here, unconditionally, before the
-            // Unhandled return, precisely because everything past this
-            // point (on-behalf-of, rate limiting) is skipped for these four
-            // paths — before the cap reached them too, they were the last
-            // unauthenticated 100 MiB buffer on the server.
+            // Lightweight probes, no auth, no on-behalf-of guard, no draw on
+            // the general rate-limit bucket (governance Gate 7, unhappy-path
+            // UP-1: monitoring integrations behind a NAT or sharing a
+            // source-IP bucket with authed REST traffic must not be able to
+            // 429-starve the health probe, nor be starved by it). Two gates
+            // do apply, in this order:
+            //   1. /health and /api/health requests that carry a credential
+            //      header only: a per-source budget,
+            //      `health::admit_probe_request`, drawn from the same
+            //      `api_rate_limiter_` (`--rate-limit`) under a key of its
+            //      own, so the probe and REST traffic from one source never
+            //      share a bucket. Credential-less requests, /livez and
+            //      /readyz are not charged.
+            //   2. The body cap (R3, call site 1 of
+            //      `enforce_pre_auth_body_cap` above), unconditionally,
+            //      before the Unhandled return, precisely because everything
+            //      past this point (on-behalf-of, the general rate-limit
+            //      bucket) is skipped for these four paths. Before the cap
+            //      reached them they were the last unauthenticated 100 MiB
+            //      buffer on the server. The plaintext redirect listener
+            //      admits no body at all (is_plaintext_probe_request,
+            //      health_routes.hpp).
+            // The rate limit runs before the cap, mirroring the non-probe
+            // order below (limiter, then cap).
             // Liveness/readiness probes are EXEMPT from the on-behalf-of guard
             // below — a RECORDED ADR-1005 exception (documented in
             // docs/auth-architecture.md; ledger entry lands with the ADR).
@@ -15354,6 +15378,8 @@ private:
             // path, and a bricked orchestrator hides the misconfiguration the
             // guard exists to surface. Every other path rejects below.
             if (yuzu::server::health::is_probe_path(req.path)) {
+                if (!yuzu::server::health::admit_probe_request(api_rate_limiter_, req, res))
+                    return httplib::Server::HandlerResponse::Handled;
                 if (enforce_pre_auth_body_cap())
                     return httplib::Server::HandlerResponse::Handled;
                 return httplib::Server::HandlerResponse::Unhandled;
@@ -15440,11 +15466,7 @@ private:
                         req.path.ends_with("/password"));
             auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
             if (!limiter.allow(req.remote_addr)) {
-                res.status = 429;
-                res.set_header("Retry-After", "1");
-                res.set_content(
-                    R"({"error":{"code":429,"message":"rate limit exceeded"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                write_rate_limited_response(res);
                 return httplib::Server::HandlerResponse::Handled;
             }
 
@@ -15467,7 +15489,7 @@ private:
             // Allow unauthenticated access to login pages, health, OIDC flow, and OpenAPI spec.
             // /health and /api/health are ALSO covered by the early-return
             // exemption at the top of this lambda (which additionally skips
-            // rate limiting). They are kept in this list as defense-in-depth
+            // the general rate-limit bucket). They are kept in this list as defense-in-depth
             // — a future contributor narrowing the early-return back to
             // /livez|/readyz alone would silently start requiring auth on
             // /health without this lower entry. Governance Gate 7, security
@@ -15693,7 +15715,9 @@ private:
         // it locally costs nothing and fails CLOSED (413) rather than
         // deferring to httplib's generic 500.
         //
-        // `[this]` ONLY. The httplib member function that invokes this
+        // `[this]` plus the two by-value init-captures named at the bottom of
+        // this comment (the step-up session resolver and audit callable); NO
+        // reference captures. The httplib member function that invokes this
         // handler (`Server::dispatch_request`) is `const`, but that constness
         // is on httplib::Server's own members — it says nothing about what
         // this lambda captures. `this` is the ServerImpl pointer, copied by
@@ -15704,69 +15728,39 @@ private:
         // (`dispatch_request` and `dispatch_request_for_content_reader`), so a
         // captured reference to something scoped to one request's stack frame
         // would be a dangling-reference hazard on the other.
-        web_server_->set_pre_request_handler([this](const httplib::Request& req,
-                                                     httplib::Response& res)
-                                                  -> httplib::Server::HandlerResponse {
-            try {
-                const auto cap_match = resolve_body_cap(req.method, req.path);
-                if (req.body.size() <= cap_match.max_body_bytes) {
-                    return httplib::Server::HandlerResponse::Unhandled;
-                }
-
-                static std::atomic<std::uint64_t> post_read_hits{0};
-                constexpr std::uint64_t kBodyLogEvery = 100;
-                if (post_read_hits.fetch_add(1, std::memory_order_relaxed) %
-                        kBodyLogEvery ==
-                    0) {
-                    spdlog::warn(
-                        "[#2407 post-read] rejected {} {} from {}: body {} bytes read, "
-                        "over the {}-byte cap (class={}, 1 log per {} rejections; the "
-                        "counter records all)",
-                        onbehalf::sanitize_for_log(req.method, 16),
-                        onbehalf::sanitize_for_log(req.path),
-                        onbehalf::sanitize_for_log(req.remote_addr, 64), req.body.size(),
-                        cap_match.max_body_bytes, cap_match.path_class, kBodyLogEvery);
-                }
-                try {
-                    metrics_
-                        .counter("yuzu_body_cap_rejected_total",
-                                 {{"path_class", std::string(cap_match.path_class)},
-                                  {"reason", "over_cap_post_read"}})
-                        .increment();
-                } catch (...) { // NOLINT(bugprone-empty-catch)
-                    // Observability must never kill the process from this
-                    // handler either — same reasoning as the pre-routing
-                    // gate's own metric try/catch above.
-                }
-
-                res.status = 413;
-                if (cap_match.path_class == "scim") {
-                    // D7 parity: same RFC 7644 §3.12 envelope the pre-routing
-                    // gate's SCIM branch uses.
-                    res.set_content(
-                        scim::error(413, "request body too large").dump(),
-                        "application/scim+json");
-                } else {
-                    res.set_content(
-                        detail::a4_denial(
-                            res, 413, "request body exceeds this route's size cap",
-                            detail::A4ErrorOpts{
-                                .remediation =
-                                    "reduce the request body size; see "
-                                    "docs/user-manual/rest-api.md for the per-route "
-                                    "limit"}),
-                        "application/json");
-                }
-                return httplib::Server::HandlerResponse::Handled;
-            } catch (...) { // NOLINT(bugprone-empty-catch)
-                // Last-resort containment for the whole block — see
-                // `enforce_pre_auth_body_cap`'s identical catch above. No
-                // envelope can be built once we are here, but the request
-                // must still be refused rather than let the throw reach an
-                // unguarded httplib call site.
-                res.status = 413;
-                return httplib::Server::HandlerResponse::Handled;
-            }
+        //
+        // The MFA step-up chokepoint is the stage AFTER the cap: once the body is known to be
+        // within bounds, `apply_step_up_chokepoint` looks the matched route up in
+        // `step_up_policy.hpp` and, for a kRequired row, evaluates the caller's step-up proof
+        // before the handler runs. A failure while evaluating a gated row is answered 503 inside
+        // it (every allocation after the policy lookup is in its own try), so the last-resort 413
+        // catch in `detail::run_pre_request_stage` (step_up_wiring.hpp) is not expected to see
+        // it, but the chokepoint is not declared noexcept: if that ever stops holding, that 413
+        // answers. The session resolver and audit callable are built once and captured by value;
+        // per request only a small struct of pointers is made.
+        web_server_->set_pre_request_handler(
+            [this,
+             step_up_resolve = StepUpSessionFn([this](const httplib::Request& r) {
+                 return auth_routes_->resolve_session(r);
+             }),
+             step_up_audit = StepUpAuditFn([this](const httplib::Request& r, const std::string& a,
+                                                  const std::string& rs, const std::string& tt,
+                                                  const std::string& ti, const std::string& d) {
+                 return audit_log(r, a, rs, tt, ti, d);
+             })](const httplib::Request& req, httplib::Response& res)
+                -> httplib::Server::HandlerResponse {
+            // The body cap and the chokepoint live in `detail::run_pre_request_stage`
+            // (step_up_wiring.hpp), which contains every throw. Building the deps does not
+            // allocate or throw; the auth store pointer is re-read per request.
+            const StepUpChokepointDeps step_up_deps{
+                .resolve_session = &step_up_resolve,
+                .auth_db = auth_mgr_.auth_db_ptr(),
+                .mfa_status = nullptr,
+                .audit_fn = &step_up_audit,
+                .metrics = &metrics_,
+                .window_secs = cfg_.mfa_step_up_window_secs,
+                .mfa_enforcement = cfg_.mfa_enforcement};
+            return detail::run_pre_request_stage(req, res, step_up_deps);
         });
 
         // -- Auth routes (login, logout, OIDC) — delegated to AuthRoutes --------
@@ -15837,6 +15831,14 @@ private:
             struct EngineClassStashClear {
                 ~EngineClassStashClear() { detail::tls_engine_principal() = false; }
             } engine_class_stash_clear;
+
+            // Step-up chokepoint: a pass that the in-handler gate never spent, on a 2xx
+            // response, is counted as handler_skipped (report-only); always clears the stash,
+            // the per-request principal binding included. It is noexcept and runs before any
+            // later code in this lambda (the quota-slot release, the response headers), so the
+            // stash and the binding are cleared first. The lexical test in test_step_up_wiring.cpp
+            // pins this order.
+            detail::finish_step_up_pass(req, res, &metrics_);
 
             // Per-principal quota (PR 4.4) — release the concurrency slot
             // (if any) admitted for this request at pre-routing. A no-op for
@@ -16014,20 +16016,8 @@ private:
         // fix immediately above.
         auto visible_set_fn =
             [this](const std::string& username) -> std::optional<std::set<std::string>> {
-            if (mgmt_group_store_ && rbac_enforcement_in_effect(rbac_store_.get())) {
-                bool global_read = rbac_store_ && rbac_store_->is_open() &&
-                                   rbac_store_->check_permission(username, "Infrastructure", "Read");
-                if (!global_read) {
-                    // ADR-0042: get_visible_agents nullopt means the mgmt-store
-                    // DEGRADED — return an EMPTY confined set (fail-closed: sees
-                    // nothing), NOT nullopt here (which means "sees all fleet").
-                    auto v = mgmt_group_store_->get_visible_agents(username);
-                    if (!v)
-                        return std::set<std::string>{};
-                    return std::set<std::string>(v->begin(), v->end());
-                }
-            }
-            return std::nullopt; // global read or RBAC disabled → sees all
+            return yuzu::server::visibility::infrastructure_visible_set(
+                rbac_store_.get(), mgmt_group_store_.get(), username);
         };
         // D3: the dashboard facet/scope surfaces' Response:Read-visible set
         // (dashboard_routes.hpp VisibleSetFn) — deliberately NOT built on
@@ -16047,17 +16037,8 @@ private:
         // perm_fn_ admission gates are untouched by this resolver.
         auto response_visible_set_fn =
             [this](const std::string& username) -> std::optional<std::set<std::string>> {
-            if (!rbac_enforcement_in_effect(rbac_store_.get())) return std::nullopt;
-            bool global_read = rbac_store_ && rbac_store_->is_open() &&
-                               rbac_store_->check_permission(username, "Response", "Read");
-            if (global_read) return std::nullopt; // global Response:Read sees all, #1715(b)
-            if (!rbac_store_ || !mgmt_group_store_) {
-                return std::set<std::string>{}; // fail-closed, no store to resolve against
-            }
-            auto v = rbac_store_->visible_agents_for_permission(username, "Response", "Read",
-                                                                 mgmt_group_store_.get());
-            if (!v) return std::set<std::string>{}; // degrade → fail-closed, never nullopt
-            return std::set<std::string>(v->begin(), v->end());
+            return yuzu::server::visibility::response_visible_set(
+                rbac_store_.get(), mgmt_group_store_.get(), username);
         };
         // #4990: who may read Forensics-plugin rows out of the response store. ONE production
         // resolver, wired into every surface that reads stored responses (REST, MCP, dashboard,
@@ -16327,7 +16308,7 @@ private:
                         // The enforced figure (the store copies it at construction), not the
                         // live config value; without a store, the startup config.
                         return audit_store_ ? audit_store_->retention_days()
-                                            : cfg_.audit_retention_days;
+                                            : cfg_.audit_retention_days.get();
                     },
                 .now_fn = []() { return static_cast<std::int64_t>(std::time(nullptr)); },
             });
@@ -16596,15 +16577,20 @@ private:
         StepUpFn step_up_fn = [this](const httplib::Request& req, httplib::Response& res,
                                      const auth::Session& session,
                                      const std::string& action_label) -> bool {
-            if (!auth_mgr_.auth_db_ptr())
-                return true; // defensive — auth_db is always non-null in production
-            return require_mfa_step_up(
-                req, res, session, *auth_mgr_.auth_db_ptr(), cfg_.mfa_step_up_window_secs,
-                [this](const httplib::Request& r, const std::string& a, const std::string& rs,
-                       const std::string& tt, const std::string& ti, const std::string& d) {
-                    return audit_log(r, a, rs, tt, ti, d);
-                },
-                action_label, cfg_.mfa_enforcement, &metrics_);
+            // The decision (consume the chokepoint's pass, else fail closed on an unwired store,
+            // else evaluate) lives in `detail::run_in_handler_step_up` (step_up_wiring.hpp) so a
+            // test can drive it with a null store. Chokepoint PR 2 deletes the pass,
+            // consume_step_up_pass and the handler_skipped outcome with the in-handler calls;
+            // the principal binding stays until resolve-once lands (#6200).
+            const StepUpAuditFn audit = [this](const httplib::Request& r, const std::string& a,
+                                               const std::string& rs, const std::string& tt,
+                                               const std::string& ti, const std::string& d) {
+                return audit_log(r, a, rs, tt, ti, d);
+            };
+            return detail::run_in_handler_step_up(req, res, session, action_label,
+                                                  auth_mgr_.auth_db_ptr(),
+                                                  cfg_.mfa_step_up_window_secs, audit,
+                                                  cfg_.mfa_enforcement, &metrics_);
         };
 
         // #2542 PR-9: the 4-route Approval API (/api/approvals,
@@ -16726,6 +16712,7 @@ private:
                              .auth_fn = auth_fn,
                              .perm_fn = perm_fn,
                              .audit_fn = audit_fn,
+                             .step_up_fn = step_up_fn,
                              .cfg = &cfg_,
                              .auto_approve = &auto_approve_,
                              .runtime_config_store = runtime_config_store_.get(),
@@ -18836,6 +18823,19 @@ private:
         // (PreflightRoutes, DeploymentRoutes, TarTreeRoutes, and McpServer's/
         // TarTreeRoutes' `set_all_devices_fn`), unrelated to DeviceRoutes itself.
         auto device_api = make_local_device_api(registry_, tag_store_.get());
+        // The customer score policy is one stored document read through a
+        // bounded-refresh provider, so every instance converges within
+        // kDexPolicyRefreshMs. It depends only on the runtime config store, so it exists
+        // whenever that store is open: PUT/DELETE /api/v1/dex/score-policy install through
+        // it even where the signals store is absent. With no runtime config store the Apps
+        // read scores under the shipped defaults (the empty function).
+        if (runtime_config_store_ && runtime_config_store_->is_open())
+            dex_score_policy_provider_ = std::make_shared<DexScorePolicyProvider>(
+                dex_score_policy_store_reader(*runtime_config_store_), []() -> std::int64_t {
+                    return std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+                });
         // ADR-0031 WS-A4 (fifth family): the DEX signals API seam — ONE
         // instance backing the GuaranteedStateStore-backed GET /api/v1/dex/*
         // signal/experience reads, wired with the SAME `dex_fleet_fn` closure
@@ -18848,21 +18848,9 @@ private:
         // (byte-identical). Mirrors verify_api's "null → 503" contract.
         std::shared_ptr<yuzu::server::DexApi> dex_api;
         if (guaranteed_state_store_) {
-            // The customer score policy is one stored document read through a
-            // bounded-refresh provider, so every instance converges within
-            // kDexPolicyRefreshMs. With no runtime config store the Apps read scores
-            // under the shipped defaults (the empty function).
             yuzu::server::DexScorePolicyFn dex_policy_fn;
-            if (runtime_config_store_ && runtime_config_store_->is_open()) {
-                dex_score_policy_provider_ = std::make_shared<DexScorePolicyProvider>(
-                    dex_score_policy_store_reader(*runtime_config_store_),
-                    []() -> std::int64_t {
-                        return std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   std::chrono::steady_clock::now().time_since_epoch())
-                            .count();
-                    });
+            if (dex_score_policy_provider_)
                 dex_policy_fn = [p = dex_score_policy_provider_] { return p->current(); };
-            }
             dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn,
                                          std::move(dex_policy_fn));
         }
@@ -20307,7 +20295,9 @@ private:
         // copies the list into its handler captures, so it must be set first.
         ca_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
         // ADR-0070 R2-2: the filtered GET /api/v1/ca/issued reads through the SAME CryptoApi
-        // instance and is withheld from a confined caller via the SAME availability callback.
+        // instance; BOTH forms of it (and the Settings CA panel's inventory) are withheld from a
+        // confined caller via the SAME availability callback. This MUST run before
+        // register_routes: the handlers capture a copy, so a later call leaves them unwired.
         ca_routes_->set_filtered_issued(CaRoutes::FilteredIssuedDeps{
             .api = crypto_api_,
             .confinement_fn = [this](const httplib::Request& req) {
@@ -21001,6 +20991,9 @@ private:
                             out.visible_agents = std::move(authz.visible_agents);
                             break;
                         case ListReadDecision::DenyAll:
+                            // Deliberately ignores `authz.read_failed`: this seam's decision
+                            // type has no "degraded" arm, so a failed read maps to deny-all
+                            // (fail closed, nothing served), as before.
                             break; // out already kDenyAll (default)
                         }
                         return out;
@@ -21269,6 +21262,20 @@ private:
         // it stamps the principal, the effective role the route captured per binding, the
         // engine class and the session correlator. MUST run BEFORE register_routes().
         rest_api_v1_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
+        // #6086: GET/PUT/DELETE /api/v1/dex/score-policy. The reader and the two conditional
+        // writes borrow runtime_config_store_ by reference. stop() waits for and joins the
+        // listener thread(s) before it resets the store, so no handler is running when the
+        // reference dies (the same ordering the provider's reader relies on). Without an open
+        // store the three routes answer 503. MUST run BEFORE register_routes().
+        if (dex_score_policy_provider_) {
+            auto policy_writes = dex_score_policy_store_writer(*runtime_config_store_);
+            rest_api_v1_->set_dex_score_policy_writer(
+                {.read_stored = dex_score_policy_store_reader(*runtime_config_store_),
+                 .compare_and_set = std::move(policy_writes.compare_and_set),
+                 .compare_and_remove = std::move(policy_writes.compare_and_remove),
+                 .provider = dex_score_policy_provider_,
+                 .audit = {}});
+        }
         // #6065 PR-Q: the dispatch-chokepoint pre-check closure, defined ONCE and
         // handed to BOTH REST (POST and DELETE /api/v1/quarantine, the trailing register_routes
         // param) and MCP (set_authorize_dispatch_fn, wired further below), so the two
@@ -21448,8 +21455,10 @@ private:
             // choice stopped being available rather than merely being avoided.
             // Empty closure would 503 those routes.
             command_dispatch_caller_fn,
-            // PR2 MFA step-up gate for the high-risk REST handlers; empty
-            // closure disables the gate (preserves pre-PR2 behaviour).
+            // PR2 MFA step-up gate for the high-risk REST handlers: the handlers' own second
+            // check behind the chokepoint (step_up_gate.hpp), which ignores this closure and
+            // evaluates the kRequired rows before the handler runs. An empty closure only
+            // drops that second check; it does not disable the gate.
             step_up_fn,
             // Step 3 — Guardian push fan-out. Resolve scope → in-scope agents, build the
             // GuaranteedStatePush from the store's enabled rules (typed
@@ -22055,6 +22064,10 @@ private:
             // with no MCP twin — an ADR-1005 gap for an ordinary
             // authenticated operator action).
             mcp_server_->set_plugin_config_store(plugin_config_store_.get());
+            // get_runtime_config / set_runtime_config: the same cfg_, auto_approve_ and
+            // runtime_config_store_ the config routes hold.
+            mcp_server_->set_runtime_config_backing(
+                {&cfg_, &auto_approve_, runtime_config_store_.get()});
             // #4036 (api-parity Batch A) — backs list_preflight_runs +
             // get_deployment_preview. Same store PreflightRoutes/
             // DeploymentRoutes already hold (constructed well before this
@@ -22112,6 +22125,7 @@ private:
                         out.visible_agents = std::move(authz.visible_agents);
                         break;
                     case ListReadDecision::DenyAll:
+                        // Deliberately ignores `authz.read_failed` (see the REST twin above).
                         break; // out already kDenyAll (default)
                     }
                     return out;
@@ -22342,6 +22356,33 @@ private:
                 // across the device_api merge).
                 app_usage_store_.get());
         }
+
+        // -- MFA step-up coverage sweep ----------------------------------------
+        //
+        // Every owner above has registered, always on `web_server_` through an HttplibRouteSink
+        // that recorded each (method, pattern). A mutating route with no row in step_up_policy.hpp
+        // is never evaluated by the chokepoint, so refuse to serve rather than run one. Same
+        // posture as the MCP tool-security validator (McpServer's constructor) and the SCIM boot
+        // guard above: log, set startup_failed_, return before the listener launches; run()
+        // re-checks startup_failed_ right after start_web_server() and stops the gRPC listeners.
+        // The fix is a row in the table, never a flag.
+        if (const auto unclassified = step_up_unclassified_registrations(web_server_.get());
+            !unclassified.empty()) {
+            for (const auto& route : unclassified)
+                spdlog::critical("start_web_server(): mutating route has no MFA step-up policy "
+                                 "row: {}",
+                                 route);
+            spdlog::critical("start_web_server(): aborting: {} mutating route(s) are not "
+                             "classified in step_up_policy.hpp; the web listener will not be "
+                             "started.",
+                             unclassified.size());
+            startup_failed_ = true;
+            return;
+        }
+        spdlog::info("MFA step-up coverage: every mutating route has a policy row");
+        // From here a mutating registration through the sink needs a table row (see
+        // route_inventory.hpp, SEALING); the sweep above covers everything registered before it.
+        RouteInventory::instance().seal(web_server_.get());
 
         // -- Listen -----------------------------------------------------------
 

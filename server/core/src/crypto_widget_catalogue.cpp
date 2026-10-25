@@ -882,6 +882,30 @@ std::string audit_detail_certs(std::string_view cid, const CaCertPage& page) {
                        page.query.cursor.empty() ? "first" : "continuation", page.total);
 }
 
+std::string audit_detail_inventory(std::string_view cid, std::size_t rows, int limit, int offset,
+                                   bool has_more) {
+    return std::format("{}inventory rows={} limit={} offset={} has_more={}", cid_prefix(cid), rows,
+                       limit, offset, has_more);
+}
+
+std::string audit_detail_with_standing(std::string detail, Access standing) {
+    // Exhaustive, no default: a new enumerator must be decided here. Only kAvailable is ever
+    // served, so only kAvailable reaches a success row; kRefused, kConfined and kDegraded are
+    // answered first. If a caller ever passed one, the row says so under a token distinct from
+    // the real standing, never a false `available`.
+    switch (standing) {
+    case Access::kAvailable:
+        detail += " standing=available";
+        break;
+    case Access::kRefused:
+    case Access::kConfined:
+    case Access::kDegraded:
+        detail += " standing=unexpected";
+        break;
+    }
+    return detail;
+}
+
 std::string audit_detail_ca_degraded(std::string_view cid, std::optional<std::int64_t> as_of,
                                      CryptoReadCause cause) {
     std::string_view what;
@@ -901,8 +925,25 @@ std::string audit_detail_ca_degraded(std::string_view cid, std::optional<std::in
                        as_of ? std::to_string(*as_of) : std::string("db_now"), what);
 }
 
-std::string audit_detail_ca_withheld(std::string_view cid) {
-    return std::format("{}ws={} withheld=confined", cid_prefix(cid), kWindowSetVersion);
+std::string audit_detail_ca_withheld(std::string_view cid, Access standing) {
+    // Exhaustive, no default: a new enumerator must be decided here.
+    std::string_view why = "unexpected";
+    switch (standing) {
+    case Access::kConfined:
+        why = "confined";
+        break;
+    case Access::kRefused:
+        why = "refused";
+        break;
+    case Access::kAvailable:
+    case Access::kDegraded:
+        break;
+    }
+    return std::format("{}ws={} withheld={}", cid_prefix(cid), kWindowSetVersion, why);
+}
+
+std::string_view withheld_message(Access standing) {
+    return standing == Access::kRefused ? kRefusedWithheldMessage : kConfinedWithheldMessage;
 }
 
 std::string audit_detail_layout(std::string_view cid, std::size_t widgets,

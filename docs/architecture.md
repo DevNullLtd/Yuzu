@@ -333,8 +333,8 @@ PR-11); the 3-route generic plugin-data Inventory API (Issue 7.17) — `GET
 colliding with `inventory_routes.hpp`'s unrelated `/inventory` dashboard, which lives directly in
 `yuzu::server`); and #2542 PR-12 (the Infra/Misc bundle — six small, heterogeneous modules with no
 single owning store, matching the `dashboard_api_routes`/`nvd_routes` bundling precedent) split a
-further 14 routes into six modules: the 2-route Runtime Configuration API (7.3) —
-`GET /api/config`, `PUT /api/config/:key` — is `config_routes.{hpp,cpp}`; the 5-route Chargen +
+further 14 routes into six modules: the Runtime Configuration API (7.3) —
+`GET /api/config`, `PUT /api/config/:key` and their `/api/v1/config` twins — is `config_routes.{hpp,cpp}` over the shared core in `config_write.{hpp,cpp}`; the 5-route Chargen +
 Procfetch diagnostic API — `POST /api/chargen/{start,stop}`, `POST /api/procfetch/fetch`,
 `GET /api/chargen/status`, `GET /api/procfetch/status` — is `diagnostics_routes.{hpp,cpp}`; the
 legacy `GET /events` SSE stream is `legacy_events_routes.{hpp,cpp}`; the 2-route Instructions HTMX

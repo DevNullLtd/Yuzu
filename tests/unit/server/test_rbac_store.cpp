@@ -969,7 +969,7 @@ TEST_CASE("rbac_enforcement_label: cached-enabled short-circuits past a stale vi
     // technique the sibling rbac_enforcement_in_effect staleness test uses.
     auto held = pool_b.acquire();
     REQUIRE(held);
-    std::this_thread::sleep_for(std::chrono::milliseconds(5200));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(5200));
 
     // The view is now genuinely stale — proven directly, bypassing
     // is_rbac_enabled()'s own refresh attempt (Gate 8 technique, lines above)
@@ -3053,7 +3053,7 @@ TEST_CASE("RbacStore: rbac_enforcement_in_effect fails closed when a generation 
 
     // Clear replica_b's refresh gate so its next read genuinely attempts a
     // durable re-read rather than serving its just-constructed cache.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
 
     // Starve replica_b's own pool for the rest of the test: every subsequent
     // maybe_refresh_generation() call on replica_b cannot acquire a
@@ -3063,13 +3063,13 @@ TEST_CASE("RbacStore: rbac_enforcement_in_effect fails closed when a generation 
     // hot path), not the wider kReadTimeout, so a failed attempt's OWN
     // blocking time is no longer large enough to reliably carry the clock
     // across kRbacStaleServeBoundMs (5000ms) the way it could when the acquire
-    // itself took ~2s. This test now advances wall time with explicit sleeps
-    // instead of relying on that blocking duration.
+    // itself took ~2s. This test now advances replica_b's local clock readings explicitly
+    // (age_refresh_state_for_test) instead of relying on that blocking duration.
     auto held = pool_b.acquire();
     REQUIRE(held);
 
     // Bounded stale-serve (#2703 Gate 7, operator-adjudicated): this FIRST
-    // failed refresh attempt lands at roughly construction + 1.1s (the sleep
+    // failed refresh attempt lands at roughly construction + 1.1s (the aging
     // above) + <=0.25s (this call's own blocking kAuthzAcquireTimeout) — well
     // inside kRbacStaleServeBoundMs (5000ms) of replica_b's last confirmed-
     // good refresh (its own construction). This is the whole point of the
@@ -3078,12 +3078,12 @@ TEST_CASE("RbacStore: rbac_enforcement_in_effect fails closed when a generation 
     // store-level degrade), only the generation view is briefly unconfirmed.
     CHECK_FALSE(rbac_enforcement_in_effect(&replica_b));
 
-    // Push past the bound with an explicit sleep — comfortably clears both
+    // Push past the bound by aging replica_b's readings — comfortably clears both
     // the 1s stampede gate (so the next call genuinely attempts a fresh
     // refresh rather than serving the gated fast path) and, combined with
     // the ~1.1-1.35s already elapsed, pushes total elapsed time since
     // construction past kRbacStaleServeBoundMs (5000ms) with margin.
-    std::this_thread::sleep_for(std::chrono::milliseconds(4200));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(4200));
 
     // Pre-fix (adversarial-review round): is_rbac_enabled() correctly stayed
     // false (the existing contract), but rbac_enforcement_in_effect() ALSO
@@ -3134,7 +3134,7 @@ TEST_CASE("RbacStore: rbac_enabled_view_degraded fails closed on elapsed time al
     // maybe_refresh_generation() -- replica_b's pool is left healthy and
     // untouched throughout, so if the old `!generation_valid_`-only check
     // were still in place, nothing in this test would ever flip it.
-    std::this_thread::sleep_for(std::chrono::milliseconds(5200));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(5200));
 
     // Called directly (bypassing maybe_refresh_generation() entirely, unlike
     // is_rbac_enabled()/rbac_enforcement_in_effect() which always trigger a
@@ -3176,11 +3176,11 @@ TEST_CASE("RbacStore: a warm permission cache survives a generation-refresh "
 
     // Clear the refresh gate, let replica_b observe the durable enable +
     // grant, and genuinely populate perm_cache_ with an ALLOW.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     REQUIRE(replica_b.check_permission("bob", "Infrastructure", "Read"));
 
     // Starve the pool and force one failed refresh attempt inside the bound.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     auto held = pool_b.acquire();
     REQUIRE(held);
 
@@ -3223,20 +3223,20 @@ TEST_CASE("RbacStore: a warm permission cache is NOT served once the "
 
     // Clear the refresh gate, let replica_b observe the durable enable +
     // grant, and genuinely populate perm_cache_ with an ALLOW.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     REQUIRE(replica_b.check_permission("bob", "Infrastructure", "Read"));
 
     // Starve the pool, then push wall time past kRbacStaleServeBoundMs
-    // (5000ms) with an explicit sleep before the next call. Unlike the
+    // (5000ms) by aging replica_b's readings before the next call. Unlike the
     // sibling rbac_enforcement_in_effect fail-closed test above (whose
     // 4200ms works because its baseline is CONSTRUCTION, never updated since
     // every refresh attempt after it fails), this test's baseline is the
     // SUCCESSFUL warming call just above -- last_successful_refresh_ms_ was
-    // genuinely updated to ~now there, so the sleep alone must exceed the
+    // genuinely updated to ~now there, so the aging alone must exceed the
     // 5000ms bound, not merely combine with an earlier one to reach it.
     auto held = pool_b.acquire();
     REQUIRE(held);
-    std::this_thread::sleep_for(std::chrono::milliseconds(5200));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(5200));
 
     // Past the bound, with the pool starved: the previously-cached ALLOW
     // must NOT be served. check_permission()'s own internal
@@ -3275,7 +3275,7 @@ TEST_CASE("RbacStore: fail-fast breaker denies without a pool touch once "
     // Clear the refresh gate opened at construction so the first starved
     // call below genuinely attempts a fresh refresh rather than serving the
     // gated fast path.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
 
     auto held = pool_b.acquire();
     REQUIRE(held);
@@ -3308,7 +3308,7 @@ TEST_CASE("RbacStore: fail-fast breaker denies without a pool touch once "
     // the starved connection so the next attempt (the half-open probe) can
     // genuinely succeed and reset the streak to 0 — an open->closed
     // transition, so the gauge goes back to 0.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     held.reset();
     CHECK(replica_b.check_permission("bob", "Infrastructure", "Read"));
     CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
@@ -3353,7 +3353,7 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
                                      // breaker test — construction's own read
                                      // (if any) must not touch the counter.
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // clear the refresh gate
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100)); // clear the refresh gate
 
     auto held = pool_b.acquire();
     REQUIRE(held);
@@ -3456,6 +3456,57 @@ TEST_CASE("RbacStore: every checked read on a store that is not open reports the
     CHECK(std::string_view{r9.error()} == kRbacErrStoreNotOpen);
     // list_roles() is this read with the error collapsed: a closed store is an empty vector.
     CHECK(broken.list_roles().empty());
+    // engine_grant_checked is null-safe like the label it snapshots: a null or not-open store
+    // is an error (a retryable 503 at the gates), never a grant.
+    const auto e1 = engine_grant_checked(nullptr, "engine:x", "Response", "Read");
+    REQUIRE_FALSE(e1.has_value());
+    const auto e2 = engine_grant_checked(&broken, "engine:x", "Response", "Read");
+    REQUIRE_FALSE(e2.has_value());
+    // The degraded arm's own text, not the not-open text a forbidden grant read would return.
+    CHECK(std::string_view{e2.error()} == kRbacErrEnforcementUnconfirmed);
+    CHECK(std::string_view{e1.error()} == kRbacErrEnforcementUnconfirmed);
+    const auto r10 = broken.check_permission_checked("bob", "Response", "Read");
+    REQUIRE_FALSE(r10.has_value());
+    CHECK(std::string_view{r10.error()} == kRbacErrStoreNotOpen);
+    CHECK_FALSE(broken.check_permission("bob", "Response", "Read")); // the plain form denies
+}
+
+TEST_CASE("RbacStore::check_permission_checked: a failed role lookup is an error that counts, "
+          "a caller with no roles is a success that does not",
+          "[rbac_store][pg][read_failed]") {
+    yuzu::MetricsRegistry metrics; // declared before the store so the store never outlives it
+    RBAC_STORE(store);
+    store.set_metrics(&metrics);
+    REQUIRE(store.create_role({.name = "Reader", .description = "d"}).has_value());
+    REQUIRE(store.set_permission({"Reader", "Response", "Read", "allow"}).has_value());
+    REQUIRE(store.assign_role({"user", "alice", "Reader"}).has_value());
+
+    // Healthy: a caller with a grant is true, a caller with no roles is false, both successes.
+    const auto granted = store.check_permission_checked("alice", "Response", "Read");
+    REQUIRE(granted.has_value());
+    CHECK(*granted);
+    const auto none = store.check_permission_checked("nobody", "Response", "Read");
+    REQUIRE(none.has_value());
+    CHECK_FALSE(*none);
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+              .value() == 0.0);
+
+    // The role table cannot be read: an error, counted once, and not cached as a denial.
+    {
+        pg::PgConn c{PQconnectdb(rbac_db_fx_.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        pg::PgResult dr{PQexec(c.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(dr.ok());
+    }
+    const auto failed = store.check_permission_checked("bob", "Response", "Read");
+    REQUIRE_FALSE(failed.has_value());
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+              .value() == 1.0);
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0); // one failure, threshold 2
+    CHECK_FALSE(store.check_permission("bob", "Response", "Read")); // the plain form denies
+    // A second failed read (the failure is not cached) reaches the breaker threshold of 2: the
+    // role-lookup failure moves the breaker, which it did not before this change.
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
 }
 
 TEST_CASE("RbacStore: the checked reads without a breaker report the shared "
@@ -3742,7 +3793,7 @@ TEST_CASE("RbacStore: generation-refresh-failed degrade records the correct "
     replica_b.set_metrics(&metrics);
 
     // Genuinely populate replica_b's cache with a confirmed-good refresh.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     REQUIRE(replica_b.check_permission("bob", "Infrastructure", "Read"));
     // check_permission's own success path never fires a degrade — sanity
     // check that this test starts from a clean counter before starving.
@@ -3760,7 +3811,7 @@ TEST_CASE("RbacStore: generation-refresh-failed degrade records the correct "
     // perm_cache_), so it's served from cache and never reaches
     // check_permission's OWN pool-fallback branch — only
     // maybe_refresh_generation()'s degrade fires.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     auto held = pool_b.acquire();
     REQUIRE(held);
     CHECK(replica_b.check_permission("bob", "Infrastructure", "Read")); // served from cache
@@ -3771,13 +3822,13 @@ TEST_CASE("RbacStore: generation-refresh-failed degrade records the correct "
                           {{"reason", "generation_refresh_failed"}})
               .value() == 0.0); // the denying reason must NOT fire while still tolerated
 
-    // Push past the bound with an explicit sleep (mirrors the existing
+    // Push past the bound by aging replica_b's readings (mirrors the existing
     // rbac_enforcement_in_effect fail-closed test's technique). This second
     // failed refresh drops the cache, so THIS call also falls through to
     // check_permission's own (still-starved) pool-fallback branch — that
     // fires its own pool_acquire_timeout degrade too, a different reason
     // label from the two asserted below, so it doesn't affect them.
-    std::this_thread::sleep_for(std::chrono::milliseconds(4200));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(4200));
     CHECK_FALSE(replica_b.check_permission("bob", "Infrastructure", "Read"));
     CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
                           {{"reason", "generation_refresh_failed"}})
@@ -3941,7 +3992,7 @@ TEST_CASE("RbacStore: a refresh finding rbac_enabled's row absent (write_generat
     // refresh rather than serving the gated fast path, then trigger one.
     // Construction already counted as a genuine completed refresh, so
     // replica_b is not degraded yet at this point.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     REQUIRE_FALSE(replica_b.rbac_enabled_view_degraded());
     (void)replica_b.is_rbac_enabled(); // triggers maybe_refresh_generation()
 
@@ -3955,13 +4006,13 @@ TEST_CASE("RbacStore: a refresh finding rbac_enabled's row absent (write_generat
     // subsequent round can ever confirm rbac_enabled either. Each call
     // below re-triggers maybe_refresh_generation() (past its own 1s gate),
     // finding the same absent row every time.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     (void)replica_b.is_rbac_enabled();
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     (void)replica_b.is_rbac_enabled();
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     (void)replica_b.is_rbac_enabled();
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
 
     // THE FIX: the view is now degraded -- pre-fix, last_successful_refresh_ms_
     // kept advancing on every one of the calls above despite rbac_enabled
@@ -4645,7 +4696,7 @@ TEST_CASE("RbacStore Gate7-Fix7: the gauge is published on replica_b's ADOPT pat
 
     // Clear the 1s stampede gate so replica_b's next check genuinely attempts
     // a refresh rather than serving its just-constructed cache.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
 
     // Drives maybe_refresh_generation() -> the adopt branch's
     // publish_enforcement_gauge() call, a GENUINE adopt (durable_gen is
@@ -4721,7 +4772,7 @@ TEST_CASE("RbacStore: rbac_enabled adoption is generation-gated — a refresh ca
 
     // Clear the 1s stampede gate so the next check genuinely attempts a
     // refresh rather than serving the gated fast path.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
 
     // THE FIX: replica_b's own cached_generation_ is already at G (from its
     // own set_rbac_enforcement commit above); the durable pair it now reads

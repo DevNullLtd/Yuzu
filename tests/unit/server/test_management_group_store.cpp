@@ -485,6 +485,16 @@ TEST_CASE("ManagementGroupStore: get_visible_agents honors RBAC-disabled posture
         CHECK(nobody->size() == 3);
     }
 
+    SECTION("RBAC disabled → an engine principal sees no agents (#6204), a human still sees all") {
+        store.set_rbac_enabled_probe([] { return false; });
+        auto engine = store.get_visible_agents("engine:vuln");
+        REQUIRE(engine.has_value()); // present-EMPTY, never nullopt and never the fleet
+        CHECK(engine->empty());
+        auto human = store.get_visible_agents("admin");
+        REQUIRE(human.has_value());
+        CHECK(human->size() == 3);
+    }
+
     SECTION("RBAC disabled → DISTINCT dedups an agent in multiple groups") {
         store.add_member(*gid_b, "agent-001"); // agent-001 now in A and B
         store.set_rbac_enabled_probe([] { return false; });

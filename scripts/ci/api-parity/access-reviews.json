@@ -5,7 +5,7 @@
     "capability_id": "get.fragments-settings-access-reviews",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:get.fragments-access-reviews-campaigns"
   },
   {
     "method": "GET",
@@ -13,7 +13,7 @@
     "capability_id": "get.fragments-settings-access-reviews-campaign",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:get.fragments-access-reviews-campaign"
   },
   {
     "method": "GET",

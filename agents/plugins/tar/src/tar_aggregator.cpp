@@ -181,12 +181,10 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
                                      std::string_view new_value, int64_t now_epoch) {
     auto enabled_key = std::format("{}_enabled", source);
     // Default `prev` to the source's declared default so the first-ever set on a
-    // fresh DB is only a transition when it differs from that default. For an
-    // opt-in source (module/procperf/netqual, default false) the first
-    // `<src>_enabled=false` is therefore NOT an enabled→disabled transition and
-    // does not write a spurious paused_at. The `_enabled` flag itself is written
-    // below, inside the one transaction with the baseline clear, so a failed
-    // clear leaves the flag unmoved (#538 ghost-`started` storm unreachable).
+    // fresh DB is only a transition when it differs from that default. The
+    // `_enabled` flag itself is written below, inside the one transaction with
+    // the baseline clear, so a failed clear leaves the flag unmoved (#538
+    // ghost-`started` storm unreachable).
     const char* prev_def = source_default_enabled(source) ? "true" : "false";
     std::string prev = db.get_config(enabled_key, prev_def);
     // Canonicalise `prev` to the strict tri-state before BOTH transition checks
@@ -421,10 +419,19 @@ std::string_view canonical_source_enabled(std::string_view stored_value) {
 // with the tri-state `status` reports. run_retention() shares the same canonical
 // gate so an "errored" source's rows are preserved, not pruned. Also the
 // authoritative paused-guard for the Phase 15.A `tar.purge_source` action.
-bool source_enabled(TarDatabase& db, std::string_view source) {
+//
+// `nullopt` = unreadable flag; source_enabled() fails closed (contract: tar_aggregator.hpp).
+std::optional<bool> source_enabled_state(TarDatabase& db, std::string_view source) {
+    auto r = db.try_get_config(std::format("{}_enabled", source));
+    if (!r)
+        return std::nullopt; // read failure: SQL errors are logged by try_get_config; a closed
+                             // store is silent here (run_retention warns once per pass)
     const char* def = source_default_enabled(source) ? "true" : "false";
-    return canonical_source_enabled(db.get_config(std::format("{}_enabled", source), def)) ==
-           "true";
+    return canonical_source_enabled(r->value_or(def)) == "true";
+}
+
+bool source_enabled(TarDatabase& db, std::string_view source) {
+    return source_enabled_state(db, source).value_or(false);
 }
 
 namespace {
@@ -755,16 +762,15 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
         // means a paused source ("false") AND a corrupt/tampered one ("errored")
         // both skip retention, so the forensic window an operator paused — or one
         // whose `_enabled` value was clobbered — is never pruned. This matches the
-        // collect-time source_enabled() gate, which also fails closed on "errored".
+        // collect-time source_enabled() gate, which also fails closed on "errored"
+        // and on a failed config read (rows preserved, never pruned, on a read error).
         //
         // This gate stays STRICTLY AHEAD of any guard bookkeeping: a paused or
         // errored source whose rows are all past their cutoff must neither
         // delete nor decline. Declining would burn a per-table decline counter
         // (and an operator-facing warn) on a source that was never going to be
         // pruned in the first place.
-        auto enabled_key = std::format("{}_enabled", src.name);
-        if (canonical_source_enabled(
-                db.get_config(enabled_key, src.default_enabled ? "true" : "false")) != "true") {
+        if (!source_enabled(db, src.name)) {
             // Clear this source's recorded fact sets while it is skipped. An
             // entry left recorded across a pause is spent: the first pass
             // after the operator re-enables the source would delete capped
