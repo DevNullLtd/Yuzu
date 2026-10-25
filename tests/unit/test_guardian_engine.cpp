@@ -831,7 +831,7 @@ TEST_CASE("GuardianEngine: a rejected push does not latch the ack ledger against
           "[guardian][engine][apply][validation]") {
     // The #4665 pre-validation pass deliberately does NOT call
     // ack_ledger_->latch_failure() on rejection (it runs before
-    // begin_application(), so there is no current application to latch a
+    // begin_*_application(), so there is no current application to latch a
     // failure against). This proves that choice leaves nothing "stuck" -
     // a rejected push followed by a genuinely valid push at a higher
     // generation must apply and advance normally.
@@ -1349,7 +1349,7 @@ TEST_CASE("GuardianEngine: stop() is sticky - a later start_local() does not res
 
 // ---------------------------------------------------------------------------
 // rung 9c PR-3, Check A (~/.claude/plans/spark-rung9c-pr3-telemetry-KICKOFF-v2.md):
-// GuardianEngine::apply_rules() calls GuardianArmAckLedger::begin_application()
+// GuardianEngine::apply_rules() calls GuardianArmAckLedger::begin_*_application()
 // UNCONDITIONALLY, regardless of prefer_spark_ - so a naive arm_stats() gated
 // only on "is there a current application" would read every default
 // (prefer_spark_=false) agent as a live, empty {pending:0, failed:0} snapshot,
@@ -1365,7 +1365,7 @@ TEST_CASE("GuardianEngine::arm_stats(): default prefer_spark_=false stays "
     // BEFORE any push: no current application at all.
     CHECK_FALSE(f.engine->arm_stats().has_value());
 
-    // A real push runs apply_rules(), which calls begin_application()
+    // A real push runs apply_rules(), which calls begin_*_application()
     // unconditionally - the exact trap Check A names. If arm_stats() were
     // gated on "current application exists" alone, this would now read
     // present {0, 0} instead of nullopt.

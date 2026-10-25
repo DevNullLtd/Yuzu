@@ -64,6 +64,13 @@ diverge across replicas. **WS-7 (HA Postgres) is NOT in this set** — it gates 
 SPOF / RPO=0), not the second *server* replica (which is safe against a single Postgres). The
 "Gates 2nd replica?" column below encodes this per row.
 
+**Known replica-local state (not a gate item).** The engine-credential rotation grace cache
+(`ApiTokenStore::rotation_grace_cache_`, about two minutes) is held in the memory of the replica
+that served the rotate. A retry that lands on another replica, or after a restart, gets `409`
+instead of the re-served secret; the recovery is to revoke the successor (see
+`docs/ops-runbooks/engine-principal-store-recovery.md`). Behind a load balancer, pin the retry
+to the same replica or expect that `409`.
+
 ## Is the presentation/core split a prerequisite? — RESOLVED: no, decoupled (ratified 2026-09-07)
 
 - **Ratified by the ADR-1005 owner (Dave Rae), 2026-09-07:** monolith active-active is the target; the

@@ -556,6 +556,14 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // shares the prefix (rule 4 in the routed-concern row).
     {kBodyCapAnyMethod, "/api/v1/crypto", 16u * 1024, false, "crypto"},
 
+    // /api/v1/config — the runtime-configuration REST v1 twin. The only body-bearing route is
+    // PUT /api/v1/config/{key} {"value": ...}: one scalar (an integer, a flag, a log level, a
+    // tag key, an OIDC client secret or a short JSON array of routed observation types), well
+    // under 16 KiB. The legacy PUT /api/config/{key} keeps the catch-all (kDefaultIsCorrectFor).
+    // ANY method: the sibling GET is bodyless and shares the prefix (rule 4 in the routed-concern
+    // row).
+    {kBodyCapAnyMethod, "/api/v1/config", 16u * 1024, false, "config"},
+
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.
     // Ordinary JSON/form traffic (most REST mutation routes) lands here.

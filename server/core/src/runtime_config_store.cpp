@@ -242,6 +242,11 @@ std::expected<void, std::string> validate_value(const std::string& key, const st
                 return std::unexpected("heartbeat_timeout must be at least " +
                                        std::to_string(kMinHeartbeatTimeoutSeconds) +
                                        " seconds (the default agent heartbeat interval)");
+            if (key == "heartbeat_timeout" && val > kMaxHeartbeatTimeoutSeconds)
+                return std::unexpected("heartbeat_timeout must be at most " +
+                                       std::to_string(kMaxHeartbeatTimeoutSeconds) +
+                                       " seconds (one day): a longer window leaves a dead agent "
+                                       "reading online");
         } catch (...) {
             return std::unexpected("value must be a valid integer");
         }

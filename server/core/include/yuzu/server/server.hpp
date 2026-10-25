@@ -40,6 +40,29 @@ private:
     static_assert(std::atomic<std::int64_t>::is_always_lock_free);
 };
 
+/// An `int` the runtime-configuration write can change while request threads read it: the three
+/// retention windows (`PUT /api/config/{key}`, `PUT /api/v1/config/{key}` and `set_runtime_config`
+/// assign them, `GET` and the data-retention page read them). `Config` is copied by value and
+/// `std::atomic` is not copyable, so, like `LiveSeconds`, this wraps one: copies take a relaxed
+/// snapshot, which is enough because the value is independent of any other state. The stores do
+/// not read these after construction (#483); this only makes the live copy safe to show.
+class LiveInt {
+public:
+    LiveInt(int v = 0) noexcept : v_(v) {}
+    LiveInt(const LiveInt& o) noexcept : v_(o.get()) {}
+    LiveInt& operator=(const LiveInt& o) noexcept { return *this = o.get(); }
+    LiveInt& operator=(int v) noexcept {
+        v_.store(v, std::memory_order_relaxed);
+        return *this;
+    }
+    [[nodiscard]] int get() const noexcept { return v_.load(std::memory_order_relaxed); }
+    operator int() const noexcept { return get(); }
+
+private:
+    std::atomic<int> v_;
+    static_assert(std::atomic<int>::is_always_lock_free);
+};
+
 struct Config {
     std::string listen_address{"0.0.0.0:50051"};     // Agent-facing gRPC
     std::string management_address{"0.0.0.0:50052"}; // Operator-facing gRPC
@@ -287,14 +310,14 @@ struct Config {
     std::string saml_email_attribute; // <Attribute Name="..."> carrying the email (display fallback)
 
     // Response persistence
-    int response_retention_days{90};
+    LiveInt response_retention_days{90};
 
     // Audit trail
-    int audit_retention_days{365};
+    LiveInt audit_retention_days{365};
 
     // Guardian (Guaranteed State) event retention. Default 30d matches
     // kDefaultEventRetentionDays + the workstream-E data inventory.
-    int guardian_event_retention_days{30};
+    LiveInt guardian_event_retention_days{30};
 
     // Analytics
     bool analytics_enabled{true};

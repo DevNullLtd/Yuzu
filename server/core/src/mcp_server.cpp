@@ -5,6 +5,7 @@
 #include "approver_assurance.hpp" // #6061: approve/reject are human-session acts (typed refusal)
 #include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
 #include "dispatch_denial_text.hpp" // shared describe_dispatch_denial (#6065 PR-Q; was an anonymous-namespace local here)
+#include "engine_no_admin_audit.hpp"      // the shared no-admin auditor (REST + MCP)
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
 #include "mcp_approval_error.hpp" // shared approval-store failure body (#2786)
@@ -100,6 +101,7 @@
 // internally — reused here so a handler's pre-validation can never diverge
 // from what the store would accept or reject.
 #include "plugin_config_store.hpp"
+#include "runtime_config_store.hpp"
 #include "plugin_config_parsers.hpp"
 #include "upload_grant_parsers.hpp"
 #include <yuzu/log_token.hpp> // is_valid_rule_id — shared REST/MCP/agent rule id charset (#4665)
@@ -1566,17 +1568,22 @@ static const ToolDef kTools[] = {
      "/api/v1/guaranteed-state/push exactly — same scope-to-agents fan-out, same "
      "GuaranteedState:Push gate. NOT idempotent: each call re-derives and re-dispatches "
      "against the current rule set and policy generation, and full_sync forces a full "
-     "re-sync rather than an incremental diff, so two calls in quick succession both "
+     "re-sync (the agent rebuilds its rule set from the push instead of merging into it), "
+     "so two calls in quick succession both "
      "dispatch (this is by design — a push is an action, not a state to converge on; a "
      "concurrent/replayed push simply re-delivers the same-or-newer generation, which "
      "agents accept idempotently on THEIR side, but the tool call itself is not safe to "
-     "retry blindly assuming no-op). Fleet-wide; requires the distinct GuaranteedState:Push "
+     "retry blindly assuming no-op). With full_sync=false the agent merges the pushed rules "
+     "and does not retry a still-unresolved rule the push omits (it holds its policy "
+     "generation instead); only a full push or a push naming the rule does, and this tool "
+     "does not bump the policy generation, so a delta at the generation an agent already "
+     "holds is not followed by an automatic full push. Fleet-wide; requires the distinct GuaranteedState:Push "
      "verb (not Write), denied outright to a service-scoped API token. REST's twin applies "
      "an MFA step-up check; MCP applies none for a cookie-session caller (architecture-wide "
      "gap, not specific to this tool - tracked in #4309).",
      R"j({"type":"object","properties":{)j"
      R"j("scope":{"type":"string","maxLength":2048,"default":"","description":"Scope DSL expression selecting target agents; empty = fleet-wide"},)j"
-     R"j("full_sync":{"type":"boolean","default":false,"description":"Force a full re-sync of the enabled rule set to in-scope agents rather than an incremental push"})j"
+     R"j("full_sync":{"type":"boolean","default":false,"description":"Force a full re-sync of the enabled rule set to in-scope agents. When false the push is a merge that does not retry a still-unresolved rule it omits"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{"queued":{"const":true},"rules":{"type":"integer"},"agents":{"type":"integer"},"scope":{"type":"string"},"full_sync":{"type":"boolean"}},"required":["queued","rules","agents","scope","full_sync"]})j"},
 
@@ -2500,7 +2507,9 @@ static const ToolDef kTools[] = {
     // docs/auth-engine-principals-design.md). An engine principal is the
     // durable identity behind an autonomous use-case-engine module —
     // hard-locked to MCP tier readonly (§8), never grantable the admin/
-    // wildcard role (§4.2 "no admin, ever"), and structurally barred from
+    // Administrator role names or a built-in role (§4.2; a custom full-grid
+    // role is permitted and detected afterwards, design doc decision log #15), and
+    // structurally barred from
     // acting as caller of its OWN lifecycle surface (§9). Mutating tools
     // require Security:Write — supervised MCP tier, approval-gated,
     // same posture as every other destructive MCP op.
@@ -2514,7 +2523,8 @@ static const ToolDef kTools[] = {
     {"create_engine_principal",
      "Create a new engine principal — the durable identity behind an autonomous use-case-engine "
      "module. Engine credentials minted against it are hard-locked to MCP tier readonly and can "
-     "never be granted the admin/wildcard role (no admin, ever). owner_username is the named "
+     "never be granted the admin/Administrator role or a built-in role (a custom wildcard role is "
+     "not refused; audit_engine_no_admin detects it afterwards). owner_username is the named "
      "responsible human and is FK-validated against the user store before the row is written. "
      "Mirrors POST /api/v1/engine-principals. Approval-gated — requires Security:Write (supervised "
      "MCP tier; maker-checker approval like every other privileged MCP op). Additive: creates a "
@@ -2536,15 +2546,21 @@ static const ToolDef kTools[] = {
 
     {"list_engine_principals",
      "List engine principals with each principal's active-credential count (admin/auditor "
-     "surface). Mirrors GET /api/v1/engine-principals. Requires EnginePrincipal:Read.",
+     "surface). Mirrors GET /api/v1/engine-principals. Requires EnginePrincipal:Read. Fails "
+     "closed: if the principal list or the credential counts cannot be read the tool returns a "
+     "retryable internal error (retry_after_ms 2000) instead of reporting 0 for something it could "
+     "not read.",
      R"j({"type":"object","properties":{)j"
      R"j("include_revoked":{"type":"boolean","default":true,"description":"false restricts to lifecycle_state=active only"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{"count":{"type":"integer"},"principals":{"type":"array","items":{"type":"object","additionalProperties":true}}},"required":["count","principals"]})j"},
 
     {"get_engine_principal",
-     "Get one engine principal's identity row plus its active-credential count. Mirrors GET "
-     "/api/v1/engine-principals/{id}. Requires EnginePrincipal:Read.",
+     "Get one engine principal's identity row plus its active-credential count (an integer here; "
+     "the REST twin returns an array of credential objects under the same name). Mirrors GET "
+     "/api/v1/engine-principals/{id}. Requires EnginePrincipal:Read. Fails closed: if the "
+     "credential read fails the tool returns a retryable internal error (retry_after_ms 2000) "
+     "instead of reporting active_credentials 0 for credentials it could not read.",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"})j"
      R"j(},"required":["principal_id"]})j",
@@ -2571,7 +2587,11 @@ static const ToolDef kTools[] = {
      "this response; it cannot be retrieved again, only rotated or revoked. Use "
      "rotate_engine_credential once a credential already exists — this tool is for the initial "
      "mint only (a second call errors: at most two active credentials, and only "
-     "rotate_engine_credential drives that state machine). Mirrors POST "
+     "rotate_engine_credential drives that state machine). If the pre-mint check cannot read the "
+     "store it returns a retryable error (retry_after_ms) and mints nothing; if the credential "
+     "was minted but cannot be read back, or the read-back finds none, the secret is withheld "
+     "(no retry hint): do not retry the mint, list the principal's credentials and rotate if one "
+     "is listed. Mirrors POST "
      "/api/v1/engine-principals/{id}/credentials. Approval-gated — requires Security:Write (live "
      "credential issuance; supervised MCP tier; maker-checker approval). Additive: issues the "
      "first credential, overwrites nothing.",
@@ -2589,8 +2609,11 @@ static const ToolDef kTools[] = {
      "generally idempotent: a re-call within a short grace window after the original mint "
      "re-serves the SAME successor secret (each reveal — original or replay — is independently "
      "audited as engine_principal.credential.reveal); once the grace window lapses, a re-call "
-     "errors and the caller must fall back to an explicit re-mint or the principal-level revoke "
-     "compromise runbook — never an indefinite retry. Mirrors POST "
+     "errors and the caller must recover over REST (find the stuck successor with GET "
+     "/api/v1/engine-principals/{id}, revoke it with DELETE /api/v1/tokens/{token_id} as an "
+     "administrator, then rotate again), never an indefinite retry, and never revoke the "
+     "principal, which is terminal. If the read-back answers but finds no linked successor, the "
+     "secret is withheld with NO retry hint: inspect the principal's credentials first. Mirrors POST "
      "/api/v1/engine-principals/{id}/credentials/rotate. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
@@ -2788,22 +2811,27 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"transferred":{"type":"boolean"},"principal_id":{"type":"string"},"new_owner":{"type":"string"}},"required":["transferred","principal_id","new_owner"]})j"},
 
     {"audit_engine_no_admin",
-     "Auditor-runnable proof (design doc §4.2) that 'no admin, ever' and 'no all-permissions "
-     "toggle' hold for every engine principal — not just a write-path claim. Joins "
-     "principal_type=engine against each principal's resolved role assignments AND effective "
-     "permissions and reports any row that would violate those constraints: the literal admin/"
-     "Administrator role name, any role flagged is_system, or a granted securable x operation "
-     "set whose size reaches the full cross-product (functionally admin-equivalent even under a "
-     "custom non-system role name). ok:true with an empty violations[] is the positive "
-     "evidence; a non-empty violations[] (ok:false) indicates the write-path guard was bypassed "
-     "(data corruption, direct DB write, or a code regression) and should be treated as a "
-     "security incident. A 503/internal-error result (rather than ok:true) means the RBAC "
-     "reference data needed to compute the wildcard bound could not be resolved — treat as "
-     "'unable to verify', never as 'clean'. Mirrors GET "
-     "/api/v1/engine-principals/audit/no-admin exactly, including its {ok, violations} response "
-     "shape. Requires AuditLog:Read.",
+     "Auditor-runnable check (design doc §4.2) of the 'no admin' rule for every engine principal; "
+     "run it after assign_engine_role and periodically. Reads every engine: grant with each role's "
+     "permissions and reports admin_role (the admin/Administrator names), system_role (an "
+     "is_system role) and wildcard_grant (a role, or the union of a principal's roles, allowing "
+     "every securable x operation pair of the grid at run time). Assignment permits a custom "
+     "wildcard role, so this detective check is the only control over it: ok:true means no role "
+     "covers the whole grid at the moment of the run (a role granting all but one pair is not "
+     "reported), it is point-in-time, and nothing schedules it. Reason admin_role or system_role "
+     "means the assignment check was bypassed (data corruption, direct DB write, or a code "
+     "regression) and is a security incident; wildcard_grant means review whether the grant is "
+     "intended (permitted by design). include_revoked=false (MCP only) skips principals the "
+     "roster lists as revoked AND additionally reports orphan_grant for any engine: grant whose "
+     "principal has no roster row, which the default run and the REST twin never report; it is "
+     "not a subset of the default run, so use the default for the full-population answer. "
+     "FAILS CLOSED: if any read cannot be answered it returns a retryable internal "
+     "error (retry_after_ms) with no partial violations[], never ok:true - treat that as "
+     "'unable to verify', not 'clean'. Same checks and {ok, violations} shape as GET "
+     "/api/v1/engine-principals/audit/no-admin; include_revoked is MCP-only. Requires "
+     "AuditLog:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("include_revoked":{"type":"boolean","default":true,"description":"false restricts the audit to lifecycle_state=active principals only"})j"
+     R"j("include_revoked":{"type":"boolean","default":true,"description":"false skips principals the roster lists as revoked and also reports orphan_grant for a grant with no roster row (the default run does not); not a subset of the default run"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{"ok":{"type":"boolean"},"violations":{"type":"array","items":{"type":"object","properties":{"principal_id":{"type":"string"},"role":{"type":"string"},"reason":{"type":"string"}},"required":["principal_id","reason"]}}},"required":["ok","violations"]})j"},
 
@@ -3414,6 +3442,55 @@ static const ToolDef kTools[] = {
     // surfaces" ledger, not just here; tests/unit/server/
     // test_operator_surface_twins.cpp asserts no served tool answers to any
     // of those five routes.
+    {"get_runtime_config",
+     "Read the server's runtime configuration. Mirrors GET /api/v1/config. Read-only. Returns "
+     "the effective values (heartbeat_timeout in seconds, response_retention_days, "
+     "audit_retention_days, guardian_event_retention_days, auto_approve_enabled, log_level), the "
+     "stored overrides (a secret key reports is_set and updated_by, never its value; a store that "
+     "cannot be read is an error, never an empty list), allowed_keys (every key set_runtime_config "
+     "knows) and read_only_keys (allowed keys with their own writer, today dex_score_policy). "
+     "The result is scoped to the caller: the override of every key this caller could not write "
+     "with set_runtime_config (the administrator-only and oidc_* keys, for an MCP-tier token) is "
+     "withheld, and so is the effective audit_retention_days, and withheld_keys lists them, so "
+     "an absent key means 'not shown to you', not 'not set'. Values shown are what is stored: "
+     "the three retention windows (including audit_retention_days) are enforced from the "
+     "server's command-line flags, not from these values. auto_approve_enabled is derived from whether any auto-approve rule exists. This is "
+     "platform configuration, not agent-scoped data, so there is no per-agent filter to apply; a "
+     "service-scoped token is refused. Requires Infrastructure:Read.",
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"config":{"type":"object","description":"effective values"},"overrides":{"type":"object","description":"stored overrides by key: value, updated_by, updated_at; a secret key carries is_set instead of value; keys in withheld_keys are absent"},"allowed_keys":{"type":"array","items":{"type":"string"}},"read_only_keys":{"type":"array","items":{"type":"string"}},"withheld_keys":{"type":"array","items":{"type":"string"},"description":"keys whose stored override is not shown to this caller, sorted"}},"required":["config","overrides","allowed_keys","read_only_keys","withheld_keys"]})j"},
+
+    {"set_runtime_config",
+     "Set one runtime configuration override. Mirrors PUT /api/v1/config/{key} (body {value}). "
+     "Idempotent: the same key and value converge on the same stored state. Requires "
+     "Infrastructure:Write; not approval-gated, but the readonly and operator tiers cannot call it "
+     "at all. A supervised-tier token can write only these keys: "
+     "heartbeat_timeout (whole seconds, 30 to 86400), response_retention_days and "
+     "guardian_event_retention_days (whole days), auto_approve_enabled ('true' or 'false'; stored, "
+     "but it changes nothing today because GET reports it from the auto-approve rules), log_level "
+     "(trace, debug, info, warn or error). Every other key in get_runtime_config's allowed_keys is "
+     "refused to an MCP-tier token with a permission error and an audit row: "
+     "plugin_signing_required, audit_retention_days, dex_alert_routing, dex_blast_min_devices, "
+     "dex_blast_window_seconds, dex_blast_cooldown_seconds, dex_cohort_export_key and the oidc_* "
+     "keys need an administrator account (an untiered administrator token is admitted, as on "
+     "REST); dex_score_policy has its own route and answers invalid params. Values are sent as "
+     "strings, e.g. \"90\"; key is 1 to 64 characters from a-z and _, value at most 256 bytes "
+     "(a longer value, such as a long dex_alert_routing, goes through PUT /api/v1/config/{key}); "
+     "extra arguments are refused. "
+     "The write is audited before it applies: if the audit row cannot be stored the call fails and "
+     "nothing changes. `applied: true` means the value was accepted and stored, not that it is in "
+     "use: `effect` says how soon it matters. 'immediate' is used by the running server now "
+     "(heartbeat_timeout, log_level); 'deferred' waits for the next DEX Alerts save or a restart "
+     "(the dex_* keys) or for a restart (oidc_admin_group, oidc_redirect_uri); 'stored_only' means "
+     "nothing consumes it. The retention values are "
+     "stored_only: they are shown by get_runtime_config but are not enforced, even after a "
+     "restart, because the response and guardian-event stores take their window from the "
+     "server's command-line flags (#483), so this call does not change what they delete. "
+     "auto_approve_enabled, plugin_signing_required (which records intent and hardens nothing) "
+     "and the other oidc_* keys are stored_only too.",
+     R"j({"type":"object","properties":{"key":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[a-z_]+$","description":"Runtime config key, one of get_runtime_config's allowed_keys"},"value":{"type":"string","maxLength":256,"description":"The new value as a string, e.g. \"90\" or \"debug\""}},"required":["key","value"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"applied":{"type":"boolean","description":"the value was accepted and stored; see effect for whether it is in use"},"effect":{"type":"string","enum":["immediate","deferred","stored_only"],"description":"immediate: used by the running server now; deferred: applied by the next DEX Alerts save or a restart (dex_*), or by a restart (oidc_admin_group, oidc_redirect_uri); stored_only: nothing consumes it"},"audit_persisted":{"type":"boolean","description":"present and false only when the outcome audit row could not be persisted"}},"required":["key","applied","effect"]})j"},
+
     {"get_plugin_config",
      "Read one plugin config value by (plugin, key). Mirrors GET "
      "/api/v1/plugin-config/{plugin}/{key}. Read-only. Requires PluginConfig:Read.",
@@ -4278,6 +4355,8 @@ static const char* const kWriteToolsRaw[] = {
     // list_upload_grants are read-only and deliberately absent.
     "set_plugin_config", "delete_plugin_config", "set_plugin_secret",
     "delete_plugin_secret", "set_plugin_kill_switch",
+    // set_runtime_config mutates; get_runtime_config is read-only and deliberately absent.
+    "set_runtime_config",
     // mint/revoke_upload_grant mutate; list_upload_grants is read-only and
     // deliberately absent.
     "mint_upload_grant", "revoke_upload_grant",
@@ -4774,6 +4853,13 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // file_retrieval_routes.hpp doc comments). Delete ops are approval-gated
     // on the supervised tier generically (mcp_policy.hpp's
     // `operation == "Delete"` rule) — no bespoke policy change needed here.
+    // Infrastructure, the securable of the REST routes these mirror. The default service scope
+    // (denied) is deliberate: runtime config is platform-wide, so a service-scoped token has no
+    // confined view of it. Not approval-gated on the supervised tier (mcp_policy.hpp), like
+    // Infrastructure:Write on set_crypto_dashboard_layout; the per-key refusal is
+    // config::write_refusal's, not this row's.
+    {"get_runtime_config", {"Infrastructure", "Read"}},
+    {"set_runtime_config", {"Infrastructure", "Write"}},
     {"get_plugin_config", {"PluginConfig", "Read"}},
     {"list_plugin_config", {"PluginConfig", "Read"}},
     {"set_plugin_config", {"PluginConfig", "Write"}},
@@ -5533,6 +5619,10 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"rewrap_secrets", {ToolEffect::Additive, true, "Resume KEK re-wrap"}},
 
     // ── ADR-0031 operator surface (PR1.5c/1.6c, p14) ──────────────────────
+    {"get_runtime_config", {ToolEffect::ReadOnly, true, "Get runtime configuration"}},
+    // set_runtime_config overwrites a stored value and the live setting (same reasoning as
+    // set_plugin_config); the end state on retry with the same arguments is identical.
+    {"set_runtime_config", {ToolEffect::Destructive, true, "Set runtime config value"}},
     {"get_plugin_config", {ToolEffect::ReadOnly, true, "Get plugin config value"}},
     {"list_plugin_config", {ToolEffect::ReadOnly, true, "List plugin config"}},
     // set_plugin_config/set_plugin_secret/set_plugin_kill_switch: upsert
@@ -8693,8 +8783,16 @@ McpServer::HandlerFn McpServer::build_handler(
                             if (!engine_credential_store_ || !engine_credential_store_->is_open())
                                 return std::unexpected(
                                     "engine credential store unavailable; retry");
-                            const auto active =
-                                engine_credential_store_->list_active_for_principal(rot_principal_id);
+                            // CHECKED read: a read that cannot answer is "could not verify", not
+                            // an empty active set. (An empty VALUE still lands on kNoneActive
+                            // below and is denied the same way: the ticket is never consumed.)
+                            const auto active_checked =
+                                engine_credential_store_->list_active_for_principal_checked(
+                                    rot_principal_id);
+                            if (!active_checked)
+                                return std::unexpected(
+                                    "engine credential store could not be read; retry");
+                            const auto& active = *active_checked;
                             using yuzu::server::detail::classify_confirm_state;
                             using yuzu::server::detail::pair_matches_pin;
                             using yuzu::server::detail::RotationConfirmState;
@@ -8926,19 +9024,28 @@ McpServer::HandlerFn McpServer::build_handler(
                         // different diagnostic tool needs its own arm here rather
                         // than inheriting this string unmodified.
                         if (kind == ConsumeFailure::kPrecondition) {
+                            // Wording only (no new retry hint): the denial may be a
+                            // transient store read failure, where the right move is to
+                            // recall the SAME approval_id, and the client cannot be told
+                            // which (anti-oracle, above). A new request here would burn
+                            // a human-approved ticket on a store blip; a retry_after_ms
+                            // would be dishonest for the terminal states. So lead with
+                            // the same-approval_id retry, and only then the state check.
                             const std::string remediation =
                                 tool_name == "confirm_engine_rotation"
-                                    ? "the approval_id is still valid and was NOT consumed; call "
-                                      "get_engine_principal (mirrors GET "
+                                    ? "the approval_id is still valid and was NOT consumed; do "
+                                      "not submit a new request because of this denial. Recall "
+                                      "this tool with the SAME approval_id. If the denial "
+                                      "persists, call get_engine_principal (mirrors GET "
                                       "/api/v1/engine-principals/{id}) to check the rotation's "
-                                      "current state before deciding whether to recall it again "
-                                      "with the same approval_id, or submit a new request if a "
-                                      "fresh approval is needed"
-                                    : "the approval_id is still valid and was NOT consumed; "
-                                      "check the current state of the operation this approval "
-                                      "authorizes before deciding whether to recall it again "
-                                      "with the same approval_id, or submit a new request if a "
-                                      "fresh approval is needed";
+                                      "current state before deciding whether a fresh approval "
+                                      "is needed"
+                                    : "the approval_id is still valid and was NOT consumed; do "
+                                      "not submit a new request because of this denial. Recall "
+                                      "this tool with the SAME approval_id. If the denial "
+                                      "persists, check the current state of the operation this "
+                                      "approval authorizes before deciding whether a fresh "
+                                      "approval is needed";
                             res.set_content(
                                 a4_error(kPermissionDenied,
                                          "approval cannot be redeemed right now: a precondition "
@@ -22712,6 +22819,137 @@ McpServer::HandlerFn McpServer::build_handler(
             //     via `audit_persisted:false` — its grant_id does not exist until
             //     the store generates it, so there is nothing to audit first.
 
+            if (tool_name == "get_runtime_config") {
+                if (!args.is_object() || !args.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "get_runtime_config takes no arguments"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                // Scoped to the caller: a key this session could not write has its override
+                // withheld and named in `withheld_keys` (config_write.hpp, build_config_view).
+                auto view = config::build_config_view(runtime_config_, *session, /*declare_withheld=*/true);
+                if (!view) {
+                    mcp_audit("failure", "runtime config store unavailable");
+                    res.set_content(a4_error(kInternalError, "runtime config store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                mcp_audit("success");
+                res.set_content(success_response(
+                                    id, tool_result(view->dump(-1, ' ', false,
+                                                                nlohmann::json::error_handler_t::replace),
+                                                    kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "set_runtime_config") {
+                // Gate order mirrors PUT /api/v1/config/{key}: permission, argument shape and
+                // bounds, then the per-key refusal (config::write_refusal, shared with both REST
+                // routes), then the store, the value, the audit-first row and the write.
+                if (!perm_fn(req, res, "Infrastructure", "Write"))
+                    return;
+                if (!args.is_object() || !args.contains("key") || !args["key"].is_string() ||
+                    !args.contains("value") || !args["value"].is_string()) {
+                    res.set_content(error_response(id, kInvalidParams, "key and value must be strings"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                // additionalProperties:false is advertised; enforce it, because an extra argument
+                // such as {"dry_run":true} must not turn into a real write.
+                for (auto it = args.begin(); it != args.end(); ++it)
+                    if (it.key() != "key" && it.key() != "value") {
+                        res.set_content(error_response(id, kInvalidParams, "unknown argument '" + it.key().substr(0, 64) + "'; set_runtime_config takes key and value only"), "application/json"); // retry-hint-exempt: caller-input rejection
+                        return;
+                    }
+                const std::string key = args["key"].get<std::string>();
+                const std::string value = args["value"].get<std::string>();
+                // The advertised schema bounds, enforced here: input schemas are validated only
+                // on the approval-gated path, which this tool never takes.
+                if (key.empty() || key.size() > 64 ||
+                    !std::ranges::all_of(key, [](unsigned char c) {
+                        return (c >= 'a' && c <= 'z') || c == '_';
+                    }) ||
+                    value.size() > 256) {
+                    res.set_content(error_response(id, kInvalidParams, "key must be 1 to 64 characters from a-z and _, and value at most 256 bytes (use PUT /api/v1/config/{key} for a longer value)"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (auto refusal = config::write_refusal(key, *session)) {
+                    if (refusal->kind == config::WriteRefusal::Kind::RouteOwned) {
+                        res.set_content(a4_error(kInvalidParams, refusal->message, refusal->remediation), "application/json"); // retry-hint-exempt: the key has its own route, retrying fails identically
+                        return;
+                    }
+                    // A `denied` row, as the REST routes write, and no `attempted` row.
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "config.update", "denied", "RuntimeConfig", key,
+                        refusal->audit_detail);
+                    mcp_audit("denied", refusal->audit_detail);
+                    res.set_content(a4_error(kPermissionDenied, refusal->message, refusal->remediation), "application/json"); // retry-hint-exempt: authorization outcome, retrying cannot change it
+                    return;
+                }
+                if (!config::store_ready(runtime_config_)) {
+                    mcp_audit("failure", "runtime config store unavailable");
+                    res.set_content(a4_error(kInternalError, "runtime config store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto parsed = config::validate_value(key, value);
+                if (!parsed) {
+                    res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!RuntimeConfigStore::is_allowed_key(key)) {
+                    res.set_content(error_response(id, kInvalidParams, "key '" + key + "' is not a configurable runtime setting; see get_runtime_config allowed_keys"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                // "No audit row, no mutation" (ADR-0033 section 9), as the REST twins. The
+                // attempted row carries no value.
+                if (!yuzu::server::detail::try_persist_audit(audit_fn, req, "config.update", "attempted",
+                                                             "RuntimeConfig", key, "")) {
+                    mcp_audit("failure", "audit unavailable; config not changed");
+                    res.set_content(a4_error(kInternalError,
+                                             "audit log unavailable; the change was not made",
+                                             "retry once the audit log is available",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                auto written = config::write_and_apply(runtime_config_, key, value, *parsed,
+                                                       session->username);
+                if (!written) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "config.update", "failure", "RuntimeConfig", key,
+                        written.error().audit_detail);
+                    mcp_audit("failure", written.error().audit_detail);
+                    if (written.error().kind == config::WriteFault::Kind::Rejected) {
+                        res.set_content(error_response(id, kInvalidParams, written.error().message), "application/json"); // retry-hint-exempt: the store refused the value, resending it fails identically
+                        return;
+                    }
+                    res.set_content(a4_error(kInternalError, written.error().message,
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "config.update", "success", "RuntimeConfig", key,
+                    config::success_audit_detail(key, value));
+                mcp_audit("success");
+                auto payload = config::applied_json(key, value, /*with_effect=*/true);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(
+                                    id, tool_result(payload.dump(-1, ' ', false,
+                                                                 nlohmann::json::error_handler_t::replace),
+                                                    kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
             if (tool_name == "get_plugin_config") {
                 if (!tier_allows(tier, "PluginConfig", "Read")) {
                     res.set_content(
@@ -26410,7 +26648,24 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const bool include_revoked = *include_revoked_opt;
-                auto principals = engine_principal_store_->list_all(include_revoked);
+                // CHECKED roster read (see the REST twin): the plain `list_all` returns an empty
+                // vector on a pool-lease timeout or query failure, and the principal and token
+                // stores share one pool, so a saturated pool would answer `count: 0` before the
+                // per-principal credential read below is reached. The store's error can carry
+                // driver text, so it is logged; the audit detail and response are fixed strings.
+                auto principals_res = engine_principal_store_->list_all_checked(include_revoked);
+                if (!principals_res) {
+                    spdlog::warn("list_engine_principals: roster read failed: {}",
+                                 principals_res.error());
+                    mcp_audit("failure", "engine principal roster could not be read");
+                    res.set_content(
+                        a4_error(kInternalError, "could not read the engine principals; retry",
+                                 "retry the request",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
+                const auto& principals = *principals_res;
                 JArr arr;
                 for (const auto& p : principals) {
                     JObj row;
@@ -26422,11 +26677,25 @@ McpServer::HandlerFn McpServer::build_handler(
                         .add("superseded_by", p.superseded_by)
                         .add("created_at", p.created_at)
                         .add("revoked_at", p.revoked_at);
-                    if (engine_credential_store_)
-                        row.add("active_credentials",
-                                static_cast<int64_t>(
-                                    engine_credential_store_->list_active_for_principal(p.principal_id)
-                                        .size()));
+                    if (engine_credential_store_) {
+                        // CHECKED read: the plain accessor turns a pool-lease timeout or
+                        // query failure into an empty vector, shown here as "0 credentials"
+                        // for a principal that holds a live one. Fail the whole list instead.
+                        auto active =
+                            engine_credential_store_->list_active_for_principal_checked(
+                                p.principal_id);
+                        if (!active) {
+                            mcp_audit("failure", active.error());
+                            res.set_content(
+                                a4_error(kInternalError,
+                                         "could not read the credential counts; retry",
+                                         "retry the request",
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                "application/json");
+                            return;
+                        }
+                        row.add("active_credentials", static_cast<int64_t>(active->size()));
+                    }
                     arr.add(row);
                 }
                 JObj payload;
@@ -26488,11 +26757,24 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("created_at", p.created_at)
                     .add("revoked_at", p.revoked_at)
                     .add("created_by", p.created_by);
-                if (engine_credential_store_)
-                    payload.add("active_credentials",
-                               static_cast<int64_t>(
-                                   engine_credential_store_->list_active_for_principal(principal_id)
-                                       .size()));
+                if (engine_credential_store_) {
+                    // CHECKED read, as on list_engine_principals: a degraded read must not
+                    // render as "0 active credentials".
+                    auto active =
+                        engine_credential_store_->list_active_for_principal_checked(principal_id);
+                    if (!active) {
+                        mcp_audit("failure", "principal_id=" + audit_caller_id(principal_id) + " " +
+                                          active.error());
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "could not read the principal's credentials; retry",
+                                     "retry the request",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    payload.add("active_credentials", static_cast<int64_t>(active->size()));
+                }
                 mcp_audit("success", principal_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -26687,7 +26969,29 @@ McpServer::HandlerFn McpServer::build_handler(
                 // credential. Distinct from the concurrent-mint race #2281
                 // addresses (a lost-response retry is sequential, and this
                 // synchronous check closes it).
-                if (!engine_credential_store_->list_active_for_principal(principal_id).empty()) {
+                //
+                // The read is the CHECKED twin: the plain accessor collapses a pool-lease
+                // timeout or query failure into an empty vector, which would read as "no
+                // credential yet" and let a retry mint the second live secret this check
+                // exists to prevent. A read that cannot answer fails closed (retryable,
+                // nothing minted), like the REST twin's 503 + Retry-After: 2.
+                auto active_before =
+                    engine_credential_store_->list_active_for_principal_checked(principal_id);
+                if (!active_before) {
+                    const bool check_audit_ok =
+                        audit_fn(req, "engine_principal.credential.mint", "failure",
+                                 "EnginePrincipal", principal_id, active_before.error());
+                    mcp_audit("failure", active_before.error());
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "could not confirm the principal has no active credential; retry",
+                                 "retry the request",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs, {},
+                                 check_audit_ok),
+                        "application/json");
+                    return;
+                }
+                if (!active_before->empty()) {
                     res.set_content(
                         error_response(id, kInvalidParams,
                                        "engine principal already has an active credential; use "
@@ -26717,18 +27021,56 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // create_token returns only the raw secret; look up the freshly
                 // minted row (the newest active credential) for its token_id.
+                //
+                // CHECKED read, taken before the success audit. create_token has already
+                // committed, so a failed read-back withholds the secret (a credential exists
+                // that no one holds): audit 'partial' (never 'failure'), and the remedy is to
+                // rotate it. No retry hint: a retry of the mint is refused as a second mint.
                 ApiToken newest;
                 bool found_newest = false;
-                for (const auto& t :
-                    engine_credential_store_->list_active_for_principal(principal_id)) {
-                    if (!found_newest || t.created_at > newest.created_at) {
-                        newest = t;
-                        found_newest = true;
+                auto active_after =
+                    engine_credential_store_->list_active_for_principal_checked(principal_id);
+                if (active_after) {
+                    for (const auto& t : *active_after) {
+                        if (!found_newest || t.created_at > newest.created_at) {
+                            newest = t;
+                            found_newest = true;
+                        }
                     }
+                }
+                // The read-back must both ANSWER and find the new row. An answered read with
+                // no active row (the credential, or the principal, revoked out of band after
+                // create_token) takes the same arm as a failed read: otherwise the secret is
+                // delivered with token_id '' under a `success` row for a dead credential.
+                if (!active_after || !found_newest) {
+                    const std::string partial_detail =
+                        active_after
+                            ? std::string("credential minted but no active credential row was "
+                                          "found on read-back, secret withheld")
+                            : "credential minted but its secret could not be read back for "
+                              "delivery: " +
+                                  active_after.error();
+                    const bool partial_audit_ok =
+                        audit_fn(req, "engine_principal.credential.mint", "partial",
+                                 "EnginePrincipal", principal_id, partial_detail);
+                    mcp_audit("partial", partial_detail);
+                    res.set_content(
+                        a4_error(503,
+                                 active_after
+                                     ? "the credential was minted but no active credential was "
+                                       "found on read-back; the one-time secret was withheld. List "
+                                       "the principal's credentials; rotate if one is listed"
+                                     : "the credential was minted but could not be read back; the "
+                                       "one-time secret was withheld. The credential exists but is "
+                                       "unusable: rotate it to obtain a secret",
+                                 "rotate the credential; do not retry the mint",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, partial_audit_ok),
+                        "application/json");
+                    return;
                 }
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "engine_principal.credential.mint", "success", "EnginePrincipal",
-                    found_newest ? newest.token_id : principal_id, "principal=" + principal_id);
+                    newest.token_id, "principal=" + principal_id);
                 if (!audit_ok) {
                     // #3937: fail closed — the credential was minted but its audit row
                     // did not persist, so the one-time secret is WITHHELD (never built
@@ -26748,7 +27090,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 JObj payload;
-                payload.add("token_id", found_newest ? newest.token_id : "")
+                payload.add("token_id", newest.token_id)
                     .add("raw_token", *minted)
                     .add("principal_id", principal_id)
                     .add("expires_at", expires_at);
@@ -26843,18 +27185,75 @@ McpServer::HandlerFn McpServer::build_handler(
                 // second-resolution, so a same-second mint→rotate ties and the
                 // newest-scan could return the predecessor's id, which would
                 // break the #2384 confirm token_id pin.
+                //
+                // CHECKED read, taken before the reveal audit (REST parity). The rotation
+                // has already committed, so a successor and its live secret exist; a read
+                // that cannot answer, or that finds no linked successor (revoked or
+                // confirmed out of band in between), fails CLOSED: retryable, secret
+                // withheld, audit 'partial' (never 'failure', a credential exists) and no
+                // reveal row, since no secret left the server. The store cached the secret
+                // for the grace window, so the same operator's retry on this replica
+                // re-serves it.
                 ApiToken successor;
                 bool found_successor = false;
-                for (const auto& t :
-                    engine_credential_store_->list_active_for_principal(principal_id)) {
-                    // At most one active row links (the store clears
-                    // supersedes_token_id at cutover, revoke-resolution, and
-                    // sweep), so first match is THE successor.
-                    if (!t.supersedes_token_id.empty()) {
-                        successor = t;
-                        found_successor = true;
-                        break;
+                auto active_after =
+                    engine_credential_store_->list_active_for_principal_checked(principal_id);
+                if (active_after) {
+                    for (const auto& t : *active_after) {
+                        // At most one active row links (the store clears
+                        // supersedes_token_id at cutover, revoke-resolution, and
+                        // sweep), so first match is THE successor.
+                        if (!t.supersedes_token_id.empty()) {
+                            successor = t;
+                            found_successor = true;
+                            break;
+                        }
                     }
+                }
+                if (!found_successor && active_after) {
+                    // The read ANSWERED and no active credential links to a predecessor
+                    // (revoked or confirmed out of band): there is no pending pair to
+                    // re-serve, so a retry hint would only drive an unrequested NEW
+                    // rotation. No retry hint; the remedy is to look, then rotate if needed.
+                    const std::string no_link_detail =
+                        "rotation committed but no active credential links to a predecessor on "
+                        "read-back (revoked or confirmed out of band); secret withheld";
+                    const bool partial_audit_ok =
+                        audit_fn(req, "engine_principal.credential.rotate", "partial",
+                                 "EnginePrincipal", principal_id, no_link_detail);
+                    mcp_audit("partial", no_link_detail);
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "rotation succeeded but no pending successor credential was "
+                                 "found; the one-time secret was withheld. A successor may exist; "
+                                 "inspect the principal's credentials (GET "
+                                 "/api/v1/engine-principals/{id}), then rotate again if needed",
+                                 "inspect the principal's credentials, then rotate again if needed; "
+                                 "do not retry automatically",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, partial_audit_ok),
+                        "application/json");
+                    return;
+                }
+                if (!found_successor) {
+                    const std::string read_failed_detail =
+                        "a successor exists (newly minted or re-served) but its secret could not "
+                        "be read back for delivery: " +
+                        active_after.error();
+                    const bool partial_audit_ok =
+                        audit_fn(req, "engine_principal.credential.rotate", "partial",
+                                 "EnginePrincipal", principal_id, read_failed_detail);
+                    mcp_audit("partial", read_failed_detail);
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "rotation succeeded but the successor could not be read back; "
+                                 "the one-time secret was withheld. Rotate again within about "
+                                 "two minutes to re-serve it",
+                                 "retry the rotation within about two minutes (same operator, "
+                                 "same server replica)",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs,
+                                 /*cid_override=*/{}, partial_audit_ok),
+                        "application/json");
+                    return;
                 }
                 // §7: every reveal — the original successor mint OR a within-grace-
                 // window replay — is its own independently audited disclosure event
@@ -26863,32 +27262,34 @@ McpServer::HandlerFn McpServer::build_handler(
                 // every JSON-RPC call, so a replay naturally produces its own row.
                 const bool reveal_audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "engine_principal.credential.reveal", "success",
-                    "EnginePrincipal", found_successor ? successor.token_id : principal_id,
+                    "EnginePrincipal", successor.token_id,
                     "principal=" + principal_id + " action=rotate");
                 if (!reveal_audit_ok) {
                     // #3937: fail closed — the reveal IS this route's success audit, so
                     // a dropped reveal-audit would let the raw secret leave the server
                     // with no audit-chain row. The one-time secret is WITHHELD (never
                     // built into the response below). Parity with the REST twin (#2466)
-                    // + the plugin-config MCP precedent; within the overlap window a
-                    // re-rotate re-serves the same successor once the audit persists.
+                    // + the plugin-config MCP precedent; within the grace window (about two
+                    // minutes, same operator, same replica) a re-rotate re-serves the same
+                    // successor once the audit persists.
                     mcp_audit("error", "audit_persist_failed");
                     res.set_content(
                         a4_error(503,
                                  "the credential was rotated but its reveal audit record could not "
                                  "be persisted; the one-time secret was withheld. Rotate again "
-                                 "within the overlap window to re-serve the same audited successor "
+                                 "within about two minutes to re-serve the same audited successor "
                                  "secret",
-                                 "rotate again within the overlap window; do not retry immediately",
+                                 "rotate again within the grace window (about two minutes, same "
+                                 "operator and server replica); do not retry immediately",
                                  /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
                         "application/json");
                     return;
                 }
                 JObj payload;
-                payload.add("token_id", found_successor ? successor.token_id : "")
+                payload.add("token_id", successor.token_id)
                     .add("raw_token", *rotated)
                     .add("principal_id", principal_id)
-                    .add("overlap_expires_at", found_successor ? successor.overlap_expires_at : 0);
+                    .add("overlap_expires_at", successor.overlap_expires_at);
                 mcp_audit("success", principal_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -27938,7 +28339,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_audit("failure", "engine principal or rbac store unavailable");
                     res.set_content(a4_error(kInternalError,
                                              "engine principal or rbac store unavailable",
-                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -27957,85 +28358,78 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const bool include_revoked = *include_revoked_opt;
-                auto principals = engine_principal_store_->list_all(include_revoked);
-                // Design doc §4.2 named PR-4.3/4.4 deliverable: "no admin, ever" and
-                // "no all-permissions toggle" are enforced at the write path
-                // (RbacStore::validate_assignment) — a claim about code behavior an
-                // auditor cannot verify by reading a policy doc. This independently
-                // joins principal_type='engine' against resolved role/permission
-                // state and asserts zero violations, the same way an auditor-runnable
-                // proof should never just ask to trust the write-path guard.
-                //
-                // G2: mirrors the REST auditor (GET
-                // /api/v1/engine-principals/audit/no-admin, rest_api_v1.cpp) EXACTLY
-                // — same three checks (literal admin/Administrator role name, any
-                // is_system role via list_roles(), and the full securable x
-                // operation cross-product wildcard-grant bound) — rather than the
-                // narrower "Security/UserManagement securable" subset this tool
-                // previously checked. The two auditors must never diverge on what
-                // counts as a violation.
-                auto all_roles = rbac_store->list_roles();
+                // The shared auditor (engine_no_admin_audit.hpp, also behind the REST
+                // twin GET /api/v1/engine-principals/audit/no-admin): grant-table
+                // driven over CHECKED reads, so a degraded read can never certify
+                // ok:true. It is the only control over a wildcard custom role
+                // (maintainer ruling 2026-10-23, #2485).
                 auto all_securables = rbac_store->list_securable_types();
                 auto all_operations = rbac_store->list_operations();
-                // G3: same fail-closed posture as the REST twin — these are seeded
-                // RBAC reference tables that a live deployment never legitimately
-                // has zero rows in, so empty means resolution failed, not "no
-                // securables exist". A silently-zero full_grant_size would make
-                // the wildcard-grant check vacuously pass every principal, so
-                // report this run as unable to verify rather than certifying
-                // "clean":true over data we could not actually read.
+                // G3: these are seeded RBAC reference tables that a live deployment
+                // never legitimately has zero rows in, so empty means resolution
+                // failed, not "no securables exist". An empty grid would make the
+                // wildcard check vacuous, so report this run as unable to verify.
                 if (all_securables.empty() || all_operations.empty()) {
                     mcp_audit("failure", "rbac reference data unavailable — cannot verify");
                     (void)audit_fn(req, "engine_principal.audit.no_admin", "failure", "AuditLog",
                                    "no-admin", "rbac_resolution_failed");
                     res.set_content(a4_error(kInternalError,
                                              "rbac reference data unavailable — cannot verify",
-                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
-                const std::size_t full_grant_size = all_securables.size() * all_operations.size();
-                JArr violations;
-                for (const auto& p : principals) {
-                    for (const auto& pr : rbac_store->get_principal_roles("engine", p.principal_id)) {
-                        if (pr.role_name == "admin" || pr.role_name == "Administrator") {
-                            violations.add(JObj()
-                                              .add("principal_id", p.principal_id)
-                                              .add("role", pr.role_name)
-                                              .add("reason", "admin_role"));
-                            continue;
-                        }
-                        auto it = std::find_if(
-                            all_roles.begin(), all_roles.end(),
-                            [&](const RbacRole& r) { return r.name == pr.role_name; });
-                        if (it != all_roles.end() && it->is_system) {
-                            violations.add(JObj()
-                                              .add("principal_id", p.principal_id)
-                                              .add("role", pr.role_name)
-                                              .add("reason", "system_role"));
-                        }
-                    }
-                    // "No all-permissions toggle" residual — same as the REST twin.
-                    auto effective = rbac_store->get_effective_permissions(p.principal_id);
-                    std::unordered_set<std::string> granted;
-                    for (const auto& perm : effective) {
-                        if (perm.effect == "allow")
-                            granted.insert(perm.securable_type + "\x1f" + perm.operation);
-                    }
-                    if (granted.size() >= full_grant_size) {
-                        violations.add(JObj()
-                                          .add("principal_id", p.principal_id)
-                                          .add("role", "")
-                                          .add("reason", "wildcard_grant"));
-                    }
+                const auto fail_closed = [&]() {
+                    mcp_audit("failure", std::string(engine_no_admin_audit::kFailureAuditDetail));
+                    (void)audit_fn(req, "engine_principal.audit.no_admin", "failure", "AuditLog",
+                                   "no-admin",
+                                   std::string(engine_no_admin_audit::kFailureAuditDetail));
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 std::string(engine_no_admin_audit::kUnavailableMessage),
+                                 "retry the request",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                };
+                auto inputs = engine_no_admin_audit::read_inputs(*rbac_store);
+                if (!inputs) {
+                    fail_closed();
+                    return;
                 }
-                // {ok, violations} — exact parity with the REST twin's response
-                // shape (GET /api/v1/engine-principals/audit/no-admin) so a
+                // include_revoked=false narrows the report to ACTIVE principals; that
+                // roster read is a checked read too. The default (true) audits every
+                // grant on record, so a revoked principal that still holds an admin
+                // grant is still flagged (parity with the REST twin). The narrowing
+                // drops ONLY principals the roster says are revoked: an engine: grant
+                // whose principal has no roster row at all is never dropped, it is
+                // reported as orphan_grant (a roster walk would hide it).
+                std::optional<engine_no_admin_audit::ActiveScope> scope;
+                if (!include_revoked) {
+                    auto roster = engine_principal_store_->list_all_checked(true);
+                    if (!roster) {
+                        fail_closed();
+                        return;
+                    }
+                    // Only lifecycle_state == "revoked" narrows a principal out; any other
+                    // state is audited normally (make_active_scope).
+                    scope = engine_no_admin_audit::make_active_scope(*roster);
+                }
+                const auto found = engine_no_admin_audit::evaluate(
+                    *inputs, all_securables, all_operations, scope ? &*scope : nullptr);
+                JArr violations;
+                for (const auto& v : found) {
+                    violations.add(JObj()
+                                       .add("principal_id", v.principal_id)
+                                       .add("role", v.role)
+                                       .add("reason", v.reason));
+                }
+                // {ok, violations} — the same response shape as the REST twin so a
                 // machine caller can treat the two transports identically.
                 JObj payload;
-                payload.add("ok", violations.size() == 0).raw("violations", violations.str());
+                payload.add("ok", found.empty()).raw("violations", violations.str());
                 (void)audit_fn(req, "engine_principal.audit.no_admin", "success", "AuditLog",
-                               "no-admin", "violations=" + std::to_string(violations.size()));
+                               "no-admin",
+                               engine_no_admin_audit::audit_detail(found, scope.has_value()));
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");

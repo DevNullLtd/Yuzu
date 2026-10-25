@@ -647,7 +647,7 @@ Full design: `docs/auth-mfa-design.md`. Summary:
   unlock, Guardian rule write / push / policy-generation raise and guard update / delete,
   software-package write, software-deploy start, approval approve and reject
   (`POST /api/approvals/{id}/approve|reject`), MFA recovery-code
-  regeneration and MFA disable, JIT elevation). 36 are enforced by the
+  regeneration and MFA disable, JIT elevation). 37 are enforced by the
   central chokepoint described under "MFA step-up chokepoint" below; the
   three JIT-elevation routes apply their own stricter gate in the handler.
   Other mutating routes and all MCP tools are not MFA-step-up gated in
@@ -685,7 +685,7 @@ by each handler.
 - **One table.** `step_up_policy.hpp`'s `kStepUpPolicy` classifies every
   mutating (`POST`/`PUT`/`PATCH`/`DELETE`) route by its exact `(method,
   registered pattern)`; there are no prefixes or wildcards. The classes are
-  `kRequired` (a fresh proof is needed; today's 36 enforced routes, 34 of
+  `kRequired` (a fresh proof is needed; today's 37 enforced routes, 34 of
   them with the audit labels they always had), `kOwnGate` (the three JIT-elevation routes,
   whose handler applies a stricter gate that the chokepoint leaves alone),
   `kExempt` (a recorded reason: pre-session, self-service, read-shaped,
@@ -693,7 +693,7 @@ by each handler.
   class (`kPendingRuling`) for routes whose classification is still being
   decided, which the chokepoint treats as exempt: 73 REST rows today, a count
   pinned in a `static_assert` (`kPendingRulingMax`) that can only shrink. The
-  table has 232 REST rows: 36 `kRequired`, 3 `kOwnGate`, 120 `kExempt` and 73
+  table has 233 REST rows: 37 `kRequired`, 3 `kOwnGate`, 120 `kExempt` and 73
   `kPendingRuling`.
 - **Where it runs.** In `run_pre_request_stage` (`step_up_wiring.hpp`), the
   body of the pre-request handler `server.cpp` installs: after the route
@@ -740,7 +740,7 @@ by each handler.
   `--mfa-step-up-window-secs 0` (or less) disables the stale-proof requirement on
   `kRequired` rows, but neither the engine denial nor the null-store check
   below. The escape hatch precedes the SAML denial and the store read in
-  `decide_step_up`, so at a window of 0 or less SAML sessions pass all 36
+  `decide_step_up`, so at a window of 0 or less SAML sessions pass all 37
   routes and the authentication store is not read; no stale proof is refused
   (so none is recorded), while engine denials and unwired-store refusals are
   still recorded. The elevation routes use the global window when it is positive
@@ -818,7 +818,7 @@ by each handler.
   calls may be deleted once handlers consume the centrally resolved session or the
   repeated resolves are removed (#6200); the binding stays until then. Until then
   the in-handler calls remain
-  as defence in depth (38 distinct labels: one per `kRequired` row, 36, plus
+  as defence in depth (39 distinct labels: one per `kRequired` row, 37, plus
   the two the elevation path uses).
 - **Audit.** Refusals written by the chokepoint go through
   `AuthRoutes::audit_log`, so the actor is the resolved session. Every row is
@@ -868,19 +868,19 @@ by each handler.
   server's route table is sealed: a later mutating registration through the
   route sink that has no row is not registered, is logged as critical and
   makes the sink throw. Adding a mutating route therefore means adding a row.
-- **Scope.** A fresh MFA proof is required on 36 named high-risk routes (plus
+- **Scope.** A fresh MFA proof is required on 37 named high-risk routes (plus
   the three JIT-elevation routes, whose handlers apply their own gate) for
   MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`;
   un-enrolled accounts and API/MCP tokens pass; engine principals are denied.
-  "High-risk" names these 36 routes; it is not a completeness claim. Other
+  "High-risk" names these 37 routes; it is not a completeness claim. Other
   mutating routes and all MCP tools are not MFA-step-up gated in this release:
   73 REST rows are still `kPendingRuling` (among them CA revoke and
   issue-code-signing, and `PUT /api/config/*`), and MCP is governed by the MCP tier
   and approval ladder (`docs/mcp-server.md`). The MCP tools are classified in
-  a second table, `step_up_mcp_policy.hpp` (64 rows: 19 `kExempt`, 45
+  a second table, `step_up_mcp_policy.hpp` (65 rows: 19 `kExempt`, 46
   `kPendingRuling`, none `kRequired`), which is data only and changes no MCP
   behaviour. The pending rows are a frozen baseline of 44 whose count only goes down,
-  plus a separate list of tools added after it (today one), legal only for a tool
+  plus a separate list of tools added after it (today two), legal only for a tool
   whose REST twin is `kRequired`, which a compile-time check ties to the REST
   table. Every pending tool with a `kRequired` twin is pending because no MCP
   consumer enforces `kRequired` yet. PR 2 promotes pending rows; an MCP `kRequired` row will need a
@@ -1939,7 +1939,7 @@ deploy, approval approve/reject, user delete/role change, MFA recovery-code rege
 JIT elevation)
 receives a `403` with `"MFA step-up is not available for SAML sessions in this
 release"`, regardless of `--mfa-enforcement` mode (the one exception is a disabled window: with
-`--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 36 routes enforced by the
+`--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 37 routes enforced by the
 central check, but not the three JIT-elevation routes, which own their gate and substitute a
 300 s window, so those still deny SAML). The step-up decision
 (`decide_step_up` in `step_up_gate.cpp`, shared by the chokepoint and
@@ -3779,8 +3779,10 @@ resulting latency bounds.
   authoring surface that makes `RbacStore::assign_role(principal_type="engine")`
   reachable in production — see `docs/user-manual/rest-api.md` "Engine
   Principals" for the full contract. Mutations require admin + MFA step-up;
-  admin/built-in/wildcard role targets are rejected as `4xx`, never silently
-  narrowed or a `500` (design §4.2 "no admin, ever").
+  the `admin`/`Administrator` roles and every built-in role are rejected as `4xx`,
+  never silently narrowed or a `500` (design §4.2 "no admin, ever"). A custom role
+  whose grants cover everything is not rejected at assignment; the no-admin audit
+  route reports it afterwards.
 - Authorization model: scoped role assignments `(principal, role, scope)`
   for **all** principal classes, evaluated permissions ∩ scope through
   ADR-0017's `authorize_list_read` chokepoint for list/fan-out reads and
@@ -4016,12 +4018,17 @@ walkthrough.
   capability. Design record: `docs/security-reviews/human-token-rotation-2026-08-10.md`
   "Open risks" (#2961, marked resolved).
 - **No-admin auditor** — `GET /api/v1/engine-principals/audit/no-admin` /
-  MCP `audit_engine_no_admin` — independently resolves every engine
-  principal's actual roles + effective permissions against the live RBAC
-  reference tables and reports any violation (literal admin/system-role
-  grant, or a full securable × operation wildcard grant). Fails closed
-  (`503`, "cannot verify") rather than reporting a false `ok:true` if RBAC
-  reference data can't be resolved.
+  MCP `audit_engine_no_admin`: one shared implementation
+  (`engine_no_admin_audit.hpp`) over CHECKED reads of the grant table, the roles
+  and the role permissions. It is the DETECTIVE control for a wildcard custom
+  role, which assignment deliberately permits (maintainer ruling 2026-10-23,
+  #2485). It reports a detected `admin_role`, `system_role` or `wildcard_grant`
+  (a role, or the union of a principal's roles, allowing every securable ×
+  operation pair of the grid at run time; a role granting all but one pair is
+  not reported). Point-in-time and pull-only: no schedule, no alert. Fails
+  closed (`503` / retryable MCP error, a `failure` audit row, no `success` row,
+  no partial list) when any read cannot be answered, so a degraded read never
+  reads as `ok:true`.
 - **Audit-persist posture (#2466/#2406 + #3937, ADR-1005 "mutations fail closed
   on audit failure"):** every *mutating* engine-principal REST route fails closed
   — `503` + `Sec-Audit-Failed: true` — if its audit row cannot persist, so a

@@ -156,17 +156,23 @@
     "method": "GET",
     "path": "/api/config",
     "capability_id": "get.api-config",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/config"
+    },
+    "mcp_twin": "get_runtime_config",
+    "status": "twinned"
   },
   {
     "method": "PUT",
     "path": "/api/config/{param}",
     "capability_id": "put.api-config-param",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "PUT",
+      "path": "/api/v1/config/{key}"
+    },
+    "mcp_twin": "set_runtime_config",
+    "status": "twinned"
   },
   {
     "method": "GET",

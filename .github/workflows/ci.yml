@@ -1148,6 +1148,22 @@ jobs:
             exit 1
           fi
           echo "pg_mode=$PG_MODE"
+          # Bound every libpq connect in the later steps. libpq applies this to
+          # each connect attempt (per host), including a backend that accepts
+          # the TCP connection and then never answers, which has no bound
+          # otherwise. 30 s is deliberately looser than PgPool's own 10 s
+          # default: pg_pool.cpp lets the variable win over that default AND
+          # over an Options-level connect_timeout_s, so the pool's connect bound
+          # in these steps is 30 s unless the DSN itself carries a
+          # connect_timeout (a DSN-level value wins over the variable; tests
+          # that need a short bound must put it in the DSN). A 10 s cap failed a
+          # fixture connect on a heavily loaded dev box, and a stalled backend
+          # still fails in 30 s instead of at the shard's meson timeout. On
+          # POSIX the [pg_reachability] tests unset it for the duration of each
+          # case (test_pg_reachability_probe.cpp), because the probe lets the
+          # variable override the 3 s deadline those tests bound.
+          echo "PGCONNECT_TIMEOUT=30" >> "$GITHUB_ENV"
+          echo "PGCONNECT_TIMEOUT=30 appended to GITHUB_ENV for the later steps"
 
       # Verified NOT to select the #3443 Phase 2 'server pg smoke' entry: the
       # --suite list below omits server-pg-smoke, and the by-name line
@@ -1167,8 +1183,9 @@ jobs:
         # added shard D, carved from B's [body_cap] tests — + the mcp bridge
         # teardown budget test + the pg shard partition invariant, #3443
         # Phase 1 — needs no Postgres DSN,
-        # --list-tests only enumerates TEST_CASE macros). Both now pass
-        # --num-processes 2 (2026-09-18, extends #3443). The old reasoning
+        # --list-tests only enumerates TEST_CASE macros). Both were then run with
+        # --num-processes 2 (2026-09-18, extends #3443; the first invocation is
+        # now 4, see 'Width history' below). The old reasoning
         # here ("UNCAPPED since neither touches Postgres") conflated
         # Postgres contention with the WITHIN-job meson fan-out #3443 already
         # proved on the pg shards below: uncapped `meson test` spawns every
@@ -1202,6 +1219,20 @@ jobs:
         # none confirmed. This cap is shipped on the single-case evidence
         # above; do not read it as a fix for the classifier cascade.
         #
+        # Width history (the Linux push ladder in docs/ci-architecture.md): the
+        # FIRST invocation below (cheap suites) runs --num-processes 4; the second
+        # (server shards) stays at 2. The cap of 2 was set against an UNCAPPED
+        # meson pool sized from cpu_count() on a job confined to 16 logical CPUs;
+        # 4 workers is not that oversubscription, but the timing-assertion flakes
+        # that cap was meant to stop were never isolated, so watch for them.
+        # Baseline at 2 (two PR #6425 runs, commits a264c1e59 and 2c6b3a120): this
+        # invocation took ~340 s wall for ~610 serial-s (agent ~240, gateway 158 of
+        # which eunit alone is 122, docs 116, platform 96); the whole non-pg step
+        # ran 6.6-7.0 min over 12 recent dev runs. One axis only: the second
+        # invocation, the pg step and Windows are unchanged. The decision rule,
+        # the measurement sources and the revert triggers are in the docs
+        # paragraph "Push 2a". Revert is this one number.
+        #
         # Cross-job with-test-slot.sh gating is deliberately NOT added here
         # yet: this step's aggregate duration is
         # still short, so the within-job cap is the single-axis fix shipped
@@ -1233,7 +1264,7 @@ jobs:
           # stale log). On a red run bash -e stops before the summary; use the
           # uploaded meson-logs artifact locally (#4884).
           rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
-          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite agent --suite docs --suite proto --suite tar --suite gateway --suite platform
+          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 --suite agent --suite docs --suite proto --suite tar --suite gateway --suite platform
           python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux non-pg (cheap suites)"
           rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
           python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "guardian cache allocation-failure sweep" "server pg shard partition invariant" "dex link no presentation symbols"
@@ -2047,6 +2078,12 @@ jobs:
             exit 1
           fi
           echo "pg_mode=$PG_MODE"
+          # Bound every libpq connect in the later steps: same export and
+          # rationale as the Linux job's Resolve step above, and the "Connect
+          # cap on the Linux and Windows test legs" paragraph in
+          # docs/ci-architecture.md.
+          echo "PGCONNECT_TIMEOUT=30" >> "$GITHUB_ENV"
+          echo "PGCONNECT_TIMEOUT=30 appended to GITHUB_ENV for the later steps"
 
       # Windows CI test-phase restructuring (#3443, 2026-08-28): mirrors the
       # Linux job's non-pg/pg-shards/pg-smoke split — see docs/ci-architecture.md

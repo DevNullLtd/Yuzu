@@ -45,6 +45,7 @@
 #include "pg/pg_pool.hpp"
 #include "ca_store.hpp"
 #include "discover_routes.hpp"     // A2 discovery builders (Issue 17.1)
+#include "engine_principal_store.hpp"
 #include "event_bus.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
@@ -57,6 +58,7 @@
 #include "response_store.hpp"
 #include "rest_api_v1.hpp"      // M.9 PR-2b: cross-transport cursor walk (REST + MCP)
 #include "test_route_sink.hpp"  // M.9 PR-2b: in-process sink for that REST half
+#include "test_principal_lock_gate.hpp" // SqlFault: a REAL table moved aside in the throwaway DB
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
 #include "test_compliance_api_double.hpp" // ADR-0031 WS-A4: FnComplianceApi
@@ -80,6 +82,8 @@
 #include "pg/pg_raii.hpp"     // PgConn/PgResult — direct-SQL secret-row verification
 #include "pg/secret_codec.hpp"
 #include "plugin_config_store.hpp"
+#include "runtime_config_store.hpp" // get/set_runtime_config tests
+#include <yuzu/server/auto_approve.hpp>
 #include "deployment_routes.hpp"    // deployment_row_json (shared REST/MCP builder)
 #include "deployment_run_store.hpp" // list_deployments / get_deployment
 #include "preflight_run_store.hpp" // #4036: PreflightRunStore for list_preflight_runs / get_deployment_preview
@@ -1091,6 +1095,11 @@ struct McpTestServer {
     /// on the "engine credential store unavailable" path.
     yuzu::server::ApiTokenStore* engine_credential_store_for_test{nullptr};
 
+    /// Optionally wire an EnginePrincipalStore so audit_engine_no_admin (which refuses to run
+    /// without one) can be exercised against a real RbacStore. Default nullptr keeps every
+    /// pre-existing test on the "store unavailable" path.
+    yuzu::server::EnginePrincipalStore* engine_principal_store_for_test{nullptr};
+
     /// #2395 track D: optionally wire a stub KekOps so rotate_kek /
     /// rewrap_secrets / get_kek_status can be exercised end-to-end at the MCP
     /// surface — mirrors ca_store_for_test above. Default-constructed
@@ -1112,6 +1121,9 @@ struct McpTestServer {
     /// must opt in with an explicit AdmitAll/AdmitScoped lambda, same as
     /// production wiring in server.cpp.
     yuzu::server::PluginConfigStore* plugin_config_store_for_test{nullptr};
+    /// get_runtime_config / set_runtime_config backing (cfg, auto-approve engine, store). Default
+    /// (all nullptr) keeps every other test on the "store unavailable" path.
+    yuzu::server::config::Backing runtime_config_for_test{};
     yuzu::server::UploadGrantStore* upload_grant_store_for_test{nullptr};
     yuzu::server::mcp::McpServer::UploadGrantListReadFn upload_grant_list_read_fn_for_test{};
 
@@ -1564,6 +1576,8 @@ private:
         // build_handler param — wire before the handlers are built.
         if (engine_credential_store_for_test)
             mcp.set_engine_credential_store(engine_credential_store_for_test);
+        if (engine_principal_store_for_test)
+            mcp.set_engine_principal_store(engine_principal_store_for_test);
 
         // #2395 track D: the KEK ops seam ALSO rides a setter (same pattern as
         // the engine-credential store above) — wire before the handlers are
@@ -1676,6 +1690,8 @@ private:
         // are built.
         if (plugin_config_store_for_test)
             mcp.set_plugin_config_store(plugin_config_store_for_test);
+        if (runtime_config_for_test.store)
+            mcp.set_runtime_config_backing(runtime_config_for_test);
         if (upload_grant_store_for_test)
             mcp.set_upload_grant_ops(upload_grant_store_for_test, upload_grant_list_read_fn_for_test);
         // #4036: preflight_run_store ALSO rides a setter, same pattern as
@@ -3055,6 +3071,200 @@ TEST_CASE("MCP confirm_engine_rotation: token_id pin round-trip via tools/call",
     CHECK(audit_bound);
 }
 
+// The MCP twin of the REST no-admin auditor shares ONE implementation with it
+// (engine_no_admin_audit.hpp). The auditor is the only control over a wildcard custom role
+// (maintainer ruling 2026-10-23, #2485), so a degraded read must never certify ok:true.
+TEST_CASE("MCP audit_engine_no_admin: fails CLOSED (error + retry hint, no ok:true, no success "
+          "audit row) when ANY checked read degrades",
+          "[mcp][pg][engine_principal][no_admin][fail_closed][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    yuzu::server::EnginePrincipalStore eps{pool};
+    REQUIRE(eps.is_open());
+
+    // A real violation: a custom role granted the whole current grid, held by an engine id.
+    REQUIRE(rbac.create_role({.name = "WildRole", .description = "d"}).has_value());
+    for (const auto& s : rbac.list_securable_types())
+        for (const auto& o : rbac.list_operations())
+            REQUIRE(rbac.set_permission({"WildRole", s, o, "allow"}).has_value());
+    REQUIRE(eps.create("mcp wild", "alice", "audit test", "internal", "alice", "engine:mcp-wild")
+                .has_value());
+    REQUIRE(rbac.assign_role({"engine", "engine:mcp-wild", "WildRole"}).has_value());
+
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.engine_principal_store_for_test = &eps;
+    ts.start("readonly");
+    const std::string call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":71,)"
+        R"("params":{"name":"audit_engine_no_admin","arguments":{}}})";
+
+    // Control: healthy, the violation is reported by role name and the success row carries it.
+    {
+        auto ok = ts.call(call);
+        REQUIRE(ok);
+        auto j = nlohmann::json::parse(ok->body);
+        REQUIRE(j.contains("result"));
+        const auto payload =
+            nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        REQUIRE(payload["violations"].size() == 1);
+        CHECK(payload["violations"][0]["role"] == "WildRole");
+        CHECK(payload["violations"][0]["reason"] == "wildcard_grant");
+        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                         "engine_principal.audit.no_admin|success") == 1);
+    }
+
+    struct Broken {
+        const char* label;
+        const char* apply;
+        const char* undo;
+    };
+    const Broken tables[] = {
+        {"principal_roles",
+         "ALTER TABLE rbac_store.principal_roles RENAME TO principal_roles_gone",
+         "ALTER TABLE rbac_store.principal_roles_gone RENAME TO principal_roles"},
+        {"roles", "ALTER TABLE rbac_store.roles RENAME TO roles_gone",
+         "ALTER TABLE rbac_store.roles_gone RENAME TO roles"},
+        {"role_permissions",
+         "ALTER TABLE rbac_store.role_permissions RENAME TO role_permissions_gone",
+         "ALTER TABLE rbac_store.role_permissions_gone RENAME TO role_permissions"},
+    };
+    for (const auto& t : tables) {
+        INFO("read broken: " << t.label);
+        ts.audit_log.clear();
+        yuzu::test::SqlFault fault(pool, t.apply, t.undo);
+        fault.arm();
+
+        auto r = ts.call(call);
+        REQUIRE(r);
+        auto j = nlohmann::json::parse(r->body);
+        REQUIRE(j.contains("error"));
+        REQUIRE_FALSE(j.contains("result"));
+        CHECK(j["error"]["message"].get<std::string>() ==
+              "rbac resolution unavailable - cannot verify");
+        // Same 2000 ms hint as the REST twin and the mint/rotate arms (REST Retry-After: 2).
+        CHECK(j["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultShortRetryMs);
+        CHECK(r->body.find("violations") == std::string::npos); // no partial list
+        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                         "engine_principal.audit.no_admin|failure") == 1);
+        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                         "mcp.audit_engine_no_admin|failure") == 1);
+        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                         "engine_principal.audit.no_admin|success") == 0);
+
+        fault.repair();
+        // Healed: the same call answers again, and the violation is reported.
+        auto healed = ts.call(call);
+        REQUIRE(healed);
+        auto jh = nlohmann::json::parse(healed->body);
+        REQUIRE(jh.contains("result"));
+        CHECK(nlohmann::json::parse(jh["result"]["content"][0]["text"].get<std::string>())
+                  ["violations"]
+                  .size() == 1);
+    }
+}
+
+TEST_CASE("MCP audit_engine_no_admin: include_revoked=false fails closed when the active "
+          "roster read degrades, and narrows to active principals when healthy",
+          "[mcp][pg][engine_principal][no_admin][fail_closed][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    yuzu::server::EnginePrincipalStore eps{pool};
+    REQUIRE(eps.is_open());
+
+    // Two engine principals that both hold an Administrator grant written straight into the
+    // table (assignment itself refuses it): one active, one revoked. The default audits both;
+    // include_revoked=false narrows the report to the active one.
+    REQUIRE(eps.create("live", "alice", "audit test", "internal", "alice", "engine:mcp-live")
+                .has_value());
+    REQUIRE(eps.create("gone", "alice", "audit test", "internal", "alice", "engine:mcp-gone")
+                .has_value());
+    REQUIRE(eps.revoke("engine:mcp-gone", "").has_value());
+    REQUIRE_FALSE(rbac.assign_role({"engine", "engine:mcp-live", "Administrator"}).has_value());
+    for (const char* id : {"engine:mcp-live", "engine:mcp-gone"}) {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto ins = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO rbac_store.principal_roles (principal_type, principal_id, role_name) "
+            "VALUES ('engine', $1, 'Administrator')",
+            std::vector<std::string>{id});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+    }
+    // A shadow grant: an engine: id with NO roster row at all (no engine_principals row), as a
+    // direct DB write or a stale grant would leave. A roster walk would never see it.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto ins = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO rbac_store.principal_roles (principal_type, principal_id, role_name) "
+            "VALUES ('user', 'engine:mcp-shadow', 'Administrator')",
+            std::vector<std::string>{});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+    }
+
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.engine_principal_store_for_test = &eps;
+    ts.start("readonly");
+
+    auto all = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":72,)"
+                       R"("params":{"name":"audit_engine_no_admin","arguments":{}}})");
+    REQUIRE(all);
+    // The detail of the most recent domain success row (the mcp.* row after it carries none).
+    const auto last_success_detail = [&ts]() -> std::string {
+        for (std::size_t i = ts.audit_log.size(); i-- > 0;)
+            if (ts.audit_log[i] == "engine_principal.audit.no_admin|success")
+                return ts.audit_details[i];
+        return "<none>";
+    };
+    auto ja = nlohmann::json::parse(all->body);
+    REQUIRE(ja.contains("result"));
+    CHECK(nlohmann::json::parse(ja["result"]["content"][0]["text"].get<std::string>())["violations"]
+              .size() == 3); // live, gone and the shadow grant
+    CHECK(last_success_detail().starts_with("violations=3 scope=all"));
+
+    const std::string active_only =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":73,)"
+        R"("params":{"name":"audit_engine_no_admin","arguments":{"include_revoked":false}}})";
+    auto narrowed = ts.call(active_only);
+    REQUIRE(narrowed);
+    auto jn = nlohmann::json::parse(narrowed->body);
+    REQUIRE(jn.contains("result"));
+    // The revoked principal is narrowed out, as asked; the shadow grant is NOT dropped: it is
+    // reported as orphan_grant (alongside its admin_role), not hidden by the roster filter.
+    const auto narrowed_v =
+        nlohmann::json::parse(jn["result"]["content"][0]["text"].get<std::string>())["violations"];
+    std::vector<std::string> seen;
+    for (const auto& v : narrowed_v)
+        seen.push_back(v["principal_id"].get<std::string>() + ":" + v["reason"].get<std::string>());
+    CHECK(seen == std::vector<std::string>{"engine:mcp-live:admin_role",
+                                           "engine:mcp-shadow:admin_role",
+                                           "engine:mcp-shadow:orphan_grant"});
+    // The success row records that this run was narrowed, so its count is not a fleet count.
+    CHECK(last_success_detail().starts_with("violations=3 scope=active"));
+
+    yuzu::test::SqlFault fault(
+        pool, "ALTER TABLE engine_principal_store.engine_principals RENAME TO engine_principals_gone",
+        "ALTER TABLE engine_principal_store.engine_principals_gone RENAME TO engine_principals");
+    fault.arm();
+    auto broken = ts.call(active_only);
+    REQUIRE(broken);
+    auto jb = nlohmann::json::parse(broken->body);
+    REQUIRE(jb.contains("error"));
+    REQUIRE_FALSE(jb.contains("result"));
+    CHECK(jb["error"]["message"].get<std::string>() ==
+          "rbac resolution unavailable - cannot verify");
+    fault.repair();
+}
+
 // #3937: the engine-principal MUTATION twins fail closed (JSON-RPC 503 error, NOT
 // a success result) when their audit row cannot persist — parity with the REST
 // twins (#2466) and the in-MCP plugin-config precedent. mint/rotate additionally
@@ -3202,6 +3412,402 @@ TEST_CASE("MCP #3937: rotate_engine_credential fails CLOSED and withholds the se
     CHECK(r->body.find("raw_token") == std::string::npos);
     // Attribution: the successor was minted (overlap pair live) though the reveal audit dropped.
     CHECK(store.list_active_for_principal(principal).size() == 2);
+}
+
+// The MCP engine-credential twins read the token store through the CHECKED accessor, like the
+// REST routes: a read that cannot answer must never read as "no credential yet" (mint) or
+// "no successor" (rotate). The degraded read is produced the way the REST cases do: hold every
+// lease of the store's own pool, or poison the schema inside the mint's own transaction.
+namespace {
+using McpTokenLeases = std::vector<decltype(std::declval<yuzu::server::pg::PgPool&>().acquire())>;
+McpTokenLeases hold_all_leases(yuzu::server::pg::PgPool& pool) {
+    McpTokenLeases held;
+    for (std::size_t i = 0; i < pool.size(); ++i) {
+        held.push_back(pool.acquire());
+        REQUIRE(held.back());
+    }
+    return held;
+}
+} // namespace
+
+TEST_CASE("MCP mint_engine_credential: fails CLOSED with a retry hint and mints nothing when "
+          "the active-credential guard cannot read",
+          "[mcp][pg][engine_principal][mint][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    const std::string principal = "engine:mcp-mint-degraded";
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+    const std::string call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"mint_engine_credential","arguments":{"principal_id":"engine:mcp-mint-degraded","ttl_days":90}}})";
+
+    {
+        auto held = hold_all_leases(pool);
+        auto r = ts.call(call);
+        REQUIRE(r);
+        auto body = nlohmann::json::parse(r->body);
+        REQUIRE(body.contains("error"));
+        REQUIRE_FALSE(body.contains("result"));
+        // The guard's own message (create_token's fallback would read differently, and carries
+        // kMcpStoreFaultRetryMs): this is the 503 of the checked pre-mint read.
+        CHECK(body["error"]["message"].get<std::string>() ==
+              "could not confirm the principal has no active credential; retry");
+        CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+              mcp::kMcpStoreFaultShortRetryMs);
+        CHECK(r->body.find("raw_token") == std::string::npos);
+    }
+    REQUIRE(!ts.audit_log.empty());
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "mcp.mint_engine_credential|failure") == 1);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "engine_principal.credential.mint|failure") == 1);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "engine_principal.credential.mint|success") == 0);
+    // Nothing was minted while the read could not answer, and the retry mints exactly one.
+    CHECK(store.list_active_for_principal(principal).empty());
+    auto retry = ts.call(call);
+    REQUIRE(retry);
+    CHECK(retry->body.find("raw_token") != std::string::npos);
+    CHECK(store.list_active_for_principal(principal).size() == 1);
+}
+
+TEST_CASE("MCP list_engine_principals and get_engine_principal: fail with a retry hint, not "
+          "zero credentials, when the credential read cannot answer",
+          "[mcp][pg][engine_principal][read][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    // The principal store gets its OWN pool: holding the token pool's leases must degrade only
+    // the credential read, not the principal-roster read the tools make first.
+    yuzu::server::pg::PgPool eps_pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(eps_pool.valid());
+    yuzu::server::EnginePrincipalStore eps{eps_pool};
+    REQUIRE(eps.is_open());
+    const std::string principal = "engine:mcp-read-degraded";
+    REQUIRE(eps.create("mcp read", "alice", "j", "internal", "alice", principal).has_value());
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("mcp read", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.engine_principal_store_for_test = &eps;
+    ts.start("readonly");
+    const std::string list_call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"list_engine_principals","arguments":{}}})";
+    const std::string get_call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,)"
+        R"("params":{"name":"get_engine_principal","arguments":{"principal_id":"engine:mcp-read-degraded"}}})";
+
+    {
+        auto held = hold_all_leases(pool);
+        for (const auto& call : {list_call, get_call}) {
+            auto r = ts.call(call);
+            REQUIRE(r);
+            auto body = nlohmann::json::parse(r->body);
+            REQUIRE(body.contains("error"));
+            REQUIRE_FALSE(body.contains("result"));
+            CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+                  mcp::kMcpStoreFaultShortRetryMs);
+            CHECK(r->body.find("active_credentials") == std::string::npos);
+        }
+    }
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(), "mcp.list_engine_principals|failure") ==
+          1);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(), "mcp.get_engine_principal|failure") ==
+          1);
+    // The failure rows carry the checked read's own reason, and the get row names the principal.
+    {
+        std::vector<std::string> details;
+        for (std::size_t i = 0; i < ts.audit_log.size() && i < ts.audit_details.size(); ++i)
+            if (ts.audit_log[i].ends_with("|failure"))
+                details.push_back(ts.audit_details[i]);
+        REQUIRE(details.size() == 2);
+        CHECK(details[0] == "pool lease timed out");
+        CHECK(details[1] == "principal_id=engine:mcp-read-degraded pool lease timed out");
+    }
+
+    // Leases back: both now report the credential that was there all along.
+    for (const auto& call : {list_call, get_call}) {
+        auto r = ts.call(call);
+        REQUIRE(r);
+        auto j = nlohmann::json::parse(r->body);
+        REQUIRE(j.contains("result"));
+        const auto text = j["result"]["content"][0]["text"].get<std::string>();
+        CHECK(text.find("\"active_credentials\":1") != std::string::npos);
+    }
+}
+
+TEST_CASE("MCP list_engine_principals: a saturated shared pool is a retryable error, not "
+          "count 0 (the principal and token stores draw from one pool in production)",
+          "[mcp][pg][engine_principal][read][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    yuzu::server::EnginePrincipalStore eps{pool}; // the SAME pool, as server.cpp builds it
+    REQUIRE(eps.is_open());
+    REQUIRE(eps.create("mcp shared", "alice", "j", "internal", "alice", "engine:mcp-shared")
+                .has_value());
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.engine_principal_store_for_test = &eps;
+    ts.start("readonly");
+    const std::string list_call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"list_engine_principals","arguments":{}}})";
+
+    {
+        auto held = hold_all_leases(pool);
+        auto r = ts.call(list_call);
+        REQUIRE(r);
+        auto body = nlohmann::json::parse(r->body);
+        REQUIRE(body.contains("error"));
+        REQUIRE_FALSE(body.contains("result"));
+        CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+              mcp::kMcpStoreFaultShortRetryMs);
+        CHECK(r->body.find("\"count\"") == std::string::npos);
+        // The store's own error text never reaches the response.
+        CHECK(r->body.find("database unavailable") == std::string::npos);
+        CHECK(r->body.find("pool lease") == std::string::npos);
+    }
+    REQUIRE(ts.audit_log.size() == ts.audit_details.size());
+    REQUIRE(!ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.list_engine_principals|failure");
+    // A fixed string: the store's own error can carry database driver text.
+    CHECK(ts.audit_details.back() == "engine principal roster could not be read");
+
+    auto ok = ts.call(list_call);
+    REQUIRE(ok);
+    auto j = nlohmann::json::parse(ok->body);
+    REQUIRE(j.contains("result"));
+    CHECK(j["result"]["content"][0]["text"].get<std::string>().find("\"count\":1") !=
+          std::string::npos);
+}
+
+TEST_CASE("MCP mint_engine_credential: withholds the secret with a partial audit when the "
+          "read-back after the insert cannot answer",
+          "[mcp][pg][engine_principal][mint][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    // create_token has no post-insert test seam, so a DEFERRED constraint trigger renames a
+    // column at COMMIT of the mint's own INSERT: the credential commits, and the read-back's
+    // SELECT then fails. Dedicated database, dropped with the test.
+    for (const char* sql :
+         {"CREATE FUNCTION api_token_store.mcp_mint_sabotage() RETURNS trigger LANGUAGE plpgsql AS "
+          "$$ BEGIN EXECUTE 'ALTER TABLE api_token_store.api_tokens RENAME COLUMN name TO "
+          "mcp_mint_gone'; RETURN NULL; END $$",
+          "CREATE CONSTRAINT TRIGGER mcp_mint_sabotage AFTER INSERT ON api_token_store.api_tokens "
+          "DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION "
+          "api_token_store.mcp_mint_sabotage()"}) {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+    auto r = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"mint_engine_credential","arguments":{"principal_id":"engine:mcp-mint-partial","ttl_days":90}}})");
+
+    REQUIRE(r);
+    auto body = nlohmann::json::parse(r->body);
+    REQUIRE(body.contains("error"));
+    REQUIRE_FALSE(body.contains("result"));
+    CHECK(r->body.find("raw_token") == std::string::npos);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "engine_principal.credential.mint|partial") == 1);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "mcp.mint_engine_credential|partial") == 1);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "engine_principal.credential.mint|success") == 0);
+}
+
+TEST_CASE("MCP mint_engine_credential: withholds the secret with a partial audit when the "
+          "read-back ANSWERS but the new credential is no longer active",
+          "[mcp][pg][engine_principal][mint][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    // A DEFERRED constraint trigger revokes the new row at COMMIT of the mint's own INSERT, as
+    // if it were revoked out of band after create_token. The read answers with no active row: it
+    // used to deliver the secret with token_id "" under a success row for a dead credential.
+    for (const char* sql :
+         {"CREATE FUNCTION api_token_store.mcp_mint_revoke() RETURNS trigger LANGUAGE plpgsql AS "
+          "$$ BEGIN UPDATE api_token_store.api_tokens SET revoked = TRUE WHERE token_id = "
+          "NEW.token_id; RETURN NULL; END $$",
+          "CREATE CONSTRAINT TRIGGER mcp_mint_revoke AFTER INSERT ON api_token_store.api_tokens "
+          "DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION "
+          "api_token_store.mcp_mint_revoke()"}) {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+    auto r = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"mint_engine_credential","arguments":{"principal_id":"engine:mcp-mint-gone","ttl_days":90}}})");
+
+    REQUIRE(r);
+    auto body = nlohmann::json::parse(r->body);
+    REQUIRE(body.contains("error"));
+    REQUIRE_FALSE(body.contains("result"));
+    CHECK(r->body.find("raw_token") == std::string::npos);
+    CHECK(body["error"]["message"].get<std::string>().find(
+              "no active credential was found on read-back") != std::string::npos);
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null()); // retrying the mint cannot help
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "engine_principal.credential.mint|partial") == 1);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "mcp.mint_engine_credential|partial") == 1);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "engine_principal.credential.mint|success") == 0);
+    CHECK(store.list_active_for_principal("engine:mcp-mint-gone").empty());
+}
+
+TEST_CASE("MCP rotate_engine_credential: withholds the secret with a retry hint and a partial "
+          "audit when the successor read-back cannot answer, and a retry re-serves it",
+          "[mcp][pg][engine_principal][rotation][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    const std::string principal = "engine:mcp-rotate-degraded";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+    const std::string call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"rotate_engine_credential","arguments":{"principal_id":"engine:mcp-rotate-degraded"}}})";
+
+    McpTokenLeases held;
+    // Fires after the rotation commits and before the store caches the secret, so the
+    // successor exists when the tool's own read-back runs dry.
+    store.test_hook_before_store_rotation_raw_ = [&] { held = hold_all_leases(pool); };
+    auto r = ts.call(call);
+    store.test_hook_before_store_rotation_raw_ = nullptr;
+    held.clear();
+
+    REQUIRE(r);
+    auto body = nlohmann::json::parse(r->body);
+    REQUIRE(body.contains("error"));
+    REQUIRE_FALSE(body.contains("result"));
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultShortRetryMs);
+    CHECK(r->body.find("raw_token") == std::string::npos);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "engine_principal.credential.rotate|partial") == 1);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "mcp.rotate_engine_credential|partial") == 1);
+    // The read-failure arm keeps its re-serve wording: the pair does exist.
+    CHECK(body["error"]["message"].get<std::string>().find("re-serve it") != std::string::npos);
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "engine_principal.credential.reveal|success");
+    CHECK(store.list_active_for_principal(principal).size() == 2);
+
+    // The same operator's retry inside the grace window re-serves the secret with a usable
+    // token_id: the newer active row, and no third credential.
+    auto retry = ts.call(call);
+    REQUIRE(retry);
+    auto rbody = nlohmann::json::parse(retry->body);
+    REQUIRE(rbody.contains("result"));
+    auto data = nlohmann::json::parse(rbody["result"]["content"][0]["text"].get<std::string>());
+    CHECK(!data["raw_token"].get<std::string>().empty());
+    std::string linked;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            linked = t.token_id;
+    CHECK(data["token_id"].get<std::string>() == linked);
+    CHECK(store.list_active_for_principal(principal).size() == 2);
+}
+
+TEST_CASE("MCP rotate_engine_credential: withholds the secret when the successor was revoked "
+          "between the commit and the read-back",
+          "[mcp][pg][engine_principal][rotation][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    const std::string principal = "engine:mcp-rotate-gone";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+    store.test_hook_before_store_rotation_raw_ = [&] {
+        for (const auto& t : store.list_active_for_principal(principal))
+            if (!t.supersedes_token_id.empty())
+                REQUIRE(store.revoke_token(t.token_id).has_value());
+    };
+    auto r = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"rotate_engine_credential","arguments":{"principal_id":"engine:mcp-rotate-gone"}}})");
+    store.test_hook_before_store_rotation_raw_ = nullptr;
+
+    REQUIRE(r);
+    auto body = nlohmann::json::parse(r->body);
+    REQUIRE(body.contains("error"));
+    REQUIRE_FALSE(body.contains("result"));
+    CHECK(r->body.find("raw_token") == std::string::npos);
+    // No retry hint and no "re-serve": the pair is gone, so a retry would perform a NEW rotation.
+    // The message says to look first.
+    const auto msg = body["error"]["message"].get<std::string>();
+    CHECK(msg.find("A successor may exist; inspect the principal's credentials") !=
+          std::string::npos);
+    CHECK(msg.find("re-serve") == std::string::npos);
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "engine_principal.credential.rotate|partial") == 1);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "mcp.rotate_engine_credential|partial") == 1);
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "engine_principal.credential.reveal|success");
 }
 
 TEST_CASE("MCP #3937: confirm_engine_rotation fails CLOSED on a dropped audit (rotation still "
@@ -40453,4 +41059,490 @@ TEST_CASE("MCP build_catalogue refuses a served text that still carries an ecosy
                           Catch::Matchers::ContainsSubstring("output schema") &&
                               Catch::Matchers::ContainsSubstring("not valid JSON"));
     }
+}
+
+
+// ── get_runtime_config / set_runtime_config ─────────────────────────────────────────────────
+
+namespace {
+
+yuzu::test::PgTestTemplate mcp_runtime_config_tpl{
+    "mcprtcfg", [](const std::string& dsn) {
+        yuzu::test::TempDir keys{"yuzu_test_keys_"};
+        yuzu::server::FileKeyProvider provider(keys.path);
+        yuzu::server::pg::SecretCodec codec(provider);
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::RuntimeConfigStore store{pool, codec};
+        if (!store.is_open())
+            throw std::runtime_error("mcp runtime config template: store failed to migrate");
+        yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+        if (PQstatus(conn.get()) != CONNECTION_OK)
+            throw std::runtime_error("mcp runtime config template: connect failed");
+        if (!codec.init(conn.get()).has_value())
+            throw std::runtime_error("mcp runtime config template: codec init failed");
+        yuzu::server::pg::PgResult reset{PQexec(conn.get(), "DELETE FROM secrets.kek_meta")};
+        if (!reset.ok())
+            throw std::runtime_error("mcp runtime config template: kek_meta reset failed");
+    }};
+
+/// A real RuntimeConfigStore plus the Config and auto-approve engine the tools mutate/read.
+struct RuntimeConfigPgWired {
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
+    yuzu::server::FileKeyProvider provider{keys.path};
+    yuzu::server::pg::SecretCodec codec{provider};
+    yuzu::server::pg::PgPool pool;
+    yuzu::server::RuntimeConfigStore store;
+    yuzu::server::Config cfg{};
+    yuzu::server::auth::AutoApproveEngine auto_approve{};
+
+    explicit RuntimeConfigPgWired(const std::string& dsn)
+        : pool{{.conninfo = dsn, .size = 4}}, store{pool, codec} {
+        REQUIRE(store.is_open());
+        yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        REQUIRE(codec.init(conn.get()).has_value());
+    }
+    yuzu::server::config::Backing backing() { return {&cfg, &auto_approve, &store}; }
+};
+
+/// Restores the process-wide spdlog level when the test ends, however it ends (set_runtime_config
+/// really applies log_level).
+struct RuntimeConfigLogLevelGuard {
+    spdlog::level::level_enum saved{spdlog::default_logger()->level()};
+    ~RuntimeConfigLogLevelGuard() { spdlog::default_logger()->set_level(saved); }
+};
+
+nlohmann::json set_runtime_config_call(McpTestServer& ts, const std::string& key,
+                                       const std::string& value) {
+    return mcp_tool_call(ts, "set_runtime_config",
+                         nlohmann::json({{"key", key}, {"value", value}}).dump());
+}
+
+std::vector<std::string> config_keys_of_class(yuzu::server::ConfigWriteClass cls) {
+    std::vector<std::string> keys;
+    for (const auto& k : yuzu::server::RuntimeConfigStore::allowed_keys())
+        if (yuzu::server::RuntimeConfigStore::write_class(k) == cls)
+            keys.push_back(k);
+    return keys;
+}
+
+} // namespace
+
+TEST_CASE("MCP runtime config: set writes the store and the live config, get reads it back; "
+          "proven by a direct store read",
+          "[pg][mcp][integration][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
+    RuntimeConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.runtime_config_for_test = w.backing();
+    ts.start("supervised");
+
+    auto set = set_runtime_config_call(ts, "response_retention_days", "140");
+    INFO(set.dump());
+    REQUIRE_FALSE(set.contains("error"));
+    auto payload = nlohmann::json::parse(set["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload == nlohmann::json({{"key", "response_retention_days"},
+                                     {"value", "140"},
+                                     {"applied", true},
+                                     {"effect", "stored_only"}}));
+    CHECK(w.store.get_value("response_retention_days") == "140");
+    CHECK(w.cfg.response_retention_days == 140);
+    REQUIRE(ts.audit_log.size() == 3);
+    CHECK(ts.audit_log[0] == "config.update|attempted");
+    CHECK(ts.audit_log[1] == "config.update|success");
+    CHECK(ts.audit_log[2] == "mcp.set_runtime_config|success");
+
+    auto get = mcp_tool_call(ts, "get_runtime_config", "{}");
+    INFO(get.dump());
+    REQUIRE_FALSE(get.contains("error"));
+    auto view = nlohmann::json::parse(get["result"]["content"][0]["text"].get<std::string>());
+    CHECK(view["config"]["response_retention_days"] == 140);
+    CHECK(view["overrides"]["response_retention_days"]["value"] == "140");
+    CHECK(view["allowed_keys"].is_array());
+    CHECK(view["read_only_keys"] == nlohmann::json::array({"dex_score_policy"}));
+}
+
+TEST_CASE("MCP runtime config: a supervised token is refused every administrator-only key with a "
+          "denied row and no write",
+          "[pg][mcp][integration][runtime_config][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
+    RuntimeConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.runtime_config_for_test = w.backing();
+    ts.start("supervised"); // an admin-minted token: mock_role is admin
+
+    auto keys = config_keys_of_class(yuzu::server::ConfigWriteClass::AdminRoute);
+    REQUIRE(keys.size() == 7);
+    keys.push_back("oidc_admin_group");
+    for (const auto& key : keys) {
+        INFO(key);
+        ts.audit_log.clear();
+        auto body = set_runtime_config_call(ts, key, "true");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(body["error"]["message"].get<std::string>().find("administrator account is required") !=
+              std::string::npos);
+        CHECK(body["error"]["data"].contains("remediation"));
+        REQUIRE(ts.audit_log.size() == 2);
+        CHECK(ts.audit_log[0] == "config.update|denied");
+        CHECK(ts.audit_log[1].starts_with("mcp.set_runtime_config|denied"));
+        CHECK(w.store.get_value(key).empty());
+    }
+}
+
+TEST_CASE("MCP runtime config: a non-administrator role is refused administrator-only keys but "
+          "may write a general key",
+          "[pg][mcp][integration][runtime_config][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
+    RuntimeConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.runtime_config_for_test = w.backing();
+    ts.mock_role = yuzu::server::auth::Role::user;
+    ts.start(); // no tier: not an MCP-tier session
+
+    auto refused = set_runtime_config_call(ts, "plugin_signing_required", "true");
+    REQUIRE(refused.contains("error"));
+    CHECK(refused["error"]["message"].get<std::string>().find("own administrator role") !=
+          std::string::npos);
+    CHECK(w.store.get_value("plugin_signing_required").empty());
+
+    auto ok = set_runtime_config_call(ts, "response_retention_days", "150");
+    REQUIRE_FALSE(ok.contains("error"));
+    CHECK(w.store.get_value("response_retention_days") == "150");
+}
+
+TEST_CASE("MCP runtime config: the route-owned key and bad input are invalid params with no audit "
+          "row and no write",
+          "[pg][mcp][integration][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
+    RuntimeConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.runtime_config_for_test = w.backing();
+    ts.start("supervised");
+
+    struct Case {
+        const char* key;
+        const char* value;
+        const char* message_part;
+    };
+    const Case cases[] = {
+        {"dex_score_policy", "{}", "PUT /api/v1/dex/score-policy"},
+        {"response_retention_days", "abc", "non-negative integer"},
+        {"not_a_setting", "x", "not a configurable"},
+        {"log_level", "loud", "one of"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.key);
+        ts.audit_log.clear();
+        auto body = set_runtime_config_call(ts, c.key, c.value);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find(c.message_part) != std::string::npos);
+        // A rejected input writes no config.update row (the store-refused value, log_level, is
+        // the one case that reaches the attempted/failure pair).
+        if (std::string(c.key) != "log_level")
+            for (const auto& entry : ts.audit_log)
+                CHECK_FALSE(entry.starts_with("config.update"));
+        CHECK(w.store.get_value(c.key).empty());
+    }
+    // The advertised bounds are enforced by the handler itself: input schemas are validated only
+    // on the approval-gated path, which this tool never takes.
+    const std::pair<std::string, std::string> out_of_bounds[] = {
+        {"BAD-KEY", "1"}, {"", "1"}, {std::string(65, 'a'), "1"}, {"log_level", std::string(257, 'x')}};
+    for (const auto& [key, value] : out_of_bounds) {
+        INFO(key.substr(0, 20) << " / " << value.size());
+        ts.audit_log.clear();
+        auto bad = set_runtime_config_call(ts, key, value);
+        REQUIRE(bad.contains("error"));
+        CHECK(bad["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(bad["error"]["message"].get<std::string>().find("at most 256 bytes") !=
+              std::string::npos);
+        CHECK(ts.audit_log.empty()); // refused before any audit row
+    }
+}
+
+TEST_CASE("MCP runtime config: an extra argument is refused, not ignored; effect and the heartbeat "
+          "ceiling are reported",
+          "[pg][mcp][integration][runtime_config]") {
+    RuntimeConfigLogLevelGuard level_guard;
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
+    RuntimeConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.runtime_config_for_test = w.backing();
+    ts.start("supervised");
+
+    // additionalProperties:false is advertised on a tool that never takes the schema-validated
+    // path, so the handler refuses it: {"dry_run":true} must not become a real write.
+    auto extra = mcp_tool_call(ts, "set_runtime_config",
+                               R"({"key":"response_retention_days","value":"150","dry_run":true})");
+    REQUIRE(extra.contains("error"));
+    CHECK(extra["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(extra["error"]["message"].get<std::string>().find("dry_run") != std::string::npos);
+    CHECK(w.store.get_value("response_retention_days").empty());
+    for (const auto& entry : ts.audit_log)
+        CHECK_FALSE(entry.starts_with("config.update"));
+
+    // The effect is reported so applied:true is not read as "in use".
+    auto live = set_runtime_config_call(ts, "log_level", "info");
+    REQUIRE_FALSE(live.contains("error"));
+    CHECK(nlohmann::json::parse(live["result"]["content"][0]["text"].get<std::string>())["effect"] ==
+          "immediate");
+    auto stored = set_runtime_config_call(ts, "auto_approve_enabled", "true");
+    REQUIRE_FALSE(stored.contains("error"));
+    CHECK(nlohmann::json::parse(stored["result"]["content"][0]["text"].get<std::string>())["effect"] ==
+          "stored_only");
+
+    // heartbeat_timeout is bounded: a value that would stop stale-agent reaping is refused.
+    for (const char* bad : {"29", "86401", "2147483647"}) {
+        INFO(bad);
+        auto body = set_runtime_config_call(ts, "heartbeat_timeout", bad);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    CHECK_FALSE(set_runtime_config_call(ts, "heartbeat_timeout", "86400").contains("error"));
+}
+
+TEST_CASE("MCP runtime config: no audit row, no mutation",
+          "[pg][mcp][integration][runtime_config][audit_failclose]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
+    RuntimeConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.runtime_config_for_test = w.backing();
+    ts.start("supervised");
+    const int before = w.cfg.response_retention_days;
+
+    ts.audit_fail_result_ = "attempted";
+    auto body = set_runtime_config_call(ts, "response_retention_days", "160");
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("the change was not made") !=
+          std::string::npos);
+    CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(w.cfg.response_retention_days == before);
+    CHECK(w.store.get_value("response_retention_days").empty());
+
+    // A lost outcome row keeps the change and says so.
+    ts.audit_fail_result_ = "success";
+    auto ok = set_runtime_config_call(ts, "response_retention_days", "161");
+    REQUIRE_FALSE(ok.contains("error"));
+    auto payload = nlohmann::json::parse(ok["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["audit_persisted"] == false);
+    CHECK(w.cfg.response_retention_days == 161);
+}
+
+TEST_CASE("MCP runtime config: readonly and operator tokens cannot write, a service-scoped token "
+          "cannot read or write, and nothing is stored or audited",
+          "[pg][mcp][integration][runtime_config][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
+    RuntimeConfigPgWired w{db.dsn()};
+    for (const char* tier : {"readonly", "operator"}) {
+        INFO(tier);
+        McpTestServer ts;
+        ts.runtime_config_for_test = w.backing();
+        ts.start(tier);
+        auto set = set_runtime_config_call(ts, "response_retention_days", "170");
+        REQUIRE(set.contains("error"));
+        CHECK(set["error"]["code"] == yuzu::server::mcp::kTierDenied);
+        for (const auto& entry : ts.audit_log)
+            CHECK_FALSE(entry.starts_with("config.update"));
+        CHECK(w.store.get_value("response_retention_days").empty());
+        // The read tool is served at both tiers (Infrastructure:Read).
+        auto get = mcp_tool_call(ts, "get_runtime_config", "{}");
+        CHECK_FALSE(get.contains("error"));
+    }
+    {
+        McpTestServer ts;
+        ts.runtime_config_for_test = w.backing();
+        ts.mock_token_scope_service = "svc-a";
+        ts.start("supervised");
+        auto set = set_runtime_config_call(ts, "response_retention_days", "171");
+        REQUIRE(set.contains("error"));
+        CHECK(set["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(set["error"]["message"].get<std::string>().find("runtime config store") ==
+              std::string::npos); // refused by the gate, not by an unwired handler
+        for (const auto& entry : ts.audit_log)
+            CHECK_FALSE(entry.starts_with("config.update"));
+        CHECK(w.store.get_value("response_retention_days").empty());
+        auto get = mcp_tool_call(ts, "get_runtime_config", "{}");
+        REQUIRE(get.contains("error"));
+        CHECK(get["error"]["message"].get<std::string>().find("runtime config store") ==
+              std::string::npos);
+    }
+}
+
+TEST_CASE("MCP runtime config: an unwired store answers unavailable with a retry hint, "
+          "and an RBAC denial stops both tools before any work (no PostgreSQL)",
+          "[mcp][runtime_config]") {
+    {
+        McpTestServer ts; // runtime_config_for_test left unwired
+        ts.start("supervised");
+        for (auto body : {set_runtime_config_call(ts, "log_level", "info"),
+                          mcp_tool_call(ts, "get_runtime_config", "{}")}) {
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["message"].get<std::string>().find("runtime config store unavailable") !=
+                  std::string::npos);
+            CHECK(body["error"]["data"]["retry_after_ms"] ==
+                  yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        }
+    }
+    {
+        // perm_fn is the RBAC gate: deny each securable in turn and the matching tool is refused
+        // before it touches the store or writes a row; the other tool is unaffected.
+        for (const char* denied_op : {"Write", "Read"}) {
+            INFO(denied_op);
+            McpTestServer ts;
+            ts.start("supervised");
+            ts.perm_override_for_test = [denied_op](const std::string& sec, const std::string& op) {
+                return !(sec == "Infrastructure" && op == denied_op);
+            };
+            const bool write_denied = std::string(denied_op) == "Write";
+            auto set = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":)"
+                               R"("set_runtime_config","arguments":{"key":"log_level","value":"info"}}})");
+            auto get = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":)"
+                               R"("get_runtime_config","arguments":{}}})");
+            REQUIRE(set);
+            REQUIRE(get);
+            CHECK((set->status == 403) == write_denied);
+            CHECK((get->status == 403) == !write_denied);
+            for (const auto& entry : ts.audit_log)
+                CHECK_FALSE(entry.starts_with("config.update"));
+        }
+    }
+}
+
+TEST_CASE("MCP runtime config: the administrator-only keys are refused with a denied row even "
+          "with no store (no PostgreSQL)",
+          "[mcp][runtime_config][elevation]") {
+    McpTestServer ts; // no store: the refusal must not need it
+    ts.start("supervised");
+    auto keys = config_keys_of_class(yuzu::server::ConfigWriteClass::AdminRoute);
+    REQUIRE(keys.size() == 7);
+    keys.push_back("oidc_admin_group");
+    for (const auto& key : keys) {
+        INFO(key);
+        ts.audit_log.clear();
+        auto body = set_runtime_config_call(ts, key, "true");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        REQUIRE(ts.audit_log.size() == 2);
+        CHECK(ts.audit_log[0] == "config.update|denied");
+    }
+    // The route-owned key is invalid params, not a denial, and writes no config.update row.
+    ts.audit_log.clear();
+    auto owned = set_runtime_config_call(ts, "dex_score_policy", "{}");
+    REQUIRE(owned.contains("error"));
+    CHECK(owned["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    for (const auto& entry : ts.audit_log)
+        CHECK_FALSE(entry.starts_with("config.update"));
+}
+
+TEST_CASE("MCP runtime config: a secret value reaches neither the response nor any audit row",
+          "[pg][mcp][integration][runtime_config][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
+    RuntimeConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.runtime_config_for_test = w.backing();
+    ts.start(); // an untiered administrator token: admitted for oidc_* as on REST
+    auto body = set_runtime_config_call(ts, "oidc_client_secret", "s3cret-via-mcp");
+    INFO(body.dump());
+    REQUIRE_FALSE(body.contains("error"));
+    CHECK(body.dump().find("s3cret-via-mcp") == std::string::npos);
+    REQUIRE(ts.audit_details.size() >= 3);
+    for (const auto& d : ts.audit_details)
+        CHECK(d.find("s3cret-via-mcp") == std::string::npos);
+    CHECK(ts.audit_details[0].empty()); // the attempted row carries no value
+    CHECK(ts.audit_details[1] == "value=<redacted>");
+}
+
+TEST_CASE("MCP runtime config: an open store whose read fails is an error with a retry hint, "
+          "never an empty configuration",
+          "[pg][mcp][integration][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
+    RuntimeConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.runtime_config_for_test = w.backing();
+    ts.start("supervised");
+    REQUIRE_FALSE(mcp_tool_call(ts, "get_runtime_config", "{}").contains("error"));
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult rename{PQexec(
+            conn.get(), "ALTER TABLE runtime_config_store.runtime_config RENAME TO runtime_config_gone")};
+        REQUIRE(rename.ok());
+    }
+    auto get = mcp_tool_call(ts, "get_runtime_config", "{}");
+    REQUIRE(get.contains("error"));
+    CHECK(get["error"]["message"].get<std::string>().find("runtime config store unavailable") !=
+          std::string::npos);
+    CHECK(get["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(get.dump().find("overrides") == std::string::npos);
+}
+
+TEST_CASE("MCP runtime config: get_runtime_config withholds what the caller could not write",
+          "[pg][mcp][integration][runtime_config][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_runtime_config_tpl);
+    RuntimeConfigPgWired w{db.dsn()};
+    {   // an administrator stores an oidc override and a general one
+        McpTestServer admin;
+        admin.runtime_config_for_test = w.backing();
+        admin.start();
+        REQUIRE_FALSE(set_runtime_config_call(admin, "oidc_admin_group", "grp-admins").contains("error"));
+        REQUIRE_FALSE(set_runtime_config_call(admin, "response_retention_days", "130").contains("error"));
+        auto view = mcp_tool_call(admin, "get_runtime_config", "{}");
+        auto data = nlohmann::json::parse(view["result"]["content"][0]["text"].get<std::string>());
+        CHECK(data["overrides"].contains("oidc_admin_group"));
+        CHECK(data["withheld_keys"] == nlohmann::json::array());
+    }
+    McpTestServer ts; // a readonly-tier token: Infrastructure:Read, nothing else
+    ts.runtime_config_for_test = w.backing();
+    ts.start("readonly");
+    auto view = mcp_tool_call(ts, "get_runtime_config", "{}");
+    REQUIRE_FALSE(view.contains("error"));
+    auto data = nlohmann::json::parse(view["result"]["content"][0]["text"].get<std::string>());
+    CHECK(data["overrides"].contains("response_retention_days"));
+    CHECK_FALSE(data["overrides"].contains("oidc_admin_group"));
+    CHECK_FALSE(data["config"].contains("audit_retention_days"));
+    bool oidc_group_declared = false;
+    for (const auto& k : data["withheld_keys"])
+        oidc_group_declared = oidc_group_declared || k == "oidc_admin_group";
+    CHECK(oidc_group_declared);
+    CHECK(view.dump().find("grp-admins") == std::string::npos);
+}
+
+// Drift tripwire: set_runtime_config's description is read by an agent deciding what it may write.
+// The sentence naming the writable keys must be exactly the General class, and every
+// administrator-only key must appear after it as refused.
+TEST_CASE("MCP runtime config: the set_runtime_config description names exactly the writable keys",
+          "[mcp][runtime_config]") {
+    McpTestServer ts;
+    ts.start("supervised");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    std::string description;
+    for (const auto& tool : nlohmann::json::parse(res->body)["result"]["tools"])
+        if (tool["name"] == "set_runtime_config")
+            description = tool["description"].get<std::string>();
+    REQUIRE_FALSE(description.empty());
+
+    const auto start = description.find("can write only these keys:");
+    const auto stop = description.find("Every other key");
+    REQUIRE(start != std::string::npos);
+    REQUIRE(stop != std::string::npos);
+    REQUIRE(start < stop);
+    const auto writable = description.substr(start, stop - start);
+    const auto refused = description.substr(stop);
+
+    using yuzu::server::ConfigWriteClass;
+    for (const auto& k : config_keys_of_class(ConfigWriteClass::General)) {
+        INFO(k);
+        CHECK(writable.find(k) != std::string::npos);
+    }
+    for (const auto cls : {ConfigWriteClass::AdminRoute, ConfigWriteClass::RouteOwned}) {
+        for (const auto& k : config_keys_of_class(cls)) {
+            INFO(k);
+            CHECK(writable.find(k) == std::string::npos);
+            CHECK(refused.find(k) != std::string::npos);
+        }
+    }
+    CHECK(writable.find("oidc_") == std::string::npos);
+    CHECK(refused.find("oidc_") != std::string::npos);
 }
