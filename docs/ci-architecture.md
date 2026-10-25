@@ -1746,7 +1746,7 @@ once the actual mechanism is understood.
 
 ### Staged widening — Linux (2026-10-21)
 
-Until Push 2a (below), Linux ran `--num-processes 2` on every test invocation since #3443. The
+Until Push 2a (below), and for the pg-shards step until Push 2c, Linux ran `--num-processes 2` on every test invocation since #3443. The
 2026-10-20 baseline at that width: the 14 pg shards were 1,778 serial-s over
 907 s wall (sum/wall 1.96, so both workers were busy throughout); the non-pg
 step was 678 serial-s over 5.4 min; the worst shard, M, took 244 s, 35% of its
@@ -1764,7 +1764,8 @@ delta is attributable to one axis ("never bundled with a topology change"):
 |---|---|---|---|---|---|---|---|---|
 | 1 | Preflight split, `platform` suite + Linux-only `docs`, `max-parallel` 4, duration summary, PGDATA/RAM probe (np stays 2) | topology | | | | | | |
 | 2a | Linux np 2 → 4 on the cheap-suites invocation only (see Push 2a below) | width | | | | | | |
-| 2 | Linux np 2 → 4 on the remaining two invocations (server shards, pg); Windows pg 6 → 8, non-pg 4 → 6 | width | | | | | | |
+| 2c | Linux np 2 → 4 on the pg-shards step only (see Push 2c below) | width | | | | | | |
+| 2 | Linux np 2 → 4 on the server-shard invocation (not planned: at most about 15 s to gain); Windows pg 6 → 8, non-pg 4 → 6 (held) | width | | | | | | |
 | 3 | tmpfs PGDATA, cap from the push-1 probe (see "Postgres for server tests") | storage | | | | | | |
 | 4 | Linux np 4 → 6, then stop | width | | | | | | |
 
@@ -1895,6 +1896,48 @@ rounds, 4,900 s (81.7 min); np=4 is 4 rounds, 2,800 s (46.7 min); np=6 is 3
 rounds, 2,100 s (35 min). The "7 rounds" and `--num-processes 2` restatements
 in the arithmetic paragraphs above describe the width in force when they were
 written and are brought forward by the width commit, not before.
+
+**Push 2c (Linux pg-shards step only, `--num-processes 2 → 4`).** The width of
+the `Test (pg shards, full)` step; the `with-test-slot.sh` slot count (3), the 14
+shards, their priorities and timeouts, and the other invocations are unchanged.
+The 14 shards of one job share that job's single Postgres container, so this
+doubles the concurrent clients on it.
+
+*Baseline at np=2.* The pg step took 451 s to 743 s over 16 `gcc-15`/`debug` runs
+from the evening of 2026-10-23 to 2026-10-25 01:00 (`dev` pushes and PR runs);
+the 14 shards summed to about 880 s to 1165 s, the longest shard 92 s to 148 s.
+The step drifted upward through 2026-10-24 on every run, with or without any
+change of ours, so a single comparison across time is worthless: this is why the
+measurement below is interleaved. The same step on Windows went from 602 s at
+`--num-processes 2` to 358 s at 4 (Push 2 above: -40.5%, worst shard 1.16x).
+
+*Expectation (an estimate, not a measurement).* The shard sum divided by four is
+the floor (about 220 s to 290 s); the Windows result suggests a cut of 30% to 40%
+of the step, so roughly 150 s to 250 s on a step of 450 s to 650 s. The single
+shared Postgres container is the unknown: four clients instead of two may slow
+every shard, which is what rule (b) bounds.
+
+*Measurement.* Alternate np=2 and np=4 runs back to back so box drift cancels.
+The np=2 side is a re-run of the `Linux gcc-15 debug` job of a recent `dev` push
+(same code, `--num-processes 2`; re-run the job only, `gh run rerun <run> --job
+<id>`); the np=4 side is this PR's job (first run plus a re-run). Take at least
+two of each, in the order np=4, np=2, np=4, np=2, waiting for each to finish
+before starting the next so they do not share the box. Read each attempt's step
+duration from the jobs API and its per-shard lines from `gh run view <run>
+--attempt <n> --job <id> --log` (the 14 `N/14 ... server pg unit tests shard X`
+lines; the same attempt caveat as Push 2a). Compare the np=4 median with the np=2
+median taken in the same window, not with earlier days.
+
+*Decision rule.* The one under "Windows test-phase concurrency gate" above,
+applied to this step: (a) the np=4 median is at least 10% below the interleaved
+np=2 median; (b) no shard takes more than 1.5x its mean np=2 time; (c) no shard
+reaches 560 s (80% of its 700 s timeout); all 14 shards pass in every sample, and
+no `too many clients`, `deadlock detected` or connection error appears in the
+log. If (b) or (c) fails, or (a) comes in under 10%, revert to 2 and stop; a
+failed safety check is not "try one more sample". To revert, set
+`--num-processes` on the pg-shards `flake-retry.py` call back to 2. Before
+Push 4 (np 4 → 6), add a flake-rate check: 10 or more push runs on the leg with
+no non-timing red. *Samples:* pending.
 
 ### Persistent runner-local test history
 

@@ -1283,6 +1283,12 @@ jobs:
         # tuning history for THIS invocation (with-test-slot.sh, --num-
         # processes, shard timeouts) — unchanged by Phase 2, kept in full.
         #
+        # Width history: this invocation runs --num-processes 4 since Push 2c of
+        # the Linux staged-widening ladder (docs/ci-architecture.md); the long
+        # history below is the evidence the cap of 2 rested on, kept for the
+        # record. The decision rule, the interleaved measurement and the revert
+        # (this one number) are in the docs paragraph "Push 2c".
+        #
         # --num-processes 2: without a cap, meson fans every test() entry out at
         # once — its default worker count is an uncapped, non-affinity-aware
         # cpu_count() (this runner's job is genuinely confined to execute on 16
@@ -1315,7 +1321,7 @@ jobs:
         # measurement protocol (docs/ci-architecture.md, current value
         # there, not restated here to avoid this comment going stale every
         # widening round) has moved Windows past 2 on real per-shard
-        # contention data; Linux stays at 2, unmeasured-and-unwidened,
+        # contention data; Linux stayed at 2, unmeasured-and-unwidened, until Push 2c,
         # since nothing here has re-derived a Linux-specific value either.
         #
         # with-test-slot.sh (#3443 AC4): --num-processes 2 alone fixed
@@ -1527,7 +1533,7 @@ jobs:
         run: |
           rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
           bash scripts/ci/with-test-slot.sh 3 -- \
-            python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite server-pg
+            python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 --suite server-pg
           # Outside the slot: pure parsing plus a --list-tests spawn per Catch2 entry.
           python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux pg shards"
 
