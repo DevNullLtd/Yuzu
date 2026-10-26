@@ -85,6 +85,7 @@ inline constexpr long kErrorSuccess = 0;
 inline constexpr long kErrorFileNotFound = 2;
 inline constexpr long kErrorPathNotFound = 3;
 inline constexpr long kErrorAccessDenied = 5;
+inline constexpr long kErrorInvalidData = 13;
 inline constexpr long kErrorNotSupported = 50;
 inline constexpr long kErrorMoreData = 234;
 inline constexpr long kErrorNoMoreItems = 259;

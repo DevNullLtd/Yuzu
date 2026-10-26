@@ -395,6 +395,57 @@ TEST_CASE("Win32Registry::final_name fails closed on a lone-surrogate key name, 
     }
 }
 
+// The enumeration a delete acts on is exact: with require_exact a raw value or key name holding a lone surrogate answers
+// ERROR_INVALID_DATA (it was validated BEFORE from_wide), while a display enumeration still converts it lossily, and a
+// real U+FFFD name passes either way. Mutation: drop the kernel_name_well_formed call in enumerated_name -> the exact
+// enumeration answers success with the lookalike's bytes.
+TEST_CASE("Win32Registry::enum_value and enum_subkey refuse a lone-surrogate name only when the exact name is required",
+          "[registry][windows][internals]") {
+    const std::string root = scratch_root("ename");
+    const std::wstring wroot = widen(root);
+    ScratchTree cleanup{root};
+    yuzu::win::RegKey key;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, wroot.c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
+                        KEY_READ | KEY_SET_VALUE | KEY_CREATE_SUB_KEY, nullptr, key.put(), nullptr) != ERROR_SUCCESS) {
+        skip_or_fail("not elevated -- HKLM scratch not writable, enumerated-name case");
+        return;
+    }
+    const std::wstring lone = L"N\xD800";
+    const std::string lookalike_utf8 = "N\xEF\xBF\xBD";
+    const BYTE data[4]{};
+    Win32Registry reg;
+    const Handle h = as_handle(key.get());
+    const auto expect = [&](bool values) {
+        std::string lossy, exact = "stale";
+        CHECK((values ? reg.enum_value(h, 0, lossy) : reg.enum_subkey(h, 0, lossy)) == ERROR_SUCCESS);
+        CHECK(lossy == lookalike_utf8);
+        CHECK((values ? reg.enum_value(h, 0, exact, true) : reg.enum_subkey(h, 0, exact, true)) == ERROR_INVALID_DATA);
+        CHECK(exact == "stale"); // nothing half-converted is handed back
+    };
+    SECTION("a value") {
+        if (RegSetValueExW(key.get(), lone.c_str(), 0, REG_DWORD, data, 4) != ERROR_SUCCESS) {
+            skip_or_fail("RegSetValueExW refused a value name holding a lone surrogate");
+            return;
+        }
+        expect(true);
+    }
+    SECTION("a key") {
+        yuzu::win::RegKey child;
+        if (RegCreateKeyExW(key.get(), lone.c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_READ, nullptr, child.put(),
+                            nullptr) != ERROR_SUCCESS) {
+            skip_or_fail("RegCreateKeyExW refused a key name holding a lone surrogate");
+            return;
+        }
+        expect(false);
+    }
+    SECTION("a real U+FFFD name passes the exact enumeration") {
+        REQUIRE(RegSetValueExW(key.get(), L"N\xFFFD", 0, REG_DWORD, data, 4) == ERROR_SUCCESS);
+        std::string name;
+        CHECK(reg.enum_value(h, 0, name, true) == ERROR_SUCCESS);
+        CHECK(name == lookalike_utf8);
+    }
+}
+
 TEST_CASE("Win32Registry::root_name is the kernel name of HKLM and HKU and is refused for HKCU and HKCR",
           "[registry][windows][internals]") {
     Win32Registry reg;

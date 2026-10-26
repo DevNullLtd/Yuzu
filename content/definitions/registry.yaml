@@ -471,7 +471,8 @@ metadata:
     symbolic link in the path is refused, never followed (the key AT the path may itself be a link: the link
     object is removed and its target is untouched). A recursive delete first VETS the whole tree: every child is
     opened from its parent's handle and probed for a link, and a link anywhere in the tree is refused as
-    key_is_link with nothing deleted. It then removes the tree post-order, each key by its own handle (no
+    key_is_link with nothing deleted (a key whose raw UTF-16 name is not well-formed, which no UTF-8 name can
+    open exactly, as unrepresentable_name). It then removes the tree post-order, each key by its own handle (no
     RegDeleteTreeW, which follows links), re-checking every key it finds for a link: a link planted since the
     vet stops the delete as key_is_link, and a tree that grew past the vet's bound stops it as concurrent_change,
     with what was already removed counted. The vet is a size bound and a link sweep, not a list of the keys it
@@ -881,7 +882,9 @@ metadata:
     path and value name the manifest carries must read back as exactly what is in the registry, so a name that a
     row cannot spell (a `|`, a control character, a C1 control, U+2028 or U+2029, invalid UTF-8, a trailing
     backslash, or a value named `-`, which a row uses for the default value) is refused as unrepresentable_name
-    before anything is changed, including the name of any value of a key an item would delete. THE UNDO BUDGET:
+    before anything is changed, including the name of any value of a key an item would delete, whose raw UTF-16
+    name must also be well-formed (a lone surrogate or a NUL has no exact UTF-8 spelling and is refused the same
+    way, in a dry run too; a value really named with U+FFFD is fine). THE UNDO BUDGET:
     one 512 KiB budget charges every byte the manifest retains (previous values, names and a fixed cost per row);
     a deleted key's values are all vetted but only as many as fit are returned, and when anything was cut the
     summary says undo_complete=0, in the dry run too, before anything is changed. Rows: one `item` per plan item,

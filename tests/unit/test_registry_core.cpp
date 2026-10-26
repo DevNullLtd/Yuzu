@@ -51,11 +51,16 @@ using NodeP = std::shared_ptr<Node>;
 struct Val {
     std::uint32_t type = 0;
     Bytes data;
+    /// Non-empty: the value's RAW UTF-16 name is not well-formed (its stored key stands for it, e.g. the WTF-8 bytes of a
+    /// lone surrogate, which no UTF-8 name can address) and an enumeration presents it lossily as this (U+FFFD); an exact
+    /// enumeration answers kErrorInvalidData.
+    std::string enum_as;
 };
 struct Node {
     std::map<std::string, NodeP, ILess> subkeys;
     std::map<std::string, Val, ILess> values;
     bool is_link = false;
+    std::string enum_as; ///< as Val::enum_as, for this key's own name as its parent's enum_subkey presents it
     /// is_link: the canonical path (from the fake root) the kernel follows to; "" is a dangling link.
     std::string link_target;
     bool deleted = false;
@@ -316,7 +321,7 @@ public:
         if (after) after(ev);
         return rc;
     }
-    long enum_value(Handle key_h, std::uint32_t index, std::string& name) override {
+    long enum_value(Handle key_h, std::uint32_t index, std::string& name, bool require_exact = false) override {
         tally("enum_value");
         if (const auto inj = take("enum_value", "enum_value")) return *inj;
         const auto n = node(key_h);
@@ -324,18 +329,18 @@ public:
         if (!has(key_h, kKeyQueryValue)) return 5;
         if (grow_on_enum) grow_on_enum(*n);
         if (index >= n->values.size()) return 259;
-        name = std::next(n->values.begin(), index)->first;
-        return 0;
+        const auto& [stored, v] = *std::next(n->values.begin(), index);
+        return enumerated(stored, v.enum_as, require_exact, name);
     }
-    long enum_subkey(Handle key_h, std::uint32_t index, std::string& name) override {
+    long enum_subkey(Handle key_h, std::uint32_t index, std::string& name, bool require_exact = false) override {
         tally("enum_subkey");
         if (const auto inj = take("enum_subkey", "enum_subkey")) return *inj;
         const auto n = node(key_h);
         if (!n || n->deleted) return 1018;
         if (!has(key_h, kKeyEnumerateSubKeys)) return 5;
         if (index >= n->subkeys.size()) return 259;
-        name = std::next(n->subkeys.begin(), index)->first;
-        return 0;
+        const auto& [stored, child] = *std::next(n->subkeys.begin(), index);
+        return enumerated(stored, child->enum_as, require_exact, name);
     }
     long flush_key(Handle key_h) override {
         tally("flush_key");
@@ -359,6 +364,13 @@ public:
     }
 
 private:
+    /// Win32Registry's enumerated_name: a malformed raw name (`lossy` set) is kErrorInvalidData when exact, else shown lossily.
+    static long enumerated(const std::string& stored, const std::string& lossy, bool require_exact, std::string& out) {
+        if (lossy.empty()) out = stored;
+        else if (require_exact) return kErrorInvalidData;
+        else out = lossy;
+        return 0;
+    }
     void tally(const char* method) {
         ++seam_calls;
         ++by_method[method];
@@ -2632,6 +2644,42 @@ TEST_CASE("registry core: a link inside the tree is refused by the vet and nothi
     CHECK(reg.get("Real", "keep")->data == dword(7));
 }
 
+// A child key whose RAW name is a lone surrogate (L"K\xD800") enumerates lossily as "K<U+FFFD>", which opens its
+// well-formed sibling L"K\xFFFD" instead: the vet would count that sibling twice, and the delete would remove it and
+// then stop on a child it cannot open. The exact enumeration refuses the whole call before anything is deleted.
+TEST_CASE("registry core: a child whose raw key name is not well-formed UTF-16 refuses the recursive delete",
+          "[registry][core][recursive]") {
+    const bool fast = GENERATE(false, true);
+    FakeRegistry reg;
+    const auto lone_child = [&reg] { reg.key("T\\K\xED\xA0\x80")->enum_as = "K\xEF\xBF\xBD"; };
+    SECTION("found by the vet: refused unrepresentable_name, in a dry run and a real run, nothing deleted") {
+        // mutant: count_tree enumerates its children lossily
+        const bool dry = GENERATE(false, true);
+        reg.put("T\\K\xED\xA0\x80", "a", kRegDword, dword(1));
+        reg.put("T\\K\xEF\xBF\xBD", "b", kRegDword, dword(2));
+        lone_child();
+        const std::string before = dump(reg);
+        const auto o = delete_key_tree(reg, FakeRegistry::kRoot, "T", fast, true, dry);
+        CHECK(o.result == "refused");
+        CHECK(o.reason == "unrepresentable_name");
+        CHECK(reg.calls("delete_key_by_handle") == 0);
+        CHECK(dump(reg) == before);
+    }
+    SECTION("appearing after the vet: the delete walk stops on it with the same token, the key stays") {
+        // mutant: delete_subtree enumerates its children lossily (it then answers key_not_found)
+        reg.put("T\\A", "a", kRegDword, dword(1));
+        reg.before = [&](const std::string& ev) {
+            if (ev == "open_sub:A" && reg.masks.back().ends_with(kDeleteMask)) lone_child();
+        };
+        const auto o = delete_key_tree(reg, FakeRegistry::kRoot, "T", fast, true, false);
+        CHECK(o.result == "failed");
+        CHECK(o.reason == "unrepresentable_name");
+        CHECK_FALSE(reg.exists("T\\A"));
+        CHECK(reg.exists("T\\K\xED\xA0\x80"));
+        CHECK(reg.exists("T"));
+    }
+}
+
 TEST_CASE("registry core: a link planted after the vet stops the delete and is never followed",
           "[registry][core][recursive]") {
     FakeRegistry reg;
@@ -3416,6 +3464,69 @@ TEST_CASE("registry apply: delete_key vets EVERY value of the leaf before it del
     }
     CHECK(reg.exists("Software\\Leaf"));
     CHECK(reg.calls("delete_key_by_handle") == 0);
+}
+
+// A value whose RAW UTF-16 name is a lone surrogate (L"V\xD800") enumerates lossily as "V<U+FFFD>", the same bytes as
+// its well-formed sibling L"V\xFFFD". A lossy vet captures the sibling twice, NtDeleteKey takes both, and the manifest
+// holds two identical rows under undo_complete=1. The vet's enumeration is exact, so the item is refused first.
+TEST_CASE("registry apply: delete_key refuses a value whose raw name is not well-formed UTF-16, in both modes",
+          "[registry][core][apply]") {
+    const std::string lone = "V\xED\xA0\x80"; // the fake's stand-in for the raw L"V\xD800"
+    const std::string fffd = "V\xEF\xBF\xBD"; // a real, well-formed U+FFFD name
+    const auto build = [&](FakeRegistry& r, bool with_lone) {
+        r.put("Software\\Leaf", fffd, kRegDword, dword(2));
+        if (with_lone) {
+            r.put("Software\\Leaf", lone, kRegDword, dword(1));
+            r.key("Software\\Leaf")->values[lone].enum_as = fffd;
+        }
+        r.put("Software\\Other", "o", kRegDword, dword(3));
+    };
+    SECTION("a lone-surrogate name next to its U+FFFD lookalike: refused, nothing deleted, the next item unaffected") {
+        // mutant: vet_leaf_values enumerates lossily (the item applies and the manifest repeats one row)
+        const json plan = json::array({del_key_item("Software\\Leaf"), del_key_item("Software\\Other")});
+        FakeRegistry dry_reg, real_reg;
+        build(dry_reg, true);
+        build(real_reg, true);
+        const auto dry = run_plan(dry_reg, plan, true, true);
+        const auto real = run_plan(real_reg, plan, false, true);
+        CHECK(dry.verdicts() == std::vector<std::string>{"refused", "would_apply"});
+        CHECK(real.verdicts() == std::vector<std::string>{"refused", "applied"});
+        CHECK(dry.reason(0) == "unrepresentable_name");
+        CHECK(real.reason(0) == dry.reason(0));
+        REQUIRE(real_reg.exists("Software\\Leaf"));
+        CHECK(real_reg.get("Software\\Leaf", lone)->data == dword(1));
+        CHECK(real_reg.get("Software\\Leaf", fffd)->data == dword(2));
+        CHECK_FALSE(real_reg.exists("Software\\Other"));
+        CHECK(real_reg.calls("delete_key_by_handle") == 1); // Other only
+        REQUIRE(real.undo.size() == 1);                      // Other's value; nothing from the refused item
+        CHECK(real.undo[0] == std::vector<std::string>{"undo", "1", "o", "REG_DWORD", "03000000", "0"});
+        CHECK(real.undo_complete());
+        CHECK(dry.undo_complete());
+    }
+    SECTION("a plain U+FFFD name alone is well-formed: applied, and the manifest spells it") {
+        const bool dry = GENERATE(true, false);
+        FakeRegistry reg;
+        build(reg, false);
+        const auto run = run_plan(reg, json::array({del_key_item("Software\\Leaf")}), dry);
+        CHECK(run.verdict(0) == (dry ? "would_apply" : "applied"));
+        if (!dry) {
+            REQUIRE(run.undo.size() == 1);
+            CHECK(run.undo[0] == std::vector<std::string>{"undo", "0", fffd, "REG_DWORD", "02000000", "0"});
+            CHECK_FALSE(reg.exists("Software\\Leaf"));
+        }
+    }
+    SECTION("a lone-surrogate name on a key no item deletes does not matter") {
+        const bool dry = GENERATE(true, false);
+        FakeRegistry reg;
+        build(reg, false);
+        reg.put("Software\\Other", lone, kRegDword, dword(1));
+        reg.key("Software\\Other")->values[lone].enum_as = fffd;
+        const auto run = run_plan(reg, json::array({set_item("Software\\Other", "o", "4", "REG_DWORD"),
+                                                    del_key_item("Software\\Leaf")}), dry);
+        CHECK(run.verdicts() == (dry ? std::vector<std::string>{"would_apply", "would_apply"}
+                                     : std::vector<std::string>{"applied", "applied"}));
+        CHECK(reg.get("Software\\Other", lone)->data == dword(1));
+    }
 }
 
 TEST_CASE("registry apply: a name the manifest cannot spell refuses before anything is opened, in both modes",

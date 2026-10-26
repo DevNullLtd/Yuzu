@@ -206,9 +206,13 @@ struct RegistryWriter {
     virtual long set_value(Handle key, std::string_view name, std::uint32_t type,
                            std::span<const std::uint8_t> data) = 0;
     virtual long delete_value(Handle key, std::string_view name) = 0;
-    /// kErrorNoMoreItems ends the enumeration.
-    virtual long enum_value(Handle key, std::uint32_t index, std::string& name) = 0;
-    virtual long enum_subkey(Handle key, std::uint32_t index, std::string& name) = 0;
+    /// kErrorNoMoreItems ends the enumeration. The name is converted from UTF-16 lossily (a lone surrogate becomes
+    /// U+FFFD, win_str.hpp), which is fine for display. `require_exact` (the callers that act on the name: the delete
+    /// vet that captures each value by it, and the recursive delete's walks that open each child by it): a raw name
+    /// that is not well-formed UTF-16 (kernel_name_well_formed) answers kErrorInvalidData instead, because its lossy
+    /// form names a DIFFERENT value or key (or none).
+    virtual long enum_value(Handle key, std::uint32_t index, std::string& name, bool require_exact = false) = 0;
+    virtual long enum_subkey(Handle key, std::uint32_t index, std::string& name, bool require_exact = false) = 0;
     /// NtDeleteKey(key): marks the key for deletion by handle. There is NO tree delete here: RegDeleteTreeW
     /// follows a registry link found inside the tree (measured 2026-10-19). noexcept: the rollback calls it from a
     /// destructor.
@@ -657,6 +661,12 @@ struct TreeCount {
     std::string error;
 };
 
+/// The token of a failed exact enumeration (`require_exact`): a raw name that is not well-formed UTF-16 is
+/// unrepresentable_name (nothing can address it by a UTF-8 name), every other code as rc_token spells it.
+[[nodiscard]] inline std::string exact_enum_token(long rc, Missing what) {
+    return rc == kErrorInvalidData ? std::string{kTokUnrepresentableName} : rc_token(rc, what);
+}
+
 /// Adds the values of the key `h` to `c`: nodes are keys + values, and the caller has already counted the key itself, so
 /// the cap is kMaxTreeNodes nodes in all. kMaxTreeNodes bounds the enumeration at 10,000 iterations even when the value
 /// set grows between calls. Past the bound `capped` is set and `values` is a lower bound.
@@ -690,7 +700,8 @@ inline void count_values_into(RegistryWriter& reg, Handle h, TreeCount& c) {
 
 /// The VET of a recursive delete: counts `h` and everything beneath it, depth first. Every child is opened from its
 /// parent's handle with REG_OPTION_OPEN_LINK and probed for a link; a link inside the tree fails the walk closed
-/// (key_is_link), because nothing may be deleted through a redirect. It is a SIZE BOUND and a LINK SWEEP, not a
+/// (key_is_link), because nothing may be deleted through a redirect; a child whose raw name is not well-formed UTF-16
+/// fails it unrepresentable_name (its lossy name would open a sibling). It is a SIZE BOUND and a LINK SWEEP, not a
 /// membership list (README "delete_key"): kMaxTreeNodes and kMaxTreeDepth cap it, `capped` is then set and the counts
 /// are a lower bound, and delete_key_tree refuses a REAL recursive delete of a tree it could not finish
 /// (tree_too_large) so that no unvetted tail is ever deleted. The real delete is delete_subtree, which re-checks every
@@ -706,10 +717,11 @@ inline void count_tree(RegistryWriter& reg, Handle h, TreeCount& c, unsigned dep
     if (c.capped || !c.error.empty()) return;
     std::string name;
     for (std::uint32_t i = 0;; ++i) {
-        const long rc = reg.enum_subkey(h, i, name);
+        // Exact: a child is opened BY this name, and a lossy one would open a sibling (or nothing) instead.
+        const long rc = reg.enum_subkey(h, i, name, /*require_exact=*/true);
         if (rc == kErrorNoMoreItems) return;
         if (rc != kErrorSuccess) {
-            c.error = rc_token(rc, Missing::key);
+            c.error = exact_enum_token(rc, Missing::key);
             return;
         }
         Handle child = 0;
@@ -741,10 +753,10 @@ inline void delete_subtree(RegistryWriter& reg, Handle h, TreeCount& d, unsigned
     }
     std::string name;
     for (;;) {
-        const long rc = reg.enum_subkey(h, 0, name); // a removed child no longer enumerates
+        const long rc = reg.enum_subkey(h, 0, name, /*require_exact=*/true); // a removed child no longer enumerates
         if (rc == kErrorNoMoreItems) break;
         if (rc != kErrorSuccess) {
-            d.error = rc_token(rc, Missing::key);
+            d.error = exact_enum_token(rc, Missing::key);
             return;
         }
         Handle child = 0;
@@ -1055,16 +1067,11 @@ struct CaptureBudget {
 }
 
 /// What an enumerated value failed with: a name that is not restorable, a value the enumeration listed but a query cannot
-/// find (a name that did not round-trip, or one removed under us), an unreadable value or a type this plugin cannot write.
+/// find (removed under us: the exact enumeration means the name itself round-trips), an unreadable value or a type this
+/// plugin cannot write.
 [[nodiscard]] inline std::string leaf_value_defect(std::string_view name, const OldValue& v) {
     if (!name_restorable(name)) return std::string{kTokUnrepresentableName};
-    if (v.state == OldState::absent) {
-        // The enumeration just reported this value, so a re-open that cannot find it is never "nothing to restore":
-        // either the name does not round-trip (a lone surrogate maps to U+FFFD, win_str.hpp, and opens a DIFFERENT name)
-        // or it was removed under us. Refuse before the key is deleted.
-        return name.find("\xEF\xBF\xBD") != std::string_view::npos ? std::string{kTokUnrepresentableName}
-                                                                    : std::string{kTokConcurrentChange};
-    }
+    if (v.state == OldState::absent) return std::string{kTokConcurrentChange}; // never "nothing to restore"
     if (v.state == OldState::unreadable) return v.error;
     if (!restorable(v)) return std::string{kTokUnsupportedOldType};
     return {};
@@ -1081,16 +1088,18 @@ struct LeafVet {
 /// defect it meets, so the refuse-before-delete promise covers every value, not only the ones the budget can keep. The
 /// same pass retains the values `budget` keeps (a value cut at kCaptureValueCap keeps its first part; the first row that
 /// does not fit ends the retention and flags the manifest incomplete). The caller passes a trial copy of its budget and
-/// adopts it only when the vet is clean, so a refused item charges nothing and retains nothing.
+/// adopts it only when the vet is clean, so a refused item charges nothing and retains nothing. The enumeration is
+/// EXACT: a raw name that is not well-formed UTF-16 is unrepresentable_name, because its lossy UTF-8 form (U+FFFD for a
+/// lone surrogate) would capture a different value, or the same one twice, under a manifest that looks complete.
 [[nodiscard]] inline LeafVet vet_leaf_values(RegistryWriter& reg, Handle h, CaptureBudget& budget) {
     LeafVet vet;
     bool retaining = true;
     std::string name;
     for (std::uint32_t i = 0;; ++i) {
-        const long rc = reg.enum_value(h, i, name);
+        const long rc = reg.enum_value(h, i, name, /*require_exact=*/true);
         if (rc == kErrorNoMoreItems) return vet;
         if (rc != kErrorSuccess) {
-            vet.error = rc_token(rc, Missing::value);
+            vet.error = exact_enum_token(rc, Missing::value);
             return vet;
         }
         if (static_cast<std::size_t>(i) + 1 >= kMaxTreeNodes) { // the key is node 1: count_values' bound

@@ -58,6 +58,7 @@ static_assert(kErrorAccessDenied == ERROR_ACCESS_DENIED);
 static_assert(kErrorNotSupported == ERROR_NOT_SUPPORTED);
 static_assert(kErrorMoreData == ERROR_MORE_DATA);
 static_assert(kErrorNoMoreItems == ERROR_NO_MORE_ITEMS);
+static_assert(kErrorInvalidData == ERROR_INVALID_DATA);
 static_assert(kErrorKeyDeleted == ERROR_KEY_DELETED);
 static_assert(kKeyQueryValue == KEY_QUERY_VALUE);
 static_assert(kKeySetValue == KEY_SET_VALUE);
@@ -142,6 +143,17 @@ template <class F> [[nodiscard]] F ntdll_proc(const char* symbol) {
         out = from_wide(name, static_cast<int>(n));
     }
     return out.empty() ? static_cast<long>(ERROR_INVALID_DATA) : static_cast<long>(ERROR_SUCCESS);
+}
+
+/// The name RegEnumValueW / RegEnumKeyExW wrote (`len` units, no NUL) as UTF-8 into `out`. `require_exact`: a name
+/// that is not well-formed UTF-16 (validated on the raw, length-delimited units BEFORE from_wide, which would map a lone
+/// surrogate to U+FFFD) or that fails to convert is ERROR_INVALID_DATA and `out` is left as it was.
+[[nodiscard]] long enumerated_name(const wchar_t* buf, DWORD len, bool require_exact, std::string& out) {
+    if (require_exact && !kernel_name_well_formed(std::wstring_view{buf, len})) return ERROR_INVALID_DATA;
+    std::string name = from_wide(buf, static_cast<int>(len));
+    if (require_exact && len != 0 && name.empty()) return ERROR_INVALID_DATA;
+    out = std::move(name);
+    return ERROR_SUCCESS;
 }
 
 /// The kernel name of a predefined root, read once per process (a function-local static per root):
@@ -273,20 +285,18 @@ public:
         return RegDeleteValueW(as_hkey(key), wname.c_str());
     }
 
-    long enum_value(Handle key, std::uint32_t index, std::string& name) override {
+    long enum_value(Handle key, std::uint32_t index, std::string& name, bool require_exact = false) override {
         wchar_t buf[16384]; // a value name is at most 16,383 characters
         DWORD len = static_cast<DWORD>(std::size(buf));
         const LSTATUS rc = RegEnumValueW(as_hkey(key), index, buf, &len, nullptr, nullptr, nullptr, nullptr);
-        if (rc == ERROR_SUCCESS) name = from_wide(buf, static_cast<int>(len));
-        return rc;
+        return rc == ERROR_SUCCESS ? enumerated_name(buf, len, require_exact, name) : rc;
     }
 
-    long enum_subkey(Handle key, std::uint32_t index, std::string& name) override {
+    long enum_subkey(Handle key, std::uint32_t index, std::string& name, bool require_exact = false) override {
         wchar_t buf[256]; // a key name is at most 255 characters
         DWORD len = static_cast<DWORD>(std::size(buf));
         const LSTATUS rc = RegEnumKeyExW(as_hkey(key), index, buf, &len, nullptr, nullptr, nullptr, nullptr);
-        if (rc == ERROR_SUCCESS) name = from_wide(buf, static_cast<int>(len));
-        return rc;
+        return rc == ERROR_SUCCESS ? enumerated_name(buf, len, require_exact, name) : rc;
     }
 
     long delete_key_by_handle(Handle key) noexcept override {

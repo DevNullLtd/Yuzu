@@ -3,9 +3,10 @@
  * through yuzu::agent::LocalDispatcher against the live Windows registry (the pure logic is locked on
  * every host by test_registry_parsers.cpp / test_registry_core.cpp; this proves the Win32 binding).
  *
- * Registry 2.1.0 adds the recursive delete_key, the per-user hive writes (the caller's LIVE hive and an OFFLINE NTUSER.DAT
- * fixture, both through the real with_user_hive ladder) and `apply` (dry run, real run, reversed manifest, a create
- * denied by ACL, a 256-item reply under the dispatcher's capture cap).
+ * Registry 2.1.0 adds the recursive delete_key, the per-user hive writes (a LIVE hive -- a synthetic salted profile whose
+ * hive is mounted at HKU\<its SID> -- and an OFFLINE NTUSER.DAT fixture, both through the real with_user_hive ladder) and
+ * `apply` (dry run, real run, reversed manifest, a create denied by ACL, a 256-item reply under the dispatcher's
+ * capture cap, a value whose raw name is not well-formed UTF-16).
  *
  * Every key lives under a salted `YuzuTest-[<scope>-]<yuzu::test::process_random_salt()>` (#1871: a fixed
  * registry key is a cross-JOB shared resource; the optional scope is YUZU_TEST_REGISTRY_SCOPE, which CI sets per
@@ -755,32 +756,6 @@ TEST_CASE("registry write: a non-ASCII key and value name reach the registry as 
 
 namespace {
 
-/// The caller's own user SID as a string ("S-1-5-21-..."), nullopt when it cannot be read.
-std::optional<std::string> current_user_sid() {
-    HANDLE token{};
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return std::nullopt;
-    struct Closer {
-        HANDLE h;
-        ~Closer() { CloseHandle(h); }
-    } guard{token};
-    DWORD needed = 0;
-    GetTokenInformation(token, TokenUser, nullptr, 0, &needed);
-    if (needed == 0) return std::nullopt;
-    std::vector<BYTE> buf(needed);
-    if (!GetTokenInformation(token, TokenUser, buf.data(), needed, &needed)) return std::nullopt;
-    LPWSTR s = nullptr;
-    const BOOL converted = ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buf.data())->User.Sid, &s);
-    const yuzu::win::LocalFreeGuard free_s{s}; // owns the string before the resize below can throw
-    if (!converted || !s) return std::nullopt;
-    // n counts the terminating NUL: the buffer holds all n bytes, then the NUL is dropped.
-    const int n = WideCharToMultiByte(CP_UTF8, 0, s, -1, nullptr, 0, nullptr, nullptr);
-    if (n <= 1) return std::nullopt;
-    std::string out(static_cast<std::size_t>(n), '\0');
-    if (WideCharToMultiByte(CP_UTF8, 0, s, -1, out.data(), n, nullptr, nullptr) != n) return std::nullopt;
-    out.pop_back();
-    return out;
-}
-
 /// The cells of one `item|...` / `undo|...` row `idx` of an apply reply (empty when the row is absent).
 std::vector<std::string> row_cells(const Plugin::Out& o, const std::string& kind, int idx) {
     std::vector<std::string> f;
@@ -928,75 +903,6 @@ TEST_CASE("registry write: a recursive delete refuses a registry link inside the
     CHECK_FALSE(key_exists(HKEY_LOCAL_MACHINE, root + "\\Tree"));
 }
 
-TEST_CASE("registry write: set_user_value / delete_user_value on the caller's own LIVE hive round-trip, "
-          "with no unload warning",
-          "[registry][windows][write][user]") {
-    Plugin p;
-    if (!p.ok()) { skip_or_fail("registry.dll not found"); return; }
-    const auto sid = current_user_sid();
-    if (!sid) { skip_or_fail("no SID"); return; }
-    const std::string root = "Software\\" + scratch_name();
-    ScratchTree cleanup{HKEY_CURRENT_USER, root};
-    // set_user_value resolves the profile through ProfileList like get_user_value; a system account
-    // (S-1-5-18/19/20) is deliberately not in that list.
-    const auto probe = p.run("get_user_value", {{"sid", *sid}, {"key", root}, {"name", "x"}});
-    if (probe.has("error|sid '" + *sid + "' not found in enumerated profiles")) {
-        skip_or_fail("own SID is not an enumerated, non-system profile (running as a system account?)");
-        return;
-    }
-    struct Case {
-        const char* what;
-        std::map<std::string, std::string> params;
-        DWORD type;
-        Bytes expect;
-        const char* type_name;
-    };
-    const std::vector<Case> cases{
-        {"REG_SZ", {{"type", "REG_SZ"}, {"value", "hello"}}, REG_SZ, utf16(L"hello"), "REG_SZ"},
-        {"REG_EXPAND_SZ", {{"type", "REG_EXPAND_SZ"}, {"value", "%TEMP%\\x"}}, REG_EXPAND_SZ, utf16(L"%TEMP%\\x"), "REG_EXPAND_SZ"},
-        {"REG_DWORD", {{"type", "REG_DWORD"}, {"value", "42"}}, REG_DWORD, le(42, 4), "REG_DWORD"},
-        {"REG_QWORD", {{"type", "REG_QWORD"}, {"value", "18446744073709551615"}}, REG_QWORD, le(~0ull, 8), "REG_QWORD"},
-        {"REG_MULTI_SZ", {{"type", "REG_MULTI_SZ"}, {"value", "a\nb"}}, REG_MULTI_SZ, Bytes{0x61, 0, 0, 0, 0x62, 0, 0, 0, 0, 0},
-         "REG_MULTI_SZ"},
-        {"REG_BINARY", {{"type", "REG_BINARY"}, {"value", "00ff0000aa"}}, REG_BINARY, Bytes{0, 0xff, 0, 0, 0xaa}, "REG_BINARY"},
-    };
-    int i = 0;
-    for (auto c : cases) {
-        INFO(c.what);
-        c.params["sid"] = *sid;
-        c.params["key"] = root + "\\u";
-        c.params["name"] = "V" + std::to_string(i++);
-        const auto set = p.run("set_user_value", c.params);
-        CHECK(set.rc == 0);
-        CHECK(set.has("status|ok"));
-        CHECK(set.audit().find("|op=set_user_value|hive=HKU|") != std::string::npos);
-        CHECK(set.audit().find("|sid=" + *sid + "|") != std::string::npos);
-        CHECK(set.audit().find("|result=ok|reason=-|verify=ok|") != std::string::npos);
-        for (const auto& l : set.lines) CHECK(l.find("hive_unload_failed") == std::string::npos);
-        const auto r = read(HKEY_CURRENT_USER, root + "\\u", c.params["name"]);
-        REQUIRE(r.found);
-        CHECK(r.type == c.type);
-        CHECK(to_hex(r.data) == to_hex(c.expect));
-        // and the read action sees the same value, through the same ladder
-        const auto got = p.run("get_user_value", {{"sid", *sid}, {"key", root + "\\u"}, {"name", c.params["name"]}});
-        CHECK(got.rc == 0);
-        CHECK(got.has(std::string{"type|"} + c.type_name));
-    }
-
-    const auto del = p.run("delete_user_value", {{"sid", *sid}, {"key", root + "\\u"}, {"name", "V2"}});
-    CHECK(del.rc == 0);
-    CHECK(del.audit().find("|op=delete_user_value|hive=HKU|") != std::string::npos);
-    CHECK_FALSE(read(HKEY_CURRENT_USER, root + "\\u", "V2").found);
-    const auto again = p.run("delete_user_value", {{"sid", *sid}, {"key", root + "\\u"}, {"name", "V2"}});
-    CHECK(again.rc == 1);
-    CHECK(again.has("error|value_not_found"));
-    const auto nosuch = p.run("set_user_value", {{"sid", "S-1-5-21-0-0-0-999999999"}, {"key", root}, {"name", "V"}, {"value", "x"}});
-    CHECK(nosuch.rc == 1);
-    const auto bad = p.run("set_user_value", {{"sid", *sid}, {"key", root + "\\u"}, {"name", "V"}, {"type", "REG_DWORD"}, {"value", "x"}});
-    CHECK(bad.rc == 1);
-    CHECK(bad.audit().find("|result=refused|reason=invalid_data|") != std::string::npos);
-}
-
 namespace {
 
 /// An elevated-only offline-hive fixture: a salted temp "profile" directory holding an NTUSER.DAT saved with
@@ -1080,6 +986,83 @@ struct OfflineProfile {
 };
 
 } // namespace
+
+TEST_CASE("registry write: set_user_value / delete_user_value on a LIVE hive (a synthetic profile's hive mounted at "
+          "HKU\\<its SID>) round-trip, with no unload warning",
+          "[registry][windows][write][user]") {
+    // Not the runner's own SID: CI's Windows leg runs as LocalSystem, which the profile resolver deliberately leaves out
+    // of ProfileList (S-1-5-18/19/20). The fixture owns a salted ProfileList entry, and its hive is mounted at
+    // HKU\<that SID>, which is exactly what a logged-on user's live hive is to the plugin's with_user_hive ladder.
+    Plugin p;
+    if (!p.ok()) { skip_or_fail("registry.dll not found"); return; }
+    OfflineProfile prof;
+    if (!prof.ok) {
+        skip_or_fail("not elevated (or no SeBackup/SeRestore), or the synthetic profile could not be built -- live-hive write cases");
+        return;
+    }
+    yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege"); // outlive the mount: its unload needs SeRestore
+    yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
+    // Unloaded however this case exits, before `prof` removes the file. With the file loaded here, an offline mount
+    // of it by the plugin would fail, so a write that succeeds went through the live arm.
+    yuzu::win::ScopedUserHive live{widen(prof.sid), (prof.dir / "NTUSER.DAT").wstring()};
+    if (!live.ok()) {
+        skip_or_fail("could not mount the synthetic profile's hive at HKU\\" + prof.sid);
+        return;
+    }
+    const std::string sid = prof.sid;
+    const std::string hku_key = sid + "\\fixture\\u"; // the same key, read straight from HKU
+    struct Case {
+        const char* what;
+        std::map<std::string, std::string> params;
+        DWORD type;
+        Bytes expect;
+        const char* type_name;
+    };
+    const std::vector<Case> cases{
+        {"REG_SZ", {{"type", "REG_SZ"}, {"value", "hello"}}, REG_SZ, utf16(L"hello"), "REG_SZ"},
+        {"REG_EXPAND_SZ", {{"type", "REG_EXPAND_SZ"}, {"value", "%TEMP%\\x"}}, REG_EXPAND_SZ, utf16(L"%TEMP%\\x"), "REG_EXPAND_SZ"},
+        {"REG_DWORD", {{"type", "REG_DWORD"}, {"value", "42"}}, REG_DWORD, le(42, 4), "REG_DWORD"},
+        {"REG_QWORD", {{"type", "REG_QWORD"}, {"value", "18446744073709551615"}}, REG_QWORD, le(~0ull, 8), "REG_QWORD"},
+        {"REG_MULTI_SZ", {{"type", "REG_MULTI_SZ"}, {"value", "a\nb"}}, REG_MULTI_SZ, Bytes{0x61, 0, 0, 0, 0x62, 0, 0, 0, 0, 0},
+         "REG_MULTI_SZ"},
+        {"REG_BINARY", {{"type", "REG_BINARY"}, {"value", "00ff0000aa"}}, REG_BINARY, Bytes{0, 0xff, 0, 0, 0xaa}, "REG_BINARY"},
+    };
+    int i = 0;
+    for (auto c : cases) {
+        INFO(c.what);
+        c.params["sid"] = sid;
+        c.params["key"] = "fixture\\u";
+        c.params["name"] = "V" + std::to_string(i++);
+        const auto set = p.run("set_user_value", c.params);
+        CHECK(set.rc == 0);
+        CHECK(set.has("status|ok"));
+        CHECK(set.audit().find("|op=set_user_value|hive=HKU|") != std::string::npos);
+        CHECK(set.audit().find("|sid=" + sid + "|") != std::string::npos);
+        CHECK(set.audit().find("|result=ok|reason=-|verify=ok|") != std::string::npos);
+        for (const auto& l : set.lines) CHECK(l.find("hive_unload_failed") == std::string::npos);
+        const auto r = read(HKEY_USERS, hku_key, c.params["name"]);
+        REQUIRE(r.found);
+        CHECK(r.type == c.type);
+        CHECK(to_hex(r.data) == to_hex(c.expect));
+        // and the read action sees the same value, through the same ladder
+        const auto got = p.run("get_user_value", {{"sid", sid}, {"key", "fixture\\u"}, {"name", c.params["name"]}});
+        CHECK(got.rc == 0);
+        CHECK(got.has(std::string{"type|"} + c.type_name));
+    }
+
+    const auto del = p.run("delete_user_value", {{"sid", sid}, {"key", "fixture\\u"}, {"name", "V2"}});
+    CHECK(del.rc == 0);
+    CHECK(del.audit().find("|op=delete_user_value|hive=HKU|") != std::string::npos);
+    CHECK_FALSE(read(HKEY_USERS, hku_key, "V2").found);
+    const auto again = p.run("delete_user_value", {{"sid", sid}, {"key", "fixture\\u"}, {"name", "V2"}});
+    CHECK(again.rc == 1);
+    CHECK(again.has("error|value_not_found"));
+    const auto nosuch = p.run("set_user_value", {{"sid", "S-1-5-21-0-0-0-999999999"}, {"key", "fixture"}, {"name", "V"}, {"value", "x"}});
+    CHECK(nosuch.rc == 1);
+    const auto bad = p.run("set_user_value", {{"sid", sid}, {"key", "fixture\\u"}, {"name", "V"}, {"type", "REG_DWORD"}, {"value", "x"}});
+    CHECK(bad.rc == 1);
+    CHECK(bad.audit().find("|result=refused|reason=invalid_data|") != std::string::npos);
+}
 
 TEST_CASE("registry write: set_user_value on an OFFLINE NTUSER.DAT is carried to the file and refused when "
           "the file cannot be mounted or trusted",
@@ -1330,6 +1313,55 @@ TEST_CASE("registry write: apply refuses a create beneath a key that denies KEY_
     CHECK(row_cells(real, "item", 2).at(6) == "applied");
     CHECK_FALSE(key_exists(HKEY_LOCAL_MACHINE, locked + "\\New"));
     CHECK(key_exists(HKEY_LOCAL_MACHINE, open_key + "\\Made"));
+}
+
+TEST_CASE("registry write: apply refuses to delete a key holding a value whose raw name is a lone surrogate next to "
+          "its U+FFFD lookalike, and both values survive",
+          "[registry][windows][write][apply]") {
+    // The kernel accepts any UTF-16 unit in a value name. L"V\xD800" converts lossily to "V<U+FFFD>", the same UTF-8 as
+    // its sibling L"V\xFFFD", so a lossy vet would capture the sibling twice and NtDeleteKey would take both values under
+    // a manifest that looked complete. The vet enumerates the raw names exactly and refuses the item first.
+    Plugin p;
+    if (!p.ok()) { skip_or_fail("registry.dll not found"); return; }
+    const std::string root = "SOFTWARE\\" + scratch_name();
+    const std::string leaf = root + "\\Leaf";
+    ScratchTree cleanup{HKEY_LOCAL_MACHINE, root};
+    yuzu::win::RegKey k;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(leaf).c_str(), 0, nullptr, 0, KEY_SET_VALUE | KEY_QUERY_VALUE, nullptr,
+                        k.put(), nullptr) != ERROR_SUCCESS) {
+        skip_or_fail("not elevated -- HKLM scratch not writable, lone-surrogate value case");
+        return;
+    }
+    const std::wstring lone = L"V\xD800"; // a lone high surrogate: no UTF-8 form
+    const std::wstring fffd = L"V\xFFFD"; // what a lossy conversion makes of it
+    const Bytes one = le(1, 4), two = le(2, 4);
+    if (RegSetValueExW(k.get(), lone.c_str(), 0, REG_DWORD, one.data(), 4) != ERROR_SUCCESS) {
+        skip_or_fail("RegSetValueExW refused a value name holding a lone surrogate");
+        return;
+    }
+    REQUIRE(RegSetValueExW(k.get(), fffd.c_str(), 0, REG_DWORD, two.data(), 4) == ERROR_SUCCESS);
+    const auto value_of = [&k](const std::wstring& name) { // "absent" once the key is gone (ERROR_KEY_DELETED)
+        Bytes b(4);
+        DWORD type = 0, size = 4;
+        return RegQueryValueExW(k.get(), name.c_str(), nullptr, &type, b.data(), &size) == ERROR_SUCCESS && size == 4
+                   ? to_hex(b)
+                   : std::string{"absent"};
+    };
+    const std::string plan = "[{\"op\":\"delete_key\",\"key\":\"" + json_path(leaf) + "\"}]";
+    for (const char* dry : {"true", "false"}) {
+        INFO("dry_run=" << dry);
+        const auto out = p.run("apply", {{"plan", plan}, {"dry_run", dry}});
+        CHECK(out.rc == 1);
+        const auto row = row_cells(out, "item", 0);
+        REQUIRE(row.size() > 7);
+        CHECK(row[6] == "refused");
+        CHECK(row[7] == "unrepresentable_name");
+        CHECK(out.audit().find("|result=refused|reason=unrepresentable_name|") != std::string::npos);
+        for (const auto& l : out.lines) CHECK(l.rfind("undo|", 0) != 0);
+        CHECK(key_exists(HKEY_LOCAL_MACHINE, leaf));
+        CHECK(value_of(lone) == "01000000");
+        CHECK(value_of(fffd) == "02000000");
+    }
 }
 
 TEST_CASE("registry write: apply refuses a flag that is not a boolean and a malformed plan before any item, unaudited",
