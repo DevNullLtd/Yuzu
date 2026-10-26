@@ -27,6 +27,7 @@
 
 #include "licensing_record.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <ctime>
 #include <optional>
@@ -127,6 +128,13 @@ public:
     /// Collection time (UTC epoch seconds) — virtual so tests can pin it and
     /// countdown→absolute-date conversions stay deterministic per run.
     virtual long long now_epoch() { return static_cast<long long>(::time(nullptr)); }
+
+    /// Monotonic clock for cooperative start gates (the entitlement_certs 10 s
+    /// budget) -- virtual so a test injects a controllable clock instead of
+    /// sleeping. Plugin-internal seam, not part of the plugin ABI.
+    virtual std::chrono::steady_clock::time_point now_steady() {
+        return std::chrono::steady_clock::now();
+    }
 };
 
 inline constexpr std::size_t kGlobMaxMatches = 512;
@@ -188,6 +196,20 @@ struct SurfaceRun {
 
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
 SurfaceRun run_platform_surfaces();
+#endif
+
+/// Individual per-OS surface runners, exported (like run_probe_specs and
+/// jetbrains_key_interpreter above) so a unit test can drive the shell that turns
+/// the pure seams into rows and probe outcomes through a controlled ProbeHost.
+/// Each appends its records and exactly one ProbeOutcome (entitlement_certs /
+/// mas_receipt) to the vectors it is given.
+#ifdef __linux__
+void run_entitlement_certs_surface(ProbeHost& host, std::vector<LicRecord>& records,
+                                   std::vector<ProbeOutcome>& outcomes);
+#endif
+#ifdef __APPLE__
+void run_mas_receipt_surface(ProbeHost& host, std::vector<LicRecord>& records,
+                             std::vector<ProbeOutcome>& outcomes);
 #endif
 
 } // namespace yuzu::license_scan

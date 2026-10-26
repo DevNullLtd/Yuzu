@@ -244,6 +244,10 @@ bool is_refusal(int err) {
     return err == EACCES || err == EPERM;
 }
 
+} // namespace
+
+// Exported (licensing_probes.hpp) so tests/unit/test_license_scan_surfaces.cpp can
+// drive this shell through a controlled ProbeHost.
 void run_entitlement_certs_surface(ProbeHost& host, std::vector<LicRecord>& records,
                                    std::vector<ProbeOutcome>& outcomes) {
     const auto dir = host.list_dir(kEntitlementDir, kMaxDirEntries);
@@ -290,9 +294,9 @@ void run_entitlement_certs_surface(ProbeHost& host, std::vector<LicRecord>& reco
     std::size_t emitted = 0;
     bool permission_denied = false;
     bool any_parse_failure = false;
-    const auto scan_deadline = std::chrono::steady_clock::now() + kEntitlementCertsScanBudget;
+    const auto scan_deadline = host.now_steady() + kEntitlementCertsScanBudget;
     for (const auto& name : certs) {
-        if (std::chrono::steady_clock::now() >= scan_deadline) {
+        if (host.now_steady() >= scan_deadline) {
             // Whatever was already parsed is real data, kept -- only the
             // remaining certs are unaccounted for, reported below via the
             // degraded outcome rather than silently truncating the scan.
@@ -342,8 +346,6 @@ void run_entitlement_certs_surface(ProbeHost& host, std::vector<LicRecord>& reco
     outcomes.push_back(
         entitlement_certs_outcome(permission_denied, budget_exhausted, emitted, any_parse_failure));
 }
-
-} // namespace
 
 // ── the Linux run ───────────────────────────────────────────────────────────
 

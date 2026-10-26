@@ -26,6 +26,7 @@
 #define YUZU_LICENSE_SCAN_LICENSING_PARSERS_HPP
 
 #include <sha256.hpp>
+#include <yuzu/plugin.h> // YuzuResultStatus / YuzuResultCompleteness (SurfaceStatus; plain C header)
 #include "licensing_record.hpp" // ProbeOutcome (platform-free; entitlement_certs_outcome() below)
 
 #include <array>
@@ -546,6 +547,38 @@ inline std::string plist_string_value(std::string_view xml, std::string_view key
             return true;
     }
     return false;
+}
+
+// ── typed result status of a run (pure seam) ───────────────────────────────
+
+/// The ABI4 typed status a run reports (status, completeness, provenance token).
+struct SurfaceStatus {
+    YuzuResultStatus status;
+    YuzuResultCompleteness completeness;
+    std::string_view provenance;
+};
+
+/// Maps a run's per-surface outcomes to the typed result status, or nullopt when
+/// every surface was ok (nothing to report: the status stays UNDECLARED). Fixed
+/// precedence: a refusal (`cert_permission_denied`) -> PERMISSION_DENIED /
+/// PARTIAL / `license_scan:permission_denied`, distinct from the generic failure
+/// so a consumer of this seam can tell "could not check" from "the check
+/// failed"; any other !ok outcome -> CONSTRAINED / PARTIAL /
+/// `license_scan:surface_error`. PARTIAL on both: rows already collected are
+/// carried on every degraded path. Pure so the precedence is unit-testable
+/// without a plugin context; license_scan_plugin.cpp's propagate_surface_status
+/// is the thin shell that hands the result to ctx.set_result_status.
+[[nodiscard]] inline std::optional<SurfaceStatus>
+surface_result_status(const std::vector<ProbeOutcome>& outcomes) {
+    if (has_permission_denied_outcome(outcomes))
+        return SurfaceStatus{YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                             "license_scan:permission_denied"};
+    for (const auto& o : outcomes) {
+        if (!o.ok)
+            return SurfaceStatus{YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                 "license_scan:surface_error"};
+    }
+    return std::nullopt;
 }
 
 // ── per_user_hives outcome decision (pure seam) ────────────────────────────

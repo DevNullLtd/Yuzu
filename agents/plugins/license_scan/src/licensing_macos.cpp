@@ -55,6 +55,10 @@ std::string bundle_name_from_app_path(const std::string& app_path) {
     return base;
 }
 
+} // namespace
+
+// Exported (licensing_probes.hpp) so tests/unit/test_license_scan_surfaces.cpp can
+// drive this shell through a controlled ProbeHost.
 void run_mas_receipt_surface(ProbeHost& host, std::vector<LicRecord>& records,
                              std::vector<ProbeOutcome>& outcomes) {
     std::size_t emitted = 0;
@@ -98,8 +102,6 @@ void run_mas_receipt_surface(ProbeHost& host, std::vector<LicRecord>& records,
     }
     outcomes.push_back({"mas_receipt", true, emitted, {}});
 }
-
-} // namespace
 
 // ── the macOS run ───────────────────────────────────────────────────────────
 

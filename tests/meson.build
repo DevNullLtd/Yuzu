@@ -525,6 +525,9 @@ agent_test_exe = executable(
                                                 # runner migration (POSIX-only, a no-op TU on Windows)
     'unit/test_license_scan_probe_host_posix.cpp', # SAM.10: ProbeHost::read_file_capped / list_dir errno contract over a real temp tree (POSIX-only, a no-op TU on Windows)
     '../agents/plugins/license_scan/src/licensing_probes.cpp', # SAM.10: the ProbeHost default bodies under test (compiles on every OS; the plugin carries the same TU)
+    'unit/test_license_scan_surfaces.cpp',   # SAM.10: the per-OS surface shells (run_entitlement_certs_surface / run_mas_receipt_surface) through a recording FakeProbeHost; each OS's cases compile only there, an empty TU on Windows
+    '../agents/plugins/license_scan/src/licensing_linux.cpp', # SAM.10: the shells under test (the plugin carries the same TU); empty off Linux via its #ifdef
+    '../agents/plugins/license_scan/src/licensing_macos.cpp', # SAM.10: likewise, empty off macOS via its #ifdef
     'unit/test_filesystem_posture_parsers.cpp', # Wave 6 PR6.1-b: pure /proc/self/mountinfo, quotactl
                                                 # errno classification, fs_snapshot_list attrlist walk,
                                                 # and the legs.hpp pure row formatters

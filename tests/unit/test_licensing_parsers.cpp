@@ -565,6 +565,61 @@ TEST_CASE("has_permission_denied_outcome: true only for a failed outcome carryin
     CHECK_FALSE(has_permission_denied_outcome({ProbeOutcome{"pkg_metadata", false, 0, "rpm_query_failed"}}));
 }
 
+// ── surface_result_status (pure typed-status seam; license_scan_plugin.cpp's
+//    propagate_surface_status hands its result to ctx.set_result_status for BOTH actions) ──
+
+TEST_CASE("surface_result_status: a run with no failed surface reports nothing",
+          "[licensing][result_status]") {
+    CHECK_FALSE(surface_result_status({}).has_value());
+    CHECK_FALSE(surface_result_status({ProbeOutcome{"pkg_metadata", true, 4, {}},
+                                       entitlement_certs_outcome(false, false, 2, false),
+                                       ProbeOutcome{"flexlm_lic", true, 0, {}}})
+                    .has_value());
+}
+
+TEST_CASE("surface_result_status: a failed surface that is not a refusal is CONSTRAINED / PARTIAL",
+          "[licensing][result_status]") {
+    const std::vector<std::vector<ProbeOutcome>> runs = {
+        {ProbeOutcome{"pkg_metadata", false, 0, "rpm_query_failed"}},
+        {entitlement_certs_outcome(false, false, 0, true)},  // cert_parse_failed
+        {entitlement_certs_outcome(false, false, 1, true)},  // cert_parse_partial
+        {entitlement_certs_outcome(false, true, 2, false)},  // cert_scan_budget_exhausted
+        // a failure on one surface beside a clean entitlement surface
+        {ProbeOutcome{"pkg_metadata", false, 0, "output_truncated"},
+         entitlement_certs_outcome(false, false, 3, false)},
+    };
+    for (const auto& outcomes : runs) {
+        const auto st = surface_result_status(outcomes);
+        REQUIRE(st.has_value());
+        CHECK(st->status == YUZU_RESULT_STATUS_CONSTRAINED);
+        CHECK(st->completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        CHECK(st->provenance == "license_scan:surface_error");
+    }
+}
+
+TEST_CASE("surface_result_status: a refusal is PERMISSION_DENIED / PARTIAL and outranks every other failure",
+          "[licensing][result_status]") {
+    const ProbeOutcome refused = entitlement_certs_outcome(true, false, 0, false);
+    const ProbeOutcome refused_with_rows = entitlement_certs_outcome(true, true, 2, true);
+    const ProbeOutcome other_failure{"pkg_metadata", false, 0, "dpkg_query_failed"};
+    const ProbeOutcome clean{"flexlm_lic", true, 1, {}};
+
+    const std::vector<std::vector<ProbeOutcome>> runs = {
+        {refused},
+        {refused_with_rows},
+        {other_failure, refused},   // precedence does not depend on order
+        {refused, other_failure},
+        {clean, refused, clean},
+    };
+    for (const auto& outcomes : runs) {
+        const auto st = surface_result_status(outcomes);
+        REQUIRE(st.has_value());
+        CHECK(st->status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+        CHECK(st->completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        CHECK(st->provenance == "license_scan:permission_denied");
+    }
+}
+
 // ── per_user_hives_outcome (pure decision seam, related issue #5291) ───────
 
 TEST_CASE("per_user_hives_outcome: precedence is privilege_missing > hive_file_refused > "
