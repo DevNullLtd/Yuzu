@@ -3206,6 +3206,15 @@ test('ensure-erlang strict-mode callers',
   timeout: 180,
 )
 
+# docs/ build inputs of Meson targets are re-included in /.dockerignore (the image
+# builds `COPY . .` with docs/ otherwise excluded).
+test('docker context re-includes embedded docs inputs',
+  _python3_test,
+  args: [files('test_docker_context_embeds_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Every script target uses yuzu_python (no ad-hoc find_program for python).
 test('meson python lookup is yuzu_python',
   _python3_test,
