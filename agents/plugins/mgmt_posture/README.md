@@ -14,19 +14,71 @@
 
 ## How it works
 
-`posture` reports which management plane controls the device, as facts only. It reads local configuration (Linux) or asks one built-in tool (macOS) and changes nothing. The first row is always a `status` row saying whether the read was complete; the data rows follow. The AD domain, OU and joined rows belong to `device_identity` and are never repeated here.
+`posture` reports which management plane controls the device, as facts only. It changes nothing, and the first row is always a `status` row saying whether the read was complete; the data rows follow. The AD domain, OU and joined rows belong to `device_identity` and are never repeated here.
 
-On Linux the leg reads `/etc/sssd/sssd.conf` and the `/etc/sssd/conf.d/*.conf` snippets (main file first, then snippets in byte order, parsed once so the last value wins as in SSSD) and derives the plane from the first active SSSD domain whose `id_provider` is `ad` or `ipa` (active means listed in `[sssd] domains` and not `enabled = false`, or marked `enabled = true`; with no `domains` key only an `enabled = true` domain is active, as `sssd.conf(5)` specifies); otherwise a `/etc/ipa/default.conf` with a realm means `ipa`, otherwise `none`. `/etc/krb5.keytab` is checked for presence only and is never opened. Every read separates present, absent and refused: a refused `sssd.conf` is `permission_denied` with plane `unknown`, never "not joined". On macOS the leg runs `/usr/bin/profiles status -type enrollment` through the bounded runner and reports MDM enrolment and the MDM server host; a nonzero exit, truncated or unrecognised output, or a runner failure (the run timed out, was cancelled, was killed by a signal or hit the 16-line cap) is `CONSTRAINED` with no data rows, and a tool that could not be started is `UNAVAILABLE` with no data rows. Windows is planned (caveat 3).
+On Linux it reads `/etc/sssd/sssd.conf` and the `/etc/sssd/conf.d/*.conf` snippets (main file first, then snippets in byte order, parsed once so the last value wins as in SSSD). The plane comes from the first active SSSD domain whose `id_provider` is `ad` or `ipa`; failing that, a `/etc/ipa/default.conf` with a realm means `ipa`, and otherwise the plane is `none`. A domain is active when it is listed in `[sssd] domains` and not `enabled = false`, or is marked `enabled = true` (with no `domains` key only an `enabled = true` domain counts, as `sssd.conf(5)` specifies). `/etc/krb5.keytab` is checked for presence only and is never opened. Every read separates present, absent and refused: a refused `sssd.conf` yields plane `unknown`, never "not joined".
+
+On macOS it runs `/usr/bin/profiles status -type enrollment` through the bounded runner (no shell, 5 second deadline, 16 lines) and reports MDM enrolment and the host of the MDM server. A nonzero exit, truncated or unrecognised output, or a runner failure (timeout, cancel, signal, line cap) is `CONSTRAINED` with no data rows; a tool that could not be started is `UNAVAILABLE` with no data rows. Windows answers with one placeholder row (see Caveats).
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Inventory.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[mgmt_posture.execute]
-  EX --> WIN[Windows leg<br/>status row only: windows:planned]
-  EX --> MAC[macOS leg<br/>profiles status -type enrollment via bounded runner]
-  EX --> LIN[Linux leg<br/>sssd.conf + conf.d, ipa default.conf, krb5.keytab presence]
-  WIN & MAC & LIN --> ROWS[rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator or workflow"] --> SRV["Server: authz Inventory, Read"]
+  SRV -->|"gRPC mTLS"| EX["Agent: mgmt_posture posture"]
+  EX --> WIN["Windows: status row only, windows:planned"]
+  EX --> MAC["macOS: profiles status via bounded runner"]
+  EX --> LIN["Linux: sssd.conf, conf.d, ipa default.conf, keytab presence"]
+  WIN --> ROWS["status row, data rows, typed result status"]
+  MAC --> ROWS
+  LIN --> ROWS
+  ROWS --> RS[("ResponseStore")]
+  RS --> API["REST /api/responses"]
 ```
+
+### What you can decide with it
+
+| Question | Linux | macOS | Windows |
+|---|---|---|---|
+| Is the device enrolled in MDM? | No: `mdm_enrolled` is always `-`. | Yes: `mdm_enrolled` is `true` or `false`. | No answer. |
+| Which MDM server manages it? | No. | The host only, in `mdm_provider`, or `-` when not enrolled. | No answer. |
+| Is it joined to AD or FreeIPA through SSSD? | Yes, from configuration: `plane` is `ad`, `ipa` or `none`. | No: `plane` is `-`; AD binding is `device_identity`'s `domain`. | No answer. |
+| Which cloud tenant? | No. | No. `tenant_id` is always `-`. | No answer. |
+
+`plane` takes only the values `none`, `ad`, `ipa` and `unknown` today. `workgroup`, `aad` and `hybrid` are in the vocabulary for the Windows leg and are never emitted. `plane|unknown` means a read was refused or failed, so the answer is not known; it never means "not managed". `plane|none` means no SSSD AD or IPA domain and no IPA realm were found in the files the agent could read; it does not prove the device is unmanaged (winbind without SSSD, or an `ldap` or `proxy` provider, also report `none`). `mdm_enrolled|false` means `profiles` reported no MDM enrolment; Jamf and other agents are not consulted.
+
+On a Linux host the useful pairing is `posture` with `device_identity`: the latter reports the domain, and this plugin explains whether a root-only `sssd.conf` was readable at all. On Windows the plugin is not usable yet.
+
+### Diagrams
+
+#### How the Linux plane is decided
+
+```mermaid
+flowchart TD
+  R["Read sssd.conf and conf.d snippets"] --> D{"Refused by permissions"}
+  D -->|"yes"| U["plane unknown, status permission_denied"]
+  D -->|"no"| A{"First active domain with id_provider ad or ipa"}
+  A -->|"ad"| AD["plane ad"]
+  A -->|"ipa"| IPA["plane ipa"]
+  A -->|"none found"| I{"ipa default.conf has a realm"}
+  I -->|"yes"| IPA
+  I -->|"no"| F{"Another read failed"}
+  F -->|"yes"| U2["plane unknown, status constrained"]
+  F -->|"no"| N["plane none"]
+```
+
+A refusal and a failure are never reported as "not joined". Missing files are the only silent case: with no `sssd.conf`, no snippets and no IPA realm the plane is `none`. A `constrained` status can still carry a real plane, for example when only the keytab probe failed.
+
+#### macOS outcomes
+
+```mermaid
+flowchart TD
+  P["Run profiles status -type enrollment"] --> S{"Tool started"}
+  S -->|"no"| UN["UNAVAILABLE: unsupported status row, no data rows"]
+  S -->|"yes"| OK{"Exited 0, not truncated, MDM line recognised"}
+  OK -->|"no"| CO["CONSTRAINED: reason token, no data rows"]
+  OK -->|"yes"| RW["OK: mdm_enrolled true or false, mdm_provider host or dash"]
+```
+
+The macOS leg has exactly three outcomes, and only the last one carries data rows. A `profiles` output that names only device enrolment (DEP) and no MDM line is not recognised and is reported as constrained.
 
 ## OS capability
 
@@ -46,9 +98,9 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | n/a — the leg reads nothing (caveat 3) | n/a | n/a | n/a — the placeholder reports `unsupported` with `windows:planned` |
-| macOS | agent daemon, default account | None: `profiles status` reports enrolment to an unprivileged caller | Not yet measured on the agent account; see Sample output for the capture | `CONSTRAINED` / partial with a `subprocess_runner:*` or `macos:mgmt_posture:profiles:*` token and no data rows; `UNAVAILABLE` / unknown with `subprocess_runner:spawn_error` when the tool could not be started |
-| Linux | agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`) | None to read in a root or capability-granted agent, but `/etc/sssd/sssd.conf` is root 0600 (SSSD requires that mode and can hold a bind credential), so the default unprivileged account cannot read it. Loosening the file mode is not a remedy: it would break SSSD or expose the credential to every plugin. The real options are a capability such as `CAP_DAC_READ_SEARCH` on the agent binary, or accepting `plane\|unknown` | Not measured on the `yuzu` account: a root capture bypasses permission bits | `PERMISSION_DENIED` / partial with `linux:mgmt_posture:sssd_conf:permission_denied` (or `...:sssd_conf_d:permission_denied`) and plane `unknown`; never reported as not joined |
+| Windows | n/a - the leg reads nothing (caveat 3) | n/a | n/a | n/a - the placeholder reports `unsupported` with `windows:planned` |
+| macOS | agent daemon (root under the shipped LaunchDaemon today, `docs/agent-privilege-model.md`) | None: `profiles status` reports enrolment to an unprivileged caller | The sample was captured as an unprivileged user (euid 501), not under the LaunchDaemon account | `CONSTRAINED` / partial with a `subprocess_runner:*` or `macos:mgmt_posture:profiles:*` token and no data rows; `UNAVAILABLE` / unknown with `subprocess_runner:spawn_error` when the tool could not be started |
+| Linux | agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`) | None to read in a root or capability-granted agent, but `/etc/sssd/sssd.conf` is root 0600 (SSSD requires that mode and it can hold a bind credential), so the default unprivileged account cannot read it. Loosening the file mode is not a remedy: it would break SSSD or expose the credential to every plugin. The real options are a capability such as `CAP_DAC_READ_SEARCH` on the agent binary, or accepting `plane\|unknown` | Not measured on the service account: the sample is a root capture in a container, which bypasses permission bits | `PERMISSION_DENIED` / partial with `linux:mgmt_posture:sssd_conf:permission_denied` (or `...:sssd_conf_d:permission_denied`) and plane `unknown`; never reported as not joined |
 
 No shell interpreter and no network use. The macOS leg runs one fixed absolute argv through the bounded runner (sink `mgmt_posture/run_macos#1`); the Linux leg is an in-process, bounded read of local files.
 
@@ -128,10 +180,10 @@ krb5_keytab|absent
 
 ## Caveats and known gaps
 
-1. **No documented customer driver.** No documented customer driver for this plugin was found (as in `local_security_policy`'s caveat); the reason it exists is the `device_identity` gap where a root-only `sssd.conf` reads as "not joined". Pure capability-gap reasoning.
-2. **Configuration, not live state.** Linux reports what the files say, not whether the join is healthy. `conf.d` snippets are merged in byte order, not SSSD's locale collation, so a mixed-case snippet set can differ. Only snippets ending `.conf` are read (at most 32, 64 KiB each). `plane|none` means no SSSD AD or IPA domain was found: `ldap`, `proxy` or `files` providers, or winbind without SSSD, also report `none`. A snippet SSSD would ignore (not root 0600) is still read if the agent can open it, and a containerised agent reads the image's `/etc`, not the host's.
-3. **Windows is planned.** The join and enrolment read (`NetGetJoinInformation`, the Enrollments and CloudDomainJoin registry keys) is not implemented; the leg reports one `unsupported` row, `windows:planned`.
-4. **Narrow scope.** macOS reports MDM enrolment only (Jamf is not read) and its `plane` is `-`: AD binding is `device_identity.domain`. No UPN or e-mail field exists; `tenant_id` is reserved and `-`.
+1. **Configuration, not live state.** Linux reports what the files say, not whether the join is healthy, and `plane|none` means no SSSD AD or IPA domain was found (winbind without SSSD, or `ldap`, `proxy` or `files` providers, also report `none`). Snippets are merged in byte order rather than SSSD's locale collation, and only `.conf` files are read (at most 32, 64 KiB each). A snippet SSSD would ignore is still read if the agent can open it, and a containerised agent reads the image's `/etc`, not the host's.
+2. **An unprivileged Linux agent usually sees `plane|unknown`.** The default service account cannot read the root-only `sssd.conf`, so a stock install reports `PERMISSION_DENIED` and `unknown` on SSSD-managed hosts, which is the common case rather than an edge case. Granting the agent `CAP_DAC_READ_SEARCH` is the supported way to get a real answer.
+3. **Windows is a placeholder and part of the plane vocabulary is reserved.** The Windows leg reads nothing and reports one `unsupported` row, `windows:planned`; the join and enrolment reads (`NetGetJoinInformation`, the Enrollments and CloudDomainJoin registry keys) are declared but not implemented. The `workgroup`, `aad` and `hybrid` values of `plane` exist for that leg and are not emitted on any OS today.
+4. **Narrow scope.** macOS reports MDM enrolment only: Jamf is not read, the DEP line is parsed but not reported, `plane` is `-`, and there is no UPN or e-mail field. `tenant_id` is reserved and always `-`.
 5. **Absent versus unknown.** `krb5_keytab|-` means presence could not be determined (a non-ENOENT `access()` failure, with a constrained token), not that the file is absent. The keytab is never opened.
 
 ## Source and tests
