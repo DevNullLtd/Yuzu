@@ -976,6 +976,23 @@ message GuaranteedStateRuleStatus {
 }
 ```
 
+The block above is the original sketch; the proto file is the source of truth for the
+fields. `GuaranteedStateEvent` fields 24 and 25, `boot_epoch` and `emit_seq`, carry the
+agent-asserted order of an event as the pair `(boot_epoch, emit_seq)`, compared
+lexicographically. They are ordinals, not timestamps: 0 means unset, and the agent sets
+both or neither. `boot_epoch` is claimed once at agent boot as the larger of the persisted
+counter plus one and the boot time in unix seconds, stored in the agent KV store under
+namespace `__guardian__`, key `meta:boot_epoch`; a stored value that cannot be parsed or is
+out of range is re-claimed from the clock and overwritten, and a KV failure leaves the epoch
+0, so the pair is sent as 0/0. `emit_seq` is drawn from one source owned by the engine and
+shared by both emit paths: the legacy sink executor draws it at admission, under the
+executor lock, and the Spark runtime draws it when it enqueues an outbox entry. Entries
+re-sent from the lifecycle journal carry 0/0, because their original position is not
+journalled. Residual, accepted and pinned by a test: if the KV row is wiped and the agent
+restarts within the same second as the previous boot, the new epoch equals the previous one.
+The server does not compare the pair in this change; until it does, the event timestamp
+remains the ordering key.
+
 ### 7.2 Wire integration
 
 Uses existing `CommandRequest` with reserved plugin name `__guard__`:

@@ -37,7 +37,8 @@ Ruling and Epistemic cells. No row currently carries `open-question` status.)
 **Every row below is an at-the-flip delta, not a live one.** `GuardianEngine`'s
 `prefer_spark` constructor parameter defaults `false` (`guardian_engine.hpp`), and the
 sole production call site (`agent.cpp`, `std::make_unique<GuardianEngine>(kv_store_.get(),
-cfg_.agent_id)`) omits it, taking the default. `reconcile_rule_locked` only reaches a
+cfg_.agent_id, /*prefer_spark=*/false, boot_epoch_claim.boot_epoch)`) passes the literal
+`false`. `reconcile_rule_locked` only reaches a
 spark placement decision when `prefer_spark_ && spark_availability_ == Available`. So
 today, fleet-wide, every row's "Spark" column is dormant and every row's "Legacy" column
 is what every agent actually does.
