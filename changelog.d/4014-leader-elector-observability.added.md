@@ -7,6 +7,8 @@
   `YuzuLeaderSplitBrain`, `YuzuLeaderNoLeader` and `YuzuLeaderCoordinationStale` (critical) and
   `YuzuLeaderFlapping` (warning); reload your rule file, and scrape each replica individually. Leadership is
   deliberately not part of `/readyz`, so these alerts are the only signal that the leader-only background
-  passes are paused. The `leader_elector: acquired leadership` log line now carries the `holder_id`. This does
+  passes are paused; like every rule they need a successful scrape, so also alert on `up == 0` for the
+  server job (none ships). Replicas on different databases are not fenced against each other, which is the
+  case `YuzuLeaderSplitBrain` can observe. The `leader_elector: acquired leadership` log line now carries the `holder_id`. This does
   not lift the second-replica safe-to-scale gate; remediation-claim counters (#6526), a CRL freshness gauge
   (#6527) and a durable cluster-capability admission gate (#6528) are tracked separately.

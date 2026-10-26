@@ -4744,8 +4744,11 @@ tests:
         eval_time: 42m
         exp_samples: []
 
-  # CASE - COUNTER RESET with `for: 0m`. A restart loop resets the counter to 0
-  # each boot (series 5 8 11 | 2 5 8: two resets' worth of growth). A naive
+  # CASE - COUNTER RESET with `for: 0m`. A counter that resets to a lower value
+  # mid-window (series 5 8 11 | 2 5 8: a replica restarted after being scraped at
+  # a high count, then climbed again). NOTE this is NOT a single replica's own
+  # restart loop: the counter is synced at scrape time, so the first scrape after
+  # each boot already reads >= 1 (the next case pins that). A naive
   # last-first reads 8-5 = 3 and stays quiet; increase() accounts for the reset
   # (about 14 once the reset is added back, extrapolated slightly higher) and fires, on the first evaluation that sees it
   # because `for: 0m` has no pending phase. RED if increase() is replaced by a
@@ -4761,6 +4764,22 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuLeaderFlapping", alertstate="firing", job="yuzu", severity="warning"}'
             value: 1
+
+  # CASE - KNOWN LIMIT, pinned so the docs cannot claim otherwise: a SINGLE
+  # replica in a restart loop. Every boot publishes acquired_total = 1 on its
+  # first scrape (the delta sync runs before serialization), so the series reads
+  # 1 1 1 1 ... with no rise and no reset, and increase() is 0: this rule stays
+  # QUIET. YuzuServerRestartLoop is the rule for that failure. RED if someone
+  # makes Flapping fire here (then update the docs that say it does not).
+  - interval: 3m
+    name: leader flapping - a single replica restart loop is not visible here
+    input_series:
+      - series: 'yuzu_server_leader_acquired_total{job="yuzu",instance="s1"}'
+        values: "1x14"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuLeaderFlapping"}'
+        eval_time: 42m
+        exp_samples: []
 
   # CASE - the repeated 0 1 2 0 1 pattern the restart-loop test would otherwise
   # under-count: still below 6 in total, so the warning stays quiet (a reset is

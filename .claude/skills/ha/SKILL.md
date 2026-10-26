@@ -135,7 +135,7 @@ delivery/ops workstreams the three-model review surfaced as missing; WS-15 (gate
 failback/rebalance, roadmap 7.1.1, #5759) was added 2026-10-13 as WS-13's pair.
 
 **WS-3 / WS-11 re-stamped 2026-10-26 (#4014):** ONLY those two rows were re-audited (against `origin/dev`
-`931842654` and `gh`); no other row was. The WS-11 leader-observability subset shipped (metrics published at
+`931842654` plus the unmerged #4014 branch, and `gh`; re-stamp at merge); no other row was. The WS-11 leader-observability subset shipped (metrics published at
 scrape time from a lock-free `LeaderElector::Stats`, the `yuzu-ha-leader` alerts; leadership and the elector
 being open stay out of `/readyz`). Follow-ups: #6526 (remediation-claim lifecycle counters), #6527 (CRL
 freshness gauge), #6528 (durable cluster-capability admission gate). The safe-to-scale gate is NOT lifted.

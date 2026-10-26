@@ -14,6 +14,13 @@ deployments sharing one Prometheus need separate `job`s. On a single-replica dep
 is the alert that can fire: it means the leader-only background passes are paused while `/readyz` stays
 green (leadership is deliberately not a readiness input). Runbook: `docs/user-manual/server-admin.md`,
 "Leader election: metrics and alerts (HA WS-11)". The thresholds are initial claims without fleet data.
+Two things to know: the `leader_elector: acquired leadership ... at epoch N` log line now ends with
+`(holder_id=srv-…)` (match on the prefix if you alert on that line), and no server `up == 0` alert ships, so
+configure one (these alerts need a successful scrape; see the runbook). If you ever run mixed versions of a
+multi-replica deployment (unsupported today), reload the rule file only after the last replica is upgraded, or
+silence `YuzuLeaderNoLeader` for the window: an old binary exports no `yuzu_server_leader_*` series, so an upgraded
+follower's `0` with an old leader's absent series sums to zero and the alert fires after 5 minutes. Silence it
+during planned Postgres maintenance longer than 5 minutes as well.
 This does not lift the safe-to-scale gate (`docs/ha-delivery-matrix.md`); running a second replica is still
 unsupported.
 
