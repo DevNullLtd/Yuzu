@@ -6,7 +6,7 @@ kind: InstructionDefinition
 metadata:
   id: windows.registry.get_value
   displayName: Get Registry Value
-  version: 1.0.0
+  version: 1.1.0
   description: >
     Read a value from the Windows registry. Value data is decoded for
     REG_SZ/REG_EXPAND_SZ/REG_DWORD/REG_QWORD; every other type, including
@@ -46,7 +46,7 @@ spec:
       - name: value
         type: string
         description: >-
-          The value's data, decoded to a display string. Never truncated or fabricated; a value over the registry's own limits fails the action rather than returning a partial string. Values: free text.
+          The value's data, decoded to a display string, for a value of at most 1 MiB (registry 2.0.1 and later; older agents read the whole value). Never truncated: a larger value fails the action with `error|value exceeds 1 MiB limit` rather than returning a partial string. Display text, not exact: `|`, every control character except TAB, DEL, the C1 controls (U+0080-U+009F), U+2028 and U+2029 each become `_` and trailing NULs are dropped, so those characters cannot be recovered from the row; get_value has no exact-bytes mode for a string value (the types it returns as hex are exact). Values: free text.
         example: "Windows 10 Pro"
         platforms: [windows]
       - name: type
@@ -140,7 +140,7 @@ spec:
       - name: value
         type: string
         description: >-
-          The value's data, decoded the same way get_value decodes it, plus REG_MULTI_SZ (records semicolon-joined) and REG_LINK (target string) — the two types get_value leaves hex-encoded — both sanitised against '|'/CR/LF so a value cannot forge a column or row. Values: free text.
+          The value's data as a display string: a REG_SZ, REG_EXPAND_SZ or REG_LINK value is read up to its first NUL (as Windows reads it; get_value shows an interior NUL as `_`), REG_MULTI_SZ records are semicolon-joined and REG_LINK gives its target (get_value leaves those two hex-encoded). Display text, not exact: the characters get_value's value column folds become `_` here too (registry 2.0.1 and later). Values: free text.
         example: "1"
         platforms: [windows]
       - name: type
@@ -380,7 +380,7 @@ spec:
       - name: subkey
         type: string
         description: >-
-          One immediate subkey name under the given key; zero rows means the key has no subkeys. Values: free text.
+          One immediate subkey name under the given key; zero rows means the key has no subkeys. Display text (registry 2.0.1 and later): `|`, every control character except TAB, DEL, the C1 controls, U+2028 and U+2029 each become `_`, so two names that differ only there render alike. Values: free text.
         example: "ProfileList"
         platforms: [windows]
   approval:
@@ -629,7 +629,7 @@ spec:
       - name: name
         type: string
         description: >-
-          The value's name; zero rows means the key has no values. Values: free text.
+          The value's name; zero rows means the key has no values. Display text (registry 2.0.1 and later): `|`, every control character except TAB, DEL, the C1 controls, U+2028 and U+2029 each become `_`, so two names that differ only there render alike. Values: free text.
         example: "ProductName"
         platforms: [windows]
       - name: type

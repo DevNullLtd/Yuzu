@@ -4,6 +4,7 @@
 #include "tar_cursor.hpp"
 
 #include "tar_db.hpp"
+#include "tar_registry_source.hpp"
 
 namespace yuzu::tar {
 
@@ -31,6 +32,10 @@ std::vector<std::unique_ptr<CursorSource>> make_cursor_sources() {
     std::vector<std::unique_ptr<CursorSource>> sources;
     sources.push_back(make_power_cursor_source());
     sources.push_back(make_removable_cursor_source());
+    // registry: Windows only. The production factory is nullptr elsewhere, and a
+    // null entry is not pushed so the vector never holds one.
+    if (auto registry = make_registry_cursor_source())
+        sources.push_back(std::move(registry));
     return sources;
 }
 

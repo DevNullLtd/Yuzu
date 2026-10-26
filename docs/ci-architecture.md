@@ -995,6 +995,28 @@ invocation selects `--suite platform` instead of `--suite docs` (the
 `assert-suite-cover.py` guard names `--exclude-suite docs`, so a missed
 label still fails loud.
 
+`Test (non-pg suites)` also carries the registry plugin's real-registry cases (#6488). It sets
+`YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1`, so a case that would skip (no `registry.dll`, or a process that
+cannot write `HKLM`; the job runs as LOCAL SYSTEM, which can) fails instead. The job-level
+`YUZU_TEST_REGISTRY_SCOPE` (`<run id>-<attempt>-<build type>`) puts every scratch key under
+`YuzuTest-<scope>-`, so two test phases sharing a box through the 2-slot gate judge only their own keys. The script
+scans only the direct children named `YuzuTest-*` of `HKLM\SOFTWARE`, its `Wow6432Node` and `HKCU\Software`; the
+local dispatcher's `Software\YuzuTest\RegistryPr17Ld_<salt>` keys (`test_registry_local_dispatcher.cpp:228,248`) are
+outside the scan.
+Before the suite, `Self-test the registry leftover check` plants a probe key under each root the script scans and proves both decisions of
+`scripts/ci/check-registry-test-leftovers.ps1` (the probe's own scope: exit 1 with an `::error` naming it; any
+other scope: exit 0 with a `::warning`); after it, `Assert this job left no YuzuTest-* registry keys behind` runs
+the same script with the job's scope; a root it cannot list fails the step (a missing root is skipped). The
+could-not-list arm has no self-test of its own (accepted residual): a persistent listing failure is caught pre-suite,
+because the self-test's probes go unnamed. It reports and never deletes (a leftover can be a registry link, and a
+tree delete follows links), so a key orphaned by a cancelled job stays as a warning in later jobs until a human
+removes it.
+
+Removing a leftover is the job of whoever owns the runner. For each `YuzuTest-*` key whose run is no longer in
+progress, open the key with `REG_OPTION_OPEN_LINK` and `DELETE` access, then call `NtDeleteKey` on that handle (a key
+with subkeys: delete them first, leaf first, the same way). Never use `Remove-Item -Recurse` or `RegDeleteTreeW`:
+both follow a registry link and can delete its target.
+
 `nightly.yml`'s `windows-asan` job now joins this same `with-test-slot.sh 2`
 gate and carries `--timeout-multiplier 2` (#4018) — previously it ran
 ungated, with no multiplier, on the shared 4-runner Wee Tam box. It shares
