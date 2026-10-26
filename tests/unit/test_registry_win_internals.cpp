@@ -711,6 +711,8 @@ TEST_CASE("Win32Registry::flush_key on a mounted scratch hive succeeds and the h
     const std::string src = "SOFTWARE\\" + yuzu::test::registry_scratch_prefix() + std::to_string(yuzu::test::process_random_salt()) + "-flushsrc";
     ScratchTree cleanup{src};
     yuzu::test::TempDir tmp{"yuzu_test_flush_"};
+    std::error_code mkdir_ec;
+    fs::create_directories(tmp.path, mkdir_ec); // TempDir only names the path: RegSaveKeyExW needs the directory to exist
     const fs::path hive_file = tmp.path / "scratch.hive";
     {
         yuzu::win::RegKey k;
