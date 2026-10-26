@@ -178,8 +178,8 @@ FORBIDDEN_HEADER_PATTERNS = [
     # to close, just for a different store header naming convention.
     "schedule_engine.hpp",
     "workflow_engine.hpp",
-    # WS-A4 S0 (Fable review of the WS-A4 plan, 2026-10-26): store-layer headers
-    # the `*_store.hpp` / `pg/*.hpp` / `agent_registry.hpp` patterns above are blind to — each is Postgres-backed
+    # WS-A4 S0: store-layer headers the `*_store.hpp` / `pg/*.hpp` /
+    # `agent_registry.hpp` patterns above are blind to - each is Postgres-backed
     # (`PgPool`) or fronts a store, yet is named neither `*_store.hpp` nor
     # `pg/*.hpp`. Before this, two unenforced-but-"clean" route TUs
     # (`approval_routes.cpp` -> `approval_manager.hpp` + `auth_db.hpp`,
@@ -199,10 +199,8 @@ FORBIDDEN_HEADER_PATTERNS = [
     "patch_manager.hpp",
     "deployment_engine.hpp",
     # `NvdDatabase` wraps a raw `sqlite3*` (the NVD CVE database) but is named
-    # `*_db.hpp`, so no pattern above saw it. Found by the Gate 2 review of this very
-    # change: the first draft of `STORE_FREE_PRESENTATION_TUS` enrolled
-    # `nvd_routes.cpp` as "store-free" although it calls
-    # `deps.nvd_db->match_inventory(...)`.
+    # `*_db.hpp`, so no pattern above saw it; `nvd_routes.cpp` calls it directly
+    # (`deps.nvd_db->match_inventory(...)`).
     "nvd_db.hpp",
 ]
 
@@ -632,7 +630,20 @@ FAMILIES = {
 # clean TUs are NOT auto-enrolled — add them here when they are written.
 # Being clean says nothing about being SEAMED: a TU here may still reach its data
 # through a provider closure that wraps a raw store in `server.cpp`; that is the
-# per-family seam work this list does not claim to have done.
+# per-family seam work this list does not claim to have done. Enrolment is a
+# REGRESSION LOCK, not seam progress.
+#
+# KNOWN LIMITS of "store-free" here (include-closure only, same as every family):
+#   - a header that merely FORWARD-DECLARES a store (`auth.hpp`, `authz_gates.hpp`,
+#     `dex_routes.hpp`, `preflight_routes.hpp`) is allowed; calling through it needs
+#     the full definition, which the closure walk would catch.
+#   - external angle headers (`<sqlite3.h>`, `<libpq-fe.h>`) are opaque to the walk;
+#     no enrolled closure includes either today.
+#   - a store-owning header that no pattern names stays invisible. Before enrolling
+#     MORE TUs, scan the union of their closures for headers owning a `PgPool` or a
+#     `sqlite3*` (today's unlisted owners include `*_owner.hpp`,
+#     `app_perf_{cohort_reader,group_reader,rollup}.hpp`, `sqlite_raii.hpp`) and add
+#     patterns first - the `nvd_db.hpp` miss was exactly this.
 STORE_FREE_PRESENTATION_TUS = [
     "server/core/src/access_audit_ui.cpp",
     "server/core/src/access_tokens_ui.cpp",
@@ -807,7 +818,9 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
         p = (roots.root / rel).resolve()
         if not p.is_file():
             gh("error", f"check-seam-closure: expected family TU not found: "
-                        f"{rel} (family {name!r})")
+                        f"{rel} (family {name!r}) - if it was renamed or deleted, "
+                        f"update that TU list here AND the frozen pin in "
+                        f"tests/test_seam_closure_selftest.py")
             ok = False
             continue
         existing.append(p)
@@ -830,7 +843,11 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
             gh("error",
                f"check-seam-closure: family {name!r}: {rel_tu} reaches "
                f"forbidden header {f.relative_to(roots.root)} (matches "
-               f"forbidden pattern {pat!r}) via include chain: {chain_str}")
+               f"forbidden pattern {pat!r}) via include chain: {chain_str}"
+               + (" - this TU is enrolled as store-free: route the data through an "
+                  "injected provider or a `*Api` seam instead of including the store "
+                  "(see STORE_FREE_PRESENTATION_TUS)"
+                  if name == "store_free_presentation" else ""))
             ok = False
     return ok
 

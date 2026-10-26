@@ -32,8 +32,10 @@ constants, not an external file the CI job could point elsewhere; instead
 this imports the checker module directly (`importlib.util.spec_from_file_
 location`, matching scripts/ci/test_check_pg_shard_partition.py's own
 established pattern for a hyphenated script) and calls its functions with
-explicit `Roots` overrides, so no monkeypatching of the real module globals
-is needed and the real repo tree is never touched by the probe.
+explicit `Roots` overrides, so the real repo tree is never touched by the probes.
+The one exception is check 19, which temporarily swaps the module's three check
+functions for recorders (restored in a `finally`) to observe how `run_check()`
+consumes its lists - the module is a private instance, never put in `sys.modules`.
 
 Wired into .github/workflows/docs-lint.yml alongside check-seam-closure.py
 itself. Stdlib only.
@@ -44,6 +46,7 @@ import contextlib
 import importlib.util
 import io
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -281,6 +284,8 @@ EXPECTED_EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthD
                                     "ScheduleEngine", "WorkflowEngine",
                                     "ApprovalManager", "DirectorySync", "UpdateRegistry",
                                     "PatchManager", "NvdDatabase"]
+# WS-A4 S0: the five tokens added by S0 are the tail of the pin (derived, so probe 18 cannot drift).
+S0_NEW_STORE_TYPE_TOKENS = EXPECTED_EXTRA_STORE_TYPE_TOKENS[-5:]
 
 
 def _fail(msg: str, failures: list) -> None:
@@ -363,6 +368,27 @@ def main() -> int:
                   failures)
     if len(set(mod.STORE_FREE_PRESENTATION_TUS)) != len(mod.STORE_FREE_PRESENTATION_TUS):
         _fail("STORE_FREE_PRESENTATION_TUS contains a duplicate entry", failures)
+
+    # 2e. The probe lists are DERIVED from the pins, never an independent copy (a
+    #     probe list that can drift from the pin silently shrinks coverage), and every
+    #     name the probes synthesise is a REAL header / type in the tree (probes 17/18
+    #     only prove "a pattern with this spelling fires"; a spelling that matches no
+    #     real file would pass them and protect nothing).
+    n_new = len(S0_NEW_FORBIDDEN_HEADERS)
+    if S0_NEW_FORBIDDEN_HEADERS != EXPECTED_FORBIDDEN_HEADER_PATTERNS[-n_new:]:
+        _fail("S0_NEW_FORBIDDEN_HEADERS is not the tail of EXPECTED_FORBIDDEN_HEADER_PATTERNS", failures)
+    for hdr in S0_NEW_FORBIDDEN_HEADERS:
+        real = list(mod.SERVER_SRC.rglob(hdr)) + list(mod.SERVER_INCLUDE.rglob(hdr))
+        if not real:
+            _fail(f"S0 forbidden header {hdr!r} names no real header under server/core - a "
+                  f"misspelt pattern would pass probe 17 and protect nothing", failures)
+    headers_text = "\n".join(
+        h.read_text(encoding="utf-8", errors="replace")
+        for h in list(mod.SERVER_SRC.rglob("*.hpp")) + list(mod.SERVER_INCLUDE.rglob("*.hpp")))
+    for tok in S0_NEW_STORE_TYPE_TOKENS:
+        if not re.search(r"\b(?:class|struct)\s+" + re.escape(tok) + r"\b", headers_text):
+            _fail(f"S0 store-type token {tok!r} is not declared as a class/struct in any "
+                  f"server/core header - a misspelt token would pass probe 18", failures)
 
     # 3. Missing-family-member HARD ERROR: a declared TU that does not exist
     #    on disk must fail the family check, never be silently skipped.
@@ -654,46 +680,56 @@ def main() -> int:
             if ok:
                 _fail(f"check_family did not fire on a synthetic TU including {hdr} - the "
                       f"WS-A4 S0 pattern is inert", failures)
-            elif hdr not in captured17.getvalue():
+            elif f"forbidden pattern '{hdr}'" not in captured17.getvalue():
                 _fail(f"S0 probe for {hdr} fired but did not name it; stderr: "
                       f"{captured17.getvalue()!r}", failures)
 
-        # 18. WS-A4 S0 TOKEN PROBE: each new type-name token must fire in an abstract header.
-        for tok in ("ApprovalManager", "DirectorySync", "UpdateRegistry", "PatchManager",
-                    "NvdDatabase"):
+        # 18. WS-A4 S0 TOKEN PROBE: each new type-name token must fire in an abstract header,
+        #     be NAMED by the message, and a longer identifier that merely starts with it
+        #     (`<Tok>Foo`) must NOT fire (the `\\b` boundary).
+        for tok in S0_NEW_STORE_TYPE_TOKENS:
             (src / f"abs_s0_{tok}_api.hpp").write_text(
                 f"#pragma once\nclass {tok};\nint use_it({tok}* p);\n", encoding="utf-8")
             captured18 = io.StringIO()
             with contextlib.redirect_stderr(captured18):
                 ok = mod.check_abstract_headers_store_type_free(
                     [f"server/core/src/abs_s0_{tok}_api.hpp"], roots=roots)
-            if ok or tok not in captured18.getvalue():
+            if ok or f"store type '{tok}'" not in captured18.getvalue():
                 _fail(f"abstract-header probe did not fire / name the WS-A4 S0 token {tok!r}",
                       failures)
+            (src / f"abs_s0_{tok}_neg_api.hpp").write_text(
+                f"#pragma once\nclass {tok}Foo;\nint use_it({tok}Foo* p);\n", encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()):
+                ok = mod.check_abstract_headers_store_type_free(
+                    [f"server/core/src/abs_s0_{tok}_neg_api.hpp"], roots=roots)
+            if not ok:
+                _fail(f"abstract-header probe over-fired on `{tok}Foo` - the token's word "
+                      f"boundary is gone", failures)
 
-    # 19. run_check() WIRING (Gate 2 S0-2): every check above exercises a helper or a
-    #     constant in isolation, so nothing observed how run_check() CONSUMES them -
-    #     deleting the store-free lane's call, passing it `[]`, overriding its patterns,
-    #     or turning a FAMILIES loop body into `pass` all left both scripts green. Swap the
-    #     three check functions for recorders and assert run_check() calls each with exactly
-    #     the module's own list and no override, and that a failing lane fails the run.
+    # 19. run_check() WIRING: every check above exercises a helper or a constant in
+    #     isolation, so nothing observed how run_check() CONSUMES them - deleting a lane's
+    #     call, passing it `[]`, overriding its patterns/roots, ignoring its result, or turning
+    #     a FAMILIES loop body into `pass` all left both scripts green. Swap the three check
+    #     functions for recorders and assert run_check() calls each lane exactly once with the
+    #     module's own list and no override, and that ANY failing lane fails the run.
     real_fns = (mod.check_family, mod.check_impl_purity, mod.check_abstract_headers_store_type_free)
+    first_family = next(iter(mod.FAMILIES))
     try:
-        for failing_name in (None, "store_free_presentation", "network"):
-            seen_family: dict = {}
-            seen_other: dict = {}
+        for failing in (None, "store_free_presentation", first_family, "impl", "abstract"):
+            fam_calls: list = []
+            other_calls: dict = {"impl": [], "abstract": []}
 
-            def fake_family(name, tus, *a, _failing=failing_name, **kw):
-                seen_family[name] = (list(tus), a, dict(kw))
+            def fake_family(name, tus, *a, _failing=failing, **kw):
+                fam_calls.append((name, list(tus), a, dict(kw)))
                 return name != _failing
 
-            def fake_impl(tus, *a, **kw):
-                seen_other["impl"] = (list(tus), a, dict(kw))
-                return True
+            def fake_impl(tus, *a, _failing=failing, **kw):
+                other_calls["impl"].append((list(tus), a, dict(kw)))
+                return _failing != "impl"
 
-            def fake_abstract(headers, *a, **kw):
-                seen_other["abstract"] = (list(headers), a, dict(kw))
-                return True
+            def fake_abstract(headers, *a, _failing=failing, **kw):
+                other_calls["abstract"].append((list(headers), a, dict(kw)))
+                return _failing != "abstract"
 
             mod.check_family = fake_family
             mod.check_impl_purity = fake_impl
@@ -703,23 +739,23 @@ def main() -> int:
                 rc = mod.run_check()
             want = {name: spec["tus"] for name, spec in mod.FAMILIES.items()}
             want["store_free_presentation"] = mod.STORE_FREE_PRESENTATION_TUS
-            if set(seen_family) != set(want):
-                _fail(f"run_check() checked families {sorted(seen_family)!r}, expected "
-                      f"{sorted(want)!r} (failing={failing_name!r})", failures)
-            for name, tus in want.items():
-                got = seen_family.get(name)
-                if got is None:
-                    continue
-                if got[0] != list(tus) or got[1] or got[2]:
-                    _fail(f"run_check() called check_family({name!r}) with {got!r}, expected "
-                          f"exactly the module list and NO extra args/overrides", failures)
-            if seen_other.get("impl", (None,))[0] != list(mod.IMPL_TUS) or \
-                    seen_other.get("abstract", (None,))[0] != list(mod.ABSTRACT_API_HEADERS):
-                _fail("run_check() did not pass IMPL_TUS / ABSTRACT_API_HEADERS to its checks", failures)
-            if (rc == 0) != (failing_name is None):
-                _fail(f"run_check() returned {rc} with check_family({failing_name!r}) failing - a "
-                      f"failing lane must fail the run, and a clean run must return 0", failures)
-            if failing_name is None and f"{len(mod.STORE_FREE_PRESENTATION_TUS)} store-free" \
+            names = [c[0] for c in fam_calls]
+            if sorted(names) != sorted(want):
+                _fail(f"run_check() called check_family for {sorted(names)!r}, expected exactly "
+                      f"once each for {sorted(want)!r} (failing={failing!r})", failures)
+            for name, tus, a, kw in fam_calls:
+                if name in want and (tus != list(want[name]) or a or kw):
+                    _fail(f"run_check() called check_family({name!r}) with {(tus, a, kw)!r}, "
+                          f"expected exactly the module list and NO extra args/overrides", failures)
+            for lane, want_list in (("impl", mod.IMPL_TUS), ("abstract", mod.ABSTRACT_API_HEADERS)):
+                calls = other_calls[lane]
+                if len(calls) != 1 or calls[0][0] != list(want_list) or calls[0][1] or calls[0][2]:
+                    _fail(f"run_check() must call the {lane} lane exactly once with the module "
+                          f"list and no override; got {calls!r} (failing={failing!r})", failures)
+            if (rc == 0) != (failing is None):
+                _fail(f"run_check() returned {rc} with the {failing!r} lane failing - any failing "
+                      f"lane must fail the run, and a clean run must return 0", failures)
+            if failing is None and f"{len(mod.STORE_FREE_PRESENTATION_TUS)} store-free" \
                     not in captured19.getvalue():
                 _fail("run_check() OK line does not report the store-free TU count", failures)
     finally:
