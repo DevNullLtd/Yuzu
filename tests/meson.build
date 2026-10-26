@@ -353,6 +353,7 @@ agent_test_exe = executable(
     'unit/test_launchd_state.cpp',      # A0 fix round: launchd_state_for (yuzu/agent/launchd_state.hpp)
     'unit/test_wmi_bounded.cpp',        # shared bounded WMI helper (roadmap C-8 extraction); header-only, no separate .cpp to list
     'unit/test_wmi_error_token.cpp',    # #4895: shared stage-aware WMI token classifier (agents/shared/wmi_error_token.hpp), portable
+    'unit/test_inventory_status_row.cpp', # shared inventory status-row grammar (agents/shared/inventory_status_row.hpp), portable
     'unit/test_installed_apps_registry_utf8.cpp',
     'unit/test_service_binpath.cpp',
     'unit/test_agent_log_options.cpp', # #4666 PR-2: make_log_handoff_options CLI-flags translator
@@ -1955,7 +1956,13 @@ if build_server
       # yuzu_proto_headers_dep - a DOWNWARD edge for both server and agent, no cycle, no
       # new build-graph node. NOT sdk/, which is the public plugin ABI surface.
       include_directories('../agents/core/src'),
-      include_directories('../agents/shared'), # test_plugin_result_audit.cpp: registry_parsers.hpp's OS-free shared includes
+      # test_plugin_result_audit.cpp includes registry_parsers.hpp, whose OS-free includes (user_profile_model.hpp,
+      # wire_utf8.hpp) live in agents/shared. WHY it is on the whole executable: include_directories is per target,
+      # not per source, so every TU of this executable now sees agents/shared too. The risk is real and silent: a
+      # header of the same name in two include dirs is resolved by include-directory order, never a compile error. So a
+      # new agents/shared header needs a name no server test header or other include dir of this executable uses
+      # (none collide today).
+      include_directories('../agents/shared'),
     ],
     # httplib.h is header-only and its Client/Server class layout depends on
     # CPPHTTPLIB_OPENSSL_SUPPORT — yuzu_server_core compiles every TU with

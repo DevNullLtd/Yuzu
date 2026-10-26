@@ -174,6 +174,7 @@ struct RegistryWriter {
     virtual long open_path(Handle root, std::string_view key_path, std::uint32_t access, Handle& out) = 0;
     /// NtQueryKey(KeyNameInformation): the canonical kernel name of the object `key` is bound to (UTF-8,
     /// e.g. `\REGISTRY\MACHINE\SOFTWARE\Acme`). Any failure, a name that does not fit included, is non-zero.
+    /// Exact: a name that does not round-trip UTF-16 to UTF-8 (a NUL, a lone surrogate) is a failure.
     virtual long final_name(Handle key, std::string& out) = 0;
     /// The kernel name of the predefined root `root`, cached by the shell. Only HKLM and HKU have one: HKCU
     /// resolves per calling user and HKCR is a merged view, so for them (and on any failure) it is non-zero.
@@ -300,8 +301,8 @@ struct Opened {
 /// equates two names the kernel keeps distinct. A name that differs only in non-ASCII case compares unequal:
 /// the fast open declines and the walk's own name test (leaf_name_check) refuses it.
 [[nodiscard]] inline bool names_equal_ascii_ci(std::string_view a, std::string_view b) {
-    const auto fold = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; };
-    return std::equal(a.begin(), a.end(), b.begin(), b.end(), [&](char x, char y) { return fold(x) == fold(y); });
+    return std::equal(a.begin(), a.end(), b.begin(), b.end(),
+                      [](char x, char y) { return detail::lower_ascii(x) == detail::lower_ascii(y); });
 }
 
 /// The fast open (see the file banner). ACCEPT => `fast` is set and `leaf` is the checked handle; every

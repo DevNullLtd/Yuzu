@@ -3,13 +3,15 @@
 registry plugin's typed verified writes: the nine definition ids, the six-type enum on set_value,
 delete_key's five result columns in order (compatible-by-append: `status` stays first) and its
 non-recursive wording, and the role gates on every mutating definition.
-It compares the YAML with the literals below; it does not read the C++ (the wire rows are pinned
-by tests/unit/test_registry_parsers.cpp / test_registry_core.cpp).
+It compares the YAML with the literals below; it reads the C++ only for one lexical pin on the
+Windows fixtures' scratch-key names (the wire rows are pinned by tests/unit/test_registry_parsers.cpp /
+test_registry_core.cpp).
 
 Runnable standalone: `python3 tests/test_registry_definition.py` (how meson runs it; a bare
 pytest-style file with no runner would execute zero assertions and always exit 0).
 """
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -133,13 +135,34 @@ class RegistryDefinitionPins(unittest.TestCase):
                 self.assertEqual(_spec(action)["compatibility"]["minAgentVersion"], "0.15.0")
 
     def test_definition_versions_and_the_plugin_doc_version(self):
-        want = {"set_value": "1.1.0", "delete_value": "1.1.0", "delete_key": "1.1.0"}
+        want = {"get_value": "1.1.0", "set_value": "1.1.0", "delete_value": "1.1.0", "delete_key": "1.1.0"}
         got = {d["spec"]["execution"]["action"]: d["metadata"]["version"] for d in _definitions().values()}
         for action, version in want.items():
             with self.subTest(action=action):
                 self.assertEqual(got[action], version)
         docs = json.loads((REPO_ROOT / "content" / "plugin-docs" / "registry.json").read_text(encoding="utf-8"))
-        self.assertEqual(docs["version"], "2.0.0")
+        self.assertEqual(docs["version"], "2.0.1")
+
+    def test_no_registry_fixture_spells_the_scratch_key_stem_itself(self):
+        # tests/unit/test_helpers.hpp registry_scratch_prefix() is the one place the `YuzuTest-` stem is written: it
+        # adds the CI job scope that scripts/ci/check-registry-test-leftovers.ps1 keys on (#6488). A fixture that
+        # spells its own "YuzuTest-..." key bypasses the scope, so a key it leaks is invisible to the per-job check.
+        # Lexical: the quoted and backslash-prefixed spellings in code lines (comments are skipped).
+        fixtures = sorted((REPO_ROOT / "tests" / "unit").glob("test_registry_*.cpp"))
+        self.assertTrue(fixtures)
+        for path in fixtures:
+            with self.subTest(file=path.name):
+                lines = [n for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+                         if not line.strip().startswith(("//", "*")) and re.search(r'["\\]YuzuTest-', line)]
+                self.assertEqual(lines, [], "build the key name from yuzu::test::registry_scratch_prefix()")
+
+    def test_the_scope_variable_is_spelt_the_same_by_its_producer_and_consumers(self):
+        # Lexical pin: CI sets YUZU_TEST_REGISTRY_SCOPE and the fixtures read it; a rename in one place would leave the
+        # leftover check (handed the scope as -Scope) judging a scope no fixture uses.
+        for rel, spelling in (("tests/unit/test_helpers.hpp", 'getenv("YUZU_TEST_REGISTRY_SCOPE")'),
+                              (".github/workflows/ci.yml", "YUZU_TEST_REGISTRY_SCOPE: ")):
+            with self.subTest(file=rel):
+                self.assertIn(spelling, (REPO_ROOT / rel).read_text(encoding="utf-8"))
 
     def test_the_writers_are_classified_destructive_for_the_risk_gate(self):
         overrides = json.loads((REPO_ROOT / "scripts" / "test" / "instructions-risk-classification.json")
