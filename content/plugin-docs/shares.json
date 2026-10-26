@@ -28,10 +28,9 @@
     }
   ],
   "caveats": [
-    "**No documented customer driver.** No documented customer driver for this plugin was found (as in `mgmt_posture`'s caveat); it exists to answer what this host exposes over SMB and NFS, which no other plugin reports. Pure capability-gap reasoning.",
-    "**Configured, not live; some Samba scope is not read.** Linux reports what the files say, not whether `nfsd` or `smbd` runs or what a client sees. The Samba registry backend, `include =` files and usershares are reported as `constrained` tokens, never as a wrong share list. `[global]` parameters written after a share section apply to it here but not in Samba.",
-    "**Windows and macOS are planned.** The Windows `NetShareEnum` level-2 read, which will flag the administrative `STYPE_SPECIAL` shares (`ADMIN$`, `IPC$`, drive shares) as `special` rather than hide them, and the macOS share-point and `/etc/exports` read are not implemented; each leg reports one `unsupported` row, `windows:planned` or `macos:planned`.",
-    "**Names and paths can identify people.** See the sensitivity bullet: a share name or path may contain an account name, so dispatch is gated at `Infrastructure:Read` (the stored result is readable by `Response:Read` holders, as for every plugin) and the definition says so."
+    "**Configured, not live; some Samba scope is not read.** Linux reports what the files say, not whether `nfsd` or `smbd` runs or what a client sees. The Samba registry backend, `include =` files and usershares are reported as `constrained` tokens, never as a wrong share list, and `[global]` parameters written after a share section apply to it here but not in Samba.",
+    "**The access flags are approximations of the written configuration.** The SMB anonymous flag reflects `guest ok` alone, and `mixed` uses a read or write list only as a presence test, never reading its names. Share names and paths can identify people (Samba `[homes]` and per-user shares), so dispatch is gated at `Infrastructure:Read`.",
+    "**Windows and macOS are planned.** The Windows `NetShareEnum` level-2 read, which would flag the administrative `STYPE_SPECIAL` shares (`ADMIN$`, `IPC$`, drive shares) as `special` rather than hide them, and the macOS share-point and `/etc/exports` read are not implemented. Each leg reports one `unsupported` row, `windows:planned` or `macos:planned`."
   ],
   "definitions": [
     {
@@ -57,7 +56,7 @@
     }
   ],
   "description": "Shares this host serves over SMB/NFS: names, paths and a few flags, never ACLs",
-  "how_it_works": "`list` reports the shares this host is configured to serve over SMB and NFS: names, paths, read-only or read-write, whether anonymous access is configured, and a few flags. For SMB the anonymous flag reflects `guest ok` as written: whether a client can actually connect as guest also depends on global authentication settings (`map to guest`, `security`). It reads local configuration files and changes nothing. The first row is always a `status` row saying whether the read was complete, then one `source` row per source the leg knows about (so zero `share` rows is never an ambiguous empty success), then the `share` rows. These are configured exports, not live `nfsd` or `smbd` state, and they are not the mapped-drive and session observations `tar` records for `mapdrive` (which track mappings this host makes and sessions against its shares). ACLs, `valid users` and NFS client host lists are never emitted: an NFS export carries a client count (`clients_<n>`) and an `anonymous` flag only.\n\nOn Linux the leg reads `/etc/exports`, the `/etc/exports.d/*.exports` snippets and `/etc/samba/smb.conf` with bounded reads that never follow a symlink at the final path component (a symlinked ancestor directory is followed), under one row and byte budget per listing. The exports files use the `exports(5)` grammar. `smb.conf` is parsed with Samba's own semantics: lines before the first `[header]` belong to `[global]`, parameter synonyms collapse to one key so the last occurrence wins, a `copy =` chain and `[global]` are consulted when a share does not set a value itself, and Samba's built-in defaults apply last. A line the parser cannot read (a UTF-8 BOM on the first line, an unterminated `[header`, a relative or option-first exports line) is skipped without a count, as `nfsd` and `testparm` reject it too.",
+  "how_it_works": "`list` reports the shares this host is configured to serve over SMB and NFS: for each, the name, the path, read-only or read-write, whether anonymous access is configured, and a few flags. It reads three kinds of local configuration file and changes nothing, so the answer is what the files declare, not what `nfsd` or `smbd` is serving right now. Rows come in a fixed order. A `status` row comes first and says whether the read was complete. One `source` row follows for each source the leg knows about (`exports`, `exports_d`, `smb_conf`), saying `read`, `absent`, `refused` or `failed`, so zero `share` rows is never an ambiguous empty success. The `share` rows come last. On Linux the leg reads `/etc/exports`, the `/etc/exports.d/*.exports` snippets and `/etc/samba/smb.conf` with bounded reads that never follow a symlink at the final path component (a symlinked ancestor directory is followed), under one row and byte budget for the whole listing. Exports lines follow the `exports(5)` grammar. `smb.conf` is read the way Samba reads it in the main: lines before the first `[header]` belong to `[global]`, parameter synonyms collapse to one key so the last occurrence wins, a share that sets nothing itself inherits through its `copy =` chain, then `[global]`, then Samba's built-in defaults. One known difference is in caveat 1. Access control lists, `valid users` and NFS client host lists are never read into a row; an NFS export carries a client count and an anonymous flag only. These rows are not the mapped-drive and session observations `tar` records for `mapdrive`, which track mappings this host makes.",
   "inputs": [],
   "kind": {
     "collector": true,
@@ -175,22 +174,22 @@
   "privileges": [
     {
       "grant": "n/a",
-      "if_refused": "n/a — the placeholder reports `unsupported` with `windows:planned`",
+      "if_refused": "n/a (the placeholder reports `unsupported` with `windows:planned`)",
       "measured": "n/a",
       "os": "Windows",
-      "runs_as": "n/a — the leg reads nothing (caveat 3)"
+      "runs_as": "n/a (the leg reads nothing, caveat 3)"
     },
     {
       "grant": "n/a",
-      "if_refused": "n/a — the placeholder reports `unsupported` with `macos:planned`",
+      "if_refused": "n/a (the placeholder reports `unsupported` with `macos:planned`)",
       "measured": "n/a",
       "os": "macOS",
-      "runs_as": "n/a — the leg reads nothing (caveat 3)"
+      "runs_as": "n/a (the leg reads nothing, caveat 3)"
     },
     {
       "grant": "None: `/etc/exports`, `/etc/exports.d/*.exports` and `/etc/samba/smb.conf` are world-readable (0644) on stock packages. A site that tightens them can grant read access to the agent account, or accept the token",
       "if_refused": "`PERMISSION_DENIED` / partial with `linux:shares:<source>:permission_denied` when a source was refused and none was read, `CONSTRAINED` when another source was read; the source row says `refused`",
-      "measured": "Not measured on the `yuzu` account; see Sample output for the capture",
+      "measured": "Not measured on the `yuzu` account; the sample was captured as `euid 0` in a container",
       "os": "Linux",
       "runs_as": "agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`)"
     }

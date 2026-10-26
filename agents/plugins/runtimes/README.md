@@ -14,18 +14,67 @@
 
 ## How it works
 
-`dotnet` and `jvm` each answer one software-inventory question: which language runtimes are installed on this host. The Linux leg walks the standard install roots with no-follow directory opens and reads metadata files only: `dotnet` lists `shared/<framework>/<version>` and `sdk/<version>` directory names under `/usr/share/dotnet`, `/usr/lib/dotnet` and `/usr/lib64/dotnet`; `jvm` reads the `release` file of every home under `/usr/lib/jvm`, `/opt/java`, `/usr/lib64/jvm` (openSUSE, SLES) and `/var/opt/java` (rpm-ostree hosts, where `/opt` links there), and reports a home that has a java binary but no `release` file (some distro OpenJDK 8 packages) with version `-` (its `install_path` names the major, for example `java-8-openjdk-amd64`). A candidate root on, under or containing a network mount is not opened (caveat 5). The plugin is zero-subprocess: no `java` or `dotnet` process is ever run, and every fact is a directory name or a file the runtime's installer laid down. Every action writes one `status` row first, then zero or more runtime rows, so an empty list is never inferred from silence. The plugin is read-only and complements `installed_apps`: it reads the runtime's own install tree, so under those roots it also sees runtimes no package manager owns, and it does no vulnerability matching (a row is presence and the upstream version at read time, not an assessment).
-
-Two decision records sit next to this plugin; it closes neither. ADR-0028 (agent component inventory), Decision 1(b), targets *"Embedded-runtime (Electron/Chromium/Node) detection... This is the single largest silent-false-negative class on a corporate fleet (Slack, Teams, Discord, VS Code) — the parent app's own version reflects none of the embedded runtime's CVE surface."* This plugin inventories installed .NET and JVM runtimes and does not detect embedded ones, and ADR-0028 is itself recorded as accepted but deferred. ADR-0024 (software licensing and entitlements) lists *"Java runtimes — vendor/distribution/version, Oracle JDK vs the OpenJDK builds..."* as a `license_scan` probe tracked by #2112, which stays open. The `vendor` field of `jvm` is the build's self-reported `IMPLEMENTOR` string: an input to a licensing audit, not proof of the licence.
+`dotnet` and `jvm` each answer one question: which .NET or Java runtimes are installed on this host. On Linux the plugin walks a fixed list of install roots and reads names and small metadata files only; it never starts `java` or `dotnet`. `dotnet` lists the `shared/<framework>/<version>` and `sdk/<version>` directory names under `/usr/share/dotnet`, `/usr/lib/dotnet` and `/usr/lib64/dotnet`. `jvm` reads the `release` file of every home under `/usr/lib/jvm`, `/opt/java`, `/usr/lib64/jvm` and `/var/opt/java`; a home that has a java binary but no `release` file (some distribution OpenJDK 8 packages) is still listed, with version `-` and a `release_missing` constraint. Every directory is opened without following symlinks, and a root on, under or containing a network mount is not opened at all. Each action writes one `status` row first, then zero or more runtime rows, so an empty list is never inferred from silence. On macOS and Windows both actions answer a single `unsupported` status row. The plugin is read-only, does no vulnerability matching (a row is presence and the upstream version string, not an assessment) and does not detect runtimes embedded inside other applications such as Electron or Node bundles. The `vendor` field of `jvm` is the build's self-reported `IMPLEMENTOR` string: an input to a licensing review, not proof of the licence.
 
 ```mermaid
 flowchart LR
   OP[Operator / workflow] --> SRV[Server<br/>authz: Inventory.Read]
   SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[runtimes.execute]
-  EX --> LIN[Linux leg<br/>no-follow directory walks + release file reads]
-  EX --> PLN[macOS and Windows legs<br/>status row only: <os>:planned]
+  EX --> LIN[Linux leg<br/>no-follow directory walks and release file reads]
+  EX --> PLN["macOS and Windows legs<br/>status row only: planned"]
   LIN & PLN --> ROWS[status row + runtime rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
 ```
+
+### What you can decide with it
+
+| Question | Linux | macOS and Windows |
+|---|---|---|
+| Which .NET shared frameworks and SDKs are installed, and at what exact version? (`dotnet`) | One row per framework or SDK version directory under the three roots, including hosts where no package manager owns the install | Nothing: one `unsupported` row, result status `UNAVAILABLE` |
+| Which JVMs are installed, JDK or JRE, which version, from which vendor? (`jvm`) | One row per home under the four roots; flavour and vendor come from the `release` file, so Debian and SUSE builds report flavour `unmodelled` | Nothing, as above |
+| Is this host running an end-of-life runtime? | Yes, by comparing the `version` column against your own support list; the plugin attaches no verdict | Not answerable |
+
+What a result proves. `supported` with zero runtime rows means none was found at the standard roots; it does not mean none is installed (a runtime in `/usr/java`, under a version manager in a home directory or in a custom prefix is not walked). `constrained` means a read failed, was skipped (a network mount) or hit a cap, so the rows may be incomplete; read the reason tokens before trusting a negative. A runtime reachable only through a symlinked alias entry can be missed (caveat 2). For the packaged-application view use `installed_apps`; for a licensing probe use `license_scan`.
+
+### Diagrams
+
+#### One action's walk
+
+```mermaid
+flowchart TD
+  S[Read mount table once] --> R[Next candidate root]
+  R --> N{Root on, under or containing a network mount?}
+  N -- yes --> SK[Skip root and record network_fs_skipped]
+  N -- no --> O[Open root hop by hop without following links]
+  O --> Q{Opened?}
+  Q -- absent --> R
+  Q -- refused or failed --> F[Record the failure token]
+  Q -- opened --> W[List entries and read release files within the caps]
+  W --> B{Row, byte or entry cap reached?}
+  B -- yes --> RC[Stop the walk and record row_cap]
+  B -- no --> R
+  SK --> R
+  F --> R
+  R -- no roots left --> D[Write status row then runtime rows]
+  RC --> D
+```
+
+The mount table is read once per dispatch. A candidate on a network mount is never touched, because an open on a dead hard mount would pin one of the agent's shared command workers. The caps apply across all roots and nesting levels together, so a large tree ends the walk with `row_cap` and a `CONSTRAINED` result rather than a silent truncation.
+
+#### How a JVM home becomes a row
+
+```mermaid
+flowchart TD
+  H[A directory under a JVM root] --> RF{release file}
+  RF -- present and readable --> V{JAVA_VERSION or JAVA_RUNTIME_VERSION present?}
+  V -- yes --> ROW[Row with version, flavour and vendor]
+  V -- no --> UP[No row, record release_unparsable]
+  RF -- unreadable or oversized --> RE[No row, record the read failure]
+  RF -- absent --> BJ{bin/java or jre/bin/java is a file or link?}
+  BJ -- yes --> RM["Row with version - and flavour unmodelled, record release_missing"]
+  BJ -- no --> NH[Not a JVM home, silently ignored]
+```
+
+A home with no `release` file is only reported when a java binary proves it is a JVM, and then it carries no version: the plugin does not run `java -version`. Such a host reads `constrained` for as long as the package is installed.
 
 ## OS capability
 
@@ -47,11 +96,11 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | n/a — the leg reads nothing (caveat 1) | n/a | n/a | `status\|<action>\|unsupported\|windows:planned`, result status `UNAVAILABLE` |
-| macOS | n/a — the leg reads nothing (caveat 1) | n/a | n/a | `status\|<action>\|unsupported\|macos:planned`, result status `UNAVAILABLE` |
-| Linux | agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md:12`) | None expected — stock install trees under `/usr`, `/opt` and `/var/opt/java` are world-readable (0755 directories, 0644 `release` files); not measured as `yuzu` (see Measured) | real-capture fixtures of the walked trees (`tests/unit/fixtures/wave10/runtimes/linux/provenance.txt`); the live-agent capture `docs/samples/linux.txt` ran as `euid 0` in a container. The unprivileged read rests on the stock file modes (0755 directories, 0644 `release`, observed on the stock images) and on a probe of the production walk as uid 65534 that returned the same rows as root over stock-mode trees (recorded in this PR's governance ledger, `governance.d/4794-runtimes-plugin.*.jsonl`; not a committed test) | `status\|<action>\|constrained\|linux:runtimes:permission_denied`; rows read before the refusal are still returned, and a later readable root never hides it |
+| Windows | n/a (the leg reads nothing, caveat 1) | n/a | n/a | n/a (the placeholder answers `status\|<action>\|unsupported\|windows:planned`, result status `UNAVAILABLE`) |
+| macOS | n/a (the leg reads nothing, caveat 1) | n/a | n/a | n/a (the placeholder answers `status\|<action>\|unsupported\|macos:planned`, result status `UNAVAILABLE`) |
+| Linux | agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`) | None expected: the stock install trees under `/usr`, `/opt` and `/var/opt/java` are world-readable (0755 directories, 0644 `release` files) | Walked trees are captured as test fixtures (`tests/unit/fixtures/wave10/runtimes/linux/provenance.txt`); the live sample was taken as `euid 0` in a container, not as `yuzu` | `status\|<action>\|constrained\|linux:runtimes:permission_denied`; rows read before the refusal are still returned, and a later readable root never hides it |
 
-No external binaries, no subprocesses, no shell-out, no network use: the plugin opens directories and reads files only. Every directory is opened `O_NOFOLLOW` hop by hop and enumerated with a per-directory entry cap (16,384); the `release` read is bounded to 64 KiB and each recognised value to 256 bytes; one action's whole walk is bounded to 4,096 rows, 1 MiB of row text and 65,536 directory entries visited (`row_cap`). A candidate root on, under or containing a network mount (by filesystem type, from `/proc/self/mountinfo` read once per dispatch) is not opened and records `network_fs_skipped`: an open on a hard mount whose server is down can block for minutes and pins one of the agent's shared command workers (caveat 5 lists what the guard cannot see).
+No external binaries, no subprocesses, no shell-out, no network use: the plugin opens directories and reads files only. Every directory is opened `O_NOFOLLOW` hop by hop and listed with a per-directory entry cap of 16,384; a `release` read is bounded to 64 KiB and each recognised value to 256 bytes; one action's whole walk is bounded to 4,096 rows, 1 MiB of row text and 65,536 directory entries visited (`row_cap`). A root on, under or containing a network mount (by filesystem type, from `/proc/self/mountinfo`) is not opened and records `network_fs_skipped`; caveat 5 lists what that guard cannot see.
 
 ## Data contract
 
@@ -122,11 +171,11 @@ status|jvm|supported|-
 
 ## Caveats and known gaps
 
-1. **macOS and Windows legs are planned.** Only the Linux leg ships; on macOS and Windows every action reads nothing and answers `status|<action>|unsupported|<os>:planned`. .NET Framework (the Windows registry family) arrives with the Windows leg, and the flavour vocabulary above is the Linux subset until then.
-2. **Runtimes reachable only through an alias entry are not listed.** A framework, version or JVM home entry that is itself a symlink (Debian `default-java`, Fedora `java`) is skipped silently because its real directory is a sibling entry; a runtime reachable only through such a link is missed. A symlink at a candidate root that is not a same-action alias is a `symlink_refused` constraint, not a skip.
-3. **Only standard locations are walked.** `dotnet`: `/usr/share/dotnet`, `/usr/lib/dotnet`, `/usr/lib64/dotnet`; `jvm`: `/usr/lib/jvm`, `/opt/java`, `/usr/lib64/jvm`, `/var/opt/java`. A runtime installed elsewhere (an Oracle-RPM `/usr/java`, a version manager under a home directory, a tarball unpacked to a custom prefix) is not found, by design: the plugin does not search user profiles. So `supported` with zero rows means none found at these roots, not that none is installed.
-4. **Some OpenJDK 8 packages ship no `release` file.** Measured: Ubuntu 22.04 `openjdk-8-jre-headless`, Rocky 9 `java-1.8.0-openjdk-headless` and Alpine 3.20 `openjdk8-jre-base` ship none; other packages may ship one. A home with `bin/java` or `jre/bin/java` but no `release` file is reported with version `-`, flavour `unmodelled` and a `release_missing` constraint, so such a host reads `constrained` for as long as it is installed; the `install_path` names the major. A `java` that is not a regular file or a symlink is not a JVM, and a symlinked `bin` or `jre` with no binary found through the other route records `symlink_refused`. Reading the version would need the package manager or `java -version`, which this plugin never uses.
-5. **Network mounts are skipped by filesystem type, from a dispatch-start snapshot.** A candidate root on, under or containing a mount of a listed network type (`yuzu::shared::is_network_fstype`: `nfs`, `nfs3`, `nfs4`, `cifs`, `smb3`, `9p`, `virtiofs`, `gpfs`, `vmhgfs`, `autofs`, network `fuse.*`, ...) is never opened and records `network_fs_skipped`, so a healthy network-mounted JDK is skipped too, and a host whose `/` is a network or virtiofs mount skips every candidate. `/proc/self/mountinfo` is read once per dispatch and streamed (an unreadable file or a table over 256 MiB records `mountinfo_unreadable` and the walk is then guarded only by the mounts read; a single line over 64 KiB may be skipped (one over 128 KiB always is), which records the same token and does not stop the scan). The guard cannot see a mount that appears after the snapshot, a stacked filesystem (an `overlay`, `ecryptfs` or loop device over a dead network mount reports its own local type), a network or FUSE type the list does not name (a bare `fuse` mount among them), or a hang on a local block device: each can pin one of the agent's shared command workers until the kernel returns, and closing that class needs a bounded-call seam in agent core (#4875).
+1. **macOS and Windows legs are planned.** Only the Linux leg ships; on macOS and Windows both actions read nothing and answer `status|<action>|unsupported|<os>:planned`. .NET Framework (the Windows registry family) is not covered until the Windows leg exists, and the flavour vocabulary above is the Linux subset.
+2. **Runtimes reachable only through an alias entry are not listed.** A framework, version or JVM home entry that is itself a symlink (Debian `default-java`, Fedora `java`) is skipped silently because its real directory is a sibling entry. A runtime reachable only through such a link is missed, while a symlink at a candidate root that is not a same-action alias is a `symlink_refused` constraint, not a skip.
+3. **Only standard locations are walked.** `dotnet` reads `/usr/share/dotnet`, `/usr/lib/dotnet` and `/usr/lib64/dotnet`; `jvm` reads `/usr/lib/jvm`, `/opt/java`, `/usr/lib64/jvm` and `/var/opt/java`. A runtime installed elsewhere (an Oracle RPM under `/usr/java`, a version manager in a home directory, a custom prefix) is not found by design, since the plugin does not search user profiles, so `supported` with zero rows means none found at these roots.
+4. **Some OpenJDK 8 packages ship no `release` file.** Ubuntu 22.04 `openjdk-8-jre-headless`, Rocky 9 `java-1.8.0-openjdk-headless` and Alpine 3.20 `openjdk8-jre-base` were measured to ship none. Such a home is reported with version `-`, flavour `unmodelled` and `release_missing`, so the host reads `constrained` while it is installed; the `install_path` names the major, and reading the real version would need the package manager or `java -version`, which this plugin never uses.
+5. **Network mounts are skipped from a dispatch-start snapshot.** A root on, under or containing a mount of a listed network type (`nfs`, `cifs`, `smb3`, `9p`, `virtiofs`, `autofs`, network `fuse.*` and others in `yuzu::shared::is_network_fstype`) is never opened, so a healthy network-mounted JDK is skipped too, and a host whose `/` is a network or virtiofs mount skips every root. The guard cannot see a mount that appears after the snapshot, a stacked filesystem such as an overlay over a dead network mount, an unlisted network type or a hang on a local block device; each can pin one of the agent's shared command workers until the kernel returns, and an unreadable mount table (`mountinfo_unreadable`) leaves the walk guarded only by the mounts read (#4875).
 
 ## Source and tests
 

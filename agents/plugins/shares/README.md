@@ -14,19 +14,69 @@
 
 ## How it works
 
-`list` reports the shares this host is configured to serve over SMB and NFS: names, paths, read-only or read-write, whether anonymous access is configured, and a few flags. For SMB the anonymous flag reflects `guest ok` as written: whether a client can actually connect as guest also depends on global authentication settings (`map to guest`, `security`). It reads local configuration files and changes nothing. The first row is always a `status` row saying whether the read was complete, then one `source` row per source the leg knows about (so zero `share` rows is never an ambiguous empty success), then the `share` rows. These are configured exports, not live `nfsd` or `smbd` state, and they are not the mapped-drive and session observations `tar` records for `mapdrive` (which track mappings this host makes and sessions against its shares). ACLs, `valid users` and NFS client host lists are never emitted: an NFS export carries a client count (`clients_<n>`) and an `anonymous` flag only.
-
-On Linux the leg reads `/etc/exports`, the `/etc/exports.d/*.exports` snippets and `/etc/samba/smb.conf` with bounded reads that never follow a symlink at the final path component (a symlinked ancestor directory is followed), under one row and byte budget per listing. The exports files use the `exports(5)` grammar. `smb.conf` is parsed with Samba's own semantics: lines before the first `[header]` belong to `[global]`, parameter synonyms collapse to one key so the last occurrence wins, a `copy =` chain and `[global]` are consulted when a share does not set a value itself, and Samba's built-in defaults apply last. A line the parser cannot read (a UTF-8 BOM on the first line, an unterminated `[header`, a relative or option-first exports line) is skipped without a count, as `nfsd` and `testparm` reject it too.
+`list` reports the shares this host is configured to serve over SMB and NFS: for each, the name, the path, read-only or read-write, whether anonymous access is configured, and a few flags. It reads three kinds of local configuration file and changes nothing, so the answer is what the files declare, not what `nfsd` or `smbd` is serving right now. Rows come in a fixed order. A `status` row comes first and says whether the read was complete. One `source` row follows for each source the leg knows about (`exports`, `exports_d`, `smb_conf`), saying `read`, `absent`, `refused` or `failed`, so zero `share` rows is never an ambiguous empty success. The `share` rows come last. On Linux the leg reads `/etc/exports`, the `/etc/exports.d/*.exports` snippets and `/etc/samba/smb.conf` with bounded reads that never follow a symlink at the final path component (a symlinked ancestor directory is followed), under one row and byte budget for the whole listing. Exports lines follow the `exports(5)` grammar. `smb.conf` is read the way Samba reads it in the main: lines before the first `[header]` belong to `[global]`, parameter synonyms collapse to one key so the last occurrence wins, a share that sets nothing itself inherits through its `copy =` chain, then `[global]`, then Samba's built-in defaults. One known difference is in caveat 1. Access control lists, `valid users` and NFS client host lists are never read into a row; an NFS export carries a client count and an anonymous flag only. These rows are not the mapped-drive and session observations `tar` records for `mapdrive`, which track mappings this host makes.
 
 ```mermaid
 flowchart LR
   OP[Operator / workflow] --> SRV[Server<br/>authz: Infrastructure.Read]
   SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[shares.execute]
-  EX --> WIN[Windows leg<br/>status row only: windows:planned]
-  EX --> MAC[macOS leg<br/>status row only: macos:planned]
-  EX --> LIN[Linux leg<br/>/etc/exports, exports.d, smb.conf]
-  WIN & MAC & LIN --> ROWS[rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  EX --> WIN["Windows leg<br/>status row only: windows:planned"]
+  EX --> MAC["macOS leg<br/>status row only: macos:planned"]
+  EX --> LIN["Linux leg<br/>/etc/exports, exports.d, smb.conf"]
+  WIN & MAC & LIN --> ROWS[status + source + share rows, typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
 ```
+
+### What you can decide with it
+
+| Question | Where the answer is | What to know |
+|---|---|---|
+| Which SMB shares does this host offer, and where do they point? | `share` rows with proto `smb`: name, path, `ro`/`rw` | Includes `[homes]`, `[printers]` and `print$` (flagged `special`); a `hidden` flag means `browseable = no` |
+| Which NFS paths does this host export, and to how many clients? | `share` rows with proto `nfs`: path, `ro`/`rw`/`mixed`, `clients_<n>` | Client names are never listed, only the count; `mixed` means the client specs disagree on ro or rw |
+| Does anything look open to everyone? | The anonymous column | NFS: any client spec of `*`, an empty client or an all-zero network mask. SMB: only `guest ok = yes` as written; whether a client can really connect as guest also depends on `map to guest` and `security` |
+| Is root exposed on an NFS export? | The `no_root_squash` flag | Set when neither `root_squash` nor `all_squash` is in effect for some client spec |
+| Is the picture complete? | The leading `status` row and the `source` rows | Any `constrained` token names what was not read (a Samba registry backend, an `include =`, usershares, a refused or oversized file) |
+
+On Windows and macOS you get nothing: one `unsupported` status row and result status `UNAVAILABLE`. A `supported` result with no `share` rows means these three files declare no shares; it does not rule out exports added at runtime without touching `/etc/exports`, a Samba instance started with another config file, or a share kept in Samba's registry (the last is flagged). A host with Samba installed commonly reports `constrained` with `usershares_not_read`, because usershares are never listed and the default usershares directory (`/var/lib/samba/usershares`) exists; setting `usershare max shares = 0` in `smb.conf` states they are off and returns `OK`.
+
+### Diagrams
+
+#### How a Samba share value is resolved
+
+```mermaid
+flowchart TD
+  P["A value is needed for one share, e.g. guest ok"] --> A{"Set in the share's own section?"}
+  A -- yes --> V["Use that value"]
+  A -- no --> B{"Share has a copy = target?"}
+  B -- yes --> C["Look in the target, then its target, up to 8 deep"]
+  C -- found --> V
+  C -- "missing, cyclic or too deep" --> U["Record copy_unresolved and carry on"]
+  B -- no --> G
+  U --> G{"Set in global, anywhere in the file?"}
+  G -- yes --> V
+  G -- no --> D["Samba default: read only yes, guest ok no, browseable yes, available yes"]
+```
+
+Synonyms such as `writable`, `public` and `browsable` are folded into one key first, so the last occurrence wins as in Samba. The `[global]` lookup is against the whole merged file, which is the one place this plugin differs from Samba (caveat 1).
+
+#### How an NFS export line becomes a row
+
+```mermaid
+flowchart TD
+  L["One logical line of an exports file"] --> P{"Absolute path and quotes closed?"}
+  P -- no --> X["Line skipped, no row"]
+  P -- yes --> D["Tokens starting with a dash set defaults for later specs"]
+  D --> S["Every other token is one client spec, counted in clients_n"]
+  S --> A{"Any client is star, empty or an all-zero mask?"}
+  A -- yes --> AY["anonymous true"]
+  A -- no --> AN["anonymous false"]
+  S --> M{"Do the specs agree on ro or rw?"}
+  M -- yes --> R["access ro or rw"]
+  M -- no --> MX["access mixed"]
+  S --> Q{"Any spec leaves both root_squash and all_squash off?"}
+  Q -- yes --> NR["flag no_root_squash"]
+```
+
+A spec's own options override the line defaults, and each `sec=` flavour inside a spec is judged separately. A line with no client at all is treated as open to everyone with `clients_0`.
 
 ## OS capability
 
@@ -46,9 +96,9 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | n/a — the leg reads nothing (caveat 3) | n/a | n/a | n/a — the placeholder reports `unsupported` with `windows:planned` |
-| macOS | n/a — the leg reads nothing (caveat 3) | n/a | n/a | n/a — the placeholder reports `unsupported` with `macos:planned` |
-| Linux | agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`) | None: `/etc/exports`, `/etc/exports.d/*.exports` and `/etc/samba/smb.conf` are world-readable (0644) on stock packages. A site that tightens them can grant read access to the agent account, or accept the token | Not measured on the `yuzu` account; see Sample output for the capture | `PERMISSION_DENIED` / partial with `linux:shares:<source>:permission_denied` when a source was refused and none was read, `CONSTRAINED` when another source was read; the source row says `refused` |
+| Windows | n/a (the leg reads nothing, caveat 3) | n/a | n/a | n/a (the placeholder reports `unsupported` with `windows:planned`) |
+| macOS | n/a (the leg reads nothing, caveat 3) | n/a | n/a | n/a (the placeholder reports `unsupported` with `macos:planned`) |
+| Linux | agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`) | None: `/etc/exports`, `/etc/exports.d/*.exports` and `/etc/samba/smb.conf` are world-readable (0644) on stock packages. A site that tightens them can grant read access to the agent account, or accept the token | Not measured on the `yuzu` account; the sample was captured as `euid 0` in a container | `PERMISSION_DENIED` / partial with `linux:shares:<source>:permission_denied` when a source was refused and none was read, `CONSTRAINED` when another source was read; the source row says `refused` |
 
 No subprocess, no shell interpreter and no network use. The Linux leg reads files in process, never following a symlink at the final path component (a symlinked ancestor directory is followed), and probes the Samba usershares directory with one `lstat` (it is never listed).
 
@@ -105,7 +155,7 @@ Every row is pipe-delimited; field 0 is the row kind, `-` is an absent value, an
 
 ## Sample output
 
-The Linux capture was taken in the Debian 13 agent build container with `samba-common` and `nfs-kernel-server` installed and NFS and Samba shares seeded under `/srv`; the stock package files (`/etc/exports`, `/etc/samba/smb.conf`) are parser test fixtures (with trailing whitespace stripped), and the three seeded inputs (`/etc/exports`, `/etc/exports.d/archive.exports`, `/etc/samba/smb.conf`) are committed verbatim as fixtures that assert the five `share` rows below.
+The Linux capture was taken in the Debian 13 agent build container with `samba-common` and `nfs-kernel-server` installed and NFS and Samba shares seeded under `/srv`; the stock package files (`/etc/exports`, `/etc/samba/smb.conf`) are parser test fixtures (with trailing whitespace stripped), and the three seeded inputs (`/etc/exports`, `/etc/exports.d/archive.exports`, `/etc/samba/smb.conf`) are committed verbatim as fixtures that assert the five `share` rows below. The capture reports `OK` because that container has no default usershares directory; a host where `/var/lib/samba/usershares` exists and `usershare max shares` is unset reports `CONSTRAINED` with `linux:shares:smb_conf:usershares_not_read`.
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
 **Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-12 · euid 0 · leg-hash 9e669e86fe0e
@@ -127,10 +177,9 @@ share|smb|projects|/srv/samba/projects|rw|false|hidden|smb_conf
 
 ## Caveats and known gaps
 
-1. **No documented customer driver.** No documented customer driver for this plugin was found (as in `mgmt_posture`'s caveat); it exists to answer what this host exposes over SMB and NFS, which no other plugin reports. Pure capability-gap reasoning.
-2. **Configured, not live; some Samba scope is not read.** Linux reports what the files say, not whether `nfsd` or `smbd` runs or what a client sees. The Samba registry backend, `include =` files and usershares are reported as `constrained` tokens, never as a wrong share list. `[global]` parameters written after a share section apply to it here but not in Samba.
-3. **Windows and macOS are planned.** The Windows `NetShareEnum` level-2 read, which will flag the administrative `STYPE_SPECIAL` shares (`ADMIN$`, `IPC$`, drive shares) as `special` rather than hide them, and the macOS share-point and `/etc/exports` read are not implemented; each leg reports one `unsupported` row, `windows:planned` or `macos:planned`.
-4. **Names and paths can identify people.** See the sensitivity bullet: a share name or path may contain an account name, so dispatch is gated at `Infrastructure:Read` (the stored result is readable by `Response:Read` holders, as for every plugin) and the definition says so.
+1. **Configured, not live; some Samba scope is not read.** Linux reports what the files say, not whether `nfsd` or `smbd` runs or what a client sees. The Samba registry backend, `include =` files and usershares are reported as `constrained` tokens, never as a wrong share list, and `[global]` parameters written after a share section apply to it here but not in Samba.
+2. **The access flags are approximations of the written configuration.** The SMB anonymous flag reflects `guest ok` alone, and `mixed` uses a read or write list only as a presence test, never reading its names. Share names and paths can identify people (Samba `[homes]` and per-user shares), so dispatch is gated at `Infrastructure:Read`.
+3. **Windows and macOS are planned.** The Windows `NetShareEnum` level-2 read, which would flag the administrative `STYPE_SPECIAL` shares (`ADMIN$`, `IPC$`, drive shares) as `special` rather than hide them, and the macOS share-point and `/etc/exports` read are not implemented. Each leg reports one `unsupported` row, `windows:planned` or `macos:planned`.
 
 ## Source and tests
 
