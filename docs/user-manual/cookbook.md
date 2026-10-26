@@ -592,9 +592,12 @@ also takes explicit `agent_ids`.
      `hive_mount_failed` or a guard token such as `hive_hardlinked` after it: the hive could not be reached or
      trusted, and nothing was written.
    - `error|flush_failed:<token>`: the offline write could not be made durable; read the value back and retry.
-5. **Undo.** With `old_state=present`, run `set_user_value` again with `type` = `old_type` and `data_hex` = `old`
-   (only when `old` has no `~<total>` at its end, i.e. was not cut); with `old_state=absent`, run
-   `delete_user_value` with the same `key` and `name`.
+5. **Undo.** With `old_state=present`, run `set_user_value` again with `type` = `old_type` and `data_hex` = `old`.
+   That works only when `old` was not cut (no `~<total>` at its end), `old_type` is one of the six types
+   `set_user_value` writes and the bytes fit that type (a string type ends in its NUL, a `REG_DWORD` is 4 bytes);
+   restore any other value with another tool (the registry README, "Undoing a change"). With `old_state=absent`, run
+   `delete_user_value` with the same `key` and `name`. Keys the write created (`created` above 0) can be removed only
+   with `windows.registry.delete_key`, `hive=HKU` and `key=<SID>\...`, while the user's hive is loaded.
 
 #### Recipe: Remove a Registry Branch Safely
 
@@ -614,8 +617,9 @@ subkeys (see [Upgrading](upgrading.md)).
 4. **Verify.** `windows.registry.key_exists` for the key answers `exists|false`.
 
 What a refusal means: `key_is_link` (a registry link inside the tree; the plugin never deletes through one),
-`access_denied` (a key the agent may not delete), `unrepresentable_name` (a key whose raw name is malformed) and
-`tree_too_large` delete nothing when the preview or the vet finds them. During the real delete, a link or malformed
+`access_denied` (a key the agent may not delete) and `unrepresentable_name` (a key whose raw name is malformed)
+delete nothing when the vet finds them, in the preview or in the real run; `tree_too_large` comes only from a real
+run (the preview answers `capped|1` instead) and also deletes nothing. During the real delete, a link or malformed
 name that appeared after the vet, or `concurrent_change` (the tree grew past the bound), stops the run: keys already
 removed stay removed (`result=failed` in the audit line), so run the preview again to see what is left, then delete
 again.
