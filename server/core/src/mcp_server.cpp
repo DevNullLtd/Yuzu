@@ -2633,7 +2633,7 @@ static const ToolDef kTools[] = {
      R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
      R"j("overlap_days":{"type":"integer","default":7,"minimum":1,"maximum":3650,"description":"Overlap window before the predecessor auto-revokes; rejected outright (never truncated) if it would fall below the 24h floor"})j"
      R"j(},"required":["principal_id"]})j",
-     R"j({"type":"object","properties":{"token_id":{"type":"string"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"principal_id":{"type":"string"},"overlap_expires_at":{"type":"integer","description":"Always 0 here: only the predecessor is stamped. Read the predecessor's stamp from active_credentials in get_engine_principal"}},"required":["token_id","raw_token","principal_id"]})j"},
+     R"j({"type":"object","properties":{"token_id":{"type":"string"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"principal_id":{"type":"string"},"overlap_expires_at":{"type":"integer","description":"Always 0 here: only the predecessor is stamped. No MCP tool returns the predecessor's stamp; the REST twin GET /api/v1/engine-principals/{id} does, per entry of active_credentials (get_engine_principal returns only a count)"}},"required":["token_id","raw_token","principal_id"]})j"},
 
     {"confirm_engine_rotation",
      "Explicit maker-checker confirmation that a rotation's successor secret has been received/"

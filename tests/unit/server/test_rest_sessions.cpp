@@ -464,7 +464,8 @@ TEST_CASE("REST DELETE /api/v1/sessions/me: MCP-tier tokens rejected (sec-M2)",
     auto res = h.sink.Delete("/api/v1/sessions/me");
     REQUIRE(res);
     CHECK(res->status == 403);
-    CHECK(res->body.find("interactive session") != std::string::npos);
+    CHECK(res->body.find("self-revoke requires an interactive session, not an MCP-tier or service-scoped token") !=
+          std::string::npos);
     // Callback must not fire — the rejection is at the credential-class
     // gate, not the dual-write.
     CHECK(h.revoke_calls.empty());

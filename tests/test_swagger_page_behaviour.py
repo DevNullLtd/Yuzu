@@ -209,6 +209,7 @@ const out = {};
       '/q6': { get: { summary: 'arrwrap', tags: ['Big'], responses: refResp('ArrHolder') } },
       '/q8': { get: { summary: 'rowsum', tags: ['Big'], responses: refResp('Sum0') } },
       '/q9': { get: { summary: 'xcutkey', tags: ['Big'], responses: refResp('XKey') } },
+      '/q11': { get: { summary: 'dblcut', tags: ['Big'], responses: refResp('DblCut') } },
       '/q10': { get: { summary: 'twoalts', tags: ['Big'], responses: refResp('TwoAlts') } },
       '/q7': { get: { summary: 'refine', tags: ['Big'], responses: refResp('Refined') } },
       '/n': { get: { summary: 'nested', tags: ['Big'], responses: R({ content: { 'application/json': { schema: { type: 'object', properties: { outer: { type: 'object', properties: { inner: { type: 'string' } } } } } } } }) } }
@@ -229,6 +230,7 @@ const out = {};
       Refined: { allOf: [{ type: 'object', properties: { t: { type: 'integer' } } }, { type: 'object', properties: { t: { type: 'integer', format: 'int64', description: 'Unix epoch seconds.' } } }] },
       XKey: { allOf: [{ type: 'object', properties: { k1: { type: 'string' } } }], xCut: true },
       TwoAlts: { allOf: [{ oneOf: [{ type: 'object', properties: { o1: { type: 'string' } } }] }, { oneOf: [{ type: 'object', properties: { o2: { type: 'string' } } }] }] },
+      DblCut: { allOf: [{ type: 'object', properties: { d1: { type: 'string' } }, oneOf: [{ type: 'object', properties: { x1: { type: 'string' } } }] }, { oneOf: [{ type: 'object', properties: { y1: { type: 'string' } } }] }] },
       SelfAll: { allOf: [{ $ref: '#/components/schemas/SelfAll' }, { type: 'object', properties: { own: { type: 'string' } } }] } }, chain) }
   };
   await reload({ status: 200, body: spec2 });
@@ -279,6 +281,8 @@ const out = {};
   const t1 = Date.now(); opRow('rowsum').byClass('sw-op-h')[0].click(); out.rowsum_ms = Date.now() - t1;
   opRow('xcutkey').byClass('sw-op-h')[0].click();
   out.xcutkey_note = opRow('xcutkey').textContent.includes('Truncated');
+  opRow('dblcut').byClass('sw-op-h')[0].click();
+  out.dblcut_note = (opRow('dblcut').textContent.match(/Truncated: at least (\d+) more/) || [])[1];
   opRow('twoalts').byClass('sw-op-h')[0].click();
   out.twoalts_note = opRow('twoalts').textContent.includes('Truncated');
   opRow('chain12').byClass('sw-op-h')[0].click();
@@ -591,6 +595,7 @@ def main():
     check(out["fan_ms"] < 1500 and out["fan_note"], "wide acyclic allOf fan-out must stay bounded and say it is cut: %r ms, note %r" % (out["fan_ms"], out["fan_note"]))
     check(out["rowsum_ms"] < 2000, "work across many rows must stay bounded, not only per merge: %r ms" % out["rowsum_ms"])
     check(not out["xcutkey_note"], "a schema keyword named xCut must not raise a truncation note")
+    check(out["dblcut_note"] == "1", "one cut must be counted once even when the schema also has properties: %r" % out["dblcut_note"])
     check(out["twoalts_note"], "a second oneOf among allOf members must say it is not shown")
     check(out["chain_note"], "an allOf chain deeper than the cap must say it is truncated")
     check(out["proto_names"] == ["__proto__", "a", "b"], "a property named __proto__ must be listed through an allOf: %r" % out["proto_names"])
@@ -699,10 +704,14 @@ def main():
                       c.startswith("2") and isinstance(r, dict) and any(isinstance(x, dict) and x.get("schema") for x in (r.get("content") or {}).values())
                       for c, r in (pi[m].get("responses") or {}).items()))
     n_schemas = len(real.get("components", {}).get("schemas", {}))
+    n_guides = sum(1 for t in real.get("tags", []) if isinstance(t, dict) and t.get("x-yuzu-guide"))
     root = pathlib.Path(__file__).resolve().parent.parent
     for rel, pat in (("docs/user-manual/upgrading.md", "gives %d of its %d operations" % (n_typed, n_ops)),
                      ("changelog.d/2026-10-22-openapi-typed-responses.changed.md", "success response of %d of its %d operations" % (n_typed, n_ops)),
-                     ("changelog.d/2026-10-22-openapi-typed-responses.changed.md", "%d component schemas" % n_schemas)):
+                     ("changelog.d/2026-10-22-openapi-typed-responses.changed.md", "%d component schemas" % n_schemas),
+                     ("docs/user-manual/upgrading.md", "%d tag groups" % n_guides),
+                     ("changelog.d/2026-10-22-swagger-api-reference-page.added.md", "%d groups opens with a guide" % n_guides),
+                     ("docs/user-manual/upgrading.md", "**Operations the server does not serve.** %d operations" % py["unavail"])):
         check(pat in (root / rel).read_text(encoding="utf-8"),
               "%s must say %r (the document has %d operations, %d typed, %d schemas)" % (rel, pat, n_ops, n_typed, n_schemas))
     check((out["r_typed"], out["r_untyped"], out["r_unavail"]) == (py["typed"], py["untyped"], py["unavail"]),
