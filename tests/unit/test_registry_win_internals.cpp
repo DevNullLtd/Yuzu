@@ -543,6 +543,49 @@ TEST_CASE("the recursive delete walk removes a plain tree post-order by handle a
     CHECK_FALSE(key_exists(root + "\\Plain"));
 }
 
+// The walk on the DEEPEST chain Windows allows. A registry tree can be at most 512 levels deep (counted from the hive root),
+// which is below kMaxTreeDepth (600): the 600/601 boundary can only be tested against the fake registry (test_registry_core.cpp),
+// and on a real hive the depth cap is never what stops a delete. What a real chain does exercise is the recursion itself: the
+// vet and the post-order delete both run to the OS limit on this build's stack (a debug MSVC build has the largest frames).
+// The chain grows one-character keys until the registry refuses a deeper key, so the case follows the OS limit instead of
+// hard-coding it.
+TEST_CASE("the recursive delete walk handles the deepest chain Windows allows", "[registry][windows][internals]") {
+    const std::string root = scratch_root("deepchain");
+    ScratchTree cleanup{root};
+    unsigned levels = 0; // keys in the chain, the top key included
+    {
+        yuzu::win::RegKey cur;
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(root + "\\Deep").c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
+                            KEY_CREATE_SUB_KEY, nullptr, cur.put(), nullptr) != ERROR_SUCCESS) {
+            skip_or_fail("not elevated -- HKLM scratch not writable, deep chain case");
+            return;
+        }
+        levels = 1;
+        for (unsigned i = 0; i < 700; ++i) {
+            yuzu::win::RegKey next;
+            if (RegCreateKeyExW(cur.get(), L"k", 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_CREATE_SUB_KEY, nullptr, next.put(),
+                                nullptr) != ERROR_SUCCESS)
+                break; // the OS limit
+            cur = std::move(next);
+            ++levels;
+        }
+    }
+    WARN("deepest chain Windows allowed under the scratch key: " << levels << " keys");
+    REQUIRE(levels > 400); // the limit is 512 from the hive root; far fewer would mean the chain stopped for another reason
+    REQUIRE(levels <= yuzu::registry::kMaxTreeDepth); // the OS limit sits below our cap, so the cap is not what is exercised
+
+    Win32Registry reg;
+    const Handle hklm = as_handle(HKEY_LOCAL_MACHINE);
+    const auto dry = yuzu::registry::delete_key_tree(reg, hklm, root + "\\Deep", true, true, /*dry_run=*/true);
+    CHECK(dry.result == "ok");
+    CHECK_FALSE(dry.capped);
+    CHECK(dry.counted_keys == levels);
+    const auto real = yuzu::registry::delete_key_tree(reg, hklm, root + "\\Deep", true, true, false);
+    CHECK(real.result == "ok");
+    CHECK(real.counted_keys == levels);
+    CHECK_FALSE(key_exists(root + "\\Deep"));
+}
+
 namespace {
 
 /// Gives `key` (a handle opened with WRITE_DAC) a DACL, from SDDL text. False when it could not.
