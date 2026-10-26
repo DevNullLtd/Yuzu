@@ -680,6 +680,9 @@ TEST_CASE("apply: a dry run cannot see the ACL a new key inherits; the real run'
     ScratchTree cleanup{root};
     const std::string parent = root + "\\Parent";
     AclRestore restore_parent{parent};
+    // The child the real run creates inherits ONLY the deny ACE (the parent's allow is not inheritable), so nobody can
+    // open it for DELETE or SET_VALUE and RegDeleteTreeW leaves the whole scratch root behind. Destroyed first.
+    AclRestore restore_child{parent + "\\New"};
     {
         yuzu::win::RegKey k;
         if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(parent).c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE, WRITE_DAC | KEY_READ,
