@@ -863,7 +863,7 @@ TEST_CASE("registry write: delete_key recursive -- dry-run counts equal the real
     }
 }
 
-TEST_CASE("registry write: a recursive delete refuses a registry link inside the tree and deletes nothing, "
+TEST_CASE("registry write: a recursive delete refuses a registry link inside the tree and deletes nothing "
           "and a link leaf is removed alone",
           "[registry][windows][write][recursive]") {
     Plugin p;
@@ -908,19 +908,25 @@ namespace {
 /// An elevated-only offline-hive fixture: a salted temp "profile" directory holding an NTUSER.DAT saved with
 /// RegSaveKeyExW from a scratch HKCU key, plus a salted fake SID under ProfileList pointing at it. Removed on scope
 /// exit. The scratch names carry registry_scratch_prefix(), so a leftover is visible to the per-job leftover check.
+/// The ProfileList row and the HKU mounts cannot carry that prefix (a ProfileList key IS a SID), so a MARKER key
+/// HKLM\SOFTWARE\<scratch>-ProfileList-<sid> lives exactly as long as the row: a crashed run leaves it, the leftover
+/// check (scripts/ci/check-registry-test-leftovers.ps1) reports it, and its `cleanup` value names what to remove.
 struct OfflineProfile {
     bool ok = false;
     std::string sid;
     yuzu::test::TempDir tmp{"yuzu_test_profile_"}; // salted, removed on destruction; matches the Defender wildcard
     fs::path dir;                                  // tmp.path in its long-path form, once created
     std::string profile_key;
+    std::string marker_key;
     HKEY hklm = HKEY_LOCAL_MACHINE;
 
     OfflineProfile() {
         yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
         yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
         if (!backup.ok() || !restore.ok()) return;
-        sid = "S-1-5-21-1-2-3-" + std::to_string(90000 + (yuzu::test::process_random_salt() % 9000));
+        // The whole 64-bit salt, as two 32-bit subauthorities: a machine-global name salted like every other one.
+        const std::uint64_t s = yuzu::test::process_random_salt();
+        sid = "S-1-5-21-1-" + std::to_string(s >> 32) + "-" + std::to_string(s & 0xFFFFFFFFu) + "-1001";
         dir = tmp.path;
         std::error_code ec;
         fs::create_directories(dir, ec);
@@ -947,10 +953,18 @@ struct OfflineProfile {
             PSID admins = nullptr;
             if (!ConvertStringSidToSidW(L"S-1-5-32-544", &admins)) return;
             const yuzu::win::LocalFreeGuard free_admins{admins};
+            // const_cast: the API takes LPWSTR but does not write through it, and the temporary wstring lives to the
+            // end of the full expression, i.e. for the whole call.
             const DWORD orc = SetNamedSecurityInfoW(const_cast<LPWSTR>(hive.wstring().c_str()), SE_FILE_OBJECT,
                                                     OWNER_SECURITY_INFORMATION, admins, nullptr, nullptr, nullptr);
             if (orc != ERROR_SUCCESS) return;
         }
+        const std::string cleanup = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\" + sid +
+                                    "; HKU\\" + sid + "; HKU\\" + scratch_name() + "-verify";
+        const std::wstring wcleanup = widen(cleanup);
+        const auto* raw = reinterpret_cast<const std::uint8_t*>(wcleanup.c_str()); // UTF-16LE, NUL included
+        marker_key = "SOFTWARE\\" + scratch_name() + "-ProfileList-" + sid; // removed by the destructor however this ends
+        if (!put(hklm, marker_key, "cleanup", REG_SZ, Bytes(raw, raw + (wcleanup.size() + 1) * sizeof(wchar_t)))) return;
         profile_key = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\" + sid;
         yuzu::win::RegKey pk;
         if (RegCreateKeyExW(hklm, widen(profile_key).c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, pk.put(), nullptr) !=
@@ -962,6 +976,7 @@ struct OfflineProfile {
     }
     ~OfflineProfile() {
         if (!profile_key.empty()) RegDeleteTreeW(hklm, widen(profile_key).c_str());
+        if (!marker_key.empty()) RegDeleteKeyW(hklm, widen(marker_key).c_str()); // after the row it stands for
         // the profile directory itself is removed by `tmp`, after this body
     }
     OfflineProfile(const OfflineProfile&) = delete;
@@ -988,7 +1003,7 @@ struct OfflineProfile {
 } // namespace
 
 TEST_CASE("registry write: set_user_value / delete_user_value on a LIVE hive (a synthetic profile's hive mounted at "
-          "HKU\\<its SID>) round-trip, with no unload warning",
+          "HKU\\<its SID>) round-trip with no unload warning",
           "[registry][windows][write][user]") {
     // Not the runner's own SID: CI's Windows leg runs as LocalSystem, which the profile resolver deliberately leaves out
     // of ProfileList (S-1-5-18/19/20). The fixture owns a salted ProfileList entry, and its hive is mounted at
@@ -1155,7 +1170,7 @@ TEST_CASE("registry write: set_user_value on an OFFLINE NTUSER.DAT is carried to
     }
 }
 
-TEST_CASE("registry write: concurrent set_user_value and get_user_value on one offline profile all complete, "
+TEST_CASE("registry write: concurrent set_user_value and get_user_value on one offline profile all complete "
           "none hive_mount_failed",
           "[registry][windows][write][user][offline]") {
     Plugin p;
@@ -1192,7 +1207,7 @@ TEST_CASE("registry write: concurrent set_user_value and get_user_value on one o
     CHECK(present == kWriters);
 }
 
-TEST_CASE("registry write: apply on the real machine hive -- dry run, real run, then the reversed manifest "
+TEST_CASE("registry write: apply on the real machine hive -- dry run real run then the reversed manifest "
           "restores the original bytes",
           "[registry][windows][write][apply]") {
     Plugin p;
@@ -1262,7 +1277,7 @@ TEST_CASE("registry write: apply on the real machine hive -- dry run, real run, 
 }
 
 TEST_CASE("registry write: apply refuses a create beneath a key that denies KEY_CREATE_SUB_KEY as access_denied "
-          "in a dry run and a real run alike, and creates nothing",
+          "in a dry run and a real run alike and creates nothing",
           "[registry][windows][write][apply]") {
     // The dry run cannot create to find out: it re-opens the deepest existing key onto itself with KEY_CREATE_SUB_KEY
     // (an empty-subkey RegOpenKeyExW) and relies on the access check happening at open. This case proves that premise
@@ -1316,7 +1331,7 @@ TEST_CASE("registry write: apply refuses a create beneath a key that denies KEY_
 }
 
 TEST_CASE("registry write: apply refuses to delete a key holding a value whose raw name is a lone surrogate next to "
-          "its U+FFFD lookalike, and both values survive",
+          "its U+FFFD lookalike and both values survive",
           "[registry][windows][write][apply]") {
     // The kernel accepts any UTF-16 unit in a value name. L"V\xD800" converts lossily to "V<U+FFFD>", the same UTF-8 as
     // its sibling L"V\xFFFD", so a lossy vet would capture the sibling twice and NtDeleteKey would take both values under
@@ -1364,7 +1379,7 @@ TEST_CASE("registry write: apply refuses to delete a key holding a value whose r
     }
 }
 
-TEST_CASE("registry write: apply refuses a flag that is not a boolean and a malformed plan before any item, unaudited",
+TEST_CASE("registry write: apply refuses a flag that is not a boolean and a malformed plan before any item unaudited",
           "[registry][windows][write][apply]") {
     // Both refusals come before the registry is touched, so this case needs the plugin but not elevation.
     Plugin p;

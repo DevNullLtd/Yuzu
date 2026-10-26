@@ -76,7 +76,7 @@ bool oracle_spellable(std::string_view s) {
 
 // ── the whole plan ───────────────────────────────────────────────────────
 
-TEST_CASE("registry parse_plan: a plan that is not a flat, bounded array of objects is refused as a whole",
+TEST_CASE("registry parse_plan: a plan that is not a flat bounded array of objects is refused as a whole",
           "[registry][plan]") {
     const auto error_of = [](std::string_view text) { return parse_plan(text).error; };
     SECTION("not JSON, not an array, empty") {
@@ -219,7 +219,7 @@ TEST_CASE("registry parse_plan: a per-item refusal rides the item and the plan s
 
 // ── the exact-name predicate ─────────────────────────────────────────────
 
-TEST_CASE("registry representable: a name survives a row cell byte for byte, or it is refused", "[registry][plan]") {
+TEST_CASE("registry representable: a name survives a row cell byte for byte or it is refused", "[registry][plan]") {
     SECTION("the cases the manifest depends on") {
         CHECK(representable(""));                       // the key's default value; a row spells it "-"
         CHECK(representable("plain"));
@@ -307,6 +307,10 @@ TEST_CASE("registry row_field: the display fold is lossy by design and empty is 
     CHECK(row_field("a\xFF" "b") == "a?b");
     CHECK(row_field("a\xE2\x80\xA8z") == "a_z");
     CHECK(row_field("a\xC2\x85z") == "a_z");
+    // a trailing backslash would escape the next separator for the server's splitter (find_unescaped_pipe)
+    CHECK(row_field("C:\\Windows\\Installer\\") == "C:\\Windows\\Installer_");
+    CHECK(row_field("\\") == "_");
+    CHECK(row_field("a\\b") == "a\\b");
 }
 
 // ── dependent items ──────────────────────────────────────────────────────
@@ -326,6 +330,13 @@ TEST_CASE("registry parse_plan: items whose verdicts would depend on each other 
     SECTION("two value ops on one key with different names, or on different keys, are independent") {
         CHECK(err(json::array({set_item("Software\\A", "v", "1"), set_item("Software\\A", "w", "2"), set_item("Software\\B", "v", "3")})).empty());
         CHECK(err(json::array({set_item("Software\\A", "", "1"), set_item("Software\\A", "v", "2")})).empty()); // default vs named
+    }
+    SECTION("two value names on one key are dependent whenever either holds a non-ASCII byte") {
+        // mutant: the ASCII fold alone (Windows folds the case of \xC3\x84rger and \xC3\xA4rger into one value name)
+        CHECK(err(json::array({item("delete_value", "Software\\A", "\xC3\x84rger"), set_item("Software\\A", "\xC3\xA4rger", "1")})) == "dependent_items:0:1");
+        CHECK(err(json::array({set_item("Software\\A", "plain", "1"), set_item("Software\\A", "caf\xC3\xA9", "2")})) == "dependent_items:0:1");
+        CHECK(err(json::array({set_item("Software\\A", "caf\xC3\xA9", "1"), set_item("Software\\B", "caf\xC3\xA9", "2")})).empty()); // other key
+        CHECK(err(json::array({set_item("Software\\A", "alpha", "1"), set_item("Software\\A", "beta", "2")})).empty()); // pure ASCII
     }
     SECTION("a key op over an equal, ancestor or descendant key of ANY other item") {
         CHECK(err(json::array({item("delete_key", "Software\\A"), set_item("Software\\A", "v", "1")})) == "dependent_items:0:1");
@@ -350,7 +361,7 @@ TEST_CASE("registry parse_plan: items whose verdicts would depend on each other 
 
 // ── the row renderers ────────────────────────────────────────────────────
 
-TEST_CASE("registry render_item_row: 14 cells, byte for byte", "[registry][plan]") {
+TEST_CASE("registry render_item_row: 14 cells byte for byte", "[registry][plan]") {
     ItemRow r;
     r.index = 3;
     r.op = "set_value";

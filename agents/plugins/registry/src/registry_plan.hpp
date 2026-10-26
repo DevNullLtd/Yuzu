@@ -33,33 +33,38 @@ namespace yuzu::registry {
 // ── the exact-name rule ──────────────────────────────────────────────────
 
 /// One cell of a row: the text scrubbed of NUL and invalid UTF-8 (wire_utf8.hpp), then folded by sanitize_field ('|',
-/// the controls, C1, U+2028 / U+2029 and trailing NULs become '_' or are dropped), "-" when nothing is left. Lossy by
-/// design; `representable` is the guard that keeps a name from ever being damaged by it.
+/// the controls, C1, U+2028 / U+2029 and trailing NULs become '_' or are dropped), and a trailing backslash becomes '_'
+/// (the server's column splitter, result_parsing.hpp find_unescaped_pipe, reads `\|` as an escaped pipe and would merge
+/// the cell with the next, as log_token guards it); "-" when nothing is left. Lossy by design; `representable` is the
+/// guard that keeps a name from ever being damaged by it.
 [[nodiscard]] inline std::string row_field(std::string_view s) {
     std::string t{s};
     yuzu::shared::scrub_wire_bytes(t);
     t = yuzu::profiles::sanitize_field(t);
-    return t.empty() ? std::string{"-"} : t;
+    if (t.empty()) return "-";
+    if (t.back() == '\\') t.back() = '_';
+    return t;
 }
 
 /// Whether `s` survives a row cell byte for byte, so the manifest names exactly what was in the registry:
-/// `row_field(s) == s` (no '|', no C0 / DEL / C1 control, no U+2028 / U+2029, no invalid UTF-8, no NUL), and
-/// additionally not the literal "-" (a row spells the empty default name that way, so a value really named "-" could
-/// not be told from it) and no trailing backslash (the server's column splitter, result_parsing.hpp
-/// find_unescaped_pipe, reads `\|` as an escaped pipe and would merge the cell with the next). The empty name is the
-/// key's default value and is representable. A TAB is kept by sanitize_field and so passes here; the callers that
-/// need a name this plugin can also WRITE BACK add validate_value_name (which refuses a control byte).
+/// `row_field(s) == s` (no '|', no C0 / DEL / C1 control, no U+2028 / U+2029, no invalid UTF-8, no NUL, no trailing
+/// backslash), and additionally not the literal "-" (a row spells the empty default name that way, so a value really
+/// named "-" could not be told from it). The empty name is the key's default value and is representable. A TAB is kept
+/// by sanitize_field and so passes here; the callers that need a name this plugin can also WRITE BACK add
+/// validate_value_name (which refuses a control byte).
 [[nodiscard]] inline bool representable(std::string_view s) {
     if (s.empty()) return true;
-    if (s == "-" || s.back() == '\\') return false;
+    if (s == "-") return false;
     return row_field(s) == s;
 }
 
 // ── the plan ─────────────────────────────────────────────────────────────
 
-enum class PlanOp { set_value, delete_value, create_key, delete_key };
+/// `count_` is not an op: it counts the enumerators, so a new op without its name fails the static_assert below.
+enum class PlanOp { set_value, delete_value, create_key, delete_key, count_ };
 
 inline constexpr std::array<std::string_view, 4> kPlanOpNames{"set_value", "delete_value", "create_key", "delete_key"};
+static_assert(kPlanOpNames.size() == static_cast<std::size_t>(PlanOp::count_)); // one name per op
 static_assert(kPlanOpNames[static_cast<std::size_t>(PlanOp::delete_key)] == "delete_key"); // indexed by enum value
 [[nodiscard]] constexpr std::string_view plan_op_name(PlanOp o) noexcept {
     return kPlanOpNames[static_cast<std::size_t>(o)];
@@ -126,6 +131,8 @@ namespace detail {
 /// are refused as a whole, so no verdict depends on an earlier item and dry run == real run; items that are already
 /// refused cannot change anything and are left out of the comparison. ponytail: O(n^2) over <= 256 items; keys compare
 /// ASCII-case-insensitively, so keys that differ only in non-ASCII case are not recognised as one (README caveat).
+/// Value names are CONSERVATIVE instead: Windows folds a value name's case with the full Unicode table, which this
+/// parser cannot reproduce, so two value items on one key are dependent whenever either name holds a non-ASCII byte.
 [[nodiscard]] inline PlanParse parse_plan(std::string_view text) {
     PlanParse out;
     const auto fail = [&](std::string e) {
@@ -201,11 +208,13 @@ namespace detail {
     }
 
     std::vector<std::string> keys, names;
+    std::vector<bool> non_ascii;
     keys.reserve(out.items.size());
     names.reserve(out.items.size());
     for (const auto& it : out.items) {
         keys.push_back(detail::fold_ascii(it.key));
         names.push_back(detail::fold_ascii(it.name));
+        non_ascii.push_back(std::ranges::any_of(it.name, [](char c) { return static_cast<unsigned char>(c) >= 0x80; }));
     }
     for (std::size_t j = 1; j < out.items.size(); ++j) {
         if (!out.items[j].invalid.empty()) continue;
@@ -214,7 +223,7 @@ namespace detail {
             const bool key_involved = detail::is_key_op(out.items[i].op) || detail::is_key_op(out.items[j].op);
             const bool clash = key_involved
                                    ? (detail::key_covers(keys[i], keys[j]) || detail::key_covers(keys[j], keys[i]))
-                                   : (keys[i] == keys[j] && names[i] == names[j]);
+                                   : (keys[i] == keys[j] && (names[i] == names[j] || non_ascii[i] || non_ascii[j]));
             if (clash)
                 return fail(std::string{kTokDependentItems} + ":" + std::to_string(i) + ":" + std::to_string(j));
         }
@@ -231,7 +240,7 @@ struct ItemRow {
     std::string reason;    ///< token, "" = "-"
     std::string verify;    ///< ok | mismatch, "" = "-"
     long long created = -1;
-    bool value_op = false; ///< set_value / delete_value: the old_* columns apply
+    bool value_op = false; ///< set_value / delete_value whose previous value was read: the old_* columns apply ("-" else)
     OldValue old;          ///< the previous value (value ops)
     long long new_len = -1;
 };

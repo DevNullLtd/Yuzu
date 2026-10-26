@@ -286,5 +286,19 @@ class RegistryDefinitionPins(unittest.TestCase):
                 self.assertEqual(overrides[f"windows.registry.{action}"], "destructive")
 
 
+
+class RegistryPerUserFlushWiring(unittest.TestCase):
+    def test_do_user_write_flushes_exactly_when_the_hive_was_mounted_offline(self):
+        # Lexical pin (the shell is Windows-only and no test on any host can tell a removed flush: the offline round trip
+        # reloads a file the unload may itself have persisted). The pure core's flush_on is unit-tested given flush=true;
+        # this pins the production wiring: flush derives from report.mounted_offline and reaches BOTH verified writes.
+        src = (REPO_ROOT / "agents" / "plugins" / "registry" / "src" / "registry_win.cpp").read_text(encoding="utf-8")
+        start = src.index("int do_user_write(")
+        body = src[start:src.index("\n}\n", start)]
+        self.assertRegex(body, r"const bool flush = report\.mounted_offline;")
+        self.assertRegex(body, r"delete_value_verified\([^;]*/\*fast_eligible=\*/false, flush\)")
+        self.assertRegex(body, r"set_value_verified\([^;]*/\*fast_eligible=\*/false, flush\)")
+
+
 if __name__ == "__main__":
     unittest.main()

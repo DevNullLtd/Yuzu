@@ -36,7 +36,9 @@
 #include "grpc_audit_signal.hpp"
 #include "pg/pg_pool.hpp"
 #include "plugin_result_audit.hpp"
+#include "result_parsing.hpp"
 #include "../../../agents/plugins/registry/src/registry_parsers.hpp"
+#include "../../../agents/plugins/registry/src/registry_plan.hpp"
 #include "test_auth_db_pg_helper.hpp"
 #include "test_principal_lock_gate.hpp"
 #include "test_tracker_scope.hpp"
@@ -416,7 +418,7 @@ TEST_CASE("registry audit: the plugin's exception literal mints one failed row p
     }
 }
 
-TEST_CASE("registry audit: the apply, per-user and dry-run lines the plugin renders extract like any other row",
+TEST_CASE("registry audit: the apply per-user and dry-run lines the plugin renders extract like any other row",
           "[server][registry_audit]") {
     // `result=` is read before key= and the caller-sized fields, whichever action rendered the line; a dry run's
     // success row says dry_run=1 in its detail (a reader filtering result=success must also read dry_run).
@@ -467,13 +469,38 @@ TEST_CASE("registry audit: the apply, per-user and dry-run lines the plugin rend
         CHECK(frame.events[0].result == "failure");
         CHECK(frame.events[0].detail.find("|reason=hive_mount_failed|") != std::string::npos);
     }
-    SECTION("a plan of 256 items is 256 rows in one frame, none truncated") {
+    SECTION("a full plan (kMaxPlanItems items) is that many rows from one frame, none truncated") {
         std::string text;
-        for (int i = 0; i < 256; ++i) text += yuzu::registry::render_audit_line(r) + "\nitem|0|x\n";
+        for (std::size_t i = 0; i < yuzu::registry::kMaxPlanItems; ++i)
+            text += yuzu::registry::render_audit_line(r) + "\nitem|0|x\n";
         const auto frame = registry_audit_events_for_frame("a1", rid(63), "registry", "apply", text, 300);
-        CHECK(frame.events.size() == 256);
+        CHECK(frame.events.size() == yuzu::registry::kMaxPlanItems);
         CHECK_FALSE(frame.truncated);
     }
+}
+
+// The plugin's plan bound and the server's bounds, tied by the compiler rather than by prose: a full plan's audit lines
+// fit one frame's line bound, and a dry run plus the real run of one full plan (2 x kMaxPlanItems rows) fit one agent's
+// row budget (the agent may still split a reply across frames at its 64 KiB flush; the budget is the binding bound).
+static_assert(yuzu::registry::kMaxPlanItems <= kMaxRegistryAuditLinesPerFrame);
+static_assert(yuzu::registry::kMaxPlanItems * 2 <= kRegistryAuditBudgetRows);
+
+TEST_CASE("registry audit: a refused apply item row with a trailing backslash still splits into 14 cells",
+          "[server][registry_audit]") {
+    // mutant: row_field keeps a trailing backslash (find_unescaped_pipe reads `\|` as escaped and merges two cells)
+    yuzu::registry::ItemRow row;
+    row.index = 3;
+    row.op = "delete_value";
+    row.hive = "HKLM";
+    row.key = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Installer\\Folders";
+    row.name = "C:\\Windows\\Installer\\";
+    row.verdict = "refused";
+    row.reason = "unrepresentable_name";
+    const auto cells = split_fields("registry", yuzu::registry::render_item_row(row));
+    REQUIRE(cells.size() == 14);
+    CHECK(cells[5] == "C:\\Windows\\Installer_");
+    CHECK(cells[6] == "refused");
+    CHECK(cells[7] == "unrepresentable_name");
 }
 
 TEST_CASE("registry audit: a string and a binary value reach the row as raw hex, capped with ~<total>",

@@ -562,8 +562,8 @@ TEST_CASE("registry parse_bool_param: empty is the default; true/1/false/0 only;
     }
 }
 
-TEST_CASE("registry classify_offline_write_race: only a hive found loaded after an offline write, or a probe that "
-          "failed, is worth saying",
+TEST_CASE("registry classify_offline_write_race: only a hive found loaded after an offline write or a probe that "
+          "failed is worth saying",
           "[registry][parsers]") {
     CHECK(classify_offline_write_race(false, true, 0).empty());   // never mounted offline: the live arm, nothing to probe
     CHECK(classify_offline_write_race(true, false, 0).empty());   // nothing was written

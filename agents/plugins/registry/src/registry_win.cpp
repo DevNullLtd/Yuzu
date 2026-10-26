@@ -726,8 +726,8 @@ int do_apply(yuzu::CommandContext& ctx, yuzu::Params params) {
         return 1;
     }
     Win32Registry reg;
-    return emit(ctx, run_apply(reg, as_handle(HKEY_LOCAL_MACHINE), parsed.items, ApplyOptions{*dry_run, *cont},
-                               /*fast_eligible=*/true));
+    return run_apply(ctx, reg, as_handle(HKEY_LOCAL_MACHINE), parsed.items, ApplyOptions{*dry_run, *cont},
+                     /*fast_eligible=*/true); // streams each item's rows as it concludes
 }
 
 int dispatch(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) {

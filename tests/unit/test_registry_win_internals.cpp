@@ -571,8 +571,8 @@ struct AclRestore {
 // handle to the key `h` is bound to and checks the requested access against THAT key's security descriptor (not the
 // access `h` was opened with), so a key whose ACL denies subkey creation answers ERROR_ACCESS_DENIED without anything
 // being created. Mutation: ask for KEY_READ in the probe (registry_core.hpp open_checked) and the locked section goes red.
-TEST_CASE("RegOpenKeyExW(h, empty, KEY_CREATE_SUB_KEY) answers ERROR_ACCESS_DENIED on a key whose ACL denies subkey "
-          "creation, and creates nothing",
+TEST_CASE("RegOpenKeyExW(h empty KEY_CREATE_SUB_KEY) answers ERROR_ACCESS_DENIED on a key whose ACL denies subkey "
+          "creation and creates nothing",
           "[registry][windows][internals]") {
     const std::string root = scratch_root("probe");
     ScratchTree cleanup{root};
@@ -659,7 +659,13 @@ TEST_CASE("apply: a dry run cannot see the ACL a new key inherits; the real run'
 
     Win32Registry reg;
     const Handle hklm = as_handle(HKEY_LOCAL_MACHINE);
-    const auto verdict_of = [](const yuzu::registry::ActionOutput& out) {
+    struct Lines { // run_apply's sink
+        std::vector<std::string> lines;
+        void write_output(std::string_view t) { lines.emplace_back(t); }
+    };
+    const auto verdict_of = [&](bool dry_run) {
+        Lines out;
+        (void)yuzu::registry::run_apply(out, reg, hklm, parsed.items, {dry_run, false}, true);
         for (const auto& l : out.lines)
             if (l.rfind("item|0|", 0) == 0) {
                 std::vector<std::string> cells;
@@ -674,12 +680,12 @@ TEST_CASE("apply: a dry run cannot see the ACL a new key inherits; the real run'
             }
         return std::vector<std::string>{};
     };
-    const auto dry = verdict_of(yuzu::registry::run_apply(reg, hklm, parsed.items, {/*dry_run=*/true, false}, true));
+    const auto dry = verdict_of(/*dry_run=*/true);
     REQUIRE(dry.size() > 9);
     CHECK(dry[6] == "would_apply");
     CHECK_FALSE(key_exists(parent + "\\New"));
 
-    const auto real = verdict_of(yuzu::registry::run_apply(reg, hklm, parsed.items, {/*dry_run=*/false, false}, true));
+    const auto real = verdict_of(/*dry_run=*/false);
     REQUIRE(real.size() > 9);
     WARN("inherited deny ACE: dry run " << dry[6] << ", real run " << real[6] << " (" << real[7] << "), created=" << real[9]);
     if (real[6] == "applied") {

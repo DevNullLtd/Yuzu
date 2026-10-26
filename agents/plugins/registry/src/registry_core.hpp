@@ -66,7 +66,8 @@
  *
  * `apply` (run_apply) opens each DISTINCT key of a plan once on a checked handle and reuses it for the later value
  * items on that key; one verdict function (refusal_reason) is taken over the same facts in a dry run and a real run, and
- * a real run mutates only after it. The undo manifest it returns is bounded by ONE budget (CaptureBudget).
+ * a real run mutates only after it. Each item's rows (audit line, item row, undo rows) are written as the item
+ * concludes, before the next item opens anything. The undo manifest is bounded by ONE budget (CaptureBudget).
  */
 
 #include <algorithm>
@@ -725,7 +726,10 @@ inline void count_tree(RegistryWriter& reg, Handle h, TreeCount& c, unsigned dep
             return;
         }
         Handle child = 0;
-        if (const long orc = reg.open_sub(h, name, kKeyQueryValue | kKeyEnumerateSubKeys, child); orc != kErrorSuccess) {
+        // The delete walk's own mask (DELETE included), so a child whose ACL denies the delete refuses here, before
+        // anything is deleted, instead of stopping the real delete part-way.
+        if (const long orc = reg.open_sub(h, name, kAccessDelete | kKeyQueryValue | kKeyEnumerateSubKeys, child);
+            orc != kErrorSuccess) {
             c.error = rc_token(orc, Missing::key);
             return;
         }
@@ -884,6 +888,33 @@ struct ActionOutput {
     int rc = 0;
 };
 
+/// Writes an action's lines one at a time (`Ctx` is yuzu::CommandContext; a template so the pure unit suites can drive
+/// it with a recording fake). Once a real `audit|` line is out, a sink failure on a later line must not reach
+/// `report_exception`'s fixed failed audit line: the server would mint a success row and then a failure row for one
+/// command_id. So that failure answers only `error|exception` (best effort) and put() answers false: the caller stops
+/// (apply mutates nothing more). A failure before any audit line has gone out propagates, and the seam's catch leaves
+/// its fixed line.
+template <class Ctx>
+struct LineSink {
+    Ctx& ctx;
+    bool audit_written = false;
+
+    [[nodiscard]] bool put(const std::string& line) {
+        try {
+            ctx.write_output(line);
+        } catch (...) {
+            if (!audit_written) throw;
+            try {
+                ctx.write_output("error|exception");
+            } catch (...) {
+            }
+            return false;
+        }
+        audit_written = audit_written || line.starts_with("audit|");
+        return true;
+    }
+};
+
 /// Copies a captured previous value onto an audit record (state always, type and bytes when present).
 inline void fill_old(AuditRecord& au, const OldValue& old) {
     au.old_state = std::string{old_state_name(old.state)};
@@ -1022,6 +1053,7 @@ struct ItemFacts {
         if (!f.leaf_error.empty()) return f.leaf_error;
         if (f.leaf_capped) return std::string{kTokTreeTooLarge};
         return {};
+    case PlanOp::count_: return std::string{kTokInvalidData}; // not an op: parse_plan never yields it
     }
     return {};
 }
@@ -1126,26 +1158,33 @@ struct ApplyOptions {
     bool continue_on_error = false;
 };
 
-/// Runs a parsed plan against the machine hive `hklm` in one pass. Per item: the key is opened ONCE per distinct
+/// Runs a parsed plan against the machine hive `hklm` in one pass, writing its rows to `ctx` (yuzu::CommandContext; a
+/// template so the pure unit suites can drive it with a recording fake). Per item: the key is opened ONCE per distinct
 /// (ASCII-case-folded) key on a checked handle and reused by the later items on that key (one checked
 /// open per key, not per item); a FAILED open is a fact for that item only and is never cached, so the next item on the
 /// key opens again with its own flags (delete_value on a missing key refused, a later set_value on it still creates it).
 /// The open uses the mutation's own access mask in BOTH modes, so a dry run sees the same denials; a dry run's create
 /// check is open_checked's `probe_create`. The facts are captured, ONE verdict (refusal_reason) is taken, and only a real
 /// run then mutates and verifies. NOT transactional: continue_on_error=false stops at the first refused or failed item (the
-/// rest are `skipped`); rc is 1 whenever any item was refused or failed. Rows, undo coverage per op and the bounds:
-/// README "apply". The handles are closed when this returns (the map dies with it), a creating item's keys that were not
-/// committed are rolled back by their Opened.
-[[nodiscard]] inline ActionOutput run_apply(RegistryWriter& reg, Handle hklm, const std::vector<PlanItem>& items,
-                                            ApplyOptions opt, bool fast_eligible = false) {
-    ActionOutput out;
+/// rest are `skipped`); the answer is 1 whenever any item was refused or failed. Rows, undo coverage per op and the
+/// bounds: README "apply".
+///
+/// STREAMED: each item's rows go out AS THE ITEM CONCLUDES, before the next item opens anything: its audit line, then its
+/// item row, then (a delete_key that mutated) its undo rows; the summary row comes last. So whatever stops the plan
+/// later (an exception, a dead agent) cannot take back the evidence and the undo manifest of the items already done. A
+/// sink failure follows LineSink's rule and STOPS the plan: nothing after that item is opened or mutated, and the answer
+/// is 1. The handles are closed when this returns (the map dies with it).
+template <class Ctx>
+[[nodiscard]] int run_apply(Ctx& ctx, RegistryWriter& reg, Handle hklm, const std::vector<PlanItem>& items,
+                            ApplyOptions opt, bool fast_eligible = false) {
+    LineSink<Ctx> sink{ctx};
+    int rc = 0;
     ApplySummary sum;
     sum.total = items.size();
     sum.dry_run = opt.dry_run;
     CaptureBudget budget;
     std::map<std::string, Opened> by_key; // folded key -> its checked handle; SUCCESSFUL opens only
     std::set<std::string> sim_created;    // dry run only: folded keys an earlier would-be item creates
-    std::vector<std::string> undo_rows;
     bool stopped = false;
 
     for (std::size_t idx = 0; idx < items.size(); ++idx) {
@@ -1159,7 +1198,7 @@ struct ApplyOptions {
         if (stopped) {
             row.verdict = "skipped";
             ++sum.skipped;
-            out.lines.push_back(render_item_row(row));
+            if (!sink.put(render_item_row(row))) return 1;
             continue;
         }
 
@@ -1171,7 +1210,6 @@ struct ApplyOptions {
         au.key = item.key;
         au.name = item.name;
         au.dry_run = opt.dry_run ? 1 : 0;
-        row.value_op = value_op;
         if (item.op == PlanOp::set_value) {
             au.type_name = item.type_name;
             au.len = static_cast<long long>(item.bytes.size());
@@ -1213,9 +1251,9 @@ struct ApplyOptions {
                     facts.old = capture_old(reg, h, item.name);
                 } else if (item.op == PlanOp::delete_key) {
                     std::string first;
-                    const long rc = reg.enum_subkey(h, 0, first);
-                    facts.has_subkeys = rc == kErrorSuccess;
-                    if (rc != kErrorSuccess && rc != kErrorNoMoreItems) facts.leaf_error = rc_token(rc, Missing::key);
+                    const long src = reg.enum_subkey(h, 0, first);
+                    facts.has_subkeys = src == kErrorSuccess;
+                    if (src != kErrorSuccess && src != kErrorNoMoreItems) facts.leaf_error = rc_token(src, Missing::key);
                     if (!facts.has_subkeys && facts.leaf_error.empty()) {
                         CaptureBudget trial = budget;
                         LeafVet vet = vet_leaf_values(reg, h, trial);
@@ -1253,18 +1291,34 @@ struct ApplyOptions {
         // ops refuse a missing key); it keeps a null handle from ever being dereferenced below.
         if (reason.empty() && !opt.dry_run && handle == nullptr) reason = std::string{kTokConcurrentChange};
 
-        if (value_op) {
+        // The previous value and the delete_key counts are facts only when they were read (a handle was captured on, or
+        // the key is known missing): an item refused BEFORE that (invalid, or its open failed) shows `-`, never
+        // `old_state=absent`, which the undo table reads as "delete it". The dry run reads the same facts as the real run.
+        const bool facts_read = item.invalid.empty() && facts.open_error.empty();
+        if (value_op && facts_read) {
+            row.value_op = true;
             row.old = budgeted_old(budget, item.name, facts.old);
             fill_old(au, facts.old); // the audit line keeps its own bounded evidence (256 raw bytes)
         }
-        if (item.op == PlanOp::delete_key) {
+        if (item.op == PlanOp::delete_key && facts_read) {
             au.counted_keys = facts.key_exists ? 1 : 0;
             au.counted_values = static_cast<long long>(facts.leaf_value_count);
             au.capped = facts.leaf_capped ? 1 : 0;
         }
 
         std::string verdict;
+        bool undo = false; // a real delete_key that took its values: its undo rows follow its item row
         if (!reason.empty()) {
+            // A real creating item whose open made keys and that is then refused: roll them back NOW, by their own
+            // handles, so `created` is what stayed when the row goes out and nothing the item made outlives it; the
+            // entry is erased, so a later item on the key opens afresh.
+            if (!opt.dry_run && handle != nullptr && !handle->made.empty()) {
+                handle->rollback();
+                open_created = handle->created;
+                row.created = au.created = static_cast<long long>(open_created);
+                by_key.erase(fold);
+                handle = nullptr;
+            }
             // open_checked created some components, then failed (it rolled back what it could: `created` is what stayed).
             const bool partial = !opt.dry_run && open_created > 0;
             // created < missing: a PREFIX of the missing tail exists, so `created=<n>` (the undo reads it as the n
@@ -1293,13 +1347,13 @@ struct ApplyOptions {
             // checked -- and a re-query would prove only that it is open.
             case PlanOp::create_key: wo.result = "ok"; break;
             case PlanOp::delete_key: wo = delete_key_on(reg, h, false); break;
+            case PlanOp::count_: break; // not an op (parse_plan never yields it): fails below
             }
             if (creating_op) handle->commit(); // the item is over, whatever it concluded: the keys it made stay
             row.verify = wo.verify;
             au.verify = wo.verify;
             // `mutated`, not `ok`: a delete whose verify then mismatched still took the values with it.
-            if (item.op == PlanOp::delete_key && wo.mutated)
-                for (const auto& nv : facts.leaf_values) undo_rows.push_back(render_undo_row(idx, nv.name, nv.v));
+            undo = item.op == PlanOp::delete_key && wo.mutated;
             if (wo.ok()) {
                 verdict = "applied";
                 au.result = "ok";
@@ -1313,43 +1367,29 @@ struct ApplyOptions {
             }
         }
         row.verdict = verdict;
-        out.lines.push_back(render_audit_line(au)); // the audit line first: it is the evidence a later sink failure must not lose
-        out.lines.push_back(render_item_row(row));
+        // The audit line first: it is the evidence a later sink failure must not lose.
+        if (!sink.put(render_audit_line(au)) || !sink.put(render_item_row(row))) return 1;
+        if (undo)
+            for (const auto& nv : facts.leaf_values)
+                if (!sink.put(render_undo_row(idx, nv.name, nv.v))) return 1;
         if (verdict == "refused" || verdict == "failed") {
-            out.rc = 1;
+            rc = 1;
             if (!opt.continue_on_error) stopped = true;
         }
     }
 
-    out.lines.insert(out.lines.end(), std::make_move_iterator(undo_rows.begin()),
-                     std::make_move_iterator(undo_rows.end()));
     sum.undo_complete = !budget.incomplete;
-    out.lines.push_back(render_summary_row(sum));
-    if (out.rc != 0) out.lines.emplace_back("error|partial_failure");
-    return out;
+    if (!sink.put(render_summary_row(sum))) return 1;
+    if (rc != 0 && !sink.put("error|partial_failure")) return 1;
+    return rc;
 }
 
-/// Writes an action's lines in order (`Ctx` is yuzu::CommandContext; a template so the pure unit suites can drive it
-/// with a recording fake). Once the call's real `audit|` line is out, a sink failure on a later line must not reach
-/// `report_exception`'s fixed failed audit line: the server would mint a success row and then a failure row for one
-/// command_id. So that failure answers only `error|exception` here (rc 1); a failure before any audit line has gone
-/// out propagates, and the seam's catch leaves its fixed line.
+/// Writes a single action's rendered lines through LineSink (its failure rule applies).
 template <class Ctx>
 int emit_lines(Ctx& ctx, const ActionOutput& out) {
-    bool audit_written = false;
-    for (const auto& line : out.lines) {
-        try {
-            ctx.write_output(line);
-        } catch (...) {
-            if (!audit_written) throw;
-            try {
-                ctx.write_output("error|exception");
-            } catch (...) {
-            }
-            return 1;
-        }
-        audit_written = audit_written || line.starts_with("audit|");
-    }
+    LineSink<Ctx> sink{ctx};
+    for (const auto& line : out.lines)
+        if (!sink.put(line)) return 1;
     return out.rc;
 }
 
