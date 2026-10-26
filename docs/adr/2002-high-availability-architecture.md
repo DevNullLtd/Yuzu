@@ -309,8 +309,9 @@ failures and losses by closed cause, and the age of the last answered coordinati
 published at scrape time from a lock-free snapshot, so a stalled coordination probe cannot stall a scrape
 and the age keeps growing if the election loop wedges. `SplitBrain` is verified by Prometheus rule unit
 cases only (a real two-leader state cannot be built against one database), and a paused ex-leader is not
-caught by it — that case is the epoch fence's, with `YuzuLeaderCoordinationStale` as the signal for a
-leader whose connection stopped answering. The fence is per database: replicas pointed at different databases (a split DSN, a Patroni double-primary) each pass their own fence, and that is the case `SplitBrain` can actually observe. This does not lift the safe-to-scale gate; remediation-claim
+caught by it — that case is the epoch fence's alone (a frozen process serves no `/metrics`, so no alert on its own series can evaluate;
+`YuzuLeaderNoLeader` fires if no other replica takes over), and `YuzuLeaderCoordinationStale` is the signal for a
+leader that is alive and serving `/metrics` but whose coordination connection stopped answering. The fence is per database: replicas pointed at different databases (a split DSN, a Patroni double-primary) each pass their own fence, and that is the case `SplitBrain` can actually observe. This does not lift the safe-to-scale gate; remediation-claim
 lifecycle counters (#6526), a CRL freshness gauge (#6527) and a durable cluster-capability admission gate
 (#6528) are separate, unshipped items.
 

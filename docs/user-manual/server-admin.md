@@ -1034,8 +1034,12 @@ that holds it).
   shipped quorum default; the fence is not claimed safe across a lossy
   asynchronous promotion) and what runs twice is the unfenced background passes. **What it does not catch:** a *paused*
   ex-leader (the case the epoch fence exists for) — its process is frozen, so its
-  series goes stale, not `1`. That case is covered by
-  `YuzuLeaderCoordinationStale` and by the fence itself. This alert is verified
+  series goes stale, not `1`, and a frozen process serves no `/metrics`, so no
+  alert on its own series can evaluate. That case is covered by the fence itself
+  (and `YuzuLeaderNoLeader` fires after 5 minutes if no other replica takes
+  over); `YuzuLeaderCoordinationStale` is the signal for a leader that is alive
+  and serving `/metrics` but whose coordination connection has stopped
+  answering. This alert is verified
   by Prometheus rule unit cases only; a genuine two-leader state cannot be
   produced against one database.
 - **`YuzuLeaderNoLeader` (critical).** No replica has believed it leads for over
