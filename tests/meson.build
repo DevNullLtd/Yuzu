@@ -1491,6 +1491,7 @@ if build_server
       'unit/server/test_home_panels_routes.cpp', # HM-2: Dashboard policies + events fragments
       'unit/server/test_leader_elector.cpp',
       'unit/server/test_leader_gate.cpp',
+      'unit/server/test_leader_metrics.cpp', # HA WS-11 (#4014): yuzu_server_leader_* seed + scrape-time publisher
       'unit/server/test_coord_dsn.cpp',
       'unit/server/test_pg_reachability_probe.cpp', # HA WS-8: /readyz pg_reachable rule + probe
       'unit/server/test_multi_host_dsn.cpp', # HA WS-8: multi-host DSN target_session_attrs guard
