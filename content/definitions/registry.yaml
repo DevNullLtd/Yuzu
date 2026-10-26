@@ -227,11 +227,25 @@ kind: InstructionDefinition
 metadata:
   id: windows.registry.set_value
   displayName: Set Registry Value
-  version: 1.0.0
+  version: 1.1.0
   description: >
-    Write a value to the Windows registry, creating the key if it does not
-    exist. Value data is written as REG_SZ (a UTF-16 string) or REG_DWORD (a
-    32-bit integer) per `type`. Windows-only.
+    Write a value to the Windows registry, creating missing key components
+    beneath an existing top-level key (a path whose first component is
+    missing is refused as root_level_create). All six writable types are supported (REG_SZ, REG_EXPAND_SZ,
+    REG_BINARY, REG_DWORD, REG_MULTI_SZ, REG_QWORD) and the write is verified:
+    the previous value is captured first, the new one is read back on the same
+    handle and compared byte for byte, and a mismatch fails the action. The
+    key is opened on a checked handle (one canonical-name-checked open, with a
+    component walk as the fallback) and a registry symbolic link anywhere in
+    the path is refused, never followed; a write under HKLM\SYSTEM\CurrentControlSet,
+    itself a link, therefore fails as key_is_link. The previous and new values
+    are recorded in a `registry.write` audit row (hex, capped at 256 bytes; they can
+    contain secrets: the product owner accepted this risk on 2026-10-20 and masking
+    is a planned later change). Needs registry 2.0.0 on the agent: an agent still
+    running registry 1.x writes an EMPTY REG_SZ for a data_hex-only write, stores
+    REG_QWORD, REG_MULTI_SZ, REG_EXPAND_SZ and REG_BINARY values as REG_SZ text and
+    follows a write under HKLM\SYSTEM\CurrentControlSet, all answering `status|ok`,
+    so upgrade the agents first. Windows-only.
   tags: [registry, windows, configuration]
 spec:
   type: action
@@ -242,7 +256,7 @@ spec:
     concurrency: per-device
   parameters:
     type: object
-    required: [hive, key, name, value]
+    required: [hive, key, name]
     properties:
       hive:
         type: string
@@ -254,27 +268,67 @@ spec:
         type: string
         description: >
           Registry key path relative to the hive root; created if it does
-          not already exist, e.g. "Software\\MyApp".
+          not already exist beneath an existing top-level key, e.g.
+          "Software\\MyApp". At most 255 bytes and 32 components; a hive
+          alias, an empty, "." or ".." component and control characters are
+          refused on the instruction and MCP routes; POST /api/command passes
+          an embedded NUL to the plugin as a C string, so the value is cut at
+          it.
       name:
         type: string
-        description: The value name to write, e.g. "InstallPath".
+        description: >
+          The value name to write, e.g. "InstallPath". Empty writes the key's
+          default value. At most 16,383 bytes.
       value:
         type: string
         description: >
-          The value data to write, as text; interpreted per `type` (decimal
-          digits for REG_DWORD, literal text for REG_SZ).
+          The value data to write, as text; interpreted per `type`: decimal
+          digits for REG_DWORD / REG_QWORD, literal text for REG_SZ /
+          REG_EXPAND_SZ, LF-separated non-empty records for REG_MULTI_SZ
+          (split on LF only, so a CR stays inside its record; an empty record
+          or a trailing LF is refused as invalid_data; empty text is the empty
+          list), hex digits for REG_BINARY (empty is zero bytes). Send exactly
+          one of `value` and `data_hex`. When neither is sent, or the one sent
+          is empty, the write stores an empty value of the type and answers ok:
+          an empty string, the empty list or zero bytes (REG_DWORD and
+          REG_QWORD refuse it as invalid_data), so a misspelt parameter name
+          writes an empty value instead of failing. Through MCP
+          `execute_instruction` and the result-set execute routes every
+          parameter value is limited to 64 KiB.
+      data_hex:
+        type: string
+        description: >
+          The exact bytes to write, as hex, for any type; give it INSTEAD of
+          `value` (both non-empty is refused as invalid_data). Shape
+          is checked per type: 4 bytes for REG_DWORD, 8 for REG_QWORD, a
+          terminating NUL for the string types, a trailing double NUL for
+          REG_MULTI_SZ. Use it for exact bytes you hold from another source. An
+          empty `data_hex` is the same as omitting it here. The plugin takes at
+          most 1 MiB of data (2,097,152 hex characters), but MCP
+          `execute_instruction` and the result-set execute routes limit every
+          parameter value to 64 KiB, so through them it carries at most 32 KiB
+          of data; the direct command route is not under that cap. Needs
+          registry 2.0.0 on the agent: registry 1.x ignores it and writes an
+          EMPTY REG_SZ over the value, answering `status|ok` (with
+          type=REG_DWORD and data_hex only, 1.x throws and writes nothing).
+        validation:
+          maxLength: 2097152
       type:
         type: string
         description: >
           Registry value type to write. Defaults to REG_SZ when omitted.
+          Mixed fleets: an agent still running registry 1.x stores
+          REG_QWORD, REG_MULTI_SZ, REG_EXPAND_SZ and REG_BINARY values as
+          REG_SZ text and answers `status|ok`, so upgrade the agents to
+          registry 2.0.0 before using them.
         validation:
-          enum: ["REG_SZ", "REG_DWORD"]
+          enum: ["REG_SZ", "REG_EXPAND_SZ", "REG_BINARY", "REG_DWORD", "REG_MULTI_SZ", "REG_QWORD"]
   result:
     columns:
       - name: status
         type: string
         description: >-
-          Confirms the write succeeded; only ever emitted on success — a failure is reported as an `error|` line and a non-zero exit instead of this column. Values: ok.
+          Confirms the write succeeded and read back identical; only ever emitted on success — a failure is reported as an `error|<token>` line (not exhaustive: access_denied, key_not_found, root_level_create, key_is_link, concurrent_change, invalid_type, invalid_data, value_overflow, invalid_key_path, invalid_value_name, verify_mismatch or win32:<code>) and a non-zero exit instead of this column. A run that resolves its hive and key, success or not, also emits one `audit|op=set_value|...` row carrying the previous and new values (hex, capped); a missing hive or key, or an unparseable hive, is a bare `error|...` line with nothing opened and no audit row, while a key path or value name that fails shape validation after the hive resolved (invalid_key_path, invalid_value_name) is audited as result=refused. Values: ok.
         example: "ok"
         platforms: [windows]
   approval:
@@ -283,7 +337,7 @@ spec:
     executeRoles: [endpoint-admin]
     authorRoles: [content-author]
   compatibility:
-    minAgentVersion: 0.2.0
+    minAgentVersion: 0.15.0
     requiredPlugins: [registry]
 status:
   phase: active
@@ -346,10 +400,14 @@ kind: InstructionDefinition
 metadata:
   id: windows.registry.delete_value
   displayName: Delete Registry Value
-  version: 1.0.0
+  version: 1.1.0
   description: >
     Delete a specific value from a Windows registry key; the key itself is
-    left in place. Windows-only.
+    left in place. Registry 2.0.0 reports a failure as an `error|<token>` line
+    (key_not_found, value_not_found, key_is_link, access_denied ...) instead of a
+    sentence, limits the key path to 255 bytes and 32 components, and emits one
+    leading `audit|op=delete_value|...` row (the old value, hex) before `status|ok`.
+    Windows-only.
   tags: [registry, windows, configuration]
 spec:
   type: action
@@ -393,7 +451,7 @@ spec:
     executeRoles: [endpoint-admin]
     authorRoles: [content-author]
   compatibility:
-    minAgentVersion: 0.2.0
+    minAgentVersion: 0.15.0
     requiredPlugins: [registry]
 status:
   phase: active
@@ -404,10 +462,18 @@ kind: InstructionDefinition
 metadata:
   id: windows.registry.delete_key
   displayName: Delete Registry Key
-  version: 1.0.0
+  version: 1.1.0
   description: >
-    Delete a Windows registry key and every value and subkey beneath it in
-    one call. Windows-only.
+    Delete a Windows registry key that has no subkeys; a key with subkeys is refused as key_has_subkeys
+    and nothing is deleted. The key is opened on a checked handle (one canonical-name-checked open, with
+    a component walk as the fallback) and a registry symbolic link in the path is refused, never followed
+    (the key AT the path may itself be a link: the link object is removed and its target is untouched).
+    The delete runs by handle on the checked key (no RegDeleteTreeW, which follows links) and is
+    confirmed by the handle reading back as deleted. counted_keys is 1 and counted_values is the number
+    of values the key held; the count stops at 10,000 nodes (the key plus up to 9,999 values), past which
+    capped is 1 and counted_values is a lower bound (the delete still removes the key with all its
+    values). A subkey created between the check and the delete makes the delete fail, not key_has_subkeys:
+    the key stays and the action answers a failure token (access_denied or win32:<code>). Windows-only.
   tags: [registry, windows, configuration]
 spec:
   type: action
@@ -437,8 +503,28 @@ spec:
       - name: status
         type: string
         description: >-
-          Confirms the delete succeeded; only ever emitted on success — a failure is reported as an `error|` line and a non-zero exit instead of this column. Values: ok.
+          Confirms the delete succeeded and the handle read back as deleted; only ever emitted on success — a failure is reported as an `error|<token>` line (not exhaustive: key_not_found, key_has_subkeys, key_is_link, access_denied, verify_mismatch, concurrent_change, invalid_key_path or win32:<code>) and a non-zero exit instead of this column. A run that resolves its hive and key, success or not, also emits one `audit|op=delete_key|...` row; a missing hive or key, or an unparseable hive, is a bare `error|...` line with nothing opened and no audit row. Values: ok.
         example: "ok"
+        platforms: [windows]
+      - name: counted_keys
+        type: int32
+        description: 'Keys removed: always the target alone, so 1. Values: 1.'
+        example: "1"
+        platforms: [windows]
+      - name: counted_values
+        type: int32
+        description: 'Values the key held, counted before the delete (a lower bound whenever capped is 1). Point in time: a writer racing the delete can add values this count never saw. Values: a non-negative integer.'
+        example: "5"
+        platforms: [windows]
+      - name: dry_run
+        type: bool
+        description: 'Always 0: this version has no dry run (the column is kept for the audit row and later releases). Values: 0 — a digit, never true/false.'
+        example: "0"
+        platforms: [windows]
+      - name: capped
+        type: bool
+        description: 'Whether the value enumeration stopped at its cap of 10,000 nodes (the key plus up to 9,999 values), making counted_values a lower bound; the delete still removes the key with all its values. Values: 1 (capped), 0 (complete) — a digit, never true/false.'
+        example: "0"
         platforms: [windows]
   approval:
     mode: role-gated
@@ -446,7 +532,7 @@ spec:
     executeRoles: [endpoint-admin]
     authorRoles: [content-author]
   compatibility:
-    minAgentVersion: 0.2.0
+    minAgentVersion: 0.15.0
     requiredPlugins: [registry]
 status:
   phase: active

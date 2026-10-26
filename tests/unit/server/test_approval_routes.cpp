@@ -946,3 +946,37 @@ TEST_CASE("approval_routes: wiring -- server.cpp passes step_up_fn and csrf_trus
     CHECK(block.find(".resolve_session_fn = resolve_session_fn") != std::string::npos);
     CHECK(block.find(".audit_fn = audit_fn") != std::string::npos);
 }
+
+TEST_CASE("approval_routes: GET /api/approvals shows a bound ticket's frozen request as an object; "
+          "an unbound row is unchanged",
+          "[server][routes][approval_routes][pg][bound]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    auto unbound = mgr->submit("def-plain", "submitter1", "scope", "", ApprovalOrigin::kInstruction);
+    REQUIRE(unbound.has_value());
+    const std::string request = R"({"definition":{"name":"Block RDP","hash":"abc"},"targets":["host-1"]})";
+    auto bound =
+        mgr->submit_bound("guardian.deploy.r1", "submitter1", "", ApprovalOrigin::kGuardianDeploy,
+                          BoundRequest{request, {"designer1"}});
+    REQUIRE(bound.has_value());
+
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.wire();
+    auto list = h.sink.Get("/api/approvals");
+    REQUIRE(list);
+    REQUIRE(list->status == 200);
+    const auto arr = body(list->body)["approvals"];
+    REQUIRE(arr.size() == 2);
+    for (const auto& row : arr) {
+        if (row["id"] == *unbound) {
+            CHECK(row.size() == 9);
+            CHECK_FALSE(row.contains("request"));
+        } else {
+            REQUIRE(row["id"] == *bound);
+            REQUIRE(row["request"].is_object());
+            CHECK(row["request"]["definition"]["hash"] == "abc");
+            CHECK(row["request_digest"].get<std::string>().size() == 64);
+            CHECK(row["excluded_roots"] == nlohmann::json::array({"designer1"}));
+        }
+    }
+}

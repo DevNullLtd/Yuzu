@@ -142,7 +142,7 @@ duplicates.
 | procfetch | ✅ | ✅ | ✅ | linux/apple/win branches |
 | quarantine | ✅ | ✅ | ✅ | full per-OS blocks; Linux covers IPv4 and IPv6 (honest `note\|ipv6_unavailable` on hosts with no IPv6 stack), macOS verifies pf is actually ENABLED and not merely loaded, and status on all three platforms reports partial/degraded containment rather than a clean `active` (#3282, #3283, #3285). Windows containment now blocks via profile-default policy rather than named Block rules, so the loopback/whitelist Allow rules actually take effect once quarantined (#3284) — see docs/quarantine-windows-firewall-precedence.md |
 | rdp_control | ✅ | ⛔ | ⛔ | Windows-only. Off-Windows returns an honest `rdp_control\|unsupported` sentinel (macOS names Screen Sharing); state-changing `set_state` reports terminal FAILURE, read-only `status` rc=0 — `rdp_control_plugin.cpp` `#ifndef _WIN32` branch |
-| registry | ✅ | ⛔ | ⛔ | Windows-only (advapi32). Off-Windows returns an honest `registry\|unsupported` sentinel (reads rc=0; mutating `set_value`/`delete_*` report terminal FAILURE — no false success) — `registry_plugin.cpp` `#ifndef _WIN32` branch. `list_profiles` (PR1.7) enumerates local profiles via ProfileList/HKEY_USERS. `get_user_value` resolves the target profile via ProfileList and reads the live `HKEY_USERS\<SID>` hive when the user is logged in, falling back to an offline `RegLoadKey` mount (SeBackup/SeRestore privileges, required only for that fallback) when not. The ladder lives in `agents/shared/win_profiles.hpp` and is shared with `installed_apps.list_per_user`, `license_scan`'s per-user surfaces and `tar`'s mapdrive history (#2771) |
+| registry | ✅ | 🔜 | 🔜 | Windows-only (advapi32). The macOS (`defaults`/CFPreferences plist) and Linux (`dconf`/`gsettings`) legs are PLANNED stubs, declared with no behaviour: off-Windows every action returns an honest `registry\|unsupported` sentinel (reads rc=0; the three mutating actions `set_value`/`delete_value`/`delete_key` report terminal FAILURE — no false success) — `registry_plugin.cpp` `#ifndef _WIN32` branch. The writes are read-back verified and run on a handle checked for registry links (`registry_core.hpp`, `registry_win.cpp`). `list_profiles` (PR1.7) enumerates local profiles via ProfileList/HKEY_USERS. `get_user_value` resolves the target profile via ProfileList and reads the live `HKEY_USERS\<SID>` hive when the user is logged in, falling back to an offline `RegLoadKey` mount (SeBackup/SeRestore privileges, required only for that fallback) when not. The ladder lives in `agents/shared/win_profiles.hpp` and is shared with `installed_apps.list_per_user`, `license_scan`'s per-user surfaces and `tar`'s mapdrive history (#2771) |
 | remote_access_audit | 🔜 | 🟡 | ✅ | SSH inbound-access audit, one `list` action: `sshd_config` as written, a SHA-256 fingerprint and option names for each account's `authorized_keys`, and `sshd` service state; never a key comment, option value or key-file path. Forensics-class: default-off behind the plugin-config kill switch, `Forensics:Read` + `AdminOrApproval`, single-target. Linux (rung 2, constrained: the unprivileged agent usually cannot open other users' homes); macOS (rung 2, adds `launchctl print-disabled system`); Windows is a PLANNED placeholder reporting one `unsupported` status row (`windows:planned`). Details: the plugin README. |
 | runtimes | 🔜 | ✅ | 🔜 | `dotnet`/`jvm` installed-runtime inventory, read-only and zero-subprocess (rung 1). Linux only: directory-name walks, `release` file reads and a `bin/java` probe for release-less homes over an injected root (`runtimes_linux_parsers.hpp`), skipping network mounts read from `/proc/self/mountinfo`. Coverage: the standard roots only (`/usr/share/dotnet`, `/usr/lib/dotnet`, `/usr/lib64/dotnet`; `/usr/lib/jvm`, `/opt/java`, `/usr/lib64/jvm`, `/var/opt/java`), so `supported` with no rows means none found there, not none installed (an Oracle-RPM `/usr/java`, `/opt/jdk-*`, SDKMAN and bundled runtimes are not walked). macOS and Windows are declared `planned`; until those legs ship those hosts answer `status\|<action>\|unsupported\|<os>:planned`. See `agents/plugins/runtimes/README.md` |
 | sccm | ✅ | ⛔ | ⛔ | Windows-only. macOS returns an honest `sccm\|unsupported` (points at Jamf/MDM); Linux `installed\|false` + "platform not supported" — `sccm_plugin.cpp` `__APPLE__` branch |
@@ -658,32 +658,32 @@ implementation is.
 | rdp_control | status | linux | unsupported | - | - | - |
 | rdp_control | status | macos | unsupported | - | - | - |
 | rdp_control | status | windows | supported | 1 | Win32 registry + INetFwPolicy2 COM + SCM | - |
-| registry | get_value | linux | unsupported | - | - | - |
-| registry | get_value | macos | unsupported | - | - | - |
+| registry | get_value | linux | planned | 2 | dconf/gsettings | planned stub: not implemented, the action answers registry\|unsupported\|... |
+| registry | get_value | macos | planned | 1 | defaults/CFPreferences (per-domain plist) | planned stub: not implemented, the action answers registry\|unsupported\|... |
 | registry | get_value | windows | supported | 1 | win32_registry | - |
-| registry | set_value | linux | unsupported | - | - | - |
-| registry | set_value | macos | unsupported | - | - | - |
+| registry | set_value | linux | planned | 2 | dconf/gsettings | planned stub: not implemented, the action answers registry\|unsupported\|... |
+| registry | set_value | macos | planned | 1 | defaults/CFPreferences (per-domain plist) | planned stub: not implemented, the action answers registry\|unsupported\|... |
 | registry | set_value | windows | supported | 1 | win32_registry | - |
-| registry | delete_value | linux | unsupported | - | - | - |
-| registry | delete_value | macos | unsupported | - | - | - |
+| registry | delete_value | linux | planned | 2 | dconf/gsettings | planned stub: not implemented, the action answers registry\|unsupported\|... |
+| registry | delete_value | macos | planned | 1 | defaults/CFPreferences (per-domain plist) | planned stub: not implemented, the action answers registry\|unsupported\|... |
 | registry | delete_value | windows | supported | 1 | win32_registry | - |
-| registry | delete_key | linux | unsupported | - | - | - |
-| registry | delete_key | macos | unsupported | - | - | - |
+| registry | delete_key | linux | planned | 2 | dconf/gsettings | planned stub: not implemented, the action answers registry\|unsupported\|... |
+| registry | delete_key | macos | planned | 1 | defaults/CFPreferences (per-domain plist) | planned stub: not implemented, the action answers registry\|unsupported\|... |
 | registry | delete_key | windows | supported | 1 | win32_registry | - |
-| registry | key_exists | linux | unsupported | - | - | - |
-| registry | key_exists | macos | unsupported | - | - | - |
+| registry | key_exists | linux | planned | 2 | dconf/gsettings | planned stub: not implemented, the action answers registry\|unsupported\|... |
+| registry | key_exists | macos | planned | 1 | defaults/CFPreferences (per-domain plist) | planned stub: not implemented, the action answers registry\|unsupported\|... |
 | registry | key_exists | windows | supported | 1 | win32_registry | - |
-| registry | enumerate_keys | linux | unsupported | - | - | - |
-| registry | enumerate_keys | macos | unsupported | - | - | - |
+| registry | enumerate_keys | linux | planned | 2 | dconf/gsettings | planned stub: not implemented, the action answers registry\|unsupported\|... |
+| registry | enumerate_keys | macos | planned | 1 | defaults/CFPreferences (per-domain plist) | planned stub: not implemented, the action answers registry\|unsupported\|... |
 | registry | enumerate_keys | windows | supported | 1 | win32_registry | - |
-| registry | enumerate_values | linux | unsupported | - | - | - |
-| registry | enumerate_values | macos | unsupported | - | - | - |
+| registry | enumerate_values | linux | planned | 2 | dconf/gsettings | planned stub: not implemented, the action answers registry\|unsupported\|... |
+| registry | enumerate_values | macos | planned | 1 | defaults/CFPreferences (per-domain plist) | planned stub: not implemented, the action answers registry\|unsupported\|... |
 | registry | enumerate_values | windows | supported | 1 | win32_registry | - |
-| registry | get_user_value | linux | unsupported | - | - | - |
-| registry | get_user_value | macos | unsupported | - | - | - |
+| registry | get_user_value | linux | planned | 2 | dconf/gsettings | planned stub: not implemented, the action answers registry\|unsupported\|... |
+| registry | get_user_value | macos | planned | 1 | defaults/CFPreferences (per-domain plist) | planned stub: not implemented, the action answers registry\|unsupported\|... |
 | registry | get_user_value | windows | supported | 1 | win32_registry+hive_mount | - |
-| registry | list_profiles | linux | unsupported | - | - | - |
-| registry | list_profiles | macos | unsupported | - | - | - |
+| registry | list_profiles | linux | planned | 2 | dconf/gsettings | planned stub: not implemented, the action answers registry\|unsupported\|... |
+| registry | list_profiles | macos | planned | 1 | defaults/CFPreferences (per-domain plist) | planned stub: not implemented, the action answers registry\|unsupported\|... |
 | registry | list_profiles | windows | supported | 1 | win32_registry | - |
 | remote_access_audit | list | linux | constrained | 2 | bounded reads of /etc/ssh/sshd_config (Include followed, config symlinks followed as sshd does) and each account's authorized_keys (no-follow; pure parsers, SHA-256 fingerprints); one bounded systemctl is-enabled argv per sshd unit | constrained: the agent runs unprivileged, so other users' homes (usually 0700) are refused, not empty, and the listing is constrained; configured access as written, not sshd's effective policy (Match is not evaluated); CA trust, key and principals commands, a principals file, hostbased auth and AuthenticationMethods are not read; key comments, option values and key-file paths are never emitted; only homes under /home and /root are walked; a symlinked key file or .ssh is refused; network mounts are skipped |
 | remote_access_audit | list | macos | supported | 2 | bounded reads of /etc/ssh/sshd_config (Include followed, config symlinks followed as sshd does) and each account's authorized_keys (no-follow; pure parsers, SHA-256 fingerprints); one bounded launchctl print-disabled system argv | configured access as written, not sshd's effective policy; the launchd override is not 'running'; CA trust, key and principals commands, a principals file, hostbased auth and AuthenticationMethods are not read; the Remote Login access list (pam_sacl) is not read; key comments, option values and key-file paths are never emitted; only homes under /Users owned by uid 500 or above, and /var/root, are walked; a symlinked key file or .ssh is refused; network mounts are skipped |
