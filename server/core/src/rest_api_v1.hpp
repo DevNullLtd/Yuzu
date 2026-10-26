@@ -19,6 +19,7 @@
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4: the public in-process VERIFY API seam
 #include "dex_api.hpp"    // ADR-0031 WS-A4: the public in-process DEX signals API seam
+#include "dex_score_policy_writer.hpp" // DexScorePolicyWriteDeps: PUT/DELETE /dex/score-policy
 #include "dex_perf_api.hpp" // ADR-0031 WS-A4: the public in-process DEX app-perf-over-time API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
@@ -601,15 +602,20 @@ public:
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
     /// TSan-hostile acceptor thread (#438).
     ///
-    /// `step_up_fn` (PR2, optional) — when present, the high-risk REST /
-    /// Settings handlers (token create/revoke, session revoke, Guardian rule
-    /// create/update/push, software package create, software deploy start,
-    /// file retrieval upload, user delete/role-change, and the two
-    /// engine-principal role assign/unassign routes) gate behind it after
-    /// permissions pass — the canonical enumerated list lives in
+    /// `step_up_fn` (PR2, optional) - the in-handler MFA step-up check on the
+    /// high-risk REST / Settings handlers (token create/revoke, session revoke,
+    /// Guardian rule create/update/delete/push, software package create,
+    /// software deploy start, user delete/role-change, and the engine-principal
+    /// and RBAC assignment routes). The routes that need step-up are classified
+    /// in step_up_policy.hpp; for those, the central check in server.cpp's
+    /// pre-request handler (step_up_gate.hpp) evaluates the same decision
+    /// BEFORE the handler runs, ahead of the handler's own permission and
+    /// its own cross-site copy (a cookie write has already met the server-wide
+    /// same-site gate in pre-routing), and this functor repeats it from that
+    /// same verdict within the request. The canonical enumerated list lives in
     /// docs/user-manual/rest-api.md "Step-up envelope on high-risk endpoints".
-    /// Empty functor disables the gate entirely (default — preserves
-    /// pre-PR2 behaviour for any caller that hasn't wired it).
+    /// An empty functor disables only this in-handler repeat; it does not
+    /// affect the central check.
     void register_routes(
         class HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
         RbacStore* rbac_store, ManagementGroupStore* mgmt_store, ApiTokenStore* token_store,
@@ -815,7 +821,17 @@ public:
         const std::string& target_type, const std::string& target_id, const std::string& detail)>;
     void set_audit_as_session_fn(AuditAsSessionFn fn) { audit_as_session_fn_ = std::move(fn); }
 
+    /// The score policy writer behind GET/PUT/DELETE /api/v1/dex/score-policy: the observed
+    /// store read, the store conditional writes and the provider (`audit` is bound per request
+    /// by the handler). Unset = the three routes answer 503 "runtime config store
+    /// unavailable". MUST be called BEFORE `register_routes()` (captured by value), like
+    /// `set_audit_as_session_fn`, whose session-bound audit writer the write routes require.
+    void set_dex_score_policy_writer(DexScorePolicyWriteDeps deps) {
+        dex_score_policy_writer_ = std::move(deps);
+    }
+
 private:
+    std::optional<DexScorePolicyWriteDeps> dex_score_policy_writer_;
     AuditAsSessionFn audit_as_session_fn_;
     EnginePrincipalStore* engine_principal_store_{nullptr};
     UserExistsFn user_exists_fn_;

@@ -360,7 +360,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        2026-07-13 SLE-erasure entry, and the admin reset 2027-01-04 from the
        2026-10-04 passwords entry (earlier ADR text); neither date is a
        recorded ruling, and the gate pins and warns on both without checking
-       that the revisit happens. #5955 covers only its own 13 rows.
+       that the revisit happens. #5955 covers only its own 13 rows (the 2026-10-15 set).
      - **The exception relaxes no control.** Every route requires its
        dedicated RBAC securable (`Read`) and is floored in
        `authz_topology_floor.hpp` so an RBAC-off deployment stays
@@ -534,7 +534,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      unchanged).** The list/record/per-device routes are REST-only, no MCP twin, and absent from
      route discovery only in the sense that no `get_hardware_ci`/
      `list_hardware`/equivalent MCP tool exists yet — the REST routes
-     themselves ARE in `openapi_spec()` and `GET /api/v1/routes` (A2/A3
+     themselves ARE in `openapi_spec()` and `GET /api/v1/discover/routes` (A2/A3
      hold for the REST half). A "no" on Decision 1/4's both-surfaces
      requirement for the MCP half.
      - **No MCP twin — tracked follow-up, not a permanent exception.** An
@@ -753,6 +753,169 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - Design record: `docs/auth-architecture.md` "Approver assurance
        (maker-checker, #6061)"; operator description:
        `docs/user-manual/instructions.md` "Who can approve".
+
+   - **2026-10-22 - API-parity ledger reconcile: owner rulings on 87 `planned`
+     rows.** The ADR owner (Dave Rae) ruled on the disposition of rows that were
+     still `planned` in `scripts/ci/api-parity/*.json`. One row of the 87,
+     `get.api-procfetch-status`, was added by the author during governance
+     review (it has the same shape as `get.api-chargen-status`) and was
+     confirmed by the owner on 2026-10-22. Where the rulings are recorded: the admin-plane rulings in
+     #6325, the retire ruling in #6326, and the NVD and UI-only rulings in
+     this entry only (#4099 and #5955 are not amended). Like the earlier
+     entries they are session statements, not signed decisions. Where #6325's
+     body words the MCP exclusion more strongly ("#520 alone", "most are
+     barred", create-user keeping #5357), this entry's narrower wording
+     governs. Ledger-only: no route, tool or
+     authorization behavior changes. The gate (`STRICT_EXCEPTION_PINS` in
+     `scripts/ci/check-api-parity.py`) pins each new dated exception by
+     capability id, issue and date; the pin is not itself a ruling and does not
+     bind the reason text. This entry is the ruling the pins cite, and the
+     frozen list of record is the pin table in that script at the commit that
+     lands this entry.
+     - **Legacy admin-plane rows: 34 time-boxed exceptions,
+       `exception:#6325 revisit:2027-03-31`.** The rows are the MFA, OIDC, TLS
+       certificate, plugin-signing, MCP enablement, enrollment-token and
+       pending-agent, OTA update-setting, DEX alert-setting and create-user
+       routes. Thirty of them are `/api/settings/*` routes covered by the 2026-09
+       class entry above. **Four are
+       `/fragments/settings/*` rows** (`get.fragments-settings-mfa`,
+       `get.fragments-settings-tokens`, `get.fragments-settings-updates` and
+       `get.fragments-settings-dex-alerts`). That entry says fragments "carry
+       no migration date"; this ruling extends the carve-out to those four rows
+       and gives them the same date, 2027-03-31. The date is a re-confirmation
+       point, not a delivery commitment: the class entry calls 2027-Q1
+       PO-adjustable. What is deferred is the REST v1 twin. No MCP twin is
+       built for these rows; that is the position today because the routes
+       are admin-gated (`require_admin` / `admin_fn_`) and, where the
+       securable is one of the six #520 denies in `mcp_policy.hpp`, hard-denied
+       at every MCP tier. It is not asserted here as a permanent per-route
+       decision: each twin PR decides its MCP posture and, for a route on a
+       securable that is not hard-denied, extends the deny set with a test (a
+       v1 route on such a securable would otherwise become reachable by a
+       supervised-tier token). `POST /api/settings/users` (create-user) is in
+       this set; its password argument is the same kind of reason as the
+       admin password reset in the 2026-10-04 entry (#5357 covers the reset,
+       not create-user): a password must not travel in an approval ticket's
+       persisted arguments. The 2026-09 class table's "settings-plane
+       exception, 2027-Q1" target stands for these rows. It is superseded for
+       the deployment-jobs and patches rows by the retire ruling below, for
+       `/api/export/json-to-csv`, `/api/help/autocomplete` and
+       `/api/help/palette` by the UI-only exceptions below (2026-11-30), and
+       for `/api/nvd/*` by the NVD exceptions below (2027-03-31).
+     - **NVD routes: 3 time-boxed exceptions,
+       `exception:#4099 revisit:2027-03-31`.** `GET /api/nvd/status`,
+       `POST /api/nvd/sync` and `POST /api/nvd/match` are grandfathered
+       surface 2. Their disposition is the re-home to a use-case engine
+       tracked by #4099 (Phase 7, not started); no twin is built for the
+       legacy routes, and no row is added to the grandfather set.
+     - **UI-only fragments: 10 temporary exceptions,
+       `exception:#5955 revisit:2026-11-30`**, in addition to the 13 accepted
+       on 2026-10-15 (this entry is the separate recorded ruling that entry
+       requires): `get.api-chargen-status`, `get.api-procfetch-status`,
+       `post.api-export-json-to-csv`, `get.api-help-autocomplete`,
+       `get.api-help-palette`, `post.fragments-instructions-yaml-preview`,
+       `get.fragments-results-filter-bar`,
+       `get.fragments-dex-device-perf-result`,
+       `get.fragments-dex-device-procperf-result` and
+       `get.fragments-device-live`. The 2026-10-15 entry covered 13 read
+       fragments; two of these ten are POST rows (`post.api-export-json-to-csv`,
+       a stateless transform of caller-supplied JSON that reads no server data,
+       and `post.fragments-instructions-yaml-preview`, HTML highlighting and validation messages for
+       caller-supplied YAML), and this ruling accepts them on the same terms.
+       The waiver's non-waiver of authentication, authorization, audit and
+       confinement applies unchanged. #5955's title and body still count 13;
+       the rows are the list of record.
+     - **Retired rows: 9 marked `retire`; the routes stay live.** The four
+       `/api/deployment-jobs` rows and the five `/api/patches` rows have no
+       working feature behind them and get no twin. "Retire" here means no
+       twin will be built and a named issue (#6326) owns removal; it does not
+       mean the route is gone, and the gate does not check that. The routes
+       keep answering, and are exercised by `scripts/e2e-api-test.sh`, until
+       #6326 removes them, together with those tests, the body-cap route
+       inventory and the user-manual pages, with a deprecation period to be
+       decided there. The user-manual, capability-map and roadmap entries that
+       advertised these as shipped were corrected in the same change.
+     - **Corrections, not exceptions.** Eleven rows already had a REST v1 twin
+       and an MCP tool on the same gate and flip from `planned` to `twinned`.
+       Twenty rows (fourteen UI fragments and six `/api/*` routes) become
+       `composed-of:` another ledger row. That is a
+       correction of how the fragment is classified, not a claim that the
+       composed capability is already twinned: eleven of the twenty compose
+       over a row that is itself still `planned` (two of them also over a
+       twinned row; the pressure stays on those base rows) and one over an
+       excepted row (`post.api-settings-cert-upload` over
+       `post.api-settings-cert-paste`). Composed rows count as
+       untwinned. Six further rows were examined and held back for a follow-up
+       change because the REST and MCP twins differ in gate or content
+       (`get.api-inventory-tables`, `post.api-inventory-query`,
+       `get.api-inventory-param-param`, `get.api-agents`,
+       `get.fragments-network-overview`, `get.api-tags`). `get.api-agents`
+       has since moved to a dated exception (the 2026-10-23 entry below).
+
+   - **2026-10-23 - MCP twin completeness gates, and `list_agents` as a dated
+     exception.** Two parts. First, `scripts/ci/check-api-parity.py` gains a
+     gate-parity check (for a ledger row with both a REST v1 twin and an MCP
+     tool, the securable, operation and gate kind must agree) and a
+     test-existence tripwire (each registry tool's test file must name the tool
+     and assert a schema and an audit row), and a Catch2 case checks that every
+     registry tool is both a ledger `mcp_twin` and a `kExpectedTwins` row. Each
+     check carries a size-pinned, shrink-only allowlist seeded from the tree as
+     it stood. The gate-parity table (`GATE_PARITY_KNOWN_MISMATCHES`) holds
+     the six rows whose REST and MCP gates still differ, or whose agreement
+     the check cannot prove, after it learned two shapes (a REST handler that
+     refuses a service-scoped token before its gate, and an MCP handler whose
+     own fleet read confines), with a
+     one-line reason each in the script; a second table
+     (`GATE_PARITY_NO_GATE_ALLOWED`) holds routes whose gate the script cannot
+     read. Both shrink only: a fix removes its entry and lowers the pin, and
+     adding an entry or raising a pin is a reviewed deferral that needs a
+     reason, a tracking issue and a ruling recorded in this ADR. These are
+     tripwires, not proofs: the check compares gate labels, not effect (REST
+     reads the management-group axis, MCP the service-scope axis), a row whose
+     `rest_v1_twin` or `mcp_twin` is null compares nothing, and the checks read
+     source text, so the first gate call in a handler is taken as its gate and
+     each further gate call must agree or be matched, one to one, by a gate call the MCP
+     handler makes, and, for a row with a REST object twin whose MCP handler body can be
+     derived, that handler's gate call for a pair other than the tool's declared
+     pair is a finding of its own (three pinned entries carry that extra handler
+     gate in their description; MCP-only tools and shared-branch handlers are not
+     held to it). `MIN_REGISTRY_FILES` rises from 1 to 3, the number of
+     `mcp_tools_*.cpp` registry files, and must equal that count; the
+     test-existence tripwire also requires the test file to be registered in
+     `tests/meson.build`, reads the `schema_violation(` call with string literals
+     blanked, and does not count a negative audit assertion. Second, `get.api-agents` becomes
+     `exception:#4041 revisit:2027-01-31`: MCP `list_agents` is unconfined (a
+     known gap, the World A gap tracked by #4041, not a design choice) while
+     `GET /api/v1/devices` is confined through `require_fleet_read`, so it is
+     not a twin until `list_agents` is confined. The legacy row
+     `get.fragments-devices-list` recorded the same pair as `twinned`; it moves
+     to the same exception so the ledger holds one answer for the pair
+     (untwinned 214 to 215). The pins are `(4041, "2027-01-31")` for both rows in
+     `STRICT_EXCEPTION_PINS`; like the 2026-10-22 entry this is a session
+     statement by the ADR owner, not a signed decision.
+
+   - **2026-10-23 - DEX customer score policy (`GET`, `PUT` and `DELETE
+     /api/v1/dex/score-policy`, #6086).** REST-only, no MCP twin: a "no" on
+     Decision 1's both-surfaces requirement, recorded rather than fixed in the
+     same change because the REST routes and the one write function behind
+     them ship first and the MCP twins follow over that function.
+     - **No MCP twin - tracked follow-up, not a permanent exception.** The
+       three twins are tracked as **#6087**; **revisit by 2027-01-31**. Until
+       they land, this row stands as the open exception for these routes, and
+       it retires when the twins merge (this entry is then amended to say so).
+       No ledger row is added: the parity ledger admits an `exception:` row
+       for a `/api/v1` route (check 1b, as for the password routes) but does
+       not require one; this one is recorded here and tracked by #6087.
+     - **The exception relaxes no control.** The routes are in
+       `openapi_spec()` and `GET /api/v1/discover/routes` (A2/A3 hold for the
+       REST half), errors from the route use the A4 envelope, `PUT` and
+       `DELETE` need `Infrastructure:Write` and an `If-Match` precondition,
+       are audit-first and fail closed on audit (`dex.score_policy.update`,
+       `.reset`, `.validate`), and a service-scoped token is refused at the
+       gate. The MCP-token posture of these routes is carried on #6087; this
+       entry does not fence MCP tokens.
+     - Wire reference: `docs/user-manual/rest-api.md`, "GET / PUT / DELETE
+       /api/v1/dex/score-policy"; audit rows: `docs/user-manual/audit-log.md`.
 
 ## Interim rules (until the named follow-ups ship)
 

@@ -13,9 +13,14 @@
 #include "pg/multi_host_dsn.hpp"
 #include "pg/pg_raii.hpp"
 
+#include "../scoped_env.hpp"
+
 #include <libpq-fe.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_test_case_info.hpp>
+#include <catch2/reporters/catch_reporter_event_listener.hpp>
+#include <catch2/reporters/catch_reporter_registrars.hpp>
 
 #include <algorithm>
 #include <optional>
@@ -99,7 +104,13 @@ std::string dsn_with(const std::string& dsn, const std::string& key, const std::
 /// Returns the first cell, or nullopt on any failure.
 std::optional<std::string> admin_scalar(const std::string& admin_dsn, const char* sql,
                                         const std::string& param) {
-    yuzu::server::pg::PgConn c{PQconnectdb(admin_dsn.c_str())};
+    // Bound the connect itself: on POSIX the listener below unsets
+    // PGCONNECT_TIMEOUT for these cases, so the cap CI exports does not reach this
+    // helper. 30 s matches that export, so Windows, where the export still
+    // applies, sees the same bound. libpq takes the last connect_timeout in a
+    // DSN, so this also wins over one already set.
+    const std::string bounded = dsn_with(admin_dsn, "connect_timeout", "30");
+    yuzu::server::pg::PgConn c{PQconnectdb(bounded.c_str())};
     if (PQstatus(c.get()) != CONNECTION_OK)
         return std::nullopt;
     const char* params[] = {param.c_str()};
@@ -124,9 +135,15 @@ int count_backends(const std::string& admin_dsn, const std::string& app) {
 
 int wait_for_backends(const std::string& admin_dsn, const std::string& app, int want) {
     int n = -1;
-    for (int i = 0; i < 50; ++i) { // ≤5s: backend exit after a client close is asynchronous
+    // ≤5s when the admin host answers: backend exit after a client close is
+    // asynchronous. The wall-clock deadline keeps a stalled admin host (each
+    // attempt can take the full 30 s connect_timeout) from consuming the shard
+    // budget: 90 s is three stalled attempts, and the iteration cap alone would
+    // allow 50 x 30 s. Whichever bound is reached first ends the wait.
+    const auto deadline = std::chrono::steady_clock::now() + 90s;
+    for (int i = 0; i < 50; ++i) {
         n = count_backends(admin_dsn, app);
-        if (n == want)
+        if (n == want || std::chrono::steady_clock::now() >= deadline)
             break;
         std::this_thread::sleep_for(100ms);
     }
@@ -134,6 +151,59 @@ int wait_for_backends(const std::string& admin_dsn, const std::string& app, int 
 }
 
 } // namespace
+
+#ifndef _WIN32
+namespace {
+
+/// Runs every `[pg_reachability]` test with PGCONNECT_TIMEOUT unset.
+///
+/// The probe lets the environment variable win over the pool default it is
+/// handed (probe_conninfo: `!env_set("PGCONNECT_TIMEOUT")`), and the host-list
+/// tests below bound their waits by that 3s test default. A CI step that exports
+/// PGCONNECT_TIMEOUT for the rest of the suite (so a stalled backend fails fast
+/// instead of wedging a shard until its meson timeout) would otherwise stretch
+/// those waits to the exported value and fail the bounds. The tag, not a list of
+/// test names, selects the tests: a new `[pg_reachability]` test is covered
+/// without anyone remembering to opt in. The one test that exercises the variable
+/// sets it itself and restores what it found, which is the unset state here; a new
+/// test that needs the variable should do the same.
+///
+/// POSIX only: the timing-sensitive host-list tests are themselves compiled out
+/// on Windows, so an exported value cannot reach them there.
+class ReachabilityConnectTimeoutEnvListener : public Catch::EventListenerBase {
+public:
+    using Catch::EventListenerBase::EventListenerBase;
+
+    void testCaseStarting(Catch::TestCaseInfo const& info) override {
+        guard_.reset();
+        for (auto const& tag : info.tags) {
+            if (tag.original == "pg_reachability") {
+                guard_.emplace("PGCONNECT_TIMEOUT", yuzu::test::unset_tag{});
+                break;
+            }
+        }
+    }
+
+    // Catch2 runs a case's SECTIONs between these two events, so the variable
+    // stays unset across section re-entry and is restored once per case.
+    void testCaseEnded(Catch::TestCaseStats const& /*stats*/) override { guard_.reset(); }
+
+private:
+    std::optional<yuzu::test::ScopedEnv> guard_;
+};
+
+} // namespace
+
+CATCH_REGISTER_LISTENER(ReachabilityConnectTimeoutEnvListener)
+
+// Checks that the tag selected this case and the listener ran. Only meaningful when the
+// runner exports PGCONNECT_TIMEOUT (the CI step that motivates the listener); with
+// it unexported the check passes trivially, never falsely red.
+TEST_CASE("pg_reachability env guard: PGCONNECT_TIMEOUT is unset inside the case",
+          "[server][readyz][pg_reachability]") {
+    CHECK(std::getenv("PGCONNECT_TIMEOUT") == nullptr);
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // The pure rule

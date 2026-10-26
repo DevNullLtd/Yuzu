@@ -204,6 +204,11 @@ using yuzu::agent::ScopedFd;
 ///    tar_cursor.hpp's on_enabled_changed contract).
 class RemovableCursorSource : public CursorSource {
 public:
+    // R-007: a source dropped after start() (tar_plugin.cpp init) must unarm its callback first.
+    // da_session_ is declared before replay_suppress_, so without this the set is destroyed
+    // while the DA callback can still read it, until ~RemovableDiskArbSession calls stop().
+    ~RemovableCursorSource() override { stop(); }
+
     [[nodiscard]] std::string name() const noexcept override { return "removable"; }
 
     void start(TarDatabase& db) override;

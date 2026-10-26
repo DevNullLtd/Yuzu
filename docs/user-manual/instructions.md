@@ -286,7 +286,7 @@ spec:
 
 | Field | Description |
 |---|---|
-| `minAgentVersion` | Agents below this version are skipped during dispatch (error `4003`). |
+| `minAgentVersion` | Declared and exported; not compared at dispatch today, so an older agent is NOT skipped and error `4003` is not raised. |
 | `requiredPlugins` | Agents missing any listed plugin are skipped (error `4001`). |
 
 ---
@@ -677,10 +677,11 @@ with a signed-in session.
   longer be used (tracked in #6098).
 
 **If the dialog says you do not have permission.** The Approvals dialog shows that one message for
-every `403`. The causes, in the order the server checks them: you lack `Approval:Approve`; the
-request carried no same-site `Origin` or `Referer` (for example a reverse proxy rewrites `Host` and the
-public address is not listed in `--csrf-trusted-origin`); or you signed in through SAML while step-up
-is on. The Approve and Reject buttons are a render hint only: a SAML session is shown them and the
+every `403`. The causes, in the order the server checks them: the request carried no same-site
+`Origin` or `Referer` (for example a reverse proxy rewrites `Host` and the public address is not
+listed in `--csrf-trusted-origin`; the server-wide same-site check answers this first, before any
+step-up); you signed in through SAML while step-up is on (the central step-up check, before the
+route handler); in the handler, you lack `Approval:Approve`. The Approve and Reject buttons are a render hint only: a SAML session is shown them and the
 route still refuses it. The Approvals tab on Instructions has no dialog: it shows the server's message
 in a toast on a `403`, "Your session expired; sign in again." on a plain `401`, and the same code prompt
 as the Approvals page on a step-up `401`, then repeats the decision once after a correct code.

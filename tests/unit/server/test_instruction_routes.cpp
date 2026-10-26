@@ -1007,6 +1007,51 @@ TEST_CASE("instruction_routes: POST yaml save create+update round-trip audits su
     CHECK(h.audits.size() == 2); // unchanged -- the mismatch guard never audits
 }
 
+TEST_CASE("instruction_routes: a guardian. id is refused at every YAML authoring path "
+          "(validate, create, and a re-save of that same id)",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    const std::string yaml =
+        "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  "
+        "id: guardian.deploy.rules\n  displayName: Reserved\nspec:\n  plugin: "
+        "os_info\n  action: os_name\n  type: question\n";
+    // The reserved-namespace text names the Guardian deploy approvals; html_escape leaves
+    // that fragment untouched, so it identifies the guardian token without the quote marks.
+    const std::string marker = "reserved for Guardian deploy approvals";
+
+    auto validate = h.sink.Post("/api/instructions/validate-yaml",
+                                "yaml_source=" + url_encode_form(yaml),
+                                "application/x-www-form-urlencoded");
+    REQUIRE(validate);
+    CHECK(validate->body.find(marker) != std::string::npos);
+
+    auto create = h.sink.Post("/api/instructions/yaml", "yaml_source=" + url_encode_form(yaml),
+                              "application/x-www-form-urlencoded");
+    REQUIRE(create);
+    CHECK(create->body.find("Cannot save") != std::string::npos);
+    CHECK(create->body.find(marker) != std::string::npos);
+
+    // The re-save (update) branch: an id is supplied, so this is the path an EXISTING
+    // definition under the prefix would take. It is refused by the same validation.
+    auto resave = h.sink.Post("/api/instructions/yaml",
+                              "id=guardian.deploy.rules&yaml_source=" + url_encode_form(yaml),
+                              "application/x-www-form-urlencoded");
+    REQUIRE(resave);
+    CHECK(resave->body.find("Cannot save") != std::string::npos);
+    CHECK(resave->body.find(marker) != std::string::npos);
+
+    // Nothing was stored and nothing was audited.
+    CHECK(h.audits.empty());
+    auto stored = w.store.get_definition("guardian.deploy.rules");
+    REQUIRE(stored.has_value());       // the read succeeded...
+    CHECK_FALSE(stored->has_value());  // ...and found nothing
+}
+
 TEST_CASE("instruction_routes: a JSON PUT and a YAML editor save keep the stored "
           "parameter_schema, even a legacy one the write gate would refuse",
           "[pg][server][routes][instruction_routes][param-schema]") {

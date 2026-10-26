@@ -1,6 +1,7 @@
 #include "approval_routes.hpp"
 
 #include "approval_manager.hpp"
+#include "approval_model.hpp" // approval_row_json (the shared read-row builder)
 #include "approver_assurance.hpp"
 #include "audited_write.hpp" // WriteGate (same-site gate for the cookie-authorised write)
 #include "http_route_sink.hpp"
@@ -64,11 +65,14 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
     // Same-site gate (#6061, governance SG-1): after this change approve/reject
     // admit ONLY cookie sessions, which is exactly the ambient-credential class
     // `browser_write_is_cross_site` exists for -- every sibling cookie-write route
-    // family carries it. It runs after the permission gate (an unauthorised caller
-    // keeps its 403) and BEFORE the class check, step-up and the `attempted` row, so
-    // a cross-site request mutates nothing and spends no step-up. It is handed the
-    // session resolved above rather than re-resolving (a third, non-atomic resolve).
-    // A bearer/MCP token is exempt here and is refused by the class check below.
+    // family carries it. The central pre-routing gate answers a cookie-session write
+    // first, then the central step-up check runs in the pre-request stage; this copy is
+    // defence in depth and runs after both and after the permission gate (an
+    // unauthorised caller keeps its 403), BEFORE the class check, this handler's
+    // step-up call and the `attempted` row, so a cross-site request mutates nothing
+    // and the handler's step-up call is never reached. It is handed the session
+    // resolved above rather than re-resolving (a third, non-atomic resolve). A
+    // bearer/MCP token is exempt here and is refused by the class check below.
     const WriteGate write_gate{[&session](const httplib::Request&) { return session; },
                                deps.csrf_trusted_origins};
     if (write_gate.refuse_cross_site(deps.audit_fn, req, res, "approval"))
@@ -80,7 +84,9 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
                      verb, log_safe(session->username), log_safe(session->auth_source, 64),
                      log_safe(session->principal_kind, 64),
                      approval::approver_refusal_reason(refusal));
-        // Evidence that a bearer/engine caller reached the decision surface.
+        // Evidence that a non-interactive caller reached the decision surface. Over REST that
+        // is a bearer-token (or other non-interactive) caller: an engine principal is refused
+        // by the central step-up check and is reachable only via MCP.
         // Best effort: the refusal is the control, this row is the trace.
         (void)deps.audit_fn(req, audit_action, "denied", "approval", req.matches[1].str(),
                             "approver_assurance:" +
@@ -106,8 +112,13 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
                  "contact an administrator");
         return;
     }
-    if (!deps.step_up_fn(req, res, *session,
-                         std::string("POST /api/approvals/{id}/") + verb))
+    // Each label is spelled out as a literal (not a prefix plus the verb) because the label pin in
+    // test_step_up_route_inventory.cpp reads these call sites lexically and must see the text
+    // kStepUpPolicy carries for the two approval rows.
+    const bool stepped_up =
+        is_approve ? deps.step_up_fn(req, res, *session, "POST /api/approvals/{id}/approve")
+                   : deps.step_up_fn(req, res, *session, "POST /api/approvals/{id}/reject");
+    if (!stepped_up)
         return; // step-up wrote its own 401 envelope
 
     const auto id = req.matches[1].str();
@@ -204,17 +215,10 @@ void register_approval_routes(HttpRouteSink& sink, Deps deps) {
 
         auto approvals = deps.approval_manager->query(q);
         nlohmann::json arr = nlohmann::json::array();
-        for (const auto& a : approvals) {
-            arr.push_back({{"id", a.id},
-                           {"definition_id", a.definition_id},
-                           {"status", a.status},
-                           {"submitted_by", a.submitted_by},
-                           {"submitted_at", a.submitted_at},
-                           {"reviewed_by", a.reviewed_by},
-                           {"reviewed_at", a.reviewed_at},
-                           {"review_comment", a.review_comment},
-                           {"scope_expression", a.scope_expression}});
-        }
+        // Shared builder (approval_model.hpp): the SAME rows as GET /api/v1/approvals and
+        // MCP list_pending_approvals, a bound ticket's frozen request included (#6062).
+        for (const auto& a : approvals)
+            arr.push_back(approval_row_json(a));
         res.set_content(nlohmann::json({{"approvals", arr}}).dump(), "application/json");
     });
 

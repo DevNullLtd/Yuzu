@@ -10,6 +10,7 @@
 #include "sqlite_raii.hpp"
 #include "utf8_sanitize.hpp"
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
 
@@ -30,41 +31,83 @@ namespace yuzu::server {
 
 // ── Allowed keys (safe for runtime modification) ─────────────────────────────
 
-static const std::vector<std::string> kAllowedKeys = {
-    "heartbeat_timeout",             // seconds before marking agent offline
-    "response_retention_days",       // days to keep instruction responses
-    "audit_retention_days",          // days to keep audit events
-    "guardian_event_retention_days", // days to keep guaranteed-state events
-    "auto_approve_enabled",          // "true" or "false"
-    "log_level",                     // trace|debug|info|warn|error
-    "oidc_issuer",                   // OIDC issuer URL
-    "oidc_client_id",                // OIDC client ID
-    "oidc_client_secret",            // OIDC client secret — SecretCodec-envelope
-                                     // encrypted; see runtime_config_secrets (ADR-0060)
-    "oidc_redirect_uri",             // OIDC redirect URI
-    "oidc_admin_group",              // OIDC admin group ID
-    "oidc_skip_tls_verify",          // "true" or "false"
-    "plugin_signing_required",       // see plugin_signing::kPluginSigningRequiredKey — must match
-    // F1 DEX alerting (Settings → DEX alerts; applied live, no restart)
-    "dex_alert_routing",             // JSON array of routed obs_types
-    "dex_blast_min_devices",         // blast-radius alert shape (clamped on apply)
-    "dex_blast_window_seconds",      //
-    "dex_blast_cooldown_seconds",    //
-    // F2a PR3 cohort metrics export (Settings → DEX alerts; next gauge sweep)
-    "dex_cohort_export_key",         // tag key; "" = export disabled (validated on apply)
-    // Customer score policy (tiers, names, weights, per-app overrides).
-    "dex_score_policy",              // JSON document; route-owned - to be written only through
-                                     // the policy route's writer (a later change), which
-                                     // validates it whole; the generic PUT refuses it. Spelled
-                                     // as kDexScorePolicyKey in dex_score_policy_json.hpp.
+namespace {
+
+struct KeySpec {
+    const char* key;
+    ConfigWriteClass write_class;
 };
 
+// One row per allowed key, and every row names its write class explicitly: the generic
+// PUT /api/config/{key} (config_routes.cpp) applies the class. General means Infrastructure:Write
+// suffices; a key that a Settings route writes must NOT be General (test_config_routes.cpp scans
+// for that). Other keys are classified by maintainer ruling on sensitivity, recorded on the row.
+// test_runtime_config_secret_redaction.cpp pins every key's class, so a new row without a
+// deliberate class fails there.
+constexpr ConfigWriteClass kGeneral = ConfigWriteClass::General;
+constexpr ConfigWriteClass kAdmin = ConfigWriteClass::AdminRoute;
+constexpr ConfigWriteClass kOidc = ConfigWriteClass::AdminRouteInteractiveOnly;
+
+constexpr KeySpec kKeySpecs[] = {
+    {"heartbeat_timeout", kGeneral},       // seconds before marking agent offline
+    {"response_retention_days", kGeneral}, // days to keep instruction responses
+    // days to keep audit events. Administrator-only by maintainer ruling because it is the
+    // stored audit-retention setting (audit evidence), not because a PUT changes the window
+    // applied today: AuditStore copies the window at construction, so a stored value is not
+    // enforced (#483). It has no Settings route; the generic PUT is its only writer.
+    // response_retention_days and guardian_event_retention_days are the same stored-only shape
+    // but operational data, deliberately General for now.
+    {"audit_retention_days", kAdmin},
+    {"guardian_event_retention_days", kGeneral}, // days to keep guaranteed-state events
+    {"auto_approve_enabled", kGeneral},          // "true" or "false"
+    {"log_level", kGeneral},                     // trace|debug|info|warn|error
+    {"oidc_issuer", kOidc},                      // OIDC issuer URL
+    {"oidc_client_id", kOidc},                   // OIDC client ID
+    {"oidc_client_secret", kOidc},               // OIDC client secret: SecretCodec-envelope
+                                                 // encrypted; see runtime_config_secrets (ADR-0060)
+    {"oidc_redirect_uri", kOidc},                // OIDC redirect URI
+    {"oidc_admin_group", kOidc},                 // OIDC admin group ID
+    {"oidc_skip_tls_verify", kOidc},             // "true" or "false"
+    // see plugin_signing::kPluginSigningRequiredKey - must match
+    {"plugin_signing_required", kAdmin},
+    // F1 DEX alerting (Settings -> DEX alerts; applied live, no restart)
+    {"dex_alert_routing", kAdmin},          // JSON array of routed obs_types
+    {"dex_blast_min_devices", kAdmin},      // blast-radius alert shape (clamped on apply)
+    {"dex_blast_window_seconds", kAdmin},   //
+    {"dex_blast_cooldown_seconds", kAdmin}, //
+    // F2a PR3 cohort metrics export (Settings -> DEX alerts; next gauge sweep)
+    {"dex_cohort_export_key", kAdmin}, // tag key; "" = export disabled (validated on apply)
+    // Customer score policy (tiers, names, weights, per-app overrides). JSON document;
+    // route-owned - written only through PUT/DELETE /api/v1/dex/score-policy via
+    // dex_api.cpp's binding, which validates it whole; the generic PUT refuses it. Spelled as
+    // kDexScorePolicyKey in dex_score_policy_json.hpp.
+    {"dex_score_policy", ConfigWriteClass::RouteOwned},
+};
+
+} // namespace
+
 const std::vector<std::string>& RuntimeConfigStore::allowed_keys() {
-    return kAllowedKeys;
+    static const std::vector<std::string> keys = [] {
+        std::vector<std::string> v;
+        for (const auto& spec : kKeySpecs)
+            v.emplace_back(spec.key);
+        return v;
+    }();
+    return keys;
 }
 
 bool RuntimeConfigStore::is_allowed_key(const std::string& key) {
-    return std::find(kAllowedKeys.begin(), kAllowedKeys.end(), key) != kAllowedKeys.end();
+    for (const auto& spec : kKeySpecs)
+        if (key == spec.key)
+            return true;
+    return false;
+}
+
+std::optional<ConfigWriteClass> RuntimeConfigStore::write_class(const std::string& key) {
+    for (const auto& spec : kKeySpecs)
+        if (key == spec.key)
+            return spec.write_class;
+    return std::nullopt;
 }
 
 bool RuntimeConfigStore::is_secret_key(const std::string& key) {
@@ -200,6 +243,11 @@ std::expected<void, std::string> validate_value(const std::string& key, const st
                 return std::unexpected("heartbeat_timeout must be at least " +
                                        std::to_string(kMinHeartbeatTimeoutSeconds) +
                                        " seconds (the default agent heartbeat interval)");
+            if (key == "heartbeat_timeout" && val > kMaxHeartbeatTimeoutSeconds)
+                return std::unexpected("heartbeat_timeout must be at most " +
+                                       std::to_string(kMaxHeartbeatTimeoutSeconds) +
+                                       " seconds (one day): a longer window leaves a dead agent "
+                                       "reading online");
         } catch (...) {
             return std::unexpected("value must be a valid integer");
         }
@@ -749,9 +797,15 @@ RuntimeConfigStore::compare_and_set(const std::string& key,
                                    "ON CONFLICT (key) DO NOTHING RETURNING key",
                                    std::vector<std::string>{key, sanitized_value, sanitized_by,
                                                             now});
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        // The class of failure is the only thing that tells an operator a constraint from a
+        // dropped connection; the caller is told "database write failed" either way.
+        const char* sqlstate = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+        spdlog::error("runtime_config compare_and_set {}: SQLSTATE {}", ::yuzu::log_key_token(key),
+                      sqlstate ? sqlstate : "none");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
                                "database write failed");
+    }
     if (PQntuples(res.get()) != 1)
         return false;
     lease.reset(); // the pool slot is not held across the live effect (set() scopes its lease)
@@ -781,9 +835,15 @@ RuntimeConfigStore::compare_and_remove(const std::string& key, const std::string
         "DELETE FROM runtime_config_store.runtime_config WHERE key = $1 AND value = $2 "
         "RETURNING key",
         std::vector<std::string>{key, expected});
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        // The class of failure is the only thing that tells an operator a constraint from a
+        // dropped connection; the caller is told "database write failed" either way.
+        const char* sqlstate = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+        spdlog::error("runtime_config compare_and_remove {}: SQLSTATE {}",
+                      ::yuzu::log_key_token(key), sqlstate ? sqlstate : "none");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
                                "database write failed");
+    }
     return PQntuples(res.get()) == 1;
 }
 

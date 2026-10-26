@@ -264,3 +264,122 @@ TEST_CASE("matcher: a JSON unsigned cell above INT64_MAX is not read as its int6
     CHECK(response_matches(R"({"column":"c","op":"eq","value":"18446744073709551615"})", kOk, out));
     CHECK_FALSE(response_matches(R"({"column":"c","op":"eq","value":"-1"})", kOk, out));
 }
+
+// ── declared-column matcher over plain pipe rows ─────────────────────────────
+// A plugin that is neither tar nor JSON (security.certificates.list) writes a header row
+// then pipe rows; the column is resolved from the definition's declared names, which admission
+// stores in the matcher (bind_declared_columns).
+namespace {
+const char* kCertSchema =
+    R"([{"name":"subject","type":"string"},{"name":"issuer","type":"string"},)"
+    R"({"name":"thumbprint","type":"string"},{"name":"not_before","type":"string"},)"
+    R"({"name":"not_after","type":"string"},{"name":"serial","type":"string"},)"
+    R"({"name":"store","type":"string"},{"name":"key_usage","type":"string"}])";
+
+const char* kCertHeader = "subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage";
+
+std::string cert_matcher(const std::string& column, const std::string& op,
+                         const std::string& value = {}) {
+    nlohmann::json m{{"column", column}, {"op", op}};
+    if (!value.empty())
+        m["value"] = value;
+    bind_declared_columns(m, kCertSchema, "certificates");
+    return m.dump();
+}
+
+std::string cert_output(const std::string& extra = {}) {
+    return std::string(kCertHeader) +
+           "\nCN=a|CN=DigiCert CA|aa|2020|2030|01|Root|sig"
+           "\nCN=b|CN=eMudhra Sub CA|bb|2020|2030|02|Root|sig"
+           "\nCN=c|CN=Other CA|cc|2020|2030|03|Root|sig" +
+           extra;
+}
+} // namespace
+
+TEST_CASE("matcher: declared columns resolve a plain pipe-row column", "[result_set][matcher]") {
+    const auto m = cert_matcher("issuer", "contains", "eMudhra");
+    const auto j = nlohmann::json::parse(m);
+    REQUIRE(j["declared_columns"].size() == 8);
+    REQUIRE(j["declared_columns"][1] == "issuer");
+    REQUIRE(j["plugin"] == "certificates");
+    REQUIRE(response_matches(m, kOk, cert_output()));
+    REQUIRE_FALSE(response_matches(cert_matcher("issuer", "contains", "Nonexistent"), kOk,
+                                   cert_output()));
+    REQUIRE(response_matches(cert_matcher("issuer", "eq", "CN=Other CA"), kOk, cert_output()));
+    REQUIRE_FALSE(response_matches(m, kFail, cert_output()));
+}
+
+TEST_CASE("matcher: declared columns skip the header and short status rows",
+          "[result_set][matcher]") {
+    // The header's own cells would satisfy exists/contains if it were read as data.
+    const auto exists = cert_matcher("issuer", "exists");
+    REQUIRE_FALSE(response_matches(exists, kOk, kCertHeader));
+    REQUIRE_FALSE(response_matches(exists, kOk, std::string(kCertHeader) + "\nstatus|not_found"));
+    REQUIRE_FALSE(response_matches(cert_matcher("issuer", "contains", "issuer"), kOk,
+                                   std::string(kCertHeader) + "\n"));
+    REQUIRE_FALSE(response_matches(exists, kOk, "not_available|no store reachable"));
+    REQUIRE(response_matches(exists, kOk, cert_output()));
+    // A short status row after real data does not change the verdict either way.
+    REQUIRE(response_matches(cert_matcher("issuer", "contains", "eMudhra"), kOk,
+                             cert_output("\nstatus|not_found")));
+    REQUIRE_FALSE(response_matches(cert_matcher("issuer", "contains", "not_found"), kOk,
+                                   "status|not_found"));
+}
+
+TEST_CASE("matcher: declared columns keep row width across an escaped pipe",
+          "[result_set][matcher]") {
+    const std::string out = std::string(kCertHeader) +
+                            "\nCN=a\\|b|CN=eMudhra CA|aa|2020|2030|01|Root|sig";
+    REQUIRE(response_matches(cert_matcher("issuer", "contains", "eMudhra"), kOk, out));
+    REQUIRE(response_matches(cert_matcher("subject", "eq", "CN=a|b"), kOk, out));
+    // An UNescaped extra pipe makes the row 9 wide: dropped, not shifted.
+    REQUIRE_FALSE(response_matches(
+        cert_matcher("issuer", "contains", "eMudhra"), kOk,
+        std::string(kCertHeader) + "\nCN=a|b|CN=eMudhra CA|aa|2020|2030|01|Root|sig"));
+}
+
+TEST_CASE("matcher: a column outside the declared list binds nothing", "[result_set][matcher]") {
+    nlohmann::json m{{"column", "nope"}, {"op", "exists"}};
+    bind_declared_columns(m, kCertSchema, "certificates");
+    REQUIRE_FALSE(m.contains("declared_columns"));
+    REQUIRE_FALSE(m.contains("plugin"));
+    nlohmann::json empty{{"column", "issuer"}, {"op", "exists"}};
+    bind_declared_columns(empty, "", "certificates");
+    REQUIRE_FALSE(empty.contains("declared_columns"));
+    nlohmann::json kind{{"kind", "any_response"}, {"column", "issuer"}};
+    bind_declared_columns(kind, kCertSchema, "certificates");
+    REQUIRE_FALSE(kind.contains("declared_columns"));
+}
+
+TEST_CASE("matcher: wrong-typed declared_columns / plugin match nobody", "[result_set][matcher]") {
+    const auto good = nlohmann::json::parse(cert_matcher("issuer", "exists"));
+    for (const auto& bad : {nlohmann::json("issuer"), nlohmann::json::array({1, 2}),
+                            nlohmann::json::object()}) {
+        auto m = good;
+        m["declared_columns"] = bad;
+        REQUIRE_FALSE(response_matches(m.dump(), kOk, cert_output()));
+    }
+    auto m = good;
+    m["plugin"] = 5;
+    REQUIRE_FALSE(response_matches(m.dump(), kOk, cert_output()));
+}
+
+TEST_CASE("matcher: admission refuses caller-supplied server-authored keys",
+          "[result_set][matcher]") {
+    const auto dc = validate_matcher(R"({"column":"issuer","op":"exists","declared_columns":["issuer"]})");
+    REQUIRE(dc);
+    CHECK(dc->find("declared_columns") != std::string::npos);
+    const auto pl = validate_matcher(R"({"column":"issuer","op":"exists","plugin":"x"})");
+    REQUIRE(pl);
+    CHECK(pl->find("plugin") != std::string::npos);
+    REQUIRE_FALSE(validate_matcher(R"({"column":"issuer","op":"exists"})"));
+}
+
+TEST_CASE("matcher: declared columns leave tar and json matching unchanged",
+          "[result_set][matcher]") {
+    nlohmann::json m{{"column", "pid"}, {"op", "eq"}, {"value", "1000"}};
+    bind_declared_columns(m, kCertSchema, "certificates"); // pid not declared: unchanged
+    REQUIRE(response_matches(m.dump(), kOk, tar_rows(2)));
+    REQUIRE(response_matches(R"({"column":"sha256","op":"eq","value":"x"})", kOk,
+                             R"([{"sha256":"x"}])"));
+}

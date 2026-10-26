@@ -310,8 +310,8 @@ inline constexpr GuardianHealthMetric kGuardianHealthMetrics[] = {
      "Fleet sum of throws caught by the agent's Guardian ack-bookkeeping maintenance firewall "
      "(#5404): the heartbeat thread's ack-drain and generation-advance tick (which includes the "
      "runtime's expiry and reaper pass; this source is live only while prefer_spark is on), and "
-     "the content-hash and begin-application steps of applying a push (not gated on "
-     "prefer_spark). Steady state 0. A caught throw skips the rest of that tick's ack drain, "
+     "the content-hash, push-rule indexing (duplicate-id check) and begin-application "
+     "steps of applying a push (not gated on prefer_spark). Steady state 0. A caught throw skips the rest of that tick's ack drain, "
      "and one that recurs every tick repeats the skip. Cumulative per agent process "
      "(resets on restart). MONITOR-ONLY, same posture as the rest of this family"},
 };

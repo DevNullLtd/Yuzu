@@ -244,7 +244,7 @@ inline constexpr std::array<CommandCapability, 45> kPluginActionCatalogueA{{
     // rollup/sql/compatibility) only observe the host and record/report —
     // ReadOnly/None/Read under `Infrastructure`, per DispatchClass's own
     // "collects and reports only" definition. query/export/sql can surface
-    // opt-in PII sources (mapdrive usernames, dns-visited-domains, arp) via
+    // PII sources (mapdrive usernames, dns-visited-domains, arp) via
     // a type filter or raw SQL — Medium, not the Read floor of Low.
     // configure changes plugin behaviour (retention/intervals/redaction) —
     // Mutating/Reversible/Write. rollup performs routine retention
@@ -265,7 +265,7 @@ inline constexpr std::array<CommandCapability, 45> kPluginActionCatalogueA{{
         .execute_gate = ExecuteGate::None,
     },
     {
-        // Medium, not the Read floor: a type filter can return opt-in PII
+        // Medium, not the Read floor: a type filter can return PII
         // sources (arp/dns/mapdrive) alongside the default event union.
         .plugin = "tar",
         .action = "query",
@@ -375,7 +375,7 @@ inline constexpr std::array<CommandCapability, 45> kPluginActionCatalogueA{{
     {
         // Medium, not the Read floor: validate_and_translate_sql is
         // SELECT-only (rejects INSERT/UPDATE/DELETE/DROP/etc.) but an
-        // operator-authored SELECT can reach the same opt-in PII tables
+        // operator-authored SELECT can reach the same PII tables
         // query/export gate behind a type filter.
         .plugin = "tar",
         .action = "sql",
@@ -416,12 +416,15 @@ inline constexpr std::array<CommandCapability, 45> kPluginActionCatalogueA{{
     // ── registry (agents/plugins/registry/src/registry_plugin.cpp) ───────
     // Windows-only; every action classified under `Infrastructure` (no
     // dedicated registry securable exists). Reads are ReadOnly/None/Read/
-    // Low. set_value can overwrite an existing value with no automatic
+    // Low. set_value can overwrite an existing value with no restorable
     // backup — conservatively Irreversible. delete_value/delete_key are
     // named-explicit deletion — Destructive/Irreversible/Delete;
-    // delete_key additionally destroys an entire subtree (every value AND
-    // subkey beneath it) in one call, a strictly larger blast radius than
-    // delete_value, so it is declared ABOVE the Delete floor at Critical.
+    // delete_key is non-recursive (it refuses a key that has subkeys and
+    // removes only that key and its own values), but it drops every value
+    // on the key in one call, a larger blast radius than delete_value, so
+    // it is declared ABOVE the Delete floor at Critical. Prior values are
+    // only in the audit row (raw hex, capped at 256 bytes per value) and
+    // are not restorable beyond that.
     // get_user_value reads a per-user hive (PII, privilege-elevated via
     // SeBackup/SeRestore) — Medium, not the Read floor.
     {
@@ -458,9 +461,9 @@ inline constexpr std::array<CommandCapability, 45> kPluginActionCatalogueA{{
         .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
-        // Above the Delete floor: destroys an entire subtree (every value
-        // and subkey beneath it) in one call — larger blast radius than
-        // delete_value.
+        // Above the Delete floor: removes the key and all of its own values
+        // in one call (non-recursive: refuses a key with subkeys) — larger
+        // blast radius than delete_value.
         .plugin = "registry",
         .action = "delete_key",
         .dispatch_class = DispatchClass::Destructive,

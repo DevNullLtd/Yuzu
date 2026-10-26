@@ -75,6 +75,10 @@ class ManagementGroupStore; // forward declaration
 inline constexpr std::string_view kRbacErrStoreNotOpen = "rbac store not open";
 inline constexpr std::string_view kRbacErrPoolAcquireTimeout = "pool acquire timeout";
 inline constexpr std::string_view kRbacErrCircuitBreakerOpen = "circuit breaker open";
+/// `engine_grant_checked`: the enforcement state itself could not be confirmed (a stale
+/// cached-disabled view), so no grant read was attempted.
+inline constexpr std::string_view kRbacErrEnforcementUnconfirmed =
+    "rbac enforcement state unconfirmed";
 
 struct RbacRole {
     std::string name;
@@ -117,7 +121,7 @@ struct ReconcileResult {
 /// Discriminated result of `RbacStore::authorize_list_read` — the ADR-0017
 /// admit-then-filter list gate for per-agent list/fan-out reads.
 enum class ListReadDecision {
-    DenyAll,     ///< no grant anywhere — 403 (REST) / empty (dashboard)
+    DenyAll,     ///< no grant anywhere — 403 (REST) / empty (dashboard); or a failed read (see read_failed)
     AdmitAll,    ///< global grant, or RBAC loaded-and-disabled → unfiltered read
     AdmitScoped, ///< management-group-confined — read ONLY `visible_agents`
 };
@@ -127,6 +131,14 @@ struct ListReadAuthorization {
     /// Populated ONLY for `AdmitScoped`; the management-group-visible agent set
     /// (possibly empty ⇒ zero rows, INV-2). Left empty for Deny/AdmitAll.
     std::vector<std::string> visible_agents;
+    /// True ONLY when `decision` is `DenyAll` because a READ failed (the global-grant read, the
+    /// permission-group resolution, the subtree expansion, or a store that is not wired or not
+    /// open), as opposed to a
+    /// genuine "no grant". It is still `DenyAll` (INV-1/INV-5: a failed read never admits); the
+    /// flag lets a caller answer a retryable 503 instead of a 403 it cannot tell from "this
+    /// caller holds no grant" - and, above all, never SERVE a list to a caller the check did
+    /// not clear. A caller that ignores it behaves exactly as before.
+    bool read_failed{false};
 };
 
 /// Result of a successful `RbacStore::set_rbac_enforcement` call.
@@ -644,6 +656,16 @@ public:
     bool check_permission(const std::string& username, const std::string& securable_type,
                           const std::string& operation) const;
 
+    /// Checked twin of `check_permission`: the SAME decision (it is the implementation; the
+    /// plain form is `.value_or(false)`), but a closed store, an open circuit breaker, a pool
+    /// lease timeout or a failed role / permission query is `unexpected(reason)` instead of a
+    /// bare `false`, so a caller that must not read a failure as "no grant" (the list-read
+    /// gates, via `ListReadAuthorization::read_failed`) can tell them apart. A cached verdict
+    /// is returned without a read, as before. A genuine "no roles" or "no allow" is `false`.
+    [[nodiscard]] std::expected<bool, std::string>
+    check_permission_checked(const std::string& username, const std::string& securable_type,
+                             const std::string& operation) const;
+
     /// Scoped permission check: first tries global, then checks group-scoped
     /// roles. FAIL-CLOSED: false on any store error.
     bool check_scoped_permission(const std::string& username, const std::string& securable_type,
@@ -697,6 +719,19 @@ public:
     // ── Reference data ───────────────────────────────────────────────────
     std::vector<std::string> list_securable_types() const;
     std::vector<std::string> list_operations() const;
+
+    /// Test hook: age THIS instance's local steady-clock readings by `elapsed`, so a
+    /// test crosses the refresh gate, the stale-serve bound or the breaker's probe
+    /// cooldown without sleeping. Moves `refresh_started_ms_` and
+    /// `last_successful_refresh_ms_` (under `cache_mtx_`), then
+    /// `breaker_last_probe_started_ms_` (under `breaker_mtx_`) `elapsed` into the
+    /// past — two sequential lock scopes, never nested. It ages only the object it is
+    /// called on (a second replica sharing the database is a separate instance with
+    /// its own readings), and it never touches `generation_valid_`: aging that would
+    /// turn a "stale by elapsed time" case into an "invalid view" case and hide the
+    /// #2703 bound logic the case exists to prove. Production code MUST NOT call
+    /// this — no caller in `server/core/src/**` references it.
+    void age_refresh_state_for_test(std::chrono::milliseconds elapsed);
 
 private:
     /// Breaker-gated, `kAuthzAcquireTimeout` read of the one `role_permissions` row for a
@@ -761,6 +796,9 @@ private:
     /// membership + direct engine-principal grant, §4.1) using `conn`. Returns
     /// empty on a query error (fail-closed: an empty role set denies).
     std::vector<std::string> collect_roles(void* conn, const std::string& username) const;
+    /// Checked twin: a failed query is `unexpected`, not an empty role set.
+    std::expected<std::vector<std::string>, std::string>
+    collect_roles_checked(void* conn, const std::string& username) const;
 
     // ── ADR-0017 shared list-gate resolver (INV-7) ───────────────────────
     struct PermGroups {
@@ -1014,6 +1052,28 @@ enum class RbacEnforcementLabel {
 /// (#2703 addressed the cached-*disabled* direction only), not a new gap
 /// this reconciliation introduces.
 [[nodiscard]] RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept;
+
+/// The ONE grant decision of the two checked-read engine arms (`AuthRoutes::require_list_read`
+/// and the fleet-read gate): an engine principal's only authority is an explicit RBAC grant,
+/// so it is never admitted on a fresh disabled view. (A cached-ENABLED view that is stale
+/// still reads the grant: the documented fail-closed asymmetry above, not covered here.)
+/// The engine arms of `require_permission` and `require_scoped_permission` are deliberately
+/// plain deny-on-degrade (ADR-0041, #6437) and do not use this.
+///
+/// One `rbac_enforcement_label()` snapshot decides: `kEnabled` returns
+/// `check_permission_checked()` (a failed read is the error); `kDisabled` returns `false`
+/// (a genuine "no": RBAC is off and the view is fresh); `kDegraded` returns an error (the
+/// enforcement state could not be confirmed, a stale cached-disabled view included), so the
+/// caller answers a retryable 503 instead of a terminal 403. It admits exactly when the
+/// raw `is_rbac_enabled()` accessor did and the grant read succeeds, so the SET OF INPUTS
+/// THAT ADMIT is unchanged; only which non-admitting answer is given differs (the
+/// admission-input-set test that the `RbacEnforcementLabel` doc above sets for a new
+/// consumer). Do NOT replace the label with
+/// `rbac_enforcement_in_effect()` here: that is `true` for a degraded view, and the grant read
+/// would then admit an engine while RBAC may be genuinely off.
+[[nodiscard]] std::expected<bool, std::string>
+engine_grant_checked(const RbacStore* store, const std::string& username,
+                     const std::string& securable_type, const std::string& operation);
 
 /// "enabled" | "disabled" | "degraded" — the wire/DB string form of
 /// `RbacEnforcementLabel`, used verbatim as the access-review export's

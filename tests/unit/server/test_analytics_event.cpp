@@ -26,6 +26,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
 #include <mutex>
 #include <span>
 #include <stdexcept>
@@ -48,7 +50,9 @@ public:
             received_.push_back(e);
         }
         ++send_count_;
-        return should_succeed_;
+        const bool ok = should_succeed_;
+        received_cv_.notify_all();
+        return ok;
     }
 
     std::string name() const override { return "mock"; }
@@ -65,8 +69,17 @@ public:
 
     void set_should_succeed(bool v) { should_succeed_ = v; }
 
+    /// Blocks until at least `n` events have been received, or `timeout` passes.
+    /// True when the count was reached. Wakes on the send itself, never on a
+    /// polling interval, so the real drain thread's cadence does not matter.
+    bool wait_for_received(std::size_t n, std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mu_);
+        return received_cv_.wait_for(lock, timeout, [&] { return received_.size() >= n; });
+    }
+
 private:
     mutable std::mutex mu_;
+    std::condition_variable received_cv_;
     std::vector<AnalyticsEvent> received_;
     int send_count_{0};
     bool should_succeed_{true};
@@ -336,9 +349,12 @@ TEST_CASE("AnalyticsEventStore: drain to mock sink", "[pg][analytics_store][drai
     REQUIRE(pending.has_value());
     CHECK(*pending == 3);
 
+    // The one case that keeps the real drain thread (so start_drain/stop_drain
+    // stay covered): wait on the sink receiving the batch, not on a fixed sleep.
+    // stop_drain() joins the thread, which finishes the in-flight pass (including
+    // the claim finalisation) before it returns.
     store.start_drain();
-    // Wait for drain cycle
-    std::this_thread::sleep_for(std::chrono::seconds(3));
+    REQUIRE(sink_ptr->wait_for_received(3, std::chrono::seconds(10)));
     store.stop_drain();
 
     auto received = sink_ptr->received();
@@ -362,13 +378,15 @@ TEST_CASE("AnalyticsEventStore: drained events not re-sent", "[pg][analytics_sto
     event.event_type = "test.once";
     store.emit(event);
 
-    store.start_drain();
-    std::this_thread::sleep_for(std::chrono::seconds(3));
-    store.stop_drain();
+    // Two synchronous passes: the second must find nothing to claim, so the event
+    // is sent exactly once however many passes run.
+    store.drain_once_for_test();
+    store.drain_once_for_test();
 
     // Should have been sent exactly once
     auto received = sink_ptr->received();
     REQUIRE(received.size() == 1);
+    CHECK(sink_ptr->send_count() == 1);
     CHECK(received[0].event_type == "test.once");
 
     // Total emitted is still 1
@@ -394,13 +412,11 @@ TEST_CASE("AnalyticsEventStore: sink failure reverts claim, event stays pending"
     event.event_type = "test.fail";
     store.emit(event);
 
-    store.start_drain();
-    std::this_thread::sleep_for(std::chrono::seconds(3));
-    store.stop_drain();
+    store.drain_once_for_test();
 
     // Sink received the batch but failed — phase C reverts the claim, so the
     // event is still pending for the next tick to retry.
-    CHECK(sink_ptr->send_count() > 0);
+    CHECK(sink_ptr->send_count() == 1);
     auto pending = store.pending_count();
     REQUIRE(pending.has_value());
     CHECK(*pending == 1);
@@ -438,9 +454,7 @@ TEST_CASE("AnalyticsEventStore: a batch row with unparseable JSON drains once an
     exec_sql(db.dsn(), "UPDATE analytics_event_store.analytics_buffer SET event_json = "
                        "'{not valid json' WHERE event_json LIKE '%test.poison%'");
 
-    store.start_drain();
-    std::this_thread::sleep_for(std::chrono::seconds(3));
-    store.stop_drain();
+    store.drain_once_for_test();
 
     auto received = sink_ptr->received();
     REQUIRE(received.size() == 1);
@@ -483,9 +497,7 @@ TEST_CASE("AnalyticsEventStore: drain skips quietly when a sibling holds the adv
         REQUIRE(lock.status() == PGRES_TUPLES_OK);
     }
 
-    store.start_drain();
-    std::this_thread::sleep_for(std::chrono::seconds(3));
-    store.stop_drain();
+    store.drain_once_for_test();
 
     CHECK(sink_ptr->send_count() == 0); // never reached phase B — the lock was held
     auto pending = store.pending_count();
@@ -699,9 +711,10 @@ TEST_CASE("AnalyticsEventStore: stop_drain() latches shutdown -- emit/start_drai
     // a fresh drain thread against a pool the owner may already be tearing
     // down. Deliberately never called start_drain() before stop_drain()
     // above (keeps this deterministic instead of racing a real drain
-    // cycle) — so the sink must still be empty: completing this call
-    // without hanging/crashing plus zero sink activity is the guard.
+    // cycle) — so no drain thread may be running afterward and the sink must
+    // still be empty: the latch is asserted directly rather than by waiting out
+    // a drain interval for the thread to (not) deliver the pending event.
     store.start_drain();
-    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    CHECK_FALSE(store.drain_running_for_test());
     CHECK(sink_ptr->received().empty());
 }

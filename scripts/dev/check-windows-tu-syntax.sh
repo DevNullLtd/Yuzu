@@ -76,7 +76,7 @@ tus=(
     agents/plugins/system_hardening/src/system_hardening_win.cpp
     agents/plugins/privacy_permissions/src/privacy_permissions_win.cpp
     agents/plugins/privacy_permissions/src/privacy_permissions_plugin.cpp
-     agents/plugins/license_scan/src/licensing_win.cpp agents/plugins/registry/src/registry_plugin.cpp agents/plugins/installed_apps/src/installed_apps_plugin.cpp agents/plugins/tar/src/tar_mapdrive_collector.cpp agents/plugins/users/src/users_plugin.cpp
+     agents/plugins/license_scan/src/licensing_win.cpp agents/plugins/registry/src/registry_plugin.cpp agents/plugins/registry/src/registry_win.cpp agents/plugins/installed_apps/src/installed_apps_plugin.cpp agents/plugins/tar/src/tar_mapdrive_collector.cpp agents/plugins/users/src/users_plugin.cpp
 )
 [ "$#" -gt 0 ] && tus+=("$@")
 
@@ -136,7 +136,7 @@ for tu in "${tus[@]}"; do
     fi
     if "$CXX" -std=c++23 -fsyntax-only -fno-elide-constructors \
         -DWIN32_LEAN_AND_MEAN -DNOMINMAX \
-        -I "$shim" -I "$src_dir" -I agents/shared -I agents/core/include -I sdk/include \
+        -I "$shim" -I "$src_dir" -I agents/shared -I common/include -I agents/core/include -I sdk/include \
         "${extra_inc[@]}" "$tu" 2>"$shim/err.log"; then
         echo "  ok    $tu"
     else

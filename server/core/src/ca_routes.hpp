@@ -7,7 +7,14 @@
 ///   and browsers need it to trust the install; it is public by definition.
 /// - `GET  /api/v1/ca/crl`    — PUBLIC. The current CRL (DER). Revocation
 ///   distribution must be reachable by every client.
-/// - `GET  /api/v1/ca/issued` — `Security:Read`. Issued-cert inventory (JSON).
+/// - `GET  /api/v1/ca/issued` — `Security:Read`. Issued-cert inventory (JSON). With
+///   any filter parameter (kind, days, week, bucket, as_of) it is the FILTERED list behind
+///   one `/crypto` Yuzu-issued count (ADR-0070 D13 condition 2, R2): the same rows, selected
+///   by exactly the count's predicate through the CryptoApi seam (`set_filtered_issued`),
+///   withheld from a confined caller and audited `crypto.ca.certificates.view`. Without one it
+///   is the offset-paged INVENTORY, held to the same confinement check, withheld answer and audit
+///   verb (the rows are fleet-wide per-agent data, and `list_issued` has no scope parameter to
+///   narrow them by).
 /// - `POST /api/v1/ca/revoke` — `Security:Delete`. Revoke a serial; republishes
 ///   the CRL.
 /// - `POST /api/v1/ca/issue-code-signing` — `Security:Write`. Code-signing leaf
@@ -33,6 +40,8 @@
 #include <yuzu/server/auth.hpp>
 
 #include "ca_store.hpp"
+#include "crypto_api.hpp"               // the filtered /issued list (pure seam)
+#include "crypto_widget_catalogue.hpp"   // its parameters, shape and the R2 Access
 #include "http_route_sink.hpp"
 
 #include <httplib.h>
@@ -41,6 +50,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -96,6 +106,17 @@ namespace yuzu::server {
 /// `list_issued_certs`, so the Revocation panel's figures have a public twin
 /// (ADR-1005 Decision 4) and are shared exactly once.
 [[nodiscard]] nlohmann::json crl_figures_json(CaStore& ca_store);
+
+/// Log a failed `CaStore::list_issued` on the unfiltered inventory reads (REST `GET
+/// /api/v1/ca/issued`, MCP `list_issued_certs`) at warn, WITH the store's error text: the
+/// handlers answer a fixed 503 message and the `failure` audit row carries a fixed detail, so
+/// without this the libpq error is nowhere. Sampled like CaStore's own degrade warns: the first
+/// failure of an episode (the first ever, or after a quiet gap over 60 s), then every 100th.
+/// The gap is measured from the previous failure, not the previous line, so a client retrying
+/// more often than once a minute gets one line and then one per 100 failures. The state is
+/// shared by REST and MCP, so `surface` ("rest" or "mcp") names the surface that happened to
+/// log, not every surface that failed. The text carries no caller input.
+void log_issued_list_failure(std::string_view surface, const std::string& error);
 
 /// Prefix on `IssueCodeSigningFn`'s `unexpected()` when the failure is a
 /// caller-attributable business refusal — no CA root to issue from — rather
@@ -231,16 +252,36 @@ public:
         csrf_trusted_origins_ = std::move(origins);
     }
 
+    /// The filtered `GET /api/v1/ca/issued` (ADR-0070 R2-2): `api` reads the rows behind one
+    /// Yuzu-issued count; `confinement_fn` answers the caller's standing for a fleet-wide-only
+    /// figure (the SAME non-auditing probe the /crypto widgets use) - kConfined withholds the
+    /// list (403, no `.permission`), kDegraded fails closed (503). The probe guards BOTH the
+    /// filtered list and the unfiltered inventory, and the Settings CA panel's rows; `api` is
+    /// needed by the filtered list only. An unset probe fails every one of them closed (503, or
+    /// the "access check" note on the panel). Set BEFORE `register_routes`.
+    struct FilteredIssuedDeps {
+        std::shared_ptr<const CryptoApi> api;
+        std::function<crypto_widgets::Access(const httplib::Request&)> confinement_fn;
+    };
+    void set_filtered_issued(FilteredIssuedDeps d) { filtered_ = std::move(d); }
     /// Whether the caller holds `Security:Read`, decided without writing a response or a denial
     /// row (`AuthRoutes::has_permission`). The dashboard revoke / import wrappers use it to
-    /// decide whether to append the CA panel to their reply: they are gated on Delete / Write,
-    /// which do not imply Read. Set BEFORE `register_routes`. Leaving it unset fails closed
-    /// (the wrappers return only their banner text).
+    /// decide whether to answer with the CA panel: they are gated on Delete / Write, which do not
+    /// imply Read. A caller without Read gets a plain note in its place (never an empty body). A
+    /// Read holder who is confined (or whose access check is degraded or unwired) gets the panel
+    /// with ONLY its issued-certificate inventory withheld. Set BEFORE `register_routes`. Leaving
+    /// it unset fails closed (the plain note).
     using ReadProbeFn = std::function<bool(const httplib::Request&)>;
     void set_read_probe(ReadProbeFn probe) { read_probe_ = std::move(probe); }
 
 private:
+    // The handler captures a COPY of the deps (set before register_routes), never `this`.
+    static void serve_filtered_issued(const FilteredIssuedDeps& filtered,
+                                      const httplib::Request& req, httplib::Response& res,
+                                      const AuditFn& audit_fn);
+
     std::vector<std::string> csrf_trusted_origins_;
+    FilteredIssuedDeps filtered_;
     ReadProbeFn read_probe_;
 };
 

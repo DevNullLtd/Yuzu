@@ -1,15 +1,18 @@
 #pragma once
 
 /// @file bounded_audit_budget.hpp
-/// A small KEYED fixed-window row budget for audit rows written on a DENIAL path.
+/// A small KEYED fixed-window row budget for audit rows an untrusted caller can provoke. Two
+/// consumers: the gateway-upstream peer guard (a row on a DENIAL path) and the `registry.write`
+/// hook (plugin_result_audit.hpp: success evidence, where a refused row is a lost record, so that
+/// caller counts every refusal).
 ///
 /// WHY IT EXISTS. A refusal that writes one audit row per refused call lets an
 /// unauthenticated caller turn its own refusals into unbounded audit-store
 /// writes. The budget bounds the ROWS, never the refusal: the caller refuses
 /// first and unconditionally, then asks `try_admit(key)` only whether it may also
 /// write a row. A refused row must never change the outcome of the call it was
-/// asked about. The unsampled metric stays the complete count, so suppressed rows
-/// are still visible as a counter.
+/// asked about. The caller keeps an unsampled counter of refusals, so suppressed rows
+/// are still visible as a number.
 ///
 /// WHY IT IS KEYED. One budget for everything would let a flood of one kind of
 /// denial (one peer, or one reason) use up the window and hide a distinct source's
@@ -28,8 +31,10 @@
 /// themselves bounded: at most `max_keys` named ones, then one shared fallback bucket
 /// (also the bucket for a call that names none). A caller minting unlimited distinct
 /// keys therefore cannot grow the table and cannot starve the keys already tracked. A key
-/// is truncated to `kAuditMaxKeyBytes` before use. The table is emptied whenever a window
-/// closes.
+/// is truncated to `max_key_bytes` (default `kAuditMaxKeyBytes`) before use, so two keys that
+/// share that prefix SHARE a budget: a consumer whose keys can be longer passes a bound that
+/// covers them (the registry hook passes the agent-id limit). The table is emptied whenever a
+/// window closes.
 ///
 /// SHAPE. Fixed window, not a token bucket: at most `max_rows` admissions per key
 /// in any one window of `window_ms`, the window restarting at the first admission
@@ -67,7 +72,7 @@ inline constexpr std::size_t kDefaultAuditMaxRows = 10;
 inline constexpr std::int64_t kDefaultAuditWindowMs = 10'000;
 /// Default bound on distinct live keys per window.
 inline constexpr std::size_t kDefaultAuditMaxKeys = 64;
-/// A key longer than this is truncated before use.
+/// Default bound on a key's length: a longer key is truncated before use.
 inline constexpr std::size_t kAuditMaxKeyBytes = 96;
 
 class DenialAuditBudget {
@@ -84,9 +89,10 @@ public:
 
     explicit DenialAuditBudget(std::size_t max_rows = kDefaultAuditMaxRows,
                                std::int64_t window_ms = kDefaultAuditWindowMs, NowMsFn now = {},
-                               std::size_t max_keys = kDefaultAuditMaxKeys)
+                               std::size_t max_keys = kDefaultAuditMaxKeys,
+                               std::size_t max_key_bytes = kAuditMaxKeyBytes)
         : max_rows_(max_rows), window_ms_(window_ms > 0 ? window_ms : 1), max_keys_(max_keys),
-          now_(now ? std::move(now) : NowMsFn{&steady_now_ms}) {}
+          max_key_bytes_(max_key_bytes), now_(now ? std::move(now) : NowMsFn{&steady_now_ms}) {}
 
     DenialAuditBudget(const DenialAuditBudget&) = delete;
     DenialAuditBudget& operator=(const DenialAuditBudget&) = delete;
@@ -95,10 +101,10 @@ public:
     /// counts that row against the key's budget. `max_rows == 0` never admits.
     [[nodiscard]] AdmitResult try_admit(std::string_view key, std::string_view overflow_key = {}) {
         const std::int64_t now = now_();
-        if (key.size() > kAuditMaxKeyBytes)
-            key = key.substr(0, kAuditMaxKeyBytes);
-        if (overflow_key.size() > kAuditMaxKeyBytes)
-            overflow_key = overflow_key.substr(0, kAuditMaxKeyBytes);
+        if (key.size() > max_key_bytes_)
+            key = key.substr(0, max_key_bytes_);
+        if (overflow_key.size() > max_key_bytes_)
+            overflow_key = overflow_key.substr(0, max_key_bytes_);
         std::lock_guard lk(mu_);
         AdmitResult result;
         if (!window_open_ || now >= window_start_ms_ + window_ms_) {
@@ -158,6 +164,7 @@ private:
     const std::size_t max_rows_;
     const std::int64_t window_ms_;
     const std::size_t max_keys_;
+    const std::size_t max_key_bytes_;
     const NowMsFn now_;
     mutable std::mutex mu_;
     bool window_open_{false};

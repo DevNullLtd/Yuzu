@@ -15,7 +15,7 @@ The page is also the home for several affordances that did not have anywhere to 
 
 1. **Retention-paused source list** — the operator-facing view of `<source>_enabled=false` per device, born from issue #539. Without it, an operator who disabled `process_enabled` on a device for forensic preservation has no aggregate view of which boxes are accumulating non-aging data.
 2. **Process tree viewer** — reconstructed per-host from that host's local TAR warehouse (`$Process_Live` + `$TCP_Live`) only, with no seed (as-built; see §5). Forensic timeline of every process born under a parent over a chosen window, with an honest "no-seed" completeness caveat (Windows is names-only). **The pane also embeds device-level DNS-cache + ARP-table panels (ADR-0015)** — dispatched read-only `tar.sql` over `$DNS_Live`/`$ARP_Live` to the selected host, rendered beside the tree. These are **device views, not per-process** (the DNS cache carries no pid); they audit `tar.dns.read` / `tar.arp.read` (DNS is usage-class PII, separately countable).
-3. **Capture sources frame (ADR-0015)** — a per-device toggle table for every TAR capture source, with a category filter and a **staged-then-push guardrail**: toggling a source only *stages* the change; nothing is dispatched until the operator clicks **Push** (guards against accidentally enabling a usage-class source). Reads `tar status` + `tar compatibility`; Push dispatches `tar configure <source>_enabled` per change (audited `tar.sources.read` / `tar.sources.configure`). The same configure path is reachable via MCP/REST `crossplatform.tar.configure`.
+3. **Capture sources frame (ADR-0015)** — a per-device toggle table for the ten core sources (`process`, `tcp`, `service`, `user`, `perf`, `procperf`, `netqual`, `module`, `arp`, `dns`; the rest are toggled through `tar.configure`), with a category filter and a **staged-then-push guardrail**: toggling a source only *stages* the change; nothing is dispatched until the operator clicks **Push** (guards against an accidental toggle of a usage-class source in either direction). Reads `tar status` + `tar compatibility`; Push dispatches `tar configure <source>_enabled` per change (audited `tar.sources.read` / `tar.sources.configure`). The same configure path is reachable via MCP/REST `crossplatform.tar.configure`.
 
 The page is also the surface where **scope walking** (per `docs/scope-walking-design.md`) becomes most visibly useful — the TAR SQL query is the canonical iterative-narrowing tool (it now starts from the Result sets page, **From TAR query**, rather than from a frame on `/tar`), and result-set chips are the operator's reasoning chain made visible.
 
@@ -131,7 +131,7 @@ The "Purge data" button on a row is more dangerous than re-enable — it tells t
 
 Server dispatches a new agent action `tar.purge_source` with `{source: <name>}`. The action is gated behind a typed-hostname confirmation ("type the device hostname to confirm purge of `process` data"), per the destructive-action discipline in the project root `CLAUDE.md`. Audit row: `action: tar.source.purge, principal: <session>, result: success|failure, detail: device=<id> source=<name>` — the dispatch audit row does **not** carry `rows_deleted` (see the as-shipped note below).
 
-> **As shipped (Phase 15.A, 2026-07-01).** Route `POST /fragments/tar/retention-paused/purge`; audit verb `tar.source.purge` (matching the `tar.source.reenable` sibling); metric `yuzu_tar_source_purge_total{result}`. The typed confirmation is a native `prompt()` ("type the device hostname"), not a bespoke modal — CSP-safe (no `hx-on`/eval), consistent with the native `confirm()` used for re-enable. **The paused-guard is agent-side and authoritative:** `tar.purge_source` refuses (`source_not_paused`) if the source is currently enabled, which closes the scan→purge TOCTOU. The server does **not** enforce a `SOURCE_NOT_PAUSED` check (§3.5) because the retention-paused frame is an ephemeral live scan with no persisted paused-state to check. Dispatch is fire-and-forget, so `rows_deleted` is computed agent-side and returned in the response record — it is not in the immediate dispatch audit row.
+> **As shipped (Phase 15.A, 2026-07-01).** Route `POST /fragments/tar/retention-paused/purge`; audit verb `tar.source.purge` (matching the `tar.source.reenable` sibling); metric `yuzu_tar_source_purge_total{result}`. The typed confirmation is a native `prompt()` ("type the device hostname"), not a bespoke modal — CSP-safe (no `hx-on`/eval), consistent with the native `confirm()` used for re-enable. **The paused-guard is agent-side and authoritative:** `tar.purge_source` refuses (`source_not_paused`) if the source is currently enabled, or (`config_unreadable`) if the enable flag cannot be read so the agent cannot confirm the source is paused (nothing is purged either way), which closes the scan→purge TOCTOU. The server does **not** enforce a `SOURCE_NOT_PAUSED` check (§3.5) because the retention-paused frame is an ephemeral live scan with no persisted paused-state to check. Dispatch is fire-and-forget, so `rows_deleted` is computed agent-side and returned in the response record — it is not in the immediate dispatch audit row.
 >
 > **A1 REST parity + generic-dispatch hardening (2026-07-01).** Automation/MCP callers use the structured `POST /api/v1/tar/retention-paused/purge` (JSON body `{device_id, source}`, `Infrastructure:Delete` per-device-scoped, A4 error envelope, `202` + `command_id`; audited fail-closed — no dispatch without a durable audit row). Both the fragment and the REST route confirm the guard is agent-side authoritative. The generic `POST /api/command` escape hatch now also elevates destructive actions: `tar.purge_source` there additionally requires `Infrastructure:Delete` and is confined to the caller's visible agents with untargeted broadcast/scope fan-out refused, so it can't be a weaker path than the dedicated route. The atomic agent-side guard (check + delete under one lock) closes the agent-local check→delete race in addition to the scan→purge TOCTOU.
 
@@ -140,7 +140,7 @@ Server dispatches a new agent action `tar.purge_source` with `{source: <name>}`.
 - View-only access requires `Infrastructure:Read`.
 - **Scan fleet** requires `Execution:Execute` (it dispatches a fleet-wide command — same tier as `run-instruction` and `tar-execute` siblings).
 - **Re-enable** requires `Execution:Execute` and the operator's RBAC visibility on the target device. Out-of-scope `device_id` values collapse to the same 404 response as not-connected agents (no enumeration oracle); the audit log records the real reason server-side.
-- Purge requires `Infrastructure:Delete` on the target device (a higher tier than re-enable's `Execution:Execute`), plus the operator's RBAC visibility on the device (same 404-collapse as re-enable). The paused-state guard is **agent-side and authoritative**: `tar.purge_source` refuses (`source_not_paused`) unless the source currently reports disabled, which closes the scan→purge TOCTOU and prevents purging an actively-collecting source. The server does **not** enforce a `SOURCE_NOT_PAUSED` check — the retention-paused frame is an ephemeral live scan with no persisted paused-state to check, so the authoritative guard lives on the agent that owns the data (see §3.4). The agent action validates `source` against the full capture-source registry; the server route additionally restricts it to the four retention-frame sources `{process, tcp, service, user}`.
+- Purge requires `Infrastructure:Delete` on the target device (a higher tier than re-enable's `Execution:Execute`), plus the operator's RBAC visibility on the device (same 404-collapse as re-enable). The paused-state guard is **agent-side and authoritative**: `tar.purge_source` refuses (`source_not_paused`) unless the source currently reports disabled, or (`config_unreadable`) when the enable flag cannot be read so the agent cannot confirm it (nothing is purged either way), which closes the scan→purge TOCTOU and prevents purging an actively-collecting source. The server does **not** enforce a `SOURCE_NOT_PAUSED` check — the retention-paused frame is an ephemeral live scan with no persisted paused-state to check, so the authoritative guard lives on the agent that owns the data (see §3.4). The agent action validates `source` against the full capture-source registry; the server route additionally restricts it to the four retention-frame sources `{process, tcp, service, user}`.
 
 ### 3.6 Tests
 
@@ -304,10 +304,112 @@ in-panel error and caches nothing rather than minting a weak token.
   dashboard-only `/run` route, itself excluded as dispatch-shaped (batched with
   #3994). Revisit once a `/run` (and `/result`) twin lands — see
   `scripts/ci/api-parity/tar.json`'s `exception:` rows on those two paths.
-- **Loaded modules / libraries** — out of scope: TAR records no module-load data; it
-  would need a new collector (ETW `Image`/`Load`) or a live modules probe.
+- **Loaded modules / libraries** — not shown by the viewer: the `module` source records
+  image loads on Windows (ETW) into the `$Module_*` tables, which `tar.sql` reads.
 - **Seed snapshot** (the original §5.1 below) — intentionally not built; revisit only
   if the no-seed completeness limit proves insufficient in the field.
+
+### 5.7 Timeline renderers (building blocks, not yet wired)
+
+`server/core/src/tar_timeline_view.hpp` defines the model of a per-device timeline
+read, and `tar_timeline_render.{hpp,cpp}` holds the pure renderers that turn it into
+the device bar, the "what is kept" chart, the lanes, the moment and selected panels
+and the "What this record cannot tell you" list. No page, route or API uses them yet,
+so nothing is operator-visible.
+
+- **What the model must say.** Each lane covers its window with typed regions (exact,
+  rolled-up, pruned, paused, not readable with a reason, capped with the point it
+  reaches back to). A stretch with no region renders as "Coverage not stated", never
+  as exact. Offline, failed and too-old-agent reads render as not readable, never as
+  empty.
+- **Retention.** An expiry is stated only from the configured policy or a row limit.
+  Measured coverage (the oldest row actually seen) is never turned into an expiry, and
+  a source whose measurement could not be made says so instead of "Gone".
+- **Wording follows the read.** Polling interval, process capture method, operating
+  system and unknown values change the wording; an unknown is worded as unknown, and
+  DNS names are never tied to a process.
+- **Bounds and escaping.** Output is bounded per lane and for the selected panel. Every
+  dynamic value is HTML-escaped; links are supplied by the caller as server-built
+  relative paths with ids percent-encoded, and no route path is fixed in the renderers.
+- **Time.** Every stated time is UTC. Windows outside the years 1970 to 9999 are not
+  drawn.
+
+The data that fills the model (the read, its permissions, audit and the API twins) is
+separate work; this section records the contract it must meet.
+
+### 5.8 Timeline page (hidden until the timeline fragments land)
+
+`GET /tar/timeline?id=<agent_id>[&at=<epoch seconds>]` is the page that will host the
+5.7 renderers, with `static/yuzu-tar-timeline.js` beside it. Both routes are registered only
+when `kTarTimelineUi` (`tar_timeline_page_ui.hpp`, copied into `page::Deps::tar_timeline_ui`)
+is true. It ships false: the paths do not exist, nothing links to them, and nothing is
+operator-visible. A signed-out request is redirected to sign in; a missing `id` is a 400.
+
+- **What the shell holds.** The page (`tar_timeline_page_ui.cpp`, shell `active_key`
+  "tar") carries no CSS or script of its own beyond the `yuzu.css` rules and the one
+  script. Slots: `#tl-run` (an htmx load of `/fragments/tar/timeline/run?id=<id>[&at=<n>]`,
+  with `data-moment-url` and `data-selected-url` naming the other two fragments),
+  `#tl-moment`, `#tl-selected`, the UTC clock, Play and Speed, and Copy link to this
+  moment. The id is percent-encoded then HTML-escaped; `at` is used only when it is
+  1 to 19 digits.
+- **What the fragments must carry.** The script reads numbers, never guesses them:
+  `.tl-body[data-from][data-to]` (the window), `.tl-ph[data-ts]` (the resolved moment,
+  emitted only for a valid window, which is the script's bind signal), moment-panel
+  Previous/Next anchors `a[data-ts]`, block buttons `button[data-ts]` (with a `data-ref`
+  when the block is one item), and the selected panel's linked-item anchors
+  `a[data-ref][data-ts]`. Every number is plain digits (at most 15): `0x10`, `1e3` or a
+  missing `data-ts` makes the window invalid. The renderers emit all of these.
+  The run fragment is expected to poll its own result with `hx-target="this"` (as the
+  process tree does). A load inside `#tl-run` that is refused, never reaches the server
+  or times out ends the run view with a note ("Could not load the record (HTTP n)." or
+  "Could not reach the server."): the poll does not retry, so the page needs a reload.
+  The run slot's own 401 is handled by htmx, not by the script: a signed-out `HX-Request`
+  gets 401 with `HX-Redirect: /home`, which htmx follows.
+- **What the script does.** It binds once per run instance (a repeated or unrelated
+  settle changes nothing; a new instance rebinds from its own moment). An invalid window,
+  or one without a playhead, gets no controls and no requests. Drag, click and the
+  arrow, Page, Home and End keys move the moment line (UTC). Every committed time
+  change requests the moment panel and, while an item is selected, the selected panel at
+  the same time; the newest request per panel wins and a superseded one is aborted. The
+  panels show whatever the server returns, including offline, not-readable and capped
+  states; a non-2xx is "Could not load this panel (HTTP n)." and an unreachable server
+  "Could not reach the server." (failures are announced as alerts, a landed panel is not).
+  Every panel request sends `HX-Request: true`, so the server answers a signed-out one with
+  401; a 401 or a redirected answer ends the session once: playback stops, both panel
+  requests are aborted and the browser goes to `/login`.
+- **Playback.** Play/Pause and a 1x / 10x / 60x speed move the moment line through the
+  window already loaded; they do not show live data. Each step advances the line by
+  speed times elapsed time, clamped to the window; a stalled timer (a throttled or
+  suspended tab) counts at most one second of elapsed time per step, so the line never
+  leaps. It stops at the window end (no loop), on Pause, on any manual move, on a failed
+  panel request, when the tab is hidden and when the run instance is replaced.
+  Repeated time changes (playback and a held key) are limited to one panel refresh a
+  second, the newest time wins, and the timer waits for the previous answer; an answer
+  still missing after ten seconds is abandoned and a fresh request made. A click on a
+  block or on Previous / Next, a scrub release, Play restart and the
+  first move after a quiet second refresh the panels at once. A click on what is already
+  shown (the same time and item) asks for nothing, unless its panel failed, in which case
+  it asks again. Stopping on Pause, the window end or a hidden tab commits the exact stop
+  time once so the panels agree with the line. A click on a linked item in the Selected
+  panel refreshes that panel and stops playback; Play at the window end restarts from the window start. Play is
+  disabled with a note when the window is a day or longer or not valid.
+
+The fragments themselves, their permissions and audit are separate work. What the page
+assumes of them:
+
+- Requests are `run?id[&at]`, `moment?id&at` and `selected?id&ref&at` under
+  `/fragments/tar/timeline/`: stateless, keyed by `id`, no token. The run poll ends at its
+  result. `at` parses fail-closed (digits only, no overflow, `at=0` invalid), `ref` has a
+  bounded length, and responses carry `Cache-Control: no-store`.
+- Per-device authorization is theirs: `require_scoped_permission`, the same posture as the
+  TAR SQL frame (5.5). One usage-class audit verb through `emit_behavioral_audit`, emitted
+  once per run open (not per moment or selected request), with an explicit choice of
+  fail-closed or proceed.
+- An A5 / ADR-1005 parity exception row (issue and revisit date) lands before the flag flips.
+- The renderers' default `href`s are not page deep links; the script intercepts them.
+- Keyboard and ARIA limits: the arrow, Page, Home and End keys move the line while the
+  timeline has focus; the range reads the moment as a UTC time; failures are announced,
+  routine refreshes are not. No accessibility conformance is claimed.
 
 ---
 
@@ -334,7 +436,7 @@ The dashboard rendered the seed timestamp prominently (`Tree as observed since �
 | Retention-paused list view | `Infrastructure:Read` | |
 | Scan fleet (Phase 15.A) | `Execution:Execute` | Dispatches `tar.status` fleet-wide; same tier as run-instruction/tar-execute |
 | Re-enable | `Execution:Execute` | Per-device RBAC visibility check; out-of-scope collapses to same 404 as not-connected (no enumeration oracle) |
-| Purge | `Infrastructure:Delete` | Per-device RBAC visibility check + typed-hostname confirmation (native `prompt()`, CSP-safe). Agent-side `source_not_paused` guard is authoritative (no server-side `SOURCE_NOT_PAUSED` check) |
+| Purge | `Infrastructure:Delete` | Per-device RBAC visibility check + typed-hostname confirmation (native `prompt()`, CSP-safe). Agent-side `source_not_paused` / `config_unreadable` guard is authoritative (no server-side `SOURCE_NOT_PAUSED` check) |
 | TAR SQL submit | `Infrastructure:Read` (today) → may tighten later | The current grant is read-only because TAR SQL is bounded to the agent's own DB and runs SELECT-only on a read-only connection behind a SQLite authorizer that allows only registry-known warehouse tables (#760/#631) |
 | Save SQL result as result set | `Infrastructure:Read` + result-set creation quota | Per scope-walking-design §3.3 |
 | Process tree view (frame only) | `Infrastructure:Read` | Frame, host picker, filter bar |

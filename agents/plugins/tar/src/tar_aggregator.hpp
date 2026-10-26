@@ -265,12 +265,10 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
  *   - no transition (idempotent set): leaves `<source>_paused_at` untouched.
  *
  * The default for `<source>_enabled` if not yet set comes from
- * `CaptureSourceDef::default_enabled` (`"true"` for always-on sources, `"false"`
- * for the opt-in module/procperf/netqual). So the first-ever set registers as a
- * transition only when it differs from that default — e.g. the first
- * `module_enabled=false` on a fresh DB is a no-op (module already defaults off)
- * and writes no spurious `paused_at`, whereas the first `process_enabled=false`
- * is a real enabled→disabled transition.
+ * `CaptureSourceDef::default_enabled` (`"true"` for every source). So the
+ * first-ever set registers as a transition only when it differs from that
+ * default — the first `<src>_enabled=false` on a fresh DB is a real
+ * enabled→disabled transition.
  *
  * #538: on the enabled→disabled transition the source's snapshot-diff baseline
  * (`diff_state_key(source)`) is cleared so a later re-enable starts from a clean
@@ -327,16 +325,23 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
 [[nodiscard]] std::string_view canonical_source_enabled(std::string_view stored_value);
 
 /**
- * The collect-time (and purge-time) gate: is a capture source actively enabled?
- * Reads `<source>_enabled` (defaulting to the source's declared default) and
- * gates on the strict tri-state (#560) — anything the plugin never wrote maps to
- * "errored", which is NOT "true", so the source reads as disabled (fail closed).
- * A never-configured source returns its `source_default_enabled()` default.
+ * The three-state read behind the enable gate: `true` / `false` are CONFIRMED
+ * (a stored value, or the registry default for a confirmed-absent row, gated on
+ * the strict tri-state of #560 -- a non-canonical stored value maps to "errored",
+ * which is NOT "true", so it reads `false`); `nullopt` means the config read
+ * itself FAILED (closed db, SQL error) and the flag is unknown.
  *
- * This is the authoritative paused-guard for the Phase 15.A destructive purge:
- * `tar.purge_source` refuses unless this returns false. It lives here (beside
- * `canonical_source_enabled`, the tri-state authority it wraps) rather than in
- * the plugin so the guard predicate is directly testable.
+ * Anything that DISCARDS, DRAINS, STOPS or DELETES because a source is disabled
+ * must branch on this and act only on a confirmed `false`, treating `nullopt` as
+ * "do nothing": collapsing it to `false` turns a transient read failure into data
+ * loss for a source that is actually enabled.
+ */
+[[nodiscard]] std::optional<bool> source_enabled_state(TarDatabase& db, std::string_view source);
+
+/**
+ * Collect-time gate: `source_enabled_state(...).value_or(false)`, so an unreadable flag skips.
+ * Collect/retention gate only (false = skip); drain/discard/purge sites use
+ * `source_enabled_state()`.
  */
 [[nodiscard]] bool source_enabled(TarDatabase& db, std::string_view source);
 
