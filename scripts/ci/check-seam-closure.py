@@ -20,7 +20,8 @@ static analysis and NOT a substitute for review. The enforceable proxy for
 closure of the TU contains no store header. To call `store->method()` the
 class definition has to be VISIBLE via some include, so if no header in the
 closure defines a store class, the TU cannot be calling into one directly.
-That implication only breaks two ways, both ACKNOWLEDGED and NOT caught here:
+That implication breaks in the ways below, all ACKNOWLEDGED and NOT caught here (the two
+numbered shapes, plus the "ALSO NOT CAUGHT" list after them):
 
   1. A COMPUTED / macro-built include (`#include SOME_MACRO`, X-macro headers,
      `#define STORE_HEADER "foo_store.hpp"` + `#include STORE_HEADER`) - the
@@ -34,6 +35,29 @@ That implication only breaks two ways, both ACKNOWLEDGED and NOT caught here:
 Neither shape exists in any family this script covers today; if one is ever
 introduced, this check will pass while the seam is actually broken. That is a
 known, stated gap - not a silent one.
+
+ALSO NOT CAUGHT (found in the WS-A4 S0 review, each reproduced on a scratch tree):
+  3. THE INCLUDE PARSER IS LINE-ANCHORED AND LITERAL. A backslash-continued
+     `#include` with the file name on the next line (a line-continuation), a UTF-8 BOM before a first-line
+     include, and `/* c */ #include "x_store.hpp"` on one line all extract NOTHING; a
+     macro include is likewise invisible. Conversely a commented-out include, an
+     `#if 0` block or a raw string containing `#include "..."` is extracted and can
+     false-FAIL (conservative direction). No such form exists in an enforced closure
+     today; hardening the parser is a tracked follow-up, not done here.
+  4. THE DENYLIST IS HAND-MAINTAINED. A store-owning header that no pattern names is
+     invisible to the walk - `nvd_db.hpp` (a raw `sqlite3*`) was exactly this until S0.
+     Others unlisted today: `*_owner.hpp`, `app_perf_{cohort,group}_reader.hpp`,
+     `app_perf_rollup.hpp`, `sqlite_raii.hpp`. See `STORE_FREE_PRESENTATION_TUS`.
+  5. EXTERNAL ANGLE HEADERS ARE OPAQUE: `<sqlite3.h>` / `<libpq-fe.h>` give raw database
+     access with no project class. The "cannot define a project store class" argument in
+     INCLUDE RESOLUTION below is about project classes only.
+  6. AN UNRESOLVED QUOTE INCLUDE IS A WARNING, NOT AN ERROR (exit 0): a header outside
+     the three resolution roots truncates the closure under it. Generated protobuf
+     headers (e.g. `agent.grpc.pb.h`) are legitimately unresolved today, so a hard error
+     needs an allowlist first - a tracked follow-up.
+  7. A FORWARD DECLARATION OF A STORE IS ALLOWED in a non-abstract closure (only the
+     abstract `*_api.hpp` headers get the type-name probe); calling through it needs the
+     full definition, which the walk would catch.
 
 ABSTRACT-VS-LOCAL SEAM (#4249): the fourth forbidden pattern,
 `*_api_local.hpp`, is NOT a store-layer header - it is the CORE-ONLY half of
@@ -819,8 +843,10 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
         if not p.is_file():
             gh("error", f"check-seam-closure: expected family TU not found: "
                         f"{rel} (family {name!r}) - if it was renamed or deleted, "
-                        f"update that TU list here AND the frozen pin in "
-                        f"tests/test_seam_closure_selftest.py")
+                        f"update "
+                        + ("STORE_FREE_PRESENTATION_TUS" if name == "store_free_presentation"
+                           else f"FAMILIES[{name!r}]")
+                        + " AND the frozen pin in tests/test_seam_closure_selftest.py")
             ok = False
             continue
         existing.append(p)

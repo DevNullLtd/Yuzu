@@ -193,11 +193,8 @@ EXPECTED_FORBIDDEN_HEADER_PATTERNS = [
     "nvd_db.hpp",
 ]
 # WS-A4 S0: the new patterns, named separately so probe 17 can prove each one fires.
-S0_NEW_FORBIDDEN_HEADERS = [
-    "execution_tracker.hpp", "auth_db.hpp", "approval_manager.hpp",
-    "directory_sync.hpp", "update_registry.hpp", "patch_manager.hpp",
-    "deployment_engine.hpp", "nvd_db.hpp",
-]
+S0_NEW_HEADER_COUNT = 8   # execution_tracker .. nvd_db: asserted in check 2e, so a shrink is loud
+S0_NEW_FORBIDDEN_HEADERS = EXPECTED_FORBIDDEN_HEADER_PATTERNS[-S0_NEW_HEADER_COUNT:]
 # WS-A4 S0: store-free presentation TUs - clean-by-gate, not by convention.
 EXPECTED_STORE_FREE_PRESENTATION_TUS = [
     "server/core/src/access_audit_ui.cpp",
@@ -285,7 +282,24 @@ EXPECTED_EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthD
                                     "ApprovalManager", "DirectorySync", "UpdateRegistry",
                                     "PatchManager", "NvdDatabase"]
 # WS-A4 S0: the five tokens added by S0 are the tail of the pin (derived, so probe 18 cannot drift).
-S0_NEW_STORE_TYPE_TOKENS = EXPECTED_EXTRA_STORE_TYPE_TOKENS[-5:]
+S0_NEW_TOKEN_COUNT = 5   # ApprovalManager .. NvdDatabase: asserted in check 2e
+S0_NEW_STORE_TYPE_TOKENS = EXPECTED_EXTRA_STORE_TYPE_TOKENS[-S0_NEW_TOKEN_COUNT:]
+# Each S0 token must be DEFINED (not merely forward-declared or mentioned) in the one header
+# that its paired forbidden pattern names.
+S0_TOKEN_HOME_HEADER = {
+    "ApprovalManager": "approval_manager.hpp", "DirectorySync": "directory_sync.hpp",
+    "UpdateRegistry": "update_registry.hpp", "PatchManager": "patch_manager.hpp",
+    "NvdDatabase": "nvd_db.hpp",
+}
+
+
+def _diff(got, want) -> str:
+    """added/removed between a module list and its frozen pin (the full lists run to ~35 paths)."""
+    got, want = list(got), list(want)
+    return (f"added={[x for x in got if x not in want]!r} "
+            f"removed={[x for x in want if x not in got]!r} "
+            f"(order-only difference if both are empty) - edit the matching EXPECTED_* constant "
+            f"in this file in the same change")
 
 
 def _fail(msg: str, failures: list) -> None:
@@ -327,8 +341,8 @@ def main() -> int:
     # 2. FORBIDDEN_HEADER_PATTERNS pinned - narrowing a pattern (or dropping
     #    one) would silently stop the gate blocking a real store-layer header.
     if mod.FORBIDDEN_HEADER_PATTERNS != EXPECTED_FORBIDDEN_HEADER_PATTERNS:
-        _fail(f"FORBIDDEN_HEADER_PATTERNS {mod.FORBIDDEN_HEADER_PATTERNS!r} != "
-              f"frozen {EXPECTED_FORBIDDEN_HEADER_PATTERNS!r}", failures)
+        _fail("FORBIDDEN_HEADER_PATTERNS differs from its frozen pin: "
+              + _diff(mod.FORBIDDEN_HEADER_PATTERNS, EXPECTED_FORBIDDEN_HEADER_PATTERNS), failures)
 
     # 2b. Impl-purity constants pinned (ADR-0031 WS-A4). A dropped impl TU, a
     #     weakened presentation-header set, or a silently-widened httplib
@@ -338,7 +352,8 @@ def main() -> int:
         _fail(f"IMPL_FORBIDDEN_HEADER_PATTERNS {mod.IMPL_FORBIDDEN_HEADER_PATTERNS!r} != "
               f"frozen {EXPECTED_IMPL_FORBIDDEN_HEADER_PATTERNS!r}", failures)
     if mod.IMPL_TUS != EXPECTED_IMPL_TUS:
-        _fail(f"IMPL_TUS {mod.IMPL_TUS!r} != frozen {EXPECTED_IMPL_TUS!r}", failures)
+        _fail("IMPL_TUS differs from its frozen pin: " + _diff(mod.IMPL_TUS, EXPECTED_IMPL_TUS),
+              failures)
     if mod.IMPL_HTTPLIB_ALLOWED != EXPECTED_IMPL_HTTPLIB_ALLOWED:
         _fail(f"IMPL_HTTPLIB_ALLOWED {mod.IMPL_HTTPLIB_ALLOWED!r} != "
               f"frozen {EXPECTED_IMPL_HTTPLIB_ALLOWED!r}", failures)
@@ -355,12 +370,16 @@ def main() -> int:
     #     FAMILIES set (a TU enforced twice is a silent ownership ambiguity), and never
     #     contains the two TUs that were clean only under the pre-S0 patterns.
     if mod.STORE_FREE_PRESENTATION_TUS != EXPECTED_STORE_FREE_PRESENTATION_TUS:
-        _fail(f"STORE_FREE_PRESENTATION_TUS {mod.STORE_FREE_PRESENTATION_TUS!r} != "
-              f"frozen {EXPECTED_STORE_FREE_PRESENTATION_TUS!r}", failures)
+        _fail("STORE_FREE_PRESENTATION_TUS differs from its frozen pin: "
+              + _diff(mod.STORE_FREE_PRESENTATION_TUS, EXPECTED_STORE_FREE_PRESENTATION_TUS),
+              failures)
     family_tus = {t for spec in mod.FAMILIES.values() for t in spec["tus"]}
     overlap = sorted(set(mod.STORE_FREE_PRESENTATION_TUS) & family_tus)
     if overlap:
-        _fail(f"STORE_FREE_PRESENTATION_TUS overlaps a FAMILIES set: {overlap!r}", failures)
+        _fail(f"STORE_FREE_PRESENTATION_TUS overlaps a FAMILIES set: {overlap!r}. A TU whose "
+              f"family seam has landed MOVES: remove it from STORE_FREE_PRESENTATION_TUS and "
+              f"EXPECTED_STORE_FREE_PRESENTATION_TUS, then add it to FAMILIES and EXPECTED_FAMILIES",
+              failures)
     for rel in S0_DELIBERATELY_NOT_STORE_FREE:
         if rel in mod.STORE_FREE_PRESENTATION_TUS:
             _fail(f"{rel} was clean only under the pre-S0 patterns and must not be in "
@@ -374,21 +393,34 @@ def main() -> int:
     #     name the probes synthesise is a REAL header / type in the tree (probes 17/18
     #     only prove "a pattern with this spelling fires"; a spelling that matches no
     #     real file would pass them and protect nothing).
-    n_new = len(S0_NEW_FORBIDDEN_HEADERS)
-    if S0_NEW_FORBIDDEN_HEADERS != EXPECTED_FORBIDDEN_HEADER_PATTERNS[-n_new:]:
-        _fail("S0_NEW_FORBIDDEN_HEADERS is not the tail of EXPECTED_FORBIDDEN_HEADER_PATTERNS", failures)
+    # Literal endpoints, NOT the slice constants above (comparing a slice to the constant that
+    # defines it is a tautology): the S0 tails must start and end where S0 put them.
+    if (len(S0_NEW_FORBIDDEN_HEADERS), S0_NEW_FORBIDDEN_HEADERS[0], S0_NEW_FORBIDDEN_HEADERS[-1]) != \
+            (8, "execution_tracker.hpp", "nvd_db.hpp") or \
+            (len(S0_NEW_STORE_TYPE_TOKENS), S0_NEW_STORE_TYPE_TOKENS[0],
+             S0_NEW_STORE_TYPE_TOKENS[-1]) != (5, "ApprovalManager", "NvdDatabase"):
+        _fail("the S0 probe lists are not the 8 headers (execution_tracker .. nvd_db) / 5 tokens "
+              "(ApprovalManager .. NvdDatabase) S0 added - a pin shrank or a slice constant drifted",
+              failures)
+    if set(S0_TOKEN_HOME_HEADER) != set(S0_NEW_STORE_TYPE_TOKENS) or \
+            not set(S0_TOKEN_HOME_HEADER.values()) <= set(S0_NEW_FORBIDDEN_HEADERS):
+        _fail("S0_TOKEN_HOME_HEADER does not cover exactly the S0 tokens, each in an S0 header",
+              failures)
     for hdr in S0_NEW_FORBIDDEN_HEADERS:
         real = list(mod.SERVER_SRC.rglob(hdr)) + list(mod.SERVER_INCLUDE.rglob(hdr))
         if not real:
             _fail(f"S0 forbidden header {hdr!r} names no real header under server/core - a "
                   f"misspelt pattern would pass probe 17 and protect nothing", failures)
-    headers_text = "\n".join(
-        h.read_text(encoding="utf-8", errors="replace")
-        for h in list(mod.SERVER_SRC.rglob("*.hpp")) + list(mod.SERVER_INCLUDE.rglob("*.hpp")))
-    for tok in S0_NEW_STORE_TYPE_TOKENS:
-        if not re.search(r"\b(?:class|struct)\s+" + re.escape(tok) + r"\b", headers_text):
-            _fail(f"S0 store-type token {tok!r} is not declared as a class/struct in any "
-                  f"server/core header - a misspelt token would pass probe 18", failures)
+    for tok, home in S0_TOKEN_HOME_HEADER.items():
+        homes = list(mod.SERVER_SRC.rglob(home)) + list(mod.SERVER_INCLUDE.rglob(home))
+        code = "\n".join(mod._strip_comments(h.read_text(encoding="utf-8", errors="replace"))
+                         for h in homes)
+        # A DEFINITION: `class|struct Tok [final] {` or `... : base {` - a `;`-terminated
+        # forward declaration, `friend class Tok;`, `enum class Tok` and comments do not count.
+        if not re.search(r"^\s*(?:class|struct)\s+" + re.escape(tok) + r"\b(?:\s+final)?\s*[{:]",
+                         code, re.M):
+            _fail(f"S0 store-type token {tok!r} is not DEFINED in {home} - a renamed class with a "
+                  f"stale forward declaration elsewhere would make the token inert", failures)
 
     # 3. Missing-family-member HARD ERROR: a declared TU that does not exist
     #    on disk must fail the family check, never be silently skipped.
@@ -684,9 +716,25 @@ def main() -> int:
                 _fail(f"S0 probe for {hdr} fired but did not name it; stderr: "
                       f"{captured17.getvalue()!r}", failures)
 
+        # 17b. The directory-qualified `pg/*.hpp` pattern fires through its path-qualified
+        #      branch (a pre-existing gap found in the S0 review: nothing proved that branch
+        #      live, so disabling it left both scripts green).
+        (src / "pg").mkdir(exist_ok=True)
+        (src / "pg" / "pool_probe.hpp").write_text("#pragma once\nclass PoolProbe {};\n",
+                                                    encoding="utf-8")
+        (src / "pg_probe_routes.cpp").write_text('#include "pg/pool_probe.hpp"\nint main() {}\n',
+                                                 encoding="utf-8")
+        captured17b = io.StringIO()
+        with contextlib.redirect_stderr(captured17b):
+            ok = mod.check_family("pg-probe", ["server/core/src/pg_probe_routes.cpp"],
+                                  roots=roots, patterns=mod.FORBIDDEN_HEADER_PATTERNS)
+        if ok or "forbidden pattern 'pg/*.hpp'" not in captured17b.getvalue():
+            _fail("check_family did not fire on a TU including a pg/*.hpp header via the "
+                  "'pg/*.hpp' pattern - the directory-qualified branch is inert", failures)
+
         # 18. WS-A4 S0 TOKEN PROBE: each new type-name token must fire in an abstract header,
         #     be NAMED by the message, and a longer identifier that merely starts with it
-        #     (`<Tok>Foo`) must NOT fire (the `\\b` boundary).
+        #     (`<Tok>Foo`) must NOT fire (the trailing word boundary).
         for tok in S0_NEW_STORE_TYPE_TOKENS:
             (src / f"abs_s0_{tok}_api.hpp").write_text(
                 f"#pragma once\nclass {tok};\nint use_it({tok}* p);\n", encoding="utf-8")
