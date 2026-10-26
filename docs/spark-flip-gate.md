@@ -2868,22 +2868,26 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   `#3972 chaos: a third sender holding the stream write mutex ...` (hidden `[.chaos]`)
   characterises UP-13 and deliberately asserts no order.
 - Merge gate for the agent change (UP-14; conditions the UP-14 SERVER change must meet before
-  the agent change merges, in the fixed order census change, server change, agent change;
-  none of these is done yet, and the agent PR description links this list as "merge gated
-  on"):
+  the agent change merges, in the fixed order census change, server change, agent change).
+  Status is tracked on #5690 and in the agent change's pull request description (one checkbox
+  per item):
   1. The comparator orders by the pair only when both sides carry a nonzero pair, and
-     otherwise by the timestamp, with a test that rejects "an unset pair ranks lowest".
+     otherwise by the timestamp, with a test that rejects "an unset pair ranks lowest". The
+     pair is agent-asserted and unauthenticated, so the comparator must key per agent_id and
+     one agent's pair must never affect another agent's rows.
   2. A tested recovery path for a pair regression (an agent KV row lost with the clock behind
-     the stored epoch; an epoch pinned ahead of the clock and then the row lost), documented
-     in the operator manual.
+     the stored epoch; an epoch pinned ahead of the clock and then the row lost), and the
+     operator manual states the reset procedure.
   3. The pair is kept out of `stored_event_matches`, so a journal replay (0/0) of an event
      already delivered is not counted as a collision (otherwise `YuzuGuardianEventsDropped`
      fires on benign replays).
   4. The rule for gap repairs (they draw a fresh pair at admission today) and for an accepted
      0/0 (overwrite or retain the stored pair) is stated and tested.
-  5. The proto hunk is byte-identical to this agent change's hunk, and its comment carries
-     the qualified wording (boot_epoch is not guaranteed monotonic across restarts: the
-     lost-row, clock-ahead and equal-epoch cases) and defines UP-14.
+  5. The server change's hunk for fields 24 and 25 is the authority (the agreed split: the
+     server change owns the fields); the agent change takes the server change's version of
+     the hunk when it merges origin/dev. That comment must say boot_epoch is not guaranteed
+     monotonic across restarts (lost row, clock-ahead pin, equal epoch, 2^62 ceiling) and
+     must define UP-14.
 - Owner: not assigned in source material.
 - Milestone: PR #5776.
 - Revisit trigger: PR-5 (F14 flip) soak. During the first flip soak, inspect

@@ -5,7 +5,8 @@
 // boot_epoch is the high half of the (boot_epoch, emit_seq) event-order pair
 // (guardian_emit_seq.hpp). emit_seq restarts at 1 every process, so the server can only
 // order events ACROSS restarts if boot_epoch strictly increases from one boot to the
-// next (except at the 2^62 ceiling). It is claimed once at agent boot, before the
+// next (given an intact row; see the DOCUMENTED RESIDUAL below; at the 2^62 ceiling the
+// next boot re-claims from the clock). It is claimed once at agent boot, before the
 // GuardianEngine is built, and passed to the engine as a constructor argument so the
 // engine stays I/O-free.
 //

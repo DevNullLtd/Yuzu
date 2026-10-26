@@ -259,8 +259,9 @@ void require_completes_within(std::chrono::milliseconds timeout, const char* wha
 }
 
 // Joins every started thread on scope exit, including when a later emplace_back throws.
-// std::jthread is not used because Apple libc++ ships it only behind -fexperimental-library;
-// see test_guardian_spark_runtime.cpp PortableJThread. Declare it BEFORE any thread starts
+// std::jthread is not used: Apple libc++ ships it only behind -fexperimental-library by
+// default, and the tree already works around its absence (see PortableJThread in
+// test_guardian_spark_runtime.cpp). Declare it BEFORE any thread starts
 // and AFTER every local the workers reference, so the joins run before those locals are
 // destroyed.
 struct JoinGuard {

@@ -28,8 +28,9 @@ Invariants (the numbered rules below; each failure message starts with its rule 
       (the replay discriminator is the page-time stamp, never the batch key:
       backfill_batch_provenance sets the key on LIVE entries); guardian_engine.cpp never calls
       `stamp_emit_pair(` (the legacy stamp is at executor admission only).
-  R2b The legacy stamp in `offer()` follows the `unique_lock<std::mutex> <name>{state_->mu}` token
-      (same unclosed block) and `++state_->next_seq`. This checks TOKEN ORDER only: it cannot see
+  R2b The legacy stamp in `offer()` follows the `unique_lock<std::mutex> <name>{state_->mu}` or
+      `lock_guard<std::mutex> <name>{state_->mu}` token (same unclosed block) and
+      `++state_->next_seq`. This checks TOKEN ORDER only: it cannot see
       an unlock() between them, a never-taken branch, or control flow, so the draw being under
       the lock is review-enforced and covered probabilistically by the concurrent [tsan] offers
       test. R2c: argument pins. The legacy call is exactly
@@ -56,8 +57,8 @@ balanced brackets on the stripped text. Patterns anchor on distinctive tokens, n
 Lexical only: it cannot see a relocation that keeps the tokens but changes control flow
 (review-enforced), and it does not prove stamp CORRECTNESS (the Catch2 suites do that).
 
-Known lexical limits (review-enforced, not detected): an unlock() between the draw and the
-lock-held region, a stamp wrapped in a never-taken branch, and a second enqueue of an already
+Known lexical limits (review-enforced, not detected): an unlock() between the lock and the
+draw, a stamp wrapped in a never-taken branch, and a second enqueue of an already
 stamped entry.
 
 The self-test applies in-memory mutations of the committed sources, one or more per rule, plus

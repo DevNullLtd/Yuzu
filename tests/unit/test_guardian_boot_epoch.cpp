@@ -505,8 +505,11 @@ TEST_CASE("boot-epoch: two writers on one KV file can claim the SAME epoch (docu
     // The interleaving is SIMULATED: two real connections open one file (the WAL premise),
     // but the stale-read wrapper hands the second claim the row as it stood before the first
     // claim's write, so no real race runs. This test pins the epoch arithmetic of the
-    // accepted residual only (both writers claim N + 1). It will NOT detect a later instance
-    // lock or compare-and-set added to the claim; that needs a real two-process test.
+    // accepted residual only (both writers claim N + 1). It will NOT detect a later
+    // per-data-directory instance lock, which lives outside the claim; that needs a real
+    // two-process test. A compare-and-set INSIDE the claim goes through the store interface
+    // and would be expected to make this test fail, which is the intended signal to update
+    // the residual paragraph in guardian_boot_epoch.hpp and design document section 7.1.
     yuzu::test::TempDbFile db{"yuzu_test_boot_epoch_two_proc-"};
     auto kv_a = KvStore::open(db.path);
     auto kv_b = KvStore::open(db.path);
