@@ -305,7 +305,10 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
     if (o.unavail) kids.push(h('div', 'sw-unavail', [pill('unavailable', 'warn'), h('span', '', [o.unavail])]));
     if (op.description) kids.push(h('p', 'sw-text', [op.description]));
     var base = o.path.indexOf('/v2/') === 0 ? '/api' : '/api/v1'; // the only v2 route is keyed /v2/... and served at /api/v2/...
-    var curl = 'curl -s -X ' + o.method.toUpperCase() + ' \\\n  -H "Authorization: Bearer $YUZU_TOKEN" \\\n  "' + location.origin + base + o.path + '"';
+    var mth = o.method.toUpperCase(), sends = mth === 'POST' || mth === 'PUT' || mth === 'PATCH';
+    // -g: curl's URL globbing would rewrite the braces of a path parameter.
+    var curl = 'curl -s -g -X ' + mth + ' \\\n  -H "Authorization: Bearer $YUZU_TOKEN" \\\n' +
+      (sends ? '  -H "Content-Type: application/json" \\\n  -d \'{}\' \\\n' : '') + '  "' + location.origin + base + o.path + '"';
     kids.push(h('h3', '', ['Request']));
     kids.push(h('pre', '', [curl]));
     if (op.parameters && op.parameters.length) { kids.push(h('h3', '', ['Parameters'])); kids.push(paramsTable(op.parameters)); }
@@ -563,7 +566,7 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
     function note(t, cls) { box.appendChild(h('div', cls, [t])); said.push(t); }
     if (hint) note(hint, 'mut');
     if (status === 401) note('Your session may have ended. Sign in again, then reload this page.', 'mut');
-    if (status === 403) note('Your account needs the Infrastructure:Read permission to read the API description.', 'mut');
+    if (status === 403) note('The API description needs the Infrastructure:Read permission. If your account holds it, the permission check itself could not be completed: reload to retry.', 'mut');
     if (cid) note('Correlation id: ' + cid, 'mut mono');
     say(said.join(' '));
     var retry = h('button', 'btn btn-sm', ['Retry']);

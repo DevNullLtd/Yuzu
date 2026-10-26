@@ -3989,7 +3989,7 @@ void RestApiV1::register_routes(
         // If-None-Match instead of refetching. `no-cache` (not `max-age`) so every use goes back
         // through the Infrastructure:Read gate above, which has already run by this line.
         res.set_header("ETag", etag);
-        res.set_header("Cache-Control", "no-cache");
+        res.set_header("Cache-Control", "no-cache, private");
         if (req.get_header_value("If-None-Match") == etag) {
             res.status = 304;
             return;
@@ -7116,7 +7116,7 @@ void RestApiV1::register_routes(
                 res.set_header("Sec-Audit-Failed", "true");
             res.status = 403;
             res.set_content(
-                detail::a4_error(res, "self-revoke requires an interactive session, not an API token"),
+                detail::a4_error(res, "self-revoke requires an interactive session, not an MCP-tier or service-scoped token"),
                 "application/json");
             return;
         }

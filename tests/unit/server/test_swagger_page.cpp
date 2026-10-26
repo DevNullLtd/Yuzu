@@ -118,7 +118,10 @@ TEST_CASE("swagger page: renders from the live spec and builds the DOM safely",
     // element (role=status, aria-live=polite).
     const auto at = html.find("id=\"sw-status\"");
     REQUIRE(at != std::string::npos);
-    const std::string region = html.substr(at, html.find('>', at) - at);
+    // The whole opening tag, whichever order its attributes are written in.
+    const auto open = html.rfind('<', at);
+    REQUIRE(open != std::string::npos);
+    const std::string region = html.substr(open, html.find('>', at) - open);
     CHECK(region.find("role=\"status\"") != std::string::npos);
     CHECK(region.find("aria-live=\"polite\"") != std::string::npos);
 }

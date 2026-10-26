@@ -440,6 +440,12 @@ const out = {};
   const wfRow = rr.filter(r => pathOf(r) === '/workflows/{id}' && r.textContent.startsWith('GET'))[0];
   wfRow.byClass('sw-op-h')[0].click();
   out.r_wf_names = wfRow.byClass('sw-name').map(e => e.textContent.trim());
+  // The request snippet: -g stops curl globbing the braces of a path parameter, and a verb that
+  // sends a body gets a JSON content type and a body placeholder.
+  const getRow = rr.filter(r => r.textContent.startsWith('GET') && pathOf(r).includes('{'))[0];
+  const postRow = rr.filter(r => r.textContent.startsWith('POST'))[0];
+  getRow.byClass('sw-op-h')[0].click(); postRow.byClass('sw-op-h')[0].click();
+  out.r_get_curl = getRow.byTag('pre')[0].textContent; out.r_post_curl = postRow.byTag('pre')[0].textContent;
   out.r_console_errors = consoleErrors.length;
   out.r_guides = root.byClass('sw-gbtn').length;
   out.r_expect_guides = (real.tags || []).filter(t => t['x-yuzu-guide']).length;
@@ -469,7 +475,16 @@ def real_spec():
                 .replace("@@ECOSYSTEM_LIST@@", "eco-a|eco-b"))
     # A renamed token would otherwise sit through json.loads as an ordinary string.
     assert "@@ECOSYSTEM_" not in text, "an ecosystem token was left unsubstituted in the spec literal"
-    doc = json.loads(text)
+    def no_duplicates(pairs):
+        # The literal is hand-maintained: a repeated key silently keeps the last value, so the
+        # lean and guide forms could diverge without any test noticing.
+        keys = [k for k, _ in pairs]
+        dup = sorted({k for k in keys if keys.count(k) > 1})
+        if dup:
+            raise ValueError("duplicate JSON key(s) in the OpenAPI literal: %s" % ", ".join(dup))
+        return dict(pairs)
+
+    doc = json.loads(text, object_pairs_hook=no_duplicates)
     if len(doc.get("paths", {})) < 100:
         raise ValueError("only %d paths in the literal: the chain was probably cut" % len(doc.get("paths", {})))
     return doc
@@ -507,8 +522,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix="yuzu_test_swagger_") as tmp:
         driver = pathlib.Path(tmp) / "driver.js"
         spec_file = pathlib.Path(tmp) / "openapi_with_guides.json"
-        driver.write_text(DRIVER, encoding="utf-8")
-        spec_file.write_text(json.dumps(real), encoding="utf-8")
+        driver.write_text(DRIVER, encoding="utf-8", newline="\n")
+        spec_file.write_text(json.dumps(real), encoding="utf-8", newline="\n")
         proc = subprocess.run([node, str(driver), str(spec_file)], input=js.encode("utf-8"),
                               capture_output=True, timeout=NODE_TIMEOUT)
     stdout = proc.stdout.decode("utf-8")
@@ -645,6 +660,40 @@ def main():
               out["r_panels"], out["r_expect_panels"], out["r_guides"], out["r_expect_guides"]))
     check(all(n in out["r_wf_names"] for n in ("name", "steps", "yaml_source")),
           "GET /workflows/{id} (an allOf of two members) must list name, steps and yaml_source: %r" % out["r_wf_names"])
+    check(out["r_get_curl"].startswith("curl -s -g -X GET") and "Content-Type" not in out["r_get_curl"],
+          "a GET snippet carries -g and no body: %r" % out["r_get_curl"])
+    check(out["r_post_curl"].startswith("curl -s -g -X POST") and "Content-Type: application/json" in out["r_post_curl"] and "-d '{}'" in out["r_post_curl"],
+          "a POST snippet carries -g, a JSON content type and a body placeholder: %r" % out["r_post_curl"])
+    # The expected pill counts are derived here, in Python, from the document, not by the
+    # page's own predicate.
+    py = {"typed": 0, "untyped": 0, "unavail": 0}
+    for path_item in real["paths"].values():
+        for method in ("get", "post", "put", "patch", "delete"):
+            op = path_item.get(method)
+            if not isinstance(op, dict):
+                continue
+            has_schema = any(code.startswith("2") and isinstance(r, dict) and any(
+                isinstance(m, dict) and m.get("schema") for m in (r.get("content") or {}).values())
+                for code, r in (op.get("responses") or {}).items())
+            py["unavail" if op.get("x-yuzu-unavailable") else ("typed" if has_schema else "untyped")] += 1
+    # The upgrade note and the changelog quote these figures by hand: pin them to the document.
+    # An operation counts as typed here when it has a success schema, whether or not it is
+    # unavailable, which is how both texts count.
+    n_ops = py["typed"] + py["untyped"] + py["unavail"]
+    n_typed = sum(1 for pi in real["paths"].values() for m in ("get", "post", "put", "patch", "delete")
+                  if isinstance(pi.get(m), dict) and any(
+                      c.startswith("2") and isinstance(r, dict) and any(isinstance(x, dict) and x.get("schema") for x in (r.get("content") or {}).values())
+                      for c, r in (pi[m].get("responses") or {}).items()))
+    n_schemas = len(real.get("components", {}).get("schemas", {}))
+    root = pathlib.Path(__file__).resolve().parent.parent
+    for rel, pat in (("docs/user-manual/upgrading.md", "gives %d of its %d operations" % (n_typed, n_ops)),
+                     ("changelog.d/2026-10-22-openapi-typed-responses.changed.md", "success response of %d of its %d operations" % (n_typed, n_ops)),
+                     ("changelog.d/2026-10-22-openapi-typed-responses.changed.md", "%d component schemas" % n_schemas)):
+        check(pat in (root / rel).read_text(encoding="utf-8"),
+              "%s must say %r (the document has %d operations, %d typed, %d schemas)" % (rel, pat, n_ops, n_typed, n_schemas))
+    check((out["r_typed"], out["r_untyped"], out["r_unavail"]) == (py["typed"], py["untyped"], py["unavail"]),
+          "page pills %r/%r/%r differ from the counts derived from the document %r" % (
+              out["r_typed"], out["r_untyped"], out["r_unavail"], py))
     check(out["r_console_errors"] == 0, "the real document must draw without a console error: %r" % out["r_console_errors"])
     if errors:
         print("FAIL")

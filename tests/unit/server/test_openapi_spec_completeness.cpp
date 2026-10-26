@@ -1013,8 +1013,8 @@ TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matchin
     CHECK(full_etag == yuzu::server::content_etag(full->body));
     CHECK(lean_etag == yuzu::server::openapi_spec_etag());
     CHECK(full_etag == yuzu::server::openapi_spec_with_guides_etag());
-    CHECK(lean->get_header_value("Cache-Control") == "no-cache");
-    CHECK(full->get_header_value("Cache-Control") == "no-cache");
+    CHECK(lean->get_header_value("Cache-Control") == "no-cache, private");
+    CHECK(full->get_header_value("Cache-Control") == "no-cache, private");
     // The two forms are different bytes, so they must not share a validator.
     CHECK(lean_etag != full_etag);
 
@@ -1024,7 +1024,7 @@ TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matchin
         CHECK(hit->status == 304);
         CHECK(hit->body.empty());
         CHECK(hit->get_header_value("ETag") == lean_etag);
-        CHECK(hit->get_header_value("Cache-Control") == "no-cache");
+        CHECK(hit->get_header_value("Cache-Control") == "no-cache, private");
 
         auto full_hit = sink.Get(full_path, {{"If-None-Match", full_etag}});
         REQUIRE(full_hit);
@@ -1383,17 +1383,12 @@ TEST_CASE("openapi documents: all but two operations declare a typed success res
         INFO("form: " << form_name(with_guides));
         const json spec = json::parse(document_text(with_guides));
         std::set<std::string> untyped;
-        std::size_t typed = 0;
         for (const auto& o : all_operations(spec)) {
-            if (has_typed_success(o.op))
-                ++typed;
-            else
+            if (!has_typed_success(o.op))
                 untyped.insert(o.where());
         }
+        // Every operation outside the exclusion list is typed: an equal set says exactly that.
         CHECK(untyped == kUntyped);
-        // Every other operation is typed: the count follows from the document and the
-        // exclusion list, so it is not a second hand-kept literal.
-        CHECK(typed == all_operations(spec).size() - kUntyped.size());
     }
 }
 
