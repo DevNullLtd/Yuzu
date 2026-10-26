@@ -114,13 +114,14 @@ public:
     /// consumer reads an admin/root-owned tree (/etc/pki/entitlement,
     /// /Applications/*.app) and the cap + regular-file check bound what a link
     /// there can cost. POSIX implementation: yuzu::shared::read_file; the
-    /// Windows default is a plain ifstream read with err 0 (Windows never calls
+    /// Windows default is a fail-closed stub (err = EIO; Windows never calls
     /// it).
     virtual CappedRead read_file_capped(std::string_view path, std::size_t cap);
     /// Entry names of one directory, errno-aware and bounded (see DirListing).
     /// The leaf is followed (Leaf::follow), same reasoning as read_file_capped.
     /// POSIX implementation: yuzu::shared::open_dir + readdir on the fd; the
-    /// Windows default is a directory_iterator walk with err 0.
+    /// Windows default is a fail-closed stub (err = EIO; Windows never calls
+    /// it).
     virtual DirListing list_dir(std::string_view path, std::size_t max_entries);
 
     /// Collection time (UTC epoch seconds) — virtual so tests can pin it and

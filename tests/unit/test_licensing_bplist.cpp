@@ -332,13 +332,12 @@ TEST_CASE("bplist SYNTHETIC: UTF-16 to UTF-8 at every encoded length (hand-compu
     CHECK(lookup(kv_image_value(ascii("")), "CFBundleName") == "");
 }
 
-TEST_CASE("bplist SYNTHETIC: a UTF-16 key is matched without materialising it",
+TEST_CASE("bplist SYNTHETIC: a UTF-16 encoded key does not match",
           "[licensing][bplist]") {
-    CHECK(lookup(kv_image(utf16(u"CFBundleName"), ascii("Cafe")), "CFBundleName") == "Cafe");
-    // A different UTF-16 string of the same length does not match.
-    CHECK_FALSE(lookup(kv_image(utf16(u"CFBundleNamX"), ascii("Cafe")), "CFBundleName").has_value());
-    // A non-zero high byte can never equal an ASCII key character.
-    CHECK_FALSE(lookup(kv_image(utf16(u"CFBundleNšme"), ascii("Cafe")), "CFBundleName").has_value());
+    // CoreFoundation writes every ASCII-clean string as ASCII (0x5x), so the Info.plist keys are
+    // never 0x6x; only the ASCII encoding names a key. (The same image with an ASCII key is
+    // covered by the round-trip case above.)
+    CHECK_FALSE(lookup(kv_image(utf16(u"CFBundleName"), ascii("Cafe")), "CFBundleName").has_value());
 }
 
 TEST_CASE("bplist SYNTHETIC: a non-string value for the key is nullopt",

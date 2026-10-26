@@ -240,10 +240,6 @@ constexpr std::size_t kMaxCertsPerFile = 16;         // a 17th cert in one file 
 // subprocess; it replaces the 60 s gate the openssl runs needed.
 constexpr std::chrono::seconds kEntitlementCertsScanBudget{10};
 
-bool ends_with(std::string_view s, std::string_view suffix) {
-    return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
 bool is_refusal(int err) {
     return err == EACCES || err == EPERM;
 }
@@ -277,7 +273,7 @@ void run_entitlement_certs_surface(ProbeHost& host, std::vector<LicRecord>& reco
     // the daily-sync hash), then cap the file count.
     std::vector<std::string> certs;
     for (const auto& name : dir.names) {
-        if (ends_with(name, ".pem") && !ends_with(name, "-key.pem"))
+        if (name.ends_with(".pem") && !name.ends_with("-key.pem"))
             certs.push_back(name);
     }
     std::sort(certs.begin(), certs.end());

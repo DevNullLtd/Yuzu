@@ -184,62 +184,6 @@ inline std::string parse_wmi_datetime_to_expiry(std::string_view cim) {
         epoch_from_civil(year, static_cast<unsigned>(month), static_cast<unsigned>(day)));
 }
 
-/// `openssl x509 -noout -enddate` output → the `expires_at` wire value
-/// (UTC-midnight epoch seconds, decimal string). Accepts both the `-dateopt
-/// iso_8601` form ("notAfter=2027-03-04 12:00:00Z") and the default form
-/// ("notAfter=Mar  4 12:00:00 2027 GMT"). Returns "" when unparsable.
-inline std::string parse_openssl_enddate(std::string_view line) {
-    line = parse_detail::trim(line);
-    constexpr std::string_view prefix = "notAfter=";
-    if (line.substr(0, prefix.size()) != prefix)
-        return {};
-    const auto value = parse_detail::trim(line.substr(prefix.size()));
-    // ISO form: YYYY-MM-DD...
-    if (value.size() >= 10 && value[4] == '-' && value[7] == '-') {
-        bool digits = true;
-        for (std::size_t i : {0u, 1u, 2u, 3u, 5u, 6u, 8u, 9u})
-            digits = digits && value[i] >= '0' && value[i] <= '9';
-        if (digits) {
-            const long long y = (value[0] - '0') * 1000 + (value[1] - '0') * 100 +
-                                (value[2] - '0') * 10 + (value[3] - '0');
-            const unsigned mo = static_cast<unsigned>((value[5] - '0') * 10 + (value[6] - '0'));
-            const unsigned d = static_cast<unsigned>((value[8] - '0') * 10 + (value[9] - '0'));
-            return expiry_wire_from_epoch(epoch_from_civil(y, mo, d));
-        }
-    }
-    // Default form: "Mon dd HH:MM:SS yyyy GMT"
-    static constexpr std::array<std::string_view, 12> months = {
-        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"};
-    const auto tokens = parse_detail::split_ws(value);
-    if (tokens.size() < 4)
-        return {};
-    const std::string mon = parse_detail::to_lower(tokens[0]);
-    unsigned month = 0;
-    for (std::size_t i = 0; i < months.size(); ++i) {
-        if (mon == months[i]) {
-            month = static_cast<unsigned>(i + 1);
-            break;
-        }
-    }
-    if (month == 0)
-        return {};
-    int day = 0;
-    for (char c : tokens[1]) {
-        if (c < '0' || c > '9')
-            return {};
-        day = day * 10 + (c - '0');
-    }
-    int year = 0;
-    for (char c : tokens[3]) {
-        if (c < '0' || c > '9')
-            return {};
-        year = year * 10 + (c - '0');
-    }
-    if (year < 1900 || day < 1 || day > 31)
-        return {};
-    return expiry_wire_from_epoch(epoch_from_civil(year, month, static_cast<unsigned>(day)));
-}
-
 // ── SLP LicenseStatus → §3.2 status (ADR-0024 D2; surface table row 1) ─────
 
 /// WMI SoftwareLicensingProduct.LicenseStatus:

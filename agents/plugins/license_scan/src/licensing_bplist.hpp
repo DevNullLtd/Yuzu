@@ -8,7 +8,8 @@
  * (CFBundleDisplayName / CFBundleName / CFBundleShortVersionString of an
  * app's Info.plist) — and refuses everything else: nested containers, ints,
  * dates, data, uids and every string that is not 7-bit ASCII (marker 0x5x) or
- * UTF-16BE (marker 0x6x) are `nullopt`, never a partial answer.
+ * UTF-16BE (marker 0x6x, accepted as a value only, never as a key) are
+ * `nullopt`, never a partial answer.
  *
  * Hostile input is the design case (an Info.plist is writable by whoever owns
  * the bundle). Every length, offset, count and reference in the file is an
@@ -103,9 +104,9 @@ struct Layout {
     const std::uint64_t num_objects = read_be(bytes, trailer + 8, 8);
     if (num_objects < 1 || num_objects > kBplistMaxObjects)
         return std::nullopt;
+    // top_object is NOT range-checked here: object_offset() is its only consumer
+    // and rejects index >= num_objects itself.
     const std::uint64_t top_object = read_be(bytes, trailer + 16, 8);
-    if (top_object >= num_objects)
-        return std::nullopt;
 
     // The offset table lies after the header and ends at or before the
     // trailer. Both ends are compared against already-validated bounds.
@@ -173,27 +174,22 @@ struct Counted {
 }
 
 /// True iff the string object at `off` is exactly the ASCII `key`. No
-/// allocation; the work is bounded by key.size().
+/// allocation; the work is bounded by key.size(). Only marker 0x5x can match:
+/// CoreFoundation writes a string as ASCII (0x5x) whenever it round-trips as
+/// ASCII, and the Info.plist keys looked up here always do, so a UTF-16 (0x6x)
+/// object never names one of them. (Values are different: see decode_string.)
 [[nodiscard]] inline bool string_equals(const Layout& l, std::size_t off,
                                         std::string_view key) noexcept {
-    const std::uint8_t kind = l.bytes[off] >> 4;
-    if (kind != 0x5 && kind != 0x6)
+    if ((l.bytes[off] >> 4) != 0x5)
         return false;
     const auto c = read_counted(l, off);
     if (!c || c->count != key.size())
         return false;
-    const std::size_t unit = kind == 0x5 ? 1 : 2;
-    const std::size_t nbytes = key.size() * unit; // key.size() is tiny (caller-literal)
-    if (nbytes > l.table_start - c->payload)
+    if (key.size() > l.table_start - c->payload)
         return false;
     for (std::size_t i = 0; i < key.size(); ++i) {
-        const auto want = static_cast<std::uint8_t>(key[i]);
-        if (kind == 0x5) {
-            if (l.bytes[c->payload + i] != want)
-                return false;
-        } else if (l.bytes[c->payload + 2 * i] != 0 || l.bytes[c->payload + 2 * i + 1] != want) {
+        if (l.bytes[c->payload + i] != static_cast<std::uint8_t>(key[i]))
             return false;
-        }
     }
     return true;
 }

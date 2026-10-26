@@ -6,8 +6,8 @@
  * platform-conditional code here is the UTF-8 <-> std::filesystem::path
  * conversion (Windows paths are UTF-16 natively) and the two errno-aware
  * primitives read_file_capped / list_dir, which use the shared POSIX
- * posix_secure_read.hpp off Windows (the Windows bodies are plain
- * ifstream / directory_iterator shapes that no Windows leg calls).
+ * posix_secure_read.hpp off Windows (the Windows bodies are fail-closed
+ * stubs, err = EIO, because no Windows leg calls them).
  *
  * Interpreters emit ONLY §3.2 closed-vocabulary values and never fabricate:
  * presence without licence evidence is status `unknown`; a parsed vendor
@@ -214,22 +214,12 @@ CappedRead ProbeHost::read_file_capped(std::string_view path, std::size_t cap) {
         break;
     }
 #else
-    // Windows never calls this (the Windows legs use the registry and
-    // read_file_prefix); a plain bounded ifstream read keeps the type usable.
-    std::ifstream f(path_from_utf8(path), std::ios::binary);
-    if (!f) {
-        out.err = EIO;
-        return out;
-    }
-    std::string content(cap, '\0');
-    f.read(content.data(), static_cast<std::streamsize>(cap));
-    const auto got = static_cast<std::size_t>(f.gcount());
-    if (got == cap && f.peek() != std::ifstream::traits_type::eof()) {
-        out.oversized = true;
-        return out;
-    }
-    content.resize(got);
-    out.data = std::move(content);
+    // Windows stub: no Windows leg calls this (the Windows legs use the registry and
+    // read_file_prefix; licensing_linux.cpp / licensing_macos.cpp compile empty
+    // there). It fails CLOSED -- a failed read, never a false empty success.
+    (void)path;
+    (void)cap;
+    out.err = EIO;
 #endif
     return out;
 }
@@ -260,20 +250,11 @@ DirListing ProbeHost::list_dir(std::string_view path, std::size_t max_entries) {
         out.names.emplace_back(name);
     }
 #else
-    // Windows never calls this; same shape on a directory_iterator.
-    std::error_code ec;
-    fs::directory_iterator it(path_from_utf8(path), ec);
-    if (ec) {
-        out.err = EIO;
-        return out;
-    }
-    for (const auto& entry : it) {
-        if (out.names.size() >= max_entries) {
-            out.truncated = true;
-            break;
-        }
-        out.names.push_back(path_to_utf8(entry.path().filename()));
-    }
+    // Windows stub: no Windows leg calls this. Fails CLOSED -- a failed listing,
+    // never a false empty one.
+    (void)path;
+    (void)max_entries;
+    out.err = EIO;
 #endif
     return out;
 }

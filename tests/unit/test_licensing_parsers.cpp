@@ -285,14 +285,6 @@ TEST_CASE("WMI CIM_DATETIME parses to a midnight-epoch expiry", "[licensing][par
     }
 }
 
-TEST_CASE("openssl -enddate output parses in both date formats", "[licensing][parsers]") {
-    CHECK(parse_openssl_enddate("notAfter=2027-03-04 12:00:00Z") == "1804118400");    // 2027-03-04
-    CHECK(parse_openssl_enddate("notAfter=Mar  4 12:00:00 2027 GMT") == "1804118400"); // 2027-03-04
-    CHECK(parse_openssl_enddate("notBefore=2020-01-01 00:00:00Z").empty());
-    CHECK(parse_openssl_enddate("garbage").empty());
-    CHECK(parse_openssl_enddate("notAfter=banana").empty());
-}
-
 // ── Office ClickToRun release-id classifier ────────────────────────────────
 
 TEST_CASE("Office C2R release ids classify by SKU family", "[licensing][parsers]") {
