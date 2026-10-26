@@ -40,26 +40,25 @@ HOTFIX REVERT: this file and tests/test_seam_closure_selftest.py are pinned in l
 so reverting one alone turns the selftest red - revert BOTH in one change.
 
 ALSO NOT CAUGHT (found in the WS-A4 S0 review, each reproduced on a scratch tree):
-  3. THE INCLUDE PARSER IS LINE-ANCHORED AND LITERAL. A backslash-continued
-     `#include` with the file name on the next line, a UTF-8 BOM before a first-line
-     include, and `/* c */ #include "x_store.hpp"` on one line all extract NOTHING; a
-     macro include is likewise invisible (digraph and `##`-spliced forms too).
-     Conversely an include inside a block comment, an `#if 0` block or a raw string
-     IS extracted and can false-FAIL (the conservative direction); a `// #include`
-     line comment is not. No such form exists in an enforced closure today;
-     hardening the parser is a tracked follow-up, not done here.
+  3. THE INCLUDE PARSER IS LINE-ANCHORED AND LITERAL. It handles a UTF-8 BOM,
+     backslash-continued lines, complete `/* */` comments before the `#` on the same
+     line and the `%:` digraph (all fixed in WS-A4 S0 governance, each probed in the
+     selftest). It still extracts NOTHING from a macro-built include
+     (`#include SOME_MACRO`) or a `##`-spliced one. Conversely an include inside a
+     multi-line block comment, an `#if 0` block or a raw string IS extracted and can
+     false-FAIL (the conservative direction); a `// #include` line comment is not.
   4. THE DENYLIST IS HAND-MAINTAINED. A store-owning header that no pattern names is
      invisible to the walk - `nvd_db.hpp` (a raw `sqlite3*`) was exactly this until S0.
      Others unlisted today: `*_owner.hpp`, `app_perf_{cohort,group}_reader.hpp`,
-     `app_perf_rollup.hpp`, `sqlite_raii.hpp`. See `STORE_FREE_PRESENTATION_TUS`.
+     `app_perf_rollup.hpp`, `sqlite_raii.hpp`. See `STORE_DEFINITION_FREE_TUS`.
   5. EXTERNAL ANGLE HEADERS ARE OPAQUE: `<sqlite3.h>` / `<libpq-fe.h>` give raw database
      access with no project class. The "cannot define a project store class" argument in
      INCLUDE RESOLUTION below is about project classes only.
-  6. AN UNRESOLVED QUOTE INCLUDE IS A WARNING, NOT AN ERROR (exit 0), and only on the
-     family lanes (the impl-purity and abstract-header lanes discard it silently): a
-     header outside the three resolution roots truncates the closure under it. Generated protobuf
-     headers (e.g. `agent.grpc.pb.h`) are legitimately unresolved today, so a hard error
-     needs an allowlist first - a tracked follow-up.
+  6. AN UNRESOLVED QUOTE INCLUDE IS A HARD ERROR on every lane (family, impl-purity,
+     abstract-header) unless it names a generated protobuf header
+     (`GENERATED_HEADER_SUFFIXES`, e.g. `agent.grpc.pb.h`) - because a header outside
+     the three resolution roots truncates the closure under it, and the closure under
+     a generated header is not checked at all (they live only in the build directory).
   7. A FORWARD DECLARATION OF A STORE IS ALLOWED in a non-abstract closure (only the
      abstract `*_api.hpp` headers get the type-name probe); calling through it needs the
      full definition, which the walk would catch.
@@ -116,9 +115,9 @@ FAMILY COVERAGE: today this checks ten families — `network`, `verify`, `compli
 `device`, `dex`, `dex_perf`, `schedule`, `workflow`, `guardian` and `crypto` — each contributing its dashboard/UI, REST-route (or seamed routes)
 and model translation units, plus the abstract in-process API header and (since
 #4249) the core-only `*_api_local.hpp` factory header. The exact per-family TU
-set is the FAMILIES dict below. Separately, `STORE_FREE_PRESENTATION_TUS` (WS-A4 S0,
-NOT a family and not counted above) enrols route/renderer TUs that were already store-free,
-so they stay so; and S0 widened `FORBIDDEN_HEADER_PATTERNS` to the store-backed headers the
+set is the FAMILIES dict below. Separately, `STORE_DEFINITION_FREE_TUS` (WS-A4 S0,
+NOT a family and not counted above) enrols route/renderer TUs whose closure reaches no
+store DEFINITION (not "touches no store": see that list's KNOWN LIMITS), so they stay so; and S0 widened `FORBIDDEN_HEADER_PATTERNS` to the store-backed headers the
 `*_store.hpp` glob missed. Each family's REST-handler TWIN registrations
 live inside `rest_api_v1.cpp` (or the family's own routes TU), and its MCP-tool
 twin inside `mcp_server.cpp` - BOTH are
@@ -640,7 +639,7 @@ FAMILIES = {
     },
 }
 
-# ── Store-free presentation TUs (WS-A4 S0, Fable review of the WS-A4 plan) ───
+# ── Store-DEFINITION-free presentation TUs (WS-A4 S0, Fable review of the WS-A4 plan) ───
 # NOT a seam family: no `*Api` is involved and the count in FAMILIES (which the
 # docstring and the selftest pin) is unchanged. These are route/renderer TUs whose
 # include closure was ALREADY free of every forbidden header when this list was
@@ -662,7 +661,7 @@ FAMILIES = {
 # per-family seam work this list does not claim to have done. Enrolment is a
 # REGRESSION LOCK, not seam progress.
 #
-# KNOWN LIMITS of "store-free" here (include-closure only, same as every family):
+# KNOWN LIMITS of "store-definition-free" here (include-closure only, same as every family):
 #   - a header that merely FORWARD-DECLARES a store (`auth.hpp`, `authz_gates.hpp`,
 #     `dex_routes.hpp`, `preflight_routes.hpp`) is allowed; calling through it needs
 #     the full definition, which the closure walk would catch.
@@ -673,7 +672,7 @@ FAMILIES = {
 #     `sqlite3*` (today's unlisted owners include `*_owner.hpp`,
 #     `app_perf_{cohort_reader,group_reader,rollup}.hpp`, `sqlite_raii.hpp`) and add
 #     patterns first - the `nvd_db.hpp` miss was exactly this.
-STORE_FREE_PRESENTATION_TUS = [
+STORE_DEFINITION_FREE_TUS = [
     "server/core/src/access_audit_ui.cpp",
     "server/core/src/access_tokens_ui.cpp",
     "server/core/src/access_ui.cpp",
@@ -710,7 +709,17 @@ STORE_FREE_PRESENTATION_TUS = [
     "server/core/src/workflows_ui.cpp",
 ]
 
-_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*(<[^>]+>|"[^"]+")')
+# `#include` / the `%:include` digraph, optionally preceded on the SAME line by complete
+# `/* ... */` comments (`/* c */ #include "x_store.hpp"` is a real include).
+_INCLUDE_RE = re.compile(r'^\s*(?:/\*.*?\*/\s*)*(?:#|%:)\s*include\s*(<[^>]+>|"[^"]+")')
+# Backslash-newline is deleted by translation phase 2, BEFORE preprocessing, so
+# `#include \` + newline + `"x_store.hpp"` is one include line.
+_LINE_CONTINUATION_RE = re.compile(r'\\\r?\n')
+
+# Quote includes that legitimately resolve nowhere in the tree: generated protobuf/gRPC
+# headers (`agent.grpc.pb.h`, `common.pb.h`) exist only in the build directory. ANY other
+# unresolved quote include is a hard error (WS-A4 S0 governance, UP-4).
+GENERATED_HEADER_SUFFIXES = (".pb.h",)
 
 
 def gh(kind, msg):
@@ -723,11 +732,15 @@ def parse_includes(path: Path):
     file order. Line-anchored regex, not a real preprocessor - a `#include`
     reached only through an `#if 0`/macro-guarded block is still extracted as
     if unconditional - which only makes the walk see MORE (a false-positive
-    edge). The OPPOSITE direction is real: a line-continued include, a BOM, a
-    same-line leading block comment and a macro include are NOT extracted, so a
-    real include can be hidden (module docstring, "ALSO NOT CAUGHT" item 3)."""
+    edge). It DOES handle a UTF-8 BOM, backslash-continued lines, complete
+    `/* */` comments before the `#` on the same line, and the `%:` digraph. It
+    does NOT see a macro-built include or a `##`-spliced one, so a real include
+    can still be hidden that way (module docstring, "ALSO NOT CAUGHT" item 3)."""
     out = []
-    text = path.read_text(encoding="utf-8", errors="replace")
+    # utf-8-sig drops a leading BOM; a BOM before the first line's `#` would
+    # otherwise make that line unmatchable.
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    text = _LINE_CONTINUATION_RE.sub("", text)
     for line in text.splitlines():
         m = _INCLUDE_RE.match(line)
         if not m:
@@ -832,6 +845,24 @@ def is_forbidden_header(abspath: Path, root: Path = ROOT,
     return False, None
 
 
+def report_unresolved(label: str, tu_rel, unresolved, roots: Roots = DEFAULT_ROOTS) -> bool:
+    """False (and a `::error::` per include) if the closure holds a QUOTE include that
+    resolves nowhere and is not a generated header. Such an include TRUNCATES the closure
+    under it - a store header moved outside the three resolution roots would otherwise
+    keep every TU that reaches it green on a warning nobody reads in a passing job."""
+    ok = True
+    for includer, spelling in unresolved:
+        if spelling.endswith(GENERATED_HEADER_SUFFIXES):
+            continue
+        gh("error",
+           f"check-seam-closure: {label}: {tu_rel}: could not resolve quote-include "
+           f"\"{spelling}\" from {includer.relative_to(roots.root)} - the closure under it "
+           f"is NOT checked. Fix the include path, or if it is a generated header add its "
+           f"suffix to GENERATED_HEADER_SUFFIXES")
+        ok = False
+    return ok
+
+
 def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
                   patterns=FORBIDDEN_HEADER_PATTERNS) -> bool:
     """Runs the seam-closure check for one family. `tus` is a list of
@@ -848,7 +879,7 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
             gh("error", f"check-seam-closure: expected family TU not found: "
                         f"{rel} (family {name!r}) - if it was renamed or deleted, "
                         f"update "
-                        + ("STORE_FREE_PRESENTATION_TUS" if name == "store_free_presentation"
+                        + ("STORE_DEFINITION_FREE_TUS" if name == "store_definition_free"
                            else f"FAMILIES[{name!r}]")
                         + " AND the frozen pin in tests/test_seam_closure_selftest.py")
             ok = False
@@ -858,12 +889,8 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
     for tu in existing:
         rel_tu = tu.relative_to(roots.root)
         visited, parent, unresolved = closure(tu, roots)
-        for includer, spelling in unresolved:
-            gh("warning",
-               f"check-seam-closure: {rel_tu}: could not resolve quote-"
-               f"include \"{spelling}\" from "
-               f"{includer.relative_to(roots.root)} (extraction gap, not "
-               f"itself a store-header finding)")
+        if not report_unresolved(f"family {name!r}", rel_tu, unresolved, roots):
+            ok = False
         for f in sorted(visited, key=str):
             hit, pat = is_forbidden_header(f, roots.root, patterns)
             if not hit:
@@ -874,10 +901,10 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
                f"check-seam-closure: family {name!r}: {rel_tu} reaches "
                f"forbidden header {f.relative_to(roots.root)} (matches "
                f"forbidden pattern {pat!r}) via include chain: {chain_str}"
-               + (" - this TU is enrolled as store-free: route the data through an "
+               + (" - this TU is enrolled as store-definition-free: route the data through an "
                   "injected provider or a `*Api` seam instead of including the store "
-                  "(see STORE_FREE_PRESENTATION_TUS)"
-                  if name == "store_free_presentation" else "")
+                  "(see STORE_DEFINITION_FREE_TUS)"
+                  if name == "store_definition_free" else "")
                + " [ADR-0031 migration step 3; docs/presentation-core-split-delivery-matrix.md, "
                  "WS-A4]")
             ok = False
@@ -910,7 +937,9 @@ def check_impl_purity(tus: list[str], roots: Roots = DEFAULT_ROOTS) -> bool:
             gh("error", f"check-seam-closure: impl-purity: expected impl TU not found: {rel}")
             ok = False
             continue
-        visited, parent, _unresolved = closure(tu, roots)
+        visited, parent, unresolved = closure(tu, roots)
+        if not report_unresolved("impl-purity", rel, unresolved, roots):
+            ok = False
         # (a) presentation in-tree headers via resolved-path basename match.
         for f in sorted(visited, key=str):
             hit, pat = is_forbidden_header(f, roots.root, patterns=IMPL_FORBIDDEN_HEADER_PATTERNS)
@@ -983,7 +1012,9 @@ def check_abstract_headers_store_type_free(headers: list[str],
             gh("error", f"check-seam-closure: abstract-header probe: header not found: {rel}")
             ok = False
             continue
-        visited, parent, _unresolved = closure(tu, roots)
+        visited, parent, unresolved = closure(tu, roots)
+        if not report_unresolved("abstract-header probe", rel, unresolved, roots):
+            ok = False
         for f in sorted({tu} | visited, key=str):
             tok = names_store_type(f)
             if tok is None:
@@ -1009,7 +1040,7 @@ def run_check() -> int:
         checked += 1
         if not check_family(name, spec["tus"]):
             ok = False
-    if not check_family("store_free_presentation", STORE_FREE_PRESENTATION_TUS):
+    if not check_family("store_definition_free", STORE_DEFINITION_FREE_TUS):
         ok = False
     impl_ok = check_impl_purity(IMPL_TUS)
     if not impl_ok:
@@ -1020,7 +1051,7 @@ def run_check() -> int:
     if ok:
         print(f"check-seam-closure: OK ({checked} famil"
               f"{'y' if checked == 1 else 'ies'} header-closure checked + "
-              f"{len(STORE_FREE_PRESENTATION_TUS)} store-free presentation TUs checked + "
+              f"{len(STORE_DEFINITION_FREE_TUS)} store-definition-free presentation TUs checked + "
               f"{len(IMPL_TUS)} impl TUs impl-purity checked + "
               f"{len(ABSTRACT_API_HEADERS)} abstract headers store-type-free checked; "
               f"all closures free of store-layer / core-only `*_api_local.hpp` headers, "

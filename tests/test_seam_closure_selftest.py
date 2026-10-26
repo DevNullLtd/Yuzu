@@ -195,8 +195,8 @@ EXPECTED_FORBIDDEN_HEADER_PATTERNS = [
 # WS-A4 S0: the new patterns, named separately so probe 17 can prove each one fires.
 S0_NEW_HEADER_COUNT = 8   # execution_tracker .. nvd_db: asserted in check 2e, so a shrink is loud
 S0_NEW_FORBIDDEN_HEADERS = EXPECTED_FORBIDDEN_HEADER_PATTERNS[-S0_NEW_HEADER_COUNT:]
-# WS-A4 S0: store-free presentation TUs - clean-by-gate, not by convention.
-EXPECTED_STORE_FREE_PRESENTATION_TUS = [
+# WS-A4 S0: store-definition-free presentation TUs - clean-by-gate, not by convention.
+EXPECTED_STORE_DEFINITION_FREE_TUS = [
     "server/core/src/access_audit_ui.cpp",
     "server/core/src/access_tokens_ui.cpp",
     "server/core/src/access_ui.cpp",
@@ -234,7 +234,7 @@ EXPECTED_STORE_FREE_PRESENTATION_TUS = [
 ]
 # TUs that were clean only under the pre-S0 patterns: must not be enrolled while their
 # closure still reaches the header named (approval_manager/auth_db, directory_sync, nvd_db).
-S0_DELIBERATELY_NOT_STORE_FREE = [
+S0_DELIBERATELY_NOT_STORE_DEFINITION_FREE = [
     "server/core/src/approval_routes.cpp",
     "server/core/src/enrollment_directory_routes.cpp",
     "server/core/src/nvd_routes.cpp",
@@ -366,27 +366,33 @@ def main() -> int:
         _fail(f"EXTRA_STORE_TYPE_TOKENS {mod.EXTRA_STORE_TYPE_TOKENS!r} != "
               f"frozen {EXPECTED_EXTRA_STORE_TYPE_TOKENS!r}", failures)
 
-    # 2d. WS-A4 S0: the store-free presentation list is pinned, is disjoint from every
+    # 2c2. The generated-header allowlist is pinned: widening it (e.g. to `.h`) would silently
+    #      re-open the "unresolved include truncates the closure" hole (UP-4).
+    if mod.GENERATED_HEADER_SUFFIXES != (".pb.h",):
+        _fail(f"GENERATED_HEADER_SUFFIXES {mod.GENERATED_HEADER_SUFFIXES!r} != frozen ('.pb.h',)",
+              failures)
+
+    # 2d. WS-A4 S0: the store-definition-free presentation list is pinned, is disjoint from every
     #     FAMILIES set (a TU enforced twice is a silent ownership ambiguity), and never
     #     contains the two TUs that were clean only under the pre-S0 patterns.
-    if mod.STORE_FREE_PRESENTATION_TUS != EXPECTED_STORE_FREE_PRESENTATION_TUS:
-        _fail("STORE_FREE_PRESENTATION_TUS differs from its frozen pin: "
-              + _diff(mod.STORE_FREE_PRESENTATION_TUS, EXPECTED_STORE_FREE_PRESENTATION_TUS),
+    if mod.STORE_DEFINITION_FREE_TUS != EXPECTED_STORE_DEFINITION_FREE_TUS:
+        _fail("STORE_DEFINITION_FREE_TUS differs from its frozen pin: "
+              + _diff(mod.STORE_DEFINITION_FREE_TUS, EXPECTED_STORE_DEFINITION_FREE_TUS),
               failures)
     family_tus = {t for spec in mod.FAMILIES.values() for t in spec["tus"]}
-    overlap = sorted(set(mod.STORE_FREE_PRESENTATION_TUS) & family_tus)
+    overlap = sorted(set(mod.STORE_DEFINITION_FREE_TUS) & family_tus)
     if overlap:
-        _fail(f"STORE_FREE_PRESENTATION_TUS overlaps a FAMILIES set: {overlap!r}. A TU whose "
-              f"family seam has landed MOVES: remove it from STORE_FREE_PRESENTATION_TUS and "
-              f"EXPECTED_STORE_FREE_PRESENTATION_TUS, then add it to FAMILIES and EXPECTED_FAMILIES",
+        _fail(f"STORE_DEFINITION_FREE_TUS overlaps a FAMILIES set: {overlap!r}. A TU whose "
+              f"family seam has landed MOVES: remove it from STORE_DEFINITION_FREE_TUS and "
+              f"EXPECTED_STORE_DEFINITION_FREE_TUS, then add it to FAMILIES and EXPECTED_FAMILIES",
               failures)
-    for rel in S0_DELIBERATELY_NOT_STORE_FREE:
-        if rel in mod.STORE_FREE_PRESENTATION_TUS:
+    for rel in S0_DELIBERATELY_NOT_STORE_DEFINITION_FREE:
+        if rel in mod.STORE_DEFINITION_FREE_TUS:
             _fail(f"{rel} was clean only under the pre-S0 patterns and must not be in "
-                  f"STORE_FREE_PRESENTATION_TUS while its closure reaches a store-backed header",
+                  f"STORE_DEFINITION_FREE_TUS while its closure reaches a store-backed header",
                   failures)
-    if len(set(mod.STORE_FREE_PRESENTATION_TUS)) != len(mod.STORE_FREE_PRESENTATION_TUS):
-        _fail("STORE_FREE_PRESENTATION_TUS contains a duplicate entry", failures)
+    if len(set(mod.STORE_DEFINITION_FREE_TUS)) != len(mod.STORE_DEFINITION_FREE_TUS):
+        _fail("STORE_DEFINITION_FREE_TUS contains a duplicate entry", failures)
 
     # 2e. The probe lists are DERIVED from the pins, never an independent copy (a
     #     probe list that can drift from the pin silently shrinks coverage), and every
@@ -759,6 +765,73 @@ def main() -> int:
                 _fail(f"abstract-header probe over-fired on `{tok}Foo` - the token's word "
                       f"boundary is gone", failures)
 
+        # 20. PARSER HARDENING (UP-1): each form below hides a real store include from a
+        #     line-anchored regex unless handled. Every one must FIRE via check_family; the
+        #     `//` line-comment control must NOT (a commented-out include is not an include).
+        (src / "hid_store.hpp").write_text("#pragma once\nclass HidStore {};\n", encoding="utf-8")
+        forms = {
+            "continuation": '#include \\\n"hid_store.hpp"\nint x;\n',
+            "continuation_crlf": '#  include \\\r\n  "hid_store.hpp"\r\nint x;\r\n',
+            "same_line_block_comment": '/* generated */ #include "hid_store.hpp"\nint x;\n',
+            "two_block_comments": '/* a */ /* b */   #  include "hid_store.hpp"\nint x;\n',
+            "digraph": '%:include "hid_store.hpp"\nint x;\n',
+        }
+        for form, body in forms.items():
+            (src / f"hid_{form}_routes.cpp").write_text(body, encoding="utf-8", newline="")
+            with contextlib.redirect_stderr(io.StringIO()):
+                ok = mod.check_family(f"hid-{form}", [f"server/core/src/hid_{form}_routes.cpp"],
+                                      roots=roots, patterns=mod.FORBIDDEN_HEADER_PATTERNS)
+            if ok:
+                _fail(f"the include parser missed a real store include written as {form!r} - the "
+                      f"closure walk is blind to it (UP-1)", failures)
+        # BOM before the first line's `#` (bytes written explicitly: Windows editors do this).
+        (src / "hid_bom_routes.cpp").write_bytes(b'\xef\xbb\xbf#include "hid_store.hpp"\nint x;\n')
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok = mod.check_family("hid-bom", ["server/core/src/hid_bom_routes.cpp"], roots=roots,
+                                  patterns=mod.FORBIDDEN_HEADER_PATTERNS)
+        if ok:
+            _fail("the include parser missed a store include on a BOM-prefixed first line (UP-1)",
+                  failures)
+        # Controls: a `//` line comment is not an include; an ordinary clean include still passes.
+        (src / "hid_linecomment_routes.cpp").write_text('// #include "hid_store.hpp"\nint x;\n',
+                                                        encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok = mod.check_family("hid-linecomment",
+                                  ["server/core/src/hid_linecomment_routes.cpp"], roots=roots,
+                                  patterns=mod.FORBIDDEN_HEADER_PATTERNS)
+        if not ok:
+            _fail("a `//`-commented include was treated as a real include (over-fire)", failures)
+
+        # 21. UNRESOLVED QUOTE INCLUDE (UP-4): hard error on EVERY lane; a generated *.pb.h is
+        #     the one allowed exception; an unresolved ANGLE include (external header) is fine.
+        (src / "unres_routes.cpp").write_text('#include "no_such_header.hpp"\nint x;\n',
+                                              encoding="utf-8")
+        (src / "unres_api.cpp").write_text('#include "no_such_header.hpp"\nint x;\n', encoding="utf-8")
+        (src / "unres_api.hpp").write_text('#pragma once\n#include "no_such_header.hpp"\n',
+                                           encoding="utf-8")
+        lanes = (
+            ("family", lambda: mod.check_family("unres", ["server/core/src/unres_routes.cpp"],
+                                                roots=roots)),
+            ("impl-purity", lambda: mod.check_impl_purity(["server/core/src/unres_api.cpp"],
+                                                          roots=roots)),
+            ("abstract-header", lambda: mod.check_abstract_headers_store_type_free(
+                ["server/core/src/unres_api.hpp"], roots=roots)),
+        )
+        for lane, fn in lanes:
+            cap = io.StringIO()
+            with contextlib.redirect_stderr(cap):
+                ok = fn()
+            if ok or "could not resolve quote-include" not in cap.getvalue():
+                _fail(f"an unresolved quote include did not hard-fail the {lane} lane - its "
+                      f"closure would be silently truncated (UP-4)", failures)
+        (src / "gen_routes.cpp").write_text('#include "agent.grpc.pb.h"\n#include <external/x.h>\n',
+                                            encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok = mod.check_family("gen", ["server/core/src/gen_routes.cpp"], roots=roots)
+        if not ok:
+            _fail("a generated *.pb.h (or an unresolved ANGLE include) hard-failed - the "
+                  "allowlist/angle exemption is gone", failures)
+
     # 19. run_check() WIRING: every check above exercises a helper or a constant in
     #     isolation, so nothing observed how run_check() CONSUMES them - deleting a lane's
     #     call, passing it `[]`, overriding its patterns/roots, ignoring its result, or turning
@@ -768,7 +841,7 @@ def main() -> int:
     real_fns = (mod.check_family, mod.check_impl_purity, mod.check_abstract_headers_store_type_free)
     first_family = next(iter(mod.FAMILIES))
     try:
-        for failing in (None, "store_free_presentation", first_family, "impl", "abstract"):
+        for failing in (None, "store_definition_free", first_family, "impl", "abstract"):
             fam_calls: list = []
             other_calls: dict = {"impl": [], "abstract": []}
 
@@ -791,7 +864,7 @@ def main() -> int:
             with contextlib.redirect_stdout(captured19), contextlib.redirect_stderr(io.StringIO()):
                 rc = mod.run_check()
             want = {name: spec["tus"] for name, spec in mod.FAMILIES.items()}
-            want["store_free_presentation"] = mod.STORE_FREE_PRESENTATION_TUS
+            want["store_definition_free"] = mod.STORE_DEFINITION_FREE_TUS
             names = [c[0] for c in fam_calls]
             if sorted(names) != sorted(want):
                 _fail(f"run_check() called check_family for {sorted(names)!r}, expected exactly "
@@ -808,9 +881,9 @@ def main() -> int:
             if (rc == 0) != (failing is None):
                 _fail(f"run_check() returned {rc} with the {failing!r} lane failing - any failing "
                       f"lane must fail the run, and a clean run must return 0", failures)
-            if failing is None and f"{len(mod.STORE_FREE_PRESENTATION_TUS)} store-free" \
+            if failing is None and f"{len(mod.STORE_DEFINITION_FREE_TUS)} store-definition-free" \
                     not in captured19.getvalue():
-                _fail("run_check() OK line does not report the store-free TU count", failures)
+                _fail("run_check() OK line does not report the store-definition-free TU count", failures)
     finally:
         (mod.check_family, mod.check_impl_purity,
          mod.check_abstract_headers_store_type_free) = real_fns
