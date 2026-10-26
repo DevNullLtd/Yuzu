@@ -80,11 +80,11 @@
     }
   ],
   "caveats": [
-    "**Linux drops the fourth output column entirely, not just leaves it blank.** The Linux leg emits `svc|name|status|description` (three fields); Windows and macOS emit four. A consumer that indexes the row by the schema's declared column names will misread Linux's `status`/`description` fields as `display_name`/`status`.",
-    "**A Windows enumeration failure is silently indistinguishable from zero services.** If `OpenSCManagerW` fails, `do_list`'s Windows branch returns an empty list with no error text and no result status set (`services_plugin.cpp:186-191`, `717-723`) — unlike the Linux/macOS legs, which forward a typed `UNAVAILABLE`/`CONSTRAINED` status on the same class of failure.",
-    "**macOS's `status` field is a raw exit-status code, not a running/stopped word.** Every sample row shows `status=0`, launchctl's last-exit-status column — to tell whether a macOS service is currently running, check the `display_name` (PID) field is not `-`, not this field (`services_plugin.cpp:747-749`; `LaunchdEntry::pid`, `services_parsers.hpp:126-128`).",
-    "**The macOS row cap already fired in this capture.** `total_seen=517` exceeded `kMaxServiceRows=512`, so the real `list` capture ends with a `svc|__truncated__|-|517|-` sentinel row (`docs/samples/macos.txt:515`) that falls outside this page's 25-row trim; the cap is documented behavior (`services_plugin.cpp:750-756`), not a capture artifact.",
-    "**No capture exercises `set_start_mode`'s actual mutation.** Every OS's `set_start_mode` sample stops at the parameter-validation rejection (`error|missing required parameter: name`) — the sudo-wrapped `enable`/`disable`/`mask`/`unmask` calls have never been captured live. The Linux `list`/`running` captures also failed outright (`subprocess_runner:spawn_error` — `systemctl` was not resolvable in the capture container), so the Linux 3-field row shape above is verified from source (`services_plugin.cpp:730-733`), not from a captured row."
+    "**Linux rows have three fields, not four.** The Linux leg emits `svc|name|status|description`; Windows and macOS emit four. A consumer that indexes by the schema's column names misreads Linux `status` and `description` as `display_name` and `status`, and has no startup type to read at all.",
+    "**A Windows enumeration failure looks like zero services.** If `OpenSCManagerW` or `EnumServicesStatusExW` fails, `enumerate_services_win` returns an empty list and the plugin sets no result status, unlike Linux and macOS, which forward a typed status for the same class of failure. Treat an empty Windows `list` on a host that should have services as unreliable, not as proof.",
+    "**macOS `status` is an exit code, and some labels never appear.** `status` is launchctl's last-exit code (`0` for nearly every row), so use the PID in the second field to tell whether a job is running. The list is capped at 512 rows with the `__truncated__` sentinel, and a launchd label containing a character outside letters, digits, `.`, `_`, `@` and `-` is dropped silently, without a status and without counting toward the sentinel's total.",
+    "**The macOS startup type is rarely known.** The join uses the `system` domain's override list only, so any label with no recorded override reads `unknown`; every row in the captured sample is `unknown`. That capture ran as an unprivileged user against the user's job list, so it does not show what the root daemon sees.",
+    "**`set_start_mode` has never been captured past validation.** Every OS sample stops at `error|missing required parameter: name`, so the `sudo`-wrapped and Win32 changes are verified from source and unit tests only. The Linux `list` and `running` captures also failed with `spawn_error`, so the three-field Linux row shape is likewise verified from source, not from a captured row."
   ],
   "definitions": [
     {
@@ -149,7 +149,7 @@
     }
   ],
   "description": "System services — enumerate, query, and configure service startup types",
-  "how_it_works": "`list` and `running` are reads: each enumerates the OS's service registry — the Service Control Manager on Windows, the systemd unit list on Linux, the launchd job list on macOS — and returns one row per service. `running` is the same enumeration filtered to services currently active (`SERVICE_ACTIVE` on Windows, `--state=running` on Linux, a non-`-` PID on macOS — `launchctl` has no running filter of its own, so the plugin filters after parsing). `set_start_mode` is the plugin's one mutation: it changes a single named service's startup type to automatic, manual, or disabled, translating that three-state input onto whatever the target OS actually supports (Windows' native `ChangeServiceConfig` start type; `systemctl enable`/`disable`/`mask`; or `launchctl enable`/`disable` — macOS has no manual state and refuses the request outright rather than aliasing it to disabled). On macOS, `list`/`running` additionally join a single bulk `launchctl print-disabled system` call against every enumerated label to report an honest startup type — one extra subprocess call total, never one per service (C-1.12). Every Linux/macOS subprocess call runs through the bounded, shell-free argv runner (no `/bin/sh -c` hop); `set_start_mode`'s mutating calls on both platforms are additionally wrapped in `sudo -n --` to match the installer's sudoers grant. The plugin is deliberately not a change-history/diff of service state — that is the separately-implemented TAR service collector (see *Where the data goes*).",
+  "how_it_works": "`list` and `running` read the host's service registry and return one `svc|` row per service: the Service Control Manager on Windows (Win32 services only, not kernel drivers), `systemctl list-units` on Linux (units systemd has loaded, which is not every unit file on disk) and `launchctl list` on macOS. `running` is the same read narrowed to services that are up: Windows asks the Service Control Manager for every state except stopped, Linux keeps systemd's `running` sub-state, and macOS keeps rows that have a PID (`launchctl` has no filter of its own, so the plugin filters after parsing). On macOS one extra call, `launchctl print-disabled system`, supplies each row's startup type; a label that domain holds no override for reads `unknown`.\n\n`set_start_mode` is the only mutation. It checks the service name and mode, then changes one service's boot-time start setting and nothing else: it does not start, stop or restart the service. Windows sets the Service Control Manager start type. Linux runs `systemctl enable` for `automatic`, `unmask` then `disable` for `manual`, and `mask` for `disabled`. macOS runs `launchctl enable` or `disable` against `system/<label>` and refuses `manual`, because launchd only has enabled and disabled. Linux and macOS commands run as shell-free argv under a 20 second deadline, prefixed with `sudo -n --` unless the agent is already root. The plugin is deliberately not a change history; the TAR service collector does that separately.",
   "inputs": [
     {
       "constraints": {
@@ -333,7 +333,7 @@
       "definition_id": "crossplatform.service.set_start_mode"
     }
   ],
-  "outputs_note": "Rows are pipe-delimited, prefixed `svc|`, one row per service. The row **shape** differs by OS, not just the values: Windows and macOS emit exactly the four fields the `result.columns` schema names (`name|display_name|status|startup_type`), but Linux emits only **three** fields (`name|status|description`) — the systemctl leg never derives a startup type, so the fourth column doesn't exist on the Linux wire, and Linux's second/third fields carry different data than the schema's `display_name`/`status` names suggest (`services_plugin.cpp:730-733`; corroborated independently by the server's own parsing comment at `server/core/src/device_routes.cpp:197`). There is no placeholder-row convention: on Windows an enumeration failure silently returns zero rows with no error and no result status (`services_plugin.cpp:186-191`); on Linux/macOS it instead sets a typed `UNAVAILABLE`/`CONSTRAINED` status via `forward_runner_failure` before whatever rows were parsed (`services_plugin.cpp:121-130`). `set_start_mode` never writes the three schema columns as one pipe row: on success it writes three separate lines, `status|ok` / `service|<name>` / `mode|<mode>`; on any failure it writes a single `error|<message>` line and none of the three (`services_plugin.cpp:446-448`, file header comment lines 13-14).",
+  "outputs_note": "Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** differs by OS, not just the values: Windows and macOS emit the four fields the schema names (`name|display_name|status|startup_type`, where macOS puts the PID in the second slot), but Linux emits only **three** (`name|status|description`), because that leg never derives a startup type. A consumer must branch on OS before indexing a row (the server's own device-page parser does). `set_start_mode` never writes a `svc|` row: on success it writes three lines, `status|ok`, `service|<name>`, `mode|<mode>`; on any failure it writes one `error|<message>` line and none of the three, with return code 1. There is no placeholder-row convention for the reads. On Windows an enumeration failure returns zero rows with no status; on Linux and macOS a degraded run sets a typed `UNAVAILABLE` or `CONSTRAINED` status before whatever rows were parsed and returns code 1. On macOS the row cap (512) ends the list with a `svc|__truncated__|-|<total>|-` sentinel row.",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -341,25 +341,25 @@
   },
   "privileges": [
     {
-      "grant": "`list`/`running`: none (default account). `set_start_mode`: `SeAssignPrimaryTokenPrivilege` (service control).",
-      "if_refused": "`list`/`running`: `OpenSCManagerW` failing returns an **empty** service list with no error and no result status set (`services_plugin.cpp:189-191`) — a permission failure reads identically to \"this host has zero services\". `set_start_mode`: `OpenServiceW`/`ChangeServiceConfigW` failure emits an explicit `error|access denied changing service '<name>'` row (`services_plugin.cpp:426-429`).",
-      "measured": "2026-09-07, bare-metal, captured as `SYSTEM`",
+      "grant": "`list`/`running`: none beyond the default account. `set_start_mode`: the plugin asks the Service Control Manager for `SC_MANAGER_CONNECT` and the target service for `SERVICE_CHANGE_CONFIG`, so the right is decided by that service's access-control list. The plugin enables or checks no privilege itself; the `SeAssignPrimaryTokenPrivilege` entry in `docs/agent-privilege-model.md` is not exercised by this code.",
+      "if_refused": "`list`/`running`: a failed `OpenSCManagerW` or `EnumServicesStatusExW` returns an **empty** list with no error and no result status, so a refusal reads like \"zero services\". A single service whose configuration cannot be opened reports `startup_type` `unknown`. `set_start_mode`: failures are explicit `error|...` rows (`access denied changing service '<name>'`, `service '<name>' not found`, or the Win32 error code).",
+      "measured": "2026-09-07, bare-metal, captured as `SYSTEM`; `list` and `running` only, `set_start_mode` stopped at parameter validation",
       "os": "Windows",
-      "runs_as": "agent service account — LocalSystem today (#1442)"
+      "runs_as": "agent service account, LocalSystem today (#1442)"
     },
     {
-      "grant": "`list`/`running`: none. `set_start_mode`: sudoers grant `/bin/launchctl enable system/*`, `/bin/launchctl disable system/*` (the installed grant also covers `bootstrap`/`bootout`, which this plugin does not use).",
-      "if_refused": "`list`/`running`: a failed `launchctl list` or `launchctl print-disabled` forwards `UNAVAILABLE`/`CONSTRAINED` via `forward_runner_failure` (`services_plugin.cpp:743-745`). `set_start_mode`: a `sudo -n` denial is captured (`merge_stderr=true`, `services_plugin.cpp:375-379`) and threaded into the `error|...` message by `decide_set_start_mode_outcome`.",
-      "measured": "2026-09-07, bare-metal, captured **unprivileged** at `euid 501 (jsmith)` — not the root identity the daemon actually runs under",
+      "grant": "None as root: the `sudo -n --` prefix is skipped when the agent's effective uid is 0. A non-root agent needs the sudoers grants `/bin/launchctl enable system/*` and `/bin/launchctl disable system/*` (the installed grant also covers `bootstrap`/`bootout`, which this plugin does not use).",
+      "if_refused": "`list`/`running`: a failed `launchctl list` or `launchctl print-disabled` sets a typed `UNAVAILABLE` or `CONSTRAINED` status through the shared runner seam. `set_start_mode`: a `sudo -n` denial is captured (stderr merged into the output) and appended to the `error|launchctl command failed for '<name>' (exit=<n>)` line.",
+      "measured": "2026-09-07, bare-metal, captured as an unprivileged interactive user, not the root identity the daemon runs under",
       "os": "macOS",
-      "runs_as": "agent daemon — root (shipped LaunchDaemon has no `UserName` key)"
+      "runs_as": "agent daemon, root (the shipped LaunchDaemon has no `UserName` key)"
     },
     {
-      "grant": "`list`/`running`: none. `set_start_mode`: sudoers grant `/bin/systemctl enable|disable|mask|unmask *` (also `/usr/bin/systemctl` on distros that mirror it).",
-      "if_refused": "Same `forward_runner_failure` path as macOS; the captured Linux sample shows exactly this on both `list` and `running` (`UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error`, `docs/samples/linux.txt:3,7`) — here caused by `systemctl` not being resolvable in the capture container, not by a privilege denial. `set_start_mode` mirrors macOS.",
-      "measured": "2026-09-06, container, captured at `euid 0` — root, not the deployed unprivileged identity",
+      "grant": "`list`/`running`: none. `set_start_mode`: the sudoers grant `systemctl enable`, `disable`, `mask` and `unmask` (`/bin/systemctl` and `/usr/bin/systemctl`); the `sudo -n --` prefix is skipped when the agent is root.",
+      "if_refused": "`list`/`running`: a typed `UNAVAILABLE` or `CONSTRAINED` status; the captured sample shows `subprocess_runner:spawn_error` on both because `systemctl` could not be resolved in the capture container, not because of a permission denial. `set_start_mode`: a missing grant surfaces as `error|systemctl command failed for '<name>' (exit=1): sudo: a password is required`.",
+      "measured": "2026-09-06, container, captured as root (`euid 0`), not the deployed unprivileged identity",
       "os": "Linux",
-      "runs_as": "agent daemon — unprivileged `yuzu` account"
+      "runs_as": "agent daemon, dedicated unprivileged account by design (`docs/agent-privilege-model.md`)"
     }
   ],
   "readme": "agents/plugins/services/README.md",
@@ -368,49 +368,49 @@
       "completeness": "UNKNOWN",
       "provenance": "(empty)",
       "status": "`UNDECLARED` (default)",
-      "when": "Every successful `list`/`running` read on every OS, and every `set_start_mode` parameter-validation or platform-decision error (missing `name`/`mode`, invalid mode, unsafe name, macOS `manual` rejection) — the plugin never calls `ctx.set_result_status` on these paths (`services_plugin.cpp`, `do_set_start_mode`)"
+      "when": "Every Windows read (including a failed one), every Linux/macOS read that completed cleanly, a successful `set_start_mode` on any OS, and every `set_start_mode` validation or platform-decision error (missing `name`/`mode`, unsafe name, invalid mode, macOS `manual`, a command that ran and exited non-zero). The plugin sets no status on these paths."
     },
     {
-      "completeness": "typically PARTIAL",
-      "provenance": "e.g. `subprocess_runner:spawn_error`",
-      "status": "`UNAVAILABLE` or `CONSTRAINED` (via `forward_runner_failure`)",
-      "when": "Linux/macOS `list`/`running` when the `systemctl`/`launchctl` subprocess fails to spawn, times out, is cancelled, or is signaled (`services_plugin.cpp:121-123`); demonstrated live in `docs/samples/linux.txt:3,7`"
+      "completeness": "PARTIAL",
+      "provenance": "`subprocess_runner:spawn_error`",
+      "status": "`UNAVAILABLE`",
+      "when": "Linux/macOS `list`/`running`/`set_start_mode`: `systemctl`/`launchctl` (or `sudo`) could not be started or was not found; shown in `docs/samples/linux.txt`"
     },
     {
-      "completeness": "partial",
+      "completeness": "PARTIAL",
       "provenance": "`subprocess_runner:deadline`",
-      "status": "`CONSTRAINED` / `PARTIAL`",
-      "when": "Linux/macOS `list`/`running`, the runner's deadline elapsed while `systemctl`/`launchctl` was still running, and it was killed"
+      "status": "`CONSTRAINED`",
+      "when": "The 20 second runner deadline elapsed and the child was killed"
     },
     {
-      "completeness": "partial",
+      "completeness": "PARTIAL",
       "provenance": "`subprocess_runner:cancelled`",
-      "status": "`CONSTRAINED` / `PARTIAL`",
-      "when": "Linux/macOS `list`/`running`, the `systemctl`/`launchctl` run was cancelled before it finished"
+      "status": "`CONSTRAINED`",
+      "when": "The `systemctl`/`launchctl` run was cancelled before it finished"
     },
     {
-      "completeness": "partial",
+      "completeness": "PARTIAL",
       "provenance": "`subprocess_runner:signaled`",
-      "status": "`CONSTRAINED` / `PARTIAL`",
-      "when": "Linux/macOS `list`/`running`, the `systemctl`/`launchctl` child was killed by a signal rather than exiting cleanly"
+      "status": "`CONSTRAINED`",
+      "when": "The child was killed by a signal rather than exiting cleanly"
     },
     {
-      "completeness": "partial",
+      "completeness": "PARTIAL",
       "provenance": "`subprocess_runner:line_limit`",
-      "status": "`OK` / `PARTIAL`",
-      "when": "Linux/macOS `list`/`running`, the runner capped `systemctl`/`launchctl` output at its line limit and killed the still-producing child — a deliberate bounded stop, not a failure"
+      "status": "`OK`",
+      "when": "Defined by the shared runner for a capped line count. This plugin sets no line limit, so it does not occur here."
     },
     {
       "completeness": "PARTIAL",
       "provenance": "`services:output_truncated`",
       "status": "`CONSTRAINED`",
-      "when": "Linux/macOS `list`/`running` when the captured subprocess output was cut short by the runner's byte cap but the tool itself exited cleanly (`services_plugin.cpp:124-128`)"
+      "when": "Linux/macOS `list`/`running`: the captured output hit the runner's byte cap but the tool itself exited cleanly"
     },
     {
       "completeness": "PARTIAL",
       "provenance": "`services:malformed_launchctl_capture`",
       "status": "`CONSTRAINED`",
-      "when": "macOS `list`/`running` when `launchctl list` exited cleanly but its output is not a well-formed listing: no lines at all, or a first line other than the `PID\\tStatus\\tLabel` header. No service rows are emitted: the malformed check fires before any row is decoded (`services_parsers.hpp:210-211`), so the caller receives zero `svc|` rows together with this status, and can tell a failed read from a host with nothing running — before this, a truncated capture read as a genuine \"0 services\" success. Reported only when no subprocess-runner failure has already set a status (`services_plugin.cpp:758-762`)"
+      "when": "macOS `list`/`running`: `launchctl list` exited cleanly but its output has no lines or no `PID\\tStatus\\tLabel` header. No `svc|` rows are emitted, so a failed read is distinguishable from a host with nothing running. Reported only when no runner failure has already set a status."
     }
   ],
   "samples": {
@@ -657,11 +657,11 @@
   },
   "version": "0.2.0",
   "where_the_data_goes": [
-    "**Instruction result only.** Rows travel the agent's mTLS gRPC channel as the command response into the ResponseStore (`response_retention_days`, default 90 — `server/core/include/yuzu/server/server.hpp:222`), queryable at `/api/responses/{id}`; the dashboard's generic result viewer renders `services` through its key/value fallback schema (`server/core/src/result_parsing.hpp:65`).",
-    "**Device pages \"Get live info\".** The `services` live-snapshot kind (`device.live.services` audit verb) dispatches `list` directly and re-parses the same 3-vs-4-field row shape described above to render the device card (`server/core/src/device_routes.cpp:79-80,197`; `server/core/src/device_ui.cpp:410`).",
-    "**Not consumed by** daily-sync inventory, TAR, or DEX/metrics — nothing here runs on a schedule; the plugin executes only when dispatched.",
-    "**Sensitivity.** `name`/`display_name` rows name installed services and applications on the host — Windows service display names (`Battle.net Update Helper Svc`, `CCleaner 7`, `AsusUpdateCheck` in the sample) and macOS launchd labels (`io.tailscale.ipn.macsys.login-item-helper`) are an installed-software inventory by another route; Linux systemd unit names carry the same signal. `status`/`startup_type` carry nothing beyond that service's own state. Nothing in any row identifies a specific device or person.",
+    "**Instruction result only.** Rows travel the agent's mTLS gRPC channel as the command response into the ResponseStore (`response_retention_days`, default 90), queryable at `/api/responses/{id}`; the dashboard's generic result viewer renders `services` through its key/value fallback schema (`result_parsing.hpp`).",
+    "**Device pages \"Get live info\".** The `services` live-snapshot kind (`device.live.services` audit verb) dispatches `list` directly and re-parses the same 3-versus-4-field row shape to render the device card (`device_routes.cpp`, `device_ui.cpp`).",
+    "**Not consumed by** daily-sync inventory, TAR, or DEX and metrics: nothing here runs on a schedule; the plugin executes only when dispatched.",
+    "**Sensitivity.** `name`/`display_name` rows name installed services and applications on the host. Windows service display names, macOS launchd labels and Linux unit names are an installed-software inventory by another route. `status`/`startup_type` carry nothing beyond that service's own state. Nothing in any row identifies a specific device or person.",
     "**Siblings:** `agents/plugins/tar/src/tar_service_collector.cpp` performs its own, independently implemented service enumeration (the same three OS mechanisms) for TAR's diff-based change detection; it shares no code with this plugin.",
-    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"crossplatform.service.list\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`; live snapshot via the device page's `services` kind (`device.live.services`)."
+    "**MCP / REST.** Discover: `discover_plugins` (summary), then `yuzu://plugin-docs` (this page as data), then `discover_instructions` / `get_definition(\"crossplatform.service.list\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`; live snapshot via the device page's `services` kind."
   ]
 }
