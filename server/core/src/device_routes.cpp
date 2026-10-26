@@ -398,7 +398,8 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             {"service", "Service", "Inventory"}, {"user", "User", "Identity"},
             {"perf", "Perf", "Performance"},     {"procperf", "ProcPerf", "Performance"},
             {"netqual", "NetQual", "Network"},   {"module", "Module", "Inventory"},
-            {"arp", "ARP", "Network"},           {"dns", "DNS", "Network"}};
+            {"arp", "ARP", "Network"},           {"dns", "DNS", "Network"},
+            {"registry", "Registry", "System"}};
         std::unordered_map<std::string, std::string> cfg;
         for (const auto& l : lines) {
             if (!l.starts_with("config|")) continue;
