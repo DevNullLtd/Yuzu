@@ -905,7 +905,7 @@ metadata:
     undo_complete=1. An item refused before its previous value was read shows "-" there, never "absent".
     Rows are written as each item concludes, so a later exception inside the plugin or a failed output channel
     cannot take back rows already written; the agent sends output at command end or each 64 KiB, so an agent
-    that dies mid-plan loses whatever it had not sent (for a smaller plan, all of it): read the keys back with a
+    that dies mid-plan loses whatever it had not sent (for a plan whose output is under 64 KiB, all of it): read the keys back with a
     dry run before replaying anything. The rows: one `audit` row per item that ran or was refused (recorded server-side as `registry.write`; a dry run's rows say
     dry_run=1 and record no change; three 256-item plans inside one minute exceed the server's 600 rows per
     agent per minute and the later rows are suppressed), its `item` row and, for a deleted key, its `undo` rows,
@@ -1023,12 +1023,12 @@ spec:
         platforms: [windows]
       - name: field_12
         type: string
-        description: 'item: the previous value as hex (the kept bytes, then ~<total> when it was cut or the undo budget dropped it); restore it with data_hex. audit: counted_values=.'
+        description: 'item: the previous value as hex (the kept bytes, then ~<total> when it was cut or the undo budget dropped it); restore it with data_hex. audit: counted_values=, or "-" when the item was refused before the contents of its key were read.'
         example: 6f006c006400
         platforms: [windows]
       - name: field_13
         type: string
-        description: 'item: the new value length in bytes, or "-". audit: capped=. (The six audit tokens that follow -- created, sid, old_state, old_type, old, new -- are in the raw row and the registry.write audit row.)'
+        description: 'item: the new value length in bytes, or "-". audit: capped=, or "-" when not read. (The six audit tokens that follow -- created, sid, old_state, old_type, old, new -- are in the raw row and the registry.write audit row.)'
         example: "8"
         platforms: [windows]
   readablePayload: "Apply a registry plan (dry_run=${dry_run})"
