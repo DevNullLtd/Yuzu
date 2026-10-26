@@ -343,7 +343,7 @@ an admitted factor generation, passed by Settings and not by the CLI, that is no
 factor changed, with nothing written); the factor `UPDATE` and the `DELETE FROM auth.mfa_recovery_codes`;
 `DELETE FROM session_store.sessions` for the account (the shared `session_sql::delete_user_sessions_in_txn`),
 only when a verified factor was cleared or the CLI asks for the fail-safe; the success row through
-`AuditStore::log_in_txn` into `audit_store.audit_events`; and LAST, and only when sessions were deleted, the
+`AuditStore::log_in_txn` into `audit_store.audit_events`; and LAST, and only when the session-delete step ran, the
 `session_meta` write-generation bump (`session_sql::bump_generation_in_txn`).
 
 The clear, the recovery codes, the sessions and the audit evidence therefore commit or abort together, and

@@ -614,9 +614,10 @@ time they sign in.
 Reactivation ends the account's sessions first. Before the account becomes
 active again, Yuzu deletes any session it still holds (cached and durable), so
 a session that survived an earlier deactivation whose session wipe failed
-cannot outlive the reactivation: the wipe is unconditional, it also drops this server's cached copy again
-after the durable delete, and other servers drop theirs within the session cache bound (about one second, 30
-seconds while a server's session-generation poll is failing). If that durable wipe fails, the account is
+leaves no durable row behind: the wipe is unconditional and it also drops this server's cached copy again
+after the durable delete. Cached copies on this server and every other are bounded by the session cache bound
+(about one second, 30 seconds while a server's session-generation poll is failing), including one entry
+re-inserted by a request already past its durable read. If that durable wipe fails, the account is
 left **inactive** and the call (a `PATCH` or `PUT` with `active:true`, or a
 `POST` that revives a deprovisioned user) answers **`500`**
 (`failed to reactivate the underlying account`, or `failed to revive the

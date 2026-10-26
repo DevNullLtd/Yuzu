@@ -511,8 +511,10 @@ operation is unsupported) and no rollback: the only way back is restoring the ba
 The `auth` v3 migration seeds nothing and starts every existing row at factor generation `0`; the trigger
 advances it only from the next enrolment change. So an account that was already enrolled reads generation
 `0`, is refused `503` `mfa_proof_unavailable` (sticky, no `retry_after_ms`) on the 37 step-up routes (the 35
-ordinary rows, approve and reject among them, and the 2 factor-credential routes) and stays refused until
-`yuzu-server --mfa-reset <user>` clears its factor. Settings self-disable and recovery-code regeneration are
+ordinary rows, approve and reject among them, and the 2 factor-credential routes) and on the 3 JIT-elevation
+routes (they probe the same factor state), and stays refused until `yuzu-server --mfa-reset <user>` clears its
+factor. The 35 ordinary rows refuse only while `--mfa-step-up-window-secs` is above 0 (at 0 they pass without
+reading the store); approve and reject, the 2 factor-credential routes and the elevation routes refuse regardless. Settings self-disable and recovery-code regeneration are
 two of those routes, so such an account cannot use them to recover, and an administrator API token still
 passes step-up.
 
@@ -527,8 +529,35 @@ SELECT username FROM auth.users WHERE mfa_enrolled_at IS NOT NULL;
 **Supported procedure for an existing deployment.**
 
 1. Stop every server replica.
-2. Back up the `auth` and `session_store` schemas, for example
-   `pg_dump "$YUZU_POSTGRES_DSN" --schema=auth --schema=session_store > yuzu-auth-before-6079.sql`.
+2. Back up the `auth` and `session_store` schemas, and the keys directory with them, as a pair. The dump holds
+   password hashes, session rows and envelope-encrypted TOTP secrets, so take it the way the runbook's
+   [Backup - the KEK pairing rule](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule) block does:
+   umask `077`, a root-owned `0700` directory, custom format, and the keys directory archived from the same point
+   in time (a dump restored next to a different KEK locks every MFA user out). On Linux, with every replica
+   stopped, that block with the dump limited to these two schemas is:
+
+   ```bash
+   STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+   sudo install -d -m 0700 -o root -g root /var/backups/yuzu
+   ( set -o pipefail
+     sudo -u _yuzu pg_dump "$YUZU_POSTGRES_DSN" --format=custom --schema=auth --schema=session_store \
+       | sudo sh -c "umask 077; cat > /var/backups/yuzu/yuzu-$STAMP.dump" &&
+     sudo sh -c "umask 077; tar -czf /var/backups/yuzu/yuzu-keys-$STAMP.tar.gz -C /etc/yuzu certs" ) &&
+     echo "OK: pair written to /var/backups/yuzu"
+   ```
+
+   The Docker Compose and Windows forms are in the same runbook section; use them for those deployments and add the
+   same two `--schema` options to the `pg_dump` call. Go on only after `OK:` (or the form's own success line). This
+   cutover rotates no KEK, so the keys archive is the directory as it stands now.
+
+   **Restoring this backup is the only way back.** There is no rollback. A restore rolls credentials and sessions
+   back to the dump (passwords, session rows, lockout state and MFA enrolments return to that moment). Restore with
+   `pg_restore --clean --if-exists` (the form the rollback recipe elsewhere in this guide uses), which drops the migrated
+   objects before it recreates them from the dump. Follow the
+   runbook's [restore steps](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule) ("A restore rolls
+   credentials and sessions back to the dump": restart every replica, end every session, re-apply password changes,
+   check both MFA binding triggers) and its
+   [Post-restore verification](../ops-runbooks/auth-db-recovery.md#post-restore-verification).
 3. Start the new build. The migrations run at the first start and seed nothing.
 4. Run the post-start check, which lists the enrolled accounts that still read generation `0`:
 
@@ -539,11 +568,13 @@ SELECT username FROM auth.users WHERE mfa_enrolled_at IS NOT NULL;
 5. Run `yuzu-server --mfa-reset <user>` on the host for each enrolled operator, administrators first (or keep
    an administrator API token to hand). It needs a host shell on the server, the Postgres DSN and the keys
    directory (`docs/ops-runbooks/auth-db-recovery.md`, "The `--mfa-reset` CLI (audited)"), so an affected user
-   cannot recover on their own. The user enrols again at next sign-in only under `--mfa-enforcement=required`
-   or `admin-only`.
+   cannot recover on their own. The user enrols again at next sign-in only under `--mfa-enforcement=required`,
+   or `admin-only` for an administrator; under `optional` nobody is made to, and under `admin-only` a non-admin
+   is not.
 
-Until step 5 is done for an account, the 37 step-up routes (approve and reject included) answer `503`
-`mfa_proof_unavailable` for it.
+Until step 5 is done for an account, the 37 step-up routes (approve and reject included) and the 3 JIT-elevation
+routes answer `503` `mfa_proof_unavailable` for it, the 35 ordinary rows only while `--mfa-step-up-window-secs` is
+above 0 (at 0 they pass without reading the store).
 
 Starting with empty `auth` and `session_store` schemas instead is an operator choice for a deployment that
 has no enrolled operators. It discards every local account, password, MFA enrolment and session, so do not

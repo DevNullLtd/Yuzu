@@ -366,9 +366,9 @@ SEPARATE step (outcome `deactivated_but_session_wipe_failed` when that step fail
 Reactivation (`AuthManager::reactivate_user`) ends the account's cached and durable
 sessions BEFORE it sets the account active again, and does not restore the factor; if
 the durable wipe fails it returns false and the account stays inactive. After the durable wipe succeeds, and
-before the account is set active, it drops the user's cached sessions again, so no cached copy survives on this
-replica; other replicas drop theirs on the wipe's generation bump within the cache bound (about 1 s, 30 s while the
-poll fails). The wipe is unconditional: called on an already-active account it also ends that account's sessions;
+before the account is set active, it drops the user's cached sessions again, so no durable row survives; cached
+copies on this replica and every other are bounded by the cache bound (R14: generation poll about 1 s, up to 30 s
+while the poll fails), including one entry re-inserted by a request already past its durable read. The wipe is unconditional: called on an already-active account it also ends that account's sessions;
 the real callers pass inactive accounts (see
 "Deprovision and reactivation" below for the SCIM consequence). A NEW factor-clear path
 outside the owner or the deactivation helper is CRITICAL. It is the same kind of ADR-0012 §3 query owner as
@@ -423,7 +423,12 @@ account with no enrolled factor, so a cached survivor of a cleared account never
 check admits an account with no enrolled factor on the 35 ordinary rows and on the 2 factor-credential rows alike,
 so a cached survivor reaches those routes like every other role-permitted route. What remains is the accepted
 cache bound (SOC 2 residual (b)) for the OTHER routes the survivor's role reaches: for that window it can use them
-as it could before the clear. When a clear is made for
+as it could before the clear. The same bound has a same-replica tail on every revocation path (a clear,
+`reactivate_user`, `remove_user_checked`, `invalidate_session`, `upsert_user`): a request already past its durable
+read in `validate_session_durable` can re-insert ONE cached entry after the replica's own cache drop (the cache
+insert is not generation-gated), and it lasts until the next generation advance (poll about 1 s, 30 s while the
+poll fails). The two enrolment routes are unaffected, because `durable_session_gate` re-reads the durable row.
+When a clear is made for
 suspected compromise the operator still ends the account's sessions or restarts the other replicas (runbook,
 "Ending the sessions by hand") to bound those routes.
 
@@ -483,7 +488,12 @@ account's next enrolment re-reveal that provisional secret, so a secret the
 revoked session's holder saw can be enrolled by the legitimate user. The same
 window also covers `POST /api/settings/mfa/recovery-codes` and `/disable`. That
 is the generic session-revocation propagation window, not a credential-specific
-one. The controls are the compromise runbook (`yuzu-server --mfa-reset`) and
+one. It also covers a same-replica tail on every revocation path (`reactivate_user`,
+`remove_user_checked`, `invalidate_session`, `upsert_user`, `MfaDisableOwner`'s drop): a
+request already past its durable read in `validate_session_durable` (the `find` to its
+unconditional cache insert, with no generation recheck between them) can re-insert ONE
+cached entry after the wipe's cache drop, which lasts until the next generation advance
+(poll about 1 s, 30 s while the poll fails). The controls are the compromise runbook (`yuzu-server --mfa-reset`) and
 the `mfa.enroll.*` audit rows adjacent to `user.password_reset`; full closure
 is a fifth credential-change owner step or a current-password field on the
 Settings enrolment form (#5392).
@@ -1061,7 +1071,7 @@ gate applied.
   regeneration or a `SecretCodec` re-encryption. The migration seeds nothing (a hard cutover, see "Rollout and cutover" below): every existing row
   starts at `0` and the trigger advances it from the next enrolment change, so an account that was already
   enrolled on a carried-over database reads generation `0`, is refused `503` `mfa_proof_unavailable`, and
-  must have its factor cleared with `yuzu-server --mfa-reset <user>` (under `--mfa-enforcement=required` or `admin-only` the user enrols again at next sign-in).
+  must have its factor cleared with `yuzu-server --mfa-reset <user>` (under `--mfa-enforcement=required`, or `admin-only` for an administrator, the user enrols again at next sign-in).
 - **The session side is guarded too.** `session_store.sessions.mfa_factor_gen` and `mfa_bind_seq`
   (session_store migration v2) hold the bound proof. The trigger `sessions_mfa_rebind_guard`
   (`ENABLE ALWAYS`) sets `mfa_factor_gen` to `0` ("unbound") on any write of a proof or identity column
@@ -1176,7 +1186,7 @@ operators; it discards local accounts, passwords, MFA enrolments and sessions.
 | State | Behaviour |
 |---|---|
 | Fresh database | Full closure on every gate. Every row starts at generation `0` and the trigger advances it from the first enrolment. |
-| Carried-over database with an already-enrolled account | The `auth` v3 migration seeds nothing, so the account reads generation `0` and is refused `503` `mfa_proof_unavailable` until `yuzu-server --mfa-reset <user>` clears its factor (under `--mfa-enforcement=required` or `admin-only` the user enrols again at next sign-in). |
+| Carried-over database with an already-enrolled account | The `auth` v3 migration seeds nothing, so the account reads generation `0` and is refused `503` `mfa_proof_unavailable` until `yuzu-server --mfa-reset <user>` clears its factor (under `--mfa-enforcement=required`, or `admin-only` for an administrator, the user enrols again at next sign-in). |
 | Trigger dropped, disabled, replica-only or body replaced | Boot refuses (only `--mfa-reset` and `--break-glass-arm` open their bootstrap `AuthDB` past it, and report the binding not enforced). While running, a validation that observes it fails every local binding decision closed (sticky). Changes made while it was not firing are not reconstructable: end the affected accounts' sessions (runbook). |
 | Coherent offline restore | The accepted ADR-2002 checkpoint class. After ANY restore of the auth schema end every session (a restart does not). |
 
@@ -2715,10 +2725,11 @@ the same audit behavior described below, not a silent no-op:
   resurrects a stale second factor. **Reactivation ends the account's
   sessions first** (`AuthManager::reactivate_user`: cached and durable
   sessions are deleted BEFORE the account becomes active again, and the cache is
-  dropped once more after the durable delete, so there is no instant at which it
-  is active and still holds a session from before it was deactivated on this
-  replica; other replicas drop theirs within the cache bound, about 1 s and 30 s
-  while their session-generation poll fails). If the durable wipe fails the account is left inactive and
+  dropped once more after the durable delete, so no durable row of a session from
+  before the deactivation survives; cached copies on this replica and every other
+  are bounded by the cache bound (R14: generation poll about 1 s, up to 30 s while
+  the poll fails), including one entry re-inserted by a request already past its
+  durable read). If the durable wipe fails the account is left inactive and
   the call returns `500` (`failed to reactivate the underlying account` on
   `PATCH`/`PUT`, `failed to revive the underlying account` on a `POST` revive)
   with an audit failure row (`scim.user.reactivated` or
@@ -2923,7 +2934,7 @@ that triggers a `500`).
 |---|---|---|
 | `scim.user.provisioned` | `success` | `POST /scim/v2/Users` succeeds (new account, or a revived reprovision) |
 | `scim.user.provisioned` | `denied` | `POST` rejected `409` — `userName` collision against a currently-active account |
-| `scim.user.provisioned` | `failure` | `POST` rolls back after a `500` (e.g. the account-creation transaction fails) |
+| `scim.user.provisioned` | `failure` | `POST` rolls back after a `500` (e.g. the account-creation transaction fails, or a revive's durable session wipe or `AuthDB` reactivation fails: `failed to revive the underlying account`) |
 | `scim.user.updated` | `success` / `failure` | `PUT /scim/v2/Users/{id}` succeeds / fails `500` |
 | `scim.user.deactivated` | `success` / `failure` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write could not persist. (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`) |
 | `scim.user.reactivated` | `success` / `failure` | `PATCH` or `PUT` sets `active:true`. `failure` causes (#4966): the tombstone's role could not be read (`500`, `tombstone role unreadable before reactivation`), the Administrator-grant read was unavailable (`503`, `administrator grant check unavailable`), or the account or mirror write failed (`500`; this includes the reactivation's session wipe failing, which leaves the account inactive so the IdP retries). An elevated tombstone or a name holding an Administrator grant is a `scim.user.provenance_denied` (`404`), not a `reactivated` row |

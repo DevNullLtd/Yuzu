@@ -228,7 +228,10 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   `AuthManager::reactivate_user` ends the account's cached and durable sessions BEFORE
   it reactivates, dropping the cached copies again after the durable wipe and
   before `AuthDB::reactivate_user` (a failed durable wipe returns false and leaves the
-  account inactive) and restores no factor. A NEW factor-clear path outside the owner or the
+  account inactive; no durable row survives, while cached copies on this replica and every
+  other are bounded by the cache bound, R14: poll about 1 s, up to 30 s while it fails,
+  including one entry re-inserted by a request already past its durable read) and restores
+  no factor. A NEW factor-clear path outside the owner or the
   deactivation helper, or a
   clear split across transactions, is CRITICAL; `AuthDB::mfa_disable` is a
   test-fixture un-enrol with no route or CLI caller.** The auth v3 migration

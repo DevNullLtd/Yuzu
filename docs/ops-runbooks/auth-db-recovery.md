@@ -404,7 +404,7 @@ Step 3 is the one people skip. It is the only cheap check that distinguishes
 "restored correctly" from "restored, and every MFA user will be locked out the
 moment they try to log in".
 
-**Enrolled accounts at generation 0 (#6079).** An enrolled account whose factor generation is not positive (`SELECT username FROM auth.users WHERE mfa_enrolled_at IS NOT NULL AND mfa_factor_gen <= 0;`) is refused `503` `mfa_proof_unavailable` on approve and reject, on the 35 ordinary step-up routes and on the 2 factor-credential routes (Settings recovery-code regeneration, `POST /api/settings/mfa/recovery-codes`, and MFA disable, `POST /api/settings/mfa/disable`) until `yuzu-server --mfa-reset <user>` clears its factor (under `--mfa-enforcement=required` or `admin-only` the user enrols again at next sign-in). The command needs a host shell, the Postgres DSN and the keys directory, so an affected user cannot recover on their own; an administrator API token still passes step-up while this is being done.
+**Enrolled accounts at generation 0 (#6079).** An enrolled account whose factor generation is not positive (`SELECT username FROM auth.users WHERE mfa_enrolled_at IS NOT NULL AND mfa_factor_gen <= 0;`) is refused `503` `mfa_proof_unavailable` on approve and reject, on the 35 ordinary step-up routes and on the 2 factor-credential routes (Settings recovery-code regeneration, `POST /api/settings/mfa/recovery-codes`, and MFA disable, `POST /api/settings/mfa/disable`) and on the 3 JIT-elevation routes (they probe the same factor state) until `yuzu-server --mfa-reset <user>` clears its factor (under `--mfa-enforcement=required`, or `admin-only` for an administrator, the user enrols again at next sign-in). The 35 ordinary routes refuse only while `--mfa-step-up-window-secs` is above 0 (at 0 they pass without reading the store); approve and reject, the 2 factor-credential routes and the elevation routes refuse regardless. The command needs a host shell, the Postgres DSN and the keys directory, so an affected user cannot recover on their own; an administrator API token still passes step-up while this is being done.
 
 ## Sessions are durable
 
@@ -757,10 +757,11 @@ case where an operator is locked out and the audit store cannot be restored. The
 **It ends the account's sessions, in the same transaction.** The factor clear, the deletion of the
 account's recovery codes, the deletion of every durable session of the account, the audit row and the
 session write-generation bump commit or abort TOGETHER, in one database transaction on one connection
-(`MfaDisableOwner`, `docs/auth-architecture.md`). The generation is bumped last, and only when sessions were
-deleted, so every replica drops its cached copy of the account's sessions on its next refresh and, within
+(`MfaDisableOwner`, `docs/auth-architecture.md`). The generation is bumped last, and only when the session-delete
+step ran, so every replica drops its cached copy of the account's sessions on its next refresh and, within
 that cache bound (about a second, up to 30 seconds while a replica's poll is failing), the account does not
-stay signed in on any replica. The
+stay signed in on any replica, apart from one cached entry that a request already past its durable read can
+re-insert (R14, until the next generation advance). The
 number of sessions deleted is recorded as `sessions_ended=<n>` at the end of the audit row's `detail`
 (`... (os_identity=<account>, sessions_ended=<n>)`); `<n>` counts every durable session row deleted for the
 account, rows that had already expired but were not yet reaped included, so it is not a count of sessions
@@ -862,7 +863,9 @@ fails the page answers "MFA backend unavailable" (status `200`), nothing is writ
 below: during it, a cached session on another replica can still use the OTHER routes its role reaches, as it
 could before the clear (the accepted cache bound in the SOC 2 note). It does not reach approvals, because the
 approver gate reads the durable proof on every decision. The Settings replica drops its own cache straight
-after the commit and the CLI is a one-shot with no cache, so only OTHER replicas are exposed. To close that
+after the commit and the CLI is a one-shot with no cache, so the exposure is the OTHER replicas (and, for one
+cached entry on any replica, a request already past its durable read, which lasts until the next generation
+advance). To close that
 remaining window at once, restart the other replicas or run the delete below and confirm the count.
 
 **Reactivating a deactivated account ends its sessions first.** Deactivating an account
@@ -870,16 +873,18 @@ remaining window at once, restart the other replicas or run the delete below and
 account transaction, and ends its sessions in a SEPARATE step. If that step failed, the outcome is
 `deactivated_but_session_wipe_failed` (also the `outcome` label of `yuzu_scim_compensation_failed_total`).
 Reactivation (`AuthManager::reactivate_user`) now deletes the account's cached and durable sessions BEFORE it
-sets the account active again, and drops this server's cached copy again after the durable delete, so a session that
-survived the failed wipe is gone by the time the account can sign in, on this replica, and on other replicas within the
-session cache bound (about 1 s, 30 s while a replica's session-generation poll is failing); no manual step is needed.
+sets the account active again, and drops this server's cached copy again after the durable delete, so no durable row of
+a session that survived the failed wipe remains when the account can sign in. Cached copies on this replica and every
+other are bounded by the session cache bound (R14: the generation poll, about 1 s, up to 30 s while a replica's
+session-generation poll is failing), including one entry re-inserted by a request already past its durable read.
 The wipe is unconditional (it also ends the sessions of an already-active account; real SCIM callers pass inactive
 accounts only). It does not restore any factor. If the durable wipe itself
 fails, the reactivation logs an error, returns false and leaves the account inactive; SCIM turns that into a
 `500` with an audit failure row (`scim.user.reactivated` or `scim.user.provisioned`, `result=failure`), so the
 IdP retries. For a reactivation made any other way, retry it. After a deactivation that reported
-`deactivated_but_session_wipe_failed` you may still run `DELETE /api/v1/sessions?username=<name>` and the
-"Check that no session remains" query; it is no longer required for safety. Deactivation itself still commits
+`deactivated_but_session_wipe_failed`, or after any reactivation, ending the account's sessions by hand
+(`DELETE /api/v1/sessions?username=<name>` and the "Check that no session remains" query) is still available when a
+stricter guarantee is wanted. Deactivation itself still commits
 the factor clear and the session wipe in two separate steps, so a failed deactivation wipe leaves the
 sessions until the wipe is retried or the account is reactivated.
 
