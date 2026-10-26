@@ -516,12 +516,12 @@ exec_id = execute("windows.registry.get_value",
                   params={
                       "hive": "HKLM",
                       "key": "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
-                      "value": "CurrentBuildNumber"
+                      "name": "CurrentBuildNumber"
                   })
 wait_for(exec_id)
 responses = get_responses("windows.registry.get_value", exec_id)
 for row in responses:
-    build = row["output"].get("data", "unknown")
+    build = row["output"].get("value", "unknown")
     print(f"{row['agent_id']}: Windows Build {build}")
 ```
 
@@ -530,15 +530,15 @@ for row in responses:
 Policy: Windows build must be 22621 or higher (Windows 11 22H2+):
 
 ```cel
-int(result.data) >= 22621
+int(result.value) >= 22621
 ```
 
 #### Dashboard UI
 
 1. **Instructions > Definitions** > `windows.registry.get_value`
 2. Click **Execute**
-3. Parameters: **Hive** = `HKLM`, **Key** = `SOFTWARE\Microsoft\Windows NT\CurrentVersion`, **Value** = `CurrentBuildNumber`
-4. Scope: leave empty (Windows-only plugin only runs on Windows agents)
+3. Parameters: **Hive** = `HKLM`, **Key** = `SOFTWARE\Microsoft\Windows NT\CurrentVersion`, **Name** = `CurrentBuildNumber`
+4. Scope: `ostype == "windows"` (the plugin also loads on macOS and Linux agents, where every action answers a `registry|unsupported|...` line instead of reading the registry)
 5. Click **Run**
 
 ---
@@ -965,9 +965,9 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `windows.registry.get_value` | get_value | Q | W | hive:enum (req), key:string (req), name:string (req) | value:string, type:string |
 | `windows.registry.get_user_value` | get_user_value | Q | W | username:string, sid:string, key:string (req), name:string | username:string, value:string, type:string |
 | `windows.registry.list_profiles` | list_profiles | Q | W | (none) | sid:string, profile_name:string, profile_path:string, hive_state:string |
-| `windows.registry.set_value` | set_value | A | W | hive:enum (req), key:string (req), name:string (req), value:string (req), type:enum | status:string |
+| `windows.registry.set_value` | set_value | A | W | hive:enum (req), key:string (req), name:string (req), value:string, data_hex:string (send one of the two), type:enum | status:string |
 | `windows.registry.delete_value` | delete_value | A | W | hive:enum (req), key:string (req), name:string (req) | status:string |
-| `windows.registry.delete_key` | delete_key | A | W | hive:enum (req), key:string (req) | status:string |
+| `windows.registry.delete_key` | delete_key | A | W | hive:enum (req), key:string (req) | status:string, counted_keys:int32, counted_values:int32, dry_run:bool, capped:bool |
 | `windows.registry.enumerate_keys` | enum_keys | Q | W | hive:enum (req), key:string (req) | subkey:string |
 | `windows.registry.enumerate_values` | enum_values | Q | W | hive:enum (req), key:string (req) | name:string, type:string |
 | `windows.registry.key_exists` | key_exists | Q | W | hive:enum (req), key:string (req) | exists:bool |

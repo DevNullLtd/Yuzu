@@ -734,6 +734,15 @@ if _gw_otp_bin != ''
   # bound for the nightly Coverage and sanitizer jobs on slower runners,
   # where parallel meson test execution can starve a shard of CPU. Change
   # this and the wrapper's value together.
+  #
+  # priority 120 (342ae2efe): gateway eunit is the longest entry of
+  # the Linux cheap-suites invocation (about 111 to 122 s unsharded over eleven
+  # runs on the self-hosted Linux runner, 2026-10-24) and, defined last, it used
+  # to start last. 120 sits between the pg shards (160-260, a sparse rank
+  # scale) and the non-pg shards (10-50) in tests/meson.build, so both eunit
+  # shards start first and overlap the other entries instead of trailing them.
+  # Priority only orders starts: it moves no case and cannot change the total
+  # work (at --num-processes 1 the order changes, the wall time does not).
   _gw_eunit_shards = {'A': '1/2', 'B': '2/2'}
   foreach _gw_shard_name, _gw_shard_spec : _gw_eunit_shards
     test('gateway eunit shard ' + _gw_shard_name,
@@ -741,6 +750,7 @@ if _gw_otp_bin != ''
       args: [_gw_test_script, _gw_src, 'eunit', '--shard', _gw_shard_spec],
       suite: 'gateway',
       timeout: 600,
+      priority: 120,
       env: {'REBAR_BASE_DIR': _gw_src / ('_build_eunit_' + _gw_shard_spec.split('/')[0]),
             'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
     )

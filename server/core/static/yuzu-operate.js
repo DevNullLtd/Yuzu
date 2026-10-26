@@ -188,6 +188,14 @@
       scopeEl.hidden = !scope;
       field(detail, 'no-scope').hidden = !!scope;
 
+      // A bound ticket (#6062) carries the frozen request as plain text: the reviewer reads
+      // what is being approved, not a bare digest. textContent only - never innerHTML.
+      var request = d.request || '';
+      var requestEl = field(detail, 'request');
+      requestEl.textContent = request;
+      requestEl.title = d.digest ? 'sha256:' + d.digest : '';
+      field(detail, 'request-row').hidden = !request;
+
       var decided = !!d.revBy;
       field(detail, 'rev-by-row').hidden = !decided;
       field(detail, 'rev-at-row').hidden = !decided;
@@ -207,12 +215,20 @@
       var pending = d.status === 'pending';
       var mine = d.mine === '1';
       var mcp = d.mcp === '1';
+      var excluded = d.excluded === '1';
       var list = $('.ops-list', host);
       var canDecide = !!list && list.getAttribute('data-can-decide') === '1';
       field(detail, 'self').hidden = !(pending && mine);
+      field(detail, 'excluded').hidden = !(pending && !mine && excluded && canDecide);
+      // The decision container serves every non-own pending row the viewer may decide.
+      // Approve is hidden when the server would refuse it: the viewer is an excluded
+      // root (they may still Reject, which is how a designer withdraws a request), or the
+      // stored request could not be read (Reject then clears the row).
       field(detail, 'actions').hidden = !(pending && !mine && canDecide);
+      var approveBtn = $('button[data-act="approve"]', detail);
+      if (approveBtn) approveBtn.hidden = excluded || d.unreadable === '1';
       field(detail, 'n-mcp').hidden = !mcp;
-      field(detail, 'n-params').hidden = mcp;
+      field(detail, 'n-params').hidden = mcp || !!request;
       field(detail, 'notes').hidden = !pending;
 
       field(detail, 'empty').hidden = true;
@@ -232,6 +248,11 @@
       facts.appendChild(factRow('Request', (d.name || '') + (d.def ? ' (' + d.def + ')' : '')));
       facts.appendChild(factRow('Requested by', d.by || ''));
       facts.appendChild(factRow('Scope', d.scope || 'None recorded', true));
+      if (d.request) {
+        var reqRow = factRow('Requested effect', d.request, true);
+        reqRow.lastChild.className = 'req';
+        facts.appendChild(reqRow);
+      }
       facts.appendChild(factRow('Requested', d.age || ''));
       var note = approve ?
         'Your decision is recorded in the audit log. Your comment is saved on the request and is ' +
@@ -239,6 +260,13 @@
         'You cannot approve your own request. ' +
         (d.mcp === '1' ?
           'The requesting agent must re-call the tool with this approval id for it to run.' :
+          d.request && d.shortened === '1' ?
+          'The summary above is shortened and is for orientation only; it does not show the ' +
+          'whole request. What you approve is the whole request as stored under the digest ' +
+          'shown.' :
+          d.request ?
+          'The summary above is for orientation. What you approve is the whole request as ' +
+          'stored under the digest shown.' :
           'The parameter values are not stored with this request. You are deciding on the ' +
           'instruction and scope only.') :
         'Your decision and reason are recorded. The requester can read the reason on the request.';

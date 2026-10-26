@@ -408,6 +408,10 @@ agent_test_exe = executable(
     'unit/test_registry_local_dispatcher.cpp', # PR1.7 remediation fix #3: real registry.dll driven
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
+    'unit/test_registry_parsers.cpp',          # registry value encoders, validators and the audit line (pure, every host)
+    'unit/test_registry_core.cpp',             # registry write logic over an in-memory fake registry (checked open, fast open, verify, delete_key; every host)
+    'unit/test_registry_write_local_dispatcher.cpp', # real registry.dll writes via LocalDispatcher (Windows branch, elevated); descriptor/version/sentinel pins on every host
+    'unit/test_registry_win_internals.cpp',    # TU-inclusion seam over registry_win.cpp -- Win32Registry on a dangling link and the final_name/root_name calls (Windows-only body, elevated; empty TU elsewhere)
     'unit/test_agent_command_frames.cpp',     # agents/core/src/command_frames.hpp -- the CommandResponse.action stamp on output + final frames (pure, every host)
     'unit/test_wmi_local_dispatcher.cpp',      # gate-1 remediation: real wmi.dll's query/get_instance
                                                 # actions driven end to end via LocalDispatcher, same
@@ -635,6 +639,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/update_source_trust/src'),  # update_source_trust_*.hpp (Wave 10 PR10.1-d)
     include_directories('../agents/plugins/mgmt_posture/src'),  # mgmt_posture_parsers.hpp / _legs.hpp
     include_directories('../agents/plugins/shares/src'),  # shares_parsers.hpp / _legs.hpp / _posix_fs.hpp
+    include_directories('../agents/plugins/registry/src'),  # registry_parsers.hpp / registry_core.hpp (pure layer)
     include_directories('../agents/plugins/remote_access_audit/src'),  # remote_access_audit_*_parsers.hpp / _legs.hpp / _posix_fs.hpp
     include_directories('../agents/plugins/firmware_posture/src'),  # firmware_posture_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/platform_security/src'),  # platform_security_*parsers.hpp / _legs.hpp (pure helpers), Wave 8 PR8.1-a1
@@ -823,6 +828,7 @@ agent_test_exe = executable(
                 update_source_trust_plugin_lib,  # Wave 10 PR10.1-d
                 mgmt_posture_plugin_lib,  # management-plane posture
                 shares_plugin_lib,  # shares
+                registry_plugin_lib,  # test_registry_write_local_dispatcher.cpp loads the real plugin by path
                 remote_access_audit_plugin_lib,  # remote_access_audit
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
                 browser_inventory_plugin_lib,  # Wave 10 P2a
@@ -1497,6 +1503,8 @@ if build_server
 
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
+      'unit/server/test_approval_manager_bound.cpp', # #6062: origin-declared consume, bound request, excluded roots
+      'unit/server/test_approval_dormant_code_tripwire.cpp', # #6062: lexical tripwire, ADR-1009 accepted dormant code
       'unit/server/test_schedule_engine.cpp',
       'unit/server/test_schedule_routes.cpp',
       'unit/server/test_schedule_runner.cpp',
@@ -1664,6 +1672,10 @@ if build_server
       'unit/server/test_dex_score_policy_json.cpp',
       # bounded-refresh score policy provider over injected read/clock fns - no store, no sleeps, no [pg]
       'unit/server/test_dex_score_policy_provider.cpp',
+      # apply_dex_score_policy over fake read/CAS/audit closures and a real provider - no store, no sleeps, no [pg]
+      'unit/server/test_dex_score_policy_writer.cpp',
+      # GET/PUT/DELETE /api/v1/dex/score-policy route shell through TestRouteSink - no store, no [pg]
+      'unit/server/test_dex_score_policy_routes.cpp',
       'unit/server/test_dex_catalogue.cpp', # ADR-0031 WS-A4 PR-1: the Catalogue View 1 read model + FnDexApi double
       'unit/server/test_dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
       'unit/server/test_schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam (schedule read)
@@ -1940,6 +1952,7 @@ if build_server
       # yuzu_proto_headers_dep - a DOWNWARD edge for both server and agent, no cycle, no
       # new build-graph node. NOT sdk/, which is the public plugin ABI surface.
       include_directories('../agents/core/src'),
+      include_directories('../agents/shared'), # test_plugin_result_audit.cpp: registry_parsers.hpp's OS-free shared includes
     ],
     # httplib.h is header-only and its Client/Server class layout depends on
     # CPPHTTPLIB_OPENSSL_SUPPORT — yuzu_server_core compiles every TU with
@@ -2858,7 +2871,7 @@ if build_server
   # skipped" from exit 4 to exit 0. A shard that matches NO case at all still
   # fails check-pg-shard-partition.py loudly. Four more shards in this change
   # (M, N, O here and P below; P has since merged into M) added four more process startups per full
-  # run and, at Linux's --num-processes 2, a longer worst-case round count
+  # run and, at Linux's then-current --num-processes 2, a longer worst-case round count
   # (see the 2026-10-11 paragraph in docs/ci-architecture.md).
   #
   # MERGED 2026-10-11 (maintainer limit: at most 14 pg shards): shard P (see
@@ -3514,6 +3527,14 @@ test('mgmt_posture definition columns',
 test('shares definition columns',
   _python3_test,
   args: [files('test_shares_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# registry's definition contract (content/definitions/registry.yaml): ids, types, result columns, role gates.
+test('registry definition columns',
+  _python3_test,
+  args: [files('test_registry_definition.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -4230,6 +4251,16 @@ test('tier policy wiring lexical gate (#5047)',
 test('guardian/spark log-injection tripwire (#4665)',
   _python3_test,
   args: [files('test_guardian_spark_log_injection_tripwire.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #6086: the DEX score policy has ONE store writer. A write of the key anywhere but
+# dex_api.cpp would skip apply_dex_score_policy's If-Match precondition, audit-first rows and
+# the provider's commit-then-install order. Lexical; the script's docstring states its limits.
+test('dex score-policy single-writer tripwire (#6086)',
+  _python3_test,
+  args: [files('test_dex_score_policy_key_writer_tripwire.py')],
   suite: 'docs',
   timeout: 30,
 )

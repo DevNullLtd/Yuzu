@@ -25,6 +25,8 @@
 #include "oidc_provider.hpp"
 #include "pg/pg_pool.hpp"
 #include "rbac_store.hpp"
+#include "management_group_store.hpp"
+#include "test_mgmt_group_pg_helper.hpp" // ManagementGroupStorePg
 #include "test_rbac_store_pg_helper.hpp" // RbacStorePg — RbacStore is PG-only (ADR-0041)
 
 #include "../test_helpers.hpp" // PgTestTemplate, pg_admin_dsn_env
@@ -68,11 +70,12 @@ yuzu::test::PgTestTemplate list_read_gate_audit_tpl{
 /// (present, RBAC disabled by default — tests toggle via
 /// rbac_store.set_rbac_enabled) and a PG-backed ApiTokenStore, so each test
 /// only has to mint a session/token and call require_list_read directly.
-/// mgmt_group_store is deliberately null —
-/// AdmitScoped needs a real ManagementGroupStore and is exercised at the
-/// route level in test_rest_guaranteed_state.cpp, not here; a null mgmt
-/// store still lets DenyAll/AdmitAll resolve correctly (resolve_perm_groups
-/// fails closed to DenyAll on a null store, same outcome as "no grant").
+/// mgmt_group_store is null by default - AdmitScoped needs a real
+/// ManagementGroupStore and is exercised at the route level in
+/// test_rest_guaranteed_state.cpp, not here, and AdmitAll needs none. A null mgmt store is an
+/// UNAVAILABLE store, not "no grant": under enforcement it answers a retryable 503
+/// (`ListReadAuthorization::read_failed`). A case that needs a genuine "no grant" 403 passes
+/// `wire_mgmt=true`, which wires a real (empty) store.
 struct ListReadGateFixture {
     Config cfg{};
     auth::AuthManager auth_mgr{};
@@ -81,13 +84,16 @@ struct ListReadGateFixture {
     yuzu::test::ApiTokenStorePg api_tokens;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
+    std::optional<yuzu::test::ManagementGroupStorePg> mgmt_; // declared before `ar`: outlives it
     std::unique_ptr<AuthRoutes> ar;
 
-    ListReadGateFixture() {
+    explicit ListReadGateFixture(bool wire_mgmt = false) {
         REQUIRE(rbac_store.is_open());
+        if (wire_mgmt)
+            mgmt_.emplace();
         ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac_store, api_tokens.get(),
                                           /*audit_store=*/nullptr,
-                                          /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                                          wire_mgmt ? mgmt_->get() : nullptr, /*tag_store=*/nullptr,
                                           /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
     }
 
@@ -209,8 +215,19 @@ TEST_CASE("require_list_read — ordinary RBAC delegate: no grant denies, a glob
           "admits unfiltered (smoke only; the full combining lattice is covered by "
           "test_list_read_confinement.cpp)",
           "[pg][auth_routes][adr0017]") {
-    ListReadGateFixture fix;
+    ListReadGateFixture fix{/*wire_mgmt=*/true};
     fix.rbac_store.set_rbac_enabled(true);
+
+    SECTION("no management-group store wired -> an unreadable check -> retryable 503, not 403") {
+        ListReadGateFixture bare; // mgmt store null
+        bare.rbac_store.set_rbac_enabled(true);
+        auto req = bare.session_request("no_store_user", auth::Role::user);
+        httplib::Response res;
+        auto gate = bare.ar->require_list_read(req, res, "GuaranteedState", "Read");
+        CHECK_FALSE(gate.admitted);
+        CHECK(res.status == 503);
+        CHECK(res.body.find("retry_after_ms") != std::string::npos);
+    }
 
     SECTION("no grant anywhere -> DenyAll -> 403") {
         auto req = fix.session_request("no_grant_user", auth::Role::user);
@@ -254,10 +271,11 @@ TEST_CASE("require_list_read — a DenyAll denial writes a real audit row (gover
     RbacStore& rbac_store = *rbac_bundle;
     REQUIRE(rbac_store.is_open());
     rbac_store.set_rbac_enabled(true); // enforcement in effect; no roles/grants created
+    yuzu::test::ManagementGroupStorePg mgmt_bundle; // a real (empty) store: a genuine "no grant"
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider;
     AuthRoutes ar(cfg, auth_mgr, &rbac_store, /*api_token_store=*/nullptr, &audit_store,
-                 /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                 mgmt_bundle.get(), /*tag_store=*/nullptr,
                  /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
 
     REQUIRE(auth_mgr.upsert_user("audited_no_grant_user", "password1234", auth::Role::user));

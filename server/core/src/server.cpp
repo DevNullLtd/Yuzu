@@ -48,6 +48,7 @@
                                      // 3 review finding 2; see that field's own doc comment)
 #include "rotation_sweep_naming.hpp"
 #include "rotation_warn_dedup.hpp"
+#include "approval_denial_audit.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "credential_change_owner.hpp" // #5342 — one-transaction local credential change
@@ -1057,13 +1058,30 @@ public:
         metrics_.describe("yuzu_mcp_approval_precondition_denied_total",
                           "MCP approval-ticket recalls refused by a pre-consume precondition "
                           "(#2443) - the ticket matched and was approved, but the underlying "
-                          "operation's live state had already moved on since mint. A subset "
+                          "operation's live state had already moved on since mint, or the "
+                          "ticket's own tool and arguments no longer matched the recall "
+                          "(the request match every approval-gated recall carries). A subset "
                           "of yuzu_mcp_approval_refused_total, broken out separately: unlike "
                           "the masked-denial split above, a precondition denial is already "
                           "distinguishable to the caller from the response body, so this "
                           "carries no anti-oracle restriction - it is not a `reason` label on "
                           "the shared counter because the shared counter's other kinds "
                           "(foreign-origin vs ordinary replay) still must not be",
+                          "counter");
+        metrics_.describe("yuzu_approval_precondition_denied_total",
+                          "Approval-ticket redemptions refused by a pre-consume precondition "
+                          "(#2443/#6062), by the ticket's origin: the ticket matched and was "
+                          "approved, but the state its effect depends on had moved on since "
+                          "mint. The ticket is left UNTOUCHED and still redeemable. Counted at "
+                          "the store for any redeemer that supplies a precondition, so it "
+                          "mirrors yuzu_mcp_approval_precondition_denied_total (which adds the "
+                          "MCP tool); each denial also writes an approval.precondition_denied "
+                          "audit row. TODAY only origin=mcp can move (every MCP "
+                          "approval-gated recall supplies a precondition: the request match, "
+                          "plus the rotation state check for confirm_engine_rotation); the "
+                          "instruction, schedule and guardian_deploy series are "
+                          "pre-seeded at zero and stay there until a redeemer for that surface "
+                          "exists",
                           "counter");
         metrics_.describe("yuzu_mcp_approval_burned_total",
                           "MCP approval-ticket recalls that SUCCESSFULLY consumed a one-time, "
@@ -1414,6 +1432,9 @@ public:
             metrics_.counter("yuzu_mcp_approval_refused_total", {{"tool", tool}});
             // Same closed set again for the #2786 masked-denial counter.
             metrics_.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", tool}});
+            // Every approval-gated recall carries a precondition now (the request match,
+            // g8r7-astra-D), so a precondition denial can reach any tool in the set.
+            metrics_.counter("yuzu_mcp_approval_precondition_denied_total", {{"tool", tool}});
             // #2444 item 3: a HANDLER can only burn a ticket for a tool that is
             // itself approval-gated in the first place, so this is the same
             // closed `tool` set as the three counters above. `reason` is a
@@ -1433,15 +1454,13 @@ public:
                 metrics_.counter(mcp::kMcpPollTotalMetric, {{"tool", tool}, {"result", result}});
             }
         }
-        // yuzu_mcp_approval_precondition_denied_total's reachable label set is
-        // NARROWER than the two above: kPrecondition can only fire for a tool
-        // that actually has a ConsumePrecondition wired, which today is just
-        // confirm_engine_rotation (#2443) — pre-seeding the full
-        // approval-gated set here would claim reachability for tools whose
-        // precondition is always `{}`. Extend this list alongside #2939's
-        // sweep as each tool gets its own precondition wired.
-        metrics_.counter("yuzu_mcp_approval_precondition_denied_total",
-                         {{"tool", "confirm_engine_rotation"}});
+        // #6062: the store-level counter's label is the ticket origin - a CLOSED set of
+        // the four writable surfaces (kUnspecified/kUnrecognised are never written and
+        // can never reach a precondition), so every combination is pre-seeded here.
+        for (const auto origin : {ApprovalOrigin::kInstruction, ApprovalOrigin::kSchedule,
+                                  ApprovalOrigin::kMcp, ApprovalOrigin::kGuardianDeploy})
+            metrics_.counter("yuzu_approval_precondition_denied_total",
+                             {{"origin", to_string(origin)}});
         // #2437 handler-side bound denials. The label set is closed on BOTH
         // axes: `tool` is execute_instruction alone (the only tool that EMITS
         // this counter today; the two kAgenticParamMaxLen read tools bound in
@@ -6590,6 +6609,16 @@ public:
             } else {
                 legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "instructions.db",
                                                          "ApprovalManager", {"approvals"});
+                // #6062: a precondition denial is counted and audited at the store, for
+                // every redeemer. audit_store_ is declared before approval_manager_, so it
+                // outlives every consume. The observer writes through AuditStore::log on
+                // its OWN lease - never the caller's transaction - so the evidence of a
+                // refused redemption survives the caller rolling back. No audit store
+                // (not open) means no row; the counter still counts.
+                approval_manager_->set_metrics(&metrics_);
+                approval_manager_->set_precondition_denial_observer(
+                    make_precondition_denial_audit_observer(
+                        [this]() -> AuditStore* { return audit_store_.get(); }));
             }
         }
 
@@ -12495,8 +12524,9 @@ private:
             .increment();
     }
 
-    /// The ONE /crypto availability callback (ADR-0070 R2; fix-spec B1): CryptoRoutes, the
-    /// filtered GET /api/v1/ca/issued and the MCP server all receive THIS function, so the REST
+    /// The ONE /crypto availability callback (ADR-0070 R2; fix-spec B1): CryptoRoutes, both
+    /// forms of GET /api/v1/ca/issued (and the Settings CA panel's inventory) and the MCP server
+    /// all receive THIS function, so the REST
     /// widget list, the dashboard and list_crypto_widgets cannot draw different answers. Fleet
     /// gate classes ask the NON-auditing fleet-read probe (a confined caller has a present
     /// VisibleSet); the global class asks the non-auditing has_permission. Never a grant.
@@ -18733,6 +18763,19 @@ private:
         // (PreflightRoutes, DeploymentRoutes, TarTreeRoutes, and McpServer's/
         // TarTreeRoutes' `set_all_devices_fn`), unrelated to DeviceRoutes itself.
         auto device_api = make_local_device_api(registry_, tag_store_.get());
+        // The customer score policy is one stored document read through a
+        // bounded-refresh provider, so every instance converges within
+        // kDexPolicyRefreshMs. It depends only on the runtime config store, so it exists
+        // whenever that store is open: PUT/DELETE /api/v1/dex/score-policy install through
+        // it even where the signals store is absent. With no runtime config store the Apps
+        // read scores under the shipped defaults (the empty function).
+        if (runtime_config_store_ && runtime_config_store_->is_open())
+            dex_score_policy_provider_ = std::make_shared<DexScorePolicyProvider>(
+                dex_score_policy_store_reader(*runtime_config_store_), []() -> std::int64_t {
+                    return std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+                });
         // ADR-0031 WS-A4 (fifth family): the DEX signals API seam — ONE
         // instance backing the GuaranteedStateStore-backed GET /api/v1/dex/*
         // signal/experience reads, wired with the SAME `dex_fleet_fn` closure
@@ -18745,21 +18788,9 @@ private:
         // (byte-identical). Mirrors verify_api's "null → 503" contract.
         std::shared_ptr<yuzu::server::DexApi> dex_api;
         if (guaranteed_state_store_) {
-            // The customer score policy is one stored document read through a
-            // bounded-refresh provider, so every instance converges within
-            // kDexPolicyRefreshMs. With no runtime config store the Apps read scores
-            // under the shipped defaults (the empty function).
             yuzu::server::DexScorePolicyFn dex_policy_fn;
-            if (runtime_config_store_ && runtime_config_store_->is_open()) {
-                dex_score_policy_provider_ = std::make_shared<DexScorePolicyProvider>(
-                    dex_score_policy_store_reader(*runtime_config_store_),
-                    []() -> std::int64_t {
-                        return std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   std::chrono::steady_clock::now().time_since_epoch())
-                            .count();
-                    });
+            if (dex_score_policy_provider_)
                 dex_policy_fn = [p = dex_score_policy_provider_] { return p->current(); };
-            }
             dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn,
                                          std::move(dex_policy_fn));
         }
@@ -20174,7 +20205,9 @@ private:
         // copies the list into its handler captures, so it must be set first.
         ca_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
         // ADR-0070 R2-2: the filtered GET /api/v1/ca/issued reads through the SAME CryptoApi
-        // instance and is withheld from a confined caller via the SAME availability callback.
+        // instance; BOTH forms of it (and the Settings CA panel's inventory) are withheld from a
+        // confined caller via the SAME availability callback. This MUST run before
+        // register_routes: the handlers capture a copy, so a later call leaves them unwired.
         ca_routes_->set_filtered_issued(CaRoutes::FilteredIssuedDeps{
             .api = crypto_api_,
             .confinement_fn = [this](const httplib::Request& req) {
@@ -20868,6 +20901,9 @@ private:
                             out.visible_agents = std::move(authz.visible_agents);
                             break;
                         case ListReadDecision::DenyAll:
+                            // Deliberately ignores `authz.read_failed`: this seam's decision
+                            // type has no "degraded" arm, so a failed read maps to deny-all
+                            // (fail closed, nothing served), as before.
                             break; // out already kDenyAll (default)
                         }
                         return out;
@@ -21132,6 +21168,20 @@ private:
         // it stamps the principal, the effective role the route captured per binding, the
         // engine class and the session correlator. MUST run BEFORE register_routes().
         rest_api_v1_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
+        // #6086: GET/PUT/DELETE /api/v1/dex/score-policy. The reader and the two conditional
+        // writes borrow runtime_config_store_ by reference. stop() waits for and joins the
+        // listener thread(s) before it resets the store, so no handler is running when the
+        // reference dies (the same ordering the provider's reader relies on). Without an open
+        // store the three routes answer 503. MUST run BEFORE register_routes().
+        if (dex_score_policy_provider_) {
+            auto policy_writes = dex_score_policy_store_writer(*runtime_config_store_);
+            rest_api_v1_->set_dex_score_policy_writer(
+                {.read_stored = dex_score_policy_store_reader(*runtime_config_store_),
+                 .compare_and_set = std::move(policy_writes.compare_and_set),
+                 .compare_and_remove = std::move(policy_writes.compare_and_remove),
+                 .provider = dex_score_policy_provider_,
+                 .audit = {}});
+        }
         // #6065 PR-Q: the dispatch-chokepoint pre-check closure, defined ONCE and
         // handed to BOTH REST (POST and DELETE /api/v1/quarantine, the trailing register_routes
         // param) and MCP (set_authorize_dispatch_fn, wired further below), so the two
@@ -21972,6 +22022,7 @@ private:
                         out.visible_agents = std::move(authz.visible_agents);
                         break;
                     case ListReadDecision::DenyAll:
+                        // Deliberately ignores `authz.read_failed` (see the REST twin above).
                         break; // out already kDenyAll (default)
                     }
                     return out;

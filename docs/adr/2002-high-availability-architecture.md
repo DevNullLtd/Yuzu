@@ -2334,7 +2334,7 @@ enumeration:
 
 Any store matching **none** of these three follows the ladder at normal priority (its divergence is
 tolerable until it migrates). `runtime_config_store` / `webhook_store` sit here but **promote** the
-moment a workstream shows a cross-instance correctness dependency.
+moment a workstream shows a cross-instance correctness dependency. `runtime_config_store` is promoted for ONE key by #6086 (2026-10-23): the `dex_score_policy` document is a compare-and-set document written on one replica and read through on all (typically within 5 seconds); every other runtime-config key stays per-instance.
 
 **NVD/CVE (`nvd_db`) — withdrawn from this list (finding 1).** NVD sync/matching moves OUT of the
 server into the UCE engine (ADR-0023 / ADR-1005 Phase 7), so it is **not** a `yuzu` store to

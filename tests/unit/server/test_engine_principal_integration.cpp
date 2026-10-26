@@ -1084,6 +1084,148 @@ TEST_CASE("require_fleet_read — engine principal with an explicit global RBAC 
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 6d. A FAILED engine grant read is a retryable 503, never the 403 of "no grant"
+//     Both engine arms read the grant with check_permission_checked.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+void drop_principal_roles(const std::string& dsn) {
+    yuzu::server::pg::PgConn c{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult dr{PQexec(c.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+    REQUIRE(dr.ok());
+}
+} // namespace
+
+TEST_CASE("engine gates — a failed grant read is 503 without a permission, a genuine no-grant is 403",
+          "[pg][engine_principal][integration][auth_routes][rbac][read_failed]") {
+    EngineRbacGateFixture fix;
+    yuzu::test::RbacStorePg rbac_bundle;
+    RbacStore& rbac_store = *rbac_bundle;
+    REQUIRE(rbac_store.is_open());
+    rbac_store.set_rbac_enabled(true);
+    REQUIRE(rbac_store.create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(
+        rbac_store.set_permission({"EngineReader", "GuaranteedState", "Read", "allow"}).has_value());
+
+    AuthRoutes ar(fix.cfg, fix.auth_mgr, &rbac_store, fix.api_tokens.get(),
+                 /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                 /*analytics_store=*/nullptr, fix.oidc_mu, fix.oidc_provider);
+    ar.set_engine_principal_store(fix.engine_store.get());
+    auto req = fix.request();
+
+    // Genuine no-grant (healthy store, nothing assigned): 403 on both gates.
+    {
+        httplib::Response res;
+        auto result = ar.require_fleet_read(req, res, "GuaranteedState", "Read");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error() == authz::GateFailure::Forbidden);
+        CHECK(res.status == 403);
+        httplib::Response res2;
+        auto gate = ar.require_list_read(req, res2, "GuaranteedState", "Read");
+        CHECK_FALSE(gate.admitted);
+        CHECK(res2.status == 403);
+    }
+
+    // The grant exists but its read fails: nothing was queried for the engine before, so the
+    // first read is the failing one (no cached verdict, no breaker shed).
+    REQUIRE(rbac_store.assign_role({"engine", "engine:vuln", "EngineReader"}).has_value());
+    drop_principal_roles(rbac_bundle.dsn());
+
+    httplib::Response res;
+    auto result = ar.require_fleet_read(req, res, "GuaranteedState", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(res.status == 503);
+    CHECK(res.body.find("\"retry_after_ms\":5000") != std::string::npos);
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+
+    httplib::Response res2;
+    auto gate = ar.require_list_read(req, res2, "GuaranteedState", "Read");
+    CHECK_FALSE(gate.admitted);
+    CHECK(res2.status == 503);
+    CHECK(res2.body.find("\"retry_after_ms\":5000") != std::string::npos);
+    CHECK(res2.body.find("\"permission\"") == std::string::npos);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 6e. A stale cached-DISABLED enforcement view is a retryable 503 through both engine arms
+//     (adversarial review, CDX-1): a replica that cached RBAC as disabled, whose refresh then
+//     fails past the stale-serve bound while another replica enabled RBAC and granted the
+//     engine, must not answer the terminal 403 of "RBAC is off".
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("engine gates - a stale cached-disabled enforcement view is 503, a fresh disabled view "
+          "is still 403",
+          "[pg][engine_principal][integration][auth_routes][rbac][read_failed]") {
+    EngineRbacGateFixture fix;
+    yuzu::test::RbacStorePg rbac_bundle;
+    RbacStore& replica_a = *rbac_bundle;
+    REQUIRE(replica_a.is_open());
+    REQUIRE_FALSE(replica_a.is_rbac_enabled());
+
+    // "Replica B": its own size-1 pool against the same database, so it can be starved alone.
+    yuzu::server::pg::PgPool pool_b{{.conninfo = rbac_bundle.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+    REQUIRE_FALSE(replica_b.is_rbac_enabled());
+
+    AuthRoutes ar(fix.cfg, fix.auth_mgr, &replica_b, fix.api_tokens.get(),
+                  /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                  /*analytics_store=*/nullptr, fix.oidc_mu, fix.oidc_provider);
+    ar.set_engine_principal_store(fix.engine_store.get());
+    auto req = fix.request();
+
+    // Replica A grants the engine principal first (a grant can exist while RBAC is off), so the
+    // control below proves a fresh disabled view is 403 even WITH a grant, then enables RBAC.
+    REQUIRE(replica_a.create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(replica_a.set_permission({"EngineReader", "GuaranteedState", "Read", "allow"})
+                .has_value());
+    REQUIRE(replica_a.assign_role({"engine", "engine:vuln", "EngineReader"}).has_value());
+
+    // Control: a FRESH disabled view is a genuine "RBAC is off": 403 on both gates, grant or not.
+    {
+        httplib::Response res;
+        auto result = ar.require_fleet_read(req, res, "GuaranteedState", "Read");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(res.status == 403);
+        httplib::Response res2;
+        auto gate = ar.require_list_read(req, res2, "GuaranteedState", "Read");
+        CHECK_FALSE(gate.admitted);
+        CHECK(res2.status == 403);
+    }
+
+    // Replica A durably enables RBAC.
+    replica_a.set_rbac_enabled(true);
+
+    // Starve replica B's pool and age its readings past the stale-serve bound (the same
+    // sequence as the rbac_store stale-view test): the first failed refresh is inside the
+    // bound, the second is past it.
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+    REQUIRE_FALSE(rbac_enforcement_in_effect(&replica_b));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(4200));
+    // Precondition: the raw flag is still false but enforcement is degraded.
+    REQUIRE_FALSE(replica_b.is_rbac_enabled());
+    REQUIRE(rbac_enforcement_label(&replica_b) == RbacEnforcementLabel::kDegraded);
+
+    httplib::Response res;
+    auto result = ar.require_fleet_read(req, res, "GuaranteedState", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(res.status == 503);
+    CHECK(res.body.find("\"retry_after_ms\":5000") != std::string::npos);
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+
+    httplib::Response res2;
+    auto gate = ar.require_list_read(req, res2, "GuaranteedState", "Read");
+    CHECK_FALSE(gate.admitted);
+    CHECK(res2.status == 503);
+    CHECK(res2.body.find("\"retry_after_ms\":5000") != std::string::npos);
+    CHECK(res2.body.find("\"permission\"") == std::string::npos);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 7. External-review Blocker 3 — engine actions must audit as
 //    principal_class=="engine", not the credential-presentation-only "agent"
 //    that principal_class_of(req) infers for every bearer token.
