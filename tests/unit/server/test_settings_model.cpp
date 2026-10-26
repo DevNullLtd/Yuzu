@@ -18,10 +18,15 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
+#include <string>
 
 #include <yuzu/server/server.hpp>
 
 using namespace yuzu::server;
+
+namespace yuzu::server {
+extern const std::string kYuzuCss; // server/core/static/yuzu.css (build-time embed)
+} // namespace yuzu::server
 namespace sm = yuzu::server::settings_model;
 
 // ── sanitize_url_userinfo ────────────────────────────────────────────────
@@ -462,13 +467,135 @@ TEST_CASE("build_data_retention_settings emits tar:null when no table is availab
     CHECK(j.at("tar").is_null());
 }
 
-TEST_CASE("render_retention_table ignores the tar block (fragment unchanged)",
+namespace {
+bool has(const std::string& h, const std::string& n) {
+    return h.find(n) != std::string::npos;
+}
+std::size_t count_sub(const std::string& h, const std::string& n) {
+    std::size_t c = 0;
+    for (auto p = h.find(n); p != std::string::npos; p = h.find(n, p + n.size()))
+        ++c;
+    return c;
+}
+nlohmann::json tier(const char* src, const char* t, const char* kind, long long limit,
+                    nlohmann::json depth = nullptr) {
+    return {{"source", src}, {"tier", t}, {"limit_kind", kind},
+            {"limit", limit}, {"bucket_seconds", 0}, {"guaranteed_depth_seconds", depth}};
+}
+nlohmann::json retention_with_tar(nlohmann::json tiers, nlohmann::json tick = 900) {
+    Config cfg;
+    auto j = sm::build_data_retention_settings(cfg, {}, nullptr);
+    j["tar"] = {{"tiers", std::move(tiers)}};
+    if (!tick.is_null())
+        j["tar"]["tick_seconds"] = tick;
+    return j;
+}
+} // namespace
+
+TEST_CASE("render_retention_table appends the TAR tier table after the three windows",
           "[settings][settings_model][retention][tar]") {
     Config cfg;
     auto with = sm::build_data_retention_settings(cfg);
     auto without = with;
     without.erase("tar");
-    CHECK(sm::render_retention_table(with) == sm::render_retention_table(without));
+    const auto w = sm::render_retention_table(with);
+    const auto wo = sm::render_retention_table(without);
+    CHECK(w.compare(0, wo.size(), wo) == 0);
+    CHECK_FALSE(has(wo, "TAR capture sources"));
+    for (const char* n : {"<caption>TAR capture sources</caption>", "<th>Exact</th>", "<th>Boot</th>",
+                          "<th>Look again after</th>", ">process<", "100,000 rows", ">1 day<",
+                          ">31 days<", ">12 months<", ">11 months<", "400 rows", "Row count only",
+                          ">7 days<", ">30 days<", "every 900 s", "never pruned", "not per-device"})
+        CHECK(has(w, n));
+    const auto cap = w.find("<caption");
+    REQUIRE(cap != std::string::npos);
+    CHECK_FALSE(has(w.substr(cap), "class=\"pill"));
+}
+
+TEST_CASE("render_retention_table with tar:null renders only the three windows",
+          "[settings][settings_model][retention][tar]") {
+    Config cfg;
+    auto j = sm::build_data_retention_settings(cfg, {}, nullptr);
+    auto absent = j;
+    absent.erase("tar");
+    const auto html = sm::render_retention_table(j);
+    CHECK(html == sm::render_retention_table(absent));
+    CHECK_FALSE(has(html, "tar-tiers"));
+    CHECK_FALSE(has(html, "<caption"));
+}
+
+TEST_CASE("tar_duration_text worked examples", "[settings][settings_model][retention][tar]") {
+    constexpr long long d = 86400;
+    CHECK(sm::tar_duration_text(3 * d) == "3 days");
+    CHECK(sm::tar_duration_text(42 * d) == "6 weeks");
+    CHECK(sm::tar_duration_text(300 * d) == "10 months");
+    CHECK(sm::tar_duration_text(420 * d) == "14 months");
+    CHECK(sm::tar_duration_text(d) == "1 day");
+    CHECK(sm::tar_duration_text(31 * d) == "31 days");
+    CHECK(sm::tar_duration_text(82800) == "23 hours");
+    CHECK(sm::tar_duration_text(3600) == "1 hour");
+    CHECK(sm::tar_duration_text(59) == "Under an hour");
+    CHECK(sm::tar_duration_text(60 * d) == "2 months");
+    CHECK(sm::tar_duration_text(14 * d) == "2 weeks");
+    CHECK(sm::tar_duration_text(13 * d) == "13 days");
+}
+
+TEST_CASE("TAR tier table escapes the source name", "[settings][settings_model][retention][tar]") {
+    const auto html = sm::render_retention_table(retention_with_tar(
+        nlohmann::json::array({tier("<img src=x onerror=alert(1)>&\"'", "hourly", "seconds", 86400, 82800)}),
+        nullptr));
+    CHECK(has(html, "&lt;img src=x onerror=alert(1)&gt;&amp;&quot;"));
+    CHECK_FALSE(has(html, "<img"));
+    CHECK_FALSE(has(html, "every "));
+}
+
+TEST_CASE("TAR tier table tolerates unknown and malformed tiers",
+          "[settings][settings_model][retention][tar]") {
+    auto tiers = nlohmann::json::array({
+        tier("X", "live", "rows", 10),
+        tier("Y", "weekly", "seconds", 86400),
+        tier("X", "daily", "bytes", 5),
+        {{"source", "Z"}, {"tier", "live"}, {"limit_kind", "rows"}},
+        {{"source", 7}, {"tier", "live"}, {"limit_kind", "rows"}, {"limit", 1}},
+        tier("Y", "boot", "rows", 1),
+    });
+    std::string html;
+    REQUIRE_NOTHROW(html = sm::render_retention_table(retention_with_tar(tiers)));
+    // header row + X + Y in the TAR table, after the three-row table's own four
+    const auto tbody = html.substr(html.find("<caption"));
+    CHECK(count_sub(tbody, "<tr>") == 3);
+    CHECK_FALSE(has(tbody, ">Z<"));
+    CHECK(has(tbody, "1 row<"));
+    CHECK(count_sub(tbody, "<td class=\"mono\">") == 2);
+}
+
+TEST_CASE("TAR look-again reads guaranteed depth, not the limit",
+          "[settings][settings_model][retention][tar]") {
+    const auto html = sm::render_retention_table(retention_with_tar(nlohmann::json::array({
+        tier("A", "monthly", "seconds", 31536000, 28857600),
+        tier("B", "live", "rows", 100),
+        tier("C", "live", "rows", 100),
+        tier("C", "daily", "seconds", 2592000, 2592000),
+    })));
+    const auto t = html.substr(html.find("<caption"));
+    CHECK(has(t, "<td class=\"look\">11 months</td>"));
+    CHECK(has(t, "<td>12 months</td>"));
+    CHECK(count_sub(t, "Row count only") == 1);
+    CHECK(has(t, "<td class=\"look\">30 days</td>"));
+}
+
+TEST_CASE("TAR tier css block is tokens only", "[settings][settings_model][retention][tar][css]") {
+    const std::string& css = kYuzuCss;
+    const std::string marker = "/* -- Settings > Data: TAR retention tiers";
+    const auto start = css.find(marker);
+    REQUIRE(start != std::string::npos);
+    CHECK(count_sub(css, marker) == 1);
+    const auto end = css.find("/* -- ", start + marker.size());
+    const std::string block = css.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    for (const char* banned : {"#", "gradient", "url(", "@import"})
+        CHECK_FALSE(has(block.substr(block.find('\n')), banned));
+    CHECK(has(block, ".tar-tiers caption"));
+    CHECK(has(block, "var(--ink)"));
 }
 
 TEST_CASE("render_retention_table: days, no expiry, unknown, and stored-not-in-force",

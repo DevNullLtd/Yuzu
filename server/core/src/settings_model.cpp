@@ -4,7 +4,12 @@
 
 #include "settings_model.hpp"
 
+#include "web_utils.hpp"
+
+#include <algorithm>
+#include <array>
 #include <cctype>
+#include <optional>
 
 #include <spdlog/spdlog.h>
 
@@ -275,6 +280,108 @@ std::string days_text(int n) {
     return std::to_string(n) + (n == 1 ? " day" : " days");
 }
 
+std::string plural(std::int64_t n, const char* unit) {
+    return std::to_string(n) + " " + unit + (n == 1 ? "" : "s");
+}
+
+std::string with_thousands(std::int64_t n) {
+    std::string d = std::to_string(n < 0 ? -n : n);
+    std::string out;
+    for (std::size_t i = 0; i < d.size(); ++i) {
+        if (i != 0 && (d.size() - i) % 3 == 0)
+            out += ',';
+        out += d[i];
+    }
+    return n < 0 ? "-" + out : out;
+}
+
+} // namespace
+
+std::string tar_duration_text(std::int64_t seconds) {
+    constexpr std::int64_t kDay = 86400;
+    if (seconds < 3600)
+        return "Under an hour";
+    if (seconds < kDay)
+        return plural(seconds / 3600, "hour");
+    const std::int64_t days = seconds / kDay;
+    if (days < 14)
+        return plural(days, "day");
+    if (days < 60)
+        return days % 7 == 0 ? plural(days / 7, "week") : plural(days, "day");
+    return plural(days / 30, "month");
+}
+
+namespace {
+
+std::string render_tar_tiers(const nlohmann::json& tar) {
+    struct SourceRow {
+        std::string source;
+        std::array<std::string, 5> cell;
+        std::optional<std::int64_t> depth;
+    };
+    std::vector<SourceRow> rows;
+    const auto tiers = tar.value("tiers", nlohmann::json::array());
+    if (tiers.is_array()) {
+        for (const auto& t : tiers) {
+            if (!t.is_object() || !t.contains("source") || !t.at("source").is_string() ||
+                !t.contains("limit") || !t.at("limit").is_number_integer())
+                continue;
+            const auto src = t.at("source").get<std::string>();
+            auto it = std::find_if(rows.begin(), rows.end(),
+                                   [&](const SourceRow& r) { return r.source == src; });
+            if (it == rows.end()) {
+                rows.push_back({src, {}, std::nullopt});
+                it = rows.end() - 1;
+            }
+            const auto tier = t.value("tier", std::string{});
+            const auto kind = t.value("limit_kind", std::string{});
+            const auto limit = t.at("limit").get<std::int64_t>();
+            int col = -1;
+            if (tier == "live") col = 0;
+            else if (tier == "hourly") col = 1;
+            else if (tier == "daily") col = 2;
+            else if (tier == "monthly") col = 3;
+            else if (tier == "boot") col = 4;
+            if (col >= 0) {
+                if (kind == "rows")
+                    it->cell[static_cast<std::size_t>(col)] = with_thousands(limit) + (limit == 1 ? " row" : " rows");
+                else if (kind == "seconds")
+                    it->cell[static_cast<std::size_t>(col)] = tar_duration_text(limit);
+            }
+            if (kind == "seconds" && t.contains("guaranteed_depth_seconds") &&
+                t.at("guaranteed_depth_seconds").is_number_integer()) {
+                const auto d = t.at("guaranteed_depth_seconds").get<std::int64_t>();
+                it->depth = it->depth ? std::max(*it->depth, d) : d;
+            }
+        }
+    }
+    std::string html =
+        "<div class=\"tw tar-tiers\"><table><caption>TAR capture sources</caption><thead><tr>"
+        "<th>Source</th><th>Exact</th><th>Hourly</th><th>Daily</th><th>Monthly</th><th>Boot</th>"
+        "<th>Look again after</th></tr></thead><tbody>";
+    for (const auto& r : rows) {
+        html += "<tr><td class=\"mono\">" + html_escape(r.source) + "</td>";
+        for (const auto& c : r.cell)
+            html += "<td>" + c + "</td>";
+        html += "<td class=\"look\">";
+        html += r.depth ? tar_duration_text(*r.depth) : "<span class=\"hint\">Row count only</span>";
+        html += "</td></tr>";
+    }
+    html += "</tbody></table></div>"
+            "<p class=\"hint\" style=\"padding:12px 16px 14px\">Look again after is how long a record "
+            "is guaranteed to stay in this source's history, measured on the agent's clock. Roll-up "
+            "rows age from the start of their bucket, so the monthly figure is a 31-day worst-case "
+            "floor. ";
+    const auto tick = tar.value("tick_seconds", 0);
+    if (tick > 0)
+        html += "Old rows are pruned every " + std::to_string(tick) +
+                " s, so a row can outlive its window by one tick. ";
+    html += "A paused or errored source is never pruned. An agent offline past a tier's catch-up "
+            "window leaves a gap in that tier, not a deeper tier. These are this release's agent "
+            "defaults, not per-device readings.</p>";
+    return html;
+}
+
 } // namespace
 
 std::string render_retention_table(const nlohmann::json& v) {
@@ -321,6 +428,8 @@ std::string render_retention_table(const nlohmann::json& v) {
             "written after the change; existing rows keep the window they were written with. Audit "
             "entries are removed at most 25,000 per cleanup pass, so the audit window is a minimum."
             "</p>";
+    if (v.contains("tar") && v.at("tar").is_object())
+        html += render_tar_tiers(v.at("tar"));
     return html;
 }
 
