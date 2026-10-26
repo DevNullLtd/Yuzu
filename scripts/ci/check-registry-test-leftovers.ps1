@@ -17,8 +17,9 @@
   It REPORTS and never deletes: a leftover can be a registry link, and every tree delete follows links (the plugin's
   own rule), so removal is left to a human.
 
-  Run by .github/workflows/ci.yml twice per Windows job: after the suite step with the job's own scope, and before it
-  in a self-test that plants a probe key and proves both decisions (exit 1 naming the key, exit 0 with a warning).
+  Run by .github/workflows/ci.yml three times per Windows job: twice before the suite in a self-test that plants a probe
+  key under each scanned root and proves both decisions (exit 1 naming the keys, exit 0 with a warning), then once
+  after the suite step with the job's own scope.
   Keep this file ASCII only (Windows PowerShell 5.1 misreads BOM-less UTF-8).
 
 .PARAMETER Scope

@@ -2034,24 +2034,42 @@ jobs:
         run: |
           $scope = $env:YUZU_TEST_REGISTRY_SCOPE
           $script = './scripts/ci/check-registry-test-leftovers.ps1'
-          $probe = "YuzuTest-selftest-$scope-probe"
-          $probePath = "HKCU:\Software\$probe"
-          function Arm($s, $want, $pat, $name) {
+          # one probe under EACH root the script scans, so dropping a root from it turns this step red
+          $probes = [ordered]@{
+            'HKCU:\Software' = "YuzuTest-selftest-$scope-probe-hkcu"
+            'HKLM:\SOFTWARE' = "YuzuTest-selftest-$scope-probe-hklm"
+            'HKLM:\SOFTWARE\Wow6432Node' = "YuzuTest-selftest-$scope-probe-wow"
+          }
+          function Arm($s, $want, $kind, $name) {
             $out = & pwsh -NoProfile -NonInteractive -File $script -Scope $s 2>&1 | Out-String
             $rc = $LASTEXITCODE
             Write-Host ($out -replace '::(error|warning)::', 'child $1: ')
-            if ($rc -ne $want -or $out -notmatch $pat) {
-              throw "registry leftover check self-test, $name arm: expected exit $want naming $probe, got exit $rc"
+            if ($rc -ne $want) {
+              throw "registry leftover check self-test, $name arm: expected exit $want, got exit $rc"
+            }
+            foreach ($p in $probes.Values) {
+              if ($out -notmatch ($kind + '.*' + [regex]::Escape($p))) {
+                throw "registry leftover check self-test, $name arm: expected exit $want naming $p, got exit $rc"
+              }
             }
           }
-          New-Item -Path $probePath -Force | Out-Null
           try {
-            Arm "selftest-$scope" 1 ('::error::leftover registry key .*' + [regex]::Escape($probe)) 'own-scope'
-            Arm $scope 0 ('::warning::.*' + [regex]::Escape($probe)) 'other-scope'
+            foreach ($root in $probes.Keys) { New-Item -Path (Join-Path $root $probes[$root]) -Force | Out-Null }
+            Arm "selftest-$scope" 1 '::error::leftover registry key ' 'own-scope'
+            Arm $scope 0 '::warning::' 'other-scope'
+            foreach ($root in $probes.Keys) {
+              if (-not (Test-Path -LiteralPath (Join-Path $root $probes[$root]))) {
+                throw "registry leftover check self-test: the check removed its probe under $root"
+              }
+            }
           } finally {
-            Remove-Item -LiteralPath $probePath
+            foreach ($root in $probes.Keys) {
+              $path = Join-Path $root $probes[$root]
+              if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }
+            }
           }
           Write-Host 'registry leftover check self-test: both decisions hold'
+          exit 0
 
       # Windows CI test-phase restructuring (#3443, 2026-08-28): mirrors the
       # Linux job's non-pg/pg-shards/pg-smoke split — see docs/ci-architecture.md

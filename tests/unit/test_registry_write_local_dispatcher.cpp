@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 
+#include "scoped_env.hpp"
 #include "test_helpers.hpp"
 
 #ifdef _WIN32
@@ -993,4 +994,18 @@ TEST_CASE("registry_scratch_prefix puts the CI scope between the fixed stem and 
     CHECK(yuzu::test::registry_scratch_prefix("") == bare); // an empty scope is no scope
     // the shape CI sets: <run id>-<attempt>-<build type>
     CHECK(yuzu::test::registry_scratch_prefix("123-2-debug") == stem + "-123-2-debug-");
+}
+
+// The zero-argument call is what every fixture makes: the CI job scope reaches the key names only through the
+// environment variable, so a rename of either end must turn this red.
+TEST_CASE("registry_scratch_prefix reads the scope from YUZU_TEST_REGISTRY_SCOPE", "[registry][scratch]") {
+    const std::string stem{"YuzuTest"};
+    {
+        yuzu::test::ScopedEnv scope{"YUZU_TEST_REGISTRY_SCOPE", "123-2-debug"};
+        CHECK(yuzu::test::registry_scratch_prefix() == stem + "-123-2-debug-");
+    }
+    {
+        yuzu::test::ScopedEnv scope{"YUZU_TEST_REGISTRY_SCOPE", yuzu::test::unset_tag{}};
+        CHECK(yuzu::test::registry_scratch_prefix() == stem + "-");
+    }
 }
