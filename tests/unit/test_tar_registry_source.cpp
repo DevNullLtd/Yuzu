@@ -155,7 +155,7 @@ TEST_CASE("default_registry_scope: curated roots; per-user roots skip non-profil
 }
 
 TEST_CASE("is_user_hive_name accepts SID-named hives only", "[tar][registry][pure]") {
-    CHECK(is_user_hive_name("S-1-5-21-1004336348-1177238915-682003330-1000"));
+    CHECK(is_user_hive_name("S-1-5-21-1111111111-2222222222-3333333333"));
     CHECK(is_user_hive_name("S-1-5-18"));
     // Not user profiles: the default hive, the classes hives, and the temporary mounts
     // (agents/shared/win_reg_handle.hpp) sibling plugins load for a logged-out profile and
