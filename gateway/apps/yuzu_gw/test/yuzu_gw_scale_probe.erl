@@ -18,6 +18,9 @@
 
 -export([start/1, stop/0, report/0, reset_hwm/0, sched_mark/0, sched_report/0,
          memory/0, mailboxes/0, singletons/0, footprint/1]).
+%% Idle memory per connection (the idle_memory case of yuzu_gw_scale_SUITE).
+-export([idle_sample/1, os_memory/0, socket_memory/1, roles/1, top_ets/1,
+         heartbeat_buffer/0, gc_all/0]).
 %% Crash and supervisor reports logged in this node (planned_stop counts them).
 -export([count_crash_reports/0, crash_reports/0]).
 %% Kill agent owner processes (owner_kill, OWNER-RESTART #5695).
@@ -210,11 +213,7 @@ footprint(K) ->
 
 footprint_one(Id) ->
     try
-        {ok, Agent} = yuzu_gw_registry:lookup(Id),
-        {_State, Data} = sys:get_state(Agent, 5000),
-        Stream = element(4, Data),          %% #data.stream_pid
-        {links, Links} = process_info(Stream, links),
-        [Conn | _] = [P || P <- Links, is_pid(P), P =/= Agent],
+        {ok, #{agent := Agent, stream := Stream, conn := Conn}} = agent_processes(Id),
         Before = [mem(P) || P <- [Agent, Stream, Conn]],
         [garbage_collect(P) || P <- [Agent, Stream, Conn]],
         [AG, SG, CG] = [mem(P) || P <- [Agent, Stream, Conn]],
@@ -226,6 +225,327 @@ footprint_one(Id) ->
 mem(Pid) ->
     {memory, M} = process_info(Pid, memory),
     M.
+
+%% The long-lived processes one registered agent costs, by role: its
+%% yuzu_gw_agent owner, the Subscribe handler (relay) that runs its stream, the
+%% Cowboy HTTP/2 connection process and, on a TLS listener, OTP ssl's three
+%% (the connection's dynamic supervisor, the receiver, which owns the TCP
+%% socket and the connection state, and the sender). The ssl ones are found
+%% from the socket the Cowboy process holds (an #sslsocket{} names the
+%% receiver and the sender) and the receiver's parent.
+-spec agent_processes(binary()) -> {ok, #{atom() => pid()}} | error.
+agent_processes(Id) ->
+    try
+        {ok, Agent} = yuzu_gw_registry:lookup(Id),
+        {_State, Data} = sys:get_state(Agent, 5000),
+        Stream = element(4, Data),          %% #data.stream_pid
+        {links, Links} = process_info(Stream, links),
+        [Conn | _] = [P || P <- Links, is_pid(P), P =/= Agent],
+        Base = #{agent => Agent, stream => Stream, conn => Conn},
+        {ok, maps:merge(Base, ssl_processes(Conn))}
+    catch _:_ -> error
+    end.
+
+ssl_processes(Conn) ->
+    try sys:get_state(Conn, 5000) of
+        State ->
+            case find_sslsocket(State, 3) of
+                {ok, Sock} ->
+                    Pids = lists:usort([P || P <- deep_pids(Sock), P =/= Conn]),
+                    ssl_roles(Pids);
+                error -> #{}
+            end
+    catch _:_ -> #{}
+    end.
+
+%% The #sslsocket{} in a Cowboy connection's sys state (which may be wrapped,
+%% e.g. {State, Buffer}), at most Depth tuples down.
+find_sslsocket(T, _) when is_tuple(T), tuple_size(T) > 0, element(1, T) =:= sslsocket ->
+    {ok, T};
+find_sslsocket(T, D) when is_tuple(T), D > 0 ->
+    first_ok([find_sslsocket(E, D - 1) || E <- tuple_to_list(T), is_tuple(E)]);
+find_sslsocket(_, _) -> error.
+
+first_ok([{ok, _} = Ok | _]) -> Ok;
+first_ok([_ | T]) -> first_ok(T);
+first_ok([]) -> error.
+
+%% Of the pids an #sslsocket{} holds, the receiver is the one whose initial
+%% call is the ssl connection state machine; the sender is tls_sender; the
+%% receiver's parent ('$ancestors') is the per-connection supervisor.
+ssl_roles(Pids) ->
+    Named = [{role_of(P), P} || P <- Pids],
+    Recv = proplists:get_value(ssl_receiver, Named),
+    Sup = case Recv of
+              undefined -> undefined;
+              _ -> parent(Recv)
+          end,
+    maps:from_list([{R, P} || {R, P} <- [{ssl_sup, Sup} | Named], is_pid(P), R =/= other]).
+
+role_of(P) ->
+    case catch proc_lib:translate_initial_call(P) of
+        {tls_sender, _, _} -> ssl_sender;
+        {M, _, _} when M =:= tls_connection; M =:= tls_server_connection;
+                       M =:= tls_gen_connection; M =:= ssl_gen_statem;
+                       M =:= tls_client_connection -> ssl_receiver;
+        _ -> other
+    end.
+
+parent(P) ->
+    case process_info(P, dictionary) of
+        {dictionary, D} ->
+            case proplists:get_value('$ancestors', D) of
+                [Parent | _] when is_pid(Parent) -> Parent;
+                _ -> undefined
+            end;
+        _ -> undefined
+    end.
+
+deep_pids(P) when is_pid(P) -> [P];
+deep_pids(T) when is_tuple(T) -> deep_pids(tuple_to_list(T));
+deep_pids(L) when is_list(L) -> lists:append([deep_pids(E) || E <- L]);
+deep_pids(_) -> [].
+
+%% @doc Per role (see agent_processes/1), the average over up to K registered
+%% agents of: `memory' (process_info, heap + stack + mailbox + process
+%% struct), the refc binary bytes it references (off-heap, so NOT in
+%% `memory', and counted in erlang:memory(binary)) shared out by reference
+%% count, and the same two after a garbage collection of that process. Also
+%% the role's process count per agent. The garbage collection changes the
+%% sampled processes, so run it after the natural samples.
+-spec roles(pos_integer()) -> map().
+roles(K) ->
+    Ids = lists:sublist(yuzu_gw_registry:all_agents(), K),
+    Sets = [S || Id <- Ids, {ok, S} <- [agent_processes(Id)]],
+    Measure = fun(P) -> #{memory => mem0(P), refc_binary => refc_bytes(P),
+                         total_heap_words => heap_words(P)} end,
+    Before = [maps:map(fun(_R, P) -> Measure(P) end, S) || S <- Sets],
+    [[catch garbage_collect(P) || P <- maps:values(S)] || S <- Sets],
+    After = [maps:map(fun(_R, P) -> Measure(P) end, S) || S <- Sets],
+    Roles = lists:usort(lists:append([maps:keys(S) || S <- Sets])),
+    Avg = fun(Rows, R, Key) ->
+                  Vs = [maps:get(Key, maps:get(R, Row)) || Row <- Rows, is_map_key(R, Row)],
+                  case Vs of [] -> 0; _ -> lists:sum(Vs) div length(Vs) end
+          end,
+    PerRole = maps:from_list(
+                [{R, #{present_in => length([1 || S <- Sets, is_map_key(R, S)]),
+                       memory => Avg(Before, R, memory),
+                       refc_binary => Avg(Before, R, refc_binary),
+                       memory_after_gc => Avg(After, R, memory),
+                       refc_binary_after_gc => Avg(After, R, refc_binary)}}
+                 || R <- Roles]),
+    Sum = fun(Key) -> lists:sum([maps:get(Key, V) || V <- maps:values(PerRole)]) end,
+    #{sampled => length(Sets), roles => PerRole,
+      processes_per_agent => length(Roles),
+      total => #{memory => Sum(memory), refc_binary => Sum(refc_binary),
+                 memory_after_gc => Sum(memory_after_gc),
+                 refc_binary_after_gc => Sum(refc_binary_after_gc)}}.
+
+mem0(P) ->
+    case process_info(P, memory) of {memory, M} -> M; undefined -> 0 end.
+
+heap_words(P) ->
+    case process_info(P, total_heap_size) of {total_heap_size, W} -> W; undefined -> 0 end.
+
+refc_bytes(P) ->
+    case process_info(P, binary) of
+        {binary, Bins} -> lists:sum([Size div max(1, Refs) || {_, Size, Refs} <- Bins]);
+        undefined -> 0
+    end.
+
+%% @doc One idle-memory sample of this node: erlang:memory/0 by category,
+%% process and port counts, the OS view of this process (os_memory/0), the
+%% kernel socket memory of the given listener ports (socket_memory/1), and
+%% the heartbeat buffer's size (heartbeat_buffer/0).
+-spec idle_sample([inet:port_number()]) -> map().
+idle_sample(Ports) ->
+    #{beam => maps:from_list(erlang:memory()),
+      process_count => erlang:system_info(process_count),
+      port_count => erlang:system_info(port_count),
+      os => os_memory(),
+      sockets => socket_memory(Ports),
+      heartbeat_buffer => heartbeat_buffer(),
+      ms => erlang:system_time(millisecond)}.
+
+%% @doc This OS process's memory as the OS sees it, in bytes.
+%% Linux: /proc/self/smaps_rollup (rss, pss, anonymous = the private and shared
+%% anonymous pages, which is the budget's "OS anon") and /proc/self/status
+%% (RssAnon, RssFile, VmHWM). macOS: `ps' RSS and `footprint' (the physical
+%% footprint: dirty anonymous plus compressed pages, the nearest macOS has to
+%% Linux's anonymous RSS). Elsewhere, or when a read fails: what was read.
+-spec os_memory() -> map().
+os_memory() ->
+    case os:type() of
+        {unix, linux} -> linux_memory();
+        {unix, darwin} -> darwin_memory();
+        _ -> #{source => none}
+    end.
+
+linux_memory() ->
+    Rollup = kv_kb("/proc/self/smaps_rollup",
+                   [{"Rss", rss}, {"Pss", pss}, {"Anonymous", anon}, {"Pss_Anon", pss_anon},
+                    {"Private_Dirty", private_dirty}, {"Swap", swap}]),
+    Status = kv_kb("/proc/self/status",
+                   [{"VmRSS", vm_rss}, {"RssAnon", rss_anon}, {"RssFile", rss_file},
+                    {"VmHWM", vm_hwm}, {"VmSize", vm_size}]),
+    maps:merge(Status, Rollup#{source => smaps_rollup}).
+
+%% "Key:   1234 kB" lines; values in bytes.
+kv_kb(File, Keys) ->
+    case file:read_file(File) of
+        {ok, Bin} ->
+            Lines = binary:split(Bin, <<"\n">>, [global]),
+            maps:from_list(
+              [{Out, Kb * 1024}
+               || L <- Lines,
+                  [K, V] <- [binary:split(L, <<":">>)],
+                  {In, Out} <- Keys, K =:= list_to_binary(In),
+                  {Kb, _} <- [string:to_integer(string:trim(binary_to_list(V)))],
+                  is_integer(Kb)]);
+        {error, _} -> #{}
+    end.
+
+darwin_memory() ->
+    Pid = os:getpid(),
+    Rss = case string:to_integer(string:trim(os:cmd("ps -o rss= -p " ++ Pid))) of
+              {Kb, _} when is_integer(Kb) -> #{rss => Kb * 1024};
+              _ -> #{}
+          end,
+    %% "name [pid]: 64-bit    Footprint: 1648 KB (16384 bytes per page)"
+    Fp = case re:run(os:cmd("footprint " ++ Pid ++ " 2>/dev/null"),
+                     "Footprint: ([0-9.]+) (B|KB|MB|GB)", [{capture, all_but_first, list}]) of
+             {match, [N, U]} -> #{phys_footprint => scale(N, U)};
+             nomatch -> #{}
+         end,
+    maps:merge(Rss, Fp#{source => ps_footprint}).
+
+scale(N, U) ->
+    V = case string:to_float(N) of
+            {F, []} -> F;
+            _ -> float(list_to_integer(N))
+        end,
+    Mul = case U of "B" -> 1; "KB" -> 1024; "MB" -> 1024 * 1024; "GB" -> 1024 * 1024 * 1024 end,
+    round(V * Mul).
+
+%% @doc Kernel memory of the TCP sockets on these local ports (the gateway's
+%% agent listeners), outside the process and outside the budget, reported so a
+%% regression there is still seen. Linux: `ss -tmn' per socket, summed:
+%% `allocated' is r + t + f + w + o + bl + d (receive and send queues, forward
+%% alloc, write queue, option memory, backlog, drops), `queued' is r + t,
+%% `limits' rb + tb (the buffer sizes autotuned). Also the host-wide TCP
+%% memory from /proc/net/sockstat (every socket on the host, the load
+%% generator's included). macOS: `netstat' receive and send queue bytes only
+%% (no allocation figures).
+-spec socket_memory([inet:port_number()]) -> map().
+socket_memory([]) -> #{};
+socket_memory(Ports) ->
+    case os:type() of
+        {unix, linux} -> linux_sockets(Ports);
+        {unix, darwin} -> darwin_sockets(Ports);
+        _ -> #{source => none}
+    end.
+
+linux_sockets(Ports) ->
+    Filter = string:join(["sport = :" ++ integer_to_list(P) || P <- Ports], " or "),
+    Out = os:cmd(ss_path() ++ " -tmnH state established '( " ++ Filter ++ " )' 2>/dev/null"),
+    Mems = [parse_skmem(M) || {match, [M]} <- [re:run(L, "skmem:\\(([^)]*)\\)",
+                                                     [{capture, all_but_first, list}])
+                                              || L <- string:split(Out, "\n", all)]],
+    Sum = fun(Keys) -> lists:sum([maps:get(K, M, 0) || M <- Mems, K <- Keys]) end,
+    Host = case file:read_file("/proc/net/sockstat") of
+               {ok, B} ->
+                   case re:run(B, "TCP: .* mem ([0-9]+)", [{capture, all_but_first, list}]) of
+                       {match, [Pages]} -> list_to_integer(Pages) * 4096;
+                       nomatch -> null
+                   end;
+               _ -> null
+           end,
+    #{source => ss, sockets => length(Mems),
+      allocated => Sum([r, t, f, w, o, bl, d]), queued => Sum([r, t]),
+      limits => Sum([rb, tb]), host_tcp_mem => Host}.
+
+%% ss lives in /usr/sbin on most distributions, which a non-root PATH (the
+%% node's, via os:cmd) often lacks.
+ss_path() ->
+    case [P || P <- ["/usr/sbin/ss", "/sbin/ss", "/usr/bin/ss", "/bin/ss"], filelib:is_regular(P)] of
+        [P | _] -> P;
+        [] -> case os:find_executable("ss") of false -> "ss"; P -> P end
+    end.
+
+%% "r0,rb131072,t0,tb87040,f0,w0,o0,bl0,d0"
+parse_skmem(S) ->
+    maps:from_list(
+      [{list_to_atom(K), list_to_integer(V)}
+       || Item <- string:split(S, ",", all),
+          {match, [K, V]} <- [re:run(Item, "^([a-z]+)([0-9]+)$", [{capture, all_but_first, list}])]]).
+
+darwin_sockets(Ports) ->
+    Out = os:cmd("netstat -an -p tcp 2>/dev/null"),
+    Suffixes = ["." ++ integer_to_list(P) || P <- Ports],
+    Rows = [{list_to_integer(R), list_to_integer(S)}
+            || L <- string:split(Out, "\n", all),
+               [_Proto, R, S, Local, _Remote, "ESTABLISHED" | _] <- [string:lexemes(L, " ")],
+               lists:any(fun(Sfx) -> lists:suffix(Sfx, Local) end, Suffixes)],
+    #{source => netstat, sockets => length(Rows),
+      queued => lists:sum([R + S || {R, S} <- Rows])}.
+
+%% @doc The K largest ETS tables of the node by memory: name (or id), rows,
+%% bytes.
+-spec top_ets(pos_integer()) -> [map()].
+top_ets(K) ->
+    W = erlang:system_info(wordsize),
+    Rows = [#{name => ets_name(T), size => S, bytes => M * W}
+            || T <- ets:all(),
+               [S, M] <- [[ets:info(T, size), ets:info(T, memory)]],
+               is_integer(S), is_integer(M)],
+    lists:sublist(lists:sort(fun(#{bytes := A}, #{bytes := B}) -> A >= B end, Rows), K).
+
+ets_name(T) ->
+    case ets:info(T, name) of
+        N when is_atom(N) -> N;
+        _ -> undefined
+    end.
+
+%% @doc The heartbeat buffer's size and what it dropped, by reason (the
+%% buffer's own format_status/1 view; the drops from its Prometheus counter).
+-spec heartbeat_buffer() -> map().
+heartbeat_buffer() ->
+    State = try sys:get_status(yuzu_gw_heartbeat_buffer, 5000) of
+                Status -> find_map_with(buf_bytes, Status)
+            catch _:_ -> #{}
+            end,
+    Drops = maps:from_list(
+              [{R, V} || R <- [buffer_full, snapshot_oversize, snapshot_evicted,
+                               heartbeat_oversize, heartbeat_invalid, chunk_rejected],
+                         V <- [catch prometheus_counter:value(
+                                       yuzu_gw_heartbeat_buffer_dropped_total, [R])],
+                         is_number(V)]),
+    maps:merge(maps:with([sessions, snapshots, buf_bytes, max_bytes], State),
+               #{dropped => Drops,
+                 process_memory => case whereis(yuzu_gw_heartbeat_buffer) of
+                                       undefined -> 0;
+                                       P -> mem0(P)
+                                   end}).
+
+find_map_with(Key, M) when is_map(M) ->
+    case is_map_key(Key, M) of
+        true -> M;
+        false -> find_map_with(Key, maps:values(M))
+    end;
+find_map_with(Key, T) when is_tuple(T) -> find_map_with(Key, tuple_to_list(T));
+find_map_with(Key, [H | T]) ->
+    case find_map_with(Key, H) of
+        #{} = M when map_size(M) > 0 -> M;
+        _ -> find_map_with(Key, T)
+    end;
+find_map_with(_Key, _) -> #{}.
+
+%% @doc Garbage-collect every process of the node (a diagnostic: what the
+%% steady state holds that a collection would free).
+-spec gc_all() -> ok.
+gc_all() ->
+    [garbage_collect(P) || P <- processes()],
+    ok.
 
 call(Msg) ->
     Pid = whereis(?NAME),

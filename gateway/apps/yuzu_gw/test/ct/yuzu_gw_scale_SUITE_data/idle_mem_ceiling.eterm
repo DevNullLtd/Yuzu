@@ -1,0 +1,23 @@
+%% idle_memory ceilings (see yuzu_gw_scale_SUITE:idle_ceiling_check/2 and
+%% docs/testing/gateway-scale-tests.md, "The ceiling (ratchet)").
+%%
+%% {{Os, Transport}, #{min_n => N, per_conn => #{Metric => Bytes}}}: checked
+%% against the largest point of a run when that point has at least min_n
+%% connections, on the named os:type() family. Metric is a key of the run's
+%% per_conn map (bytes per connection, (M(N) - M(0)) / N).
+%%
+%% These values may only go DOWN. A change that lowers the measured cost
+%% lowers the ceiling in the same commit; raising one is a reviewed decision,
+%% never a fix for a failing run.
+%%
+%% Source: run 20261026T172533-6I6BU, rocky9 VM (EL9, kernel 5.14, x86_64,
+%% 16 schedulers), OTP 28.4.2, default settings (150000 B snapshot on every
+%% 30 s heartbeat, 97 status tags), N = 10000, every point steady. Measured
+%% per connection: TLS beam_total 845531, os_anon 923816; plain beam_total
+%% 441183, os_anon 576255. Ceilings are those plus 15% headroom, rounded up to
+%% 1000 B. The headroom is a guess until run-to-run variance is measured on
+%% the CI host (one earlier, shorter-settle run read TLS beam_total 707 KiB).
+%% The goal these ratchet towards is 8 KiB.
+{ceilings,
+ [{{linux, tls},   #{min_n => 10000, per_conn => #{beam_total => 973000, os_anon => 1063000}}},
+  {{linux, plain}, #{min_n => 10000, per_conn => #{beam_total => 508000, os_anon => 663000}}}]}.

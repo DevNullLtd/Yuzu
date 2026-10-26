@@ -15,7 +15,17 @@
 %%%      SUCCESS after a random delay in reply_delay_ms;
 %%%   3. Heartbeat (unary) every hb_interval_ms on the same connection, the first
 %%%      at a random offset; a NOT_FOUND answer (the gateway no longer knows the
-%%%      session) makes it register again, as the C++ agent does.
+%%%      session) makes it register again, as the C++ agent does. The request
+%%%      carries sent_at, the `hb_tags' status tags and, on every
+%%%      `hb_snapshot_every'-th heartbeat, the `hb_snapshot' fleet snapshot
+%%%      (agents/core/src/agent.cpp attaches the snapshot its 30 s pump produced
+%%%      since the last heartbeat; with both at 30 s that is about every one).
+%%%      With neither set it is session_id and sent_at only.
+%%%
+%%% The connection is plaintext unless `tls' is set, then TLS over the same gun
+%%% HTTP/2 connection (ALPN h2), verifying the gateway's certificate against
+%%% the given CA and, when the map names a certfile, presenting a client
+%%% certificate (the agent edge moved to mutual TLS).
 %%%
 %%% Retries follow agents/core/src/agent.cpp: after a failed Register, a lost
 %%% connection or an ended Subscribe the agent waits 2^n seconds (n = failures
@@ -82,7 +92,7 @@
 -define(F_DISC, 10).
 
 -record(a, {id, idx, req, conn, mref, session, sub, buf = <<>>, hb, hb_timer,
-            failures = 0, attempt = 0, gen = 0}).
+            failures = 0, attempt = 0, gen = 0, beats = 0}).
 
 %%--------------------------------------------------------------------
 %% Control API
@@ -98,6 +108,11 @@
 %%   backoff_unit_ms the length of one backoff "second" (1000 = the agent's)
 %%   register_timeout_ms  the Register deadline (30000 = the agent's)
 %%   reconnect       whether an agent reconnects after losing its session
+%%   tls             false (plaintext) or #{cacertfile, server_name} plus, for
+%%                   a client certificate, certfile and keyfile
+%%   hb_tags         the heartbeat's status_tags (map, default none)
+%%   hb_snapshot     the fleet_snapshot_json bytes (default none)
+%%   hb_snapshot_every  attach the snapshot to every Nth heartbeat (default 1)
 -spec start(map()) -> ok.
 start(Cfg) ->
     {ok, _} = application:ensure_all_started(gun),
@@ -207,7 +222,9 @@ init(Cfg) ->
                                            connections_lost, subscribe_ended]]),
     set_config(maps:merge(#{hb_interval_ms => 0, reply_delay_ms => {0, 0}, output_bytes => 1024,
                             backoff_unit_ms => 1000, register_timeout_ms => 30000,
-                            reconnect => true, prefix => <<"scale">>}, Cfg)),
+                            reconnect => true, prefix => <<"scale">>, tls => false,
+                            hb_tags => #{}, hb_snapshot => <<>>, hb_snapshot_every => 1},
+                          Cfg)),
     {ok, #{}}.
 
 handle_call({spawn, #{from := From, count := Count, mode := Mode}}, _From, S) ->
@@ -284,10 +301,7 @@ connect(#a{idx = Idx} = A) ->
     {Ip, Port} = lists:nth(1 + (Idx rem length(Targets)), Targets),
     Inet = case tuple_size(Ip) of 8 -> [inet6]; _ -> [] end,
     ConnectStart = attempt_start(),
-    {ok, Conn} = gun:open(Ip, Port, #{protocols => [http2], retry => 0,
-                                      connect_timeout => 10000,
-                                      tcp_opts => [{linger, {true, 0}}, {nodelay, true} | Inet],
-                                      http2_opts => #{keepalive => infinity}}),
+    {ok, Conn} = gun:open(Ip, Port, transport_opts(cfg(tls), Inet)),
     MRef = monitor(process, Conn),
     case gun:await_up(Conn, 15000, MRef) of
         {ok, http2} ->
@@ -366,12 +380,13 @@ live(#a{conn = Conn, mref = MRef, sub = Sub, hb = Hb, gen = Gen} = A) ->
         {reply, _OldGen, _CmdId} ->
             live(A);
         {heartbeat, Gen} ->
+            Beat = A#a.beats + 1,
             Ref = gun:post(Conn, ?HEARTBEAT, grpc_headers(10000),
                            yuzu_grpc_frame:encode(
-                             agent_pb:encode_msg(#{session_id => A#a.session},
+                             agent_pb:encode_msg(heartbeat_request(A#a.session, Beat),
                                                  'yuzu.agent.v1.HeartbeatRequest'))),
             bump(heartbeats_sent),
-            live(arm_heartbeat(A#a{hb = {Ref, <<>>}}, next));
+            live(arm_heartbeat(A#a{hb = {Ref, <<>>}, beats = Beat}, next));
         {heartbeat, _OldGen} ->
             live(A);
         {gun_response, Conn, HbRef, fin, _Status, Headers} when element(1, Hb) =:= HbRef ->
@@ -467,6 +482,43 @@ arm_heartbeat(A, When) ->
             Delay = case When of first -> rand:uniform(Hb); next -> Hb end,
             A#a{hb_timer = erlang:send_after(Delay, self(), {heartbeat, A#a.gen})}
     end.
+
+%% The agent's HeartbeatRequest: the session, sent_at, the status tags and,
+%% on every hb_snapshot_every-th beat, the fleet snapshot. Tags and snapshot
+%% are left out when the run does not set them (session_id and sent_at only).
+heartbeat_request(Session, Beat) ->
+    Base = #{session_id => Session,
+             sent_at => #{millis_epoch => erlang:system_time(millisecond)}},
+    Tags = cfg(hb_tags),
+    WithTags = case map_size(Tags) of
+                   0 -> Base;
+                   _ -> Base#{status_tags => Tags}
+               end,
+    case {cfg(hb_snapshot), Beat rem cfg(hb_snapshot_every)} of
+        {<<>>, _} -> WithTags;
+        {Snap, 0} -> WithTags#{fleet_snapshot_json => Snap};
+        {_, _} -> WithTags
+    end.
+
+%% gun's options for an agent connection: plaintext, or TLS verifying the
+%% gateway against the run's CA (and presenting a client certificate when the
+%% map has one). The agent's TLS stack offers TLS 1.3 and 1.2; the gateway's
+%% agent listener allows 1.2 only (yuzu_grpc_listener:ssl_opts/1).
+transport_opts(false, Inet) ->
+    #{protocols => [http2], retry => 0, connect_timeout => 10000,
+      tcp_opts => [{linger, {true, 0}}, {nodelay, true} | Inet],
+      http2_opts => #{keepalive => infinity}};
+transport_opts(#{cacertfile := Ca, server_name := Sni} = Tls, Inet) ->
+    Client = case Tls of
+                 #{certfile := C, keyfile := K} -> [{certfile, C}, {keyfile, K}];
+                 _ -> []
+             end,
+    #{protocols => [http2], retry => 0, connect_timeout => 10000, transport => tls,
+      tls_handshake_timeout => 30000,
+      tls_opts => [{verify, verify_peer}, {cacertfile, Ca}, {server_name_indication, Sni},
+                   {versions, ['tlsv1.3', 'tlsv1.2']}, {reuse_sessions, false},
+                   {linger, {true, 0}}, {nodelay, true} | Client ++ Inet],
+      http2_opts => #{keepalive => infinity}}.
 
 cancel_heartbeat(#a{hb_timer = undefined}) -> ok;
 cancel_heartbeat(#a{hb_timer = T}) -> erlang:cancel_timer(T), ok.

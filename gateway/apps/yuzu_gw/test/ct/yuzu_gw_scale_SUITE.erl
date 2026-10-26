@@ -94,14 +94,28 @@
 %%% YUZU_GW_SCALE_OUTPUT_BYTES (2048), YUZU_GW_SCALE_HB_MS (30000),
 %%% YUZU_GW_SCALE_BUDGET_MS (60000 + 10 ms per agent), YUZU_GW_SCALE_RESULTS_DIR.
 %%%
+%%% idle_memory (on demand, NOT in all/0, so neither the default run nor CI
+%%% runs it): the bytes one idle agent connection costs the gateway. For each
+%%% transport (TLS with the shipped agent-listener options, plaintext, or
+%%% mutual TLS) and each N of a sweep, N agents register (69-plugin request),
+%%% hold Subscribe open and heartbeat at the agent's cadence with its status
+%%% tags and a fleet snapshot; after a settle period the gateway is sampled
+%%% until its memory is steady (erlang:memory/0 by category, process count, OS
+%%% RSS and anonymous memory, kernel socket memory) and the marginal cost per
+%%% connection is
+%%% (M(N) - M(0)) / N. See docs/testing/gateway-scale-tests.md, "Idle memory
+%%% per connection", and scripts/test/gateway-idle-mem.sh.
+%%%
 %%% Run:
 %%%   rebar3 ct --dir apps/yuzu_gw/test/ct --suite yuzu_gw_scale_SUITE
 %%%   YUZU_GW_SCALE_AGENTS=5000 rebar3 ct --dir apps/yuzu_gw/test/ct --suite yuzu_gw_scale_SUITE --case storm
+%%%   rebar3 ct --dir apps/yuzu_gw/test/ct --suite yuzu_gw_scale_SUITE --case idle_memory
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_scale_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
+-include_lib("public_key/include/public_key.hrl").
 
 -compile([export_all, nowarn_export_all]).
 
@@ -188,6 +202,10 @@ end_per_group(_Group, Config) ->
     ct:pal("Gateway scale run summary: ~s", [Out]),
     ok.
 
+init_per_testcase(idle_memory, Config) ->
+    %% The case starts and stops its own nodes, once per transport.
+    [{tag, ?config(run, Config) ++ "-idle_memory"}, {log_dir, ?config(priv_dir, Config)}
+     | Config];
 init_per_testcase(Case, Config) ->
     N = ?config(n, Config),
     Tag = ?config(run, Config) ++ "-" ++ atom_to_list(Case),
@@ -667,6 +685,565 @@ unacknowledged(Config) ->
     finish(unacknowledged, Config, R).
 
 %% The breaker's transitions so far, read from the gateway's own counter.
+%%%===================================================================
+%%% Idle memory per connection (on demand; not in all/0)
+%%%===================================================================
+
+%% @doc The gateway's memory per idle agent connection: for each transport and
+%% each N of the sweep, N agents registered, Subscribe open, heartbeating at
+%% the agent's cadence with its tags and a fleet snapshot; after the settle
+%% period, samples until the memory is steady (idle_steady/3). Reports M(N)
+%% (the mean of the last window), the marginal
+%% (M(N) - M(0)) / N and the slope between sweep points, per memory category,
+%% plus the per-role process footprint of an agent and the largest ETS tables
+%% at the largest N. Writes yuzu_gw_idle_mem-<run>.json and a .txt summary.
+idle_memory(Config) ->
+    Opts = idle_opts(),
+    #{transports := Transports, sweep := Sweep} = Opts,
+    Pki = idle_pki(?config(priv_dir, Config)),
+    Plugins = ?config(plugins, Config),
+    Tags = idle_tags(Config),
+    Snapshot = idle_snapshot(maps:get(snapshot_bytes, Opts)),
+    %% The size of the load generator's RegisterRequest (its shape, one id).
+    RegBytes = byte_size(agent_pb:encode_msg(
+                           #{info => #{agent_id => <<"m0000-000001">>,
+                                       hostname => <<"scale-host-m0000-000001">>,
+                                       agent_version => <<"0.14.0">>,
+                                       platform => #{os => <<"linux">>, arch => <<"x86_64">>,
+                                                     version => <<"6.8.0-45-generic">>},
+                                       plugins => Plugins,
+                                       scopable_tags => #{<<"env">> => <<"scale-test">>,
+                                                          <<"site">> => <<"lab-1">>,
+                                                          <<"role">> => <<"workstation">>,
+                                                          <<"scale_attempt">> => <<"1">>}},
+                             enrollment_token => <<"scale-test-enrollment-token-0123456789abcdef">>},
+                           'yuzu.agent.v1.RegisterRequest')),
+    HbBytes = byte_size(agent_pb:encode_msg(#{session_id => <<"0123456789abcdef0123456789abcdef">>,
+                                              status_tags => Tags,
+                                              fleet_snapshot_json => Snapshot},
+                                            'yuzu.agent.v1.HeartbeatRequest')),
+    ct:pal("idle_memory: transports ~p, sweep ~w, heartbeat every ~b ms (~b tags, snapshot ~b B "
+           "on every ~b; ~b B encoded), RegisterRequest ~b B; settle at least ~b ms, then "
+           "steady within ~b% between ~b ms windows sampled every ~b ms (at most ~b ms)",
+           [Transports, Sweep, maps:get(hb_ms, Opts), map_size(Tags), byte_size(Snapshot),
+            maps:get(snapshot_every, Opts), HbBytes, RegBytes, maps:get(settle_ms, Opts),
+            maps:get(steady_tol_pct, Opts), maps:get(window_ms, Opts), maps:get(sample_ms, Opts),
+            maps:get(settle_max_ms, Opts)]),
+    Runs = [idle_run(T, Opts, Pki, Plugins, Tags, Snapshot, Config) || T <- Transports],
+    Result = #{kind => idle_memory,
+               run => list_to_binary(?config(run, Config)),
+               time => list_to_binary(calendar:system_time_to_rfc3339(
+                                        erlang:system_time(second))),
+               host => idle_host_facts(),
+               config => (maps:without([transports], Opts))#{
+                           transports => Transports, heartbeat_tags => map_size(Tags),
+                           heartbeat_encoded_bytes => HbBytes,
+                           register_request_bytes => RegBytes,
+                           register_plugins => length(Plugins)},
+               runs => Runs},
+    Ceil = idle_ceiling_check(Config, Result),
+    Final = Result#{ceiling => Ceil},
+    Dir = ?config(results_dir, Config),
+    Base = filename:join(Dir, "yuzu_gw_idle_mem-" ++ ?config(run, Config)),
+    ok = file:write_file(Base ++ ".json", json:encode(jsonable(Final))),
+    Summary = idle_summary(Final),
+    ok = file:write_file(Base ++ ".txt", Summary),
+    ct:pal("~s~nresults: ~s.json and ~s.txt", [Summary, Base, Base]),
+    print(idle_memory, lists:last(Sweep), maps:from_list(
+                                            [{T, idle_headline(R)} || #{transport := T} = R <- Runs])),
+    Unsteady = [{T, N} || #{transport := T, points := Ps} <- Runs,
+                          #{n := N, steady := false} <- Ps, N > 0],
+    case [C || #{ok := false} = C <- maps:get(checks, Ceil, [])] of
+        [] when Unsteady =:= [] -> ok;
+        Over ->
+            %% A point that never settled is not a measurement of the steady
+            %% state: recorded like a ceiling breach.
+            Msg = lists:flatten(io_lib:format("idle_memory over its ceiling: ~0p; not steady: ~0p",
+                                              [Over, Unsteady])),
+            case mode(Config) of
+                gate -> ct:fail(Msg);
+                report -> {comment, Msg ++ " (report mode: recorded, not failed)"}
+            end
+    end.
+
+idle_opts() ->
+    Hb = env_int("YUZU_GW_SCALE_HB_MS", 30000),
+    #{transports => [list_to_atom(T)
+                     || T <- string:lexemes(env_str("YUZU_GW_IDLEMEM_TRANSPORTS", "tls,plain"), ",")],
+      sweep => lists:usort([0 | [list_to_integer(X)
+                                 || X <- string:lexemes(env_str("YUZU_GW_IDLEMEM_SWEEP",
+                                                                "0,1000,5000,10000"), ",")]]),
+      hb_ms => Hb,
+      rate => env_int("YUZU_GW_IDLEMEM_RATE", 500),
+      settle_ms => env_int("YUZU_GW_IDLEMEM_SETTLE_MS", 2 * Hb),
+      settle_max_ms => env_int("YUZU_GW_IDLEMEM_SETTLE_MAX_MS", 20 * Hb),
+      steady_tol_pct => env_int("YUZU_GW_IDLEMEM_STEADY_TOL_PCT", 2),
+      window_ms => env_int("YUZU_GW_IDLEMEM_WINDOW_MS", 4 * Hb),
+      sample_ms => env_int("YUZU_GW_IDLEMEM_SAMPLE_MS", 5000),
+      snapshot_bytes => env_int("YUZU_GW_IDLEMEM_SNAPSHOT_BYTES", 150000),
+      snapshot_every => env_int("YUZU_GW_IDLEMEM_SNAPSHOT_EVERY", 1),
+      tags => env_int("YUZU_GW_IDLEMEM_TAGS", 1) =:= 1,
+      roles_k => env_int("YUZU_GW_IDLEMEM_ROLES_K", 20)}.
+
+%% One transport: fresh nodes, the sweep, the per-role footprint and ETS at
+%% the largest N, then a forced collection of every process as a diagnostic.
+idle_run(Transport, Opts, Pki, Plugins, Tags, Snapshot, Config) ->
+    #{sweep := Sweep} = Opts,
+    Max = lists:max(Sweep),
+    Fds = 2 * Max + 4096,
+    Tag = ?config(tag, Config) ++ "-" ++ atom_to_list(Transport),
+    LogDir = ?config(log_dir, Config),
+    Up = start_upstream_node(log(LogDir, upstream, Tag)),
+    {ok, UpPort} = ?PEER:call(Up, ?UP, start, [#{port => 0, max_streams => upstream_streams()}]),
+    Gw = start_gateway(#{log => log(LogDir, gateway, Tag), fds => Fds, upstream_port => UpPort,
+                         n => Max, agent_port => 0, agent6_port => 0, mgmt_port => 0,
+                         tls => idle_listener_tls(Transport, Pki)}),
+    {ok, Load} = ?PEER:start(loadgen, #{fds => Fds, log => log(LogDir, loadgen, Tag),
+                                        args => ["+sbwt", "none"]}),
+    track(loadgen, Load),
+    ok = ?PEER:call(Load, ?FLEET, start,
+                    [#{targets => targets(Gw), prefix => list_to_binary("m" ++ short_tag()),
+                       plugins => Plugins, hb_interval_ms => maps:get(hb_ms, Opts),
+                       tls => idle_client_tls(Transport, Pki),
+                       hb_tags => Tags, hb_snapshot => Snapshot,
+                       hb_snapshot_every => maps:get(snapshot_every, Opts)}]),
+    C = [{up, Up}, {up_port, UpPort}, {gw, Gw}, {load, Load} | Config],
+    Ports = [P || {_, P} <- targets(Gw)],
+    ct:pal("idle_memory ~p: gateway agent ~p, fds ~p", [Transport, targets(Gw),
+                                                       ?PEER:fds(maps:get(peer, Gw))]),
+    {Points, _} = lists:mapfoldl(
+                    fun(N, Prev) -> {idle_point(C, Opts, Ports, Prev, N), N} end, 0, Sweep),
+    Roles = case Max of
+                0 -> #{};
+                _ -> gw_call(C, ?PROBE, roles, [maps:get(roles_k, Opts)])
+            end,
+    Ets = gw_call(C, ?PROBE, top_ets, [15]),
+    ok = gw_call(C, ?PROBE, gc_all, []),
+    AfterGc = idle_flat(gw_call(C, ?PROBE, idle_sample, [Ports])),
+    Fleet = load_call(C, counters, []),
+    stop_tracked(),
+    Base = maps:get(mean, hd(Points)),
+    Marginal = [P#{per_conn => per_conn(maps:get(mean, P), Base, N),
+                   per_conn_envelope => envelope(P, Base, N),
+                   slope => slope(P, Prev)}
+                || {P = #{n := N}, Prev} <- lists:zip(Points, [undefined | lists:droplast(Points)])],
+    #{transport => Transport,
+      points => Marginal,
+      largest_n => Max,
+      agent_roles => Roles,
+      top_ets => Ets,
+      forced_gc_at_largest_n => #{sample => AfterGc,
+                                  per_conn => per_conn(AfterGc, Base, Max)},
+      loadgen => Fleet}.
+
+%% One sweep point: grow the fleet to N (ramped), wait for every agent live,
+%% settle, then sample until steady; M(N) is the mean of the last window.
+idle_point(C, Opts, Ports, Prev, N) ->
+    T0 = erlang:system_time(millisecond),
+    Reg = case N - Prev of
+              0 -> #{};
+              Add ->
+                  ok = load_call(C, spawn_agents, [#{from => Prev + 1, count => Add,
+                                                     mode => {ramp, maps:get(rate, Opts)}}]),
+                  maps:with([all_registered, live, time_to_all_registered_ms],
+                            await_registered(C, N, T0))
+          end,
+    timer:sleep(maps:get(settle_ms, Opts)),
+    #{window := Samples, steady := Steady, settled_ms := SettledMs, trace := Trace} =
+        idle_steady(C, Ports, Opts),
+    Flat = [idle_flat(S) || S <- Samples],
+    Registered = gw_call(C, yuzu_gw_registry, agent_count, []),
+    #{live := Live} = load_call(C, status, []),
+    ct:pal("idle_memory point N=~b: ~b registered at the gateway, ~b live at the load generator",
+           [N, Registered, Live]),
+    %% A point whose agents are not all there measures something else: the
+    %% harness is broken (a TLS refusal, a full listener), so stop.
+    (Registered =:= N andalso Live =:= N) orelse
+        ct:fail("idle_memory N=~b: ~b registered at the gateway, ~b live at the load generator "
+                "(see the gateway and loadgen logs in the case's log_private)",
+                [N, Registered, Live]),
+    #{n => N, registration => Reg, gateway_registered => Registered, loadgen_live => Live,
+      steady => Steady, settled_ms => SettledMs, trace => Trace,
+      samples => Flat, mean => mean_map(Flat),
+      heartbeat_buffer => maps:get(heartbeat_buffer, lists:last(Samples))}.
+
+%% Sample every sample_ms until the memory is steady: the mean of the last
+%% window_ms of samples (four heartbeat intervals by default, so whole
+%% collection cycles are averaged) is within steady_tol_pct of the mean of the
+%% window before it, for beam_total
+%% and for os_anon; or until settle_max_ms has passed since the fleet was
+%% complete (then steady is false and the last window is reported anyway).
+%% A point is never judged on a window that is still climbing: the
+%% heartbeat path's dead snapshot copies accumulate for several heartbeats
+%% before the processes holding them collect. Returns the last window (raw
+%% samples), whether it was steady, how long the point took to settle, and
+%% the trace of every sample: [ms since sampling began, beam_total, os_anon].
+idle_steady(C, Ports, Opts) ->
+    #{window_ms := WinMs, sample_ms := Ms, steady_tol_pct := Tol, settle_max_ms := Max,
+      settle_ms := Min} = Opts,
+    W = max(2, WinMs div Ms),
+    T0 = erlang:monotonic_time(millisecond),
+    idle_steady(C, Ports, W, Ms, Tol, T0 + max(0, Max - Min), T0, []).
+
+idle_steady(C, Ports, W, Ms, Tol, Deadline, T0, Acc0) ->
+    S = gw_call(C, ?PROBE, idle_sample, [Ports]),
+    Now = erlang:monotonic_time(millisecond),
+    Acc = [{Now - T0, S} | Acc0],
+    Done = fun(Steady) ->
+                   Window = lists:reverse([X || {_, X} <- lists:sublist(Acc, W)]),
+                   #{window => Window, steady => Steady, settled_ms => Now - T0,
+                     trace => [[T, maps:get(total, B), maps:get(os_anon, F, null)]
+                               || {T, X = #{beam := B}} <- lists:reverse(Acc),
+                                  F <- [idle_flat(X)]]}
+           end,
+    case length(Acc) >= 2 * W andalso window_steady(Acc, W, Tol) of
+        true -> Done(true);
+        false when Now >= Deadline -> Done(false);
+        false -> timer:sleep(Ms), idle_steady(C, Ports, W, Ms, Tol, Deadline, T0, Acc)
+    end.
+
+window_steady(Acc, W, Tol) ->
+    {Last, Rest} = lists:split(W, [idle_flat(X) || {_, X} <- Acc]),
+    Prev = lists:sublist(Rest, W),
+    Mean = fun(Rows, K) ->
+                   case [maps:get(K, R) || R <- Rows, is_map_key(K, R)] of
+                       [] -> undefined;
+                       Vs -> mean(Vs)
+                   end
+           end,
+    lists:all(fun(K) ->
+                      case {Mean(Last, K), Mean(Prev, K)} of
+                          {undefined, _} -> true;
+                          {_, undefined} -> true;
+                          {_, P} when P == 0 -> true;
+                          {L, P} -> abs(L - P) / P * 100 =< Tol
+                      end
+              end, [beam_total, os_anon]).
+
+%% One sample as flat numbers: beam_<category>, process_count, port_count,
+%% os_rss, os_anon (Linux: smaps_rollup Anonymous; macOS: the physical
+%% footprint), os_<other keys>, socket_<key>, hb_buffer_bytes.
+idle_flat(#{beam := Beam, os := Os, sockets := Sock, heartbeat_buffer := Hb} = S) ->
+    B = maps:from_list([{list_to_atom("beam_" ++ atom_to_list(K)), V} || {K, V} <- maps:to_list(Beam)]),
+    O = maps:from_list([{list_to_atom("os_" ++ atom_to_list(K)), V}
+                        || {K, V} <- maps:to_list(Os), is_integer(V)]),
+    Anon = case Os of
+               #{anon := A} -> #{os_anon => A};
+               #{phys_footprint := F} -> #{os_anon => F};
+               _ -> #{}
+           end,
+    K = maps:from_list([{list_to_atom("socket_" ++ atom_to_list(Key)), V}
+                        || {Key, V} <- maps:to_list(Sock), is_integer(V)]),
+    lists:foldl(fun maps:merge/2, #{}, [B, O, Anon, K,
+                                        #{process_count => maps:get(process_count, S),
+                                          port_count => maps:get(port_count, S),
+                                          hb_buffer_bytes => maps:get(buf_bytes, Hb, 0)}]).
+
+%% The time average of the window (samples are evenly spaced), trimmed: the
+%% gateway's memory swings with the heartbeat path's garbage collections (in
+%% the harness the agents' collections are phase-aligned, because they
+%% registered within seconds, so the swing is large), and the average over
+%% whole cycles is the expected memory of a fleet whose phases are spread. The
+%% lowest and highest tenth of the samples are dropped first: on Linux the
+%% anonymous memory dips for a single sample now and then (the allocator
+%% returning pages it takes back at once), and one such dip would otherwise
+%% move a window's mean by a few percent.
+mean_map([]) -> #{};
+mean_map([First | _] = Rows) ->
+    maps:from_list([{K, mean([maps:get(K, R) || R <- Rows, is_map_key(K, R)])}
+                    || K <- maps:keys(First)]).
+
+mean(L) ->
+    S = lists:sort(L),
+    Cut = length(S) div 10,
+    Kept = lists:sublist(S, Cut + 1, length(S) - 2 * Cut),
+    round(lists:sum(Kept) / length(Kept)).
+
+%% The lowest and highest sample of the window, per connection, for the
+%% headline numbers (the swing around the mean).
+envelope(#{n := 0}, _Base, _N) -> #{};
+envelope(#{samples := Samples}, Base, N) ->
+    maps:from_list(
+      [{K, #{min => (lists:min(Vs) - maps:get(K, Base)) div N,
+             max => (lists:max(Vs) - maps:get(K, Base)) div N}}
+       || K <- [beam_total, beam_processes, beam_binary, os_anon], is_map_key(K, Base),
+          Vs <- [[maps:get(K, S) || S <- Samples, is_map_key(K, S)]], Vs =/= []]).
+
+%% (M(N) - M(0)) / N for every number of the sample; nothing at N = 0.
+per_conn(_M, _Base, 0) -> #{};
+per_conn(M, Base, N) ->
+    maps:from_list([{K, (V - maps:get(K, Base)) div N}
+                    || {K, V} <- maps:to_list(M), is_map_key(K, Base)]).
+
+%% (M(N) - M(Nprev)) / (N - Nprev): the cost of the agents added at this step.
+slope(_P, undefined) -> #{};
+slope(#{n := N, mean := M}, #{n := Np, mean := Mp}) when N > Np ->
+    maps:from_list([{K, (V - maps:get(K, Mp)) div (N - Np)}
+                    || {K, V} <- maps:to_list(M), is_map_key(K, Mp)]);
+slope(_, _) -> #{}.
+
+idle_headline(#{points := Points}) ->
+    #{n := N, per_conn := P} = lists:last(Points),
+    maps:with([beam_total, beam_processes, beam_binary, beam_ets, os_anon, os_rss,
+               process_count], P#{n => N}).
+
+%% TLS material for a run: a P-384 root and a P-256 gateway leaf (the shapes
+%% the server's first-boot PKI issues, x509_ca.cpp), and a P-256 client leaf
+%% for the mutual TLS transport, written as PEM files the listener reads.
+idle_pki(Dir) ->
+    Sni = "yuzu-gw.scale.test",
+    San = #'Extension'{extnID = ?'id-ce-subjectAltName', critical = false,
+                       extnValue = [{dNSName, Sni}]},
+    Data = public_key:pkix_test_data(
+             #{server_chain => #{root => [{key, {namedCurve, secp384r1}}, {digest, sha384}],
+                                 intermediates => [],
+                                 peer => [{key, {namedCurve, secp256r1}}, {digest, sha256},
+                                          {extensions, [San]}]},
+               client_chain => #{root => [{key, {namedCurve, secp384r1}}, {digest, sha384}],
+                                 intermediates => [],
+                                 peer => [{key, {namedCurve, secp256r1}}, {digest, sha256}]}}),
+    #{server_config := Srv, client_config := Cli} = Data,
+    Write = fun(Name, Entries) ->
+                    F = filename:join(Dir, "idle-mem-" ++ Name ++ ".pem"),
+                    ok = file:write_file(F, public_key:pem_encode(Entries)),
+                    F
+            end,
+    Key = fun(Cfg) -> {Alg, Der} = proplists:get_value(key, Cfg), {Alg, Der, not_encrypted} end,
+    Cert = fun(Cfg) -> {'Certificate', proplists:get_value(cert, Cfg), not_encrypted} end,
+    %% Each config's cacerts mixes roots; pick by issuer (no intermediates, so
+    %% the root issued the leaf).
+    AllCas = lists:usort(proplists:get_value(cacerts, Srv) ++ proplists:get_value(cacerts, Cli)),
+    IssuerOf = fun(Cfg) ->
+                       Leaf = proplists:get_value(cert, Cfg),
+                       [{'Certificate', Ca, not_encrypted}
+                        || Ca <- AllCas, public_key:pkix_is_issuer(Leaf, Ca)]
+               end,
+    #{sni => Sni,
+      server_cert => Write("server-cert", [Cert(Srv)]),
+      server_key => Write("server-key", [Key(Srv)]),
+      %% The root the agents trust for the gateway's certificate.
+      server_cacerts => Write("server-ca", IssuerOf(Srv)),
+      client_cert => Write("client-cert", [Cert(Cli)]),
+      client_key => Write("client-key", [Key(Cli)]),
+      %% The root the gateway trusts for client certificates.
+      client_cacerts => Write("client-ca", IssuerOf(Cli))}.
+
+%% The agent listener's tls map: `tls' is the shipped one (config/sys.config.prod:
+%% one-way, verify_none, fail_if_no_peer_cert false); `mtls' the documented move
+%% to mutual TLS (verify_peer, fail_if_no_peer_cert false, docs/user-manual/
+%% gateway.md); `plain' none.
+idle_listener_tls(plain, _) -> undefined;
+idle_listener_tls(tls, #{server_cert := C, server_key := K, client_cacerts := Ca}) ->
+    #{certfile => C, keyfile => K, cacertfile => Ca,
+      verify => verify_none, fail_if_no_peer_cert => false};
+idle_listener_tls(mtls, #{server_cert := C, server_key := K, client_cacerts := Ca}) ->
+    #{certfile => C, keyfile => K, cacertfile => Ca,
+      verify => verify_peer, fail_if_no_peer_cert => false}.
+
+idle_client_tls(plain, _) -> false;
+idle_client_tls(tls, #{server_cacerts := Ca, sni := Sni}) ->
+    #{cacertfile => Ca, server_name => Sni};
+idle_client_tls(mtls, #{server_cacerts := Ca, sni := Sni, client_cert := C, client_key := K}) ->
+    #{cacertfile => Ca, server_name => Sni, certfile => C, keyfile => K}.
+
+idle_tags(Config) ->
+    case env_int("YUZU_GW_IDLEMEM_TAGS", 1) of
+        1 ->
+            {ok, [{tags, Tags}]} =
+                file:consult(filename:join(?config(data_dir, Config), "heartbeat_tags.eterm")),
+            maps:from_list(Tags);
+        _ -> #{}
+    end.
+
+%% A fleet_snapshot.v1 document (agents/plugins/tar/src/tar_fleet_snapshot.hpp)
+%% of about Bytes bytes: process rows and one connection row per 20 processes,
+%% with the field set and value shapes the builder writes. 0 = no snapshot.
+%% The default, 150000, is what this schema gives for the process and socket
+%% tables of a developer macOS host on 2026-10-26 (836 processes, 43 sockets:
+%% 150,178 bytes); the tar header documents 50 to 500 KB for realistic hosts
+%% and about 1.3 MB at its 4096-row cap, and docs/user-manual/gateway.md
+%% records 200 to 800 KB observed on a busy rig host.
+idle_snapshot(0) -> <<>>;
+idle_snapshot(Bytes) ->
+    Names = [<<"systemd">>, <<"sshd">>, <<"chrome">>, <<"java">>, <<"postgres">>,
+             <<"python3">>, <<"node">>, <<"svchost.exe">>, <<"kworker/3:1">>, <<"bash">>],
+    Proc = fun(I) ->
+                   Name = lists:nth(1 + I rem length(Names), Names),
+                   #{pid => 1000 + I, ppid => 1 + I div 7, name => Name,
+                     cmdline => iolist_to_binary(
+                                  [<<"/usr/lib/">>, Name, <<"/bin/">>, Name,
+                                   <<" --type=renderer --lang=en-US --field-trial-handle=">>,
+                                   integer_to_binary(I * 7919), <<" --enable-features=">>,
+                                   binary:copy(<<"x">>, (I * 37) rem 120)]),
+                     user => case I rem 3 of 0 -> <<"root">>; _ -> <<"svc_app">> end}
+           end,
+    Conn = fun(I) ->
+                   #{proto => <<"tcp">>, local_addr => <<"10.20.30.40">>,
+                     local_port => 40000 + I, remote_addr => <<"10.20.1.", (integer_to_binary(I rem 250))/binary>>,
+                     remote_host => <<>>, remote_port => 443, state => <<"ESTABLISHED">>,
+                     pid => 1000 + I, process_name => lists:nth(1 + I rem length(Names), Names)}
+           end,
+    Doc = fun(K) ->
+                  iolist_to_binary(json:encode(
+                    #{schema => <<"fleet_snapshot.v1">>, schema_minor => 2,
+                      ts => 1793000000, hostname => <<"scale-host.example.test">>,
+                      local_ips => [<<"10.20.30.40">>],
+                      processes => [Proc(I) || I <- lists:seq(1, K)],
+                      connections => [Conn(I) || I <- lists:seq(1, max(1, K div 20))],
+                      truncated_processes => false, truncated_connections => false}))
+          end,
+    %% Rows are about 190 bytes; grow K until the document reaches Bytes.
+    grow_snapshot(Doc, max(1, Bytes div 200), Bytes).
+
+grow_snapshot(Doc, K, Bytes) ->
+    D = Doc(K),
+    case byte_size(D) >= Bytes orelse K >= 4096 of
+        true -> D;
+        false -> grow_snapshot(Doc, K + max(1, (Bytes - byte_size(D)) div 200), Bytes)
+    end.
+
+idle_host_facts() ->
+    (host_facts())#{arch => list_to_binary(erlang:system_info(system_architecture)),
+                    otp_version => otp_version(),
+                    kernel => list_to_binary(string:trim(os:cmd("uname -sr"))),
+                    memory_bytes => host_memory()}.
+
+otp_version() ->
+    F = filename:join([code:root_dir(), "releases", erlang:system_info(otp_release), "OTP_VERSION"]),
+    case file:read_file(F) of
+        {ok, B} -> string:trim(B);
+        _ -> list_to_binary(erlang:system_info(otp_release))
+    end.
+
+host_memory() ->
+    case os:type() of
+        {unix, darwin} ->
+            case string:to_integer(string:trim(os:cmd("sysctl -n hw.memsize"))) of
+                {M, _} when is_integer(M) -> M;
+                _ -> null
+            end;
+        {unix, linux} ->
+            case re:run(element(2, file:read_file("/proc/meminfo")), "MemTotal:\\s+([0-9]+)",
+                        [{capture, all_but_first, list}]) of
+                {match, [Kb]} -> list_to_integer(Kb) * 1024;
+                _ -> null
+            end;
+        _ -> null
+    end.
+
+%% The ratchet: yuzu_gw_scale_SUITE_data/idle_mem_ceiling.eterm holds, per
+%% {OsFamily, Transport}, a ceiling in bytes per connection for some of the
+%% headline numbers at the largest N of the sweep (only for a sweep whose
+%% largest N is at least the entry's min_n). A ceiling may only go down: lower
+%% it in the change that makes the gateway cheaper. A run on an OS or transport
+%% with no entry checks nothing.
+idle_ceiling_check(Config, #{runs := Runs}) ->
+    File = filename:join(?config(data_dir, Config), "idle_mem_ceiling.eterm"),
+    Entries = case file:consult(File) of
+                  {ok, [{ceilings, E}]} -> E;
+                  _ -> []
+              end,
+    {_, OsName} = os:type(),
+    Checks = [#{transport => T, metric => Metric, n => N, measured => Measured,
+                ceiling => Ceiling, ok => Measured =< Ceiling}
+              || #{transport := T, points := Points} <- Runs,
+                 #{n := N, per_conn := PerConn} <- [lists:last(Points)],
+                 {{Os, T1}, #{min_n := MinN, per_conn := Ceilings}} <- Entries,
+                 Os =:= OsName, T1 =:= T, N >= MinN,
+                 {Metric, Ceiling} <- maps:to_list(Ceilings),
+                 Measured <- [maps:get(Metric, PerConn, undefined)],
+                 is_integer(Measured)],
+    #{file => list_to_binary(File), os => OsName, checks => Checks}.
+
+%% The human summary.
+idle_summary(#{run := Run, host := Host, config := Cfg, runs := Runs, ceiling := Ceil}) ->
+    KiB = fun(null) -> "-"; (undefined) -> "-";
+             (B) -> io_lib:format("~.1f", [B / 1024]) end,
+    MiB = fun(undefined) -> "-"; (B) -> io_lib:format("~.1f", [B / 1048576]) end,
+    Head = io_lib:format(
+             "Gateway idle memory per connection - run ~s~n"
+             "host ~s ~s, OTP ~s, ~b schedulers~n"
+             "heartbeat every ~b ms: ~b status tags, snapshot ~b B on every ~b; RegisterRequest ~b B "
+             "(~b plugins)~nsettle: at least ~b ms, then until two consecutive ~b ms windows (a sample "
+             "every ~b ms) agree within ~b% (at most ~b ms); the last window's mean is reported~n",
+             [Run, maps:get(kernel, Host), maps:get(arch, Host), maps:get(otp_version, Host),
+              maps:get(schedulers, Host), maps:get(hb_ms, Cfg), maps:get(heartbeat_tags, Cfg),
+              maps:get(snapshot_bytes, Cfg), maps:get(snapshot_every, Cfg),
+              maps:get(register_request_bytes, Cfg), maps:get(register_plugins, Cfg),
+              maps:get(settle_ms, Cfg), maps:get(window_ms, Cfg), maps:get(sample_ms, Cfg),
+              maps:get(steady_tol_pct, Cfg), maps:get(settle_max_ms, Cfg)]),
+    Cols = "~-6s ~7s ~7s ~9s ~9s | per conn KiB: ~7s ~13s ~7s ~7s ~7s ~7s ~7s | procs ~3s | sock KiB ~6s~n",
+    Range = fun(#{per_conn_envelope := #{beam_total := #{min := Lo, max := Hi}}}) ->
+                    io_lib:format("~b-~b", [Lo div 1024, Hi div 1024]);
+               (_) -> "-"
+            end,
+    Steady = fun(#{n := 0}) -> "";
+                (#{steady := true, settled_ms := Ms}) -> io_lib:format("~bs", [Ms div 1000]);
+                (#{steady := false}) -> "NOT"
+             end,
+    Table = fun(#{transport := T, points := Points}) ->
+                    [io_lib:format(Cols, ["", "N", "steady", "BEAM MiB", "anon MiB", "BEAM",
+                                          "BEAM min-max", "procs", "binary", "ets", "anon", "rss",
+                                          "", "kernel"]),
+                     [begin
+                          Pc = maps:get(per_conn, P),
+                          io_lib:format(Cols,
+                                        [atom_to_list(T), integer_to_list(N), Steady(P),
+                                         MiB(maps:get(beam_total, M, undefined)),
+                                         MiB(maps:get(os_anon, M, undefined)),
+                                         KiB(maps:get(beam_total, Pc, undefined)),
+                                         Range(P),
+                                         KiB(maps:get(beam_processes, Pc, undefined)),
+                                         KiB(maps:get(beam_binary, Pc, undefined)),
+                                         KiB(maps:get(beam_ets, Pc, undefined)),
+                                         KiB(maps:get(os_anon, Pc, undefined)),
+                                         KiB(maps:get(os_rss, Pc, undefined)),
+                                         case Pc of
+                                             #{process_count := Pn} -> integer_to_list(Pn);
+                                             _ -> "-"
+                                         end,
+                                         KiB(maps:get(socket_allocated, Pc,
+                                                      maps:get(socket_queued, Pc, undefined)))])
+                      end || #{n := N, mean := M} = P <- Points]]
+            end,
+    Roles = fun(#{transport := T, agent_roles := #{roles := R, total := Tot}}) ->
+                    [io_lib:format("~p agent processes (avg of sampled agents), KiB memory / refc binary"
+                                   " -> after GC:~n", [T]),
+                     [io_lib:format("  ~-14s ~7s / ~7s -> ~7s / ~7s~n",
+                                    [atom_to_list(Role), KiB(maps:get(memory, V)),
+                                     KiB(maps:get(refc_binary, V)),
+                                     KiB(maps:get(memory_after_gc, V)),
+                                     KiB(maps:get(refc_binary_after_gc, V))])
+                      || {Role, V} <- lists:sort(maps:to_list(R))],
+                     io_lib:format("  ~-14s ~7s / ~7s -> ~7s / ~7s~n",
+                                   ["total", KiB(maps:get(memory, Tot)), KiB(maps:get(refc_binary, Tot)),
+                                    KiB(maps:get(memory_after_gc, Tot)),
+                                    KiB(maps:get(refc_binary_after_gc, Tot))])];
+               (_) -> []
+            end,
+    Gc = fun(#{transport := T, largest_n := N, forced_gc_at_largest_n := #{per_conn := Pc}}) ->
+                 io_lib:format("~p after a forced GC of every process at N=~b: BEAM ~s KiB/conn, "
+                               "anon ~s KiB/conn~n",
+                               [T, N, KiB(maps:get(beam_total, Pc, undefined)),
+                                KiB(maps:get(os_anon, Pc, undefined))])
+         end,
+    CeilLines = case maps:get(checks, Ceil) of
+                    [] -> io_lib:format("ceiling: no entry for ~p in ~s~n",
+                                        [maps:get(os, Ceil), maps:get(file, Ceil)]);
+                    Cs -> [io_lib:format("ceiling ~p ~p: ~b B/conn measured, ceiling ~b: ~s~n",
+                                         [T, M, V, C, case Ok of true -> "ok"; false -> "OVER" end])
+                           || #{transport := T, metric := M, measured := V, ceiling := C, ok := Ok} <- Cs]
+                end,
+    lists:flatten([Head, [Table(R) || R <- Runs], [Roles(R) || R <- Runs], [Gc(R) || R <- Runs],
+                   CeilLines]).
+
+env_str(Name, Default) ->
+    case os:getenv(Name) of
+        false -> Default;
+        "" -> Default;
+        V -> V
+    end.
+
 breaker_transitions(Config) ->
     maps:from_list([{S, gw_call(Config, prometheus_counter, value,
                                 [yuzu_gw_upstream_circuit_transitions_total, [atom_to_binary(S)]])}
@@ -1061,7 +1638,8 @@ headline_re() ->
     "fanout_completion_ms|fanout_answered|fanout_connection_drops|latency_ms_p(50|95|99)|"
     "upstream_register_peak_inflight|upstream_wasted_register_rpcs|"
     "gateway_memory_per_connection_bytes|"
-    "gateway_probe_mailbox_hwm_yuzu_gw_(upstream|registry|router))_n[0-9]+$".
+    "gateway_probe_mailbox_hwm_yuzu_gw_(upstream|registry|router)|"
+    "(tls|mtls|plain)_(beam_total|os_anon))_n[0-9]+$".
 
 flatten(Prefix, M) when is_map(M) ->
     lists:append([flatten(Prefix ++ "_" ++ key(K), V) || {K, V} <- lists:sort(maps:to_list(M)),
@@ -1118,7 +1696,7 @@ host_facts() ->
 %%%===================================================================
 
 start_gateway(#{log := Log, fds := Fds, upstream_port := UpPort, n := N,
-                agent_port := AgentPort, agent6_port := Agent6Port, mgmt_port := MgmtPort}) ->
+                agent_port := AgentPort, agent6_port := Agent6Port, mgmt_port := MgmtPort} = Spec) ->
     %% The production VM flags (config/vm.args.src) less the node name/cookie.
     Args = ["+K", "true", "+A", "128", "+SDio", "128", "+P", "4194304", "+Q", "2097152",
             "+MBas", "aobf", "+MBlmbcs", "512", "+MEas", "aobf",
@@ -1128,7 +1706,8 @@ start_gateway(#{log := Log, fds := Fds, upstream_port := UpPort, n := N,
     Dual = N > env_int("YUZU_GW_SCALE_DUAL_STACK_ABOVE", ?DUAL_STACK_ABOVE),
     ok = ?PEER:call(Peer, application, load, [yuzu_gw]),
     [ok = ?PEER:call(Peer, application, set_env, [yuzu_gw, K, V])
-     || {K, V} <- gateway_env(UpPort, AgentPort, Agent6Port, MgmtPort, Dual)],
+     || {K, V} <- gateway_env(UpPort, AgentPort, Agent6Port, MgmtPort, Dual,
+                              maps:get(tls, Spec, undefined))],
     {ok, _} = ?PEER:call(Peer, application, ensure_all_started, [yuzu_gw], 120000),
     ok = ?PEER:call(Peer, ?PROBE, start, [50]),
     ok = ?PEER:call(Peer, ?PROBE, sched_mark, []),
@@ -1141,10 +1720,17 @@ start_gateway(#{log := Log, fds := Fds, upstream_port := UpPort, n := N,
       mgmt_port => ?PEER:call(Peer, ranch, get_port, [{yuzu_grpc, mgmt}]),
       mem_baseline => ?PEER:call(Peer, ?PROBE, memory, [])}.
 
-%% sys.config.prod's listeners and breaker settings, plaintext, on loopback.
-gateway_env(UpPort, AgentPort, Agent6Port, MgmtPort, Dual) ->
+%% sys.config.prod's listeners and breaker settings, on loopback. The agent
+%% listener is plaintext unless Tls is a listener `tls' map (idle_memory: the
+%% shipped one-way TLS options, or mutual TLS); management and upstream stay
+%% plaintext.
+gateway_env(UpPort, AgentPort, Agent6Port, MgmtPort, Dual, Tls) ->
+    WithTls = case Tls of
+                  #{} -> fun(E) -> E#{tls => Tls} end;
+                  undefined -> fun(E) -> E end
+              end,
     Agent = fun(Name, Ip, Port) ->
-                    #{name => Name,
+                    WithTls(#{name => Name,
                       service_protos => [agent_pb],
                       services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service},
                       listen => #{port => Port, ip => Ip},
@@ -1152,7 +1738,7 @@ gateway_env(UpPort, AgentPort, Agent6Port, MgmtPort, Dual) ->
                       http2 => #{idle_timeout => 180000, max_concurrent_streams => 32},
                       limits => #{max_connections => 60000, max_message_bytes => 4194304,
                                   max_connection_memory_bytes => 33554432,
-                                  request_timeout_ms => 30000}}
+                                  request_timeout_ms => 30000}})
             end,
     Mgmt = #{name => mgmt,
              service_protos => [management_pb],
