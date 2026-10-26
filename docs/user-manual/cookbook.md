@@ -967,7 +967,10 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `windows.registry.list_profiles` | list_profiles | Q | W | (none) | sid:string, profile_name:string, profile_path:string, hive_state:string |
 | `windows.registry.set_value` | set_value | A | W | hive:enum (req), key:string (req), name:string (req), value:string, data_hex:string (send one of the two), type:enum | status:string |
 | `windows.registry.delete_value` | delete_value | A | W | hive:enum (req), key:string (req), name:string (req) | status:string |
-| `windows.registry.delete_key` | delete_key | A | W | hive:enum (req), key:string (req) | status:string, counted_keys:int32, counted_values:int32, dry_run:bool, capped:bool |
+| `windows.registry.delete_key` | delete_key | A | W | hive:enum (req), key:string (req), recursive:enum, dry_run:enum | status:string, counted_keys:int32, counted_values:int32, dry_run:bool, capped:bool |
+| `windows.registry.set_user_value` | set_user_value | A | W | username:string, sid:string, key:string (req), name:string (req), value:string, data_hex:string (send one of the two), type:enum | status:string |
+| `windows.registry.delete_user_value` | delete_user_value | A | W | username:string, sid:string, key:string (req), name:string (req) | status:string |
+| `windows.registry.apply` | apply | A | W | plan:string (req, JSON array of up to 256 items), dry_run:enum (default true), continue_on_error:enum | row_kind:string, field_1..field_13:string |
 | `windows.registry.enumerate_keys` | enum_keys | Q | W | hive:enum (req), key:string (req) | subkey:string |
 | `windows.registry.enumerate_values` | enum_values | Q | W | hive:enum (req), key:string (req) | name:string, type:string |
 | `windows.registry.key_exists` | key_exists | Q | W | hive:enum (req), key:string (req) | exists:bool |
