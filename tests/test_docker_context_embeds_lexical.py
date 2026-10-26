@@ -39,10 +39,12 @@ class DockerContextEmbeds(unittest.TestCase):
                     needed.add(target)
         self.assertTrue(needed, "expected at least one docs/ build input (the retention TSV)")
         with open(os.path.join(REPO, ".dockerignore"), encoding="utf-8") as f:
-            lines = {l.strip() for l in f}
-        missing = sorted(p for p in needed if "!" + p not in lines)
+            lines = [l.strip() for l in f]
+        # Docker applies rules in order, last match wins: the `!` line must follow `docs/`.
+        excl = lines.index("docs/") if "docs/" in lines else -1
+        missing = sorted(p for p in needed if "!" + p not in lines or lines.index("!" + p) < excl)
         self.assertEqual(missing, [],
-                         "add `!<path>` under the docs/ exclusion in /.dockerignore")
+                         "add `!<path>` AFTER the docs/ exclusion in /.dockerignore")
 
 
 if __name__ == "__main__":
