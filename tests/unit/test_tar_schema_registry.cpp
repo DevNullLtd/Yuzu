@@ -238,7 +238,7 @@ TEST_CASE("TAR schema: the registry source row (PR11.8)", "[tar][schema][registr
     CHECK(def->unique_key_column == "record_key");
     REQUIRE(def->os_support.size() == 3);
     CHECK(os_support_status("registry", "windows") == OsSupportStatus::kSupported);
-    CHECK(supported_capture_method("registry", "windows") == "regnotify");
+    CHECK(supported_capture_method("registry", "windows") == "regnotify+etw");
     CHECK(os_support_status("registry", "linux") == OsSupportStatus::kUnsupported);
     CHECK(os_support_status("registry", "macos") == OsSupportStatus::kUnsupported);
     REQUIRE(def->granularities.size() == 1); // one live tier, no rollups

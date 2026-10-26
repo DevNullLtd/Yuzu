@@ -412,9 +412,10 @@ struct RemovableEvent {
 };
 
 /// One registry_live row (cursor-model seam, tar_cursor.hpp) -- a value or key
-/// change the key watch observed (tar_registry_parsers.hpp). The actor columns
-/// exist for a later change that attributes writers: until then actor_pid is 0
-/// and actor_image is ''. `data`/`prev_data` are UNMASKED rendered values.
+/// change the key watch observed (tar_registry_parsers.hpp). The actor columns hold
+/// the writer correlated to the change (a lead to verify, not proof): actor_pid is 0
+/// and actor_image '' when no writer is named, and `detail` says why (attr:*).
+/// `data`/`prev_data` are UNMASKED rendered values.
 /// Warehouse columns are NOT NULL DEFAULT '' / 0, so "not applicable" (removals,
 /// key removals, gaps; the old value of an addition) is '' / 0, and `data_type`
 /// /`prev_data_type` == '' is what tells an absent value from an empty one.
@@ -433,11 +434,11 @@ struct RegistryEvent {
     std::string prev_data;
     int64_t prev_data_size{0};
     int prev_data_truncated{0};
-    int64_t actor_pid{0}; // 0 = unattributed
+    int64_t actor_pid{0}; // 0 = no writer named
     std::string actor_image;
     std::string source;     // notify | reconcile
     int64_t observed_at{0}; // unix ms
-    std::string detail;     // the gap description; '' on a change row
+    std::string detail;     // attr:* on a change row; the gap description on a gap
     std::string record_key; // UNIQUE -- replay idempotence (INSERT OR IGNORE)
 };
 
@@ -594,7 +595,9 @@ public:
      * transaction: a baseline can never advance without the rows it explains, nor
      * the rows without the baseline (a failed commit rolls all three back).
      * The collision check compares IDENTITY columns only (what changed), never
-     * the actor/detail columns.
+     * the actor/detail columns: the record_key does not depend on attribution, so a
+     * replay that re-derives a different attribution (the event buffer is in
+     * memory and does not survive a restart) is a silent no-op.
      */
     std::expected<void, CursorInsertError> insert_registry_events_and_cursor(
         const std::vector<RegistryEvent>& events, const std::string& cursor_json,

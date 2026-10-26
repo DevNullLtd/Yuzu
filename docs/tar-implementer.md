@@ -133,7 +133,7 @@ function, never in `applies_*` collectors.
 | **Uninstall** (`yuzu-agent --remove-service`, MSI uninstall) | tar.db is **left in place** by design. The data dir is operator-managed; uninstall removes the binary and service registration only. To wipe TAR data, delete `<data_dir>/tar.db` explicitly. |
 | **Reinstall over an existing data dir** | The new binary opens the existing tar.db, runs migration if the schema version differs, and resumes collection. State in `tar_state` may be stale (see §5). On Windows, files left by a different agent account are refused rather than adopted (`docs/user-manual/tar.md` "Data storage"). |
 | **`data_dir` change** (config update) | The new directory has no tar.db — the next collect_fast creates it from scratch. The old tar.db at the previous path is orphaned but not deleted. Operator concern, not TAR's. |
-| **Roll back to an older agent** | The older binary opens the same `tar.db` (the registry source adds no schema version) but does not know the `registry` source, so the `registry_live` table, the `registry` row of `tar_cursor` and every `registry:%` baseline in `tar_state` stay on disk, with the per-key baselines holding every watched value unmasked, and the older binary has no way to erase them. Run `tar.purge_source` on the paused `registry` source BEFORE the rollback. |
+| **Roll back to an older agent** | The older binary opens the same `tar.db` (the registry source adds no schema version) but does not know the `registry` source, so the `registry_live` table, the `registry` row of `tar_cursor` and every `registry:%` baseline in `tar_state` stay on disk, with the per-key baselines holding every watched value unmasked (and the cursor row, for about one tick, the rendered old and new values of changes still waiting for their writer), and the older binary has no way to erase them. Run `tar.purge_source` on the paused `registry` source BEFORE the rollback. |
 | **Corruption detected at open** (#559) | `TarDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm`/`-journal` sidecars are renamed to `tar.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `tar_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `tar.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — TAR refuses to load rather than trust the corrupt DB. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.tar.*` heartbeat tags; the server exposes `yuzu_fleet_tar_db_corruption_agents` and writes a `tar.db.corruption_quarantined` audit row — see docs/user-manual/tar.md "Fleet visibility". |
 
 The "leave data on uninstall" rule is identical to other Yuzu agent
@@ -454,10 +454,61 @@ cursor.** What it adds to the pattern:
   hive loading and that read, up to one slow interval, are folded into the
   baseline and are not recorded; no per-root gap row is written, since a logon
   would add one per root per user.
-- **Rows land in the tick that observes the change.** A diff row is stamped with
-  the end of the read that saw it and written in that tick's transaction.
-  `actor_pid`/`actor_image` are in the schema but hold `0`/`''` until a later
-  change attributes writers; the row's `record_key` never depends on them.
+- **Rows land one tick after the one that observes the change.** A diff produces
+  a *candidate*, not a row. It is stamped with the end of the read that saw it and
+  with the time window in which the write must have happened
+  (`candidate_window`: from the root's last COMPLETE read start to this read's
+  end, tightened to the notify burst +/- 1 s when the key watch triggered the
+  read). It is HELD in the cursor row until `kEtwSettle100ns` (5 s) after that
+  window closed, because an event can trail its write by that long, and only then
+  does `stitch_registry_tick` write it with the attribution outcome in `detail`.
+  The row's `record_key` never depends on attribution, and the store's collision
+  check compares identity columns only, so a replay that attributes differently
+  is a silent no-op, not a collision.
+- **Who wrote it is correlated, never read off an event.** A write-only
+  Kernel-Registry ETW session (mask `0x4300`: SetValueKey, DeleteValueKey,
+  DeleteKey; never OpenKey or CreateKey) delivers the writer's pid and the value
+  name, type and size, but its key-name field is empty on most events.
+  `attribute_candidate` therefore matches a candidate to events on case-folded
+  value name, type, size and the (lo, hi] window, and names a writer ONLY when
+  exactly one pid matches; `key_removed` is never attributed. The marker
+  precedence is lost-restart > off > degraded > corr / ambiguous / none. Every
+  sentence in the user manual must keep saying "a lead to verify, not proof":
+  a change made without a value-write event (a hive load, a restore) is
+  correlated to an unrelated same-signature writer in its window.
+- **Loss is a window, not a flag.** A buffer eviction (oldest first; its
+  timestamps widen a drop range), the kernel's `EventsLost` /
+  `RealTimeBuffersLost`, a callback decode failure and a failed session query
+  each become a `LossEpoch` in the cursor plus one `gap:loss:<n>` row; a
+  candidate whose window intersects an epoch is written `attr:degraded`. The
+  counters, the drop range and the buffer's retirement advance only AFTER the
+  event+cursor transaction commits, like the dirty flags: a failed commit
+  re-derives and re-reports all of it.
+- **`RegistryEtwBuffer` is not `BoundedPendingQueue`.** It releases by sequence
+  identity like `ack_through`, but selectively: after a commit it retires the
+  events older than the minimum root `window_base` (`retention_watermark`) that
+  no held candidate's window covers (`release_event`). The events a held
+  candidate still needs are interleaved with ones it does not, which a prefix
+  release cannot express. It is not persisted: a restart, or a disable and
+  re-enable, loses it, and the candidates it would have attributed are written
+  `attr:lost-restart`. A root that is never completely read keeps its
+  `window_base` at 0 and so pins the buffer until the cap evicts, which then
+  degrades what the eviction overlaps.
+- **The cursor row is a third content store.** Besides the rows and the
+  baselines, `held` carries each waiting candidate's rendered old and new values
+  for about one tick (readable through `tar.sql` as `tar_cursor`; erased by
+  `purge_source("registry")`). Cursor decode treats `window_base`, `held` and
+  `loss` as optional so a cursor written by the key-watch-only source decodes as
+  present; a malformed one would re-baseline every root.
+- **The Windows ETW code has no unit seam and no fault-injection test of the
+  callback.** `WinEtw` (the session and consumer handles each behind a RAII
+  owner, one `ProcessTrace` worker, a `noexcept` callback that contains every
+  exception and counts a decode failure) is covered by compile plus the
+  `[registry][windows]` live cases, which need an elevated agent and SKIP with a
+  named reason otherwise. Teardown order is explicit in `WinEtw::stop()`:
+  CloseTrace (it unblocks `ProcessTrace`), join, then stop the session. A
+  session that cannot open is degrade-not-fail (`registry_capture_method` =
+  `notify`, rows `attr:off`); one that dies after it opened is not restarted.
 - **Windows warehouse columns are NOT NULL.** "Not applicable" is `''`/`0`, and an
   empty `data_type` distinguishes an absent value from an empty one.
 

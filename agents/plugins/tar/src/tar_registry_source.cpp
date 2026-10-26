@@ -3,11 +3,11 @@
  *
  * Cross-platform section: the collect() state machine over an injected
  * RegistryReader (unit-tested on every platform). Windows section (#ifdef
- * _WIN32): the RegNotifyChangeKeyValue watcher thread and the budgeted subtree
- * reader, wired into a RegistryReader by make_registry_cursor_source().
- * Off-Windows the production factory is nullptr.
+ * _WIN32): the Kernel-Registry ETW session, the RegNotifyChangeKeyValue watcher
+ * thread and the budgeted subtree reader, wired into a RegistryReader by
+ * make_registry_cursor_source(). Off-Windows the production factory is nullptr.
  *
- * Design: tar_registry_parsers.hpp.
+ * Design and the exact meaning of the attribution: tar_registry_parsers.hpp.
  */
 
 #include "tar_registry_source.hpp"
@@ -78,20 +78,25 @@ void RegistryCursorSource::ensure_watch(const std::vector<std::string>& roots) {
 
 void RegistryCursorSource::start(TarDatabase& db) {
     // A persisted cursor means a previous run: whatever was written while the agent
-    // was down is found by the baseline diff. An unreadable cursor is treated the
-    // same way.
+    // was down is found by the baseline diff, but the events that would name its
+    // writer were never seen. An unreadable cursor is treated the same way.
     const auto cursor = db.get_cursor("registry");
     if (!cursor || cursor->has_value()) {
         pending_gap_ = true;
         gap_cause_ = GapCause::Restart;
+        restarted_ = true;
         force_all_ = true;
     }
+    reader_.start(); // a session that cannot open degrades to the key watch (rows attr:off)
+    events_since_ = reader_.etw_running() ? reader_.now_ts() : 0;
+    last_query_ts_ = events_since_;
     ensure_watch(scope_.roots_for(reader_.loaded_sids()));
 }
 
 void RegistryCursorSource::stop() noexcept {
     try {
         reader_.stop();
+        reader_.buffer->clear();
     } catch (...) {
         // stop() must not throw (tar_cursor.hpp); nothing left to release.
     }
@@ -99,13 +104,20 @@ void RegistryCursorSource::stop() noexcept {
 
 void RegistryCursorSource::on_enabled_changed(bool enabled) {
     if (!enabled) {
-        // The watcher stays warm. The first tick after re-enable re-baselines every
-        // root (forensic-pause contract), so the paused window's changes are never stored.
+        // The watcher and the session stay warm. Gate the buffer FIRST so nothing new is
+        // queued, and discard what it holds, so no event from the paused window can ever
+        // be matched. The first tick after re-enable re-baselines every root
+        // (forensic-pause contract), so the paused window's changes are never stored.
+        reader_.buffer->pause();
         was_disabled_ = true;
     } else if (was_disabled_) {
+        reader_.buffer->resume();
         pending_gap_ = true;
         gap_cause_ = GapCause::Disabled;
         was_disabled_ = false;
+        // Nothing before this instant is in the buffer: held candidates read earlier
+        // finalise as lost-restart rather than as a clean attribution.
+        events_since_ = reader_.now_ts();
     }
 }
 
@@ -135,7 +147,7 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
                cause == GapCause::Restart ? "restart" : "disabled", std::to_string(now),
                cause == GapCause::Restart
                   ? "gap:restart: the agent was not running; registry changes made meanwhile are "
-                    "found by the baseline diff"
+                    "found by the baseline diff but their writers were never observed"
                   : "gap:disabled: the registry source was disabled; the disabled window's "
                     "changes were never captured and every root was re-baselined (forensic-pause "
                     "contract)",
@@ -176,6 +188,7 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
         const bool ccs_switched = !cur.ccs.empty() && cur.ccs != ccs_now;
         cur.ccs = ccs_now;
 
+        std::vector<RegistryCandidate> fresh_candidates;
         const std::int64_t deadline = now + kSnapshotBudget100ns;
         const std::size_t n = roots.size();
         const std::size_t start_idx = n == 0 ? 0 : static_cast<std::size_t>(cur.tick) % n;
@@ -221,6 +234,7 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
             const std::int64_t read_start = reader_.now_ts();
             SubtreeRead rd = reader_.read_subtree(root, deadline);
             const std::int64_t read_end = reader_.now_ts();
+            const std::int64_t last_dirty = reader_.dirty->last(root);
 
             RegistryBaseline base;
             bool fresh_root = !st.baselined;
@@ -242,10 +256,15 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
                     base = decoded.baseline;
                 }
             }
-            DiffResult diff = diff_registry_snapshot(
-               base, rd, snap.first != 0 ? "notify" : "reconcile", read_end, fresh_root);
-            for (const auto& c : diff.candidates)
-                rows.push_back(registry_row_from_candidate(c, snapshot_id));
+            // The window the writes behind these candidates fall in; st.window_base (this
+            // root's last COMPLETE read start) is advanced only below, after the diff.
+            const RegistryWindow window = candidate_window(st.window_base, read_end, snap.first,
+                                                           last_dirty, kEtwWindowSlack100ns);
+            DiffResult diff = diff_registry_snapshot(base, rd, root,
+                                                     snap.first != 0 ? "notify" : "reconcile",
+                                                     window, read_end, fresh_root);
+            for (auto& c : diff.candidates)
+                fresh_candidates.push_back(std::move(c));
             if (rd.status != RegistryReadStatus::Unreadable && (fresh_root || diff.changed))
                 state_writes.push_back({baseline_collector(root),
                                         encode_registry_baseline(diff.baseline)});
@@ -301,10 +320,54 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
             st.status = std::string(to_string(rd.status));
             if (rd.status != RegistryReadStatus::Unreadable)
                 st.baselined = true; // a Capped first read is a partial baseline, by design
+            if (rd.status == RegistryReadStatus::Complete || rd.status == RegistryReadStatus::Absent)
+                st.window_base = read_start; // the NEXT window starts here
         }
 
+        // Loss accounting. The drop range and the session counters are cumulative; what is
+        // new since the last COMMITTED tick becomes one gap row and a loss epoch. A failed
+        // loss query is itself loss: the session's counters are then unknown.
+        const auto drops = reader_.buffer->drop_info();
+        const SessionLoss sl = reader_.session_loss();
+        const std::uint64_t fail_now = sl.query_ok ? 0 : 1;
+        const std::uint64_t kernel_total =
+           sl.events_lost + sl.rt_buffers_lost + sl.decode_failed + query_failures_ + fail_now;
+        const std::uint64_t drop_delta =
+           drops.count > last_reported_drops_ ? drops.count - last_reported_drops_ : 0;
+        const std::uint64_t kernel_delta =
+           kernel_total > last_reported_kernel_ ? kernel_total - last_reported_kernel_ : 0;
+        std::vector<LossEpoch> epochs = cur.loss;
+        if (drop_delta > 0)
+            append_loss_epoch(epochs, {drops.ts_lo, drops.ts_hi});
+        if (kernel_delta > 0) // where inside the interval since the last query the loss lies is unknown
+            append_loss_epoch(epochs, {last_query_ts_, now});
+        if (drop_delta + kernel_delta > 0)
+            rows.push_back(registry_gap_row("loss", std::to_string(now),
+                                            std::format("gap:loss:{}", drop_delta + kernel_delta),
+                                            now, snapshot_id));
+
+        // Held candidates (from earlier ticks) and this tick's fresh ones, against the buffer.
+        const auto batch = reader_.buffer->snapshot();
+        std::vector<RegistryCandidate> candidates = std::move(cur.held);
+        for (auto& c : fresh_candidates)
+            candidates.push_back(std::move(c));
+        const StitchFlags flags{reader_.etw_running(), restarted_, events_since_};
+        StitchResult stitched =
+           stitch_registry_tick(candidates, batch.items, epochs, flags, now, snapshot_id);
+        for (auto& r : stitched.rows)
+            rows.push_back(std::move(r));
+
         cur.tick += 1;
+        cur.held = std::move(stitched.held_next);
         cur.hku = sids;
+        // No future window starts before the minimum window_base, nor does any held one
+        // start before its own lo: an epoch ending before both can never intersect again.
+        const std::int64_t watermark = retention_watermark(cur.roots);
+        std::int64_t floor = watermark;
+        for (const auto& h : cur.held)
+            floor = std::min(floor, h.window_lo);
+        age_loss_epochs(epochs, floor);
+        cur.loss = std::move(epochs);
 
         const std::string new_cursor = encode_registry_cursor(cur);
         if (auto ins = db.insert_registry_events_and_cursor(rows, new_cursor, state_writes); !ins) {
@@ -316,9 +379,25 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
         }
         rb.active = false; // committed: the dirty flags stay consumed
 
-        // Only now may the transient state move (a failed commit re-derives all of it).
+        // Only now may the transient state move (a failed commit re-derives all of it: the
+        // dirty flags above, the buffer, the loss counters and the totals stay untouched,
+        // and the replay's rows carry the same record_keys, since identity excludes the
+        // attribution).
+        reader_.buffer->retire(batch.last_seq, [&](const RegistryEtwEvent& e) {
+            return release_event(e, watermark, cur.held);
+        });
+        reader_.buffer->reset_drop_range(drops.count);
+        last_reported_drops_ = drops.count;
+        last_reported_kernel_ = kernel_total;
+        query_failures_ += fail_now;
+        last_query_ts_ = now;
         pending_gap_ = false;
+        restarted_ = false;
         force_all_ = false;
+        totals_.attributed += stitched.counters.attributed;
+        totals_.ambiguous += stitched.counters.ambiguous;
+        totals_.none += stitched.counters.none;
+        reader_.tick_committed();
 
         // Status keys (always written, skipped when unchanged).
         std::size_t unarmed = 0, unreadable = 0, capped = 0;
@@ -328,7 +407,14 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
             capped += st.status == "capped" ? 1 : 0;
         }
         const std::pair<const char*, std::string> keys[] = {
-           {"registry_capture_method", "notify"},
+           // The key watch is always what detects; the session only names the writer.
+           {"registry_capture_method", reader_.etw_running() ? "notify+etw" : "notify"},
+           {"registry_etw_events", std::to_string(reader_.buffer->pushed())},
+           {"registry_etw_dropped", std::to_string(drops.count)},
+           {"registry_etw_lost", std::to_string(kernel_total)},
+           {"registry_attr_attributed", std::to_string(totals_.attributed)},
+           {"registry_attr_ambiguous", std::to_string(totals_.ambiguous)},
+           {"registry_attr_none", std::to_string(totals_.none)},
            {"registry_watch_roots", std::to_string(roots.size())},
            {"registry_watch_roots_unarmed", std::to_string(unarmed)},
            {"registry_roots_unreadable", std::to_string(unreadable)},
@@ -363,7 +449,7 @@ std::unique_ptr<RegistryCursorSource> make_registry_cursor_source(RegistryScope 
 } // namespace yuzu::tar
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Windows: key-watch thread + budgeted reader
+// Windows: Kernel-Registry ETW session + key-watch thread + budgeted reader
 // ═══════════════════════════════════════════════════════════════════════════
 #ifdef _WIN32
 
@@ -374,13 +460,22 @@ std::unique_ptr<RegistryCursorSource> make_registry_cursor_source(RegistryScope 
 #define NOMINMAX
 #endif
 #include <windows.h>
+// <evntcons.h>/<evntrace.h> must follow windows.h; <tdh.h> follows those.
+#include <evntcons.h>
+#include <evntrace.h>
+#include <tdh.h>
 
 #include <guard_win_handle.hpp> // yuzu::agent::detail::EventHandle (agents/core/src)
 #include <win_reg_handle.hpp>   // yuzu::win::RegKey
 #include <win_str.hpp>          // yuzu::win wide<->UTF-8
 
-#include <thread>
+#include "tar_win_process_name.hpp" // process_basename_for_pid
 
+#include <atomic>
+#include <thread>
+#include <unordered_map>
+
+#pragma comment(lib, "tdh.lib")
 #pragma comment(lib, "advapi32.lib")
 
 #ifndef REG_NOTIFY_THREAD_AGNOSTIC
@@ -400,12 +495,300 @@ constexpr std::size_t kHkuIdx = static_cast<std::size_t>(-2);
 // The registry's maximum value-name length, in characters (the buffer adds the NUL).
 constexpr std::size_t kMaxValueNameChars = 16383;
 
+// Microsoft-Windows-Kernel-Registry: {70EB4F03-C1DE-4F73-A051-33D13D5413BD}
+constexpr GUID kKernelRegistryGuid = {
+    0x70eb4f03, 0xc1de, 0x4f73, {0xa0, 0x51, 0x33, 0xd1, 0x3d, 0x54, 0x13, 0xbd}};
+constexpr USHORT kEvDeleteKey = 3;
+constexpr USHORT kEvSetValueKey = 5;
+constexpr USHORT kEvDeleteValueKey = 6;
+
 std::int64_t filetime_now() {
     FILETIME ft;
     GetSystemTimePreciseAsFileTime(&ft);
     return static_cast<std::int64_t>((static_cast<std::uint64_t>(ft.dwHighDateTime) << 32) |
                                      ft.dwLowDateTime);
 }
+
+// ── The Kernel-Registry ETW half ────────────────────────────────────────────
+
+// Named-property readers (TDH decodes by NAME so a layout change across builds is
+// tolerated). false = absent or torn: the caller counts a decode failure.
+bool prop_u32(EVENT_RECORD* rec, const wchar_t* name, std::uint32_t& out) {
+    PROPERTY_DATA_DESCRIPTOR pdd{};
+    pdd.PropertyName = reinterpret_cast<ULONGLONG>(name);
+    pdd.ArrayIndex = ULONG_MAX;
+    ULONG val = 0;
+    if (TdhGetProperty(rec, 0, nullptr, 1, &pdd, sizeof(val), reinterpret_cast<PBYTE>(&val)) !=
+        ERROR_SUCCESS)
+        return false;
+    out = static_cast<std::uint32_t>(val);
+    return true;
+}
+
+bool prop_u64(EVENT_RECORD* rec, const wchar_t* name, std::uint64_t& out) {
+    PROPERTY_DATA_DESCRIPTOR pdd{};
+    pdd.PropertyName = reinterpret_cast<ULONGLONG>(name);
+    pdd.ArrayIndex = ULONG_MAX;
+    ULONGLONG val = 0;
+    if (TdhGetProperty(rec, 0, nullptr, 1, &pdd, sizeof(val), reinterpret_cast<PBYTE>(&val)) !=
+        ERROR_SUCCESS)
+        return false;
+    out = val;
+    return true;
+}
+
+// ValueName; the default value ("") is a legitimate 2-byte (NUL only) property.
+bool prop_string(EVENT_RECORD* rec, const wchar_t* name, std::string& out) {
+    PROPERTY_DATA_DESCRIPTOR pdd{};
+    pdd.PropertyName = reinterpret_cast<ULONGLONG>(name);
+    pdd.ArrayIndex = ULONG_MAX;
+    ULONG size = 0;
+    if (TdhGetPropertySize(rec, 0, nullptr, 1, &pdd, &size) != ERROR_SUCCESS)
+        return false;
+    if (size <= sizeof(wchar_t)) {
+        out.clear();
+        return true;
+    }
+    std::vector<wchar_t> buf(size / sizeof(wchar_t) + 1, L'\0');
+    if (TdhGetProperty(rec, 0, nullptr, 1, &pdd, size, reinterpret_cast<PBYTE>(buf.data())) !=
+        ERROR_SUCCESS)
+        return false;
+    out = yuzu::win::from_wide(buf.data());
+    return true;
+}
+
+// Owns a started trace session: its handle and the EVENT_TRACE_PROPERTIES block (with
+// the session name behind it) every ControlTrace call needs. reset() stops the session
+// by handle. Move-only; the destructor is the safety net, WinEtw::stop() orders teardown.
+struct TraceSession {
+    TRACEHANDLE h = 0;
+    std::vector<BYTE> buf; // EVENT_TRACE_PROPERTIES + the session name
+
+    TraceSession() = default;
+    TraceSession(const TraceSession&) = delete;
+    TraceSession& operator=(const TraceSession&) = delete;
+    TraceSession(TraceSession&& o) noexcept : h(std::exchange(o.h, TRACEHANDLE{0})), buf(std::move(o.buf)) {}
+    TraceSession& operator=(TraceSession&& o) noexcept {
+        if (this != &o) {
+            reset();
+            h = std::exchange(o.h, TRACEHANDLE{0});
+            buf = std::move(o.buf);
+        }
+        return *this;
+    }
+    ~TraceSession() { reset(); }
+
+    EVENT_TRACE_PROPERTIES* props() { return reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buf.data()); }
+
+    // (Re)initialise the properties block for `name_bytes` of session name.
+    void init(std::size_t name_bytes) {
+        buf.assign(sizeof(EVENT_TRACE_PROPERTIES) + name_bytes, 0);
+        props()->Wnode.BufferSize = static_cast<ULONG>(buf.size());
+        props()->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        props()->Wnode.ClientContext = 2; // system-time timestamps: FILETIME, now_ts's clock
+        props()->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+        props()->FlushTimer = 1; // flush every 1 s so low-volume events deliver promptly
+        props()->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+    }
+
+    void reset() noexcept {
+        if (h == 0)
+            return;
+        ControlTraceW(h, nullptr, props(), EVENT_TRACE_CONTROL_STOP);
+        h = 0;
+    }
+};
+
+// Owns the OpenTrace consumer handle; reset() is CloseTrace, which is also what
+// unblocks a ProcessTrace running on another thread.
+struct TraceConsumer {
+    TRACEHANDLE h = INVALID_PROCESSTRACE_HANDLE;
+
+    TraceConsumer() = default;
+    TraceConsumer(const TraceConsumer&) = delete;
+    TraceConsumer& operator=(const TraceConsumer&) = delete;
+    TraceConsumer(TraceConsumer&& o) noexcept : h(std::exchange(o.h, INVALID_PROCESSTRACE_HANDLE)) {}
+    TraceConsumer& operator=(TraceConsumer&& o) noexcept {
+        if (this != &o) {
+            reset();
+            h = std::exchange(o.h, INVALID_PROCESSTRACE_HANDLE);
+        }
+        return *this;
+    }
+    ~TraceConsumer() { reset(); }
+
+    void reset() noexcept {
+        if (h == INVALID_PROCESSTRACE_HANDLE)
+            return;
+        CloseTrace(h);
+        h = INVALID_PROCESSTRACE_HANDLE;
+    }
+};
+
+// One real-time session, write-only mask, decoded by name into the shared buffer.
+// The ProcessTrace callback is serial, so the pid-name cache needs no lock.
+struct WinEtw {
+    std::mutex mu; // serialises start / stop / loss (they share the session block)
+    TraceSession session;
+    TraceConsumer consumer;
+    std::thread worker;
+    std::wstring session_name;
+    std::shared_ptr<RegistryEtwBuffer> buffer;
+    std::atomic<bool> running{false};
+    std::atomic<std::uint64_t> decode_failed{0};
+    std::unordered_map<std::uint32_t, std::string> pid_name; // ProcessTrace thread only
+    std::atomic<bool> names_stale{false}; // set by the collect tick, honoured by the callback
+    static constexpr std::size_t kPidNameCap = 65536;
+
+    ~WinEtw() { stop(); }
+
+    // Idempotent, and the ONLY place that orders teardown: CloseTrace first (it is what
+    // unblocks ProcessTrace), then join the worker, then stop the session. The members'
+    // destructors repeat this as a safety net but cannot order it across the join.
+    void stop() noexcept {
+        std::lock_guard lock(mu);
+        teardown_locked();
+    }
+
+    // noexcept: runs across the ETW (C) frame, where an escaping C++ exception is
+    // undefined behaviour. A failed decode costs one event and is COUNTED (it breaks the
+    // "every write produced an event" invariant the attribution rests on), never silent.
+    static void WINAPI on_event(EVENT_RECORD* rec) noexcept {
+        auto* self = static_cast<WinEtw*>(rec->UserContext);
+        try {
+            if (self == nullptr || !IsEqualGUID(rec->EventHeader.ProviderId, kKernelRegistryGuid))
+                return;
+            const USHORT id = rec->EventHeader.EventDescriptor.Id;
+            if (id != kEvSetValueKey && id != kEvDeleteValueKey && id != kEvDeleteKey)
+                return;
+            RegistryEtwEvent ev;
+            std::uint32_t status = 0;
+            if (!prop_u32(rec, L"Status", status) || !prop_u64(rec, L"KeyObject", ev.key_object)) {
+                self->decode_failed.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            if (status != 0)
+                return; // the operation failed: nothing changed
+            ev.ts100ns = rec->EventHeader.TimeStamp.QuadPart;
+            ev.pid = rec->EventHeader.ProcessId;
+            ev.tid = rec->EventHeader.ThreadId;
+            if (id == kEvDeleteKey) {
+                ev.op = RegistryEtwOp::DeleteKey;
+            } else {
+                ev.op = id == kEvSetValueKey ? RegistryEtwOp::Set : RegistryEtwOp::DeleteValue;
+                bool ok = prop_string(rec, L"ValueName", ev.value);
+                if (ok && id == kEvSetValueKey)
+                    ok = prop_u32(rec, L"Type", ev.type) && prop_u32(rec, L"DataSize", ev.size);
+                if (!ok) {
+                    self->decode_failed.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+            }
+            if (self->names_stale.exchange(false, std::memory_order_relaxed))
+                self->pid_name.clear(); // a reused pid names stale for at most one tick
+            auto it = self->pid_name.find(ev.pid);
+            if (it == self->pid_name.end()) {
+                if (self->pid_name.size() >= kPidNameCap)
+                    self->pid_name.clear(); // wholesale flush: no past-cap naming blackout
+                it = self->pid_name.emplace(ev.pid, process_basename_for_pid(ev.pid)).first;
+            }
+            ev.image = it->second;
+            self->buffer->push(std::move(ev));
+        } catch (...) {
+            if (self != nullptr)
+                self->decode_failed.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    // false = the session could not be opened (not elevated, or the provider is refused):
+    // the key watch still runs and rows carry attr:off.
+    bool start() noexcept {
+        try {
+            std::lock_guard lock(mu);
+            if (running.load())
+                return true;
+            session_name = registry_etw_session_name();
+            const std::size_t name_bytes = (session_name.size() + 1) * sizeof(wchar_t);
+            session.init(name_bytes);
+            ULONG rc = StartTraceW(&session.h, session_name.c_str(), session.props());
+            if (rc == ERROR_ALREADY_EXISTS) { // a stale session from a crashed predecessor
+                ControlTraceW(0, session_name.c_str(), session.props(), EVENT_TRACE_CONTROL_STOP);
+                session.init(name_bytes);
+                rc = StartTraceW(&session.h, session_name.c_str(), session.props());
+            }
+            if (rc != ERROR_SUCCESS) {
+                session.h = 0; // nothing was started: nothing for reset() to stop
+                return false;
+            }
+            ENABLE_TRACE_PARAMETERS params{};
+            params.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+            rc = EnableTraceEx2(session.h, &kKernelRegistryGuid, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                                TRACE_LEVEL_INFORMATION, kEtwKeywordMask, 0, 0, &params);
+            if (rc != ERROR_SUCCESS) {
+                teardown_locked();
+                return false;
+            }
+            EVENT_TRACE_LOGFILEW logfile{};
+            logfile.LoggerName = const_cast<LPWSTR>(session_name.c_str());
+            logfile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+            logfile.EventRecordCallback = &WinEtw::on_event;
+            logfile.Context = this;
+            consumer.h = OpenTraceW(&logfile);
+            if (consumer.h == INVALID_PROCESSTRACE_HANDLE) {
+                teardown_locked();
+                return false;
+            }
+            running.store(true);
+            // The worker takes its own copy of the handle: nothing is shared with the thread
+            // that later resets `consumer`.
+            worker = std::thread([this, handle = consumer.h]() mutable {
+                try {
+                    // Blocks until CloseTrace() (stop()) -- or returns on its own if the
+                    // session dies. Either way, mark not-running so a dead session reads as
+                    // attr:off rather than as a quiet registry.
+                    ProcessTrace(&handle, 1, nullptr, nullptr);
+                } catch (...) {
+                    // nothing to release; fall through to the not-running mark
+                }
+                running.store(false, std::memory_order_relaxed);
+            });
+            return true;
+        } catch (...) {
+            // bad_alloc / system_error (the thread): tear down whatever was opened.
+            stop();
+            return false;
+        }
+    }
+
+    // The session's own loss counters (ControlTraceW QUERY by name).
+    SessionLoss loss() noexcept {
+        SessionLoss out;
+        out.decode_failed = decode_failed.load(std::memory_order_relaxed);
+        std::lock_guard lock(mu);
+        if (!running.load() || session.h == 0)
+            return out; // no live session: etw_running() says so, and attr:off marks the rows
+        session.props()->Wnode.BufferSize = static_cast<ULONG>(session.buf.size());
+        session.props()->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        session.props()->LogFileNameOffset = 0;
+        if (ControlTraceW(0, session_name.c_str(), session.props(), EVENT_TRACE_CONTROL_QUERY) !=
+            ERROR_SUCCESS) {
+            out.query_ok = false;
+            return out;
+        }
+        out.events_lost = session.props()->EventsLost;
+        out.rt_buffers_lost = session.props()->RealTimeBuffersLost;
+        return out;
+    }
+
+private:
+    void teardown_locked() noexcept {
+        running.store(false, std::memory_order_relaxed);
+        consumer.reset(); // CloseTrace: unblocks ProcessTrace
+        if (worker.joinable())
+            worker.join();
+        session.reset(); // ControlTrace STOP
+    }
+};
 
 HKEY hive_of(std::string_view token) {
     return token == "HKU" ? HKEY_USERS : HKEY_LOCAL_MACHINE;
@@ -789,23 +1172,48 @@ std::vector<std::string> enumerate_hku() {
 
 } // namespace
 
+std::wstring registry_etw_session_name() {
+    // Salted per process: the CI pools run several agents as one OS identity, and a
+    // fixed session name is a cross-job shared resource.
+    return L"YuzuTarRegistryEtw-" + std::to_wstring(::GetCurrentProcessId());
+}
+
 RegistryReader make_windows_registry_reader() {
     auto dirty = std::make_shared<RegistryDirtyTable>();
+    auto buffer = std::make_shared<RegistryEtwBuffer>();
+    auto etw = std::make_shared<WinEtw>();
+    etw->buffer = buffer;
     auto watcher = std::make_shared<WinWatcher>();
     watcher->dirty = dirty;
 
     RegistryReader r;
     r.dirty = dirty;
+    r.buffer = buffer;
     r.read_subtree = [](const std::string& root, std::int64_t deadline) {
         return read_root(normalise_registry_path(root, read_current_control_set()), deadline);
     };
     r.loaded_sids = [] { return enumerate_hku(); };
     r.now_ts = [] { return filetime_now(); };
+    r.etw_running = [etw] { return etw->running.load(); };
+    r.session_loss = [etw] { return etw->loss(); };
     r.current_control_set = [] { return read_current_control_set(); };
     r.watch_roots = [watcher](const std::vector<std::string>& roots) { watcher->watch(roots); };
     r.root_armed = [watcher](const std::string& root) { return watcher->armed(root); };
     r.rearm = [watcher](const std::string& root) { return watcher->rearm(root); };
-    r.stop = [watcher] { watcher->shutdown(); };
+    // ponytail: a session that dies after start is not restarted -- capture_method flips to
+    // notify and rows say attr:off; add a restart if that is ever seen in the field.
+    r.start = [etw] {
+        if (!etw->start())
+            spdlog::warn("TAR registry: Kernel-Registry ETW session unavailable (not elevated?) "
+                         "-- the key watch still runs, rows will carry attr:off");
+    };
+    // The session first: it is a system-wide kernel object that outlives a leaked handle,
+    // where the watcher's resources die with the process.
+    r.stop = [etw, watcher] {
+        etw->stop();
+        watcher->shutdown();
+    };
+    r.tick_committed = [etw] { etw->names_stale.store(true, std::memory_order_relaxed); };
     return r;
 }
 

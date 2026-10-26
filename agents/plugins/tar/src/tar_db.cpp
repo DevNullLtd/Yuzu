@@ -1870,8 +1870,10 @@ std::expected<void, TarDatabase::CursorInsertError> TarDatabase::insert_registry
                     }
                     // Ignored: a legitimate replay, or a collision. Only the stored
                     // IDENTITY (what changed) can tell them apart -- never the actor
-                    // or detail columns, which are not identity and must not wedge
-                    // the source on a permanent KeyCollision.
+                    // or detail columns: attribution is re-derived from an in-memory
+                    // buffer, so a replay may name a different writer (or none), and
+                    // that is not identity and must not wedge the source on a permanent
+                    // KeyCollision.
                     sqlite3_reset(dup.get());
                     sqlite3_clear_bindings(dup.get());
                     bind_text(dup.get(), 1, ev.record_key);
@@ -2111,10 +2113,11 @@ std::expected<int, std::string> TarDatabase::purge_source(const std::string& sou
 
     // registry (PR11.8): registry_live is not the only place the source keeps
     // captured content. Each root's BASELINE (`registry:<root>` tar_state rows)
-    // holds rendered values. Erase them, and the cursor row, in THIS transaction,
-    // or a purge that the operator expects to be permanent leaves the very values
-    // it removed. The cursor erase also means the next collect is a fresh Baseline
-    // (zero rows), never a diff against a baseline that no longer exists.
+    // holds rendered values, and the CURSOR row holds the rendered old and new values
+    // of changes still waiting for their attribution to settle. Erase them all in THIS
+    // transaction, or a purge that the operator expects to be permanent leaves the very
+    // values it removed. The cursor erase also means the next collect is a fresh
+    // Baseline (zero rows), never a diff against a baseline that no longer exists.
     // Bookkeeping rows are not counted in `total`.
     if (source == "registry") {
         for (const char* sql : {"DELETE FROM tar_cursor WHERE source = 'registry'",

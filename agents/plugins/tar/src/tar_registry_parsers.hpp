@@ -5,11 +5,35 @@
 // over strings/structs: no OS handle, no file I/O -- so it compiles and
 // unit-tests identically on every platform (tests/unit/test_tar_registry_source.cpp).
 //
-// THE MECHANISM. A RegNotifyChangeKeyValue subtree watch marks a root dirty; a
-// budgeted subtree read is diffed against the root's persisted BASELINE (tar_state
-// `registry:<root>`), giving added/changed/removed values with old and new data
-// (diff_registry_snapshot). A change becomes a row in the tick that observes it,
-// stamped with that read's end time.
+// THE MECHANISM, IN TWO LAYERS
+//   Layer 1 (WHAT changed): a RegNotifyChangeKeyValue subtree watch marks a root
+//     dirty; a budgeted subtree read is diffed against the root's persisted
+//     BASELINE (tar_state `registry:<root>`), giving added/changed/removed values
+//     with old and new data (diff_registry_snapshot).
+//   Layer 2 (WHO): a write-only Kernel-Registry ETW session (SetValueKey |
+//     DeleteValueKey | DeleteKey, mask 0x4300). Those events carry the writer's
+//     pid and the VALUE NAME, but the key-name field is empty on most of them, so
+//     the key can never be read off an event. The actor is therefore CORRELATED to
+//     a Layer-1 change on value name + type + size + time window
+//     (attribute_candidate), never read off an event that named the key.
+//
+// A change becomes a row only after its attribution is final: a candidate is HELD
+// (persisted in the cursor) until kEtwSettle100ns after its window closed, since an
+// event for a write just before the read can still arrive that long after it
+// (stitch_registry_tick). The row is stamped with the end of the read that saw it.
+//
+// WHAT CORRELATION ESTABLISHES. For a candidate change C, E(C) is the set of write
+// events whose signature matches C inside C's window and P(C) their distinct
+// pids. While the session ran and NO loss was observed over the window, every
+// successful in-scope value write produced an event, so the true writer's pid is in
+// P(C); when |P(C)| == 1 that pid is the writer. The residual: a change produced
+// WITHOUT a value-write event (hive load, RegRestoreKey, a transacted commit
+// outside the window) has no true event in E(C), so one unrelated same-signature
+// writer inside the window is correlated to it. actor_pid is an investigative lead
+// to verify against $Process_Live, NOT proof. Every DETECTABLE break of the
+// invariant is marked rather than guessed: loss -> attr:degraded, session down ->
+// attr:off, buffer lost across a restart/pause -> attr:lost-restart, two or more
+// pids -> attr:ambiguous:<n>, none -> attr:none.
 
 #include "tar_db.hpp" // RegistryEvent
 
@@ -22,10 +46,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -43,7 +70,13 @@ inline constexpr std::size_t kBaselineBytesCap = 64u * 1024u * 1024u;    // byte
 inline constexpr std::size_t kSkippedCap = 32; // access-denied child keys recorded per root read
 inline constexpr std::int64_t kSnapshotBudget100ns = 10LL * 10'000'000;  // 10 s
 inline constexpr std::int64_t kReconcileEveryTicks = 12;     // 12 x 300 s = hourly full re-read
+inline constexpr std::size_t kRegistryEtwBufferCap = 65536;  // buffered write events; oldest evicted past it
+inline constexpr std::int64_t kEtwWindowSlack100ns = 10'000'000; // 1 s either side of a notify burst
+inline constexpr std::int64_t kEtwSettle100ns = 50'000'000;      // 5 s: how long a late event may trail its write
+inline constexpr std::size_t kLossEpochCap = 64; // loss epochs kept before they collapse into one
 inline constexpr std::size_t kWatchHandleCap = 62; // + HKEY_USERS name watch + stop event = 64
+
+inline constexpr std::uint64_t kEtwKeywordMask = 0x4300; // SetValueKey 0x100 | DeleteValueKey 0x200 | DeleteKey 0x4000
 
 static_assert(kWatchHandleCap + 2 <= 64, "WaitForMultipleObjects takes at most 64 handles");
 
@@ -388,8 +421,44 @@ struct RegistryBaseline {
     bool operator==(const RegistryBaseline&) const = default;
 };
 
-/// A change the baseline diff observed, written as one registry_live row.
+[[nodiscard]] inline std::string fold_value_name(std::string_view n) {
+    std::string out(n);
+    for (auto& c : out)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    return out;
+}
+
+struct RegistryWindow {
+    std::int64_t lo{0}, hi{0};
+};
+
+/// The time window (lo, hi] (FILETIME 100 ns) in which a change observed by a read
+/// ending at `read_end` must have been written. `window_base` is the root's last
+/// COMPLETE read start (R5: a Capped/Unreadable read does not advance it, so a
+/// change in the unvisited part cannot fall outside the next window). A
+/// notify-triggered read (first_dirty != 0) is tightened to the notify burst
+/// +/- slack; a reconcile read keeps the whole interval.
+[[nodiscard]] inline RegistryWindow candidate_window(std::int64_t window_base, std::int64_t read_end,
+                                                     std::int64_t first_dirty,
+                                                     std::int64_t last_dirty, std::int64_t slack) {
+    RegistryWindow wide{window_base, read_end};
+    if (wide.hi < wide.lo)
+        wide.lo = wide.hi;
+    if (first_dirty == 0)
+        return wide;
+    RegistryWindow w;
+    w.lo = std::max(window_base, first_dirty - slack);
+    w.hi = std::min(read_end, last_dirty + slack);
+    if (w.lo > w.hi)
+        return wide; // inconsistent stamps: never narrow on them
+    return w;
+}
+
+/// A change the key watch observed, awaiting its attribution (held for the settle
+/// interval) and then written as one registry_live row.
 struct RegistryCandidate {
+    std::string root;
     std::string key; // full, HKLM\... / HKU\<sid>\...
     std::string value;
     std::string action; // added | changed | removed | key_removed
@@ -403,7 +472,8 @@ struct RegistryCandidate {
     std::string prev_data;
     bool prev_truncated{false};
     std::int64_t observed_at{0}; // FILETIME of the read that saw it
-    std::string source;          // notify | reconcile
+    std::int64_t window_lo{0}, window_hi{0}; // (lo, hi]: when the write must have happened
+    std::string source;                      // notify | reconcile
 };
 
 struct DiffResult {
@@ -427,10 +497,12 @@ struct DiffResult {
 /// never for a key at or under one of `read.skipped`, whose baseline is kept as
 /// it was; Unreadable changes nothing; Capped adds/updates what it visited and
 /// retains the rest. `suppress` returns the new baseline with no candidates (the
-/// first read of a root).
+/// first read of a root). Every candidate carries its `root` and `window`.
 [[nodiscard]] inline DiffResult diff_registry_snapshot(const RegistryBaseline& base,
                                                        const SubtreeRead& read,
+                                                       std::string_view root,
                                                        std::string_view source,
+                                                       const RegistryWindow& window,
                                                        std::int64_t observed_at,
                                                        bool suppress = false) {
     DiffResult r;
@@ -444,10 +516,13 @@ struct DiffResult {
 
     auto make = [&](const std::string& key, const std::string& value, const char* action) {
         RegistryCandidate c;
+        c.root = std::string(root);
         c.key = key;
         c.value = value;
         c.action = action;
         c.observed_at = observed_at;
+        c.window_lo = window.lo;
+        c.window_hi = window.hi;
         c.source = std::string(source);
         return c;
     };
@@ -529,6 +604,142 @@ struct DiffResult {
     return r;
 }
 
+// ── ETW events and attribution ──────────────────────────────────────────────
+
+enum class RegistryEtwOp { Set, DeleteValue, DeleteKey };
+
+struct RegistryEtwEvent {
+    std::uint64_t seq{0}; // assigned by the buffer
+    std::int64_t ts100ns{0};
+    std::uint32_t pid{0};
+    std::uint32_t tid{0};
+    std::string image;
+    std::uint64_t key_object{0}; // dedupe only -- no inference is drawn from it
+    RegistryEtwOp op{RegistryEtwOp::Set};
+    std::string value;
+    std::uint32_t type{0};
+    std::uint32_t size{0};
+};
+
+struct LossEpoch {
+    std::int64_t lo{0}, hi{0}; // closed [lo, hi]
+    bool operator==(const LossEpoch&) const = default;
+};
+
+[[nodiscard]] inline bool window_intersects(const RegistryWindow& w, const LossEpoch& e) {
+    return e.lo <= w.hi && e.hi > w.lo;
+}
+
+[[nodiscard]] inline bool intersects_loss(const RegistryCandidate& c,
+                                          const std::vector<LossEpoch>& epochs) {
+    const RegistryWindow w{c.window_lo, c.window_hi};
+    return std::any_of(epochs.begin(), epochs.end(),
+                       [&](const LossEpoch& e) { return window_intersects(w, e); });
+}
+
+/// Appends an epoch; past kLossEpochCap everything collapses into one covering
+/// interval (conservative: it can only degrade more candidates, never fewer).
+inline void append_loss_epoch(std::vector<LossEpoch>& epochs, LossEpoch e) {
+    if (e.hi < e.lo)
+        e.hi = e.lo;
+    epochs.push_back(e);
+    if (epochs.size() <= kLossEpochCap)
+        return;
+    LossEpoch all = epochs.front();
+    for (const auto& x : epochs) {
+        all.lo = std::min(all.lo, x.lo);
+        all.hi = std::max(all.hi, x.hi);
+    }
+    epochs.assign(1, all);
+}
+
+/// Drops epochs no future window can reach (hi < `floor`).
+inline void age_loss_epochs(std::vector<LossEpoch>& epochs, std::int64_t floor) {
+    std::erase_if(epochs, [&](const LossEpoch& e) { return e.hi < floor; });
+}
+
+enum class AttributionKind { Corr, Ambiguous, None };
+
+struct Attribution {
+    AttributionKind kind{AttributionKind::None};
+    std::uint32_t pid{0};
+    std::string image;
+    std::size_t n_pids{0};
+    std::size_t n_events{0};
+};
+
+/// Drops repeated deliveries of one event (same ts, pid, tid, key object, op, value).
+[[nodiscard]] inline std::vector<RegistryEtwEvent>
+dedupe_registry_events(std::vector<RegistryEtwEvent> events) {
+    std::set<std::tuple<std::int64_t, std::uint32_t, std::uint32_t, std::uint64_t, int,
+                        std::string>>
+       seen;
+    std::vector<RegistryEtwEvent> out;
+    out.reserve(events.size());
+    for (auto& e : events) {
+        if (seen.emplace(e.ts100ns, e.pid, e.tid, e.key_object, static_cast<int>(e.op), e.value)
+               .second)
+            out.push_back(std::move(e));
+    }
+    return out;
+}
+
+/// Matches write events to a candidate on signature and window (see the header
+/// comment for what this establishes). `key_removed` is never attributed: a
+/// DeleteKey event carries no name, and no sibling inference is drawn. A writer is
+/// named ONLY when exactly one pid matches.
+[[nodiscard]] inline Attribution attribute_candidate(const RegistryCandidate& c,
+                                                     const std::vector<RegistryEtwEvent>& events) {
+    Attribution a;
+    if (c.action == "key_removed")
+        return a;
+    const bool is_set = c.action == "added" || c.action == "changed";
+    const std::string name = fold_value_name(c.value);
+    const RegistryEtwEvent* last = nullptr;
+    std::set<std::uint32_t> pids;
+    for (const auto& e : events) {
+        if (!(c.window_lo < e.ts100ns && e.ts100ns <= c.window_hi))
+            continue;
+        if (is_set) {
+            if (e.op != RegistryEtwOp::Set || e.type != c.type || e.size != c.size)
+                continue;
+        } else if (e.op != RegistryEtwOp::DeleteValue) {
+            continue;
+        }
+        if (fold_value_name(e.value) != name)
+            continue;
+        pids.insert(e.pid);
+        ++a.n_events;
+        if (last == nullptr || e.ts100ns >= last->ts100ns)
+            last = &e;
+    }
+    a.n_pids = pids.size();
+    if (pids.size() == 1 && last != nullptr) {
+        a.kind = AttributionKind::Corr;
+        a.pid = last->pid;
+        a.image = last->image;
+    } else if (pids.size() >= 2) {
+        a.kind = AttributionKind::Ambiguous;
+    }
+    return a;
+}
+
+struct StitchFlags {
+    bool etw_running{true};
+    bool restarted{false};        // the event buffer was discarded since the candidates were read
+    std::int64_t events_since{0}; // the buffer holds nothing from before this instant (0 = n/a)
+};
+
+struct StitchCounters {
+    std::uint64_t attributed{0}, ambiguous{0}, none{0};
+};
+
+struct StitchResult {
+    std::vector<RegistryEvent> rows;
+    std::vector<RegistryCandidate> held_next;
+    StitchCounters counters;
+};
+
 // ── Rows ────────────────────────────────────────────────────────────────────
 
 namespace registry_detail {
@@ -549,9 +760,9 @@ inline std::string rk_escape(std::string_view s) {
 
 } // namespace registry_detail
 
-/// Diff-row key: independent of the actor columns (so filling them later never
-/// changes a key) and length-framed so key/value cannot be re-split into another
-/// pair. NUL (legal in a registry name) and '\' are escaped, as the store refuses
+/// Diff-row key: independent of attribution (so a retry after a restart re-derives
+/// the same key whatever the buffer then holds) and length-framed so key/value
+/// cannot be re-split into another pair. NUL (legal in a registry name) and '\' are escaped, as the store refuses
 /// a NUL-bearing key.
 [[nodiscard]] inline std::string registry_diff_record_key(std::string_view source,
                                                           std::int64_t read_end,
@@ -563,8 +774,8 @@ inline std::string rk_escape(std::string_view s) {
                        registry_detail::rk_escape(value));
 }
 
-/// kind in restart | disabled | cursorlost | baselinelost | unreadable; `ident` is a
-/// timestamp or the root.
+/// kind in restart | disabled | cursorlost | loss | baselinelost | unreadable; `ident`
+/// is a timestamp or the root.
 [[nodiscard]] inline std::string registry_gap_record_key(std::string_view kind,
                                                          std::string_view ident) {
     return std::format("gap:{}:{}", kind, registry_detail::rk_escape(ident));
@@ -585,7 +796,9 @@ inline std::string rk_escape(std::string_view s) {
 }
 
 [[nodiscard]] inline RegistryEvent
-registry_row_from_candidate(const RegistryCandidate& c, std::int64_t snapshot_id) {
+registry_row_from_candidate(const RegistryCandidate& c, std::uint32_t actor_pid,
+                            const std::string& actor_image, std::string detail,
+                            std::int64_t snapshot_id) {
     RegistryEvent ev;
     const auto ms = filetime_to_unix_ms(c.observed_at);
     ev.ts = ms / 1000;
@@ -607,17 +820,75 @@ registry_row_from_candidate(const RegistryCandidate& c, std::int64_t snapshot_id
         ev.prev_data_size = static_cast<std::int64_t>(c.prev_size);
         ev.prev_data_truncated = c.prev_truncated ? 1 : 0;
     }
+    ev.actor_pid = actor_pid;
+    ev.actor_image = actor_image;
     ev.source = c.source;
     ev.observed_at = ms;
+    ev.detail = std::move(detail);
     ev.record_key =
        registry_diff_record_key(c.source, c.observed_at, c.action, c.key, c.value);
     return ev;
 }
 
-// ── Cursor state and codecs ─────────────────────────────────────────────────
+/// Finalises every held candidate whose window closed at least kEtwSettle100ns
+/// before `now` (a late event for a write just before the read can still arrive
+/// that long after it); the rest stay held. Order of precedence for the marker:
+/// buffer discarded (lost-restart) > session down (off) > loss over the window
+/// (degraded) > the correlation outcome.
+[[nodiscard]] inline StitchResult
+stitch_registry_tick(const std::vector<RegistryCandidate>& candidates,
+                     const std::vector<RegistryEtwEvent>& raw_events,
+                     const std::vector<LossEpoch>& epochs, const StitchFlags& flags,
+                     std::int64_t now, std::int64_t snapshot_id) {
+    StitchResult out;
+    const auto events = dedupe_registry_events(raw_events);
+    for (const auto& c : candidates) {
+        if (now - c.window_hi < kEtwSettle100ns) {
+            out.held_next.push_back(c);
+            continue;
+        }
+        std::uint32_t pid = 0;
+        std::string image;
+        std::string detail;
+        if (flags.restarted || c.window_lo < flags.events_since) {
+            detail = "attr:lost-restart";
+            ++out.counters.none;
+        } else if (!flags.etw_running) {
+            detail = "attr:off";
+            ++out.counters.none;
+        } else if (intersects_loss(c, epochs)) {
+            detail = "attr:degraded";
+            ++out.counters.none;
+        } else {
+            const Attribution a = attribute_candidate(c, events);
+            switch (a.kind) {
+            case AttributionKind::Corr:
+                pid = a.pid;
+                image = a.image;
+                detail = a.n_events > 1 ? std::format("attr:corr;events:{}", a.n_events)
+                                        : std::string{"attr:corr"};
+                ++out.counters.attributed;
+                break;
+            case AttributionKind::Ambiguous:
+                detail = std::format("attr:ambiguous:{}", a.n_pids);
+                ++out.counters.ambiguous;
+                break;
+            case AttributionKind::None:
+                detail = "attr:none";
+                ++out.counters.none;
+                break;
+            }
+        }
+        out.rows.push_back(registry_row_from_candidate(c, pid, image, std::move(detail), snapshot_id));
+    }
+    return out;
+}
+
+// ── Retention ───────────────────────────────────────────────────────────────
 
 struct RegistryRootState {
     bool baselined{false};
+    std::int64_t window_base{0}; // last COMPLETE (or Absent) read_start; 0 = never
     std::int64_t read_start{0};
     std::int64_t read_end{0};
     std::string status; // complete | absent | unreadable | capped | due
@@ -626,14 +897,80 @@ struct RegistryRootState {
     bool operator==(const RegistryRootState&) const = default;
 };
 
+/// Every future candidate's window starts at or after its root's window_base, so
+/// an event at or before the minimum of them can never be matched again. A root
+/// never completely read contributes 0 (retain everything until the cap).
+[[nodiscard]] inline std::int64_t
+retention_watermark(const std::map<std::string, RegistryRootState>& roots) {
+    if (roots.empty())
+        return std::numeric_limits<std::int64_t>::max();
+    std::int64_t m = std::numeric_limits<std::int64_t>::max();
+    for (const auto& [_, st] : roots)
+        m = std::min(m, st.window_base);
+    return m;
+}
+
+/// May `e` be erased? Only if no future window can need it AND no held
+/// candidate's window still covers it.
+[[nodiscard]] inline bool release_event(const RegistryEtwEvent& e, std::int64_t watermark,
+                                        const std::vector<RegistryCandidate>& held) {
+    if (e.ts100ns > watermark)
+        return false;
+    return std::none_of(held.begin(), held.end(), [&](const RegistryCandidate& h) {
+        return h.window_lo < e.ts100ns && e.ts100ns <= h.window_hi;
+    });
+}
+
+// ── Cursor state and codecs ─────────────────────────────────────────────────
+
+/// The cursor row is a content store (v1): besides positions it holds the HELD
+/// candidates -- changes the key watch saw whose attribution is not final yet --
+/// with their rendered old and new values, for up to one settle interval.
 struct RegistryCursor {
     bool present{false};   // a cursor was supplied at all
     bool malformed{false}; // supplied but unusable (CursorLost, never a Baseline)
     std::int64_t tick{0};
     std::map<std::string, RegistryRootState> roots;
+    std::vector<RegistryCandidate> held;
+    std::vector<LossEpoch> loss;
     std::vector<std::string> hku;
     std::string ccs; // ControlSetNNN the machine was on when the baselines were taken
 };
+
+namespace registry_detail {
+
+inline nlohmann::json candidate_to_json(const RegistryCandidate& c) {
+    return {{"r", c.root},         {"k", c.key},          {"v", c.value},
+            {"a", c.action},       {"t", c.type},         {"s", c.size},
+            {"d", c.data},         {"dtr", c.data_truncated}, {"hp", c.has_prev},
+            {"pt", c.prev_type},   {"ps", c.prev_size},   {"pd", c.prev_data},
+            {"ptr", c.prev_truncated}, {"o", c.observed_at}, {"lo", c.window_lo},
+            {"hi", c.window_hi},   {"src", c.source}};
+}
+
+inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
+    RegistryCandidate c;
+    c.root = j.at("r").get<std::string>();
+    c.key = j.at("k").get<std::string>();
+    c.value = j.at("v").get<std::string>();
+    c.action = j.at("a").get<std::string>();
+    c.type = j.at("t").get<std::uint32_t>();
+    c.size = j.at("s").get<std::uint64_t>();
+    c.data = j.at("d").get<std::string>();
+    c.data_truncated = j.at("dtr").get<bool>();
+    c.has_prev = j.at("hp").get<bool>();
+    c.prev_type = j.at("pt").get<std::uint32_t>();
+    c.prev_size = j.at("ps").get<std::uint64_t>();
+    c.prev_data = j.at("pd").get<std::string>();
+    c.prev_truncated = j.at("ptr").get<bool>();
+    c.observed_at = j.at("o").get<std::int64_t>();
+    c.window_lo = j.at("lo").get<std::int64_t>();
+    c.window_hi = j.at("hi").get<std::int64_t>();
+    c.source = j.at("src").get<std::string>();
+    return c;
+}
+
+} // namespace registry_detail
 
 [[nodiscard]] inline RegistryCursor decode_registry_cursor(const std::optional<std::string>& json) {
     RegistryCursor cur;
@@ -651,6 +988,9 @@ struct RegistryCursor {
         for (const auto& [name, r] : j.at("roots").items()) {
             RegistryRootState st;
             st.baselined = r.at("baselined").get<bool>();
+            // Optional: a cursor written before window_base existed decodes with 0 (a wide
+            // first window, which the first complete read narrows).
+            st.window_base = r.value("window_base", std::int64_t{0});
             st.read_start = r.at("read_start").get<std::int64_t>();
             st.read_end = r.at("read_end").get<std::int64_t>();
             st.status = r.at("status").get<std::string>();
@@ -658,6 +998,14 @@ struct RegistryCursor {
             st.skipped = r.value("skipped", std::vector<std::string>{});
             cur.roots.emplace(name, std::move(st));
         }
+        // Optional: a cursor written before held/loss existed has neither, and holds no
+        // candidate. A present-but-malformed element still throws into CursorLost below.
+        if (const auto it = j.find("held"); it != j.end())
+            for (const auto& h : it->get<std::vector<nlohmann::json>>())
+                cur.held.push_back(registry_detail::candidate_from_json(h));
+        if (const auto it = j.find("loss"); it != j.end())
+            for (const auto& e : it->get<std::vector<nlohmann::json>>())
+                cur.loss.push_back({e.at(0).get<std::int64_t>(), e.at(1).get<std::int64_t>()});
         for (const auto& s : j.at("hku"))
             cur.hku.push_back(s.get<std::string>());
         // An unknown field is ignored, so a later build can add state to this v1 cursor.
@@ -677,10 +1025,19 @@ struct RegistryCursor {
     j["ccs"] = cur.ccs;
     auto roots = nlohmann::json::object();
     for (const auto& [name, st] : cur.roots)
-        roots[name] = {{"baselined", st.baselined}, {"read_start", st.read_start},
-                       {"read_end", st.read_end},   {"status", st.status},
-                       {"armed", st.armed},         {"skipped", st.skipped}};
+        roots[name] = {{"baselined", st.baselined},   {"window_base", st.window_base},
+                       {"read_start", st.read_start}, {"read_end", st.read_end},
+                       {"status", st.status},         {"armed", st.armed},
+                       {"skipped", st.skipped}};
     j["roots"] = std::move(roots);
+    auto held = nlohmann::json::array();
+    for (const auto& c : cur.held)
+        held.push_back(registry_detail::candidate_to_json(c));
+    j["held"] = std::move(held);
+    auto loss = nlohmann::json::array();
+    for (const auto& e : cur.loss)
+        loss.push_back(nlohmann::json::array({e.lo, e.hi}));
+    j["loss"] = std::move(loss);
     j["hku"] = cur.hku;
     // A registry value can hold bytes that are not valid UTF-8 after rendering;
     // never let that decide whether the cursor can be written.
