@@ -1283,7 +1283,13 @@ jobs:
         # tuning history for THIS invocation (with-test-slot.sh, --num-
         # processes, shard timeouts) — unchanged by Phase 2, kept in full.
         #
-        # --num-processes 2: without a cap, meson fans every test() entry out at
+        # Width history: this invocation runs --num-processes 4 since Push 2c of
+        # the Linux staged-widening ladder (docs/ci-architecture.md); the long
+        # history below is the evidence the cap of 2 rested on, kept for the
+        # record. The decision rule, the interleaved measurement and the revert
+        # (this one number) are in the docs paragraph "Push 2c".
+        #
+        # Cap-of-2 history: without a cap, meson fans every test() entry out at
         # once — its default worker count is an uncapped, non-affinity-aware
         # cpu_count() (this runner's job is genuinely confined to execute on 16
         # logical CPUs via cgroup, "Self-hosted runner topology" in
@@ -1308,15 +1314,15 @@ jobs:
         # measured A=227.86s H=214.19s B=90.35s D=227.48s E=353.32s G=317.04s
         # F=262.81s C=359.42s — E and G both already well past HALF the then-
         # 600s ceiling on their own, with no contention at all. --num-processes
-        # 2 stays at 2 here, not a higher number: this mirrored Windows' own
+        # 2 was held at 2 here, not a higher number: this mirrored Windows' own
         # starting `--num-processes 2` on its "Test (pg shards, full)" step
         # (#3443) rather than deriving a Linux-specific value — the two
         # platforms have since DIVERGED: PR #3677's staged Windows
         # measurement protocol (docs/ci-architecture.md, current value
         # there, not restated here to avoid this comment going stale every
         # widening round) has moved Windows past 2 on real per-shard
-        # contention data; Linux stays at 2, unmeasured-and-unwidened,
-        # since nothing here has re-derived a Linux-specific value either.
+        # contention data; Linux was held at 2 until Push 2c widened it (the
+        # samples and the verdict are in docs/ci-architecture.md, "Push 2c").
         #
         # with-test-slot.sh (#3443 AC4): --num-processes 2 alone fixed
         # WITHIN-job fan-out but left cross-job contention unmeasured. Now
@@ -1374,9 +1380,10 @@ jobs:
         # is still a real, if smaller, improvement — it removes an incidental
         # ~51s gap this reconstruction also found between shards A and H
         # starting — but it does not by itself explain or fix E/G's own margin.
-        # --num-processes stays at 2 here, not 3: an earlier version of this
-        # commit raised it, reasoning the pool was now pg-only so 2 had "no
-        # competition to spend margin on" — but 3-wide FIFO over shards A,H,B,D,
+        # --num-processes was held at 2 here, not 3 (as of 2026-08-25): an
+        # earlier version of this commit raised it, reasoning the pool was now
+        # pg-only so 2 had "no competition to spend margin on" — but 3-wide FIFO
+        # over shards A,H,B,D,
         # E,G,F,C predicts D, E, and G (three of the heaviest) running
         # concurrently for a long stretch, worse than today's 2-wide pairing,
         # not better. Reverted without a real run confirming it helps; this
@@ -1386,7 +1393,7 @@ jobs:
         # this paragraph was written, for the same reason (box-wide job
         # saturation, #3443 AC4) — SUPERSEDED 2026-08-25, see the "Cross-job
         # slot count: 2 -> 3" paragraph below. --num-processes here is
-        # UNCHANGED (still 2) — only the box-wide slot count moved.
+        # UNCHANGED (2 at the time); only the box-wide slot count moved.
         #
         # 2026-08-25: the solo diagnostic above (E=353.32s, G=317.04s) is what
         # finally disproved the "isolate the pool and it'll fit" premise this
@@ -1417,8 +1424,9 @@ jobs:
         # two shards #3582 split. See tests/meson.build's shard-E/I/G/J
         # comment block and docs/ci-architecture.md's worst-case job-budget
         # arithmetic (re-derived for all-ten-at-700s: makespan is now a
-        # deterministic 3500s at --num-processes 2, no pairing variance,
-        # margin against the 90-min job ceiling under 2 minutes worst-case).
+        # deterministic 3500s at --num-processes 2 (the width then in force), no
+        # pairing variance, margin against the 90-min job ceiling under 2 minutes
+        # worst-case).
         #
         # Telemetry note: each invocation overwrites meson's single
         # testlog.junit.xml, so only the LAST one's per-suite ci_test_suites
@@ -1496,11 +1504,13 @@ jobs:
         # margin above further, on top of whatever the 3-slot regime itself
         # costs.
         #
-        # --num-processes stays at 2, deliberately NOT bundled with this
+        # --num-processes stayed at 2 (as of 2026-08-25), deliberately NOT bundled with this
         # change: 2 slots x 2 shards/job = 4 concurrent pg shards today; 3
         # slots x 2 = 6; 3 slots x 3 would jump to 9 with no diagnostic
         # support at that load and no way to attribute a regression to either
-        # knob. Ship and measure one axis at a time.
+        # knob. Ship and measure one axis at a time. Push 2c later widened it to 4
+        # on its own axis; box-wide that is 3 slots x 4 = 12 concurrent pg
+        # shards (docs/ci-architecture.md, "Push 2c", Capacity).
         #
         # Acceptance/rollback signal: the #2093 duration watchdog's 560s
         # (80% of the 700s per-shard ceiling) warning is an EXPECTED, accepted
@@ -1527,7 +1537,7 @@ jobs:
         run: |
           rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
           bash scripts/ci/with-test-slot.sh 3 -- \
-            python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite server-pg
+            python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 --suite server-pg
           # Outside the slot: pure parsing plus a --list-tests spawn per Catch2 entry.
           python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux pg shards"
 

@@ -342,6 +342,86 @@ window gauge, so both new alerts go silent.
   bucket `--login-rate-limit` and this health budget) now carries `correlation_id` and
   `retry_after_ms`; every field those refusals had before is unchanged.
 
+## ⚠️ Breaking: the `guardian.` definition-id prefix is reserved; approvals gain frozen-request columns; a new audit action and metric (#6062)
+
+This release lands the storage and redemption half of the four-eyes bound approval primitive
+([ADR-1009](../adr/1009-four-eyes-mvp-bound-approval.md), epic #6060). **Nothing in this release
+creates a bound approval ticket and there is no Guardian deploy gate yet**; those arrive in later
+changes (#6063 onwards). What an operator can see today is the three items below, plus a fourth
+refusal that normal operation never triggers.
+
+**1. The `guardian.` definition-id prefix is reserved (breaking for operator-authored ids).** A
+new instruction definition whose id starts `guardian.` is refused on create, import and the
+dashboard YAML editor, and such a definition is skipped at boot auto-import. No shipped content
+uses the prefix. Definitions that already carry such an id keep executing, but cannot be saved
+from the YAML editor if the document declares `metadata.id`, and cannot be re-imported. **Before
+upgrading, run the read-only check and rename anything it lists**: see
+[the `guardian.` entry in Server Administration](server-admin.md#vnext-the-guardian-instruction-definition-id-prefix-is-reserved-6062-breaking).
+
+**2. Approvals schema migration v3 (store `approval_manager`).** It adds three text columns to
+`approvals` (`request_json`, `request_digest`, `excluded_roots`), each `NOT NULL DEFAULT ''`, so
+every existing row reads as "binds no request, excludes nobody" and behaves as before. The
+migration is additive and needs no operator step, but it takes a brief `ACCESS EXCLUSIVE` lock on
+`approvals`. If a long-running or idle-in-transaction session holds that table, the upgraded
+replica cannot finish the migration and refuses to start (`Refusing to start: approval manager
+migration/open failed`) rather than serve with a half-migrated schema; end the session and start
+it again. It follows the data-only v2 step of the scheduled-approval change (#6096, below), which
+claimed v2 first, so a database upgraded from a build with neither change runs v2 and then v3 in
+two separate transactions, and one already at v2 runs only v3. The v3 step is idempotent
+(`ADD COLUMN IF NOT EXISTS`), so a development or UAT database that ran an earlier build of this
+branch, which recorded the same columns as version 2, upgrades cleanly instead of failing on a
+column that already exists.
+
+- **Rolling upgrade.** An older replica never touches the new columns and keeps redeeming the
+  tickets it and this build mint, all of which are unbound. The migration runner applies only
+  versions above the one stored for the store and has no newer-schema refusal, so an older binary
+  starts against a newer database: a build with neither change against a v2 or v3 database, and a
+  build with the #6096 change but not this one (highest version 2) against a v3 database. That is
+  established by reading the runner; it has not been exercised as a live rolling restart.
+- **Rollback to the previous build** is therefore expected to work while no bound ticket exists,
+  which is the case for this whole release: the previous build ignores the columns and the
+  default-empty values lose nothing. Rolling back across the #6096 change as well has its own
+  consequences, described in that section.
+- **Rollback is NOT supported once a bound ticket exists.** The previous build does not read
+  `excluded_roots`, so a reviewer who was barred from a bound ticket could approve it, and it
+  redeems without comparing the frozen request. The change that first creates a bound ticket
+  (#6063) must not do so until every replica runs a build that includes this migration, and must
+  define what rollback means after that point. Until it does, a row with a non-empty
+  `request_json` is not expected to exist; if you find one, do not roll back.
+
+**3. A new audit action and metric: `approval.precondition_denied` and
+`yuzu_approval_precondition_denied_total{origin}`.** When an approved ticket is refused at
+redemption because the state its effect depends on has changed, the approval store now counts the
+denial and writes an `approval.precondition_denied` audit row (`result=denied`; see
+[the audit log reference](audit-log.md)). The only redemptions that supply such a check today are
+MCP recalls (every approval-gated tool checks that the ticket still matches the recalled tool and
+arguments; `confirm_engine_rotation` also checks the rotation's state), so for now the new series
+moves only with `origin="mcp"`; the other three `origin` values are present at 0 until their producers exist.
+**For SIEM and alert owners:** add `approval.precondition_denied` to any audit-action allow-list.
+An MCP recall refused this way still writes its own `mcp.*` denied row as before, so one MCP event
+now leaves two rows: do not sum the two when counting denials. The older
+`yuzu_mcp_approval_precondition_denied_total{tool}` series keeps its meaning but is now
+pre-seeded, and can move, for every approval-gated tool rather than only `confirm_engine_rotation`.
+
+**4. A redemption integrity re-check, and a row-moved refusal.** Redeeming an approved,
+unconsumed ticket now re-checks the stored row. This applies to every MCP recall of an
+approval-gated tool (the ticket flow that runs before the tool for a supervised-tier token, for
+example `execute_instruction`, `quarantine_device`, `revoke_certificate` and
+`confirm_engine_rotation`), not only to the one that supplies a precondition. A ticket is refused if its reviewer is the submitter or an excluded root, it records no reviewer,
+its excluded roots cannot be read, or its stored request does not match its digest. Through MCP it surfaces as the same "approval already used (one-time ticket)" refusal a replay gets, and the
+audit row reads `refused: foreign_origin`; the cause is only in the server log. Approving a
+ticket always records a distinct reviewer, so ordinary operation never triggers this: it
+indicates a row edited by hand, restored from a backup or written by an older build, and such a
+ticket stays unredeemable until its seven-day lifetime ends. Separately, a ticket whose row was
+rewritten by another transaction between the check and the consuming statement (and, rarely,
+VACUUM FULL or CLUSTER running at that moment, which move the row) is also refused, audited as
+`refused: not_consumable`. Both read like a replay in the counter and the audit trail. The
+second is a false refusal only when the cause was a no-op rewrite or one of those maintenance
+commands: a retry then succeeds. When the other transaction was a concurrent recall that spent
+the ticket, or a real edit, the refusal is correct and a retry is refused again ("approval
+already used"). See [MCP approvals](mcp.md) and
+[metrics](metrics.md).
+
 ## Behaviour change: the Windows agent installer passes the enrollment token by file
 
 **What changed.** The Windows agent installer no longer puts the enrollment token on the
