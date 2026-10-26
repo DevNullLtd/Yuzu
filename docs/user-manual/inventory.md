@@ -1219,6 +1219,12 @@ points. It never lands in the generic inventory store, on either path.
   that lists it, so an older server never receives it. Agent-side gating arrives with the agent
   collector (2a-2e). The gateway relays the field only from this release on: an older gateway
   drops it, so agents behind it never send the source until the gateway is upgraded too.
+  The gateway also enforces the capability itself, per upstream connection: it forwards a
+  relayed report's `certificate_inventory` key only to a connection whose latest accepted
+  `ProxyRegister` answer listed `certificate_inventory_v1`. To any other connection, or one it
+  cannot identify, it removes that key, forwards the rest of the report, and counts the removal
+  in `yuzu_gw_inventory_source_stripped_total`. This covers registration replays the agent never
+  sees and reports routed to a different server. See "Inventory Proxy" in [Gateway](gateway.md).
 - **Deploy order.** Upgrade gateways with or before servers, and servers before agents. `certificate_inventory` is in the
   typed set from the typed-source read filter change, so even a gateway-proxied blob
   reaching a server without this store is not stored in the generic store.

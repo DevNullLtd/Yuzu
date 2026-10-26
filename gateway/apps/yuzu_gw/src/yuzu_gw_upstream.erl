@@ -108,6 +108,44 @@
 %%%       sender.
 %%%   Ordinary workers never report to the breaker.
 %%%
+%%% Capability-gated inventory sources (slice-2 PR 2a-2a, fail closed):
+%%%   Some daily-sync sources may reach only a server that said it ingests them
+%%%   typed (RegisterResponse.server_capabilities). The agent decides from the
+%%%   RegisterResponse it saw, but the gateway replays registrations without the
+%%%   agent seeing the answer and may send a later call to a different server
+%%%   (another endpoint of default_channel, or another backend behind one
+%%%   endpoint after a reconnect). So the gateway enforces it again, per upstream
+%%%   connection:
+%%%     - The upstream identity is the HTTP/2 connection process the request is
+%%%       written to. subchannel_interceptor/7, installed on default_channel
+%%%       (install_subchannel_interceptor/0, at init), records the subchannel the
+%%%       client picked for the call; the request encoder (marshal_fun), which
+%%%       grpcbox runs in this process after it obtained that subchannel's
+%%%       connection, asks the subchannel for its connection. The subchannel
+%%%       replaces its connection only after the old one exited, so the answer is
+%%%       either the connection the request is written to or a newer one while
+%%%       the old one is dead (the request then fails and reaches no server).
+%%%     - Every accepted ProxyRegister answer (live calls and replays) sets the
+%%%       capabilities recorded for its connection to the gated capabilities it
+%%%       lists, so an answer without one removes it. A rejected answer, an error
+%%%       and an answer whose connection could not be told change nothing. A
+%%%       record is dropped when its connection process exits (monitor), so a new
+%%%       connection starts unknown.
+%%%     - A ProxyInventory whose plugin_data carries a gated source key forwards
+%%%       that key only when the connection the encoder resolves has the matching
+%%%       capability recorded. Otherwise the key is removed from plugin_data
+%%%       (content_hashes and every other key are forwarded unchanged), the report
+%%%       is still sent, and yuzu_gw_inventory_source_stripped_total{source,reason}
+%%%       counts it (reason upstream_lacks_capability for a connection whose
+%%%       latest answer did not list it, upstream_unknown for a connection with
+%%%       no record or one that could not be told). Unknown is empty: no
+%%%       interceptor (another unary_interceptor configured on default_channel,
+%%%       or grpcbox not running) means every gated key is removed.
+%%%   Gated today: certificate_inventory, by certificate_inventory_v1
+%%%   (common/include/yuzu/server_capabilities.hpp). The limit: a gRPC-aware
+%%%   (L7) balancer that sends each request on one HTTP/2 connection to a
+%%%   different backend defeats a per-connection record; an L4 balancer does not.
+%%%
 %%% Includes a circuit breaker to prevent cascading failures when the
 %%% upstream server is unreachable. States:
 %%%   closed    — RPCs pass through; consecutive failures tracked
@@ -180,6 +218,9 @@
          circuit_state/0]).
 -export([classify_tls_error/1]).  %% for testing (R-3 TLS-error classifier)
 -export([call_timeout/0]).        %% for testing (upstream_call_timeout_ms validation)
+%% The per-connection capability gate on inventory sources (see the module doc).
+-export([subchannel_interceptor/7, install_subchannel_interceptor/0]).
+-export([strip_gated_sources/2]).  %% for testing
 %% The reason/stacktrace redaction format_status/1 applies, shared with the
 %% crash-report filter (yuzu_gw_crash_redact), which applies it to the parts of
 %% a report OTP prints outside format_status.
@@ -240,6 +281,25 @@
 %% CommandRequest.dispatch_tag = 9 and forwards it untouched. See
 %% encode_command_request/1 in yuzu_gw_proto.erl for the forwarding half.
 -define(WIRE_CAP_DISPATCH_TAG_V1, <<"command_dispatch_tag_v1">>).
+
+%% Inventory sources forwarded only to an upstream connection whose latest
+%% accepted ProxyRegister answer listed the paired capability, as
+%% {SourceKey, Capability}. The key is the server's typed-source wire key
+%% (server/core/src/typed_inventory_sources.hpp) and the capability the literal of
+%% common/include/yuzu/server_capabilities.hpp; both are fixed lowercase names.
+-define(GATED_INVENTORY_SOURCES,
+        [{<<"certificate_inventory">>, <<"certificate_inventory_v1">>}]).
+
+%% Process dictionary keys of the capability gate. The subchannel is set by
+%% subchannel_interceptor/7 for the length of one call; the peer is set by the
+%% ProxyRegister encoder and read back by rpc_register/4.
+-define(PD_SUBCHANNEL, '$yuzu_gw_upstream_subchannel').
+-define(PD_PEER, '$yuzu_gw_upstream_peer').
+%% How long the encoder waits for the subchannel to name its connection. The
+%% subchannel has just answered the same question for this call, so it answers at
+%% once unless its connection died meanwhile; an answer that does not come in
+%% time leaves the connection unknown (every gated key is then removed).
+-define(PEER_RESOLVE_TIMEOUT_MS, 1000).
 
 %% The tag of the exception encode_request/2 raises: the request could not be
 %% encoded in this process (see do_rpc/4).
@@ -324,7 +384,12 @@
     %% which cluster owns an agent's live stream. Read once at init; a
     %% pre-WS-4 build has no such config and the env default (<<"default">>)
     %% keeps a single-cluster deployment's id stable and non-empty.
-    cluster_id      :: binary()
+    cluster_id      :: binary(),
+    %% The gated capabilities (?GATED_INVENTORY_SOURCES) the latest accepted
+    %% ProxyRegister answer listed, per upstream HTTP/2 connection process, with
+    %% the monitor that drops the entry when the connection exits. Bounded by the
+    %% live upstream connections (one per default_channel endpoint).
+    upstream_caps = #{} :: #{pid() => {reference(), [binary()]}}
 }).
 
 %%%===================================================================
@@ -469,6 +534,10 @@ init_state(ClusterId) ->
     %% from zero here (workers of an earlier instance are unlinked and uncounted).
     emit_notify_queue(0, 0),
 
+    %% The capability gate needs to know the subchannel of each call; without the
+    %% interceptor every gated inventory key is removed (fail closed).
+    _ = install_subchannel_interceptor(),
+
     {ok, #state{
         notify_pids     = #{},
         notify_pending  = yuzu_gw_notify_queue:new(NotifyPendingMax),
@@ -518,8 +587,8 @@ handle_call({proxy_register, RegisterReq}, _From, State) ->
             {reply, {error, circuit_open}, State1};
         {allow, State1} ->
             Before = notify_counts(State1),
-            Result = do_rpc('ProxyRegister', RegisterReq, register),
-            State2 = drain(record_result(Result, State1)),
+            {Result, State1a} = rpc_register(RegisterReq, ctx:background(), State1),
+            State2 = drain(record_result(Result, State1a)),
             {reply, public_result(Result), report_notify_counts(Before, State2)}
     end;
 
@@ -529,7 +598,10 @@ handle_call({proxy_inventory, InventoryReport}, _From, State) ->
             {reply, {error, circuit_open}, State1};
         {allow, State1} ->
             Before = notify_counts(State1),
-            Result = do_rpc('ProxyInventory', InventoryReport, inventory),
+            %% Gated sources are removed for a connection that did not list
+            %% their capability (see the module doc), at encode time.
+            Result = do_rpc('ProxyInventory', InventoryReport, inventory, ctx:background(),
+                            inventory_gate(State1#state.upstream_caps)),
             State2 = drain(record_result(Result, State1)),
             {reply, public_result(Result), report_notify_counts(Before, State2)}
     end;
@@ -889,6 +961,12 @@ handle_info({notify_probe_timeout, Pid, Gen},
 handle_info({notify_probe_timeout, _Pid, _Gen}, State) ->
     {noreply, State};
 
+%% An upstream connection with a capability record exited: forget it, so a
+%% connection that replaces it starts unknown (fail closed).
+handle_info({'DOWN', MonRef, process, Pid, _Reason}, #state{upstream_caps = Caps} = State)
+  when is_map_key(Pid, Caps), element(1, map_get(Pid, Caps)) =:= MonRef ->
+    {noreply, State#state{upstream_caps = maps:remove(Pid, Caps)}};
+
 handle_info({'DOWN', _MonRef, process, Pid, _Reason},
             #state{notify_pids = Pids, guardian_pids = GPids} = State) ->
     %% A finished notify OR guardian-forward worker. Remove from whichever set
@@ -916,7 +994,7 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
     %% every upstream reconnect (which would otherwise let a zombie replay
     %% clobber a live agent's route once the routing directory is
     %% dispatch-authoritative, WS-4 4.2).
-    Result = do_rpc_replay('ProxyRegister', RegisterReq, register, SessionId),
+    {Result, State0} = rpc_register(RegisterReq, replay_ctx(SessionId), State),
     NewState =
         case Result of
             {local_error, {Class, Why}} ->
@@ -926,7 +1004,7 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                 logger:warning("Registration replay: ~s could not be encoded (~p:~p); "
                                "skipped without touching the circuit breaker",
                                [yuzu_gw_env:log_text(AgentId), Class, Why]),
-                record_result_no_replay(Result, State);
+                record_result_no_replay(Result, State0);
             {ok, #{accepted := false} = Response} ->
                 %% The server answered OK but did not install the session
                 %% (RegisterResponse.accepted = false, e.g. a rejected
@@ -946,7 +1024,7 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                                "disconnecting so the agent follows its own registration path",
                                [yuzu_gw_env:log_text(AgentId), reject_reason_for_log(Response)]),
                 yuzu_gw_agent:disconnect(Pid),
-                record_result_no_replay({ok, Response}, State);
+                record_result_no_replay({ok, Response}, State0);
             {ok, Response} when is_map(Response) ->
                 %% HA WS-4 4.4: the server now ALWAYS adopts the presented
                 %% session on success (never a throwaway fresh mint, see
@@ -968,7 +1046,7 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                 %% ProxyRegister), rather than leaving this agent
                 %% dispatch-unreachable until its next real reconnect.
                 yuzu_gw_agent:reannounce(Pid, AdoptedSession),
-                record_result_no_replay({ok, Response}, State);
+                record_result_no_replay({ok, Response}, State0);
             {ok, _NotAMap} ->
                 %% An OK whose message is not a decoded response (for example
                 %% an OK with trailers and no DATA frame): the server never
@@ -976,7 +1054,7 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                 %% an RPC error. Neither the body nor the session id is logged.
                 logger:warning("Registration replay: ~s got an upstream answer that is "
                                "not a response message", [yuzu_gw_env:log_text(AgentId)]),
-                record_result_no_replay({error, malformed_response}, State);
+                record_result_no_replay({error, malformed_response}, State0);
             {error, {Status, _Message}} when Status =:= ?GRPC_STATUS_FAILED_PRECONDITION ->
                 %% The presented session was superseded by a DIFFERENT, LIVE
                 %% session server-side — a genuine stale/zombie replay, not
@@ -992,11 +1070,11 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                 logger:warning("Registration replay: ~s's presented session was superseded — "
                               "forcing a fresh reconnect", [yuzu_gw_env:log_text(AgentId)]),
                 yuzu_gw_agent:disconnect(Pid),
-                record_result_no_replay({ok, superseded}, State);
+                record_result_no_replay({ok, superseded}, State0);
             {error, Reason} ->
                 logger:warning("Registration replay: ~s failed: ~p",
                                [yuzu_gw_env:log_text(AgentId), Reason]),
-                record_result_no_replay(Result, State)
+                record_result_no_replay(Result, State0)
         end,
     %% Gate 7 sre OBS-4 — registration-replay observability. `replayed`
     %% counts this re-proxy attempt (any outcome); `queue_depth` lets an
@@ -1008,8 +1086,18 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
 terminate(_Reason, _State) ->
     ok.
 
+%% A state from before the capability gate lacks its last field (upstream_caps):
+%% append it empty, so every connection starts unknown (fail closed), and
+%% install the interceptor init/1 would have installed. Other shapes are kept.
 code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
+    case is_tuple(State) andalso tuple_size(State) =:= record_info(size, state) - 1
+         andalso element(1, State) =:= state of
+        true ->
+            _ = install_subchannel_interceptor(),
+            {ok, erlang:append_element(State, #{})};
+        false ->
+            {ok, State}
+    end.
 
 %% @doc What a crash report and sys:get_status/1 show of this process.
 %%
@@ -1609,6 +1697,192 @@ reject_reason_for_log(Response) ->
     yuzu_gw_env:log_text(maps:get(reject_reason, Response, <<>>)).
 
 %%%===================================================================
+%%% Internal — capability-gated inventory sources (see the module doc)
+%%%===================================================================
+
+%% @doc Install subchannel_interceptor/7 as the unary interceptor of
+%% default_channel, through the interceptor table grpcbox's public include
+%% defines (?CHANNELS_TAB, the row grpcbox_channel writes for a configured
+%% unary_interceptor and grpcbox_client:unary/5 reads on every call). The row is
+%% owned by grpcbox_channel_sup, so it survives a channel restart. Never replaces
+%% an interceptor configured by the operator: then the gate cannot tell the
+%% connection of a call, and every gated inventory key is removed (fail closed),
+%% with a warning. Exported so a test can install it on a channel it started.
+-spec install_subchannel_interceptor() -> installed | not_running | other_interceptor.
+install_subchannel_interceptor() ->
+    Mine = fun ?MODULE:subchannel_interceptor/7,
+    Key = {default_channel, unary},
+    case ets:whereis(?CHANNELS_TAB) of
+        undefined ->
+            not_running;
+        _ ->
+            case ets:insert_new(?CHANNELS_TAB, {Key, Mine}) of
+                true ->
+                    installed;
+                false ->
+                    case ets:lookup(?CHANNELS_TAB, Key) of
+                        [{Key, Mine}] ->
+                            installed;
+                        _ ->
+                            logger:warning("default_channel has a unary_interceptor of its own; "
+                                           "the gateway cannot tell which upstream a call "
+                                           "reaches, so it removes every capability-gated "
+                                           "inventory source (~s) from relayed reports",
+                                           [gated_source_names()]),
+                            other_interceptor
+                    end
+            end
+    end.
+
+%% @doc The unary interceptor of default_channel: records the subchannel the
+%% client picked for this call (SubChannel, a grpcbox_subchannel pid) for the
+%% request encoder, for the length of the call, and runs the call unchanged. It
+%% runs in the calling process; for a caller that is not this module (the
+%% heartbeat buffer) it only sets and restores a process dictionary key.
+-spec subchannel_interceptor(term(), pid(), fun((term(), term()) -> term()), binary(), term(),
+                             term(), map()) -> term().
+subchannel_interceptor(Ctx, SubChannel, Handler, _Path, Input, _Def, _Options) ->
+    Prev = put(?PD_SUBCHANNEL, SubChannel),
+    try
+        Handler(Ctx, Input)
+    after
+        restore_pd(?PD_SUBCHANNEL, Prev)
+    end.
+
+restore_pd(Key, undefined) -> erase(Key);
+restore_pd(Key, Prev)      -> put(Key, Prev).
+
+%% The HTTP/2 connection process of the subchannel of this call, or undefined
+%% when there is no recorded subchannel or it does not name a live connection in
+%% time. Called from inside the request encoder only (see the module doc for why
+%% the answer is the connection the request is written to, or the request reaches
+%% no server). Never raises: the encoder must not.
+-spec current_peer() -> pid() | undefined.
+current_peer() ->
+    case get(?PD_SUBCHANNEL) of
+        SubChannel when is_pid(SubChannel) ->
+            try grpcbox_subchannel:conn(SubChannel, ?PEER_RESOLVE_TIMEOUT_MS) of
+                {ok, Conn, _Info} ->
+                    h2_stream_set:connection(Conn);
+                _ ->
+                    undefined
+            catch
+                _:_ -> undefined
+            end;
+        _ ->
+            undefined
+    end.
+
+%% A ProxyRegister through the capability recorder: the encoder notes the
+%% connection, and an accepted answer sets that connection's record. Used by the
+%% live call and the replay alike.
+-spec rpc_register(map(), term(), #state{}) -> {rpc_result(), #state{}}.
+rpc_register(RegisterReq, Ctx, State) ->
+    _ = erase(?PD_PEER),
+    Result = do_rpc('ProxyRegister', RegisterReq, register, Ctx, fun note_peer/1),
+    Peer = erase(?PD_PEER),
+    {Result, record_capabilities(Peer, Result, State)}.
+
+note_peer(Msg) ->
+    _ = put(?PD_PEER, current_peer()),
+    Msg.
+
+%% Only an accepted answer is a statement about the server's capabilities: the
+%% server lists them on its accepted path only. An answer without a gated
+%% capability removes it (capability loss); an unknown connection records nothing.
+-spec record_capabilities(pid() | undefined, rpc_result(), #state{}) -> #state{}.
+record_capabilities(Peer, {ok, #{accepted := false}}, State) when is_pid(Peer) ->
+    State;
+record_capabilities(Peer, {ok, Response}, #state{upstream_caps = Caps} = State)
+  when is_pid(Peer), is_map(Response) ->
+    Listed = gated_capabilities(maps:get(server_capabilities, Response, [])),
+    case maps:find(Peer, Caps) of
+        {ok, {MRef, Listed}} ->
+            State#state{upstream_caps = Caps#{Peer := {MRef, Listed}}};
+        {ok, {MRef, Old}} ->
+            logger:info("Upstream connection ~p now lists capabilities ~p (was ~p)",
+                        [Peer, Listed, Old]),
+            State#state{upstream_caps = Caps#{Peer := {MRef, Listed}}};
+        error ->
+            MRef = erlang:monitor(process, Peer),
+            State#state{upstream_caps = Caps#{Peer => {MRef, Listed}}}
+    end;
+record_capabilities(_Peer, _Result, State) ->
+    State.
+
+%% The gated capabilities a server-supplied list names: a closed set, so the
+%% record holds at most the length of ?GATED_INVENTORY_SOURCES per connection.
+gated_capabilities(Listed) when is_list(Listed) ->
+    [Cap || {_Source, Cap} <- ?GATED_INVENTORY_SOURCES, lists:member(Cap, Listed)];
+gated_capabilities(_Listed) ->
+    [].
+
+gated_source_names() ->
+    lists:join(", ", [Source || {Source, _Cap} <- ?GATED_INVENTORY_SOURCES]).
+
+%% The ProxyInventory encoder step: a report with no gated source key passes
+%% untouched (no connection lookup); otherwise the connection of this call is
+%% resolved and every gated key it has no capability for is removed and counted.
+-spec inventory_gate(#{pid() => {reference(), [binary()]}}) -> fun((map()) -> map()).
+inventory_gate(CapsByPeer) ->
+    fun(Report) ->
+            case has_gated_source(Report) of
+                false ->
+                    Report;
+                true ->
+                    PeerCaps = case current_peer() of
+                                   undefined -> unknown;
+                                   Peer ->
+                                       case maps:find(Peer, CapsByPeer) of
+                                           {ok, {_MRef, Listed}} -> Listed;
+                                           error                 -> unknown
+                                       end
+                               end,
+                    {Report1, Stripped} = strip_gated_sources(Report, PeerCaps),
+                    [count_stripped(Source, Reason) || {Source, Reason} <- Stripped],
+                    Report1
+            end
+    end.
+
+has_gated_source(#{plugin_data := Data}) when is_map(Data) ->
+    lists:any(fun({Source, _Cap}) -> is_map_key(Source, Data) end, ?GATED_INVENTORY_SOURCES);
+has_gated_source(_Report) ->
+    false.
+
+%% @doc Remove from Report's plugin_data every gated source key whose capability
+%% PeerCaps (the capabilities recorded for the connection, or `unknown') does not
+%% list. Returns the report and the removed keys with their reason. Everything
+%% else in the report, content_hashes included, is unchanged. Pure; exported for
+%% testing.
+-spec strip_gated_sources(map(), [binary()] | unknown) ->
+          {map(), [{binary(), upstream_unknown | upstream_lacks_capability}]}.
+strip_gated_sources(#{plugin_data := Data} = Report, PeerCaps) when is_map(Data) ->
+    {Data1, Stripped} =
+        lists:foldl(
+          fun({Source, Cap}, {D, Acc}) ->
+                  case is_map_key(Source, D) andalso not has_capability(Cap, PeerCaps) of
+                      true  -> {maps:remove(Source, D), [{Source, strip_reason(PeerCaps)} | Acc]};
+                      false -> {D, Acc}
+                  end
+          end, {Data, []}, ?GATED_INVENTORY_SOURCES),
+    {Report#{plugin_data := Data1}, lists:reverse(Stripped)};
+strip_gated_sources(Report, _PeerCaps) ->
+    {Report, []}.
+
+has_capability(_Cap, unknown) -> false;
+has_capability(Cap, Listed)   -> lists:member(Cap, Listed).
+
+strip_reason(unknown) -> upstream_unknown;
+strip_reason(_Listed) -> upstream_lacks_capability.
+
+count_stripped(Source, Reason) ->
+    telemetry:execute([yuzu, gw, upstream, inventory_source_stripped], #{count => 1},
+                      #{source => Source, reason => atom_to_binary(Reason, utf8)}),
+    yuzu_gw_safe_call:warn_limited(inventory_source_stripped,
+                                   "Inventory source ~s removed from a relayed report: ~s",
+                                   [Source, Reason]).
+
+%%%===================================================================
 %%% Internal — RPC execution
 %%%===================================================================
 
@@ -1626,7 +1900,7 @@ rpc_types('ForwardGuardianMessage') -> {'yuzu.gateway.v1.ForwardGuardianRequest'
 do_rpc(Method, Request, Tag) ->
     do_rpc(Method, Request, Tag, ctx:background()).
 
-%% @doc Like do_rpc/3 but for the registration-replay path (HA WS-4 4.1):
+%% @doc The context of a registration-replay ProxyRegister (HA WS-4 4.1):
 %% attaches the agent's EXISTING session id as `x-yuzu-session-id` outgoing
 %% gRPC metadata, via grpcbox's ctx-carried metadata (grpcbox_metadata:
 %% append_to_outgoing_ctx/2 + grpcbox_client_stream's metadata_headers/1,
@@ -1634,20 +1908,27 @@ do_rpc(Method, Request, Tag) ->
 %% client mechanism, not a new wire path). Undefined/empty SessionId (the
 %% register_agent/5 back-compat path) sends the request with no such header,
 %% same as before this change.
-do_rpc_replay(Method, Request, Tag, SessionId) when is_binary(SessionId), SessionId =/= <<>> ->
-    Ctx = grpcbox_metadata:append_to_outgoing_ctx(
-            ctx:background(), #{<<"x-yuzu-session-id">> => SessionId}),
-    do_rpc(Method, Request, Tag, Ctx);
-do_rpc_replay(Method, Request, Tag, _SessionId) ->
-    do_rpc(Method, Request, Tag, ctx:background()).
+replay_ctx(SessionId) when is_binary(SessionId), SessionId =/= <<>> ->
+    grpcbox_metadata:append_to_outgoing_ctx(
+      ctx:background(), #{<<"x-yuzu-session-id">> => SessionId});
+replay_ctx(_SessionId) ->
+    ctx:background().
 
 -spec do_rpc(atom(), map(), atom(), term()) -> rpc_result().
 do_rpc(Method, Request, Tag, Ctx) ->
+    do_rpc(Method, Request, Tag, Ctx, fun(Msg) -> Msg end).
+
+%% Prepare runs inside the request encoder, so after the client obtained the
+%% connection the request is written to (the capability gate's moment, see the
+%% module doc). It must not raise: an exception from it would read as a client
+%% exception, not a local encode failure.
+-spec do_rpc(atom(), map(), atom(), term(), fun((map()) -> map())) -> rpc_result().
+do_rpc(Method, Request, Tag, Ctx, Prepare) ->
     {InputType, OutputType} = rpc_types(Method),
     Def = #grpcbox_def{
         service       = 'yuzu.gateway.v1.GatewayUpstream',
         message_type  = atom_to_binary(InputType, utf8),
-        marshal_fun   = fun(Msg) -> encode_request(Msg, InputType) end,
+        marshal_fun   = fun(Msg) -> encode_request(Prepare(Msg), InputType) end,
         unmarshal_fun = fun(Bin) -> gateway_pb:decode_msg(Bin, OutputType) end
     },
     Path = <<"/yuzu.gateway.v1.GatewayUpstream/", (atom_to_binary(Method, utf8))/binary>>,

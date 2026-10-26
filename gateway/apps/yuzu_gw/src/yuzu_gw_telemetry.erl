@@ -40,6 +40,7 @@
     [yuzu, gw, upstream, notify_dropped],
     [yuzu, gw, upstream, notify_queue],
     [yuzu, gw, upstream, notify_coalesced],
+    [yuzu, gw, upstream, inventory_source_stripped],
     [yuzu, gw, upstream, registration_replay_triggered],
 
     %% Guardian side-channel forwarding (agent drift events -> control plane)
@@ -207,6 +208,24 @@ handle_event([yuzu, gw, upstream, notify_dropped], #{count := N}, Meta, _Config)
         _ -> <<"unknown">>
     end,
     prometheus_counter:inc(yuzu_gw_upstream_notify_dropped_total, [Reason], N);
+
+%% Slice-2 PR 2a-2a: a capability-gated inventory source removed from a relayed
+%% report because the upstream connection of the call did not list its
+%% capability (yuzu_gw_upstream's module doc). Both labels are closed sets: a
+%% source outside the gated list and a reason outside the two the gateway emits
+%% fold to a pre-seeded `unknown' series, so a bug cannot widen the label set.
+%% The handler must never crash (telemetry detaches a handler that raises).
+handle_event([yuzu, gw, upstream, inventory_source_stripped], #{count := N}, Meta, _Config) ->
+    Source = case maps:get(source, Meta, unknown) of
+        <<"certificate_inventory">> -> <<"certificate_inventory">>;
+        _ -> <<"unknown">>
+    end,
+    Reason = case maps:get(reason, Meta, unknown) of
+        <<"upstream_unknown">> -> <<"upstream_unknown">>;
+        <<"upstream_lacks_capability">> -> <<"upstream_lacks_capability">>;
+        _ -> <<"unknown">>
+    end,
+    prometheus_counter:inc(yuzu_gw_inventory_source_stripped_total, [Source, Reason], N);
 
 %% #4632: a Register the gateway edge refused itself (an agent id that is empty,
 %% missing, not a binary or over 256 bytes), before any reservation and before
@@ -536,6 +555,20 @@ declare_metrics() ->
                "the same agent session and stream home, or a failed probe "
                "notification superseded by one"}]),
     prometheus_counter:inc(yuzu_gw_upstream_notify_coalesced_total, [], 0),
+    prometheus_counter:declare([
+        {name, yuzu_gw_inventory_source_stripped_total},
+        {labels, [source, reason]},
+        {help, "Capability-gated inventory sources removed from a relayed "
+               "ReportInventory because the upstream connection the report was "
+               "sent on did not list the source's capability in its latest "
+               "accepted ProxyRegister answer (the rest of the report is "
+               "forwarded). source: certificate_inventory, or unknown. reason: "
+               "upstream_lacks_capability (the connection's latest answer did not "
+               "list it), upstream_unknown (no answer recorded for the "
+               "connection, or the connection could not be told), or unknown."}]),
+    [prometheus_counter:inc(yuzu_gw_inventory_source_stripped_total, [S, R], 0)
+     || S <- [<<"certificate_inventory">>, <<"unknown">>],
+        R <- [<<"upstream_lacks_capability">>, <<"upstream_unknown">>, <<"unknown">>]],
     prometheus_counter:declare([
         {name, yuzu_gw_guardian_forward_accepted_total},
         {labels, []},

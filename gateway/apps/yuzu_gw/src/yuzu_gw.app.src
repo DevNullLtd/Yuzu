@@ -18,6 +18,7 @@
         crypto,
         public_key,
         ctx,
+        chatterbox,
         grpcbox,
         telemetry,
         prometheus,

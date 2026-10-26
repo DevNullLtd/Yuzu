@@ -544,6 +544,37 @@ crash report entry under "Known limits".
 Full inventory reports from agents are forwarded to the C++ server via
 `ProxyInventory` for storage and querying.
 
+**Capability-gated sources.** Some inventory sources may reach only a server that
+said, in its `RegisterResponse.server_capabilities`, that it ingests them. Today
+that is `certificate_inventory`, gated by `certificate_inventory_v1`. The agent
+decides from the `RegisterResponse` it received, but the gateway can replay
+registrations without the agent seeing the answer, and can send a later report to
+a different server (another endpoint of the upstream channel, or another backend
+behind one endpoint after a reconnect). So the gateway checks again, per upstream
+connection, and fails closed:
+
+- For each HTTP/2 connection to the upstream, the gateway keeps the gated
+  capabilities listed by that connection's latest accepted `ProxyRegister` answer,
+  live or replayed. An accepted answer without a capability removes it. A rejected
+  answer or an error changes nothing. When the connection closes, its record is
+  dropped, so a new connection starts with no capabilities.
+- When a relayed report's `plugin_data` has a gated source key, the gateway
+  forwards that key only if the connection carrying this report lists the
+  capability. Otherwise it removes the key from `plugin_data` and forwards the rest
+  of the report. The gateway does not error the report or change `content_hashes`,
+  so a capable server that later sees the hash without the blob asks the agent
+  for a full resend (`need_full`).
+- Each removal is counted in `yuzu_gw_inventory_source_stripped_total{source,reason}`
+  and logged as a rate-limited warning.
+
+The connection of a call is identified by a unary interceptor that the upstream
+client installs on `default_channel` at start. If you configured your own
+`unary_interceptor` on `default_channel`, the gateway does not replace it and logs
+a warning at start. It then cannot tell which connection a call uses, so every
+gated key is removed. The record is per connection, so a gRPC-aware (L7) balancer
+that sends the requests of one HTTP/2 connection to different backends defeats it.
+An L4 balancer, which pins a connection to one backend, does not.
+
 ### Stream Status Notification
 
 When an agent's Subscribe stream connects or disconnects at the gateway, a
@@ -3060,6 +3091,7 @@ that are actually emitted are listed.
 | `yuzu_gw_upstream_notify_inflight` | gauge | NotifyStreamStatus workers tracked by this gateway process (at most 10). Label `node`, created at 0 at start. Counts the current upstream client process only: workers of a previous process after an upstream client restart are not counted |
 | `yuzu_gw_upstream_notify_coalesced_total` | counter | Held stream-status notifications replaced by a newer event for the same agent session and stream home, or a failed probe notification superseded by one. Unlabelled, created at 0 at start. It measures suppression, not delivery: an identical repeated `CONNECTED` also counts |
 | `yuzu_gw_upstream_notify_dropped_total` | counter | Stream-status notifications lost at admission because the pending store was at its cap: a new key is admitted only while the held keys plus the key of a half open probe in flight stay below `notify_pending_max` (label `reason`, closed set `at_capacity` and `unknown`, both created at 0 at start; `unknown` catches an unexpected value and is not emitted today). The value `circuit_open` is retired: a notification that arrives while the breaker is not closed is held, and only an older gateway still exports it. It does not count delivery loss after admission (a failed or killed worker, a gateway stop) |
+| `yuzu_gw_inventory_source_stripped_total` | counter | Capability-gated inventory sources removed from a relayed `ReportInventory`, because the upstream connection that carried it did not list the source's capability in its latest accepted `ProxyRegister` answer (see [Inventory Proxy](#inventory-proxy)). The rest of the report is forwarded. Labels `source` (`certificate_inventory`, or `unknown`) and `reason` (`upstream_lacks_capability` = the connection's latest answer did not list it; `upstream_unknown` = no answer recorded for the connection, or the gateway could not tell the connection; `unknown` = any other value, not emitted). Every series starts at 0. A steady rate of `upstream_unknown` with a capable server means the gateway cannot tell connections (check for a WARN at start about `default_channel` having its own `unary_interceptor`). |
 | `yuzu_gw_cluster_peers_resolved` | gauge | Peer addresses found by the cluster-formation redial loop's most recent tick (label `node`; HA WS-4 `#4555`). 0 is expected for a genuinely single-node deployment. |
 | `yuzu_gw_cluster_peers_connected` | gauge | Distribution-connected peer nodes as of the most recent redial tick (label `node`; `#4555`). Compare against `peers_resolved` — a sustained gap most often means a distribution-cookie mismatch across replicas. |
 | `yuzu_gw_cluster_connect_failures_total` | counter | Total `net_kernel:connect_node/1` failures from the redial loop (`#4555`). |
