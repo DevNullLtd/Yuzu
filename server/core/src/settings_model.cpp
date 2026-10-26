@@ -10,6 +10,7 @@
 #include <array>
 #include <cctype>
 #include <optional>
+#include <string_view>
 
 #include <spdlog/spdlog.h>
 
@@ -313,6 +314,8 @@ std::string tar_duration_text(std::int64_t seconds) {
 
 namespace {
 
+constexpr std::array<std::string_view, 5> kTierCols{"live", "hourly", "daily", "monthly", "boot"};
+
 std::string render_tar_tiers(const nlohmann::json& tar) {
     struct SourceRow {
         std::string source;
@@ -336,17 +339,13 @@ std::string render_tar_tiers(const nlohmann::json& tar) {
             const auto tier = t.value("tier", std::string{});
             const auto kind = t.value("limit_kind", std::string{});
             const auto limit = t.at("limit").get<std::int64_t>();
-            int col = -1;
-            if (tier == "live") col = 0;
-            else if (tier == "hourly") col = 1;
-            else if (tier == "daily") col = 2;
-            else if (tier == "monthly") col = 3;
-            else if (tier == "boot") col = 4;
-            if (col >= 0) {
+            const auto col_it = std::find(kTierCols.begin(), kTierCols.end(), tier);
+            if (col_it != kTierCols.end()) {
+                auto& cell = it->cell[static_cast<std::size_t>(col_it - kTierCols.begin())];
                 if (kind == "rows")
-                    it->cell[static_cast<std::size_t>(col)] = with_thousands(limit) + (limit == 1 ? " row" : " rows");
+                    cell = with_thousands(limit) + (limit == 1 ? " row" : " rows");
                 else if (kind == "seconds")
-                    it->cell[static_cast<std::size_t>(col)] = tar_duration_text(limit);
+                    cell = tar_duration_text(limit);
             }
             if (kind == "seconds" && t.contains("guaranteed_depth_seconds") &&
                 t.at("guaranteed_depth_seconds").is_number_integer()) {
@@ -364,18 +363,20 @@ std::string render_tar_tiers(const nlohmann::json& tar) {
         for (const auto& c : r.cell)
             html += "<td>" + c + "</td>";
         html += "<td class=\"look\">";
-        html += r.depth ? tar_duration_text(*r.depth) : "<span class=\"hint\">Row count only</span>";
+        html += r.depth ? tar_duration_text(*r.depth)
+                        : "<span class=\"hint\">Row count only</span>";
         html += "</td></tr>";
     }
     html += "</tbody></table></div>"
-            "<p class=\"hint\" style=\"padding:12px 16px 14px\">Look again after is how long a record "
-            "is guaranteed to stay in this source's history, measured on the agent's clock. Roll-up "
-            "rows age from the start of their bucket, so the monthly figure is a 31-day worst-case "
-            "floor. ";
+            "<p class=\"hint\" style=\"padding:12px 16px 14px\">Look again after is how long a "
+            "record is guaranteed to stay in this source's history, measured on the agent's clock. "
+            "Roll-up rows age from the start of their bucket, so the monthly figure is a 31-day "
+            "worst-case floor. ";
     const auto tick = tar.value("tick_seconds", 0);
     if (tick > 0)
         html += "Old rows are pruned every " + std::to_string(tick) +
-                " s, so a row can outlive its window by one tick. ";
+                " s, so a row can outlive its window by about one tick, more under a "
+                "backlog. ";
     html += "A paused or errored source is never pruned. An agent offline past a tier's catch-up "
             "window leaves a gap in that tier, not a deeper tier. These are this release's agent "
             "defaults, not per-device readings.</p>";

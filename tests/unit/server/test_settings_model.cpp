@@ -569,7 +569,7 @@ TEST_CASE("TAR tier table tolerates unknown and malformed tiers",
     CHECK(count_sub(tbody, "<td class=\"mono\">") == 2);
 }
 
-TEST_CASE("TAR look-again reads guaranteed depth, not the limit",
+TEST_CASE("TAR look-again reads guaranteed depth not the limit",
           "[settings][settings_model][retention][tar]") {
     const auto html = sm::render_retention_table(retention_with_tar(nlohmann::json::array({
         tier("A", "monthly", "seconds", 31536000, 28857600),
