@@ -4562,3 +4562,287 @@ tests:
       - eval_time: 29m
         alertname: YuzuSameSiteGateInternalError
         exp_alerts: []
+
+  # ── HA WS-11 (#4014): the fenced LeaderElector alerts (group yuzu-ha-leader) ──
+  #
+  # The metric names below are the exact series leader_metrics.hpp exports;
+  # tests/test_leader_alert_metric_names.py fails if a name here drifts from that
+  # header (promtool alone cannot know the exporter, so a renamed series would
+  # leave every case green against input series nothing ever emits). Every
+  # threshold under test is a WS-9 calibration CLAIM, not fleet data. NO case
+  # below proves a real two-leader state: that cannot be constructed against one
+  # database, so YuzuLeaderSplitBrain is verified here (promtool) only.
+
+  # CASE - two replicas both reporting leader for >2m fires, aggregated to the
+  # deployment (`by (job)` drops `instance`). Also pins `for:` from below: at 1m
+  # the alert is only pending. RED if `> 1` becomes `>= 1` (the next case), the
+  # metric name drifts, or `for:` is shortened below 2m.
+  - interval: 1m
+    name: leader split brain - two believers fire after for 2m, critical
+    input_series:
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="s1"}'
+        values: "1x10"
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="s2"}'
+        values: "1x10"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuLeaderSplitBrain", alertstate="firing"}'
+        eval_time: 1m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuLeaderSplitBrain", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuLeaderSplitBrain", alertstate="firing", job="yuzu", severity="critical"}'
+            value: 1
+
+  # CASE - the healthy shapes stay quiet: one leader and one follower, a
+  # single-replica deployment, and a lone replica that is itself the leader.
+  # RED if `> 1` becomes `>= 1` (it would page every healthy single replica) or
+  # the aggregation sums followers in.
+  - interval: 1m
+    name: leader split brain - one leader, and a single replica, stay quiet
+    input_series:
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="s1"}'
+        values: "1x10"
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="s2"}'
+        values: "0x10"
+      - series: 'yuzu_server_leader_is_leader{job="solo",instance="only"}'
+        values: "1x10"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuLeaderSplitBrain"}'
+        eval_time: 8m
+        exp_samples: []
+
+  # CASE - a graceful handover where both replicas read 1 for under 2 minutes
+  # stays quiet. RED if `for:` is dropped or shortened to <= 1m (it would fire
+  # at 1m, which the firing assertion catches; the resolved state at 6m alone
+  # would not).
+  - interval: 1m
+    name: leader split brain - a 2-sample overlap during handover stays quiet
+    input_series:
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="s1"}'
+        values: "1x10"
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="s2"}'
+        values: "1 1 0x8"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuLeaderSplitBrain", alertstate="firing"}'
+        eval_time: 1m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuLeaderSplitBrain", alertstate="firing"}'
+        eval_time: 2m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuLeaderSplitBrain", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples: []
+
+  # CASE - ONE replica scraped through two paths (same job and instance, an
+  # extra `scrape` label) must not count as two leaders. RED if the inner
+  # `max by (job, instance)` is removed: the sum becomes 2 and it pages.
+  - interval: 1m
+    name: leader split brain - one replica exposed twice is not two leaders
+    input_series:
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="s1",scrape="a"}'
+        values: "1x10"
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="s1",scrape="b"}'
+        values: "1x10"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuLeaderSplitBrain"}'
+        eval_time: 8m
+        exp_samples: []
+
+  # CASE - no replica leads for >5m: critical, deployment-level. RED if `== 0`
+  # becomes `< 1`-equivalent drift, the severity drops, or the name drifts.
+  - interval: 1m
+    name: leader no leader - zero believers for 5m fires, critical
+    input_series:
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="s1"}'
+        values: "0x12"
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="s2"}'
+        values: "0x12"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuLeaderNoLeader", alertstate="firing"}'
+        eval_time: 4m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuLeaderNoLeader", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuLeaderNoLeader", alertstate="firing", job="yuzu", severity="critical"}'
+            value: 1
+
+  # CASE - a leader exists (the other replica is a follower): quiet. And an
+  # ABSENT metric (no elector, or the target down) is an empty vector, not 0:
+  # quiet, so an unscraped or elector-less deployment never pages. RED if the
+  # expression is rewritten so absence reads as zero (e.g. `or vector(0)`).
+  - interval: 1m
+    name: leader no leader - one leader, and an absent series, stay quiet
+    input_series:
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="s1"}'
+        values: "1x12"
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="s2"}'
+        values: "0x12"
+      - series: 'up{job="noelector",instance="x"}'
+        values: "1x12"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuLeaderNoLeader"}'
+        eval_time: 10m
+        exp_samples: []
+
+  # CASE - a 3-minute leaderless blip (an ordinary failover) stays quiet; it also
+  # pins `for:` from below: a `for: 3m` would fire at 3m. RED if `for:` is
+  # shortened below 4m.
+  - interval: 1m
+    name: leader no leader - a short leaderless blip stays quiet
+    input_series:
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="s1"}'
+        values: "0x3 1x10"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuLeaderNoLeader", alertstate="firing"}'
+        eval_time: 3m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuLeaderNoLeader", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+
+  # CASE - repeated acquisitions fire the warning (an acquisition every 3
+  # minutes, 12 in all, so far more than 6 land in any 30m window). RED if the
+  # counter name drifts or the comparison is inverted.
+  - interval: 3m
+    name: leader flapping - a steady acquisition churn fires, warning
+    input_series:
+      - series: 'yuzu_server_leader_acquired_total{job="yuzu",instance="s1"}'
+        values: "0+1x14"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuLeaderFlapping", alertstate="firing"}'
+        eval_time: 36m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuLeaderFlapping", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE - a rolling restart of four replicas (four acquisitions inside the
+  # window, one per boot) and a calm deployment (one early acquisition, then
+  # flat) stay quiet. RED if the threshold is lowered toward the rolling-restart
+  # count (the documented reason it is 6, a WS-9 calibration claim).
+  - interval: 3m
+    name: leader flapping - a four-replica rolling restart and a calm counter stay quiet
+    input_series:
+      - series: 'yuzu_server_leader_acquired_total{job="yuzu",instance="s1"}'
+        values: "0 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+      - series: 'yuzu_server_leader_acquired_total{job="yuzu",instance="s2"}'
+        values: "0 0 0 0 0 0 1 1 1 1 1 1 1 1 1"
+      - series: 'yuzu_server_leader_acquired_total{job="roll",instance="a"}'
+        values: "0 0 0 0 0 0 0 0 0 1 1 1 1 1 1"
+      - series: 'yuzu_server_leader_acquired_total{job="roll",instance="b"}'
+        values: "0 0 0 0 0 0 0 0 0 0 1 1 1 1 1"
+      - series: 'yuzu_server_leader_acquired_total{job="roll",instance="c"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0 1 1 1 1"
+      - series: 'yuzu_server_leader_acquired_total{job="roll",instance="d"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0 0 1 1 1"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuLeaderFlapping"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuLeaderFlapping"}'
+        eval_time: 42m
+        exp_samples: []
+
+  # CASE - COUNTER RESET with `for: 0m`. A restart loop resets the counter to 0
+  # each boot (series 5 8 11 | 2 5 8: two resets' worth of growth). A naive
+  # last-first reads 8-5 = 3 and stays quiet; increase() accounts for the reset
+  # (about 14 once the reset is added back, extrapolated slightly higher) and fires, on the first evaluation that sees it
+  # because `for: 0m` has no pending phase. RED if increase() is replaced by a
+  # delta()/last-first, or if a `for:` is added (it would be pending, not firing).
+  - interval: 1m
+    name: leader flapping - a counter reset across restarts still fires immediately
+    input_series:
+      - series: 'yuzu_server_leader_acquired_total{job="yuzu",instance="s1"}'
+        values: "5 8 11 2 5 8"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuLeaderFlapping", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuLeaderFlapping", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE - the repeated 0 1 2 0 1 pattern the restart-loop test would otherwise
+  # under-count: still below 6 in total, so the warning stays quiet (a reset is
+  # not double-counted into a page).
+  - interval: 1m
+    name: leader flapping - a small counter reset does not over-count
+    input_series:
+      - series: 'yuzu_server_leader_acquired_total{job="yuzu",instance="s1"}'
+        values: "0 1 2 0 1"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuLeaderFlapping"}'
+        eval_time: 4m
+        exp_samples: []
+
+  # CASE - the partition-with-ACKing-peer scenario (the reason this alert is
+  # required). The replica still reads leader, so sum(is_leader) stays 1 and
+  # SplitBrain and NoLeader are SILENT (asserted below), while the coordination
+  # age grows past 120s. Only CoordinationStale moves. RED if the age series
+  # name drifts, the `and ... == 1` conjunct is dropped (next case), the
+  # threshold is raised, or the severity drops from critical.
+  - interval: 1m
+    name: leader coordination stale - a leader whose connection stopped answering fires, critical
+    input_series:
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="s1"}'
+        values: "1x12"
+      - series: 'yuzu_server_leader_last_ok_age_seconds{job="yuzu",instance="s1"}'
+        values: "0+60x12"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuLeaderCoordinationStale", alertstate="firing"}'
+        eval_time: 4m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuLeaderCoordinationStale", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuLeaderCoordinationStale", alertstate="firing", instance="s1", job="yuzu", severity="critical"}'
+            value: 1
+      # The two sum-based alerts are blind to this state by construction.
+      - expr: 'ALERTS{alertname=~"YuzuLeaderSplitBrain|YuzuLeaderNoLeader"}'
+        eval_time: 8m
+        exp_samples: []
+
+  # CASE - the quiet shapes: a stale age on a FOLLOWER (the `== 1` conjunct), a
+  # healthy leader with a small age, and an age just under the threshold. RED if
+  # the conjunct is dropped (the follower would page) or the threshold is
+  # lowered under 100s.
+  - interval: 1m
+    name: leader coordination stale - a follower, a fresh leader and a sub-threshold age stay quiet
+    input_series:
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="f1"}'
+        values: "0x12"
+      - series: 'yuzu_server_leader_last_ok_age_seconds{job="yuzu",instance="f1"}'
+        values: "300x12"
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="l1"}'
+        values: "1x12"
+      - series: 'yuzu_server_leader_last_ok_age_seconds{job="yuzu",instance="l1"}'
+        values: "5x12"
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="l2"}'
+        values: "1x12"
+      - series: 'yuzu_server_leader_last_ok_age_seconds{job="yuzu",instance="l2"}'
+        values: "100x12"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuLeaderCoordinationStale"}'
+        eval_time: 10m
+        exp_samples: []
+
+  # CASE - a stale age for under 2 minutes stays quiet and the alert is only
+  # pending at 1m after the age first exceeds the threshold. RED if `for:` is
+  # dropped or shortened below 2m.
+  - interval: 1m
+    name: leader coordination stale - a one-sample spike stays quiet
+    input_series:
+      - series: 'yuzu_server_leader_is_leader{job="yuzu",instance="s1"}'
+        values: "1x12"
+      - series: 'yuzu_server_leader_last_ok_age_seconds{job="yuzu",instance="s1"}'
+        values: "5 5 500 5 5 5 5 5 5 5 5 5 5"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuLeaderCoordinationStale", alertstate="firing"}'
+        eval_time: 2m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuLeaderCoordinationStale", alertstate="firing"}'
+        eval_time: 3m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuLeaderCoordinationStale", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []

@@ -3900,6 +3900,16 @@ test('alert runbook anchors resolve',
   timeout: 30,
 )
 
+# HA WS-11 (#4014): the leader-election alerts, their promtool cases and the metrics reference may
+# name only series leader_metrics.hpp really exports (promtool cannot know the exporter), and the
+# reference must document every exported name and cause label. Source-text only, so Python.
+test('leader alert metric names match the exporter',
+  _python3_test,
+  args: [files('test_leader_alert_metric_names.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Access reviews: pins the production wiring in server.cpp (the loud perm_fn gate, the scratch-response
 # Attest probe, the fail-closed store reads, the grant-table read). Source-text only, so Python.
 test('access reviews production wiring lexical gate',

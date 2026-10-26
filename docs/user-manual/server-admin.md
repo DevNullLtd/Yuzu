@@ -938,15 +938,15 @@ leader elected over a dedicated Postgres coordination connection (ADR-2002 §3).
 On a single server the sole replica is always the leader, so behaviour is
 unchanged.
 
-> **This is the *attempt-gate* half only — do NOT run a second server replica on
-> the strength of this change alone.** It ensures only the leader *attempts* the
-> dispatching loops; the correctness guarantee that a paused ex-leader cannot
-> still commit a dispatch (the epoch fence in the claim write) lands in a
-> follow-on slice, and a supported active-active deployment additionally needs
-> gateway-fronted routing, shared agent presence, and PKI HA. Running a second
-> replica against this slice alone can double-dispatch destructive singleton work
-> (quarantine, deployment, policy remediation). Single-server is the only
-> supported topology today.
+> **The elector alone is not a reason to run a second server replica.** It
+> ensures only the leader *attempts* the dispatching loops. The correctness
+> guarantee that a paused ex-leader cannot still commit a leader-driven dispatch
+> is the epoch fence in the claim write (the command outbox, since the follow-on
+> slice 3.3; operator-triggered remediation is arbitrated by its own durable
+> per-target claim instead). A supported active-active deployment additionally
+> needs gateway-fronted routing, shared agent presence, PKI HA and the rest of
+> the safe-to-scale gate (`docs/ha-delivery-matrix.md`); that gate is **not**
+> lifted. Single-server is the only supported topology today.
 
 What you will see, on **every** deployment including single-server, are new
 startup log lines — these are routine, not a fault:
@@ -968,6 +968,71 @@ remediation/evaluation is also *completed* on that same replica, so it still rea
 a terminal verdict even while that replica is not the leader. Only the leader-owned
 *scheduling* half — the automatic due-policy dispatch and the periodic CRL freshness
 re-publish — pauses.)
+
+### Leader election: metrics and alerts (HA WS-11)
+
+Each replica exposes the elector's state as `yuzu_server_leader_*` series on its
+own `/metrics` (reference: [metrics.md](metrics.md) "Leader election metrics"),
+and `docs/prometheus/yuzu-alerts.yml` ships the `yuzu-ha-leader` group. Reload
+your Prometheus rule file to pick it up. **Prometheus must scrape each replica
+individually** (not through the load balancer), and unrelated Yuzu deployments
+sharing one Prometheus need separate `job`s, because the alerts aggregate
+`sum by (job)`. **`/readyz` does not include leadership**: a replica that cannot
+lead is a ready follower, so these alerts are the only signal that the leader-only
+passes (scheduled dispatch, policy dispatch, quarantine reconciliation, the
+command-outbox delivery loop and the CRL re-publish) are paused. The thresholds
+below (2 m, 5 m, 6 acquisitions per 30 m, 120 s) are initial claims with no
+multi-replica fleet data behind them; tune them from your own history.
+
+Find the replica that is the leader with
+`yuzu_server_leader_is_leader == 1`; the cluster's authoritative record is
+`SELECT * FROM leader_elector.leader_state;` (its `holder_id` matches the
+`(holder_id=srv-…)` text in the `acquired leadership` log line of the process
+that holds it).
+
+- **`YuzuLeaderSplitBrain` (critical).** More than one replica believes it leads
+  for over 2 minutes. The stale replica is the one whose
+  `yuzu_server_leader_epoch` differs from
+  `leader_state.current_leader_epoch`. Against the real elector the usual cause
+  is replicas pointed at **different databases** (a split `--postgres-dsn`, or a
+  Patroni double-primary): compare each replica's coordination host/dbname in its
+  startup log line. Restart the stale replica after fixing the DSN. Fenced claims
+  stay safe throughout; what runs twice is the unfenced background passes.
+  **What it does not catch:** a *paused* ex-leader (the case the epoch fence
+  exists for) — its process is frozen, so its series goes stale, not `1`. That
+  case is covered by `YuzuLeaderCoordinationStale` and by the fence itself. This
+  alert is verified by Prometheus rule unit cases only; a genuine two-leader
+  state cannot be produced against one database.
+- **`YuzuLeaderNoLeader` (critical).** No replica has believed it leads for over
+  5 minutes, so the leader-only passes are paused on every replica while
+  `/readyz` stays green. Check, in order: the server log for
+  `[HA] leader_elector could not open its coordination connection` and the
+  `yuzu_server_leader_acquire_failures_total{cause}` series (`connect` rising
+  means the dedicated connection cannot be made: reach the primary directly, not
+  through a transaction-mode pooler); then, in Postgres,
+  `SELECT pid, state, backend_start FROM pg_locks l JOIN pg_stat_activity a USING (pid) WHERE l.locktype = 'advisory' AND l.classid = 1735291205;`
+  — a lock held by a backend whose owner is gone is a **zombie lock holder** (a
+  half-open connection the server side has not noticed; Postgres notices only via
+  its own keepalives, which can take hours by default). `SELECT pg_terminate_backend(<pid>);`
+  releases it and a replica acquires within one election cycle. During a restart
+  of the only replica the series is absent and the alert does not fire.
+- **`YuzuLeaderFlapping` (warning).** Six or more acquisitions in 30 minutes: a
+  network or Postgres failover flap, or a replica in a restart loop. Compare with
+  `YuzuServerPostgresUnreachable` and
+  `yuzu_server_leader_lost_total{cause="liveness_failed"}`. A rolling upgrade of an
+  N-replica deployment legitimately adds up to N acquisitions; the threshold
+  leaves room for four replicas.
+- **`YuzuLeaderCoordinationStale` (critical).** A replica still reads leader but
+  its coordination connection has not answered for over 120 seconds. This is the
+  only series that moves when a network partition lets the peer's kernel keep
+  acknowledging packets: the heartbeat then blocks inside a database call (up to
+  about 100 seconds per call in measurement), the replica's leadership belief
+  stays `1`, so the count of leaders stays at one and **both `YuzuLeaderSplitBrain`
+  and `YuzuLeaderNoLeader` stay silent** while that replica's leader-only passes
+  keep attempting work it cannot commit. Fenced claims still cannot double-dispatch
+  (the epoch predicate is evaluated in the claim's write on an ordinary pooled
+  connection). Check connectivity from that replica to the primary; terminate the
+  stuck backend as above, or restart the replica.
 
 ### vNEXT — Guardian compliance % and the fleet honesty banner now reflect Linux Service Guards correctly (#4252; NOT breaking)
 
