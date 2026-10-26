@@ -1413,7 +1413,7 @@ Overlap-pair rotation (design doc §7): mints a successor credential while the e
 
 **Grace-window re-serve:** a same-caller retry within a ~120-second grace window after the original mint re-serves the **same** successor secret (rather than erroring or minting a second successor). Each successful return — the original reveal or a grace-window re-serve — is independently recorded under its own `engine_principal.credential.reveal` audit row, since every time the raw secret leaves the server is independently on the audit chain, whether or not the bytes are new. Once the grace window lapses, a further rotate call while a rotation is already in flight errors — the caller must fall back to `credentials/confirm` (below) or the principal-level revoke-and-replace runbook, never an indefinite retry loop.
 
-**Response:** same no-store headers as the mint route; the `data` object adds `overlap_expires_at` (the epoch at which the predecessor is auto-revoked) alongside `token`, `token_id`, and `expires_at`.
+**Response:** same no-store headers as the mint route; the `data` object carries `token`, `token_id`, `expires_at` and `overlap_expires_at`. `expires_at` is 90 days from the rotation; it is not inherited from the predecessor. `overlap_expires_at` is the successor row's own stamp and is always `0`, because only the predecessor is stamped; read the predecessor's stamp on its entry in `active_credentials` of `GET /api/v1/engine-principals/{id}`.
 
 **No `404` path:** unlike `credentials` (mint) and `transfer-owner`, this route never looks up `{id}` via a `get()` call before acting — it drives the rotation state machine straight off the principal's active credential rows. An unknown or revoked `{id}` therefore does **not** 404.
 
@@ -2859,7 +2859,7 @@ List the fleet-wide roles currently assigned to an engine principal.
 ```json
 {
   "data": [
-    { "principal_id": "engine:vuln-viewer", "role_name": "Viewer" }
+    { "principal_id": "engine:vuln-viewer", "role": "Viewer" }
   ],
   "meta": { "api_version": "v1" }
 }
@@ -2927,8 +2927,8 @@ Unassign a fleet-wide role from an engine principal.
 }
 ```
 
-**Errors:** `400` — the role was not assigned to this principal (store-returned
-error); `401`/`403` — not authenticated, missing `Security:Write`, or MFA
+**Errors:** the call is idempotent: a role that was not held also answers `200`
+(`removed=false` appears only in the audit detail); `401`/`403` — not authenticated, missing `Security:Write`, or MFA
 step-up required/failed; `503` — the RBAC store is unavailable. Audited
 `engine_principal.role.unassigned` on success. `503` + `Sec-Audit-Failed: true`
 — the unassign audit row could not persist (see *Audit-persist failure* above):

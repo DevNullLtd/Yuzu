@@ -3945,8 +3945,11 @@ walkthrough.
   the auditor route is admin-only on a default install). Every route —
   reads included — structurally denies a caller whose own session is
   engine-classed (`principal_kind="engine"` / `auth_source="engine_token"`, the
-  §9 belt): an engine principal can never read or mutate its own or another
-  engine principal's lifecycle surface.
+  §9 belt), with one exception: `GET /engine-principals/{id}/roles` (list)
+  relies on `EnginePrincipal:Read` alone, and the role assign and unassign
+  routes are refused at the central step-up check. Apart from that list, an
+  engine principal can never read or mutate its own or another engine
+  principal's lifecycle surface.
 - **MCP gating:** the 6 mutating tools all gate on `Security:Write`
   (`mint_engine_credential`/`rotate_engine_credential` included — aligned with
   their REST twins, not `Security:Execute`), require the `supervised` tier,

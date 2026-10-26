@@ -195,6 +195,13 @@ const out = {};
       '/w2': { get: { summary: 'deep', tags: ['Big'], responses: refResp('L0') } },
       '/m1': { get: { summary: 'combo', tags: ['Big'], responses: refResp('Detail') } },
       '/m2': { get: { summary: 'loopall', tags: ['Big'], responses: refResp('SelfAll') } },
+      '/q1': { get: { summary: 'fanout', tags: ['Big'], responses: refResp('Fan0') } },
+      '/q2': { get: { summary: 'chain12', tags: ['Big'], responses: refResp('Ch0') } },
+      '/q3': { get: { summary: 'protoname', tags: ['Big'], responses: refResp('ProtoN') } },
+      '/q4': { get: { summary: 'oneofm', tags: ['Big'], responses: refResp('OneOfM') } },
+      '/q5': { get: { summary: 'nonarr', tags: ['Big'], responses: refResp('NonArr') } },
+      '/q6': { get: { summary: 'arrwrap', tags: ['Big'], responses: refResp('ArrHolder') } },
+      '/q7': { get: { summary: 'refine', tags: ['Big'], responses: refResp('Refined') } },
       '/n': { get: { summary: 'nested', tags: ['Big'], responses: R({ content: { 'application/json': { schema: { type: 'object', properties: { outer: { type: 'object', properties: { inner: { type: 'string' } } } } } } } }) } }
     },
     components: { schemas: Object.assign({
@@ -204,6 +211,13 @@ const out = {};
       Wide: { type: 'object', properties: wideProps },
       Row: { type: 'object', properties: { name: { type: 'string' }, steps: { type: 'array', items: { type: 'string' } } }, required: ['name'] },
       Detail: { allOf: [{ $ref: '#/components/schemas/Row' }, { type: 'object', properties: { yaml_source: { type: 'string' } }, required: ['yaml_source'] }] },
+      ProtoN: { allOf: [{ type: 'object', properties: JSON.parse('{"__proto__": {"type": "string"}, "a": {"type": "string"}}') }, { type: 'object', properties: { b: { type: 'string' } } }] },
+      OneOfM: { allOf: [{ type: 'object', properties: { x: { type: 'string' } } }, { oneOf: [{ type: 'object', properties: { alt_a: { type: 'string' } } }, { type: 'object', properties: { alt_b: { type: 'string' } } }] }] },
+      NonArr: { allOf: 'oops', properties: { ok: { type: 'string' } } },
+      ArrHolder: { type: 'object', properties: { rows: { allOf: [{ $ref: '#/components/schemas/ArrOfRow' }] } } },
+      ArrOfRow: { type: 'array', items: { $ref: '#/components/schemas/RowItem' } },
+      RowItem: { type: 'object', properties: { item_name: { type: 'string' } } },
+      Refined: { allOf: [{ type: 'object', properties: { t: { type: 'integer' } } }, { type: 'object', properties: { t: { type: 'integer', format: 'int64', description: 'Unix epoch seconds.' } } }] },
       SelfAll: { allOf: [{ $ref: '#/components/schemas/SelfAll' }, { type: 'object', properties: { own: { type: 'string' } } }] } }, chain) }
   };
   await reload({ status: 200, body: spec2 });
@@ -234,6 +248,26 @@ const out = {};
   out.allof_required = opRow('combo').byClass('pill').map(e => e.textContent).filter(t => t === 'required').length;
   opRow('loopall').byClass('sw-op-h')[0].click();
   out.allof_self_names = opRow('loopall').byClass('sw-name').map(e => e.textContent.trim());
+  // Hostile allOf shapes: wide acyclic fan-out must stay bounded, a long chain and a
+  // non-array allOf must say they are cut, and the plain cases must list what they hold.
+  for (let i = 0; i < 8; i++) { const ms = []; for (let j = 0; j < 6; j++) ms.push({ $ref: '#/components/schemas/Fan' + (i + 1) }); spec2.components.schemas['Fan' + i] = { allOf: ms }; }
+  spec2.components.schemas.Fan8 = { type: 'object', properties: { leaf: { type: 'string' } } };
+  for (let i = 0; i < 13; i++) { const f = {}; f['f' + i] = { type: 'string' }; const ms = [{ type: 'object', properties: f }]; if (i < 12) ms.push({ $ref: '#/components/schemas/Ch' + (i + 1) }); spec2.components.schemas['Ch' + i] = { allOf: ms }; }
+  await reload({ status: 200, body: spec2 });
+  const t0 = Date.now(); opRow('fanout').byClass('sw-op-h')[0].click(); out.fan_ms = Date.now() - t0;
+  out.fan_note = opRow('fanout').textContent.includes('Truncated');
+  opRow('chain12').byClass('sw-op-h')[0].click();
+  out.chain_note = opRow('chain12').textContent.includes('Truncated');
+  opRow('protoname').byClass('sw-op-h')[0].click();
+  out.proto_names = opRow('protoname').byClass('sw-name').map(e => e.textContent.trim()).sort();
+  opRow('oneofm').byClass('sw-op-h')[0].click();
+  out.oneofm_text = opRow('oneofm').textContent;
+  opRow('nonarr').byClass('sw-op-h')[0].click();
+  out.nonarr = { errors: opRow('nonarr').byClass('sw-error').length, names: opRow('nonarr').byClass('sw-name').map(e => e.textContent.trim()), note: opRow('nonarr').textContent.includes('Truncated') };
+  opRow('arrwrap').byClass('sw-op-h')[0].click();
+  out.arrwrap_names = opRow('arrwrap').byClass('sw-name').map(e => e.textContent.trim());
+  opRow('refine').byClass('sw-op-h')[0].click();
+  out.refine_text = opRow('refine').textContent;
   opRow('deep').byClass('sw-op-h')[0].click();
   out.deep_rows = opRow('deep').byClass('sw-name').length;
   out.deep_note = /Truncated: at least \d+ more fields/.test(opRow('deep').textContent);
@@ -511,6 +545,15 @@ def main():
     check(out["allof_names"] == ["name", "steps", "yaml_source"] and out["allof_required"] >= 2,
           "an allOf of several members must list the merged fields, with required: %r" % out["allof_names"])
     check(out["allof_self_names"] == ["own"], "an allOf member that names its own schema must be skipped, not looped: %r" % out["allof_self_names"])
+    check(out["fan_ms"] < 1500 and out["fan_note"], "wide acyclic allOf fan-out must stay bounded and say it is cut: %r ms, note %r" % (out["fan_ms"], out["fan_note"]))
+    check(out["chain_note"], "an allOf chain deeper than the cap must say it is truncated")
+    check(out["proto_names"] == ["__proto__", "a", "b"], "a property named __proto__ must be listed through an allOf: %r" % out["proto_names"])
+    check("alt_a" in out["oneofm_text"] and "alt_b" in out["oneofm_text"] and "Option 2" in out["oneofm_text"],
+          "an allOf member that is a oneOf must show its options: %r" % out["oneofm_text"][:200])
+    check(out["nonarr"]["errors"] == 0 and out["nonarr"]["names"] == ["ok"] and out["nonarr"]["note"],
+          "an allOf that is not an array must not hide the operation: %r" % out["nonarr"])
+    check("item_name" in out["arrwrap_names"], "a one-member allOf around an array must still descend into its rows: %r" % out["arrwrap_names"])
+    check("Unix epoch seconds." in out["refine_text"], "a later allOf member must fill a missing description: %r" % out["refine_text"][:200])
     check(out["deep_rows"] == 2000 and out["deep_note"], "a wide 8-level chain must stop at 2000 rows with a note: %r" % out["deep_rows"])
     check(not out["small_note"], "a small schema must not carry a truncation note")
     check(out["indent_nbsp"], "nested rows must indent with three U+00A0 characters (UTF-8 survived the pipe)")

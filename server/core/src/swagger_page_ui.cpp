@@ -168,7 +168,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
     if (!s) return 'any';
     if (s.$ref) return refName(s.$ref);
     if (s.allOf && s.allOf.length === 1) return label(s.allOf[0]) + (s.nullable ? ' | null' : '');
-    var t = s.type || (s.properties ? 'object' : s.oneOf ? 'oneOf' : s.anyOf ? 'anyOf' : 'any');
+    var t = s.type || (s.properties || s.allOf ? 'object' : s.oneOf ? 'oneOf' : s.anyOf ? 'anyOf' : 'any');
     if (t === 'array') t = label(s.items) + '[]';
     if (s.enum) t = (s.type || 'string') + ' enum';
     return t + (s.nullable ? ' | null' : '');
@@ -188,37 +188,13 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
   // document: the largest block has 97 rows, so this cap is about twenty times that.
   var MAX_ROWS = 2000;
 
-  // allOf -> one schema. Every member is followed through its $ref and its properties and
-  // required lists are merged in order, so a model written as "row plus extra fields" lists
-  // all of them. Members already open above (seen) or deeper than 8 levels contribute nothing,
-  // which bounds a cyclic spec.
-  function flat(s, seen, depth) {
-    if (!s || !s.allOf || !s.allOf.length) return s || {};
-    var out = {}, props = {}, req = [];
-    Object.keys(s).forEach(function (k) { if (k !== 'allOf') out[k] = s[k]; });
-    Object.keys(s.properties || {}).forEach(function (k) { props[k] = s.properties[k]; });
-    req = (s.required || []).slice();
-    if ((depth || 0) < 8) {
-      s.allOf.forEach(function (m) {
-        var n = m && m.$ref ? refName(m.$ref) : null;
-        if (n && seen && seen.indexOf(n) >= 0) return;
-        var f = flat(deref(m, seen), n ? (seen || []).concat([n]) : seen, (depth || 0) + 1);
-        Object.keys(f.properties || {}).forEach(function (k) { if (!Object.prototype.hasOwnProperty.call(props, k)) props[k] = f.properties[k]; });
-        (f.required || []).forEach(function (k) { if (req.indexOf(k) < 0) req.push(k); });
-        ['type', 'description', 'oneOf', 'anyOf', 'items', 'enum'].forEach(function (k) { if (out[k] === undefined && f[k] !== undefined) out[k] = f[k]; });
-      });
-    }
-    if (Object.keys(props).length) out.properties = props;
-    if (req.length) out.required = req;
-    return out;
-  }
-
   // Schema -> table rows. depth/seen guard against recursion; budget bounds the row count.
   function schemaRows(s, depth, seen, req, out, indent, budget) {
     var base = s.allOf && s.allOf.length === 1 && !s.properties ? s.allOf[0] : s;
     var n = base.$ref ? refName(base.$ref) : null;
     var nseen = n ? (seen || []).concat([n]) : seen;
-    var d = flat(deref(base, seen), nseen, 0);
+    var d = flat(deref(base, seen), nseen, 0, { n: 0 });
+    if (d.xCut) budget.skipped++;
     if (d.type === 'array' && d.items) { return schemaRows(d.items, depth, nseen, req, out, indent, budget); }
     var props = d.properties || {};
     var required = d.required || [];
@@ -234,8 +210,8 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
       ]);
       out.push(tr);
       var inner = p.items ? p.items : p;
-      var innerD = flat(deref(inner, nseen), nseen, 0);
-      if (depth < 5 && innerD.properties) {
+      var innerD = flat(deref(inner, nseen), nseen, 0, { n: 0 });
+      if (depth < 5 && (innerD.properties || (innerD.type === 'array' && innerD.items))) {
         schemaRows(inner, depth + 1, nseen, false, out, indent + 1, budget);
       }
     });
@@ -255,7 +231,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
     var n = inner.$ref ? refName(inner.$ref) : null;
     if (n && seen.indexOf(n) >= 0) return h('div', 'sw-untyped', ['(recursive: ' + n + ')']);
     var nseen = n ? seen.concat([n]) : seen;
-    var d = deref(inner);
+    var d = flat(deref(inner), seen, 0, { n: 0 });
     var alts = d.oneOf || d.anyOf;
     if (alts && alts.length) {
       var akids = [h('div', 'sw-schema-head', [pill(d.oneOf ? 'one of' : 'any of', 'info mono'), d.description ? h('span', 'mut', [d.description]) : null])];
@@ -646,6 +622,38 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
       });
   }
   load();
+  // allOf -> one schema (in this piece to keep the first under the size gate; declarations
+  // hoist). Members are followed through $ref; properties and required merge in order, the
+  // first definition wins and a later one only fills a missing description or format; type,
+  // description, oneOf, anyOf, items and enum come from the first member having one. seen
+  // stops a cycle, b.n bounds total expansions, and anything cut sets xCut (shown as
+  // truncated). A member open in an ancestor adds nothing.
+  function flat(s, seen, depth, b) {
+    if (!s || !s.allOf) return s || {};
+    var out = {}, props = Object.create(null), req = (s.required || []).slice();
+    Object.keys(s).forEach(function (k) { if (k !== 'allOf') out[k] = s[k]; });
+    Object.keys(s.properties || {}).forEach(function (k) { props[k] = s.properties[k]; });
+    if (!Array.isArray(s.allOf) || depth >= 8) out.xCut = true;
+    else s.allOf.forEach(function (m) {
+      var n = m && m.$ref ? refName(m.$ref) : null;
+      if (n && seen && seen.indexOf(n) >= 0) return;
+      if (++b.n > 200) { out.xCut = true; return; }
+      var f = flat(deref(m, seen), n ? (seen || []).concat([n]) : seen, depth + 1, b);
+      if (f.xCut) out.xCut = true;
+      Object.keys(f.properties || {}).forEach(function (k) {
+        var e = props[k], x = f.properties[k];
+        if (!(k in props)) props[k] = x;
+        else if (e && x && ((!e.description && x.description) || (!e.format && x.format))) {
+          props[k] = Object.assign({}, e, { description: e.description || x.description, format: e.format || x.format });
+        }
+      });
+      (f.required || []).forEach(function (k) { if (req.indexOf(k) < 0) req.push(k); });
+      ['type', 'description', 'oneOf', 'anyOf', 'items', 'enum'].forEach(function (k) { if (out[k] === undefined && f[k] !== undefined) out[k] = f[k]; });
+    });
+    if (Object.keys(props).length) out.properties = props;
+    if (req.length) out.required = req;
+    return out;
+  }
 })();)SWG";
 
 // Closing tags.

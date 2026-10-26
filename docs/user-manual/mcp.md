@@ -741,7 +741,8 @@ for the tool to execute.
 > `GET /engine-principals/{id}/roles` (the role assign and unassign routes are
 > step-up gated and refuse an engine session). The role tools `list_engine_roles`,
 > `assign_engine_role` and `unassign_engine_role` carry no such belt; they
-> rely on their tier and permission gates alone.
+> rely on their tier and permission gates alone, so unlike the REST role
+> mutations an engine-classed MCP session is stopped on them only by those gates.
 
 > **`revoke_certificate` tier behavior:** destructive (`Security:Delete`), so it
 > follows the same rules as every other destructive MCP op — `readonly`/`operator`
