@@ -2633,7 +2633,7 @@ static const ToolDef kTools[] = {
      R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
      R"j("overlap_days":{"type":"integer","default":7,"minimum":1,"maximum":3650,"description":"Overlap window before the predecessor auto-revokes; rejected outright (never truncated) if it would fall below the 24h floor"})j"
      R"j(},"required":["principal_id"]})j",
-     R"j({"type":"object","properties":{"token_id":{"type":"string"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"principal_id":{"type":"string"},"overlap_expires_at":{"type":"integer"}},"required":["token_id","raw_token","principal_id"]})j"},
+     R"j({"type":"object","properties":{"token_id":{"type":"string"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"principal_id":{"type":"string"},"overlap_expires_at":{"type":"integer","description":"Always 0 here: only the predecessor is stamped. Read the predecessor's stamp from active_credentials in get_engine_principal"}},"required":["token_id","raw_token","principal_id"]})j"},
 
     {"confirm_engine_rotation",
      "Explicit maker-checker confirmation that a rotation's successor secret has been received/"
@@ -3003,7 +3003,8 @@ static const ToolDef kTools[] = {
      "standing authority it currently grants that autonomous module. Mirrors DELETE "
      "/api/v1/engine-principals/{id}/roles/{role}. Destructive — it takes away access a "
      "module may be actively relying on; verify the module doesn't need this role before "
-     "calling. Requires Security:Write (supervised MCP tier; approval-gated).",
+     "calling. Idempotent: unassigned is true even when the role was not held. Requires "
+     "Security:Write (supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","pattern":"^[a-z0-9._-]+$","description":"Engine principal slug WITHOUT the engine: prefix"},)j"
      R"j("role":{"type":"string","minLength":1,"description":"The role name to revoke"})j"

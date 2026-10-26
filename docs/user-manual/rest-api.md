@@ -2928,8 +2928,10 @@ Unassign a fleet-wide role from an engine principal.
 ```
 
 **Errors:** the call is idempotent: a role that was not held also answers `200`
-(`removed=false` appears only in the audit detail); `401`/`403` — not authenticated, missing `Security:Write`, or MFA
-step-up required/failed; `503` — the RBAC store is unavailable. Audited
+(`removed=false` appears only in the audit detail). `401` or `403`: not
+authenticated, missing `Security:Write`, an engine session, or MFA step-up
+required or failed. `503`: the RBAC store is unavailable or the query failed.
+Audited
 `engine_principal.role.unassigned` on success. `503` + `Sec-Audit-Failed: true`
 — the unassign audit row could not persist (see *Audit-persist failure* above):
 the grant may already be removed, so reconcile via `GET /{id}/roles`.

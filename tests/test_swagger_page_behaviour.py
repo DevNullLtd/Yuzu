@@ -201,6 +201,9 @@ const out = {};
       '/q4': { get: { summary: 'oneofm', tags: ['Big'], responses: refResp('OneOfM') } },
       '/q5': { get: { summary: 'nonarr', tags: ['Big'], responses: refResp('NonArr') } },
       '/q6': { get: { summary: 'arrwrap', tags: ['Big'], responses: refResp('ArrHolder') } },
+      '/q8': { get: { summary: 'rowsum', tags: ['Big'], responses: refResp('Sum0') } },
+      '/q9': { get: { summary: 'xcutkey', tags: ['Big'], responses: refResp('XKey') } },
+      '/q10': { get: { summary: 'twoalts', tags: ['Big'], responses: refResp('TwoAlts') } },
       '/q7': { get: { summary: 'refine', tags: ['Big'], responses: refResp('Refined') } },
       '/n': { get: { summary: 'nested', tags: ['Big'], responses: R({ content: { 'application/json': { schema: { type: 'object', properties: { outer: { type: 'object', properties: { inner: { type: 'string' } } } } } } } }) } }
     },
@@ -218,6 +221,8 @@ const out = {};
       ArrOfRow: { type: 'array', items: { $ref: '#/components/schemas/RowItem' } },
       RowItem: { type: 'object', properties: { item_name: { type: 'string' } } },
       Refined: { allOf: [{ type: 'object', properties: { t: { type: 'integer' } } }, { type: 'object', properties: { t: { type: 'integer', format: 'int64', description: 'Unix epoch seconds.' } } }] },
+      XKey: { allOf: [{ type: 'object', properties: { k1: { type: 'string' } } }], xCut: true },
+      TwoAlts: { allOf: [{ oneOf: [{ type: 'object', properties: { o1: { type: 'string' } } }] }, { oneOf: [{ type: 'object', properties: { o2: { type: 'string' } } }] }] },
       SelfAll: { allOf: [{ $ref: '#/components/schemas/SelfAll' }, { type: 'object', properties: { own: { type: 'string' } } }] } }, chain) }
   };
   await reload({ status: 200, body: spec2 });
@@ -253,9 +258,23 @@ const out = {};
   for (let i = 0; i < 8; i++) { const ms = []; for (let j = 0; j < 6; j++) ms.push({ $ref: '#/components/schemas/Fan' + (i + 1) }); spec2.components.schemas['Fan' + i] = { allOf: ms }; }
   spec2.components.schemas.Fan8 = { type: 'object', properties: { leaf: { type: 'string' } } };
   for (let i = 0; i < 13; i++) { const f = {}; f['f' + i] = { type: 'string' }; const ms = [{ type: 'object', properties: f }]; if (i < 12) ms.push({ $ref: '#/components/schemas/Ch' + (i + 1) }); spec2.components.schemas['Ch' + i] = { allOf: ms }; }
+  // Cross-row sum: five single-property levels, then 200 rows (never descended: depth 5) that
+  // each reference a 200-member allOf of one 3000-property schema.
+  const bigP = {}; for (let i = 0; i < 3000; i++) bigP['b' + i] = { type: 'string' };
+  spec2.components.schemas.BigObj = { type: 'object', properties: bigP };
+  const fatM = []; for (let j = 0; j < 200; j++) fatM.push({ $ref: '#/components/schemas/BigObj' });
+  spec2.components.schemas.Fat = { allOf: fatM };
+  for (let i = 0; i < 5; i++) spec2.components.schemas['Sum' + i] = { type: 'object', properties: { n: { $ref: '#/components/schemas/Sum' + (i + 1) } } };
+  const sumRows = {}; for (let i = 0; i < 200; i++) sumRows['r' + i] = { $ref: '#/components/schemas/Fat' };
+  spec2.components.schemas.Sum5 = { type: 'object', properties: sumRows };
   await reload({ status: 200, body: spec2 });
   const t0 = Date.now(); opRow('fanout').byClass('sw-op-h')[0].click(); out.fan_ms = Date.now() - t0;
   out.fan_note = opRow('fanout').textContent.includes('Truncated');
+  const t1 = Date.now(); opRow('rowsum').byClass('sw-op-h')[0].click(); out.rowsum_ms = Date.now() - t1;
+  opRow('xcutkey').byClass('sw-op-h')[0].click();
+  out.xcutkey_note = opRow('xcutkey').textContent.includes('Truncated');
+  opRow('twoalts').byClass('sw-op-h')[0].click();
+  out.twoalts_note = opRow('twoalts').textContent.includes('Truncated');
   opRow('chain12').byClass('sw-op-h')[0].click();
   out.chain_note = opRow('chain12').textContent.includes('Truncated');
   opRow('protoname').byClass('sw-op-h')[0].click();
@@ -546,6 +565,9 @@ def main():
           "an allOf of several members must list the merged fields, with required: %r" % out["allof_names"])
     check(out["allof_self_names"] == ["own"], "an allOf member that names its own schema must be skipped, not looped: %r" % out["allof_self_names"])
     check(out["fan_ms"] < 1500 and out["fan_note"], "wide acyclic allOf fan-out must stay bounded and say it is cut: %r ms, note %r" % (out["fan_ms"], out["fan_note"]))
+    check(out["rowsum_ms"] < 2000, "work across many rows must stay bounded, not only per merge: %r ms" % out["rowsum_ms"])
+    check(not out["xcutkey_note"], "a schema keyword named xCut must not raise a truncation note")
+    check(out["twoalts_note"], "a second oneOf among allOf members must say it is not shown")
     check(out["chain_note"], "an allOf chain deeper than the cap must say it is truncated")
     check(out["proto_names"] == ["__proto__", "a", "b"], "a property named __proto__ must be listed through an allOf: %r" % out["proto_names"])
     check("alt_a" in out["oneofm_text"] and "alt_b" in out["oneofm_text"] and "Option 2" in out["oneofm_text"],

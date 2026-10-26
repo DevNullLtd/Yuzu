@@ -210,7 +210,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
       ]);
       out.push(tr);
       var inner = p.items ? p.items : p;
-      var innerD = flat(deref(inner, nseen), nseen, 0, { n: 0 });
+      var innerD = depth < 5 ? flat(deref(inner, nseen), nseen, 0, { n: 0 }) : {};
       if (depth < 5 && (innerD.properties || (innerD.type === 'array' && innerD.items))) {
         schemaRows(inner, depth + 1, nseen, false, out, indent + 1, budget);
       }
@@ -234,6 +234,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
     var d = flat(deref(inner), seen, 0, { n: 0 });
     var alts = d.oneOf || d.anyOf;
     if (alts && alts.length) {
+      if (d.xCut) budget.skipped++;
       var akids = [h('div', 'sw-schema-head', [pill(d.oneOf ? 'one of' : 'any of', 'info mono'), d.description ? h('span', 'mut', [d.description]) : null])];
       // Properties declared beside the alternatives apply to every option; show them first.
       var shared = d.properties ? schemaRows(s, 0, seen, false, [], 0, budget) : [];
@@ -632,6 +633,7 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
     if (!s || !s.allOf) return s || {};
     var out = {}, props = Object.create(null), req = (s.required || []).slice();
     Object.keys(s).forEach(function (k) { if (k !== 'allOf') out[k] = s[k]; });
+    delete out.xCut;
     Object.keys(s.properties || {}).forEach(function (k) { props[k] = s.properties[k]; });
     if (!Array.isArray(s.allOf) || depth >= 8) out.xCut = true;
     else s.allOf.forEach(function (m) {
@@ -648,7 +650,11 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
         }
       });
       (f.required || []).forEach(function (k) { if (req.indexOf(k) < 0) req.push(k); });
-      ['type', 'description', 'oneOf', 'anyOf', 'items', 'enum'].forEach(function (k) { if (out[k] === undefined && f[k] !== undefined) out[k] = f[k]; });
+      ['type', 'description', 'oneOf', 'anyOf', 'items', 'enum'].forEach(function (k) {
+        if (f[k] === undefined) return;
+        if (out[k] === undefined) out[k] = f[k];
+        else if ((k === 'oneOf' || k === 'anyOf') && out[k] !== f[k]) out.xCut = true;
+      });
     });
     if (Object.keys(props).length) out.properties = props;
     if (req.length) out.required = req;

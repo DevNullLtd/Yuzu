@@ -3938,12 +3938,12 @@ walkthrough.
   behind a one-time secret-reveal panel, revoked rows showing `superseded_by` +
   revoke detail).
 - **REST gating:** every *mutating* route is human-admin + MFA-step-up gated;
-  the three read routes are human-admin + RBAC gated but not step-up gated —
-  list and get on `EnginePrincipal:Read` (moved off the over-broad
+  the read routes are human-admin + RBAC gated but not step-up gated: list,
+  get and the roles list on `EnginePrincipal:Read` (moved off the over-broad
   `Security:Read` by #2376, see "The authorization topology floor" above), and
   `audit/no-admin` on `AuditLog:Read` (floored under RBAC-off by #5771, so
-  the auditor route is admin-only on a default install). Every route —
-  reads included — structurally denies a caller whose own session is
+  the auditor route is admin-only on a default install). Every route, reads
+  included, structurally denies a caller whose own session is
   engine-classed (`principal_kind="engine"` / `auth_source="engine_token"`, the
   §9 belt), with one exception: `GET /engine-principals/{id}/roles` (list)
   relies on `EnginePrincipal:Read` alone, and the role assign and unassign
@@ -4195,8 +4195,7 @@ this section does not restate them.
   token stays a 30-day token measured from its own original grant) — never
   recomputed as `now + 90d`, which would silently extend authorization
   lifetime through what should be a lateral credential swap. The store-level
-  API retains an internal `successor_expires_at` override parameter (reused
-  by the engine arm's own successor-TTL logic), but the REST route
+  API retains an internal `successor_expires_at` override parameter, but the REST route
   deliberately does not expose it — a senior-architecture ruling, recorded
   in the security review, that rotation must read as lifetime-neutral in
   CC6.3 evidence with no caller-controlled escape hatch. A caller that
