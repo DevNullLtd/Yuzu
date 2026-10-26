@@ -16,7 +16,8 @@ description: Maintain Yuzu's protobuf wire contracts, code generation, and gatew
 
 - Preserve field numbers.
 - Do not remove fields or change field types.
-- Never delete anything from a `.proto` (field, oneof, enum value, message, enum, rpc, service, file), even with `reserved` — owner ruling 2026-10-26. Retire an item by ceasing to use it and marking it `[deprecated = true]` / `option deprecated = true;` where protobuf has that option (a oneof has none: deprecate its fields). `proto/buf.yaml` enforces this with the `*_NO_DELETE` breaking rules.
+- Never delete anything from a `.proto` (field, oneof, enum value, message, enum, rpc, service, file), even with `reserved` — owner ruling 2026-10-26 (#6555). Retire an item by ceasing to use it and marking it `[deprecated = true]` / `option deprecated = true;` where protobuf has that option (a oneof has none: deprecate its fields). Moving a type to another file counts as a deletion. `proto/buf.yaml` enforces this with the `*_NO_DELETE` breaking rules.
+- `deprecated` is metadata only. A security-motivated RPC retirement must also remove the server/gateway handler. protoc marks a deprecated field's C++ accessors `[[deprecated]]`, so code that still reads it during a mixed-version window will warn.
 - Treat `buf breaking` as the baseline contract check, not an optional extra.
 
 ## Preserve Codegen Behavior

@@ -7,7 +7,7 @@ lint:
 breaking:
   use:
     - WIRE_JSON
-    # No-deletion policy (owner ruling, 2026-10-26): "proto subtractions are
+    # No-deletion policy (owner ruling, 2026-10-26, recorded in #6555): "proto subtractions are
     # breaking, so we should just not use the field, not remove it from the
     # protobufs." Nothing is ever deleted from a .proto -- not even with
     # `reserved` (which WIRE_JSON alone accepts) -- and RPCs/services are
@@ -17,6 +17,13 @@ breaking:
     # FILE-category rules, so moving a message/enum/service to another
     # file also counts as a deletion. Rule IDs checked against buf 1.50.0
     # `buf config ls-breaking-rules`.
+    # `deprecated` is metadata only: retiring an RPC for a security reason
+    # also means removing its server/gateway handler (it then answers
+    # UNIMPLEMENTED). If a deletion reaches dev anyway, revert it. A
+    # deliberate removal needs a new owner ruling and an `ignore_only` entry
+    # scoped to one rule and one file, removed once the deletion is on main:
+    # a stale entry silently re-allows `reserved` deletes in that file. Do
+    # not edit this list to get a PR green (#6552 tracks pinning it).
     - FILE_NO_DELETE
     - MESSAGE_NO_DELETE
     - ENUM_NO_DELETE
