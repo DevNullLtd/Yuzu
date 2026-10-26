@@ -302,7 +302,17 @@ claim-commit and the external send is unavoidable:
 **Status (WS-3): 3.1 done (#4011); 3.2 done (#4134); 3.3 done (#4169); 3.4 LANDED.** `leader_elector.{hpp,cpp}`
 exists (the fenced-lock primitive) and is wired in `ServerImpl` for the leader-election loop (3.2).
 The transactional command outbox (3.3) has merged; `PolicyEvaluator` remediation redesign (3.4)
-has landed with the durable per-(policy,agent) claim.
+has landed with the durable per-(policy,agent) claim. **WS-11 (#4014) leader observability shipped:** each
+replica exports `yuzu_server_leader_*` (leader belief, the epoch it leads at, acquisitions, acquire
+failures and losses by closed cause, and the age of the last answered coordination query) and the
+`yuzu-ha-leader` alert group ships (split brain, no leader, flapping, stale coordination). The series are
+published at scrape time from a lock-free snapshot, so a stalled coordination probe cannot stall a scrape
+and the age keeps growing if the election loop wedges. `SplitBrain` is verified by Prometheus rule unit
+cases only (a real two-leader state cannot be built against one database), and a paused ex-leader is not
+caught by it — that case is the epoch fence's, with `YuzuLeaderCoordinationStale` as the signal for a
+leader whose connection stopped answering. This does not lift the safe-to-scale gate; remediation-claim
+lifecycle counters (#6526), a CRL freshness gauge (#6527) and a durable cluster-capability admission gate
+(#6528) are separate, unshipped items.
 
 ### 7. Gateway cluster topology + routing (Q7)
 **Independent gateway clusters, one per trust zone / region** (internal-vs-external is a trust
@@ -2378,7 +2388,10 @@ gaps closed:
   connection so the next probe re-resolves, rather than staying on a standby that a proxy, DNS name
   or read-any port routed a new connection to. Consequence, accepted: a Postgres failover
   turns **every** replica red for the failover window — truthful, since nothing can serve writes.
-  Leadership is deliberately not a readiness condition.
+  Leadership is deliberately not a readiness condition, and neither is the elector being open (#4014):
+  a replica that cannot lead is a ready follower that still serves every operator-synchronous path, so
+  gating it out would evict a working replica from the load balancer. The pause of the leader-only passes
+  is surfaced by the `yuzu_server_leader_*` series and `YuzuLeaderNoLeader`, which are therefore not optional.
 - **Multi-host DSNs.** libpq walks the host list for the probe exactly as for the pool (order, which
   failures move on and which end the attempt, the pool's connection parameters), so the probe
   measures the host the pool reaches — every re-implementation of that walk diverged (governance

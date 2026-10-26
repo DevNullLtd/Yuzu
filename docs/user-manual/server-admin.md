@@ -1131,9 +1131,9 @@ dispatch a fix. (This is the guarantee for when the safe-to-scale gate lifts, AD
 **Scope of the guarantee.** This holds between replicas running the **same
 schema version**. A rolling upgrade across the migration boundary can
 transiently run an old binary that predates the durable claim alongside a new
-one; that mixed-version window is gated today by issue #4014 (which blocks
-running a second production replica) pending a durable cluster-capability
-admission gate. The exposure is one-directional: a row written by an old
+one; that mixed-version window is covered today only by the safe-to-scale gate
+(`docs/ha-delivery-matrix.md`, which is procedural and not lifted), pending a
+durable cluster-capability admission gate (#6528). The exposure is one-directional: a row written by an old
 binary carries claim-generation `0`, a value a new binary never mints.
 Separately, this is effectively-once, not exactly-once (consistent with
 ADR-2002): a replica that pauses for longer than `fixing_stale_seconds`
@@ -5902,7 +5902,7 @@ On the main listener, a `/health` or `/api/health` request that carries a `Cooki
 - **A sustained overload also reds every replica together, and that is deliberate (#4944).** If the probe's one-row, no-table `SELECT` misses its 2 s deadline twice in a row, the database cannot answer real requests within their deadlines either (nearly every request validates a session and writes an audit row), so the replica is truthfully unable to serve — and, from the client side, a hopelessly slow backend and a frozen one look the same. There is **no server-side hysteresis** by decision: the rule stays two failures to go red, one success to recover, and your load balancer's thresholds are the damping — see "Load balancers and shutdown drain" below for the recommended values. A *brief* stall never evicts: one failed probe is a blip (`scripts/ha/ha-readyz-scenarios.sh`, scenario M holds a 3 s pause green; scenario L shows a CPU-starved database going red and recovering within one probe of the limit being lifted).
 - **Enablement is detail, not a gate.** The `enablement` object reports whether a regression is declared (`regression_pending`), whether this boot found no continuity anchor (`anchor_unwitnessed_at_boot`, which is `true` on every fresh install) and whether an endpoint reported above the store's highest (`report_ahead`). None of them changes the verdict. They are read from a cache refreshed at boot and when this replica declares a regression, so a declaration made by another replica shows here only after this one restarts; see [Enablement continuity anchor](#enablement-continuity-anchor). The `enablement_store` row is an ordinary startup check.
 - **The store rows are startup checks.** Every other row (`response_store`, `session_store`, ...) reports whether that store opened and migrated when the server started. They do not re-check a running store — a runtime problem with one store (a revoked grant, a dropped table) shows up as `503`s on that store's routes and in metrics, not on `/readyz`, because every replica shares the same database and moving traffic elsewhere would not help. For example, DEX Apps lists refuse with `score_policy_unavailable` once the `dex_score_policy` key has been unreadable for over 60 s, or at once when no policy is cached (a restart during the outage, or a concurrent first read) (see `yuzu_server_runtime_config_read_degrade_total{reason}`).
-- **Leadership is not readiness.** A replica that is not the background-work leader is fully ready.
+- **Leadership is not readiness.** A replica that is not the background-work leader is fully ready, and so is one whose leader elector could not open its coordination connection: it still serves every operator-synchronous request. The paused background passes are reported by the `yuzu_server_leader_*` metrics and the `YuzuLeaderNoLeader` alert instead (see [Leader election: metrics and alerts](#leader-election-metrics-and-alerts-ha-ws-11)).
 
 ### Probing a TLS-enabled server
 

@@ -2,6 +2,21 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## New: leader-election metrics and alerts (HA WS-11, #4014)
+
+Additive; no behaviour change and no action is needed to keep a deployment working. Every server with a
+Postgres-backed elector now exposes seven `yuzu_server_leader_*` series on `/metrics` (reference:
+`docs/user-manual/metrics.md`, "Leader election metrics"), and `docs/prometheus/yuzu-alerts.yml` gains the
+`yuzu-ha-leader` group: `YuzuLeaderSplitBrain`, `YuzuLeaderNoLeader` and `YuzuLeaderCoordinationStale`
+(critical) and `YuzuLeaderFlapping` (warning). **Reload your Prometheus rule file to pick them up.** The
+alerts aggregate `sum by (job)`, so Prometheus must scrape each replica individually and unrelated Yuzu
+deployments sharing one Prometheus need separate `job`s. On a single-replica deployment `YuzuLeaderNoLeader`
+is the alert that can fire: it means the leader-only background passes are paused while `/readyz` stays
+green (leadership is deliberately not a readiness input). Runbook: `docs/user-manual/server-admin.md`,
+"Leader election: metrics and alerts (HA WS-11)". The thresholds are initial claims without fleet data.
+This does not lift the safe-to-scale gate (`docs/ha-delivery-matrix.md`); running a second replica is still
+unsupported.
+
 ## ⚠️ Breaking: the `registry` plugin 2.0.0 writes typed values, verifies them and refuses registry links
 
 `registry` 2.0.0 changes three existing actions. `set_value` writes any of six value types (`REG_SZ`, `REG_EXPAND_SZ`, `REG_BINARY`, `REG_DWORD`, `REG_MULTI_SZ`, `REG_QWORD`) from `value` text or exact `data_hex` bytes, captures the previous value, reads the new one back on the same handle and fails with `verify_mismatch` when it differs. It validates its `type` and numeric text instead of storing every non-`REG_DWORD` type as `REG_SZ`: 1.0.0 parsed a `REG_DWORD` value with `stoul`, so `0x10` wrote 0, `-1` wrote 4294967295 and `12abc` wrote 12, `abc` or an empty value threw out of the plugin, and a type spelt in lower case (`reg_dword`) stored the text as `REG_SZ`; 2.0.0 refuses each of those (`invalid_data`, `value_overflow`, `invalid_type`). A creating write whose first key component is missing directly under the hive root is refused `root_level_create`. `delete_value` and `delete_key` fail with tokens (`key_not_found`, `value_not_found`, `key_has_subkeys`, `access_denied`, ...) instead of sentences; `delete_key` still removes only a key with no subkeys, and on success appends four rows (`counted_keys`, `counted_values`, `dry_run`, `capped`) after `status|ok`. All three mutating actions now validate their input before anything is opened and refuse it as `invalid_key_path` or `invalid_value_name`: a key path that is empty, longer than 255 bytes or 32 components, has an empty, `.` or `..` component (so a leading, trailing or doubled backslash), begins with a hive alias (`HKLM\...`, `HKEY_LOCAL_MACHINE\...`: the hive is its own parameter), or holds a control byte or invalid UTF-8; and a value name longer than 16,383 bytes or holding a control byte or invalid UTF-8 (control bytes are refused on the instruction and MCP routes; `POST /api/command` passes an embedded NUL to the plugin as a C string, so the value is cut at it). Every mutating action emits one leading `audit|` row before `status|ok` or `error|<token>`, so the first output line of these actions is now the audit row once the target resolves; a missing or unparseable hive or key is a bare `error|` line with no audit row. **Registry links are refused, not followed:** 1.0.0 followed them, so every `set_value`, `delete_value` and `delete_key` under `HKLM\SYSTEM\CurrentControlSet` (itself a link to the active control set) now answers `error|key_is_link`; reads still follow it. The read actions (`get_value`, `enumerate_keys`, `enumerate_values`, `get_user_value`) map `|`, CR and LF in registry data to `_`.
