@@ -2428,11 +2428,13 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // wipe every kBaselinePrefix baseline record, reintroducing exactly the
         // silent-relaunder bug this file's baseline persistence exists to close (a
         // rule's captured "known good" state must survive a full_sync). Scoped to
-        // kRulePrefix keys only — the ONLY other keys ever written under this
-        // namespace are kKeyGen (rewritten unconditionally just below regardless)
-        // and kBaselinePrefix records (deliberately untouched by full_sync — see
-        // guardian_seed_baseline's doc for why absence-from-a-push must not sweep
-        // a baseline either).
+        // kRulePrefix keys only: this sweep is `rule:`-prefixed and must never become a
+        // blanket clear, because other keys live in the same namespace - kKeyGen
+        // (rewritten unconditionally just below regardless), kBaselinePrefix records
+        // (deliberately untouched by full_sync — see guardian_seed_baseline's doc for why
+        // absence-from-a-push must not sweep a baseline either), and the `meta:` keys
+        // (meta:policy_generation and, UP-14, meta:boot_epoch, whose loss would drop the
+        // boot epoch back to the wall clock).
         // #4415: within kRulePrefix the sweep removes only the rows the push OMITS
         // (absent from push_ids). A row the push still carries is left in place and
         // put_rule_locked rewrites it only when the stored bytes differ, so an identical

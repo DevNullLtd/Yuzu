@@ -13,7 +13,8 @@
  *
  * A JournalRecord is FROZEN AT MINT: every field it carries is exactly what was
  * (or will be) sent on the wire, so a replay reconstructs a byte-identical
- * GuaranteedStateEvent and the server's redelivery compare (PR-Sv) sees a match,
+ * GuaranteedStateEvent (except the ordering pair, fields 24/25, which replays carry
+ * as 0/0) and the server's redelivery compare (PR-Sv) sees a match,
  * not a false Conflict. Nothing here is ever re-stamped or re-measured.
  */
 

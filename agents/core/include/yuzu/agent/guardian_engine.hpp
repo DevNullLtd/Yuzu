@@ -166,8 +166,8 @@ public:
     /// claimed once at agent boot by claim_guardian_boot_epoch() (guardian_boot_epoch.hpp)
     /// and passed in so this constructor stays I/O-free. 0 (the default, and what every
     /// test using the 2- or 3-argument form gets) means "unordered": events still draw an
-    /// emit_seq internally but the wire carries 0/0 and the server falls back to the
-    /// timestamp key.
+    /// emit_seq internally but the wire carries 0/0 (a server that compares the pair
+    /// ignores a 0/0 pair and keeps ordering by the timestamp).
     GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark = false,
                    std::uint64_t boot_epoch = 0);
     ~GuardianEngine();
@@ -220,9 +220,9 @@ public:
     /// between two losses is legitimately older than the SECOND loss and should
     /// still be overwritten by a repair covering that second loss, which stamping
     /// with `now` instead of `last_lost` would otherwise let a stale repair do to
-    /// a NEWER, already-delivered real verdict, via the server's own
-    /// `updated_at >=` upsert guard — belt-and-braces alongside the executor's own
-    /// seq-guarded clearing and dequeue-time supersession check, see
+    /// a NEWER, already-delivered real verdict, if the server orders by timestamp
+    /// (`updated_at >=` upsert guard); the executor's own seq-guarded clearing and
+    /// dequeue-time supersession check are the agent-side stale-repair defence, see
     /// guardian_legacy_sink_executor.hpp's class doc comment). The server's
     /// census goes fail-closed (errored) for a gapped rule until either the
     /// repair is confirmed delivered or the rule's next real verdict clears it
@@ -1291,15 +1291,16 @@ private:
     /// `first_lost` — a real verdict delivered between two losses is legitimately
     /// older than the SECOND loss and should still be overwritten by a repair
     /// covering that second loss); every real guard callsite leaves it at
-    /// nullopt and keeps stamping `now`. This is belt-and-braces alongside the
-    /// executor's own seq-guarded clearing and dequeue-time supersession check —
-    /// it lets the server's existing `updated_at >=` upsert guard see the repair at
-    /// the time of the loss rather than the time of the repair. UP-14: that stays a
-    /// display/backdating choice and is NOT an ordering authority. A repair goes
-    /// through offer() like any event and draws a FRESH (boot_epoch, emit_seq) pair at
-    /// admission, so once the server compares that pair (the server PR) the pair, not
-    /// this timestamp, orders the repair against other verdicts. Until then (or while
-    /// the pair is 0/0) the timestamp is still the server's key.
+    /// nullopt and keeps stamping `now`. The executor's own seq-guarded clearing and
+    /// dequeue-time supersession check are the agent-side stale-repair defence; the
+    /// backdated timestamp is an input to a server that orders by timestamp (its
+    /// `updated_at >=` upsert guard sees the repair at the time of the loss rather than
+    /// the time of the repair). UP-14: that stays a display/backdating choice and is NOT
+    /// an ordering authority the agent can rely on. A repair goes through offer() like
+    /// any event and draws a FRESH (boot_epoch, emit_seq) pair at admission; the pair and
+    /// the timestamp are both inputs, a server that compares the pair orders the repair
+    /// against other verdicts by it, and one that does not (or sees 0/0) falls back to
+    /// the timestamp.
     ///
     /// `expected_gap_lost_seq` (adversarial-review finding, 2026-09-24): threaded
     /// straight through to offer()'s own parameter of the same name — see

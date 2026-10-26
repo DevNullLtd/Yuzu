@@ -881,9 +881,9 @@ public:
         // stays I/O-free (the epoch must already be known when the engine builds the emit
         // source its executor and Spark runtime share). It is NOT read in start_local(),
         // which is deferred past the network. A null kv_store_ is handled by the claim
-        // (epoch 0 = unordered: the wire pair is 0/0 and the server falls back to the
-        // timestamp key). The literal `false` stays visible on purpose: prefer_spark_ is
-        // never passed true in production.
+        // (epoch 0 = unordered: the wire pair is 0/0, which a pair-comparing server treats
+        // as unordered and orders by the timestamp key). The literal `false` stays visible on
+        // purpose: prefer_spark_ is never passed true in production.
         const auto now_unix_s = std::chrono::duration_cast<std::chrono::seconds>(
                                     std::chrono::system_clock::now().time_since_epoch())
                                     .count();

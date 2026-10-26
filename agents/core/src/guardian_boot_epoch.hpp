@@ -20,28 +20,40 @@
 //
 // FAILURE RULES. A claim that cannot be made durably is 0 ("unordered"), and nothing is
 // invented in memory: an in-memory epoch would not be persisted, so the next boot would
-// repeat it. Epoch 0 makes the engine emit the pair as 0/0 and the server fall back to
-// the timestamp key. 0 is returned for: a null store, a read error, a write failure, and
-// a candidate that would reach the ceiling.
+// repeat it. Epoch 0 makes the engine emit the pair as 0/0, which a pair-comparing
+// server treats as unordered and orders by the timestamp key instead. 0 is returned for:
+// a null store, a read error, a write failure, and a clock term at or above the ceiling.
 //
 // A stored value that is present but unusable (unparseable, trailing bytes, embedded
-// NUL, out of range, or at or above the ceiling) carries no more information than a
-// wiped row, so it is RE-CLAIMED as max(1, clock) and overwritten (Outcome::Recovered,
-// error-level log) rather than left to degrade every later boot to epoch 0.
+// NUL, out of range, at or above the ceiling, or one whose successor would reach the
+// ceiling) carries no more information than a wiped row, so it is RE-CLAIMED as
+// max(1, clock) and overwritten (Outcome::Recovered, error-level log) rather than left
+// to degrade every later boot to epoch 0.
 //
 // CEILING. Every epoch is strictly below 2^62. The persisted value is checked against
-// the ceiling BEFORE any "+ 1", so the arithmetic can never wrap.
+// the ceiling BEFORE any "+ 1", so the arithmetic can never wrap: a persisted value of
+// 2^62 - 1 or more is unusable (its successor would reach the ceiling), so 2^62 - 1 is
+// the last epoch that can be claimed from a persisted value.
 //
 // SINGLE-WRITER ASSUMPTION. The claim is a plain read followed by a plain set(). It
-// assumes ONE agent process owns the KV file. Two processes racing on the same file could
-// both read N and both claim N + 1 (an equal epoch); the agent's single-instance
-// ownership of its data directory is what excludes that, and this module does not add a
-// second mechanism.
+// assumes ONE agent process uses the KV file at a time. Nothing in the agent enforces
+// this: there is no instance lock, pidfile or data-directory mutex, and the KV file is in
+// WAL mode, which admits a second process. Each service manager starts one instance per
+// unit, but a manual run against the same --data-dir is not excluded. Two processes that
+// both read N would both claim N + 1 and draw emit_seq from 1, so their events carry equal
+// epochs and overlapping sequences that the server cannot tell apart. Accepted (ruling
+// D3) and recorded with the documented residual below; this module adds no second
+// mechanism.
 //
 // DOCUMENTED RESIDUAL. If the KV row is wiped AND the agent restarts within the same
 // wall-clock second as the previous boot, the new epoch equals the previous one (both
 // are that second). The server cannot see this as a regression. Accepted: closing it
-// needs a sub-second clock term, which changes the epoch's definition.
+// needs a sub-second clock term, which changes the epoch's definition. Two further
+// consequences of the same hybrid: a clock wrongly AHEAD at boot pins the epoch ahead and
+// does not self-heal (the claim tracks the persisted value, not the clock), and a lost or
+// corrupt row after such a pin re-claims from the clock and can land BELOW epochs already
+// issued. A VM memory-snapshot revert continues with the same epoch and a lower emit_seq
+// and involves no boot, so no claim runs.
 //
 // COUNTER EXHAUSTION. A single boot drawing 2^62 emit_seq values is not supported.
 //
@@ -70,7 +82,7 @@ struct GuardianBootEpochClaim {
         NoStore,     ///< null store; epoch 0, nothing written
         ReadFailed,  ///< get_entry failed; epoch 0, nothing written
         WriteFailed, ///< set() failed; epoch 0
-        OutOfRange,  ///< candidate would reach the ceiling; epoch 0, nothing written
+        OutOfRange,  ///< clock term at or above the ceiling; epoch 0, nothing written
     };
 
     std::uint64_t boot_epoch = 0; ///< 0 means unordered (any outcome except Claimed/Recovered)
@@ -80,7 +92,7 @@ struct GuardianBootEpochClaim {
 
 /// Claim this boot's epoch. `now_unix_s` is the wall clock in whole seconds; a value
 /// <= 0 contributes 0 to the clock term. Never throws; logs one structured line.
-YUZU_EXPORT GuardianBootEpochClaim claim_guardian_boot_epoch(IJournalStore* store,
-                                                             std::int64_t now_unix_s) noexcept;
+[[nodiscard]] YUZU_EXPORT GuardianBootEpochClaim
+claim_guardian_boot_epoch(IJournalStore* store, std::int64_t now_unix_s) noexcept;
 
 } // namespace yuzu::agent

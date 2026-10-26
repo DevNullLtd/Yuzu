@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <functional>
 #include <latch>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -256,6 +257,21 @@ void require_completes_within(std::chrono::milliseconds timeout, const char* wha
         std::this_thread::sleep_for(1ms);
     }
 }
+
+// Joins every started thread on scope exit, including when a later emplace_back throws.
+// Not std::jthread: Apple Clang 15's libc++ lacks it. Declare it BEFORE any thread starts and
+// AFTER every local the workers reference, so the joins run before those locals are destroyed.
+struct JoinGuard {
+    std::vector<std::thread> threads;
+    JoinGuard() = default;
+    JoinGuard(const JoinGuard&) = delete;
+    JoinGuard& operator=(const JoinGuard&) = delete;
+    ~JoinGuard() {
+        for (auto& t : threads)
+            if (t.joinable())
+                t.join();
+    }
+};
 
 } // namespace
 
@@ -1714,6 +1730,39 @@ TEST_CASE("emit-seq: an admission fault (ThrowOnNode) consumes a value",
     CHECK(src->last.load() == 2);
 }
 
+TEST_CASE("emit-seq: a RefusedStopping refusal consumes a value",
+          "[guardian][legacy_sink][emit_seq]") {
+    // The draw sits before the stopping check, so an offer refused because the executor is
+    // stopping still consumes one emit_seq value: a harmless gap, exactly as for a capacity
+    // refusal. (ThrowOnTicket, the other refusal fault, is not covered here: it fails after
+    // the admission block and adds nothing this ordering check does not already pin.)
+    auto src = std::make_shared<GuardianEmitSeqSource>(5);
+    GuardianLegacySinkExecutor exec{config_with_source(src)};
+    StampRecordingSend send;
+    ScopeExit cleanup{[&] { CHECK(exec.wait_workers_retired_for_test(5s)); }};
+
+    require_completes_within(5s, "stop() on an idle executor", [&] { exec.stop(); });
+    CHECK(src->last.load() == 0);
+    REQUIRE(exec.offer(make_event("A", "guard.compliant"), std::ref(send)) ==
+            OfferOutcome::RefusedStopping);
+    CHECK(src->last.load() == 1); // the refused offer drew, and drew exactly once
+    CHECK(send.count() == 0);
+}
+
+TEST_CASE("emit-seq: kEmitPairMaxWireBytes is the exact worst-case wire growth",
+          "[guardian][legacy_sink][emit_seq]") {
+    // offer() charges this many bytes against max_bytes BEFORE the stamp is applied under the
+    // lock. Pin the constant against a real serialization: with both fields at uint64 max
+    // (two 2-byte tags, two 10-byte varints) the event grows by exactly that many bytes.
+    static_assert(GuardianLegacySinkExecutor::kEmitPairMaxWireBytes == 24);
+    const Event plain = make_event("r", "guard.compliant");
+    Event stamped = plain;
+    stamp_emit_pair(stamped, std::numeric_limits<std::uint64_t>::max(),
+                    std::numeric_limits<std::uint64_t>::max());
+    CHECK(stamped.ByteSizeLong() - plain.ByteSizeLong() ==
+          GuardianLegacySinkExecutor::kEmitPairMaxWireBytes);
+}
+
 TEST_CASE("emit-seq: an epoch-0 source still draws but puts nothing on the wire",
           "[guardian][legacy_sink][emit_seq]") {
     auto src = std::make_shared<GuardianEmitSeqSource>(0);
@@ -1838,21 +1887,28 @@ TEST_CASE("emit-seq: concurrent offers are delivered in strictly increasing emit
 
     {
         std::latch start(kThreads);
-        std::vector<std::jthread> workers;
-        workers.reserve(kThreads);
-        for (int t = 0; t < kThreads; ++t) {
-            workers.emplace_back([&, t] {
-                start.arrive_and_wait();
-                for (int i = 0; i < kOffers; ++i) {
-                    // Offers all fit the default bounds, so every one is Queued; a
-                    // refusal would only shrink the delivered set, never break the
-                    // order check below.
-                    (void)exec.offer(make_event("t" + std::to_string(t), "guard.compliant"),
-                                     std::ref(send));
-                }
-            });
+        JoinGuard workers;
+        workers.threads.reserve(kThreads);
+        int spawned = 0;
+        try {
+            for (int t = 0; t < kThreads; ++t) {
+                workers.threads.emplace_back([&, t] {
+                    start.arrive_and_wait();
+                    for (int i = 0; i < kOffers; ++i) {
+                        // Offers all fit the default bounds, so every one is Queued; a
+                        // refusal would only shrink the delivered set, never break the
+                        // order check below.
+                        (void)exec.offer(make_event("t" + std::to_string(t), "guard.compliant"),
+                                         std::ref(send));
+                    }
+                });
+                ++spawned;
+            }
+        } catch (...) {
+            start.count_down(kThreads - spawned); // release the started workers, then join
+            throw;
         }
-    } // jthreads join here
+    } // the guard joins here
     REQUIRE(spin_until([&] { return send.count() == std::size_t{kThreads} * kOffers; }));
 
     // Order is checked over the GLOBAL delivery sequence, not per producer thread:

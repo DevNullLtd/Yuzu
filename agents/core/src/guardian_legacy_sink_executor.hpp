@@ -29,8 +29,9 @@
  * event is delivered in admission order or counted as lost; two events for the
  * SAME rule_id never collapse into one slot (drift.detected, drift.remediated,
  * remediation.failed, guard.compliant, guard.unhealthy are all distinct census
- * signals - the server orders same-second events by ARRIVAL order, so reordering
- * is a correctness bug, not just a cardinality change). Bounded by BOTH
+ * signals - a server that does not compare the (boot_epoch, emit_seq) pair orders
+ * same-second events by ARRIVAL order, and the pair itself is drawn in admission
+ * order, so reordering is a correctness bug, not just a cardinality change). Bounded by BOTH
  * `max_events` and `max_bytes` (Event::ByteSizeLong() plus kEmitPairMaxWireBytes,
  * computed once at offer()).
  *
@@ -100,8 +101,10 @@
  * been re-cleared by a fresh real event, so it was never stamped with a live
  * repair_seq at all), the repair is SKIPPED - never sent - and counted in
  * `repairs_suppressed`. This is the piece that actually closes the reported
- * symptom (a stale synthetic repair overwriting a newer real verdict on the
- * server via its own `updated_at >=` upsert guard): checking supersession only
+ * symptom (a stale synthetic repair overwriting a newer real verdict on a server
+ * that orders by timestamp, e.g. via an `updated_at >=` upsert guard; this check and
+ * SEQ-GUARDED CLEARING are the agent-side defence, independent of how the server
+ * orders): checking supersession only
  * at kick/fire time is not enough, because the supersession can happen AFTER
  * the repair is already queued and BEFORE it reaches the front.
  *

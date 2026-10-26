@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """UP-14 static lexical gate pinning where the Guardian wire emit pair is stamped.
 
-Every GuaranteedStateEvent the agent daemon sends carries (boot_epoch, emit_seq), both-or-neither
-(proto fields 24/25), so the server can order events by a per-boot monotonic ordinal instead of a
-wall-clock timestamp. The stamp primitives are unit-tested in isolation, but nothing unit-tests
+Every census-feeding GuaranteedStateEvent the agent daemon sends (legacy guard events and live Spark
+lifecycle entries) carries (boot_epoch, emit_seq), both-or-neither (proto fields 24/25), so a server
+that compares the pair can order events by a per-boot monotonic ordinal instead of a wall-clock
+timestamp. DEX observations, journal replays and epoch-0 boots carry 0/0 by design. The stamp primitives are unit-tested in isolation, but nothing unit-tests
 that EVERY producer calls them: a future enqueue that forgets the stamp compiles and passes, and
 simply degrades that event to unordered. This gate pins the call sites lexically.
 
-Invariants (the four numbered rules below; each failure message starts with its rule tag):
+Invariants (the numbered rules below; each failure message starts with its rule tag):
 
   R1  agents/core/src/guardian_spark_runtime.cpp: every production enqueue into the Spark outbox
       (`outbox_.enqueue(`, `outbox_.enqueue_all(`, `lifecycle_log_.enqueue(`,
@@ -15,7 +16,11 @@ Invariants (the four numbered rules below; each failure message starts with its 
       `outbox_mu_` lock token and the enqueue token (anchored on the lock token, never on a line
       distance). Exactly one `stamp_seq_locked(` call passes `wire_ordered=false` (the page-time
       stamp, whose seq is a hold key only and must NOT put a pair on the wire) and it sits inside
-      `try_page_batch`; every other call keeps the default (live, wire-ordered).
+      `try_page_batch`; every other call keeps the default (live, wire-ordered). The stamp token
+      must sit inside the SAME member function body as the enqueue it protects (a lock token in an
+      earlier function never anchors a later one), and its first argument must be the entry being
+      enqueued (`stamp_seq_locked(x` for `enqueue(std::move(x))`; a `for (auto& v : x)` loop over
+      the enqueued container for `enqueue_all(std::move(x))`).
   R2  `stamp_emit_pair(` is called only inside `offer(` in guardian_legacy_sink_executor.hpp and
       inside `set_common` in guardian_spark_send.cpp (its definition lives in
       guardian_emit_seq.hpp); the raw `set_emit_seq(` / `set_boot_epoch(` setters appear only in
@@ -23,6 +28,12 @@ Invariants (the four numbered rules below; each failure message starts with its 
       (the replay discriminator is the page-time stamp, never the batch key:
       backfill_batch_provenance sets the key on LIVE entries); guardian_engine.cpp never calls
       `stamp_emit_pair(` (the legacy stamp is at executor admission only).
+  R2b The legacy stamp in `offer()` follows the `unique_lock<std::mutex> <name>{state_->mu}` token
+      (same unclosed block) and `++state_->next_seq`, so the draw is taken under the lock that
+      decides queue order. R2c: argument pins. The legacy call is exactly
+      `stamp_emit_pair(ev, state_->emit_seq_source->boot_epoch, state_->emit_seq_source->draw())`
+      and `set_common`'s is exactly `stamp_emit_pair(ev, e.boot_epoch, e.seq)`: swapping the
+      arguments, a constant in place of `draw()`, or the wrong field is lexically distinct.
   R3  agents/core/src/agent.cpp: the identifier assigned from `claim_guardian_boot_epoch(` is the
       FOURTH argument of `std::make_unique<GuardianEngine>(` (third is the literal `false`) and
       the claim precedes the construction. TRIPWIRE ON KNOWN WRITERS (not a proof that no other
@@ -183,21 +194,60 @@ _ENQ = re.compile(r"(?<![A-Za-z0-9_])(?:outbox_|lifecycle_log_)\.enqueue(?:_all)
 _STAMP_SEQ = r"(?<![A-Za-z0-9_])stamp_seq_locked"
 
 
+def member_bodies(t, cls):
+    """Bodies of every out-of-class member function definition `cls::name(...) {...}`."""
+    out = []
+    for name in sorted(set(re.findall(re.escape(cls) + r"::(~?\w+) ?\(", t))):
+        out.extend(function_bodies(t, cls + "::" + name))
+    return out
+
+
+def _enqueued_name(t, m):
+    """The identifier X of `enqueue(std::move(X))` / `enqueue_all(std::move(X))`, or None."""
+    op = m.end() - 1
+    cp = match_close(t, op)
+    a = re.fullmatch(r"std::move\((\w+)\)", t[op + 1:cp]) if cp >= 0 else None
+    return a.group(1) if a else None
+
+
 def _rule1(t, out):
     locks = [m.end() for m in _LOCK.finditer(t)]
     enqs = list(_ENQ.finditer(t))
+    bodies = member_bodies(t, "GuardianSparkRuntime")
     if len(enqs) < 5:
         out.append(f"R1: found only {len(enqs)} outbox/lifecycle_log enqueue sites in {RUNTIME}"
                    " (expected the five known stamp sites; the gate pattern is stale)")
     for m in enqs:
-        prior = [e for e in locks if e <= m.start()]
         what = m.group(0)
-        if not prior:
-            out.append(f"R1: {what} in {RUNTIME} has no preceding outbox_mu_ lock token")
+        # The stamp must be in the SAME member function as the enqueue: the lookback starts at
+        # the later of the nearest preceding lock token and the enclosing function's first
+        # character, so a lock (or a stamp) in an earlier function can never satisfy this one.
+        # try_page_batch takes no lock of its own (its caller holds outbox_mu_); its window is
+        # its own body.
+        enclosing = [(a, b) for (a, b) in bodies if a <= m.start() < b]
+        if not enclosing:
+            out.append(f"R1: {what} in {RUNTIME} is not inside any GuardianSparkRuntime:: member "
+                       "function body (the gate cannot scope its stamp)")
             continue
-        if "stamp_seq_locked(" not in t[prior[-1]:m.start()]:
-            out.append(f"R1: {what} in {RUNTIME} is not preceded by stamp_seq_locked( between the "
-                       "outbox_mu_ lock and the enqueue (an unstamped event is unordered on the wire)")
+        body_start = min(enclosing, key=lambda r: r[1] - r[0])[0]
+        anchor = max([e for e in locks if body_start <= e <= m.start()] + [body_start])
+        window = t[anchor:m.start()]
+        if "stamp_seq_locked(" not in window:
+            out.append(f"R1: {what} in {RUNTIME} is not preceded by stamp_seq_locked( in the same "
+                       "function, after its outbox_mu_ lock (an unstamped event is unordered on the wire)")
+            continue
+        x = _enqueued_name(t, m)
+        if x is None:
+            out.append(f"R1: {what} in {RUNTIME} does not enqueue `std::move(<identifier>)` "
+                       "(the gate cannot tie the stamp to the enqueued entry)")
+        elif what.endswith("enqueue_all("):
+            if not re.search(r"for\(auto& (\w+) ?: ?" + re.escape(x) + r"\)(?:\{)?stamp_seq_locked\(\1[,)]",
+                             window):
+                out.append(f"R1: {what} in {RUNTIME} enqueues `{x}` but no `for (auto& v : {x})` "
+                           "loop stamps each element with stamp_seq_locked(v)")
+        elif not re.search(r"(?<![A-Za-z0-9_])stamp_seq_locked\(" + re.escape(x) + r"[,)]", window):
+            out.append(f"R1: {what} in {RUNTIME} enqueues `{x}` but the preceding "
+                       f"stamp_seq_locked( call does not stamp `{x}`")
 
     page = function_bodies(t, "try_page_batch")
     calls = call_sites(t, _STAMP_SEQ)
@@ -219,6 +269,42 @@ def _rule1(t, out):
                    f"in {RUNTIME}")
 
 
+_LEGACY_ARGS = ["ev", "state_->emit_seq_source->boot_epoch", "state_->emit_seq_source->draw()"]
+_SET_COMMON_ARGS = ["ev", "e.boot_epoch", "e.seq"]
+_OFFER_LOCK = re.compile(r"(?:unique_lock|lock_guard)<std::mutex> (\w+)\{state_->mu\}")
+
+
+def _rule2b(ex, offer, sites, out):
+    """R2b ordering of the legacy stamp against the admission lock; R2c its exact arguments."""
+    for (a, b) in offer:
+        stamps = [(s, a0, a1) for (s, a0, a1) in sites if a <= s < b]
+        for (_, a0, a1) in stamps:
+            if split_args(ex[a0:a1]) != _LEGACY_ARGS:
+                out.append(f"R2c: the legacy stamp_emit_pair({ex[a0:a1]}) in {EXECUTOR} must be exactly "
+                           "stamp_emit_pair(ev, state_->emit_seq_source->boot_epoch, "
+                           "state_->emit_seq_source->draw())")
+        lock = _OFFER_LOCK.search(ex, a, b)
+        if not lock:
+            out.append(f"R2b: offer() in {EXECUTOR} has no unique_lock<std::mutex> <name>{{state_->mu}} token")
+            continue
+        for (s, _, _) in stamps:
+            if s < lock.end():
+                out.append(f"R2b: the stamp_emit_pair( in {EXECUTOR} offer() precedes the state_->mu lock "
+                           "(the emit_seq draw must be taken under the lock that decides queue order)")
+                continue
+            depth = 0
+            for c in ex[lock.end():s]:
+                depth += (c == "{") - (c == "}")
+                if depth < 0:
+                    out.append(f"R2b: the stamp_emit_pair( in {EXECUTOR} offer() is outside the block "
+                               "holding the state_->mu lock")
+                    break
+            else:
+                if "++state_->next_seq" not in ex[lock.end():s]:
+                    out.append(f"R2b: the stamp_emit_pair( in {EXECUTOR} offer() does not follow "
+                               "++state_->next_seq under the lock")
+
+
 def _rule2(srcs, norm, out):
     ex = norm(EXECUTOR)
     offer = function_bodies(ex, "offer")
@@ -228,6 +314,7 @@ def _rule2(srcs, norm, out):
             out.append(f"R2: stamp_emit_pair( in {EXECUTOR} outside offer()")
     if not any(_inside(s, offer) for (s, _, _) in sites):
         out.append(f"R2: offer() in {EXECUTOR} no longer calls stamp_emit_pair( (executor admission stamp)")
+    _rule2b(ex, offer, sites, out)
 
     sd = norm(SEND)
     common = function_bodies(sd, "set_common")
@@ -237,6 +324,10 @@ def _rule2(srcs, norm, out):
             out.append(f"R2: stamp_emit_pair( in {SEND} outside set_common")
     if not any(_inside(s, common) for (s, _, _) in sites):
         out.append(f"R2: set_common in {SEND} no longer calls stamp_emit_pair(")
+    for (s, a0, a1) in sites:
+        if _inside(s, common) and split_args(sd[a0:a1]) != _SET_COMMON_ARGS:
+            out.append(f"R2c: set_common's stamp_emit_pair({sd[a0:a1]}) in {SEND} must be exactly "
+                       "stamp_emit_pair(ev, e.boot_epoch, e.seq)")
     for (a, b) in common:
         if re.search(r"(?<![A-Za-z0-9_])journal_batch_key", sd[a:b]):
             out.append(f"R2: set_common in {SEND} mentions journal_batch_key (the replay "
@@ -415,6 +506,49 @@ MUTATIONS = [
     ("R1 live call passing false", RUNTIME,
      r"stamp_seq_locked\(entry\);(\s*const bool accepted = lifecycle_log_\.enqueue\(std::move\(entry\)\); // throwing)",
      r"stamp_seq_locked(entry, false);\1", 1, 0, "expected exactly one stamp_seq_locked(..., false)"),
+    # R1: an enqueue in a lock-less member function placed after try_page_batch. The nearest
+    # preceding lock token (try_page_batch's own) and its stamp used to satisfy the old rule.
+    ("R1 unstamped enqueue in a lock-less function after try_page_batch", RUNTIME,
+     r"(void GuardianSparkRuntime::set_outbox_enqueue_waker\()",
+     "void GuardianSparkRuntime::extra_lockless_for_gate(OutboxEntry e) {\n"
+     "    outbox_.enqueue(std::move(e));\n}\n\n\\1", 1, 0, "R1: outbox_.enqueue("),
+    # R1: the stamp names a different object than the one enqueued.
+    ("R1 stamp names another entry (lifecycle enqueue)", RUNTIME,
+     r"stamp_seq_locked\(entry\);(\s*const bool accepted = lifecycle_log_\.enqueue\(std::move\(entry\)\); // throwing)",
+     r"stamp_seq_locked(other_entry);\1", 1, 0, "does not stamp `entry`"),
+    ("R1 stamp loop walks another container (enqueue_all)", RUNTIME,
+     r"for \(auto& e : entries\)(\s*)stamp_seq_locked\(e\);(\s*outbox_\.enqueue_all\(std::move\(entries\)\); // best-effort)",
+     r"for (auto& e : other_entries)\1stamp_seq_locked(e);\2", 1, 0, "loop stamps each element"),
+    ("R1 stamp loop stamps another element (enqueue_all)", RUNTIME,
+     r"for \(auto& e : entries\)(\s*)stamp_seq_locked\(e\);(\s*outbox_\.enqueue_all\(std::move\(entries\)\); // best-effort)",
+     r"for (auto& e : entries)\1stamp_seq_locked(other);\2", 1, 0, "loop stamps each element"),
+    # R2b: the legacy stamp relative to the admission lock.
+    ("R2b stamp hoisted above the admission lock", EXECUTOR,
+     r"(std::unique_lock<std::mutex> lk\{state_->mu\};)((?:(?!unique_lock).)*?)(stamp_emit_pair\(ev, state_->emit_seq_source->boot_epoch,\s*state_->emit_seq_source->draw\(\)\);)",
+     r"\3\n                \1\2", 1, 0, "precedes the state_->mu lock"),
+    ("R2b stamp before ++next_seq", EXECUTOR,
+     r"(// \(2\.5\) .*?)const std::uint64_t seq = \+\+state_->next_seq;",
+     r"\1const std::uint64_t seq = state_->next_seq;", 1, 0, "does not follow ++state_->next_seq"),
+    ("R2b lock scoped in an inner block that closes before the stamp", EXECUTOR,
+     r"(std::unique_lock<std::mutex> lk\{state_->mu\};)(\s*// \(2\.5\))", r"{\1}\2", 1, 0,
+     "outside the block holding the state_->mu lock"),
+    # R2c: exact arguments of the two stamps.
+    ("R2c legacy stamp arguments swapped", EXECUTOR,
+     r"stamp_emit_pair\(ev, state_->emit_seq_source->boot_epoch,\s*state_->emit_seq_source->draw\(\)\)",
+     "stamp_emit_pair(ev, state_->emit_seq_source->draw(), state_->emit_seq_source->boot_epoch)",
+     1, 0, "R2c: the legacy stamp_emit_pair("),
+    ("R2c legacy stamp draws a constant", EXECUTOR,
+     r"(stamp_emit_pair\(ev, state_->emit_seq_source->boot_epoch,\s*)state_->emit_seq_source->draw\(\)\)",
+     r"\g<1>1)", 1, 0, "R2c: the legacy stamp_emit_pair("),
+    ("R2c legacy stamp ignores the shared source", EXECUTOR,
+     r"stamp_emit_pair\(ev, state_->emit_seq_source->boot_epoch,\s*state_->emit_seq_source->draw\(\)\)",
+     "stamp_emit_pair(ev, 7, state_->emit_seq_source->draw())", 1, 0, "R2c: the legacy stamp_emit_pair("),
+    ("R2c set_common stamps the wrong field", SEND,
+     r"stamp_emit_pair\(ev, e\.boot_epoch, e\.seq\);", "stamp_emit_pair(ev, e.boot_epoch, e.enqueued_ns);",
+     1, 0, "R2c: set_common's stamp_emit_pair("),
+    ("R2c set_common arguments swapped", SEND,
+     r"stamp_emit_pair\(ev, e\.boot_epoch, e\.seq\);", "stamp_emit_pair(ev, e.seq, e.boot_epoch);",
+     1, 0, "R2c: set_common's stamp_emit_pair("),
     # R2
     ("R2 stamp_emit_pair in the engine", ENGINE,
      r"(GuardianEngine::emit_seq_source_for_test\(\) const \{)", r"\1\n    stamp_emit_pair(*(gpb::GuaranteedStateEvent*)nullptr, 1, 1);",
@@ -504,6 +638,12 @@ class GuardianEmitStampLexical(unittest.TestCase):
         self.assertGreaterEqual(len(_ENQ.findall(rt)), 5)
         self.assertGreaterEqual(len(call_sites(rt, _STAMP_SEQ)), 5)
         self.assertTrue(function_bodies(rt, "try_page_batch"))
+        bodies = member_bodies(rt, "GuardianSparkRuntime")
+        self.assertGreater(len(bodies), 20)
+        for m in _ENQ.finditer(rt):  # every enqueue is scoped to a member function
+            self.assertTrue(any(a <= m.start() < b for (a, b) in bodies), m.group(0))
+        ex = normalise(self.srcs[EXECUTOR])
+        self.assertTrue(_OFFER_LOCK.search(ex), "offer() admission lock pattern is stale")
         self.assertTrue(function_bodies(normalise(self.srcs[EXECUTOR]), "offer"))
         self.assertTrue(function_bodies(normalise(self.srcs[SEND]), "set_common"))
         self.assertTrue(function_bodies(normalise(self.srcs[ENGINE]), "make_legacy_sink_executor"))

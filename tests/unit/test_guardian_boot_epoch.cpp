@@ -1,9 +1,12 @@
 // Unit tests for claim_guardian_boot_epoch (UP-14): the hybrid max(persisted + 1, clock)
-// boot epoch, its D1 recovery of an unusable stored value, the 2^62 ceiling (checked on the
-// persisted value BEFORE the + 1), and the fail-to-zero rules (null store, read error, write
-// failure, ceiling): a failed claim is 0 and nothing is invented in memory or written.
+// boot epoch, its D1 recovery of an unusable stored value (including 2^62 - 1, whose
+// successor would reach the ceiling), the 2^62 ceiling (checked on the persisted value
+// BEFORE the + 1), the documented single-writer and same-second residuals, and the
+// fail-to-zero rules (null store, read error, write failure, ceiling): a failed claim is 0
+// and nothing is invented in memory or written.
 
 #include "guardian_boot_epoch.hpp"
+#include "guardian_emit_seq.hpp"
 
 #include <yuzu/agent/kv_store.hpp>
 
@@ -13,6 +16,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <expected>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -20,6 +24,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 using namespace yuzu::agent;
 using Outcome = GuardianBootEpochClaim::Outcome;
@@ -252,6 +257,15 @@ TEST_CASE("boot-epoch: a wiped row in the same second reuses the epoch (document
     FaultingStore after_wipe; // an empty store: the row is gone
     const auto b = claim_guardian_boot_epoch(&after_wipe, kNow);
     CHECK(a.boot_epoch == b.boot_epoch);
+
+    // The consequence: equal epoch with a RESTARTED sequence. Each boot builds a fresh emit
+    // source, so both start at emit_seq 1 and the pair (epoch, 1) is emitted twice; a server
+    // comparing the pair cannot tell the two boots apart.
+    GuardianEmitSeqSource first_boot(a.boot_epoch);
+    GuardianEmitSeqSource second_boot(b.boot_epoch);
+    CHECK(first_boot.boot_epoch == second_boot.boot_epoch);
+    CHECK(first_boot.draw() == 1);
+    CHECK(second_boot.draw() == 1);
 }
 
 TEST_CASE("boot-epoch: the ceiling is checked on the persisted value before the + 1",
@@ -271,15 +285,17 @@ TEST_CASE("boot-epoch: the ceiling is checked on the persisted value before the 
         CHECK(c.outcome == Outcome::Recovered);
         CHECK(c.boot_epoch == static_cast<std::uint64_t>(kNow));
     }
-    SECTION("2^62 - 1 is a valid persisted value, but its successor reaches the ceiling") {
+    SECTION("2^62 - 1 is unusable: its successor would reach the ceiling, so it recovers") {
         FaultingStore s;
         s.seed(dec(kCeiling - 1));
         const auto c = claim_guardian_boot_epoch(&s, kNow);
-        CHECK(c.outcome == Outcome::OutOfRange);
-        CHECK(c.boot_epoch == 0);
-        CHECK(c.persisted == kCeiling - 1); // it parsed as valid, not as corrupt
-        CHECK(s.set_calls == 0);
-        CHECK(s.stored() == dec(kCeiling - 1)); // nothing written
+        // Not OutOfRange: that would leave the row in place and degrade EVERY later boot
+        // to epoch 0 with nothing to correct it.
+        CHECK(c.outcome == Outcome::Recovered);
+        CHECK(c.boot_epoch == static_cast<std::uint64_t>(kNow));
+        CHECK(c.persisted == 0); // an unusable value is not reported as a persisted one
+        CHECK(s.set_calls == 1);
+        CHECK(s.stored() == dec(kNow)); // overwritten with the re-claim
     }
     SECTION("2^62 - 2 -> 2^62 - 1 is the largest claimable epoch") {
         FaultingStore s;
@@ -297,6 +313,45 @@ TEST_CASE("boot-epoch: the ceiling is checked on the persisted value before the 
         CHECK(s.set_calls == 0);
         CHECK_FALSE(s.stored().has_value());
     }
+}
+
+TEST_CASE("boot-epoch: a persisted 2^62 - 1 recovers once, then claims normally",
+          "[guardian][boot_epoch]") {
+    FaultingStore s;
+    s.seed(dec(kCeiling - 1));
+
+    const auto boot1 = claim_guardian_boot_epoch(&s, kNow);
+    REQUIRE(boot1.outcome == Outcome::Recovered);
+    REQUIRE(boot1.boot_epoch == static_cast<std::uint64_t>(kNow));
+    REQUIRE(s.stored() == dec(kNow));
+
+    const auto boot2 = claim_guardian_boot_epoch(&s, kNow); // same second
+    CHECK(boot2.outcome == Outcome::Claimed);
+    CHECK(boot2.persisted == boot1.boot_epoch);
+    CHECK(boot2.boot_epoch == boot1.boot_epoch + 1); // persisted + 1, not epoch 0
+    CHECK(s.stored() == dec(boot2.boot_epoch));
+}
+
+TEST_CASE("boot-epoch: a persisted 2^62 - 2 claims the last usable epoch, then recovers",
+          "[guardian][boot_epoch]") {
+    FaultingStore s;
+    s.seed(dec(kCeiling - 2));
+
+    const auto boot1 = claim_guardian_boot_epoch(&s, kNow);
+    REQUIRE(boot1.outcome == Outcome::Claimed);
+    REQUIRE(boot1.boot_epoch == kCeiling - 1);
+    REQUIRE(s.stored() == dec(kCeiling - 1));
+
+    // The next boot finds 2^62 - 1: unusable, so it re-claims from the clock rather than
+    // sticking at 0.
+    const auto boot2 = claim_guardian_boot_epoch(&s, kNow);
+    CHECK(boot2.outcome == Outcome::Recovered);
+    CHECK(boot2.boot_epoch == static_cast<std::uint64_t>(kNow));
+    CHECK(s.stored() == dec(kNow));
+
+    const auto boot3 = claim_guardian_boot_epoch(&s, kNow);
+    CHECK(boot3.outcome == Outcome::Claimed);
+    CHECK(boot3.boot_epoch == boot2.boot_epoch + 1);
 }
 
 TEST_CASE("boot-epoch: a stored value must parse in full, else it is recovered",
@@ -392,4 +447,84 @@ TEST_CASE("boot-epoch: round-trips through a real KvStore across a reopen",
     CHECK(second.outcome == Outcome::Claimed);
     CHECK(second.boot_epoch > first);
     CHECK(second.boot_epoch == first + 1);
+}
+
+namespace {
+
+// Reads a stale snapshot of the epoch row, forwarding everything else to a real store. It
+// stands in for a second process whose get_entry ran BEFORE the sibling's set(): the
+// interleaving a plain read-then-set() claim does not exclude.
+class StaleEpochReadStore final : public IJournalStore {
+public:
+    StaleEpochReadStore(IJournalStore& inner, std::string stale_row)
+        : inner_(inner), stale_row_(std::move(stale_row)) {}
+
+    int pragma_synchronous() override { return inner_.pragma_synchronous(); }
+    std::expected<KvNamespaceSize, KvStoreError> namespace_size(std::string_view p,
+                                                                std::string_view x) override {
+        return inner_.namespace_size(p, x);
+    }
+    std::expected<std::vector<KvKeySize>, KvStoreError>
+    list_keys_sized(std::string_view p, std::string_view x) override {
+        return inner_.list_keys_sized(p, x);
+    }
+    std::expected<std::optional<std::string>, KvStoreError> get_entry(std::string_view p,
+                                                                      std::string_view k) override {
+        if (p == kGuardianBootEpochNamespace && k == kGuardianBootEpochKey)
+            return std::optional<std::string>{stale_row_};
+        return inner_.get_entry(p, k);
+    }
+    KvInsert insert_if_absent(std::string_view p, std::string_view k, std::string_view v) override {
+        return inner_.insert_if_absent(p, k, v);
+    }
+    KvRename rename_key(std::string_view p, std::string_view a, std::string_view b) override {
+        return inner_.rename_key(p, a, b);
+    }
+    int del_keys(std::string_view p, const std::vector<std::string>& keys) override {
+        return inner_.del_keys(p, keys);
+    }
+    bool set(std::string_view p, std::string_view k, std::string_view v) override {
+        return inner_.set(p, k, v);
+    }
+
+private:
+    IJournalStore& inner_;
+    std::string stale_row_;
+};
+
+} // namespace
+
+TEST_CASE("boot-epoch: two processes on one KV file can claim the SAME epoch (documented residual)",
+          "[guardian][boot_epoch]") {
+    // PINS A DOCUMENTED, ACCEPTED RESIDUAL (ruling D3), NOT DESIRED BEHAVIOUR. Nothing in the
+    // agent enforces one process per data directory (see guardian_boot_epoch.hpp, SINGLE-WRITER
+    // ASSUMPTION), and the KV file is in WAL mode, which admits a second connection. If two
+    // processes both read N before either writes, both claim N + 1 and draw emit_seq from 1.
+    // If this test starts failing, the residual changed: update that paragraph with it.
+    //
+    // Two REAL connections open one file (the WAL premise). The racing read is simulated by
+    // handing the second claim the row as it stood before the first claim's write.
+    yuzu::test::TempDbFile db{"yuzu_test_boot_epoch_two_proc-"};
+    auto kv_a = KvStore::open(db.path);
+    auto kv_b = KvStore::open(db.path);
+    REQUIRE(kv_a.has_value());
+    REQUIRE(kv_b.has_value()); // a second connection to the same file is not refused
+
+    const auto seed = claim_guardian_boot_epoch(&*kv_a, kNow); // establishes the row N
+    REQUIRE(seed.outcome == Outcome::Claimed);
+    const std::string n = dec(seed.boot_epoch);
+
+    // Process A claims N + 1 and writes it. Process B's read had already returned N.
+    const auto a = claim_guardian_boot_epoch(&*kv_a, kNow);
+    StaleEpochReadStore b_view(*kv_b, n);
+    const auto b = claim_guardian_boot_epoch(&b_view, kNow);
+
+    REQUIRE(a.outcome == Outcome::Claimed);
+    REQUIRE(b.outcome == Outcome::Claimed);
+    CHECK(a.boot_epoch == seed.boot_epoch + 1);
+    CHECK(b.boot_epoch == a.boot_epoch); // the SAME epoch, from two live processes
+
+    GuardianEmitSeqSource proc_a(a.boot_epoch);
+    GuardianEmitSeqSource proc_b(b.boot_epoch);
+    CHECK(proc_a.draw() == proc_b.draw()); // overlapping sequences: both draw 1
 }

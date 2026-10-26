@@ -15,6 +15,25 @@
 using namespace yuzu::agent;
 namespace gpb = ::yuzu::guardian::v1;
 
+namespace {
+
+// Joins every started thread on scope exit, including when a later emplace_back throws.
+// Not std::jthread: Apple Clang 15's libc++ lacks it. Declare it BEFORE any thread starts and
+// AFTER every local the workers reference, so the joins run before those locals are destroyed.
+struct JoinGuard {
+    std::vector<std::thread> threads;
+    JoinGuard() = default;
+    JoinGuard(const JoinGuard&) = delete;
+    JoinGuard& operator=(const JoinGuard&) = delete;
+    ~JoinGuard() {
+        for (auto& t : threads)
+            if (t.joinable())
+                t.join();
+    }
+};
+
+} // namespace
+
 TEST_CASE("emit-seq: draw is 1-based and strictly increasing", "[guardian][emit_seq]") {
     GuardianEmitSeqSource src(7);
     CHECK(src.boot_epoch == 7);
@@ -45,17 +64,24 @@ TEST_CASE("emit-seq: concurrent draws are unique and gap-free", "[guardian][emit
     std::vector<std::vector<std::uint64_t>> got(kThreads);
     std::latch start(kThreads);
     {
-        std::vector<std::jthread> workers;
-        workers.reserve(kThreads);
-        for (int t = 0; t < kThreads; ++t) {
-            workers.emplace_back([&, t] {
-                got[t].reserve(kDraws);
-                start.arrive_and_wait();
-                for (int i = 0; i < kDraws; ++i)
-                    got[t].push_back(src.draw());
-            });
+        JoinGuard workers;
+        workers.threads.reserve(kThreads);
+        int spawned = 0;
+        try {
+            for (int t = 0; t < kThreads; ++t) {
+                workers.threads.emplace_back([&, t] {
+                    got[t].reserve(kDraws);
+                    start.arrive_and_wait();
+                    for (int i = 0; i < kDraws; ++i)
+                        got[t].push_back(src.draw());
+                });
+                ++spawned;
+            }
+        } catch (...) {
+            start.count_down(kThreads - spawned); // release the started workers, then join
+            throw;
         }
-    } // jthreads join here
+    } // the guard joins here
 
     std::vector<std::uint64_t> all;
     for (const auto& g : got) {

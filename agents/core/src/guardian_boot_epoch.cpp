@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -75,9 +76,11 @@ GuardianBootEpochClaim claim_impl(IJournalStore* store, std::int64_t now_unix_s,
         const std::string& raw = **entry;
         d.stored_len = raw.size();
         const auto parsed = parse_decimal(raw);
-        // The ceiling check on the PERSISTED value precedes any "+ 1": a value at or
-        // above 2^62 (including uint64 max) is treated as corrupt, never incremented.
-        if (parsed.has_value() && *parsed < kGuardianBootEpochCeiling) {
+        // The ceiling check on the PERSISTED value precedes any "+ 1". A value whose
+        // successor would reach the ceiling (2^62 - 1 and above, including uint64 max) is
+        // unusable: it is re-claimed from the clock, never incremented, and never left to
+        // fail the claim on every later boot.
+        if (parsed.has_value() && *parsed < kGuardianBootEpochCeiling - 1) {
             persisted = *parsed;
             d.stored = Stored::Parsed;
         } else {
@@ -86,8 +89,9 @@ GuardianBootEpochClaim claim_impl(IJournalStore* store, std::int64_t now_unix_s,
         }
     }
 
-    // Safe: persisted < 2^62, so persisted + 1 cannot wrap. A corrupt row re-claims from
-    // the clock alone (floor 1, so the epoch is never 0 on a successful claim).
+    // Safe: persisted < 2^62 - 1, so persisted + 1 is below the ceiling and cannot wrap. An
+    // unusable row re-claims from the clock alone (floor 1, so the epoch is never 0 on a
+    // successful claim). Only a clock term at or above the ceiling can still reach it.
     const std::uint64_t lower = recovered ? 1 : persisted + 1;
     d.candidate = std::max(lower, d.clock);
 
