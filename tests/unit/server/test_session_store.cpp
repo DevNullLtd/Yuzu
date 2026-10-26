@@ -1189,12 +1189,14 @@ TEST_CASE("SessionStore v3: concurrent validation latches when the trigger is di
     CHECK_FALSE(store.rebind_guard_ok());
 }
 
-TEST_CASE("SessionStore v3: a validation that cannot run is not sticky, and the row is still "
-          "served",
+TEST_CASE("SessionStore v3: a validation that cannot run does not latch the flag and is "
+          "retried on the next find",
           "[session_store][pg][mfa_binding]") {
     // The documented asymmetry: BOOT refuses on an inconclusive check, a RUNNING store does not
     // flip the flag on one (the query failing is not evidence about the trigger) and retries on
-    // the next find rather than waiting out the memo.
+    // the next find rather than waiting out the memo. Not covered here: a catalog query that
+    // fails while the row SELECT after it succeeds. That read is served, by design (the
+    // auth-architecture "Enforcement of the triggers is checked, not assumed" section).
     YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     SessionStore store{pool};
