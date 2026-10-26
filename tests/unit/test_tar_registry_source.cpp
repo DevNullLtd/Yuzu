@@ -1059,6 +1059,28 @@ TEST_CASE("registry source: baseline tick writes baselines and no rows; a change
     CHECK(count_rows(t.db) == 1);
 }
 
+TEST_CASE("registry source: a burst well before the tick is written in that same tick",
+          "[tar][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    f.reads[kRoot] = svc(1);
+    REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
+
+    // The burst ended 50 s before the tick: its window closed (last notify + 1 s) far more
+    // than the settle interval ago, so the writer's events are all in and nothing is held.
+    f.clock = T0 + 100 * SEC;
+    f.reads[kRoot] = svc(2);
+    burst(f, kRoot, T0 + 49 * SEC, T0 + 50 * SEC);
+    src->push_event_for_test(ev(T0 + 49 * SEC + SEC / 2, 812, RegistryEtwOp::Set, "Start", 4, 4, "services.exe"));
+    CHECK(tick(t.db, *src).events_emitted == 1);
+    CHECK(read_cursor(t.db).held.empty());
+    const auto rows = q(t.db, "SELECT actor_pid, detail FROM registry_live");
+    REQUIRE(rows.rows.size() == 1);
+    CHECK(rows.rows[0][0] == "812");
+    CHECK(rows.rows[0][1] == "attr:corr");
+}
+
 TEST_CASE("registry source: a pushed event attributes by correlation; two pids are ambiguous",
           "[tar][registry][lifecycle]") {
     for (const bool two_pids : {false, true}) {
@@ -1167,6 +1189,8 @@ TEST_CASE("registry source: a failed commit rolls back in memory and replays cle
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "5");
     CHECK(rows.rows[0][1] == "attr:corr");
+    // the totals advanced once, by the committed replay, not also by the trapped tick
+    CHECK(t.db.get_config("registry_attr_attributed", "") == "1");
     // the key is the diff's identity, whatever the replay attributed
     CHECK(rows.rows[0][2] ==
           registry_diff_record_key(held.source, held.observed_at, held.action, held.key, held.value));
@@ -1217,6 +1241,37 @@ TEST_CASE("registry source: lost cursor; restart; baseline loss; storage errors"
         CHECK(rows.rows[1][0] == "changed");
         CHECK(rows.rows[1][1] == "attr:lost-restart");
         CHECK(rows.rows[1][2] == "reconcile"); // no notify survives a restart
+    }
+
+    SECTION("restart: a change made after start() is attributed, one found at the restart is not") {
+        REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
+        Fake f2;
+        f2.clock = T0 + 400 * SEC;
+        f2.reads[kRoot] = svc(2); // changed while the agent was down
+        auto src2 = make_registry_cursor_source(scope1(), f2.reader());
+        src2->start(t.db);
+        f2.clock = T0 + 410 * SEC;
+        CHECK(tick(t.db, *src2).outcome == CursorOutcome::Advanced); // reconcile finds 1 -> 2: held
+
+        // A change made after the restart, under a notify burst whose window opens after
+        // start(): the buffer saw all of it, so the writer is named. The restart candidate
+        // finalises in the same tick, its window opened before start().
+        f2.clock = T0 + 500 * SEC;
+        f2.reads[kRoot] = svc(3);
+        burst(f2, kRoot, T0 + 497 * SEC, T0 + 498 * SEC);
+        src2->push_event_for_test(ev(T0 + 497 * SEC + SEC / 2, 812, RegistryEtwOp::Set, "Start", 4, 4, "services.exe"));
+        tick(t.db, *src2);
+        f2.clock = T0 + 600 * SEC;
+        tick(t.db, *src2);
+        const auto rows = q(t.db, "SELECT data, actor_pid, detail FROM registry_live "
+                                  "WHERE action = 'changed' ORDER BY id");
+        REQUIRE(rows.rows.size() == 2);
+        CHECK(rows.rows[0][0] == "2");
+        CHECK(rows.rows[0][1] == "0");
+        CHECK(rows.rows[0][2] == "attr:lost-restart");
+        CHECK(rows.rows[1][0] == "3");
+        CHECK(rows.rows[1][1] == "812");
+        CHECK(rows.rows[1][2] == "attr:corr"); // events_since_ is the start, not each tick
     }
 
     SECTION("restart with a candidate still held: its attribution is lost and says so") {

@@ -606,9 +606,8 @@ struct WinEtw {
     std::unordered_map<std::uint32_t, std::string> pid_name; // ProcessTrace thread only
     std::int64_t pid_name_flushed{0};                        // ProcessTrace thread only
     static constexpr std::size_t kPidNameCap = 65536;
-    // A pid can be reused, so a cached name goes stale. Flushed this often (FILETIME), which
-    // is the default slow tick (tar.yaml slow_interval): a reused pid names stale for at
-    // most one tick at the default cadence.
+    // A pid can be reused, so a cached name goes stale. Flushed every 5 minutes
+    // (FILETIME), so a reused pid names stale for at most that long.
     static constexpr std::int64_t kPidNameFlush100ns = 300LL * 10'000'000;
 
     ~WinEtw() { stop(); }
@@ -1149,7 +1148,10 @@ std::vector<std::string> enumerate_hku() {
 
 std::wstring registry_etw_session_name() {
     // Salted per process: the CI pools run several agents as one OS identity, and a
-    // fixed session name is a cross-job shared resource.
+    // fixed session name is a cross-job shared resource. The name is per process, so it
+    // assumes one source per process (one TAR plugin instance); a second in-process source
+    // would stop the first one's session by name. The live tests stop each source before
+    // the next one starts.
     return L"YuzuTarRegistryEtw-" + std::to_wstring(::GetCurrentProcessId());
 }
 

@@ -454,27 +454,38 @@ cursor.** What it adds to the pattern:
   hive loading and that read, up to one slow interval, are folded into the
   baseline and are not recorded; no per-root gap row is written, since a logon
   would add one per root per user.
-- **Rows land one tick after the one that observes the change, and the writer is
-  correlated, not verified.** The mechanism, the `attr:*` precedence, loss epochs and
-  exactly what an attribution does and does not establish are written once, in the
-  banner of `tar_registry_parsers.hpp` (the row key: `registry_diff_record_key`). Every
-  user-manual sentence must keep saying "a lead to verify, not proof".
+- **Rows land in the tick that observes the change, or the next one, and the writer is
+  correlated, not verified.** A candidate is held only while `now - window_hi <
+  kEtwSettle100ns` (5 s), and a notify window closes 1 s after the last notify, so a
+  burst that ended more than about 6 s before the tick is written in that same tick;
+  a burst nearer the tick, and every reconcile-found change (its window ends at the
+  end of the read, after `now`), is held to the next one. The mechanism, the
+  `attr:*` precedence, loss epochs and exactly what an attribution does and does
+  not establish are written once, in the banner of `tar_registry_parsers.hpp` (the
+  row key: `registry_diff_record_key`). Every user-manual sentence must keep
+  saying "a lead to verify, not proof".
 - **`RegistryEtwBuffer` is not `BoundedPendingQueue`.** It releases by sequence
   identity like `ack_through`, but selectively: after a commit it retires the
   events older than the minimum root `window_base` (`retention_watermark`) that
   no held candidate's window covers (`release_event`). The events a held
   candidate still needs are interleaved with ones it does not, which a prefix
-  release cannot express. It is not persisted: a restart, or a disable and
+  release cannot express. `EventRing` (`tar_proc_stream.hpp`) was not reused for the
+  same reason: it evicts by position, and this buffer must release selectively by
+  sequence identity. It is not persisted: a restart, or a disable and
   re-enable, loses it, and the candidates it would have attributed are written
   `attr:lost-restart`. A root that is never completely read keeps its
   `window_base` at 0 and so pins the buffer until the cap evicts, which then
   degrades what the eviction overlaps.
 - **The cursor row is a third content store.** Besides the rows and the
   baselines, `held` carries each waiting candidate's rendered old and new values
-  for about one tick (readable through `tar.sql` as `tar_cursor`; erased by
-  `purge_source("registry")`). Cursor decode treats `window_base`, `held` and
-  `loss` as optional so a cursor written by the key-watch-only source decodes as
-  present; a malformed one would re-baseline every root.
+  until the next tick at most (readable through `tar.sql` as `tar_cursor`; erased by
+  `purge_source("registry")`). A candidate held when the source is disabled stays in
+  the row until re-enable (then written `attr:lost-restart` with its original
+  `observed_at`; the disable does not drop it, since it is a change observed before
+  the pause and the re-enable re-baselines silently) or `purge_source` on the paused
+  source. Cursor decode treats `window_base`, `held` and `loss` as optional so a
+  cursor written by the key-watch-only source decodes as present; a malformed one
+  would re-baseline every root.
 - **The Windows ETW code has no unit seam and no fault-injection test of the
   callback.** `WinEtw` (the session and consumer handles each behind a RAII
   owner, one `ProcessTrace` worker, a `noexcept` callback that contains every

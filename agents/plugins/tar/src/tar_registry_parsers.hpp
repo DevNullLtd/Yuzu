@@ -29,8 +29,13 @@
 // P(C); when |P(C)| == 1 that pid is the writer. The residual: a change produced
 // WITHOUT a value-write event (hive load, RegRestoreKey, a transacted commit
 // outside the window) has no true event in E(C), so one unrelated same-signature
-// writer inside the window is correlated to it. actor_pid is an investigative lead
-// to verify against $Process_Live, NOT proof. Every DETECTABLE break of the
+// writer inside the window is correlated to it. The same holds for the per-value
+// `removed` rows of a deleted KEY: deleting a key emits one DeleteKey event and no
+// DeleteValue event for its values, so each such row can be correlated to an
+// unrelated process that deleted a same-named value in the window (the key_removed
+// row itself is always attr:none). events:<n> counts the deliveries matched, so a
+// repeated delivery of one write inflates n, never the pid set. actor_pid is an
+// investigative lead to verify against $Process_Live, NOT proof. Every DETECTABLE break of the
 // invariant is marked rather than guessed: loss -> attr:degraded, session down ->
 // attr:off, buffer lost across a restart/pause -> attr:lost-restart, two or more
 // pids -> attr:ambiguous:<n>, none -> attr:none.
