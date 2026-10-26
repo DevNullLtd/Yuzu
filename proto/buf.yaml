@@ -7,3 +7,22 @@ lint:
 breaking:
   use:
     - WIRE_JSON
+    # No-deletion policy (owner ruling, 2026-10-26): "proto subtractions are
+    # breaking, so we should just not use the field, not remove it from the
+    # protobufs." Nothing is ever deleted from a .proto -- not even with
+    # `reserved` (which WIRE_JSON alone accepts) -- and RPCs/services are
+    # never removed. Retire an item by marking it `[deprecated = true]`
+    # (or `option deprecated = true;`) and ceasing to use it. These are
+    # FILE-category rules, so moving a message/enum/service to another
+    # file also counts as a deletion. Rule IDs checked against buf 1.50.0
+    # `buf config ls-breaking-rules`.
+    - FILE_NO_DELETE
+    - MESSAGE_NO_DELETE
+    - ENUM_NO_DELETE
+    - SERVICE_NO_DELETE
+    - EXTENSION_NO_DELETE
+    - FIELD_NO_DELETE
+    - ONEOF_NO_DELETE
+    - ENUM_VALUE_NO_DELETE
+    - RPC_NO_DELETE
+    - EXTENSION_MESSAGE_NO_DELETE
