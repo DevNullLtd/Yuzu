@@ -40,13 +40,15 @@ HOTFIX REVERT: this file and tests/test_seam_closure_selftest.py are pinned in l
 so reverting one alone turns the selftest red - revert BOTH in one change.
 
 ALSO NOT CAUGHT (found in the WS-A4 S0 review, each reproduced on a scratch tree):
-  3. THE INCLUDE PARSER IS LINE-ANCHORED AND LITERAL. It handles a UTF-8 BOM,
-     backslash-continued lines, complete `/* */` comments before the `#` on the same
-     line and the `%:` digraph (all fixed in WS-A4 S0 governance, each probed in the
-     selftest). It still extracts NOTHING from a macro-built include
-     (`#include SOME_MACRO`) or a `##`-spliced one. Conversely an include inside a
-     multi-line block comment, an `#if 0` block or a raw string IS extracted and can
-     false-FAIL (the conservative direction); a `// #include` line comment is not.
+  3. THE INCLUDE PARSER SEES DIRECTIVES, NOT THE PREPROCESSOR. It strips comments in one
+     linear lexer pass (`strip_comments`: `//`, `/* */` across lines, string/char/raw-string
+     aware), joins backslash-newline (trailing blanks allowed), drops a UTF-8 BOM, decodes
+     UTF-16 and accepts `%:include` and `include_next` - cross-checked against `g++ -MM` on
+     38 fixtures plus the selftest's (WS-A4 S0 governance). It still extracts NOTHING from a
+     macro-built include (`#include SOME_MACRO`) or a `##`-spliced one, and it cannot see an
+     include guarded away by `__has_include`. Conversely an `#include` line inside `#if 0`
+     or alone on a line inside a raw string IS extracted and can false-FAIL (the
+     conservative direction).
   4. THE DENYLIST IS HAND-MAINTAINED. A store-owning header that no pattern names is
      invisible to the walk - `nvd_db.hpp` (a raw `sqlite3*`) was exactly this until S0.
      Others unlisted today: `*_owner.hpp`, `app_perf_{cohort,group}_reader.hpp`,
@@ -57,8 +59,11 @@ ALSO NOT CAUGHT (found in the WS-A4 S0 review, each reproduced on a scratch tree
   6. AN UNRESOLVED QUOTE INCLUDE IS A HARD ERROR on every lane (family, impl-purity,
      abstract-header) unless it names a generated protobuf header
      (`GENERATED_HEADER_SUFFIXES`, e.g. `agent.grpc.pb.h`) - because a header outside
-     the three resolution roots truncates the closure under it, and the closure under
-     a generated header is not checked at all (they live only in the build directory).
+     the resolution roots truncates the closure under it, and the closure under a
+     generated header is not checked at all (they live only in the build directory). The
+     roots mirror the build's -I directories (`Roots.extra_include`: `sdk/include`,
+     `server/core/vendor/qrcodegen`); a NEW build include directory must be added there.
+     Unresolved ANGLE includes stay silent (they are external by default; item 5).
   7. A FORWARD DECLARATION OF A STORE IS ALLOWED in a non-abstract closure (only the
      abstract `*_api.hpp` headers get the type-name probe); calling through it needs the
      full definition, which the walk would catch.
@@ -155,9 +160,17 @@ class Roots(NamedTuple):
     server_src: Path
     server_include: Path
     common_include: Path
+    # Further directories the BUILD adds with -I (mirrored, not guessed): `sdk/include`
+    # (`"yuzu/metrics.hpp"`, reached through the yuzu_sdk dependency) and
+    # `server/core/vendor/qrcodegen` (`"qrcodegen.hpp"`, the MFA-QR target,
+    # server/core/meson.build). Without them a legitimate quote include of a checked-in header
+    # would read as unresolved and - now that unresolved is a hard error - false-fail any
+    # future enrolment of a TU that reaches on_behalf_guard.hpp / mfa_qr.cpp.
+    extra_include: tuple = ()
 
 
-DEFAULT_ROOTS = Roots(ROOT, SERVER_SRC, SERVER_INCLUDE, COMMON_INCLUDE)
+DEFAULT_ROOTS = Roots(ROOT, SERVER_SRC, SERVER_INCLUDE, COMMON_INCLUDE,
+                      (ROOT / "sdk" / "include", SERVER_CORE / "vendor" / "qrcodegen"))
 
 # ── Forbidden header patterns (store layer + the core-only API half) ─────
 # Evidence (see the PR description / junior report for the exact commands):
@@ -649,6 +662,10 @@ FAMILIES = {
 # edit that adds a store include to any of them fails CI instead of passing
 # silently. Zero refactor cost — it only locks in what is already true.
 #
+# "STORE-DEFINITION-FREE" means exactly this and no more: walking the TU's `#include` closure
+# reaches no header matching `FORBIDDEN_HEADER_PATTERNS` - i.e. no store/engine/DB class
+# DEFINITION. It does NOT mean "touches no store" (see KNOWN LIMITS below).
+#
 # Membership rule: a `*_routes.cpp` / `*_ui.cpp` whose closure is clean under the
 # CURRENT `FORBIDDEN_HEADER_PATTERNS` and which no FAMILIES entry already enforces.
 # `approval_routes.cpp`, `enrollment_directory_routes.cpp` and `nvd_routes.cpp` are
@@ -709,15 +726,21 @@ STORE_DEFINITION_FREE_TUS = [
     "server/core/src/workflows_ui.cpp",
 ]
 
-# `#include` / the `%:include` digraph. Complete `/* ... */` comments before it on the
-# SAME line (`/* c */ #include "x_store.hpp"` is a real include) are removed by
-# `_strip_leading_block_comments` first - NOT folded into this regex: the nested
-# quantifier `(?:/\*.*?\*/\s*)*` backtracks catastrophically on a line of many closed
-# comments that is not an include (measured: it hung), and this script gates CI.
-_INCLUDE_RE = re.compile(r'^\s*(?:#|%:)\s*include\s*(<[^>]+>|"[^"]+")')
-# Backslash-newline is deleted by translation phase 2, BEFORE preprocessing, so
-# `#include \` + newline + `"x_store.hpp"` is one include line.
-_LINE_CONTINUATION_RE = re.compile(r'\\\r?\n')
+# The directive itself. By the time this runs every comment is already gone (see
+# `strip_comments`), backslash-newline is already joined, and string literals are intact, so
+# `#include/*c*/"x"`, `# /* c */ include "x"` and a multi-line comment closing before the `#`
+# all reach it as plain `#include "x"`. `include_next` is a GCC/Clang spelling of the same
+# thing. Horizontal whitespace only: the text is split on `\n` first.
+_INCLUDE_RE = re.compile(r'^[ \t\f\v]*(?:#|%:)[ \t\f\v]*include(?:_next)?[ \t\f\v]*'
+                         r'(<[^>\n]+>|"[^"\n]+")')
+# Translation phase 2: backslash-newline is deleted BEFORE comments and directives exist
+# (GCC/Clang also accept trailing blanks between the backslash and the newline, with a
+# warning, and MSVC does too).
+_LINE_CONTINUATION_RE = re.compile(r'\\[ \t]*\r?\n')
+_SPECIAL_RE = re.compile(r"[/\"']")
+_STR_END_RE = re.compile(r'["\\\n]')
+_CHR_END_RE = re.compile(r"['\\\n]")
+_RAW_OPEN_RE = re.compile(r'"([^()\\ \t\n]{0,16})\(')
 
 # Quote includes that legitimately resolve nowhere in the tree: generated protobuf/gRPC
 # headers (`agent.grpc.pb.h`, `common.pb.h`) exist only in the build directory. ANY other
@@ -730,45 +753,137 @@ def gh(kind, msg):
     print(f"::{kind}::{msg}", file=sys.stderr, flush=True)
 
 
-def _strip_leading_block_comments(line: str) -> str:
-    """Drop complete `/* ... */` comments (and the whitespace around them) from the START
-    of `line`. Strictly linear in the line length (index-based: no repeated slicing). An
-    unterminated `/*` is left as-is (the include regex then simply does not match, which is
-    the conservative reading of a comment that continues onto the next line)."""
-    n = len(line)
+def _is_ident_char(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
+def strip_comments(text: str, blank_strings: bool) -> str:
+    """ONE LINEAR PASS over `text`: every `//` and `/* ... */` comment becomes a single space;
+    string, char and raw-string literals are skipped, so a `//` or `/*` INSIDE one is never
+    read as a comment; with `blank_strings` their contents are replaced by `""` / `''`.
+    Backslash-newline is deleted first (translation phase 2), so a `//` comment ending in a
+    backslash correctly swallows the next line, exactly as the compiler does.
+
+    Linear by construction: `_SPECIAL_RE` jumps to the next `/`, `"` or `'`, and each
+    terminator is found with `str.find` / a forward regex search from where the scan already
+    is. Do NOT replace this with `re.sub` over nested/lazy quantifiers: the previous versions
+    of this function were quadratic (a header of `"\\"\\"...` or of repeated unterminated
+    `/*` took 5-30 s per 64-240 KB) and this script gates CI.
+
+    Differentially tested against `g++ -MM` (38 fixtures, no MISS): the only disagreements
+    are the conservative ones - an `#include` on its own line inside a raw string, and
+    inside `#if 0` - which are still extracted (over-extraction, never a hidden include).
+    An unterminated `/*` consumes the rest of the file (the compiler rejects such a file)."""
+    text = _LINE_CONTINUATION_RE.sub("", text)
+    n = len(text)
+    out: list[str] = []
+    last = 0
     i = 0
     while True:
-        while i < n and line[i].isspace():
-            i += 1
-        if not line.startswith("/*", i):
-            return line[i:]
-        end = line.find("*/", i + 2)
-        if end < 0:
-            return line
-        i = end + 2
+        m = _SPECIAL_RE.search(text, i)
+        if m is None:
+            break
+        j = m.start()
+        c = text[j]
+        if c == "/":
+            nxt = text[j + 1:j + 2]
+            if nxt == "/":
+                end = text.find("\n", j + 2)
+                end = n if end < 0 else end
+                out.append(text[last:j])
+                out.append(" ")
+                last = i = end
+            elif nxt == "*":
+                end = text.find("*/", j + 2)
+                out.append(text[last:j])
+                out.append(" ")
+                if end < 0:
+                    last = i = n
+                    break
+                last = i = end + 2
+            else:
+                i = j + 1
+        elif c == '"':
+            end = None
+            # Raw string: R"delim( ... )delim" (also LR / uR / UR / u8R prefixes).
+            if j > 0 and text[j - 1] == "R" and (
+                    j == 1 or not _is_ident_char(text[j - 2]) or text[j - 2] in "Lu8U"):
+                rm = _RAW_OPEN_RE.match(text, j)
+                if rm:
+                    close = text.find(")" + rm.group(1) + '"', rm.end())
+                    end = n if close < 0 else close + len(rm.group(1)) + 2
+            if end is None:
+                k = j + 1
+                while True:
+                    sm = _STR_END_RE.search(text, k)
+                    if sm is None:
+                        end = n
+                        break
+                    ch = text[sm.start()]
+                    if ch == "\\":
+                        k = sm.start() + 2
+                        continue
+                    # an unterminated string ends at the newline (which is NOT consumed)
+                    end = sm.start() if ch == "\n" else sm.end()
+                    break
+            if blank_strings:
+                out.append(text[last:j])
+                out.append('""')
+                last = end
+            i = end
+        else:  # a single quote
+            if j > 0 and _is_ident_char(text[j - 1]):
+                i = j + 1  # C++14 digit separator (1'000) or a literal suffix: not a char literal
+                continue
+            k = j + 1
+            while True:
+                sm = _CHR_END_RE.search(text, k)
+                if sm is None:
+                    end = n
+                    break
+                ch = text[sm.start()]
+                if ch == "\\":
+                    k = sm.start() + 2
+                    continue
+                end = sm.start() if ch == "\n" else sm.end()
+                break
+            if blank_strings:
+                out.append(text[last:j])
+                out.append("''")
+                last = end
+            i = end
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _read_source(path: Path) -> str:
+    """Decode a source file: UTF-16 when it starts with a UTF-16 BOM (MSVC accepts such files),
+    else UTF-8 with a leading BOM dropped. Never raises on bad bytes (`replace`)."""
+    raw = path.read_bytes()
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    return raw.decode("utf-8-sig", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
 
 
 def parse_includes(path: Path):
-    """Yields (is_angle, spelling) for every `#include` line in `path`, in
-    file order. Line-anchored regex, not a real preprocessor - a `#include`
-    reached only through an `#if 0`/macro-guarded block is still extracted as
-    if unconditional - which only makes the walk see MORE (a false-positive
-    edge). It DOES handle a UTF-8 BOM, backslash-continued lines, complete
-    `/* */` comments before the `#` on the same line, and the `%:` digraph. It
-    does NOT see a macro-built include or a `##`-spliced one, so a real include
-    can still be hidden that way (module docstring, "ALSO NOT CAUGHT" item 3)."""
+    """Yields (is_angle, spelling) for every `#include` / `#include_next` directive in `path`,
+    in file order. Comments are removed first by the linear `strip_comments`, backslash-newline
+    is joined, a BOM is dropped and UTF-16 is decoded, so the forms a line-anchored regex
+    missed - `#include/*c*/"x"`, `# /* c */ include "x"`, a multi-line comment closing before the
+    `#`, `#include \\` + blank + newline, `%:include`, `include_next` - ARE found (each probed
+    in the selftest and cross-checked against `g++ -MM`).
+
+    Still NOT seen: a macro-built include (`#include SOME_MACRO`) or a `##`-spliced one.
+    Over-extracted (the conservative direction, a possible false FAIL): an `#include` line
+    inside `#if 0` or inside a raw string literal."""
     out = []
-    # utf-8-sig drops a leading BOM; a BOM before the first line's `#` would
-    # otherwise make that line unmatchable.
-    text = path.read_text(encoding="utf-8-sig", errors="replace")
-    text = _LINE_CONTINUATION_RE.sub("", text)
-    for line in text.splitlines():
-        m = _INCLUDE_RE.match(_strip_leading_block_comments(line))
+    text = strip_comments(_read_source(path), blank_strings=False)
+    for line in text.split("\n"):
+        m = _INCLUDE_RE.match(line)
         if not m:
             continue
         spelling = m.group(1)
-        is_angle = spelling.startswith("<")
-        out.append((is_angle, spelling[1:-1]))
+        out.append((spelling.startswith("<"), spelling[1:-1]))
     return out
 
 
@@ -779,7 +894,7 @@ def resolve_include(includer: Path, is_angle: bool, name: str, roots: Roots = DE
     section for why angle vs quote is not itself the external/internal
     signal in this codebase."""
     if is_angle:
-        for r in (roots.server_include, roots.common_include):
+        for r in (roots.server_include, roots.common_include, *roots.extra_include):
             candidate = r / name
             if candidate.is_file():
                 return candidate.resolve()
@@ -788,7 +903,8 @@ def resolve_include(includer: Path, is_angle: bool, name: str, roots: Roots = DE
     # behaviour), then the same internal roots plus server/core/src itself
     # (a fallback for a quote-include reaching a sibling file by a path
     # relative to src/ rather than to the includer's own subdirectory).
-    for d in (includer.parent, roots.server_include, roots.common_include, roots.server_src):
+    for d in (includer.parent, roots.server_include, roots.common_include,
+              *roots.extra_include, roots.server_src):
         candidate = d / name
         if candidate.is_file():
             return candidate.resolve()
@@ -804,12 +920,12 @@ def closure(tu_path: Path, roots: Roots = DEFAULT_ROOTS):
       parent     - {child_path: includer_path} for chain reconstruction.
       unresolved - [(includer_path, spelling)] for a QUOTE include that could
                    not be resolved anywhere in the tree. Quote includes in
-                   this codebase are always in-tree by construction, so an
-                   unresolved one is reported as a warning (an extraction
-                   gap to fix, not itself evidence of a store reach) rather
-                   than silently ignored. An unresolved ANGLE include is the
-                   expected, common case (a real external header) and is not
-                   reported at all.
+                   this codebase are in-tree by construction, so an unresolved
+                   one TRUNCATES the closure under it and is a HARD ERROR on
+                   every lane (`report_unresolved`) unless it names a generated
+                   `*.pb.h`. An unresolved ANGLE include is the expected,
+                   common case (a real external header) and is not reported
+                   at all.
     """
     tu_path = tu_path.resolve()
     visited: set[Path] = set()
@@ -866,7 +982,8 @@ def is_forbidden_header(abspath: Path, root: Path = ROOT,
     return False, None
 
 
-def report_unresolved(label: str, tu_rel, unresolved, roots: Roots = DEFAULT_ROOTS) -> bool:
+def report_unresolved(label: str, tu_rel, unresolved, roots: Roots = DEFAULT_ROOTS,
+                      seen: set | None = None) -> bool:
     """False (and a `::error::` per include) if the closure holds a QUOTE include that
     resolves nowhere and is not a generated header. Such an include TRUNCATES the closure
     under it - a store header moved outside the three resolution roots would otherwise
@@ -875,12 +992,21 @@ def report_unresolved(label: str, tu_rel, unresolved, roots: Roots = DEFAULT_ROO
     for includer, spelling in unresolved:
         if spelling.endswith(GENERATED_HEADER_SUFFIXES):
             continue
+        ok = False
+        # One shared header reached by N enrolled TUs would otherwise print N identical errors
+        # and bury the finding: report each (includer, spelling) once per lane.
+        key = (str(includer), spelling)
+        if seen is not None:
+            if key in seen:
+                continue
+            seen.add(key)
         gh("error",
            f"check-seam-closure: {label}: {tu_rel}: could not resolve quote-include "
            f"\"{spelling}\" from {includer.relative_to(roots.root)} - the closure under it "
-           f"is NOT checked. Fix the include path, or if it is a generated header add its "
-           f"suffix to GENERATED_HEADER_SUFFIXES")
-        ok = False
+           f"is NOT checked. Prefer fixing the include path; if the header lives in a "
+           f"directory the build adds with -I, add that directory to Roots.extra_include. "
+           f"Widening GENERATED_HEADER_SUFFIXES re-opens the hole this error closes and needs "
+           f"security-guardian sign-off")
     return ok
 
 
@@ -893,6 +1019,7 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
     defect this gate exists to prevent), reported and then EXCLUDED from the
     closure walk so the remaining members are still checked."""
     ok = True
+    seen_unresolved: set = set()
     existing: list[Path] = []
     for rel in tus:
         p = (roots.root / rel).resolve()
@@ -910,7 +1037,7 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
     for tu in existing:
         rel_tu = tu.relative_to(roots.root)
         visited, parent, unresolved = closure(tu, roots)
-        if not report_unresolved(f"family {name!r}", rel_tu, unresolved, roots):
+        if not report_unresolved(f"family {name!r}", rel_tu, unresolved, roots, seen_unresolved):
             ok = False
         for f in sorted(visited, key=str):
             hit, pat = is_forbidden_header(f, roots.root, patterns)
@@ -952,6 +1079,7 @@ def check_impl_purity(tus: list[str], roots: Roots = DEFAULT_ROOTS) -> bool:
     dex_api.cpp -> dex_routes.hpp -> httplib inversion. A missing declared TU is
     a HARD ERROR (same posture as check_family)."""
     ok = True
+    seen_unresolved: set = set()
     for rel in tus:
         tu = (roots.root / rel).resolve()
         if not tu.is_file():
@@ -959,7 +1087,7 @@ def check_impl_purity(tus: list[str], roots: Roots = DEFAULT_ROOTS) -> bool:
             ok = False
             continue
         visited, parent, unresolved = closure(tu, roots)
-        if not report_unresolved("impl-purity", rel, unresolved, roots):
+        if not report_unresolved("impl-purity", rel, unresolved, roots, seen_unresolved):
             ok = False
         # (a) presentation in-tree headers via resolved-path basename match.
         for f in sorted(visited, key=str):
@@ -987,31 +1115,19 @@ def check_impl_purity(tus: list[str], roots: Roots = DEFAULT_ROOTS) -> bool:
 
 
 def _strip_comments(text: str) -> str:
-    """Blank ordinary string/char literal CONTENTS first, then remove /* */
-    block comments and // line comments (covers /// doc comments too). Not a
-    full C++ lexer. Blanking literals before comment-stripping is load-bearing:
-    a `//` or `/*` INSIDE a string literal (e.g. `const char* u = "http://h";`)
-    would otherwise be treated as a comment and over-strip a real store-type
-    token that follows the literal on the same line — the exact bypass this
-    probe exists to prevent (#4582 review). After the literal-blank the pass is
-    sound in the direction that matters: it can under-strip (a leftover token
-    just produces an author-resolved false positive), and can no longer
-    over-strip via an ordinary literal. RESIDUAL: raw string literals
-    (`R"(...)"`) are not lexed, so a `//` inside one could still over-strip;
-    accepted because no abstract `*_api.hpp` closure contains a raw string (a
-    selftest case pins the ordinary-literal fix)."""
-    text = re.sub(r'"(?:\\.|[^"\\\n])*"', '""', text)  # blank string literals
-    text = re.sub(r"'(?:\\.|[^'\\\n])*'", "''", text)  # blank char literals
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
-    text = re.sub(r"//[^\n]*", " ", text)
-    return text
+    """Comments removed and string/char literal CONTENTS blanked, in ONE LINEAR PASS
+    (`strip_comments`). Blanking literals is load-bearing for the type-token probe: a `//` or
+    `/*` inside a string literal (`const char* u = "http://h";`) must not be read as a comment
+    start, or a real store-type token after it is over-stripped - the bypass #4582 found.
+    Raw strings are lexed too (this used to be a documented residual)."""
+    return strip_comments(text, blank_strings=True)
 
 
 def names_store_type(path: Path):
     """Returns the first store-type token this file NAMES in code (comments
     stripped), or None. Catches both `*Store` class names (regex) and the
     non-`Store` store row/data types (EXTRA_STORE_TYPE_TOKENS)."""
-    code = _strip_comments(path.read_text(encoding="utf-8", errors="replace"))
+    code = _strip_comments(_read_source(path))
     m = STORE_TYPE_TOKEN_RE.search(code)
     if m:
         return m.group(0)
@@ -1027,6 +1143,7 @@ def check_abstract_headers_store_type_free(headers: list[str],
     include closure — must NAME no store type in code (see the probe's block
     comment above). A missing declared header is a HARD ERROR."""
     ok = True
+    seen_unresolved: set = set()
     for rel in headers:
         tu = (roots.root / rel).resolve()
         if not tu.is_file():
@@ -1034,7 +1151,7 @@ def check_abstract_headers_store_type_free(headers: list[str],
             ok = False
             continue
         visited, parent, unresolved = closure(tu, roots)
-        if not report_unresolved("abstract-header probe", rel, unresolved, roots):
+        if not report_unresolved("abstract-header probe", rel, unresolved, roots, seen_unresolved):
             ok = False
         for f in sorted({tu} | visited, key=str):
             tok = names_store_type(f)

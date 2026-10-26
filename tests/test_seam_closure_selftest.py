@@ -766,42 +766,81 @@ def main() -> int:
                 _fail(f"abstract-header probe over-fired on `{tok}Foo` - the token's word "
                       f"boundary is gone", failures)
 
-        # 20. PARSER HARDENING (UP-1): each form below hides a real store include from a
-        #     line-anchored regex unless handled. Every one must FIRE via check_family; the
-        #     `//` line-comment control must NOT (a commented-out include is not an include).
+        # 20. PARSER (UP-1, UP-3): every form below hides a real store include from a
+        #     line-anchored regex unless handled, and is a real include to GCC/Clang -
+        #     each `fire` form was cross-checked against `g++ -MM` while writing this (38
+        #     fixtures, no MISS). Every `fire` form must fire via check_family; every `hide` form
+        #     (a comment, a splice into a comment, an unterminated comment) must NOT.
         (src / "hid_store.hpp").write_text("#pragma once\nclass HidStore {};\n", encoding="utf-8")
-        forms = {
-            "continuation": '#include \\\n"hid_store.hpp"\nint x;\n',
-            "continuation_crlf": '#  include \\\r\n  "hid_store.hpp"\r\nint x;\r\n',
-            "same_line_block_comment": '/* generated */ #include "hid_store.hpp"\nint x;\n',
-            "two_block_comments": '/* a */ /* b */   #  include "hid_store.hpp"\nint x;\n',
-            "digraph": '%:include "hid_store.hpp"\nint x;\n',
+        parser_forms = {
+            # name: (body, fires)
+            "plain": ('#include "hid_store.hpp"\nint x;\n', True),
+            "continuation": ('#include \\\n"hid_store.hpp"\nint x;\n', True),
+            "continuation_crlf": ('#  include \\\r\n  "hid_store.hpp"\r\nint x;\r\n', True),
+            "continuation_trailing_blank": ('#include \\ \n"hid_store.hpp"\nint x;\n', True),
+            "continuation_in_name": ('#inc\\\nlude "hid_store.hpp"\nint x;\n', True),
+            "same_line_block_comment": ('/* generated */ #include "hid_store.hpp"\nint x;\n', True),
+            "block_comment_no_space": ('/**/#include "hid_store.hpp"\nint x;\n', True),
+            "two_block_comments": ('/* a */ /* b */   #  include "hid_store.hpp"\nint x;\n', True),
+            "multiline_comment_closing_before_hash": ('/* a\n b */ #include "hid_store.hpp"\nint x;\n', True),
+            "comment_between_hash_and_include": ('# /* c */ include "hid_store.hpp"\nint x;\n', True),
+            "comment_between_hash_and_include_tight": ('#/*c*/include "hid_store.hpp"\nint x;\n', True),
+            "comment_between_include_and_name": ('#include /* c */ "hid_store.hpp"\nint x;\n', True),
+            "comment_between_include_and_name_tight": ('#include/*c*/"hid_store.hpp"\nint x;\n', True),
+            "include_next": ('#include_next "hid_store.hpp"\nint x;\n', True),
+            "digraph": ('%:include "hid_store.hpp"\nint x;\n', True),
+            "form_feed_prefix": ('\f#include "hid_store.hpp"\nint x;\n', True),
+            "after_string_containing_comment_open": ('const char* s = "/* ";\n#include "hid_store.hpp"\nconst char* e = " */";\n', True),
+            "after_string_containing_slashes": ('const char* u = "http://h";\n#include "hid_store.hpp"\n', True),
+            "after_raw_string_containing_comment_open": ('const char* r = R"x(/* )x";\n#include "hid_store.hpp"\n', True),
+            "after_char_literal_quote": ("char q = '\"';\n#include \"hid_store.hpp\"\n", True),
+            "after_digit_separator": ("int n = 1'000'000; /* c\n*/\n#include \"hid_store.hpp\"\n", True),
+            "after_escaped_quote_string": ('const char* s = "a\\"/*";\n#include "hid_store.hpp"\n', True),
+            # Discriminating literal cases (a naive scanner passes the ones above by luck):
+            "raw_string_with_inner_quote_and_comment_open": ('const char* r = R"x(a" /* b)x";\n#include "hid_store.hpp"\n', True),
+            "u8_raw_string_with_inner_quote": ('const char* r = u8R"x(a" /* b)x";\n#include "hid_store.hpp"\n', True),
+            "wide_raw_string_with_inner_quote": ('const wchar_t* r = LR"x(a" /* b)x";\n#include "hid_store.hpp"\n', True),
+            "raw_string_custom_delim_with_paren": ('const char* r = R"d(a)" /* b)d";\n#include "hid_store.hpp"\n', True),
+            # hide: NOT includes to the compiler
+            "line_comment": ('// #include "hid_store.hpp"\nint x;\n', False),
+            "line_comment_continued_over_include": ('// c \\\n#include "hid_store.hpp"\nint x;\n', False),
+            "inside_multiline_block_comment": ('/*\n#include "hid_store.hpp"\n*/\nint x;\n', False),
+            "inside_one_line_block_comment": ('/* #include "hid_store.hpp" */\nint x;\n', False),
+            "after_code_same_line": ('int x; /* c */ #include "hid_store.hpp"\n', False),
+            "multiline_comment_after_code": ('int x; /* a\n */ #include "hid_store.hpp"\n', False),
+            "unterminated_comment_opens_before_include": ('/* #include "hid_store.hpp"\nint x;\n', False),
+            # a REAL comment must open after a digit separator / escaped backslash, hiding the include
+            "digit_separator_then_comment_hides_include": ("int n = 1'000; /* hides\n#include \"hid_store.hpp\"\n*/ int z;\n", False),
+            "escaped_backslash_then_comment_hides_include": ('const char* s = "a\\\\"; /* hides\n#include "hid_store.hpp"\n*/ int z;\n', False),
+            # U+2028 / VT are not line terminators to the compiler: no directive starts after them
+            "unicode_line_separator_is_not_a_newline": ('int x;\u2028#include "hid_store.hpp"\n', False),
+            "vertical_tab_mid_line_is_not_a_newline": ('int x;\x0b#include "hid_store.hpp"\n', False),
         }
-        for form, body in forms.items():
+        for form, (body, fires) in parser_forms.items():
             (src / f"hid_{form}_routes.cpp").write_text(body, encoding="utf-8", newline="")
             with contextlib.redirect_stderr(io.StringIO()):
                 ok = mod.check_family(f"hid-{form}", [f"server/core/src/hid_{form}_routes.cpp"],
                                       roots=roots, patterns=mod.FORBIDDEN_HEADER_PATTERNS)
-            if ok:
+            if fires and ok:
                 _fail(f"the include parser missed a real store include written as {form!r} - the "
-                      f"closure walk is blind to it (UP-1)", failures)
-        # BOM before the first line's `#` (bytes written explicitly: Windows editors do this).
-        (src / "hid_bom_routes.cpp").write_bytes(b'\xef\xbb\xbf#include "hid_store.hpp"\nint x;\n')
-        with contextlib.redirect_stderr(io.StringIO()):
-            ok = mod.check_family("hid-bom", ["server/core/src/hid_bom_routes.cpp"], roots=roots,
-                                  patterns=mod.FORBIDDEN_HEADER_PATTERNS)
-        if ok:
-            _fail("the include parser missed a store include on a BOM-prefixed first line (UP-1)",
-                  failures)
-        # Controls: a `//` line comment is not an include; an ordinary clean include still passes.
-        (src / "hid_linecomment_routes.cpp").write_text('// #include "hid_store.hpp"\nint x;\n',
-                                                        encoding="utf-8")
-        with contextlib.redirect_stderr(io.StringIO()):
-            ok = mod.check_family("hid-linecomment",
-                                  ["server/core/src/hid_linecomment_routes.cpp"], roots=roots,
-                                  patterns=mod.FORBIDDEN_HEADER_PATTERNS)
-        if not ok:
-            _fail("a `//`-commented include was treated as a real include (over-fire)", failures)
+                      f"closure walk is blind to it (UP-1/UP-3)", failures)
+            if not fires and not ok:
+                _fail(f"the include parser over-fired on {form!r}: a comment is not an include", failures)
+        # BOM / UTF-16 (bytes written explicitly: Windows editors and MSVC produce both).
+        for form, raw in (("bom", b'\xef\xbb\xbf#include "hid_store.hpp"\nint x;\n'),
+                          ("utf16_le", b'\xff\xfe' + '#include "hid_store.hpp"\nint x;\n'.encode("utf-16-le")),
+                          ("utf16_be", b'\xfe\xff' + '#include "hid_store.hpp"\nint x;\n'.encode("utf-16-be"))):
+            (src / f"hid_{form}_routes.cpp").write_bytes(raw)
+            with contextlib.redirect_stderr(io.StringIO()):
+                ok = mod.check_family(f"hid-{form}", [f"server/core/src/hid_{form}_routes.cpp"],
+                                      roots=roots, patterns=mod.FORBIDDEN_HEADER_PATTERNS)
+            if ok:
+                _fail(f"the include parser missed a store include in a {form} file (UP-1/UP-4)", failures)
+        # Parser return values, not just check_family outcomes: (is_angle, name) pairs.
+        (src / "ret_routes.cpp").write_text('#include <a.h>\n#include "b.h"\n#include_next <c.h>\n',
+                                            encoding="utf-8")
+        if mod.parse_includes(src / "ret_routes.cpp") != [(True, "a.h"), (False, "b.h"), (True, "c.h")]:
+            _fail("parse_includes did not return (is_angle, name) pairs in file order", failures)
 
         # 21. UNRESOLVED QUOTE INCLUDE (UP-4): hard error on EVERY lane; a generated *.pb.h is
         #     the one allowed exception; an unresolved ANGLE include (external header) is fine.
@@ -825,6 +864,48 @@ def main() -> int:
             if ok or "could not resolve quote-include" not in cap.getvalue():
                 _fail(f"an unresolved quote include did not hard-fail the {lane} lane - its "
                       f"closure would be silently truncated (UP-4)", failures)
+        # The allowlist matches only the SUFFIX of a quote include: these must still hard-fail.
+        for nm in ("x.pb.hpp", "pbkdf_store.hpp", "x.pb.h.hpp", "pb.h/x.hpp"):
+            (src / "sfx_routes.cpp").write_text(f'#include "{nm}"\n', encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()):
+                ok = mod.check_family("sfx", ["server/core/src/sfx_routes.cpp"], roots=roots)
+            if ok:
+                _fail(f"an unresolved quote include {nm!r} passed - the generated-header allowlist "
+                      f"must match only a true *.pb.h suffix", failures)
+        # One shared header reached by several TUs reports ONCE (not once per TU).
+        (src / "shared_bad.hpp").write_text('#pragma once\n#include "no_such_shared.hpp"\n', encoding="utf-8")
+        for k in range(3):
+            (src / f"fan{k}_routes.cpp").write_text('#include "shared_bad.hpp"\n', encoding="utf-8")
+        cap_fan = io.StringIO()
+        with contextlib.redirect_stderr(cap_fan):
+            mod.check_family("fan", [f"server/core/src/fan{k}_routes.cpp" for k in range(3)], roots=roots)
+        if cap_fan.getvalue().count("could not resolve quote-include") != 1:
+            _fail("the same unresolved include reached by 3 TUs was not reported exactly once "
+                  f"(got {cap_fan.getvalue().count('could not resolve quote-include')})", failures)
+        # extra_include roots mirror the build's -I directories: a quote include that resolves
+        # ONLY there is resolved (not an error), and angle includes resolve there too.
+        extra_dir = root / "sdk" / "include" / "yuzu"
+        extra_dir.mkdir(parents=True)
+        (extra_dir / "metrics.hpp").write_text("#pragma once\n", encoding="utf-8")
+        (src / "extra_routes.cpp").write_text('#include "yuzu/metrics.hpp"\n#include <yuzu/metrics.hpp>\n',
+                                              encoding="utf-8")
+        # an ANGLE include that resolves only in an extra root must be WALKED (its own includes
+        # reach a store here), not silently dropped.
+        (extra_dir / "metrics2.hpp").write_text('#pragma once\n#include "evil_store.hpp"\n', encoding="utf-8")
+        (src / "angwalk_routes.cpp").write_text("#include <yuzu/metrics2.hpp>\n", encoding="utf-8")
+        roots_extra = mod.Roots(root, src, inc, common, (root / "sdk" / "include",))
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok_ang = mod.check_family("angwalk", ["server/core/src/angwalk_routes.cpp"], roots=roots_extra,
+                                      patterns=mod.FORBIDDEN_HEADER_PATTERNS)
+        if ok_ang:
+            _fail("an angle include resolving only via Roots.extra_include was not walked", failures)
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok_extra = mod.check_family("extra", ["server/core/src/extra_routes.cpp"], roots=roots_extra)
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok_noextra = mod.check_family("noextra", ["server/core/src/extra_routes.cpp"], roots=roots)
+        if not ok_extra or ok_noextra:
+            _fail("Roots.extra_include is not consulted for quote/angle resolution (or an include that "
+                  "resolves only there is treated as unresolved)", failures)
         (src / "gen_routes.cpp").write_text('#include "agent.grpc.pb.h"\n#include <external/x.h>\n',
                                             encoding="utf-8")
         with contextlib.redirect_stderr(io.StringIO()):
@@ -833,40 +914,70 @@ def main() -> int:
             _fail("a generated *.pb.h (or an unresolved ANGLE include) hard-failed - the "
                   "allowlist/angle exemption is gone", failures)
 
-        # 22. PARSER COST + CONTROLS. The gate runs in CI over repo files: a pathological line
-        #     must never hang it. The first draft of the same-line-comment support was a nested
-        #     quantifier that backtracked catastrophically on many closed comments followed by
-        #     a non-include (it hung for >120 s). `re` holds the GIL while backtracking, so a
-        #     thread cannot be timed out - the probe runs the parse in a SUBPROCESS with a hard
-        #     timeout, so a regression FAILS instead of wedging CI.
-        (src / "slow_routes.cpp").write_text("/* x */ " * 20000 + "int x;\n", encoding="utf-8")
+        # 22. PARSER + COMMENT-STRIPPER COST. The gate runs in CI over repo files: a pathological
+        #     header must never hang it. Earlier drafts were superlinear in two places: a nested
+        #     quantifier in the include regex (hung >120 s on 20000 closed comments) and
+        #     `_strip_comments`' `"(?:\\.|[^"\\\n])*"` / `/\*.*?\*/` (5.7 s at 64 KB, 30 s at 240 KB).
+        #     `re` holds the GIL while backtracking, so a thread cannot be timed out - run the
+        #     work in a SUBPROCESS with a hard timeout, so a regression FAILS instead of wedging CI.
+        pathological = {
+            "closed_comments": "/* x */ " * 20000 + "int x;\n",
+            "unterminated_comment_starts": "/* " * 100000 + "\n",
+            "escaped_quotes": '"\\"' * 100000 + "\n",
+            "string_openers": '"' * 200000 + "\n",
+            "line_continuations": "\\\n" * 200000 + "int x;\n",
+            "comment_then_include": "/* x */ " * 20000 + '#include "a.hpp"\n',
+        }
         probe_code = (
-            "import importlib.util, sys\n"
+            "import importlib.util, pathlib, sys\n"
             "spec = importlib.util.spec_from_file_location('c', sys.argv[1])\n"
             "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
-            "print(len(m.parse_includes(__import__('pathlib').Path(sys.argv[2]))))\n")
-        try:
-            done = subprocess.run([sys.executable, "-B", "-I", "-c", probe_code, str(CHECKER_PATH),
-                                   str(src / "slow_routes.cpp")], capture_output=True, text=True,
-                                  timeout=20)
-            if done.returncode != 0 or done.stdout.strip() != "0":
-                _fail(f"parse_includes on 20000 closed comments returned rc={done.returncode} "
-                      f"out={done.stdout.strip()!r} err={done.stderr.strip()[:200]!r} (expected 0 includes)",
-                      failures)
-        except subprocess.TimeoutExpired:
-            _fail("parse_includes did not finish 20000 closed comments on one line within 20 s - the "
-                  "include regex is superlinear again (ReDoS) and would hang CI", failures)
-        # semantic controls: what is and is NOT an include after leading comments
-        for line, want in (
-                ('/* a */ #include "x.h"', [(False, "x.h")]),
-                ('  /* a */  /* b */   #  include <y.h>', [(True, "y.h")]),
-                ('/* unterminated #include "x.h"', []),
-                ('/* a */ int x; #include "q.h"', []),
-                ('// #include "x.h"', [])):
-            (src / "ctl_routes.cpp").write_text(line + "\n", encoding="utf-8")
-            got = mod.parse_includes(src / "ctl_routes.cpp")
-            if got != want:
-                _fail(f"parse_includes({line!r}) -> {got!r}, expected {want!r}", failures)
+            "f = pathlib.Path(sys.argv[2])\n"
+            "print(len(m.parse_includes(f)), len(m._strip_comments(f.read_text())))\n")
+        for label, body in pathological.items():
+            (src / "slow_input.cpp").write_text(body, encoding="utf-8")
+            try:
+                done = subprocess.run([sys.executable, "-B", "-I", "-c", probe_code, str(CHECKER_PATH),
+                                       str(src / "slow_input.cpp")], capture_output=True, text=True,
+                                      timeout=20)
+                want_inc = "1" if label == "comment_then_include" else "0"
+                if done.returncode != 0 or done.stdout.split()[:1] != [want_inc]:
+                    _fail(f"pathological input {label!r}: rc={done.returncode} out={done.stdout.strip()!r} "
+                          f"err={done.stderr.strip()[:200]!r} (expected {want_inc} includes)", failures)
+            except subprocess.TimeoutExpired:
+                _fail(f"pathological input {label!r} did not finish within 20 s - a comment/include "
+                      f"regex is superlinear again (ReDoS) and would hang CI", failures)
+        # return-value controls for the comment stripper (what the type-token probe reads)
+        for text, want in (('const char* u = "http://h"; class FooStore;', 'const char* u = ""; class FooStore;'),
+                           ("int a; // class HidStore;\nint b;", "int a;  \nint b;"),
+                           ("int a; /* class HidStore; */ int b;", "int a;   int b;"),
+                           ("char c = '\"'; class FooStore;", "char c = ''; class FooStore;"),
+                           ('const char* r = R"x(/* class HidStore; )x"; int z;', 'const char* r = R""; int z;'),
+                           ('const char* r = R"x(a" /* b)x"; class FooStore;', 'const char* r = R""; class FooStore;'),
+                           ("int n = 1'000; /* gone */ class FooStore;", "int n = 1'000;   class FooStore;")):
+            if mod._strip_comments(text) != want:
+                _fail(f"_strip_comments({text!r}) -> {mod._strip_comments(text)!r}, expected {want!r}", failures)
+        # failure-message hints are pinned (the store-definition-free lane tells the author what to do)
+        (src / "kh_routes.cpp").write_text('#include "evil_store.hpp"\n', encoding="utf-8")
+        cap_h = io.StringIO()
+        with contextlib.redirect_stderr(cap_h):
+            mod.check_family("store_definition_free", ["server/core/src/kh_routes.cpp"], roots=roots,
+                             patterns=mod.FORBIDDEN_HEADER_PATTERNS)
+        cap_o = io.StringIO()
+        with contextlib.redirect_stderr(cap_o):
+            mod.check_family("network", ["server/core/src/kh_routes.cpp"], roots=roots,
+                             patterns=mod.FORBIDDEN_HEADER_PATTERNS)
+        if "enrolled as store-definition-free" not in cap_h.getvalue() or \
+                "enrolled as store-definition-free" in cap_o.getvalue():
+            _fail("the store-definition-free remediation hint is missing for that lane or leaked into "
+                  "another family's message", failures)
+        if "ADR-0031" not in cap_h.getvalue() or "ADR-0031" not in cap_o.getvalue():
+            _fail("a forbidden-header failure no longer points at ADR-0031 / the matrix", failures)
+        cap_nf = io.StringIO()
+        with contextlib.redirect_stderr(cap_nf):
+            mod.check_family("store_definition_free", ["server/core/src/nope_routes.cpp"], roots=roots)
+        if "STORE_DEFINITION_FREE_TUS" not in cap_nf.getvalue():
+            _fail("the missing-TU message does not name STORE_DEFINITION_FREE_TUS for that lane", failures)
 
     # 19. run_check() WIRING: every check above exercises a helper or a constant in
     #     isolation, so nothing observed how run_check() CONSUMES them - deleting a lane's
