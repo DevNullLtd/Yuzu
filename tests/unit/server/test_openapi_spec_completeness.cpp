@@ -734,3 +734,21 @@ TEST_CASE("ecosystem_parameter_schemas(): resolves referenced parameters and sch
     CHECK(by_where["get /x"] == json::array({"a"}));
     CHECK(by_where["post /x"] == json::array({"b"}));
 }
+
+TEST_CASE("openapi_spec_json(): the data-retention operation documents the TAR tiers",
+          "[openapi][retention][tar]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec.contains("paths"));
+    REQUIRE(spec["paths"].contains("/settings/data-retention"));
+    const auto& get_op = spec["paths"]["/settings/data-retention"]["get"];
+
+    const std::string description = get_op.value("description", "");
+    for (const char* needle :
+         {"tick_seconds", "guaranteed_depth_seconds", "not per-device readings",
+          "paused source is never pruned", "outlive their limit", "per-pass delete cap"})
+        CHECK(description.find(needle) != std::string::npos);
+
+    const std::string ok = get_op["responses"]["200"].value("description", "");
+    CHECK(ok.find("tar: {tick_seconds, tiers") != std::string::npos);
+}

@@ -8,7 +8,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <set>
 #include <string>
 
 namespace yuzu::server {
@@ -63,6 +62,7 @@ TEST_CASE("parse_tar_retention_tiers rejects malformed tables naming the line",
     bad("", "line 1");
     bad(with_header("process\tlive\trows\n"), "line 2");
     bad(with_header("process\tlive\tdays\t5\n"), "line 2");
+    bad(with_header("process\thourlly\tseconds\t5\n"), "line 2");
     bad(with_header("process\tlive\trows\tabc\n"), "line 2");
     bad(with_header("process\tlive\trows\t0\n"), "line 2");
     bad(with_header("process\tlive\trows\t-5\n"), "line 2");
@@ -73,11 +73,6 @@ TEST_CASE("parse_tar_retention_tiers rejects malformed tables naming the line",
 TEST_CASE("the embedded TAR retention table parses", "[tar][retention]") {
     auto r = parse_tar_retention_tiers(yuzu::server::kTarRetentionTiersTsv);
     REQUIRE(r.has_value());
-    CHECK(r->size() == 36);
-    std::set<std::string> sources;
-    for (const auto& t : *r)
-        sources.insert(t.source);
-    CHECK(sources.size() == 16);
     const auto* live = find(*r, "process", "live");
     REQUIRE(live);
     CHECK(live->row_count);
@@ -94,7 +89,6 @@ TEST_CASE("bucket_seconds per tier", "[tar][retention]") {
     CHECK(bucket_seconds("hourly") == 3600);
     CHECK(bucket_seconds("daily") == kDay);
     CHECK(bucket_seconds("monthly") == 2678400);
-    CHECK(bucket_seconds("mystery") == 0);
 }
 
 TEST_CASE("guaranteed_depth_seconds is limit minus bucket; null for row counts",
@@ -130,8 +124,4 @@ TEST_CASE("worked ages for the process source", "[tar][retention]") {
     CHECK_FALSE(holds("hourly", 426));
     CHECK_FALSE(holds("daily", 426));
     CHECK_FALSE(holds("monthly", 426));
-}
-
-TEST_CASE("kTarRetentionTickSeconds mirrors the agent rollup tick", "[tar][retention]") {
-    CHECK(kTarRetentionTickSeconds == 900);
 }

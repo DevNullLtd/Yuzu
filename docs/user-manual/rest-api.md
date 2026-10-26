@@ -5541,12 +5541,16 @@ roll-up bucket: 0 for `live`/`boot`, 3600, 86400, or 2678400 for a month, the 31
 case) and `guaranteed_depth_seconds`. Roll-up rows age from the start of their bucket, so
 a time-based tier is guaranteed for `limit - bucket_seconds` (a 365-day monthly tier is
 guaranteed for 334 days). It is `null` for `rows` tiers, whose time depth depends on how
-fast a device writes.
+fast a device writes. `guaranteed_depth_seconds` is a floor on how long a record is kept, not
+where it sits: a record is still in its finer tier until the coarser roll-up closes. The
+`usage`/`live` row is a backstop, not an operative bound: the usage fold bounds its own open
+set (20,000 runs) before this limit can apply.
 
 These are the registry **defaults** every agent applies, not per-device readings: TAR
 prunes on the agent, so the server has no live value. A paused source is never pruned;
-rows may outlive their limit by up to `tick_seconds`, and longer when the retention clock
-guard declines a prune. `tar` is `null` only if the server's embedded table cannot be read.
+rows may outlive their limit by up to `tick_seconds`, longer when the retention clock guard
+declines a prune, and longer still while a backlog drains through the per-pass delete cap
+(5,000 rows per table per tick). `tar` is `null` only if the server's embedded table cannot be read.
 
 ```json
 {

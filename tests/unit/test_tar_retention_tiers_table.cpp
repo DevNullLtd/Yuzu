@@ -79,6 +79,9 @@ TEST_CASE("tar_retention_tiers.tsv matches capture_sources() retention defaults"
     std::set<Row> table_rows;
     std::set<std::string> table_sources;
     std::string line;
+    // Deliberately independent of server/core's parse_tar_retention_tiers: the tar
+    // suite must not include server headers, and an independent reader cannot share
+    // a parser bug.
     bool first = true;
     while (std::getline(f, line)) {
         if (!line.empty() && line.back() == '\r')

@@ -26,11 +26,13 @@
 #include <utility>
 #include <vector>
 
+#include <yuzu/tar_retention_tick.hpp>
+
 namespace yuzu::server::tar_retention {
 
-/// Mirrors the agent's `tar.rollup` trigger interval (tar_plugin.cpp, 900 s).
-/// A change there must change this; it is a caveat figure, not a pruning input.
-inline constexpr std::int64_t kTarRetentionTickSeconds = 900;
+/// The agent's `tar.rollup` trigger interval, shared via
+/// yuzu/tar_retention_tick.hpp so the caveat figure cannot drift from the trigger.
+inline constexpr std::int64_t kTarRetentionTickSeconds = yuzu::kTarRollupTickSeconds;
 
 struct TarRetentionTier {
     std::string source;
@@ -81,6 +83,9 @@ parse_tar_retention_tiers(std::string_view tsv) {
             return err("expected 4 non-empty tab-separated cells");
         if (cells[2] != "rows" && cells[2] != "seconds")
             return err("limit_kind must be rows or seconds");
+        if (cells[1] != "live" && cells[1] != "hourly" && cells[1] != "daily" &&
+            cells[1] != "monthly" && cells[1] != "boot")
+            return err("unknown tier");
         std::int64_t limit = 0;
         const auto [p, ec] = std::from_chars(cells[3].data(), cells[3].data() + cells[3].size(), limit);
         if (ec != std::errc{} || p != cells[3].data() + cells[3].size() || limit <= 0)

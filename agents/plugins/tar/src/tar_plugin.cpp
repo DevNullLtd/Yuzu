@@ -38,6 +38,7 @@
 #include "tar_perf.hpp"
 #include "tar_proc_perf.hpp"
 #include "tar_schema_registry.hpp"
+#include <yuzu/tar_retention_tick.hpp> // kTarRollupTickSeconds (shared with the data-retention API)
 #include "tar_aggregator.hpp"
 #include "tar_software_core.hpp"
 #include "tar_sql_executor.hpp"
@@ -671,7 +672,8 @@ public:
 
         // Register rollup trigger (15-minute aggregation cycle)
         auto rollup_config = std::format(
-            R"({{"interval_seconds":900,"plugin":"tar","action":"rollup","parameters":{{}}}})");
+            R"({{"interval_seconds":{},"plugin":"tar","action":"rollup","parameters":{{}}}})",
+            yuzu::kTarRollupTickSeconds);
         ctx.register_trigger("tar.rollup", "interval", rollup_config);
 
         // Gap-free process events: ETW on Windows, Endpoint Security on macOS. On

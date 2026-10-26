@@ -612,7 +612,8 @@ yuzu_server_core_lib = static_library(
    yuzu_groups_js_embed,
    yuzu_system_js_embed,
    yuzu_developer_js_embed,
-   yuzu_tar_timeline_js_embed, tar_retention_tiers_tsv_embed,
+   yuzu_tar_timeline_js_embed,
+   tar_retention_tiers_tsv_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',

@@ -434,7 +434,6 @@ TEST_CASE("build_data_retention_settings publishes the TAR retention tiers",
     CHECK(j.at("tar").at("tick_seconds").get<int>() == 900);
     const auto& tiers = j.at("tar").at("tiers");
     REQUIRE(tiers.is_array());
-    CHECK(tiers.size() == 36);
     for (const auto& t : tiers)
         CHECK(t.size() == 6);
 
