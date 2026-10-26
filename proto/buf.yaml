@@ -11,8 +11,9 @@ breaking:
     # breaking, so we should just not use the field, not remove it from the
     # protobufs." Nothing is ever deleted from a .proto -- not even with
     # `reserved` (which WIRE_JSON alone accepts) -- and RPCs/services are
-    # never removed. Retire an item by marking it `[deprecated = true]`
-    # (or `option deprecated = true;`) and ceasing to use it. These are
+    # never removed. Retire an item by ceasing to use it and marking it
+    # `[deprecated = true]` / `option deprecated = true;` where protobuf
+    # has that option (a oneof has none: deprecate its fields). These are
     # FILE-category rules, so moving a message/enum/service to another
     # file also counts as a deletion. Rule IDs checked against buf 1.50.0
     # `buf config ls-breaking-rules`.

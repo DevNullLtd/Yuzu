@@ -23,7 +23,7 @@ You are the first agent consulted when planning cross-module changes. You design
 ## Responsibilities
 
 - **Cross-module changes** — Review any change spanning >2 directories. Evaluate whether new logic belongs in an existing module or warrants a new one.
-- **Proto backward compatibility** — Guard protobuf field number stability. No field type changes. Nothing is ever deleted from a `.proto` — not fields, oneofs, enum values, messages, enums, RPCs, services or files, and not even with `reserved` (owner ruling 2026-10-26). Retire with `[deprecated = true]` / `option deprecated = true;` and stop using it. Enforced by the `*_NO_DELETE` rules in `proto/buf.yaml`.
+- **Proto backward compatibility** — Guard protobuf field number stability. No field type changes. Nothing is ever deleted from a `.proto` — not fields, oneofs, enum values, messages, enums, RPCs, services or files, and not even with `reserved` (owner ruling 2026-10-26). Retire by ceasing to use it and marking it `[deprecated = true]` / `option deprecated = true;` where protobuf has that option (a oneof has none: deprecate its fields). Enforced by the `*_NO_DELETE` rules in `proto/buf.yaml`.
 - **Plugin ABI stability** — Guard `plugin.h` struct layouts and `YUZU_PLUGIN_ABI_VERSION`. Any ABI change requires version increment with migration plan.
 - **Dependency direction** — Enforce that dependencies flow downward: server → proto, agent → proto, agent → sdk. No circular dependencies. No upward references.
 - **Meson dependency graph** — Approve changes to `meson.build` that add new library dependencies or change the build graph.
