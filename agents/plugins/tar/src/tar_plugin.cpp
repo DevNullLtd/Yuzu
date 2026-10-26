@@ -38,7 +38,6 @@
 #include "tar_perf.hpp"
 #include "tar_proc_perf.hpp"
 #include "tar_schema_registry.hpp"
-#include <yuzu/tar_retention_tick.hpp> // kTarRollupTickSeconds (shared with the data-retention API)
 #include "tar_aggregator.hpp"
 #include "tar_software_core.hpp"
 #include "tar_sql_executor.hpp"
@@ -46,6 +45,7 @@
 #include <yuzu/agent/network_interfaces.hpp>
 #include <yuzu/agent/process_enum.hpp>
 #include <yuzu/plugin.hpp>
+#include <yuzu/tar_retention_tick.hpp> // kTarRollupTickSeconds (shared with the data-retention API)
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>

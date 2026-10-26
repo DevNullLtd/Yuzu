@@ -68,6 +68,24 @@ TEST_CASE("parse_tar_retention_tiers rejects malformed tables naming the line",
     bad(with_header("process\tlive\trows\t-5\n"), "line 2");
     bad(with_header("process\tlive\trows\t5x\n"), "line 2");
     bad(with_header("process\tlive\trows\t5\nprocess\tlive\trows\t6\n"), "line 3");
+    bad(with_header("process\tlive\trows\t99999999999999999999\n"), "line 2");
+    bad(with_header("process\tlive\trows\t+5\n"), "line 2");
+    bad(with_header("process\tlive\trows\t 5\n"), "line 2");
+    bad(with_header("process\tlive\trows\t5 \n"), "line 2");
+    bad(with_header("process\tlive\trows\t5\textra\n"), "line 2");
+    bad(kHeader, "no tier rows"); // an empty table must not read as a valid empty answer
+}
+
+TEST_CASE("parse_tar_retention_tiers tolerates framing quirks", "[tar][retention]") {
+    const auto good = [](const std::string& tsv) {
+        auto r = parse_tar_retention_tiers(tsv);
+        INFO(tsv);
+        REQUIRE(r.has_value());
+        CHECK(r->size() == 1);
+    };
+    good("source\ttier\tlimit_kind\tlimit\r\nprocess\tlive\trows\t5\n"); // CRLF header
+    good(with_header("process\tlive\trows\t5"));                           // no trailing newline
+    good(std::string("\n\n") + with_header("process\tlive\trows\t5\n")); // leading blank lines
 }
 
 TEST_CASE("the embedded TAR retention table parses", "[tar][retention]") {
@@ -99,6 +117,8 @@ TEST_CASE("guaranteed_depth_seconds is limit minus bucket; null for row counts",
     CHECK(guaranteed_depth_seconds({"perf", "live", false, 604800}) == 604800);
     CHECK(guaranteed_depth_seconds({"process", "live", true, 100000}) == std::nullopt);
     CHECK(guaranteed_depth_seconds({"x", "hourly", false, 60}) == 0); // never negative
+    CHECK(guaranteed_depth_seconds({"x", "daily", false, 86400}) == 0); // limit == bucket
+    CHECK(guaranteed_depth_seconds({"netqual", "boot", false, 400}) == 400); // boot: bucket 0
 }
 
 TEST_CASE("worked ages for the process source", "[tar][retention]") {
@@ -115,10 +135,15 @@ TEST_CASE("worked ages for the process source", "[tar][retention]") {
     CHECK_FALSE(holds("hourly", 3));
     CHECK(holds("daily", 3));
     CHECK(holds("monthly", 3));
-    // 6 weeks: daily gone, monthly holds.
+    // Exactly on the boundary does not hold (strict <): daily depth is 30 d.
+    CHECK_FALSE(holds("daily", 30));
+    // 6 weeks: hourly and daily gone, monthly holds.
+    CHECK_FALSE(holds("hourly", 42));
     CHECK_FALSE(holds("daily", 42));
     CHECK(holds("monthly", 42));
-    // 10 months: monthly holds.
+    // 10 months: only monthly holds.
+    CHECK_FALSE(holds("hourly", 304));
+    CHECK_FALSE(holds("daily", 304));
     CHECK(holds("monthly", 304));
     // 14 months: nothing holds.
     CHECK_FALSE(holds("hourly", 426));

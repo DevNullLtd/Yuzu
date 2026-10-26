@@ -5542,15 +5542,25 @@ case) and `guaranteed_depth_seconds`. Roll-up rows age from the start of their b
 a time-based tier is guaranteed for `limit - bucket_seconds` (a 365-day monthly tier is
 guaranteed for 334 days). It is `null` for `rows` tiers, whose time depth depends on how
 fast a device writes. `guaranteed_depth_seconds` is a floor on how long a record is kept, not
-where it sits: a record is still in its finer tier until the coarser roll-up closes. The
+where it sits: a record is still in its finer tier until the coarser roll-up closes. It is a
+floor on rows that exist, not on coverage: after an agent is offline longer than a tier's
+roll-up catch-up window (2 h hourly, 2 d daily, about 62 d monthly) the missed span is a gap in
+that tier, not a deeper tier. The
 `usage`/`live` row is a backstop, not an operative bound: the usage fold bounds its own open
 set (20,000 runs) before this limit can apply.
 
-These are the registry **defaults** every agent applies, not per-device readings: TAR
-prunes on the agent, so the server has no live value. A paused source is never pruned;
-rows may outlive their limit by up to `tick_seconds`, longer when the retention clock guard
-declines a prune, and longer still while a backlog drains through the per-pass delete cap
+These are the registry **defaults** an agent of this server's release applies (agents on other
+releases may differ), not per-device readings: TAR prunes on the agent, so the server has no
+live value. A paused or errored source is never pruned; while the agent is running, rows may
+outlive their limit by up to `tick_seconds` (an offline agent or a disabled plugin prunes
+nothing), longer when the retention clock guard declines a prune, shorter by any plausible
+forward skew of the endpoint clock, which the guard does not decline (the depth is measured on
+the agent's own clock), and longer still while a backlog drains through the per-pass delete cap
 (5,000 rows per table per tick). `tar` is `null` only if the server's embedded table cannot be read.
+
+The order of `tiers` is unspecified; match rows by (`source`, `tier`). Clients must tolerate
+unknown `tier` and `limit_kind` values: a new tier is an additive change. A per-device or
+server-enforced reading, if one ever ships, lands under a new key, never by redefining `tiers`.
 
 ```json
 {

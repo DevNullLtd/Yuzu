@@ -746,7 +746,8 @@ TEST_CASE("openapi_spec_json(): the data-retention operation documents the TAR t
     const std::string description = get_op.value("description", "");
     for (const char* needle :
          {"tick_seconds", "guaranteed_depth_seconds", "not per-device readings",
-          "paused source is never pruned", "outlive their limit", "per-pass delete cap"})
+          "paused or errored source is never pruned", "outlive their limit",
+          "per-pass delete cap", "catch-up window", "not on coverage"})
         CHECK(description.find(needle) != std::string::npos);
 
     const std::string ok = get_op["responses"]["200"].value("description", "");

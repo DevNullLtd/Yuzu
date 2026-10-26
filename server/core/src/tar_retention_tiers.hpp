@@ -96,6 +96,8 @@ parse_tar_retention_tiers(std::string_view tsv) {
     }
     if (!header_seen)
         return std::unexpected("line 1: bad header");
+    if (out.empty())
+        return std::unexpected("no tier rows");
     return out;
 }
 
