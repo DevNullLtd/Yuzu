@@ -613,6 +613,49 @@ TEST_CASE("stability model: the default model is byte-identical to no model", "[
     }
 }
 
+TEST_CASE("stability model: default outputs match pinned-base raw fixtures", "[dex][stability]") {
+    // Literals captured from the unmodified base build (before StabilityModel
+    // existed), compared with exact ==. The inputs were recovered by matching the
+    // six pinned outputs against the formula; each row is mk(N, A, crash, hang, rr).
+    struct Pin {
+        StabilityInputs in;
+        double score;
+        StabilityBand band;
+        double breadth, crashes, hangs, regression;
+    };
+    const Pin pins[] = {
+        {mk(50, 7, 10, 3), 90.703999999999994, StabilityBand::Excellent, 8.4000000000000004,
+         0.80000000000000004, 0.096000000000000002, 0.0},
+        {mk(1000, 100, 300, 50, Rr{1.5, 4.0}), 89.719999999999999, StabilityBand::Good, 6.0, 1.2,
+         0.080000000000000002, 3.0},
+        {mk(100, 100, 500, 500, Rr{3.0, 9.0}), 0.0, StabilityBand::Poor, 60.0, 20.0, 8.0, 12.0},
+        {mk(1000, 100, 300, 0, Rr{2.0, 4.5}), 86.799999999999997, StabilityBand::Good, 6.0, 1.2,
+         0.0, 6.0},
+        {mk(7, 3, 9, 4), 68.228571428571428, StabilityBand::Fair, 25.714285714285712,
+         5.1428571428571423, 0.91428571428571426, 0.0},
+        {mk(1000, 100, 300, 0, Rr{2.25, 3.0}), 85.299999999999997, StabilityBand::Good, 6.0, 1.2,
+         0.0, 7.5},
+    };
+    for (const auto& pin : pins) {
+        INFO("N=" << pin.in.reporting_devices << " A=" << pin.in.devices_affected);
+        const StabilityScore got[] = {
+            compute_stability_score(pin.in, kFloor),
+            compute_stability_score(pin.in, kFloor, kStabilityWeights, kStabilityBandEdges,
+                                    kStabilityModel)};
+        for (const auto& r : got) {
+            REQUIRE(r.score.has_value());
+            REQUIRE(r.band.has_value());
+            REQUIRE(r.deductions.size() == 4);
+            CHECK(*r.score == pin.score);
+            CHECK(*r.band == pin.band);
+            CHECK(r.deductions[0].points == pin.breadth);
+            CHECK(r.deductions[1].points == pin.crashes);
+            CHECK(r.deductions[2].points == pin.hangs);
+            CHECK(r.deductions[3].points == pin.regression);
+        }
+    }
+}
+
 TEST_CASE("stability model: known answers at non-default values", "[dex][stability]") {
     // Cap 10 halves the crash intensity: 20 * 300 / (1000 * 10) = 0.6 (1.2 at cap 5).
     const auto in = mk(1000, 100, 300, 0);

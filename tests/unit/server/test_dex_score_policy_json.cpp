@@ -500,6 +500,21 @@ TEST_CASE("policy json: a model parameter in use makes the document version 2 an
     CHECK(dex_score_policy_canonical(parsed(R"({"version":2})")) == kBaseDefaultText);
 }
 
+TEST_CASE("policy json: a confidence just off 0.95 is in use and exactly 0.95 is not",
+          "[dex][policy_json]") {
+    DexScorePolicy p = dex_default_score_policy();
+    p.interval_confidence = 0.9500000001;
+    CHECK(dex_score_policy_uses_model_parameters(p));
+    const std::string t = dex_score_policy_canonical(p);
+    CHECK(json::parse(t)["version"] == 2);
+    CHECK(parsed(t).interval_confidence == 0.9500000001);
+    CHECK(dex_score_policy_canonical(parsed(t)) == t);
+
+    p.interval_confidence = 0.95;
+    CHECK_FALSE(dex_score_policy_uses_model_parameters(p));
+    CHECK(dex_score_policy_canonical(p) == kBaseDefaultText);
+}
+
 TEST_CASE("policy json: presence of an override model field, not its value, selects version 2",
           "[dex][policy_json]") {
     DexScorePolicy p = dex_default_score_policy();

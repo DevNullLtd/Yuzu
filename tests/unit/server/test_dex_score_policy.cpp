@@ -821,6 +821,21 @@ TEST_CASE("policy: the model's acceptance boundaries validate", "[dex][policy]")
     }
 }
 
+TEST_CASE("policy: model_fault agrees with stability_model_valid over the boundary values",
+          "[dex][policy]") {
+    // The same cap, start and full values the scorer's validity test lists.
+    const std::int64_t caps[] = {-1, 0, 1, 5, 1000, 1001};
+    const double ratios[] = {0.5, 1.0, 2.0, 2.5, 3.0, 999.0, 1000.0, 1000.5, kNaN, kInf};
+    for (const auto cap : caps)
+        for (const double start : ratios)
+            for (const double full : ratios) {
+                const StabilityModel m{cap, full, start};
+                INFO("cap " << cap << " start " << start << " full " << full);
+                CHECK(dex_score_policy_detail::model_fault(m).has_value() !=
+                      stability_model_valid(m));
+            }
+}
+
 TEST_CASE("policy: an override's model is checked against the inherited values at its index",
           "[dex][policy]") {
     auto p = with_model(5, 3.0, 1.5);

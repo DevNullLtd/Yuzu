@@ -699,6 +699,35 @@ TEST_CASE("DexStats: the confidence parameter on dex_proportion and dex_rate", "
     CHECK(big90->estimate == big95->estimate);
 }
 
+TEST_CASE("DexStats: default outputs match pinned-base raw values", "[dex][stats]") {
+    // Literals captured from the unmodified base build (before the confidence
+    // parameter existed); exact equality, no tolerance. Inputs: dex_proportion(81, 263),
+    // dex_rate(15, 1.0), dex_rate(2'000'000, 1.0).
+    constexpr double kPropLower = 0.25528851987827422;
+    constexpr double kPropEst = 0.30798479087452474;
+    constexpr double kPropUpper = 0.36620957698280004;
+    constexpr double kRateLower = 8.3953861327833152;
+    constexpr double kRateEst = 15.0;
+    constexpr double kRateUpper = 24.740218871485844;
+    constexpr double kBigLower = 1997229.1396149851;
+    constexpr double kBigUpper = 2002773.7553837411;
+    for (const bool explicit_level : {false, true}) {
+        INFO("explicit 0.95: " << explicit_level);
+        const auto p = explicit_level ? dex_proportion(81, 263, 0.95) : dex_proportion(81, 263);
+        const auto r = explicit_level ? dex_rate(15, 1.0, 0.95) : dex_rate(15, 1.0);
+        const auto b = explicit_level ? dex_rate(2'000'000, 1.0, 0.95) : dex_rate(2'000'000, 1.0);
+        REQUIRE((p && r && b));
+        CHECK(p->lower == kPropLower);
+        CHECK(p->estimate == kPropEst);
+        CHECK(p->upper == kPropUpper);
+        CHECK(r->lower == kRateLower);
+        CHECK(r->estimate == kRateEst);
+        CHECK(r->upper == kRateUpper);
+        CHECK(b->lower == kBigLower);
+        CHECK(b->upper == kBigUpper);
+    }
+}
+
 TEST_CASE("DexStats: an invalid confidence is nullopt, the same counts at 0.95 are not",
           "[dex][stats]") {
     CHECK(dex_proportion(7, 50));
