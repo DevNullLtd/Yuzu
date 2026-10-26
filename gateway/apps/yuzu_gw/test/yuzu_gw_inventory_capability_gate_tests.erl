@@ -63,7 +63,13 @@ gate_test_() ->
               {"a report without a gated key is forwarded unchanged and resolves no connection",
                fun ungated_report_untouched/0},
               {"a registration REPLAY answer records the capability too",
-               fun replay_records_capability/0}]]}.
+               fun replay_records_capability/0},
+              {"a report stripped on an identified, unrecorded connection probes it once",
+               fun unknown_connection_is_probed/0},
+              {"the probe is rate-limited per connection",
+               fun probe_is_rate_limited/0},
+              {"no probe when the connection cannot be identified",
+               fun unidentified_connection_is_not_probed/0}]]}.
 
 setup() ->
     yuzu_gw_test_registry:ensure(),
@@ -324,6 +330,64 @@ replay_records_capability() ->
     ?assertEqual([?CERT, <<"installed_software">>], keys(inventory_via(A, report()))),
     ?assertEqual([], stripped()).
 
+%% An agent the registry holds, so its session can be replayed.
+held_agent() ->
+    Id = iolist_to_binary(["cap-gate-", integer_to_list(erlang:unique_integer([positive]))]),
+    Sid = <<"sess-", Id/binary>>,
+    Dummy = spawn_idle(),
+    ets:insert(?T, {{proc, {dummy, Id}}, Dummy}),
+    ok = yuzu_gw_registry:register_agent(Id, Dummy, Sid, [<<"svc">>], <<"host">>,
+                                         #{agent_id => Id}, conn_test),
+    Sid.
+
+register_calls() ->
+    [{_, W}] = ets:lookup(?T, wire),
+    length([P || {P, _} <- W, P =:= ?REG_PATH]).
+
+%% A silent reconnect: the connection was never answered. The stripped report
+%% queues a replay of its own session; the replay's answer records the
+%% connection, so the next report is forwarded.
+unknown_connection_is_probed() ->
+    A = upstream(a),
+    answers(A, [?CAP]),
+    Sid = held_agent(),
+    ?assertEqual([<<"installed_software">>],
+                 keys(inventory_via(A, (report())#{session_id := Sid}))),
+    ok = wait_until(fun() -> meck:num_calls(yuzu_gw_agent, reannounce, '_') > 0 end, 5000),
+    ?assertEqual(1, register_calls()),
+    ?assertEqual([?CERT, <<"installed_software">>],
+                 keys(inventory_via(A, (report())#{session_id := Sid}))),
+    ?assertEqual([{?CERT, <<"upstream_unknown">>}], stripped()).
+
+%% The first probe's answer is a rejection, so nothing is recorded and later
+%% reports are still stripped; a second agent's report on the same connection
+%% inside the window does not start another probe.
+probe_is_rate_limited() ->
+    {_, Conn} = A = upstream(a),
+    ets:insert(?T, {{answer, Conn}, #{accepted => false, server_capabilities => [?CAP]}}),
+    Sid1 = held_agent(),
+    Sid2 = held_agent(),
+    _ = inventory_via(A, (report())#{session_id := Sid1}),
+    ok = wait_until(fun() -> meck:num_calls(yuzu_gw_agent, disconnect, '_') > 0 end, 5000),
+    ?assertEqual(1, register_calls()),
+    ?assertEqual([<<"installed_software">>],
+                 keys(inventory_via(A, (report())#{session_id := Sid2}))),
+    _ = sys:get_state(yuzu_gw_upstream),
+    timer:sleep(100),
+    _ = sys:get_state(yuzu_gw_upstream),
+    ?assertEqual(1, register_calls()).
+
+unidentified_connection_is_not_probed() ->
+    {Sub, _} = A = upstream(a),
+    ets:delete(?T, {route, Sub}),
+    Sid = held_agent(),
+    via(A),
+    {ok, _} = yuzu_gw_upstream:proxy_inventory((report())#{session_id := Sid}),
+    timer:sleep(100),
+    _ = sys:get_state(yuzu_gw_upstream),
+    ?assertEqual(0, register_calls()),
+    ?assertEqual([{?CERT, <<"upstream_unknown">>}], stripped()).
+
 wait_until(Pred, Timeout) when Timeout =< 0 ->
     case Pred() of true -> ok; false -> {error, timeout} end;
 wait_until(Pred, Timeout) ->
@@ -454,3 +518,42 @@ code_change_appends_empty_caps_test() ->
     after
         gen_server:stop(Up, shutdown, 5000)
     end.
+
+%%%===================================================================
+%%% The Erlang literals equal the C++ constants they are copied from
+%%%===================================================================
+
+literals_match_cpp_headers_test() ->
+    Root = filename:join([filename:dirname(?FILE), "..", "..", "..", ".."]),
+    {ok, Caps} = file:read_file(filename:join(Root, "common/include/yuzu/server_capabilities.hpp")),
+    {ok, Typed} = file:read_file(filename:join(Root, "server/core/src/typed_inventory_sources.hpp")),
+    [{Source, Cap}] = yuzu_gw_upstream:gated_inventory_sources(),
+    ?assertMatch({match, [Cap]},
+                 re:run(Caps, "kServerCapCertificateInventoryV1 = \"([^\"]*)\"",
+                        [{capture, all_but_first, binary}])),
+    {match, [Body]} = re:run(Typed, "kTypedInventorySources = \\{(.*?)\\};",
+                             [dotall, {capture, all_but_first, binary}]),
+    {match, Names} = re:run(Body, "^\\s*\"([a-z0-9_]+)\",", [global, multiline,
+                                                              {capture, all_but_first, binary}]),
+    ?assert(lists:member([Source], Names)).
+
+capability_gate_gauge_test_() ->
+    {setup,
+     fun() ->
+             {ok, S1} = application:ensure_all_started(prometheus),
+             {ok, S2} = application:ensure_all_started(telemetry),
+             catch telemetry:detach(yuzu_gw_prometheus),
+             ok = yuzu_gw_telemetry:setup(),
+             S1 ++ S2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [{"the gauge starts at 0 and follows the capability_gate event",
+       fun() ->
+               G = fun() -> prometheus_gauge:value(yuzu_gw_upstream_capability_gate_ready,
+                                                   [node()]) end,
+               ?assertEqual(0, G()),
+               telemetry:execute([yuzu, gw, upstream, capability_gate], #{ready => 1}, #{}),
+               ?assertEqual(1, G()),
+               telemetry:execute([yuzu, gw, upstream, capability_gate], #{ready => 0}, #{}),
+               ?assertEqual(0, G())
+       end}]}.

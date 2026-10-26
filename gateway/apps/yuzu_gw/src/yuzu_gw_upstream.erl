@@ -141,6 +141,13 @@
 %%%       no record or one that could not be told). Unknown is empty: no
 %%%       interceptor (another unary_interceptor configured on default_channel,
 %%%       or grpcbox not running) means every gated key is removed.
+%%%     - A report stripped because its connection was identified but has no
+%%%       record (a silent reconnect to a server no agent of this node has
+%%%       registered through since) starts a capability probe: the reporting
+%%%       agent's session is queued for a registration replay (trigger
+%%%       `capability'), at most once per connection per 30 s, so the record is
+%%%       learnt without waiting for an agent to register again. Reports are
+%%%       stripped until it is.
 %%%   Gated today: certificate_inventory, by certificate_inventory_v1
 %%%   (common/include/yuzu/server_capabilities.hpp). The limit: a gRPC-aware
 %%%   (L7) balancer that sends each request on one HTTP/2 connection to a
@@ -220,7 +227,7 @@
 -export([call_timeout/0]).        %% for testing (upstream_call_timeout_ms validation)
 %% The per-connection capability gate on inventory sources (see the module doc).
 -export([subchannel_interceptor/7, install_subchannel_interceptor/0]).
--export([strip_gated_sources/2]).  %% for testing
+-export([strip_gated_sources/2, gated_inventory_sources/0]).  %% for testing
 %% The reason/stacktrace redaction format_status/1 applies, shared with the
 %% crash-report filter (yuzu_gw_crash_redact), which applies it to the parts of
 %% a report OTP prints outside format_status.
@@ -295,11 +302,17 @@
 %% ProxyRegister encoder and read back by rpc_register/4.
 -define(PD_SUBCHANNEL, '$yuzu_gw_upstream_subchannel').
 -define(PD_PEER, '$yuzu_gw_upstream_peer').
-%% How long the encoder waits for the subchannel to name its connection. The
-%% subchannel has just answered the same question for this call, so it answers at
-%% once unless its connection died meanwhile; an answer that does not come in
-%% time leaves the connection unknown (every gated key is then removed).
+-define(PD_UNKNOWN_PEER, '$yuzu_gw_upstream_unknown_peer').
+%% The longest the encoder waits for the subchannel to name its connection; the
+%% wait is also capped at half the caller's call timeout (peer_resolve_timeout/0),
+%% so it can never use up a short upstream_call_timeout_ms. The subchannel has
+%% just answered the same question for this call, so it answers at once unless
+%% its connection died meanwhile; an answer that does not come in time leaves the
+%% connection unknown (every gated key is then removed).
 -define(PEER_RESOLVE_TIMEOUT_MS, 1000).
+%% At most one capability probe (a registration replay of the reporting agent's
+%% session) per unknown upstream connection in this window.
+-define(CAP_PROBE_INTERVAL_MS, 30000).
 
 %% The tag of the exception encode_request/2 raises: the request could not be
 %% encoded in this process (see do_rpc/4).
@@ -389,7 +402,11 @@
     %% ProxyRegister answer listed, per upstream HTTP/2 connection process, with
     %% the monitor that drops the entry when the connection exits. Bounded by the
     %% live upstream connections (one per default_channel endpoint).
-    upstream_caps = #{} :: #{pid() => {reference(), [binary()]}}
+    upstream_caps = #{} :: #{pid() => {reference(), [binary()]}},
+    %% When a capability probe was last started for an upstream connection that
+    %% had no record (monotonic ms). Pruned to the probe window on every check,
+    %% so it is bounded by the connections seen unknown within one window.
+    cap_probes = #{} :: #{pid() => integer()}
 }).
 
 %%%===================================================================
@@ -535,7 +552,8 @@ init_state(ClusterId) ->
     emit_notify_queue(0, 0),
 
     %% The capability gate needs to know the subchannel of each call; without the
-    %% interceptor every gated inventory key is removed (fail closed).
+    %% interceptor every gated inventory key is removed (fail closed). The gauge
+    %% yuzu_gw_upstream_capability_gate_ready says which.
     _ = install_subchannel_interceptor(),
 
     {ok, #state{
@@ -600,9 +618,12 @@ handle_call({proxy_inventory, InventoryReport}, _From, State) ->
             Before = notify_counts(State1),
             %% Gated sources are removed for a connection that did not list
             %% their capability (see the module doc), at encode time.
+            _ = erase(?PD_UNKNOWN_PEER),
             Result = do_rpc('ProxyInventory', InventoryReport, inventory, ctx:background(),
                             inventory_gate(State1#state.upstream_caps)),
-            State2 = drain(record_result(Result, State1)),
+            State1a = maybe_probe_capabilities(erase(?PD_UNKNOWN_PEER), InventoryReport,
+                                               State1),
+            State2 = drain(record_result(Result, State1a)),
             {reply, public_result(Result), report_notify_counts(Before, State2)}
     end;
 
@@ -1086,18 +1107,26 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
 terminate(_Reason, _State) ->
     ok.
 
-%% A state from before the capability gate lacks its last field (upstream_caps):
-%% append it empty, so every connection starts unknown (fail closed), and
-%% install the interceptor init/1 would have installed. Other shapes are kept.
+%% A state from before the capability gate lacks its last fields (upstream_caps,
+%% cap_probes, or only cap_probes): append them empty, so every connection
+%% starts unknown (fail closed), and install the interceptor init/1 would have
+%% installed. Other shapes are kept.
 code_change(_OldVsn, State, _Extra) ->
-    case is_tuple(State) andalso tuple_size(State) =:= record_info(size, state) - 1
-         andalso element(1, State) =:= state of
+    Size = record_info(size, state),
+    case is_tuple(State) andalso element(1, State) =:= state
+         andalso tuple_size(State) >= Size - 2 andalso tuple_size(State) < Size of
         true ->
+            %% upstream_caps and cap_probes are the last two fields, both maps.
             _ = install_subchannel_interceptor(),
-            {ok, erlang:append_element(State, #{})};
+            {ok, pad_state(State, Size)};
         false ->
             {ok, State}
     end.
+
+pad_state(State, Size) when tuple_size(State) < Size ->
+    pad_state(erlang:append_element(State, #{}), Size);
+pad_state(State, _Size) ->
+    State.
 
 %% @doc What a crash report and sys:get_status/1 show of this process.
 %%
@@ -1580,7 +1609,7 @@ replay_verdict(SessionIds, #state{cb_state = open} = State) ->
 replay_verdict(SessionIds, State) ->
     %% closed or half_open. half_open queues on purpose: the first replay
     %% RPC is the probe that decides whether the breaker closes.
-    enqueue_sessions(SessionIds, State).
+    enqueue_sessions(SessionIds, heartbeat, State).
 
 %% @doc Queue the entries for the sessions a heartbeat verdict named (#1197).
 %% Ids are resolved to entries by session (yuzu_gw_registry:
@@ -1609,8 +1638,10 @@ replay_verdict(SessionIds, State) ->
 %% queue depth is reported (so the gauge is not stale until the first pop),
 %% and the drip is started if the queue was empty. A running drip picks the
 %% new entries up on its own. The log line carries counts only, never ids.
--spec enqueue_sessions([binary()], #state{}) -> #state{}.
-enqueue_sessions(SessionIds, State0) ->
+%% Trigger `capability' (maybe_probe_capabilities/3) queues the same way; its
+%% one id is not a verdict, so it is not counted in verdict_dropped.
+-spec enqueue_sessions([binary()], heartbeat | capability, #state{}) -> #state{}.
+enqueue_sessions(SessionIds, Trigger, State0) ->
     #state{replay_queue = Queue, recent_replays = Recent,
            replay_queue_max = Max} = State = prune_recent_replays(State0),
     Entries = yuzu_gw_registry:entries_for_sessions(SessionIds),
@@ -1632,20 +1663,26 @@ enqueue_sessions(SessionIds, State0) ->
               end
           end,
           {[], QueuedAgents, QueueLen, 0, 0, 0}, Entries),
-    emit_verdict_dropped(not_local, NotLocal),
-    emit_verdict_dropped(queue_full, QueueFull),
+    case Trigger of
+        heartbeat ->
+            emit_verdict_dropped(not_local, NotLocal),
+            emit_verdict_dropped(queue_full, QueueFull);
+        capability ->
+            ok
+    end,
     Appended = Size - QueueLen,
     Level = case Appended of 0 -> debug; _ -> info end,
-    logger:log(Level, "Registration replay: heartbeat verdict named ~b session(s); "
+    logger:log(Level, "Registration replay: ~s named ~b session(s); "
                       "queued ~b, not local ~b, already queued ~b, within guard ~b, "
                       "queue full ~b",
-               [length(SessionIds), Appended, NotLocal, AlreadyQueued, WithinGuard, QueueFull]),
+               [trigger_text(Trigger), length(SessionIds), Appended, NotLocal,
+                AlreadyQueued, WithinGuard, QueueFull]),
     case RevAppended of
         [] ->
             State;
         _ ->
             telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
-                              #{count => 1}, #{trigger => heartbeat}),
+                              #{count => 1}, #{trigger => Trigger}),
             emit_queue_depth(Size),
             case Queue of
                 [] -> self() ! replay_next;
@@ -1653,6 +1690,9 @@ enqueue_sessions(SessionIds, State0) ->
             end,
             State#state{replay_queue = Queue ++ lists:reverse(RevAppended)}
     end.
+
+trigger_text(heartbeat)  -> "heartbeat verdict";
+trigger_text(capability) -> "capability probe".
 
 %% @doc The head entry is finished: keep the rest of the queue. When that
 %% empties the queue the replay is complete, so stale guard stamps are pruned
@@ -1710,6 +1750,12 @@ reject_reason_for_log(Response) ->
 %% with a warning. Exported so a test can install it on a channel it started.
 -spec install_subchannel_interceptor() -> installed | not_running | other_interceptor.
 install_subchannel_interceptor() ->
+    Outcome = do_install_subchannel_interceptor(),
+    telemetry:execute([yuzu, gw, upstream, capability_gate],
+                      #{ready => case Outcome of installed -> 1; _ -> 0 end}, #{}),
+    Outcome.
+
+do_install_subchannel_interceptor() ->
     Mine = fun ?MODULE:subchannel_interceptor/7,
     Key = {default_channel, unary},
     case ets:whereis(?CHANNELS_TAB) of
@@ -1761,7 +1807,7 @@ restore_pd(Key, Prev)      -> put(Key, Prev).
 current_peer() ->
     case get(?PD_SUBCHANNEL) of
         SubChannel when is_pid(SubChannel) ->
-            try grpcbox_subchannel:conn(SubChannel, ?PEER_RESOLVE_TIMEOUT_MS) of
+            try grpcbox_subchannel:conn(SubChannel, peer_resolve_timeout()) of
                 {ok, Conn, _Info} ->
                     h2_stream_set:connection(Conn);
                 _ ->
@@ -1817,6 +1863,12 @@ gated_capabilities(Listed) when is_list(Listed) ->
 gated_capabilities(_Listed) ->
     [].
 
+%% @doc The gated {SourceKey, Capability} pairs. Exported for the test that pins
+%% them to the C++ headers they are copied from.
+-spec gated_inventory_sources() -> [{binary(), binary()}].
+gated_inventory_sources() ->
+    ?GATED_INVENTORY_SOURCES.
+
 gated_source_names() ->
     lists:join(", ", [Source || {Source, _Cap} <- ?GATED_INVENTORY_SOURCES]).
 
@@ -1835,7 +1887,11 @@ inventory_gate(CapsByPeer) ->
                                    Peer ->
                                        case maps:find(Peer, CapsByPeer) of
                                            {ok, {_MRef, Listed}} -> Listed;
-                                           error                 -> unknown
+                                           error ->
+                                               %% Identified, never answered:
+                                               %% the caller may probe it.
+                                               _ = put(?PD_UNKNOWN_PEER, Peer),
+                                               unknown
                                        end
                                end,
                     {Report1, Stripped} = strip_gated_sources(Report, PeerCaps),
@@ -1843,6 +1899,42 @@ inventory_gate(CapsByPeer) ->
                     Report1
             end
     end.
+
+%% The resolve wait: at most ?PEER_RESOLVE_TIMEOUT_MS and at most half the call
+%% timeout of proxy_inventory/1, so the caller is answered before it gives up.
+peer_resolve_timeout() ->
+    min(?PEER_RESOLVE_TIMEOUT_MS, max(1, call_timeout() div 2)).
+
+%% @doc The capability probe (Gate 8 G8-10-conn-swap-no-replay). A gated key was
+%% removed because the report's connection (Peer) has no recorded answer, for
+%% example after the subchannel reconnected to a server none of this node's
+%% agents registered through since. Waiting for an agent to register again could
+%% take indefinitely in a quiet fleet, so the reporting agent's session is queued
+%% for a registration replay through the existing drip (enqueue_sessions/3): its
+%% accepted answer records the capabilities of the connection it lands on. At
+%% most one probe per connection per ?CAP_PROBE_INTERVAL_MS; the replay's own
+%% session guard and one-entry-per-agent rule apply too. Reports keep being
+%% stripped until a record exists. With several endpoints in default_channel the
+%% replay goes to whichever subchannel the balancer picks, so it may record
+%% another connection first; a later report over this one probes again after the
+%% window. Nothing is queued while the breaker is open.
+-spec maybe_probe_capabilities(pid() | undefined, map(), #state{}) -> #state{}.
+maybe_probe_capabilities(Peer, #{session_id := SessionId},
+                         #state{cap_probes = Probes, cb_state = CbState} = State)
+  when is_pid(Peer), is_binary(SessionId), SessionId =/= <<>>, CbState =/= open ->
+    Now = erlang:monotonic_time(millisecond),
+    Live = maps:filter(fun(_, At) -> Now - At < ?CAP_PROBE_INTERVAL_MS end, Probes),
+    case maps:is_key(Peer, Live) of
+        true ->
+            State#state{cap_probes = Live};
+        false ->
+            logger:info("Upstream connection ~p has no recorded capabilities; "
+                        "replaying one agent registration to learn them", [Peer]),
+            enqueue_sessions([SessionId], capability,
+                             State#state{cap_probes = Live#{Peer => Now}})
+    end;
+maybe_probe_capabilities(_Peer, _Report, State) ->
+    State.
 
 has_gated_source(#{plugin_data := Data}) when is_map(Data) ->
     lists:any(fun({Source, _Cap}) -> is_map_key(Source, Data) end, ?GATED_INVENTORY_SOURCES);

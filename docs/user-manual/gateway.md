@@ -566,14 +566,41 @@ connection, and fails closed:
   for a full resend (`need_full`).
 - Each removal is counted in `yuzu_gw_inventory_source_stripped_total{source,reason}`
   and logged as a rate-limited warning.
+- A report stripped because its connection has no record yet (for example after the
+  upstream channel reconnected to a server no agent of this gateway has registered
+  through since) starts a capability probe: the gateway replays the reporting agent's
+  registration through the usual replay drip (`yuzu_gw_registration_replay_triggered_total{trigger="capability"}`),
+  at most once per connection every 30 seconds, and the answer records the
+  connection. Reports on that connection are stripped until the answer arrives. With
+  several endpoints in `default_channel`, the replay goes to whichever endpoint the
+  channel picks, so it can take more than one probe to reach every connection.
 
 The connection of a call is identified by a unary interceptor that the upstream
 client installs on `default_channel` at start. If you configured your own
 `unary_interceptor` on `default_channel`, the gateway does not replace it and logs
 a warning at start. It then cannot tell which connection a call uses, so every
-gated key is removed. The record is per connection, so a gRPC-aware (L7) balancer
-that sends the requests of one HTTP/2 connection to different backends defeats it.
-An L4 balancer, which pins a connection to one backend, does not.
+gated key is removed (`yuzu_gw_upstream_capability_gate_ready` reads 0). The record is
+per connection. An L4 balancer, which pins a connection to one backend, does not
+weaken it. Behind a gRPC-aware (L7) balancer that spreads the requests of one HTTP/2 connection across backends, the gateway cannot tell which backend a report reaches: it forwards the key on a connection whose latest answer listed the capability, and the next request on that connection can land on a different backend. A backend older than the typed-source reservation release (slice-2 PR 2a-1, which adds `certificate_inventory` to the typed set) stores such a blob in the generic inventory store, readable under `Inventory:Read` and `Infrastructure:Read` rather than the certificate inventory's own gate. No tagged release contains the reservation yet. **Requirement:** before you enable certificate-collecting agents behind such a balancer, run every backend at the typed-source reservation release or later, and do not roll any backend back below it while those agents report.
+
+**Troubleshooting missing certificate inventory behind a gateway.** If devices behind
+a gateway show no certificate data, read `yuzu_gw_inventory_source_stripped_total` on
+that gateway:
+
+- `reason="upstream_lacks_capability"` rising: the server the gateway reaches answered
+  `ProxyRegister` without `certificate_inventory_v1`. Check that server's release and
+  that its certificate inventory store opened (`/readyz` lists
+  `certificate_inventory_store`).
+- `reason="upstream_unknown"` rising briefly after a reconnect: expected; the capability
+  probe records the connection within one replay (check
+  `yuzu_gw_registration_replay_triggered_total{trigger="capability"}` and the
+  `Registration replay` log lines).
+- `reason="upstream_unknown"` rising steadily: the gateway cannot identify connections.
+  Check `yuzu_gw_upstream_capability_gate_ready` (0 means an operator
+  `unary_interceptor` on `default_channel`; the start-up WARN names it) and whether the
+  circuit breaker is open (no probe is queued while it is).
+- No increase at all: the gateway forwarded the source; look at the server's
+  `yuzu_server_cert_inventory_ingest_total`.
 
 ### Stream Status Notification
 
@@ -3082,7 +3109,7 @@ that are actually emitted are listed.
 | `yuzu_gw_register_refused_total` | counter | `Register` calls the gateway edge refused before any upstream call because the agent id was empty or longer than 256 bytes (label `reason`, closed set `agent_id_length` and `unknown`; both created at 0 at start). No label is derived from agent data. |
 | `yuzu_gw_registration_replay_total` | counter | Total registration replay attempts by the drip, any outcome. The drip runs after the upstream circuit breaker recovers, and when a heartbeat verdict lists sessions the gateway still holds |
 | `yuzu_gw_registration_replay_queue_depth` | gauge | Agents still queued for registration replay, whether queued by an upstream recovery or by a heartbeat verdict (0 = idle, label `node`). A non-zero value is normal while a drip runs: each entry takes the `ProxyRegister` RPC time plus the spacing (20 ms by default), so a full 10000-entry verdict queue takes at least 200 s to drain (250 s at 5 ms RPC time, see the table under "Load and convergence bounds"), and a breaker-seeded snapshot can be larger. A value that does not fall over longer than that points to a replay that is not draining (INFERRED). No alert rule ships for it. |
-| `yuzu_gw_registration_replay_triggered_total` | counter | Registration replays started, by `trigger` (`breaker` = the upstream recovered and every agent this node holds is queued for replay, unless a verdict-seeded drip is already queued, in which case the trigger is dropped, `heartbeat` = a heartbeat verdict listed sessions the server does not know and only those are replayed). Both series are created at 0 at start. |
+| `yuzu_gw_registration_replay_triggered_total` | counter | Registration replays started, by `trigger` (`breaker` = the upstream recovered and every agent this node holds is queued for replay, unless a verdict-seeded drip is already queued, in which case the trigger is dropped, `heartbeat` = a heartbeat verdict listed sessions the server does not know and only those are replayed, `capability` = a relayed inventory report reached an upstream connection with no recorded capabilities and the reporting agent's session was replayed to learn them, see [Inventory Proxy](#inventory-proxy)). All three series are created at 0 at start. |
 | `yuzu_gw_heartbeat_unknown_truncated_total` | counter | `BatchHeartbeat` responses whose list of unknown sessions the server truncated at 4096. Sessions beyond the cap may be reported again by later heartbeats. Every occurrence is counted; the matching WARN is logged at most once per 60 s per heartbeat buffer process (the limit resets when that process restarts). |
 | `yuzu_gw_heartbeat_verdict_dropped_total` | counter | Session ids named by a heartbeat verdict that were not queued for replay (label `reason`, closed set: `malformed` = not a usable session id, `not_local` = this node does not hold the session, `circuit_open` = the upstream circuit breaker is open, `queue_full` = the replay queue is at its cap, or the upstream process already holds more than 100 unhandled messages so the ids were not handed to it; the cap bounds only verdict appends, so while a breaker-seeded snapshot of that size or larger drains, every verdict id for an agent not already queued counts here). Every reason is created at 0 at start. Ids already queued, or replayed within the session guard window, are not counted. |
 | `yuzu_gw_heartbeat_buffer_dropped_total` | counter | Heartbeat state the gateway's heartbeat buffer dropped instead of sending (label `reason`, closed set of six, all created at 0 at start: `buffer_full` = a heartbeat of a new session was dropped because the buffer held `max_heartbeat_buffer` sessions, or the oldest whole session was dropped because the buffer was still over `max_heartbeat_buffer_bytes` with no snapshot left to drop; `snapshot_oversize` = a single heartbeat larger than about 3 MiB was sent without its snapshot; `snapshot_evicted` = a retained snapshot was dropped, oldest first, because the buffer was over `max_heartbeat_buffer_bytes`; `heartbeat_oversize` = a heartbeat still larger than about 3 MiB after its snapshot was removed, or with more than 512 status tags, or with a status tag key or value over about 64 KiB or more than about 256 KiB of tag bytes in total (checked before the UTF-8 repair), was forwarded without its status tags; `heartbeat_invalid` = a heartbeat with a status tag that is not valid UTF-8 was forwarded with the invalid bytes replaced by replacement characters (the reason also counts tags removed because a tag was not a binary, and a heartbeat dropped for a bad or empty session id; see Heartbeat Batching); `chunk_rejected` = a single heartbeat the server rejected with a non-transient status was dropped). What is lost is older heartbeat state; for `heartbeat_oversize` the status tags of one heartbeat, for `heartbeat_invalid` only the invalid bytes, and for `chunk_rejected` one whole heartbeat. See [Heartbeat Batching](#heartbeat-batching). |
@@ -3092,6 +3119,7 @@ that are actually emitted are listed.
 | `yuzu_gw_upstream_notify_coalesced_total` | counter | Held stream-status notifications replaced by a newer event for the same agent session and stream home, or a failed probe notification superseded by one. Unlabelled, created at 0 at start. It measures suppression, not delivery: an identical repeated `CONNECTED` also counts |
 | `yuzu_gw_upstream_notify_dropped_total` | counter | Stream-status notifications lost at admission because the pending store was at its cap: a new key is admitted only while the held keys plus the key of a half open probe in flight stay below `notify_pending_max` (label `reason`, closed set `at_capacity` and `unknown`, both created at 0 at start; `unknown` catches an unexpected value and is not emitted today). The value `circuit_open` is retired: a notification that arrives while the breaker is not closed is held, and only an older gateway still exports it. It does not count delivery loss after admission (a failed or killed worker, a gateway stop) |
 | `yuzu_gw_inventory_source_stripped_total` | counter | Capability-gated inventory sources removed from a relayed `ReportInventory`, because the upstream connection that carried it did not list the source's capability in its latest accepted `ProxyRegister` answer (see [Inventory Proxy](#inventory-proxy)). The rest of the report is forwarded. Labels `source` (`certificate_inventory`, or `unknown`) and `reason` (`upstream_lacks_capability` = the connection's latest answer did not list it; `upstream_unknown` = no answer recorded for the connection, or the gateway could not tell the connection; `unknown` = any other value, not emitted). Every series starts at 0. A steady rate of `upstream_unknown` with a capable server means the gateway cannot tell connections (check for a WARN at start about `default_channel` having its own `unary_interceptor`). |
+| `yuzu_gw_upstream_capability_gate_ready` | gauge | 1 when the upstream client installed its subchannel interceptor on `default_channel`, so it can tell which upstream connection a relayed inventory report uses; 0 when it could not (an operator `unary_interceptor` on `default_channel`), in which case every capability-gated inventory source is removed. Label `node`, created at 0 at start and set when the upstream client starts. See [Inventory Proxy](#inventory-proxy). |
 | `yuzu_gw_cluster_peers_resolved` | gauge | Peer addresses found by the cluster-formation redial loop's most recent tick (label `node`; HA WS-4 `#4555`). 0 is expected for a genuinely single-node deployment. |
 | `yuzu_gw_cluster_peers_connected` | gauge | Distribution-connected peer nodes as of the most recent redial tick (label `node`; `#4555`). Compare against `peers_resolved` — a sustained gap most often means a distribution-cookie mismatch across replicas. |
 | `yuzu_gw_cluster_connect_failures_total` | counter | Total `net_kernel:connect_node/1` failures from the redial loop (`#4555`). |

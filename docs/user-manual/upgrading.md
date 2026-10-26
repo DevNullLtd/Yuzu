@@ -302,7 +302,17 @@ the older binary and is not read. Plan capacity before agents start reporting: D
 bounded at 1 MiB per device, so a large fleet is storage- and WAL-heavy (see
 [Server administration](server-admin.md#fleet-certificate-inventory-storage)).
 
-## Behaviour change: generic inventory reads never return a typed source's rows
+## Behaviour change: the gateway forwards `certificate_inventory` only to servers that advertise it
+
+Servers now list `certificate_inventory_v1` in `RegisterResponse.server_capabilities`, and the
+gateway enforces it per upstream connection: a relayed report's `certificate_inventory` key is
+forwarded only on a connection whose latest accepted `ProxyRegister` answer listed the capability,
+and removed (counted in `yuzu_gw_inventory_source_stripped_total`) otherwise. No agent sends the
+source yet. Upgrade gateways with or before servers: an older gateway drops the capability field,
+so agents behind it never send the source.
+
+**L7 balancers.** Behind a gRPC-aware (L7) balancer that spreads the requests of one HTTP/2 connection across backends, the gateway cannot tell which backend a report reaches: it forwards the key on a connection whose latest answer listed the capability, and the next request on that connection can land on a different backend. A backend older than the typed-source reservation release (slice-2 PR 2a-1, which adds `certificate_inventory` to the typed set) stores such a blob in the generic inventory store, readable under `Inventory:Read` and `Infrastructure:Read` rather than the certificate inventory's own gate. No tagged release contains the reservation yet. **Requirement:** before you enable certificate-collecting agents behind such a balancer, run every backend at the typed-source reservation release or later, and do not roll any backend back below it while those agents report.
+
 
 **What changed.** The generic inventory store's reads (`query_inventory`, `get_agent_inventory`, `list_inventory_tables` and their REST twins, `POST /api/v1/inventory/evaluate`, and the inventory-query result-set source) no longer return rows for the typed daily-sync sources: `installed_software`, `app_perf`, `device_ci`, `software_licensing`, `app_usage`, and the reserved `certificate_inventory`. Those sources have their own stores and gates. Before this change, a typed source's blob that reached the generic store through an older server's gateway path could be read there under `Infrastructure:Read` or `Inventory:Read` until the next boot purge removed it. That window is now closed on every server at this release or later (see the per-server note below). The gateway also drops a `certificate_inventory` blob, a source no agent sends yet, instead of storing it generically.
 

@@ -41,6 +41,7 @@
     [yuzu, gw, upstream, notify_queue],
     [yuzu, gw, upstream, notify_coalesced],
     [yuzu, gw, upstream, inventory_source_stripped],
+    [yuzu, gw, upstream, capability_gate],
     [yuzu, gw, upstream, registration_replay_triggered],
 
     %% Guardian side-channel forwarding (agent drift events -> control plane)
@@ -215,6 +216,12 @@ handle_event([yuzu, gw, upstream, notify_dropped], #{count := N}, Meta, _Config)
 %% source outside the gated list and a reason outside the two the gateway emits
 %% fold to a pre-seeded `unknown' series, so a bug cannot widen the label set.
 %% The handler must never crash (telemetry detaches a handler that raises).
+%% Whether the upstream client's subchannel interceptor is installed on
+%% default_channel (1) or not (0: every gated inventory key is removed).
+handle_event([yuzu, gw, upstream, capability_gate], #{ready := R}, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_upstream_capability_gate_ready, [node()],
+                         case R of 1 -> 1; _ -> 0 end);
+
 handle_event([yuzu, gw, upstream, inventory_source_stripped], #{count := N}, Meta, _Config) ->
     Source = case maps:get(source, Meta, unknown) of
         <<"certificate_inventory">> -> <<"certificate_inventory">>;
@@ -302,7 +309,7 @@ handle_event([yuzu, gw, heartbeat, session_mismatch], #{count := N}, _Meta, _Con
                            [<<"security">>], N);
 
 %% Heartbeat verdict consumer (#1197). `registration_replay_triggered'
-%% counts replays that started, by trigger (breaker | heartbeat); the label is
+%% counts replays that started, by trigger (breaker | heartbeat | capability); the label is
 %% an atom chosen by yuzu_gw_upstream, never caller-supplied, so a sender
 %% cannot control label cardinality. `unknown_truncated' counts verdicts the
 %% server cut short. `verdict_dropped' counts session ids the verdict named
@@ -317,7 +324,7 @@ handle_event([yuzu, gw, heartbeat, session_mismatch], #{count := N}, _Meta, _Con
 %% every metric.
 handle_event([yuzu, gw, upstream, registration_replay_triggered], #{count := N}, Meta, _Config) ->
     Trigger = case maps:get(trigger, Meta, unknown) of
-        T when T =:= breaker; T =:= heartbeat -> T;
+        T when T =:= breaker; T =:= heartbeat; T =:= capability -> T;
         _ -> unknown
     end,
     prometheus_counter:inc(yuzu_gw_registration_replay_triggered_total,
@@ -566,6 +573,16 @@ declare_metrics() ->
                "upstream_lacks_capability (the connection's latest answer did not "
                "list it), upstream_unknown (no answer recorded for the "
                "connection, or the connection could not be told), or unknown."}]),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_upstream_capability_gate_ready},
+        {labels, [node]},
+        {help, "1 when the upstream client could install its subchannel "
+               "interceptor on default_channel, so it can tell which upstream "
+               "connection a relayed inventory report uses; 0 when it could not "
+               "(an operator unary_interceptor on default_channel, or not yet "
+               "started), in which case every capability-gated inventory source "
+               "is removed from relayed reports"}]),
+    prometheus_gauge:set(yuzu_gw_upstream_capability_gate_ready, [node()], 0),
     [prometheus_counter:inc(yuzu_gw_inventory_source_stripped_total, [S, R], 0)
      || S <- [<<"certificate_inventory">>, <<"unknown">>],
         R <- [<<"upstream_lacks_capability">>, <<"upstream_unknown">>, <<"unknown">>]],
@@ -634,7 +651,9 @@ declare_metrics() ->
         {help, "Registration replays started, by trigger (breaker = the upstream "
                "recovered from failures, replaying every agent this node holds; "
                "heartbeat = the server's heartbeat verdict listed sessions it does "
-               "not know, replaying only those)"}]),
+               "not know, replaying only those; capability = a relayed inventory "
+               "report reached an upstream connection with no recorded "
+               "capabilities, replaying the reporting agent's session)"}]),
     prometheus_counter:declare([
         {name, yuzu_gw_heartbeat_unknown_truncated_total},
         {labels, []},
@@ -655,7 +674,7 @@ declare_metrics() ->
     %% Create every series at 0 now (a series that first appears already at 1
     %% is invisible to increase()).
     [prometheus_counter:inc(yuzu_gw_registration_replay_triggered_total, [T], 0)
-     || T <- [<<"breaker">>, <<"heartbeat">>]],
+     || T <- [<<"breaker">>, <<"heartbeat">>, <<"capability">>]],
     [prometheus_counter:inc(yuzu_gw_heartbeat_verdict_dropped_total, [R], 0)
      || R <- [<<"malformed">>, <<"not_local">>, <<"circuit_open">>, <<"queue_full">>]],
     prometheus_counter:declare([

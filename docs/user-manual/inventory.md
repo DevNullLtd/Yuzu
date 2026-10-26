@@ -1224,10 +1224,15 @@ points. It never lands in the generic inventory store, on either path.
   `ProxyRegister` answer listed `certificate_inventory_v1`. To any other connection, or one it
   cannot identify, it removes that key, forwards the rest of the report, and counts the removal
   in `yuzu_gw_inventory_source_stripped_total`. This covers registration replays the agent never
-  sees and reports routed to a different server. See "Inventory Proxy" in [Gateway](gateway.md).
-- **Deploy order.** Upgrade gateways with or before servers, and servers before agents. `certificate_inventory` is in the
-  typed set from the typed-source read filter change, so even a gateway-proxied blob
-  reaching a server without this store is not stored in the generic store.
+  sees, and a reconnect or failover to a different server that pins a connection to one backend
+  (an L4 balancer, or several gateway endpoints). It does not cover an L7 balancer: see the
+  next bullet. See "Inventory Proxy" in [Gateway](gateway.md).
+- **L7 balancers.** Behind a gRPC-aware (L7) balancer that spreads the requests of one HTTP/2 connection across backends, the gateway cannot tell which backend a report reaches: it forwards the key on a connection whose latest answer listed the capability, and the next request on that connection can land on a different backend. A backend older than the typed-source reservation release (slice-2 PR 2a-1, which adds `certificate_inventory` to the typed set) stores such a blob in the generic inventory store, readable under `Inventory:Read` and `Infrastructure:Read` rather than the certificate inventory's own gate. No tagged release contains the reservation yet. **Requirement:** before you enable certificate-collecting agents behind such a balancer, run every backend at the typed-source reservation release or later, and do not roll any backend back below it while those agents report.
+- **Deploy order.** Upgrade gateways with or before servers, and servers before agents. A server at
+  the typed-source reservation release (2a-1) or later never stores a `certificate_inventory` blob
+  in the generic store, even one that reaches it without this store; a server older than that
+  stores it there. The gateway's per-connection check keeps the blob away from a server that did
+  not advertise the capability, except behind an L7 balancer (previous bullet).
 
 ## See also
 
