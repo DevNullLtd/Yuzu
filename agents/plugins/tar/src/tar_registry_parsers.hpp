@@ -62,19 +62,23 @@ struct RegistryScope {
     std::vector<std::string> hklm;       // HKLM-relative paths
     std::vector<std::string> hku_suffix; // appended after the HKU sid component
 
-    /// Concrete roots for the loaded hive names under HKEY_USERS. `.DEFAULT` and
-    /// `<sid>_Classes` are not user profiles and are skipped.
+    /// Concrete roots for the loaded hive names under HKEY_USERS. Only SID-named hives
+    /// are user profiles (see is_user_hive_name); every other name is skipped.
     [[nodiscard]] std::vector<std::string>
     roots_for(const std::vector<std::string>& hku_subkeys) const;
 };
 
+/// A loaded user profile's HKEY_USERS key is its SID: "S-1-" and then digits and dashes.
+/// Anything else is not watched -- `.DEFAULT`, `<sid>_Classes`, and the temporary
+/// `YUZU_HIVE_<sid>_<hex>_<n>` mounts sibling plugins load for a logged-out profile and
+/// unload without force: a watch handle held open on one would fail that unload and leave
+/// the user's NTUSER.DAT locked.
 [[nodiscard]] inline bool is_user_hive_name(std::string_view n) {
-    if (n.empty() || n.front() == '.')
+    constexpr std::string_view kSidPrefix = "S-1-";
+    if (!n.starts_with(kSidPrefix) || n.size() == kSidPrefix.size())
         return false;
-    std::string lower(n);
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return !lower.ends_with("_classes");
+    return std::all_of(n.begin() + kSidPrefix.size(), n.end(),
+                       [](char c) { return (c >= '0' && c <= '9') || c == '-'; });
 }
 
 inline std::vector<std::string>
@@ -321,7 +325,8 @@ struct RegistryValueRead {
 /// most kSkippedCap; one more makes the read Capped). They are absent from `keys`,
 /// and the diff keeps whatever the baseline holds at or under them rather than
 /// reading their absence as a deletion. A denied child therefore never blinds the
-/// rest of its root: `Unreadable` means the ROOT itself could not be read.
+/// rest of its root. `Unreadable` means the root, or any key beneath it other than an
+/// access-denied child, could not be read.
 struct SubtreeRead {
     RegistryReadStatus status{RegistryReadStatus::Unreadable};
     std::map<std::string, std::map<std::string, RegistryValueRead>> keys;

@@ -17,6 +17,7 @@
 #include "tar_db.hpp"
 
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp> // yuzu::log_key_token: a denied key name is user-chosen (CWE-117)
 
 #include <algorithm>
 #include <format>
@@ -31,7 +32,9 @@ constexpr const char* kEmptyBaselineJson = R"({"v":1,"keys":{}})";
 
 std::string baseline_collector(const std::string& root) { return "registry:" + root; }
 
-// The gap row text for child keys that denied read access: names the first few.
+// The gap row text for child keys that denied read access: names the first few. The names
+// are key names a local user chose under their own hive, so each goes through log_key_token
+// (control bytes and line separators folded) before it lands in the stored row.
 std::string denied_children_detail(const std::string& root, const std::vector<std::string>& denied) {
     constexpr std::size_t kShown = 3;
     std::string d = std::format("gap:unreadable:{} ({} child key(s) denied read access; their values "
@@ -39,7 +42,7 @@ std::string denied_children_detail(const std::string& root, const std::vector<st
                                 "are not derived, until they can be): ",
                                 root, denied.size());
     for (std::size_t i = 0; i < denied.size() && i < kShown; ++i)
-        d += (i == 0 ? "" : "; ") + denied[i];
+        d += (i == 0 ? "" : "; ") + yuzu::log_key_token(denied[i]);
     if (denied.size() > kShown)
         d += std::format("; +{} more", denied.size() - kShown);
     return d;
@@ -273,10 +276,19 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
                 for (const auto& s : rd.skipped)
                     if (known.insert(s).second)
                         gained = true;
-                if (rd.status == RegistryReadStatus::Capped)
+                if (rd.status == RegistryReadStatus::Capped) {
+                    // Bounded: each Capped read can add up to kSkippedCap fresh names, so a root
+                    // that stays Capped would grow the persisted cursor row without limit. Past
+                    // the cap the sorted prefix is kept (`gained` was decided above, so a new name
+                    // still writes its one gap row); a name clamped away can raise one more gap
+                    // row when a later read sees it again -- at most one a tick, and 33 denied
+                    // children under one root is already the Capped anomaly the manual documents.
                     st.skipped.assign(known.begin(), known.end());
-                else
+                    if (st.skipped.size() > kSkippedCap)
+                        st.skipped.resize(kSkippedCap);
+                } else {
                     st.skipped = std::move(rd.skipped);
+                }
                 if (gained)
                     rows.push_back(registry_gap_row("unreadable",
                                                     root + ":" + std::to_string(read_end),
@@ -452,7 +464,10 @@ struct WinWatcher {
 
     // No live watcher: every root is unarmed, so the collect tick reads each one every
     // tick (reconcile-only coverage) instead of trusting a watch that is not there.
-    void unarm_all() {
+    // noexcept: the catch handlers below call this, and its one throwing operation is the
+    // lock -- whose failure means the mutex is unusable and the agent cannot continue safely
+    // either way. noexcept makes that terminate explicit here, not implicit in the call sites.
+    void unarm_all() noexcept {
         std::lock_guard lock(mu);
         live = false;
         for (auto& s : slots)
@@ -592,6 +607,22 @@ struct ReadCtx {
     std::vector<wchar_t> name = std::vector<wchar_t>(kMaxValueNameChars + 1);
 };
 
+// What RegQueryInfoKeyW says about one key, taken before and after its enumeration so a write
+// that landed during the walk is detectable (see read_key).
+struct KeyInfo {
+    DWORD n_sub{0}, max_sub{0}, n_val{0}, max_data{0};
+    FILETIME written{};
+
+    bool operator==(const KeyInfo& o) const {
+        return n_sub == o.n_sub && n_val == o.n_val && CompareFileTime(&written, &o.written) == 0;
+    }
+};
+
+LONG query_key(HKEY key, KeyInfo& out) {
+    return RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, &out.n_sub, &out.max_sub, nullptr,
+                            &out.n_val, nullptr, &out.max_data, nullptr, &out.written);
+}
+
 void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth) {
     if (ctx.capped || ctx.unreadable)
         return;
@@ -600,12 +631,12 @@ void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth
         ctx.capped = true;
         return;
     }
-    DWORD n_sub = 0, max_sub = 0, n_val = 0, max_data = 0;
-    if (RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, &n_sub, &max_sub, nullptr, &n_val,
-                         nullptr, &max_data, nullptr, nullptr) != ERROR_SUCCESS) {
+    KeyInfo before;
+    if (query_key(key, before) != ERROR_SUCCESS) {
         ctx.unreadable = true;
         return;
     }
+    const DWORD max_sub = before.max_sub, max_data = before.max_data;
     auto& values = ctx.out->keys[full]; // present even when empty: a vanished key is detectable
     // lpData is never null: with a null buffer RegEnumValueW answers ERROR_SUCCESS and only
     // reports the size, so a value that grew since QueryInfoKey would be copied from nullptr.
@@ -687,6 +718,18 @@ void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth
         if (ctx.capped || ctx.unreadable)
             return;
     }
+
+    // Both enumerations above are index-driven: an entry deleted at an index already passed
+    // shifts the next one into it, so that one is never visited -- yet the read would end
+    // Complete and a surviving value or key would be derived as removed. Counts and last-write
+    // time are compared with the first query (the time catches a delete and a create that net
+    // to the same count); any difference means this key was written to during the walk, so the
+    // read is partial (Capped: no removals, and the root is read again next tick). A key that
+    // can no longer be queried was deleted mid-walk, which is the same answer. Control flow
+    // reaches here only when neither `capped` nor `unreadable` is set.
+    KeyInfo after;
+    if (query_key(key, after) != ERROR_SUCCESS || !(after == before))
+        ctx.capped = true;
 }
 
 SubtreeRead read_root(const std::string& root, std::int64_t deadline) noexcept {

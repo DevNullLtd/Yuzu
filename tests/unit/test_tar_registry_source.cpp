@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <format>
 #include <map>
 #include <optional>
 #include <set>
@@ -109,9 +110,11 @@ TEST_CASE("default_registry_scope: curated roots; per-user roots skip non-profil
           "[tar][registry][pure]") {
     const auto scope = default_registry_scope();
     // Two profile hives pass the filter (an interactive SID and LocalSystem); the
-    // dot-prefixed default hive and both `_Classes` spellings do not.
+    // dot-prefixed default hive, both `_Classes` spellings and a sibling plugin's temporary
+    // profile mount do not.
     const auto roots = scope.roots_for({"S-1-5-21-1", ".DEFAULT", "S-1-5-21-1_Classes",
-                                         "S-1-5-21-1_CLASSES", "S-1-5-18"});
+                                         "S-1-5-21-1_CLASSES", "S-1-5-18",
+                                         "YUZU_HIVE_S-1-5-21-2_0123456789abcdef_1"});
     const std::set<std::string> got(roots.begin(), roots.end());
     CHECK(got.size() == roots.size()); // every root once
 
@@ -149,6 +152,22 @@ TEST_CASE("default_registry_scope: curated roots; per-user roots skip non-profil
 
     CHECK_FALSE(got.contains("HKU\\.DEFAULT\\Software\\Policies"));
     CHECK_FALSE(got.contains("HKU\\S-1-5-21-1_Classes\\Software\\Policies"));
+}
+
+TEST_CASE("is_user_hive_name accepts SID-named hives only", "[tar][registry][pure]") {
+    CHECK(is_user_hive_name("S-1-5-21-1004336348-1177238915-682003330-1000"));
+    CHECK(is_user_hive_name("S-1-5-18"));
+    // Not user profiles: the default hive, the classes hives, and the temporary mounts
+    // (agents/shared/win_reg_handle.hpp) sibling plugins load for a logged-out profile and
+    // unload without force -- a watch handle open on one would fail that unload.
+    CHECK_FALSE(is_user_hive_name(".DEFAULT"));
+    CHECK_FALSE(is_user_hive_name("S-1-5-21-1_Classes"));
+    CHECK_FALSE(is_user_hive_name("S-1-5-21-1_CLASSES"));
+    CHECK_FALSE(is_user_hive_name("YUZU_HIVE_S-1-5-21-1_0123456789abcdef_1"));
+    CHECK_FALSE(is_user_hive_name(""));
+    CHECK_FALSE(is_user_hive_name("S-1-"));
+    CHECK_FALSE(is_user_hive_name("S-1-5-x"));
+    CHECK_FALSE(is_user_hive_name("alice"));
 }
 
 TEST_CASE("render_reg_data renders each registry type", "[tar][registry][pure]") {
@@ -960,6 +979,30 @@ TEST_CASE("registry source: the denied child set writes a gap only when it gains
         CHECK_THAT(detail, ContainsSubstring("(4 child key(s) denied read access"));
         CHECK_THAT(detail, ContainsSubstring(a + "; " + b + "; " + c + "; +1 more"));
         CHECK_THAT(detail, !ContainsSubstring(d));
+    }
+
+    SECTION("a denied child's name is key text a user chose: control bytes never reach the stored detail") {
+        next_tick(S::Complete, {kRoot + "\\x\r\n\x1b[31mred", kRoot + "\\tab\there"});
+        REQUIRE(gap_count() == 1);
+        const std::string detail = last_gap();
+        CHECK(detail.find_first_of("\r\n\t\x1b") == std::string::npos);
+        // CR, LF and ESC each fold to one underscore; the TAB too. Names list in sorted order.
+        CHECK_THAT(detail, ContainsSubstring("tab_here; " + kRoot + "\\x___[31mred"));
+    }
+
+    SECTION("a root that stays Capped cannot grow the stored denied set past kSkippedCap") {
+        // Every Capped read brings kSkippedCap names the stored set has not seen. Each still
+        // gains (its one gap row), but the persisted set holds the sorted first kSkippedCap.
+        for (int round = 0; round < 3; ++round) {
+            std::vector<std::string> fresh;
+            for (std::size_t i = 0; i < kSkippedCap; ++i)
+                fresh.push_back(std::format("{}\\D{}_{:03}", kRoot, round, i));
+            CHECK(next_tick(S::Capped, fresh).events_emitted == 1);
+            CHECK(stored().size() == kSkippedCap);
+        }
+        CHECK(gap_count() == 3);
+        CHECK(stored().front() == kRoot + "\\D0_000");
+        CHECK(stored().back() == kRoot + "\\D0_031");
     }
 }
 

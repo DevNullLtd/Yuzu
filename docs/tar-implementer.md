@@ -133,6 +133,7 @@ function, never in `applies_*` collectors.
 | **Uninstall** (`yuzu-agent --remove-service`, MSI uninstall) | tar.db is **left in place** by design. The data dir is operator-managed; uninstall removes the binary and service registration only. To wipe TAR data, delete `<data_dir>/tar.db` explicitly. |
 | **Reinstall over an existing data dir** | The new binary opens the existing tar.db, runs migration if the schema version differs, and resumes collection. State in `tar_state` may be stale (see §5). On Windows, files left by a different agent account are refused rather than adopted (`docs/user-manual/tar.md` "Data storage"). |
 | **`data_dir` change** (config update) | The new directory has no tar.db — the next collect_fast creates it from scratch. The old tar.db at the previous path is orphaned but not deleted. Operator concern, not TAR's. |
+| **Roll back to an older agent** | The older binary opens the same `tar.db` (the registry source adds no schema version) but does not know the `registry` source, so the `registry_live` table, the `registry` row of `tar_cursor` and every `registry:%` baseline in `tar_state` stay on disk, with the per-key baselines holding every watched value unmasked, and the older binary has no way to erase them. Run `tar.purge_source` on the paused `registry` source BEFORE the rollback. |
 | **Corruption detected at open** (#559) | `TarDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm`/`-journal` sidecars are renamed to `tar.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `tar_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `tar.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — TAR refuses to load rather than trust the corrupt DB. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.tar.*` heartbeat tags; the server exposes `yuzu_fleet_tar_db_corruption_agents` and writes a `tar.db.corruption_quarantined` audit row — see docs/user-manual/tar.md "Fleet visibility". |
 
 The "leave data on uninstall" rule is identical to other Yuzu agent
@@ -419,13 +420,40 @@ cursor.** What it adds to the pattern:
 - **Four read statuses.** Complete, Absent, Unreadable, Capped. Removals are
   derived only from Complete and Absent reads; an Unreadable read changes
   nothing and a Capped one only adds and updates, so a partial read can never
-  fabricate a deletion. Unreadable means the ROOT could not be read: a child key
-  that denies access is listed in the read's `skipped` set instead, the rest of
-  the root is read as usual, and the diff keeps what the baseline holds beneath
-  the denied key. A root going Unreadable, or the denied set gaining a member,
-  writes one `gap:unreadable:<root>` row; the set is kept in the cursor so a
-  steady state, a shrink or a clear writes nothing. A Capped read's list is
-  partial, so it can add to the stored set but never shrinks it.
+  fabricate a deletion. Unreadable means the root, or any key beneath it other
+  than an access-denied child, could not be read (an open, a query or an
+  enumeration failure there makes the whole root Unreadable). Only an
+  access-denied child is isolated: it is listed in the read's `skipped` set, the
+  rest of the root is read as usual, and the diff keeps what the baseline holds
+  beneath the denied key. That holds for up to `kSkippedCap` (32) children per
+  read; the 33rd makes the read Capped, which derives no deletion in that root.
+  A root going Unreadable, or the denied set gaining a member, writes one
+  `gap:unreadable:<root>` row; the set is kept in the cursor so a steady state,
+  a shrink or a clear writes nothing. A Capped read's list is partial, so it can
+  add to the stored set but never shrinks it, and the stored set is clamped to
+  `kSkippedCap` names so a root that stays Capped cannot grow the cursor row.
+  Keys are opened with `REG_OPTION_OPEN_LINK`, so a watched key that is itself a
+  symbolic link is recorded as the link (its `SymbolicLinkValue`) and its target
+  is never followed: following it would let a user point this agent's SYSTEM
+  token at a key they cannot read, and the price is that writes under a link a
+  user planted over their own `Run` key are invisible. The reader's enumeration
+  is index-driven, so `read_key` compares each key's value count, subkey count
+  and last-write time before and after walking it; a difference means the key
+  was written to mid-walk, and the read is Capped (no removals, root re-read at
+  the next tick), never Complete, because a deletion at an index already passed
+  would otherwise hide a surviving entry and report it removed.
+- **Reconcile.** Every `kReconcileEveryTicks` (12) slow ticks every root is
+  re-read whether or not the watch fired (hourly at the default 300 s
+  `slow_interval`). It finds what the watch missed (a notify lost to a watcher
+  that is not running, an unarmed root) and a child that became denied after the
+  last read: the watch mask is `NAME | LAST_SET`, so a permission change raises
+  nothing.
+- **A root's first read is silent.** A root not yet baselined (first run, a user
+  hive loaded at logon, a user who logged off and back on, a re-enable) has its
+  first read taken as the baseline, with no rows. Writes made to it between the
+  hive loading and that read, up to one slow interval, are folded into the
+  baseline and are not recorded; no per-root gap row is written, since a logon
+  would add one per root per user.
 - **Rows land in the tick that observes the change.** A diff row is stamped with
   the end of the read that saw it and written in that tick's transaction.
   `actor_pid`/`actor_image` are in the schema but hold `0`/`''` until a later
