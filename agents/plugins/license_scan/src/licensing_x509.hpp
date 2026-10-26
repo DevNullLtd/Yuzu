@@ -32,9 +32,11 @@
  * own name matching, not treated as errors.
  *
  * Pinned against OpenSSL 3.x (vectors in the test record the generating
- * command). The OpenSSL error queue is per-thread; this function clears it on
- * entry and on every exit it leaves an error behind, so a stale entry from
- * other libcrypto use on the same thread cannot be mistaken for a clean EOF.
+ * command). The OpenSSL error queue is per-thread; for an input that reaches
+ * the parser this function clears the queue on entry and again on every exit
+ * from the parser, so a stale entry from other libcrypto use on the same
+ * thread cannot be mistaken for a clean EOF. The empty / oversized early
+ * return happens before the parser and does not touch the queue.
  */
 
 #ifndef YUZU_LICENSE_SCAN_LICENSING_X509_HPP

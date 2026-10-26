@@ -24,9 +24,13 @@
  *     (objects <= kBplistMaxObjects, dict entries <= objects);
  *   - a key is compared in place, never materialised, so a dictionary whose
  *     key references all point at one large string cannot multiply a copy.
- * Any structural defect — bad trailer, offset table not inside the file, an
- * object offset outside the object region, a reference >= object count, a
- * lone UTF-16 surrogate — returns nullopt for the WHOLE lookup.
+ * Any structural defect in the file layout (bad trailer, offset table not
+ * inside the file) or in an object on the path the lookup actually examines
+ * (an object offset outside the object region, a reference >= object count, a
+ * lone UTF-16 surrogate) returns nullopt for the whole lookup. The lookup
+ * stops at the first matching key, so a defect in a later dictionary entry or
+ * in an object it never visits does not affect a lookup that resolved before
+ * reaching it.
  *
  * Format reference: Apple CFBinaryPList.c. Layout: 8-byte "bplist00" header,
  * objects, an offset table (one big-endian offset per object), then a 32-byte

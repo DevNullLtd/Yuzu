@@ -11,8 +11,11 @@
  *   2. SYNTHETIC images built by the helpers below. Labelled SYNTHETIC: they
  *      prove the decoder over widths and string kinds the three captures do not
  *      cover, not what Apple's writer emits.
- *   3. HOSTILE corpus: every structural defect must give nullopt for the
- *      WHOLE lookup, never a partial answer.
+ *   3. HOSTILE corpus: a structural defect in the file layout or in any
+ *      object on the examined lookup path must give nullopt for the whole
+ *      lookup, never a partial answer. The lookup stops at the first matching
+ *      key, so a defect in an entry it never reaches is not examined (pinned
+ *      by one test below).
  *   4. WRAP vectors (peer review R2): every attacker-controlled u64 (offset,
  *      count, length, reference, table position) set to values near UINT64_MAX
  *      or 2^63, placed so a naive `start + length <= end` check would wrap and
@@ -477,6 +480,18 @@ TEST_CASE("bplist hostile: dictionary shape defects are nullopt", "[licensing][b
     cases.push_back({"top object is an array",
                      make_image({Bytes{0xA1, 0x00}}, 1, 1)});
     expect_all_rejected(cases, "CFBundleName");
+}
+
+// The lookup stops at the first matching key, so a bad reference in a LATER entry is never
+// examined: the present key resolves, while a lookup that has to walk past the match (an absent
+// key) reaches the bad reference and is nullopt. This pins the "examined lookup path" wording in
+// licensing_bplist.hpp: only the layout and the objects the lookup visits are validated.
+TEST_CASE("bplist boundary: a defect after the matching key is not examined",
+          "[licensing][bplist]") {
+    // keys [1, 99] -> values [2, 2]; key ref 99 >= num_objects (3).
+    const Bytes img = make_image({dict({1, 99}, {2, 2}, 1), ascii("CFBundleName"), ascii("ok")}, 1, 1);
+    CHECK(lookup(img, "CFBundleName") == "ok");
+    CHECK_FALSE(lookup(img, "CFBundleShortVersionString").has_value());
 }
 
 TEST_CASE("bplist hostile: string defects are nullopt", "[licensing][bplist]") {
