@@ -106,11 +106,11 @@
     }
   ],
   "caveats": [
-    "**`battery` and `thermal` never set a typed result status.** `do_thermal` has no `set_result_status` call on any platform (`power_health_plugin.cpp:320-493`), and `do_battery` calls it only on the single Windows `GetSystemPowerStatus`-failure branch (`:247`) — every other battery/thermal branch, clean reads included, stays `UNDECLARED`/`UNKNOWN`, exactly as all three samples above show.",
-    "**The Windows battery-PRESENT path was fixed only after a real hardware run.** A present battery resting on AC below 100% was originally classified `unknown`; PR #4009's HP ZBook Firefly review caught the firmware charge-hold case and it now reports `not_charging` (`power_health_parsers.hpp:174-181`). The equivalent macOS branch (`:244-252`) is still fixture-only and UNVERIFIED on real battery hardware.",
-    "**`thermal`'s row shape differs by platform and status.** A non-ok row omits the `celsius` field entirely (`thermal|status|detail`), an ok row with real zones repeats one row per zone (`thermal|ok|name|celsius`), and macOS's ok row is always the 3-field form carrying the pressure level instead of a zone name (`power_health_parsers.hpp:361-375`; macOS sample: `thermal|ok|nominal`) — no sample in this package captures a numeric Celsius value.",
-    "**`set_power_plan` guarantees no mutation on every pre-set failure, but a post-set failure leaves state genuinely unknown.** `MissingParam`/`Timeout`/`EnumerationIncomplete`/`Ambiguous`/`NoMatch`/`ReadPriorFailed` are all pre-mutation; `SetFailed`/`ReadbackFailed`/`ReadbackMismatch` deliberately do NOT claim \"unchanged\" because the mutation may already be applied — `previous_guid` is still emitted so the caller can revert manually (`power_health_parsers.hpp:658-681`, `power_health_plugin.cpp:670-705`). It is the first Destructive+Reversible row in the catalogue and is allowlisted by name in `tests/unit/server/test_capability_catalogue.cpp:180`.",
-    "**Linux `power_plan`/`set_power_plan` are declared, not implemented; macOS is unsupported by design.** Linux is PLANNED (`platform_profile`); macOS has no named power schemes and `IOPMSetPMPreferences` is SPI, deliberately not adopted (`power_health_plugin.cpp:729-755`). The Linux capture in this package ran at euid 0 in a container — more privileged than the agent's intended unprivileged posture (`docs/agent-privilege-model.md:12`) — so it is not representative of production privilege."
+    "**Result status is mostly undeclared; read the row.** `thermal` never sets a result status and `battery` sets one only when the read itself fails, so a clean read, an empty result and a \"no sensors\" answer all show `UNDECLARED`. Key on the row's own `status` and `state` fields, and treat `UNDECLARED` as \"no completeness claim\", not as success.",
+    "**Windows thermal often returns no temperature, by two different routes.** A host with no thermal-zone instances gets `constrained` with `no_thermal_zones_exposed`, but the Windows capture host got `unavailable` with `pdh_collect_failed`, because the collect call returned an error rather than an empty set. The row does not record the PDH status code, so the two cannot be told apart from the result, and neither means the machine is cool.",
+    "**Battery coverage is uneven.** The Windows battery-present path was checked on one laptop model, and that run found the AC-resting case that is now `not_charging`; the macOS battery-present path and the whole Linux battery leg are fixture-tested only, with no capture on real battery hardware. Windows and macOS never report `cycle_count` or `health_percent`; only Linux does, when the kernel driver exposes them.",
+    "**A failed or unconfirmed `set_power_plan` leaves the state unknown.** Refusals before the set call (`missing_param`, `timeout`, `enumeration_incomplete`, `ambiguous`, `no_match`, `read_prior_failed`) change nothing, but `set_failed`, `readback_failed` and `readback_mismatch` do not claim \"unchanged\" because the switch may have landed; each carries `previous_guid` for checking and rollback. The capture host never ran a successful switch (the sample shows only the missing-parameter refusal), so the `ok` path is covered by the sequencing tests, not by a live capture.",
+    "**Power plans are Windows only.** macOS has no named power schemes and `IOPMSetPMPreferences` is private API that is deliberately not used; Linux `power_plan` and `set_power_plan` are declared against `platform_profile` and not implemented. Both return a typed `unsupported_on_macos` or `planned_not_implemented` row and never mutate."
   ],
   "definitions": [
     {
@@ -198,7 +198,7 @@
     }
   ],
   "description": "Battery, thermal, and power-plan inventory, plus a gated power-plan switch",
-  "how_it_works": "`battery` enumerates power sources and classifies each into a closed state set (`charging`/`discharging`/`full`/`not_charging`/`ac_no_battery`/`unknown`) from `GetSystemPowerStatus`+`CallNtPowerInformation` (Windows), `IOPSCopyPowerSourcesInfo`/`IOPSCopyPowerSourcesList` (macOS), or `/sys/class/power_supply` uevent parsing (Linux). `thermal` reads per-zone Celsius on Windows (PDH) and Linux (sysfs), or macOS's 4-level thermal-pressure enum (`NSProcessInfo.thermalState`, never a temperature) supplemented by `IOPMGetThermalWarningLevel`. `power_plan` enumerates named Windows power schemes (PowrProf) and which is active; macOS has no named schemes so it is unsupported, and Linux support is declared but not implemented. `set_power_plan` is the plugin's only mutating action: it resolves the `scheme` parameter to exactly one live scheme, reads the prior active scheme, calls `PowerSetActiveScheme`, then reads back and verifies the switch took — every branch before the set call is guaranteed to leave the system unmutated, and a failure after the set call reports the final state as unknown rather than falsely claiming it is unchanged.\n\nDeliberately not: macOS battery never reads the `AppleSmartBattery` IORegistry node, which is present and active even on battery-less Mac minis and would report a phantom battery; Windows never uses WMI, `powercfg`, or COM for any action; a PDH zero-instance thermal read is reported as an explicit `no_thermal_zones_exposed` success, never an error or a fabricated zero.",
+  "how_it_works": "`battery` reads the host's power sources and reports one row each: whether a battery is present, one of six states (`charging`, `discharging`, `full`, `not_charging`, `ac_no_battery`, `unknown`), charge percent and minutes to empty, with `-1` wherever the operating system gives no honest value. `thermal` reads per-zone temperatures in Celsius on Windows (Performance Data Helper, PDH, the Windows performance-counter interface) and Linux (`/sys/class/thermal`); on macOS it reports Apple's four-level thermal-pressure setting, never a temperature. `power_plan` lists the named Windows power schemes and marks the active one; macOS has no named schemes and Linux support is declared but not implemented. `set_power_plan` is the plugin's only mutating action, Windows only: it matches a friendly name exactly (ignoring case) to exactly one live scheme, or passes a GUID-shaped value to Windows as given, then reads the scheme that is active now, switches, reads the active scheme back and reports `ok` only when the read-back matches. It never edits a scheme's settings, never runs `powercfg`, and every call into PowrProf (the Windows power-profile API) and the PDH collect call is bounded to 2 seconds.\n\nDeliberately not: the macOS battery leg never reads the `AppleSmartBattery` registry node, which exists even on a battery-less Mac mini and would report a phantom battery; Windows uses no WMI, no `powercfg` and no COM for any action; and a failed read is reported as a failure, never as an empty or zero reading, on Windows and Linux (through a failure row or a result status). Two exceptions: on macOS a failed power-source query returns an empty list, which looks the same as a host with no power source (`present` 0, `unknown`), and on Linux a supply whose `uevent` file cannot be opened is skipped without a trace.",
   "inputs": [
     {
       "constraints": null,
@@ -439,29 +439,35 @@
   },
   "privileges": [
     {
-      "grant": "None — `GetSystemPowerStatus`/`CallNtPowerInformation`/PDH/PowrProf calls need no elevated right; `set_power_plan`'s `PowerManagement.Write`/AdminOrApproval requirement is an application-level RBAC/approval gate, not an OS privilege",
-      "if_refused": "`battery`: result status `UNAVAILABLE`, \"GetSystemPowerStatus failed\" (`power_health_plugin.cpp:247`); `thermal` failures are typed per-branch but leave result status `UNDECLARED` (see Result status)",
-      "measured": "captured 2026-09-07 as `SYSTEM` (`docs/samples/windows.txt`)",
+      "grant": "None known for the reads: they were measured only as `SYSTEM`, so the least OS right they need is not established. The OS right needed for `set_power_plan`'s `PowerSetActiveScheme` call was not tested. `set_power_plan` is also gated by the application-level `PowerManagement` Write permission (admin role or approval), which is a server rule and not an OS privilege",
+      "if_refused": "`battery`: result status `UNAVAILABLE`, \"GetSystemPowerStatus failed\". `thermal` failures are typed in the row (`unavailable` plus a `pdh_` token) and leave the result status undeclared",
+      "measured": "2026-09-07 as `SYSTEM` (`docs/samples/windows.txt`); the plan switch itself was not run on the capture host",
       "os": "Windows",
-      "runs_as": "agent service account (LocalSystem today, #1442)"
+      "runs_as": "Agent service account: LocalSystem (the built-in all-powerful Windows service account) today, not yet the intended virtual service account (`docs/agent-privilege-model.md`)"
     },
     {
-      "grant": "None — `IOPSCopyPowerSourcesInfo`/`List` and `NSProcessInfo`/`IOPMGetThermalWarningLevel` are public frameworks needing no entitlement",
-      "if_refused": "`battery`: an empty power-source list is reported as a genuine empty result, never a permission error (`power_health_plugin.cpp:274-283`)",
-      "measured": "captured 2026-09-07 at euid 501, unprivileged (`docs/samples/macos.txt`)",
+      "grant": "None: `IOPSCopyPowerSourcesInfo`, `NSProcessInfo.thermalState` and `IOPMGetThermalWarningLevel` are public interfaces that answer an unprivileged caller",
+      "if_refused": "`battery`: an empty power-source list gives an empty row (`present` 0, `unknown`), never a permission error; a failed power-source query gives the same row. `thermal` has no refusal path",
+      "measured": "2026-09-07 as an ordinary non-root user (`docs/samples/macos.txt`), below the production identity",
       "os": "macOS",
-      "runs_as": "agent daemon, dedicated unprivileged account by design (`docs/agent-privilege-model.md:12`)"
+      "runs_as": "Agent daemon as root: the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md`). The plugin does not drop privilege"
     },
     {
-      "grant": "None — `/sys/class/power_supply` and `/sys/class/thermal` are normally world-readable",
-      "if_refused": "`battery`: result status `CONSTRAINED`, \"/sys/class/power_supply not readable\" (`power_health_plugin.cpp:288`); `thermal`: row reports `unavailable`/`sys_class_thermal_not_readable` but result status stays `UNDECLARED` (`power_health_plugin.cpp:457-463`)",
-      "measured": "captured 2026-09-06 at euid 0 in a container (`docs/samples/linux.txt`) — a more privileged posture than the intended unprivileged design",
+      "grant": "None: `/sys/class/power_supply` and `/sys/class/thermal` are normally world-readable",
+      "if_refused": "`battery`: result status `CONSTRAINED`, \"/sys/class/power_supply not readable\". `thermal`: row `unavailable` with `sys_class_thermal_not_readable`, result status undeclared",
+      "measured": "2026-09-06 in a container as root (`euid 0`), a more privileged identity than production (`docs/samples/linux.txt`)",
       "os": "Linux",
-      "runs_as": "dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md:12`)"
+      "runs_as": "Agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`)"
     }
   ],
   "readme": "agents/plugins/power_health/README.md",
   "result_status": [
+    {
+      "completeness": "full",
+      "provenance": "(empty)",
+      "status": "`OK`",
+      "when": "Windows `set_power_plan`: the switch was applied and the read-back matched the target"
+    },
     {
       "completeness": "partial",
       "provenance": "\"GetSystemPowerStatus failed\"",
@@ -482,33 +488,39 @@
     },
     {
       "completeness": "partial",
-      "provenance": "\"macOS has no named power schemes…\" / \"power_plan is PLANNED…not implemented\"",
+      "provenance": "\"macOS has no named power schemes; IOPMSetPMPreferences is SPI, not adopted\" / \"power_plan is PLANNED (platform_profile) — not implemented in this package\"",
       "status": "`UNAVAILABLE`",
-      "when": "macOS/Linux `power_plan`: always (no mutation, no enumeration)"
+      "when": "macOS and Linux `power_plan`: always"
     },
     {
       "completeness": "partial",
-      "provenance": "one of `missing_param`/`timeout`/`enumeration_incomplete`/`ambiguous`/`no_match`/`read_prior_failed`/`set_failed`/`readback_failed`/`readback_mismatch`",
-      "status": "`UNAVAILABLE`",
-      "when": "Windows `set_power_plan`: every failure branch"
+      "provenance": "\"bounded_call timed out enumerating power schemes; no mutation attempted\"",
+      "status": "`CONSTRAINED`",
+      "when": "Windows `set_power_plan`: the scheme enumeration timed out (row reason `timeout`)"
     },
     {
       "completeness": "partial",
-      "provenance": "\"macOS has no named power schemes; no mutation attempted\" / \"…PLANNED on Linux…no mutation attempted\"",
+      "provenance": "\"missing required param 'scheme'\" / \"PowerEnumerate ended on a non-terminal error; refusing to resolve a scheme name against an incomplete inventory; no mutation attempted\" / \"scheme name matched more than one scheme; no mutation attempted\" / \"no scheme matched the given name/GUID; no mutation attempted\" / \"failed to read the prior active scheme; no mutation attempted\"",
       "status": "`UNAVAILABLE`",
-      "when": "macOS/Linux `set_power_plan`: always"
+      "when": "Windows `set_power_plan`: every refusal before the set call (reasons `missing_param`, `enumeration_incomplete`, `ambiguous`, `no_match`, `read_prior_failed`)"
     },
     {
-      "completeness": "full",
-      "provenance": "—",
-      "status": "`OK`",
-      "when": "Windows `set_power_plan`: the mutation was applied and the read-back verified it"
+      "completeness": "partial",
+      "provenance": "\"PowerSetActiveScheme failed or timed out; the mutation was NOT confirmed and, on a timeout, may still have been applied — final state is unknown; previous_guid is reported for manual verification/revert\" / \"post-set read-back failed; the mutation may already be applied and final state is unknown — previous_guid is reported for manual verification/revert\" / \"post-set read-back scheme does not match the target; final state is uncertain\"",
+      "status": "`UNAVAILABLE`",
+      "when": "Windows `set_power_plan`: failures at or after the set call (reasons `set_failed`, `readback_failed`, `readback_mismatch`); the final state is unknown"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "\"macOS has no named power schemes; no mutation attempted\" / \"power_plan mutation is PLANNED on Linux, not implemented; no mutation attempted\"",
+      "status": "`UNAVAILABLE`",
+      "when": "macOS and Linux `set_power_plan`: always (exit code 1)"
     },
     {
       "completeness": "—",
       "provenance": "—",
       "status": "`UNDECLARED`",
-      "when": "`thermal` on every platform and branch; `battery` on every branch except the one Windows failure above (including a clean read on any platform, and Windows `power_plan`'s successful enumeration path) — the agent records `UNDECLARED`/`UNKNOWN`, exactly as every sample below shows"
+      "when": "`thermal` everywhere; `battery` on every branch except the two failures above; Windows `power_plan` when enumeration and the active-scheme read both succeed"
     }
   ],
   "samples": {
@@ -803,10 +815,10 @@
   },
   "version": "1.0.0",
   "where_the_data_goes": [
-    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`.",
-    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — a grep of `server/core/src` for `power_health`/`crossplatform.power` finds only the capability-catalogue registration and the `PowerManagement` RBAC securable seed (`server/core/src/rbac_store.cpp:582`, `server/core/src/server.cpp:138,22119`), no sync-source or TAR consumer. `gather.ttlSeconds` (300s reads, 60s `set_power_plan`) is a response-cache TTL, not a scheduled dispatch.",
-    "**Sensitivity.** Rows carry no device, person, or software identifiers — `battery`/`thermal` report only charge/thermal state and percentages, and `power_plan`'s `friendly_name` is a generic, operator-settable scheme label (`Balanced`, `High performance`, `Power saver`), never a serial number, MAC, hostname, or username; nothing here goes beyond the device id.",
-    "**Siblings:** none — this is the fleet's only power-state source.",
-    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"crossplatform.power.battery\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the server's response store, queryable at `/api/responses/{id}`. The device page's live Battery and Thermal cards dispatch `battery` and `thermal` on demand and render the same rows. `gather.ttlSeconds` (300 seconds for the reads, 60 for `set_power_plan`) is the window the agent has to respond, not a cache lifetime or a schedule.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX (Digital Employee Experience) or metrics: the server references the plugin only in the capability catalogue (`server/core/src/capability_fragments.hpp` pulls in its capability declarations), the table of per-OS switchable units (`server/core/src/enablement_units.hpp`), the `PowerManagement` permission category seeded for role-based access control, and the device page's live cards, with no sync-source or TAR consumer. The switchable-unit table lists `battery` and `thermal` for Windows, Linux and macOS, and `power_plan` and `set_power_plan` for Windows and Linux; the Linux entries follow the \"planned\" declaration, so those two actions only return a `planned_not_implemented` row there.",
+    "**Sensitivity.** Rows carry no device, person or software identifiers: `battery` and `thermal` report charge and thermal state, and `power_plan`'s `friendly_name` is an operator-settable scheme label (`Balanced`, `High performance`), never a serial number, hostname or account name; nothing here goes beyond the device id.",
+    "**Siblings:** none for battery, thermal or power-plan state. TAR (the agent's forensic history recorder) has a power source that records sleep/wake and AC/battery transitions only.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary), then `yuzu://plugin-docs` (this page as data), then `discover_instructions` / `get_definition(\"crossplatform.power.battery\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
   ]
 }
