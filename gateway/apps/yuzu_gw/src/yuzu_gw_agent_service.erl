@@ -340,7 +340,13 @@ execute_command(_Ctx, _CommandReq) ->
 %%--------------------------------------------------------------------
 
 report_inventory(Ctx, InventoryReport) ->
-    case yuzu_gw_upstream:proxy_inventory(InventoryReport) of
+    %% The report is forwarded whether or not this node admitted its session (the
+    %% server authenticates it); admission only decides whether the report may
+    %% start the upstream client's capability probe. The pure check: an inventory
+    %% report is not counted as a heartbeat rejection.
+    Admitted = yuzu_gw_heartbeat_admission:check(
+                 Ctx, maps:get(session_id, InventoryReport, undefined)) =:= ok,
+    case yuzu_gw_upstream:proxy_inventory(InventoryReport, Admitted) of
         {ok, Response} ->
             {ok, Response, Ctx};
         {error, Reason} ->

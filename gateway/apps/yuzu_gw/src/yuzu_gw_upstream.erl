@@ -219,6 +219,7 @@
 -export([start_link/0,
          proxy_register/1,
          proxy_inventory/1,
+         proxy_inventory/2,
          notify_stream_status/5,
          forward_guardian_message/2,
          replay_sessions/1,
@@ -434,8 +435,17 @@ proxy_register(RegisterReq) ->
 %% never exits the caller: `{error, upstream_unavailable}' instead.
 -spec proxy_inventory(map()) -> {ok, map()} | {error, term()}.
 proxy_inventory(InventoryReport) ->
-    yuzu_gw_safe_call:call(?SERVER, {proxy_inventory, InventoryReport}, call_timeout(),
-                           upstream_unavailable).
+    proxy_inventory(InventoryReport, false).
+
+%% @doc proxy_inventory/1, saying whether the report's session was admitted by
+%% this node (yuzu_gw_heartbeat_admission:check/2: the session is held here and
+%% the call arrived on the connection it is bound to). Only an admitted report
+%% may start a capability probe (maybe_probe_capabilities/4); the report itself
+%% is forwarded either way, as before.
+-spec proxy_inventory(map(), boolean()) -> {ok, map()} | {error, term()}.
+proxy_inventory(InventoryReport, Admitted) when is_boolean(Admitted) ->
+    yuzu_gw_safe_call:call(?SERVER, {proxy_inventory, InventoryReport, Admitted},
+                           call_timeout(), upstream_unavailable).
 
 %% @doc Notify C++ server about agent stream connect/disconnect.
 -spec notify_stream_status(binary(), binary() | undefined, connected | disconnected, binary(),
@@ -610,7 +620,11 @@ handle_call({proxy_register, RegisterReq}, _From, State) ->
             {reply, public_result(Result), report_notify_counts(Before, State2)}
     end;
 
-handle_call({proxy_inventory, InventoryReport}, _From, State) ->
+%% The pre-admission message shape (a caller from before proxy_inventory/2, for
+%% example across a hot upgrade): never admitted, so it never probes.
+handle_call({proxy_inventory, InventoryReport}, From, State) ->
+    handle_call({proxy_inventory, InventoryReport, false}, From, State);
+handle_call({proxy_inventory, InventoryReport, Admitted}, _From, State) ->
     case check_circuit(State) of
         {reject, State1} ->
             {reply, {error, circuit_open}, State1};
@@ -622,7 +636,7 @@ handle_call({proxy_inventory, InventoryReport}, _From, State) ->
             Result = do_rpc('ProxyInventory', InventoryReport, inventory, ctx:background(),
                             inventory_gate(State1#state.upstream_caps)),
             State1a = maybe_probe_capabilities(erase(?PD_UNKNOWN_PEER), InventoryReport,
-                                               State1),
+                                               Admitted, State1),
             State2 = drain(record_result(Result, State1a)),
             {reply, public_result(Result), report_notify_counts(Before, State2)}
     end;
@@ -1193,6 +1207,7 @@ notify_pending_len(Pending) ->
 %% address or a guardian frame; anything else is shown as is.
 redact_message({proxy_register, _Req})            -> {proxy_register, '$redacted'};
 redact_message({proxy_inventory, _Report})        -> {proxy_inventory, '$redacted'};
+redact_message({proxy_inventory, _Report, A})     -> {proxy_inventory, '$redacted', A};
 redact_message({replay_sessions, _Ids})           -> {replay_sessions, '$redacted'};
 redact_message({forward_guardian_message, AgentId, _Frame}) ->
     {forward_guardian_message, AgentId, '$redacted'};
@@ -1918,8 +1933,16 @@ peer_resolve_timeout() ->
 %% replay goes to whichever subchannel the balancer picks, so it may record
 %% another connection first; a later report over this one probes again after the
 %% window. Nothing is queued while the breaker is open.
--spec maybe_probe_capabilities(pid() | undefined, map(), #state{}) -> #state{}.
-maybe_probe_capabilities(Peer, #{session_id := SessionId},
+%%
+%% Only an ADMITTED report probes (Gate 8 G8-11): its session is held by this
+%% node and the call came on the connection the session is bound to, so a
+%% caller cannot name another agent's session to steer the replay, and an
+%% unauthenticated report neither probes nor uses up the window. The window is
+%% stamped only when a replay was actually queued, so a report whose session
+%% could not be queued (already queued, inside the replay guard, queue full)
+%% does not hold the slot either.
+-spec maybe_probe_capabilities(pid() | undefined, map(), boolean(), #state{}) -> #state{}.
+maybe_probe_capabilities(Peer, #{session_id := SessionId}, true,
                          #state{cap_probes = Probes, cb_state = CbState} = State)
   when is_pid(Peer), is_binary(SessionId), SessionId =/= <<>>, CbState =/= open ->
     Now = erlang:monotonic_time(millisecond),
@@ -1928,12 +1951,18 @@ maybe_probe_capabilities(Peer, #{session_id := SessionId},
         true ->
             State#state{cap_probes = Live};
         false ->
-            logger:info("Upstream connection ~p has no recorded capabilities; "
-                        "replaying one agent registration to learn them", [Peer]),
-            enqueue_sessions([SessionId], capability,
-                             State#state{cap_probes = Live#{Peer => Now}})
+            Before = length(State#state.replay_queue),
+            State1 = enqueue_sessions([SessionId], capability, State#state{cap_probes = Live}),
+            case length(State1#state.replay_queue) > Before of
+                true ->
+                    logger:info("Upstream connection ~p has no recorded capabilities; "
+                                "replaying one agent registration to learn them", [Peer]),
+                    State1#state{cap_probes = Live#{Peer => Now}};
+                false ->
+                    State1
+            end
     end;
-maybe_probe_capabilities(_Peer, _Report, State) ->
+maybe_probe_capabilities(_Peer, _Report, _Admitted, State) ->
     State.
 
 has_gated_source(#{plugin_data := Data}) when is_map(Data) ->

@@ -69,7 +69,11 @@ gate_test_() ->
               {"the probe is rate-limited per connection",
                fun probe_is_rate_limited/0},
               {"no probe when the connection cannot be identified",
-               fun unidentified_connection_is_not_probed/0}]]}.
+               fun unidentified_connection_is_not_probed/0},
+              {"an unadmitted report neither probes nor uses up the probe window",
+               fun unadmitted_report_does_not_probe/0},
+              {"a probe that queued no replay does not use up the window",
+               fun unqueued_probe_does_not_stamp/0}]]}.
 
 setup() ->
     yuzu_gw_test_registry:ensure(),
@@ -193,9 +197,14 @@ report() ->
       content_hashes => #{?CERT => <<"h1">>, <<"installed_software">> => <<"h2">>}}.
 
 %% Send Report through U; answer the decoded request that went on the wire.
+%% inventory_via/2 sends it as admitted (the session is held and bound to the
+%% caller's connection), inventory_via/3 says which.
 inventory_via(U, Report) ->
+    inventory_via(U, Report, true).
+
+inventory_via(U, Report, Admitted) ->
     via(U),
-    {ok, _} = yuzu_gw_upstream:proxy_inventory(Report),
+    {ok, _} = yuzu_gw_upstream:proxy_inventory(Report, Admitted),
     [{_, W}] = ets:lookup(?T, wire),
     {?INV_PATH, Bin} = lists:last(W),
     gateway_pb:decode_msg(Bin, 'yuzu.agent.v1.InventoryReport').
@@ -382,11 +391,53 @@ unidentified_connection_is_not_probed() ->
     ets:delete(?T, {route, Sub}),
     Sid = held_agent(),
     via(A),
-    {ok, _} = yuzu_gw_upstream:proxy_inventory((report())#{session_id := Sid}),
+    {ok, _} = yuzu_gw_upstream:proxy_inventory((report())#{session_id := Sid}, true),
     timer:sleep(100),
     _ = sys:get_state(yuzu_gw_upstream),
     ?assertEqual(0, register_calls()),
     ?assertEqual([{?CERT, <<"upstream_unknown">>}], stripped()).
+
+%% G8-11: a report whose session this node did not admit (unauthenticated, or
+%% naming another agent's session from a different connection) is forwarded
+%% (stripped) but starts no replay; an admitted report right after it, on the
+%% same connection, still probes.
+unadmitted_report_does_not_probe() ->
+    A = upstream(a),
+    answers(A, [?CAP]),
+    Victim = held_agent(),
+    Sid = held_agent(),
+    [?assertEqual([<<"installed_software">>],
+                  keys(inventory_via(A, (report())#{session_id := Victim}, false)))
+     || _ <- [1, 2, 3]],
+    timer:sleep(100),
+    _ = sys:get_state(yuzu_gw_upstream),
+    ?assertEqual(0, register_calls()),
+    _ = inventory_via(A, (report())#{session_id := Sid}),
+    ok = wait_until(fun() -> register_calls() =:= 1 end, 5000),
+    ok = wait_until(fun() -> meck:num_calls(yuzu_gw_agent, reannounce, '_') > 0 end, 5000),
+    ?assertEqual([?CERT, <<"installed_software">>],
+                 keys(inventory_via(A, (report())#{session_id := Sid}))).
+
+%% An admitted report whose session cannot be queued (this node no longer
+%% holds it, so the drip has nothing to replay) leaves the window free: the
+%% next admitted report on the same connection probes at once.
+unqueued_probe_does_not_stamp() ->
+    A = upstream(a),
+    answers(A, [?CAP]),
+    _ = inventory_via(A, (report())#{session_id := <<"sess-not-held-here">>}),
+    timer:sleep(100),
+    _ = sys:get_state(yuzu_gw_upstream),
+    ?assertEqual(0, register_calls()),
+    ?assertEqual(#{}, upstream_field(cap_probes)),
+    Sid = held_agent(),
+    _ = inventory_via(A, (report())#{session_id := Sid}),
+    ok = wait_until(fun() -> register_calls() =:= 1 end, 5000),
+    ?assertEqual(1, map_size(upstream_field(cap_probes))).
+
+upstream_field(Name) ->
+    {status, _, _, [_, _, _, _, Misc]} = sys:get_status(yuzu_gw_upstream),
+    [Fields] = [F || {data, [{"State", F}]} <- Misc],
+    maps:get(Name, Fields).
 
 wait_until(Pred, Timeout) when Timeout =< 0 ->
     case Pred() of true -> ok; false -> {error, timeout} end;
@@ -556,4 +607,38 @@ capability_gate_gauge_test_() ->
                ?assertEqual(1, G()),
                telemetry:execute([yuzu, gw, upstream, capability_gate], #{ready => 0}, #{}),
                ?assertEqual(0, G())
+       end}]}.
+
+%%%===================================================================
+%%% yuzu_gw_agent_service:report_inventory/2 passes the admission decision
+%%%===================================================================
+
+report_inventory_passes_admission_test_() ->
+    {foreach,
+     fun() ->
+             catch meck:unload(yuzu_gw_upstream),
+             catch meck:unload(yuzu_gw_heartbeat_admission),
+             ok = meck:new(yuzu_gw_upstream, [no_link]),
+             ok = meck:expect(yuzu_gw_upstream, proxy_inventory,
+                              fun(_Report, Admitted) -> {ok, #{received => Admitted}} end),
+             ok = meck:new(yuzu_gw_heartbeat_admission, [passthrough, no_link])
+     end,
+     fun(_) -> meck:unload([yuzu_gw_upstream, yuzu_gw_heartbeat_admission]) end,
+     [{"admitted session: true; the pure check is used, nothing counted",
+       fun() ->
+               ok = meck:expect(yuzu_gw_heartbeat_admission, check, fun(_, <<"s">>) -> ok end),
+               ?assertMatch({ok, #{received := true}, _},
+                            yuzu_gw_agent_service:report_inventory(ctx:background(),
+                                                                   #{session_id => <<"s">>})),
+               ?assertEqual(0, meck:num_calls(yuzu_gw_heartbeat_admission, admit, '_'))
+       end},
+      {"rejected or missing session: false, and the report is still forwarded",
+       fun() ->
+               ok = meck:expect(yuzu_gw_heartbeat_admission, check,
+                                fun(_, _) -> {reject, connection_mismatch} end),
+               ?assertMatch({ok, #{received := false}, _},
+                            yuzu_gw_agent_service:report_inventory(ctx:background(),
+                                                                   #{session_id => <<"s">>})),
+               ?assertMatch({ok, #{received := false}, _},
+                            yuzu_gw_agent_service:report_inventory(ctx:background(), #{}))
        end}]}.

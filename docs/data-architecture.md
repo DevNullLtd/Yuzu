@@ -30,6 +30,19 @@ When building new features, design data schemas with downstream analytics in min
 - Per-plugin structured blobs stored server-side.
 - Queryable via REST API with filter expressions.
 - **Schema is self-describing** — the plugin reports its own schema at registration. Downstream tooling consumes the schema to materialize tables, not by hard-coding column lists.
+- **Fleet certificate inventory (`certificate_inventory`, typed, `CertificateInventoryStore`) —
+  potential personal data.** Certificate subject DNs and SANs can carry a person's name, e-mail
+  address or UPN (a user-issued or user-named machine certificate), and host names that are often
+  user-named, so treat both fields as **potential personal data**, not as technical metadata. They
+  are never stored in the generic inventory store (it is a typed source, see
+  `server/core/src/typed_inventory_sources.hpp`). **Access tier:** the read surface (slice-2 PR
+  2a-2b) gates on `CertificateInventory:Read`, which is in the authorization-topology floor, so
+  with RBAC off only an administrator can read it. Never export these fields to analytics or
+  metric labels. **Retention:** until the device is decommissioned (the agent-decommission
+  cascade); the read surface, the prune of stores unread for 30 days (PR 2a-2d) and their
+  retention are documented in `docs/user-manual/crypto.md`, and the current state in
+  `docs/user-manual/inventory.md` "Certificate inventory" and the SOC 2 data inventory
+  (`docs/enterprise-readiness-soc2-first-customer.md`, "Fleet certificate inventory").
 - **Standard-format exports** (for example the CycloneDX CBOM at `GET /api/v1/crypto/cbom`) carry Yuzu-specific facts as document properties named `yuzu:<domain>:<snake_key>` (such as `yuzu:crypto:scope`), with string values, so a standard consumer ignores them safely and Yuzu-aware tooling can read them.
 
 ## Storage substrate

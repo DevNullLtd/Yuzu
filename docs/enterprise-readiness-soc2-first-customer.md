@@ -392,6 +392,24 @@ Risk-register entry: an identity provider that removes a person who is the fleet
 administrator leaves that person active (loud: audit row, counter, critical event),
 until an operator promotes a second administrator and demotes the first.
 
+**Risk-register entry — PENDING owner decision, not accepted (2026-10-26, owner: liamsomerville
+(decision pending)): certificate inventory behind an L7 gRPC balancer (CC6.1, C1.1).** The gateway
+forwards the `certificate_inventory` daily-sync source only on an upstream HTTP/2 connection whose
+latest accepted `ProxyRegister` answer listed `certificate_inventory_v1`. A gRPC-aware (L7)
+balancer between the gateway and the servers can send the requests of one connection to different
+backends, so the gateway cannot tell which backend a report reaches. A backend older than the
+typed-source reservation release (slice-2 PR 2a-1) stores such a blob in the generic inventory
+store, where certificate subject DNs and SANs (potential personal data) are readable under
+`Inventory:Read`/`Infrastructure:Read` instead of the admin-floored `CertificateInventory:Read`.
+No tagged release contains the reservation yet, and no agent sends the source yet.
+Compensating controls: the documented deployment requirement (every backend behind an L7
+balancer at the reservation release or later, no rollback below it, before certificate-collecting
+agents are enabled: `docs/user-manual/inventory.md`, `gateway.md`, `upgrading.md`); the gateway's
+per-connection capability gate, which removes the source on any connection that did not advertise
+it or cannot be identified; and the counter `yuzu_gw_inventory_source_stripped_total{source,reason}`
+with the gauge `yuzu_gw_upstream_capability_gate_ready`. No alert rule ships yet. Review before the
+agent collector (2a-2e) ships.
+
 **Addendum: approver assurance for approve and reject (CC6.1/CC6.3, #6061).** Approving or
 rejecting an approval request requires an interactive human session (local or OIDC), a human
 principal that is not an engine principal, `Approval:Approve`, a reviewer who is not the

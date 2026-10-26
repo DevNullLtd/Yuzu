@@ -149,7 +149,7 @@ init_per_suite(Config) ->
     meck:expect(yuzu_gw_upstream, proxy_register, fun(_) ->
         {ok, #{session_id => <<"test-session">>}}
     end),
-    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_) ->
+    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_, _Admitted) ->
         {ok, #{received => true}}
     end),
 
@@ -229,7 +229,7 @@ end_per_group(upstream, Config) ->
     meck:expect(yuzu_gw_upstream, proxy_register, fun(_) ->
         {ok, #{session_id => <<"test-session">>}}
     end),
-    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_) ->
+    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_, _Admitted) ->
         {ok, #{received => true}}
     end),
     Config;
@@ -326,7 +326,7 @@ agent_heartbeat_batching(_Config) ->
     end.
 
 agent_inventory_proxy(_Config) ->
-    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_Report) ->
+    meck:expect(yuzu_gw_upstream, proxy_inventory, fun(_Report, _Admitted) ->
         {ok, #{received => true}}
     end),
 
