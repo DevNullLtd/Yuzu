@@ -5,8 +5,9 @@
 // boot_epoch is the high half of the (boot_epoch, emit_seq) event-order pair
 // (guardian_emit_seq.hpp). emit_seq restarts at 1 every process, so the server can only
 // order events ACROSS restarts if boot_epoch strictly increases from one boot to the
-// next. It is claimed once at agent boot, before the GuardianEngine is built, and passed
-// to the engine as a constructor argument so the engine stays I/O-free.
+// next (except at the 2^62 ceiling). It is claimed once at agent boot, before the
+// GuardianEngine is built, and passed to the engine as a constructor argument so the
+// engine stays I/O-free.
 //
 // The value is the HYBRID  max(persisted + 1, clock):
 //   * persisted + 1  - the floor. It makes the epoch strictly increase across restarts
@@ -41,9 +42,9 @@
 // WAL mode, which admits a second process. Each service manager starts one instance per
 // unit, but a manual run against the same --data-dir is not excluded. Two processes that
 // both read N would both claim N + 1 and draw emit_seq from 1, so their events carry equal
-// epochs and overlapping sequences that the server cannot tell apart. Accepted (ruling
-// D3) and recorded with the documented residual below; this module adds no second
-// mechanism.
+// epochs and overlapping sequences that the server cannot tell apart. Accepted (the UP-14
+// residual-acceptance ruling) and recorded with the documented residual below; this
+// module adds no second mechanism.
 //
 // DOCUMENTED RESIDUAL. If the KV row is wiped AND the agent restarts within the same
 // wall-clock second as the previous boot, the new epoch equals the previous one (both

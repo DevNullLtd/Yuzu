@@ -259,8 +259,10 @@ void require_completes_within(std::chrono::milliseconds timeout, const char* wha
 }
 
 // Joins every started thread on scope exit, including when a later emplace_back throws.
-// Not std::jthread: Apple Clang 15's libc++ lacks it. Declare it BEFORE any thread starts and
-// AFTER every local the workers reference, so the joins run before those locals are destroyed.
+// std::jthread is not used because Apple libc++ ships it only behind -fexperimental-library;
+// see test_guardian_spark_runtime.cpp PortableJThread. Declare it BEFORE any thread starts
+// and AFTER every local the workers reference, so the joins run before those locals are
+// destroyed.
 struct JoinGuard {
     std::vector<std::thread> threads;
     JoinGuard() = default;
@@ -1734,8 +1736,9 @@ TEST_CASE("emit-seq: a RefusedStopping refusal consumes a value",
           "[guardian][legacy_sink][emit_seq]") {
     // The draw sits before the stopping check, so an offer refused because the executor is
     // stopping still consumes one emit_seq value: a harmless gap, exactly as for a capacity
-    // refusal. (ThrowOnTicket, the other refusal fault, is not covered here: it fails after
-    // the admission block and adds nothing this ordering check does not already pin.)
+    // refusal. (ThrowOnTicket, the other refusal fault, is not covered here: it throws
+    // before the lock is taken and before draw(), so it consumes no sequence number and has
+    // no draw to pin.)
     auto src = std::make_shared<GuardianEmitSeqSource>(5);
     GuardianLegacySinkExecutor exec{config_with_source(src)};
     StampRecordingSend send;

@@ -29,8 +29,10 @@ Invariants (the numbered rules below; each failure message starts with its rule 
       backfill_batch_provenance sets the key on LIVE entries); guardian_engine.cpp never calls
       `stamp_emit_pair(` (the legacy stamp is at executor admission only).
   R2b The legacy stamp in `offer()` follows the `unique_lock<std::mutex> <name>{state_->mu}` token
-      (same unclosed block) and `++state_->next_seq`, so the draw is taken under the lock that
-      decides queue order. R2c: argument pins. The legacy call is exactly
+      (same unclosed block) and `++state_->next_seq`. This checks TOKEN ORDER only: it cannot see
+      an unlock() between them, a never-taken branch, or control flow, so the draw being under
+      the lock is review-enforced and covered probabilistically by the concurrent [tsan] offers
+      test. R2c: argument pins. The legacy call is exactly
       `stamp_emit_pair(ev, state_->emit_seq_source->boot_epoch, state_->emit_seq_source->draw())`
       and `set_common`'s is exactly `stamp_emit_pair(ev, e.boot_epoch, e.seq)`: swapping the
       arguments, a constant in place of `draw()`, or the wrong field is lexically distinct.
@@ -52,8 +54,13 @@ string mentioning a token can neither satisfy nor trip a rule. Function-body sco
 balanced brackets on the stripped text. Patterns anchor on distinctive tokens, never line numbers.
 
 Lexical only: it cannot see a relocation that keeps the tokens but changes control flow
-(review-enforced), and it does not prove stamp CORRECTNESS (the Catch2 suites do that). The
-self-test applies in-memory mutations of the committed sources, one or more per rule, plus
+(review-enforced), and it does not prove stamp CORRECTNESS (the Catch2 suites do that).
+
+Known lexical limits (review-enforced, not detected): an unlock() between the draw and the
+lock-held region, a stamp wrapped in a never-taken branch, and a second enqueue of an already
+stamped entry.
+
+The self-test applies in-memory mutations of the committed sources, one or more per rule, plus
 comment/string-stripping proofs, and requires problems() to report each; a mutation whose
 pattern no longer matches fails loudly (stale pattern) rather than passing vacuously.
 

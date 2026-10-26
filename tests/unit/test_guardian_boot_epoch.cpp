@@ -247,10 +247,10 @@ TEST_CASE("boot-epoch: a throwing store is a failed claim, never an exception",
 
 TEST_CASE("boot-epoch: a wiped row in the same second reuses the epoch (documented residual)",
           "[guardian][boot_epoch]") {
-    // PINNED RESIDUAL (D3), not a goal: with the KV row wiped and a restart inside the same
-    // wall-clock second, both boots resolve to that second, so the epochs are EQUAL and the
-    // server cannot see a regression. Closing it needs a sub-second clock term, which would
-    // change the epoch's definition. If this test starts failing, the residual changed:
+    // PINNED RESIDUAL (the UP-14 residual-acceptance ruling), not a goal: with the KV row wiped and
+    // a restart inside the same wall-clock second, both boots resolve to that second, so the epochs
+    // are EQUAL and the server cannot see a regression. Closing it needs a sub-second clock term,
+    // which would change the epoch's definition. If this test starts failing, the residual changed:
     // update guardian_boot_epoch.hpp's DOCUMENTED RESIDUAL paragraph with it.
     FaultingStore before_wipe;
     const auto a = claim_guardian_boot_epoch(&before_wipe, kNow);
@@ -494,16 +494,19 @@ private:
 
 } // namespace
 
-TEST_CASE("boot-epoch: two processes on one KV file can claim the SAME epoch (documented residual)",
+TEST_CASE("boot-epoch: two writers on one KV file can claim the SAME epoch (documented residual)",
           "[guardian][boot_epoch]") {
-    // PINS A DOCUMENTED, ACCEPTED RESIDUAL (ruling D3), NOT DESIRED BEHAVIOUR. Nothing in the
-    // agent enforces one process per data directory (see guardian_boot_epoch.hpp, SINGLE-WRITER
-    // ASSUMPTION), and the KV file is in WAL mode, which admits a second connection. If two
-    // processes both read N before either writes, both claim N + 1 and draw emit_seq from 1.
-    // If this test starts failing, the residual changed: update that paragraph with it.
+    // PINS A DOCUMENTED, ACCEPTED RESIDUAL (the UP-14 residual-acceptance ruling), NOT
+    // DESIRED BEHAVIOUR. Nothing in the agent enforces one process per data directory (see
+    // guardian_boot_epoch.hpp, SINGLE-WRITER ASSUMPTION), and the KV file is in WAL mode,
+    // which admits a second connection. If two writers both read N before either writes,
+    // both claim N + 1 and draw emit_seq from 1.
     //
-    // Two REAL connections open one file (the WAL premise). The racing read is simulated by
-    // handing the second claim the row as it stood before the first claim's write.
+    // The interleaving is SIMULATED: two real connections open one file (the WAL premise),
+    // but the stale-read wrapper hands the second claim the row as it stood before the first
+    // claim's write, so no real race runs. This test pins the epoch arithmetic of the
+    // accepted residual only (both writers claim N + 1). It will NOT detect a later instance
+    // lock or compare-and-set added to the claim; that needs a real two-process test.
     yuzu::test::TempDbFile db{"yuzu_test_boot_epoch_two_proc-"};
     auto kv_a = KvStore::open(db.path);
     auto kv_b = KvStore::open(db.path);
@@ -522,7 +525,7 @@ TEST_CASE("boot-epoch: two processes on one KV file can claim the SAME epoch (do
     REQUIRE(a.outcome == Outcome::Claimed);
     REQUIRE(b.outcome == Outcome::Claimed);
     CHECK(a.boot_epoch == seed.boot_epoch + 1);
-    CHECK(b.boot_epoch == a.boot_epoch); // the SAME epoch, from two live processes
+    CHECK(b.boot_epoch == a.boot_epoch); // the SAME epoch, from two writers
 
     GuardianEmitSeqSource proc_a(a.boot_epoch);
     GuardianEmitSeqSource proc_b(b.boot_epoch);

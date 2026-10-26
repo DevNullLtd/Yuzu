@@ -31,9 +31,9 @@
  * remediation.failed, guard.compliant, guard.unhealthy are all distinct census
  * signals - a server that does not compare the (boot_epoch, emit_seq) pair orders
  * same-second events by ARRIVAL order, and the pair itself is drawn in admission
- * order, so reordering is a correctness bug, not just a cardinality change). Bounded by BOTH
- * `max_events` and `max_bytes` (Event::ByteSizeLong() plus kEmitPairMaxWireBytes,
- * computed once at offer()).
+ * order, so reordering is a correctness bug, not just a cardinality change).
+ * Bounded by BOTH `max_events` and `max_bytes` (Event::ByteSizeLong() plus
+ * kEmitPairMaxWireBytes, computed once at offer()).
  *
  * LOSS ACCOUNTING AND THE STICKY INTEGRITY GAP. Every event this executor admitted
  * or was offered but the server will not receive is a *loss* except the two
@@ -104,9 +104,9 @@
  * symptom (a stale synthetic repair overwriting a newer real verdict on a server
  * that orders by timestamp, e.g. via an `updated_at >=` upsert guard; this check and
  * SEQ-GUARDED CLEARING are the agent-side defence, independent of how the server
- * orders): checking supersession only
- * at kick/fire time is not enough, because the supersession can happen AFTER
- * the repair is already queued and BEFORE it reaches the front.
+ * orders): checking supersession only at kick/fire time is not enough, because the
+ * supersession can happen AFTER the repair is already queued and BEFORE it reaches
+ * the front.
  *
  * ADMISSION-TIME EPISODE BINDING (adversarial-review finding, 2026-09-24 - a
  * residual gap in SEQ-GUARDED CLEARING that DEQUEUE-TIME SUPERSESSION alone

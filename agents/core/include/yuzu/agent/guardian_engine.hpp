@@ -226,8 +226,9 @@ public:
     /// guardian_legacy_sink_executor.hpp's class doc comment). The server's
     /// census goes fail-closed (errored) for a gapped rule until either the
     /// repair is confirmed delivered or the rule's next real verdict clears it
-    /// (same-or-newer timestamp `>=` ordering — D11's "first verdict clears"
-    /// semantics, docs/spark-legacy-delta-registry.md); locally, the executor's
+    /// (same-or-newer timestamp `>=` ordering until the server compares the pair;
+    /// D11's "first verdict clears" semantics,
+    /// docs/spark-legacy-delta-registry.md); locally, the executor's
     /// own gap ledger can ALSO be cleared by that same next real verdict, before
     /// any repair for it is ever dispatched — see
     /// guardian_legacy_sink_executor.hpp's SEQ-GUARDED CLEARING section. noexcept:

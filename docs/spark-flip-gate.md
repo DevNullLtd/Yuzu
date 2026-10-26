@@ -2867,6 +2867,23 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   UP-14 but worsens UP-13. The test
   `#3972 chaos: a third sender holding the stream write mutex ...` (hidden `[.chaos]`)
   characterises UP-13 and deliberately asserts no order.
+- Merge gate for the agent change (UP-14; conditions the UP-14 SERVER change must meet before
+  the agent change merges, in the fixed order census change, server change, agent change;
+  none of these is done yet, and the agent PR description links this list as "merge gated
+  on"):
+  1. The comparator orders by the pair only when both sides carry a nonzero pair, and
+     otherwise by the timestamp, with a test that rejects "an unset pair ranks lowest".
+  2. A tested recovery path for a pair regression (an agent KV row lost with the clock behind
+     the stored epoch; an epoch pinned ahead of the clock and then the row lost), documented
+     in the operator manual.
+  3. The pair is kept out of `stored_event_matches`, so a journal replay (0/0) of an event
+     already delivered is not counted as a collision (otherwise `YuzuGuardianEventsDropped`
+     fires on benign replays).
+  4. The rule for gap repairs (they draw a fresh pair at admission today) and for an accepted
+     0/0 (overwrite or retain the stored pair) is stated and tested.
+  5. The proto hunk is byte-identical to this agent change's hunk, and its comment carries
+     the qualified wording (boot_epoch is not guaranteed monotonic across restarts: the
+     lost-row, clock-ahead and equal-epoch cases) and defines UP-14.
 - Owner: not assigned in source material.
 - Milestone: PR #5776.
 - Revisit trigger: PR-5 (F14 flip) soak. During the first flip soak, inspect

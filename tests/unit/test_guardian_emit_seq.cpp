@@ -18,8 +18,10 @@ namespace gpb = ::yuzu::guardian::v1;
 namespace {
 
 // Joins every started thread on scope exit, including when a later emplace_back throws.
-// Not std::jthread: Apple Clang 15's libc++ lacks it. Declare it BEFORE any thread starts and
-// AFTER every local the workers reference, so the joins run before those locals are destroyed.
+// std::jthread is not used because Apple libc++ ships it only behind -fexperimental-library;
+// see test_guardian_spark_runtime.cpp PortableJThread. Declare it BEFORE any thread starts
+// and AFTER every local the workers reference, so the joins run before those locals are
+// destroyed.
 struct JoinGuard {
     std::vector<std::thread> threads;
     JoinGuard() = default;

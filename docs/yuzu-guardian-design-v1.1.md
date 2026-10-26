@@ -982,9 +982,10 @@ agent-asserted order of an event as the pair `(boot_epoch, emit_seq)`, compared
 lexicographically. They are ordinals, not timestamps: 0 means unset, and the agent sets
 both or neither. `boot_epoch` is claimed once at agent boot as the larger of the persisted
 counter plus one and the boot time in unix seconds, stored in the agent KV store under
-namespace `__guardian__`, key `meta:boot_epoch`; a stored value that cannot be parsed or is
-out of range is re-claimed from the clock and overwritten, and a KV failure leaves the epoch
-0, so the pair is sent as 0/0. `emit_seq` is drawn from one source owned by the engine and
+namespace `__guardian__`, key `meta:boot_epoch`; a stored value that cannot be parsed, or is
+at or above 2^62 - 1, is re-claimed from the clock and overwritten, and a KV failure leaves
+the epoch 0, so the pair is sent as 0/0. The agent logs one `Guardian boot_epoch claim` line
+per boot, which also prints `synchronous=` (expected 2, FULL). `emit_seq` is drawn from one source owned by the engine and
 shared by both emit paths: the legacy sink executor draws it at admission, under the
 executor lock, and the Spark runtime draws it when it enqueues an outbox entry. Entries
 re-sent from the lifecycle journal carry 0/0, because their original position is not
@@ -992,22 +993,26 @@ journalled; DEX observations also carry 0/0. 0/0 means unordered, not oldest. A 
 should compare the pair only when both sides carry a nonzero pair, and otherwise order by the
 timestamp. A server that compares the pair orders by it; one that does not ignores it and
 keeps ordering by the timestamp. The server change owns the comparator and the recovery path
-for a pinned or lost epoch.
+for a pinned or lost epoch. Acceptance list for the server change: see the UP-14 entry in
+`docs/spark-flip-gate.md` and issue #5690.
 
 Known limits of the boot epoch:
 
 - If the KV row is wiped and the agent restarts within the same second as the previous boot,
-  the new epoch equals the previous one and `emit_seq` restarts at 1 (accepted, ruling D3; the
-  equal epoch is pinned by a test).
+  the new epoch equals the previous one and `emit_seq` restarts at 1 (accepted by the UP-14
+  residual-acceptance ruling; the equal epoch is pinned by a test).
 - A single writer is assumed, not enforced: two agent processes on one data directory can claim
-  the same epoch and draw overlapping `emit_seq` values (accepted under D3). Each service
+  the same epoch and draw overlapping `emit_seq` values (accepted under the same ruling). Each service
   manager starts one instance per unit, but a manual run against the same `--data-dir` is not
   excluded.
 - A clock wrongly ahead at boot pins the epoch ahead, and it does not self-heal because the
-  claim tracks the persisted value rather than the clock. A lost or corrupt row after such a
-  pin re-claims from the clock and can land below epochs already issued. A deleted or
-  restored-from-backup `kv_store.db` likewise loses the ordering history; restoring is safe
-  when the clock is correct because the clock term wins. A VM memory-snapshot revert continues
+  claim tracks the persisted value rather than the clock. A burst of restarts or a crash loop
+  within the same second also pushes the epoch ahead of a correct clock (n boots in one second
+  give clock + n - 1). A lost or corrupt row after such a pin re-claims from the clock and can
+  land below epochs already issued. A deleted or restored-from-backup `kv_store.db` likewise
+  loses the ordering history; restoring an older copy is normally safe because the clock term
+  wins, unless the agent restarted repeatedly within a few seconds before the restore or the
+  epoch had been pinned ahead of the clock. A VM memory-snapshot revert continues
   with the same epoch and a lower `emit_seq` and involves no boot, so no claim runs.
 - An agent whose epoch claim fails (no store, a read or write failure, or a clock reading at
   or above the 2^62 ceiling) sends the pair as 0/0 for the whole process lifetime, ordered by
@@ -1015,6 +1020,8 @@ Known limits of the boot epoch:
   line.
 - Events replayed from the lifecycle journal carry 0/0, so a replayed event is not
   byte-identical to its live original in fields 24 and 25.
+- The pair is agent-asserted and not authenticated: a local administrator or a compromised
+  agent can set any epoch, for that agent's own events only.
 
 ### 7.2 Wire integration
 
