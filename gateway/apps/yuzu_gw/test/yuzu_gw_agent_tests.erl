@@ -75,6 +75,8 @@ agent_test_() ->
       {"agent stops on stream_error", fun stops_on_error/0},
       {"disconnect notifies pending waiters", fun disconnect_notifies_pending/0},
       {"get_info returns state", fun get_info_works/0},
+      {"the owner keeps the hostname, not the whole AgentInfo (Phase 1c G1)",
+       fun owner_keeps_hostname_not_agent_info/0},
       {"stream handler death triggers disconnect", fun stream_handler_death/0},
       {"stream handler death in connecting state", fun stream_handler_death_connecting/0},
       {"HA WS-4 4.4: reannounce for the CURRENT session re-sends CONNECTED",
@@ -408,6 +410,28 @@ get_info_works() ->
     ?assertEqual(<<"gi-1">>, maps:get(agent_id, Info)),
     ?assertEqual(streaming, maps:get(state, Info)),
     ?assert(is_integer(maps:get(connected_at, Info))),
+    stop_agent(Pid).
+
+%% Phase 1c G1 (2026-10-26): the owner keeps only the hostname of the agent's
+%% AgentInfo. A marker in another AgentInfo field must not be anywhere in the
+%% process's state, and get_info/1 still answers hostname and plugins.
+owner_keeps_hostname_not_agent_info() ->
+    Marker = <<"MARKER-g1-description">>,
+    Args = #{agent_id   => <<"g1-1">>,
+             session_id => <<"sess-g1-1">>,
+             stream_pid => self(),
+             agent_info => #{hostname => <<"host-g1">>,
+                             platform => #{os => <<"linux">>},
+                             plugins  => [#{name => <<"svc">>, description => Marker}]},
+             peer_addr  => <<"127.0.0.1">>},
+    {ok, Pid} = yuzu_gw_agent:start_link(Args),
+    unlink(Pid),
+    {ok, Info} = yuzu_gw_agent:get_info(Pid),
+    ?assertEqual(<<"host-g1">>, maps:get(hostname, Info)),
+    ?assertEqual([<<"svc">>], maps:get(plugins, Info)),
+    ?assertNot(maps:is_key(agent_info, Info)),
+    {_State, Data} = sys:get_state(Pid),
+    ?assertEqual(nomatch, binary:match(term_to_binary(Data), Marker)),
     stop_agent(Pid).
 
 stream_handler_death() ->

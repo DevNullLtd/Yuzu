@@ -125,7 +125,13 @@
     session_id  :: binary() | undefined,
     stream_pid  :: pid() | undefined,     %% subscribe handler process
     stream_mon  :: reference() | undefined, %% monitor ref for stream_pid
-    agent_info  :: map(),
+    %% The agent's hostname, the only part of the RegisterRequest's AgentInfo
+    %% this process reads (registry row, re-register, get_info). The whole
+    %% AgentInfo (26 KB for an agent with 69 plugins, measured 2026-10-26) is
+    %% NOT kept: nothing here reads the rest, and the owner table keeps the
+    %% request for a restart. Same tuple position as the old `agent_info'
+    %% field, so #data.stream_pid stays element 4 (yuzu_gw_scale_probe reads it).
+    hostname    :: binary(),
     register_req :: map(),                %% verbatim RegisterRequest (for upstream-reconnect replay)
     plugins     :: [binary()],
     %% command_id => {reply_to, fanout_ref, dispatched_at, plugin}. The plugin
@@ -286,6 +292,7 @@ init_owner(#{agent_id := AgentId, agent_info := AgentInfo,
              stream_pid := StreamPid, peer_addr := PeerAddr} = Args, OwnerKey, StreamHomeId) ->
     SessionId = maps:get(session_id, Args, undefined),
     Plugins = extract_plugin_names(AgentInfo),
+    Hostname = hostname_of(AgentInfo),
     %% Verbatim RegisterRequest, threaded from the subscribe handler.
     %% Defaulted so an agent started without it (older callers, tests)
     %% still works — replay just skips agents whose req is empty.
@@ -306,7 +313,7 @@ init_owner(#{agent_id := AgentId, agent_info := AgentInfo,
         session_id  = SessionId,
         stream_pid  = StreamPid,
         stream_mon  = StreamMon,
-        agent_info  = AgentInfo,
+        hostname    = Hostname,
         register_req = RegisterReq,
         plugins     = Plugins,
         pending     = #{},
@@ -330,13 +337,11 @@ registering(enter, _OldState, _Data) ->
     keep_state_and_data;
 
 registering(internal, {register, ConnKey, Ack},
-            #data{agent_id = AgentId, session_id = SessionId, agent_info = AgentInfo,
+            #data{agent_id = AgentId, session_id = SessionId, hostname = Hostname,
                   plugins = Plugins, register_req = RegisterReq} = Data) ->
     %% Register in the routing table. The RegisterRequest is stashed in the
     %% registry so yuzu_gw_upstream can re-proxy it when the upstream
     %% connection re-establishes.
-    Hostname = maps:get(<<"hostname">>, AgentInfo,
-                        maps:get(hostname, AgentInfo, <<>>)),
     case yuzu_gw_registry:register_agent(AgentId, self(), SessionId, Plugins,
                                          Hostname, RegisterReq, ConnKey) of
         ok ->
@@ -541,8 +546,7 @@ await_settled(#data{agent_id = AgentId, session_id = SessionId, stream_home_id =
     end.
 
 register_again(#data{agent_id = AgentId, session_id = SessionId, plugins = Plugins,
-                     agent_info = AgentInfo, register_req = RegisterReq} = Data) ->
-    Hostname = maps:get(<<"hostname">>, AgentInfo, maps:get(hostname, AgentInfo, <<>>)),
+                     hostname = Hostname, register_req = RegisterReq} = Data) ->
     case yuzu_gw_registry:recover_agent(AgentId, self(), SessionId, Plugins, Hostname,
                                         RegisterReq, conn_key(Data)) of
         ok ->
@@ -590,7 +594,7 @@ restored_data(#{agent_id := AgentId, agent_info := AgentInfo, peer_addr := PeerA
           session_id   = maps:get(session_id, Args, undefined),
           stream_pid   = maps:get(stream_pid, Args, undefined),
           stream_mon   = undefined,
-          agent_info   = AgentInfo,
+          hostname     = hostname_of(AgentInfo),
           register_req = maps:get(register_req, Args, #{}),
           plugins      = extract_plugin_names(AgentInfo),
           pending      = #{},
@@ -835,6 +839,10 @@ code_change(_OldVsn, State, Data0, Extra) when is_tuple(Data0), element(1, Data0
                                                 tuple_size(Data0) =:= tuple_size(#data{}) - 1 ->
     %% A record from before OWNER-RESTART: no owner_key (never restarted).
     code_change(_OldVsn, State, erlang:append_element(Data0, undefined), Extra);
+code_change(_OldVsn, State, #data{hostname = Info} = Data, Extra) when is_map(Info) ->
+    %% A record from before Phase 1c (2026-10-26): the field held the whole
+    %% AgentInfo; only its hostname is kept.
+    code_change(_OldVsn, State, Data#data{hostname = hostname_of(Info)}, Extra);
 code_change(_OldVsn, State, #data{pending = Pending} = Data, _Extra) ->
     %% A pending entry from a version that did not keep the dispatched plugin
     %% is a 3-tuple; it completes with the plugin unknown.
@@ -1023,17 +1031,23 @@ notify_watchers(Event) ->
 ensure_binary(undefined) -> <<>>;
 ensure_binary(B) when is_binary(B) -> B.
 
+%% The hostname from an AgentInfo map (atom keys from gpb, binary keys from a
+%% hand-built map in tests).
+hostname_of(AgentInfo) ->
+    maps:get(<<"hostname">>, AgentInfo, maps:get(hostname, AgentInfo, <<>>)).
+
 extract_plugin_names(AgentInfo) ->
     Plugins = maps:get(<<"plugins">>, AgentInfo,
                        maps:get(plugins, AgentInfo, [])),
     [maps:get(<<"name">>, P, maps:get(name, P, <<"unknown">>)) || P <- Plugins].
 
+%% The answer to get_info/1 (GetAgent reads plugins, hostname and
+%% connected_at). It no longer carries the agent's whole AgentInfo: the process
+%% does not keep it (see #data.hostname).
 format_info(#data{agent_id = AgentId, session_id = SessionId,
                    plugins = Plugins, connected_at = ConnectedAt,
-                   agent_info = AgentInfo, peer_addr = PeerAddr,
+                   hostname = Hostname, peer_addr = PeerAddr,
                    pending = Pending}, State) ->
-    Hostname = maps:get(<<"hostname">>, AgentInfo,
-                        maps:get(hostname, AgentInfo, <<>>)),
     #{agent_id     => AgentId,
       session_id   => SessionId,
       state        => State,
@@ -1041,5 +1055,4 @@ format_info(#data{agent_id = AgentId, session_id = SessionId,
       hostname     => Hostname,
       connected_at => ConnectedAt,
       peer_addr    => PeerAddr,
-      agent_info   => AgentInfo,
       pending_cmds => maps:size(Pending)}.
