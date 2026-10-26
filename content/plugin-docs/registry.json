@@ -1459,7 +1459,7 @@
     {
       "grant": "n/a",
       "if_refused": "always `registry|unsupported|Windows registry is not available on this platform`, rc 0 (reads) / rc 1 (mutators)",
-      "measured": "2026-10-22, vm, euid 0 (the three 2.1.0 actions are `[not captured]`: added after that capture, recaptured on a Linux host later)",
+      "measured": "2026-10-26, vm (WSL2 Ubuntu 26.04), euid 0, all twelve actions captured with the built `plugin-capture`",
       "os": "Linux",
       "runs_as": "n/a: plugin loads but every action is the honest `unsupported` stub (dconf support is PLANNED)"
     }
@@ -1615,39 +1615,57 @@
         },
         {
           "action": "set_user_value",
-          "not_captured": "Mutating/Irreversible: added in registry 2.1.0 after this leg's 2026-10-22 capture; captured on a Linux host later",
+          "not_captured": null,
           "params": "username=jsmith key=Software\\YuzuCaptureTmp name=probe value=1",
-          "rc": 0,
-          "result_status": null,
-          "row_count": 0,
-          "rows": [],
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry is not available on this platform"
+          ],
           "truncated": false
         },
         {
           "action": "delete_user_value",
-          "not_captured": "Destructive/Irreversible: added in registry 2.1.0 after this leg's 2026-10-22 capture; captured on a Linux host later",
+          "not_captured": null,
           "params": "username=jsmith key=Software\\YuzuCaptureTmp name=probe",
-          "rc": 0,
-          "result_status": null,
-          "row_count": 0,
-          "rows": [],
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry is not available on this platform"
+          ],
           "truncated": false
         },
         {
           "action": "apply",
-          "not_captured": "Destructive/Irreversible: added in registry 2.1.0 after this leg's 2026-10-22 capture; captured on a Linux host later",
+          "not_captured": null,
           "params": "plan=[{\"op\":\"create_key\",\"key\":\"SOFTWARE\\\\YuzuCaptureTmp\"}]",
-          "rc": 0,
-          "result_status": null,
-          "row_count": 0,
-          "rows": [],
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry is not available on this platform"
+          ],
           "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-10-22",
+        "date": "2026-10-26",
         "host_class": "vm",
-        "leg_hash": "pending",
+        "leg_hash": "2db0b6e73233",
         "os": "linux",
         "os_version": "Ubuntu 26.04.1 LTS x86_64",
         "privilege": "euid 0"

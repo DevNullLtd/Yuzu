@@ -97,7 +97,7 @@ flowchart LR
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, #1442) | Writes against `HKLM\*` need the service account in `Administrators`; `HKCU\*` needs no elevation. `get_user_value`, `set_user_value` and `delete_user_value` use the offline-hive fallback only when the target user is logged out: it needs `SeBackupPrivilege`+`SeRestorePrivilege`, already granted to the service account, so there is no new grant (the privileges are enabled on the PROCESS token for the span of the mount, a documented residual of `with_user_hive`); the live-hive path, the machine-hive writes (`apply` included) and `list_profiles` need no elevated privilege beyond the key's own ACL. `NtDeleteKey` and `NtQueryKey` (ntdll) need no privilege beyond `DELETE` on the key and a handle the caller already holds. | 2026-10-23, bare-metal, elevated interactive user: the nine registry 2.0.1 actions captured (`docs/samples/windows.txt`; the three added in 2.1.0 are `[not captured]` there: they were added after that capture, and the Windows leg is recaptured with them later); the write arms, the recursive delete, the per-user writes and `apply` also run in `tests/unit/test_registry_write_local_dispatcher.cpp` and `tests/unit/test_registry_win_internals.cpp` on elevated Windows runs | `error\|key not found` / `error\|value not found` (reads; `get_value` answers `error\|value changed while reading ...` for a value that kept growing through its bounded re-reads and `error\|win32:<code>` for any other failed read); the mutating actions name the cause: `error\|access_denied`, `key_not_found`, `value_not_found`, `key_is_link`, `key_has_subkeys`, `concurrent_change`, `root_level_create`, `verify_mismatch`, `invalid_key_path`, `invalid_value_name`, `invalid_type`, `invalid_data`, `value_overflow`, `tree_too_large`, `unsupported_old_type`, `unrepresentable_name`, `flush_failed:<token>`, `win32:<code>` or `exception`; the per-user writes add `hive_not_found`, `privilege_missing`, `hive_mount_failed`, a hive-file guard token (`hive_hardlinked`, ...) and `hive_unload_failed`, and `apply` adds `invalid_hive`, `dependent_items:<i>:<j>`, `invalid_plan:<why>` and `partial_failure` (the token table under Outputs says what each means) |
 | macOS | n/a: plugin loads but every action is the honest `unsupported` stub (plist support is PLANNED) | n/a | 2026-10-26, bare-metal, euid 501 | always `registry\|unsupported\|Windows registry has no macOS equivalent; use defaults/plists`, rc 0 (reads) / rc 1 (mutators) |
-| Linux | n/a: plugin loads but every action is the honest `unsupported` stub (dconf support is PLANNED) | n/a | 2026-10-22, vm, euid 0 (the three 2.1.0 actions are `[not captured]`: added after that capture, recaptured on a Linux host later) | always `registry\|unsupported\|Windows registry is not available on this platform`, rc 0 (reads) / rc 1 (mutators) |
+| Linux | n/a: plugin loads but every action is the honest `unsupported` stub (dconf support is PLANNED) | n/a | 2026-10-26, vm (WSL2 Ubuntu 26.04), euid 0, all twelve actions captured with the built `plugin-capture` | always `registry\|unsupported\|Windows registry is not available on this platform`, rc 0 (reads) / rc 1 (mutators) |
 
 No external binaries, no subprocesses, no network access: every call is an in-process Win32 `Reg*W`/`AdjustTokenPrivileges`/`NtDeleteKey`/`NtQueryKey` call (`registry_win.cpp`, `agents/shared/win_profiles.hpp`, `agents/shared/win_reg_handle.hpp`).
 
@@ -501,7 +501,7 @@ registry|unsupported|Windows registry has no macOS equivalent; use defaults/plis
 [rc] 1
 ```
 
-**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-22 · euid 0 · leg-hash pending
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-26 · euid 0 · leg-hash 2db0b6e73233
 
 ```
 == action=get_value hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" name=ProductName
@@ -544,13 +544,19 @@ registry|unsupported|Windows registry is not available on this platform
 [result_status] UNDECLARED / UNKNOWN
 
 == action=set_user_value username=jsmith key=Software\YuzuCaptureTmp name=probe value=1
-[not captured] Mutating/Irreversible: added in registry 2.1.0 after this leg's 2026-10-22 capture; captured on a Linux host later
+registry|unsupported|Windows registry is not available on this platform
+[result_status] UNDECLARED / UNKNOWN
+[rc] 1
 
 == action=delete_user_value username=jsmith key=Software\YuzuCaptureTmp name=probe
-[not captured] Destructive/Irreversible: added in registry 2.1.0 after this leg's 2026-10-22 capture; captured on a Linux host later
+registry|unsupported|Windows registry is not available on this platform
+[result_status] UNDECLARED / UNKNOWN
+[rc] 1
 
 == action=apply plan=[{"op":"create_key","key":"SOFTWARE\\YuzuCaptureTmp"}]
-[not captured] Destructive/Irreversible: added in registry 2.1.0 after this leg's 2026-10-22 capture; captured on a Linux host later
+registry|unsupported|Windows registry is not available on this platform
+[result_status] UNDECLARED / UNKNOWN
+[rc] 1
 ```
 <!-- END GENERATED -->
 
