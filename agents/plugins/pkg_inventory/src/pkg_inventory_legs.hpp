@@ -90,8 +90,9 @@ inline void emit_result(yuzu::CommandContext& ctx, Action a,
                         const std::vector<std::string>& data_rows,
                         const std::optional<std::string>& constraint) {
     const bool constrained = constraint.has_value();
-    ctx.write_output(format_status_row(
-        action_name(a), constrained ? StatusLevel::constrained : StatusLevel::supported,
+    ctx.write_output(yuzu::shared::format_status_row(
+        action_name(a),
+        constrained ? yuzu::shared::StatusLevel::constrained : yuzu::shared::StatusLevel::supported,
         constrained ? std::string_view{*constraint} : std::string_view{}));
     for (const auto& row : data_rows)
         ctx.write_output(row);
@@ -120,7 +121,8 @@ inline void emit_unsupported(yuzu::CommandContext& ctx, Action a, std::string_vi
 /// failure to report is swallowed and the command still fails with rc 1.
 inline int report_execute_exception(yuzu::CommandContext& ctx, std::string_view action) noexcept {
     try {
-        ctx.write_output(format_status_row(action, StatusLevel::constrained, kTokenException));
+        ctx.write_output(yuzu::shared::format_status_row(
+            action, yuzu::shared::StatusLevel::constrained, kTokenException));
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               kTokenException);
     } catch (...) {
