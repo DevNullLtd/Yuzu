@@ -36,6 +36,7 @@
 #include "guardian_backend.hpp" // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_convergence_scheduler.hpp"
 #include "guardian_drift_event.hpp" // apply_drift_to_event (shared with the spark path)
+#include "guardian_emit_seq.hpp"    // GuardianEmitSeqSource (UP-14)
 #include "guardian_health_heartbeat.hpp" // GuardianHealthStats, guardian_spark_claim_health_stats (#5404)
 #include "guardian_detached_worker_role.hpp" // rung 9c R5.1: executor workers
 #include "guardian_joined_thread_role.hpp"
@@ -946,10 +947,29 @@ GuardianBaselinePersister::persist_staged(GuardianSparkRuntime& rt, Trigger trig
     return out;
 }
 
-GuardianEngine::GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark)
+GuardianEngine::GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark,
+                               std::uint64_t boot_epoch)
     : kv_{kv}, agent_id_{std::move(agent_id)},
-      legacy_sink_executor_{std::make_unique<GuardianLegacySinkExecutor>()},
-      prefer_spark_{prefer_spark}, ack_ledger_{std::make_unique<GuardianArmAckLedger>()} {}
+      emit_seq_source_{std::make_shared<GuardianEmitSeqSource>(boot_epoch)},
+      legacy_sink_executor_{make_legacy_sink_executor()}, prefer_spark_{prefer_spark},
+      ack_ledger_{std::make_unique<GuardianArmAckLedger>()} {}
+
+std::unique_ptr<GuardianLegacySinkExecutor>
+GuardianEngine::make_legacy_sink_executor(std::optional<std::size_t> max_events) const {
+    GuardianLegacySinkExecutor::Config cfg;
+    if (max_events)
+        cfg.max_events = *max_events;
+    cfg.emit_seq_source = emit_seq_source_;
+    return std::make_unique<GuardianLegacySinkExecutor>(std::move(cfg));
+}
+
+std::uint64_t GuardianEngine::boot_epoch() const noexcept {
+    return emit_seq_source_->boot_epoch;
+}
+
+std::shared_ptr<GuardianEmitSeqSource> GuardianEngine::emit_seq_source_for_test() const {
+    return emit_seq_source_;
+}
 
 GuardianEngine::~GuardianEngine() {
     // Explicit (not = default): join the guard worker threads here via stop().
@@ -3239,9 +3259,9 @@ std::uint64_t GuardianEngine::legacy_sink_dropped_unwired() const {
 void GuardianEngine::set_legacy_sink_max_events_for_test(std::size_t max_events) {
     assert(!started_ &&
            "set_legacy_sink_max_events_for_test: must be called before start_local()");
-    GuardianLegacySinkExecutor::Config cfg;
-    cfg.max_events = max_events;
-    legacy_sink_executor_ = std::make_unique<GuardianLegacySinkExecutor>(cfg);
+    // UP-14: through the shared builder so the rebuilt executor still carries the engine's
+    // emit-order source (a bare Config would silently revert it to a private epoch-0 source).
+    legacy_sink_executor_ = make_legacy_sink_executor(max_events);
 }
 
 // #4783 TEST-ONLY seams (see guardian_engine.hpp's own doc comments). None of these
@@ -3868,6 +3888,11 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         GuardianSparkRuntime::Config spark_runtime_cfg{};
         if (test_spark_backend_op_deadline_)
             spark_runtime_cfg.backend_op_deadline = *test_spark_backend_op_deadline_;
+        // UP-14: the runtime co-owns the engine's emit-order source (shared_ptr, per the
+        // own-everything-borrow-nothing rule below) so Spark lifecycle entries and legacy
+        // events draw from ONE sequence. The source lives in the engine, not here, because
+        // this runtime can be absent (SparkDisabled / SparkFailed).
+        spark_runtime_cfg.emit_seq_source = emit_seq_source_;
         spark_runtime_ = std::make_shared<GuardianSparkRuntime>(spark_reader_, spark_backend_,
                                                                 spark_runtime_cfg);
         // Provider captures a COPY of agent_id_, never `this` (#2237): the runtime is the
@@ -4067,8 +4092,10 @@ guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
 // Test-support helper — see guardian_engine.hpp. Friend of GuardianEngine so it
 // can reach the private emit_guard_event(); production drift only ever enters
 // that method from a guard worker's sink lambda (see start_guard_for_rule_locked).
-void guardian_emit_drift_for_test(GuardianEngine& engine, const GuardDrift& drift) {
-    engine.emit_guard_event(drift);
+void guardian_emit_drift_for_test(
+    GuardianEngine& engine, const GuardDrift& drift,
+    std::optional<std::chrono::system_clock::time_point> timestamp_override) {
+    engine.emit_guard_event(drift, /*is_gap_repair=*/false, timestamp_override);
 }
 
 // Test-support helpers — see guardian_engine.hpp (#4021 adversarial-review

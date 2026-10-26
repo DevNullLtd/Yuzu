@@ -65,6 +65,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "guardian_health_heartbeat.hpp"  // emit_guardian_health_heartbeat_tags (M1)
 #include "guardian_baseline_heartbeat.hpp" // emit_guardian_baseline_persist_heartbeat_tags (#4045)
 #include "guardian_baseline_persister.hpp" // kBaselineShutdownGrace (#4045; static_assert below)
+#include "guardian_boot_epoch.hpp"         // claim_guardian_boot_epoch (UP-14)
 #include "guardian_io_ceiling_heartbeat.hpp" // emit_guardian_io_ceiling_heartbeat_tags (rung 9c PR-3)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (item 7 PR-Ag)
 #include "guardian_legacy_sink_executor.hpp" // #4783: LegacySendOutcome (EventSink's return type)
@@ -874,7 +875,22 @@ public:
         // The engine persists rules into the KV store and answers __guard__
         // dispatches once the Subscribe stream is open. Construction is
         // safe even when KV failed to open (it degrades to in-memory only).
-        guardian_ = std::make_unique<GuardianEngine>(kv_store_.get(), cfg_.agent_id);
+        //
+        // UP-14: claim this boot's event-order epoch HERE, after the KvStore is open and before
+        // the engine exists, and pass it as the 4th constructor argument so the constructor
+        // stays I/O-free (the epoch must already be known when the engine builds the emit
+        // source its executor and Spark runtime share). It is NOT read in start_local(),
+        // which is deferred past the network. A null kv_store_ is handled by the claim
+        // (epoch 0 = unordered: the wire pair is 0/0 and the server falls back to the
+        // timestamp key). The literal `false` stays visible on purpose: prefer_spark_ is
+        // never passed true in production.
+        const auto now_unix_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+        const auto boot_epoch_claim = claim_guardian_boot_epoch(kv_store_.get(), now_unix_s);
+        guardian_ =
+            std::make_unique<GuardianEngine>(kv_store_.get(), cfg_.agent_id,
+                                             /*prefer_spark=*/false, boot_epoch_claim.boot_epoch);
         // Spread this endpoint's journal maintenance and its forced (boot / reconnect) replay
         // pages over their intervals - the ONLY place jitter is turned on, so every test keeps
         // a deterministic cadence. Must precede wire_spark_engine(), which builds the worker.
