@@ -732,7 +732,7 @@ hold: the store's latest report says `unreadable` or `not_observed`, and its `ob
 than a stated bound. Age alone never prunes. The prune follows the clock-guarded-retention routed
 concern. The design states how a pruned store's rows are re-sent despite hash-skip.
 
-**Proposed (prune rule pending owner ruling R16; see [Decisions](#decisions)):**
+**Proposed (prune rule ruled by the owner 2026-10-26, decision 7; see [Decisions](#decisions)):**
 - **Bound:** 30 days.
 - **One rule, at location grain.** A `cert_location` row is pruned when all three hold:
   its store's latest status is `unreadable`, `not_observed` or `constrained` (an `ok` or `absent`
@@ -744,8 +744,8 @@ concern. The design states how a pruned store's rows are re-sent despite hash-sk
   store-grain predicate on `observed_at < now()`, which governance showed pruned an offline
   device's rows once a store had read `unreadable` before it went offline. It is at least as strict
   as D12's store-grain condition wherever that condition applies, and extends R15's location grain
-  to `unreadable` and `not_observed` stores; the extension is ruling R16.
-- **Accepted residual (pending R16):** a forward step of the database clock that is in force when
+  to `unreadable` and `not_observed` stores; the extension is ruling R16 (accepted 2026-10-26).
+- **Accepted residual (R16, accepted 2026-10-26):** a forward step of the database clock that is in force when
   an agent next reports is added to that agent's `last_seen`, so its kept locations can age out
   that much early. `last_seen <= now()` stops a stored future value, not a step that `now()`
   itself carries.
@@ -1917,14 +1917,17 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
    by the same pass. The owner confirmed this reading of D12's store-grain condition over a
    per-store ceiling ([Retention and the prune](#retention-and-the-prune)).
 
-**Pending the owner's ruling (raised by governance on 2a-2d, 2026-10-23):**
+**Decided by the owner, 2026-10-26** (items raised by governance on 2a-2d, 2a-2e, 2a-3 and 2a-4; the owner took the recommendations on all):
 
-7. **R16, one location-grain prune rule** (ADR-0070 D12, proposed). See
-   [Retention and the prune](#retention-and-the-prune). 2a-2d does not merge before this ruling.
-8. **R17, the agents-before-servers window** (ADR-0070 D12, proposed): accept it by deploy order
-   and amend D12, or close it with a server-sent `__sync__` enable action. 2a-2e does not merge
-   before this ruling; option (b) adds a server half to 2a-2a's successor and an agent half to
-   2a-2e.
+7. **R16, one location-grain prune rule** (ADR-0070 D12). Ruled 2026-10-26: accepted as written
+   (see ADR R16), points (i)-(iv) accepted as residuals. See
+   [Retention and the prune](#retention-and-the-prune).
+8. **R17, the agents-before-servers window** (ADR-0070 D12). Ruled 2026-10-26: option (a). The
+   window is accepted and closed by deploy order (servers first; never roll a server back below
+   the typed-source read filter while certificate-collecting agents run), the agent PR's
+   merge-order test and an `upgrading.md` note; D12's "not acceptable" is amended for this case
+   (see ADR R17). Option (b) is not adopted: it would add a new server-to-agent protocol action
+   for a window opened only by a documented-forbidden rollback.
 
 9. **D13 counts at fleet scale** (raised by 2a-3, measured 2026-10-23). Computed from raw rows
    in one statement, the counts finish inside the 10 s statement cap only up to about 1.3M
@@ -1937,20 +1940,25 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
    while one runs. That holds at the default bound of two, which needs a pool of 8 or more; a
    pool of 4 to 7 gives a bound of one and a pool under 4 refuses the certificate reads. A
    per-replica fairness yield reduces, but does not eliminate, one principal starving others of
-   the long slot. The owner chooses the fleet-scale fix: a stored rollup keyed to its `as_of`
-   (an amendment to D13 condition 3, "never stored"), a longer bound with its own read slot, or
-   an asynchronous count job. 2a-3 ships the read-time counts with the limit stated; the chosen
-   fix is its own PR.
+   the long slot. **Ruled 2026-10-26:** slice 2 ships the read-time counts with the limit stated
+   (`scale_limit`, non-retryable, documented). The fleet-scale fix is a stored rollup keyed to its
+   `as_of`, delivered as its own later PR. That PR amends D13 condition 3 ("computed at read,
+   never stored"); the amendment is approved in principle for that PR and is not in force until
+   it ships.
 
 10. **CBOM audit posture** (raised by 2a-4's governance, owner acknowledgement pending). The CBOM
     certificate half writes its own `crypto.certificates.view` row (`via=cbom`) and is omitted,
     named in `halves_omitted`, when that row cannot be stored, on REST and on MCP alike (stricter
     than OD-2's MCP set-and-proceed); the export's own row stays set-and-proceed for the library
     half. The code is kept and this design follows it.
+    **Ruled 2026-10-26:** acknowledged as built; the certificate half fails closed on its own
+    audit row on REST and MCP.
 
 11. **The Linux walk's residual** (raised by 2a-2e's governance and measured by its chaos runs;
-    an owner decision: accept it as disclosed, or require further closure). Source: `sync_cancel.hpp`
-    header (2a-2e), copied verbatim. 2a-2e does not merge before the owner decides.
+    an owner decision). **Ruled 2026-10-26:** accepted as disclosed, including clause (4)'s Linux
+    5.8-6.7 mount-id-reuse gap. Operators running FUSE or autofs on certificate-collecting hosts
+    are advised to run Linux 6.8 or later; the agent PR's (2a-2e) README and manual must carry
+    that advice. Source: `sync_cancel.hpp` header (2a-2e), copied verbatim.
 
     WHAT REMAINS (disclosed residual, as measured):
     (1) With the mount table read in full and statx available (Linux 5.8 or later, not blocked by seccomp), an unnamed dead autofs or FUSE mount as root, path hop or entry is refused without blocking, and a late overmount over a named local mount is refused.

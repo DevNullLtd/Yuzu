@@ -1002,7 +1002,7 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     no reports, so nothing of it is pruned: age alone still never prunes. Ruled by the owner
     (liamsomerville) on 2026-10-23 and recorded as decision 6 in the Decisions section of
     `docs/crypto-slice2-certificate-design.md`, whose governance ledger is under `governance.d/`.
-  - **R16 — one location-grain prune rule (PROPOSED, awaiting the owner's ruling; not in force).**
+  - **R16 — one location-grain prune rule (owner, 2026-10-26; in force as written).**
     Governance on the prune PR showed that the store-grain condition, compared against the
     server's current time, prunes an offline device's rows once a store read `unreadable` before
     the device went offline, and never prunes a store whose first read was `constrained`. The
@@ -1012,24 +1012,30 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     receipt time), and the device's last receipt time is not in the future. An offline device is
     never pruned, and a location seen within the bound never is. Accepted residual: a forward step
     of the database clock in force when the device next reports shortens the bound by that step.
-    The prune PR does not merge until the owner rules on this. Points for the ruling, raised by
-    the prune PR's governance: (i) a device that returns after more than the bound offline can
+    Ruled by the owner (liamsomerville) on 2026-10-26: the rule is accepted and in force as
+    written, with points (i)-(iv) accepted as residuals; recorded as decision 7 in the Decisions
+    section of `docs/crypto-slice2-certificate-design.md`. Points raised by the prune PR's
+    governance: (i) a device that returns after more than the bound offline can
     lose its kept locations after one report; (ii) a location in a `constrained` store that went
     unreported for longer than the bound is pruned on the next report that reads the store
     `unreadable`; (iii) the forward-clock residual above; (iv) the rule covers machine-scope
     stores only (per-user stores are not collected in slice 2).
-  - **R17 — the agents-before-servers window for `certificate_inventory` (PROPOSED, awaiting the
-    owner's ruling; not in force).** D12 says stray certificate rows must never be readable and the
-    mixed-version window is not acceptable for this source. A server older than the typed-source
+  - **R17 — the agents-before-servers window for `certificate_inventory` (owner, 2026-10-26;
+    option (a) ruled).** D12 says stray certificate rows must never be readable and the
+    mixed-version window is not acceptable for this source, except as amended here: the window is
+    accepted for this source and closed by deploy order. A server older than the typed-source
     read filter (or rolled back below it) that receives the agent's blob through a gateway stores
     it in the generic store, readable under `Infrastructure:Read`. The agent receives no persistent
-    configuration from the server today, so it cannot tell such a server apart. The owner chooses:
-    (a) accept the window, closed by deploy order (servers first, never roll a server back below
-    the read filter while certificate-collecting agents run), the agent PR's merge-order test and
-    an `upgrading.md` note, and amend D12's "not acceptable" for this case; or (b) close it in
-    code: a new reserved `__sync__` enable action, persisted on the agent with the source off by
-    default and sent by the server on every connect from a stored setting, so an older server
-    never enables it. The agent collector PR does not merge until the owner rules on this.
+    configuration from the server today, so it cannot tell such a server apart. Ruled by the owner
+    (liamsomerville) on 2026-10-26: option (a). The window is accepted and closed by deploy order
+    (servers first; never roll a server back below the typed-source read filter while
+    certificate-collecting agents run), the agent PR's merge-order test and an `upgrading.md`
+    note. D12's "the mixed-version window is not acceptable" is amended for this case only: it
+    holds for every other typed source and for any window not opened by a documented-forbidden
+    rollback. Option (b), a reserved `__sync__` enable action persisted on the agent, was not
+    adopted: it would add a new server-to-agent protocol action for a window opened only by a
+    rollback the deploy order forbids. Recorded as decision 8 in the Decisions section of
+    `docs/crypto-slice2-certificate-design.md`.
 - A capped or timed-out capture is reported `constrained`, and the report is never an
   empty success.
 - An empty blob is never sent for a failed or constrained capture (the ADR-0016
