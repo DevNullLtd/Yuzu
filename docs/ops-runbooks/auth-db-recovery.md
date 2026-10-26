@@ -1669,8 +1669,8 @@ fault falls between the two reads), can still receive a `503` from that check (A
 counted `route="approval"` on `yuzu_auth_secret_unavailable_total`, audit
 `approval.approve` or `approval.reject` with `result=error` and `detail`
 `approver_assurance:mfa_store_unavailable`). The envelope carries `retry_after_ms: 5000` for the
-transient causes (an unreadable enrolment or stored-proof read, or a single catalog check that could
-not run) and **no** retry hint for the three sticky causes, whose remediation points at the MFA binding
+transient causes (an unreadable enrolment or stored-proof read, or, on the `auth` side only, a single
+catalog check that could not run) and **no** retry hint for the three sticky causes, whose remediation points at the MFA binding
 enforcement procedure below: the account-store trigger observed not in force
 (`mfa_binding_unenforced`), the session store's rebind guard latched not in force
 (`mfa_proof_unavailable`), and an enrolled account whose factor generation is not positive
@@ -1897,9 +1897,10 @@ check the gauges, then the generation query there. The approver routes answer th
 three causes are sticky and carry no `retry_after_ms` (the remediation points here): the account-store
 trigger observed not in force (`mfa_binding_unenforced`), the session store's rebind guard latched not in
 force (`mfa_proof_unavailable`), and an enrolled row whose factor generation is not positive
-(`mfa_proof_unavailable`). A transient cause (an unreadable enrolment or stored-proof read, or a
-single catalog query that could not run, which reports the binding not enforced for that one read and
-passes on the next) keeps `retry_after_ms: 5000`.
+(`mfa_proof_unavailable`). A transient cause (an unreadable enrolment or stored-proof read, or, on the
+`auth` side only, a single catalog query that could not run, which reports the binding not enforced for
+that one read and passes on the next) keeps `retry_after_ms: 5000`. The session store does not refuse on
+such a query: it serves the row and retries the check on the next read.
 
 **What the gauge can and cannot tell you.** It reads an in-process flag that a request-driven
 validation sets (at most one catalog query per minute per process while checks succeed, on an MFA

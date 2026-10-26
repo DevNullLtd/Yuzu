@@ -321,8 +321,7 @@ out each item as PASS / FINDING / N/A:
 - `docs/postgres-store-playbook.md` — the general born-on-PG store recipe
   `AuthDB` followed.
 - `docs/ops-runbooks/auth-db-recovery.md` — operator recovery procedures
-  (SQLite-era; verify against the current Postgres substrate before
-  following verbatim — a stale-doc follow-up, not yet rewritten).
+  (Postgres-current; the SQLite procedure is gone).
 - `docs/security-reviews/authdb-2026-04-30.md` — the v0.12.0 SQLite-era
   security review record (the source of several invariants above that
   carried forward unchanged).
