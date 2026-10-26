@@ -2857,16 +2857,16 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   and a newer errored gives the errored an earlier timestamp, so the server keeps the compliant
   whatever the wire order, and the hold cannot touch it (server side). The agent now also
   stamps a `(boot_epoch, emit_seq)` pair at the point queue order is decided (legacy executor
-  admission; the Spark outbox stamp), so once a server compares the pair, order between a
-  retained verdict and a newer one need not depend on the wall-clock timestamp. Until then the
-  timestamp remains the key, and it stays the key for entries that carry no pair: journal-paged
-  replays and boots whose epoch could not be claimed are sent with the pair unset (0/0). Note on
-  #5690's acceptance options (factual, not a ruling): a same-second tie policy closes UP-13 but
-  not UP-14; receipt-sequence ordering closes UP-14 but worsens UP-13; of those three, only
-  terminal precedence closes both. A comparison by the agent-asserted pair is a further option
-  that orders by the agent's queue order, which depends on neither the wall clock nor arrival
-  order; it closes nothing until the server compares it. The test `#3972 chaos: a third sender holding the stream write mutex ...`
-  (hidden `[.chaos]`) characterises UP-13 and deliberately asserts no order.
+  admission; the Spark outbox stamp). A server that compares the pair orders a retained
+  verdict against a newer one by it, and that order depends on neither the wall clock nor
+  arrival order; a server that does not compare it ignores the pair and keeps ordering by the
+  timestamp. The timestamp stays the key for entries that carry no pair: journal-paged
+  replays, DEX observations, and an agent whose boot epoch could not be claimed are sent
+  with the pair unset (0/0). Factual note on #5690's acceptance options (not a ruling): a
+  same-second tie policy closes UP-13 but not UP-14, and receipt-sequence ordering closes
+  UP-14 but worsens UP-13. The test
+  `#3972 chaos: a third sender holding the stream write mutex ...` (hidden `[.chaos]`)
+  characterises UP-13 and deliberately asserts no order.
 - Owner: not assigned in source material.
 - Milestone: PR #5776.
 - Revisit trigger: PR-5 (F14 flip) soak. During the first flip soak, inspect
@@ -2916,9 +2916,11 @@ was raised (`governance.d/3953-3966-outbox-hardening.T6I4sf.jsonl` line 15).
 standing ruling stands).** `prefer_spark_` is `const` and fixed at construction
 (`guardian_engine.hpp`: "IMMUTABLE for object lifetime"), and `agent.cpp` constructs
 `GuardianEngine` with the literal `false` (`guardian_ = std::make_unique<GuardianEngine>(kv_store_.get(),
-cfg_.agent_id, /*prefer_spark=*/false, boot_epoch_claim.boot_epoch)`), so there is no runtime switch for it. The rollback lever is
-the boot-time deploy opt-out `--spark-disable` / `YUZU_AGENT_SPARK_DISABLE` (`agent.cpp`
-~1232-1248: the SparkEngine is not instantiated and detection stays on the legacy `IGuard` path),
+cfg_.agent_id, /*prefer_spark=*/false, boot_epoch_claim.boot_epoch)`), so there is no runtime
+switch for it. The rollback lever is the boot-time deploy opt-out `--spark-disable` /
+`YUZU_AGENT_SPARK_DISABLE` (`agent.cpp`, the `if (cfg_.spark_disable)` branch ahead of the
+SparkEngine construction: the SparkEngine is not instantiated and detection stays on the
+legacy `IGuard` path),
 the sole lever per section 6: restart-required, deploy-time, not server-pushable. It persists
 across restarts only on Linux (`EnvironmentFile=`, #3851); Windows and macOS have no persistence
 mechanism yet (#3973). There is no hold-only lever: the hold's H and N are compile-time defaults.

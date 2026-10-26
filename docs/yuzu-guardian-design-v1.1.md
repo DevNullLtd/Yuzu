@@ -988,10 +988,33 @@ out of range is re-claimed from the clock and overwritten, and a KV failure leav
 shared by both emit paths: the legacy sink executor draws it at admission, under the
 executor lock, and the Spark runtime draws it when it enqueues an outbox entry. Entries
 re-sent from the lifecycle journal carry 0/0, because their original position is not
-journalled. Residual, accepted and pinned by a test: if the KV row is wiped and the agent
-restarts within the same second as the previous boot, the new epoch equals the previous one.
-The server does not compare the pair in this change; until it does, the event timestamp
-remains the ordering key.
+journalled; DEX observations also carry 0/0. 0/0 means unordered, not oldest. A receiver
+should compare the pair only when both sides carry a nonzero pair, and otherwise order by the
+timestamp. A server that compares the pair orders by it; one that does not ignores it and
+keeps ordering by the timestamp. The server change owns the comparator and the recovery path
+for a pinned or lost epoch.
+
+Known limits of the boot epoch:
+
+- If the KV row is wiped and the agent restarts within the same second as the previous boot,
+  the new epoch equals the previous one and `emit_seq` restarts at 1 (accepted, ruling D3; the
+  equal epoch is pinned by a test).
+- A single writer is assumed, not enforced: two agent processes on one data directory can claim
+  the same epoch and draw overlapping `emit_seq` values (accepted under D3). Each service
+  manager starts one instance per unit, but a manual run against the same `--data-dir` is not
+  excluded.
+- A clock wrongly ahead at boot pins the epoch ahead, and it does not self-heal because the
+  claim tracks the persisted value rather than the clock. A lost or corrupt row after such a
+  pin re-claims from the clock and can land below epochs already issued. A deleted or
+  restored-from-backup `kv_store.db` likewise loses the ordering history; restoring is safe
+  when the clock is correct because the clock term wins. A VM memory-snapshot revert continues
+  with the same epoch and a lower `emit_seq` and involves no boot, so no claim runs.
+- An agent whose epoch claim fails (no store, a read or write failure, or a clock reading at
+  or above the 2^62 ceiling) sends the pair as 0/0 for the whole process lifetime, ordered by
+  the timestamp. Today this is visible only as an error-level `Guardian boot_epoch claim` log
+  line.
+- Events replayed from the lifecycle journal carry 0/0, so a replayed event is not
+  byte-identical to its live original in fields 24 and 25.
 
 ### 7.2 Wire integration
 
