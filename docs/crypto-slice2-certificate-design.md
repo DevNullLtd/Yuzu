@@ -84,11 +84,11 @@ counter or a store rather than a read, the PR says so, and the next PR in the ch
 |---|---|---|---|---|
 | 2a-1 | Typed-source read filter | One exported array of typed source names in `typed_inventory_sources.hpp`, **already including the reserved name `certificate_inventory`**, used by the predicate (and so the gateway skip), the boot purge and a new read-time filter on every generic `InventoryStore` read. No certificate code. Amends the app-usage read-surface routed-concern row in the same change. | It closes today's accepted stray-row window for `app_usage` and `device_ci` (see [Typed set](#typed-set-purge-and-read-filter)). D12 forbids that window for certificates, so it must exist, with the certificate source name reserved, before any agent sends the source. | — |
 | 2a-1b | Background typed-source purge | The boot purge becomes a bounded, batched background pass, classified in `background_jobs.hpp`, started at every boot and no longer awaited before serving. | Boot no longer waits on an unbounded delete; the pass's progress is counted. | 2a-1 |
-| 2a-2a | Certificate store and ingest | `CertificateInventoryStore` (schema `certificate_inventory_store`) and the shared ingest seam on the direct and gateway paths: blob parse, hash-skip, per-store replace rules, the per-agent lock, decommission cascade membership (erase only; no tombstone), `/readyz` membership, `yuzu_server_cert_inventory_ingest_total`, and the schema lint. | A report from an agent (or a test) is stored, counted by result and reason, erased on decommission, and covered by `/readyz`. | 2a-1 |
-| 2a-2b | Certificate read surface | The `CertificateInventory` securable, its seeding and floor entry; the per-certificate read and the raw-value summary (REST + MCP + `/crypto` fragment) with every filter in [Parameters](#parameters-strict-or-free-text-the-same-on-both-twins); admission, truncation, audit (OD-2), the D10 lint, and the `cert_inventory.fleet_store_status` gauge job. | Operators read fleet certificates, including the [one-CA queries](#finding-one-cas-certificates). | 2a-2a |
+| 2a-2a | Certificate store and ingest | `CertificateInventoryStore` (schema `certificate_inventory_store`) and the shared ingest seam on the direct and gateway paths: blob parse, hash-skip, per-store replace rules, the per-agent lock, decommission cascade membership (erase only; no tombstone), `/readyz` membership, `yuzu_server_cert_inventory_ingest_total`, the schema lint, the `certificate_inventory_v1` server capability in `RegisterResponse` (`server_capabilities = 9`, advertised only while the store opened), and the SOC 2 data-inventory row for `certificate_inventory_store`. | A report from an agent (or a test) is stored, counted by result and reason, erased on decommission, and covered by `/readyz`. | 2a-1 |
+| 2a-2b | Certificate read surface | The `CertificateInventory` securable, its seeding and floor entry; the per-certificate read and the raw-value summary (REST + MCP + `/crypto` fragment) with every filter in [Parameters](#parameters-strict-or-free-text-the-same-on-both-twins); admission, truncation, audit (OD-2), the D10 lint, the `cert_inventory.fleet_store_status` gauge job, and the `dn_dict` name table with its SOC 2 data-inventory row. | Operators read fleet certificates, including the [one-CA queries](#finding-one-cas-certificates). | 2a-2a |
 | 2a-2c | Decommission tombstones | The decommission tombstone itself (written by `delete_agent`, checked by ingest), the admin-only tombstone list and purge (REST + MCP, OD-4), `coverage.tombstoned_agents_registered`, and the cross-schema enrolment clear (`CertificateEnrolmentTombstoneOwner`) at every approval write. | An administrator lists and purges tombstones; approving a tombstoned agent clears it. | 2a-2b, and the DPIA screening |
 | 2a-2d | Certificate retention prune | The [prune](#retention-and-the-prune), at store and location grain, with its metrics and its clock-guarded-retention register entry. | Stores unread for 30 days are pruned and counted. | 2a-2a |
-| 2a-2e | Agent collector: action, daily-sync source and Linux | `certificates.list_inventory` (no catalogue row, OD-1), the `certificate_inventory` daily-sync source and blob writer, and the Linux store reads; the daily sync never sends one report over the transport limit (the certificate blob is sent on its own when the combined report would exceed it). | A Linux agent reports its certificates daily. | 2a-2b, 2a-2c, 2a-2d |
+| 2a-2e | Agent collector: action, daily-sync source and Linux | `certificates.list_inventory` (no catalogue row, OD-1), the `certificate_inventory` daily-sync source and blob writer, and the Linux store reads on a dedicated worker thread (the sync thread waits at most the 60 s deadline, then reports the source `constrained` with `walk_stalled`; a stuck worker blocks only itself and no second worker starts while one is stuck; shutdown uses the existing `hard_exit` grace path; the `walk_stalled` fleet signal is this PR's deliverable, see [decision 11](#decisions)), the agent gate that sends the source only when the server advertises `certificate_inventory_v1`; the daily sync never sends one report over the transport limit (the certificate blob is sent on its own when the combined report would exceed it). | A Linux agent reports its certificates daily. | 2a-2b, 2a-2c, 2a-2d |
 | 2a-2f | Agent collector: Windows | The Windows machine-store reads and the private-key metadata. | A Windows agent reports its certificates. | 2a-2e |
 | 2a-2g | Agent collector: macOS | The System keychain and SystemRoots reads. | A macOS agent reports its certificates. | 2a-2e |
 | 2a-3 | D13 certificate counts | The counts read (REST + MCP), the snapshot export, the D13 condition-1 lint entries and the recompute test; the data the certificate widgets read. | Operators see the counts on `/crypto` and through MCP. | 2a-2b |
@@ -112,31 +112,30 @@ Where the rest of this design says "2a-2", it means the 2a-2a to 2a-2g chain, an
 says which PR carries each item. "2b-1" likewise means 2b-1a and 2b-1b.
 
 **Deploy order** is server before agents, as for blob v2 of `installed_software`
-(`docs/adr/0016-agent-daily-sync-framework.md`, "Deploy order: server before agents"). Nothing
-enforces that order, so the design does not rely on it:
+(`docs/adr/0016-agent-daily-sync-framework.md`, "Deploy order: server before agents"), but this
+design does not rely on it. The window is closed in code (ADR-0070 R17, decision 8):
 - From 2a-1 on, `certificate_inventory` is in the typed set before any agent sends it. A server at
   2a-1 or later never stores the blob in the generic store on the gateway path, and its read filter
   hides any stray row.
-- **The remaining window (disclosed):** a server older than 2a-1, including a server rolled back
-  below it, that receives the blob from a 2a-2e agent through a gateway stores it in the generic
-  store, readable under `Infrastructure:Read` / `Inventory:Read`. The rows become unreadable as soon as the server is
-  at 2a-1 or later, and the purge removes them. `upgrading.md` states this and says to upgrade
-  servers before agents and never roll a server back below 2a-1 while 2a-2e agents run.
+- 2a-2a makes the server advertise `certificate_inventory_v1` in `RegisterResponse` while its
+  certificate store is open, and 2a-2e makes the agent send the source only when it sees that
+  capability. A server older than 2a-2a, a rolled-back server, or a server whose store did not
+  open advertises nothing, so the agent never sends. There is no remaining window.
 
 **Owed documents, per PR** (beyond the obligations in
 [Still owed by every slice-2 PR](#still-owed-by-every-slice-2-pr)):
 
 | PR | Documents |
 |---|---|
-| 2a-1 | `upgrading.md`: the `app_usage`/`device_ci` behaviour change (stray generic rows stop being readable), the deploy order, and the downgrade note above. The app-usage read-surface routed-concern row: its accepted mixed-version window becomes closed. A changelog fragment. |
+| 2a-1 | `upgrading.md`: the `app_usage`/`device_ci` behaviour change (stray generic rows stop being readable). The app-usage read-surface routed-concern row: its accepted mixed-version window becomes closed. A changelog fragment. |
 | 2a-1b | The purge metric where inventory metrics are documented, and `upgrading.md` (boot no longer waits on the purge). |
-| 2a-2a | `rest-api.md`/`server-admin.md` for the ingest metric and `/readyz` membership; `inventory.md` for the server side of the new daily-sync source. |
-| 2a-2b | `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (the read verbs), `rbac.md` and the SOC 2 access-control inventory (`CertificateInventory`). |
+| 2a-2a | `rest-api.md`/`server-admin.md` for the ingest metric and `/readyz` membership; `inventory.md` for the server side of the new daily-sync source and the `certificate_inventory_v1` capability; the SOC 2 data-inventory row (`docs/enterprise-readiness-soc2-first-customer.md`) for `certificate_inventory_store`. |
+| 2a-2b | `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (the read verbs), `rbac.md` and the SOC 2 access-control inventory (`CertificateInventory`); the SOC 2 data-inventory row for `dn_dict`; `crypto.md` states the pool bound for the per-certificate read (pool under 4 refuses, 4 to 7 gives one slot). |
 | 2a-2c | `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (`crypto.certificates.tombstones.view`, `crypto.certificates.tombstone_purge`). The A2/A1 RBAC-administration routed-concern row (`.claude/routed-concerns-access-control.md`), amended for the new `is_rbac_administrator()` call sites, as that row requires. |
 | 2a-2d | `crypto.md` (retention) and the clock-guarded-retention adoption register, with a separate decision for the location grain, whose cutoff compares two stored receipt times (`status_at`, `last_seen`) rather than the pass's own `now()`. |
-| 2a-2e, 2a-2f, 2a-2g | The generated plugin README and the OS capability matrix, per OS. 2a-2c links the DPIA screening record, which must exist before it merges. |
+| 2a-2e, 2a-2f, 2a-2g | The generated plugin README and the OS capability matrix, per OS; 2a-2e also owes the supported-kernel statement (Linux 5.8+ supported; below 6.8 the mount-id-reuse residual applies; FUSE or autofs hosts run 6.8+) in the OS capability matrix row and the manual, `upgrading.md` for the `certificate_inventory_v1` gate, and the `walk_stalled` fleet signal documentation. 2a-2c links the DPIA screening record, which must exist before it merges. |
 | #6125 (owed request, not an edit) | Ask that D6's "never opens ... key blocks in PEM files" (`0070:630`) be worded as the exact property in [Linux link and file rules](#stores-read-per-os): key-block lines discarded unretained, never base64-decoded, buffer cleansed. Tracked until #6125 answers; this design does not edit D6 (it amends D12 only through R15). |
-| 2a-3 | `crypto.md`, `rest-api.md`, `mcp.md` and `audit-log.md` for the snapshot export (`GET /api/v1/crypto/certificates/snapshot`, `export_crypto_certificate_snapshot`, verb `crypto.certificates.snapshot`), including that paged reads make no cross-page consistency promise. `crypto.md` (each count's rule, window and boundary), the D10 lint's allow-list entries. |
+| 2a-3 | `crypto.md`, `rest-api.md`, `mcp.md` and `audit-log.md` for the snapshot export (`GET /api/v1/crypto/certificates/snapshot`, `export_crypto_certificate_snapshot`, verb `crypto.certificates.snapshot`), including that paged reads make no cross-page consistency promise. `crypto.md` and `server-admin.md` carry the counts limit (about 1.3M certificates in scope, then non-retryable `scale_limit`) and the Postgres pool floor of 8 for the default long-read bound of two (decision 9). `crypto.md` (each count's rule, window and boundary), the D10 lint's allow-list entries. |
 | 2a-4 | `crypto.md` and `rest-api.md`/`mcp.md` (the certificate half of the CBOM, its securable and its `halves_omitted` metadata). |
 | 2b-1a, 2b-1b | The A2/A1 RBAC-administration routed-concern row (`.claude/routed-concerns-access-control.md`), amended for 2b-1a's new `is_rbac_administrator()`-style call sites. `server-admin.md` and `security-hardening.md`: CRL egress, the address rules, and firewall guidance for the server's outbound CRL fetches. `rbac.md`, `audit-log.md` and the SOC 2 inventory (`RevocationSource`). The fetcher's security review record. |
 | 2b-2 | `crypto.md`: the revocation statements and their causes. |
@@ -328,7 +327,10 @@ its signature, so its revocation statement uses the "matched by issuer and seria
 disagreement with the agent's claimed fields is counted
 (`yuzu_server_cert_inventory_claim_mismatch_total`), and the server's values are stored. The
 re-parse ships in 2b-2, beside the signature check that already reads stored DER; until then
-`server_parsed` is false and the stored facts are the agent's, which every read states.
+the stored facts are the agent's. **Disclosed residual:** the store records `server_parsed`, but
+no certificate read emits it today (only the CBOM half states the source of its facts), so a
+reader of the per-certificate read, the snapshot or the fragments cannot tell agent-claimed facts
+from server-parsed ones. This design adds no field for it.
 
 ### Private-key metadata
 
@@ -762,7 +764,7 @@ concern. The design states how a pruned store's rows are re-sent despite hash-sk
   agent. The agent's next report then mismatches, the server answers `need_full`, and the agent
   resends the full blob. If the store has come back, its rows return on that report.
 - **An offline device** sends no reports, so its `agent_state.last_seen` stops and none of its
-  locations is ever pruned. Its rows stay until decommission, shown "last observed" at their `observed_at`. A
+  locations is ever pruned. Its rows stay until it reports again (R16 residual (i) applies on its return) or it is decommissioned, shown "last observed" at their `observed_at`. A
   fleet-wide outage behaves the same way.
 - **Metrics:** `yuzu_server_cert_inventory_pruned_total` (locations removed),
   `yuzu_server_cert_inventory_prune_capped_total` (passes that stopped at the per-pass cap),
@@ -1689,17 +1691,31 @@ posture, and the data-processor obligations an engine takes on.
 **Proposed:**
 - **Per-user stores are excluded from slice 2.** Machine stores can still hold personal data: a
   client or S/MIME certificate in `LocalMachine\My`, or a UPN SAN on a device certificate.
-- **Where it can appear.** Subject DNs and SAN values (`rfc822`, `upn`, `dirname`) are stored and
-  served on the per-certificate read and in the CBOM certificate half only. Both are behind
-  `CertificateInventory:Read`, which is admin-only under RBAC off. They are never a summary or
-  count grouping key, never a metric label, and never in audit details (only counts and filters are
-  audited).
+- **Where it can appear.** Subject DNs, issuer DNs and SAN values (`rfc822`, `upn`, `dirname`) are
+  stored. They are served on every surface that serves certificate rows: the per-certificate read,
+  the CBOM certificate half, the snapshot export (`GET /api/v1/crypto/certificates/snapshot` and
+  MCP `export_crypto_certificate_snapshot`, up to 50k rows) and the `/fragments/crypto/certificates`
+  dashboard fragments. All are behind `CertificateInventory:Read`, which is admin-only under RBAC
+  off. An issuer DN is a personal name when the issuer is a personal CA or a self-issued
+  certificate, and the `/summary` read groups by issuer DN (top 50), so the grouping can show such
+  a name (self-signed end-entity certificates are excluded; a personal CA, or a self-issued
+  certificate whose `self_signed` flag is false or NULL, is not). Distinguished names are also
+  held once, fleet-wide, in the `dn_dict` table of `certificate_inventory_store`, an interning
+  table whose names are not tied to a device: it is pruned hourly of names no certificate row
+  references, and a name is erased on decommission only when both DN indexes are valid; while they
+  are not yet built the erasure is skipped and the hourly prune removes the name once the indexes
+  are valid and the references are gone. Subjects, issuers and SANs are never a count grouping
+  key, never a metric label, and never in audit details (only counts and filter names are audited).
+  The pre-existing `certificates.list` plugin results, stored as ordinary responses, are outside
+  this table and follow `Response:Read`.
 - **No redaction.** An e-mail SAN is the certificate's identity, so redacting it would falsify the
   fact. That differs from `browser_inventory`, where an e-mail is incidental. The narrow securable
   is the control instead.
 - **Retention:** rows live while the device reports them, or until 30 days after a reporting
   device's store stops being read, when they are pruned. An offline device's rows are not pruned
-  (see [Retention and the prune](#retention-and-the-prune)); decommission erases them.
+  (see [Retention and the prune](#retention-and-the-prune), including R16 residual (i), by which a
+  returning device can lose kept locations); decommission erases them, and `dn_dict` names follow
+  as above.
 - **DPIA (Decided, owner 2026-10-23, decision 1).** The owner and the compliance-officer own the
   screening. It is recorded in `docs/security-reviews/` (a dated screening record for machine-scope
   certificate data) before 2a-2c merges, and the 2a-2c PR links it: the tombstone is the first
@@ -1721,7 +1737,7 @@ posture, and the data-processor obligations an engine takes on.
   from the device, at the next successful read of that store, or when the device is decommissioned.
   Slice 2 builds no per-subject erasure route. A data-subject request is met by removing the
   certificate from the device; if the device is offline, its rows stay until it reports or is
-  decommissioned. The DPIA screening records this, and whether a per-subject purge is needed.
+  decommissioned, and a `dn_dict` name persists until the prune removes it. The DPIA screening records this, and whether a per-subject purge is needed.
 - **Engines.** An engine that consumes subjects and SANs becomes a data processor with its own
   retention and deletion duties. ADR-1005 Decision 5's review applies to any bulk transfer of them
   (the ADR-0024 re-home note is the precedent). The engine-grain read carries `last_seen` and
@@ -1922,12 +1938,19 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
 7. **R16, one location-grain prune rule** (ADR-0070 D12). Ruled 2026-10-26: accepted as written
    (see ADR R16), points (i)-(iv) accepted as residuals. See
    [Retention and the prune](#retention-and-the-prune).
-8. **R17, the agents-before-servers window** (ADR-0070 D12). Ruled 2026-10-26: option (a). The
-   window is accepted and closed by deploy order (servers first; never roll a server back below
-   the typed-source read filter while certificate-collecting agents run), the agent PR's
-   merge-order test and an `upgrading.md` note; D12's "not acceptable" is amended for this case
-   (see ADR R17). Option (b) is not adopted: it would add a new server-to-agent protocol action
-   for a window opened only by a documented-forbidden rollback.
+8. **R17, the agents-before-servers window** (ADR-0070 D12). Ruled 2026-10-26: closed in code
+   by a capability gate, superseding the earlier option (a). The agent sends
+   `certificate_inventory` only when the server's `RegisterResponse` advertises
+   `certificate_inventory_v1` (new field `repeated string server_capabilities = 9`); the server
+   advertises it only while its certificate store opened. Absent means never sent, so the gate
+   fails closed. The server capability ships in 2a-2a and the agent gate in 2a-2e. D12's "the
+   mixed-version window is not acceptable" stands unamended (see ADR R17). Not adopted: (a)
+   accepting the window and closing it by deploy order (servers first, never roll back, a
+   merge-order test and an `upgrading.md` note), because it relies on an order nothing enforces
+   and amends D12; (b) a reserved `__sync__` enable action persisted on the agent, because it adds
+   a server-to-agent action and persistent agent state. The capability is stateless: it is read
+   from every registration, so a rollback or a mixed-replica upgrade is covered without relying
+   on deploy order.
 
 9. **D13 counts at fleet scale** (raised by 2a-3, measured 2026-10-23). Computed from raw rows
    in one statement, the counts finish inside the 10 s statement cap only up to about 1.3M
@@ -1960,12 +1983,24 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
     are advised to run Linux 6.8 or later; the agent PR's (2a-2e) README and manual must carry
     that advice. Source: `sync_cancel.hpp` header (2a-2e), copied verbatim.
 
+    **Restated 2026-10-26 (owner), superseding the consequence the ruling above was given on:**
+    the walk no longer blocks the agent. 2a-2e runs it on a dedicated worker; the sync thread waits
+    at most the 60 s deadline, then reports the source `constrained` with `walk_stalled`; a stuck
+    worker blocks only itself, and no second worker starts while one is stuck; shutdown uses the
+    existing `hard_exit` grace path, so a stuck worker cannot hold a reconnect or a stop. The
+    residual below is therefore bounded to the certificate source on that device. The 60 s deadline
+    bounds the sync thread's wait, not the syscall: item (5) stands. The fleet signal for a stuck
+    walk is a `walk_stalled` gauge and heartbeat key, which is 2a-2e's deliverable. Supported
+    kernels: Linux 5.8 or later is supported; below 6.8 the mount-id-reuse residual (4) applies;
+    on hosts with FUSE or autofs run 6.8 or later.
+
     WHAT REMAINS (disclosed residual, as measured):
     (1) With the mount table read in full and statx available (Linux 5.8 or later, not blocked by seccomp), an unnamed dead autofs or FUSE mount as root, path hop or entry is refused without blocking, and a late overmount over a named local mount is refused.
     (2) On the FALLBACK path (kernel before 5.8, or a seccomp profile denying statx) there is no mount id and the stat is fstatat: entries, hops and roots on a silent FUSE mount, named or unnamed, can block in fstatat; an autofs hop can block in openat although an autofs root is refused; and a late overmount (a FUSE or autofs mount stacked after the snapshot over a named local mount) blocks in fstatat or openat before any fstatfs check can run.
     (3) When the mount table cannot be read in full (mountinfo_unreadable) hop and root boundaries cannot be told from ordinary local mounts and are not refused: a dead autofs root or hop blocks in openat, and a dead FUSE root or hop blocks in openat. On the statx path an entry is still refused (measured); on the fallback path a dead FUSE entry blocks in fstatat.
     (4) Mount-id reuse. On Linux 6.8 or later every candidate mount is matched to the snapshot by its never-reused mount id (STATX_MNT_ID_UNIQUE), so a mount swapped in after the snapshot is refused before any open, even when it reuses the old legacy id and device number; measured with a silent FUSE, a dead autofs, an answering FUSE and proc each reusing the id, at an entry and at a hop. On Linux 5.8 to 6.7 only the legacy id and the statx device can be compared, and anonymous device numbers (tmpfs, FUSE, overlay) are drawn from one pool, so a dead FUSE or autofs mount that reuses both the id and the device blocks in openat (measured at an entry and at a hop); the fstatfs check on the opened directory runs only after that open.
     (5) The 60 s action deadline and cooperative cancellation cannot interrupt a syscall already blocked in the kernel.
+    (Restated outside the verbatim header: the deadline bounds the sync thread's wait, not the syscall; the worker absorbs the block.)
 
 ## How this could ship wrong
 

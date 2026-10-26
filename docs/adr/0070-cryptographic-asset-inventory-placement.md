@@ -1021,21 +1021,22 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     `unreadable`; (iii) the forward-clock residual above; (iv) the rule covers machine-scope
     stores only (per-user stores are not collected in slice 2).
   - **R17 — the agents-before-servers window for `certificate_inventory` (owner, 2026-10-26;
-    option (a) ruled).** D12 says stray certificate rows must never be readable and the
-    mixed-version window is not acceptable for this source, except as amended here: the window is
-    accepted for this source and closed by deploy order. A server older than the typed-source
-    read filter (or rolled back below it) that receives the agent's blob through a gateway stores
-    it in the generic store, readable under `Infrastructure:Read`. The agent receives no persistent
-    configuration from the server today, so it cannot tell such a server apart. Ruled by the owner
-    (liamsomerville) on 2026-10-26: option (a). The window is accepted and closed by deploy order
-    (servers first; never roll a server back below the typed-source read filter while
-    certificate-collecting agents run), the agent PR's merge-order test and an `upgrading.md`
-    note. D12's "the mixed-version window is not acceptable" is amended for this case only: it
-    holds for every other typed source and for any window not opened by a documented-forbidden
-    rollback. Option (b), a reserved `__sync__` enable action persisted on the agent, was not
-    adopted: it would add a new server-to-agent protocol action for a window opened only by a
-    rollback the deploy order forbids. Recorded as decision 8 in the Decisions section of
-    `docs/crypto-slice2-certificate-design.md`.
+    closed in code by a capability gate).** D12 says stray certificate rows must never be
+    readable and the mixed-version window is not acceptable for this source; that stands
+    unamended. A server older than the typed-source read filter (or rolled back below it) that
+    receives the agent's blob through a gateway would store it in the generic store, readable
+    under `Infrastructure:Read`. The owner (liamsomerville) ruled on 2026-10-26 that the window is
+    closed in code, not by deploy order: the agent sends `certificate_inventory` only when the
+    server's `RegisterResponse` advertises `certificate_inventory_v1` (new field
+    `repeated string server_capabilities = 9`), and the server advertises it only while its
+    certificate store opened. Absent means never sent, so the gate fails closed and is stateless.
+    The server capability ships in 2a-2a and the agent gate in 2a-2e. Not adopted: (a) accepting
+    the window and closing it by deploy order (servers first, never roll back, a merge-order test
+    and an `upgrading.md` note), because it relies on operators following an order nothing
+    enforces and amends D12; (b) a reserved `__sync__` enable action persisted on the agent,
+    because it adds a server-to-agent action and persistent agent state that a capability
+    advertised on every registration makes unnecessary. Recorded as decision 8 in the Decisions
+    section of `docs/crypto-slice2-certificate-design.md`.
 - A capped or timed-out capture is reported `constrained`, and the report is never an
   empty success.
 - An empty blob is never sent for a failed or constrained capture (the ADR-0016
@@ -1495,6 +1496,10 @@ carries once that PR merges. Before the merge, the PR is the proposal.
   `constrained` store), made after this ADR was accepted. It is ratified by the approving review
   of the PR that adds it (approver not the author), which records it alongside the slice-2
   design's decision 6.
+- R16 and R17 are the owner's rulings of 2026-10-26, given in the session that produced this
+  branch and recorded as decisions 7 and 8 of the slice-2 design; the ledger of that run is
+  under `governance.d/` (`*-crypto-slice2-split-decisions*.jsonl`). They are ratified by the
+  approving review of the PR that carries them, as R15 is.
 - The approval grants those five rulings as written. Approvers are asked to state each
   ruling in the review, so that the record shows each one, but the statements are a
   request, not a separate acceptance gate. On merge, the "ruling requested" notes in those
