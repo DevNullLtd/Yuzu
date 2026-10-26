@@ -546,7 +546,7 @@ TEST_CASE("registry exception_audit_line: one fixed 19-field literal per mutatin
     }
 }
 
-// ── the PR11.7-P4 classifiers ─────────────────────────────────────────────
+// ── the registry 2.1.0 classifiers ────────────────────────────────────────
 
 TEST_CASE("registry parse_bool_param: empty is the default; true/1/false/0 only; anything else is nullopt",
           "[registry][parsers]") {
@@ -622,7 +622,7 @@ TEST_CASE("registry restorable: whether this plugin could write a captured previ
     }
 }
 
-TEST_CASE("registry P4 limits", "[registry][parsers]") {
+TEST_CASE("registry recursion and plan limits", "[registry][parsers]") {
     // The numbers the README and the definitions quote that no behavioural test pins by value.
     CHECK(kMaxTreeNodes == 10000);
     CHECK(kMaxTreeDepth == 600);

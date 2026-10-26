@@ -260,13 +260,14 @@ class RegistryDefinitionPins(unittest.TestCase):
         # tests/unit/test_helpers.hpp registry_scratch_prefix() is the one place the `YuzuTest-` stem is written: it
         # adds the CI job scope that scripts/ci/check-registry-test-leftovers.ps1 keys on (#6488). A fixture that
         # spells its own "YuzuTest-..." key bypasses the scope, so a key it leaks is invisible to the per-job check.
-        # Lexical: the quoted and backslash-prefixed spellings in code lines (comments are skipped).
+        # Lexical: the quoted and backslash-prefixed spellings in code lines (comments are skipped), the stem run on into
+        # a longer name included (an HKU mount name such as L"YuzuTestHold..." bypasses the scope the same way).
         fixtures = sorted((REPO_ROOT / "tests" / "unit").glob("test_registry_*.cpp"))
         self.assertTrue(fixtures)
         for path in fixtures:
             with self.subTest(file=path.name):
                 lines = [n for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
-                         if not line.strip().startswith(("//", "*")) and re.search(r'["\\]YuzuTest-', line)]
+                         if not line.strip().startswith(("//", "*")) and re.search(r'["\\]YuzuTest[-\w]', line)]
                 self.assertEqual(lines, [], "build the key name from yuzu::test::registry_scratch_prefix()")
 
     def test_the_scope_variable_is_spelt_the_same_by_its_producer_and_consumers(self):

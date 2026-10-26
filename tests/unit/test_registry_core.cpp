@@ -2501,7 +2501,7 @@ TEST_CASE("registry core: a leaf link is accepted by the fast open only to be de
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// PR11.7-P4: recursive delete_key, flush, per-user write output, apply
+// registry 2.1.0: recursive delete_key, flush, per-user write output, apply
 // ═════════════════════════════════════════════════════════════════════════
 
 namespace {
@@ -2765,6 +2765,38 @@ TEST_CASE("registry core: a tree that outgrows the bound between the vet and the
     CHECK(o.counted_values == 1);
     CHECK(reg.exists("T\\Z"));
     CHECK(reg.exists("T"));
+}
+
+TEST_CASE("registry core: values added to an ancestor after the vet count toward the tree's running total",
+          "[registry][core][recursive]") {
+    // At T's own delete the walk has removed A and Z (a key and a value each: 4 nodes) and T itself is node 5, so T
+    // may hold kMaxTreeNodes - 5 values. The values are planted on T once the delete phase opens Z.
+    const bool over = GENERATE(false, true);
+    const std::size_t planted = kMaxTreeNodes - 5 + (over ? 1 : 0);
+    FakeRegistry reg;
+    reg.put("T\\A", "a", kRegDword, dword(1));
+    reg.put("T\\Z", "z", kRegDword, dword(2));
+    bool done = false;
+    reg.before = [&](const std::string& ev) {
+        if (done || ev != "open_sub:Z" || !reg.masks.back().ends_with(kDeleteMask)) return;
+        done = true;
+        for (std::size_t i = 0; i < planted; ++i) reg.put("T", "g" + std::to_string(i), kRegDword, dword(1));
+    };
+    const auto o = delete_key_tree(reg, FakeRegistry::kRoot, "T", false, true, false);
+    REQUIRE(done);
+    if (over) {
+        // mutant: T's values counted from a fresh total (the per-key cap) and T is deleted past the bound
+        CHECK(o.result == "failed");
+        CHECK(o.reason == "concurrent_change");
+        CHECK(o.counted_keys == 2);
+        CHECK(o.counted_values == 2);
+        CHECK(reg.exists("T"));
+    } else {
+        CHECK(o.result == "ok");
+        CHECK(o.counted_keys == 3);
+        CHECK(o.counted_values == 2 + planted);
+        CHECK_FALSE(reg.exists("T"));
+    }
 }
 
 TEST_CASE("registry core: a recursive delete of a link leaf removes the link object only",
@@ -3560,6 +3592,15 @@ TEST_CASE("registry apply: the reverse plan built from the manifest restores the
     const auto back2 = run_plan(reg, second, false);
     REQUIRE(back2.out.rc == 0);
     CHECK(dump(reg) == before);
+
+    // A TAB name passes `representable` but set_value cannot write it back, so a delete_key over a key holding one is
+    // refused unrepresentable_name rather than handing back a manifest that could not restore it.
+    reg.put("Software\\Tabbed", "a\tb", kRegDword, dword(1));
+    const std::string with_tab = dump(reg);
+    const auto tab = run_plan(reg, json::array({del_key_item("Software\\Tabbed")}), false);
+    CHECK(tab.verdict(0) == "refused");
+    CHECK(tab.reason(0) == "unrepresentable_name");
+    CHECK(dump(reg) == with_tab);
 }
 
 TEST_CASE("registry apply: each distinct key is opened once and its handle reused, whatever the spelling of its case",
@@ -3585,8 +3626,8 @@ TEST_CASE("registry apply: each distinct key is opened once and its handle reuse
 }
 
 TEST_CASE("registry apply: a 256-item plan over 8 keys issues a fixed number of seam calls at every depth",
-          "[registry][core][apply][nfr1]") {
-    // NFR-1 (microsecond writes): the cost of an apply is one checked open per DISTINCT key plus three seam calls per item
+          "[registry][core][apply]") {
+    // The cost of an apply is one checked open per DISTINCT key plus three seam calls per item
     // (capture, set, read-back), whatever the depth. Per key: root_name + open_path + final_name + the leaf probe + close.
     constexpr std::size_t kKeys = 8, kNames = 32;
     std::vector<std::size_t> real_counts, dry_counts;

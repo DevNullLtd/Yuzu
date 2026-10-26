@@ -761,7 +761,15 @@ inline void delete_subtree(RegistryWriter& reg, Handle h, TreeCount& d, unsigned
         delete_subtree(reg, child, d, depth + 1);
         if (!d.error.empty()) return;
     }
-    const TreeCount own = count_values(reg, h); // this key's values, counted before the delete takes them
+    // This key and its values join the walk's running total before the delete takes them, so a value added to any
+    // key since the vet (an ancestor included) cannot carry the delete past kMaxTreeNodes nodes in all.
+    if (d.nodes >= kMaxTreeNodes) {
+        d.error = std::string{kTokConcurrentChange};
+        return;
+    }
+    TreeCount own;
+    own.nodes = d.nodes + 1;
+    count_values_into(reg, h, own);
     if (!own.error.empty() || own.capped) {
         d.error = own.error.empty() ? std::string{kTokConcurrentChange} : own.error;
         return;
@@ -773,7 +781,7 @@ inline void delete_subtree(RegistryWriter& reg, Handle h, TreeCount& d, unsigned
     }
     ++d.keys;
     d.values += own.values;
-    d.nodes += own.nodes;
+    d.nodes = own.nodes;
 }
 
 /// Deletes the key on the checked handle `h`: with `recursive`, everything beneath it first (delete_subtree, which also
@@ -936,6 +944,10 @@ struct HiveFacts {
     if (!hf.race_warning.empty()) out.lines.push_back("warning|" + hf.race_warning);
     if (hf.status != HiveAccessStatus::ok) {
         wo = WriteOutcome{};
+        // The audit reason and the closing `error|<token>` share the write tokens' space (key_not_found,
+        // value_not_found, access_denied ...), so a hive outcome carries a hive_ prefix here: the bare not_found /
+        // mount_failed / file_refused that yuzu::profiles::hive_access_token spells for the autoruns and tar rows would
+        // read as a key or value fact. The hive-access lines above are the shared sentences, unchanged.
         switch (hf.status) {
         case HiveAccessStatus::not_found: wo.reason = "hive_not_found"; break;
         case HiveAccessStatus::privilege_missing: wo.reason = "privilege_missing"; break;
@@ -1106,7 +1118,7 @@ struct ApplyOptions {
 };
 
 /// Runs a parsed plan against the machine hive `hklm` in one pass. Per item: the key is opened ONCE per distinct
-/// (ASCII-case-folded) key on a checked handle and reused by the later items on that key (the NFR-1 shape: one checked
+/// (ASCII-case-folded) key on a checked handle and reused by the later items on that key (one checked
 /// open per key, not per item); a FAILED open is a fact for that item only and is never cached, so the next item on the
 /// key opens again with its own flags (delete_value on a missing key refused, a later set_value on it still creates it).
 /// The open uses the mutation's own access mask in BOTH modes, so a dry run sees the same denials; a dry run's create

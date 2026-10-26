@@ -3,7 +3,7 @@
  * through yuzu::agent::LocalDispatcher against the live Windows registry (the pure logic is locked on
  * every host by test_registry_parsers.cpp / test_registry_core.cpp; this proves the Win32 binding).
  *
- * PR11.7-P4 adds the recursive delete_key, the per-user hive writes (the caller's LIVE hive and an OFFLINE NTUSER.DAT
+ * Registry 2.1.0 adds the recursive delete_key, the per-user hive writes (the caller's LIVE hive and an OFFLINE NTUSER.DAT
  * fixture, both through the real with_user_hive ladder) and `apply` (dry run, real run, reversed manifest, a create
  * denied by ACL, a 256-item reply under the dispatcher's capture cap).
  *
@@ -750,7 +750,7 @@ TEST_CASE("registry write: a non-ASCII key and value name reach the registry as 
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// PR11.7-P4: recursive delete_key, per-user hive writes, apply
+// registry 2.1.0: recursive delete_key, per-user hive writes, apply
 // ═════════════════════════════════════════════════════════════════════════
 
 namespace {
@@ -772,12 +772,12 @@ std::optional<std::string> current_user_sid() {
     const BOOL converted = ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buf.data())->User.Sid, &s);
     const yuzu::win::LocalFreeGuard free_s{s}; // owns the string before the resize below can throw
     if (!converted || !s) return std::nullopt;
-    std::string out;
+    // n counts the terminating NUL: the buffer holds all n bytes, then the NUL is dropped.
     const int n = WideCharToMultiByte(CP_UTF8, 0, s, -1, nullptr, 0, nullptr, nullptr);
-    if (n > 1) {
-        out.resize(static_cast<std::size_t>(n) - 1);
-        WideCharToMultiByte(CP_UTF8, 0, s, -1, out.data(), n, nullptr, nullptr);
-    }
+    if (n <= 1) return std::nullopt;
+    std::string out(static_cast<std::size_t>(n), '\0');
+    if (WideCharToMultiByte(CP_UTF8, 0, s, -1, out.data(), n, nullptr, nullptr) != n) return std::nullopt;
+    out.pop_back();
     return out;
 }
 
@@ -1071,7 +1071,7 @@ struct OfflineProfile {
         // on the shared box. The scopes above outlive it (the unload needs SeRestore).
         bool unload_failed = false;
         {
-            yuzu::win::ScopedUserHive hive{L"YuzuTestVerify" + widen(salt()), (dir / "NTUSER.DAT").wstring(), &unload_failed};
+            yuzu::win::ScopedUserHive hive{widen(scratch_name() + "-verify"), (dir / "NTUSER.DAT").wstring(), &unload_failed};
             if (!hive.ok()) return false;
             hive.with_root(fn);
         }
@@ -1131,7 +1131,7 @@ TEST_CASE("registry write: set_user_value on an OFFLINE NTUSER.DAT is carried to
         yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
         Plugin::Out out;
         {   // the mount is held by a guard that unloads it however this case exits
-            yuzu::win::ScopedUserHive hold{L"YuzuTestHold" + widen(salt()), (prof.dir / "NTUSER.DAT").wstring()};
+            yuzu::win::ScopedUserHive hold{widen(scratch_name() + "-hold"), (prof.dir / "NTUSER.DAT").wstring()};
             REQUIRE(hold.ok());
             out = p.run("set_user_value", {{"sid", prof.sid}, {"key", "fixture"}, {"name", "V"}, {"value", "x"}});
         }
@@ -1330,6 +1330,36 @@ TEST_CASE("registry write: apply refuses a create beneath a key that denies KEY_
     CHECK(row_cells(real, "item", 2).at(6) == "applied");
     CHECK_FALSE(key_exists(HKEY_LOCAL_MACHINE, locked + "\\New"));
     CHECK(key_exists(HKEY_LOCAL_MACHINE, open_key + "\\Made"));
+}
+
+TEST_CASE("registry write: apply refuses a flag that is not a boolean and a malformed plan before any item, unaudited",
+          "[registry][windows][write][apply]") {
+    // Both refusals come before the registry is touched, so this case needs the plugin but not elevation.
+    Plugin p;
+    if (!p.ok()) { skip_or_fail("registry.dll not found"); return; }
+    const std::string root = "SOFTWARE\\" + scratch_name();
+    ScratchTree cleanup{HKEY_LOCAL_MACHINE, root};
+    const std::string plan = "[{\"op\":\"create_key\",\"key\":\"" + json_path(root) + "\\\\Made\"}]";
+    SECTION("a flag that is not a boolean is invalid_data") {
+        // the last case would be a REAL run (dry_run=false) but for its continue_on_error
+        for (const auto& flags : std::vector<std::map<std::string, std::string>>{
+                 {{"dry_run", "maybe"}}, {{"continue_on_error", "maybe"}}, {{"dry_run", "false"}, {"continue_on_error", "2"}}}) {
+            auto params = flags;
+            params["plan"] = plan;
+            INFO("dry_run=" << (flags.contains("dry_run") ? flags.at("dry_run") : "(default)"));
+            const auto out = p.run("apply", params);
+            CHECK(out.rc == 1);
+            CHECK(out.lines == std::vector<std::string>{"error|invalid_data"});
+            CHECK(out.audit_count() == 0);
+            CHECK_FALSE(key_exists(HKEY_LOCAL_MACHINE, root));
+        }
+    }
+    SECTION("a whole-plan shape error names the defect and its index") {
+        const auto out = p.run("apply", {{"plan", "[{\"op\":\"nope\"}]"}});
+        CHECK(out.rc == 1);
+        CHECK(out.lines == std::vector<std::string>{"error|invalid_plan:invalid_op:0"});
+        CHECK(out.audit_count() == 0);
+    }
 }
 
 TEST_CASE("registry write: a 256-item apply reply stays under the dispatcher's capture cap and is not truncated",

@@ -677,7 +677,8 @@ TEST_CASE("Win32Registry::flush_key on a mounted scratch hive succeeds and the h
     };
     bool unload_failed = false;
     {
-        yuzu::win::ScopedUserHive hive{L"YuzuTestFlush" + widen(std::to_string(yuzu::test::process_random_salt())),
+        yuzu::win::ScopedUserHive hive{widen(yuzu::test::registry_scratch_prefix() +
+                                             std::to_string(yuzu::test::process_random_salt()) + "-flush"),
                                        hive_file.wstring(), &unload_failed};
         REQUIRE(hive.ok());
         hive.with_root([&](HKEY root) {
