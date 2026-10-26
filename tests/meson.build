@@ -3856,6 +3856,20 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   timeout: 30,
 )
 
+# UP-14: static lexical gate pinning WHERE the Guardian wire emit pair (boot_epoch, emit_seq) is
+# stamped: every Spark outbox enqueue is preceded by stamp_seq_locked() under outbox_mu_, the
+# page-time stamp is the only wire_ordered=false call, stamp_emit_pair() has exactly two homes
+# (executor offer(), outbox set_common), agent.cpp passes the claimed boot epoch as the 4th
+# GuardianEngine argument, and both executor construction paths share the engine's emit source.
+# Carries its own in-memory mutation self-test (one or more per rule, plus comment/string
+# stripping proofs). No build required. Python, one process, ~2 s.
+test('guardian emit-pair stamp wiring lexical gate (UP-14)',
+  _python3_test,
+  args: [files('test_guardian_emit_stamp_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # Access Users page: pins the production wiring in server.cpp (the real require_admin gate and the
 # AuthDB::list_users() account source), which every route test stubs. Source-text only, so Python.
 # Suite 'docs': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a
