@@ -21,7 +21,7 @@ start**.
 - **Rolling back** to an older server leaves the `revocation_source_store` schema in place; the older
   binary ignores it. Nothing is dropped, and upgrading again reuses it (registrations, and the CAs'
   anti-rollback marks, survive a rollback).
-- **Four new step-up routes and 39 securable types.** The four mutating routes are step-up gated (40 gated
+- **Four new step-up routes and 39 securable types.** The four mutating routes are step-up gated (41 gated
   routes in total), and RBAC now seeds a `RevocationSource` securable (Administrator only; see
   [RBAC](rbac.md)). Nothing is fetched yet: this release registers CRL sources only.
 ## ⚠️ Breaking: the `registry` plugin 2.0.0 writes typed values, verifies them and refuses registry links
