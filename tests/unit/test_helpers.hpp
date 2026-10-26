@@ -568,10 +568,9 @@ class PgTestTemplate;
 ///
 /// A fresh admin connect per statement was the largest single connection
 /// source on a clone-heavy [pg] shard (two per test database; on Windows every
-/// connection forks a postgres.exe). One connection is
-/// opened lazily, guarded by a mutex held across every PQexec (a PGconn is not
-/// thread-safe), and reused. PROCESS-LOCAL by design: never shared across
-/// processes or runner agents.
+/// connection forks a postgres.exe). One connection is opened lazily, guarded by
+/// a mutex held across every PQexec (a PGconn is not thread-safe), and reused.
+/// PROCESS-LOCAL by design: never shared across processes or runner agents.
 ///
 /// close() is called from the Catch2 testRunEnded listener
 /// (test_pg_template_cleanup.cpp), after the last drop and while libpq's TLS
@@ -599,7 +598,7 @@ public:
     /// Run `sql` on the shared connection (one-shot after close()). A statement
     /// is retried here only when the shared link was found dead; any other
     /// retry policy (55006) belongs to the caller.
-    static Outcome exec(const std::string& dsn, const std::string& sql) {
+    [[nodiscard]] static Outcome exec(const std::string& dsn, const std::string& sql) {
         State& s = state();
         std::unique_lock<std::mutex> lock(s.mu);
         if (s.closed) {
@@ -611,10 +610,11 @@ public:
             s.conn.reset();
         const bool reused = static_cast<bool>(s.conn);
         if (!reused) {
+            s.dsn = dsn; // before the handle: a throw here must not leave a conn under a stale DSN
             s.conn = yuzu::server::pg::PgConn{PQconnectdb(dsn.c_str())};
-            s.dsn = dsn;
             ++s.connects;
         }
+        ++s.statements;
         Outcome out = run(s.conn, sql);
         if (!out.connected && reused) {
             // The backend died since the last statement (a restarted server):
@@ -636,13 +636,30 @@ public:
         s.closed = true;
     }
 
-    /// Connections the shared slot has opened; lets a test prove statements ran
-    /// through it instead of a fresh connect each. Test observability only,
-    /// not a contract.
+    /// Connections the shared slot has opened, reconnects included (not
+    /// one-shot connects after close()). Test observability only, not a
+    /// contract.
     static std::uint64_t connects() {
         State& s = state();
         const std::lock_guard<std::mutex> lock(s.mu);
         return s.connects;
+    }
+
+    /// Statements run through the shared slot (not one-shot after close()); a
+    /// test that a fixture's CREATE/DROP went through it, whatever connects()
+    /// was before. Test observability only.
+    static std::uint64_t statements() {
+        State& s = state();
+        const std::lock_guard<std::mutex> lock(s.mu);
+        return s.statements;
+    }
+
+    /// Server backend pid of the shared connection, 0 when none is open. Lets a
+    /// test terminate exactly this backend (and no other session).
+    static int backend_pid() {
+        State& s = state();
+        const std::lock_guard<std::mutex> lock(s.mu);
+        return s.conn ? PQbackendPID(s.conn.get()) : 0;
     }
 
 private:
@@ -651,6 +668,7 @@ private:
         yuzu::server::pg::PgConn conn;
         std::string dsn;
         std::uint64_t connects{0};
+        std::uint64_t statements{0};
         bool closed{false};
     };
     // Intentionally leaked: a function-local static would PQfinish from its

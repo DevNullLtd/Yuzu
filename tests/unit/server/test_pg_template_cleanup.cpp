@@ -33,6 +33,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/reporters/catch_reporter_event_listener.hpp>
@@ -354,6 +355,7 @@ TEST_CASE("PostgresTestDb: CREATE and DROP run through the shared admin connecti
     }
     const std::string admin = yuzu::test::pg_admin_dsn_env();
     const auto connects_before = yuzu::test::AdminConn::connects();
+    const auto statements_before = yuzu::test::AdminConn::statements();
 
     std::string first_name;
     {
@@ -368,6 +370,8 @@ TEST_CASE("PostgresTestDb: CREATE and DROP run through the shared admin connecti
     // most one connection (none if an earlier test already opened it).
     const auto connects_after_first = yuzu::test::AdminConn::connects();
     CHECK(connects_after_first == std::max<std::uint64_t>(connects_before, 1));
+    // Whatever opened the slot first, CREATE and DROP both ran through it.
+    CHECK(yuzu::test::AdminConn::statements() >= statements_before + 2);
 
     std::string second_name;
     {
@@ -381,6 +385,58 @@ TEST_CASE("PostgresTestDb: CREATE and DROP run through the shared admin connecti
     CHECK_FALSE(database_exists(admin, second_name));
     // ...and reused it: no second admin connect for the second database.
     CHECK(yuzu::test::AdminConn::connects() == connects_after_first);
+    CHECK(yuzu::test::AdminConn::statements() >= statements_before + 4);
+}
+
+TEST_CASE("PostgresTestDb: a shared admin connection whose backend was terminated is reopened "
+          "once",
+          "[pg][template]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    }
+    const std::string admin = yuzu::test::pg_admin_dsn_env();
+    {
+        yuzu::test::PostgresTestDb warm; // makes sure the shared slot is open
+        REQUIRE(warm.available());
+    }
+    const int pid = yuzu::test::AdminConn::backend_pid();
+    REQUIRE(pid > 0);
+
+    // Terminate exactly the shared backend (by pid, so no other session on the
+    // instance is touched) and wait until it is gone.
+    yuzu::server::pg::PgConn observer{PQconnectdb(admin.c_str())};
+    REQUIRE(PQstatus(observer.get()) == CONNECTION_OK);
+    {
+        yuzu::server::pg::PgResult res{PQexec(
+            observer.get(), ("SELECT pg_terminate_backend(" + std::to_string(pid) + ")").c_str())};
+        REQUIRE(res.ok());
+    }
+    const std::string alive_sql =
+        "SELECT 1 FROM pg_stat_activity WHERE pid = " + std::to_string(pid);
+    bool gone = false;
+    for (int attempt = 0; attempt < 100 && !gone; ++attempt) {
+        yuzu::server::pg::PgResult res{PQexec(observer.get(), alive_sql.c_str())};
+        REQUIRE(PQresultStatus(res.get()) == PGRES_TUPLES_OK);
+        gone = PQntuples(res.get()) == 0;
+        if (!gone)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    REQUIRE(gone);
+
+    // The next fixture finds the shared link dead mid-statement and must reopen
+    // it once instead of failing its CREATE.
+    const auto connects_before = yuzu::test::AdminConn::connects();
+    std::string name;
+    {
+        yuzu::test::PostgresTestDb fixture;
+        INFO("fixture error: " << fixture.error());
+        REQUIRE(fixture.available());
+        name = fixture.db_name();
+        CHECK(database_exists(admin, name));
+    }
+    CHECK_FALSE(database_exists(admin, name)); // and its DROP landed on the new link
+    CHECK(yuzu::test::AdminConn::connects() == connects_before + 1);
+    CHECK(yuzu::test::AdminConn::backend_pid() != pid);
 }
 
 TEST_CASE("sweep_stale_test_databases: end-to-end against a live instance", "[pg][template]") {
