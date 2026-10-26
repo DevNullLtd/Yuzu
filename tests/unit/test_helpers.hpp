@@ -622,7 +622,7 @@ public:
             // re-run: a CREATE that did land fails loudly (42P04), a DROP is
             // IF EXISTS.
             std::fprintf(stderr, "AdminConn: shared admin link was dead (%s); reconnecting\n",
-                         out.error.c_str());
+                         out.error.substr(0, out.error.find('\n')).c_str());
             s.conn = yuzu::server::pg::PgConn{PQconnectdb(dsn.c_str())};
             ++s.connects;
             out = run(s.conn, sql);
@@ -634,9 +634,10 @@ public:
     static void close() noexcept {
         State& s = state();
         const std::lock_guard<std::mutex> lock(s.mu);
-        if (!s.closed)
+        if (!s.closed && (s.connects != 0 || s.statements != 0))
             std::fprintf(stderr,
-                         "AdminConn: %llu connect(s), %llu statement(s) through the shared slot\n",
+                         "AdminConn: %llu connect attempt(s), %llu statement(s) through the shared "
+                         "slot\n",
                          static_cast<unsigned long long>(s.connects),
                          static_cast<unsigned long long>(s.statements));
         s.conn.reset();
