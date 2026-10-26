@@ -3389,9 +3389,14 @@ TEST_CASE("AuthDB recovery consume takes the users row lock first, bounded, and 
         std::atomic<int> losses{0};
         std::atomic<int> errors{0};
         std::atomic<std::int64_t> gen_seen{-1};
-        auto fire = [&] {
-            while (!go.load(std::memory_order_acquire))
+        // The stop token lets a jthread that is unwinding (a later construction threw) leave the
+        // start spin instead of waiting for a `go` that will never be set.
+        auto fire = [&](std::stop_token st) {
+            while (!go.load(std::memory_order_acquire)) {
+                if (st.stop_requested())
+                    return;
                 std::this_thread::yield();
+            }
             auto r = h.db.mfa_consume_recovery_code("r1", f.result.recovery_codes[0]);
             if (!r.has_value())
                 errors.fetch_add(1);
@@ -3401,11 +3406,11 @@ TEST_CASE("AuthDB recovery consume takes the users row lock first, bounded, and 
             } else
                 losses.fetch_add(1);
         };
-        std::thread t1(fire);
-        std::thread t2(fire);
-        go.store(true, std::memory_order_release);
-        t1.join();
-        t2.join();
+        {
+            std::jthread t1(fire);
+            std::jthread t2(fire);
+            go.store(true, std::memory_order_release);
+        }
         CHECK(wins.load() == 1);
         CHECK(losses.load() == 1);
         CHECK(errors.load() == 0);
