@@ -184,3 +184,32 @@ TEST_CASE("send-map: journal-replay provenance NEVER reaches the wire event (ite
     CHECK(ev.event_id() == "evt-id");
     CHECK(ev.rule_name() == "rule name");
 }
+
+// UP-14: the (boot_epoch, emit_seq) ordering pair. The field numbers are wire contract
+// shared with the server-side PR, which carries a byte-identical proto hunk; pin them so
+// a renumber on either side fails here instead of silently desynchronising ordering.
+namespace {
+using WireEvent = ::yuzu::guardian::v1::GuaranteedStateEvent;
+static_assert(WireEvent::kBootEpochFieldNumber == 24,
+              "boot_epoch wire field number is a cross-PR contract");
+static_assert(WireEvent::kEmitSeqFieldNumber == 25,
+              "emit_seq wire field number is a cross-PR contract");
+} // namespace
+
+TEST_CASE("send-map: boot_epoch/emit_seq round-trip through the wire and default to unset",
+          "[spark][sendmap]") {
+    ::yuzu::guardian::v1::GuaranteedStateEvent unset;
+    CHECK(unset.boot_epoch() == 0);
+    CHECK(unset.emit_seq() == 0);
+
+    ::yuzu::guardian::v1::GuaranteedStateEvent ev;
+    ev.set_event_id("evt");
+    ev.set_boot_epoch(1'790'000'000ULL);
+    ev.set_emit_seq(0x1'0000'0001ULL); // above 32 bits: the field is a full uint64
+
+    ::yuzu::guardian::v1::GuaranteedStateEvent parsed;
+    REQUIRE(parsed.ParseFromString(ev.SerializeAsString()));
+    CHECK(parsed.boot_epoch() == 1'790'000'000ULL);
+    CHECK(parsed.emit_seq() == 0x1'0000'0001ULL);
+    CHECK(parsed.event_id() == "evt");
+}
