@@ -737,8 +737,9 @@ for the tool to execute.
 > denial belt: a caller whose own MCP token is itself engine-classed
 > (`principal_kind="engine"` / `auth_source="engine_token"`) is denied on
 > every one of them, matching the REST surface's posture of denying an
-> engine-classed session on every engine-principal route except the three
-> `/engine-principals/{id}/roles` routes. The role tools `list_engine_roles`,
+> engine-classed session on every engine-principal route except
+> `GET /engine-principals/{id}/roles` (the role assign and unassign routes are
+> step-up gated and refuse an engine session). The role tools `list_engine_roles`,
 > `assign_engine_role` and `unassign_engine_role` carry no such belt; they
 > rely on their tier and permission gates alone.
 
