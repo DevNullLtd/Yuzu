@@ -568,7 +568,11 @@ connection, and fails closed:
   and logged as a rate-limited warning.
 - A report stripped because its connection has no record yet (for example after the
   upstream channel reconnected to a server no agent of this gateway has registered
-  through since) starts a capability probe: the gateway replays the reporting agent's
+  through since) starts a capability probe, but only if the gateway admitted the
+  report's session: the session is held by this gateway and the report arrived on the
+  connection the session is bound to (the same check heartbeats pass). A report from
+  an unadmitted session is still forwarded, with the gated key removed, but never
+  starts a probe and never uses up the 30-second window. An admitted report's probe: the gateway replays the reporting agent's
   registration through the usual replay drip (`yuzu_gw_registration_replay_triggered_total{trigger="capability"}`),
   at most once per connection every 30 seconds, and the answer records the
   connection. Reports on that connection are stripped until the answer arrives. With

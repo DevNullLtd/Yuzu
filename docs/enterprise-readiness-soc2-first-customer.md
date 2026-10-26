@@ -407,8 +407,11 @@ balancer at the reservation release or later, no rollback below it, before certi
 agents are enabled: `docs/user-manual/inventory.md`, `gateway.md`, `upgrading.md`); the gateway's
 per-connection capability gate, which removes the source on any connection that did not advertise
 it or cannot be identified; and the counter `yuzu_gw_inventory_source_stripped_total{source,reason}`
-with the gauge `yuzu_gw_upstream_capability_gate_ready`. No alert rule ships yet. Review before the
-agent collector (2a-2e) ships.
+with the gauge `yuzu_gw_upstream_capability_gate_ready`. No alert rule ships yet. **Review by
+2027-01-31**, and in any case before the agent collector (2a-2e) ships. **Prerequisites for
+closing the entry:** an alert rule on the strip metric is shipped in `docs/prometheus/yuzu-alerts.yml`,
+and every backend behind an L7 balancer runs the 2a-1 release or later. Until the owner decides,
+the entry stays PENDING, not accepted.
 
 **Addendum: approver assurance for approve and reject (CC6.1/CC6.3, #6061).** Approving or
 rejecting an approval request requires an interactive human session (local or OIDC), a human
