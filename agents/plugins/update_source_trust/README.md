@@ -14,19 +14,61 @@
 
 ## How it works
 
-`sources` reports facts about how the device's package and update sources are configured to trust their signing authorities. It reads local configuration and nothing else: no subprocess, no network fetch, no write. The first row is always a `status` row saying whether the read was complete; the data rows follow, one per source. It reports what is configured and leaves any judgement, and any enforcement, to the consumer and to the sibling posture plugins.
+`sources` reports facts about how the device's package and update sources are configured to trust their signing authorities. It reads local configuration files and nothing else: no subprocess, no network fetch, no write. The first row is always a `status` row saying whether the read was complete; the data rows follow, one per source line or stanza and one per keyring file. It reports what is configured and leaves any judgement, and any enforcement, to the consumer and to the sibling posture plugins.
 
-On Linux, apt sources are read from `/etc/apt/sources.list` and `/etc/apt/sources.list.d/` in both the one-line and the deb822 format, with the `signed-by`, `trusted` and (one-line only) `allow-insecure` settings surfaced. The apt keyring files under `/etc/apt/trusted.gpg`, `/etc/apt/trusted.gpg.d/` and `/etc/apt/keyrings/` are listed with their format and size (key material is never emitted). The leg also lists `/etc/yum.repos.d` by name (no `.repo` file is opened) and, when that directory has entries, reports `CONSTRAINED` with `linux:rpm_repo:planned`, so an rpm host never reads as having no sources (caveat 3). On macOS and Windows the leg reads nothing and answers with one `unsupported` status row, `macos:planned` or `windows:planned` (caveat 4). A symlink as the final component of a file or directory is refused rather than followed, each source file is read with a 1 MiB cap (a keyring only for its first 64 bytes), a directory is read up to 1,024 entries, the rows of one run share a 1 MiB budget, and the bytes read by one run share a 16 MiB budget (failed reads count). In `sources.list.d` only the files apt itself reads are reported: hidden files and names with characters outside `[A-Za-z0-9_.:-]` are skipped, as apt skips them. Keyrings are selected by suffix alone (`*.gpg` and `*.asc` in `trusted.gpg.d`, any name in `/etc/apt/keyrings`), because apt before 3.0 trusts a key under any such name; apt 3.0 and later skip odd names there, so an extra row can appear on those hosts. An entry apt itself would refuse (an unknown type, an option without `=`, a quoted or percent-encoded option) is reported as `unparsed_entry`, not as a row. A NUL or non-UTF-8 byte that reaches a reported field is replaced with `?` and flagged (`invalid_bytes`; such bytes in a comment or an ignored field are not), and a file whose size or modification time changes while it is read, or that is empty and was modified within the last two seconds, is flagged (`modified_during_read`) rather than reported as read.
+On Linux the plugin reads the apt family. Source files come from `/etc/apt/sources.list` and `/etc/apt/sources.list.d/` in both the one-line and the deb822 format, and each row carries the `signed-by`, `trusted`, `enabled` and (one-line only) `allow-insecure` settings. The keyrings in `/etc/apt/trusted.gpg`, `/etc/apt/trusted.gpg.d/` and `/etc/apt/keyrings/` are listed with their format and size; key material is never emitted. The plugin also lists `/etc/yum.repos.d` by name without opening any `.repo` file, and when that directory has entries the result is `CONSTRAINED` with `linux:rpm_repo:planned`, so an rpm host never reads as having no sources. On macOS and Windows the plugin reads nothing and answers with one `unsupported` status row (`macos:planned` or `windows:planned`).
+
+Reads are bounded and conservative. A symlink as the final component of a file or directory is refused, never followed. A source file over 1 MiB, a directory over 1,024 entries, rows beyond a 1 MiB total, or more than 16 MiB read in one run stops that part of the walk and is reported, never silently truncated. In `sources.list.d` only the files apt itself reads are reported (not hidden, names within `[A-Za-z0-9_.:-]`, suffix `.list` or `.sources`). Keyrings are chosen by suffix alone (`*.gpg` and `*.asc` in `trusted.gpg.d`, any name in `/etc/apt/keyrings`), because apt before 3.0 trusts a key under any such name; apt 3.0 and later skip odd names there, so an extra row can appear on those hosts. An entry apt itself would refuse is counted as `unparsed_entry` and produces no row. A NUL or non-UTF-8 byte in a reported field is replaced with `?` and flagged `invalid_bytes`. A file whose size or modification time changes while it is read, or that is empty and was modified within the last two seconds, is flagged `modified_during_read` instead of being reported as read.
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Security.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[update_source_trust.execute]
-  EX --> WIN[Windows leg<br/>status row only: windows:planned]
-  EX --> MAC[macOS leg<br/>status row only: macos:planned]
-  EX --> LIN[Linux leg<br/>apt sources and keyrings; /etc/yum.repos.d listed by name]
-  WIN & MAC & LIN --> ROWS[rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator or workflow"] -->|"authz: Security Read"| SRV["Server"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"] --> EX["update_source_trust execute"]
+  EX --> WIN["Windows: status row only, windows:planned"]
+  EX --> MAC["macOS: status row only, macos:planned"]
+  EX --> LIN["Linux: apt sources and keyrings, yum.repos.d listed by name"]
+  WIN --> ROWS["rows and typed result status"]
+  MAC --> ROWS
+  LIN --> ROWS
+  ROWS --> RS[("ResponseStore")] --> API["REST /api/responses"]
 ```
+
+### What you can decide with it
+
+Each data row is one fact an operator can act on. On Linux (apt hosts):
+
+| Question | Where to look | Reading it |
+|---|---|---|
+| Is signature checking switched off for a source? | `apt_source` fields 8 and 9 (`trusted`, `allow_insecure`) | `yes` means apt skips signature checking for that source. `unset` means the source does not say; it does not prove checking is enforced, because global apt settings are not read. |
+| Does a source pin its own key, or rely on every globally trusted key? | `apt_source` field 7 (`signed_by`) | A path or fingerprint pins the source to that key. `-` means apt falls back to its global trusted keyrings. `inline_key` means the key is embedded in the file. |
+| Which keys does apt trust for every source? | `apt_keyring` rows with scope `legacy_trusted_gpg` or `trusted_gpg_d` | Every key in those files is a global trust anchor. Rows in scope `etc_apt_keyrings` are only trusted where a `signed-by` names them. |
+| Where does this host install software from? | `apt_source` URIs, suites, components | The URI list, with any `user:pass@` redacted. A disabled source shows `enabled` = `no`. |
+
+What it cannot tell you: who owns a keyring file or whether its key is valid (no fingerprint is computed), whether a URI is reachable or legitimate, anything about rpm/dnf, zypper, pacman or apk hosts, or the macOS and Windows update policy. A clean result (`OK`, zero or more rows, no `trusted=yes`) proves only that the apt source files that were read do not disable verification; it does not prove an apt host is hardened, and zero rows on a non-apt host says nothing. There is no workflow to follow: the action is read-only and takes no parameters.
+
+### Diagrams
+
+```mermaid
+flowchart TD
+  A["Candidate file or directory under /etc/apt"] --> B{"Exists?"}
+  B -->|"no"| Z["Zero rows, no token, stays supported"]
+  B -->|"yes"| C{"Final component a symlink, or not a regular file?"}
+  C -->|"yes"| T1["Token symlink_refused, not_a_directory or not_regular"]
+  C -->|"no"| D{"Over 1 MiB, or run already past 16 MiB read?"}
+  D -->|"yes"| T2["Token oversized or input_cap, stop that part"]
+  D -->|"no"| E["Read between two size and time checks"]
+  E --> F{"Changed while read?"}
+  F -->|"yes"| T3["Token short_read or modified_during_read"]
+  F -->|"no"| G{"Entry parses the way apt parses it?"}
+  G -->|"no"| T4["Token unparsed_entry, no row"]
+  G -->|"yes"| H["Row emitted, within the 1 MiB row budget"]
+  T1 --> R["Result is CONSTRAINED with every token"]
+  T2 --> R
+  T3 --> R
+  T4 --> R
+```
+
+The diagram follows one candidate file through the Linux read. A file that is merely absent is not a failure, while every other way of not reading it completely becomes a token that turns the whole result into `CONSTRAINED`, so a source that could not be read is never reported as absent or unsigned. Rows that were read are still returned alongside the tokens.
 
 ## OS capability
 
@@ -153,11 +195,11 @@ apt_keyring|/etc/apt/trusted.gpg.d/debian-archive-trixie-stable.asc|trusted_gpg_
 
 ## Caveats and known gaps
 
-1. **No documented customer driver.** Zero documented driver: `docs/capability-map.md` section 8.8 "Patch Connectivity Testing" tests reachability to update sources, never their trust or authenticity, and every "supply chain" mention in the SOC 2 doc (Workstream C) is about Yuzu's own build and release pipeline, never a customer endpoint's OS or package update-source configuration. Pure capability-gap reasoning.
-2. **Facts only.** The plugin is read-only and reports how sources are configured; an unsigned or rogue source is a row, not a verdict. It does not enforce, fetch, verify a signature or resolve a key, and enforcement posture belongs to the sibling posture plugins.
-3. **rpm/dnf family planned.** The yum/dnf `.repo` read (`gpgcheck`, `repo_gpgcheck`, `gpgkey`, `sslverify`) is not read yet. A Linux host whose `/etc/yum.repos.d` has entries reports `CONSTRAINED` with `linux:rpm_repo:planned` and no `rpm_repo` rows, so it never reads as having no sources; a host without that directory (Debian, Ubuntu) is unaffected and stays `supported`.
-4. **macOS and Windows legs planned.** The macOS Software Update policy read (the local and the MDM-managed `com.apple.SoftwareUpdate.plist`, including its Managed Preferences read) and the Windows WSUS and Automatic Updates policy read under `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate` are not read yet; each reports one `unsupported` status row.
-5. **Known limits.** Keys referenced by an apt `Signed-By` are reported by path, not resolved or fingerprinted, and `/usr/share/keyrings` is not inventoried. Only the apt family is modelled, so a host whose sources live elsewhere (zypper `/etc/zypp/repos.d`, pacman, apk `/etc/apk/repositories`) reports zero rows and `supported`, and an empty result there is not evidence that no sources exist. Global apt configuration (`/etc/apt/apt.conf`, `apt.conf.d`) is not read, so a per-source `unset` means the source does not say, not that signature checks are enforced (for example `Acquire::AllowInsecureRepositories` turns an unsigned-repository error into a warning). Only `signed-by`, `trusted` and `Enabled` (deb822), and `signed-by`, `trusted` and `allow-insecure` (one-line), are surfaced and every other option is ignored; option names are case-sensitive as in apt, a `+=` or `-=` on a surfaced option is reported `unmodelled`, a deb822 `Allow-Insecure` field is ignored by apt and so reported `unset`, a one-line `signed-by` with `+=` or `-=` is reported `unmodelled`, and only apt's own boolean words (`yes/no/true/false/1/0/on/off/with/without/enable/disable`) are recognised. A file that a writer keeps empty for the whole read cannot be told from a genuinely empty one, and `trusted.gpg.d` names are not filtered (apt 3.0 and later skip hidden and oddly named keys there).
+1. **No documented customer driver.** The capability map's "Patch Connectivity Testing" row checks that update sources are reachable, not whether they are trustworthy, and the SOC 2 supply-chain material covers Yuzu's own build pipeline rather than a customer endpoint's package sources. The plugin exists on capability-gap reasoning alone.
+2. **Facts only.** The plugin is read-only and reports how sources are configured; an unsigned or unexpected source is a row, not a verdict. It does not enforce, fetch, verify a signature or resolve a key, and enforcement posture belongs to the sibling posture plugins.
+3. **rpm/dnf family planned.** The yum/dnf `.repo` settings (`gpgcheck`, `repo_gpgcheck`, `gpgkey`, `sslverify`) are not read. A Linux host whose `/etc/yum.repos.d` has entries reports `CONSTRAINED` with `linux:rpm_repo:planned` and no `rpm_repo` rows, so it never reads as having no sources; a host without that directory (Debian, Ubuntu) stays `supported`.
+4. **macOS and Windows legs planned.** The macOS Software Update policy (local and MDM-managed `com.apple.SoftwareUpdate.plist`) and the Windows WSUS and Automatic Updates policy (`HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate`) are not read; each leg reports one `unsupported` status row.
+5. **Known limits of the apt read.** A `Signed-By` key is reported by path or fingerprint text, not resolved, and `/usr/share/keyrings` is not inventoried; global apt configuration (`apt.conf`, `apt.conf.d`) is not read, so `unset` never means "enforced". Only the apt family is modelled, so zypper, pacman and apk hosts report zero rows and `supported`, and options other than `signed-by`, `trusted`, `enabled` and `allow-insecure` are ignored; a file a writer keeps empty for the whole read looks genuinely empty.
 
 ## Source and tests
 
