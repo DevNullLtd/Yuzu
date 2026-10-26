@@ -71,7 +71,13 @@ globalThis.document = { getElementById: i => (i === 'sw-root' ? root : i === 'sw
   createTextNode: t => { const e = new E('#text'); e._t = String(t); return e; } };
 globalThis.location = { origin: 'https://yuzu.test', hash: '' };
 globalThis.history = { replaceState: (a, b, h) => { globalThis.location.hash = h; } };
-globalThis.setTimeout = () => 1; globalThis.clearTimeout = () => {};
+// Timers never fire on their own; the announcer's 500 ms debounce is run by hand so the test
+// neither waits nor races.
+const timers = new Map(); let timerId = 0;
+globalThis.setTimeout = (f, ms) => { timers.set(++timerId, { f, ms }); return timerId; };
+globalThis.clearTimeout = id => { timers.delete(id); };
+const pendingAnnounce = () => [...timers.values()].filter(t => t.ms === 500).length;
+const flushAnnounce = () => { for (const [id, t] of [...timers]) if (t.ms === 500) { timers.delete(id); t.f(); } };
 let queue = [], fetches = [];
 globalThis.fetch = (u, o) => { fetches.push(u); const r = queue.shift();
   if (r.fail) return Promise.reject(new Error('NETRAW'));
@@ -368,7 +374,7 @@ const out = {};
   await reload({ status: 200, body: specF });
   const q = root.byTag('input')[0];
   const [msel, tsel, ysel] = root.byTag('select');
-  const countEl = () => root.all(c => c.getAttribute('aria-live') === 'polite')[0];
+  const countEl = () => root.all(c => c.id === 'sw-count')[0];
   const emptyEl = () => root.byClass('sw-empty')[0];
   const rowsF = () => root.byClass('sw-op');
   const keyOf = r => r.byClass('pill')[0].textContent + ' ' + pathOf(r);
@@ -379,7 +385,7 @@ const out = {};
   const reset = () => { setQ(''); setSel(msel, 0); setSel(tsel, 0); setSel(ysel, 0); };
   out.f_all_shown = shown().length;
   out.f_count0 = countEl().textContent;
-  out.f_count_live = countEl().getAttribute('role') + '/' + countEl().getAttribute('aria-live');
+  out.f_count_live = String(countEl().getAttribute('aria-live')) + '/' + String(countEl().getAttribute('role'));
   out.f_empty0 = emptyEl().hidden;
   out.f_pills = rowsF().map(r => pathOf(r) + '=' + r.byClass('pill').slice(-1)[0].textContent).sort();
   out.f_chips = root.byClass('chip').map(c => c.textContent);
@@ -400,6 +406,9 @@ const out = {};
   setQ('typed'); out.f_search_summary = shown();              // matches "typed one", "typed two", "untyped one"
   setSel(ysel, 1); out.f_search_and_typed = shown();          // narrowed again by the typed filter
   reset();
+  // The count is announced once when typing pauses, not on every keystroke.
+  live.textContent = ''; setQ('t'); setQ('ty'); setQ('typ'); out.ann_during = live.textContent; out.ann_pending = pendingAnnounce();
+  flushAnnounce(); out.ann_after = live.textContent; out.ann_count = countEl().textContent;
   setQ('no-such-operation'); out.f_none = shown().length; out.f_none_count = countEl().textContent;
   out.f_none_empty = emptyEl().hidden; out.f_none_panels = root.byTag('section').filter(p => !p.hidden).length;
   out.f_none_toc = tocHidden();
@@ -424,7 +433,7 @@ const out = {};
   out.r_untyped = rr.filter(r => lastPill(r) === 'untyped').length;
   out.r_unavail = rr.filter(r => lastPill(r) === 'unavailable').length;
   const rq = root.byTag('input')[0], [rm, rt, ry] = root.byTag('select');
-  const rcount = () => root.all(c => c.getAttribute('aria-live') === 'polite')[0].textContent;
+  const rcount = () => root.all(c => c.id === 'sw-count')[0].textContent;
   out.r_count0 = rcount();
   ry.selectedIndex = 1; ry.fire('change');
   out.r_filter_typed = root.byClass('sw-op').filter(r => !r.hidden).length; out.r_expect_filter_typed = expect.filter(e => e.typed).length;
@@ -622,7 +631,12 @@ def main():
     # Search and filters.
     check(out["f_all_shown"] == 6 and out["f_count0"] == "6 of 6 operations" and out["f_empty0"] is True,
           "all six operations shown at first, with a count and no empty view: %r %r" % (out["f_all_shown"], out["f_count0"]))
-    check(out["f_count_live"] == "status/polite", "the filter count must be a polite live region: %r" % out["f_count_live"])
+    check("polite" not in out["f_count_live"] and "status" not in out["f_count_live"],
+          "the filter count must not be a live region itself (it changes on every keystroke): %r" % out["f_count_live"])
+    check(out["ann_pending"] == 1, "three keystrokes must leave one pending announcement, not three: %r" % out["ann_pending"])
+    check(out["ann_during"] == "" and out["ann_after"] == out["ann_count"] and out["ann_count"].endswith(" operations"),
+          "the count is announced once, when typing pauses, in the page live region: during %r, after %r, count %r" % (
+              out["ann_during"], out["ann_after"], out["ann_count"]))
     check(out["f_pills"] == ["/d1=untyped", "/e1=untyped", "/t1=typed", "/t2=typed", "/u1=untyped", "/x1=unavailable"],
           "each row's pill: typed only for a 2xx schema, unavailable over both: %r" % out["f_pills"])
     check(any(c == "Typed responses2 (33%)" for c in out["f_chips"]) and any(c == "Unavailable1" for c in out["f_chips"])

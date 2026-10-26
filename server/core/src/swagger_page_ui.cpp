@@ -393,10 +393,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
       kids.push(h('div', 'sw-flow', g.how_it_works.map(function (s) {
         return h('div', '', [h('b', '', [s.title]), h('span', '', [s.text])]);
       })));
-)SWG";
-
-// Renderer, part 2 of 2.
-extern const char* const kSwaggerJs2 = R"SWG(    }
+    }
     (g.tables || []).forEach(function (t) {
       kids.push(h('h3', '', [t.title]));
       if (t.caption) kids.push(h('p', 'mut sw-cap', [t.caption]));
@@ -416,7 +413,10 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
 
   function build() {
     ops = []; tags = []; guides = dict(); st = { q: '', method: '', tag: '', typed: '' };
-    // A malformed entry (a null tag, a guide that is not an object, a null path item) is
+)SWG";
+
+// Renderer, part 2 of 2.
+extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null tag, a guide that is not an object, a null path item) is
     // skipped, not allowed to take the whole page down.
     function isObj(x) { return !!x && typeof x === 'object' && !Array.isArray(x); }
     (Array.isArray(spec.tags) ? spec.tags : []).forEach(function (t) {
@@ -443,7 +443,7 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
     var msel = h('select', 'sw-ctl', [h('option', '', ['All methods'])].concat(METHODS.map(function (m) { return h('option', '', [m.toUpperCase()]); }))); msel.id = 'sw-m'; msel.setAttribute('aria-label', 'Method');
     var tsel = h('select', 'sw-ctl', [h('option', '', ['All groups'])].concat(tags.map(function (t) { return h('option', '', [t]); }))); tsel.id = 'sw-t'; tsel.setAttribute('aria-label', 'Group');
     var ysel = h('select', 'sw-ctl', ['Any response schema', 'Typed response', 'Untyped response'].map(function (t) { return h('option', '', [t]); })); ysel.id = 'sw-y'; ysel.setAttribute('aria-label', 'Response schema');
-    var count = h('span', 'mut', ['']); count.setAttribute('role', 'status'); count.setAttribute('aria-live', 'polite');
+    var count = h('span', 'mut', ['']); count.id = 'sw-count'; // read by the filters; announced by announce(), not live itself
 
     var summary = h('div', 'sw-chips', [
       h('span', 'chip', ['Operations', h('b', '', [String(ops.length)])]),
@@ -538,13 +538,16 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
       count.textContent = shown + ' of ' + ops.length + ' operations';
       empty.hidden = shown !== 0;
     }
-    q.addEventListener('input', function () { st.q = q.value; apply(); });
-    msel.addEventListener('change', function () { st.method = msel.selectedIndex ? METHODS[msel.selectedIndex - 1] : ''; apply(); });
+    // The count updates on every keystroke; a screen reader hears it once, when typing pauses.
+    var said = null;
+    function announce() { clearTimeout(said); said = setTimeout(function () { say(count.textContent); }, 500); }
+    q.addEventListener('input', function () { st.q = q.value; apply(); announce(); });
+    msel.addEventListener('change', function () { st.method = msel.selectedIndex ? METHODS[msel.selectedIndex - 1] : ''; apply(); announce(); });
     tsel.addEventListener('change', function () {
-      st.tag = tsel.selectedIndex ? tags[tsel.selectedIndex - 1] : ''; apply();
+      st.tag = tsel.selectedIndex ? tags[tsel.selectedIndex - 1] : ''; apply(); announce();
       if (st.tag && panels[st.tag].toggleGuide) panels[st.tag].toggleGuide(true);
     });
-    ysel.addEventListener('change', function () { st.typed = ['', 'typed', 'untyped'][ysel.selectedIndex]; apply(); });
+    ysel.addEventListener('change', function () { st.typed = ['', 'typed', 'untyped'][ysel.selectedIndex]; apply(); announce(); });
 
     root.textContent = '';
     say('');

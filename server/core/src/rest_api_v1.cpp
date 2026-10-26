@@ -3979,6 +3979,11 @@ void RestApiV1::register_routes(
     // "Read")`), matching the sibling `/api/v1/discover/*` docs surface
     // (discover_routes.cpp). `perm_fn` writes its own A4 denial body + header
     // on refusal, so no separate envelope call is needed here.
+    // Derive both forms of the document and their validators now, at registration, so the first
+    // request after a restart does not leave concurrent callers waiting on one worker's
+    // derivation (parse, strip, serialise, hash: tens of milliseconds).
+    (void)openapi_spec_etag();
+    (void)openapi_spec_with_guides_etag();
     sink.Get("/api/v1/openapi.json", [perm_fn](const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "Infrastructure", "Read"))
             return;
