@@ -47,6 +47,7 @@ import importlib.util
 import io
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -801,6 +802,27 @@ def main() -> int:
             "u8_raw_string_with_inner_quote": ('const char* r = u8R"x(a" /* b)x";\n#include "hid_store.hpp"\n', True),
             "wide_raw_string_with_inner_quote": ('const wchar_t* r = LR"x(a" /* b)x";\n#include "hid_store.hpp"\n', True),
             "raw_string_custom_delim_with_paren": ('const char* r = R"d(a)" /* b)d";\n#include "hid_store.hpp"\n', True),
+            # Shapes found by an independent randomized differential fuzz against g++ (round 6):
+            "char_literal_after_return": ("char f() { return'/*'; }\n#include \"hid_store.hpp\"\n/* x */\n", True),
+            "char_literal_after_L_prefix": ("auto c = L'/*';\n#include \"hid_store.hpp\"\n/* x */\n", True),
+            "char_literal_after_u8_prefix": ("auto c = u8'/*';\n#include \"hid_store.hpp\"\n/* x */\n", True),
+            "quote_after_digit_is_a_char_literal": ("int k = 1'/*';\n#include \"hid_store.hpp\"\n/* x */\n", True),
+            "udl_suffix_R_is_not_a_raw_string": ('auto s = "a"R"(";\n#include/**/"hid_store.hpp"\n', True),
+            "nul_byte_is_whitespace": ('\0#include "hid_store.hpp"\n', True),
+            "nul_byte_inside_directive": ('#\0include "hid_store.hpp"\n', True),
+            "form_feed_splice_before_comment": ('/\\\f\n/* x\n#include "hid_store.hpp"\n', True),
+            "vertical_tab_splice": ('#include \\\v\n"hid_store.hpp"\n', True),
+            "import_directive": ('#import "hid_store.hpp"\n', True),
+            "digraph_import": ('%:import "hid_store.hpp"\n', True),
+            # separators that must STILL be recognised (a comment opens after them and hides the include)
+            "hex_digit_separator_then_comment_hides_include": ("int n = 0xAB'CD; /* hides\n#include \"hid_store.hpp\"\n*/ int z;\n", False),
+            "float_digit_separator_then_comment_hides_include": ("double d = 1'000.5'5; /* hides\n#include \"hid_store.hpp\"\n*/ int z;\n", False),
+            # a char literal whose body is alphanumeric must not be mistaken for a digit separator
+            # (the swallowed `'; /* hides` would then un-hide the include): comment opens, include HIDDEN
+            "alnum_char_literal_after_prefix_then_comment_hides_include": ("char16_t c = u'a'; /* hides\n#include \"hid_store.hpp\"\n*/ int z;\n", False),
+            "alnum_char_literal_after_return_then_comment_hides_include": ("char f() { return'a'; } /* hides\n#include \"hid_store.hpp\"\n*/ int z;\n", False),
+            # a hex separator chain whose later segment starts with a LETTER is still one pp-number
+            "hex_separator_chain_then_comment_hides_include": ("int n = 0xAB'CD'EF; /* hides\n#include \"hid_store.hpp\"\n*/ int z;\n", False),
             # hide: NOT includes to the compiler
             "line_comment": ('// #include "hid_store.hpp"\nint x;\n', False),
             "line_comment_continued_over_include": ('// c \\\n#include "hid_store.hpp"\nint x;\n', False),
@@ -816,11 +838,20 @@ def main() -> int:
             "unicode_line_separator_is_not_a_newline": ('int x;\u2028#include "hid_store.hpp"\n', False),
             "vertical_tab_mid_line_is_not_a_newline": ('int x;\x0b#include "hid_store.hpp"\n', False),
         }
+        gxx = shutil.which("g++")   # optional oracle: present on the CI runner, skipped elsewhere
         for form, (body, fires) in parser_forms.items():
             (src / f"hid_{form}_routes.cpp").write_text(body, encoding="utf-8", newline="")
             with contextlib.redirect_stderr(io.StringIO()):
                 ok = mod.check_family(f"hid-{form}", [f"server/core/src/hid_{form}_routes.cpp"],
                                       roots=roots, patterns=mod.FORBIDDEN_HEADER_PATTERNS)
+            if gxx:
+                # The oracle: the real compiler's preprocessor must agree with the expectation.
+                dep = subprocess.run([gxx, "-std=gnu++23", "-MM", "-MG", "-I", str(src),
+                                      str(src / f"hid_{form}_routes.cpp")], capture_output=True, text=True)
+                if ("hid_store.hpp" in dep.stdout) != fires:
+                    _fail(f"the compiler ({gxx}) disagrees with this selftest's expectation for {form!r}: "
+                          f"it {'lists' if 'hid_store.hpp' in dep.stdout else 'does not list'} hid_store.hpp "
+                          f"but the probe expects fires={fires}", failures)
             if fires and ok:
                 _fail(f"the include parser missed a real store include written as {form!r} - the "
                       f"closure walk is blind to it (UP-1/UP-3)", failures)

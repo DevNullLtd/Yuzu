@@ -42,13 +42,18 @@ so reverting one alone turns the selftest red - revert BOTH in one change.
 ALSO NOT CAUGHT (found in the WS-A4 S0 review, each reproduced on a scratch tree):
   3. THE INCLUDE PARSER SEES DIRECTIVES, NOT THE PREPROCESSOR. It strips comments in one
      linear lexer pass (`strip_comments`: `//`, `/* */` across lines, string/char/raw-string
-     aware), joins backslash-newline (trailing blanks allowed), drops a UTF-8 BOM, decodes
-     UTF-16 and accepts `%:include` and `include_next` - cross-checked against `g++ -MM` on
-     38 fixtures plus the selftest's (WS-A4 S0 governance). It still extracts NOTHING from a
-     macro-built include (`#include SOME_MACRO`) or a `##`-spliced one, and it cannot see an
-     include guarded away by `__has_include`. Conversely an `#include` line inside `#if 0`
-     or alone on a line inside a raw string IS extracted and can false-FAIL (the
-     conservative direction).
+     aware), joins backslash-newline (trailing blanks / FF / VT allowed), drops a UTF-8 BOM,
+     decodes UTF-16, treats NUL as whitespace and accepts `%:include`, `include_next` and
+     `import` - cross-checked against `g++ -MM -MG` (a fuzz of ~100k files found six hiding
+     shapes in an earlier draft; five are fixed and pinned). It still extracts NOTHING from a
+     macro-built include (`#include SOME_MACRO`) or a `##`-spliced one, cannot see an include
+     guarded away by `__has_include`, and has one contrived residual (a backslash-newline
+     INSIDE a raw string; see `strip_comments`). Conversely an `#include` line inside `#if 0`
+     or alone on a line inside a raw string IS extracted and can false-FAIL (conservative).
+     THREAT MODEL: this is a regression lock against honest mistakes and refactors, not a proof
+     against an author deliberately contorting source to hide a store include (a macro include
+     already can); it is merge-gating, so it is held to "no MISS in the fuzz grammar", not to
+     "cannot be defeated".
   4. THE DENYLIST IS HAND-MAINTAINED. A store-owning header that no pattern names is
      invisible to the walk - `nvd_db.hpp` (a raw `sqlite3*`) was exactly this until S0.
      Others unlisted today: `*_owner.hpp`, `app_perf_{cohort,group}_reader.hpp`,
@@ -731,12 +736,12 @@ STORE_DEFINITION_FREE_TUS = [
 # `#include/*c*/"x"`, `# /* c */ include "x"` and a multi-line comment closing before the `#`
 # all reach it as plain `#include "x"`. `include_next` is a GCC/Clang spelling of the same
 # thing. Horizontal whitespace only: the text is split on `\n` first.
-_INCLUDE_RE = re.compile(r'^[ \t\f\v]*(?:#|%:)[ \t\f\v]*include(?:_next)?[ \t\f\v]*'
+_INCLUDE_RE = re.compile(r'^[ \t\f\v]*(?:#|%:)[ \t\f\v]*(?:include(?:_next)?|import)[ \t\f\v]*'
                          r'(<[^>\n]+>|"[^"\n]+")')
 # Translation phase 2: backslash-newline is deleted BEFORE comments and directives exist
 # (GCC/Clang also accept trailing blanks between the backslash and the newline, with a
 # warning, and MSVC does too).
-_LINE_CONTINUATION_RE = re.compile(r'\\[ \t]*\r?\n')
+_LINE_CONTINUATION_RE = re.compile(r'\\[ \t\f\v]*\r?\n')
 _SPECIAL_RE = re.compile(r"[/\"']")
 _STR_END_RE = re.compile(r'["\\\n]')
 _CHR_END_RE = re.compile(r"['\\\n]")
@@ -770,15 +775,33 @@ def strip_comments(text: str, blank_strings: bool) -> str:
     of this function were quadratic (a header of `"\\"\\"...` or of repeated unterminated
     `/*` took 5-30 s per 64-240 KB) and this script gates CI.
 
-    Differentially tested against `g++ -MM` (38 fixtures, no MISS): the only disagreements
-    are the conservative ones - an `#include` on its own line inside a raw string, and
-    inside `#if 0` - which are still extracted (over-extraction, never a hidden include).
-    An unterminated `/*` consumes the rest of the file (the compiler rejects such a file)."""
+    Differentially tested against `g++ -MM -MG` as the oracle: ~46 hand-written fixtures (pinned
+    in the selftest, which re-checks them against g++ when one is installed) and, in review, ~100k
+    randomly generated files from a grammar of comments / literals / raw strings / splices /
+    digraphs / NULs / prefixes. That fuzz FOUND six hiding shapes in an earlier draft - a char
+    literal after `return`/`L`/`u8`/a digit, `R` used as a user-defined-literal suffix, a NUL byte,
+    a splice with FF/VT before the newline, `#import`, and a splice inside a raw string - five
+    are fixed and pinned; a fresh 9000-file re-run found none.
+
+    KNOWN RESIDUAL (not fixed, contrived): phase-2 splices are removed BEFORE raw strings are
+    lexed, but the compiler keeps a backslash-newline INSIDE a raw string. So
+    a raw string whose body contains a backslash immediately followed by a newline and then
+    `"/*` (the body `)` + backslash + newline + `"/*`, closed by `)"`), followed by an include and
+    a later `*/`, makes this lexer close the raw string early and open a comment that hides the
+    include. It needs a raw string holding a
+    backslash-newline followed by a comment opener, and no real code does that; it is documented
+    rather than built (splice-aware lexing is the next step if this lock ever needs to resist an
+    adversary - at which point asking the compiler (`g++ -MM -MG`) is the exact design).
+
+    An include on its own line inside `#if 0` or a raw string is still extracted (the
+    conservative direction: a possible false FAIL, never a hidden include). An unterminated
+    `/*` consumes the rest of the file (the compiler rejects such a file)."""
     text = _LINE_CONTINUATION_RE.sub("", text)
     n = len(text)
     out: list[str] = []
     last = 0
     i = 0
+    last_sep = -1   # position of the previous digit-separator quote (a chain 1'0'0'0 is one token)
     while True:
         m = _SPECIAL_RE.search(text, i)
         if m is None:
@@ -807,7 +830,8 @@ def strip_comments(text: str, blank_strings: bool) -> str:
             end = None
             # Raw string: R"delim( ... )delim" (also LR / uR / UR / u8R prefixes).
             if j > 0 and text[j - 1] == "R" and (
-                    j == 1 or not _is_ident_char(text[j - 2]) or text[j - 2] in "Lu8U"):
+                    j == 1 or (text[j - 2] not in "\"'" and (
+                        not _is_ident_char(text[j - 2]) or text[j - 2] in "Lu8U"))):
                 rm = _RAW_OPEN_RE.match(text, j)
                 if rm:
                     close = text.find(")" + rm.group(1) + '"', rm.end())
@@ -832,9 +856,17 @@ def strip_comments(text: str, blank_strings: bool) -> str:
                 last = end
             i = end
         else:  # a single quote
-            if j > 0 and _is_ident_char(text[j - 1]):
-                i = j + 1  # C++14 digit separator (1'000) or a literal suffix: not a char literal
-                continue
+            if j > 0 and _is_ident_char(text[j - 1]) and text[j + 1:j + 2].isalnum():
+                # C++14 digit separator (1'000'000) - but ONLY inside a pp-number: walk back over
+                # the token; it must START with a digit (an earlier separator in the same chain
+                # counts). `return'/*'`, `L'x'`, `u8'x'` and `1'/*'` are char literals.
+                k = j - 1
+                while k >= 0 and (text[k].isalnum() or text[k] in "_."):
+                    k -= 1
+                if (k >= 0 and k == last_sep) or text[k + 1].isdigit():
+                    last_sep = j
+                    i = j + 1
+                    continue
             k = j + 1
             while True:
                 sm = _CHR_END_RE.search(text, k)
@@ -861,8 +893,11 @@ def _read_source(path: Path) -> str:
     else UTF-8 with a leading BOM dropped. Never raises on bad bytes (`replace`)."""
     raw = path.read_bytes()
     if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        return raw.decode("utf-16", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
-    return raw.decode("utf-8-sig", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+        text = raw.decode("utf-16", errors="replace")
+    else:
+        text = raw.decode("utf-8-sig", errors="replace")
+    # GCC treats a NUL byte as whitespace (with a warning), so `\0#include "x"` is a directive.
+    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\0", " ")
 
 
 def parse_includes(path: Path):
