@@ -3316,6 +3316,29 @@ TEST_CASE("registry apply: a value NAME is charged to the budget too, and the ve
                               << " bytes charged");
 }
 
+TEST_CASE("registry apply: a refused or capped delete_key charges the budget nothing, and each leaf is enumerated once",
+          "[registry][core][apply]") {
+    const bool dry = GENERATE(true, false);
+    const bool capped = GENERATE(true, false);
+    INFO((dry ? "dry run" : "real run") << (capped ? ", capped leaf" : ", leaf with a defect"));
+    FakeRegistry reg;
+    for (std::size_t i = 0; i < 100; ++i) {
+        const std::string name = "v" + std::to_string(1000 + i).substr(1);
+        reg.put("Software\\Good", name, kRegBinary, Bytes(4000, 1));
+        if (!capped) reg.put("Software\\Bad", name, kRegBinary, Bytes(4000, 2));
+    }
+    if (capped)
+        for (std::size_t i = 0; i < kMaxTreeNodes + 5; ++i) reg.put("Software\\Bad", "w" + std::to_string(i), kRegDword, dword(1));
+    else
+        reg.put("Software\\Bad", "v999", 0 /*REG_NONE*/, Bytes{});
+    const auto run = run_plan(reg, json::array({del_key_item("Software\\Bad"), del_key_item("Software\\Good")}), dry, true);
+    CHECK(run.verdicts() == std::vector<std::string>{"refused", dry ? "would_apply" : "applied"});
+    CHECK(run.reason(0) == (capped ? "tree_too_large" : "unsupported_old_type"));
+    CHECK(run.undo_complete());
+    CHECK(run.undo.size() == (dry ? 0u : 100u));
+    CHECK(reg.method_calls("enum_value") == (capped ? kMaxTreeNodes : 100 + 1) + (100 + 1));
+}
+
 TEST_CASE("registry apply: delete_key vets EVERY value of the leaf before it deletes anything",
           "[registry][core][apply]") {
     const bool dry = GENERATE(true, false);

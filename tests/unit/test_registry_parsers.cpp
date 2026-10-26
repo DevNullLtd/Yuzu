@@ -622,18 +622,11 @@ TEST_CASE("registry restorable: whether this plugin could write a captured previ
     }
 }
 
-TEST_CASE("registry P4 limits and tokens", "[registry][parsers]") {
-    // The numbers the README, the definitions and the budget arithmetic quote.
+TEST_CASE("registry P4 limits", "[registry][parsers]") {
+    // The numbers the README and the definitions quote that no behavioural test pins by value.
     CHECK(kMaxTreeNodes == 10000);
     CHECK(kMaxTreeDepth == 600);
-    CHECK(kCaptureTotalCap == 512 * 1024);
-    CHECK(kMaxPlanItems == 256);
     CHECK(kMaxPlanBytes == 65536);
-    CHECK(kTokTreeTooLarge == "tree_too_large");
-    CHECK(kTokUnsupportedOldType == "unsupported_old_type");
-    CHECK(kTokUnrepresentableName == "unrepresentable_name");
-    CHECK(kTokDependentItems == "dependent_items");
-    CHECK(kTokInvalidHive == "invalid_hive");
 }
 
 // ── prepare_set (the front half of set_value) ────────────────────────────

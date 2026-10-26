@@ -1062,13 +1062,17 @@ struct LeafVet {
     std::string error;      ///< the first defect of any value ("" = every value can be restored)
     bool capped = false;    ///< more values than count_values' bound: nothing is deleted (tree_too_large)
     std::uint64_t values = 0;
+    std::vector<NamedValue> kept; ///< the values `budget` retained, in enumeration order
 };
 
-/// Streams EVERY value of the leaf `h` (enum_value + one capture each, nothing retained) up to count_values' bound and
-/// answers the first defect it meets, so the refuse-before-delete promise covers every value, not only the ones the
-/// budget can keep.
-[[nodiscard]] inline LeafVet vet_leaf_values(RegistryWriter& reg, Handle h) {
+/// Streams EVERY value of the leaf `h` (enum_value + one capture each) up to count_values' bound and answers the first
+/// defect it meets, so the refuse-before-delete promise covers every value, not only the ones the budget can keep. The
+/// same pass retains the values `budget` keeps (a value cut at kCaptureValueCap keeps its first part; the first row that
+/// does not fit ends the retention and flags the manifest incomplete). The caller passes a trial copy of its budget and
+/// adopts it only when the vet is clean, so a refused item charges nothing and retains nothing.
+[[nodiscard]] inline LeafVet vet_leaf_values(RegistryWriter& reg, Handle h, CaptureBudget& budget) {
     LeafVet vet;
+    bool retaining = true;
     std::string name;
     for (std::uint32_t i = 0;; ++i) {
         const long rc = reg.enum_value(h, i, name);
@@ -1081,38 +1085,18 @@ struct LeafVet {
             vet.capped = true;
             return vet;
         }
-        if (auto defect = leaf_value_defect(name, capture_old(reg, h, name)); !defect.empty()) {
+        OldValue v = capture_old(reg, h, name);
+        if (auto defect = leaf_value_defect(name, v); !defect.empty()) {
             vet.error = std::move(defect);
             return vet;
         }
         ++vet.values;
-    }
-}
-
-/// Retains, in enumeration order, the values of the vetted leaf `h` that the budget keeps (a value cut at
-/// kCaptureValueCap keeps its first part; the first row that does not fit ends the retention and flags the manifest
-/// incomplete). A defect the vet did not see (a value that changed since) refuses via `f.leaf_error`.
-inline void capture_leaf_values(RegistryWriter& reg, Handle h, CaptureBudget& budget, ItemFacts& f) {
-    std::string name;
-    for (std::uint32_t i = 0;; ++i) {
-        const long rc = reg.enum_value(h, i, name);
-        if (rc == kErrorNoMoreItems) return;
-        if (rc != kErrorSuccess) {
-            f.leaf_error = rc_token(rc, Missing::value);
-            return;
-        }
-        if (static_cast<std::size_t>(i) + 1 >= kMaxTreeNodes) { // grew past the vet's bound since
-            f.leaf_error = std::string{kTokConcurrentChange};
-            return;
-        }
-        OldValue v = capture_old(reg, h, name);
-        if (auto defect = leaf_value_defect(name, v); !defect.empty()) {
-            f.leaf_error = std::move(defect);
-            return;
-        }
+        if (!retaining) continue;
         if (v.bytes.size() < v.total) budget.incomplete = true;
-        if (!budget.charge(name.size(), v.bytes.size())) return;
-        f.leaf_values.push_back(NamedValue{name, std::move(v)});
+        if (budget.charge(name.size(), v.bytes.size()))
+            vet.kept.push_back(NamedValue{name, std::move(v)});
+        else
+            retaining = false;
     }
 }
 
@@ -1212,11 +1196,15 @@ struct ApplyOptions {
                     facts.has_subkeys = rc == kErrorSuccess;
                     if (rc != kErrorSuccess && rc != kErrorNoMoreItems) facts.leaf_error = rc_token(rc, Missing::key);
                     if (!facts.has_subkeys && facts.leaf_error.empty()) {
-                        const LeafVet vet = vet_leaf_values(reg, h);
-                        facts.leaf_error = vet.error;
+                        CaptureBudget trial = budget;
+                        LeafVet vet = vet_leaf_values(reg, h, trial);
+                        facts.leaf_error = std::move(vet.error);
                         facts.leaf_capped = vet.capped;
                         facts.leaf_value_count = vet.values;
-                        if (vet.error.empty() && !vet.capped) capture_leaf_values(reg, h, budget, facts);
+                        if (facts.leaf_error.empty() && !vet.capped) {
+                            budget = trial;
+                            facts.leaf_values = std::move(vet.kept);
+                        }
                     }
                 }
             }

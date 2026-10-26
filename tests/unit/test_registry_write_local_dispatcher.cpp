@@ -801,18 +801,22 @@ std::string json_path(const std::string& path) {
     return e;
 }
 
+/// Gives `key` (a handle opened with WRITE_DAC) a DACL, from SDDL text. False when it could not.
+bool set_key_sddl(HKEY key, const wchar_t* sddl) {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd, nullptr)) return false;
+    const yuzu::win::LocalFreeGuard free_sd{sd};
+    return RegSetKeySecurity(key, DACL_SECURITY_INFORMATION, sd) == ERROR_SUCCESS;
+}
+
 /// Reopens `path` (HKLM) onto a permissive DACL on scope exit, so a deny ACE the case installed never blocks the
 /// scratch tree's removal. Never throws.
 struct AclRestore {
     std::string path;
     ~AclRestore() {
         yuzu::win::RegKey k;
-        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, widen(path).c_str(), 0, WRITE_DAC | READ_CONTROL, k.put()) != ERROR_SUCCESS) return;
-        PSECURITY_DESCRIPTOR sd = nullptr;
-        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:(A;;GA;;;WD)", SDDL_REVISION_1, &sd, nullptr)) {
-            const yuzu::win::LocalFreeGuard free_sd{sd};
-            RegSetKeySecurity(k.get(), DACL_SECURITY_INFORMATION, sd);
-        }
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, widen(path).c_str(), 0, WRITE_DAC | READ_CONTROL, k.put()) == ERROR_SUCCESS)
+            set_key_sddl(k.get(), L"D:(A;;GA;;;WD)");
     }
 };
 
@@ -1295,11 +1299,8 @@ TEST_CASE("registry write: apply refuses a create beneath a key that denies KEY_
     {
         yuzu::win::RegKey k;
         REQUIRE(RegOpenKeyExW(HKEY_LOCAL_MACHINE, widen(locked).c_str(), 0, WRITE_DAC, k.put()) == ERROR_SUCCESS);
-        PSECURITY_DESCRIPTOR sd = nullptr;
         // Deny KEY_CREATE_SUB_KEY (0x4) to Everyone, allow everything else.
-        const BOOL made = ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:(D;;0x4;;;WD)(A;;GA;;;WD)", SDDL_REVISION_1, &sd, nullptr);
-        const yuzu::win::LocalFreeGuard free_sd{sd}; // null-safe: owns it on both exits below
-        if (!made || RegSetKeySecurity(k.get(), DACL_SECURITY_INFORMATION, sd) != ERROR_SUCCESS) {
+        if (!set_key_sddl(k.get(), L"D:(D;;0x4;;;WD)(A;;GA;;;WD)")) {
             skip_or_fail("could not install a deny ACE");
             return;
         }
