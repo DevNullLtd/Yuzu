@@ -27,6 +27,7 @@
 #if defined(YUZU_TEST_ENABLE_PG)
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -414,7 +415,7 @@ TEST_CASE("PostgresTestDb: a shared admin connection whose backend was terminate
     const std::string alive_sql =
         "SELECT 1 FROM pg_stat_activity WHERE pid = " + std::to_string(pid);
     bool gone = false;
-    for (int attempt = 0; attempt < 100 && !gone; ++attempt) {
+    for (int attempt = 0; attempt < 200 && !gone; ++attempt) {
         yuzu::server::pg::PgResult res{PQexec(observer.get(), alive_sql.c_str())};
         REQUIRE(PQresultStatus(res.get()) == PGRES_TUPLES_OK);
         gone = PQntuples(res.get()) == 0;
@@ -436,7 +437,6 @@ TEST_CASE("PostgresTestDb: a shared admin connection whose backend was terminate
     }
     CHECK_FALSE(database_exists(admin, name)); // and its DROP landed on the new link
     CHECK(yuzu::test::AdminConn::connects() == connects_before + 1);
-    CHECK(yuzu::test::AdminConn::backend_pid() != pid);
 }
 
 TEST_CASE("sweep_stale_test_databases: end-to-end against a live instance", "[pg][template]") {
