@@ -231,7 +231,9 @@ FRAGMENT_FILES = [
 # re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a baseline.
 # remote_access_audit (list, +1, ReadOnly, Forensics:Read, gate AdminOrApproval) on top of that 234 =
 # 235, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a baseline.
-EXPECTED_TOTAL_ROWS = 235
+# registry 2.1.0: +3 (set_user_value Mutating, delete_user_value Destructive, apply Destructive; all
+# Infrastructure, gate AdminOrApproval) on top of that 235 = 238, re-derived the same way.
+EXPECTED_TOTAL_ROWS = 238
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

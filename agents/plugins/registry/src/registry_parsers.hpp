@@ -4,7 +4,8 @@
  * registry_parsers.hpp -- the registry plugin's PURE layer (no windows.h, no I/O, no clock; unit-tested
  * on every host; the shell is registry_win.cpp, the logic over an injected registry registry_core.hpp):
  * value encoders, the key-path / value-name validators (the trust boundary of every mutating action),
- * the error tokens, and the audit-line renderer.
+ * the error tokens, the audit-line renderer, the small pure classifiers the per-user writes and `apply`
+ * share, and the limits of both (the apply plan itself lives in registry_plan.hpp, which needs nlohmann).
  *
  * Limits: Microsoft's "Registry Element Size Limits" allow a key name 255 characters and a value name
  * 16,383; this plugin also caps a whole key path at 255 bytes and 32 components (kMaxKeyPathBytes,
@@ -40,9 +41,20 @@ inline constexpr std::size_t kMaxValueNameBytes = 16383;
 inline constexpr std::size_t kMaxWriteBytes = 1024 * 1024;
 /// A previous value is captured up to this many bytes; `OldValue::total` keeps the full size.
 inline constexpr std::size_t kCaptureValueCap = 4096;
-/// delete_key: nodes (the key itself plus its values) counted by the bounded enumeration before `capped`;
-/// past it `counted_values` is a lower bound.
+/// delete_key: nodes (keys plus values) counted by the bounded vetting walk before `capped`; past it the counts are
+/// a lower bound and a REAL recursive delete is refused tree_too_large.
 inline constexpr std::size_t kMaxTreeNodes = 10000;
+/// delete_key recursive: levels below the target the vetting and the delete walk descend (one open handle per level
+/// is held, so this bounds the handles a walk holds); a deeper tree is `capped`.
+inline constexpr unsigned kMaxTreeDepth = 600;
+/// apply: the ONE budget of every byte a plan retains for its undo manifest, names and captured values alike (see
+/// registry_core.hpp CaptureBudget). Hex doubles it, which keeps the whole reply under the dispatcher's 2 MiB cap.
+inline constexpr std::size_t kCaptureTotalCap = 512 * 1024;
+/// apply: the fixed cost charged to the capture budget for every retained row, for the row text around the hex.
+inline constexpr std::size_t kUndoRowOverhead = 64;
+/// apply: the plan's bounds (parse_plan).
+inline constexpr std::size_t kMaxPlanItems = 256;
+inline constexpr std::size_t kMaxPlanBytes = 65536;
 /// Audit line budgets: raw bytes of old/new data and characters of a name token.
 inline constexpr std::size_t kAuditHexCapBytes = 256;
 inline constexpr std::size_t kAuditTokenCap = 256;
@@ -62,6 +74,11 @@ inline constexpr std::string_view kTokInvalidKeyPath = "invalid_key_path";
 inline constexpr std::string_view kTokInvalidValueName = "invalid_value_name";
 inline constexpr std::string_view kTokVerifyMismatch = "verify_mismatch";
 inline constexpr std::string_view kTokKeyHasSubkeys = "key_has_subkeys";
+inline constexpr std::string_view kTokTreeTooLarge = "tree_too_large";
+inline constexpr std::string_view kTokUnsupportedOldType = "unsupported_old_type";
+inline constexpr std::string_view kTokUnrepresentableName = "unrepresentable_name";
+inline constexpr std::string_view kTokDependentItems = "dependent_items";
+inline constexpr std::string_view kTokInvalidHive = "invalid_hive";
 
 // Win32 codes this layer branches on (registry_win.cpp static_asserts each against the SDK).
 inline constexpr long kErrorSuccess = 0;
@@ -447,6 +464,15 @@ inline void put_le(std::vector<std::uint8_t>& out, std::uint64_t v, int bytes) {
     return {};
 }
 
+/// A boolean action parameter (the server stringifies JSON booleans to "true"/"false"): empty means `def`; "true" / "1"
+/// and "false" / "0" are the only other spellings; anything else is nullopt (the caller refuses invalid_data).
+[[nodiscard]] inline std::optional<bool> parse_bool_param(std::string_view text, bool def) noexcept {
+    if (text.empty()) return def;
+    if (text == "true" || text == "1") return true;
+    if (text == "false" || text == "0") return false;
+    return std::nullopt;
+}
+
 // ── Win32 return codes -> tokens ─────────────────────────────────────────
 
 enum class Missing { key, value };
@@ -498,6 +524,27 @@ struct OldValue {
     std::size_t total = 0;
     std::string error;
 };
+
+/// Whether this plugin could write a captured previous value back as it was: an absent or unreadable one has nothing to
+/// write, a present one needs a writable type and a shape check_value_shape accepts (a capture cut at kCaptureValueCap
+/// can only be judged by its type and size: the part it kept is not the whole value) and a size set_value will carry.
+[[nodiscard]] inline bool restorable(const OldValue& v) {
+    if (v.state != OldState::present) return true;
+    if (!is_writable_type(v.type) || v.total > kMaxWriteBytes) return false;
+    return v.bytes.size() < v.total || check_value_shape(v.type, v.bytes).empty();
+}
+
+/// After an OFFLINE per-user write is unloaded the shell probes `RegOpenKeyExW(HKEY_USERS, sid)`: a hive now LOADED
+/// means a session loaded NTUSER.DAT after the write returned (README caveat: a logon that failed while the hive was
+/// mounted leaves no trace). The warning token, or "" when there is nothing to say: not mounted offline, nothing
+/// written, or the probe found no hive (not-found is the clean answer); any other probe failure is reported.
+[[nodiscard]] inline std::string classify_offline_write_race(bool mounted_offline, bool wrote,
+                                                             long post_unload_open_rc) {
+    if (!mounted_offline || !wrote) return {};
+    if (post_unload_open_rc == kErrorFileNotFound || post_unload_open_rc == kErrorPathNotFound) return {};
+    if (post_unload_open_rc == kErrorSuccess) return "hive_loaded_after_offline_write";
+    return "hive_post_unload_probe_failed:win32_" + std::to_string(post_unload_open_rc);
+}
 
 // ── audit line ───────────────────────────────────────────────────────────
 
@@ -642,6 +689,15 @@ namespace detail {
                "counted_keys=-|counted_values=-|capped=-|created=-|sid=-|old_state=-|old_type=-|old=-|new=-";
     if (action == "delete_key")
         return "audit|op=delete_key|hive=-|result=failed|reason=exception|verify=-|key=-|name=-|type=-|len=-|dry_run=-|"
+               "counted_keys=-|counted_values=-|capped=-|created=-|sid=-|old_state=-|old_type=-|old=-|new=-";
+    if (action == "set_user_value")
+        return "audit|op=set_user_value|hive=-|result=failed|reason=exception|verify=-|key=-|name=-|type=-|len=-|dry_run=-|"
+               "counted_keys=-|counted_values=-|capped=-|created=-|sid=-|old_state=-|old_type=-|old=-|new=-";
+    if (action == "delete_user_value")
+        return "audit|op=delete_user_value|hive=-|result=failed|reason=exception|verify=-|key=-|name=-|type=-|len=-|"
+               "dry_run=-|counted_keys=-|counted_values=-|capped=-|created=-|sid=-|old_state=-|old_type=-|old=-|new=-";
+    if (action == "apply")
+        return "audit|op=apply|hive=-|result=failed|reason=exception|verify=-|key=-|name=-|type=-|len=-|dry_run=-|"
                "counted_keys=-|counted_values=-|capped=-|created=-|sid=-|old_state=-|old_type=-|old=-|new=-";
     return {};
 }

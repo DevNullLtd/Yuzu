@@ -17,6 +17,7 @@
 #include <new>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -103,9 +104,10 @@ public:
     /// Every call across the seam, and per method: the deterministic stand-in for latency.
     std::size_t seam_calls = 0;
     std::map<std::string, std::size_t> by_method;
-    /// Fired BEFORE create_sub, set_value, delete_value and final_name ("final_name") and AFTER query_value /
+    /// Fired BEFORE open_sub, create_sub, set_value, delete_value and final_name ("final_name") and AFTER query_value /
     /// delete_value (a value erased by the call is gone when `after` runs), named
-    /// "<op>:<name>" (e.g. "create_sub:B"), so a test can change the tree at a call boundary (or throw there).
+    /// "<op>:<name>" (e.g. "create_sub:B"), so a test can change the tree at a call boundary (or throw there). A
+    /// test completes a link or adds a key from a hook with `link()` / `key()`; `masks.back()` is the call's own mask.
     std::function<void(const std::string&)> before, after;
     std::function<void(Node&, const std::string&)> tamper_after_set;
     /// Fired at the start of every enum_value call: a value set that grows while it is being enumerated.
@@ -113,6 +115,8 @@ public:
     /// "<op>:<name>" -> rc, consumed on use. open_path/final_name/root_name/enum_value/enum_subkey also take the bare
     /// method name.
     std::map<std::string, long> inject;
+    /// RegFlushKey calls that answered success.
+    std::size_t flushed = 0;
 
     NodeP node(Handle h) const {
         if (h == kRoot || h == kRootNoName) return root;
@@ -181,12 +185,19 @@ public:
         const std::string ev = "open_sub:" + std::string{name};
         log.push_back(ev);
         masks.push_back(std::format("{}:{:#x}", ev, access));
+        if (before) before(ev);
         long rc = 0;
         if (const auto inj = take(ev)) rc = *inj;
         NodeP child;
         if (rc == 0) {
             const auto base = children_of(node(parent));
             if (base.rc != 0) rc = base.rc;
+            else if (name.empty()) {
+                // RegOpenKeyExW(h, L""): a NEW handle to the same key, access-checked against ITS descriptor (not the
+                // mask `h` was opened with), which is how a dry run asks "could I create here?" without creating.
+                if ((access & kKeyCreateSubKey) != 0 && base.node->deny_create) rc = 5;
+                else child = base.node;
+            }
             else if (const auto it = base.node->subkeys.find(std::string{name}); it == base.node->subkeys.end()) rc = 2;
             else if (it->second->deny_open) rc = 5;
             else child = it->second;
@@ -324,6 +335,15 @@ public:
         if (!has(key_h, kKeyEnumerateSubKeys)) return 5;
         if (index >= n->subkeys.size()) return 259;
         name = std::next(n->subkeys.begin(), index)->first;
+        return 0;
+    }
+    long flush_key(Handle key_h) override {
+        tally("flush_key");
+        log.push_back("flush_key");
+        if (const auto inj = take("flush_key", "flush_key")) return *inj;
+        const auto n = node(key_h);
+        if (!n || n->deleted) return 1018;
+        ++flushed;
         return 0;
     }
     long delete_key_by_handle(Handle key_h) noexcept override {
@@ -2478,4 +2498,1178 @@ TEST_CASE("registry core: a leaf link is accepted by the fast open only to be de
         CHECK(delete_value_verified(reg, FakeRegistry::kRoot, "Software\\L", "V", true).reason == "key_is_link");
         CHECK(reg.get("Real\\Target", "V")->data == dword(1));
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// PR11.7-P4: recursive delete_key, flush, per-user write output, apply
+// ═════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+/// Every key and value of the fake as one string: the registry's state, for "changed nothing" and "restored exactly".
+void dump_node(const Node& n, const std::string& path, std::string& out) {
+    for (const auto& [name, v] : n.values)
+        out += path + "|" + name + "|" + std::to_string(v.type) + "|" + yuzu::profiles::hex_encode(v.data) + "\n";
+    for (const auto& [name, k] : n.subkeys) {
+        const std::string p = path.empty() ? name : path + "\\" + name;
+        out += p + "/\n"; // the key itself, so an empty key is part of the state
+        dump_node(*k, p, out);
+    }
+}
+std::string dump(const FakeRegistry& reg) {
+    std::string out;
+    dump_node(*reg.root, "", out);
+    return out;
+}
+
+std::vector<std::string> cells(const std::string& line) {
+    std::vector<std::string> out;
+    std::size_t pos = 0;
+    for (;;) {
+        const auto bar = line.find('|', pos);
+        out.push_back(line.substr(pos, bar == std::string::npos ? std::string::npos : bar - pos));
+        if (bar == std::string::npos) return out;
+        pos = bar + 1;
+    }
+}
+
+/// A chain D\k\k\k... with `below` keys under D.
+void make_chain(FakeRegistry& reg, unsigned below) {
+    NodeP cur = reg.key("D");
+    for (unsigned i = 0; i < below; ++i) {
+        auto n = std::make_shared<Node>();
+        cur->subkeys["k"] = n;
+        cur = n;
+    }
+}
+
+constexpr const char* kDeleteMask = ":0x10009"; // DELETE | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE
+constexpr const char* kVetMask = ":0x9";        // KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE
+
+} // namespace
+
+TEST_CASE("registry core: recursive delete_key dry run counts what a real run removes and deletes nothing",
+          "[registry][core][recursive]") {
+    const bool fast = GENERATE(false, true);
+    FakeRegistry reg;
+    build_tree(reg); // T (2 values), C1 (1), G1 (2), C2: 4 keys, 5 values
+    const std::string before = dump(reg);
+    const auto dry = delete_key_tree(reg, FakeRegistry::kRoot, "T", fast, /*recursive=*/true, /*dry_run=*/true);
+    CHECK(dry.result == "ok");
+    CHECK(dry.dry_run);
+    CHECK(dry.counted_keys == 4);
+    CHECK(dry.counted_values == 5);
+    CHECK_FALSE(dry.capped);
+    CHECK(dump(reg) == before);
+    CHECK(reg.calls("delete_key_by_handle") == 0);
+    // the vet asks for QUERY | ENUM on every child (the target's own open, by the walk, is open_checked's), and the
+    // audit line and rows say it was a dry run
+    std::size_t vet_opens = 0;
+    for (const auto& m : reg.masks)
+        if (m.starts_with("open_sub:") && !m.starts_with("open_sub:T:")) {
+            CHECK(m.ends_with(kVetMask));
+            ++vet_opens;
+        }
+    CHECK(vet_opens == 3); // C1, G1, C2
+    const auto rendered = render_single_action(AuditRecord{}, dry, true);
+    REQUIRE(rendered.lines.size() == 6);
+    CHECK(rendered.lines[0].find("|dry_run=1|counted_keys=4|counted_values=5|capped=0|") != std::string::npos);
+    CHECK(rendered.lines[1] == "status|ok");
+    CHECK(rendered.lines[4] == "dry_run|1");
+
+    const auto real = delete_key_tree(reg, FakeRegistry::kRoot, "T", fast, true, false);
+    CHECK(real.result == "ok");
+    CHECK(real.verify == "ok");
+    CHECK_FALSE(real.dry_run);
+    CHECK(real.counted_keys == dry.counted_keys);
+    CHECK(real.counted_values == dry.counted_values);
+    CHECK_FALSE(reg.exists("T"));
+    CHECK(reg.exists("Keep"));
+    CHECK(reg.calls("delete_key_by_handle") == 4);
+    // every child the delete walk opened asked for DELETE | QUERY | ENUM (the fake enforces the masks)
+    std::size_t delete_opens = 0;
+    for (const auto& m : reg.masks)
+        if (m.starts_with("open_sub:") && !m.starts_with("open_sub:T:") && m.ends_with(kDeleteMask)) ++delete_opens;
+    CHECK(delete_opens == 3); // C1, G1, C2: the target itself was opened by open_checked
+    CHECK(render_single_action(AuditRecord{}, real, true).lines[4] == "dry_run|0");
+}
+
+TEST_CASE("registry core: a non-recursive dry run counts a leaf and refuses a key with subkeys, deleting nothing",
+          "[registry][core][recursive]") {
+    FakeRegistry reg;
+    build_tree(reg);
+    const auto leaf = delete_key_tree(reg, FakeRegistry::kRoot, "T\\C1\\G1", false, /*recursive=*/false, /*dry_run=*/true);
+    CHECK(leaf.result == "ok");
+    CHECK(leaf.dry_run);
+    CHECK(leaf.counted_keys == 1);
+    CHECK(leaf.counted_values == 2);
+    CHECK(reg.exists("T\\C1\\G1"));
+    const auto top = delete_key_tree(reg, FakeRegistry::kRoot, "T", false, false, true);
+    CHECK(top.result == "refused");
+    CHECK(top.reason == "key_has_subkeys");
+    CHECK(top.dry_run);
+    // the default arguments are the 2.0.x behaviour: no recursion, a real delete
+    const auto plain = delete_key_tree(reg, FakeRegistry::kRoot, "T\\C1\\G1");
+    CHECK(plain.result == "ok");
+    CHECK_FALSE(plain.dry_run);
+    CHECK_FALSE(reg.exists("T\\C1\\G1"));
+}
+
+TEST_CASE("registry core: a link inside the tree is refused by the vet and nothing is deleted",
+          "[registry][core][recursive]") {
+    const bool fast = GENERATE(false, true);
+    const bool dry = GENERATE(false, true);
+    FakeRegistry reg;
+    build_tree(reg);
+    reg.put("Real", "keep", kRegDword, dword(7));
+    reg.link("T\\C1\\L", "Real");
+    const std::string before = dump(reg);
+    const auto o = delete_key_tree(reg, FakeRegistry::kRoot, "T", fast, true, dry);
+    CHECK(o.result == "refused");
+    CHECK(o.reason == "key_is_link");
+    CHECK(reg.calls("delete_key_by_handle") == 0);
+    CHECK(dump(reg) == before); // the link, its target and every sibling are untouched
+    CHECK(reg.get("Real", "keep")->data == dword(7));
+}
+
+TEST_CASE("registry core: a link planted after the vet stops the delete and is never followed",
+          "[registry][core][recursive]") {
+    FakeRegistry reg;
+    reg.put("T\\A", "a", kRegDword, dword(1));
+    reg.put("T\\Z", "z", kRegDword, dword(2));
+    reg.put("Real", "keep", kRegDword, dword(7));
+    const auto plant_at = [&](const std::string& name) {
+        // the DELETE-phase open of `name` (the vet's opens ask for QUERY | ENUM only)
+        reg.before = [&reg, name](const std::string& ev) {
+            if (ev == "open_sub:" + name && reg.masks.back().ends_with(kDeleteMask)) reg.link("T\\" + name, "Real");
+        };
+    };
+    SECTION("after one key was removed: failed, the partial truth is counted") {
+        // mutant: delete_subtree does not re-probe a child it finds at delete time
+        plant_at("Z");
+        const auto o = delete_key_tree(reg, FakeRegistry::kRoot, "T", false, true, false);
+        CHECK(o.result == "failed");
+        CHECK(o.reason == "key_is_link");
+        CHECK(o.mutated);
+        CHECK(o.counted_keys == 1);
+        CHECK(o.counted_values == 1);
+        CHECK_FALSE(reg.exists("T\\A"));
+        CHECK(reg.exists("T\\Z"));
+        CHECK(reg.exists("T"));
+        CHECK(reg.calls("delete_key_by_handle") == 1);
+        CHECK(reg.get("Real", "keep")->data == dword(7));
+    }
+    SECTION("before anything was removed: refused, nothing counted") {
+        plant_at("A");
+        const auto o = delete_key_tree(reg, FakeRegistry::kRoot, "T", false, true, false);
+        CHECK(o.result == "refused");
+        CHECK(o.reason == "key_is_link");
+        CHECK_FALSE(o.mutated);
+        CHECK(o.counted_keys == 0);
+        CHECK(reg.calls("delete_key_by_handle") == 0);
+        CHECK(reg.exists("T\\A"));
+    }
+}
+
+TEST_CASE("registry core: a key added after the vet is deleted and counted like any other",
+          "[registry][core][recursive]") {
+    // The vet is a size bound and a link sweep, not a membership list: the operator named the tree, and a child that
+    // appeared under it since is under it still.
+    FakeRegistry reg;
+    reg.put("T\\A", "a", kRegDword, dword(1));
+    reg.put("T\\Z", "z", kRegDword, dword(2));
+    const auto dry = delete_key_tree(reg, FakeRegistry::kRoot, "T", false, true, true);
+    REQUIRE(dry.ok());
+    CHECK(dry.counted_keys == 3);
+    bool planted = false;
+    reg.before = [&](const std::string& ev) {
+        if (!planted && ev.starts_with("open_sub:") && ev != "open_sub:T" && reg.masks.back().ends_with(kDeleteMask)) {
+            planted = true;
+            reg.put("T\\New", "n1", kRegDword, dword(3));
+            reg.put("T\\New\\Deep", "n2", kRegDword, dword(4));
+        }
+    };
+    const auto o = delete_key_tree(reg, FakeRegistry::kRoot, "T", false, true, false);
+    CHECK(planted);
+    CHECK(o.result == "ok");
+    CHECK(o.verify == "ok");
+    CHECK(o.counted_keys == 5);   // T, A, Z, New, Deep: what was REMOVED, more than the dry run saw
+    CHECK(o.counted_values == 4);
+    CHECK(o.counted_keys > dry.counted_keys);
+    CHECK_FALSE(reg.exists("T"));
+}
+
+TEST_CASE("registry core: a tree past the node or depth bound is capped, and a real delete of it is refused",
+          "[registry][core][recursive]") {
+    const bool fast = GENERATE(false, true);
+    SECTION("more nodes than kMaxTreeNodes") {
+        FakeRegistry reg;
+        reg.key("Top");
+        for (std::size_t i = 0; i < kMaxTreeNodes + 5; ++i) reg.put("Top\\Big", "v" + std::to_string(i), kRegDword, dword(1));
+        const auto dry = delete_key_tree(reg, FakeRegistry::kRoot, "Top\\Big", fast, true, true);
+        CHECK(dry.result == "ok");
+        CHECK(dry.capped);
+        CHECK(dry.counted_values == kMaxTreeNodes - 1); // a lower bound
+        const auto real = delete_key_tree(reg, FakeRegistry::kRoot, "Top\\Big", fast, true, false);
+        // mutant: the tree_too_large refusal is dropped and the capped tree is deleted
+        CHECK(real.result == "refused");
+        CHECK(real.reason == "tree_too_large");
+        CHECK(real.capped);
+        CHECK(reg.calls("delete_key_by_handle") == 0);
+        CHECK(reg.exists("Top\\Big"));
+        const auto rendered = render_single_action(AuditRecord{}, dry, true);
+        CHECK(rendered.lines[5] == "capped|1");
+    }
+    SECTION("keys that outnumber the bound") {
+        FakeRegistry reg;
+        reg.key("Wide");
+        for (std::size_t i = 0; i < kMaxTreeNodes + 5; ++i) reg.key("Wide\\k" + std::to_string(i));
+        const auto dry = delete_key_tree(reg, FakeRegistry::kRoot, "Wide", fast, true, true);
+        CHECK(dry.capped);
+        CHECK(dry.counted_keys == kMaxTreeNodes);
+        CHECK(delete_key_tree(reg, FakeRegistry::kRoot, "Wide", fast, true, false).reason == "tree_too_large");
+        CHECK(reg.exists("Wide"));
+    }
+    SECTION("exactly kMaxTreeDepth levels below the target is within the bound; one more is capped") {
+        FakeRegistry ok_tree, deep_tree;
+        make_chain(ok_tree, kMaxTreeDepth);
+        make_chain(deep_tree, kMaxTreeDepth + 1);
+        const auto fits = delete_key_tree(ok_tree, FakeRegistry::kRoot, "D", fast, true, false);
+        CHECK(fits.result == "ok");
+        CHECK(fits.counted_keys == kMaxTreeDepth + 1);
+        CHECK_FALSE(ok_tree.exists("D"));
+        const auto dry = delete_key_tree(deep_tree, FakeRegistry::kRoot, "D", fast, true, true);
+        CHECK(dry.capped);
+        const auto real = delete_key_tree(deep_tree, FakeRegistry::kRoot, "D", fast, true, false);
+        CHECK(real.reason == "tree_too_large");
+        CHECK(deep_tree.calls("delete_key_by_handle") == 0);
+        CHECK(deep_tree.exists("D"));
+    }
+}
+
+TEST_CASE("registry core: a tree that outgrows the bound between the vet and the delete stops concurrent_change",
+          "[registry][core][recursive]") {
+    FakeRegistry reg;
+    reg.put("T\\A", "a", kRegDword, dword(1));
+    reg.put("T\\Z", "z", kRegDword, dword(2));
+    std::size_t added = 0;
+    reg.before = [&](const std::string& ev) {
+        // from the delete-phase open of Z on, every value enumeration of a key adds a value
+        if (ev == "open_sub:Z" && reg.masks.back().ends_with(kDeleteMask))
+            reg.grow_on_enum = [&added](Node& n) { n.values["g" + std::to_string(added++)] = Val{kRegDword, dword(1)}; };
+    };
+    const auto o = delete_key_tree(reg, FakeRegistry::kRoot, "T", false, true, false);
+    CHECK(o.result == "failed"); // A's NtDeleteKey was issued before the stop
+    CHECK(o.reason == "concurrent_change");
+    CHECK(o.counted_keys == 1);
+    CHECK(o.counted_values == 1);
+    CHECK(reg.exists("T\\Z"));
+    CHECK(reg.exists("T"));
+}
+
+TEST_CASE("registry core: a recursive delete of a link leaf removes the link object only",
+          "[registry][core][recursive]") {
+    const bool fast = GENERATE(false, true);
+    FakeRegistry reg;
+    reg.put("Real\\Target", "keep", kRegDword, dword(1));
+    reg.link("Software\\L", "Real\\Target");
+    const auto o = delete_key_tree(reg, FakeRegistry::kRoot, "Software\\L", fast, true, false);
+    CHECK(o.result == "ok");
+    CHECK(o.counted_keys == 1);
+    CHECK_FALSE(reg.exists("Software\\L"));
+    CHECK(reg.get("Real\\Target", "keep")->data == dword(1));
+}
+
+// ── flush ────────────────────────────────────────────────────────────────
+
+TEST_CASE("registry core: flush is called once after a verified write and never after a refusal",
+          "[registry][core][flush]") {
+    FakeRegistry reg;
+    reg.put("A", "V", kRegDword, dword(1));
+    SECTION("set_value, flush on") {
+        const auto o = set_value_verified(reg, FakeRegistry::kRoot, "A", "V", kRegDword, dword(2), false, true);
+        CHECK(o.ok());
+        CHECK(reg.flushed == 1);
+    }
+    SECTION("set_value, flush off (the default)") {
+        CHECK(set_value_verified(reg, FakeRegistry::kRoot, "A", "V", kRegDword, dword(2)).ok());
+        CHECK(reg.flushed == 0);
+    }
+    SECTION("delete_value, flush on") {
+        CHECK(delete_value_verified(reg, FakeRegistry::kRoot, "A", "V", false, true).ok());
+        CHECK(reg.flushed == 1);
+    }
+    SECTION("a refusal flushes nothing") {
+        CHECK(delete_value_verified(reg, FakeRegistry::kRoot, "A", "Nope", false, true).reason == "value_not_found");
+        CHECK(delete_value_verified(reg, FakeRegistry::kRoot, "Nope", "V", false, true).reason == "key_not_found");
+        reg.key("A")->deny_set = true;
+        CHECK(set_value_verified(reg, FakeRegistry::kRoot, "A", "V", kRegDword, dword(2), false, true).reason ==
+              "access_denied");
+        CHECK(reg.flushed == 0);
+        CHECK(reg.calls("flush_key") == 0);
+    }
+    SECTION("a verify mismatch is not flushed either") {
+        reg.tamper_after_set = [](Node& n, const std::string& name) { n.values[name].data[0] ^= 0xff; };
+        CHECK(set_value_verified(reg, FakeRegistry::kRoot, "A", "V", kRegDword, dword(2), false, true).reason ==
+              "verify_mismatch");
+        CHECK(reg.calls("flush_key") == 0);
+    }
+}
+
+TEST_CASE("registry core: a flush failure fails the write; a creating write's keys are rolled back",
+          "[registry][core][flush]") {
+    FakeRegistry reg;
+    reg.key("Software");
+    SECTION("an overwrite: failed with the flush token, the verified value stays (durability unknown)") {
+        reg.put("Software\\Acme", "V", kRegDword, dword(1));
+        reg.inject["flush_key"] = 5;
+        const auto o = set_value_verified(reg, FakeRegistry::kRoot, "Software\\Acme", "V", kRegDword, dword(2), false, true);
+        CHECK(o.result == "failed");
+        CHECK(o.reason == "flush_failed:access_denied");
+        CHECK(o.verify == "ok");
+        CHECK(o.mutated);
+        CHECK(reg.get("Software\\Acme", "V")->data == dword(2));
+    }
+    SECTION("a creating write: the value and the keys it made are removed again") {
+        // mutant: flush_on runs after op.commit(), so the rollback has nothing to do
+        reg.inject["flush_key"] = 1450;
+        const auto o = set_value_verified(reg, FakeRegistry::kRoot, "Software\\New\\Deeper", "V", kRegDword, dword(3), false, true);
+        CHECK(o.result == "failed");
+        CHECK(o.reason == "flush_failed:win32:1450");
+        CHECK(o.created == 0);
+        CHECK_FALSE(reg.exists("Software\\New"));
+        CHECK(reg.method_calls("delete_key_by_handle") == 2);
+    }
+    SECTION("delete_value") {
+        reg.put("Software\\Acme", "V", kRegDword, dword(1));
+        reg.inject["flush_key"] = 5;
+        const auto o = delete_value_verified(reg, FakeRegistry::kRoot, "Software\\Acme", "V", false, true);
+        CHECK(o.result == "failed");
+        CHECK(o.reason == "flush_failed:access_denied");
+        CHECK(reg.get("Software\\Acme", "V") == nullptr);
+    }
+}
+
+TEST_CASE("registry core: commit keeps the leaf open until the Opened is destroyed", "[registry][core][flush]") {
+    FakeRegistry reg;
+    reg.key("Software");
+    {
+        Opened op = open_checked(reg, FakeRegistry::kRoot, "Software\\New\\Deeper", kKeySetValue, true);
+        REQUIRE(op.error.empty());
+        REQUIRE(op.created == 2);
+        op.commit();
+        CHECK(reg.open.size() == 1); // the intermediate handle closed, the leaf did not
+        const Handle h = op.handle();
+        CHECK(reg.set_value(h, "V", kRegDword, dword(5)) == 0); // still usable
+        op.rollback();                                          // committed: nothing to roll back
+        CHECK(reg.exists("Software\\New\\Deeper"));
+    }
+    CHECK(reg.open.empty());
+    CHECK(reg.get("Software\\New\\Deeper", "V")->data == dword(5));
+}
+
+// ── open_checked probe_create ────────────────────────────────────────────
+
+TEST_CASE("registry core: probe_create asks for create access on the deepest existing key and creates nothing",
+          "[registry][core][probe]") {
+    FakeRegistry reg;
+    reg.key("Software\\Acme");
+    SECTION("allowed: key_not_found with the missing count, nothing created") {
+        const Opened o = open_checked(reg, FakeRegistry::kRoot, "Software\\Acme\\New\\Deeper", kKeySetValue, false,
+                                      false, false, /*probe_create=*/true);
+        CHECK(o.error == "key_not_found");
+        CHECK(o.missing == 2);
+        CHECK(o.created == 0);
+        CHECK(reg.method_calls("create_sub") == 0);
+        CHECK_FALSE(reg.exists("Software\\Acme\\New"));
+        CHECK(std::ranges::find(reg.masks, "open_sub::0x4") != reg.masks.end()); // the self re-open for KEY_CREATE_SUB_KEY
+    }
+    SECTION("denied: access_denied, exactly what the real create would answer") {
+        reg.key("Software\\Acme")->deny_create = true;
+        const Opened probe = open_checked(reg, FakeRegistry::kRoot, "Software\\Acme\\New", kKeySetValue, false, false,
+                                          false, true);
+        CHECK(probe.error == "access_denied");
+        const Opened real = open_checked(reg, FakeRegistry::kRoot, "Software\\Acme\\New", kKeySetValue, true);
+        CHECK(real.error == "access_denied");
+    }
+    SECTION("a first component missing under the root is root_level_create in both modes") {
+        CHECK(open_checked(reg, FakeRegistry::kRoot, "Nowhere\\K", kKeySetValue, false, false, false, true).error ==
+              "root_level_create");
+        CHECK(open_checked(reg, FakeRegistry::kRoot, "Nowhere\\K", kKeySetValue, true).error == "root_level_create");
+    }
+    SECTION("without the flag a missing key stays plain key_not_found and no probe is made") {
+        const Opened o = open_checked(reg, FakeRegistry::kRoot, "Software\\Acme\\New", kKeySetValue, false);
+        CHECK(o.error == "key_not_found");
+        CHECK(std::ranges::find(reg.masks, "open_sub::0x4") == reg.masks.end());
+    }
+    SECTION("an existing key is opened as usual") {
+        const Opened o = open_checked(reg, FakeRegistry::kRoot, "Software\\Acme", kKeySetValue, false, false, false, true);
+        CHECK(o.error.empty());
+        CHECK(std::ranges::find(reg.masks, "open_sub::0x4") == reg.masks.end());
+    }
+}
+
+// ── per-user write output ────────────────────────────────────────────────
+
+namespace {
+
+using yuzu::profiles::HiveAccessStatus;
+
+constexpr const char* kSid = "S-1-5-21-111-222-333-1001";
+
+AuditRecord user_record(const char* op = "set_user_value") {
+    AuditRecord au;
+    au.op = op;
+    au.hive = "HKU";
+    au.key = "Software\\Acme";
+    au.name = "V";
+    au.type_name = "REG_DWORD";
+    au.len = 4;
+    return au;
+}
+
+WriteOutcome ok_write() {
+    WriteOutcome wo;
+    wo.result = "ok";
+    wo.verify = "ok";
+    wo.mutated = true;
+    return wo;
+}
+
+bool starts(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
+
+} // namespace
+
+TEST_CASE("registry core: render_user_write orders the hive lines, the race warning, the audit line and the status",
+          "[registry][core][user]") {
+    SECTION("a clean write: the audit line (hive=HKU, sid=) then status|ok") {
+        const auto out = render_user_write(user_record(), ok_write(), HiveFacts{}, kSid);
+        REQUIRE(out.lines.size() == 2);
+        CHECK(starts(out.lines[0], "audit|op=set_user_value|hive=HKU|result=ok|reason=-|verify=ok|"));
+        CHECK(out.lines[0].find(std::string{"|sid="} + kSid + "|") != std::string::npos);
+        CHECK(out.lines[1] == "status|ok");
+        CHECK(out.rc == 0);
+    }
+    SECTION("an unload that failed after a durable write keeps result=ok and says so in the reason, warning first") {
+        HiveFacts hf;
+        hf.unload_failed = true;
+        hf.mount_name = "YUZU_HIVE_x";
+        const auto out = render_user_write(user_record(), ok_write(), hf, kSid);
+        REQUIRE(out.lines.size() == 3);
+        CHECK(starts(out.lines[0], "warning|hive_unload_failed:"));
+        CHECK(starts(out.lines[1], "audit|op=set_user_value|hive=HKU|result=ok|reason=hive_unload_failed|"));
+        CHECK(out.lines[2] == "status|ok");
+        CHECK(out.rc == 0);
+    }
+    SECTION("a mount that failed AND failed to unload: the unload warning precedes the terminal error") {
+        HiveFacts hf;
+        hf.status = HiveAccessStatus::mount_failed;
+        hf.unload_failed = true;
+        const auto out = render_user_write(user_record(), WriteOutcome{}, hf, kSid);
+        REQUIRE(out.lines.size() == 4);
+        CHECK(starts(out.lines[0], "warning|hive_unload_failed:"));
+        CHECK(starts(out.lines[1], "error|failed to load hive for sid"));
+        CHECK(starts(out.lines[2], "audit|op=set_user_value|hive=HKU|result=refused|reason=hive_mount_failed|"));
+        CHECK(out.lines[3] == "error|hive_mount_failed");
+        CHECK(out.rc == 1);
+    }
+    SECTION("each unreachable status is a refusal with its own reason, whatever the outcome claimed") {
+        // mutant: a non-ok hive status keeps the caller's WriteOutcome (here a stale "ok")
+        const struct {
+            HiveAccessStatus st;
+            const char* reason;
+        } cases[] = {{HiveAccessStatus::not_found, "hive_not_found"},
+                     {HiveAccessStatus::privilege_missing, "privilege_missing"},
+                     {HiveAccessStatus::mount_failed, "hive_mount_failed"}};
+        for (const auto& c : cases) {
+            HiveFacts hf;
+            hf.status = c.st;
+            const auto out = render_user_write(user_record(), ok_write(), hf, kSid);
+            INFO(c.reason);
+            REQUIRE_FALSE(out.lines.empty());
+            CHECK(out.rc == 1);
+            CHECK(out.lines.back() == std::string{"error|"} + c.reason);
+            CHECK(out.lines[out.lines.size() - 2].find(std::string{"|result=refused|reason="} + c.reason + "|") !=
+                  std::string::npos);
+        }
+    }
+    SECTION("a refused hive file names the guard's token on the error line and as the reason") {
+        HiveFacts hf;
+        hf.status = HiveAccessStatus::file_refused;
+        hf.refusal = "hive_file_reparse_point";
+        const auto out = render_user_write(user_record(), WriteOutcome{}, hf, kSid);
+        REQUIRE(out.lines.size() == 3);
+        CHECK(out.lines[0] == std::string{"error|hive file refused for sid '"} + kSid + "': hive_file_reparse_point");
+        CHECK(starts(out.lines[1], "audit|op=set_user_value|hive=HKU|result=refused|reason=hive_file_reparse_point|"));
+        CHECK(out.lines[2] == "error|hive_file_reparse_point");
+        CHECK(out.rc == 1);
+        hf.refusal.clear();
+        CHECK(render_user_write(user_record(), WriteOutcome{}, hf, kSid).lines.back() == "error|hive_file_refused");
+    }
+    SECTION("the race warning follows the hive lines and precedes the audit line; the write stays ok") {
+        HiveFacts hf;
+        hf.race_warning = "hive_loaded_after_offline_write";
+        const auto out = render_user_write(user_record("delete_user_value"), ok_write(), hf, kSid);
+        REQUIRE(out.lines.size() == 3);
+        CHECK(out.lines[0] == "warning|hive_loaded_after_offline_write");
+        CHECK(starts(out.lines[1], "audit|op=delete_user_value|hive=HKU|result=ok|"));
+        CHECK(out.rc == 0);
+    }
+    SECTION("a failed write keeps its own reason and rc 1") {
+        WriteOutcome wo = ok_write();
+        wo.fail("flush_failed:access_denied", true);
+        const auto out = render_user_write(user_record(), wo, HiveFacts{}, kSid);
+        REQUIRE(out.lines.size() == 2);
+        CHECK(starts(out.lines[0], "audit|op=set_user_value|hive=HKU|result=failed|reason=flush_failed:access_denied|"));
+        CHECK(out.lines[1] == "error|flush_failed:access_denied");
+        CHECK(out.rc == 1);
+    }
+}
+
+// ── apply ────────────────────────────────────────────────────────────────
+
+namespace {
+
+using json = nlohmann::json;
+
+json set_item(const std::string& key, const std::string& name, const std::string& value,
+              const std::string& type = "REG_SZ") {
+    return {{"op", "set_value"}, {"key", key}, {"name", name}, {"type", type}, {"value", value}};
+}
+json hex_item(const std::string& key, const std::string& name, const std::string& type, const std::string& hex) {
+    return {{"op", "set_value"}, {"key", key}, {"name", name}, {"type", type}, {"data_hex", hex}};
+}
+json del_value_item(const std::string& key, const std::string& name) {
+    return {{"op", "delete_value"}, {"key", key}, {"name", name}};
+}
+json make_key_item(const std::string& key) { return {{"op", "create_key"}, {"key", key}}; }
+json del_key_item(const std::string& key) { return {{"op", "delete_key"}, {"key", key}}; }
+
+std::vector<PlanItem> plan_of(const json& plan) {
+    auto parsed = parse_plan(plan.dump());
+    REQUIRE(parsed.error.empty());
+    return std::move(parsed.items);
+}
+
+/// run_apply's output split into its row kinds (item/undo/summary as cells).
+struct ApplyRun {
+    ActionOutput out;
+    std::vector<std::vector<std::string>> items, undo;
+    std::vector<std::string> audits;
+    std::vector<std::string> summary;
+    [[nodiscard]] const std::string& verdict(std::size_t i) const { return items.at(i).at(6); }
+    [[nodiscard]] const std::string& reason(std::size_t i) const { return items.at(i).at(7); }
+    [[nodiscard]] std::vector<std::string> verdicts() const {
+        std::vector<std::string> v;
+        for (const auto& row : items) v.push_back(row.at(6));
+        return v;
+    }
+    [[nodiscard]] bool undo_complete() const { return summary.at(7) == "1"; }
+    [[nodiscard]] std::size_t bytes() const {
+        std::size_t n = 0;
+        for (const auto& l : out.lines) n += l.size() + 1;
+        return n;
+    }
+};
+
+ApplyRun split_output(ActionOutput out) {
+    ApplyRun r;
+    for (const auto& line : out.lines) {
+        if (starts(line, "item|")) r.items.push_back(cells(line));
+        else if (starts(line, "undo|")) r.undo.push_back(cells(line));
+        else if (starts(line, "audit|")) r.audits.push_back(line);
+        else if (starts(line, "summary|")) r.summary = cells(line);
+    }
+    r.out = std::move(out);
+    return r;
+}
+
+ApplyRun run_plan(FakeRegistry& reg, const json& plan, bool dry, bool cont = false, bool fast = true) {
+    return split_output(run_apply(reg, FakeRegistry::kRoot, plan_of(plan), ApplyOptions{dry, cont}, fast));
+}
+
+std::string long_name(char fill, std::size_t index) {
+    std::string n(kMaxValueNameBytes - 3, fill);
+    n += std::to_string(1000 + index).substr(1);
+    return n;
+}
+
+} // namespace
+
+TEST_CASE("registry apply: a dry run gives the real run's verdicts item for item and changes nothing",
+          "[registry][core][apply]") {
+    const auto build = [](FakeRegistry& r) {
+        r.put("Software\\Acme", "Keep", kRegDword, dword(1));
+        r.put("Software\\Acme", "Gone", kRegSz, sz("bye"));
+        r.put("Software\\Old", "a", kRegDword, dword(2));
+        r.put("Software\\Old", "b", kRegBinary, B({1, 2, 3}));
+        r.key("Software\\Parent\\Child");
+    };
+    const json plan = json::array({
+        set_item("Software\\Acme", "Keep", "5", "REG_DWORD"),   // 0 overwrite
+        del_value_item("Software\\Acme", "Gone"),               // 1
+        set_item("Software\\Fresh\\Deep", "v", "x"),            // 2 creates two keys
+        make_key_item("Software\\Made"),                        // 3
+        del_key_item("Software\\Old"),                          // 4 a leaf with two values
+        del_value_item("Software\\Acme", "Missing"),            // 5 refused: value_not_found
+        del_key_item("Software\\Nope"),                         // 6 refused: key_not_found
+        del_key_item("Software\\Parent"),                       // 7 refused: key_has_subkeys
+    });
+    FakeRegistry dry_reg, real_reg;
+    build(dry_reg);
+    build(real_reg);
+    const std::string before = dump(dry_reg);
+
+    const auto dry = run_plan(dry_reg, plan, /*dry=*/true, /*cont=*/true);
+    CHECK(dump(dry_reg) == before); // a dry run mutates nothing
+    CHECK(dry_reg.method_calls("set_value") == 0);
+    CHECK(dry_reg.method_calls("delete_value") == 0);
+    CHECK(dry_reg.method_calls("create_sub") == 0);
+    CHECK(dry_reg.method_calls("delete_key_by_handle") == 0);
+    const auto real = run_plan(real_reg, plan, /*dry=*/false, /*cont=*/true);
+
+    CHECK(dry.verdicts() == std::vector<std::string>{"would_apply", "would_apply", "would_apply", "would_apply",
+                                                      "would_apply", "refused", "refused", "refused"});
+    CHECK(real.verdicts() == std::vector<std::string>{"applied", "applied", "applied", "applied", "applied", "refused",
+                                                       "refused", "refused"});
+    REQUIRE(dry.items.size() == real.items.size());
+    for (std::size_t i = 0; i < dry.items.size(); ++i) {
+        INFO("item " << i);
+        CHECK(dry.items[i].size() == 14);
+        CHECK(dry.reason(i) == real.reason(i));               // the same facts, the same verdict function
+        CHECK(dry.items[i][9] == real.items[i][9]);           // created: predicted == actual
+        for (const std::size_t c : {10u, 11u, 12u, 13u}) CHECK(dry.items[i][c] == real.items[i][c]); // old_* and new_len
+    }
+    CHECK(dry.reason(5) == "value_not_found");
+    CHECK(dry.reason(6) == "key_not_found");
+    CHECK(dry.reason(7) == "key_has_subkeys");
+    CHECK(dry.items[2][9] == "2"); // Fresh and Deep
+    CHECK(dry.items[0][10] == "present");
+    CHECK(dry.items[0][11] == "REG_DWORD");
+    CHECK(dry.items[0][12] == "01000000");
+    CHECK(dry.items[0][13] == "4");
+    CHECK(dry.out.rc == 1);
+    CHECK(real.out.rc == 1);
+    CHECK(dry.out.lines.back() == "error|partial_failure");
+    CHECK(dry.summary == std::vector<std::string>{"summary", "8", "5", "3", "0", "0", "1", "1"});
+    CHECK(real.summary == std::vector<std::string>{"summary", "8", "5", "3", "0", "0", "0", "1"});
+
+    CHECK(real_reg.get("Software\\Acme", "Keep")->data == dword(5));
+    CHECK(real_reg.get("Software\\Acme", "Gone") == nullptr);
+    CHECK(real_reg.get("Software\\Fresh\\Deep", "v") != nullptr);
+    CHECK(real_reg.exists("Software\\Made"));
+    CHECK_FALSE(real_reg.exists("Software\\Old"));
+    // the deleted key's values come back as undo rows
+    REQUIRE(real.undo.size() == 2);
+    CHECK(real.undo[0] == std::vector<std::string>{"undo", "4", "a", "REG_DWORD", "02000000", "0"});
+    CHECK(real.undo[1] == std::vector<std::string>{"undo", "4", "b", "REG_BINARY", "010203", "0"});
+    // one audit line per item, op=apply.<op>, dry_run reported, the old and new values on the value ops
+    REQUIRE(dry.audits.size() == 8);
+    CHECK(starts(dry.audits[0], "audit|op=apply.set_value|hive=HKLM|result=ok|reason=-|verify=-|key=Software\\Acme|name=Keep|"
+                                "type=REG_DWORD|len=4|dry_run=1|"));
+    CHECK(dry.audits[0].ends_with("|old_state=present|old_type=REG_DWORD|old=01000000|new=05000000"));
+    CHECK(starts(real.audits[0], "audit|op=apply.set_value|hive=HKLM|result=ok|reason=-|verify=ok|"));
+    CHECK(real.audits[0].find("|dry_run=0|") != std::string::npos);
+    CHECK(real.audits[4].find("|op=apply.delete_key|") != std::string::npos);
+    CHECK(real.audits[4].find("|counted_keys=1|counted_values=2|capped=0|") != std::string::npos);
+    CHECK(starts(real.audits[5], "audit|op=apply.delete_value|hive=HKLM|result=refused|reason=value_not_found|"));
+}
+
+TEST_CASE("registry apply: a dry run opens with the mutation's own mask and probes create access without creating",
+          "[registry][core][apply]") {
+    FakeRegistry reg;
+    reg.key("Software\\Locked")->deny_create = true;
+    reg.put("Software\\Acme", "V", kRegDword, dword(1));
+    const json plan = json::array({
+        set_item("Software\\Locked\\New", "V", "1", "REG_DWORD"),
+        set_item("Software\\Acme", "V", "2", "REG_DWORD"),
+    });
+    SECTION("dry run") {
+        const auto run = run_plan(reg, plan, true, true);
+        CHECK(run.verdicts() == std::vector<std::string>{"refused", "would_apply"});
+        CHECK(run.reason(0) == "access_denied");
+        CHECK(reg.method_calls("create_sub") == 0);
+        CHECK_FALSE(reg.exists("Software\\Locked\\New"));
+        CHECK(std::ranges::find(reg.masks, "open_path:Software\\Acme:0x3") != reg.masks.end()); // QUERY | SET, like a write
+        CHECK(std::ranges::find(reg.masks, "open_sub::0x4") != reg.masks.end());                 // the create probe
+    }
+    SECTION("real run: the same verdict") {
+        const auto run = run_plan(reg, plan, false, true);
+        CHECK(run.verdicts() == std::vector<std::string>{"refused", "applied"});
+        CHECK(run.reason(0) == "access_denied");
+        CHECK_FALSE(reg.exists("Software\\Locked\\New"));
+    }
+    SECTION("a first component missing under the root is root_level_create in both modes") {
+        const json top = json::array({set_item("NewTop\\K", "V", "x")});
+        FakeRegistry a, b;
+        const auto dry = run_plan(a, top, true, true);
+        const auto real = run_plan(b, top, false, true);
+        CHECK(dry.reason(0) == "root_level_create");
+        CHECK(real.reason(0) == "root_level_create");
+        CHECK(dry.verdict(0) == "refused");
+        CHECK(real.verdict(0) == "refused");
+    }
+}
+
+TEST_CASE("registry apply: a failed open is never cached, so a later item on the key still creates it",
+          "[registry][core][apply]") {
+    SECTION("delete_value on a missing key, then set_value on it") {
+        // mutant: the open's outcome is cached per key even when it failed
+        const json plan = json::array({del_value_item("Software\\K", "a"), set_item("Software\\K", "b", "1", "REG_DWORD")});
+        FakeRegistry dry_reg, real_reg;
+        dry_reg.key("Software");
+        real_reg.key("Software");
+        const auto dry = run_plan(dry_reg, plan, true, true);
+        const auto real = run_plan(real_reg, plan, false, true);
+        CHECK(dry.verdicts() == std::vector<std::string>{"refused", "would_apply"});
+        CHECK(real.verdicts() == std::vector<std::string>{"refused", "applied"});
+        CHECK(dry.reason(0) == "key_not_found");
+        CHECK(real.reason(0) == "key_not_found");
+        CHECK(dry.items[1][9] == "1");
+        CHECK(real.items[1][9] == "1");
+        CHECK(real_reg.get("Software\\K", "b") != nullptr); // the second item CREATED the key
+        CHECK_FALSE(dry_reg.exists("Software\\K"));
+    }
+    SECTION("the reverse order: the delete finds the key the first item created, in both modes") {
+        const json plan = json::array({set_item("Software\\K", "b", "1", "REG_DWORD"), del_value_item("Software\\K", "a")});
+        FakeRegistry dry_reg, real_reg;
+        dry_reg.key("Software");
+        real_reg.key("Software");
+        const auto dry = run_plan(dry_reg, plan, true, true);
+        const auto real = run_plan(real_reg, plan, false, true);
+        CHECK(dry.verdicts() == std::vector<std::string>{"would_apply", "refused"});
+        CHECK(real.verdicts() == std::vector<std::string>{"applied", "refused"});
+        CHECK(dry.reason(1) == "value_not_found");
+        CHECK(real.reason(1) == "value_not_found");
+        CHECK(dry.items[0][9] == real.items[0][9]);
+        // and the key the second item reached was the first item's handle, not a second open
+        CHECK(real_reg.method_calls("create_sub") == 1);
+    }
+}
+
+TEST_CASE("registry apply: previous values are captured and the one budget flags an incomplete manifest",
+          "[registry][core][apply]") {
+    SECTION("the previous value is in the item row; a value over 4 KiB keeps its first 4 KiB and flags the manifest") {
+        FakeRegistry reg;
+        Bytes big(5000);
+        for (std::size_t i = 0; i < big.size(); ++i) big[i] = static_cast<std::uint8_t>(i % 251);
+        reg.put("Software\\A", "Big", kRegBinary, big);
+        reg.put("Software\\A", "Small", kRegSz, sz("old"));
+        const auto run = run_plan(reg, json::array({set_item("Software\\A", "Small", "new"),
+                                                    hex_item("Software\\A", "Big", "REG_BINARY", "00")}), true);
+        CHECK(run.items[0][12] == yuzu::profiles::hex_encode(sz("old")));
+        CHECK(run.items[1][12] == yuzu::profiles::hex_encode(std::span<const std::uint8_t>{big}.first(kCaptureValueCap)) + "~5000");
+        CHECK_FALSE(run.undo_complete());
+    }
+    SECTION("128 values of 4,000 bytes fit the 512 KiB budget; the 129th and later keep their metadata but no bytes") {
+        FakeRegistry reg;
+        json plan = json::array();
+        for (std::size_t i = 0; i < 140; ++i) {
+            const std::string name = "v" + std::to_string(1000 + i).substr(1);
+            reg.put("Software\\Big", name, kRegBinary, Bytes(4000, static_cast<std::uint8_t>(i)));
+            plan.push_back(del_value_item("Software\\Big", name));
+        }
+        const auto dry = run_plan(reg, plan, true, true);
+        const auto real = run_plan(reg, plan, false, true);
+        for (const auto* run : {&dry, &real}) {
+            REQUIRE(run->items.size() == 140);
+            std::size_t retained = 0, kept_rows = 0;
+            for (const auto& row : run->items) {
+                CHECK(row[6] == (run == &dry ? "would_apply" : "applied"));
+                if (row[12].find('~') == std::string::npos) { // the whole 4,000 bytes
+                    ++kept_rows;
+                    retained += row[5].size() + row[12].size() / 2 + kUndoRowOverhead;
+                } else {
+                    CHECK(row[12] == "~4000"); // metadata and the size, no bytes
+                }
+            }
+            CHECK(kept_rows == 128);
+            CHECK(retained <= kCaptureTotalCap);
+            CHECK_FALSE(run->undo_complete());
+        }
+        CHECK(reg.key("Software\\Big")->values.empty()); // the real run deleted them all
+    }
+}
+
+TEST_CASE("registry apply: a value NAME is charged to the budget too, and the vet still sees every value",
+          "[registry][core][apply]") {
+    FakeRegistry reg;
+    for (std::size_t i = 0; i < 256; ++i) reg.put("Software\\Names", long_name('n', i), kRegBinary, Bytes{});
+    const json plan = json::array({del_key_item("Software\\Names")});
+    const auto dry = run_plan(reg, plan, true);
+    REQUIRE(dry.verdict(0) == "would_apply");
+    CHECK(dry.audits[0].find("|counted_keys=1|counted_values=256|capped=0|") != std::string::npos); // all 256 vetted
+    CHECK(reg.exists("Software\\Names"));
+    const auto real = run_plan(reg, plan, false);
+    CHECK(real.verdict(0) == "applied");
+    CHECK_FALSE(reg.exists("Software\\Names")); // the delete proceeds although the manifest cannot hold every row
+    CHECK_FALSE(real.undo_complete());
+    CHECK_FALSE(dry.undo_complete()); // the dry run charges identically, so the operator sees it before mutating
+    // one row costs name + data + kUndoRowOverhead: 16,383 + 0 + 64 -> 31 rows in 512 KiB, never more
+    constexpr std::size_t kRow = kMaxValueNameBytes + kUndoRowOverhead;
+    REQUIRE(real.undo.size() == kCaptureTotalCap / kRow);
+    std::size_t retained = 0;
+    for (const auto& row : real.undo) retained += row[2].size() + row[4].size() / 2 + kUndoRowOverhead;
+    CHECK(retained <= kCaptureTotalCap);
+    CHECK(retained + kRow > kCaptureTotalCap); // and it stopped because the next row would not fit
+    WARN("long-name budget: " << real.undo.size() << " of 256 rows retained, " << retained << " of " << kCaptureTotalCap
+                              << " bytes charged");
+}
+
+TEST_CASE("registry apply: delete_key vets EVERY value of the leaf before it deletes anything",
+          "[registry][core][apply]") {
+    const bool dry = GENERATE(true, false);
+    FakeRegistry reg;
+    for (std::size_t i = 0; i < 299; ++i)
+        reg.put("Software\\Leaf", "v" + std::to_string(1000 + i).substr(1), kRegDword, dword(1));
+    const json plan = json::array({del_key_item("Software\\Leaf")});
+    SECTION("the 300th value has a type this plugin cannot write back") {
+        // mutant: only the values the budget retained (or the first 256) are checked
+        reg.put("Software\\Leaf", "v299", 0 /*REG_NONE*/, Bytes{});
+        const auto run = run_plan(reg, plan, dry);
+        CHECK(run.verdict(0) == "refused");
+        CHECK(run.reason(0) == "unsupported_old_type");
+    }
+    SECTION("the 300th value has a name the manifest cannot spell") {
+        reg.put("Software\\Leaf", "v299|x", kRegDword, dword(1));
+        const auto run = run_plan(reg, plan, dry);
+        CHECK(run.reason(0) == "unrepresentable_name");
+    }
+    SECTION("an enumerated name that is not valid UTF-8, holds a tab, a C1 control or ends in a backslash") {
+        const std::string bad = GENERATE(std::string{"ab\xFF"}, std::string{"a\tb"}, std::string{"a\xC2\x85z"},
+                                         std::string{"a\\"}, std::string{"-"});
+        INFO("name bytes " << yuzu::profiles::hex_encode(std::span<const std::uint8_t>{
+                                  reinterpret_cast<const std::uint8_t*>(bad.data()), bad.size()}));
+        reg.put("Software\\Leaf", bad, kRegDword, dword(1));
+        const auto run = run_plan(reg, plan, dry);
+        CHECK(run.reason(0) == "unrepresentable_name");
+    }
+    SECTION("an unreadable value") {
+        reg.put("Software\\Leaf", "v299", kRegDword, dword(1));
+        reg.key("Software\\Leaf")->unreadable_values.insert("v299");
+        CHECK(run_plan(reg, plan, dry).reason(0) == "access_denied");
+    }
+    SECTION("a shape this plugin could not write (a REG_DWORD that is not four bytes)") {
+        reg.put("Software\\Leaf", "v299", kRegDword, B({1, 2}));
+        CHECK(run_plan(reg, plan, dry).reason(0) == "unsupported_old_type");
+    }
+    SECTION("more values than the bound: tree_too_large, nothing deleted") {
+        for (std::size_t i = 0; i < kMaxTreeNodes + 5; ++i) reg.put("Software\\Leaf", "w" + std::to_string(i), kRegDword, dword(1));
+        const auto run = run_plan(reg, plan, dry);
+        CHECK(run.reason(0) == "tree_too_large");
+        CHECK(run.audits[0].find("|capped=1|") != std::string::npos);
+    }
+    CHECK(reg.exists("Software\\Leaf"));
+    CHECK(reg.calls("delete_key_by_handle") == 0);
+}
+
+TEST_CASE("registry apply: a name the manifest cannot spell refuses before anything is opened, in both modes",
+          "[registry][core][apply]") {
+    const bool dry = GENERATE(true, false);
+    struct Case {
+        json item;
+        const char* what;
+    };
+    const Case cases[] = {
+        {set_item("Software\\A", "-", "x"), "a value named \"-\" (the row spelling of the default name)"},
+        {set_item("Software\\A", "a|b", "x"), "a pipe in the value name"},
+        {set_item("Software\\A|B", "v", "x"), "a pipe in the key"},
+        {set_item("Software\\A", "a\xE2\x80\xA8z", "x"), "U+2028"},
+        {set_item("Software\\A", "a\xE2\x80\xA9z", "x"), "U+2029"},
+        {set_item("Software\\A", "a\xC2\x85z", "x"), "a C1 control (NEL)"},
+        {del_value_item("Software\\A", "a\\"), "a trailing backslash"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.what);
+        FakeRegistry reg;
+        reg.put("Software\\A", "v", kRegDword, dword(1));
+        const auto run = run_plan(reg, json::array({c.item}), dry, true);
+        CHECK(run.verdict(0) == "refused");
+        CHECK(run.reason(0) == "unrepresentable_name");
+        CHECK(reg.seam_calls == 0); // refused by the parser's verdict, nothing opened, probed or written
+    }
+}
+
+TEST_CASE("registry apply: an unreadable previous value refuses before any mutation, in both modes",
+          "[registry][core][apply]") {
+    const bool dry = GENERATE(true, false);
+    FakeRegistry reg;
+    reg.put("Software\\K", "v", kRegDword, dword(1));
+    reg.put("Software\\K", "w", kRegDword, dword(1));
+    reg.key("Software\\K")->unreadable_values.insert("v");
+    reg.key("Software\\K")->unreadable_values.insert("w");
+    const auto run = run_plan(reg, json::array({set_item("Software\\K", "v", "2", "REG_DWORD"), del_value_item("Software\\K", "w")}),
+                              dry, true);
+    CHECK(run.verdicts() == std::vector<std::string>{"refused", "refused"});
+    CHECK(run.reason(0) == "access_denied");
+    CHECK(run.reason(1) == "access_denied");
+    CHECK(reg.calls("set_value") == 0);
+    CHECK(reg.calls("delete_value") == 0);
+    CHECK(run.items[0][10] == "unreadable");
+}
+
+TEST_CASE("registry apply: a delete_key that mutated but failed its verify still hands back its undo rows",
+          "[registry][core][apply]") {
+    FakeRegistry reg;
+    reg.put("Software\\Del", "a", kRegDword, dword(1));
+    reg.put("Software\\Del", "b", kRegSz, sz("x"));
+    // the verify reads the deleted handle with the default value name: answer "present" for it
+    reg.inject["query_value:"] = 0;
+    const auto run = run_plan(reg, json::array({del_key_item("Software\\Del")}), false);
+    CHECK(run.verdict(0) == "failed");
+    CHECK(run.reason(0) == "verify_mismatch");
+    CHECK(run.items[0][8] == "mismatch");
+    CHECK_FALSE(reg.exists("Software\\Del")); // it was deleted all the same
+    REQUIRE(run.undo.size() == 2);            // mutant: undo rows only when the verify held
+    CHECK(run.undo[0][2] == "a");
+    CHECK(run.undo[1][2] == "b");
+    CHECK(run.out.rc == 1);
+}
+
+TEST_CASE("registry apply: stop at the first refused item, or carry on, and always say partial_failure",
+          "[registry][core][apply]") {
+    const json plan = json::array({set_item("Software\\A", "one", "1"), del_value_item("Software\\A", "missing"),
+                                   set_item("Software\\A", "three", "3")});
+    SECTION("continue_on_error=false: the rest are skipped, with no audit line of their own") {
+        FakeRegistry reg;
+        reg.key("Software\\A");
+        const auto run = run_plan(reg, plan, false, false);
+        CHECK(run.verdicts() == std::vector<std::string>{"applied", "refused", "skipped"});
+        CHECK(run.audits.size() == 2);
+        CHECK(reg.get("Software\\A", "three") == nullptr);
+        CHECK(run.summary == std::vector<std::string>{"summary", "3", "1", "1", "0", "1", "0", "1"});
+        CHECK(run.out.rc == 1);
+        CHECK(run.out.lines.back() == "error|partial_failure");
+    }
+    SECTION("continue_on_error=true: every item is tried") {
+        FakeRegistry reg;
+        reg.key("Software\\A");
+        const auto run = run_plan(reg, plan, false, true);
+        CHECK(run.verdicts() == std::vector<std::string>{"applied", "refused", "applied"});
+        CHECK(reg.get("Software\\A", "three") != nullptr);
+        CHECK(run.out.rc == 1);
+    }
+    SECTION("nothing refused: rc 0 and no error line") {
+        FakeRegistry reg;
+        reg.key("Software\\A");
+        const auto run = run_plan(reg, json::array({set_item("Software\\A", "one", "1")}), false);
+        CHECK(run.out.rc == 0);
+        CHECK(run.out.lines.back().rfind("summary|", 0) == 0);
+    }
+}
+
+TEST_CASE("registry apply: a creating item that fails part-way flags the manifest incomplete and reports what stayed",
+          "[registry][core][apply]") {
+    FakeRegistry reg;
+    reg.key("Software");
+    // a stranger puts a value in Mid just before Deeper is created, so the rollback must keep Mid (and New above it)
+    reg.before = [&](const std::string& ev) {
+        if (ev == "create_sub:Deeper") reg.put("Software\\New\\Mid", "Foreign", kRegDword, dword(1));
+    };
+    reg.inject["create_sub:Deeper"] = 1450;
+    const auto run = run_plan(reg, json::array({set_item("Software\\New\\Mid\\Deeper", "v", "1")}), false);
+    CHECK(run.verdict(0) == "failed");
+    CHECK(run.reason(0) == "win32:1450");
+    CHECK(run.items[0][9] == "2"); // New and Mid are still there
+    CHECK_FALSE(run.undo_complete()); // created (2) < missing (3): `created=2` cannot name what to remove
+    CHECK(reg.exists("Software\\New\\Mid"));
+    CHECK(run.out.rc == 1);
+}
+
+TEST_CASE("registry apply: the reverse plan built from the manifest restores the registry byte for byte",
+          "[registry][core][apply]") {
+    const std::string cafe = "caf\xC3\xA9";
+    const std::string longn = long_name('x', 0);
+    FakeRegistry reg;
+    reg.put("Software\\Acme", "Keep", kRegDword, dword(1));
+    reg.put("Software\\Acme", "Gone", kRegSz, sz("bye"));
+    reg.put("Software\\Acme", "", kRegSz, sz("dflt"));
+    reg.put("Software\\Acme", cafe, kRegDword, dword(7));
+    reg.put("Software\\Acme", longn, kRegBinary, B({9, 8}));
+    reg.put("Software\\Old", "a", kRegDword, dword(2));
+    reg.put("Software\\Old", "b", kRegBinary, B({1, 2, 3}));
+    reg.put("Software\\Old", cafe, kRegSz, sz("u"));
+    reg.put("Software\\Old", "", kRegDword, dword(4));
+    reg.put("Software\\Old", long_name('y', 1), kRegBinary, Bytes{});
+    reg.put("Software\\Untouched", "u", kRegDword, dword(0));
+    const std::string before = dump(reg);
+
+    const auto fwd = run_plan(reg, json::array({
+        set_item("Software\\Acme", "Keep", "99", "REG_DWORD"),
+        del_value_item("Software\\Acme", "Gone"),
+        set_item("Software\\Acme", "", "new-default"),
+        del_value_item("Software\\Acme", cafe),
+        set_item("Software\\Acme", "newval", "5", "REG_DWORD"),
+        set_item("Software\\Fresh", "v", "1", "REG_DWORD"),
+        del_key_item("Software\\Old"),
+        hex_item("Software\\Acme", longn, "REG_BINARY", "ff"),
+        make_key_item("Software\\Made"),
+        set_item("Software\\Caf\xC3\xA9", "v", "1", "REG_DWORD"),
+    }), false);
+    REQUIRE(fwd.out.rc == 0);
+    REQUIRE(fwd.undo_complete());
+    REQUIRE(dump(reg) != before);
+
+    // the reverse, read from the rows alone ("-" is the empty default name, a ~ suffix would mean a cut value)
+    const auto name_of = [](const std::string& cell) { return cell == "-" ? std::string{} : cell; };
+    json first = json::array(), second = json::array();
+    for (const auto& r : fwd.items) {
+        const std::string &op = r[2], &key = r[4], name = name_of(r[5]);
+        const std::string &old_state = r[10], &old_type = r[11], &old_hex = r[12];
+        const bool made_key = r[9] != "0";
+        REQUIRE(old_hex.find('~') == std::string::npos);
+        if (op == "set_value" || op == "delete_value") {
+            if (old_state == "present") first.push_back(hex_item(key, name, old_type, old_hex));
+            else if (made_key) first.push_back(del_key_item(key)); // the write created this key (a single component)
+            else first.push_back(del_value_item(key, name));
+        } else if (op == "create_key" && made_key) {
+            first.push_back(del_key_item(key));
+        }
+    }
+    std::set<std::string> recreated;
+    for (const auto& u : fwd.undo) {
+        const std::string key = fwd.items.at(std::stoul(u[1]))[4]; // the undo row names its item; the item names the key
+        if (recreated.insert(key).second) first.push_back(make_key_item(key));
+        second.push_back(hex_item(key, name_of(u[2]), u[3], u[4]));
+    }
+    const auto back1 = run_plan(reg, first, false);
+    REQUIRE(back1.out.rc == 0);
+    const auto back2 = run_plan(reg, second, false);
+    REQUIRE(back2.out.rc == 0);
+    CHECK(dump(reg) == before);
+}
+
+TEST_CASE("registry apply: each distinct key is opened once and its handle reused, whatever the spelling of its case",
+          "[registry][core][apply]") {
+    FakeRegistry reg;
+    reg.put("Software\\Acme", "a", kRegDword, dword(1));
+    reg.put("Software\\Acme", "b", kRegDword, dword(1));
+    const auto run = run_plan(reg, json::array({set_item("Software\\Acme", "a", "2", "REG_DWORD"),
+                                                set_item("SOFTWARE\\ACME", "b", "3", "REG_DWORD")}), false);
+    CHECK(run.out.rc == 0);
+    CHECK(reg.method_calls("open_path") == 1); // mutant: one open per item
+    CHECK(reg.method_calls("root_name") == 1);
+    CHECK(reg.method_calls("final_name") == 1);
+    CHECK(reg.get("Software\\Acme", "b")->data == dword(3));
+    // a key op is never given a value op's handle: the parser refuses them on one key (dependent_items), and two key
+    // ops are different keys here, so each opens its own
+    FakeRegistry reg2;
+    reg2.key("Software\\X");
+    reg2.key("Software\\Y");
+    const auto keys = run_plan(reg2, json::array({make_key_item("Software\\X"), make_key_item("Software\\Y")}), false);
+    CHECK(keys.out.rc == 0);
+    CHECK(reg2.method_calls("open_path") == 2);
+}
+
+TEST_CASE("registry apply: a 256-item plan over 8 keys issues a fixed number of seam calls at every depth",
+          "[registry][core][apply][nfr1]") {
+    // NFR-1 (microsecond writes): the cost of an apply is one checked open per DISTINCT key plus three seam calls per item
+    // (capture, set, read-back), whatever the depth. Per key: root_name + open_path + final_name + the leaf probe + close.
+    constexpr std::size_t kKeys = 8, kNames = 32;
+    std::vector<std::size_t> real_counts, dry_counts;
+    for (const std::size_t depth : {3u, 6u, 10u}) {
+        std::string base;
+        for (std::size_t i = 0; i + 1 < depth; ++i) base += "K" + std::to_string(i) + "\\";
+        for (const bool dry : {false, true}) {
+            FakeRegistry reg;
+            json plan = json::array();
+            for (std::size_t k = 0; k < kKeys; ++k) {
+                const std::string key = base + "S" + std::to_string(k);
+                for (std::size_t n = 0; n < kNames; ++n) {
+                    const std::string name = "n" + std::to_string(n);
+                    reg.put(key, name, kRegDword, dword(1));
+                    plan.push_back(set_item(key, name, "2", "REG_DWORD"));
+                }
+            }
+            REQUIRE(plan.size() == 256);
+            const auto run = run_plan(reg, plan, dry);
+            REQUIRE(run.out.rc == 0);
+            (dry ? dry_counts : real_counts).push_back(reg.seam_calls);
+            INFO("depth " << depth << (dry ? " dry" : " real"));
+            CHECK(reg.method_calls("open_path") == kKeys);
+            CHECK(reg.method_calls("root_name") == kKeys);
+            CHECK(reg.method_calls("final_name") == kKeys);
+            CHECK(reg.method_calls("close") == kKeys);
+            CHECK(reg.method_calls("open_sub") == 0);
+            CHECK(reg.method_calls("create_sub") == 0);
+            CHECK(reg.method_calls("set_value") == (dry ? 0u : kKeys * kNames));
+            CHECK(reg.seam_calls == kKeys * 5 + kKeys * kNames * (dry ? 1 : 3));
+        }
+    }
+    for (const auto* counts : {&real_counts, &dry_counts}) {
+        REQUIRE(counts->size() == 3);
+        CHECK((*counts)[0] == (*counts)[1]);
+        CHECK((*counts)[1] == (*counts)[2]); // equal at depth 3, 6 and 10
+    }
+    WARN("seam calls for a 256-item apply over 8 keys: real " << real_counts[0] << ", dry run " << dry_counts[0]
+                                                                << " (8*5 + 256*3 and 8*5 + 256*1)");
+}
+
+TEST_CASE("registry apply: a plan's reply stays under the dispatcher's 2 MiB capture cap", "[registry][core][apply]") {
+    // 100 overwrites of 4,000-byte values and 100 leaf deletes of three 4,000-byte values each: the budget, not the
+    // data, decides how much of the previous state is carried, so the whole reply is bounded.
+    FakeRegistry reg;
+    json plan = json::array();
+    for (std::size_t i = 0; i < 100; ++i) {
+        const std::string name = "v" + std::to_string(1000 + i).substr(1);
+        reg.put("Software\\Big", name, kRegBinary, Bytes(4000, 0xAB));
+        plan.push_back(hex_item("Software\\Big", name, "REG_BINARY", "00"));
+        const std::string leaf = "Software\\Leaf" + std::to_string(1000 + i).substr(1);
+        for (const char* v : {"x", "y", "z"}) reg.put(leaf, v, kRegBinary, Bytes(4000, 0xCD));
+        plan.push_back(del_key_item(leaf));
+    }
+    const auto run = run_plan(reg, plan, false);
+    REQUIRE(run.out.rc == 0);
+    CHECK_FALSE(run.undo_complete());
+    constexpr std::size_t kDispatcherCap = 2 * 1024 * 1024; // agents/core/src/local_dispatcher.hpp
+    CHECK(run.bytes() < kDispatcherCap);
+    // every row that kept its bytes was charged name + bytes + kUndoRowOverhead against the one budget (all values here
+    // are under the 4 KiB capture cap, so a `~` means the budget dropped the bytes and the row was not charged)
+    std::size_t retained = 0;
+    for (const auto& row : run.items)
+        if (row[10] == "present" && row[12].find('~') == std::string::npos)
+            retained += row[5].size() + row[12].size() / 2 + kUndoRowOverhead;
+    for (const auto& row : run.undo)
+        if (row[4].find('~') == std::string::npos) retained += row[2].size() + row[4].size() / 2 + kUndoRowOverhead;
+    CHECK(retained <= kCaptureTotalCap);
+    WARN("a 200-item plan with 4,000-byte values: reply " << run.bytes() << " bytes of " << kDispatcherCap
+                                                          << ", retained " << retained << " of " << kCaptureTotalCap);
+}
+
+TEST_CASE("registry apply: an exception mid-write closes every handle and rolls back the keys the item made",
+          "[registry][core][apply]") {
+    FakeRegistry reg;
+    reg.key("Software");
+    reg.before = [](const std::string& ev) {
+        if (ev == "set_value:v") throw std::runtime_error("injected");
+    };
+    CHECK_THROWS_AS(run_plan(reg, json::array({set_item("Software\\New\\Deeper", "v", "1")}), false), std::runtime_error);
+    CHECK_FALSE(reg.exists("Software\\New")); // ~Opened rolled back what the walk made
+    CHECK(reg.method_calls("delete_key_by_handle") == 2);
+    // the fake's destructor then checks that no handle was left open
+}
+
+TEST_CASE("registry apply: create_key and delete_key refuse a link and a missing key; creating an existing key is a no-op",
+          "[registry][core][apply]") {
+    FakeRegistry reg;
+    reg.put("Real\\Target", "keep", kRegDword, dword(1));
+    reg.link("Software\\L", "Real\\Target");
+    reg.key("Software\\Plain");
+    const auto run = run_plan(reg, json::array({make_key_item("Software\\L"), del_key_item("Software\\L2"),
+                                                make_key_item("Software\\Plain")}), true, true);
+    // create_key over a link is refused (no op recreates a link), over a plain key it is a no-op that would apply
+    CHECK(run.verdict(0) == "refused");
+    CHECK(run.reason(0) == "key_is_link");
+    CHECK(run.verdict(1) == "refused");
+    CHECK(run.reason(1) == "key_not_found");
+    CHECK(run.verdict(2) == "would_apply");
+    CHECK(run.items[2][9] == "0");
+    CHECK(run.audits[2].find("|op=apply.create_key|") != std::string::npos);
+    FakeRegistry link_delete;
+    link_delete.put("Real\\Target", "keep", kRegDword, dword(1));
+    link_delete.link("Software\\L", "Real\\Target");
+    const auto del = run_plan(link_delete, json::array({del_key_item("Software\\L")}), false);
+    CHECK(del.reason(0) == "key_is_link"); // apply's delete_key is not allowed to remove a link
+    CHECK(link_delete.exists("Software\\L"));
+    CHECK(link_delete.get("Real\\Target", "keep")->data == dword(1));
 }

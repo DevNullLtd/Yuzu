@@ -8,6 +8,8 @@
  *    (key_is_link), so test_registry_write_local_dispatcher.cpp never reaches the create step with a link in
  *    place; calling create_sub on a dangling link here is that swap, deterministically.
  *  - the fast open's two kernel calls, final_name (NtQueryKey) and root_name.
+ *  - the recursive delete walk, the dry-run create probe (an empty-subkey RegOpenKeyExW with KEY_CREATE_SUB_KEY), the
+ *    ACL a dry run cannot see, and RegFlushKey on a mounted hive: Win32 behaviour the in-memory fake only models.
  *  - execute_guarded, the ABI seam: an action that throws (this TU's guard macro makes any action throw when
  *    its `name` parameter is `__throw_std` or `__throw_other`) comes out as rc 1, the action's fixed exception
  *    audit line when it is a mutator, and one `error|exception` line, never as an exception.
@@ -35,13 +37,21 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <windows.h>
+
+#include <sddl.h>
+
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp"
 
 #include <yuzu/plugin.h>
 #include <yuzu/plugin.hpp>
 
+#include <win_hive_file_probe.hpp> // yuzu::win::LocalFreeGuard
+#include <win_profiles.hpp>        // PrivilegeScope, ScopedUserHive
+
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <span>
 #include <string>
@@ -397,6 +407,294 @@ TEST_CASE("Win32Registry::root_name is the kernel name of HKLM and HKU and is re
     CHECK(reg.root_name(as_handle(HKEY_CLASSES_ROOT), name) == ERROR_NOT_SUPPORTED);
 }
 
+// The recursive delete's post-order walk over the REAL registry. Kingsley probe K1 (MSVC 14.44, 2026-10-19):
+// RegDeleteTreeW on a tree holding a REG_LINK emptied the link's TARGET (K1b: a handle opened with
+// REG_OPTION_OPEN_LINK on the link itself did not). The core now deletes by handle and probes every key again,
+// so a link met at delete time stops the walk (key_is_link) whichever order the child keys enumerate in.
+// test_registry_core.cpp pins the same stop on the fake. Mutation: drop the probe_link call in delete_subtree
+// (registry_core.hpp) and this case goes red (the walk enters the link and the Target is no longer intact).
+// The link sits in a tree reached through delete_key_on directly, i.e. PAST the vet (count_tree), which is the
+// planted-link-since-the-vet shape the walk's own re-probe exists for.
+TEST_CASE("the recursive delete walk stops at a registry link inside the tree and leaves its target intact",
+          "[registry][windows][internals]") {
+    const std::string root = scratch_root("deltree");
+    ScratchTree cleanup{root};
+
+    const auto make_key_with_value = [](const std::string& path) {
+        yuzu::win::RegKey k;
+        const DWORD v = 7;
+        return RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(path).c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
+                               KEY_SET_VALUE, nullptr, k.put(), nullptr) == ERROR_SUCCESS &&
+               RegSetValueExW(k.get(), L"v", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v), sizeof(v)) == ERROR_SUCCESS;
+    };
+    if (!make_key_with_value(root + "\\Tree\\A") || !make_key_with_value(root + "\\Target") ||
+        !make_key_with_value(root + "\\Target\\Y")) {
+        skip_or_fail("not elevated -- HKLM scratch not writable, delete-walk link case");
+        return;
+    }
+
+    Win32Registry reg;
+    Handle top = 0;
+    REQUIRE(reg.open_sub(as_handle(HKEY_LOCAL_MACHINE), root + "\\Tree",
+                         DELETE | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE | KEY_SET_VALUE, top) == ERROR_SUCCESS);
+    const Owned top_h{reg, top};
+    LinkSweep sweep{reg, top}; // a failed REQUIRE (or a build that followed the link) must not leave it for the cleanup
+    if (!make_machine_link(root + "\\Tree\\Link", root + "\\Target")) {
+        skip_or_fail("could not create a registry link here");
+        return;
+    }
+
+    const auto o = yuzu::registry::delete_key_on(reg, top, /*recursive=*/true);
+    CHECK(o.reason == "key_is_link");
+    CHECK(key_exists(root + "\\Target\\Y")); // the target and its subtree survived
+    yuzu::win::RegKey target;
+    REQUIRE(RegOpenKeyExW(HKEY_LOCAL_MACHINE, widen(root + "\\Target").c_str(), 0, KEY_QUERY_VALUE, target.put()) ==
+            ERROR_SUCCESS);
+    DWORD size = 0;
+    CHECK(RegQueryValueExW(target.get(), L"v", nullptr, nullptr, nullptr, &size) == ERROR_SUCCESS); // its value too
+    CHECK(key_exists(root + "\\Tree")); // the walk never reached the top key's own delete
+}
+
+// The same walk on a tree with no link: the production Win32Registry removes it post-order by handle (NtDeleteKey on
+// each key's own handle), the removed child no longer enumerates at index 0 (the walk's loop relies on that), and the
+// dry run counted what the real run removed. The scratch tree is therefore gone by handle, not by RegDeleteTreeW.
+TEST_CASE("the recursive delete walk removes a plain tree post-order by handle and counts what it removed",
+          "[registry][windows][internals]") {
+    const std::string root = scratch_root("delplain");
+    ScratchTree cleanup{root};
+    const auto make_key_with_value = [](const std::string& path) {
+        yuzu::win::RegKey k;
+        const DWORD v = 7;
+        return RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(path).c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
+                               KEY_SET_VALUE, nullptr, k.put(), nullptr) == ERROR_SUCCESS &&
+               RegSetValueExW(k.get(), L"v", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v), sizeof(v)) == ERROR_SUCCESS;
+    };
+    if (!make_key_with_value(root + "\\Plain") || !make_key_with_value(root + "\\Plain\\A") ||
+        !make_key_with_value(root + "\\Plain\\A\\B") || !make_key_with_value(root + "\\Plain\\C")) {
+        skip_or_fail("not elevated -- HKLM scratch not writable, delete-walk plain case");
+        return;
+    }
+    Win32Registry reg;
+    const Handle hklm = as_handle(HKEY_LOCAL_MACHINE);
+    const auto dry = yuzu::registry::delete_key_tree(reg, hklm, root + "\\Plain", /*fast_eligible=*/true,
+                                                     /*recursive=*/true, /*dry_run=*/true);
+    CHECK(dry.result == "ok");
+    CHECK(dry.counted_keys == 4);
+    CHECK(dry.counted_values == 4);
+    CHECK(key_exists(root + "\\Plain\\A\\B"));
+    const auto real = yuzu::registry::delete_key_tree(reg, hklm, root + "\\Plain", true, true, false);
+    CHECK(real.result == "ok");
+    CHECK(real.verify == "ok");
+    CHECK(real.counted_keys == 4);
+    CHECK(real.counted_values == 4);
+    CHECK_FALSE(key_exists(root + "\\Plain"));
+}
+
+namespace {
+
+/// Gives `key` (a handle opened with WRITE_DAC) a DACL, from SDDL text. False when it could not.
+bool set_key_sddl(HKEY key, const wchar_t* sddl) {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd, nullptr)) return false;
+    const yuzu::win::LocalFreeGuard free_sd{sd};
+    return RegSetKeySecurity(key, DACL_SECURITY_INFORMATION, sd) == ERROR_SUCCESS;
+}
+
+/// Puts a permissive DACL back on `path` (HKLM-relative) on scope exit, so a deny ACE a case installed never blocks the
+/// scratch tree's removal. Declare it AFTER the ScratchTree it protects. Never throws.
+struct AclRestore {
+    std::string path;
+    explicit AclRestore(std::string p) : path(std::move(p)) {}
+    ~AclRestore() {
+        yuzu::win::RegKey k;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, widen(path).c_str(), 0, WRITE_DAC | READ_CONTROL, k.put()) == ERROR_SUCCESS)
+            set_key_sddl(k.get(), L"D:(A;;GA;;;WD)");
+    }
+    AclRestore(const AclRestore&) = delete;
+    AclRestore& operator=(const AclRestore&) = delete;
+};
+
+} // namespace
+
+// The dry run's create check. Win32 semantics relied on: RegOpenKeyExW(h, L"", ..., KEY_CREATE_SUB_KEY) opens a NEW
+// handle to the key `h` is bound to and checks the requested access against THAT key's security descriptor (not the
+// access `h` was opened with), so a key whose ACL denies subkey creation answers ERROR_ACCESS_DENIED without anything
+// being created. Mutation: ask for KEY_READ in the probe (registry_core.hpp open_checked) and the locked section goes red.
+TEST_CASE("RegOpenKeyExW(h, empty, KEY_CREATE_SUB_KEY) answers ERROR_ACCESS_DENIED on a key whose ACL denies subkey "
+          "creation, and creates nothing",
+          "[registry][windows][internals]") {
+    const std::string root = scratch_root("probe");
+    ScratchTree cleanup{root};
+    const std::string locked = root + "\\Locked";
+    const std::string open_key = root + "\\Open";
+    AclRestore unlock{locked}; // destroyed first: removes the deny ACE, then the subtree goes
+    for (const std::string& path : {locked, open_key}) {
+        yuzu::win::RegKey k;
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(path).c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE, WRITE_DAC | KEY_READ,
+                            nullptr, k.put(), nullptr) != ERROR_SUCCESS) {
+            skip_or_fail("not elevated -- HKLM scratch not writable, create-probe case");
+            return;
+        }
+        if (path == locked && !set_key_sddl(k.get(), L"D:(D;;0x4;;;WD)(A;;GA;;;WD)")) {
+            skip_or_fail("could not install a deny ACE");
+            return;
+        }
+    }
+    Win32Registry reg;
+    const Handle hklm = as_handle(HKEY_LOCAL_MACHINE);
+    // The parent handles are opened WITHOUT the create right: the probe must not depend on what the handle was opened with.
+    Handle locked_h = 0, open_h = 0;
+    REQUIRE(reg.open_sub(hklm, locked, KEY_READ, locked_h) == ERROR_SUCCESS);
+    const Owned locked_guard{reg, locked_h};
+    REQUIRE(reg.open_sub(hklm, open_key, KEY_READ, open_h) == ERROR_SUCCESS);
+    const Owned open_guard{reg, open_h};
+
+    SECTION("a key that denies subkey creation") {
+        Handle probe = 0;
+        CHECK(reg.open_sub(locked_h, "", KEY_CREATE_SUB_KEY, probe) == ERROR_ACCESS_DENIED);
+        if (probe != 0) reg.close(probe);
+        CHECK(yuzu::registry::open_checked(reg, hklm, locked + "\\New", KEY_SET_VALUE | KEY_QUERY_VALUE, /*create=*/false,
+                                           false, false, /*probe_create=*/true)
+                  .error == "access_denied");
+        CHECK(yuzu::registry::open_checked(reg, hklm, locked + "\\New", KEY_SET_VALUE | KEY_QUERY_VALUE, /*create=*/true)
+                  .error == "access_denied"); // what the real run answers
+    }
+    SECTION("a key that allows it: a new handle, and still nothing created") {
+        Handle probe = 0;
+        REQUIRE(reg.open_sub(open_h, "", KEY_CREATE_SUB_KEY, probe) == ERROR_SUCCESS);
+        const Owned probe_guard{reg, probe};
+        CHECK(probe != open_h); // a new handle, not the one passed in
+        const auto o = yuzu::registry::open_checked(reg, hklm, open_key + "\\New", KEY_SET_VALUE | KEY_QUERY_VALUE, false,
+                                                    false, false, true);
+        CHECK(o.error == "key_not_found");
+        CHECK(o.missing == 1);
+    }
+    CHECK_FALSE(key_exists(locked + "\\New"));
+    CHECK_FALSE(key_exists(open_key + "\\New"));
+}
+
+// P6 (the documented predictive limit): the dry run's probe proves create access on the EXISTING parent, not the ACL a
+// key that does not exist yet will inherit. Here the parent allows creation and hands every new child a deny ACE for
+// KEY_SET_VALUE. The dry run says would_apply (it cannot see the child's descriptor); what the real run does with the
+// handle RegCreateKeyExW hands back is Windows' answer, recorded below. Whatever it is, the real run must leave the
+// registry consistent with what it reports: a verdict other than applied leaves no key behind and reports created=0.
+TEST_CASE("apply: a dry run cannot see the ACL a new key inherits; the real run's outcome matches the registry",
+          "[registry][windows][internals]") {
+    const std::string root = scratch_root("inherit");
+    ScratchTree cleanup{root};
+    const std::string parent = root + "\\Parent";
+    AclRestore restore_parent{parent};
+    {
+        yuzu::win::RegKey k;
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(parent).c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE, WRITE_DAC | KEY_READ,
+                            nullptr, k.put(), nullptr) != ERROR_SUCCESS) {
+            skip_or_fail("not elevated -- HKLM scratch not writable, inherited-ACL case");
+            return;
+        }
+        // Everyone may do anything to the parent itself; the inherit-only ACE gives every NEW child a deny for
+        // KEY_SET_VALUE (0x2) to Everyone.
+        if (!set_key_sddl(k.get(), L"D:(A;;GA;;;WD)(D;CIIO;0x2;;;WD)")) {
+            skip_or_fail("could not install an inheritable deny ACE");
+            return;
+        }
+    }
+    const auto parsed = yuzu::registry::parse_plan(
+        R"([{"op":"set_value","key":")" + [&] {
+            std::string e;
+            for (const char c : parent) e += (c == '\\') ? "\\\\" : std::string{c};
+            return e;
+        }() + R"(\\New","name":"V","type":"REG_DWORD","value":"1"}])");
+    REQUIRE(parsed.error.empty());
+
+    Win32Registry reg;
+    const Handle hklm = as_handle(HKEY_LOCAL_MACHINE);
+    const auto verdict_of = [](const yuzu::registry::ActionOutput& out) {
+        for (const auto& l : out.lines)
+            if (l.rfind("item|0|", 0) == 0) {
+                std::vector<std::string> cells;
+                std::size_t pos = 0;
+                for (;;) {
+                    const auto bar = l.find('|', pos);
+                    cells.push_back(l.substr(pos, bar == std::string::npos ? std::string::npos : bar - pos));
+                    if (bar == std::string::npos) break;
+                    pos = bar + 1;
+                }
+                return cells;
+            }
+        return std::vector<std::string>{};
+    };
+    const auto dry = verdict_of(yuzu::registry::run_apply(reg, hklm, parsed.items, {/*dry_run=*/true, false}, true));
+    REQUIRE(dry.size() > 9);
+    CHECK(dry[6] == "would_apply");
+    CHECK_FALSE(key_exists(parent + "\\New"));
+
+    const auto real = verdict_of(yuzu::registry::run_apply(reg, hklm, parsed.items, {/*dry_run=*/false, false}, true));
+    REQUIRE(real.size() > 9);
+    WARN("inherited deny ACE: dry run " << dry[6] << ", real run " << real[6] << " (" << real[7] << "), created=" << real[9]);
+    if (real[6] == "applied") {
+        CHECK(key_exists(parent + "\\New"));
+    } else {
+        CHECK_FALSE(key_exists(parent + "\\New")); // rolled back by handle
+        CHECK(real[9] == "0");
+    }
+}
+
+// RegFlushKey on a key of a MOUNTED hive writes the hive to its file (the per-user write arm calls it before the
+// unload, because RegUnLoadKey does not itself modify the file). A 128 KiB value forces the hive to grow by whole bins,
+// so the file's size moves when the flush writes it; an unflushed hive keeps its on-disk size until the lazy writer runs.
+TEST_CASE("Win32Registry::flush_key on a mounted scratch hive succeeds and the hive file grows",
+          "[registry][windows][internals]") {
+    namespace fs = std::filesystem;
+    yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
+    yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
+    if (!backup.ok() || !restore.ok()) {
+        skip_or_fail("not elevated (no SeBackup/SeRestore) -- hive flush case");
+        return;
+    }
+    const std::string src = "SOFTWARE\\" + yuzu::test::registry_scratch_prefix() + std::to_string(yuzu::test::process_random_salt()) + "-flushsrc";
+    ScratchTree cleanup{src};
+    yuzu::test::TempDir tmp{"yuzu_test_flush_"};
+    const fs::path hive_file = tmp.path / "scratch.hive";
+    {
+        yuzu::win::RegKey k;
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(src).c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_SET_VALUE,
+                            nullptr, k.put(), nullptr) != ERROR_SUCCESS) {
+            skip_or_fail("not elevated -- HKLM scratch not writable, hive flush case");
+            return;
+        }
+        const DWORD v = 1;
+        REQUIRE(RegSetValueExW(k.get(), L"seed", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v), sizeof(v)) == ERROR_SUCCESS);
+        const LSTATUS rc = RegSaveKeyExW(k.get(), hive_file.wstring().c_str(), nullptr, REG_STANDARD_FORMAT);
+        if (rc != ERROR_SUCCESS) {
+            skip_or_fail("RegSaveKeyExW could not save the scratch hive, rc=" + std::to_string(rc));
+            return;
+        }
+    }
+    const auto file_size = [&] {
+        WIN32_FILE_ATTRIBUTE_DATA d{};
+        if (!GetFileAttributesExW(hive_file.wstring().c_str(), GetFileExInfoStandard, &d)) return std::uintmax_t{0};
+        return (static_cast<std::uintmax_t>(d.nFileSizeHigh) << 32) | d.nFileSizeLow;
+    };
+    bool unload_failed = false;
+    {
+        yuzu::win::ScopedUserHive hive{L"YuzuTestFlush" + widen(std::to_string(yuzu::test::process_random_salt())),
+                                       hive_file.wstring(), &unload_failed};
+        REQUIRE(hive.ok());
+        hive.with_root([&](HKEY root) {
+            yuzu::win::RegKey k;
+            REQUIRE(RegCreateKeyExW(root, L"k", 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE | KEY_QUERY_VALUE, nullptr,
+                                    k.put(), nullptr) == ERROR_SUCCESS);
+            const std::vector<BYTE> big(128 * 1024, 0xAB);
+            const auto before = file_size();
+            REQUIRE(RegSetValueExW(k.get(), L"big", 0, REG_BINARY, big.data(), static_cast<DWORD>(big.size())) == ERROR_SUCCESS);
+            Win32Registry reg;
+            CHECK(reg.flush_key(as_handle(k.get())) == ERROR_SUCCESS);
+            CHECK(file_size() > before);
+        });
+    }
+    CHECK_FALSE(unload_failed);
+}
+
 // The frozen-seam rule: nothing a registry action throws crosses the plugin boundary. dispatch throws a
 // std::exception for `name=__throw_std` and a non-std value for `name=__throw_other` in this TU only (the guard
 // macro). A mutating action leaves its fixed audit line first, so the server still mints a failed registry.write row.
@@ -417,7 +715,7 @@ TEST_CASE("execute_guarded turns a throwing action into rc 1 and one error|excep
         REQUIRE(r.lines.size() == 1);
         CHECK(r.lines[0] == "error|exception");
     }
-    for (const char* mutator : {"set_value", "delete_value", "delete_key"}) {
+    for (const char* mutator : {"set_value", "delete_value", "delete_key", "set_user_value", "delete_user_value", "apply"}) {
         for (const char* how : {"__throw_std", "__throw_other"}) {
             SECTION(std::string{mutator} + " throwing " + how + ": the fixed audit line, then error|exception") {
                 const auto r = run_guarded(mutator, how);

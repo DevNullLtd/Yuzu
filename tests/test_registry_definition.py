@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """test_registry_definition.py -- pins content/definitions/registry.yaml's contract for the
-registry plugin's typed verified writes: the nine definition ids, the six-type enum on set_value,
-delete_key's five result columns in order (compatible-by-append: `status` stays first) and its
-non-recursive wording, and the role gates on every mutating definition.
+registry plugin's typed verified writes: the twelve definition ids, the six-type enum on set_value and
+set_user_value, delete_key's five result columns in order (compatible-by-append: `status` stays first), its
+recursion and dry-run parameters and the mixed-fleet hazard its description states, the apply plan's bounds
+and row columns, and the role gates on every mutating definition.
 It compares the YAML with the literals below; it reads the C++ only for one lexical pin on the
 Windows fixtures' scratch-key names (the wire rows are pinned by tests/unit/test_registry_parsers.cpp /
 test_registry_core.cpp).
@@ -21,9 +22,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFINITION = REPO_ROOT / "content" / "definitions" / "registry.yaml"
 
 ACTIONS = ["get_value", "get_user_value", "list_profiles", "set_value", "enumerate_keys", "delete_value",
-           "delete_key", "key_exists", "enumerate_values"]
+           "delete_key", "key_exists", "enumerate_values", "set_user_value", "delete_user_value", "apply"]
 IDS = {f"windows.registry.{a}": a for a in ACTIONS}
-MUTATING = ["set_value", "delete_value", "delete_key"]
+MUTATING = ["set_value", "delete_value", "delete_key", "set_user_value", "delete_user_value", "apply"]
+HIVE_PARAMETER = ["set_value", "delete_value", "delete_key"]  # the other mutators name a profile or carry a plan
+APPLY_COLUMNS = ["row_kind"] + [f"field_{i}" for i in range(1, 14)]
 SIX_TYPES = ["REG_SZ", "REG_EXPAND_SZ", "REG_BINARY", "REG_DWORD", "REG_MULTI_SZ", "REG_QWORD"]
 DELETE_KEY_COLUMNS = ["status", "counted_keys", "counted_values", "dry_run", "capped"]
 
@@ -38,8 +41,16 @@ def _spec(action: str) -> dict:
     return by_action[action]["spec"]
 
 
+def _words(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _version(text: str) -> tuple:
+    return tuple(int(part) for part in text.split("."))
+
+
 class RegistryDefinitionIds(unittest.TestCase):
-    def test_nine_definitions_each_bound_to_its_action(self):
+    def test_twelve_definitions_each_bound_to_its_action(self):
         defs = _definitions()
         self.assertEqual({i: d["spec"]["execution"]["action"] for i, d in defs.items()}, IDS)
 
@@ -87,33 +98,134 @@ class RegistryDeleteKey(unittest.TestCase):
         cols = _spec("delete_key")["result"]["columns"]
         self.assertEqual([c["name"] for c in cols], DELETE_KEY_COLUMNS)
 
-    def test_takes_only_the_hive_and_the_key(self):
+    def test_takes_the_hive_the_key_and_the_two_optional_flags(self):
         spec = _spec("delete_key")["parameters"]
-        self.assertEqual(sorted(spec["properties"]), ["hive", "key"])
-        self.assertEqual(spec["required"], ["hive", "key"])
+        self.assertEqual(sorted(spec["properties"]), ["dry_run", "hive", "key", "recursive"])
+        self.assertEqual(spec["required"], ["hive", "key"])  # additive: the flags are optional
 
-    def test_version_is_the_minor_bump(self):
-        self.assertEqual(_definitions()["windows.registry.delete_key"]["metadata"]["version"], "1.1.0")
+    def test_the_flags_are_true_false_strings_defaulting_to_false(self):
+        props = _spec("delete_key")["parameters"]["properties"]
+        for flag in ("recursive", "dry_run"):
+            with self.subTest(flag=flag):
+                self.assertEqual(props[flag]["type"], "string")
+                self.assertEqual(props[flag]["default"], "false")
+                self.assertEqual(props[flag]["validation"]["enum"], ["true", "false"])
 
-    def test_description_is_non_recursive_and_names_the_value_cap(self):
-        text = _definitions()["windows.registry.delete_key"]["metadata"]["description"].lower()
-        self.assertIn("key_has_subkeys", text)
-        self.assertIn("10,000 nodes (the key plus up to 9,999 values)", text)
-        self.assertIn("lower bound", text)
-        self.assertNotIn("recursive=true", text)
-        self.assertNotIn("every value and subkey", text)
+    def test_version_is_the_additive_minor_bump(self):
+        self.assertEqual(_definitions()["windows.registry.delete_key"]["metadata"]["version"], "1.2.0")
 
-    def test_capped_column_is_the_value_count_cap(self):
+    def test_description_states_the_recursion_contract(self):
+        text = _words(_definitions()["windows.registry.delete_key"]["metadata"]["description"])
+        for needle in ("key_has_subkeys", "tree_too_large", "10,000 keys and values", "600 levels", "lower bound",
+                       "key_is_link", "concurrent_change", "RegDeleteTreeW", "size bound and a link sweep, not a list",
+                       "what the delete removed"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, text)
+
+    def test_the_2_0_x_dry_run_hazard_is_stated_where_the_operator_reads_it(self):
+        # A registry 2.0.x agent never reads dry_run: delete_key(dry_run=true) DELETES a leaf key there, and nothing on the
+        # server compares a plugin version at dispatch (#6484), so the definition itself has to say so.
+        defn = _definitions()["windows.registry.delete_key"]
+        for where, text in (("description", defn["metadata"]["description"]),
+                            ("dry_run parameter", _spec("delete_key")["parameters"]["properties"]["dry_run"]["description"])):
+            with self.subTest(where=where):
+                words = _words(text)
+                self.assertIn("2.0.x", words)
+                self.assertIn("DELETES a key that has no subkeys", words)
+        self.assertIn("#6484", _words(defn["metadata"]["description"]))
+
+    def test_min_agent_version_is_declared_as_the_input_to_the_dispatch_gate(self):
+        # Declared and exported, not compared at dispatch today (#6484); pinned so the gate is correct the day it lands.
+        self.assertGreaterEqual(_version(_spec("delete_key")["compatibility"]["minAgentVersion"]), (0, 15, 0))
+
+    def test_capped_dry_run_and_counts_columns_describe_the_new_semantics(self):
         cols = {c["name"]: c for c in _spec("delete_key")["result"]["columns"]}
-        self.assertIn("10,000 nodes (the key plus up to 9,999 values)", cols["capped"]["description"])
-        self.assertIn("Always 0", cols["dry_run"]["description"])
+        self.assertIn("10,000 keys and values, 600 levels", cols["capped"]["description"])
+        self.assertIn("tree_too_large", cols["capped"]["description"])
+        self.assertIn("1 (counted, nothing deleted) or 0", cols["dry_run"]["description"])
+        self.assertNotIn("Always 0", cols["dry_run"]["description"])
+        self.assertIn("REMOVED", cols["counted_keys"]["description"])
+
+
+class RegistryPerUserWrites(unittest.TestCase):
+    def test_set_user_value_has_the_six_type_enum_and_the_value_or_data_hex_rule(self):
+        props = _spec("set_user_value")["parameters"]["properties"]
+        self.assertEqual(props["type"]["validation"]["enum"], SIX_TYPES)
+        self.assertEqual(sorted(props), ["data_hex", "key", "name", "sid", "type", "username", "value"])
+        self.assertEqual(_spec("set_user_value")["parameters"]["required"], ["key", "name"])
+        self.assertIn("exactly one of", _words(props["value"]["description"]))
+        self.assertEqual(props["data_hex"]["validation"]["maxLength"], 2 * 1024 * 1024)
+
+    def test_delete_user_value_takes_the_profile_the_key_and_the_name(self):
+        props = _spec("delete_user_value")["parameters"]["properties"]
+        self.assertEqual(sorted(props), ["key", "name", "sid", "username"])
+        self.assertEqual(_spec("delete_user_value")["parameters"]["required"], ["key", "name"])
+
+    def test_both_state_the_flush_the_guard_and_the_mixed_fleet_answer(self):
+        for action in ("set_user_value", "delete_user_value"):
+            with self.subTest(action=action):
+                text = _words(_definitions()[f"windows.registry.{action}"]["metadata"]["description"])
+                self.assertIn("2.0.x", text)
+                self.assertIn("unknown action", text)
+        text = _words(_definitions()["windows.registry.set_user_value"]["metadata"]["description"])
+        self.assertIn("flushed", text)
+        self.assertIn("hive-file guard", text)
+
+    def test_the_status_column_names_the_hive_warnings_and_the_audit_row(self):
+        for action in ("set_user_value", "delete_user_value"):
+            with self.subTest(action=action):
+                cols = _spec(action)["result"]["columns"]
+                self.assertEqual([c["name"] for c in cols], ["status"])
+                self.assertIn(f"audit|op={action}|", cols[0]["description"])
+                self.assertIn("hive=HKU", cols[0]["description"])
+
+
+class RegistryApply(unittest.TestCase):
+    def test_plan_is_the_only_required_parameter_and_is_bounded_to_64_kib(self):
+        params = _spec("apply")["parameters"]
+        self.assertEqual(params["required"], ["plan"])
+        self.assertEqual(sorted(params["properties"]), ["continue_on_error", "dry_run", "plan"])
+        self.assertEqual(params["properties"]["plan"]["validation"]["maxLength"], 65536)
+        self.assertIn("256", params["properties"]["plan"]["description"])
+
+    def test_dry_run_defaults_to_true_and_continue_on_error_to_false(self):
+        props = _spec("apply")["parameters"]["properties"]
+        self.assertEqual(props["dry_run"]["default"], "true")
+        self.assertEqual(props["continue_on_error"]["default"], "false")
+        for flag in ("dry_run", "continue_on_error"):
+            with self.subTest(flag=flag):
+                self.assertEqual(props[flag]["type"], "string")
+                self.assertEqual(props[flag]["validation"]["enum"], ["true", "false"])
+
+    def test_result_columns_are_the_row_kind_and_thirteen_fields(self):
+        cols = _spec("apply")["result"]["columns"]
+        self.assertEqual([c["name"] for c in cols], APPLY_COLUMNS)
+        self.assertEqual(cols[0]["values"], ["item", "undo", "audit", "summary"])
+
+    def test_description_states_the_contract_an_operator_acts_on(self):
+        text = _words(_definitions()["windows.registry.apply"]["metadata"]["description"])
+        for needle in ("Dry run is the default", "ONE verdict function", "dependent_items", "NOT transactional",
+                       "unrepresentable_name", "THE EXACT-NAME RULE", "512 KiB", "undo_complete=0",
+                       "cannot see the ACL a key that does not exist yet will inherit", "2.0.x", "unknown action",
+                       "600 rows per agent per minute"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, text)
+
+    def test_the_audit_columns_follow_the_audit_line_order(self):
+        # field_1..field_13 of an `audit` row are the first 13 tokens of the audit line: op, hive, result, reason, verify,
+        # key, name, type, len, dry_run, counted_keys, counted_values, capped (registry_parsers.hpp render_audit_line).
+        cols = {c["name"]: c["description"] for c in _spec("apply")["result"]["columns"]}
+        for field, token in zip(range(1, 14), ("op=apply.<op>", "hive=", "result=", "reason=", "verify=", "key=", "name=",
+                                               "type=", "len=", "dry_run=", "counted_keys=", "counted_values=", "capped=")):
+            with self.subTest(field=field):
+                self.assertIn(f"audit: {token}", cols[f"field_{field}"])
 
 
 class RegistryDefinitionPins(unittest.TestCase):
     """Values a quiet edit could weaken while every test above stayed green."""
 
     def test_hive_enum_is_the_four_hives(self):
-        for action in MUTATING:
+        for action in HIVE_PARAMETER:
             with self.subTest(action=action):
                 enum = _spec(action)["parameters"]["properties"]["hive"]["validation"]["enum"]
                 self.assertEqual(enum, ["HKLM", "HKCU", "HKCR", "HKU"])
@@ -132,16 +244,17 @@ class RegistryDefinitionPins(unittest.TestCase):
         # Declared and exported, not compared at dispatch (docs/user-manual/upgrading.md): 1.0.0 named no agent.
         for action in MUTATING:
             with self.subTest(action=action):
-                self.assertEqual(_spec(action)["compatibility"]["minAgentVersion"], "0.15.0")
+                self.assertGreaterEqual(_version(_spec(action)["compatibility"]["minAgentVersion"]), (0, 15, 0))
 
     def test_definition_versions_and_the_plugin_doc_version(self):
-        want = {"get_value": "1.1.0", "set_value": "1.1.0", "delete_value": "1.1.0", "delete_key": "1.1.0"}
+        want = {"get_value": "1.1.0", "set_value": "1.1.0", "delete_value": "1.1.0", "delete_key": "1.2.0",
+                "set_user_value": "1.0.0", "delete_user_value": "1.0.0", "apply": "1.0.0"}
         got = {d["spec"]["execution"]["action"]: d["metadata"]["version"] for d in _definitions().values()}
         for action, version in want.items():
             with self.subTest(action=action):
                 self.assertEqual(got[action], version)
         docs = json.loads((REPO_ROOT / "content" / "plugin-docs" / "registry.json").read_text(encoding="utf-8"))
-        self.assertEqual(docs["version"], "2.0.1")
+        self.assertEqual(docs["version"], "2.1.0")
 
     def test_no_registry_fixture_spells_the_scratch_key_stem_itself(self):
         # tests/unit/test_helpers.hpp registry_scratch_prefix() is the one place the `YuzuTest-` stem is written: it

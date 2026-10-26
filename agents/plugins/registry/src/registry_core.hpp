@@ -55,11 +55,26 @@
  * first component's name plus the remaining requested components, so a link completed after its probe, or a
  * component moved by a rename, refuses `key_is_link` instead of landing the write on the object it now reaches.
  * A same-path substitution (a plain key recreated at the requested name) is not a redirect and stays out of scope.
+ *
+ * RECURSIVE delete_key (count_tree, delete_subtree): RegDeleteTreeW is never called (it follows a link found inside
+ * the tree). The vet walk opens every child from its parent's HANDLE with REG_OPTION_OPEN_LINK and probes it for a
+ * link (a hit refuses key_is_link); it is a SIZE BOUND (kMaxTreeNodes keys and values, kMaxTreeDepth levels) and a link
+ * sweep, NOT a membership list. The delete walk re-opens and re-probes every child it finds AT DELETE TIME and removes
+ * it post-order by its own handle, so a key added after the vet is deleted and counted like any other (it sits under the
+ * key the operator named), a link added after the vet is refused key_is_link, and a tree that outgrew the bound stops
+ * concurrent_change; the counts it reports are what it REMOVED.
+ *
+ * `apply` (run_apply) opens each DISTINCT key of a plan once on a checked handle and reuses it for the later value
+ * items on that key; one verdict function (refusal_reason) is taken over the same facts in a dry run and a real run, and
+ * a real run mutates only after it. The undo manifest it returns is bounded by ONE budget (CaptureBudget).
  */
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
+#include <map>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -67,6 +82,7 @@
 #include <vector>
 
 #include "registry_parsers.hpp"
+#include "registry_plan.hpp"
 
 namespace yuzu {
 class CommandContext;
@@ -197,6 +213,9 @@ struct RegistryWriter {
     /// follows a registry link found inside the tree (measured 2026-10-19). noexcept: the rollback calls it from a
     /// destructor.
     virtual long delete_key_by_handle(Handle key) noexcept = 0;
+    /// RegFlushKey(key): writes the key's hive to disk. The per-user write arm calls it on an offline-mounted hive
+    /// before the unload, because RegUnLoadKeyW does not itself modify the file.
+    virtual long flush_key(Handle key) = 0;
 };
 
 /// Closes a non-predefined handle on scope exit (a predefined root is never wrapped).
@@ -260,8 +279,11 @@ struct Opened {
     /// The checked handle every mutation runs on.
     [[nodiscard]] Handle handle() const noexcept { return made.empty() ? leaf.get() : made.back().get(); }
 
-    /// The verified write is over: the keys it made stay (reported in `created`) and their handles close.
+    /// The verified write is over: the keys it made stay (reported in `created`). The leaf stays OPEN as `leaf`, so a
+    /// caller that holds the Opened (apply, which reuses one handle per key) keeps working on it; the intermediate
+    /// handles close. The destructor closes the leaf, so no handle outlives the Opened.
     void commit() noexcept {
+        if (!made.empty()) leaf = std::move(made.back());
         made.clear();
         value_landed = false;
     }
@@ -354,9 +376,19 @@ struct Opened {
 /// directly under the hive root as root_level_create (README). `fast_eligible` (HKLM and HKU, decided by the
 /// shell) tries open_fast first; a missing key, a refusal and every doubt fall through to the walk below. A
 /// creating walk returns the keys it made inside the Opened (see there): the caller commits them.
+///
+/// `probe_create` (apply's dry run, with create=false): where a real run would create a missing component, answer the
+/// question "could it?" without creating anything. At the first missing component the walk re-opens the DEEPEST EXISTING
+/// key with KEY_CREATE_SUB_KEY (RegOpenKeyExW(h, L"") is an access-checked new handle to the same key): a denial is
+/// `access_denied`, exactly what the real run's create would answer; success closes the probe and the walk answers
+/// key_not_found with `missing` set. A first component missing under the hive root is `root_level_create` in both
+/// modes. LIMIT (documented, not closable here): the probe proves create access on the EXISTING parent only. The ACL a
+/// key that does not exist yet would INHERIT is first seen by the real run, which can therefore still answer failed
+/// (the keys it made are rolled back by handle, `created` reports what stayed) where the dry run said would_apply.
 [[nodiscard]] inline Opened open_checked(RegistryWriter& reg, Handle root, std::string_view key_path,
                                          std::uint32_t leaf_access, bool create,
-                                         bool leaf_may_be_link = false, bool fast_eligible = false) {
+                                         bool leaf_may_be_link = false, bool fast_eligible = false,
+                                         bool probe_create = false) {
     if (fast_eligible)
         if (auto fast = open_fast(reg, root, key_path, leaf_access, leaf_may_be_link); fast.fast) return fast;
     Opened out{reg};
@@ -394,11 +426,19 @@ struct Opened {
             rc = reg.open_sub(parent, parts[i], kKeyQueryValue, next);
         if (rc == kErrorFileNotFound || rc == kErrorPathNotFound) {
             out.missing = static_cast<unsigned>(parts.size() - i);
-            if (i == 0 && create) { // a component missing directly under the hive root is never created
+            if (i == 0 && (create || probe_create)) { // a component missing directly under the hive root is never created
                 out.error = std::string{kTokRootLevelCreate};
                 return out;
             }
             if (!create) {
+                if (probe_create) { // i > 0: `parent` is the deepest existing key, still open
+                    Handle probe = 0;
+                    if (const long prc = reg.open_sub(parent, "", kKeyCreateSubKey, probe); prc != kErrorSuccess) {
+                        out.error = rc_token(prc, Missing::key);
+                        return out;
+                    }
+                    const Owned closes{reg, probe}; // the probe created nothing; it only asked
+                }
                 out.error = std::string{kTokKeyNotFound};
                 return out;
             }
@@ -494,6 +534,7 @@ struct WriteOutcome {
     std::uint64_t counted_keys = 0;
     std::uint64_t counted_values = 0;
     bool capped = false;
+    bool dry_run = false; ///< delete_key: the request asked to count and delete nothing
     [[nodiscard]] bool ok() const noexcept { return result == "ok"; }
 
     /// Records a failure: `attempted` false = refused (nothing was mutated), true = failed (a mutation ran).
@@ -547,10 +588,20 @@ struct WriteOutcome {
     return o;
 }
 
+/// `flush` (the per-user write arm, on an offline-mounted hive): RegFlushKey on the written key's handle, so the change
+/// reaches the hive FILE before RegUnLoadKeyW, whose documentation says unloading does not itself modify the file. A
+/// flush failure fails the write (`flush_failed:<rc token>`, a mutation was attempted): durability is unknown. Only
+/// called after a verified write, never after a refusal. False when it failed.
+inline bool flush_on(RegistryWriter& reg, Handle h, WriteOutcome& o) {
+    const long rc = reg.flush_key(h);
+    if (rc != kErrorSuccess) o.fail("flush_failed:" + rc_token(rc, Missing::key), true);
+    return rc == kErrorSuccess;
+}
+
 [[nodiscard]] inline WriteOutcome set_value_verified(RegistryWriter& reg, Handle root, std::string_view key,
                                                      std::string_view name, std::uint32_t type,
                                                      std::span<const std::uint8_t> bytes,
-                                                     bool fast_eligible = false) {
+                                                     bool fast_eligible = false, bool flush = false) {
     auto op = open_checked(reg, root, key, kKeySetValue | kKeyQueryValue, /*create=*/true,
                            /*leaf_may_be_link=*/false, fast_eligible);
     if (!op.error.empty()) {
@@ -562,7 +613,13 @@ struct WriteOutcome {
     op.value_name = name; // a creating write that unwinds first removes this value again (Opened::rollback)
     OldValue old = capture_old(reg, op.handle(), name);
     WriteOutcome o = write_value_on(reg, op.handle(), name, type, bytes, &op.value_landed);
-    op.commit(); // the verified write is over, whatever it concluded: the keys it made stay and are reported
+    // A write whose flush failed is NOT committed: the destructor-path rollback removes the value and the keys this
+    // call made (best effort), so a creating write that cannot be made durable does not leave its keys behind. Any
+    // other outcome is over, whatever it concluded: the keys it made stay and are reported.
+    if (flush && o.ok() && !flush_on(reg, op.handle(), o))
+        op.rollback();
+    else
+        op.commit();
     o.created = op.created;
     o.old = std::move(old);
     o.has_old = true;
@@ -570,7 +627,8 @@ struct WriteOutcome {
 }
 
 [[nodiscard]] inline WriteOutcome delete_value_verified(RegistryWriter& reg, Handle root, std::string_view key,
-                                                        std::string_view name, bool fast_eligible = false) {
+                                                        std::string_view name, bool fast_eligible = false,
+                                                        bool flush = false) {
     auto op = open_checked(reg, root, key, kKeySetValue | kKeyQueryValue, /*create=*/false,
                            /*leaf_may_be_link=*/false, fast_eligible);
     if (!op.error.empty()) {
@@ -584,6 +642,7 @@ struct WriteOutcome {
         o.fail(std::string{kTokValueNotFound}, false);
     else
         o = delete_value_on(reg, op.handle(), name);
+    if (flush && o.ok()) (void)flush_on(reg, op.handle(), o);
     o.old = std::move(old);
     o.has_old = true;
     return o;
@@ -594,78 +653,207 @@ struct WriteOutcome {
 struct TreeCount {
     std::uint64_t keys = 0, values = 0, nodes = 0;
     bool capped = false;
+    bool attempted = false; ///< the delete walk only: an NtDeleteKey was issued (so a stop is `failed`, not `refused`)
     std::string error;
 };
 
-/// Counts the values of the leaf `h`: nodes are keys + values, and the key itself is node 1 (so the cap is
-/// the key plus up to kMaxTreeNodes - 1 values). kMaxTreeNodes bounds the enumeration at 10,000 iterations even
-/// when the value set grows between calls. Past the bound `capped` is set and `values` is a lower bound; the
-/// delete still proceeds, because NtDeleteKey of a leaf removes its values.
-[[nodiscard]] inline TreeCount count_values(RegistryWriter& reg, Handle h) {
-    TreeCount c;
-    c.keys = 1;
-    c.nodes = 1;
+/// Adds the values of the key `h` to `c`: nodes are keys + values, and the caller has already counted the key itself, so
+/// the cap is kMaxTreeNodes nodes in all. kMaxTreeNodes bounds the enumeration at 10,000 iterations even when the value
+/// set grows between calls. Past the bound `capped` is set and `values` is a lower bound.
+inline void count_values_into(RegistryWriter& reg, Handle h, TreeCount& c) {
     std::string name;
     for (std::uint32_t i = 0;; ++i) {
         const long rc = reg.enum_value(h, i, name);
-        if (rc == kErrorNoMoreItems) return c;
+        if (rc == kErrorNoMoreItems) return;
         if (rc != kErrorSuccess) {
             c.error = rc_token(rc, Missing::value);
-            return c;
+            return;
         }
         if (c.nodes >= kMaxTreeNodes) {
             c.capped = true;
-            return c;
+            return;
         }
         ++c.values;
         ++c.nodes;
     }
 }
 
-/// Deletes the key on the checked handle `h` with NtDeleteKey(h), verified by the deleted handle reporting
-/// ERROR_KEY_DELETED.
-[[nodiscard]] inline WriteOutcome delete_key_on(RegistryWriter& reg, Handle h) {
-    WriteOutcome o;
-    if (const long rc = reg.delete_key_by_handle(h); rc != kErrorSuccess) {
-        o.fail(rc_token(rc, Missing::key), true);
-        return o;
+/// Counts the values of the leaf `h`: the key itself is node 1 (so the cap is the key plus up to kMaxTreeNodes - 1
+/// values). A leaf delete proceeds past the cap, because NtDeleteKey of a leaf removes its values whatever their number.
+[[nodiscard]] inline TreeCount count_values(RegistryWriter& reg, Handle h) {
+    TreeCount c;
+    c.keys = 1;
+    c.nodes = 1;
+    count_values_into(reg, h, c);
+    return c;
+}
+
+/// The VET of a recursive delete: counts `h` and everything beneath it, depth first. Every child is opened from its
+/// parent's handle with REG_OPTION_OPEN_LINK and probed for a link; a link inside the tree fails the walk closed
+/// (key_is_link), because nothing may be deleted through a redirect. It is a SIZE BOUND and a LINK SWEEP, not a
+/// membership list (README "delete_key"): kMaxTreeNodes and kMaxTreeDepth cap it, `capped` is then set and the counts
+/// are a lower bound, and delete_key_tree refuses a REAL recursive delete of a tree it could not finish
+/// (tree_too_large) so that no unvetted tail is ever deleted. The real delete is delete_subtree, which re-checks every
+/// key. One Owned per level is held (at most kMaxTreeDepth + 1 handles).
+inline void count_tree(RegistryWriter& reg, Handle h, TreeCount& c, unsigned depth = 0) {
+    if (depth > kMaxTreeDepth || c.nodes >= kMaxTreeNodes) {
+        c.capped = true;
+        return;
     }
-    o.mutated = true;
+    ++c.keys;
+    ++c.nodes;
+    count_values_into(reg, h, c);
+    if (c.capped || !c.error.empty()) return;
+    std::string name;
+    for (std::uint32_t i = 0;; ++i) {
+        const long rc = reg.enum_subkey(h, i, name);
+        if (rc == kErrorNoMoreItems) return;
+        if (rc != kErrorSuccess) {
+            c.error = rc_token(rc, Missing::key);
+            return;
+        }
+        Handle child = 0;
+        if (const long orc = reg.open_sub(h, name, kKeyQueryValue | kKeyEnumerateSubKeys, child); orc != kErrorSuccess) {
+            c.error = rc_token(orc, Missing::key);
+            return;
+        }
+        const Owned guard{reg, child};
+        if (auto link = probe_link(reg, child); !link.empty()) {
+            c.error = std::move(link);
+            return;
+        }
+        count_tree(reg, child, c, depth + 1);
+        if (c.capped || !c.error.empty()) return;
+    }
+}
+
+/// The delete of a recursive delete_key: removes the tree under `h` post-order and then `h` itself, every removal an
+/// NtDeleteKey on the key's OWN handle. Each child found AT DELETE TIME is opened with REG_OPTION_OPEN_LINK and probed
+/// again (count_tree ran earlier, and a link planted since is the link object itself: it STOPS the walk with key_is_link
+/// and is never entered or followed), so a key added after the vet is deleted and counted like any other. A tree that
+/// outgrew the bound (nodes or levels) stops concurrent_change. `d` holds what this walk REMOVED, so a stop reports
+/// the partial truth. ponytail: the per-child kernel-name check is not repeated here (one NtQueryKey per child on the
+/// delete path); a half-made link is still only ever deleted as its own object, by its own handle.
+inline void delete_subtree(RegistryWriter& reg, Handle h, TreeCount& d, unsigned depth = 0) {
+    if (depth > kMaxTreeDepth || d.nodes >= kMaxTreeNodes) {
+        d.error = std::string{kTokConcurrentChange};
+        return;
+    }
+    std::string name;
+    for (;;) {
+        const long rc = reg.enum_subkey(h, 0, name); // a removed child no longer enumerates
+        if (rc == kErrorNoMoreItems) break;
+        if (rc != kErrorSuccess) {
+            d.error = rc_token(rc, Missing::key);
+            return;
+        }
+        Handle child = 0;
+        if (const long orc = reg.open_sub(h, name, kAccessDelete | kKeyQueryValue | kKeyEnumerateSubKeys, child);
+            orc != kErrorSuccess) {
+            d.error = rc_token(orc, Missing::key);
+            return;
+        }
+        const Owned guard{reg, child};
+        if (auto link = probe_link(reg, child); !link.empty()) {
+            d.error = std::move(link);
+            return;
+        }
+        delete_subtree(reg, child, d, depth + 1);
+        if (!d.error.empty()) return;
+    }
+    const TreeCount own = count_values(reg, h); // this key's values, counted before the delete takes them
+    if (!own.error.empty() || own.capped) {
+        d.error = own.error.empty() ? std::string{kTokConcurrentChange} : own.error;
+        return;
+    }
+    d.attempted = true;
+    if (const long rc = reg.delete_key_by_handle(h); rc != kErrorSuccess) {
+        d.error = rc_token(rc, Missing::key);
+        return;
+    }
+    ++d.keys;
+    d.values += own.values;
+    d.nodes += own.nodes;
+}
+
+/// Deletes the key on the checked handle `h`: with `recursive`, everything beneath it first (delete_subtree, which also
+/// removes `h`), else NtDeleteKey(h). Verified by the deleted handle reporting ERROR_KEY_DELETED. A recursive run's
+/// counts are what the walk REMOVED (a stop reports the partial total); a non-recursive run leaves them 0 (the caller
+/// has the vet's).
+[[nodiscard]] inline WriteOutcome delete_key_on(RegistryWriter& reg, Handle h, bool recursive = false) {
+    WriteOutcome o;
+    if (recursive) {
+        TreeCount d;
+        delete_subtree(reg, h, d);
+        o.counted_keys = d.keys;
+        o.counted_values = d.values;
+        o.mutated = d.keys > 0;
+        if (!d.error.empty()) {
+            o.fail(d.error, d.attempted);
+            return o;
+        }
+    } else {
+        if (const long rc = reg.delete_key_by_handle(h); rc != kErrorSuccess) {
+            o.fail(rc_token(rc, Missing::key), true);
+            return o;
+        }
+        o.mutated = true;
+    }
     QueryResult q;
     o.confirm(reg.query_value(h, "", 0, q) == kErrorKeyDeleted);
     return o;
 }
 
-/// Non-recursive delete_key: a key with subkeys is refused `key_has_subkeys` and nothing is deleted. A leaf's
-/// counts are what the enumeration saw before the delete (a lower bound when `capped`); a link leaf is
-/// opened as the link object, so the delete removes the link and never its target.
+/// delete_key. Non-recursive (the default): a key with subkeys is refused `key_has_subkeys` and nothing is deleted; a
+/// leaf's counts are what the enumeration saw before the delete (a lower bound when `capped`); a link leaf is opened as
+/// the link object, so the delete removes the link and never its target. `recursive`: the vet (count_tree) first, then
+/// delete_subtree. `dry_run`: the vet only -- result ok, the vet's counts, nothing deleted. Counts: a dry run, a
+/// refusal and a non-recursive delete report the vet's count (a lower bound when capped; a refusal reports what was
+/// counted before it); a REAL recursive delete reports what its walk REMOVED -- exact when ok, the partial total when
+/// it stopped -- which can exceed a dry run's snapshot. A REAL recursive delete whose vet was capped is refused
+/// tree_too_large with nothing deleted. (The recursion flags follow `fast_eligible` so every earlier caller's
+/// positional arguments keep their meaning.)
 [[nodiscard]] inline WriteOutcome delete_key_tree(RegistryWriter& reg, Handle root, std::string_view key,
-                                                  bool fast_eligible = false) {
+                                                  bool fast_eligible = false, bool recursive = false,
+                                                  bool dry_run = false) {
     auto op = open_checked(reg, root, key, kAccessDelete | kKeyEnumerateSubKeys | kKeyQueryValue,
                            /*create=*/false, /*leaf_may_be_link=*/true, fast_eligible);
     if (!op.error.empty()) {
         WriteOutcome o;
+        o.dry_run = dry_run;
         o.fail(op.error, false);
         return o;
     }
     const Handle h = op.handle();
     TreeCount c;
-    std::string first;
-    const long rc = reg.enum_subkey(h, 0, first);
-    if (rc == kErrorSuccess)
-        c.error = std::string{kTokKeyHasSubkeys};
-    else if (rc != kErrorNoMoreItems)
-        c.error = rc_token(rc, Missing::key);
-    else
-        c = count_values(reg, h);
+    if (recursive) {
+        count_tree(reg, h, c);
+    } else {
+        std::string first;
+        const long rc = reg.enum_subkey(h, 0, first);
+        if (rc == kErrorSuccess)
+            c.error = std::string{kTokKeyHasSubkeys};
+        else if (rc != kErrorNoMoreItems)
+            c.error = rc_token(rc, Missing::key);
+        else
+            c = count_values(reg, h);
+    }
     WriteOutcome o;
-    if (c.error.empty())
-        o = delete_key_on(reg, h);
-    else
+    const bool too_large = recursive && c.capped && !dry_run;
+    if (!c.error.empty())
         o.fail(c.error, false);
-    o.counted_keys = c.keys;
-    o.counted_values = c.values;
-    o.capped = c.capped;
+    else if (too_large)
+        o.fail(std::string{kTokTreeTooLarge}, false);
+    else if (dry_run)
+        o.result = "ok";
+    else
+        o = delete_key_on(reg, h, recursive);
+    o.dry_run = dry_run;
+    if (!(recursive && !dry_run && c.error.empty() && !too_large)) { // else: the walk's removed counts stand
+        o.counted_keys = c.keys;
+        o.counted_values = c.values;
+        o.capped = c.capped;
+    }
     return o;
 }
 
@@ -699,7 +887,7 @@ inline void fill_old(AuditRecord& au, const OldValue& old) {
     base.created = static_cast<long long>(o.created);
     if (o.has_old) fill_old(base, o.old);
     if (is_delete_key) {
-        base.dry_run = 0;
+        base.dry_run = o.dry_run ? 1 : 0;
         base.counted_keys = static_cast<long long>(o.counted_keys);
         base.counted_values = static_cast<long long>(o.counted_values);
         base.capped = o.capped ? 1 : 0;
@@ -716,9 +904,419 @@ inline void fill_old(AuditRecord& au, const OldValue& old) {
     if (is_delete_key) {
         out.lines.push_back("counted_keys|" + std::to_string(o.counted_keys));
         out.lines.push_back("counted_values|" + std::to_string(o.counted_values));
-        out.lines.push_back("dry_run|0");
+        out.lines.push_back(std::string{"dry_run|"} + (o.dry_run ? "1" : "0"));
         out.lines.push_back(std::string{"capped|"} + (o.capped ? "1" : "0"));
     }
+    return out;
+}
+
+// ── per-user write output ────────────────────────────────────────────────
+
+/// What with_user_hive and the post-unload probe reported (registry_win.cpp fills it).
+struct HiveFacts {
+    yuzu::profiles::HiveAccessStatus status = yuzu::profiles::HiveAccessStatus::ok;
+    bool unload_failed = false;
+    std::string mount_name;
+    std::string refusal;      ///< the OfflineHiveFileCheck token when status == file_refused
+    std::string race_warning; ///< classify_offline_write_race's token ("" = none)
+};
+
+/// The wire output of set_user_value / delete_user_value, in emission order: the hive-access lines (the unload warning
+/// first, then the terminal hive error, which names the file-guard refusal token when there is one: unload_failed can be
+/// true even on mount_failed), the offline-write race warning, then the audit line and `status|ok` / `error|<token>`. A
+/// hive that was not reached or was refused means nothing was written: the audit result is `refused` with the hive reason
+/// (hive_not_found, privilege_missing, hive_mount_failed, or the guard's own token). A verified, flushed write whose mount
+/// then failed to unload stays result=ok (the write is durable) with reason=hive_unload_failed in the audit trail. rc is
+/// 1 unless the write is ok. `au` arrives pre-filled like render_single_action's `base`; the sid is set here.
+[[nodiscard]] inline ActionOutput render_user_write(AuditRecord au, WriteOutcome wo, const HiveFacts& hf,
+                                                    std::string_view sid) {
+    using yuzu::profiles::HiveAccessStatus;
+    ActionOutput out;
+    out.lines = yuzu::profiles::render_hive_access_lines(hf.status, hf.unload_failed, hf.mount_name, sid, hf.refusal);
+    if (!hf.race_warning.empty()) out.lines.push_back("warning|" + hf.race_warning);
+    if (hf.status != HiveAccessStatus::ok) {
+        wo = WriteOutcome{};
+        switch (hf.status) {
+        case HiveAccessStatus::not_found: wo.reason = "hive_not_found"; break;
+        case HiveAccessStatus::privilege_missing: wo.reason = "privilege_missing"; break;
+        case HiveAccessStatus::mount_failed: wo.reason = "hive_mount_failed"; break;
+        case HiveAccessStatus::file_refused: wo.reason = hf.refusal.empty() ? "hive_file_refused" : hf.refusal; break;
+        case HiveAccessStatus::ok: break;
+        }
+    } else if (wo.ok() && hf.unload_failed) {
+        wo.reason = "hive_unload_failed";
+    }
+    au.sid = std::string{sid};
+    auto single = render_single_action(std::move(au), wo, false);
+    out.rc = single.rc;
+    for (auto& line : single.lines) out.lines.push_back(std::move(line));
+    return out;
+}
+
+// ── apply ────────────────────────────────────────────────────────────────
+
+/// A value of a key an item deletes, retained for the undo manifest (a row's worth, charged to the CaptureBudget).
+struct NamedValue {
+    std::string name;
+    OldValue v;
+};
+
+/// Everything the verdict function sees about one item, captured on the item's own checked handle (the same facts in a
+/// dry run and a real run).
+struct ItemFacts {
+    std::string open_error;   ///< open_checked's token other than a plain missing key
+    bool key_exists = true;
+    OldValue old;             ///< value ops: the previous value (full, up to kCaptureValueCap)
+    bool has_subkeys = false; ///< delete_key
+    std::string leaf_error;   ///< delete_key: enumerating or vetting the leaf's values answered a refusal token
+    bool leaf_capped = false; ///< delete_key: the leaf holds more values than count_values' bound
+    std::uint64_t leaf_value_count = 0;
+    std::vector<NamedValue> leaf_values; ///< delete_key: the values retained for the undo manifest, budget permitting
+};
+
+/// THE verdict function: "" = the item proceeds, else the refusal token. A dry run and a real run call it with the same
+/// facts, so their verdicts are identical (the parser's dependent_items refusal guarantees no earlier item changes what a
+/// later one captures, apart from creating a key, which run_apply's dry run simulates). It reads no mode.
+[[nodiscard]] inline std::string refusal_reason(const PlanItem& item, const ItemFacts& f) {
+    if (!item.invalid.empty()) return item.invalid;
+    if (!f.open_error.empty()) return f.open_error;
+    switch (item.op) {
+    case PlanOp::set_value:
+        if (f.old.state == OldState::unreadable) return f.old.error;
+        if (!restorable(f.old)) return std::string{kTokUnsupportedOldType};
+        return {};
+    case PlanOp::delete_value:
+        if (!f.key_exists) return std::string{kTokKeyNotFound};
+        if (f.old.state == OldState::absent) return std::string{kTokValueNotFound};
+        if (f.old.state == OldState::unreadable) return f.old.error;
+        if (!restorable(f.old)) return std::string{kTokUnsupportedOldType};
+        return {};
+    case PlanOp::create_key: return {};
+    case PlanOp::delete_key:
+        if (!f.key_exists) return std::string{kTokKeyNotFound};
+        if (f.has_subkeys) return std::string{kTokKeyHasSubkeys};
+        if (!f.leaf_error.empty()) return f.leaf_error;
+        if (f.leaf_capped) return std::string{kTokTreeTooLarge};
+        return {};
+    }
+    return {};
+}
+
+/// The ONE budget of everything a plan retains for its undo manifest: every retained row is charged its name bytes, its
+/// data bytes and kUndoRowOverhead BEFORE anything is kept or rendered, against kCaptureTotalCap. A row that does not fit
+/// is not retained and the manifest is flagged incomplete (`undo_complete=0` in the summary, visible in the dry run, which
+/// charges identically); so is a value cut at kCaptureValueCap. Hex doubles what is retained, which keeps the whole reply
+/// under the dispatcher's 2 MiB output cap (agents/core/src/local_dispatcher.hpp):
+///   - retained rows: <= 512 KiB charged => <= ~1 MiB of rendered hex, names and row text;
+///   - <= 256 audit lines, each < 2 KiB (render_audit_line): <= 512 KiB;
+///   - <= 256 item rows whose key and name come from the <= 64 KiB plan: ~110 KiB; one summary row.
+/// A deleted key's values are STREAMED (vet_leaf_values) and only the ones that fit are retained.
+struct CaptureBudget {
+    std::size_t remaining = kCaptureTotalCap;
+    bool incomplete = false;
+
+    /// Charges one row; false = it does not fit (nothing may be kept) and the manifest is incomplete.
+    [[nodiscard]] bool charge(std::size_t name_bytes, std::size_t data_bytes) noexcept {
+        const std::size_t cost = name_bytes + data_bytes + kUndoRowOverhead;
+        if (cost > remaining) {
+            incomplete = true;
+            return false;
+        }
+        remaining -= cost;
+        return true;
+    }
+};
+
+/// The previous value of a value op as the item row keeps it: charged to the budget, and its bytes dropped (metadata and
+/// `~total` stay) when the row does not fit. A value cut at kCaptureValueCap flags the manifest incomplete.
+[[nodiscard]] inline OldValue budgeted_old(CaptureBudget& budget, std::string_view name, const OldValue& old) {
+    OldValue kept = old;
+    if (old.state != OldState::present) return kept;
+    if (old.bytes.size() < old.total) budget.incomplete = true;
+    if (!budget.charge(name.size(), old.bytes.size())) kept.bytes.clear();
+    return kept;
+}
+
+/// A name this plugin can write back AND the manifest can spell exactly: set_value's own check plus `representable`.
+[[nodiscard]] inline bool name_restorable(std::string_view name) {
+    return validate_value_name(name).empty() && representable(name);
+}
+
+/// What an enumerated value failed with: a name that is not restorable, a value the enumeration listed but a query cannot
+/// find (a name that did not round-trip, or one removed under us), an unreadable value or a type this plugin cannot write.
+[[nodiscard]] inline std::string leaf_value_defect(std::string_view name, const OldValue& v) {
+    if (!name_restorable(name)) return std::string{kTokUnrepresentableName};
+    if (v.state == OldState::absent) {
+        // The enumeration just reported this value, so a re-open that cannot find it is never "nothing to restore":
+        // either the name does not round-trip (a lone surrogate maps to U+FFFD, win_str.hpp, and opens a DIFFERENT name)
+        // or it was removed under us. Refuse before the key is deleted.
+        return name.find("\xEF\xBF\xBD") != std::string_view::npos ? std::string{kTokUnrepresentableName}
+                                                                    : std::string{kTokConcurrentChange};
+    }
+    if (v.state == OldState::unreadable) return v.error;
+    if (!restorable(v)) return std::string{kTokUnsupportedOldType};
+    return {};
+}
+
+struct LeafVet {
+    std::string error;      ///< the first defect of any value ("" = every value can be restored)
+    bool capped = false;    ///< more values than count_values' bound: nothing is deleted (tree_too_large)
+    std::uint64_t values = 0;
+};
+
+/// Streams EVERY value of the leaf `h` (enum_value + one capture each, nothing retained) up to count_values' bound and
+/// answers the first defect it meets, so the refuse-before-delete promise covers every value, not only the ones the
+/// budget can keep.
+[[nodiscard]] inline LeafVet vet_leaf_values(RegistryWriter& reg, Handle h) {
+    LeafVet vet;
+    std::string name;
+    for (std::uint32_t i = 0;; ++i) {
+        const long rc = reg.enum_value(h, i, name);
+        if (rc == kErrorNoMoreItems) return vet;
+        if (rc != kErrorSuccess) {
+            vet.error = rc_token(rc, Missing::value);
+            return vet;
+        }
+        if (static_cast<std::size_t>(i) + 1 >= kMaxTreeNodes) { // the key is node 1: count_values' bound
+            vet.capped = true;
+            return vet;
+        }
+        if (auto defect = leaf_value_defect(name, capture_old(reg, h, name)); !defect.empty()) {
+            vet.error = std::move(defect);
+            return vet;
+        }
+        ++vet.values;
+    }
+}
+
+/// Retains, in enumeration order, the values of the vetted leaf `h` that the budget keeps (a value cut at
+/// kCaptureValueCap keeps its first part; the first row that does not fit ends the retention and flags the manifest
+/// incomplete). A defect the vet did not see (a value that changed since) refuses via `f.leaf_error`.
+inline void capture_leaf_values(RegistryWriter& reg, Handle h, CaptureBudget& budget, ItemFacts& f) {
+    std::string name;
+    for (std::uint32_t i = 0;; ++i) {
+        const long rc = reg.enum_value(h, i, name);
+        if (rc == kErrorNoMoreItems) return;
+        if (rc != kErrorSuccess) {
+            f.leaf_error = rc_token(rc, Missing::value);
+            return;
+        }
+        if (static_cast<std::size_t>(i) + 1 >= kMaxTreeNodes) { // grew past the vet's bound since
+            f.leaf_error = std::string{kTokConcurrentChange};
+            return;
+        }
+        OldValue v = capture_old(reg, h, name);
+        if (auto defect = leaf_value_defect(name, v); !defect.empty()) {
+            f.leaf_error = std::move(defect);
+            return;
+        }
+        if (v.bytes.size() < v.total) budget.incomplete = true;
+        if (!budget.charge(name.size(), v.bytes.size())) return;
+        f.leaf_values.push_back(NamedValue{name, std::move(v)});
+    }
+}
+
+struct ApplyOptions {
+    bool dry_run = true;
+    bool continue_on_error = false;
+};
+
+/// Runs a parsed plan against the machine hive `hklm` in one pass. Per item: the key is opened ONCE per distinct
+/// (ASCII-case-folded) key on a checked handle and reused by the later items on that key (the NFR-1 shape: one checked
+/// open per key, not per item); a FAILED open is a fact for that item only and is never cached, so the next item on the
+/// key opens again with its own flags (delete_value on a missing key refused, a later set_value on it still creates it).
+/// The open uses the mutation's own access mask in BOTH modes, so a dry run sees the same denials; a dry run's create
+/// check is open_checked's `probe_create`. The facts are captured, ONE verdict (refusal_reason) is taken, and only a real
+/// run then mutates and verifies. NOT transactional: continue_on_error=false stops at the first refused or failed item (the
+/// rest are `skipped`); rc is 1 whenever any item was refused or failed. Rows, undo coverage per op and the bounds:
+/// README "apply". The handles are closed when this returns (the map dies with it), a creating item's keys that were not
+/// committed are rolled back by their Opened.
+[[nodiscard]] inline ActionOutput run_apply(RegistryWriter& reg, Handle hklm, const std::vector<PlanItem>& items,
+                                            ApplyOptions opt, bool fast_eligible = false) {
+    ActionOutput out;
+    ApplySummary sum;
+    sum.total = items.size();
+    sum.dry_run = opt.dry_run;
+    CaptureBudget budget;
+    std::map<std::string, Opened> by_key; // folded key -> its checked handle; SUCCESSFUL opens only
+    std::set<std::string> sim_created;    // dry run only: folded keys an earlier would-be item creates
+    std::vector<std::string> undo_rows;
+    bool stopped = false;
+
+    for (std::size_t idx = 0; idx < items.size(); ++idx) {
+        const PlanItem& item = items[idx];
+        ItemRow row;
+        row.index = idx;
+        row.op = std::string{plan_op_name(item.op)};
+        row.hive = item.hive;
+        row.key = item.key;
+        row.name = item.name;
+        if (stopped) {
+            row.verdict = "skipped";
+            ++sum.skipped;
+            out.lines.push_back(render_item_row(row));
+            continue;
+        }
+
+        const bool value_op = !detail::is_key_op(item.op);
+        const bool creating_op = item.op == PlanOp::set_value || item.op == PlanOp::create_key;
+        AuditRecord au;
+        au.op = "apply." + row.op;
+        au.hive = item.hive;
+        au.key = item.key;
+        au.name = item.name;
+        au.dry_run = opt.dry_run ? 1 : 0;
+        row.value_op = value_op;
+        if (item.op == PlanOp::set_value) {
+            au.type_name = item.type_name;
+            au.len = static_cast<long long>(item.bytes.size());
+            au.new_bytes = item.bytes;
+            au.new_total = item.bytes.size();
+            au.has_new = true;
+            row.new_len = au.len;
+        }
+
+        ItemFacts facts;
+        Opened* handle = nullptr; // this item's checked handle, owned by by_key
+        unsigned open_created = 0, open_missing = 0;
+        std::string fold;
+        if (item.invalid.empty()) {
+            fold = detail::fold_ascii(item.key);
+            auto it = by_key.find(fold);
+            if (it == by_key.end()) {
+                std::uint32_t mask = kKeyQueryValue;
+                if (value_op) mask |= kKeySetValue;
+                if (item.op == PlanOp::delete_key) mask |= kAccessDelete | kKeyEnumerateSubKeys;
+                // A link leaf is refused (key_is_link) for delete_key and create_key too: apply promises an undo
+                // and its vocabulary has no op that recreates a link.
+                Opened op = open_checked(reg, hklm, item.key, mask, /*create=*/!opt.dry_run && creating_op,
+                                         /*leaf_may_be_link=*/false, fast_eligible,
+                                         /*probe_create=*/opt.dry_run && creating_op);
+                open_created = op.created;
+                open_missing = op.missing;
+                if (op.error.empty())
+                    it = by_key.emplace(fold, std::move(op)).first;
+                else if (op.error == kTokKeyNotFound && (opt.dry_run || !creating_op))
+                    facts.key_exists = false; // a missing key is a fact, not an open failure
+                else // a real creating open that answers "not found" lost a race with a delete
+                    facts.open_error = op.error == kTokKeyNotFound ? std::string{kTokConcurrentChange} : op.error;
+            }
+            if (it != by_key.end()) handle = &it->second;
+            if (handle != nullptr) {
+                const Handle h = handle->handle();
+                if (value_op) {
+                    facts.old = capture_old(reg, h, item.name);
+                } else if (item.op == PlanOp::delete_key) {
+                    std::string first;
+                    const long rc = reg.enum_subkey(h, 0, first);
+                    facts.has_subkeys = rc == kErrorSuccess;
+                    if (rc != kErrorSuccess && rc != kErrorNoMoreItems) facts.leaf_error = rc_token(rc, Missing::key);
+                    if (!facts.has_subkeys && facts.leaf_error.empty()) {
+                        const LeafVet vet = vet_leaf_values(reg, h);
+                        facts.leaf_error = vet.error;
+                        facts.leaf_capped = vet.capped;
+                        facts.leaf_value_count = vet.values;
+                        if (vet.error.empty() && !vet.capped) capture_leaf_values(reg, h, budget, facts);
+                    }
+                }
+            }
+            if (opt.dry_run && !facts.key_exists) {
+                // A dry run creates nothing, so the key an earlier would-be item creates is still missing here: predict
+                // `created` through the folded prefixes those items would make, and let a delete_value see such a key.
+                if (creating_op) {
+                    const auto parts = split_key(item.key);
+                    std::string prefix;
+                    unsigned would = 0;
+                    for (std::size_t i = 0; i < parts.size(); ++i) {
+                        prefix += (i != 0 ? "\\" : "") + detail::fold_ascii(parts[i]);
+                        if (i + open_missing >= parts.size() && sim_created.insert(prefix).second) ++would;
+                    }
+                    open_created = would;
+                } else if (sim_created.contains(fold)) {
+                    facts.key_exists = true; // the real run would find it (with no values in it)
+                }
+            }
+            row.created = static_cast<long long>(open_created);
+            au.created = row.created;
+        }
+        std::string reason = refusal_reason(item, facts);
+        // Unreachable by construction (a real run's creating open either yields a handle or an open_error, and the other
+        // ops refuse a missing key); it keeps a null handle from ever being dereferenced below.
+        if (reason.empty() && !opt.dry_run && handle == nullptr) reason = std::string{kTokConcurrentChange};
+
+        if (value_op) {
+            row.old = budgeted_old(budget, item.name, facts.old);
+            fill_old(au, facts.old); // the audit line keeps its own bounded evidence (256 raw bytes)
+        }
+        if (item.op == PlanOp::delete_key) {
+            au.counted_keys = facts.key_exists ? 1 : 0;
+            au.counted_values = static_cast<long long>(facts.leaf_value_count);
+            au.capped = facts.leaf_capped ? 1 : 0;
+        }
+
+        std::string verdict;
+        if (!reason.empty()) {
+            // open_checked created some components, then failed (it rolled back what it could: `created` is what stayed).
+            const bool partial = !opt.dry_run && open_created > 0;
+            // created < missing: a PREFIX of the missing tail exists, so `created=<n>` (the undo reads it as the n
+            // trailing components) cannot name what to remove -- flag the manifest. All created and then refused is exact.
+            if (partial && open_created < open_missing) budget.incomplete = true;
+            verdict = partial ? "failed" : "refused";
+            row.reason = reason;
+            au.result = verdict;
+            au.reason = reason;
+            ++(partial ? sum.failed : sum.refused);
+        } else if (opt.dry_run) {
+            verdict = "would_apply";
+            au.result = "ok";
+            ++sum.applied;
+        } else {
+            const Handle h = handle->handle();
+            WriteOutcome wo;
+            switch (item.op) {
+            case PlanOp::set_value:
+                handle->value_name = item.name; // a creating write that unwinds first removes this value again
+                wo = write_value_on(reg, h, item.name, item.type, item.bytes, &handle->value_landed);
+                break;
+            case PlanOp::delete_value: wo = delete_value_on(reg, h, item.name); break;
+            // No read-back (verify stays `-`): the handle open_checked returned is the evidence the key exists -- an
+            // existing key it opened and link-probed, or one it created whose REG_CREATED_NEW_KEY disposition it
+            // checked -- and a re-query would prove only that it is open.
+            case PlanOp::create_key: wo.result = "ok"; break;
+            case PlanOp::delete_key: wo = delete_key_on(reg, h, false); break;
+            }
+            if (creating_op) handle->commit(); // the item is over, whatever it concluded: the keys it made stay
+            row.verify = wo.verify;
+            au.verify = wo.verify;
+            // `mutated`, not `ok`: a delete whose verify then mismatched still took the values with it.
+            if (item.op == PlanOp::delete_key && wo.mutated)
+                for (const auto& nv : facts.leaf_values) undo_rows.push_back(render_undo_row(idx, nv.name, nv.v));
+            if (wo.ok()) {
+                verdict = "applied";
+                au.result = "ok";
+                ++sum.applied;
+            } else {
+                verdict = "failed";
+                row.reason = wo.reason;
+                au.result = "failed";
+                au.reason = wo.reason;
+                ++sum.failed;
+            }
+        }
+        row.verdict = verdict;
+        out.lines.push_back(render_audit_line(au)); // the audit line first: it is the evidence a later sink failure must not lose
+        out.lines.push_back(render_item_row(row));
+        if (verdict == "refused" || verdict == "failed") {
+            out.rc = 1;
+            if (!opt.continue_on_error) stopped = true;
+        }
+    }
+
+    out.lines.insert(out.lines.end(), std::make_move_iterator(undo_rows.begin()),
+                     std::make_move_iterator(undo_rows.end()));
+    sum.undo_complete = !budget.incomplete;
+    out.lines.push_back(render_summary_row(sum));
+    if (out.rc != 0) out.lines.emplace_back("error|partial_failure");
     return out;
 }
 

@@ -11,7 +11,7 @@
  * plugin name keeps the operator's spelling, so it is compared ASCII-case-insensitively) AND the
  * frame's `CommandResponse.action` (stamped by the AGENT on every plugin-output RUNNING frame and on
  * the terminal frame: make_output_frame / make_final_frame in agents/core/src/command_frames.hpp,
- * called from agent.cpp) is one of the three
+ * called from agent.cpp) is one of the six
  * MUTATING actions. A read action's output can never mint a row, and an agent that stamps no action
  * (every agent that predates the stamp) produces none: fail-closed, documented. A read action's
  * output is never parsed for `audit|` lines, so the action gate is the control, not the content.
@@ -39,7 +39,8 @@
  * result or forge a second row). Put `result=` before any caller-sized field: it is read from the
  * whole line, but a line over the byte bound loses its tail. At most kMaxRegistryAuditLinesPerFrame
  * lines and kMaxRegistryAuditLineBytes bytes per line. One operation is ONE record (a delete_key
- * removes one key and the counts ride in fields): the frame and budget bounds assume it.
+ * removes one key and the counts ride in fields; an `apply` writes one record per plan item, at most 256, so a
+ * plan fits one frame): the frame and budget bounds assume it.
  *
  * PRODUCER: agents/plugins/registry/README.md ("Audit line grammar and producer contract"), pinned
  * against this parser by the render-pin cases in tests/unit/server/test_plugin_result_audit.cpp.
@@ -66,9 +67,9 @@
 
 namespace yuzu::server {
 
-/// The registry plugin's three state-changing actions -- the only ones whose output is audited.
-inline constexpr std::array<std::string_view, 3> kRegistryMutatingActions{
-    "set_value", "delete_value", "delete_key"};
+/// The registry plugin's six state-changing actions -- the only ones whose output is audited.
+inline constexpr std::array<std::string_view, 6> kRegistryMutatingActions{
+    "set_value", "delete_value", "delete_key", "set_user_value", "delete_user_value", "apply"};
 
 [[nodiscard]] constexpr bool is_registry_mutating_action(std::string_view action) noexcept {
     return std::ranges::find(kRegistryMutatingActions, action) != kRegistryMutatingActions.end();

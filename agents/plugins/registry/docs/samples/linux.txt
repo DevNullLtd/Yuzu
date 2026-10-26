@@ -1,4 +1,4 @@
-captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-22 · euid 0 · leg-hash 8e63a482f476
+captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-22 · euid 0 · leg-hash 2db0b6e73233
 == action=get_value hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" name=ProductName
 registry|unsupported|Windows registry is not available on this platform
 [result_status] UNDECLARED / UNKNOWN / 
@@ -37,3 +37,18 @@ registry|unsupported|Windows registry is not available on this platform
 == action=list_profiles
 registry|unsupported|Windows registry is not available on this platform
 [result_status] UNDECLARED / UNKNOWN / 
+
+== action=set_user_value username=jsmith key=Software\YuzuCaptureTmp name=probe value=1
+registry|unsupported|Windows registry is not available on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=delete_user_value username=jsmith key=Software\YuzuCaptureTmp name=probe
+registry|unsupported|Windows registry is not available on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=apply plan=[{"op":"create_key","key":"SOFTWARE\\YuzuCaptureTmp"}]
+registry|unsupported|Windows registry is not available on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
