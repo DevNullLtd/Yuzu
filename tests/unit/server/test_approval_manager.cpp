@@ -365,7 +365,7 @@ TEST_CASE("ApprovalManager: consume_ticket stamps consumed_by with the recalling
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
 
-    auto consumed = mgr.consume_ticket(*id, "operator1", {});
+    auto consumed = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(consumed.has_value());
 
     auto row = mgr.get(*id);
@@ -384,7 +384,7 @@ TEST_CASE("ApprovalManager: consume_ticket without a principal fails closed",
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
     // An unattributable consumption would be a CC7.2 evidence hole.
-    auto consumed = mgr.consume_ticket(*id, "", {});
+    auto consumed = mgr.consume_ticket(*id, "", ApprovalOrigin::kMcp, {});
     CHECK(!consumed.has_value());
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
@@ -406,9 +406,9 @@ TEST_CASE("ApprovalManager: consume_ticket replay is rejected and keeps the orig
     auto id = mgr.submit("mcp.quarantine_device", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
 
-    auto replay = mgr.consume_ticket(*id, "operator1", {});
+    auto replay = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!replay.has_value());
     CHECK(replay.error().kind == ConsumeFailure::kNotConsumable);
     auto row = mgr.get(*id);
@@ -495,7 +495,7 @@ TEST_CASE("ApprovalManager: an undeclared submit still records kUnspecified, and
     CHECK(row->origin == ApprovalOrigin::kUnspecified); // still recorded honestly, not folded
 
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    auto denied = mgr.consume_ticket(*id, "operator1", {});
+    auto denied = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!denied.has_value());
     CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin); // refused, not granted
     CHECK(mgr.get(*id)->consumed_at == 0);
@@ -568,7 +568,7 @@ TEST_CASE("ApprovalManager: a pre-v5 ticket cannot be redeemed at the MCP recall
     }
     REQUIRE(mgr.get(*id)->origin == ApprovalOrigin::kUnrecognised);
 
-    auto denied = mgr.consume_ticket(*id, "operator1", {});
+    auto denied = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!denied.has_value());
     CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin);
     CHECK(mgr.get(*id)->consumed_at == 0); // untouched — still evidence
@@ -590,7 +590,7 @@ TEST_CASE("ApprovalManager: a failing pre-consume recheck denies WITHOUT consumi
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
 
-    auto consumed = mgr.consume_ticket(*id, "operator1", [](const Approval&) {
+    auto consumed = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, [](const Approval&) {
         return std::expected<void, std::string>(
             std::unexpected("rotation t1 already resolved; mint a fresh ticket"));
     });
@@ -621,9 +621,9 @@ TEST_CASE("ApprovalManager: a ticket denied by the recheck is still consumable a
         return {};
     };
 
-    REQUIRE(!mgr.consume_ticket(*id, "operator1", recheck).has_value());
+    REQUIRE(!mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, recheck).has_value());
     drifted = false; // operator resolved the drift — the SAME ticket still works
-    REQUIRE(mgr.consume_ticket(*id, "operator1", recheck).has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, recheck).has_value());
 
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
@@ -643,6 +643,7 @@ TEST_CASE("ApprovalManager: the pre-consume recheck sees the matched ticket's ow
 
     Approval seen;
     auto consumed = mgr.consume_ticket(*id, "operator1",
+                                       ApprovalOrigin::kMcp,
                                        [&seen](const Approval& a) -> std::expected<void, std::string> {
                                            seen = a;
                                            return {};
@@ -664,7 +665,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
 
     // Replay by the SAME submitter, deliberately — a replay by a DIFFERENT
     // principal is refused earlier, by the #2442 submitter-binding check, as
@@ -673,6 +674,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
     // foreign-submitter replay would never reach.
     bool ran = false;
     auto replay = mgr.consume_ticket(*id, "operator1",
+                                     ApprovalOrigin::kMcp,
                                      [&ran](const Approval&) -> std::expected<void, std::string> {
                                          ran = true;
                                          return {};
@@ -687,6 +689,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
     REQUIRE(pending.has_value());
     ran = false; // reset per sub-case so a regression names WHICH one regressed
     auto on_pending = mgr.consume_ticket(*pending, "operator1",
+                                         ApprovalOrigin::kMcp,
                                          [&ran](const Approval&) -> std::expected<void, std::string> {
                                              ran = true;
                                              return {};
@@ -696,6 +699,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
 
     ran = false;
     auto absent = mgr.consume_ticket("does-not-exist", "operator1",
+                                     ApprovalOrigin::kMcp,
                                      [&ran](const Approval&) -> std::expected<void, std::string> {
                                          ran = true;
                                          return {};
@@ -705,7 +709,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
     CHECK(!ran);
 }
 
-TEST_CASE("ApprovalManager: an empty precondition consumes exactly like the two-argument overload",
+TEST_CASE("ApprovalManager: an empty precondition consumes exactly like no precondition at all",
           "[pg][approval_manager][approval]") {
     yuzu::test::ApprovalManagerPg mgr_bundle;
     ApprovalManager& mgr = *mgr_bundle;
@@ -714,7 +718,7 @@ TEST_CASE("ApprovalManager: an empty precondition consumes exactly like the two-
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
-    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
     CHECK(row->consumed_by == "operator1");
@@ -731,6 +735,7 @@ TEST_CASE("ApprovalManager: a missing principal fails closed on the recheck over
 
     bool ran = false;
     auto consumed = mgr.consume_ticket(*id, "",
+                                       ApprovalOrigin::kMcp,
                                        [&ran](const Approval&) -> std::expected<void, std::string> {
                                            ran = true;
                                            return {};
@@ -762,8 +767,9 @@ TEST_CASE("ApprovalManager: the CAS still wins when the row is consumed during t
     // which is a different property than the one under test here.
     auto outer =
         mgr.consume_ticket(*id, "operator1",
+                           ApprovalOrigin::kMcp,
                            [&mgr, &id](const Approval&) -> std::expected<void, std::string> {
-                               (void)mgr.consume_ticket(*id, "operator1", {});
+                               (void)mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
                                return {};
                            });
     REQUIRE(!outer.has_value());
@@ -787,7 +793,7 @@ TEST_CASE("ApprovalManager: a throwing recheck denies without consuming and does
     // not leave a store method as an exception, and must not be reported as a
     // decision the callback never made.
     auto threw = mgr.consume_ticket(
-        *id, "operator1", [](const Approval&) -> std::expected<void, std::string> {
+        *id, "operator1", ApprovalOrigin::kMcp, [](const Approval&) -> std::expected<void, std::string> {
             throw std::runtime_error("rotation lookup failed");
         });
     REQUIRE(!threw.has_value());
@@ -802,6 +808,7 @@ TEST_CASE("ApprovalManager: a throwing recheck denies without consuming and does
     // A non-std throw takes the same path.
     auto odd = mgr.consume_ticket(
         *id, "operator1",
+        ApprovalOrigin::kMcp,
         [](const Approval&) -> std::expected<void, std::string> { throw 42; });
     REQUIRE(!odd.has_value());
     CHECK(odd.error().kind == ConsumeFailure::kStoreError);
@@ -832,6 +839,7 @@ TEST_CASE("ApprovalManager: a store failure during the recheck is not reported a
 
     bool ran = false;
     auto r = mgr.consume_ticket(*id, "operator1",
+                                ApprovalOrigin::kMcp,
                                 [&ran](const Approval&) -> std::expected<void, std::string> {
                                     ran = true;
                                     return {};
@@ -882,7 +890,7 @@ TEST_CASE("ApprovalManager: the recheck may read the store without deadlocking",
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
     auto consumed = mgr.consume_ticket(
-        *id, "operator1", [&mgr](const Approval& a) -> std::expected<void, std::string> {
+        *id, "operator1", ApprovalOrigin::kMcp, [&mgr](const Approval& a) -> std::expected<void, std::string> {
             (void)mgr.get(a.id);
             (void)mgr.pending_count();
             (void)mgr.query({});
@@ -988,7 +996,7 @@ TEST_CASE("ApprovalManager: approved-but-unconsumed tickets expire 7 days after 
     CHECK(row->status == "expired"); // the leaked capability token is dead
 
     // An expired ticket is no longer consumable.
-    auto consumed = mgr.consume_ticket(*id, "operator1", {});
+    auto consumed = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     CHECK(!consumed.has_value());
 }
 
@@ -1008,7 +1016,7 @@ TEST_CASE("ApprovalManager: an approved ticket past its TTL is refused AT CONSUM
     REQUIRE(row_before.has_value());
     REQUIRE(row_before->status == "approved"); // not swept
 
-    auto consumed = mgr.consume_ticket(*id, "operator1", {});
+    auto consumed = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!consumed.has_value());
     CHECK(consumed.error().kind == ConsumeFailure::kExpired);
     CHECK(std::string(consume_denial_reason(consumed.error().kind)) == "expired");
@@ -1025,7 +1033,7 @@ TEST_CASE("ApprovalManager: an approved ticket past its TTL is refused AT CONSUM
     // Once swept it is still refused, still as expired rather than "already used".
     REQUIRE(mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction)
                 .has_value());
-    auto swept = mgr.consume_ticket(*id, "operator1", {});
+    auto swept = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!swept.has_value());
     CHECK(swept.error().kind == ConsumeFailure::kExpired);
 }
@@ -1046,8 +1054,8 @@ TEST_CASE("ApprovalManager: consume expiry boundary -- inside the TTL consumes, 
     backdate(mgr_bundle.pool(), *fresh, "reviewed_at", 6 * 24 * 3600);
     backdate(mgr_bundle.pool(), *edge, "reviewed_at", kApprovalTicketTtlSeconds + 60);
 
-    CHECK(mgr.consume_ticket(*fresh, "operator1", {}).has_value());
-    auto refused = mgr.consume_ticket(*edge, "operator1", {});
+    CHECK(mgr.consume_ticket(*fresh, "operator1", ApprovalOrigin::kMcp, {}).has_value());
+    auto refused = mgr.consume_ticket(*edge, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!refused.has_value());
     CHECK(refused.error().kind == ConsumeFailure::kExpired);
 }
@@ -1092,7 +1100,7 @@ TEST_CASE("ApprovalManager: reviewed_at and consumed_at are written and fall ins
     REQUIRE(row.has_value());
     CHECK(row->reviewed_at >= before);
     CHECK(row->reviewed_at <= after);
-    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
     auto consumed = mgr.get(*id);
     REQUIRE(consumed.has_value());
     CHECK(consumed->consumed_at >= before);
@@ -1119,13 +1127,13 @@ TEST_CASE("ApprovalManager: an approved ticket reviewed in the future is not con
     backdate(mgr_bundle.pool(), *within, "reviewed_at", -100);
     backdate(mgr_bundle.pool(), *beyond, "reviewed_at", -3600);
 
-    auto far_r = mgr.consume_ticket(*far, "operator1", {});
+    auto far_r = mgr.consume_ticket(*far, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!far_r.has_value());
     CHECK(far_r.error().kind == ConsumeFailure::kExpired);
-    auto beyond_r = mgr.consume_ticket(*beyond, "operator1", {});
+    auto beyond_r = mgr.consume_ticket(*beyond, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!beyond_r.has_value());
     CHECK(beyond_r.error().kind == ConsumeFailure::kExpired);
-    CHECK(mgr.consume_ticket(*within, "operator1", {}).has_value());
+    CHECK(mgr.consume_ticket(*within, "operator1", ApprovalOrigin::kMcp, {}).has_value());
 
     // The refusals touched nothing.
     auto row = mgr.get(*far);
@@ -1169,7 +1177,7 @@ TEST_CASE("ApprovalManager: submit() sweep leaves live tickets of every age insi
     REQUIRE(a.has_value());
     CHECK(p->status == "pending");
     CHECK(a->status == "approved");
-    CHECK(mgr.consume_ticket(*approved, "operator1", {}).has_value());
+    CHECK(mgr.consume_ticket(*approved, "operator1", ApprovalOrigin::kMcp, {}).has_value());
 }
 
 namespace {
@@ -1278,7 +1286,8 @@ const std::vector<std::string_view>& schedule_path_banned_needles() {
 // above run both clocks on one host), so this pins the CAUSE at the source: EVERY stamp and
 // cutoff -- submitted_at, reviewed_at, consumed_at (consume CAS and the schedule-origin
 // retire), the consume expiry diagnostic, ticket_is_live(), the shared liveness predicate and
-// both submit() sweeps -- is authored in-SQL from kDbNowEpochSql, and approval_manager.cpp
+// both submit() sweeps -- is authored in-SQL from the database clock (kDbNowEpochSql, except
+// the consume liveness test, which uses kDbWallEpochSql: #6062 sg-6), and approval_manager.cpp
 // reads NO process clock at all. Adding a clock read of ANY spelling fails here.
 TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL from the database "
           "clock; approval_manager.cpp reads no process clock (UP-3/UP-4/#6096 source tripwire)",
@@ -1301,8 +1310,17 @@ TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL fro
         INFO("banned clock API: " << banned);
         CHECK(std::none_of(banned.begin(), banned.end(),
                            [](unsigned char ch) { return std::isupper(ch) != 0; }));
+        // The one exemption (#6062 sg-6): the DATABASE's wall clock, spelled once, in
+        // kDbWallEpochSql, for the consume liveness test on a caller-held transaction, where
+        // `now()` is the transaction start. It is the same clock, not a per-replica one.
+        if (banned == "clock_timestamp")
+            continue;
         CHECK_FALSE(tripwire_matches(lc, banned));
     }
+    CHECK(count_occurrences(lc, "clock_timestamp") == 1);
+    const auto db_wall_def = statement_from(code, "constexpr const char* kDbWallEpochSql");
+    REQUIRE_FALSE(db_wall_def.empty());
+    CHECK(db_wall_def.find("clock_timestamp()") != std::string::npos);
     // The one database clock: SQL `now()` (any case) appears only in kDbNowEpochSql's own
     // definition.
     CHECK(count_occurrences(lc, "now()") == 1);
@@ -1347,15 +1365,37 @@ TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL fro
         CHECK(code.substr(from, at - from).find("SET LOCAL statement_timeout = '300s';") !=
               std::string::npos);
     }
-    CHECK(consume.find("ticket_live_sql()") != std::string::npos);
-    CHECK(why.find("ticket_live_sql()") != std::string::npos);   // consume's expiry diagnostic
+    // The consume CAS and its diagnostic read test liveness on the wall clock (#6062 sg-6):
+    // both pass `true` to the shared predicate, so they cannot drift apart or back to `now()`.
+    constexpr std::string_view kLiveCall = "ticket_live_sql(";
+    for (const auto* stmt : {&consume, &why}) {
+        const auto at = stmt->find(kLiveCall);
+        REQUIRE(at != std::string::npos);
+        // The comment stripper leaves blanks where `/*wall_clock=*/` was; the first real
+        // token of the argument list must be `true`, not merely a `true` nearby.
+        const auto arg = stmt->find_first_not_of(" \t\r\n", at + kLiveCall.size());
+        REQUIRE(arg != std::string::npos);
+        CHECK(stmt->compare(arg, 5, "true)") == 0);
+    }
+    // The predicate itself: the parameter really selects the wall clock, the default is the
+    // transaction-start clock, and BOTH bounds are measured on the selected clock. Without
+    // this a swapped ternary, or a bound rewritten to name kDbNowEpochSql directly, would pass
+    // everything above on a machine with no Postgres (the behavioural test is PG-gated and
+    // covers only the lower bound).
+    CHECK(count_occurrences(code, "std::string ticket_live_sql(bool wall_clock = false) {") == 1);
+    CHECK(live_now.find("wall_clock ? kDbWallEpochSql : kDbNowEpochSql") != std::string::npos);
+    CHECK(count_occurrences(code, "kDbWallEpochSql") == 2); // its definition and that one use
+    CHECK(count_occurrences(code, "+ now +") == 2);         // the lower and the upper bound
     CHECK(is_live.find("ticket_live_sql()") != std::string::npos); // ticket_is_live()
     CHECK(db_now.find("kDbNowEpochSql") != std::string::npos);   // the pending-sweep cutoff
     CHECK(sweep_pending.find("db_now") != std::string::npos);
     // submitted_at (#6096): the INSERT concatenates db_now into the VALUES list rather than
     // binding a C++-authored value, so there is no `submitted_at` parameter left to stamp.
+    // The INSERT also carries #6062's three bound columns as the LAST parameters ($9..$11), so
+    // "no $9" no longer says this; the position does: db_now sits in the submitted_at slot
+    // (fifth VALUES entry, between submitted_by's $3 and the reviewed_by/at/comment literals).
     CHECK(insert.find("db_now") != std::string::npos);
-    CHECK(insert.find("$9") == std::string::npos);
+    CHECK(insert.find("$3,\" + db_now + \",'',0,'',$4,") != std::string::npos);
     CHECK(live_now.find("kDbNowEpochSql") != std::string::npos); // the liveness predicate
     CHECK(live_stmt.find("ticket_live_sql()") != std::string::npos);
     CHECK(sweep_approved.find("live_sql") != std::string::npos); // approved sweep cutoff
@@ -1601,10 +1641,15 @@ TEST_CASE("ApprovalManager::retire_schedule_tickets: settles a schedule's unsett
     SECTION("consume_ticket still refuses a schedule-origin ticket") {
         const auto id = mint("sched-a");
         REQUIRE(mgr.approve(id, "boss", "ok").has_value());
-        auto c = mgr.consume_ticket(id, "operator1", {});
-        REQUIRE_FALSE(c.has_value());
-        CHECK(c.error().kind == ConsumeFailure::kForeignOrigin);
-        CHECK(mgr.get(id)->consumed_at == 0);
+        // consume_ticket now takes the surface the CALLER redeems for (#6062). The MCP recall
+        // is the only production caller and declares kMcp; a schedule-origin ticket is not
+        // an MCP ticket. An undeclared surface (kUnspecified) refuses whatever the row says.
+        for (const auto declared : {ApprovalOrigin::kMcp, ApprovalOrigin::kUnspecified}) {
+            auto c = mgr.consume_ticket(id, "operator1", declared, {});
+            REQUIRE_FALSE(c.has_value());
+            CHECK(c.error().kind == ConsumeFailure::kForeignOrigin);
+            CHECK(mgr.get(id)->consumed_at == 0);
+        }
     }
 }
 
@@ -1714,7 +1759,7 @@ TEST_CASE("ApprovalManager::ticket_is_live: the shared liveness predicate",
     CHECK_FALSE(*mgr.ticket_is_live(*id));
 
     // Agrees with consume_ticket on the same row (the point of sharing it).
-    auto refused = mgr.consume_ticket(*id, "operator1", {});
+    auto refused = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!refused.has_value());
     CHECK(refused.error().kind == ConsumeFailure::kExpired);
 
@@ -1725,7 +1770,7 @@ TEST_CASE("ApprovalManager::ticket_is_live: the shared liveness predicate",
     auto used = mgr.submit("mcp.delete_tag", "operator1", "{ }", "", ApprovalOrigin::kMcp);
     REQUIRE(used.has_value());
     REQUIRE(mgr.approve(*used, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*used, "operator1", {}).has_value());
+    REQUIRE(mgr.consume_ticket(*used, "operator1", ApprovalOrigin::kMcp, {}).has_value());
     CHECK_FALSE(*mgr.ticket_is_live(*used));
 }
 
@@ -1738,14 +1783,14 @@ TEST_CASE("ApprovalManager: an unconsumable, non-expired ticket is still kNotCon
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     // Still pending: not approved, not expired.
-    auto pending = mgr.consume_ticket(*id, "operator1", {});
+    auto pending = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!pending.has_value());
     CHECK(pending.error().kind == ConsumeFailure::kNotConsumable);
     // Replay of a consumed one: also not expired, even when old (consumed rows are history).
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
     backdate(mgr_bundle.pool(), *id, "reviewed_at", k8Days);
-    auto replay = mgr.consume_ticket(*id, "operator1", {});
+    auto replay = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!replay.has_value());
     CHECK(replay.error().kind == ConsumeFailure::kNotConsumable);
 }
@@ -1758,7 +1803,7 @@ TEST_CASE("ApprovalManager: consumed tickets are history, never expired",
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
     backdate(mgr_bundle.pool(), *id, "reviewed_at", k8Days);
 
     REQUIRE(mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction)
@@ -1792,7 +1837,7 @@ TEST_CASE("ApprovalManager: a ticket minted by a declared non-MCP surface cannot
     REQUIRE(mgr.approve(*forged, "admin1", "").has_value());
 
     // The redemption is where it dies. This is the MCP recall's call shape.
-    auto redeemed = mgr.consume_ticket(*forged, "attacker", {});
+    auto redeemed = mgr.consume_ticket(*forged, "attacker", ApprovalOrigin::kMcp, {});
     REQUIRE(!redeemed.has_value());
 
     // And the ticket is UNTOUCHED — a refused forgery must not burn it.
@@ -1807,7 +1852,7 @@ TEST_CASE("ApprovalManager: a ticket minted by a declared non-MCP surface cannot
                             ApprovalOrigin::kSchedule);
     REQUIRE(sched.has_value());
     REQUIRE(mgr.approve(*sched, "admin1", "").has_value());
-    CHECK(!mgr.consume_ticket(*sched, "attacker", {}).has_value());
+    CHECK(!mgr.consume_ticket(*sched, "attacker", ApprovalOrigin::kMcp, {}).has_value());
     CHECK(mgr.get(*sched)->consumed_at == 0);
 }
 
@@ -1821,7 +1866,7 @@ TEST_CASE("ApprovalManager: the redemption refusal is a distinct kind but not a 
     REQUIRE(forged.has_value());
     REQUIRE(mgr.approve(*forged, "admin1", "").has_value());
 
-    auto denied = mgr.consume_ticket(*forged, "attacker", {});
+    auto denied = mgr.consume_ticket(*forged, "attacker", ApprovalOrigin::kMcp, {});
     REQUIRE(!denied.has_value());
     // The KIND separates a forgery attempt from a replay, so the log and any
     // future audit row can tell them apart.
@@ -1833,8 +1878,8 @@ TEST_CASE("ApprovalManager: the redemption refusal is a distinct kind but not a 
     auto spent = mgr.submit("inventory.audit", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(spent.has_value());
     REQUIRE(mgr.approve(*spent, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*spent, "operator1", {}).has_value()); // first use succeeds
-    auto replay = mgr.consume_ticket(*spent, "operator1", {});    // second does not
+    REQUIRE(mgr.consume_ticket(*spent, "operator1", ApprovalOrigin::kMcp, {}).has_value()); // first use succeeds
+    auto replay = mgr.consume_ticket(*spent, "operator1", ApprovalOrigin::kMcp, {});    // second does not
     REQUIRE(!replay.has_value());
     CHECK(replay.error().kind == ConsumeFailure::kNotConsumable);
     CHECK(denied.error().message == replay.error().message);
@@ -1851,7 +1896,7 @@ TEST_CASE("ApprovalManager: an MCP-minted ticket under the reserved prefix still
                                ApprovalOrigin::kMcp);
     REQUIRE(declared.has_value());
     REQUIRE(mgr.approve(*declared, "admin1", "").has_value());
-    CHECK(mgr.consume_ticket(*declared, "operator1", {}).has_value());
+    CHECK(mgr.consume_ticket(*declared, "operator1", ApprovalOrigin::kMcp, {}).has_value());
     CHECK(mgr.get(*declared)->consumed_at != 0);
 
     // The undeclared mint used to be what the frozen MCP gate actually did,
@@ -1876,7 +1921,7 @@ TEST_CASE("ApprovalManager: an ordinary non-MCP ticket is refused at redemption 
     auto rest = mgr.submit("inventory.audit", "operator1", "{}", "", ApprovalOrigin::kInstruction);
     REQUIRE(rest.has_value());
     REQUIRE(mgr.approve(*rest, "admin1", "").has_value());
-    auto denied = mgr.consume_ticket(*rest, "operator1", {});
+    auto denied = mgr.consume_ticket(*rest, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!denied.has_value());
     CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin);
     CHECK(mgr.get(*rest)->consumed_at == 0);
@@ -1900,7 +1945,7 @@ TEST_CASE("ApprovalManager: a ticket recalls for the principal it was submitted 
                          ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    CHECK(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    CHECK(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
     CHECK(mgr.get(*id)->consumed_by == "operator1");
 }
 
@@ -1920,7 +1965,7 @@ TEST_CASE("ApprovalManager: a ticket recalled by a different principal is refuse
     // The scenario this closes: operator2 read operator1's ticket id off
     // GET /api/approvals (Approval:Read, seeded to Viewer) and also holds the
     // target tool's own RBAC permission.
-    auto redeemed = mgr.consume_ticket(*id, "operator2", {});
+    auto redeemed = mgr.consume_ticket(*id, "operator2", ApprovalOrigin::kMcp, {});
     REQUIRE(!redeemed.has_value());
     CHECK(redeemed.error().kind == ConsumeFailure::kForeignSubmitter);
     // Same message as every other "not consumable" outcome — see
@@ -1946,15 +1991,15 @@ TEST_CASE("ApprovalManager: the foreign-submitter refusal is a distinct kind but
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    auto denied = mgr.consume_ticket(*id, "operator2", {});
+    auto denied = mgr.consume_ticket(*id, "operator2", ApprovalOrigin::kMcp, {});
     REQUIRE(!denied.has_value());
     CHECK(denied.error().kind == ConsumeFailure::kForeignSubmitter);
 
     auto spent = mgr.submit("mcp.quarantine_device", "operator3", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(spent.has_value());
     REQUIRE(mgr.approve(*spent, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*spent, "operator3", {}).has_value()); // first use succeeds
-    auto replay = mgr.consume_ticket(*spent, "operator3", {});        // second does not
+    REQUIRE(mgr.consume_ticket(*spent, "operator3", ApprovalOrigin::kMcp, {}).has_value()); // first use succeeds
+    auto replay = mgr.consume_ticket(*spent, "operator3", ApprovalOrigin::kMcp, {});        // second does not
     REQUIRE(!replay.has_value());
     CHECK(replay.error().kind == ConsumeFailure::kNotConsumable);
     CHECK(denied.error().message == replay.error().message);
@@ -1979,7 +2024,7 @@ TEST_CASE("ApprovalManager: a ticket wrong on BOTH origin and submitter reports 
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
-    auto denied = mgr.consume_ticket(*id, "operator2", {});
+    auto denied = mgr.consume_ticket(*id, "operator2", ApprovalOrigin::kMcp, {});
     REQUIRE(!denied.has_value());
     CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin);
     CHECK(denied.error().message == kNotConsumableMessage);
@@ -2018,7 +2063,7 @@ TEST_CASE("ApprovalManager: a store fault AT the binding check masks a foreign-s
                             std::vector<std::string>{})
                 .status() == PGRES_COMMAND_OK);
 
-    auto faulted = mgr.consume_ticket(*id, "operator2", {});
+    auto faulted = mgr.consume_ticket(*id, "operator2", ApprovalOrigin::kMcp, {});
     REQUIRE(!faulted.has_value());
     CHECK(faulted.error().kind == ConsumeFailure::kStoreError);
     CHECK(faulted.error().sqlstate == "55P03");
@@ -2030,7 +2075,7 @@ TEST_CASE("ApprovalManager: a store fault AT the binding check masks a foreign-s
 
     CHECK(mgr.get(*id)->consumed_at == 0); // untouched
 
-    auto cleared = mgr.consume_ticket(*id, "operator2", {});
+    auto cleared = mgr.consume_ticket(*id, "operator2", ApprovalOrigin::kMcp, {});
     REQUIRE(!cleared.has_value());
     CHECK(cleared.error().kind == ConsumeFailure::kForeignSubmitter);
     CHECK(!cleared.error().binding_check_unevaluated);
@@ -2038,7 +2083,7 @@ TEST_CASE("ApprovalManager: a store fault AT the binding check masks a foreign-s
 
     // And the rightful submitter can still redeem it — the fault and the
     // forged recall attempt did not burn the ticket.
-    CHECK(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    CHECK(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
 }
 
 TEST_CASE("ApprovalManager: an empty precondition consumes with no precondition supplied",
@@ -2050,7 +2095,7 @@ TEST_CASE("ApprovalManager: an empty precondition consumes with no precondition 
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
-    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
     CHECK(row->consumed_by == "operator1");
@@ -2067,6 +2112,7 @@ TEST_CASE("ApprovalManager: a missing principal fails closed on the recheck path
 
     bool ran = false;
     auto consumed = mgr.consume_ticket(*id, "",
+                                       ApprovalOrigin::kMcp,
                                        [&ran](const Approval&) -> std::expected<void, std::string> {
                                            ran = true;
                                            return {};
@@ -2109,7 +2155,7 @@ TEST_CASE("ApprovalManager: a store failure is not reported as spent in the mess
         REQUIRE(res.status() == PGRES_COMMAND_OK);
     }
 
-    auto flat = mgr.consume_ticket(*id, "operator1", {});
+    auto flat = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!flat.has_value());
     // The property that matters is the negative: it must NOT read as spent, or
     // an operator is told to discard a live human-approved capability. (The
@@ -2136,7 +2182,7 @@ TEST_CASE("ApprovalManager: an unrecognised origin column value is refused, not 
     CHECK(approval_origin_from_string("mcp") == ApprovalOrigin::kMcp);
     CHECK(approval_origin_from_string("MCP") == ApprovalOrigin::kUnrecognised); // case-sensitive
     CHECK(approval_origin_from_string("nonsense") == ApprovalOrigin::kUnrecognised);
-    CHECK(declares_non_mcp_surface(ApprovalOrigin::kUnrecognised));
+    CHECK_FALSE(origin_redeemable_as(ApprovalOrigin::kUnrecognised, ApprovalOrigin::kMcp));
 
     // End to end: a row written by a newer binary, read back by this one.
     yuzu::test::ApprovalManagerPg mgr_bundle;
@@ -2153,7 +2199,7 @@ TEST_CASE("ApprovalManager: an unrecognised origin column value is refused, not 
         REQUIRE(res.status() == PGRES_COMMAND_OK);
     }
 
-    auto denied = mgr.consume_ticket(*id, "operator1", {});
+    auto denied = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!denied.has_value());
     CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin);
     CHECK(mgr.get(*id)->consumed_at == 0);
@@ -2296,7 +2342,7 @@ TEST_CASE("ApprovalManager: a genuinely transient fault at the origin check is f
                             std::vector<std::string>{})
                 .status() == PGRES_COMMAND_OK);
 
-    auto faulted = mgr.consume_ticket(*forged, "attacker", {});
+    auto faulted = mgr.consume_ticket(*forged, "attacker", ApprovalOrigin::kMcp, {});
     REQUIRE(!faulted.has_value());
     CHECK(faulted.error().kind == ConsumeFailure::kStoreError);
     CHECK(faulted.error().sqlstate == "55P03");
@@ -2315,7 +2361,7 @@ TEST_CASE("ApprovalManager: a genuinely transient fault at the origin check is f
 
     // Once the fault clears, the forgery signal is NOT lost: the same ticket
     // now correctly reports kForeignOrigin, not a repeat of kStoreError.
-    auto cleared = mgr.consume_ticket(*forged, "attacker", {});
+    auto cleared = mgr.consume_ticket(*forged, "attacker", ApprovalOrigin::kMcp, {});
     REQUIRE(!cleared.has_value());
     CHECK(cleared.error().kind == ConsumeFailure::kForeignOrigin);
     CHECK(!cleared.error().binding_check_unevaluated);
@@ -2360,7 +2406,7 @@ TEST_CASE("ApprovalManager: a CAS-step fault after a passing binding check does 
         REQUIRE(trig.status() == PGRES_COMMAND_OK);
     }
 
-    auto faulted = mgr.consume_ticket(*id, "operator1", {});
+    auto faulted = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!faulted.has_value());
     CHECK(faulted.error().kind == ConsumeFailure::kStoreError);
     CHECK(!faulted.error().sqlstate.empty());

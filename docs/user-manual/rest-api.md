@@ -11385,7 +11385,7 @@ uniqueness against existing definitions.
 **Response (400):** Validation error (missing required field, invalid
 `approval_mode`, malformed JSON, a request/`parameter_schema`/`visualization_spec`/
 `response_templates_spec` body nesting deeper than 32 levels (`kMcpMaxJsonDepth`),
-or an `id` under the reserved `mcp.` prefix). Body is `{"error": "<reason>"}`.
+or an `id` under the reserved `mcp.` or `guardian.` prefix). Body is `{"error": "<reason>"}`.
 
 The `mcp.` definition-id prefix is **reserved** (#2442): it names MCP approval
 tickets, and a definition authored under that prefix could line up with an MCP
@@ -11801,13 +11801,25 @@ Fetch a single approval by id. This is the **A4 `status_url` target**: when an o
 
 `status` is one of `pending` | `approved` | `rejected` | `expired`. The response always carries an `X-Correlation-Id` header.
 
+**Bound tickets (#6062).** A ticket minted with a frozen request (today only the reserved Guardian rule-deploy surface; nothing in this release mints one yet) additionally carries three fields, so an agentic worker sees exactly what the dashboard's Approvals page shows a reviewer. An ordinary ticket (every MCP, interactive-instruction and scheduled-fire ticket) carries none of them and its body is unchanged:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `request` | object or `null` | The frozen request the reviewer approves, as a JSON object (the stored document parsed). `null` when there is no readable request: `request_unreadable` is `true` when one is stored but cannot be shown, and absent when none is stored at all (an inconsistent row holding only a digest). |
+| `request_digest` | string | Lowercase hex SHA-256 of the **exact stored bytes** of the request. The object above is a parsed view and a re-serialisation (sorted keys, no whitespace) need not reproduce those bytes, so use the digest to identify the request, not to recompute it. |
+| `excluded_roots` | array of string | Principals barred from approving this ticket, in addition to its submitter, who is always barred. Matched byte-for-byte against the reviewer's name. |
+| `request_unreadable` | boolean | Present (`true`) only when `request` is `null` because the stored request could not be read or exceeds its bounds. Such a ticket cannot be approved (the approve call returns `400`), but it can be rejected. |
+| `excluded_roots_unreadable` | boolean | Present (`true`) only when the stored excluded-roots list could not be read. Such a ticket cannot be approved. |
+
+These fields are readable under the same bare `Approval:Read` gate as the rest of the row and are not confined by management group: a frozen request can name devices in its `targets`, and every holder of `Approval:Read` can already read the ticket's `scope_expression`. The permission gate and the A4 error envelope are unchanged.
+
 **An aged `approved` ticket (#6098):** `status` is only rewritten to `expired` by the next accepted approval submission, so an approved ticket whose `reviewed_at` is more than 7 days old keeps showing `approved` until then, although consuming it and `ScheduleRunner` already refuse it. Read `reviewed_at` as well as `status` before treating an approved ticket as usable.
 
 **Errors:** `404` (no approval matches the id — A4 envelope), `503` (approval store not initialised — A4 envelope with `retry_after_ms: 5000`).
 
 #### `GET /api/v1/approvals`
 
-REST v1 twin of the legacy unversioned `GET /api/approvals` below and the widened MCP `list_pending_approvals` tool. This route, the single-fetch `GET /api/v1/approvals/{id}` route, and MCP `list_pending_approvals` share one JSON-row builder (`approval_row_json`) so those three cannot drift from each other; the legacy route below is a separate, unmigrated implementation that emits the same field set today by convention, not by construction. **Permission:** bare `Approval:Read` — approval requests carry no per-agent axis for the ADR-0017 admit-then-filter `fleet_read_fn` chokepoint to confine against (same rationale as `GET /api/v1/schedules` above), so this list is fleet-wide for anyone holding the permission; a reviewer approving or rejecting a ticket needs to see the ticket's full `scope_expression` to make that decision, so confinement-filtering this list would break the maker-checker function itself. Accepts `status` and `submitted_by` query parameters, same as the legacy route. **Omitting `status` returns ALL statuses** — unlike MCP `list_pending_approvals`, which defaults to `pending`-only when its own `status` argument is omitted; a caller wiring both a REST dashboard and an MCP agent against the same queue with no filter gets two different result sets. A supplied `status` outside `pending`/`approved`/`rejected`/`expired` is rejected with `400` (governance fix — previously silently produced an empty result, indistinguishable from a genuinely empty match). The underlying query is hard-capped at 100 rows (no caller-visible limit/cursor); `pagination.result_truncated_by_cap` is added when more than 100 approvals match, so `pagination.total` is never presented as the true match count.
+REST v1 twin of the legacy unversioned `GET /api/approvals` below and the widened MCP `list_pending_approvals` tool. This route, the single-fetch `GET /api/v1/approvals/{id}` route, and MCP `list_pending_approvals` share one JSON-row builder (`approval_row_json`) so those three cannot drift from each other; the legacy route below builds its rows with the same function, so a bound ticket's `request`, `request_digest` and `excluded_roots` (see the single-fetch route above) appear on all of them. **Permission:** bare `Approval:Read` — approval requests carry no per-agent axis for the ADR-0017 admit-then-filter `fleet_read_fn` chokepoint to confine against (same rationale as `GET /api/v1/schedules` above), so this list is fleet-wide for anyone holding the permission; a reviewer approving or rejecting a ticket needs to see the ticket's full `scope_expression` to make that decision, so confinement-filtering this list would break the maker-checker function itself. Accepts `status` and `submitted_by` query parameters, same as the legacy route. **Omitting `status` returns ALL statuses** — unlike MCP `list_pending_approvals`, which defaults to `pending`-only when its own `status` argument is omitted; a caller wiring both a REST dashboard and an MCP agent against the same queue with no filter gets two different result sets. A supplied `status` outside `pending`/`approved`/`rejected`/`expired` is rejected with `400` (governance fix — previously silently produced an empty result, indistinguishable from a genuinely empty match). The underlying query is hard-capped at 100 rows (no caller-visible limit/cursor); `pagination.result_truncated_by_cap` is added when more than 100 approvals match, so `pagination.total` is never presented as the true match count.
 
 **Response (200):**
 
