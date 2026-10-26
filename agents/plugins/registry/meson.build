@@ -5,9 +5,13 @@ if host_machine.system() == 'windows'
   registry_deps += [cxx.find_library('advapi32')]
 endif
 
-shared_library(
+# Assigned so tests/meson.build link_depends can name it, matching shares_plugin_lib.
+registry_plugin_lib = shared_library(
   'registry',
-  files('src/registry_plugin.cpp'),
+  files(
+    'src/registry_plugin.cpp',
+    'src/registry_win.cpp',
+  ),
   name_prefix: '',
   include_directories: include_directories('../../shared'),  # win_str.hpp (#1681), win_profiles.hpp/win_reg_handle.hpp/user_profile_model.hpp (PR1.7)
   dependencies: registry_deps,

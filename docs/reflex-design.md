@@ -215,6 +215,12 @@ only rule governing ordinary `on_success`/`on_failure` chain gating.
 
 ## Two-person approval (D9)
 
+> **Amendment pending: ADR-1009 (proposed).** ADR-1009 amends the Guardian baseline gate of
+> ADR-0021 Decision 9 (symmetric, all-enforce). Its text states that the Reaction clause is
+> unchanged and Reflex is outside that MVP, so this section stands as written. The bound-ticket
+> primitive it adds (`docs/adr/1009-four-eyes-mvp-bound-approval.md`) is what a Reflex Set deploy
+> would redeem through; none of it is wired to Reflex.
+
 Any Reflex Set deploy whose compiled content contains at least one dangerous Reaction (per the
 chokepoint above) requires approval by a principal representing a **distinct human root**, per
 ADR-0033 §7's identity-resolution rule — not merely "a different principal string": an editor

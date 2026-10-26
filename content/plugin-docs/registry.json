@@ -7,16 +7,16 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "dconf/gsettings",
+          "rung": "2",
+          "support": "planned"
         },
         "macos": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "defaults/CFPreferences (per-domain plist)",
+          "rung": "1",
+          "support": "planned"
         },
         "windows": {
           "fallback": "",
@@ -33,16 +33,16 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "dconf/gsettings",
+          "rung": "2",
+          "support": "planned"
         },
         "macos": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "defaults/CFPreferences (per-domain plist)",
+          "rung": "1",
+          "support": "planned"
         },
         "windows": {
           "fallback": "",
@@ -59,16 +59,16 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "dconf/gsettings",
+          "rung": "2",
+          "support": "planned"
         },
         "macos": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "defaults/CFPreferences (per-domain plist)",
+          "rung": "1",
+          "support": "planned"
         },
         "windows": {
           "fallback": "",
@@ -85,16 +85,16 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "dconf/gsettings",
+          "rung": "2",
+          "support": "planned"
         },
         "macos": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "defaults/CFPreferences (per-domain plist)",
+          "rung": "1",
+          "support": "planned"
         },
         "windows": {
           "fallback": "",
@@ -111,16 +111,16 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "dconf/gsettings",
+          "rung": "2",
+          "support": "planned"
         },
         "macos": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "defaults/CFPreferences (per-domain plist)",
+          "rung": "1",
+          "support": "planned"
         },
         "windows": {
           "fallback": "",
@@ -137,16 +137,16 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "dconf/gsettings",
+          "rung": "2",
+          "support": "planned"
         },
         "macos": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "defaults/CFPreferences (per-domain plist)",
+          "rung": "1",
+          "support": "planned"
         },
         "windows": {
           "fallback": "",
@@ -163,16 +163,16 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "dconf/gsettings",
+          "rung": "2",
+          "support": "planned"
         },
         "macos": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "defaults/CFPreferences (per-domain plist)",
+          "rung": "1",
+          "support": "planned"
         },
         "windows": {
           "fallback": "",
@@ -189,16 +189,16 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "dconf/gsettings",
+          "rung": "2",
+          "support": "planned"
         },
         "macos": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "defaults/CFPreferences (per-domain plist)",
+          "rung": "1",
+          "support": "planned"
         },
         "windows": {
           "fallback": "",
@@ -215,16 +215,16 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "dconf/gsettings",
+          "rung": "2",
+          "support": "planned"
         },
         "macos": {
-          "fallback": "",
-          "mechanism": "",
-          "rung": "",
-          "support": "unsupported"
+          "fallback": "planned stub: not implemented, the action answers registry|unsupported|...",
+          "mechanism": "defaults/CFPreferences (per-domain plist)",
+          "rung": "1",
+          "support": "planned"
         },
         "windows": {
           "fallback": "",
@@ -236,11 +236,11 @@
     }
   ],
   "caveats": [
-    "**`enumerate_values`'s wire format carries an undocumented literal tag.** Each line is `value|<name>|<type>` (`registry_plugin.cpp:383`), but the definition's `result.columns` lists only `name` and `type` — the leading `value` segment is a fixed literal, not a third data column, and a naive \"split on the declared column count\" parser will misread every row by one field.",
-    "**`get_value`/`enumerate_values` do not decode `REG_MULTI_SZ`/`REG_LINK` values; `get_user_value` does.** Both fall to the hex-dump default branch on the first two actions (`registry_plugin.cpp:277-280`) but are decoded (semicolon-joined records / sanitised target string) on the third via the shared `read_reg_value` (`agents/shared/win_profiles.hpp:660-742`). This is a declared, deliberate inconsistency (`catalog.md`'s value-type notes) — closing it changes `get_value`'s output for existing callers and is out of scope here.",
-    "**`set_value`/`delete_value`/`delete_key` cannot distinguish \"access denied\" from \"does not exist\" in their error text.** `do_set_value`'s `RegCreateKeyExW` failure always reports `error|failed to open/create key` (`registry_plugin.cpp:296-299`) and `do_delete_value`'s `RegOpenKeyExW` failure always reports `error|key not found` (`registry_plugin.cpp:324-326`) regardless of the underlying `LSTATUS` — unlike `get_user_value`'s ladder, which does separate `key_access_denied` from `key_not_found` (`agents/shared/user_profile_model.hpp:266-278`).",
-    "**`PrivilegeScope`'s `AdjustTokenPrivileges` call must keep its `ReturnLength` argument.** A prior version omitted it and the call failed with `ERROR_NOACCESS` on every invocation, so the offline per-user hive fallback silently never enabled `SeBackup`/`SeRestore` from the plugin's initial ship until #2771 (`agents/shared/win_profiles.hpp:358-371`, `changelog.d/2771-privilegescope-token-adjust-bug.fixed.md`) — do not \"simplify\" that call signature.",
-    "**The `get_user_value` capture exercised the live-hive path, not the offline mount.** `list_profiles` in the same Windows capture reports the target SID's `hive_state` as `loaded`, so `with_user_hive`'s first `RegOpenKeyExW(HKEY_USERS, <sid>, ...)` succeeded and the offline `RegLoadKeyW`/`SeBackup`+`SeRestore` fallback (`win_profiles.hpp:495-534`) was never reached — this sample does not exercise that branch, the unload-warning line, or the `mount_failed`/`privilege_missing` error text."
+    "**The fast open is more permissive than the walk in two ancestor-only cases.** An ancestor the caller may traverse but not read: the walk answers `access_denied`, the fast open accepts. An ordinary non-link ancestor that carries a value named `SymbolicLinkValue`: the link probe cannot tell it from a link, so the walk answers `key_is_link` and the fast open accepts. In both the write lands on the real requested key, which is what registry 1.0.0's single open did; probing every ancestor on the fast path would cost it the constant call count. A decoy value on the LEAF of a `set_value` or `delete_value` is refused on both paths (a `delete_key` leaf is opened as a possible link, so it is not probed). `HKCU`, `HKCR`, a missing key and any failed name query take the walk (same verdicts, more calls; a name query that keeps failing refuses there too). A path whose case differs from the stored spelling only outside ASCII declines the fast open, and the walk then refuses it `key_is_link` (every component, the first included, is compared with the kernel's name by the same ASCII-only fold): write such a key with its stored spelling. If the kernel name of `HKLM` or `HKU` cannot be read at the first write, the fast open is off for that root until the agent restarts. **`HKCR` may be refused `key_is_link` where its merged view reaches the other backing hive.** `HKCR` merges `HKLM\\SOFTWARE\\Classes` with the calling user's classes hive (the agent runs as `SYSTEM`, so that half is `HKU\\.DEFAULT_Classes`). The walk requires the leaf's kernel name to equal the first component's name plus the rest of the requested path, the same compare for every hive; if the merged view resolves a lower component into the other backing hive than the first component, the two names differ and the write is refused `key_is_link` with nothing written, although no link is involved. A refusal is the failure mode, never an unverified write. Measured on Windows 11 (2026-10-23): for an interactive user a key whose first component exists in both backing hives and whose lower component exists only in the machine hive IS refused `key_is_link` (the first component is bound to the user hive, the lower one to `HKLM`); the reverse orientation and every key wholly inside one hive are accepted. As `SYSTEM`, the agent's identity, `HKCR` shows only `HKLM\\SOFTWARE\\Classes`, so the shape does not arise there. If an `HKCR` write is refused, write under `HKLM\\SOFTWARE\\Classes` or `HKU\\<SID>_Classes` directly. **`HKCU\\Software\\Classes` is a registry link for a real user.** Measured on Windows (2026-10-25): For a real user's hive `HKCU\\Software\\Classes` is itself a registry link (to the user's `_Classes` hive), so a creating write below it is refused `key_is_link` (1.0.0 followed it); as SYSTEM, the agent's identity, `HKCU` is `HKU\\.DEFAULT` and `Software\\Classes` is not a link, so such writes succeed; to write a user's classes use `hive=HKU` with `<SID>_Classes`.",
+    "**The audit trail is lossy by design.** Key and value names go through `yuzu::log_token` (space, `=`, `,`, control bytes and `|` become `_`, and so does a trailing backslash; over 256 bytes they are cut with `~<length>`), and old/new data is hex capped at 256 raw bytes, so an audit row identifies the change but cannot always reproduce it (a value cut at 256 bytes cannot be rebuilt from it, and the hex can hold a secret: owner risk acceptance, see \"Sensitivity\"); a `delete_key` row carries counts, not values: `old=-|new=-`; `old=` and the delete counts are point in time; the single actions accept a value named `-`, whose audit line renders `name=-` exactly like the default value. Rows exist only for agents that stamp `CommandResponse.action`: an agent at v0.14.1 or earlier writes registry values but produces no `registry.write` rows, and a read action never does. **An exception inside a mutating action** (an allocation failure while capturing, writing or reading back is the realistic one) is contained at the plugin ABI seam: the plugin writes a fixed failed audit line (`result=failed`, `reason=exception`, every other field `-`, so `created=-` and no `old=`/`new=`) and then `error|exception` with rc 1, and the server records that line as a failed `registry.write` row. A creating write tries to remove the keys it made, and the value it had written into them, on an exception before its verified write ends (best effort, below); a write onto an existing key that had already landed keeps its value, and so does a write whose exception came after its verified write (while the reply was being built): the row says `failed`, and the key must be read back to know. An agent that dies mid-command writes no row at all; the server's `command.dispatch` row and the stored response keep the attempt attributable. The rollback is BEST EFFORT: a key that holds a value or a subkey when it checks is kept and, on a returning exit, counted in `created=` (`result=failed`), and `created=` can also count a key another party deleted first, which the rollback then cannot delete again. A write that lands between the check and the delete, or over our own same-named value before the rollback deletes it by name, can still be lost, because Windows has no delete-if-empty call. After a double fault (a rollback step that fails or throws) the value and the keys may stay with `created=-` and nothing logged. \"Where the data goes\" has the procedure for what a failed create can leave.",
+    "**Behaviour changes from 1.0.** The changes to existing actions are listed in the 2.0.0 changelog entry (`changelog.d/2026-10-22-registry-typed-writes.changed.md`) and in `docs/user-manual/upgrading.md`, which also gives the rollout order (server replicas first) and the minimum agent version for `registry.write` rows (the first release that contains the audit binding of #6294, later than 0.14.1). **Mixed fleets:** an agent still running registry 1.x writes an EMPTY `REG_SZ` over the value for a `data_hex`-only `set_value` (it reads only `name`, `value` and `type`; with `type=REG_DWORD` and `data_hex` only it throws and writes nothing), stores `REG_QWORD`, `REG_MULTI_SZ`, `REG_EXPAND_SZ` and `REG_BINARY` values as `REG_SZ` text, reports `status|ok` for all of those, and follows a write under `HKLM\\SYSTEM\\CurrentControlSet` that 2.0.0 refuses; nothing on the server gates dispatch on a plugin version (the definitions' `minAgentVersion` is declared and exported, not compared at dispatch), so upgrade the agents before using the new types or `data_hex`, in schedules, workflows, policies and bundles as well as scripts. **Embedded NUL:** a NUL inside a parameter sent through `POST /api/command` reaches the plugin as a C string and cuts the value at the NUL on every agent version (the instruction and MCP routes refuse control bytes), so a key or value name that carries one writes a shorter key or name than the one sent. A reply that is a bare `status|ok` with no leading `audit|` row came from a 1.x agent: read the value back with `get_value`. **An existing server install keeps the 1.0.0 definitions:** bundled definitions are inserted only when absent, so an install that already holds `windows.registry.set_value`, `delete_value` and `delete_key` keeps their 1.0.0 text, enum and parameters (no `data_hex`, a `type` enum of `REG_SZ` and `REG_DWORD` only, `value` required) until they are replaced: export, delete and re-import the three definitions (`docs/user-manual/instructions.md`, \"Replacing a stored parameter schema\") to get the 1.1.0 text, enum and `data_hex`. Until the fleet is upgraded, scope such a write to upgraded devices (`ostype == \"windows\" AND tag:<key> == \"<value>\"`, with a tag that marks the upgraded devices) or switch the action off with the `set_value` kill switch. **2.0.0 asks the key for more access than 1.0.0 did.** `set_value` opens the leaf with `KEY_SET_VALUE` and `KEY_QUERY_VALUE` (the read-back and the link probe need the second), and `KEY_CREATE_SUB_KEY` on each parent it creates under; `delete_value` the same two on the leaf; `delete_key` `DELETE`, `KEY_ENUMERATE_SUB_KEYS` and `KEY_QUERY_VALUE`; the walk adds `KEY_QUERY_VALUE` on every component it passes through. An ACL that grants less answers `access_denied`. **Creating a key now asks for `DELETE` on it**, so that a walk that stops can remove what it made by handle: where an inherited ACL gives the agent identity no `DELETE` on a new key (SYSTEM and Administrators have it on the usual parents) the create answers `access_denied`, and there is deliberately no retry without it.",
+    "**`delete_key` removes only a key with no subkeys.** A key with subkeys is refused `key_has_subkeys` and nothing is deleted; there is no recursive delete and no `dry_run` in this version (the `dry_run` column is always 0). The key's own values go with it, and the counts are a point-in-time read of them. A subkey created between the check and the delete cannot be refused as `key_has_subkeys`: `NtDeleteKey` refuses the delete and the action answers a failure token (`access_denied` or `win32:<code>`, not `key_has_subkeys`), with the key still in place and nothing deleted.",
+    "**The read-side gaps are unchanged.** `enumerate_values` writes `value|<name>|<type>` (the leading `value` is a literal tag, not a third column), `get_value`/`enumerate_values` leave `REG_MULTI_SZ`/`REG_LINK` values hex-encoded where `get_user_value` decodes them (changing that changes `get_value`'s output for existing callers), and `PrivilegeScope`'s `AdjustTokenPrivileges` call must keep its `ReturnLength` argument (without it the offline fallback silently never enabled the privileges until #2771: `agents/shared/win_profiles.hpp`, `changelog.d/2771-privilegescope-token-adjust-bug.fixed.md`). The `get_user_value` capture exercised the live-hive path, not the offline mount. A registry value of at least 16 MiB can be created by any writer of the key, and `get_value` reads a whole value (unchanged 1.0.0 behaviour; a bounded read is a follow-up)."
   ],
   "definitions": [
     {
@@ -248,7 +248,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Delete a Windows registry key and every value and subkey beneath it in one call. Windows-only.",
+      "description": "Delete a Windows registry key that has no subkeys; a key with subkeys is refused as key_has_subkeys and nothing is deleted. The key is opened on a checked handle (one canonical-name-checked open, with a component walk as the fallback) and a registry symbolic link in the path is refused, never followed (the key AT the path may itself be a link: the link object is removed and its target is untouched). The delete runs by handle on the checked key (no RegDeleteTreeW, which follows links) and is confirmed by the handle reading back as deleted. counted_keys is 1 and counted_values is the number of values the key held; the count stops at 10,000 nodes (the key plus up to 9,999 values), past which capped is 1 and counted_values is a lower bound (the delete still removes the key with all its values). A subkey created between the check and the delete makes the delete fail, not key_has_subkeys: the key stays and the action answers a failure token (access_denied or win32:<code>). Windows-only.",
       "display_name": "Delete Registry Key",
       "execute_roles": [
         "endpoint-admin"
@@ -264,7 +264,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Delete a specific value from a Windows registry key; the key itself is left in place. Windows-only.",
+      "description": "Delete a specific value from a Windows registry key; the key itself is left in place. Registry 2.0.0 reports a failure as an `error|<token>` line (key_not_found, value_not_found, key_is_link, access_denied ...) instead of a sentence, limits the key path to 255 bytes and 32 components, and emits one leading `audit|op=delete_value|...` row (the old value, hex) before `status|ok`. Windows-only.",
       "display_name": "Delete Registry Value",
       "execute_roles": [
         "endpoint-admin"
@@ -381,7 +381,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Write a value to the Windows registry, creating the key if it does not exist. Value data is written as REG_SZ (a UTF-16 string) or REG_DWORD (a 32-bit integer) per `type`. Windows-only.",
+      "description": "Write a value to the Windows registry, creating missing key components beneath an existing top-level key (a path whose first component is missing is refused as root_level_create). All six writable types are supported (REG_SZ, REG_EXPAND_SZ, REG_BINARY, REG_DWORD, REG_MULTI_SZ, REG_QWORD) and the write is verified: the previous value is captured first, the new one is read back on the same handle and compared byte for byte, and a mismatch fails the action. The key is opened on a checked handle (one canonical-name-checked open, with a component walk as the fallback) and a registry symbolic link anywhere in the path is refused, never followed; a write under HKLM\\SYSTEM\\CurrentControlSet, itself a link, therefore fails as key_is_link. The previous and new values are recorded in a `registry.write` audit row (hex, capped at 256 bytes; they can contain secrets: the product owner accepted this risk on 2026-10-20 and masking is a planned later change). Needs registry 2.0.0 on the agent: an agent still running registry 1.x writes an EMPTY REG_SZ for a data_hex-only write, stores REG_QWORD, REG_MULTI_SZ, REG_EXPAND_SZ and REG_BINARY values as REG_SZ text and follows a write under HKLM\\SYSTEM\\CurrentControlSet, all answering `status|ok`, so upgrade the agents first. Windows-only.",
       "display_name": "Set Registry Value",
       "execute_roles": [
         "endpoint-admin"
@@ -393,8 +393,8 @@
       ]
     }
   ],
-  "description": "Windows Registry — get, set, delete, enumerate keys and values",
-  "how_it_works": "All nine actions are direct, synchronous Win32 registry calls — there is no scheduled gather. `get_value`/`key_exists`/`enumerate_keys`/`enumerate_values` open a key read-only and read or list it; `set_value` opens the key with `KEY_WRITE` (creating it if absent); `delete_value`/`delete_key` open with `KEY_SET_VALUE` or call `RegDeleteKeyW` directly. Every one of these six validates `hive`+`key` through one shared `parse_params` helper, which also logs (never blocks) access to a small set of sensitive `HKLM` subtrees (`...CurrentVersion\\Run*`, `...Services`) via `spdlog::info` — an audit trail, not a policy gate.\n\n`get_user_value` is the odd one out: it resolves the target profile through the same `ProfileList` walk `list_profiles` exposes as its own action, reads the live `HKEY_USERS\\<SID>` hive if the user is logged in, and only falls back to an offline `RegLoadKeyW` mount of that profile's `NTUSER.DAT` — under `SeBackup`/`SeRestore` privilege and a process-wide mutex serialising the whole offline arm — when the user is logged out. `list_profiles` is the discovery step the other per-user action needs: SID, resolved name, path, and live hive-load state, with the three well-known system SIDs filtered out.\n\nThe plugin deliberately does **not** decode `REG_MULTI_SZ`/`REG_LINK` *values* on `get_value`/`enumerate_values` — both are left hex-encoded there, unlike `get_user_value`, which decodes both; closing that gap would change `get_value`'s output shape for existing callers and is out of scope for this plugin as it stands. On macOS/Linux every action honestly reports `registry|unsupported|...` — reads return rc 0 (an honest \"unsupported\" read is itself a successful read) and the three mutators return rc 1 (a state-changing action that touched nothing must never report SUCCESS).",
+  "description": "Windows Registry -- get, set (six types, verified), delete value, delete key, enumerate, per-user reads",
+  "how_it_works": "All nine actions are direct, synchronous Win32 registry calls: there is no scheduled gather. The six read actions (`get_value`, `key_exists`, `enumerate_keys`, `enumerate_values`, `get_user_value`, `list_profiles`) open a key read-only and read or list it; every registry-controlled string they render passes through `sanitize_field` (`|`, CR and LF become `_`), so no read output can contain a line that starts with `audit|`. `get_user_value` resolves the target profile through the same `ProfileList` walk `list_profiles` exposes, reads the live `HKEY_USERS\\<SID>` hive if the user is logged in, and falls back to an offline `RegLoadKeyW` mount of `NTUSER.DAT` (under `SeBackup`/`SeRestore` and a process-wide mutex serialising the whole offline arm) only when the user is logged out. The seven `hive`+`key` actions validate through one `parse_target` helper, which also logs (never blocks) access to a few sensitive `HKLM` subtrees via `spdlog::info`.\n\nThe three mutating actions (`set_value`, `delete_value`, `delete_key`) share one core (`registry_core.hpp`, over an injected registry; `registry_win.cpp` binds it to `Reg*W`). Each obtains a CHECKED handle for the key, and every step after that -- the previous-value capture, `RegSetValueExW`, the verifying read-back, `RegDeleteValueW`, `NtDeleteKey(h)` -- runs on that handle: nothing re-resolves the path by name, and no handle outlives the command. There are two ways to the handle.\n\n- **The fast open (`HKLM` and `HKU` only).** ONE `RegOpenKeyExW` of the whole path with `REG_OPTION_OPEN_LINK`, then `NtQueryKey(KeyNameInformation)` names the object the handle is bound to. The open is accepted only when that kernel name equals `<root kernel name>\\<requested path>` (every byte exact except that A-Z fold, so a name that differs in non-ASCII case, a name that does not fit the 4 KiB buffer and a failed query all decline) and the leaf has no `SymbolicLinkValue`. A registry link before the leaf makes the kernel open the link's TARGET, whose name cannot equal the requested one, so the fast open can only accept the canonical object with no real link traversed; everything else declines to the walk. A `set_value` on an existing key is 7 calls across the plugin's registry seam (`open_path`, `final_name`, the link probe, capture, set, read-back, close; the cached root-name lookup is an eighth), the same at every depth, and about 7 Win32 calls: the link probe, the capture and the read-back are each one `RegQueryValueExW` for a value that fits a 256-byte first buffer (a larger value costs one more read). The walk costs about 3 more per path component, plus two name queries.\n- **The walk (the reference).** `open_checked` walks the path component by component from the hive root, opening each component from the previous HANDLE with `REG_OPTION_OPEN_LINK` and probing it for `SymbolicLinkValue`: a registry link is refused (`key_is_link`), never followed. A probe only sees the key as it is at that instant, and a link is made in two steps (the key, then its `SymbolicLinkValue`), so the walk also ends on the fast open's test. It reads the canonical kernel name of the FIRST component's handle right after that open (before its probe; it has to end in the requested first component, else `key_is_link`) and of the leaf handle at the end (after the create loop too), and hands the leaf over only when the leaf's name equals the first component's name plus the remaining requested components (A-Z fold). A link completed after its probe, or a component moved away by a rename, leaves the handle bound to an object whose name is not the requested path: the action is refused `key_is_link` and no value is written, and a name that cannot be read is refused with its Win32 token. A link completed during the create loop is the one case where the walk has already written: a create is relative to a handle the kernel parses again, so the keys can land beneath the link's target. The keys a creating walk makes stay owned by the operation until its verified write is over (`Opened::made`; its destructor is the rollback). So a walk that does not hand its leaf over (the name test refuses, a later create fails, or a later create finds its key already there), and an exception anywhere from the first create to the end of the verified write (an allocation failure while capturing the previous value, writing or reading back), try to delete every key the walk created, by its own handle, leaf first, after the value the write had set when it had landed, so that normally nothing is left (`result=refused`, `created=0`, with the reason it stopped for: `key_is_link`, `concurrent_change` or the Win32 token; after an exception the plugin's fixed failed audit line, caveat 2). The rule is the same without an attacker: a create that fails part-way under a plain parent (say `access_denied` on the second component) also removes the first. A key a create merely opened is closed, never deleted. The rollback is BEST EFFORT. A key that holds a value or a subkey when the rollback checks it is kept, because `NtDeleteKey` would destroy the values with it (the rollback asks `RegEnumValueW` first), and so is a key whose delete failed: each is counted in the audit line (`result=failed`, `created=<n>`). Windows has no delete-if-empty call, so two windows stay open: a value another writer puts into the key between that check and the delete is deleted with the key, and a value another writer puts over our own same-named value before the rollback deletes it by name is deleted with it. After a double fault (a rollback step that itself fails or throws) the value and the keys can stay with `created=-` and nothing logged. One derivation serves every hive, `HKCU` and `HKCR` included, and costs two `final_name` calls per walk whatever the depth. It is always used for `HKCU` (it resolves per calling user) and `HKCR` (a merged view of two trees), neither of which has one kernel name to compare with, for a key that is missing, and whenever the fast open declines. It alone produces the verdict token and creates: a missing component is created component-wise from the checked parent, a create that finds the key already there refuses `concurrent_change`, and a creating action never creates a key directly beneath the hive root (`root_level_create`).\n\nThe two differ in exactly two ancestor-only cases where the walk is the stricter (see Caveats); in both the write lands on the real requested key, as registry 1.0.0's single open did. A path under `HKLM\\SYSTEM\\CurrentControlSet`, itself a link to the active control set, is refused on both: write under `HKLM\\SYSTEM\\ControlSet001` (or the numbered set `Select\\Current` names); registry 1.0.0 followed it, reads still do. `set_value` writes any of the six types (`REG_SZ`, `REG_EXPAND_SZ`, `REG_BINARY`, `REG_DWORD`, `REG_MULTI_SZ`, `REG_QWORD`) from text or exact `data_hex` bytes, reads the value back on the same handle and compares type and bytes; a mismatch fails the action (`verify_mismatch`). `delete_key` refuses a key that has subkeys (`key_has_subkeys`) and otherwise deletes the key by handle with `NtDeleteKey`, never `RegDeleteTreeW`, which follows a registry link met inside a tree; a link at the leaf is opened as the link object, so the delete removes the link and never its target. Its counts are what the key held: `counted_keys|1` and `counted_values|<n>`, with `capped|1` when the value enumeration stopped at its cap of 10,000 nodes, the key plus up to 9,999 values (`counted_values` is then a lower bound; the delete still removes the key with all its values). Every mutating action captures the previous value first and emits ONE `audit|` line (see \"Audit line grammar and producer contract\").\n\nCode anchors (file and function; line numbers move with every edit): the fast open `open_fast`, the checked walk `open_checked`, its name test `leaf_name_check` and its link probe `probe_link`, the guarded value read `query_value_bounded`, the verifying write `write_value_on`, the by-handle delete `delete_key_on` and the counts in `delete_key_tree` (all in `registry_core.hpp`); the encoders `encode_value`, `validate_key_path` and `render_audit_line` (`registry_parsers.hpp`); the kernel calls `Win32Registry::open_path`, `final_name`, `root_name` and `delete_key_by_handle` (`registry_win.cpp`); the server-side binding `registry_audit_events_for_frame` (`server/core/src/plugin_result_audit.hpp`).",
   "inputs": [
     {
       "constraints": {
@@ -628,7 +628,7 @@
       "constraints": null,
       "default": null,
       "definition_id": "windows.registry.set_value",
-      "description": "Registry key path relative to the hive root; created if it does not already exist, e.g. \"Software\\\\MyApp\".\n",
+      "description": "Registry key path relative to the hive root; created if it does not already exist beneath an existing top-level key, e.g. \"Software\\\\MyApp\". At most 255 bytes and 32 components; a hive alias, an empty, \".\" or \"..\" component and control characters are refused on the instruction and MCP routes; POST /api/command passes an embedded NUL to the plugin as a C string, so the value is cut at it.\n",
       "name": "key",
       "required": true,
       "type": "string"
@@ -637,7 +637,7 @@
       "constraints": null,
       "default": null,
       "definition_id": "windows.registry.set_value",
-      "description": "The value name to write, e.g. \"InstallPath\".",
+      "description": "The value name to write, e.g. \"InstallPath\". Empty writes the key's default value. At most 16,383 bytes.\n",
       "name": "name",
       "required": true,
       "type": "string"
@@ -646,21 +646,36 @@
       "constraints": null,
       "default": null,
       "definition_id": "windows.registry.set_value",
-      "description": "The value data to write, as text; interpreted per `type` (decimal digits for REG_DWORD, literal text for REG_SZ).\n",
+      "description": "The value data to write, as text; interpreted per `type`: decimal digits for REG_DWORD / REG_QWORD, literal text for REG_SZ / REG_EXPAND_SZ, LF-separated non-empty records for REG_MULTI_SZ (split on LF only, so a CR stays inside its record; an empty record or a trailing LF is refused as invalid_data; empty text is the empty list), hex digits for REG_BINARY (empty is zero bytes). Send exactly one of `value` and `data_hex`. When neither is sent, or the one sent is empty, the write stores an empty value of the type and answers ok: an empty string, the empty list or zero bytes (REG_DWORD and REG_QWORD refuse it as invalid_data), so a misspelt parameter name writes an empty value instead of failing. Through MCP `execute_instruction` and the result-set execute routes every parameter value is limited to 64 KiB.\n",
       "name": "value",
-      "required": true,
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 2097152
+      },
+      "default": null,
+      "definition_id": "windows.registry.set_value",
+      "description": "The exact bytes to write, as hex, for any type; give it INSTEAD of `value` (both non-empty is refused as invalid_data). Shape is checked per type: 4 bytes for REG_DWORD, 8 for REG_QWORD, a terminating NUL for the string types, a trailing double NUL for REG_MULTI_SZ. Use it for exact bytes you hold from another source. An empty `data_hex` is the same as omitting it here. The plugin takes at most 1 MiB of data (2,097,152 hex characters), but MCP `execute_instruction` and the result-set execute routes limit every parameter value to 64 KiB, so through them it carries at most 32 KiB of data; the direct command route is not under that cap. Needs registry 2.0.0 on the agent: registry 1.x ignores it and writes an EMPTY REG_SZ over the value, answering `status|ok` (with type=REG_DWORD and data_hex only, 1.x throws and writes nothing).\n",
+      "name": "data_hex",
+      "required": false,
       "type": "string"
     },
     {
       "constraints": {
         "enum": [
           "REG_SZ",
-          "REG_DWORD"
+          "REG_EXPAND_SZ",
+          "REG_BINARY",
+          "REG_DWORD",
+          "REG_MULTI_SZ",
+          "REG_QWORD"
         ]
       },
       "default": null,
       "definition_id": "windows.registry.set_value",
-      "description": "Registry value type to write. Defaults to REG_SZ when omitted.\n",
+      "description": "Registry value type to write. Defaults to REG_SZ when omitted. Mixed fleets: an agent still running registry 1.x stores REG_QWORD, REG_MULTI_SZ, REG_EXPAND_SZ and REG_BINARY values as REG_SZ text and answers `status|ok`, so upgrade the agents to registry 2.0.0 before using them.\n",
       "name": "type",
       "required": false,
       "type": "string"
@@ -671,20 +686,60 @@
     "gathered": false,
     "mutating": true
   },
-  "leg_hash": "6255117edeb8",
+  "leg_hash": "8e63a482f476",
   "manifest_version": 1,
   "name": "registry",
   "outputs": [
     {
       "columns": [
         {
-          "description": "Confirms the delete succeeded; only ever emitted on success — a failure is reported as an `error|` line and a non-zero exit instead of this column. Values: ok.",
+          "description": "Confirms the delete succeeded and the handle read back as deleted; only ever emitted on success — a failure is reported as an `error|<token>` line (not exhaustive: key_not_found, key_has_subkeys, key_is_link, access_denied, verify_mismatch, concurrent_change, invalid_key_path or win32:<code>) and a non-zero exit instead of this column. A run that resolves its hive and key, success or not, also emits one `audit|op=delete_key|...` row; a missing hive or key, or an unparseable hive, is a bare `error|...` line with nothing opened and no audit row. Values: ok.",
           "example": "ok",
           "name": "status",
           "platforms": [
             "windows"
           ],
           "type": "string",
+          "values": null
+        },
+        {
+          "description": "Keys removed: always the target alone, so 1. Values: 1.",
+          "example": "1",
+          "name": "counted_keys",
+          "platforms": [
+            "windows"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Values the key held, counted before the delete (a lower bound whenever capped is 1). Point in time: a writer racing the delete can add values this count never saw. Values: a non-negative integer.",
+          "example": "5",
+          "name": "counted_values",
+          "platforms": [
+            "windows"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Always 0: this version has no dry run (the column is kept for the audit row and later releases). Values: 0 — a digit, never true/false.",
+          "example": "0",
+          "name": "dry_run",
+          "platforms": [
+            "windows"
+          ],
+          "type": "bool",
+          "values": null
+        },
+        {
+          "description": "Whether the value enumeration stopped at its cap of 10,000 nodes (the key plus up to 9,999 values), making counted_values a lower bound; the delete still removes the key with all its values. Values: 1 (capped), 0 (complete) — a digit, never true/false.",
+          "example": "0",
+          "name": "capped",
+          "platforms": [
+            "windows"
+          ],
+          "type": "bool",
           "values": null
         }
       ],
@@ -868,7 +923,7 @@
     {
       "columns": [
         {
-          "description": "Confirms the write succeeded; only ever emitted on success — a failure is reported as an `error|` line and a non-zero exit instead of this column. Values: ok.",
+          "description": "Confirms the write succeeded and read back identical; only ever emitted on success — a failure is reported as an `error|<token>` line (not exhaustive: access_denied, key_not_found, root_level_create, key_is_link, concurrent_change, invalid_type, invalid_data, value_overflow, invalid_key_path, invalid_value_name, verify_mismatch or win32:<code>) and a non-zero exit instead of this column. A run that resolves its hive and key, success or not, also emits one `audit|op=set_value|...` row carrying the previous and new values (hex, capped); a missing hive or key, or an unparseable hive, is a bare `error|...` line with nothing opened and no audit row, while a key path or value name that fails shape validation after the hive resolved (invalid_key_path, invalid_value_name) is audited as result=refused. Values: ok.",
           "example": "ok",
           "name": "status",
           "platforms": [
@@ -881,33 +936,33 @@
       "definition_id": "windows.registry.set_value"
     }
   ],
-  "outputs_note": "This plugin does not emit a uniform pipe-joined \"row\"; each action has its own shape. `get_value`, `get_user_value`, `key_exists`, `set_value`, `delete_value` and `delete_key` each write one self-describing `field_name|value` line per field, on success only — a failure instead writes an `error|...` line and returns rc 1, so `-` is never used as an absence placeholder anywhere in this plugin. `enumerate_keys` writes one `subkey|<name>` line per subkey; a genuinely empty key emits zero lines with rc 0 (a key that cannot be opened at all instead reports `error|key not found`, rc 1). `enumerate_values` writes one line per value shaped `value|<name>|<type>` — the leading `value` is a fixed literal tag, not one of the two documented columns (`name`, `type`); see Caveats. `list_profiles` writes one true pipe-joined row per profile (`<sid>|<name>|<path>|<state>`, no discriminator prefix) and zero rows is a structural success, not an error, when the host has no non-system profiles.",
+  "outputs_note": "This plugin does not emit a uniform pipe-joined \"row\"; each action has its own shape. `get_value`, `get_user_value` and `key_exists` write one self-describing `field_name|value` line per field on success; a failure writes an `error|...` line and returns rc 1, so `-` is never used as an absence placeholder in the read actions. Every mutating action that resolves its target writes ONE `audit|...` line first (grammar below; `-` is \"not applicable\" inside it), then `status|ok` or `error|<token>`; a missing hive or key or an unparseable hive is a bare `error|...` line with nothing opened and no audit line, while a key path or value name that fails shape validation after the hive resolved is audited as `result=refused`; the dashboard shows the `audit` line as one more row. `delete_key` appends four `key|value` rows after `status|ok`: `counted_keys` (1), `counted_values` (the values the key held), `dry_run` (always 0 in this version) and `capped` (1 when the value count stopped at its cap of 10,000 nodes, the key plus up to 9,999 values, which makes `counted_values` a lower bound; the key is still deleted with all its values); the counts are point in time, since a writer racing the delete can add values the count never saw. `enumerate_keys` writes one `subkey|<name>` line per subkey; a genuinely empty key emits zero lines with rc 0. `enumerate_values` writes one line per value shaped `value|<name>|<type>` -- the leading `value` is a fixed literal tag, not one of the two documented columns (`name`, `type`); see Caveats. `list_profiles` writes one true pipe-joined row per profile (`<sid>|<name>|<path>|<state>`, no discriminator prefix) and zero rows is a structural success.\n\n**Error tokens of the mutating actions.** `error|<token>` and the audit line's `reason=` carry the bare token and nothing more, and the agent logs nothing about an ordinary failure (an exception is the exception: it is logged with the action name). What each means and where to look:\n\n| Token | Meaning | What to check |\n|---|---|---|\n| `access_denied` | `ERROR_ACCESS_DENIED`, from several causes: the agent identity's ACL on the key refuses an access the action asks for (caveat 3 lists them); a parent the walk may traverse but not read (the walk opens every component with `KEY_QUERY_VALUE` to probe it; the fast open does not); a create refused on a parent, or an inherited ACL that gives the new key no `DELETE`; the link probe itself refused | the ACL of the key and of each parent for the agent identity |\n| `key_not_found` | the key, or a component of the path, does not exist (nothing was written) | the spelling; `key_exists`; a `WOW6432Node` path |\n| `value_not_found` | `delete_value` named a value the key does not hold (nothing deleted) | `enumerate_values` |\n| `root_level_create` | the first key component is missing directly under the hive root; a creating write never creates one | the parent has to exist already |\n| `key_is_link` | a component is a registry symbolic link, or the handle's kernel name is not the requested path (a link completed mid-walk, a component renamed, a non-ASCII case variant, a decoy value named `SymbolicLinkValue` on an ancestor); nothing was written | the link's target path; the key's stored spelling |\n| `key_has_subkeys` | `delete_key` on a key with subkeys (nothing deleted) | delete the subkeys first, one key per call |\n| `concurrent_change` | another party created the key between the walk's check and its create, or the handle went stale (`ERROR_KEY_DELETED`) | read the key and retry |\n| `verify_mismatch` | the read-back differs from what was written, or the key did not read back as deleted. It can be a false positive: another writer, or a Group Policy refresh, that touches the value between the write and the read-back looks the same | `get_value` the value and decide |\n| `invalid_key_path`, `invalid_value_name` | the input failed shape validation before anything was opened (limits under Inputs) | the parameter |\n| `invalid_type` | `type` is not one of the six names (case-sensitive) | the spelling |\n| `invalid_data` | the text or `data_hex` does not fit the type: not decimal digits for a number; not hex, or an odd count; a string without its terminating NUL; a REG_MULTI_SZ with an empty record or a trailing LF (records are split on LF only, so a CR stays in its record); `value` and `data_hex` both sent | the parameter |\n| `value_overflow` | a number out of range for its type, or data over 1 MiB | the parameter |\n| `win32:<code>` | any other Win32 or NT failure, by number, including the answer when `NtDeleteKey` refuses for a reason not listed here (caveat 4) | `net helpmsg <code>` |\n| `exception` | an exception ended the action (an allocation failure is the realistic one); the audit line is the fixed failed line of caveat 2 | the agent log, and \"A partial or failed create\" under Where the data goes |\n\nA misspelt or missing `value` parameter on a `REG_SZ`, `REG_EXPAND_SZ`, `REG_MULTI_SZ` or `REG_BINARY` write is not an error: it writes an empty value of the type and answers `status|ok` (`REG_DWORD` and `REG_QWORD` refuse it as `invalid_data`).",
   "platforms": {
-    "linux": "unsupported",
-    "macos": "unsupported",
+    "linux": "planned",
+    "macos": "planned",
     "windows": "supported"
   },
   "privileges": [
     {
-      "grant": "`set_value`/`delete_value`/`delete_key` against `HKLM\\*` need the service account in `Administrators`; `HKCU\\*` needs no elevation. `get_user_value`'s offline-hive fallback needs `SeBackupPrivilege`+`SeRestorePrivilege`, already granted to the service account — no new grant; its live-hive path and `list_profiles` need no elevated privilege at all.",
-      "if_refused": "`error|key not found` / `error|value not found` (reads); `error|failed to open/create key` / `error|failed to delete key` (writes/deletes) — Win32 does not distinguish \"access denied\" from \"does not exist\" in these two messages",
-      "measured": "2026-09-07, bare-metal, as `SYSTEM`",
+      "grant": "Writes against `HKLM\\*` need the service account in `Administrators`; `HKCU\\*` needs no elevation. `get_user_value` uses the offline-hive fallback only when the target user is logged out: it needs `SeBackupPrivilege`+`SeRestorePrivilege`, already granted to the service account, so there is no new grant; the live-hive path, the machine-hive writes and `list_profiles` need no elevated privilege beyond the key's own ACL. `NtDeleteKey` and `NtQueryKey` (ntdll) need no privilege beyond `DELETE` on the key and a handle the caller already holds.",
+      "if_refused": "`error|key not found` / `error|value not found` (reads); the mutating actions name the cause: `error|access_denied`, `key_not_found`, `value_not_found`, `key_is_link`, `key_has_subkeys`, `concurrent_change`, `root_level_create`, `verify_mismatch`, `invalid_key_path`, `invalid_value_name`, `invalid_type`, `invalid_data`, `value_overflow`, `win32:<code>` or `exception` (the token table under Outputs says what each means)",
+      "measured": "2026-10-23, bare-metal, elevated interactive user: the nine actions captured (`docs/samples/windows.txt`); the write arms also run in `tests/unit/test_registry_write_local_dispatcher.cpp` and `tests/unit/test_registry_win_internals.cpp` on elevated Windows runs",
       "os": "Windows",
       "runs_as": "agent service account (LocalSystem today, #1442)"
     },
     {
       "grant": "n/a",
       "if_refused": "always `registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists`, rc 0 (reads) / rc 1 (mutators)",
-      "measured": "2026-09-07, bare-metal, euid 501 (jsmith)",
+      "measured": "2026-10-22, bare-metal, euid 501",
       "os": "macOS",
-      "runs_as": "n/a — plugin loads but every action is the honest `unsupported` leg"
+      "runs_as": "n/a: plugin loads but every action is the honest `unsupported` stub (plist support is PLANNED)"
     },
     {
       "grant": "n/a",
       "if_refused": "always `registry|unsupported|Windows registry is not available on this platform`, rc 0 (reads) / rc 1 (mutators)",
-      "measured": "2026-09-07, container, euid 0",
+      "measured": "2026-10-22, vm, euid 0",
       "os": "Linux",
-      "runs_as": "n/a — plugin loads but every action is the honest `unsupported` leg"
+      "runs_as": "n/a: plugin loads but every action is the honest `unsupported` stub (dconf support is PLANNED)"
     }
   ],
   "readme": "agents/plugins/registry/README.md",
@@ -1061,11 +1116,11 @@
         }
       ],
       "stamp": {
-        "date": "2026-09-07",
-        "host_class": "container",
-        "leg_hash": "6255117edeb8",
+        "date": "2026-10-22",
+        "host_class": "vm",
+        "leg_hash": "8e63a482f476",
         "os": "linux",
-        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "os_version": "Ubuntu 26.04.1 LTS x86_64",
         "privilege": "euid 0"
       }
     },
@@ -1217,12 +1272,12 @@
         }
       ],
       "stamp": {
-        "date": "2026-09-07",
+        "date": "2026-10-22",
         "host_class": "bare-metal",
-        "leg_hash": "6255117edeb8",
+        "leg_hash": "8e63a482f476",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (jsmith)"
+        "privilege": "euid 501"
       }
     },
     "windows": {
@@ -1254,8 +1309,9 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 1,
+          "row_count": 2,
           "rows": [
+            "audit|op=set_value|hive=HKCU|result=ok|reason=-|verify=ok|key=Software\\YuzuCaptureTmp|name=probe|type=REG_SZ|len=4|dry_run=-|counted_keys=-|counted_values=-|capped=-|created=1|sid=-|old_state=absent|old_type=-|old=-|new=31000000",
             "status|ok"
           ],
           "truncated": false
@@ -1270,8 +1326,9 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 1,
+          "row_count": 2,
           "rows": [
+            "audit|op=delete_value|hive=HKCU|result=ok|reason=-|verify=ok|key=Software\\YuzuCaptureTmp|name=probe|type=-|len=-|dry_run=-|counted_keys=-|counted_values=-|capped=-|created=0|sid=-|old_state=present|old_type=REG_SZ|old=31000000|new=-",
             "status|ok"
           ],
           "truncated": false
@@ -1286,9 +1343,13 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 1,
+          "row_count": 6,
           "rows": [
-            "status|ok"
+            "audit|op=delete_key|hive=HKCU|result=ok|reason=-|verify=ok|key=Software\\YuzuCaptureTmp|name=-|type=-|len=-|dry_run=0|counted_keys=1|counted_values=0|capped=0|created=0|sid=-|old_state=-|old_type=-|old=-|new=-",
+            "status|ok",
+            "counted_keys|1",
+            "counted_values|0",
+            "dry_run|0"
           ],
           "truncated": false
         },
@@ -1318,7 +1379,7 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 99,
+          "row_count": 101,
           "rows": [
             "subkey|Accessibility",
             "subkey|AdaptiveDisplayBrightness",
@@ -1361,7 +1422,7 @@
           "row_count": 3,
           "rows": [
             "username|jsmith",
-            "value|1",
+            "value|2",
             "type|REG_DWORD"
           ],
           "truncated": false
@@ -1384,12 +1445,12 @@
         }
       ],
       "stamp": {
-        "date": "2026-09-07",
+        "date": "2026-10-23",
         "host_class": "bare-metal",
-        "leg_hash": "6255117edeb8",
+        "leg_hash": "8e63a482f476",
         "os": "windows",
-        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
-        "privilege": "SYSTEM (account name redacted to jsmith; account SID replaced with a placeholder)"
+        "os_version": "Windows 10.0.26200 x86_64",
+        "privilege": "interactive user (elevated; username, SID and profile path anonymised)"
       }
     }
   },
@@ -1480,24 +1541,37 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
     ],
-    "changelog": [],
+    "changelog": [
+      "changelog.d/2026-10-22-registry-typed-writes.added.md",
+      "changelog.d/2026-10-22-registry-typed-writes.changed.md"
+    ],
     "definitions": [
       "content/definitions/registry.yaml"
     ],
     "plugin": [
-      "agents/plugins/registry/src/registry_plugin.cpp"
+      "agents/plugins/registry/src/registry_core.hpp",
+      "agents/plugins/registry/src/registry_parsers.hpp",
+      "agents/plugins/registry/src/registry_plugin.cpp",
+      "agents/plugins/registry/src/registry_win.cpp"
     ],
     "privilege_row": true,
     "tests": [
-      "tests/unit/test_registry_local_dispatcher.cpp"
+      "tests/test_registry_definition.py",
+      "tests/unit/test_registry_core.cpp",
+      "tests/unit/test_registry_local_dispatcher.cpp",
+      "tests/unit/test_registry_parsers.cpp",
+      "tests/unit/test_registry_win_internals.cpp",
+      "tests/unit/test_registry_write_local_dispatcher.cpp"
     ]
   },
-  "version": "1.0.0",
+  "version": "2.0.0",
   "where_the_data_goes": [
-    "**Instruction result only.** Rows/lines travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`.",
-    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — nothing here runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its nine definitions.",
-    "**Sensitivity.** `get_value`/`enumerate_values`/`get_user_value` can return arbitrary registry data — the real captures above include `ProductName`/`CurrentVersion`/`BuildLab` (installed-software/OS-version identification) and `RegisteredOwner`/`DigitalProductId` (a person's name and a device-specific product-key hash) among the readable values; `get_user_value`'s `username` field and `list_profiles`' `profile_name`/`profile_path` (e.g. `jsmith`/`C:\\Users\\jsmith`) directly identify a specific person and their home directory.",
-    "**Siblings:** none. Guardian's own real-time registry-key watch (`guard_type: \"registry\"`, `spark_fleet_tags.hpp:112`) is an unrelated detection mechanism, not this plugin — this plugin is on-demand CRUD only, with no watch/trigger surface.",
-    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"windows.registry.get_value\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+    "**Instruction result.** Rows/lines travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90 days), queryable at `/api/responses/{id}`.",
+    "**Audit log.** The server records a `registry.write` row only for a `registry` command whose agent-stamped `CommandResponse.action` is one of the three mutating actions; an agent older than this plugin stamps none and produces no rows. Principal, result, retention and the join to the operator's row: `docs/user-manual/audit-log.md`.",
+    "**A partial or failed create.** A `set_value` row with `result=failed` and `created=<n>` above 0, an `error|exception` reply, or an agent that stopped in the middle of a command can leave keys the call made (and, for a write that landed, its value). Take the hive, key and value name from the request that dispatched the command, not from the audit row: the exception row has `hive=-|key=-|created=-`, and the `command.dispatch` row carries only `registry:set_value -> N agent(s)`. The request parameters are in `executions.parameter_values` of the execution that holds the row's `command_id` (join on it; the command-to-execution mapping is reaped after 24 hours, so the join can come back empty, and then only the dispatching script, workflow or schedule holds the request), or in the dispatching script, workflow or schedule. A call creates only the trailing components of a path that did not exist and the leading ones existed before, and a pre-existing empty parent looks exactly like a created one; the rollback goes leaf first, so the keys a failed call leaves are normally the shallowest of the ones it made, but not when the leaf holds a value or key another party put there: the leaf is kept and every ancestor above it survives with it (`created=<n>` counts the survivors on a returning exit). Read the candidates with `key_exists`, `enumerate_values` and `enumerate_keys`, and decide per key: remove it with `delete_key` (it refuses a key with subkeys, so go leaf first, one call per key) only when this call's creation of it can be shown (for example an earlier `key_exists` for the path answered false) and it is empty; a key that holds a value you did not write is another party's and stays, and so does any key whose creation by this call you cannot show. For an exception whose audit line could not be written, and for an agent that died mid-command, there is no `registry.write` row: only the `command.dispatch` row and the stored response show the attempt.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics: nothing here runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its nine definitions.",
+    "**Sensitivity.** The audit rows and the `set_value`/`delete_value` responses carry registry data OLD and NEW (hex of the raw bytes, 256 bytes at most per value in an audit row, for every value type) and key paths, so they can hold secrets that live in the registry (a service account's autologon password, a product key, an agent token). **Owner risk acceptance:** old and new values are recorded as raw hex and can contain secrets; the product owner accepted this risk on 2026-10-20 and masking is a planned later change, and nothing in the plugin redacts them today. A key path can name a person. `get_value`/`enumerate_values`/`get_user_value` can return arbitrary registry data, among it `RegisteredOwner`/`DigitalProductId` (a person's name and a device-specific product-key hash); `get_user_value`'s `username` and `list_profiles`' `profile_name`/`profile_path` (e.g. `jsmith`/`C:\\Users\\jsmith`) directly identify a person and their home directory. The readers are wider than the writers: `AuditLog:Read` and `Response:Read` (the Viewer, Operator, PlatformEngineer, ITServiceOwner and Administrator roles hold both; `Response:Read` is not floored while RBAC is off), the legacy `/events` stream (any authenticated non-service-scoped session) and MCP `query_audit_log`; the executions' `parameter_values` carries the write parameters, `value` and `data_hex` alike, unredacted, and `delete_value` returns the old value in its response too. By default audit rows are retained 365 days (`--audit-retention-days`) and the response store 90 days (`--response-retention-days`); the executions table is not in the server's retention settings and no pass prunes it, so `parameter_values` stays until the database is purged. Read-time redaction is not built.",
+    "**Siblings:** none. Guardian's own real-time registry-key watch (`guard_type: \"registry\"`) is an unrelated detection mechanism; this plugin is on-demand only, with no watch/trigger surface.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) -> `yuzu://plugin-docs` (this page as data) -> `discover_instructions` / `get_definition(\"windows.registry.get_value\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`; the audit rows: the audit log API filtered on `registry.write`."
   ]
 }

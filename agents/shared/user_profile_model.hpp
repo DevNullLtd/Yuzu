@@ -205,12 +205,11 @@ struct ProfileInfo {
     return std::nullopt;
 }
 
-/// Strips '|', '\r', '\n' from a field before it is written into the
+/// Replaces '|', '\r', '\n' in a field with '_' before it is written into the
 /// pipe-delimited plugin-output protocol, so a value containing one of those
-/// cannot forge a column or row boundary. Same behaviour as
-/// registry_plugin.cpp's local sanitize_field, which today applies only to
-/// the unknown-action error string; every field this header renders goes
-/// through this copy instead.
+/// cannot forge a column or row boundary. Every field this header renders
+/// goes through it, and the registry plugin's unknown-action error path
+/// calls it directly.
 [[nodiscard]] inline std::string sanitize_field(std::string_view s) {
     std::string out;
     out.reserve(s.size());

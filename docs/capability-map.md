@@ -703,7 +703,7 @@ gRPC streaming delivers output in real time.
 
 ### 12.5 Registry Key/Value Write/Delete :white_check_mark: `T2`
 
-`registry` plugin with `set_value`, `delete_value`, and `delete_key` actions. Support REG_SZ and REG_DWORD types.
+`registry` plugin (2.0.0) with `set_value` (all six value types, from text or exact `data_hex` bytes, read-back verified), `delete_value` and `delete_key` (a key with no subkeys; it counts the values the key held, `counted_values`, and reports no contents). Every mutation runs on a handle checked for registry links (one canonical-name-checked open on HKLM and HKU, a component walk otherwise or as the fallback), and each emits an audit line that the server records as a `registry.write` row when the agent (registry 2.0.0) stamps the action; the row carries the old and new value as raw hex (256 bytes at most), which can contain secrets: the product owner accepted this risk on 2026-10-20 and masking is a planned later change. *(Evidence: `agents/plugins/registry/src/registry_core.hpp`, `registry_win.cpp`, `server/core/src/plugin_result_audit.hpp`.)*
 
 ### 12.6 Registry Enumeration :white_check_mark: `T2`
 

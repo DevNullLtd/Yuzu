@@ -1616,6 +1616,53 @@ from the dashboard's YAML editor (that path validates the id on every save, not 
 create). Rename those definitions before upgrading — create a replacement under a different id
 and delete the original.
 
+### vNEXT: the `guardian.` instruction-definition id prefix is reserved (#6062) (breaking)
+
+**Who this affects.** Anyone whose instruction definitions include an id beginning `guardian.`.
+No shipped or bundled content uses that prefix, so a deployment running only Yuzu-supplied
+content needs no action for this item. Operator-authored definitions are the population this
+cannot rule out: the prefix reads like a natural name for a Guardian-related definition, and
+nothing before this release refused it.
+
+**Why.** `guardian.<...>` is the namespace reserved for Guardian rule-deploy approval tickets
+(four-eyes epic #6060, [ADR-1009](../adr/1009-four-eyes-mvp-bound-approval.md)). Keeping authored
+definitions out of it keeps the two namespaces separable in the store, on the Approvals page and
+in the audit log, in the same way `mcp.` is kept apart for MCP tickets (previous entry). No
+Guardian deploy approval exists yet in this release; the reservation lands first so that no
+definition has to be renamed later, when a ticket that uses the prefix does exist.
+
+**What changes.** Creating a definition whose id starts `guardian.` is refused with a 400 on
+every authoring route that accepts an explicit id (`POST /api/instructions`, `POST
+/api/instructions/yaml`, `POST /api/instructions/import`) and such a definition is skipped
+(counted in `defs_errored`) at boot auto-import. The dashboard's YAML validator refuses it as
+well, so Validate and Save agree. The error text is `definition id may not use the reserved
+'guardian.' prefix (reserved for Guardian deploy approvals)`; the `mcp.` text is unchanged, so a
+SIEM or script rule keyed on it keeps matching exactly what it matched before. The rule is
+case-sensitive and exact-prefix: `Guardian.foo`, `my.guardian.foo` and `guardianx.foo` are not
+reserved.
+
+**What does NOT change.** As for `mcp.`, the store applies the rule at creation only. A
+definition that already carries a `guardian.` id keeps executing and can still be saved through
+`PUT /api/instructions/{id}`. The one exception is the dashboard's YAML editor, which runs the
+same validation on every save, create or update: an existing `guardian.`-prefixed definition
+cannot be edited there if its document declares `metadata.id` (a document that omits it still
+saves). Re-importing an export of such a definition also fails.
+
+**What to do.** Before upgrading, look for affected ids. Query the instruction database directly
+rather than the REST list route: `GET /api/v1/definitions` caps its result at 100 definitions
+and the shipped content alone exceeds that, so an API-based check can report a false all-clear.
+The query is read-only and case-sensitive, matching the reservation:
+
+```bash
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT id FROM instruction_store.instruction_definitions WHERE id ~ '^guardian\.';"
+```
+
+An empty result means nothing to do. For any id listed, create a replacement under a different id
+(for example `site.guardian-baseline-check`) and delete the original; update any schedule,
+workflow or script that refers to the old id first. Definitions you leave in place keep
+executing, but you lose the dashboard YAML editor and re-import for them.
+
 ### vNEXT — behind a reverse proxy, declare your external origin or CSRF-gated dashboard actions keep failing (#2537)
 
 **Who this affects.** Anyone running the dashboard behind nginx, Envoy, HAProxy, an ALB or
@@ -5357,6 +5404,42 @@ note below.
 > see [The retention clock guard](audit-log.md#the-retention-clock-guard).
 
 > **Note:** All three retention values can also be set via environment variables (`YUZU_RESPONSE_RETENTION_DAYS`, `YUZU_AUDIT_RETENTION_DAYS`, `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`). `PUT /api/config/<key>` (with `Infrastructure:Write`; `audit_retention_days` also needs an administrator account, see [REST API](rest-api.md#put-apiconfigkey)) persists a value via `RuntimeConfigStore` and `/api/config` then reports it — **but each running store copied its retention value at construction and does not re-read it, so a stored value is not the window being enforced.** Change a window with the startup option or environment variable and restart. This limitation is shared across all three retention keys and is tracked as issue #483. The **Data and retention** page (Settings, System group) shows the enforced value and flags a stored value that is not in force.
+
+
+### Approval requests are not pruned, and a bound request is stored in clear text (#6062)
+
+None of the settings above applies to approval tickets. The `approvals` table has no retention
+pass today and nothing deletes a row, so every approval ever submitted is kept (growth is tracked
+in #3728). Each row records who submitted, reviewed and consumed a ticket, which is why it is
+kept rather than aged out.
+
+From #6062 an approval row can also carry a **bound request**: the exact effect the reviewer
+was shown, frozen at submission. It is stored in the `request_json` column as clear `TEXT`, up to
+16 KiB, with its SHA-256 in `request_digest` and the barred reviewers in `excluded_roots`. Treat
+`request_json` as follows:
+
+- **It is not a secret store.** It is not encrypted or hashed at rest, and it may contain the
+  operator-supplied parameters and the target devices of the request. Never put a secret
+  (password, token, key, connection string) in an instruction parameter that goes through a
+  four-eyes approval: the reviewer must be able to read it, so it is shown, and it stays in the
+  table.
+- **It is personal data if the parameters are.** A parameter that names a user, a path under a
+  user profile or an e-mail address is retained with the row. Include the `approvals` table in
+  your data inventory and in any subject-access or erasure process; there is no per-row delete
+  route.
+- **Who can read it.** Every principal holding `Approval:Read` (the seeded `Viewer`, `Operator`,
+  `PlatformEngineer`, `ITServiceOwner` and `Administrator` roles; with RBAC off, every
+  authenticated session) can
+  read it, on the Approvals page and in every approval read response: `GET /api/v1/approvals`,
+  `GET /api/v1/approvals/{id}`, the legacy `GET /api/approvals`, and MCP
+  (`list_pending_approvals`). A service-scoped API token is refused on all of them, even one whose
+  `ITServiceOwner` ceiling includes `Approval:Read`.
+- **Retention.** It is kept as long as its row, and rows are not pruned. Any future prune is a
+  bulk delete on a wall-clock cutoff and falls under the clock-guarded retention rules
+  ([`docs/clock-guarded-retention.md`](../clock-guarded-retention.md)).
+
+No feature creates a bound request in this release, so no `request_json` is stored yet; this is
+the contract for the change that does.
 
 ---
 
