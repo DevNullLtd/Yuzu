@@ -985,7 +985,7 @@ const std::string& openapi_spec() {
       },
       "Approval": {
         "type": "object",
-        "description": "A queued instruction-approval request. Returned by GET /api/v1/approvals/{id} (the A4 status_url target).",
+        "description": "A queued instruction-approval request. Returned by GET /api/v1/approvals/{id} (the A4 status_url target) and as each item of GET /api/v1/approvals. A bound ticket additionally carries the request fields below.",
         "properties": {
           "id": {"type": "string"},
           "definition_id": {"type": "string"},
