@@ -1054,7 +1054,7 @@ TEST_CASE("writer: a version-2 body whose model equals the defaults stores the v
     CHECK(*v.stored == stored_a); // byte-identical, so the same revision
 }
 
-TEST_CASE("writer: a model in a version-1 body is refused, and so is a bad model value",
+TEST_CASE("writer: a model in a version-1 body is refused and so is a bad model value",
           "[dex][score_policy_writer]") {
     World w;
     const auto a = w.put("default", R"({"model":{"per_device_event_cap":6}})");

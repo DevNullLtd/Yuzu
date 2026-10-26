@@ -728,7 +728,7 @@ TEST_CASE("DexStats: default outputs match pinned-base raw values", "[dex][stats
     }
 }
 
-TEST_CASE("DexStats: an invalid confidence is nullopt, the same counts at 0.95 are not",
+TEST_CASE("DexStats: an invalid confidence is nullopt and the same counts at 0.95 are not",
           "[dex][stats]") {
     CHECK(dex_proportion(7, 50));
     CHECK(dex_rate(15, 1.0));

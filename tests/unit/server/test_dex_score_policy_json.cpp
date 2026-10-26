@@ -515,7 +515,7 @@ TEST_CASE("policy json: a confidence just off 0.95 is in use and exactly 0.95 is
     CHECK(dex_score_policy_canonical(p) == kBaseDefaultText);
 }
 
-TEST_CASE("policy json: presence of an override model field, not its value, selects version 2",
+TEST_CASE("policy json: presence of an override model field and not its value selects version 2",
           "[dex][policy_json]") {
     DexScorePolicy p = dex_default_score_policy();
     DexScoreOverride o = override_for("app.exe");
@@ -536,7 +536,7 @@ TEST_CASE("policy json: presence of an override model field, not its value, sele
     CHECK(dex_score_policy_canonical(dex_default_score_policy()) == kBaseDefaultText);
 }
 
-TEST_CASE("policy json: model in a version-1 document is refused, as is the wrong shape",
+TEST_CASE("policy json: model in a version-1 document is refused as is the wrong shape",
           "[dex][policy_json]") {
     CHECK(refused_field(R"({"version":1,"model":{}})") == "model");
     CHECK(refused_message(R"({"version":1,"model":{}})") == "requires version 2");
@@ -595,7 +595,7 @@ TEST_CASE("policy json: model faults map to a path and are reported through the 
               .fault == "regression_ratio_out_of_range at overrides[1].model");
 }
 
-TEST_CASE("policy json: a stored version-2 text is served, a version-3 text falls back whole",
+TEST_CASE("policy json: a stored version-2 text is served and a version-3 text falls back whole",
           "[dex][policy_json]") {
     const std::string v2 = R"({"version":2,"model":{"per_device_event_cap":6}})";
     const auto in = dex_policy_in_force_from_stored(v2);

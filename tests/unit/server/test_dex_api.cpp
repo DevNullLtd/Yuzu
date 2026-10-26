@@ -1083,6 +1083,9 @@ TEST_CASE("DexApi: a per-application event cap override reaches the store", "[pg
     seed_n("a4", "capme.exe", "process.crashed", "2.0", 3);
     seed_n("a4", "capme.exe", "process.hung", "2.0", 3);
     seed_n("a3", "CapMe.EXE", "process.hung", "1.0", 4);
+    // A subject that differs from the override key "capmi.exe" only by a non-ASCII byte pair
+    // (U+0130): a locale-aware lower() can fold it to ASCII "i", the ASCII-only fold must not.
+    seed_n("a3", "CAPM\xC4\xB0.EXE", "process.crashed", "1.0", 4);
     // The unaffected control: a2 hangs 3 on each of app.exe's two versions (6 across them).
     seed_n("a2", "app.exe", "process.hung", "1.0.0.0", 3);
     seed_n("a2", "app.exe", "process.hung", "2.0.0.0", 3);
@@ -1154,6 +1157,13 @@ TEST_CASE("DexApi: a per-application event cap override reaches the store", "[pg
     CHECK(crashes_points(row(over, "CapMe.EXE")) == Approx(20.0 * 2 / (20 * 2)));
     CHECK(hangs_points(row(over, "CapMe.EXE")) == Approx(8.0 * 2 / (20 * 2)));
     CHECK(row(over, "CapMe.EXE").profile == DexPolicyProfile::Override);
+    // Sibling of the ASCII fold: a non-ASCII-different subject neither matches nor gets the
+    // override (a lower()-based join would give it cap 2).
+    const auto ovi = apps_under(
+        R"({"version":2,"overrides":[{"image":"capmi.exe","model":{"per_device_event_cap":2}}]})");
+    REQUIRE_FALSE(ovi.degraded);
+    CHECK(row(ovi, "CAPM\xC4\xB0.EXE").profile == DexPolicyProfile::Default);
+    CHECK(crashes_points(row(ovi, "CAPM\xC4\xB0.EXE")) == Approx(20.0 * 4 / (20 * 5)));
     // Other applications keep the global cap.
     CHECK(crashes_points(row(over, "app.exe")) == Approx(app_exe_base));
     CHECK(hangs_points(row(over, "app.exe")) == Approx(8.0 * 6 / (20 * 5)));

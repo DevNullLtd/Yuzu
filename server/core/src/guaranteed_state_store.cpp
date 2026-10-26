@@ -1450,20 +1450,36 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
             // rows (ad JOIN vc JOIN top) and the capped version rows (ranked,
             // rn <= $4) are UNIONed. Online figures are COALESCEd: FILTER over
             // no rows is NULL.
-            pg::PgResult res = pg::exec_params(
-                conn,
-                "WITH caps AS ("
-                " SELECT s, cap FROM unnest($7::text[], $8::bigint[]) AS k(s, cap)),"
-                "d AS ("
+            // With no per-subject caps the caps CTE and its join are left out and the
+            // cap is the constant $5 (the join costs a translate() per observation row);
+            // $7/$8 are then not sent, as an unreferenced parameter has no type.
+            const bool has_caps = !per_subject_caps.empty();
+            std::vector<std::string> params{since,
+                                            platform,
+                                            std::to_string(std::clamp(app_limit, 0, kMaxEventsLimit)),
+                                            std::to_string(std::clamp(version_limit, 0, kMaxEventsLimit)),
+                                            std::to_string(per_device_cap),
+                                            online_array};
+            if (has_caps) {
+                params.push_back(cap_subject_array);
+                params.push_back(cap_value_array);
+            }
+            const std::string sql =
+                std::string(has_caps ? "WITH caps AS ("
+                                       " SELECT s, cap FROM unnest($7::text[], $8::bigint[])"
+                                       " AS k(s, cap)),"
+                                       "d AS ("
+                                     : "WITH d AS (") +
                 " SELECT g.subject, g.version, g.agent_id,"
                 "  COUNT(*) FILTER (WHERE g.obs_type = 'process.crashed') AS c,"
                 "  COUNT(*) FILTER (WHERE g.obs_type = 'process.hung') AS h,"
                 "  MAX(g.observed_at) AS ls,"
                 "  bool_or(g.agent_id = ANY($6::text[])) AS o,"
-                "  MAX(COALESCE(k.cap, $5::bigint)) AS cap"
-                " FROM guaranteed_state_store.guardian_observations g"
-                " LEFT JOIN caps k ON k.s = translate(g.subject,"
-                "  'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+                + std::string(has_caps ? "  MAX(COALESCE(k.cap, $5::bigint)) AS cap" : "  $5::bigint AS cap") +
+                " FROM guaranteed_state_store.guardian_observations g" +
+                std::string(has_caps ? " LEFT JOIN caps k ON k.s = translate(g.subject,"
+                                       "  'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+                                     : "") +
                 " WHERE g.obs_type IN ('process.crashed', 'process.hung')"
                 "  AND g.observed_at >= $1 AND g.platform = $2"
                 " GROUP BY g.subject, g.version, g.agent_id),"
@@ -1501,12 +1517,8 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
                 "UNION ALL "
                 "SELECT subject, version, c::bigint, h::bigint, a::bigint, cc::bigint, ch::bigint,"
                 " ls, 0::bigint, 0::bigint, ao::bigint, co::bigint, ho::bigint "
-                "FROM ranked WHERE rn <= $4::bigint",
-                std::vector<std::string>{since, platform,
-                                         std::to_string(std::clamp(app_limit, 0, kMaxEventsLimit)),
-                                         std::to_string(std::clamp(version_limit, 0, kMaxEventsLimit)),
-                                         std::to_string(per_device_cap), online_array,
-                                         cap_subject_array, cap_value_array});
+                "FROM ranked WHERE rn <= $4::bigint";
+            pg::PgResult res = pg::exec_params(conn, sql.c_str(), params);
             if (res.status() != PGRES_TUPLES_OK)
                 return std::nullopt;
             std::vector<DexAppStabilityRow> out;

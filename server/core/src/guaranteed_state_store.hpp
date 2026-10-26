@@ -99,6 +99,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "dex_types.hpp" // ADR-0031 WS-A4: DEX leaf value types relocated here (pure, store-free)
@@ -313,7 +314,8 @@ public:
     /// it for the subjects they name: a subject matches when its ASCII-lowercase
     /// fold (A-Z to a-z, nothing else, byte-identical to the policy resolver's
     /// fold) equals the key, so a subject stored as "CapMe.EXE" gets the
-    /// override for "capme.exe". `online_agent_ids` is the population the share, rate and score are
+    /// override for "capme.exe". The keys of `per_subject_caps` must be unique (a duplicate fans
+    /// the join out and counts the subject's events twice). `online_agent_ids` is the population the share, rate and score are
     /// divided by: the `*_online` row figures and `capped_*` cover only those
     /// devices (so they are members of it), while `crashes`, `hangs` and
     /// `affected_devices` stay window-wide. At most `kDexAppsConcurrentReads`

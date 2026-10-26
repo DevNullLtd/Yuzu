@@ -722,7 +722,7 @@ TEST_CASE("stability model: validity bounds are exact", "[dex][stability]") {
     CHECK_FALSE(stability_model_valid(model(5, 1000.5, 1.0)));
 }
 
-TEST_CASE("stability model: an invalid model is withheld invalid_model, in its place in the order",
+TEST_CASE("stability model: an invalid model is withheld invalid_model in its place in the order",
           "[dex][stability]") {
     const auto score = [](const StabilityInputs& in, const StabilityModel& m,
                           const StabilityWeights& w = kStabilityWeights,
