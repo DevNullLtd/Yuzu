@@ -20,7 +20,8 @@ configure one (these alerts need a successful scrape; see the runbook). If you e
 multi-replica deployment (unsupported today), reload the rule file only after the last replica is upgraded, or
 silence `YuzuLeaderNoLeader` for the window: an old binary exports no `yuzu_server_leader_*` series, so an upgraded
 follower's `0` with an old leader's absent series sums to zero and the alert fires after 5 minutes. Silence it
-during planned Postgres maintenance longer than 5 minutes as well.
+during planned Postgres maintenance longer than 5 minutes as well, scoped to the job and ending shortly after the
+window (the silence must expire), then confirm a replica reads `yuzu_server_leader_is_leader 1`.
 This does not lift the safe-to-scale gate (`docs/ha-delivery-matrix.md`); running a second replica is still
 unsupported.
 

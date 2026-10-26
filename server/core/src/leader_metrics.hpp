@@ -53,8 +53,10 @@ inline constexpr const char* kLeaderLostMetric = "yuzu_server_leader_lost_total"
 inline constexpr const char* kLeaderLastOkAgeMetric = "yuzu_server_leader_last_ok_age_seconds";
 inline constexpr const char* kLeaderLoopErrorsMetric = "yuzu_server_leader_loop_errors_total";
 
-/// Register HELP/TYPE and birth every series at 0 so the first event contributes
-/// to `increase()` and a "no leader yet" replica reads 0, not absent
+/// Register HELP/TYPE and birth every series at 0 so a LATER event shows as a rise
+/// and a "no leader yet" replica reads 0, not absent. An event that lands before
+/// the first scrape (the boot acquisition) is still first seen at its non-zero
+/// value, so `increase()` does not count it
 /// (docs/observability-conventions.md). Driven from the elector's closed cause
 /// arrays so a seed site and an emit site cannot drift.
 ///

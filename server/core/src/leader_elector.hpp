@@ -108,7 +108,11 @@ inline constexpr std::array<const char*, kLeadershipLossCount> kLeadershipLossLa
 // A hand-written count and a hand-written label list can drift apart: a brace
 // list shorter than its std::array leaves the tail slots nullptr, which would
 // become `std::string(nullptr)` when the exporter builds the `cause` label at
-// boot. Tie the counts to the last enumerator and require every label present.
+// boot. These asserts catch a count that disagrees with the CURRENT last
+// enumerator and any missing/empty label. They do not catch a new enumerator
+// appended after the current last one without bumping the count (that would index
+// the cause arrays out of bounds); test_leader_metrics.cpp's "every cause
+// enumerator has a count site" test covers that direction at run time.
 namespace leader_label_detail {
 template <std::size_t N>
 constexpr bool all_labels_present(const std::array<const char*, N>& labels) {

@@ -959,7 +959,8 @@ If instead you see `[HA] leader_elector could not open its coordination
 connection; FencedLeaderOnly background loops are PAUSED …`, the server could not
 reach its Postgres coordination connection: it keeps serving and re-tries every
 election cycle (so a transient blip self-heals within seconds), but while the
-message persists the four dispatching loops above do not run. This is fail-closed
+message persists the leader-only background loops (the four above, plus command-outbox
+delivery) do not run. This is fail-closed
 by design — a paused loop never double-dispatches — and a persistent occurrence
 is a Postgres-reachability problem to investigate, not a server bug. (The
 operator-triggered paths are unaffected: a manual policy remediation or evaluation,
@@ -970,6 +971,11 @@ a terminal verdict even while that replica is not the leader. Only the leader-ow
 re-publish — pauses.)
 
 ### Leader election: metrics and alerts (HA WS-11)
+
+Running more than one server replica is **not supported today** (the safe-to-scale gate in
+`docs/ha-delivery-matrix.md` is not lifted); the multi-replica wording below is for pilots and
+pre-GA testing. On the supported single-server deployment only `YuzuLeaderNoLeader` and
+`YuzuLeaderCoordinationStale` can fire.
 
 Each replica exposes the elector's state as `yuzu_server_leader_*` series on its
 own `/metrics` (reference: [metrics.md](metrics.md) "Leader election metrics"),
@@ -990,8 +996,11 @@ own history.
 rule ships.** If the primary freezes while its kernel keeps acknowledging packets,
 the `/metrics` handler's own database queries hang too, the scrape fails, every
 `yuzu_server_leader_*` series goes stale at once and every rule below evaluates
-empty. Configure an `up{job="yuzu-server"} == 0` alert (and watch `/readyz`) as the
-backstop; the missing server dead-man's-switch is tracked as #2956.
+empty. Configure an `up{job="<your server job>"} == 0` alert (the shipped scrape configs
+name the job `yuzu-server`; use yours, with a `for:` of a few scrape intervals) and probe `/readyz`
+from a blackbox exporter or your load balancer as the backstop. A hung scrape becomes
+`up == 0` only after Prometheus's `scrape_timeout`. No server dead-man's-switch rule ships:
+#2956 tracked it and was folded into the open #2459.
 
 Find the replica that is the leader with
 `yuzu_server_leader_is_leader == 1`; the cluster's authoritative record is
@@ -1008,9 +1017,15 @@ that holds it).
   *in its own database*, so the epoch fence does **not** span them: both
   replicas run every leader-only pass, and on a forked database the same
   scheduled occurrence can be sent twice (only the agent's `command_id` dedup,
-  which is effectively-once, absorbs it). Fix the DSN, or fence or demote the
-  wrong primary in Patroni, **before restarting any replica**: a restart just
-  reconnects to whichever primary the DSN resolves to. Only when every replica
+  which is effectively-once, absorbs it). First establish **which database is
+  authoritative**: `patronictl list`, and compare
+  `SELECT system_identifier FROM pg_control_system();` on each side (two different
+  identifiers are two different clusters; hostnames, aliases and a VIP can make
+  "different" hosts the same cluster, and a Patroni demotion followed by `pg_rewind`
+  discards the demoted side's divergent writes, so do not demote on a log-line
+  comparison alone). Then fix the DSN, or fence or demote the wrong primary in
+  Patroni, **before restarting any replica**: a restart just reconnects to
+  whichever primary the DSN resolves to. Only when every replica
   shares **one** database is the stale replica the one whose
   `yuzu_server_leader_epoch` differs from `leader_state.current_leader_epoch`;
   restart it. Within one database fenced claims stay safe and what runs twice is
@@ -1043,20 +1058,26 @@ that holds it).
   the normal follower outcome and is not counted. Only that backend should be
   terminated: `SELECT pg_terminate_backend(<pid>);` (this needs superuser or
   membership of `pg_signal_backend`), after which a replica acquires within one
-  election cycle. Terminating a *live* leader's backend is not data-damaging (the
-  epoch fence keeps claims safe) but forces a failover. During a restart of the
-  only replica the series is absent and the alert does not fire. **Silence this
-  alert during planned Postgres maintenance or a switchover that will take more
-  than 5 minutes.**
+  election cycle. Terminating a *live* leader's backend forces a failover. Fenced claims stay
+  safe; for the few seconds before the old leader notices, its unfenced passes
+  (schedule tick, policy dispatch, quarantine reconcile, CRL re-publish) can
+  overlap the successor's, and any duplicate dispatch is absorbed only by the
+  agent's `command_id` dedup. During a restart of the only replica the series is
+  absent and the alert does not fire. **Silence this alert during planned
+  Postgres maintenance or a switchover that will take more than 5 minutes:**
+  scope the silence to the job, end it at the window plus about 10 minutes, and
+  afterwards confirm a replica reads `yuzu_server_leader_is_leader 1`.
 - **`YuzuLeaderFlapping` (warning).** Six or more acquisitions in 30 minutes across
   a **multi-replica** deployment: a network or Postgres failover flap, or a
   handover loop. Compare with `YuzuServerPostgresUnreachable` and
   `yuzu_server_leader_lost_total{cause="liveness_failed"}`. A rolling upgrade of an
   N-replica deployment legitimately adds up to N acquisitions; the threshold
-  leaves room for four replicas. **It does not detect a single replica in a
-  restart loop** (the counter is synced at scrape time, so every boot already
-  reads 1 on its first scrape and `increase()` sees no rise); use
-  `YuzuServerRestartLoop` for that.
+  leaves room for four replicas. **It usually does not detect a single
+  replica in a restart loop**: the counter is synced at scrape time, so a boot whose
+  leadership is acquired before its first scrape reads 1 with no rise, whereas a
+  boot whose acquire is delayed (slow or unreachable Postgres, a lock still held by
+  the previous process) is counted. Do not rely on this rule for that failure; use
+  `YuzuServerRestartLoop` (which has its own documented limits).
 - **`YuzuLeaderCoordinationStale` (critical).** A replica still reads leader but
   its coordination connection has not answered for over 120 seconds. This is the
   only series that moves when a network partition lets the peer's kernel keep
@@ -1066,12 +1087,14 @@ that holds it).
   merely how long one measured pause lasted), the replica's leadership belief
   stays `1`, so the count of leaders stays at one and **both `YuzuLeaderSplitBrain`
   and `YuzuLeaderNoLeader` stay silent** while that replica's leader-only passes
-  keep attempting work it cannot commit. Fenced claims still cannot double-dispatch
+  keep attempting, and its fenced claims cannot commit (its unfenced passes may still succeed). Fenced claims still cannot double-dispatch
   (the epoch predicate is evaluated in the claim's write on an ordinary pooled
   connection). Detection takes about 4–5 minutes (age above 120 s, held for 2
   minutes, plus a scrape interval); a shorter freeze never alerts. Check
   connectivity from that replica to the primary. If the primary is reachable,
-  terminate the stuck backend as above; otherwise restart the replica. A restart
+  terminate the stuck backend as above (that ends the lock and unblocks the stale
+  replica, which then drops its belief; its unfenced passes can briefly overlap the
+  successor's, with the same `command_id`-dedup caveat); otherwise restart the replica. A restart
   can take as long as the supervisor's stop timeout, or need a second signal,
   while the coordination call is wedged; if the old backend still holds the
   advisory lock afterwards, terminate it (see `YuzuLeaderNoLeader`). **Blind

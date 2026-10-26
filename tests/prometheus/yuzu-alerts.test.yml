@@ -4747,8 +4747,9 @@ tests:
   # CASE - COUNTER RESET with `for: 0m`. A counter that resets to a lower value
   # mid-window (series 5 8 11 | 2 5 8: a replica restarted after being scraped at
   # a high count, then climbed again). NOTE this is NOT a single replica's own
-  # restart loop: the counter is synced at scrape time, so the first scrape after
-  # each boot already reads >= 1 (the next case pins that). A naive
+  # restart loop: the counter is synced at scrape time, so a boot whose leadership
+  # is acquired before its first scrape already reads >= 1 (the next case pins
+  # that usual shape). A naive
   # last-first reads 8-5 = 3 and stays quiet; increase() accounts for the reset
   # (about 14 once the reset is added back, extrapolated slightly higher) and fires, on the first evaluation that sees it
   # because `for: 0m` has no pending phase. RED if increase() is replaced by a
@@ -4765,12 +4766,15 @@ tests:
           - labels: 'ALERTS{alertname="YuzuLeaderFlapping", alertstate="firing", job="yuzu", severity="warning"}'
             value: 1
 
-  # CASE - KNOWN LIMIT, pinned so the docs cannot claim otherwise: a SINGLE
-  # replica in a restart loop. Every boot publishes acquired_total = 1 on its
-  # first scrape (the delta sync runs before serialization), so the series reads
-  # 1 1 1 1 ... with no rise and no reset, and increase() is 0: this rule stays
-  # QUIET. YuzuServerRestartLoop is the rule for that failure. RED if someone
-  # makes Flapping fire here (then update the docs that say it does not).
+  # CASE - KNOWN LIMIT of the USUAL shape, pinned so the docs cannot claim more:
+  # a SINGLE replica in a restart loop whose boots acquire before their first
+  # scrape. The delta sync runs before serialization, so each boot publishes
+  # acquired_total = 1 on its first scrape, the series reads 1 1 1 1 ... with no
+  # rise and no reset, and increase() is 0: this rule stays QUIET. (A boot whose
+  # acquire is delayed past its first scrape reads 0 then 1 and IS counted: that
+  # shape is not modelled here, which is why the docs say 'usually' and do not
+  # rely on this rule.) YuzuServerRestartLoop is the rule for the failure. RED if
+  # someone makes Flapping fire on the usual shape (then update the docs).
   - interval: 3m
     name: leader flapping - a single replica restart loop is not visible here
     input_series:

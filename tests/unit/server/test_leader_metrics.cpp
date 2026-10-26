@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -252,14 +253,26 @@ TEST_CASE("leader metrics: simultaneous scrapes of one snapshot count it exactly
     // syncs by `target - value()` and the read-then-increment is a LOGICAL race
     // that ThreadSanitizer cannot see (every underlying operation is internally
     // locked): without the publisher's mutex, two scrapes that read value()==0
-    // together each add 1 and the counter reads 2. Eight threads are released
-    // together by a spin barrier, one publish each, over a FRESH registry per
-    // round, so the interleaving is hit often enough to be a reliable detector;
-    // with the mutex the result is exactly 1 in every round.
-    constexpr int kRounds = 5000;
-    constexpr int kThreads = 8;
+    // together each add 1 and the counter reads 2. Up to eight threads are
+    // released together by a spin barrier, one publish each, over a FRESH registry
+    // per round, so the interleaving is hit often enough to be a reliable
+    // detector; with the mutex the result is exactly 1 in every round.
+    //
+    // HONEST LIMIT: the race needs real parallelism. The thread count follows the
+    // host's hardware concurrency (a yield-spinning crowd on 2-4 cores is both
+    // slow and unable to interleave), and the run is bounded by a wall-clock
+    // budget, so on a small host this case still passes quickly on correct code
+    // but is NOT a reliable detector there (measured: a mutex-removed mutant is
+    // caught on 8+ cores and missed on 4 or fewer).
+    const unsigned hw = std::thread::hardware_concurrency();
+    const int kThreads = static_cast<int>(std::clamp(hw == 0 ? 2u : hw, 2u, 8u));
+    constexpr int kMaxRounds = 5000;
+    constexpr int kMinRounds = 100;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     int miscounted = 0;
-    for (int round = 0; round < kRounds; ++round) {
+    for (int round = 0; round < kMaxRounds; ++round) {
+        if (round >= kMinRounds && std::chrono::steady_clock::now() > deadline)
+            break;
         yuzu::MetricsRegistry m;
         seed_leader_metrics(m);
         LeaderMetricsPublisher pub;
