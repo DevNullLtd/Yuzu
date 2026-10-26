@@ -462,18 +462,33 @@ kind: InstructionDefinition
 metadata:
   id: windows.registry.delete_key
   displayName: Delete Registry Key
-  version: 1.1.0
+  version: 1.2.0
   description: >
-    Delete a Windows registry key that has no subkeys; a key with subkeys is refused as key_has_subkeys
-    and nothing is deleted. The key is opened on a checked handle (one canonical-name-checked open, with
-    a component walk as the fallback) and a registry symbolic link in the path is refused, never followed
-    (the key AT the path may itself be a link: the link object is removed and its target is untouched).
-    The delete runs by handle on the checked key (no RegDeleteTreeW, which follows links) and is
-    confirmed by the handle reading back as deleted. counted_keys is 1 and counted_values is the number
-    of values the key held; the count stops at 10,000 nodes (the key plus up to 9,999 values), past which
-    capped is 1 and counted_values is a lower bound (the delete still removes the key with all its
-    values). A subkey created between the check and the delete makes the delete fail, not key_has_subkeys:
-    the key stays and the action answers a failure token (access_denied or win32:<code>). Windows-only.
+    Delete a Windows registry key. By default only a key with no subkeys is deleted (one with subkeys is
+    refused as key_has_subkeys and nothing is deleted); `recursive` true removes the key and everything beneath
+    it, and `dry_run` true counts what a real run would remove and deletes nothing. The key is opened on a
+    checked handle (one canonical-name-checked open, with a component walk as the fallback) and a registry
+    symbolic link in the path is refused, never followed (the key AT the path may itself be a link: the link
+    object is removed and its target is untouched). A recursive delete first VETS the whole tree: every child is
+    opened from its parent's handle with the delete's own access and probed for a link, and a link anywhere in
+    the tree is refused as key_is_link with nothing deleted (a child whose ACL denies the delete, as
+    access_denied, in a dry run too; a key whose raw UTF-16 name is not well-formed, which no UTF-8 name can
+    open exactly, as unrepresentable_name). It then removes the tree post-order, each key by its own handle (no
+    RegDeleteTreeW, which follows links), re-checking every key it finds for a link: a link planted since the
+    vet stops the delete as key_is_link, and a tree that grew past the vet's bound stops it as concurrent_change,
+    with what was already removed counted. The vet is a size bound and a link sweep, not a list of the keys it
+    saw: a key added after it is deleted and counted like any other. It visits at most 10,000 keys and values and
+    600 levels; a dry run past that reports a lower bound with capped=1, and a real recursive delete of a tree it
+    could not finish is refused as tree_too_large with nothing deleted (delete it in parts). On a dry run or a
+    refusal the counts are what the vet counted; on a real run they are what the delete removed (exact when it
+    succeeds, the partial total when it stopped), so they can exceed a dry run's. A non-recursive delete of a key
+    holding more than 10,000 values removes only that key and its own values. MIXED FLEETS: an agent running
+    registry 1.x or 2.0.x (every agent released before 2.1.0, v0.14.1 included) reads neither `recursive` nor
+    `dry_run`: sent dry_run=true it DELETES a key that has no subkeys (a key with subkeys is refused), and a bare
+    `status|ok` or a `dry_run|0` row in answer to dry_run=true means the key was deleted. The server does not
+    compare plugin versions at dispatch (#6484), so upgrade the server, then the agents to registry 2.1.0 before
+    using either flag, scope any preview to a tag that marks devices verified at 2.1.0, and until then use the
+    delete_key kill switch as the stop-gap. Windows-only.
   tags: [registry, windows, configuration]
 spec:
   type: action
@@ -498,32 +513,56 @@ spec:
         displayName: Key Path
         description: >
           Registry key path to delete, relative to the hive root.
+      recursive:
+        type: string
+        displayName: Recursive
+        description: >
+          "true" deletes every subkey and value beneath the key as well; "false" (the default) refuses a key
+          that has subkeys. The tree is vetted first (at most 10,000 keys and values and 600 levels, else
+          tree_too_large with nothing deleted; a registry link inside it is refused as key_is_link), and the
+          counts of a dry run are a snapshot. Any other spelling is refused as invalid_data (the direct command
+          route, which has no enum, also accepts 1 and 0). Needs registry 2.1.0 on the agent: registry 1.x and
+          2.0.x ignore it.
+        default: "false"
+        validation:
+          enum: ["true", "false"]
+      dry_run:
+        type: string
+        displayName: Dry Run
+        description: >
+          "true" counts what a real run would remove (with `recursive`, the vetted tree) and deletes nothing;
+          "false" (the default) deletes. Any other spelling is refused as invalid_data (the direct command route
+          also accepts 1 and 0). Needs registry 2.1.0 on the agent: an agent at registry 1.x or 2.0.x ignores this
+          flag and DELETES a key that has no subkeys, so upgrade agents first (docs/user-manual/upgrading.md).
+        default: "false"
+        validation:
+          enum: ["true", "false"]
   result:
     columns:
       - name: status
         type: string
         description: >-
-          Confirms the delete succeeded and the handle read back as deleted; only ever emitted on success — a failure is reported as an `error|<token>` line (not exhaustive: key_not_found, key_has_subkeys, key_is_link, access_denied, verify_mismatch, concurrent_change, invalid_key_path or win32:<code>) and a non-zero exit instead of this column. A run that resolves its hive and key, success or not, also emits one `audit|op=delete_key|...` row; a missing hive or key, or an unparseable hive, is a bare `error|...` line with nothing opened and no audit row. Values: ok.
+          Confirms the run succeeded and, on a real run, that the handle read back as deleted (a dry run answers ok too); only ever emitted on success — a failure is reported as an `error|<token>` line (not exhaustive: key_not_found, key_has_subkeys, tree_too_large, key_is_link, access_denied, verify_mismatch, concurrent_change, invalid_key_path, invalid_data or win32:<code>) and a non-zero exit instead of this column. A run that resolves its hive and key, success or not, also emits one `audit|op=delete_key|...` row (dry_run=1 on a dry run, whose success row records that a vet ran, not a deletion); a missing hive or key, or an unparseable hive, is a bare `error|...` line with nothing opened and no audit row. Values: ok.
         example: "ok"
         platforms: [windows]
       - name: counted_keys
         type: int32
-        description: 'Keys removed: always the target alone, so 1. Values: 1.'
-        example: "1"
+        description: 'Keys in the subtree, the target included: on a real run what the delete REMOVED (exact when it succeeds, the partial total when it stopped), on a dry run what the vet counted (a lower bound when capped is 1). A non-recursive delete counts the target alone, so 1. Emitted on success only: a refusal carries its counts in the audit row (counted_keys=). Values: a non-negative integer.'
+        example: "4"
         platforms: [windows]
       - name: counted_values
         type: int32
-        description: 'Values the key held, counted before the delete (a lower bound whenever capped is 1). Point in time: a writer racing the delete can add values this count never saw. Values: a non-negative integer.'
+        description: 'Values in those keys, counted the same way (a lower bound whenever capped is 1). Point in time: a writer racing the delete can add values a dry run never saw. Values: a non-negative integer.'
         example: "5"
         platforms: [windows]
       - name: dry_run
         type: bool
-        description: 'Always 0: this version has no dry run (the column is kept for the audit row and later releases). Values: 0 — a digit, never true/false.'
+        description: 'Whether this was a dry run: 1 (counted, nothing deleted) or 0 (a real run). Values: 1, 0 — a digit, never true/false.'
         example: "0"
         platforms: [windows]
       - name: capped
         type: bool
-        description: 'Whether the value enumeration stopped at its cap of 10,000 nodes (the key plus up to 9,999 values), making counted_values a lower bound; the delete still removes the key with all its values. Values: 1 (capped), 0 (complete) — a digit, never true/false.'
+        description: 'Whether the vet or the value enumeration stopped at its bound (10,000 keys and values, 600 levels), making the counts a lower bound; reported on a dry run or a non-recursive delete of a key holding more than 10,000 values (it removes that key with all its values). A real recursive delete past the bound is refused as tree_too_large, never capped: that refusal says capped=1 in its audit row only. Values: 1 (capped), 0 (complete) — a digit, never true/false.'
         example: "0"
         platforms: [windows]
   approval:
@@ -645,6 +684,362 @@ spec:
     authorRoles: [content-author]
   compatibility:
     minAgentVersion: 0.2.0
+    requiredPlugins: [registry]
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.registry.set_user_value
+  displayName: Set Per-User Registry Value
+  version: 1.0.0
+  description: >
+    Write a registry value into a specific user's hive. Resolves the target profile via ProfileList (by
+    username or an explicit SID), then writes through the live HKEY_USERS\<SID> hive if the user is logged in,
+    or loads that profile's NTUSER.DAT as a fallback. The offline load runs behind the shared hive-file guard
+    (reparse ancestors, a second hard link, ownership, transaction-log sidecars and the file identity after the
+    load are checked first), the write is verified by reading it back, and the key is flushed to disk before the
+    hive unloads (a flush that fails fails the write). SeBackupPrivilege and SeRestorePrivilege are needed only
+    for the offline fallback. A hive that is loaded after the write returned is reported as a warning; a logon
+    that failed while the hive was mounted leaves no trace. Same types, encoding and verification as
+    set_value. A `registry.write` audit row records the previous and new values (hex, capped at 256 bytes;
+    they can contain secrets: the product owner accepted this risk on 2026-10-20 and masking is a planned
+    later change), and the `value` and
+    `data_hex` parameters are stored unredacted in the execution's parameter_values. Needs registry 2.1.0 on the
+    agent: an agent at registry 1.x or 2.0.x answers `error|unknown action`. Windows-only.
+  tags: [registry, windows, per-user, configuration]
+spec:
+  type: action
+  platforms: [windows]
+  execution:
+    plugin: registry
+    action: set_user_value
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [key, name]
+    properties:
+      username:
+        type: string
+        displayName: Username
+        description: >
+          Windows profile folder name to resolve via ProfileList (see list_profiles), matched
+          case-insensitively. Either username or sid is required; sid takes precedence if both are given.
+        validation:
+          maxLength: 256
+      sid:
+        type: string
+        displayName: User SID
+        description: >
+          Windows security identifier of the target profile, as an alternative to username. Must match one of the
+          profiles list_profiles would report; a sid not found there is rejected.
+        validation:
+          maxLength: 256
+      key:
+        type: string
+        displayName: Key Path
+        description: >
+          Registry key path relative to the resolved user's hive root (e.g., "Software\\MyApp"); created if it
+          does not exist beneath an existing top-level key. At most 255 bytes and 32 components, as set_value.
+        validation:
+          maxLength: 255
+      name:
+        type: string
+        displayName: Value Name
+        description: The registry value name to write. Empty writes the key's default value. At most 16,383 bytes.
+        validation:
+          maxLength: 16383
+      value:
+        type: string
+        displayName: Value
+        description: >
+          The value data to write, as text; interpreted per `type` exactly as in set_value. Send exactly one of
+          `value` and `data_hex`; a missing or empty one writes an empty value of the type.
+      data_hex:
+        type: string
+        displayName: Data (hex)
+        description: >
+          The exact bytes to write, as hex, for any type; give it INSTEAD of `value` (both non-empty is refused as
+          invalid_data). Shape is checked per type, as in set_value.
+        validation:
+          maxLength: 2097152
+      type:
+        type: string
+        displayName: Value Type
+        description: Registry value type to write. Defaults to REG_SZ when omitted.
+        validation:
+          enum: ["REG_SZ", "REG_EXPAND_SZ", "REG_BINARY", "REG_DWORD", "REG_MULTI_SZ", "REG_QWORD"]
+  result:
+    columns:
+      - name: status
+        type: string
+        description: >-
+          Confirms the write was verified (and, on the offline NTUSER.DAT arm only, flushed with RegFlushKey before the unload; a live HKEY_USERS\<SID> write is not flushed); only ever emitted on success — a failure is an `error|<token>` line (not exhaustive: hive_not_found, privilege_missing, hive_mount_failed, profile_list_unreadable, a hive-file guard token such as hive_path_reparse_ancestor, flush_failed:<token>, or any set_value token), preceded by the hive's own error sentence, and a non-zero exit. A `warning|hive_unload_failed: ...`, `warning|hive_loaded_after_offline_write` or `warning|hive_post_unload_probe_failed:win32_<n>` line may precede the audit row. A run whose profile resolves also emits one `audit|op=set_user_value|...` row (hive=HKU, sid=<SID>); a missing sid, username or key, or a profile that is not found, is a bare `error|...` line with nothing opened and no audit row, while a key path or value name that fails shape validation after the profile resolved is audited as result=refused. Values: ok.
+        example: "ok"
+        platforms: [windows]
+  readablePayload: "Write registry value '${name}' into user '${username}${sid}' key '${key}'"
+  approval:
+    mode: role-gated
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.15.0
+    requiredPlugins: [registry]
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.registry.delete_user_value
+  displayName: Delete Per-User Registry Value
+  version: 1.0.0
+  description: >
+    Delete a registry value from a specific user's hive; the key itself is left in place. Same profile
+    resolution, live-or-offline hive path, hive-file guard, read-back verification, flush and audit row as
+    set_user_value (the deleted value's previous data is in that row and in the response). Needs registry 2.1.0
+    on the agent: an agent at registry 1.x or 2.0.x answers `error|unknown action`. Windows-only.
+  tags: [registry, windows, per-user, configuration]
+spec:
+  type: action
+  platforms: [windows]
+  execution:
+    plugin: registry
+    action: delete_user_value
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [key, name]
+    properties:
+      username:
+        type: string
+        displayName: Username
+        description: >
+          Windows profile folder name to resolve via ProfileList (see list_profiles), matched
+          case-insensitively. Either username or sid is required; sid takes precedence if both are given.
+        validation:
+          maxLength: 256
+      sid:
+        type: string
+        displayName: User SID
+        description: >
+          Windows security identifier of the target profile, as an alternative to username. Must match one of the
+          profiles list_profiles would report.
+        validation:
+          maxLength: 256
+      key:
+        type: string
+        displayName: Key Path
+        description: Registry key path relative to the resolved user's hive root (at most 255 bytes and 32 components).
+        validation:
+          maxLength: 255
+      name:
+        type: string
+        displayName: Value Name
+        description: The registry value name to delete. Empty deletes the key's default value.
+        validation:
+          maxLength: 16383
+  result:
+    columns:
+      - name: status
+        type: string
+        description: >-
+          Confirms the delete was verified (and, on the offline NTUSER.DAT arm only, flushed with RegFlushKey before the unload; a live HKEY_USERS\<SID> delete is not flushed); only ever emitted on success — a failure is an `error|<token>` line (not exhaustive: value_not_found, key_not_found, hive_not_found, privilege_missing, hive_mount_failed, profile_list_unreadable, a hive-file guard token, flush_failed:<token>, access_denied or win32:<code>), preceded by the hive's own error sentence, and a non-zero exit. The same warnings as set_user_value may precede the audit row. A run whose profile resolves also emits one `audit|op=delete_user_value|...` row (hive=HKU, sid=<SID>); a missing sid, username or key, or a profile that is not found, is a bare `error|...` line with nothing opened and no audit row, while a key path or value name that fails shape validation after the profile resolved is audited as result=refused. Values: ok.
+        example: "ok"
+        platforms: [windows]
+  readablePayload: "Delete registry value '${name}' from user '${username}${sid}' key '${key}'"
+  approval:
+    mode: role-gated
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.15.0
+    requiredPlugins: [registry]
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.registry.apply
+  displayName: Apply Registry Plan
+  version: 1.0.0
+  description: >
+    Apply a declarative plan of machine-hive (HKLM) changes -- set_value, delete_value, create_key and
+    non-recursive delete_key items -- with a dry run, read-back verification of value writes and deletes (a
+    created key is evidenced by its create disposition, an existing one by being opened) and an undo manifest in
+    the response; nothing is persisted on the endpoint. Dry run is the default: pass dry_run=false to change
+    anything. Each key is opened ONCE on a checked handle (a registry symbolic link is refused, never followed)
+    and every item on it reuses that handle; the previous value is captured before it is changed, and an item
+    whose previous value this plugin could not write back (a type it cannot write, a shape it would refuse) is
+    refused before anything changes. A dry run and a real run take ONE verdict function over the same facts, so
+    they agree item for item (would_apply or applied, or refused); a plan is refused whole as dependent_items
+    when two items touch the same value or a key item overlaps another item's key. The dry run opens with the
+    mutation's own access mask and checks create access on the deepest existing key, but it cannot see the ACL a
+    key that does not exist yet will inherit: a real run can still be refused or fail where the dry run said
+    would_apply (the keys it made are rolled back by handle and `created` reports any that stayed). NOT
+    transactional: with continue_on_error=false the first refused or failed item stops the run and the rest are
+    skipped; the exit code is non-zero whenever any item was refused or failed. THE EXACT-NAME RULE: every key
+    path and value name the manifest carries must read back as exactly what is in the registry, so a name that a
+    row cannot spell (a `|`, a control character, a C1 control, U+2028 or U+2029, invalid UTF-8, a trailing
+    backslash, or a value named `-`, which a row uses for the default value) is refused as unrepresentable_name
+    before anything is changed, including the name of any value of a key an item would delete, whose raw UTF-16
+    name must also be well-formed (a lone surrogate or a NUL has no exact UTF-8 spelling and is refused the same
+    way, in a dry run too; a value really named with U+FFFD is fine). Two value items on one key are also
+    dependent_items whenever either name holds a non-ASCII character (Windows folds value-name case with a
+    Unicode table the parser cannot reproduce). THE UNDO BUDGET: one 512 KiB budget charges every byte the
+    manifest retains (previous values up to 4,096 bytes each, names and a fixed cost per row); a deleted key's
+    values are all vetted but only as many as fit are returned, and when anything was cut the summary says
+    undo_complete=0, in the dry run too, before anything is changed. THE UNDO CONTRACT: undo only `applied`
+    items and `failed` ones with created above 0 or a mutation, in REVERSE item order; recreate a deleted key
+    from its delete_key item (a key that held no values has no undo rows), then replay its undo rows in a
+    second plan (a value whose name holds a non-ASCII character in a plan of its own when the key has other
+    undo rows). The manifest restores VALUES only: a deleted key's owner, DACL, SACL, class and volatility are
+    not captured, so a recreated key gets the parent's inherited security. It is a snapshot taken at capture:
+    a value another writer changes between the capture and the change is lost or stale even with
+    undo_complete=1. An item refused before its previous value was read shows "-" there, never "absent".
+    Rows are written as each item concludes, so a later exception inside the plugin or a failed output channel
+    cannot take back rows already written; the agent sends output at command end or each 64 KiB, so an agent
+    that dies mid-plan loses whatever it had not sent (for a plan whose output is under 64 KiB, all of it): read the keys back with a
+    dry run before replaying anything. The rows: one `audit` row per item that ran or was refused (recorded server-side as `registry.write`; a dry run's rows say
+    dry_run=1 and record no change; three 256-item plans inside one minute exceed the server's 600 rows per
+    agent per minute and the later rows are suppressed), its `item` row and, for a deleted key, its `undo` rows,
+    then a closing `summary`. The plan parameter, with every value in it, is stored unredacted in the
+    execution's parameter_values, and the reply holds previous values (secrets included) for Response:Read
+    holders. Needs registry 2.1.0 on the agent: an agent at registry 1.x or 2.0.x answers `error|unknown
+    action`. Windows-only.
+  tags: [registry, windows, configuration, bulk]
+spec:
+  type: action
+  platforms: [windows]
+  execution:
+    plugin: registry
+    action: apply
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [plan]
+    properties:
+      plan:
+        type: string
+        displayName: Plan (JSON)
+        description: >
+          A JSON array of up to 256 flat objects (64 KiB at most). Fields (all strings): `op` (set_value,
+          delete_value, create_key or delete_key), `hive` (HKLM, the default and the only one), `key`, `name`,
+          `type`, `value`, `data_hex`. set_value takes type (default REG_SZ) and value or data_hex, exactly as the
+          set_value action; a present but empty `data_hex` is the zero-byte form (REG_BINARY only), which lets a
+          captured empty value round-trip. delete_value takes key and name; create_key and delete_key take key
+          only (delete_key is NOT recursive and refuses a link). A set_value or create_key item whose first key
+          component does not already exist directly under the hive is refused root_level_create, in a dry run and
+          a real run alike. An agent still on registry 1.x or 2.0.x answers `error|unknown action`.
+        validation:
+          maxLength: 65536
+      dry_run:
+        type: string
+        displayName: Dry Run
+        description: >
+          "true" (the default) reports every item's verdict and changes nothing; "false" applies the plan. Any
+          other spelling is refused as invalid_data (the direct command route, which has no enum, also accepts 1
+          and 0).
+        default: "true"
+        validation:
+          enum: ["true", "false"]
+      continue_on_error:
+        type: string
+        displayName: Continue On Error
+        description: >
+          "true" keeps applying later items after a refused or failed one; "false" (the default) stops and reports
+          the remaining items skipped.
+        default: "false"
+        validation:
+          enum: ["true", "false"]
+  result:
+    columns:
+      - name: row_kind
+        type: string
+        values: [item, undo, audit, summary]
+        description: 'Row shape discriminator (field 0). Values: item, undo, audit, summary. A closing `error|partial_failure` line, which has no row_kind, follows the summary whenever any item was refused or failed.'
+        example: item
+        platforms: [windows]
+      - name: field_1
+        type: string
+        description: 'item and undo: the plan item index (0-based). audit: op=apply.<op>. summary: the item count.'
+        example: "0"
+        platforms: [windows]
+      - name: field_2
+        type: string
+        description: 'item: the op (set_value, delete_value, create_key, delete_key). undo: the value name ("-" for the default value). audit: hive=. summary: items applied (or that would apply in a dry run).'
+        example: set_value
+        platforms: [windows]
+      - name: field_3
+        type: string
+        description: 'item: the hive. undo: the value type. audit: result= (ok, refused, failed). summary: items refused.'
+        example: HKLM
+        platforms: [windows]
+      - name: field_4
+        type: string
+        description: 'item: the key path (exact for an item that proceeds). undo: the value data as hex (the kept bytes, then ~<total> when the capture was cut). audit: reason=. summary: items failed.'
+        example: SOFTWARE\Acme
+        platforms: [windows]
+      - name: field_5
+        type: string
+        description: 'item: the value name ("-" for none or the default value; exact for an item that proceeds). undo: 1 when the capture was cut, else 0. audit: verify=. summary: items skipped after a stop.'
+        example: Mode
+        platforms: [windows]
+      - name: field_6
+        type: string
+        description: 'item: the verdict (would_apply in a dry run, applied, refused, failed, skipped). audit: key= (capped at 256 bytes). summary: 1 for a dry run, 0 for a real run.'
+        example: applied
+        platforms: [windows]
+      - name: field_7
+        type: string
+        description: 'item: the refusal or failure token (key_not_found, value_not_found, key_has_subkeys, key_is_link, access_denied, root_level_create, tree_too_large, unsupported_old_type, unrepresentable_name, verify_mismatch, invalid_* ...) or "-". audit: name= (capped). summary: 1 when the undo manifest is complete, 0 when anything was cut or a creating item failed part-way.'
+        example: "-"
+        platforms: [windows]
+      - name: field_8
+        type: string
+        description: 'item: the read-back verification (ok, mismatch, "-"). audit: type=.'
+        example: ok
+        platforms: [windows]
+      - name: field_9
+        type: string
+        description: 'item: the number of key components this item created (reverse: delete_key of each, deepest first), predicted in a dry run. audit: len=.'
+        example: "0"
+        platforms: [windows]
+      - name: field_10
+        type: string
+        description: 'item: the previous value state (absent, present, unreadable) for value ops; "-" for a key op and for an item refused before its previous value was read (never read as absent). audit: dry_run=.'
+        example: present
+        platforms: [windows]
+      - name: field_11
+        type: string
+        description: 'item: the previous value type. audit: counted_keys= ("-" for a delete_key that was invalid or whose open failed).'
+        example: REG_SZ
+        platforms: [windows]
+      - name: field_12
+        type: string
+        description: 'item: the previous value as hex (the kept bytes, then ~<total> when it was cut or the undo budget dropped it); restore it with data_hex. audit: counted_values=, or "-" when the item was refused before the contents of its key were read.'
+        example: 6f006c006400
+        platforms: [windows]
+      - name: field_13
+        type: string
+        description: 'item: the new value length in bytes, or "-". audit: capped=, or "-" when not read. (The six audit tokens that follow -- created, sid, old_state, old_type, old, new -- are in the raw row and the registry.write audit row.)'
+        example: "8"
+        platforms: [windows]
+  readablePayload: "Apply a registry plan (dry_run=${dry_run})"
+  approval:
+    mode: role-gated
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.15.0
     requiredPlugins: [registry]
 status:
   phase: active

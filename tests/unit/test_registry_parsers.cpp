@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -525,7 +526,7 @@ TEST_CASE("registry audit producer contract: no pipe LF or CR survives and the f
 
 TEST_CASE("registry exception_audit_line: one fixed 19-field literal per mutating action", "[registry][parsers]") {
     // The literal is what render_audit_line makes of a record that knows only the op, the failure and its reason.
-    for (const char* op : {"set_value", "delete_value", "delete_key"}) {
+    for (const char* op : {"set_value", "delete_value", "delete_key", "set_user_value", "delete_user_value", "apply"}) {
         INFO(op);
         AuditRecord x;
         x.op = op;
@@ -540,9 +541,92 @@ TEST_CASE("registry exception_audit_line: one fixed 19-field literal per mutatin
     }
     SECTION("a read action, an unknown one and the empty name have none") {
         for (const char* action : {"get_value", "key_exists", "enumerate_keys", "enumerate_values", "get_user_value",
-                                   "list_profiles", "", "Set_Value", "set_value "})
+                                   "list_profiles", "", "Set_Value", "set_value ", "apply.set_value", "Apply", "set_user_values"})
             CHECK(exception_audit_line(action).empty());
     }
+}
+
+// ── the registry 2.1.0 classifiers ────────────────────────────────────────
+
+TEST_CASE("registry parse_bool_param: empty is the default; true/1/false/0 only; anything else is nullopt",
+          "[registry][parsers]") {
+    CHECK(parse_bool_param("", false) == std::optional<bool>{false});
+    CHECK(parse_bool_param("", true) == std::optional<bool>{true}); // apply's dry_run defaults to true
+    for (const bool def : {false, true}) {
+        CHECK(parse_bool_param("true", def) == std::optional<bool>{true});
+        CHECK(parse_bool_param("1", def) == std::optional<bool>{true});
+        CHECK(parse_bool_param("false", def) == std::optional<bool>{false});
+        CHECK(parse_bool_param("0", def) == std::optional<bool>{false});
+        for (const char* bad : {"True", "FALSE", "yes", "no", "2", "-1", "t", " true", "true ", "maybe", "00", "on"})
+            CHECK_FALSE(parse_bool_param(bad, def).has_value());
+    }
+}
+
+TEST_CASE("registry classify_offline_write_race: only a hive found loaded after an offline write or a probe that "
+          "failed is worth saying",
+          "[registry][parsers]") {
+    CHECK(classify_offline_write_race(false, true, 0).empty());   // never mounted offline: the live arm, nothing to probe
+    CHECK(classify_offline_write_race(true, false, 0).empty());   // nothing was written
+    CHECK(classify_offline_write_race(true, true, kErrorFileNotFound).empty()); // the clean answer: no hive loaded now
+    CHECK(classify_offline_write_race(true, true, kErrorPathNotFound).empty());
+    CHECK(classify_offline_write_race(true, true, kErrorSuccess) == "hive_loaded_after_offline_write");
+    CHECK(classify_offline_write_race(true, true, kErrorAccessDenied) == "hive_post_unload_probe_failed:win32_5");
+    CHECK(classify_offline_write_race(true, true, 1450) == "hive_post_unload_probe_failed:win32_1450");
+}
+
+TEST_CASE("registry restorable: whether this plugin could write a captured previous value back as it was",
+          "[registry][parsers]") {
+    const auto present = [](std::uint32_t type, Bytes bytes, std::size_t total = 0) {
+        OldValue v;
+        v.state = OldState::present;
+        v.type = type;
+        v.total = total != 0 ? total : bytes.size();
+        v.bytes = std::move(bytes);
+        return v;
+    };
+    SECTION("nothing to write back is always restorable") {
+        CHECK(restorable(OldValue{}));                    // absent
+        OldValue unreadable;
+        unreadable.state = OldState::unreadable;
+        CHECK(restorable(unreadable));
+    }
+    SECTION("a writable type of a valid shape") {
+        CHECK(restorable(present(kRegDword, B({1, 0, 0, 0}))));
+        CHECK(restorable(present(kRegQword, Bytes(8, 1))));
+        CHECK(restorable(present(kRegSz, B({0x61, 0, 0, 0}))));
+        CHECK(restorable(present(kRegBinary, Bytes{})));         // a zero-byte binary
+        CHECK(restorable(present(kRegMultiSz, B({0, 0, 0, 0}))));
+    }
+    SECTION("a type this plugin cannot write: REG_NONE, REG_LINK, REG_DWORD_BIG_ENDIAN, anything unknown") {
+        for (const std::uint32_t t : {0u, 5u, 6u, 7u, 8u, 11u, 99u}) {
+            INFO("type " << t);
+            CHECK_FALSE(restorable(present(t, B({1, 2, 3, 4}))));
+        }
+    }
+    SECTION("a shape set_value would refuse") {
+        CHECK_FALSE(restorable(present(kRegDword, B({1, 2}))));
+        CHECK_FALSE(restorable(present(kRegQword, B({1, 2, 3, 4}))));
+        CHECK_FALSE(restorable(present(kRegSz, B({0x61, 0}))));        // no terminating NUL unit
+        CHECK_FALSE(restorable(present(kRegMultiSz, B({0x61, 0, 0, 0})))); // not a double NUL
+    }
+    SECTION("a capture cut at kCaptureValueCap is judged by its type and size, not by the part it kept") {
+        // 4,096 bytes of a 10,000-byte REG_DWORD would fail the shape check; the real value is not the capture
+        CHECK(restorable(present(kRegBinary, Bytes(4096, 7), 10000)));
+        CHECK(restorable(present(kRegSz, Bytes(4096, 7), 10000)));
+        CHECK_FALSE(restorable(present(0, Bytes(4096, 7), 10000)));    // still not a writable type
+    }
+    SECTION("a value over kMaxWriteBytes could not be written back either") {
+        CHECK(restorable(present(kRegBinary, Bytes(4096, 1), kMaxWriteBytes)));
+        CHECK_FALSE(restorable(present(kRegBinary, Bytes{}, kMaxWriteBytes + 1)));
+        CHECK_FALSE(restorable(present(kRegBinary, Bytes(4096, 1), kMaxWriteBytes + 1)));
+    }
+}
+
+TEST_CASE("registry recursion and plan limits", "[registry][parsers]") {
+    // The numbers the README and the definitions quote that no behavioural test pins by value.
+    CHECK(kMaxTreeNodes == 10000);
+    CHECK(kMaxTreeDepth == 600);
+    CHECK(kMaxPlanBytes == 65536);
 }
 
 // ── prepare_set (the front half of set_value) ────────────────────────────
@@ -716,3 +800,24 @@ TEST_CASE("registry kernel_name_well_formed: no NUL unit, no lone surrogate; a p
     CHECK_FALSE(well_formed(std::u16string_view{u"L\0", 2}));
     CHECK_FALSE(well_formed(std::u16string_view{u"\0L", 2}));
 }
+
+TEST_CASE("registry kernel_name_well_formed: a high surrogate pairs only with a low one, at both ends of each range",
+          "[registry][parsers]") {
+    // the unit after a high surrogate must be DC00..DFFF: below it and above it are both lone highs
+    CHECK_FALSE(well_formed(u"\xD800\xDBFF")); // another high
+    CHECK_FALSE(well_formed(u"\xD800\xE000")); // the first unit above the low range
+    CHECK_FALSE(well_formed(u"\xD800\xFFFF"));
+    CHECK(well_formed(u"\xD800\xDC00"));       // the first pair
+    CHECK(well_formed(u"\xD800\xDFFF"));
+    // the last high surrogate is DBFF: alone it is lone, with a low after it it is a pair
+    CHECK_FALSE(well_formed(u"\xDBFF"));
+    CHECK(well_formed(u"\xDBFF\xDFFF"));
+    CHECK(well_formed(u"\xDBFF\xDC00"));
+    // and the unit just past each range is an ordinary character
+    CHECK(well_formed(u"\xD7FF"));
+    CHECK(well_formed(u"\xE000"));
+}
+
+// ERROR_INVALID_DATA: what an exact enumeration answers for a raw name that is not well-formed UTF-16
+// (Win32Registry::enumerated_name). registry_win.cpp pins the number on Windows only; this pins it on every host.
+static_assert(kErrorInvalidData == 13, "ERROR_INVALID_DATA");

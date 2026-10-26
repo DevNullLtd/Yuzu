@@ -410,6 +410,7 @@ agent_test_exe = executable(
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
     'unit/test_registry_parsers.cpp',          # registry value encoders, validators and the audit line (pure, every host)
+    'unit/test_registry_plan.cpp',             # apply plan parser and the item/undo/summary row renderers (pure, every host)
     'unit/test_registry_core.cpp',             # registry write logic over an in-memory fake registry (checked open, fast open, verify, delete_key; every host)
     'unit/test_registry_write_local_dispatcher.cpp', # real registry.dll writes via LocalDispatcher (Windows branch, elevated); descriptor/version/sentinel pins on every host
     'unit/test_registry_win_internals.cpp',    # TU-inclusion seam over registry_win.cpp -- Win32Registry on a dangling link and the final_name/root_name calls (Windows-only body, elevated; empty TU elsewhere)
