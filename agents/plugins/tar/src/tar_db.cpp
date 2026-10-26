@@ -18,6 +18,7 @@
 
 #include <sqlite3.h>
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp> // yuzu::log_token: a registry key/value name is attacker-chosen (CWE-117)
 
 #include <array>
 #include <cctype>
@@ -1876,7 +1877,8 @@ std::expected<void, TarDatabase::CursorInsertError> TarDatabase::insert_registry
                     bind_text(dup.get(), 1, ev.record_key);
                     if (sqlite3_step(dup.get()) != SQLITE_ROW) {
                         spdlog::error("{} dup-check: record_key '{}' was ignored but no stored "
-                                      "row could be read back", log_prefix, ev.record_key);
+                                      "row could be read back", log_prefix,
+                                      yuzu::log_token(ev.record_key));
                         return false;
                     }
                     auto col = [&](int i) {
@@ -1902,7 +1904,7 @@ std::expected<void, TarDatabase::CursorInsertError> TarDatabase::insert_registry
                     spdlog::error("{} record_key COLLISION on '{}': the stored row is a DIFFERENT "
                                   "change, so accepting this batch would advance the cursor past "
                                   "one that was never stored -- failing the transaction instead",
-                                  log_prefix, ev.record_key);
+                                  log_prefix, yuzu::log_token(ev.record_key));
                     collided = true;
                     return false;
                 }

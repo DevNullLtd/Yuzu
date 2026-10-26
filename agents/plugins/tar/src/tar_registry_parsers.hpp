@@ -40,6 +40,7 @@ inline constexpr std::size_t kBaselineKeyCap = 20000;       // keys per root rea
 inline constexpr std::size_t kBaselineDepthCap = 16;
 inline constexpr std::size_t kBaselineValueReadCap = 4u * 1024u * 1024u; // bytes read per value
 inline constexpr std::size_t kBaselineBytesCap = 64u * 1024u * 1024u;    // bytes read per root
+inline constexpr std::size_t kSkippedCap = 32; // access-denied child keys recorded per root read
 inline constexpr std::int64_t kSnapshotBudget100ns = 10LL * 10'000'000;  // 10 s
 inline constexpr std::int64_t kReconcileEveryTicks = 12;     // 12 x 300 s = hourly full re-read
 inline constexpr std::size_t kWatchHandleCap = 62; // + HKEY_USERS name watch + stop event = 64
@@ -315,10 +316,23 @@ struct RegistryValueRead {
 /// One bounded subtree read: key path (full, `HKLM\...`) -> value name -> value.
 /// Every visited key is present, with an empty map when it holds no values, so a
 /// vanished key is distinguishable from a key that never had values.
+///
+/// `skipped` names the child keys the reader was denied access to (full paths, at
+/// most kSkippedCap; one more makes the read Capped). They are absent from `keys`,
+/// and the diff keeps whatever the baseline holds at or under them rather than
+/// reading their absence as a deletion. A denied child therefore never blinds the
+/// rest of its root: `Unreadable` means the ROOT itself could not be read.
 struct SubtreeRead {
     RegistryReadStatus status{RegistryReadStatus::Unreadable};
     std::map<std::string, std::map<std::string, RegistryValueRead>> keys;
+    std::vector<std::string> skipped;
 };
+
+/// True when `key` is `prefix` itself or a descendant of it (on a path-separator
+/// boundary, so `...\Run2` is not under `...\Run`).
+[[nodiscard]] inline bool registry_key_under(std::string_view key, std::string_view prefix) {
+    return key.starts_with(prefix) && (key.size() == prefix.size() || key[prefix.size()] == '\\');
+}
 
 /// Pure budget accounting for the production reader (R9): one place decides when
 /// a read has visited as much as a root may cost.
@@ -404,10 +418,11 @@ struct DiffResult {
 }
 
 /// Diffs a read against a root's baseline. Removals are derived ONLY from a
-/// Complete or Absent read (a partial read cannot prove anything is gone);
-/// Unreadable changes nothing; Capped adds/updates what it visited and retains
-/// the rest. `suppress` returns the new baseline with no candidates (the first
-/// read of a root).
+/// Complete or Absent read (a partial read cannot prove anything is gone) and
+/// never for a key at or under one of `read.skipped`, whose baseline is kept as
+/// it was; Unreadable changes nothing; Capped adds/updates what it visited and
+/// retains the rest. `suppress` returns the new baseline with no candidates (the
+/// first read of a root).
 [[nodiscard]] inline DiffResult diff_registry_snapshot(const RegistryBaseline& base,
                                                        const SubtreeRead& read,
                                                        std::string_view source,
@@ -466,9 +481,18 @@ struct DiffResult {
     }
 
     if (authoritative) {
+        const auto under_skipped = [&](const std::string& key) {
+            return std::any_of(read.skipped.begin(), read.skipped.end(), [&](const std::string& p) {
+                return registry_key_under(key, p);
+            });
+        };
         for (const auto& [key, values] : base.keys) {
             if (read.keys.contains(key))
                 continue;
+            if (under_skipped(key)) {
+                r.baseline.keys[key] = values; // not readable now: nothing proves it is gone
+                continue;
+            }
             // A whole key vanished: each of its values, then the key itself.
             for (const auto& [name, e] : values) {
                 if (suppress)
@@ -534,8 +558,8 @@ inline std::string rk_escape(std::string_view s) {
                        registry_detail::rk_escape(value));
 }
 
-/// kind in restart | disabled | cursorlost | baselinelost; `ident` is a timestamp
-/// or the root.
+/// kind in restart | disabled | cursorlost | baselinelost | unreadable; `ident` is a
+/// timestamp or the root.
 [[nodiscard]] inline std::string registry_gap_record_key(std::string_view kind,
                                                          std::string_view ident) {
     return std::format("gap:{}:{}", kind, registry_detail::rk_escape(ident));
@@ -593,6 +617,7 @@ struct RegistryRootState {
     std::int64_t read_end{0};
     std::string status; // complete | absent | unreadable | capped | due
     bool armed{true};
+    std::vector<std::string> skipped; // denied child keys of the last read (sorted): a change is a gap
     bool operator==(const RegistryRootState&) const = default;
 };
 
@@ -625,6 +650,7 @@ struct RegistryCursor {
             st.read_end = r.at("read_end").get<std::int64_t>();
             st.status = r.at("status").get<std::string>();
             st.armed = r.at("armed").get<bool>();
+            st.skipped = r.value("skipped", std::vector<std::string>{});
             cur.roots.emplace(name, std::move(st));
         }
         for (const auto& s : j.at("hku"))
@@ -648,7 +674,7 @@ struct RegistryCursor {
     for (const auto& [name, st] : cur.roots)
         roots[name] = {{"baselined", st.baselined}, {"read_start", st.read_start},
                        {"read_end", st.read_end},   {"status", st.status},
-                       {"armed", st.armed}};
+                       {"armed", st.armed},         {"skipped", st.skipped}};
     j["roots"] = std::move(roots);
     j["hku"] = cur.hku;
     // A registry value can hold bytes that are not valid UTF-8 after rendering;

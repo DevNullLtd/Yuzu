@@ -105,7 +105,7 @@ TEST_CASE("normalise_registry_path maps only the current control set", "[tar][re
           "HKU\\S-1-5-21-1\\Software\\Run"); // case and content preserved
 }
 
-TEST_CASE("default_registry_scope: curated roots, per-user roots skip non-profile hives",
+TEST_CASE("default_registry_scope: curated roots; per-user roots skip non-profile hives",
           "[tar][registry][pure]") {
     const auto scope = default_registry_scope();
     // Two profile hives pass the filter (an interactive SID and LocalSystem); the
@@ -190,7 +190,7 @@ TEST_CASE("baseline_entry_from_bytes hashes every byte read (R8)", "[tar][regist
     CHECK(big.s == 9'000'000);
 }
 
-TEST_CASE("diff_registry_snapshot: added, changed, removed and the four read statuses",
+TEST_CASE("diff_registry_snapshot: added/changed/removed values and the four read statuses",
           "[tar][registry][pure]") {
     namespace P = yuzu::profiles;
     const std::string root = "HKLM\\SOFTWARE\\r";
@@ -260,6 +260,39 @@ TEST_CASE("diff_registry_snapshot: added, changed, removed and the four read sta
         CHECK(d.baseline.keys.at(root + "\\B").contains("ImagePath"));
     }
 
+    SECTION("a denied child key keeps what the baseline holds beneath it; the rest of the root still diffs") {
+        const std::string a = root + "\\A";
+        const auto base_read = complete({{a, {{"ImagePath", vread(P::kRegSz, utf16("c:\\a.exe"))}}},
+                                         {a + "\\Denied", {{"x", vread(P::kRegDword, dword(1))}}},
+                                         {a + "\\Denied\\Deep", {{"y", vread(P::kRegDword, dword(2))}}},
+                                         {a + "\\Denied2", {{"z", vread(P::kRegDword, dword(3))}}}});
+        const auto base = diff_registry_snapshot({}, base_read, "reconcile", 20, /*suppress=*/true).baseline;
+
+        // A lost its ImagePath, Denied can no longer be read, Denied2 (a sibling whose name only
+        // starts the same) is really gone.
+        SubtreeRead now = complete({{a, {}}});
+        now.skipped = {a + "\\Denied"};
+        const auto d = diff_registry_snapshot(base, now, "notify", 20);
+        std::set<std::string> got;
+        for (const auto& c : d.candidates)
+            got.insert(c.action + ":" + c.key.substr(root.size() + 1) + ":" + c.value);
+        CHECK(got == std::set<std::string>{"removed:A:ImagePath", "removed:A\\Denied2:z",
+                                           "key_removed:A\\Denied2:"});
+        CHECK(d.baseline.keys.at(a + "\\Denied") == base.keys.at(a + "\\Denied"));
+        CHECK(d.baseline.keys.at(a + "\\Denied\\Deep") == base.keys.at(a + "\\Denied\\Deep"));
+        CHECK_FALSE(d.baseline.keys.contains(a + "\\Denied2"));
+
+        // Readable again, it diffs against what was kept: x changed, y removed.
+        const auto back = complete({{a, {}},
+                                    {a + "\\Denied", {{"x", vread(P::kRegDword, dword(9))}}},
+                                    {a + "\\Denied\\Deep", {}}});
+        const auto d2 = diff_registry_snapshot(d.baseline, back, "notify", 21);
+        got.clear();
+        for (const auto& c : d2.candidates)
+            got.insert(c.action + ":" + c.key.substr(root.size() + 1) + ":" + c.value);
+        CHECK(got == std::set<std::string>{"changed:A\\Denied:x", "removed:A\\Denied\\Deep:y"});
+    }
+
     SECTION("new data is truncated at kRegistryDataCap and the stored size is the full size") {
         RegistryValueRead big;
         big.type = P::kRegBinary;
@@ -276,13 +309,14 @@ TEST_CASE("diff_registry_snapshot: added, changed, removed and the four read sta
     }
 }
 
-TEST_CASE("RegistryReadBudget caps keys, values and bytes (R9)", "[tar][registry][pure]") {
+TEST_CASE("RegistryReadBudget caps keys and values and bytes (R9)", "[tar][registry][pure]") {
     {
         RegistryReadBudget b;
-        bool ok = true;
-        for (std::size_t i = 0; i <= kBaselineKeyCap; ++i)
-            ok = b.admit_key();
-        CHECK_FALSE(ok); // the 20,001st key
+        bool all_admitted = true;
+        for (std::size_t i = 0; i < kBaselineKeyCap; ++i)
+            all_admitted = b.admit_key() && all_admitted; // every call is made
+        CHECK(all_admitted);       // the first 20,000 keys are admitted ...
+        CHECK_FALSE(b.admit_key()); // ... the 20,001st is not
     }
     {
         RegistryReadBudget b;
@@ -348,7 +382,8 @@ TEST_CASE("cursor and baseline codecs", "[tar][registry][pure]") {
     cur.tick = 7;
     cur.ccs = "ControlSet001";
     cur.hku = {"S-1-5-21-1"};
-    cur.roots["HKLM\\R"] = RegistryRootState{true, 110, 120, "complete", false};
+    cur.roots["HKLM\\R"] =
+       RegistryRootState{true, 110, 120, "complete", false, {"HKLM\\R\\Denied", "HKLM\\R\\Denied2"}};
     const auto json = encode_registry_cursor(cur);
     const auto back = decode_registry_cursor(json);
     CHECK_FALSE(back.malformed);
@@ -362,6 +397,10 @@ TEST_CASE("cursor and baseline codecs", "[tar][registry][pure]") {
     CHECK_FALSE(decode_registry_cursor(std::nullopt).malformed);
     for (const char* bad : {"", "garbage", "{\"v\":2}", "{\"v\":1}", "[]"})
         CHECK(decode_registry_cursor(std::string(bad)).malformed);
+    // a cursor written before `skipped` existed decodes with the set empty
+    auto older = nlohmann::json::parse(json);
+    older["roots"]["HKLM\\R"].erase("skipped");
+    CHECK(decode_registry_cursor(older.dump()).roots.at("HKLM\\R").skipped.empty());
     // an unknown field is ignored, so a later build can add state to this v1 cursor
     auto j = nlohmann::json::parse(json);
     j["later_field"] = nlohmann::json::array({1, 2});
@@ -620,7 +659,7 @@ TEST_CASE("registry source: a failed commit rolls back in memory and replays cle
     CHECK(rows.rows[0][3] == "notify");
 }
 
-TEST_CASE("registry source: lost cursor, restart, baseline loss and storage errors",
+TEST_CASE("registry source: lost cursor; restart; baseline loss; storage errors",
           "[tar][registry][lifecycle]") {
     auto t = make_db();
     Fake f;
@@ -709,7 +748,7 @@ TEST_CASE("registry source: re-enable re-baselines with a gap; the paused window
     CHECK_THAT(rows.rows[0][0], ContainsSubstring("gap:disabled"));
 }
 
-TEST_CASE("registry source: read statuses, status keys and fair root scheduling",
+TEST_CASE("registry source: read statuses; status keys; fair root scheduling",
           "[tar][registry][lifecycle]") {
     auto t = make_db();
     Fake f;
@@ -729,7 +768,11 @@ TEST_CASE("registry source: read statuses, status keys and fair root scheduling"
         CHECK(std::count(f.read_calls.begin(), f.read_calls.end(), kRoot) == 1); // still due
         const auto cur = read_cursor(t.db);
         CHECK_FALSE(cur.roots.at(kRoot).baselined);
-        CHECK(count_rows(t.db) == 1); // a row only for the readable root
+        // a change row only for the readable root, plus the ONE gap for the root that went
+        // unreadable (it was already unreadable on the second tick: nothing more)
+        CHECK(count_rows(t.db) == 2);
+        CHECK(std::stoll(q(t.db, "SELECT COUNT(*) FROM registry_live WHERE action <> 'capture_gap'")
+                            .rows.at(0).at(0)) == 1);
         CHECK(t.db.get_config("registry_roots_unreadable", "") == "1");
         CHECK(t.db.get_config("registry_capture_method", "") == "notify");
         CHECK_FALSE(t.db.try_get_state("registry:" + kRoot).value().has_value());
@@ -756,6 +799,92 @@ TEST_CASE("registry source: read statuses, status keys and fair root scheduling"
         CHECK(std::count(f.read_calls.begin(), f.read_calls.end(), kRoot2) == 0);
         CHECK(t.db.get_config("registry_watch_roots_unarmed", "") == "1");
     }
+}
+
+TEST_CASE("registry source: a denied child key and an unreadable root each write one gap row when they start or change",
+          "[tar][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    const std::string locked = kRoot + "\\Locked";
+    auto gap_count = [&] {
+        return std::stoll(q(t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'")
+                             .rows.at(0).at(0));
+    };
+    auto last_gap = [&] {
+        return q(t.db, "SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
+                       "ORDER BY id DESC LIMIT 1").rows.at(0).at(0);
+    };
+    // A read of the root with Svc\Start = `start`, optionally with Locked readable and holding a value.
+    auto read = [&](std::uint32_t start, bool locked_readable, std::vector<std::string> denied) {
+        auto r = svc(start);
+        if (locked_readable)
+            r.keys[locked] = {{"Hidden", vread(4, dword(7))}};
+        r.skipped = std::move(denied);
+        return r;
+    };
+    auto next_tick = [&](SubtreeRead r) {
+        f.reads[kRoot] = std::move(r);
+        f.clock += 100 * SEC;
+        f.dirty->mark(kRoot, f.clock);
+        return tick(t.db, *src);
+    };
+
+    f.reads[kRoot] = read(1, /*locked_readable=*/true, {});
+    REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
+    CHECK(gap_count() == 0);
+    const std::string baseline_before = *t.db.try_get_state("registry:" + kRoot).value();
+    CHECK_THAT(baseline_before, ContainsSubstring("Locked"));
+
+    // Locked becomes unreadable: the rest of the root still diffs, the denied key's stored
+    // values are kept (no `removed` rows), the root is NOT unreadable, and ONE gap names it.
+    CHECK(next_tick(read(2, false, {locked})).events_emitted == 2);
+    CHECK(count_rows(t.db) == 2);
+    CHECK(std::stoll(q(t.db, "SELECT COUNT(*) FROM registry_live WHERE action IN ('removed','key_removed')")
+                        .rows.at(0).at(0)) == 0);
+    CHECK(gap_count() == 1);
+    CHECK_THAT(last_gap(), ContainsSubstring("gap:unreadable:" + kRoot));
+    CHECK_THAT(last_gap(), ContainsSubstring(locked));
+    CHECK_THAT(*t.db.try_get_state("registry:" + kRoot).value(), ContainsSubstring("Hidden"));
+    CHECK(read_cursor(t.db).roots.at(kRoot).status == "complete");
+    CHECK(read_cursor(t.db).roots.at(kRoot).skipped == std::vector<std::string>{locked});
+    CHECK(t.db.get_config("registry_roots_unreadable", "") == "0");
+
+    // The same denied set on the next read: the change still lands, no new gap.
+    CHECK(next_tick(read(3, false, {locked})).events_emitted == 1);
+    CHECK(gap_count() == 1);
+
+    // The denied set grows: one more gap, naming how many.
+    CHECK(next_tick(read(3, false, {locked, kRoot + "\\Other"})).events_emitted == 1);
+    CHECK(gap_count() == 2);
+    CHECK_THAT(last_gap(), ContainsSubstring("2 child key(s)"));
+
+    // Access is restored: Locked reads again and is diffed against what was kept (Hidden is
+    // unchanged), nothing is reported as a gap.
+    CHECK(next_tick(read(3, true, {})).events_emitted == 0);
+    CHECK(gap_count() == 2);
+    CHECK(read_cursor(t.db).roots.at(kRoot).skipped.empty());
+
+    // The root itself becomes unreadable: one gap, the baseline is untouched, it is counted.
+    const std::string baseline_ok = *t.db.try_get_state("registry:" + kRoot).value();
+    SubtreeRead bad;
+    bad.status = RegistryReadStatus::Unreadable;
+    CHECK(next_tick(bad).events_emitted == 1);
+    CHECK(gap_count() == 3);
+    CHECK_THAT(last_gap(), ContainsSubstring("the root could not be read"));
+    CHECK(*t.db.try_get_state("registry:" + kRoot).value() == baseline_ok);
+    CHECK(t.db.get_config("registry_roots_unreadable", "") == "1");
+
+    // Still unreadable on the next ticks (it is due every tick): nothing more.
+    CHECK(next_tick(bad).events_emitted == 0);
+    CHECK(next_tick(bad).events_emitted == 0);
+    CHECK(gap_count() == 3);
+
+    // Readable again, then unreadable again: the second loss is a new transition.
+    CHECK(next_tick(read(4, true, {})).events_emitted == 1); // the change since the kept baseline
+    CHECK(t.db.get_config("registry_roots_unreadable", "") == "0");
+    CHECK(next_tick(bad).events_emitted == 1);
+    CHECK(gap_count() == 4);
 }
 
 TEST_CASE("registry source: with a budget admitting one root per tick every root is read within n ticks (R15)",
@@ -788,7 +917,7 @@ TEST_CASE("registry source: with a budget admitting one root per tick every root
     CHECK(seen == std::set<std::string>(roots.begin(), roots.end()));
 }
 
-TEST_CASE("registry source: a control-set switch re-baselines CurrentControlSet roots, a failed read does not",
+TEST_CASE("registry source: a control-set switch re-baselines CurrentControlSet roots; a failed read does not",
           "[tar][registry][lifecycle]") {
     auto t = make_db();
     Fake f;
@@ -889,7 +1018,7 @@ struct LiveRun {
 
 } // namespace
 
-TEST_CASE("registry live: set, change and delete through a pre-opened handle land with no actor",
+TEST_CASE("registry live: set/change/delete through a pre-opened handle land with no actor",
           "[tar][registry][windows]") {
     const std::string leaf = "yuzu_test_reg_" + salt();
     TestKey key(leaf);
@@ -935,28 +1064,28 @@ TEST_CASE("registry live: a deleted and recreated root re-arms (R13)", "[tar][re
     LiveRun run("SOFTWARE\\" + leaf);
     tick(run.t.db, *run.src); // baseline
     DWORD v = 1;
-    RegSetValueExW(key.h, L"Seed", 0, REG_DWORD, reinterpret_cast<BYTE*>(&v), 4);
-    tick(run.t.db, *run.src);
+    run.transition([&] { RegSetValueExW(key.h, L"Seed", 0, REG_DWORD, reinterpret_cast<BYTE*>(&v), 4); });
     RegCloseKey(key.h);
     key.h = nullptr;
-    RegDeleteTreeW(HKEY_LOCAL_MACHINE, key.path.c_str());
-    RegDeleteKeyW(HKEY_LOCAL_MACHINE, key.path.c_str());
-    run.dirty->mark("HKLM\\SOFTWARE\\" + leaf, 0); // the watch may already have said so
-    tick(run.t.db, *run.src); // Absent: values and the key removed
+    // Deleting the watched key is itself a notification (the delete signals the watch).
+    run.transition([&] {
+        RegDeleteTreeW(HKEY_LOCAL_MACHINE, key.path.c_str());
+        RegDeleteKeyW(HKEY_LOCAL_MACHINE, key.path.c_str());
+    }); // Absent: values and the key removed
     const auto removed = q(run.t.db, "SELECT COUNT(*) FROM registry_live WHERE action IN ('removed','key_removed')");
     CHECK(std::stoi(removed.rows[0][0]) >= 1);
 
+    // Recreated: the root is unarmed, so this tick re-opens it and arms it again ...
     REQUIRE(key.create() == ERROR_SUCCESS);
-    RegSetValueExW(key.h, L"Again", 0, REG_DWORD, reinterpret_cast<BYTE*>(&v), 4);
-    run.dirty->mark("HKLM\\SOFTWARE\\" + leaf, 1);
     tick(run.t.db, *run.src);
-    tick(run.t.db, *run.src);
+    CHECK(run.t.db.get_config("registry_watch_roots_unarmed", "") == "0"); // armed again
+    // ... and a write after that is reported by the key watch itself, not by a hand-made mark.
+    run.transition([&] { RegSetValueExW(key.h, L"Again", 0, REG_DWORD, reinterpret_cast<BYTE*>(&v), 4); });
     CHECK(std::stoi(q(run.t.db, "SELECT COUNT(*) FROM registry_live WHERE value_name = 'Again' AND action = 'added'")
                        .rows[0][0]) == 1);
-    CHECK(run.t.db.get_config("registry_watch_roots_unarmed", "") == "0"); // armed again
 }
 
-TEST_CASE("registry live: the reader returns Capped, Unreadable and sees a last-byte change (R8/R9)",
+TEST_CASE("registry live: the reader returns Capped; reports denied children; sees a last-byte change and a 16383-character name (R8/R9)",
           "[tar][registry][windows]") {
     const std::string leaf = "yuzu_test_reg_" + salt();
     TestKey key(leaf);
@@ -964,6 +1093,15 @@ TEST_CASE("registry live: the reader returns Capped, Unreadable and sees a last-
         SKIP("cannot write HKLM (not elevated)");
     auto reader = make_windows_registry_reader();
     const std::string root = "HKLM\\SOFTWARE\\" + leaf;
+
+    // The longest legal value name (16383 characters) is read under its full name.
+    const std::string long_name(16383, 'n');
+    DWORD one = 1;
+    REQUIRE(RegSetValueExW(key.h, yuzu::win::to_wide(long_name).c_str(), 0, REG_DWORD,
+                           reinterpret_cast<BYTE*>(&one), 4) == ERROR_SUCCESS);
+    const auto named = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+    REQUIRE(named.status == RegistryReadStatus::Complete);
+    CHECK(named.keys.at(root).contains(long_name));
 
     // A 100 KiB binary changed only in its last byte: the stored size is equal, the hash differs.
     std::vector<BYTE> blob(100 * 1024, 0x41);
@@ -977,7 +1115,14 @@ TEST_CASE("registry live: the reader returns Capped, Unreadable and sees a last-
     REQUIRE(d.candidates.size() == 1);
     CHECK(d.candidates[0].action == "changed");
 
-    // An ACL-denied subkey makes the whole read Unreadable, never a partial success.
+    // An ACL-denied subkey hides only itself: the read stays Complete, names the denied key in
+    // `skipped`, and still returns the root's own values and the readable sibling.
+    HKEY open_key = nullptr;
+    REQUIRE(RegCreateKeyExW(key.h, L"Open", 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &open_key, nullptr) ==
+            ERROR_SUCCESS);
+    DWORD seen = 5;
+    RegSetValueExW(open_key, L"Seen", 0, REG_DWORD, reinterpret_cast<BYTE*>(&seen), 4);
+    RegCloseKey(open_key);
     HKEY denied = nullptr;
     PSECURITY_DESCRIPTOR deny = nullptr;
     REQUIRE(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:PAI(D;;KR;;;WD)(A;;KA;;;SY)(A;;KA;;;BA)",
@@ -987,7 +1132,7 @@ TEST_CASE("registry live: the reader returns Capped, Unreadable and sees a last-
     RegSetKeySecurity(denied, DACL_SECURITY_INFORMATION, deny);
     LocalFree(deny);
     RegCloseKey(denied);
-    const auto unreadable = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+    const auto with_denied = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
     // restore access so the cleanup can delete the subtree
     PSECURITY_DESCRIPTOR allow = nullptr;
     ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:PAI(A;;KA;;;WD)", SDDL_REVISION_1, &allow,
@@ -998,7 +1143,11 @@ TEST_CASE("registry live: the reader returns Capped, Unreadable and sees a last-
         RegCloseKey(again);
     }
     LocalFree(allow);
-    CHECK(unreadable.status == RegistryReadStatus::Unreadable);
+    CHECK(with_denied.status == RegistryReadStatus::Complete);
+    CHECK(with_denied.skipped == std::vector<std::string>{root + "\\Denied"});
+    CHECK_FALSE(with_denied.keys.contains(root + "\\Denied"));
+    CHECK(with_denied.keys.at(root).contains("Blob"));
+    CHECK(with_denied.keys.at(root + "\\Open").contains("Seen"));
 
     // More subkeys than the key cap: Capped within the budget, not a stall.
     RegDeleteTreeW(key.h, L"Denied");
@@ -1015,17 +1164,58 @@ TEST_CASE("registry live: the reader returns Capped, Unreadable and sees a last-
     CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(30));
 }
 
-TEST_CASE("registry live: stop then destruction with no collect is clean, and no session remains",
+TEST_CASE("registry live: a symbolic-link key is read as the link and never followed",
+          "[tar][registry][windows]") {
+    const std::string leaf = "yuzu_test_reg_" + salt();
+    TestKey key(leaf);
+    if (key.create() != ERROR_SUCCESS)
+        SKIP("cannot write HKLM (not elevated)");
+
+    // Target holds a value the link must not expose.
+    HKEY target = nullptr;
+    REQUIRE(RegCreateKeyExW(key.h, L"Target", 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &target, nullptr) ==
+            ERROR_SUCCESS);
+    DWORD secret = 7;
+    RegSetValueExW(target, L"Secret", 0, REG_DWORD, reinterpret_cast<BYTE*>(&secret), 4);
+    RegCloseKey(target);
+
+    // A volatile link key `Link` pointing at Target (the link's value is the NT path, no NUL).
+    const std::wstring nt_target = L"\\Registry\\Machine\\" + key.path + L"\\Target";
+    HKEY link = nullptr;
+    REQUIRE(RegCreateKeyExW(key.h, L"Link", 0, nullptr, REG_OPTION_CREATE_LINK | REG_OPTION_VOLATILE,
+                            KEY_ALL_ACCESS | KEY_CREATE_LINK, nullptr, &link, nullptr) == ERROR_SUCCESS);
+    REQUIRE(RegSetValueExW(link, L"SymbolicLinkValue", 0, REG_LINK,
+                           reinterpret_cast<const BYTE*>(nt_target.data()),
+                           static_cast<DWORD>(nt_target.size() * sizeof(wchar_t))) == ERROR_SUCCESS);
+    RegCloseKey(link);
+
+    auto reader = make_windows_registry_reader();
+    const std::string root = "HKLM\\SOFTWARE\\" + leaf;
+    const auto r = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+    REQUIRE(r.status == RegistryReadStatus::Complete);
+    // The link is a key of its own holding its SymbolicLinkValue ...
+    REQUIRE(r.keys.contains(root + "\\Link"));
+    const auto& link_values = r.keys.at(root + "\\Link");
+    REQUIRE(link_values.contains("SymbolicLinkValue"));
+    CHECK(link_values.at("SymbolicLinkValue").type == REG_LINK);
+    // ... and what it points at is not read through it.
+    CHECK_FALSE(link_values.contains("Secret"));
+    CHECK(r.keys.at(root + "\\Target").contains("Secret")); // read once, as the key it is
+
+    // Remove the link itself, so the cleanup's tree walk is never asked to follow it.
+    RegDeleteKeyW(key.h, L"Link");
+}
+
+TEST_CASE("registry live: stop is idempotent and destruction after stop is clean",
           "[tar][registry][windows]") {
     {
         auto src = make_registry_cursor_source(RegistryScope{{"SOFTWARE\\yuzu_test_reg_none"}, {}},
                                          make_windows_registry_reader());
         TestDb t = make_db();
         src->start(t.db);
-        src->stop();
-        src->stop(); // idempotent
-    }
-    CHECK(true); // reaching here means stop()/~RegistryCursorSource() neither threw nor hung
+        REQUIRE_NOTHROW(src->stop());
+        REQUIRE_NOTHROW(src->stop()); // idempotent
+    } // ~RegistryCursorSource() after stop() must neither throw nor hang
 }
 
 #endif // _WIN32

@@ -30,6 +30,20 @@ constexpr const char* kEmptyBaselineJson = R"({"v":1,"keys":{}})";
 
 std::string baseline_collector(const std::string& root) { return "registry:" + root; }
 
+// The gap row text for child keys that denied read access: names the first few.
+std::string denied_children_detail(const std::string& root, const std::vector<std::string>& denied) {
+    constexpr std::size_t kShown = 3;
+    std::string d = std::format("gap:unreadable:{} ({} child key(s) denied read access; their values "
+                                "and anything beneath them are not read, and deletions beneath them "
+                                "are not derived, until they can be): ",
+                                root, denied.size());
+    for (std::size_t i = 0; i < denied.size() && i < kShown; ++i)
+        d += (i == 0 ? "" : "; ") + denied[i];
+    if (denied.size() > kShown)
+        d += std::format("; +{} more", denied.size() - kShown);
+    return d;
+}
+
 // Restores the dirty flags a tick took if the tick does not commit (R7): the next
 // tick must re-read those roots and re-diff against the committed baseline.
 struct DirtyRollback {
@@ -187,7 +201,11 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
             if (!due)
                 continue;
             if (read_any && reader_.now_ts() >= deadline) {
-                st.status = "due"; // not reached this tick; first in line next time
+                // Not reached this tick; first in line next time. An already-unsettled
+                // status is kept: it is what tells a root that STAYS unreadable from one
+                // that just became so.
+                if (!unsettled)
+                    st.status = "due";
                 continue;
             }
             read_any = true;
@@ -227,6 +245,29 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
             if (rd.status != RegistryReadStatus::Unreadable && (fresh_root || diff.changed))
                 state_writes.push_back({baseline_collector(root),
                                         encode_registry_baseline(diff.baseline)});
+
+            // A root that could not be read, or child keys that deny access, are a blind
+            // spot the operator must be able to see: one gap row when it starts or changes,
+            // none while it holds steady. The cursor commits with the row, so a replay
+            // cannot lose or duplicate it.
+            if (rd.status == RegistryReadStatus::Unreadable) {
+                if (st.status != "unreadable")
+                    rows.push_back(registry_gap_row(
+                       "unreadable", root + ":" + std::to_string(read_end),
+                       "gap:unreadable:" + root +
+                          " (the root could not be read; its baseline is kept and nothing is "
+                          "derived for it until it can be)",
+                       now, snapshot_id));
+            } else {
+                std::sort(rd.skipped.begin(), rd.skipped.end());
+                rd.skipped.erase(std::unique(rd.skipped.begin(), rd.skipped.end()), rd.skipped.end());
+                if (!rd.skipped.empty() && rd.skipped != st.skipped)
+                    rows.push_back(registry_gap_row("unreadable",
+                                                    root + ":" + std::to_string(read_end),
+                                                    denied_children_detail(root, rd.skipped), now,
+                                                    snapshot_id));
+                st.skipped = std::move(rd.skipped);
+            }
 
             st.read_start = read_start;
             st.read_end = read_end;
@@ -307,8 +348,9 @@ std::unique_ptr<RegistryCursorSource> make_registry_cursor_source(RegistryScope 
 #endif
 #include <windows.h>
 
-#include <win_reg_handle.hpp> // yuzu::win::RegKey
-#include <win_str.hpp>        // yuzu::win wide<->UTF-8
+#include <guard_win_handle.hpp> // yuzu::agent::detail::EventHandle (agents/core/src)
+#include <win_reg_handle.hpp>   // yuzu::win::RegKey
+#include <win_str.hpp>          // yuzu::win wide<->UTF-8
 
 #include <thread>
 
@@ -322,6 +364,15 @@ namespace yuzu::tar {
 
 namespace {
 
+using yuzu::agent::detail::EventHandle;
+
+// run()'s handles[] -> slot index map: these two stand for the control events.
+constexpr std::size_t kStopIdx = static_cast<std::size_t>(-1);
+constexpr std::size_t kHkuIdx = static_cast<std::size_t>(-2);
+
+// The registry's maximum value-name length, in characters (the buffer adds the NUL).
+constexpr std::size_t kMaxValueNameChars = 16383;
+
 std::int64_t filetime_now() {
     FILETIME ft;
     GetSystemTimePreciseAsFileTime(&ft);
@@ -333,10 +384,15 @@ HKEY hive_of(std::string_view token) {
     return token == "HKU" ? HKEY_USERS : HKEY_LOCAL_MACHINE;
 }
 
-// Opens the root's key for the given access. nullopt-style via rc.
+// Opens the root's key for the given access. REG_OPTION_OPEN_LINK: a root that is itself a
+// symbolic-link key is opened as the link and never followed, so a link a user plants can
+// not point this agent's SYSTEM token at a protected key. Defence in depth -- the kernel's
+// untrusted-hive link check is the primary control and is not relied on. The flag covers
+// the final path component only; an intermediate link (CurrentControlSet is one, by design)
+// is the kernel's to resolve.
 LONG open_root(const std::string& root, REGSAM access, yuzu::win::RegKey& out) {
     auto [hive, rest] = split_hive(root);
-    return RegOpenKeyExW(hive_of(hive), yuzu::win::to_wide(rest).c_str(), 0,
+    return RegOpenKeyExW(hive_of(hive), yuzu::win::to_wide(rest).c_str(), REG_OPTION_OPEN_LINK,
                          access | KEY_WOW64_64KEY, out.put());
 }
 
@@ -347,18 +403,19 @@ LONG open_root(const std::string& root, REGSAM access, yuzu::win::RegKey& out) {
 struct WinWatcher {
     struct Slot {
         std::string root;
-        HANDLE event{nullptr};
+        EventHandle event;
         yuzu::win::RegKey key;
         bool armed{false};
     };
 
     std::shared_ptr<RegistryDirtyTable> dirty;
-    std::mutex mu; // guards slots (key + armed) between the thread and the collect tick
+    std::mutex mu; // guards slots (key + armed) and `live` between the thread and the collect tick
     std::vector<Slot> slots;
-    HANDLE stop_event{nullptr};
-    HANDLE hku_event{nullptr};
+    EventHandle stop_event;
+    EventHandle hku_event;
     yuzu::win::RegKey hku_key;
     std::thread thread;
+    bool live{false}; // a watcher thread is running; arming is only trusted while it is
 
     ~WinWatcher() { shutdown(); }
 
@@ -368,108 +425,116 @@ struct WinWatcher {
             s.armed = false;
             return false;
         }
-        ResetEvent(s.event);
+        ResetEvent(s.event.get());
         s.armed = RegNotifyChangeKeyValue(s.key.get(), TRUE,
                                           REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET |
                                              REG_NOTIFY_THREAD_AGNOSTIC,
-                                          s.event, TRUE) == ERROR_SUCCESS;
+                                          s.event.get(), TRUE) == ERROR_SUCCESS;
         if (!s.armed)
             s.key.reset();
         return s.armed;
     }
 
+    // No live watcher: every root is unarmed, so the collect tick reads each one every
+    // tick (reconcile-only coverage) instead of trusting a watch that is not there.
+    void unarm_all() {
+        std::lock_guard lock(mu);
+        live = false;
+        for (auto& s : slots)
+            s.armed = false;
+    }
+
     void shutdown() {
-        if (stop_event != nullptr)
-            SetEvent(stop_event);
+        if (stop_event)
+            SetEvent(stop_event.get());
         if (thread.joinable())
             thread.join();
         std::lock_guard lock(mu);
-        for (auto& s : slots) {
-            s.key.reset();
-            if (s.event != nullptr)
-                CloseHandle(s.event);
-        }
-        slots.clear();
+        live = false;
+        slots.clear(); // closes each slot's key, then its event
         hku_key.reset();
-        if (hku_event != nullptr)
-            CloseHandle(hku_event);
-        if (stop_event != nullptr)
-            CloseHandle(stop_event);
-        hku_event = stop_event = nullptr;
+        hku_event.reset();
+        stop_event.reset();
     }
 
     // Replaces the watch with one over `roots`. Roots past the handle cap get no
     // event: they stay unarmed and are covered by the reconcile read.
     void watch(const std::vector<std::string>& roots) {
         shutdown();
-        stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        hku_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (stop_event == nullptr || hku_event == nullptr) {
-            // Without both control events the wait below fails at once and the thread
-            // would exit while every slot still claimed to be armed. Report the truth:
-            // no watch, every root unarmed, so the collect tick reads each one every tick.
-            // shutdown() tolerates the null handles and the never-started thread.
-            if (stop_event != nullptr)
-                CloseHandle(stop_event);
-            if (hku_event != nullptr)
-                CloseHandle(hku_event);
-            stop_event = hku_event = nullptr;
-            std::lock_guard lock(mu);
-            for (const auto& root : roots) {
-                Slot s;
-                s.root = root;
-                slots.push_back(std::move(s));
-            }
-            return;
-        }
-        {
+        try {
+            stop_event.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+            hku_event.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
+            // Without both control events the wait would fail at once and the thread exit
+            // while every slot still claimed to be armed: report the truth, no watch.
+            const bool can_watch = stop_event && hku_event;
             std::lock_guard lock(mu);
             for (std::size_t i = 0; i < roots.size(); ++i) {
                 Slot s;
                 s.root = roots[i];
-                if (i < kWatchHandleCap) {
-                    s.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-                    if (s.event != nullptr)
+                if (can_watch && i < kWatchHandleCap) {
+                    s.event.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
+                    if (s.event)
                         arm(s);
                 }
                 slots.push_back(std::move(s));
             }
+            if (!can_watch)
+                return;
             if (RegOpenKeyExW(HKEY_USERS, L"", 0, KEY_NOTIFY, hku_key.put()) == ERROR_SUCCESS)
                 RegNotifyChangeKeyValue(hku_key.get(), FALSE, REG_NOTIFY_CHANGE_NAME |
                                                                   REG_NOTIFY_THREAD_AGNOSTIC,
-                                        hku_event, TRUE);
+                                        hku_event.get(), TRUE);
+            live = true; // before the thread can run: it re-arms through the same lock
+            thread = std::thread([this] { run(); });
+        } catch (...) {
+            // bad_alloc / system_error while building the watch.
+            unarm_all();
         }
-        thread = std::thread([this] { run(); });
     }
 
     void run() {
+        bool stopped = false;
+        try {
+            stopped = wait_loop();
+        } catch (...) {
+            // bad_alloc / system_error on this thread would be std::terminate and take the
+            // agent with it: end the watch instead and say so, below.
+        }
+        if (!stopped)
+            unarm_all();
+    }
+
+    // True when stopped on purpose; false when the wait itself failed.
+    bool wait_loop() {
         std::vector<HANDLE> handles;
-        std::vector<std::size_t> slot_of; // handles[i] -> slot index (npos for stop/hku)
+        std::vector<std::size_t> slot_of; // handles[i] -> slot index (kStopIdx/kHkuIdx for the controls)
         {
             std::lock_guard lock(mu);
-            handles.push_back(stop_event);
-            slot_of.push_back(static_cast<std::size_t>(-1));
-            handles.push_back(hku_event);
-            slot_of.push_back(static_cast<std::size_t>(-2));
+            handles.push_back(stop_event.get());
+            slot_of.push_back(kStopIdx);
+            handles.push_back(hku_event.get());
+            slot_of.push_back(kHkuIdx);
             for (std::size_t i = 0; i < slots.size(); ++i)
-                if (slots[i].event != nullptr) {
-                    handles.push_back(slots[i].event);
+                if (slots[i].event) {
+                    handles.push_back(slots[i].event.get());
                     slot_of.push_back(i);
                 }
         }
         for (;;) {
             const DWORD w = WaitForMultipleObjects(static_cast<DWORD>(handles.size()),
                                                    handles.data(), FALSE, INFINITE);
-            if (w == WAIT_OBJECT_0 || w >= WAIT_OBJECT_0 + handles.size())
-                return; // stop, or a wait failure (never spin on one)
+            if (w == WAIT_OBJECT_0)
+                return true;
+            if (w >= WAIT_OBJECT_0 + handles.size())
+                return false; // a wait failure (never spin on one)
             const std::size_t which = slot_of[w - WAIT_OBJECT_0];
-            if (which == static_cast<std::size_t>(-2)) {
+            if (which == kHkuIdx) {
                 dirty->mark_hku();
                 std::lock_guard lock(mu);
                 if (hku_key)
                     RegNotifyChangeKeyValue(hku_key.get(), FALSE,
                                             REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_THREAD_AGNOSTIC,
-                                            hku_event, TRUE);
+                                            hku_event.get(), TRUE);
                 continue;
             }
             std::lock_guard lock(mu);
@@ -489,9 +554,11 @@ struct WinWatcher {
 
     bool rearm(const std::string& root) {
         std::lock_guard lock(mu);
+        if (!live)
+            return false; // nothing is waiting on the events: arming would only look armed
         for (auto& s : slots)
             if (s.root == root)
-                return s.event != nullptr && arm(s);
+                return s.event && arm(s);
         return false;
     }
 };
@@ -505,6 +572,9 @@ struct ReadCtx {
     bool capped{false};
     bool unreadable{false};
     std::vector<BYTE> data;
+    // Sized once per root to the registry's maximum name, so an ERROR_MORE_DATA from
+    // RegEnumValueW can only mean the DATA buffer.
+    std::vector<wchar_t> name = std::vector<wchar_t>(kMaxValueNameChars + 1);
 };
 
 void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth) {
@@ -515,26 +585,36 @@ void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth
         ctx.capped = true;
         return;
     }
-    DWORD n_sub = 0, max_sub = 0, n_val = 0, max_name = 0, max_data = 0;
+    DWORD n_sub = 0, max_sub = 0, n_val = 0, max_data = 0;
     if (RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, &n_sub, &max_sub, nullptr, &n_val,
-                         &max_name, &max_data, nullptr, nullptr) != ERROR_SUCCESS) {
+                         nullptr, &max_data, nullptr, nullptr) != ERROR_SUCCESS) {
         ctx.unreadable = true;
         return;
     }
     auto& values = ctx.out->keys[full]; // present even when empty: a vanished key is detectable
-    std::vector<wchar_t> name(static_cast<std::size_t>(max_name) + 2);
-    const DWORD buf_len = std::min<DWORD>(max_data, static_cast<DWORD>(kBaselineValueReadCap));
+    // lpData is never null: with a null buffer RegEnumValueW answers ERROR_SUCCESS and only
+    // reports the size, so a value that grew since QueryInfoKey would be copied from nullptr.
+    const std::size_t buf_len =
+       std::max<std::size_t>(std::min<std::size_t>(max_data, kBaselineValueReadCap), 1);
     if (ctx.data.size() < buf_len)
         ctx.data.resize(buf_len);
     for (DWORD i = 0;; ++i) {
-        DWORD nlen = static_cast<DWORD>(name.size());
+        DWORD nlen = static_cast<DWORD>(ctx.name.size());
         DWORD type = 0, dlen = static_cast<DWORD>(ctx.data.size());
-        LONG rc = RegEnumValueW(key, i, name.data(), &nlen, nullptr, &type, ctx.data.data(), &dlen);
+        LONG rc = RegEnumValueW(key, i, ctx.name.data(), &nlen, nullptr, &type, ctx.data.data(), &dlen);
         if (rc == ERROR_NO_MORE_ITEMS)
             break;
+        if (rc == ERROR_MORE_DATA && nlen >= ctx.name.size()) {
+            // The NAME did not fit (not expected at the registry maximum): nothing may be
+            // recorded under a partial name. Mark the read partial so the next one revisits.
+            // (Only for MORE_DATA: on any other error nlen is unset and the else branch below
+            // ends the key, so this `continue` always advances toward ERROR_NO_MORE_ITEMS.)
+            ctx.capped = true;
+            continue;
+        }
         RegistryValueRead v;
         v.type = type;
-        if (rc == ERROR_MORE_DATA) {
+        if (rc == ERROR_MORE_DATA || (rc == ERROR_SUCCESS && dlen > ctx.data.size())) {
             // Larger than the read cap (or grew since QueryInfo): the API gives no
             // partial read, so keep the size and let the hash cover nothing.
             v.full_size = dlen;
@@ -550,8 +630,10 @@ void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth
             ctx.capped = true;
             return;
         }
-        values[yuzu::win::from_wide(name.data(), static_cast<int>(nlen))] = std::move(v);
+        values[yuzu::win::from_wide(ctx.name.data(), static_cast<int>(nlen))] = std::move(v);
     }
+    if (ctx.capped)
+        return; // a value was left unread: the read is partial, do not walk on
 
     std::vector<wchar_t> sub(static_cast<std::size_t>(max_sub) + 2);
     for (DWORD i = 0;; ++i) {
@@ -563,16 +645,30 @@ void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth
             ctx.unreadable = true;
             return;
         }
+        const std::string child_path =
+           full + "\\" + yuzu::win::from_wide(sub.data(), static_cast<int>(slen));
         yuzu::win::RegKey child;
-        const LONG orc = RegOpenKeyExW(key, sub.data(), 0, KEY_READ | KEY_WOW64_64KEY, child.put());
+        // OPEN_LINK: a child that is a symbolic-link key is read as the link (its own
+        // SymbolicLinkValue), never followed into whatever it points at.
+        const LONG orc = RegOpenKeyExW(key, sub.data(), REG_OPTION_OPEN_LINK, KEY_READ | KEY_WOW64_64KEY,
+                                       child.put());
         if (orc == ERROR_FILE_NOT_FOUND || orc == ERROR_KEY_DELETED)
             continue; // deleted between enumerate and open: the next read sees it gone
+        if (orc == ERROR_ACCESS_DENIED) {
+            // A child this agent may not read hides only itself: record it and read on. The
+            // diff keeps what the baseline holds beneath it, and collect() reports the gap.
+            if (ctx.out->skipped.size() >= kSkippedCap) {
+                ctx.capped = true; // too many to track: a partial read, so no removals
+                return;
+            }
+            ctx.out->skipped.push_back(child_path);
+            continue;
+        }
         if (orc != ERROR_SUCCESS) {
-            ctx.unreadable = true; // e.g. access denied: a partial read proves nothing
+            ctx.unreadable = true; // any other failure: a partial read proves nothing
             return;
         }
-        read_key(ctx, child.get(),
-                 full + "\\" + yuzu::win::from_wide(sub.data(), static_cast<int>(slen)), depth + 1);
+        read_key(ctx, child.get(), child_path, depth + 1);
         if (ctx.capped || ctx.unreadable)
             return;
     }
@@ -595,12 +691,14 @@ SubtreeRead read_root(const std::string& root, std::int64_t deadline) noexcept {
         read_key(ctx, key.get(), root, 0);
         if (ctx.unreadable) {
             out.keys.clear();
+            out.skipped.clear();
             out.status = RegistryReadStatus::Unreadable;
         } else {
             out.status = ctx.capped ? RegistryReadStatus::Capped : RegistryReadStatus::Complete;
         }
     } catch (...) {
         out.keys.clear();
+        out.skipped.clear();
         out.status = RegistryReadStatus::Unreadable;
     }
     return out;
