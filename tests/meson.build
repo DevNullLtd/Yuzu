@@ -1958,7 +1958,13 @@ if build_server
       # yuzu_proto_headers_dep - a DOWNWARD edge for both server and agent, no cycle, no
       # new build-graph node. NOT sdk/, which is the public plugin ABI surface.
       include_directories('../agents/core/src'),
-      include_directories('../agents/shared'), # test_plugin_result_audit.cpp: registry_parsers.hpp's OS-free shared includes
+      # test_plugin_result_audit.cpp includes registry_parsers.hpp, whose OS-free includes (user_profile_model.hpp,
+      # wire_utf8.hpp) live in agents/shared. WHY it is on the whole executable: include_directories is per target,
+      # not per source, so every TU of this executable now sees agents/shared too. The risk is real and silent: a
+      # header of the same name in two include dirs is resolved by include-directory order, never a compile error. So a
+      # new agents/shared header needs a name no server test header or other include dir of this executable uses
+      # (none collide today).
+      include_directories('../agents/shared'),
     ],
     # httplib.h is header-only and its Client/Server class layout depends on
     # CPPHTTPLIB_OPENSSL_SUPPORT — yuzu_server_core compiles every TU with

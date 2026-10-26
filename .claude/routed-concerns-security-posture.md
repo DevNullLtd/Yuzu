@@ -5,7 +5,8 @@
      data/observability concerns stay in `routed-concerns.md`, auth and
      access-control in `routed-concerns-access-control.md`, and Forensics /
      per-user-software-data concerns in `routed-concerns-software-estate.md`.
-     This file also holds the gateway-upstream peer-authorization row; four
+     This file also holds the gateway-upstream peer-authorization, mutating
+     `registry` and same-site write-gate rows; four
      files is the cap (docs/instruction-file-standard.md).
      Row discipline unchanged: catastrophic-if-violated invariants + doc
      pointers only — detail goes in the plugin README. -->
