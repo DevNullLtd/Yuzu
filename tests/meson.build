@@ -320,6 +320,7 @@ agent_test_exe = executable(
     'unit/test_guardian_outbox.cpp',
     'unit/test_guardian_spark_send.cpp',
     'unit/test_guardian_emit_seq.cpp',
+    'unit/test_guardian_boot_epoch.cpp',
     'unit/test_guardian_spark_runtime.cpp',
     'unit/test_guardian_state_reader.cpp',
     'unit/test_guardian_convergence_scheduler.cpp',

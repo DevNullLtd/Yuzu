@@ -84,9 +84,11 @@ enum class KvRename { Renamed, NotFound, Conflict, Error };
 
 /// The storage contract GuardianLifecycleJournal requires: the 8 KvStore methods it
 /// calls, with signatures identical to KvStore's own. This is a NARROW seam (#4153),
-/// not a general KvStore abstraction - it exists solely so the journal's concurrency
+/// not a general KvStore abstraction - it exists so the journal's concurrency
 /// checkpoints can run against an in-memory test double instead of real SQLite I/O.
-/// Production always constructs the journal with a real KvStore.
+/// Production always constructs the journal with a real KvStore. A second consumer is
+/// the Guardian boot-epoch claim (guardian_boot_epoch.hpp), which uses only get_entry, set
+/// and pragma_synchronous.
 ///
 /// Contract every implementation MUST keep - the journal's multi-caller safety
 /// argument (see guardian_lifecycle_journal.hpp's CONCURRENCY block) rests on it:
@@ -96,7 +98,7 @@ enum class KvRename { Renamed, NotFound, Conflict, Error };
 ///     internal state, and releases its lock before returning;
 ///   * a call never invokes a callback, blocks on another participant, or calls
 ///     back into the journal while holding its lock.
-/// A future second consumer of this interface must not weaken any of the three.
+/// A further consumer of this interface must not weaken any of the three.
 class YUZU_EXPORT IJournalStore {
 public:
     virtual ~IJournalStore() = default;
