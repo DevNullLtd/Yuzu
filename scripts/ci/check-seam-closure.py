@@ -36,14 +36,18 @@ Neither shape exists in any family this script covers today; if one is ever
 introduced, this check will pass while the seam is actually broken. That is a
 known, stated gap - not a silent one.
 
+HOTFIX REVERT: this file and tests/test_seam_closure_selftest.py are pinned in lockstep,
+so reverting one alone turns the selftest red - revert BOTH in one change.
+
 ALSO NOT CAUGHT (found in the WS-A4 S0 review, each reproduced on a scratch tree):
   3. THE INCLUDE PARSER IS LINE-ANCHORED AND LITERAL. A backslash-continued
-     `#include` with the file name on the next line (a line-continuation), a UTF-8 BOM before a first-line
+     `#include` with the file name on the next line, a UTF-8 BOM before a first-line
      include, and `/* c */ #include "x_store.hpp"` on one line all extract NOTHING; a
-     macro include is likewise invisible. Conversely a commented-out include, an
-     `#if 0` block or a raw string containing `#include "..."` is extracted and can
-     false-FAIL (conservative direction). No such form exists in an enforced closure
-     today; hardening the parser is a tracked follow-up, not done here.
+     macro include is likewise invisible (digraph and `##`-spliced forms too).
+     Conversely an include inside a block comment, an `#if 0` block or a raw string
+     IS extracted and can false-FAIL (the conservative direction); a `// #include`
+     line comment is not. No such form exists in an enforced closure today;
+     hardening the parser is a tracked follow-up, not done here.
   4. THE DENYLIST IS HAND-MAINTAINED. A store-owning header that no pattern names is
      invisible to the walk - `nvd_db.hpp` (a raw `sqlite3*`) was exactly this until S0.
      Others unlisted today: `*_owner.hpp`, `app_perf_{cohort,group}_reader.hpp`,
@@ -51,8 +55,9 @@ ALSO NOT CAUGHT (found in the WS-A4 S0 review, each reproduced on a scratch tree
   5. EXTERNAL ANGLE HEADERS ARE OPAQUE: `<sqlite3.h>` / `<libpq-fe.h>` give raw database
      access with no project class. The "cannot define a project store class" argument in
      INCLUDE RESOLUTION below is about project classes only.
-  6. AN UNRESOLVED QUOTE INCLUDE IS A WARNING, NOT AN ERROR (exit 0): a header outside
-     the three resolution roots truncates the closure under it. Generated protobuf
+  6. AN UNRESOLVED QUOTE INCLUDE IS A WARNING, NOT AN ERROR (exit 0), and only on the
+     family lanes (the impl-purity and abstract-header lanes discard it silently): a
+     header outside the three resolution roots truncates the closure under it. Generated protobuf
      headers (e.g. `agent.grpc.pb.h`) are legitimately unresolved today, so a hard error
      needs an allowlist first - a tracked follow-up.
   7. A FORWARD DECLARATION OF A STORE IS ALLOWED in a non-abstract closure (only the
@@ -717,11 +722,10 @@ def parse_includes(path: Path):
     """Yields (is_angle, spelling) for every `#include` line in `path`, in
     file order. Line-anchored regex, not a real preprocessor - a `#include`
     reached only through an `#if 0`/macro-guarded block is still extracted as
-    if unconditional. That is conservative in the direction that matters for
-    this gate (it can only make the walk see MORE of the tree, never hide a
-    real include), so it is not a soundness gap for the "no store in the
-    closure" claim, only a possible source of a false-positive edge the
-    escapes section above does not need to cover."""
+    if unconditional - which only makes the walk see MORE (a false-positive
+    edge). The OPPOSITE direction is real: a line-continued include, a BOM, a
+    same-line leading block comment and a macro include are NOT extracted, so a
+    real include can be hidden (module docstring, "ALSO NOT CAUGHT" item 3)."""
     out = []
     text = path.read_text(encoding="utf-8", errors="replace")
     for line in text.splitlines():
@@ -873,7 +877,9 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
                + (" - this TU is enrolled as store-free: route the data through an "
                   "injected provider or a `*Api` seam instead of including the store "
                   "(see STORE_FREE_PRESENTATION_TUS)"
-                  if name == "store_free_presentation" else ""))
+                  if name == "store_free_presentation" else "")
+               + " [ADR-0031 migration step 3; docs/presentation-core-split-delivery-matrix.md, "
+                 "WS-A4]")
             ok = False
     return ok
 

@@ -400,8 +400,10 @@ def main() -> int:
             (len(S0_NEW_STORE_TYPE_TOKENS), S0_NEW_STORE_TYPE_TOKENS[0],
              S0_NEW_STORE_TYPE_TOKENS[-1]) != (5, "ApprovalManager", "NvdDatabase"):
         _fail("the S0 probe lists are not the 8 headers (execution_tracker .. nvd_db) / 5 tokens "
-              "(ApprovalManager .. NvdDatabase) S0 added - a pin shrank or a slice constant drifted",
-              failures)
+              "(ApprovalManager .. NvdDatabase) S0 added. The tails are POSITIONAL: if you "
+              "legitimately added a pattern/token, edit S0_NEW_HEADER_COUNT / S0_NEW_TOKEN_COUNT "
+              "and this literal endpoint check (and decide whether the new entry is an 'S0' one); "
+              "otherwise a pin shrank", failures)
     if set(S0_TOKEN_HOME_HEADER) != set(S0_NEW_STORE_TYPE_TOKENS) or \
             not set(S0_TOKEN_HOME_HEADER.values()) <= set(S0_NEW_FORBIDDEN_HEADERS):
         _fail("S0_TOKEN_HOME_HEADER does not cover exactly the S0 tokens, each in an S0 header",
@@ -419,8 +421,11 @@ def main() -> int:
         # forward declaration, `friend class Tok;`, `enum class Tok` and comments do not count.
         if not re.search(r"^\s*(?:class|struct)\s+" + re.escape(tok) + r"\b(?:\s+final)?\s*[{:]",
                          code, re.M):
-            _fail(f"S0 store-type token {tok!r} is not DEFINED in {home} - a renamed class with a "
-                  f"stale forward declaration elsewhere would make the token inert", failures)
+            _fail(f"S0 store-type token {tok!r} is not DEFINED in {home}: a renamed class (stale "
+                  f"forward declaration elsewhere) would make the token inert. Note the check is "
+                  f"deliberately strict - a definition written with an attribute or macro between "
+                  f"the keyword and the name (`class [[nodiscard]] X`, `class YUZU_API X`) also "
+                  f"fails it; extend the regex in check 2e if you introduce that form", failures)
 
     # 3. Missing-family-member HARD ERROR: a declared TU that does not exist
     #    on disk must fail the family check, never be silently skipped.
