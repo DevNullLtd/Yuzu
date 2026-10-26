@@ -167,9 +167,11 @@ bool make_machine_link(const std::string& link_path, const std::string& target_p
     return make_machine_link(widen(link_path), widen(target_path));
 }
 
+// A key whose DACL denies read (the inherited-ACL case) still exists: only "not found" means absent.
 bool key_exists(const std::string& key) {
     yuzu::win::RegKey k;
-    return RegOpenKeyExW(HKEY_LOCAL_MACHINE, widen(key).c_str(), 0, KEY_READ, k.put()) == ERROR_SUCCESS;
+    const LSTATUS rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, widen(key).c_str(), 0, KEY_READ, k.put());
+    return rc == ERROR_SUCCESS || rc == ERROR_ACCESS_DENIED;
 }
 
 /// Removes the salted scratch subtree on scope exit. Declared BEFORE the link guard below, so the link
