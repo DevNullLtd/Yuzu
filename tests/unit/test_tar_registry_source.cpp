@@ -118,7 +118,7 @@ RegistryEtwEvent ev(std::int64_t ts, std::uint32_t pid, RegistryEtwOp op, std::s
     e.pid = pid;
     e.image = std::move(image);
     e.op = op;
-    e.value = std::move(value);
+    e.value_key = value_name_key(value);
     e.type = type;
     e.size = size;
     return e;
@@ -473,6 +473,26 @@ TEST_CASE("attribute_candidate: correlation on value name, type, size and window
               AttributionKind::None);
         CHECK(attribute_candidate(removed, {ev(150, 3, RegistryEtwOp::DeleteValue, "Start")}).pid == 3);
     }
+    SECTION("names match by a folded digest: both sides canonicalise, and nothing is clipped") {
+        CHECK(value_name_key("Start") == value_name_key("sTART"));
+        CHECK(value_name_key("Start") != value_name_key("Starts"));
+        CHECK(value_name_key("") != value_name_key("Start")); // the default value is a name too
+        // an UPPERCASE event name against a lowercase candidate: the reverse of the case above
+        CHECK(attribute_candidate(cand("changed", "start", 4, 4, 100, 200),
+                                  {ev(150, 1, RegistryEtwOp::Set, "START")})
+                 .kind == AttributionKind::Corr);
+        // two 16383-character names (the registry maximum) that differ only in their last
+        // character are two names: a clipped key would conflate them into a wrong attribution
+        const std::string long_a(16383, 'n');
+        std::string long_b = long_a;
+        long_b.back() = 'm';
+        const auto lc = cand("changed", long_a, 4, 4, 100, 200);
+        CHECK(attribute_candidate(lc, {ev(150, 1, RegistryEtwOp::Set, long_a)}).kind ==
+              AttributionKind::Corr);
+        CHECK(attribute_candidate(lc, {ev(150, 1, RegistryEtwOp::Set, long_b)}).kind ==
+              AttributionKind::None);
+        static_assert(sizeof(ValueNameKey) == 32); // an event is a fixed size whatever its name
+    }
     SECTION("the window is (lo, hi]") {
         CHECK(attribute_candidate(c, {ev(100, 1, RegistryEtwOp::Set, "Start")}).kind ==
               AttributionKind::None); // ts == lo is NOT matched
@@ -548,6 +568,25 @@ TEST_CASE("stitch_registry_tick: rows, counters, the settle hold and what is NOT
         const auto done = stitch_registry_tick({c}, {}, {}, on, c.window_hi + 5 * SEC, 1);
         CHECK(done.rows.size() == 1);
         CHECK(done.held_next.empty());
+    }
+    SECTION("off and lost-restart are written at once; a loss epoch or a clean window keeps waiting") {
+        const std::int64_t at = c.window_hi + SEC; // 1 s after the window closed: inside the settle
+        const auto off = stitch_registry_tick({c}, {}, {}, StitchFlags{false, 0}, at, 1);
+        REQUIRE(off.rows.size() == 1);
+        CHECK(off.rows[0].detail == "attr:off");
+        CHECK(off.held_next.empty());
+        const auto lost = stitch_registry_tick({c}, {}, {}, StitchFlags{true, c.window_lo + 1}, at, 1);
+        REQUIRE(lost.rows.size() == 1);
+        CHECK(lost.rows[0].detail == "attr:lost-restart");
+        CHECK(lost.held_next.empty());
+        // neither of those consults an event, so waiting cannot change them; a loss epoch can
+        // still be recorded by a later tick, so a degraded candidate is held like any other
+        const auto degraded = stitch_registry_tick({c}, {}, {LossEpoch{c.window_lo + 1, c.window_hi}}, on,
+                                                   at, 1);
+        CHECK(degraded.rows.empty());
+        CHECK(degraded.held_next.size() == 1);
+        // events_since 0 means "n/a", never a restart
+        CHECK(stitch_registry_tick({c}, {}, {}, on, at, 1).held_next.size() == 1);
     }
     SECTION("loss epochs degrade a window they intersect, whenever they were recorded") {
         const auto evs = std::vector<RegistryEtwEvent>{ev(105 * SEC, 5, RegistryEtwOp::Set, "Start")};
@@ -658,12 +697,13 @@ TEST_CASE("RegistryEtwBuffer retires by sequence identity and counts what it evi
     }
     SECTION("the bounded wait sees a matching event and never polls") {
         RegistryEtwBuffer b;
-        const auto is_v = [](const RegistryEtwEvent& e) { return e.value == "v"; };
+        const auto is_v = [](const RegistryEtwEvent& e) { return e.value_key == value_name_key("v"); };
         CHECK_FALSE(b.wait_for_event(is_v, std::chrono::steady_clock::now())); // past deadline: at once
         b.push(ev(1, 1, RegistryEtwOp::Set, "v"));
         CHECK(b.wait_for_event(is_v, std::chrono::steady_clock::now() + std::chrono::seconds(30)));
-        CHECK_FALSE(b.wait_for_event([](const RegistryEtwEvent& e) { return e.value == "w"; },
-                                     std::chrono::steady_clock::now()));
+        CHECK_FALSE(b.wait_for_event(
+           [](const RegistryEtwEvent& e) { return e.value_key == value_name_key("w"); },
+           std::chrono::steady_clock::now()));
     }
 }
 
@@ -672,8 +712,11 @@ TEST_CASE("retention rule (R5): the watermark and held windows decide what is re
     std::map<std::string, RegistryRootState> roots;
     CHECK(retention_watermark(roots) == std::numeric_limits<std::int64_t>::max()); // no roots
     roots["a"].window_base = 100;
-    roots["b"].window_base = 0; // never completely read
-    CHECK(retention_watermark(roots) == 0);
+    roots["b"].window_base = 0; // never completely read: it holds nothing back (see the rule)
+    CHECK(retention_watermark(roots) == 100);
+    roots["a"].window_base = 0;
+    CHECK(retention_watermark(roots) == std::numeric_limits<std::int64_t>::max()); // none to protect
+    roots["a"].window_base = 100;
     roots["b"].window_base = 200;
     CHECK(retention_watermark(roots) == 100);
 
@@ -741,6 +784,19 @@ TEST_CASE("cursor and baseline codecs", "[tar][registry][pure]") {
     held.data = std::string("a\xff") + "b"; // not valid UTF-8: must not stop the cursor being written
     cur.held = {held};
     const auto json = encode_registry_cursor(cur);
+    // A held candidate or a loss epoch makes this version 2: a build that predates them reads
+    // only version 1, so it takes the cursor as lost (a gap row and a re-baseline) instead of
+    // re-encoding it without the changes it holds. Without either it stays version 1.
+    CHECK(nlohmann::json::parse(json).at("v").get<int>() == 2);
+    auto bare = cur;
+    bare.held.clear();
+    CHECK(nlohmann::json::parse(encode_registry_cursor(bare)).at("v").get<int>() == 2); // loss alone
+    bare.loss.clear();
+    CHECK(nlohmann::json::parse(encode_registry_cursor(bare)).at("v").get<int>() == 1);
+    CHECK_FALSE(decode_registry_cursor(encode_registry_cursor(bare)).malformed);
+    auto future = nlohmann::json::parse(json);
+    future["v"] = 3; // a version this build does not know
+    CHECK(decode_registry_cursor(future.dump()).malformed);
     const auto back = decode_registry_cursor(json);
     CHECK_FALSE(back.malformed);
     CHECK(back.tick == 7);
@@ -759,7 +815,7 @@ TEST_CASE("cursor and baseline codecs", "[tar][registry][pure]") {
 
     CHECK_FALSE(decode_registry_cursor(std::nullopt).present); // absent, not malformed
     CHECK_FALSE(decode_registry_cursor(std::nullopt).malformed);
-    for (const char* bad : {"", "garbage", "{\"v\":2}", "{\"v\":1}", "[]"})
+    for (const char* bad : {"", "garbage", "{\"v\":1}", "[]"})
         CHECK(decode_registry_cursor(std::string(bad)).malformed);
     // a cursor written before `skipped` existed decodes with the set empty
     auto older = nlohmann::json::parse(json);
@@ -768,6 +824,7 @@ TEST_CASE("cursor and baseline codecs", "[tar][registry][pure]") {
     // a cursor written before window_base, held and loss existed (the key-watch-only source)
     // decodes as present and not malformed -- a malformed one would re-baseline every root
     auto v1 = nlohmann::json::parse(json);
+    v1["v"] = 1;
     v1.erase("held");
     v1.erase("loss");
     v1["roots"]["HKLM\\R"].erase("window_base");
@@ -785,10 +842,24 @@ TEST_CASE("cursor and baseline codecs", "[tar][registry][pure]") {
     auto bad_loss = nlohmann::json::parse(json);
     bad_loss["loss"] = nlohmann::json::array({nlohmann::json::array({1})});
     CHECK(decode_registry_cursor(bad_loss.dump()).malformed);
-    // an unknown field is ignored, so a later build can add state to this v1 cursor
+    // an unknown field is ignored, so a later build can add state to this cursor
     auto j = nlohmann::json::parse(json);
     j["later_field"] = nlohmann::json::array({1, 2});
     CHECK_FALSE(decode_registry_cursor(j.dump()).malformed);
+    // a window that is negative or inverted (a corrupt or tampered row) is clamped to a valid
+    // one, so the stitch's `now - window_hi` can never overflow
+    auto tampered = nlohmann::json::parse(json);
+    tampered["held"][0]["lo"] = std::numeric_limits<std::int64_t>::min();
+    tampered["held"][0]["hi"] = std::numeric_limits<std::int64_t>::min();
+    auto clamped = decode_registry_cursor(tampered.dump());
+    REQUIRE(clamped.held.size() == 1);
+    CHECK(clamped.held[0].window_lo == 0);
+    CHECK(clamped.held[0].window_hi == 0);
+    tampered["held"][0]["lo"] = 50;
+    tampered["held"][0]["hi"] = 10;
+    clamped = decode_registry_cursor(tampered.dump());
+    REQUIRE(clamped.held.size() == 1);
+    CHECK(clamped.held[0].window_hi == clamped.held[0].window_lo);
     // bytes that are not valid UTF-8 must never decide whether the cursor can be written
     cur.hku.push_back(std::string("S-\xff"));
     CHECK_NOTHROW(encode_registry_cursor(cur));
@@ -1114,16 +1185,22 @@ TEST_CASE("registry source: a pushed event attributes by correlation; two pids a
     }
 }
 
-TEST_CASE("registry source: with the session down a change lands as attr:off and the method is notify",
+TEST_CASE("registry source: with the session down a change lands as attr:off at once and the method is notify",
           "[tar][registry][lifecycle]") {
     auto t = make_db();
     Fake f;
     f.etw = false;
     auto src = make_registry_cursor_source(scope1(), f.reader());
-    const auto held = baseline_then_change(t, f, *src, 1, 2);
-    src->push_event_for_test(ev(held.window_lo + SEC / 2, 812, RegistryEtwOp::Set, "Start")); // never used
-    f.clock = T0 + 300 * SEC;
-    tick(t.db, *src);
+    f.reads[kRoot] = svc(1);
+    REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
+    f.clock = T0 + 100 * SEC;
+    f.reads[kRoot] = svc(2);
+    burst(f, kRoot, T0 + 97 * SEC, T0 + 98 * SEC);
+    src->push_event_for_test(ev(T0 + 97 * SEC + SEC / 2, 812, RegistryEtwOp::Set, "Start")); // never used
+    // attr:off does not depend on any later event, so there is nothing to wait for: the row is
+    // written by the tick that saw the change and nothing is held in the cursor.
+    CHECK(tick(t.db, *src).events_emitted == 1);
+    CHECK(read_cursor(t.db).held.empty());
     const auto rows = q(t.db, "SELECT actor_pid, detail FROM registry_live");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "0");
@@ -1229,10 +1306,11 @@ TEST_CASE("registry source: lost cursor; restart; baseline loss; storage errors"
         const auto r = tick(t.db, *src2);
         CHECK(r.outcome == CursorOutcome::Advanced);
         CHECK(f2.read_calls.size() == 1); // the first tick after a restart reads every root
-        // The change is held like any other; the writer's events were never seen, and the row
-        // says that rather than naming nobody quietly.
+        // The writer's events were never seen, and the row says that rather than naming nobody
+        // quietly. It does not wait for the settle: the marker cannot depend on a later event.
+        CHECK(read_cursor(t.db).held.empty());
         f2.clock = T0 + 600 * SEC;
-        tick(t.db, *src2);
+        CHECK(tick(t.db, *src2).events_emitted == 0);
         const auto rows = q(t.db, "SELECT action, detail, source FROM registry_live ORDER BY id");
         REQUIRE(rows.rows.size() == 2);
         CHECK(rows.rows[0][0] == "capture_gap");
@@ -1251,11 +1329,11 @@ TEST_CASE("registry source: lost cursor; restart; baseline loss; storage errors"
         auto src2 = make_registry_cursor_source(scope1(), f2.reader());
         src2->start(t.db);
         f2.clock = T0 + 410 * SEC;
-        CHECK(tick(t.db, *src2).outcome == CursorOutcome::Advanced); // reconcile finds 1 -> 2: held
+        CHECK(tick(t.db, *src2).outcome == CursorOutcome::Advanced); // reconcile finds 1 -> 2: written
 
         // A change made after the restart, under a notify burst whose window opens after
-        // start(): the buffer saw all of it, so the writer is named. The restart candidate
-        // finalises in the same tick, its window opened before start().
+        // start(): the buffer saw all of it, so the writer is named once it settles. The
+        // restart change was already written (lost-restart) by the reconcile tick above.
         f2.clock = T0 + 500 * SEC;
         f2.reads[kRoot] = svc(3);
         burst(f2, kRoot, T0 + 497 * SEC, T0 + 498 * SEC);
@@ -1434,6 +1512,10 @@ TEST_CASE("registry source: buffer overflow becomes a loss epoch that degrades o
     CHECK(rows.rows[0][1] == "22");
     CHECK(rows.rows[1][2] == "attr:degraded"); // Start, root A: the evicted event lay in its window
     CHECK(rows.rows[1][1] == "0");
+    // The eviction was reported by the first tick and absorbed with its commit: the second tick
+    // (no new eviction) writes no second gap row.
+    CHECK(std::stoll(q(t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:loss:%'")
+                        .rows.at(0).at(0)) == 1);
 }
 
 TEST_CASE("registry source: kernel loss and a failed loss query are loss, reported once",
@@ -1473,6 +1555,70 @@ TEST_CASE("registry source: kernel loss and a failed loss query are loss, report
     gap = q(t.db, "SELECT detail FROM registry_live ORDER BY id");
     REQUIRE(gap.rows.size() == 3);
     CHECK(gap.rows[2][0] == "gap:loss:2");
+}
+
+TEST_CASE("registry source: loss over a held window degrades it (kernel counters, failed loss query)",
+          "[tar][registry][lifecycle]") {
+    enum class Loss { None, Kernel, FailedQuery };
+    for (const Loss mode : {Loss::None, Loss::Kernel, Loss::FailedQuery}) {
+        INFO("mode=" << static_cast<int>(mode));
+        auto t = make_db();
+        Fake f;
+        auto src = make_registry_cursor_source(scope1(), f.reader());
+        f.reads[kRoot] = svc(1);
+        REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
+
+        // The change is read at the end of a burst, so its window (first notify - 1 s, read end]
+        // reaches past this tick's start -- which is where the NEXT tick's kernel-loss interval
+        // begins -- and a clean writer sits inside it.
+        f.clock = T0 + 100 * SEC;
+        f.reads[kRoot] = svc(2);
+        burst(f, kRoot, T0 + 99 * SEC, T0 + 100 * SEC);
+        src->push_event_for_test(
+           ev(T0 + 99 * SEC + SEC / 2, 812, RegistryEtwOp::Set, "Start", 4, 4, "services.exe"));
+        tick(t.db, *src);
+        REQUIRE(read_cursor(t.db).held.size() == 1);
+
+        f.clock = T0 + 300 * SEC;
+        if (mode == Loss::Kernel)
+            f.loss.events_lost = 3;
+        if (mode == Loss::FailedQuery)
+            f.loss.query_ok = false;
+        tick(t.db, *src);
+        const auto rows = q(t.db, "SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
+        REQUIRE(rows.rows.size() == 1);
+        if (mode == Loss::None) { // the control: the same setup attributes when nothing was lost
+            CHECK(rows.rows[0][0] == "812");
+            CHECK(rows.rows[0][1] == "attr:corr");
+        } else {
+            CHECK(rows.rows[0][0] == "0"); // never a writer named across reported loss
+            CHECK(rows.rows[0][1] == "attr:degraded");
+        }
+    }
+}
+
+TEST_CASE("registry source: a root that stays Capped does not pin the event buffer",
+          "[tar][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope2(), f.reader());
+    SubtreeRead capped = complete({{kRoot + "\\A", {{"v", vread(4, dword(1))}}}});
+    capped.status = RegistryReadStatus::Capped;
+    f.reads[kRoot] = capped;
+    f.reads[kRoot2] = complete({{kRoot2 + "\\S", {{"Count", vread(4, dword(1))}}}});
+    tick(t.db, *src);
+    const auto cur = read_cursor(t.db);
+    REQUIRE(cur.roots.at(kRoot).window_base == 0); // never completely read
+    const auto base2 = cur.roots.at(kRoot2).window_base;
+    REQUIRE(base2 != 0);
+
+    // An event older than the one completely-read root's last read can never be matched again;
+    // the Capped root (read again every tick) must not keep it.
+    src->push_event_for_test(ev(base2 - SEC, 1, RegistryEtwOp::Set, "old"));
+    REQUIRE(src->buffer_for_test().size() == 1);
+    f.clock = base2 + 10 * SEC;
+    tick(t.db, *src);
+    CHECK(src->buffer_for_test().size() == 0);
 }
 
 TEST_CASE("registry source: read statuses; status keys; fair root scheduling",
@@ -1899,6 +2045,19 @@ namespace {
 // window_base or read stamp ever carries the offset; it is reset straight after.
 std::atomic<std::int64_t> g_clock_offset{0};
 
+// Is this process's token elevated? The ETW cases SKIP when it is not, and FAIL when it is and
+// the session still did not open, so a broken session can never pass as "not elevated".
+bool is_elevated() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return false;
+    TOKEN_ELEVATION e{};
+    DWORD len = 0;
+    const bool ok = GetTokenInformation(token, TokenElevation, &e, sizeof(e), &len) != 0;
+    CloseHandle(token);
+    return ok && e.TokenIsElevated != 0;
+}
+
 std::string salt() { return std::to_string(::GetCurrentProcessId()) + "_" + std::to_string(::GetTickCount64()); }
 
 struct TestKey {
@@ -2004,8 +2163,8 @@ struct LiveRun {
 
 // This process's own write of `value`, as the session reports it.
 std::function<bool(const RegistryEtwEvent&)> mine(std::string value, RegistryEtwOp op) {
-    return [value = fold_value_name(value), op](const RegistryEtwEvent& e) {
-        return e.pid == ::GetCurrentProcessId() && e.op == op && fold_value_name(e.value) == value;
+    return [key = value_name_key(value), op](const RegistryEtwEvent& e) {
+        return e.pid == ::GetCurrentProcessId() && e.op == op && e.value_key == key;
     };
 }
 
@@ -2021,8 +2180,12 @@ TEST_CASE("registry live: set, change and delete through a pre-opened handle are
     tick(run.t.db, *run.src); // baseline
     if (std::stoi(run.t.db.get_config("registry_watch_roots", "0")) == 0)
         FAIL("the watch did not arm");
-    if (run.t.db.get_config("registry_capture_method", "") != "notify+etw")
+    if (const auto method = run.t.db.get_config("registry_capture_method", ""); method != "notify+etw") {
+        if (is_elevated())
+            FAIL("the token is elevated but the ETW session did not open: registry_capture_method="
+                 << method);
         SKIP("ETW session unavailable (not elevated)");
+    }
 
     DWORD one = 1, two = 2;
     run.transition([&] { RegSetValueExW(key.h, L"LiveVal", 0, REG_DWORD, reinterpret_cast<BYTE*>(&one), 4); },
@@ -2086,8 +2249,11 @@ TEST_CASE("registry live: stop leaves no ETW session behind", "[tar][registry][w
     auto src = make_registry_cursor_source(RegistryScope{{"SOFTWARE\\yuzu_test_reg_none"}, {}}, std::move(reader));
     TestDb t = make_db();
     src->start(t.db); // ~RegistryCursorSource() stops the session even if a REQUIRE below throws
-    if (!etw_running())
+    if (!etw_running()) {
+        if (is_elevated())
+            FAIL("the token is elevated but the ETW session did not open");
         SKIP("ETW session unavailable (not elevated)");
+    }
     REQUIRE(session_exists()); // the positive control: the lookup does find a running session
     src->stop();
     CHECK_FALSE(session_exists());

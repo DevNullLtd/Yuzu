@@ -20,25 +20,39 @@
 // A change becomes a row only after its attribution is final: a candidate is HELD
 // (persisted in the cursor) until kEtwSettle100ns after its window closed, since an
 // event for a write just before the read can still arrive that long after it
-// (stitch_registry_tick). The row is stamped with the end of the read that saw it.
+// (stitch_registry_tick). The one exception is a change whose marker cannot depend on
+// a later event (attr:off, attr:lost-restart): it is written in the tick that sees it.
+// The row is stamped with the end of the read that saw it.
 //
 // WHAT CORRELATION ESTABLISHES. For a candidate change C, E(C) is the set of write
 // events whose signature matches C inside C's window and P(C) their distinct
 // pids. While the session ran and NO loss was observed over the window, every
 // successful in-scope value write produced an event, so the true writer's pid is in
-// P(C); when |P(C)| == 1 that pid is the writer. The residual: a change produced
-// WITHOUT a value-write event (hive load, RegRestoreKey, a transacted commit
-// outside the window) has no true event in E(C), so one unrelated same-signature
-// writer inside the window is correlated to it. The same holds for the per-value
-// `removed` rows of a deleted KEY: deleting a key emits one DeleteKey event and no
-// DeleteValue event for its values, so each such row can be correlated to an
-// unrelated process that deleted a same-named value in the window (the key_removed
-// row itself is always attr:none). events:<n> counts the deliveries matched, so a
-// repeated delivery of one write inflates n, never the pid set. actor_pid is an
-// investigative lead to verify against $Process_Live, NOT proof. Every DETECTABLE break of the
-// invariant is marked rather than guessed: loss -> attr:degraded, session down ->
-// attr:off, buffer lost across a restart/pause -> attr:lost-restart, two or more
-// pids -> attr:ambiguous:<n>, none -> attr:none.
+// P(C); when |P(C)| == 1 that pid can be correlated to the change. The residuals:
+//   - a change produced WITHOUT a value-write event (hive load, RegRestoreKey, a
+//     transacted commit outside the window) has no true event in E(C), so one
+//     unrelated same-signature writer inside the window can be correlated to it. The
+//     same holds for the per-value `removed` rows of a deleted KEY: deleting a key
+//     emits one DeleteKey event and no DeleteValue event for its values, so each such
+//     row can be correlated to an unrelated process that deleted a same-named value in
+//     the window (the key_removed row itself is always attr:none);
+//   - an event delivered more than kEtwSettle100ns after its window closed, with no
+//     counted loss (a starved consumer, suspend/resume), misses the stitch, and one
+//     unrelated same-signature writer can then be correlated instead;
+//   - ambiguity can be forced: events carry no key name, so any local process that
+//     writes a same-name, same-type, same-size value inside the window makes the change
+//     attr:ambiguous, and the contract then names nobody;
+//   - actor_image is the name of the process holding the pid when the event was
+//     DELIVERED (up to about a second after the write), not when it was written: it is
+//     empty when that process had already exited or a newer process held the pid, and
+//     can be stale for up to the pid-name cache flush (five minutes) under pid reuse.
+//     The pid itself is read from the event header and cannot be forged.
+// events:<n> counts the deliveries matched, so a repeated delivery of one write inflates
+// n, never the pid set. actor_pid is an investigative lead to verify against
+// $Process_Live, NOT proof. Every DETECTABLE break of the invariant is marked rather
+// than guessed: loss -> attr:degraded, session down -> attr:off, buffer lost across a
+// restart/pause -> attr:lost-restart, two or more pids -> attr:ambiguous:<n>, none ->
+// attr:none.
 
 #include "tar_db.hpp" // RegistryEvent
 
@@ -47,6 +61,7 @@
 #include <user_profile_model.hpp> // yuzu::profiles::reg_type_name
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -425,12 +440,30 @@ struct RegistryBaseline {
     bool operator==(const RegistryBaseline&) const = default;
 };
 
+/// ASCII-only case fold. The registry compares value names with its own (Unicode) upcase
+/// table, so a non-ASCII name whose case differs between the stored value and the
+/// writer's spelling compares unequal here and the change is attr:none: it fails safe, and
+/// a lead that is not proof does not justify reproducing that table.
 [[nodiscard]] inline std::string fold_value_name(std::string_view n) {
     std::string out(n);
     for (auto& c : out)
         if (c >= 'A' && c <= 'Z')
             c = static_cast<char>(c - 'A' + 'a');
     return out;
+}
+
+/// What an ETW event keeps of its value name: the SHA-256 of the folded name. Equal folded
+/// names have equal keys, so matching is unchanged, but every buffered event is a fixed
+/// size whatever length of name the writer chose (a name can be 16383 characters, and the
+/// session is system-wide), and the stitch folds each candidate name once, not once per
+/// candidate-event pair.
+using ValueNameKey = std::array<unsigned char, 32>;
+
+[[nodiscard]] inline ValueNameKey value_name_key(std::string_view n) {
+    const std::string folded = fold_value_name(n);
+    yuzu::shared::Sha256 sha;
+    sha.update(folded.data(), folded.size());
+    return sha.raw_digest();
 }
 
 struct RegistryWindow {
@@ -618,7 +651,7 @@ struct RegistryEtwEvent {
     std::uint32_t pid{0};
     std::string image;
     RegistryEtwOp op{RegistryEtwOp::Set};
-    std::string value;
+    ValueNameKey value_key{}; // value_name_key() of the written name (see there)
     std::uint32_t type{0};
     std::uint32_t size{0};
 };
@@ -677,7 +710,7 @@ struct Attribution {
     if (c.action == "key_removed")
         return a;
     const bool is_set = c.action == "added" || c.action == "changed";
-    const std::string name = fold_value_name(c.value);
+    const ValueNameKey name = value_name_key(c.value);
     const RegistryEtwEvent* last = nullptr;
     std::set<std::uint32_t> pids;
     for (const auto& e : events) {
@@ -689,7 +722,7 @@ struct Attribution {
         } else if (e.op != RegistryEtwOp::DeleteValue) {
             continue;
         }
-        if (fold_value_name(e.value) != name)
+        if (e.value_key != name)
             continue;
         pids.insert(e.pid);
         ++a.n_events;
@@ -815,9 +848,13 @@ registry_row_from_candidate(const RegistryCandidate& c, std::uint32_t actor_pid,
 
 /// Finalises every held candidate whose window closed at least kEtwSettle100ns
 /// before `now` (a late event for a write just before the read can still arrive
-/// that long after it); the rest stay held. Order of precedence for the marker:
-/// the buffer holds nothing from before the window opened (lost-restart: a restart
-/// or a re-enable) > session down (off) > loss over the window (degraded) > the
+/// that long after it); the rest stay held. A candidate whose marker is decided before
+/// any event is consulted (lost-restart, off) is finalised at once: both conditions
+/// only ever become more true within a run, so waiting buys nothing and would persist a
+/// restart's whole reconcile in the cursor row. Degraded stays held, as a loss epoch
+/// recorded in a later tick can still intersect its window. Order of precedence for the
+/// marker: the buffer holds nothing from before the window opened (lost-restart: a
+/// restart or a re-enable) > session down (off) > loss over the window (degraded) > the
 /// correlation outcome.
 [[nodiscard]] inline StitchResult
 stitch_registry_tick(const std::vector<RegistryCandidate>& candidates,
@@ -826,17 +863,19 @@ stitch_registry_tick(const std::vector<RegistryCandidate>& candidates,
                      std::int64_t now, std::int64_t snapshot_id) {
     StitchResult out;
     for (const auto& c : candidates) {
-        if (now - c.window_hi < kEtwSettle100ns) {
+        const bool lost_restart = c.window_lo < flags.events_since;
+        const bool off = !flags.etw_running;
+        if (!lost_restart && !off && now - c.window_hi < kEtwSettle100ns) {
             out.held_next.push_back(c);
             continue;
         }
         std::uint32_t pid = 0;
         std::string image;
         std::string detail;
-        if (c.window_lo < flags.events_since) {
+        if (lost_restart) {
             detail = "attr:lost-restart";
             ++out.counters.none;
-        } else if (!flags.etw_running) {
+        } else if (off) {
             detail = "attr:off";
             ++out.counters.none;
         } else if (intersects_loss(c, epochs)) {
@@ -881,15 +920,19 @@ struct RegistryRootState {
 };
 
 /// Every future candidate's window starts at or after its root's window_base, so
-/// an event at or before the minimum of them can never be matched again. A root
-/// never completely read contributes 0 (retain everything until the cap).
+/// an event at or before the minimum of them can never be matched again. A root never
+/// completely read (window_base 0) does not take part: every candidate it yields has a
+/// wide window starting at 0, which is before events_since and so finalises as
+/// attr:lost-restart whatever the buffer holds, and its narrow notify candidates keep
+/// their events through release_event's held-window test. Counting it would let one root
+/// that stays Capped (a user-owned Software\Policies past the read budget) pin the
+/// watermark at 0 and keep the buffer full for the whole fleet's attribution.
 [[nodiscard]] inline std::int64_t
 retention_watermark(const std::map<std::string, RegistryRootState>& roots) {
-    if (roots.empty())
-        return std::numeric_limits<std::int64_t>::max();
     std::int64_t m = std::numeric_limits<std::int64_t>::max();
     for (const auto& [_, st] : roots)
-        m = std::min(m, st.window_base);
+        if (st.window_base != 0)
+            m = std::min(m, st.window_base);
     return m;
 }
 
@@ -906,9 +949,14 @@ retention_watermark(const std::map<std::string, RegistryRootState>& roots) {
 
 // ── Cursor state and codecs ─────────────────────────────────────────────────
 
-/// The cursor row is a content store (v1): besides positions it holds the HELD
-/// candidates -- changes the key watch saw whose attribution is not final yet --
-/// with their rendered old and new values, for up to one settle interval.
+/// The cursor row is a content store: besides positions it holds the HELD candidates --
+/// changes the key watch saw whose attribution is not final yet -- with their rendered
+/// old and new values, for up to one settle interval. It is written as version 2
+/// whenever it holds a candidate or a loss epoch, else as version 1: a build that
+/// predates `held` ignores the field and would re-encode the cursor without it, dropping
+/// changes whose baseline already advanced with no gap row. Such a build only reads
+/// version 1, so it takes a version 2 cursor as lost -- one gap:cursorlost row and a
+/// re-baseline, never a silent loss.
 struct RegistryCursor {
     bool present{false};   // a cursor was supplied at all
     bool malformed{false}; // supplied but unusable (CursorLost, never a Baseline)
@@ -947,8 +995,10 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
     c.prev_data = j.at("pd").get<std::string>();
     c.prev_truncated = j.at("ptr").get<bool>();
     c.observed_at = j.at("o").get<std::int64_t>();
-    c.window_lo = j.at("lo").get<std::int64_t>();
-    c.window_hi = j.at("hi").get<std::int64_t>();
+    // Clamped: now - window_hi is signed arithmetic, and a corrupt or tampered row must
+    // not make it overflow. A valid window is non-negative and ordered.
+    c.window_lo = std::max<std::int64_t>(0, j.at("lo").get<std::int64_t>());
+    c.window_hi = std::max(c.window_lo, j.at("hi").get<std::int64_t>());
     c.source = j.at("src").get<std::string>();
     return c;
 }
@@ -962,7 +1012,8 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
     cur.present = true;
     try {
         const auto j = nlohmann::json::parse(*json);
-        if (!j.is_object() || j.at("v").get<int>() != 1) {
+        const int v = j.is_object() ? j.at("v").get<int>() : 0;
+        if (v != 1 && v != 2) {
             cur.malformed = true; // empty, wrong shape or a version this build cannot read
             return cur;
         }
@@ -991,7 +1042,7 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
                 cur.loss.push_back({e.at(0).get<std::int64_t>(), e.at(1).get<std::int64_t>()});
         for (const auto& s : j.at("hku"))
             cur.hku.push_back(s.get<std::string>());
-        // An unknown field is ignored, so a later build can add state to this v1 cursor.
+        // An unknown field is ignored, so a later build can add state to this cursor.
     } catch (const nlohmann::json::exception&) {
         RegistryCursor lost;
         lost.present = true;
@@ -1003,7 +1054,7 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
 
 [[nodiscard]] inline std::string encode_registry_cursor(const RegistryCursor& cur) {
     nlohmann::json j;
-    j["v"] = 1;
+    j["v"] = cur.held.empty() && cur.loss.empty() ? 1 : 2;
     j["tick"] = cur.tick;
     j["ccs"] = cur.ccs;
     auto roots = nlohmann::json::object();

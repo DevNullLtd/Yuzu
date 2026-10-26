@@ -324,6 +324,13 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
                 st.window_base = read_start; // the NEXT window starts here
         }
 
+        // The buffer is read BEFORE the loss counters: an eviction between the two would
+        // otherwise be in neither this tick's epochs nor the snapshot, and a candidate whose
+        // true event was evicted could be correlated to one unrelated writer. Read in this
+        // order every eviction the snapshot missed is counted, and a later one only adds
+        // loss.
+        const auto batch = reader_.buffer->snapshot();
+
         // Loss accounting. The drop range and the session counters are cumulative; what is
         // new since the last COMMITTED tick becomes one gap row and a loss epoch. A failed
         // loss query is itself loss: the session's counters are then unknown.
@@ -347,7 +354,6 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
                                             now, snapshot_id));
 
         // Held candidates (from earlier ticks) and this tick's fresh ones, against the buffer.
-        const auto batch = reader_.buffer->snapshot();
         std::vector<RegistryCandidate> candidates = std::move(cur.held);
         for (auto& c : fresh_candidates)
             candidates.push_back(std::move(c));
@@ -529,6 +535,10 @@ bool prop_string(EVENT_RECORD* rec, const wchar_t* name, std::string& out) {
     ULONG size = 0;
     if (TdhGetPropertySize(rec, 0, nullptr, 1, &pdd, &size) != ERROR_SUCCESS)
         return false;
+    // A size beyond the registry's longest value name is a torn property: refuse it before
+    // allocating for it.
+    if (size > (kMaxValueNameChars + 1) * sizeof(wchar_t))
+        return false;
     if (size <= sizeof(wchar_t)) {
         out.clear();
         return true;
@@ -545,8 +555,12 @@ bool prop_string(EVENT_RECORD* rec, const wchar_t* name, std::string& out) {
 // the session name behind it) every ControlTrace call needs. reset() stops the session
 // by handle. The destructor is the safety net, WinEtw::stop() orders teardown.
 struct TraceSession {
+    // ControlTrace needs room behind the properties for BOTH names it may write back (the
+    // logger name and the log file name), each up to this many characters.
+    static constexpr std::size_t kNameChars = 1024;
+
     TRACEHANDLE h = 0;
-    std::vector<BYTE> buf; // EVENT_TRACE_PROPERTIES + the session name
+    std::vector<BYTE> buf; // EVENT_TRACE_PROPERTIES + room for the two names
 
     TraceSession() = default;
     TraceSession(const TraceSession&) = delete;
@@ -555,9 +569,9 @@ struct TraceSession {
 
     EVENT_TRACE_PROPERTIES* props() { return reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buf.data()); }
 
-    // (Re)initialise the properties block for `name_bytes` of session name.
-    void init(std::size_t name_bytes) {
-        buf.assign(sizeof(EVENT_TRACE_PROPERTIES) + name_bytes, 0);
+    // (Re)initialise the properties block.
+    void init() {
+        buf.assign(sizeof(EVENT_TRACE_PROPERTIES) + 2 * kNameChars * sizeof(wchar_t), 0);
         props()->Wnode.BufferSize = static_cast<ULONG>(buf.size());
         props()->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
         props()->Wnode.ClientContext = 2; // system-time timestamps: FILETIME, now_ts's clock
@@ -569,6 +583,7 @@ struct TraceSession {
     void reset() noexcept {
         if (h == 0)
             return;
+        props()->LogFileNameOffset = 0; // a QUERY may have set it: this is a real-time session
         ControlTraceW(h, nullptr, props(), EVENT_TRACE_CONTROL_STOP);
         h = 0;
     }
@@ -645,25 +660,33 @@ struct WinEtw {
                 ev.op = RegistryEtwOp::DeleteKey;
             } else {
                 ev.op = id == kEvSetValueKey ? RegistryEtwOp::Set : RegistryEtwOp::DeleteValue;
-                bool ok = prop_string(rec, L"ValueName", ev.value);
+                std::string name;
+                bool ok = prop_string(rec, L"ValueName", name);
                 if (ok && id == kEvSetValueKey)
                     ok = prop_u32(rec, L"Type", ev.type) && prop_u32(rec, L"DataSize", ev.size);
                 if (!ok) {
                     self->decode_failed.fetch_add(1, std::memory_order_relaxed);
                     return;
                 }
+                ev.value_key = value_name_key(name); // the name itself is not kept
             }
             if (ev.ts100ns - self->pid_name_flushed > kPidNameFlush100ns) {
                 self->pid_name.clear();
                 self->pid_name_flushed = ev.ts100ns;
             }
-            auto it = self->pid_name.find(ev.pid);
-            if (it == self->pid_name.end()) {
-                if (self->pid_name.size() >= kPidNameCap)
-                    self->pid_name.clear(); // wholesale flush: no past-cap naming blackout
-                it = self->pid_name.emplace(ev.pid, process_basename_for_pid(ev.pid)).first;
+            if (const auto it = self->pid_name.find(ev.pid); it != self->pid_name.end()) {
+                ev.image = it->second;
+            } else {
+                // Looked up at delivery, and refused when a newer process already holds the pid
+                // (created after this event), so the new holder is named at its own first event.
+                // Only a name is cached: an empty result is retried at the next event.
+                ev.image = process_basename_for_pid(ev.pid, ev.ts100ns);
+                if (!ev.image.empty()) {
+                    if (self->pid_name.size() >= kPidNameCap)
+                        self->pid_name.clear(); // wholesale flush: no past-cap naming blackout
+                    self->pid_name.emplace(ev.pid, ev.image);
+                }
             }
-            ev.image = it->second;
             self->buffer->push(std::move(ev));
         } catch (...) {
             if (self != nullptr)
@@ -671,28 +694,32 @@ struct WinEtw {
         }
     }
 
-    // false = the session could not be opened (not elevated, or the provider is refused):
-    // the key watch still runs and rows carry attr:off.
-    bool start() noexcept {
+    // ERROR_SUCCESS, or the Win32 error that stopped the session opening (access denied when
+    // the agent is not elevated, no free logger slot, a refused provider): the key watch
+    // still runs and rows carry attr:off.
+    ULONG start() noexcept {
         try {
             std::lock_guard lock(mu);
             if (running.load())
-                return true;
+                return ERROR_SUCCESS;
+            // A session that ended on its own left a joinable worker and live handles: release
+            // them before the members are assigned again.
+            teardown_locked();
             session_name = registry_etw_session_name();
-            const std::size_t name_bytes = (session_name.size() + 1) * sizeof(wchar_t);
-            session.init(name_bytes);
+            session.init();
             ULONG rc = StartTraceW(&session.h, session_name.c_str(), session.props());
             // Pid reuse after a crash: a session is a kernel object that outlives its process,
             // so the predecessor's carries this pid's name. Stop it and retry once, else this
             // run is attr:off and the leaked session runs until reboot.
             if (rc == ERROR_ALREADY_EXISTS) {
+                session.props()->LogFileNameOffset = 0;
                 ControlTraceW(0, session_name.c_str(), session.props(), EVENT_TRACE_CONTROL_STOP);
-                session.init(name_bytes);
+                session.init();
                 rc = StartTraceW(&session.h, session_name.c_str(), session.props());
             }
             if (rc != ERROR_SUCCESS) {
                 session.h = 0; // nothing was started: nothing for reset() to stop
-                return false;
+                return rc;
             }
             ENABLE_TRACE_PARAMETERS params{};
             params.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
@@ -700,7 +727,7 @@ struct WinEtw {
                                 TRACE_LEVEL_INFORMATION, kEtwKeywordMask, 0, 0, &params);
             if (rc != ERROR_SUCCESS) {
                 teardown_locked();
-                return false;
+                return rc;
             }
             EVENT_TRACE_LOGFILEW logfile{};
             logfile.LoggerName = const_cast<LPWSTR>(session_name.c_str());
@@ -709,8 +736,9 @@ struct WinEtw {
             logfile.Context = this;
             consumer.h = OpenTraceW(&logfile);
             if (consumer.h == INVALID_PROCESSTRACE_HANDLE) {
+                const ULONG err = GetLastError();
                 teardown_locked();
-                return false;
+                return err != ERROR_SUCCESS ? err : ERROR_INTERNAL_ERROR;
             }
             running.store(true);
             // The worker takes its own copy of the handle: nothing is shared with the thread
@@ -726,11 +754,11 @@ struct WinEtw {
                 }
                 running.store(false, std::memory_order_relaxed);
             });
-            return true;
+            return ERROR_SUCCESS;
         } catch (...) {
             // bad_alloc / system_error (the thread): tear down whatever was opened.
             stop();
-            return false;
+            return ERROR_OUTOFMEMORY;
         }
     }
 
@@ -1180,9 +1208,11 @@ RegistryReader make_windows_registry_reader() {
     // ponytail: a session that dies after start is not restarted -- capture_method flips to
     // notify and rows say attr:off; add a restart if that is ever seen in the field.
     r.start = [etw] {
-        if (!etw->start())
-            spdlog::warn("TAR registry: Kernel-Registry ETW session unavailable (not elevated?) "
-                         "-- the key watch still runs, rows will carry attr:off");
+        if (const ULONG rc = etw->start(); rc != ERROR_SUCCESS)
+            spdlog::warn("TAR registry: Kernel-Registry ETW session unavailable (Win32 error {}; "
+                         "5 = the agent is not elevated) -- the key watch still runs, rows will "
+                         "carry attr:off",
+                         rc);
     };
     // The session first: it is a system-wide kernel object that outlives a leaked handle,
     // where the watcher's resources die with the process.

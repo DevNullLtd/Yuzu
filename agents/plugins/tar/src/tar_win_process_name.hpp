@@ -20,11 +20,28 @@ namespace yuzu::tar {
 /// Best-effort owning-process basename for a (usually still-alive) pid. Callers cache
 /// it by pid so QueryFullProcessImageName runs ~once per pid. "" for protected or
 /// exited processes, and on any failure.
-inline std::string process_basename_for_pid(std::uint32_t pid) {
+///
+/// `event_ts100ns` (0 = unchecked) is the FILETIME of the event the pid came from: a
+/// process created after it cannot have produced it, so the pid was reused and "" is
+/// returned. A pid reused by a process that was already running at the event, or that
+/// is looked up from a cache after it was reused, is not detected.
+inline std::string process_basename_for_pid(std::uint32_t pid, std::int64_t event_ts100ns = 0) {
     yuzu::agent::detail::ScopedWinHandle<&yuzu::agent::detail::close_handle_> proc{
         OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)};
     if (!proc)
         return {};
+    if (event_ts100ns != 0) {
+        // ETW stamps come from the coarse system clock (up to ~16 ms behind), so a process
+        // that wrote within its first moments must not read as created after its own event.
+        constexpr std::int64_t kClockSlack100ns = 1'000'000; // 100 ms
+        FILETIME created{}, exited{}, kernel{}, user{};
+        if (!GetProcessTimes(proc.get(), &created, &exited, &kernel, &user))
+            return {};
+        const auto created_at = static_cast<std::int64_t>(
+           (static_cast<std::uint64_t>(created.dwHighDateTime) << 32) | created.dwLowDateTime);
+        if (created_at > event_ts100ns + kClockSlack100ns)
+            return {};
+    }
     wchar_t buf[MAX_PATH];
     DWORD len = MAX_PATH;
     if (!QueryFullProcessImageNameW(proc.get(), 0, buf, &len) || len == 0)
