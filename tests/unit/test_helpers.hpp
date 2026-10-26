@@ -89,6 +89,17 @@ inline std::uint64_t process_random_salt() {
     return salt;
 }
 
+/// The name prefix of every scratch registry key the registry plugin's Windows tests create under HKLM\SOFTWARE or
+/// HKCU\Software: `YuzuTest-<scope>-` when YUZU_TEST_REGISTRY_SCOPE is set and non-empty, else `YuzuTest-`. CI sets the
+/// scope per job (run id, attempt, build type), so its leftover-key tripwire can tell this job's keys from a
+/// concurrent job's on the same box (two test phases may share one runner machine); the per-process salt the fixtures
+/// append is unchanged. The scope must be registry-name-safe (no backslash). `scope` is a parameter only so a pure
+/// test can feed it (nullptr and "" both mean unset); every caller takes the default, the environment.
+inline std::string registry_scratch_prefix(const char* scope = std::getenv("YUZU_TEST_REGISTRY_SCOPE")) {
+    if (scope == nullptr || scope[0] == '\0') return "YuzuTest-";
+    return std::string{"YuzuTest-"} + scope + "-";
+}
+
 /// Generate a unique filesystem path under the system temp directory.
 ///
 /// Uniqueness is guaranteed within a process by a monotonic atomic counter,

@@ -29,13 +29,11 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
-#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <format>
 #include <iterator>
-#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -70,6 +68,7 @@ static_assert(yuzu::profiles::kRegBinary == REG_BINARY);
 static_assert(yuzu::profiles::kRegDword == REG_DWORD);
 static_assert(yuzu::profiles::kRegMultiSz == REG_MULTI_SZ);
 static_assert(yuzu::profiles::kRegQword == REG_QWORD);
+static_assert(kMaxWriteBytes == yuzu::win::kMaxRegValueBytes); // one bound for every value read in the plugin
 
 using yuzu::win::from_wide;
 using yuzu::win::to_wide;
@@ -114,6 +113,9 @@ template <class F> [[nodiscard]] F ntdll_proc(const char* symbol) {
 
 /// NtQueryKey(KeyNameInformation) of an open key as UTF-8. A failure of any kind, STATUS_BUFFER_OVERFLOW
 /// (a name past the 4 KiB buffer) included, is non-zero and leaves `out` empty: a half name is never compared.
+/// A name holding a lone surrogate or a NUL fails closed the same way (ERROR_INVALID_DATA): from_wide would convert
+/// it lossily (U+FFFD, one trailing NUL dropped), and the compare against the requested path must never run on an
+/// approximation of the kernel's name.
 [[nodiscard]] long query_key_name(HKEY key, std::string& out) {
     out.clear();
     static const NtQueryKeyFn fn = ntdll_proc<NtQueryKeyFn>("NtQueryKey");
@@ -130,6 +132,7 @@ template <class F> [[nodiscard]] F ntdll_proc(const char* symbol) {
     // needs), and the bytes were written by the kernel, not through another C++ object.
     const auto* name = reinterpret_cast<const wchar_t*>(buf + sizeof name_bytes);
     const std::size_t n = name_bytes / sizeof(wchar_t);
+    if (!kernel_name_well_formed(std::wstring_view{name, n})) return ERROR_INVALID_DATA;
     if (std::all_of(name, name + n, [](wchar_t c) { return c > 0 && c < 0x80; })) { // the usual name: no NLS call
         out.resize(n);
         std::transform(name, name + n, out.begin(), [](wchar_t c) { return static_cast<char>(c); });
@@ -299,20 +302,6 @@ int emit(yuzu::CommandContext& ctx, const ActionOutput& out) {
     return emit_lines(ctx, out);
 }
 
-// L7: log access to sensitive registry paths for the agent log. The key is request-supplied and not yet validated,
-// so it is logged through sanitize_field (a CR or LF in it must not forge an agent-log line).
-void audit_sensitive_path(std::string_view hive, std::string_view key_path) {
-    if (hive != "HKLM") return;
-    const auto starts_ci = [&](std::string_view upper_prefix) { // ASCII upper-cased prefix match, no copy of the key
-        return key_path.size() >= upper_prefix.size() &&
-               std::equal(upper_prefix.begin(), upper_prefix.end(), key_path.begin(), [](char p, char c) {
-                   return p == static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-               });
-    };
-    if (starts_ci("SOFTWARE\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\RUN") || starts_ci("SYSTEM\\CURRENTCONTROLSET\\SERVICES"))
-        spdlog::info("Registry: accessing sensitive path HKLM\\{}", sanitize_field(key_path));
-}
-
 struct Target {
     Hive hive = Hive::hklm;
     std::string_view key; ///< a view into the command's parameters, which outlive the action
@@ -323,17 +312,16 @@ struct Target {
 std::optional<Target> parse_target(yuzu::CommandContext& ctx, yuzu::Params params) {
     const auto hive = params.get("hive");
     const auto key = params.get("key");
-    if (hive.empty() || key.empty()) {
-        ctx.write_output("error|missing required parameters: hive, key");
+    const auto p = resolve_target(hive, key);
+    if (!p) {
+        ctx.write_output(p.error());
         return std::nullopt;
     }
-    const auto h = parse_hive(hive);
-    if (!h) {
-        ctx.write_output("error|invalid hive (use HKLM, HKCU, HKCR, or HKU)");
-        return std::nullopt;
-    }
-    audit_sensitive_path(hive, key);
-    return Target{*h, key, fast_open_hive(*h)};
+    // L7: the key is request-supplied and not yet validated, so it is logged through sanitize_field (a CR or LF in
+    // it must not forge an agent-log line).
+    if (is_sensitive_hklm_path(hive, key))
+        spdlog::info("Registry: accessing sensitive path HKLM\\{}", sanitize_field(key));
+    return Target{*p, key, fast_open_hive(*p)};
 }
 
 /// A refused single action: the audit line and `error|<token>` with rc 1.
@@ -367,13 +355,18 @@ int do_get_value(yuzu::CommandContext& ctx, yuzu::Params params) {
         return 1;
     }
 
-    // The whole value, as before (no size bound: get_value's output for existing callers is unchanged);
-    // only the acquisition is the shared guarded read.
-    constexpr std::size_t kWhole = (std::numeric_limits<std::uint32_t>::max)();
+    // The shared guarded read, bounded at kMaxWriteBytes (the bound get_user_value and the write path use): a larger
+    // value is reported by size alone (q.bytes stays empty) and refused, never read whole into memory three times
+    // (the bytes, the hex string, the sanitised copy).
     const Wide wname{val_name};
     QueryResult q;
-    if (query_value_bounded(kWhole, raw_query(opened.get(), wname.c_str()), q, kWhole) != ERROR_SUCCESS) {
-        ctx.write_output("error|value not found");
+    if (const long rc = query_value_bounded(kMaxWriteBytes, raw_query(opened.get(), wname.c_str()), q, kMaxWriteBytes);
+        rc != ERROR_SUCCESS) {
+        ctx.write_output(get_value_error_line(rc, t.key));
+        return 1;
+    }
+    if (q.size > kMaxWriteBytes) {
+        ctx.write_output(yuzu::profiles::render_user_key_error(yuzu::profiles::UserKeyStatus::value_oversized, t.key));
         return 1;
     }
     const DWORD type = q.type;
@@ -599,37 +592,6 @@ int do_list_profiles(yuzu::CommandContext& ctx, yuzu::Params) {
 }
 
 // ── mutating single actions ──────────────────────────────────────────────
-
-/// The front half of set_value: validate, encode, and record the type and new bytes on the audit record.
-/// `err` is empty on success.
-struct PreparedSet {
-    std::string_view err;
-    std::optional<std::uint32_t> type;
-    Encoded enc;
-};
-
-PreparedSet prepare_set(AuditRecord& au, std::string_view key, std::string_view name, std::string_view type_str,
-                        std::string_view value, std::string_view data_hex) {
-    if (type_str.empty()) type_str = "REG_SZ";
-    au.type_name = std::string{type_str};
-    PreparedSet p;
-    p.err = validate_key_path(key);
-    if (p.err.empty()) p.err = validate_value_name(name);
-    p.type = parse_reg_type(type_str);
-    if (p.err.empty() && !p.type) p.err = kTokInvalidType;
-    if (p.err.empty()) {
-        // On the string-map actions an empty data_hex is the same as an absent one.
-        p.enc = encode_value(*p.type, value, data_hex, !data_hex.empty());
-        p.err = p.enc.error;
-    }
-    if (p.err.empty()) {
-        au.len = static_cast<long long>(p.enc.bytes.size());
-        au.new_bytes = p.enc.bytes;
-        au.new_total = p.enc.bytes.size();
-        au.has_new = true;
-    }
-    return p;
-}
 
 int do_set_value(yuzu::CommandContext& ctx, yuzu::Params params) {
     const auto target = parse_target(ctx, params);

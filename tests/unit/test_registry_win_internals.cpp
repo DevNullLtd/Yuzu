@@ -18,7 +18,7 @@
  * `..._UNIT_TEST_INTERNALS_ONLY` guard, which drops the one plugin-facing function so the file can be
  * included). `#if defined(_WIN32)` guards the WHOLE body -- empty TU elsewhere. Needs an elevated token
  * (a salted HKLM scratch key); like the dispatcher cases it WARN-skips otherwise, and
- * YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1 (the kingsley evidence jobs) turns that skip into a FAIL.
+ * YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1 (CI's Windows leg, #6488, and the evidence runs) turns that skip into a FAIL.
  */
 #if !defined(_WIN32)
 
@@ -141,15 +141,20 @@ Guarded run_guarded(std::string_view action, const char* name_param = nullptr) {
 
 /// Creates a registry link key `link_path` under HKLM whose SymbolicLinkValue (a REG_LINK: the target path
 /// WITHOUT a terminating NUL) names HKLM\<target_path>, which need not exist. False when it cannot be made.
-bool make_machine_link(const std::string& link_path, const std::string& target_path) {
+bool make_machine_link(const std::wstring& link_path, const std::wstring& target_path) {
     yuzu::win::RegKey link;
-    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(link_path).c_str(), 0, nullptr, REG_OPTION_CREATE_LINK,
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, link_path.c_str(), 0, nullptr, REG_OPTION_CREATE_LINK,
                         KEY_SET_VALUE | KEY_CREATE_LINK, nullptr, link.put(), nullptr) != ERROR_SUCCESS)
         return false;
-    const std::wstring target = L"\\Registry\\Machine\\" + widen(target_path);
+    const std::wstring target = L"\\Registry\\Machine\\" + target_path;
     return RegSetValueExW(link.get(), L"SymbolicLinkValue", 0, REG_LINK,
                           reinterpret_cast<const BYTE*>(target.data()),
                           static_cast<DWORD>(target.size() * sizeof(wchar_t))) == ERROR_SUCCESS;
+}
+
+/// The ASCII form of the above (every link name and target the older cases use is ASCII).
+bool make_machine_link(const std::string& link_path, const std::string& target_path) {
+    return make_machine_link(widen(link_path), widen(target_path));
 }
 
 bool key_exists(const std::string& key) {
@@ -167,23 +172,31 @@ struct ScratchTree {
     ScratchTree& operator=(const ScratchTree&) = delete;
 };
 
-/// Deletes the link object at `parent\Link` by handle on scope exit (a link-opening open + NtDeleteKey),
+/// Deletes the link object at `parent\<name>` by handle on scope exit (a link-opening open + NtDeleteKey),
 /// so a failed REQUIRE, or a build without the flag where create_sub followed the link, still leaves no
 /// link behind for RegDeleteTreeW to trip over. Never throws.
 struct LinkSweep {
     Win32Registry& reg;
     Handle parent;
+    std::string name;
     ~LinkSweep() {
         Handle h = 0;
-        if (reg.open_sub(parent, "Link", DELETE, h) == ERROR_SUCCESS) {
+        if (reg.open_sub(parent, name, DELETE, h) == ERROR_SUCCESS) {
             reg.delete_key_by_handle(h);
             reg.close(h);
         }
     }
-    LinkSweep(Win32Registry& r, Handle p) : reg(r), parent(p) {}
+    LinkSweep(Win32Registry& r, Handle p, std::string n = "Link") : reg(r), parent(p), name(std::move(n)) {}
     LinkSweep(const LinkSweep&) = delete;
     LinkSweep& operator=(const LinkSweep&) = delete;
 };
+
+/// `SOFTWARE\YuzuTest-[<scope>-]<salt>-<tag>`: the scope (YUZU_TEST_REGISTRY_SCOPE, set per job in CI) lets the
+/// job's leftover-key check tell its keys from a concurrent job's.
+std::string scratch_root(const char* tag) {
+    return "SOFTWARE\\" + yuzu::test::registry_scratch_prefix() + std::to_string(yuzu::test::process_random_salt()) + "-" +
+           tag;
+}
 
 } // namespace
 
@@ -194,8 +207,7 @@ struct LinkSweep {
 // (created_new becomes true, the handle is the Target, and the Target key exists afterwards).
 TEST_CASE("Win32Registry::create_sub opens a dangling registry link as the link and creates nothing through it",
           "[registry][windows][internals]") {
-    const std::string root =
-        "SOFTWARE\\YuzuTest-" + std::to_string(yuzu::test::process_random_salt()) + "-internals";
+    const std::string root = scratch_root("internals");
     ScratchTree cleanup{root};
 
     // The scratch parent, opened with the right the create needs. HKLM\SOFTWARE is writable only elevated.
@@ -205,14 +217,13 @@ TEST_CASE("Win32Registry::create_sub opens a dangling registry link as the link 
         skip_or_fail("not elevated -- HKLM scratch not writable, create_sub link case");
         return;
     }
+    Win32Registry reg;
+    const Handle parent_handle = as_handle(parent.get());
+    LinkSweep sweep{reg, parent_handle}; // before the link exists, so a link made by a failing call goes too
     if (!make_machine_link(root + "\\Link", root + "\\Target")) { // Target is never created by this case
         skip_or_fail("could not create a registry link here");
         return;
     }
-
-    Win32Registry reg;
-    const Handle parent_handle = as_handle(parent.get());
-    LinkSweep sweep{reg, parent_handle};
 
     // Exactly the create open_checked issues for a missing component, with DELETE added so the link
     // object can be removed by handle below (the access mask does not change how a link is treated).
@@ -242,7 +253,7 @@ TEST_CASE("Win32Registry::create_sub opens a dangling registry link as the link 
 // canonical name of what a path through it opens is the target's.
 TEST_CASE("Win32Registry::final_name names the object a handle is bound to and the probe reports a link leaf",
           "[registry][windows][internals]") {
-    const std::string root = "SOFTWARE\\YuzuTest-" + std::to_string(yuzu::test::process_random_salt()) + "-names";
+    const std::string root = scratch_root("names");
     ScratchTree cleanup{root};
     yuzu::win::RegKey sub;
     if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(root + "\\Target\\Sub").c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
@@ -255,13 +266,13 @@ TEST_CASE("Win32Registry::final_name names the object a handle is bound to and t
         skip_or_fail("could not open the scratch parent");
         return;
     }
+    Win32Registry reg;
+    const Handle hklm = as_handle(HKEY_LOCAL_MACHINE);
+    LinkSweep sweep{reg, as_handle(parent.get())}; // before the link exists, so a link made by a failing call goes too
     if (!make_machine_link(root + "\\Link", root + "\\Target")) {
         skip_or_fail("could not create a registry link here");
         return;
     }
-    Win32Registry reg;
-    const Handle hklm = as_handle(HKEY_LOCAL_MACHINE);
-    LinkSweep sweep{reg, as_handle(parent.get())};
     const std::string machine = "\\REGISTRY\\MACHINE\\" + root;
 
     SECTION("a plain key is named by its own path, in the stored case") {
@@ -290,6 +301,87 @@ TEST_CASE("Win32Registry::final_name names the object a handle is bound to and t
         REQUIRE(reg.final_name(h, name) == ERROR_SUCCESS);
         CHECK(yuzu::registry::names_equal_ascii_ci(name, machine + "\\Target\\Sub"));
         CHECK_FALSE(yuzu::registry::names_equal_ascii_ci(name, machine + "\\Link\\Sub"));
+    }
+}
+
+// #6487: the fast open ACCEPTs a handle only when its canonical kernel name equals the requested path, and that
+// compare runs on the UTF-8 form. A key named `L<U+D800>` (a lone surrogate: the kernel accepts any UTF-16 unit)
+// converted lossily to U+FFFD, the same bytes as a requested `L<U+FFFD>`, so the compare passed on a handle one code
+// unit away from the name asked for. query_key_name now fails closed on such a name (kernel_name_well_formed), so
+// final_name answers ERROR_INVALID_DATA, open_fast declines and the walk decides.
+//
+// The link sits in an ANCESTOR position on purpose: open_path passes REG_OPTION_OPEN_LINK, which holds for the final
+// component only, so a LEAF link is opened as the link object and probe_link refuses it with or without the name
+// check; a link traversed mid-path is what the lossy compare lets through.
+// Mutation: delete the kernel_name_well_formed call in query_key_name -> final_name converts `...\L<D800>\Child`
+// to `...\L<FFFD>\Child`, equal to the requested path, Child probes clean, and the fast open ACCEPTs: the last
+// second section answers ok and V lands on L<D800>\Child.
+TEST_CASE("Win32Registry::final_name fails closed on a lone-surrogate key name, so a U+FFFD lookalike link cannot "
+          "redirect a fast set_value",
+          "[registry][windows][internals]") {
+    const std::string root = scratch_root("kname");
+    const std::wstring wroot = widen(root);
+    ScratchTree cleanup{root};
+    yuzu::win::RegKey parent;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, wroot.c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
+                        KEY_READ | KEY_CREATE_SUB_KEY, nullptr, parent.put(), nullptr) != ERROR_SUCCESS) {
+        skip_or_fail("not elevated -- HKLM scratch not writable, kernel-name case");
+        return;
+    }
+    const std::wstring lone = L"L\xD800";           // a lone high surrogate: no UTF-8 form
+    const std::wstring lookalike = L"L\xFFFD";       // U+FFFD, what a lossy conversion makes of it
+    const std::string lookalike_utf8 = "L\xEF\xBF\xBD";
+    const auto create_key = [&](const std::wstring& rel) {
+        yuzu::win::RegKey k;
+        return RegCreateKeyExW(parent.get(), rel.c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_READ, nullptr,
+                               k.put(), nullptr);
+    };
+    if (const LONG rc = create_key(L"L"); rc != ERROR_SUCCESS) {
+        skip_or_fail("could not create the plain key L, rc=" + std::to_string(rc));
+        return;
+    }
+    if (const LONG rc = create_key(lone + L"\\Child"); rc != ERROR_SUCCESS) {
+        skip_or_fail("RegCreateKeyExW refused a key name holding a lone surrogate, rc=" + std::to_string(rc));
+        return;
+    }
+    Win32Registry reg;
+    const Handle hklm = as_handle(HKEY_LOCAL_MACHINE);
+
+    SECTION("a plain key is named; its lone-surrogate sibling is not") {
+        Handle h = 0;
+        REQUIRE(reg.open_path(hklm, root + "\\L", KEY_QUERY_VALUE, h) == ERROR_SUCCESS);
+        {
+            const Owned guard{reg, h};
+            std::string name;
+            REQUIRE(reg.final_name(h, name) == ERROR_SUCCESS);
+            CHECK(yuzu::registry::names_equal_ascii_ci(name, "\\REGISTRY\\MACHINE\\" + root + "\\L"));
+        }
+        yuzu::win::RegKey sibling;
+        REQUIRE(RegOpenKeyExW(HKEY_LOCAL_MACHINE, (wroot + L"\\" + lone).c_str(), REG_OPTION_OPEN_LINK, KEY_QUERY_VALUE,
+                              sibling.put()) == ERROR_SUCCESS);
+        std::string name = "stale";
+        CHECK(reg.final_name(as_handle(sibling.get()), name) == ERROR_INVALID_DATA);
+        CHECK(name.empty()); // a half-converted name is never handed back
+    }
+    SECTION("a link named for U+FFFD, standing for the lone-surrogate key, is refused and nothing is written") {
+        LinkSweep sweep{reg, as_handle(parent.get()), lookalike_utf8}; // before the link exists
+        if (!make_machine_link(wroot + L"\\" + lookalike, wroot + L"\\" + lone)) {
+            skip_or_fail("could not create a registry link here");
+            return;
+        }
+        const std::vector<std::uint8_t> value{7, 0, 0, 0};
+        // The requested path is plain UTF-8 (valid, passes validate_key_path): `<root>\L<U+FFFD>\Child`. The kernel
+        // follows the ancestor link to `L<U+D800>\Child`; only the lone-surrogate rule keeps the fast open from
+        // accepting that handle. The fast open then declines and the walk opens the link with OPEN_LINK and refuses it.
+        const auto o = yuzu::registry::set_value_verified(reg, hklm, root + "\\" + lookalike_utf8 + "\\Child", "V",
+                                                          REG_DWORD, value, /*fast_eligible=*/true);
+        CHECK(o.result == "refused");
+        CHECK(o.reason == "key_is_link");
+        CHECK(o.created == 0);
+        yuzu::win::RegKey child;
+        REQUIRE(RegOpenKeyExW(HKEY_LOCAL_MACHINE, (wroot + L"\\" + lone + L"\\Child").c_str(), 0, KEY_QUERY_VALUE,
+                              child.put()) == ERROR_SUCCESS);
+        CHECK(RegQueryValueExW(child.get(), L"V", nullptr, nullptr, nullptr, nullptr) == ERROR_FILE_NOT_FOUND);
     }
 }
 
@@ -350,8 +442,7 @@ TEST_CASE("Win32Registry::query_value returns a REG_SZ stored without its termin
     // The capture of a pre-existing value feeds the audit row's old= field: it must be the stored bytes. A
     // RegQueryValueExW into a roomy buffer may append a terminator the stored value never had; this pins that
     // the plugin's read does not report one.
-    const std::string root =
-        "SOFTWARE\\YuzuTest-" + std::to_string(yuzu::test::process_random_salt()) + "-unterminated";
+    const std::string root = scratch_root("unterminated");
     ScratchTree cleanup{root};
     yuzu::win::RegKey raw; // closes on every exit, a failed REQUIRE included
     if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(root).c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
