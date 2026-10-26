@@ -118,6 +118,17 @@ TEST_CASE("license_scan plugin: surfaces reports probe_status diagnostics via Lo
     // attempted.
     INFO("full captured output: " << result.captured);
     CHECK(result.captured.find("probe_status|pkg_metadata|ok|") != std::string::npos);
+
+    // entitlement_certs is read in-process (licensing_x509.hpp, SAM.10): the
+    // surface always reports, the retired openssl-CLI token can never appear,
+    // and on a host without /etc/pki/entitlement the line is exactly the
+    // structural-empty success -- an absent directory is ENOENT, not an error.
+    CHECK(result.captured.find("probe_status|entitlement_certs|") != std::string::npos);
+    CHECK(result.captured.find("openssl_unavailable") == std::string::npos);
+    std::error_code ec;
+    if (!std::filesystem::exists("/etc/pki/entitlement", ec) && !ec) {
+        CHECK(result.captured.find("probe_status|entitlement_certs|ok|0") != std::string::npos);
+    }
 #endif
 }
 

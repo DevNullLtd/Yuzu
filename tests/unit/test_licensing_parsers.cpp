@@ -459,30 +459,30 @@ TEST_CASE("vocabulary helpers pin the §3.2 sets exactly", "[licensing][record]"
     CHECK_FALSE(is_valid_confidence("certain"));      // ditto
 }
 
-// ── entitlement_certs_outcome (pure decision seam, Wave 4 PR4.3b gate-3) ───
+// ── entitlement_certs_outcome (pure decision seam, Wave 4 PR4.3b gate-3; SAM.10) ───
 
 TEST_CASE("entitlement_certs_outcome: a budget-exhausted scan is never clean",
           "[licensing][entitlement_certs]") {
     // Whatever was parsed before the deadline is kept as real data (the
     // `rows` count), but the outcome must never read as a completed scan --
     // certs were left unexamined.
-    auto o = entitlement_certs_outcome(/*budget_exhausted=*/true, /*emitted=*/3,
-                                       /*any_parse_failure=*/false);
+    auto o = entitlement_certs_outcome(/*permission_denied=*/false, /*budget_exhausted=*/true,
+                                       /*emitted=*/3, /*any_parse_failure=*/false);
     CHECK_FALSE(o.ok);
     CHECK(o.rows == 3);
     CHECK(o.error == "cert_scan_budget_exhausted");
 
     // Budget exhaustion wins even alongside a parse failure -- one reason is
     // reported, not both, and it's the one that stopped the scan.
-    auto o2 = entitlement_certs_outcome(true, 1, true);
+    auto o2 = entitlement_certs_outcome(false, true, 1, true);
     CHECK_FALSE(o2.ok);
     CHECK(o2.error == "cert_scan_budget_exhausted");
 }
 
 TEST_CASE("entitlement_certs_outcome: every cert failing is total failure, not partial",
           "[licensing][entitlement_certs]") {
-    auto o = entitlement_certs_outcome(/*budget_exhausted=*/false, /*emitted=*/0,
-                                       /*any_parse_failure=*/true);
+    auto o = entitlement_certs_outcome(/*permission_denied=*/false, /*budget_exhausted=*/false,
+                                       /*emitted=*/0, /*any_parse_failure=*/true);
     CHECK_FALSE(o.ok);
     CHECK(o.rows == 0);
     CHECK(o.error == "cert_parse_failed");
@@ -494,8 +494,8 @@ TEST_CASE("entitlement_certs_outcome: a mix of parsed and unreadable certs is ne
     // parsed AND at least one failed used to report a clean success, so the
     // corrupt/lapsed cert vanished from this authoritative compliance
     // surface with no trace.
-    auto o = entitlement_certs_outcome(/*budget_exhausted=*/false, /*emitted=*/2,
-                                       /*any_parse_failure=*/true);
+    auto o = entitlement_certs_outcome(/*permission_denied=*/false, /*budget_exhausted=*/false,
+                                       /*emitted=*/2, /*any_parse_failure=*/true);
     CHECK_FALSE(o.ok);
     CHECK(o.rows == 2);
     CHECK(o.error == "cert_parse_partial");
@@ -506,17 +506,71 @@ TEST_CASE("entitlement_certs_outcome: a mix of parsed and unreadable certs is ne
 
 TEST_CASE("entitlement_certs_outcome: every cert parsing cleanly is a genuine success",
           "[licensing][entitlement_certs]") {
-    auto o = entitlement_certs_outcome(/*budget_exhausted=*/false, /*emitted=*/5,
-                                       /*any_parse_failure=*/false);
+    auto o = entitlement_certs_outcome(/*permission_denied=*/false, /*budget_exhausted=*/false,
+                                       /*emitted=*/5, /*any_parse_failure=*/false);
     CHECK(o.ok);
     CHECK(o.rows == 5);
     CHECK(o.error.empty());
 
     // Zero certs found (no failure, nothing to fail) is also clean --
     // structurally a successful probe of an empty surface (ADR-0024 D3).
-    auto o2 = entitlement_certs_outcome(false, 0, false);
+    auto o2 = entitlement_certs_outcome(false, false, 0, false);
     CHECK(o2.ok);
     CHECK(o2.rows == 0);
+}
+
+TEST_CASE("entitlement_certs_outcome: a refusal is cert_permission_denied and keeps the parsed rows",
+          "[licensing][entitlement_certs]") {
+    // The agent could not list the directory or read a cert: "could not
+    // check" is never an empty or clean surface. Records already parsed stay.
+    auto o = entitlement_certs_outcome(/*permission_denied=*/true, /*budget_exhausted=*/false,
+                                       /*emitted=*/2, /*any_parse_failure=*/false);
+    CHECK_FALSE(o.ok);
+    CHECK(o.rows == 2);
+    CHECK(o.error == "cert_permission_denied");
+
+    // A refusal with nothing parsed (the denied-directory case) is still a failure, not ok|0.
+    auto none = entitlement_certs_outcome(true, false, 0, false);
+    CHECK_FALSE(none.ok);
+    CHECK(none.rows == 0);
+    CHECK(none.error == "cert_permission_denied");
+}
+
+TEST_CASE("entitlement_certs_outcome: permission_denied outranks every other degradation",
+          "[licensing][entitlement_certs]") {
+    // Precedence: permission_denied > budget_exhausted > parse_failed > parse_partial.
+    CHECK(entitlement_certs_outcome(true, true, 1, true).error == "cert_permission_denied");
+    CHECK(entitlement_certs_outcome(true, true, 0, false).error == "cert_permission_denied");
+    CHECK(entitlement_certs_outcome(true, false, 0, true).error == "cert_permission_denied");
+    CHECK(entitlement_certs_outcome(true, false, 3, true).error == "cert_permission_denied");
+    // ...and each lower rung still holds without it.
+    CHECK(entitlement_certs_outcome(false, true, 0, true).error == "cert_scan_budget_exhausted");
+    CHECK(entitlement_certs_outcome(false, false, 0, true).error == "cert_parse_failed");
+    CHECK(entitlement_certs_outcome(false, false, 1, true).error == "cert_parse_partial");
+}
+
+TEST_CASE("has_permission_denied_outcome: true only for a failed outcome carrying exactly "
+          "cert_permission_denied",
+          "[licensing][entitlement_certs]") {
+    CHECK_FALSE(has_permission_denied_outcome({}));
+
+    const ProbeOutcome refused = entitlement_certs_outcome(true, false, 0, false);
+    const ProbeOutcome parse_failed = entitlement_certs_outcome(false, false, 0, true);
+    const ProbeOutcome budget = entitlement_certs_outcome(false, true, 1, false);
+    const ProbeOutcome clean = entitlement_certs_outcome(false, false, 2, false);
+
+    CHECK(has_permission_denied_outcome({refused}));
+    CHECK(has_permission_denied_outcome({clean, refused}));
+    CHECK_FALSE(has_permission_denied_outcome({parse_failed}));
+    CHECK_FALSE(has_permission_denied_outcome({budget}));
+    CHECK_FALSE(has_permission_denied_outcome({clean}));
+    CHECK_FALSE(has_permission_denied_outcome({parse_failed, budget, clean}));
+
+    // An OK outcome that merely mentions the token is not a refusal.
+    ProbeOutcome ok_with_text{"entitlement_certs", true, 0, "cert_permission_denied"};
+    CHECK_FALSE(has_permission_denied_outcome({ok_with_text}));
+    // A different failed token is not a refusal either, even for another surface.
+    CHECK_FALSE(has_permission_denied_outcome({ProbeOutcome{"pkg_metadata", false, 0, "rpm_query_failed"}}));
 }
 
 // ── per_user_hives_outcome (pure decision seam, related issue #5291) ───────

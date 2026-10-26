@@ -1,18 +1,23 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 93534d76a8aa
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-26 · euid 501 · leg-hash pending
 == action=list
-lic|Pages Creator Studio|||retail||licensed||app_receipt|probable|||machine|
-lic|iMovie|||retail||licensed||app_receipt|probable|||machine|
-lic|Numbers Creator Studio|||retail||licensed||app_receipt|probable|||machine|
-lic|Keynote Creator Studio|||retail||licensed||app_receipt|probable|||machine|
-lic|uBlock Origin Lite||2026.901.1442|retail||licensed||app_receipt|probable|||machine|
-lic|GarageBand|||retail||licensed||app_receipt|probable|||machine|
+lic|Pages Creator Studio||15.1.1|retail||licensed||app_receipt|probable|||machine|
+lic|OneDrive||26.168.0830|retail||licensed||app_receipt|probable|||machine|
+lic|iMovie||10.4.4|retail||licensed||app_receipt|probable|||machine|
+lic|Microsoft Word||16.114.1|retail||licensed||app_receipt|probable|||machine|
+lic|Numbers Creator Studio||15.1|retail||licensed||app_receipt|probable|||machine|
+lic|Microsoft Excel||16.114.1|retail||licensed||app_receipt|probable|||machine|
+lic|Microsoft Outlook||16.113.2|retail||licensed||app_receipt|probable|||machine|
+lic|Keynote Creator Studio||15.1.1|retail||licensed||app_receipt|probable|||machine|
+lic|uBlock Origin Lite||2026.1018.2229|retail||licensed||app_receipt|probable|||machine|
+lic|GarageBand||10.4.13|retail||licensed||app_receipt|probable|||machine|
+lic|Microsoft PowerPoint||16.114.1|retail||licensed||app_receipt|probable|||machine|
 lic|Hush||1.0.19|retail||licensed||app_receipt|probable|||machine|
-probe_status|mas_receipt|ok|7
+probe_status|mas_receipt|ok|12
 probe_status|vendor_plists|ok|0
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=surfaces
-probe_status|mas_receipt|ok|7
+probe_status|mas_receipt|ok|12
 probe_status|vendor_plists|ok|0
 [result_status] UNDECLARED / UNKNOWN / 
 

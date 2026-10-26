@@ -39,6 +39,7 @@
 #include <string_view>
 #include <vector>
 
+#include "licensing_parsers.hpp"
 #include "licensing_probes.hpp"
 #include "licensing_record.hpp"
 
@@ -71,8 +72,20 @@ yuzu::license_scan::SurfaceRun collect_surfaces() {
 // structural, the enumeration sweep itself completed; the existing
 // test_license_scan_actions.cpp test already pins rc==0 as part of the
 // documented contract, unaffected by this change).
+//
+// A refusal (cert_permission_denied: the agent may not list /etc/pki/entitlement
+// or read a certificate in it) is reported as PERMISSION_DENIED -- distinct from
+// the generic CONSTRAINED surface error so a consumer reading this seam can tell
+// "could not check" from "the check failed" (SAM.10). Every other !ok outcome
+// stays CONSTRAINED / license_scan:surface_error. Rows already collected are
+// carried on every degraded path, hence PARTIAL.
 void propagate_surface_status(yuzu::CommandContext& ctx,
                               const std::vector<yuzu::license_scan::ProbeOutcome>& outcomes) {
+    if (yuzu::license_scan::has_permission_denied_outcome(outcomes)) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED,
+                              YUZU_RESULT_COMPLETENESS_PARTIAL, "license_scan:permission_denied");
+        return;
+    }
     for (const auto& outcome : outcomes) {
         if (!outcome.ok) {
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
@@ -115,41 +128,46 @@ int do_surfaces(yuzu::CommandContext& ctx) {
 //     enumerator, registry ProbeSpec rows, and per-user hive/file probes —
 //     every one a native, in-process Win32/COM call (rung 1).
 //   - Linux (licensing_linux.cpp run_platform_surfaces): pkg_metadata
-//     (rpm/dpkg-query) and entitlement_certs (openssl x509) now go through
-//     the shared bounded argv runner (rung 2, run_bounded_subprocess) — no
-//     shell, no popen (Wave 4 PR4.3b migration). DEMOTED to CONSTRAINED (was
-//     SUPPORTED at rung 3) by a deliberate Alex/K-review decision, not a
-//     regression in what the surfaces do: pkg_metadata was always a
-//     declared-licence CLASSIFICATION only (no lapse detection — a gap
-//     independent of the acquisition mechanism, see the file's own header
-//     comment), and entitlement_certs' authoritative expiry still depends on
-//     the openssl CLI being present on the host.
-//   - macOS (licensing_macos.cpp run_platform_surfaces): pure filesystem
-//     glob + in-house XML-plist string parsing, no exec at all (rung 1). The
-//     header's own doc comment records the real limitation: a BINARY
-//     (bplist00) Info.plist is not parsed and falls back to the bundle name
-//     with an empty version — CONSTRAINED, not SUPPORTED.
+//     (rpm/dpkg-query) goes through the shared bounded argv runner (rung 2,
+//     run_bounded_subprocess -- no shell, no popen); entitlement_certs reads the
+//     certificates and their notAfter in-process via libcrypto
+//     (licensing_x509.hpp, no subprocess). CONSTRAINED (was SUPPORTED at rung 3)
+//     by a deliberate Alex/K-review decision, not a regression in what the
+//     surfaces do: pkg_metadata is a declared-licence CLASSIFICATION only (no
+//     lapse detection -- a gap independent of the acquisition mechanism, see the
+//     file's own header comment), and whether the agent's account can read
+//     /etc/pki/entitlement on a real RHEL host is UNMEASURED (a refused
+//     directory or certificate reports cert_permission_denied).
+//   - macOS (licensing_macos.cpp run_platform_surfaces): pure filesystem glob +
+//     in-house plist parsing, no exec at all (rung 1). XML Info.plist files go
+//     through plist_string_value and binary (bplist00) ones through the bounded
+//     decoder in licensing_bplist.hpp; a plist neither can decode falls back to
+//     the bundle name with an empty version. SUPPORTED: the binary decoder was
+//     measured 2026-10-26 on a real host (unprivileged user) byte-for-byte
+//     against plutil over every binary /Applications Info.plist. vendor_plists
+//     rows stay presence-only and the MAS receipt PKCS#7 is not validated
+//     (declared below).
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         "list",
-        {YUZU_SUPPORT_CONSTRAINED, 2, "rpm/dpkg-query/openssl via bounded argv runner",
-         "declared-licence classification only (no lapse detection) for pkg_metadata; "
-         "entitlement_certs' authoritative expiry still depends on the openssl CLI being "
-         "present"},
-        {YUZU_SUPPORT_CONSTRAINED, 1, "filesystem_probe(glob+plist)",
-         "binary (bplist00) Info.plist files are not parsed; falls back to the bundle "
-         "name with an empty version"},
+        {YUZU_SUPPORT_CONSTRAINED, 2, "rpm/dpkg-query via bounded argv runner; in-process libcrypto X.509",
+         "pkg_metadata is declared-licence classification only (no lapse detection); entitlement "
+         "cert readability on RHEL is unmeasured -- a refused directory or cert reports "
+         "cert_permission_denied"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "filesystem_probe(glob+plist, XML and bplist00)",
+         "vendor_plists rows are presence-only (status unknown); MAS receipt PKCS#7 is not "
+         "validated"},
         {YUZU_SUPPORT_SUPPORTED, 1, "wmi+win32_registry", nullptr},
     },
     {
         "surfaces",
-        {YUZU_SUPPORT_CONSTRAINED, 2, "rpm/dpkg-query/openssl via bounded argv runner",
-         "declared-licence classification only (no lapse detection) for pkg_metadata; "
-         "entitlement_certs' authoritative expiry still depends on the openssl CLI being "
-         "present"},
-        {YUZU_SUPPORT_CONSTRAINED, 1, "filesystem_probe(glob+plist)",
-         "binary (bplist00) Info.plist files are not parsed; falls back to the bundle "
-         "name with an empty version"},
+        {YUZU_SUPPORT_CONSTRAINED, 2, "rpm/dpkg-query via bounded argv runner; in-process libcrypto X.509",
+         "pkg_metadata is declared-licence classification only (no lapse detection); entitlement "
+         "cert readability on RHEL is unmeasured -- a refused directory or cert reports "
+         "cert_permission_denied"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "filesystem_probe(glob+plist, XML and bplist00)",
+         "vendor_plists rows are presence-only (status unknown); MAS receipt PKCS#7 is not "
+         "validated"},
         {YUZU_SUPPORT_SUPPORTED, 1, "wmi+win32_registry", nullptr},
     },
 };

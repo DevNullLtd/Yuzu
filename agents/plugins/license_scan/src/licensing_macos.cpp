@@ -6,11 +6,11 @@
  *   mas_receipt   — /Applications/*.app/Contents/_MASReceipt/receipt presence
  *                   + Info.plist identity (probable: App Store purchased).
  *                   Identity comes from the XML-plist reader in
- *                   licensing_parsers.hpp; a BINARY Info.plist (bplist00)
- *                   falls back to the .app bundle name with an honest-empty
- *                   version — parsing binary plists without a Mac to verify
- *                   against is not attempted (deliberately lean; recorded in
- *                   the implementation report).
+ *                   licensing_parsers.hpp or, for a BINARY Info.plist
+ *                   (bplist00), the bounded decoder in licensing_bplist.hpp.
+ *                   Only a plist neither reader can decode (oversized,
+ *                   unreadable, malformed) falls back to the .app bundle name
+ *                   with an honest-empty version.
  *   vendor_plists — machine-scope vendor plists via the ProbeSpec table
  *                   (Office volume licence plist, Parallels) — presence
  *                   probes only (probable/heuristic); the payloads are
@@ -23,10 +23,14 @@
 
 #ifdef __APPLE__
 
+#include "licensing_bplist.hpp"
 #include "licensing_parsers.hpp"
 #include "licensing_probes.hpp"
 #include "licensing_record.hpp"
 
+#include <cstddef>
+#include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -35,6 +39,11 @@
 namespace yuzu::license_scan {
 
 namespace {
+
+// An Info.plist is a few KiB to ~60 KiB (Word's XML is the largest seen); the
+// cap bounds a hostile or runaway file. Oversized/unreadable/undecodable falls
+// back to the bundle name, as it always has.
+constexpr std::size_t kInfoPlistCapBytes = 4 * 1024 * 1024;
 
 std::string bundle_name_from_app_path(const std::string& app_path) {
     // ".../Foo.app" -> "Foo"
@@ -58,16 +67,26 @@ void run_mas_receipt_surface(ProbeHost& host, std::vector<LicRecord>& records,
 
         LicRecord r;
         r.vendor = ""; // unknown — never synthesised
-        const auto info = host.read_file_prefix(app_path + "/Contents/Info.plist", 256 * 1024);
-        if (info && info->rfind("bplist00", 0) != 0) {
-            // XML plist: read the bundle identity directly.
-            r.product = plist_string_value(*info, "CFBundleDisplayName");
-            if (r.product.empty())
-                r.product = plist_string_value(*info, "CFBundleName");
-            r.version = plist_string_value(*info, "CFBundleShortVersionString");
+        const auto info = host.read_file_capped(app_path + "/Contents/Info.plist", kInfoPlistCapBytes);
+        if (info.data) {
+            if (info.data->rfind("bplist00", 0) == 0) {
+                // Binary plist: bounded top-level string lookup (pure decoder).
+                const std::span<const std::uint8_t> bytes{
+                    reinterpret_cast<const std::uint8_t*>(info.data->data()), info.data->size()};
+                r.product = bplist_string_for_key(bytes, "CFBundleDisplayName").value_or("");
+                if (r.product.empty())
+                    r.product = bplist_string_for_key(bytes, "CFBundleName").value_or("");
+                r.version = bplist_string_for_key(bytes, "CFBundleShortVersionString").value_or("");
+            } else {
+                // XML plist: read the bundle identity directly.
+                r.product = plist_string_value(*info.data, "CFBundleDisplayName");
+                if (r.product.empty())
+                    r.product = plist_string_value(*info.data, "CFBundleName");
+                r.version = plist_string_value(*info.data, "CFBundleShortVersionString");
+            }
         }
         if (r.product.empty())
-            r.product = bundle_name_from_app_path(app_path); // binary-plist fallback
+            r.product = bundle_name_from_app_path(app_path); // undecodable-plist fallback
         if (r.product.empty())
             continue;
         r.license_type = "retail"; // an App Store purchase receipt

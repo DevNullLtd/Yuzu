@@ -4,7 +4,10 @@
  *
  * Compiles on every OS: all platform I/O goes through ProbeHost, and the only
  * platform-conditional code here is the UTF-8 <-> std::filesystem::path
- * conversion (Windows paths are UTF-16 natively).
+ * conversion (Windows paths are UTF-16 natively) and the two errno-aware
+ * primitives read_file_capped / list_dir, which use the shared POSIX
+ * posix_secure_read.hpp off Windows (the Windows bodies are plain
+ * ifstream / directory_iterator shapes that no Windows leg calls).
  *
  * Interpreters emit ONLY §3.2 closed-vocabulary values and never fabricate:
  * presence without licence evidence is status `unknown`; a parsed vendor
@@ -14,12 +17,17 @@
 #include "licensing_probes.hpp"
 #include "licensing_parsers.hpp"
 
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <system_error>
 
 #ifdef _WIN32
 #include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681, R17)
+#else
+#include <dirent.h>
+
+#include <posix_secure_read.hpp> // errno-aware bounded file read + directory open (SAM.10)
 #endif
 
 namespace yuzu::license_scan {
@@ -181,6 +189,93 @@ std::optional<std::string> ProbeHost::read_file_prefix(std::string_view path,
     f.read(content.data(), static_cast<std::streamsize>(max_bytes));
     content.resize(static_cast<std::size_t>(f.gcount()));
     return content;
+}
+
+CappedRead ProbeHost::read_file_capped(std::string_view path, std::size_t cap) {
+    CappedRead out;
+#ifndef _WIN32
+    using yuzu::shared::ReadError;
+    auto fr = yuzu::shared::read_file(std::string(path), cap, yuzu::shared::Leaf::follow);
+    switch (fr.error) {
+    case ReadError::none:
+        out.data = std::move(fr.data);
+        break;
+    case ReadError::oversized:
+        out.oversized = true;
+        break;
+    case ReadError::io:
+        // fr.err is the errno captured at the failing call. NEVER read the
+        // ambient errno here: the helper's fd cleanup may have clobbered it.
+        out.err = fr.err != 0 ? fr.err : EIO;
+        break;
+    case ReadError::symlink_refused: // unreachable under Leaf::follow; fail closed anyway
+    case ReadError::not_regular:     // FIFO / device / directory: refused without blocking
+        out.err = EINVAL;
+        break;
+    }
+#else
+    // Windows never calls this (the Windows legs use the registry and
+    // read_file_prefix); a plain bounded ifstream read keeps the type usable.
+    std::ifstream f(path_from_utf8(path), std::ios::binary);
+    if (!f) {
+        out.err = EIO;
+        return out;
+    }
+    std::string content(cap, '\0');
+    f.read(content.data(), static_cast<std::streamsize>(cap));
+    const auto got = static_cast<std::size_t>(f.gcount());
+    if (got == cap && f.peek() != std::ifstream::traits_type::eof()) {
+        out.oversized = true;
+        return out;
+    }
+    content.resize(got);
+    out.data = std::move(content);
+#endif
+    return out;
+}
+
+DirListing ProbeHost::list_dir(std::string_view path, std::size_t max_entries) {
+    DirListing out;
+#ifndef _WIN32
+    const auto open = yuzu::shared::open_dir(std::string(path), yuzu::shared::Leaf::follow);
+    if (!open.opened()) {
+        out.err = open.err != 0 ? open.err : EIO;
+        return out;
+    }
+    for (;;) {
+        errno = 0; // readdir returns NULL for both end-of-stream and error; errno tells which
+        const struct dirent* ent = ::readdir(open.dir.get());
+        if (ent == nullptr) {
+            if (errno != 0)
+                out.err = errno;
+            break;
+        }
+        const std::string_view name = ent->d_name;
+        if (name == "." || name == "..")
+            continue;
+        if (out.names.size() >= max_entries) {
+            out.truncated = true; // an entry exists beyond the budget
+            break;
+        }
+        out.names.emplace_back(name);
+    }
+#else
+    // Windows never calls this; same shape on a directory_iterator.
+    std::error_code ec;
+    fs::directory_iterator it(path_from_utf8(path), ec);
+    if (ec) {
+        out.err = EIO;
+        return out;
+    }
+    for (const auto& entry : it) {
+        if (out.names.size() >= max_entries) {
+            out.truncated = true;
+            break;
+        }
+        out.names.push_back(path_to_utf8(entry.path().filename()));
+    }
+#endif
+    return out;
 }
 
 // ── interpreters ────────────────────────────────────────────────────────────

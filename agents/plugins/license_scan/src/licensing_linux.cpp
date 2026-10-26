@@ -10,10 +10,11 @@
  *                       os-capability-matrix rows.
  *   entitlement_certs — RHEL entitlement certificates
  *                       (/etc/pki/entitlement/*.pem notAfter). Authoritative
- *                       subscription expiry. Uses `openssl x509` via
- *                       subprocess, matching the certificates plugin's
- *                       established agent crypto usage — the agent has no
- *                       shared in-process X509 helper.
+ *                       subscription expiry, read in-process via libcrypto
+ *                       (licensing_x509.hpp, rung 1; no subprocess). A
+ *                       directory or certificate the agent may not read is
+ *                       `cert_permission_denied`, never an empty or clean
+ *                       surface.
  *   flexlm_lic        — FlexLM `.lic` files under conventional dirs, via the
  *                       ProbeSpec table rows (pure INCREMENT parser;
  *                       authoritative expiry).
@@ -25,17 +26,21 @@
 
 #ifdef __linux__
 
-#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (ADR-3002 rung 2)
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (ADR-3002 rung 2; pkg_metadata only)
 
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include "licensing_parsers.hpp"
 #include "licensing_probes.hpp"
 #include "licensing_record.hpp"
+#include "licensing_x509.hpp"
 
 namespace yuzu::license_scan {
 
@@ -218,46 +223,79 @@ void run_pkg_metadata_surface(ProbeHost& host, std::vector<LicRecord>& records,
 
 // ── entitlement_certs (surface table Linux row 2; authoritative) ───────────
 
-// Aggregate wall-clock budget for the WHOLE per-cert loop below, not the
-// per-openssl-run deadline (20s, unnamed at each run_argv call). This is a
-// START-GATE checked before each iteration, not a hard cap on the loop's
-// total cost: an iteration already admitted can still run up to two 20s
-// openssl runs (the -dateopt fallback) before the NEXT admission check, so
-// the loop's real worst case is this budget plus one cert's cost -- up to
-// ~100s, not 60s. Still bounds what would otherwise be unbounded: a
-// directory with many certs -- 512 x 2 x 20s is several hours -- could pin
-// the instruction worker on a single entitlement_certs call without it.
-// Strictly better than the pre-migration unbounded popen this replaced (no
-// budget at all), but cheap enough to add here too.
-constexpr std::chrono::seconds kEntitlementCertsScanBudget{60};
+constexpr std::string_view kEntitlementDir = "/etc/pki/entitlement";
+constexpr std::size_t kMaxDirEntries = 4096;         // more entries = truncated listing
+constexpr std::size_t kPemFileCapBytes = 64 * 1024;  // larger file = parse failure, never a partial parse
+constexpr std::size_t kMaxCertFiles = 64;            // more candidate files = budget exhausted
+constexpr std::size_t kMaxCertsPerFile = 16;         // a 17th cert in one file = budget exhausted
+
+// START GATE checked before each certificate file is read -- cooperative, NOT a
+// hard deadline. The directory listing precedes the gate and a single blocking
+// read (e.g. a cert reached through a followed link onto a dead network mount;
+// open/read carry no deadline, O_NONBLOCK is inert on regular files) can
+// overrun it. /etc/pki/entitlement is a fixed root-owned path on the root
+// filesystem by subscription-manager's contract, so no mount-table guard here
+// (the README names this residual, same shape as runtimes/#4875). With the
+// in-process reads below the budget only bounds a slow filesystem, not a
+// subprocess; it replaces the 60 s gate the openssl runs needed.
+constexpr std::chrono::seconds kEntitlementCertsScanBudget{10};
+
+bool ends_with(std::string_view s, std::string_view suffix) {
+    return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+bool is_refusal(int err) {
+    return err == EACCES || err == EPERM;
+}
 
 void run_entitlement_certs_surface(ProbeHost& host, std::vector<LicRecord>& records,
                                    std::vector<ProbeOutcome>& outcomes) {
-    auto pems = host.glob("/etc/pki/entitlement/*.pem");
-    // Entitlement key pairs live beside the certs as <serial>-key.pem — skip.
-    std::vector<std::string> certs;
-    for (auto& p : pems) {
-        if (p.size() >= 8 && p.compare(p.size() - 8, 8, "-key.pem") == 0)
-            continue;
-        certs.push_back(std::move(p));
-    }
-    if (certs.empty()) {
+    const auto dir = host.list_dir(kEntitlementDir, kMaxDirEntries);
+    if (dir.err == ENOENT || dir.err == ENOTDIR) {
+        // Not a RHEL-family host (or no subscription): a probe that ran and
+        // found nothing is a structural success (ADR-0024 D3).
         outcomes.push_back({"entitlement_certs", true, 0, {}});
         return;
     }
-    auto openssl = yuzu::agent::probe_tool_path({"/usr/bin/openssl", "/bin/openssl"});
-    if (openssl.empty()) {
-        // Certs exist but cannot be parsed — a real failure, not empty.
-        outcomes.push_back({"entitlement_certs", false, 0, "openssl_unavailable"});
+    if (is_refusal(dir.err)) {
+        // The agent may not list the directory: a refusal, NEVER ok|0 -- on this
+        // authoritative surface the sync would otherwise full-replace the
+        // host's stored entitlement records to empty.
+        outcomes.push_back(entitlement_certs_outcome(true, false, 0, false));
+        return;
+    }
+    if (dir.err != 0) {
+        // Any other open/read failure: an unlistable directory is a failed
+        // surface, never an empty one.
+        outcomes.push_back(entitlement_certs_outcome(false, false, 0, true));
+        return;
+    }
+
+    bool budget_exhausted = dir.truncated; // entries beyond the listing cap were never seen
+    // Entitlement key pairs live beside the certs as <serial>-key.pem -- skip.
+    // Filter the WHOLE listing first, then sort (deterministic row order for
+    // the daily-sync hash), then cap the file count.
+    std::vector<std::string> certs;
+    for (const auto& name : dir.names) {
+        if (ends_with(name, ".pem") && !ends_with(name, "-key.pem"))
+            certs.push_back(name);
+    }
+    std::sort(certs.begin(), certs.end());
+    if (certs.size() > kMaxCertFiles) {
+        budget_exhausted = true;
+        certs.resize(kMaxCertFiles);
+    }
+    if (certs.empty() && !budget_exhausted) {
+        outcomes.push_back({"entitlement_certs", true, 0, {}});
         return;
     }
 
     const long long now = host.now_epoch();
     std::size_t emitted = 0;
+    bool permission_denied = false;
     bool any_parse_failure = false;
-    bool budget_exhausted = false;
     const auto scan_deadline = std::chrono::steady_clock::now() + kEntitlementCertsScanBudget;
-    for (const auto& cert : certs) {
+    for (const auto& name : certs) {
         if (std::chrono::steady_clock::now() >= scan_deadline) {
             // Whatever was already parsed is real data, kept -- only the
             // remaining certs are unaccounted for, reported below via the
@@ -265,48 +303,48 @@ void run_entitlement_certs_surface(ProbeHost& host, std::vector<LicRecord>& reco
             budget_exhausted = true;
             break;
         }
-        // -dateopt iso_8601 where supported; parse_openssl_enddate also
-        // accepts the older default date format. The cert path is globbed from
-        // /etc/pki/entitlement (attacker-influenceable filenames) -- as a
-        // plain argv element it is injection-proof by construction, no
-        // shell-quoting needed (shell_single_quote is gone: there is no
-        // shell left to escape against).
-        // license_scan/run_entitlement_certs_surface_linux#1 (docs/agent-spawn-sink-manifest.md)
-        auto res = run_argv(
-            {openssl, "x509", "-noout", "-enddate", "-dateopt", "iso_8601", "-in", cert});
-        if (!res.ok || res.truncated) {
-            // license_scan/run_entitlement_certs_surface_linux#2 (docs/agent-spawn-sink-manifest.md)
-            res = run_argv({openssl, "x509", "-noout", "-enddate", "-in", cert});
-        }
-        const std::string not_after =
-            (res.ok && !res.truncated) ? parse_openssl_enddate(res.output) : std::string{};
-        if (not_after.empty()) {
-            any_parse_failure = true;
+        const auto file =
+            host.read_file_capped(std::string(kEntitlementDir) + "/" + name, kPemFileCapBytes);
+        if (!file.data) {
+            // oversized (never a truncated parse) and every non-refusal failure
+            // are parse failures; a refusal is its own, higher-precedence token.
+            if (!file.oversized && is_refusal(file.err))
+                permission_denied = true;
+            else
+                any_parse_failure = true;
             continue;
         }
-        LicRecord r;
-        r.product = "Red Hat subscription entitlement";
-        r.vendor = "Red Hat";
-        r.license_type = "subscription";
-        r.expires_at = not_after;
-        // not_after is a UTC-midnight epoch string; compare it numerically to
-        // the collection day (whole-day granularity — epoch decimal strings do
-        // not lexicographically sort across widths). The server-side evaluator
-        // re-derives lapse against its own clock — this is the agent-observed
-        // state.
-        const long long expiry_epoch = std::strtoll(not_after.c_str(), nullptr, 10);
-        const long long today_epoch = now - (now % 86400);
-        r.status = (expiry_epoch > 0 && expiry_epoch < today_epoch) ? "expired"
-                                                                    : "subscription_active";
-        r.source = "entitlement_cert";
-        r.confidence = "authoritative";
-        records.push_back(std::move(r));
-        ++emitted;
+        const auto parsed = parse_pem_not_after(*file.data, kMaxCertsPerFile);
+        if (parsed.parse_failure)
+            any_parse_failure = true;
+        if (parsed.cert_cap_hit)
+            budget_exhausted = true;
+        for (const auto& not_after : parsed.expires_wire) {
+            LicRecord r;
+            r.product = "Red Hat subscription entitlement";
+            r.vendor = "Red Hat";
+            r.license_type = "subscription";
+            r.expires_at = not_after;
+            // not_after is a UTC-midnight epoch string; compare it numerically
+            // to the collection day (whole-day granularity -- epoch decimal
+            // strings do not lexicographically sort across widths). The
+            // server-side evaluator re-derives lapse against its own clock --
+            // this is the agent-observed state.
+            const long long expiry_epoch = std::strtoll(not_after.c_str(), nullptr, 10);
+            const long long today_epoch = now - (now % 86400);
+            r.status = (expiry_epoch > 0 && expiry_epoch < today_epoch) ? "expired"
+                                                                        : "subscription_active";
+            r.source = "entitlement_cert";
+            r.confidence = "authoritative";
+            records.push_back(std::move(r));
+            ++emitted;
+        }
     }
 
     // See entitlement_certs_outcome()'s doc comment (licensing_parsers.hpp)
     // for the honest-degrade invariants this classification encodes.
-    outcomes.push_back(entitlement_certs_outcome(budget_exhausted, emitted, any_parse_failure));
+    outcomes.push_back(
+        entitlement_certs_outcome(permission_denied, budget_exhausted, emitted, any_parse_failure));
 }
 
 } // namespace

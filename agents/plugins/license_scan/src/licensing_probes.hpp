@@ -40,6 +40,34 @@ namespace yuzu::license_scan {
 enum class Platform { windows_os, linux_os, macos_os };
 enum class Scope { machine, user };
 
+/// Result of ProbeHost::read_file_capped. Exactly one of three shapes:
+///   - data set, err 0, oversized false  — the whole file, <= cap bytes;
+///   - oversized true, data nullopt, err 0 — the file is larger than the cap
+///     (never a truncated read: a caller must not parse half a certificate);
+///   - data nullopt, err != 0 — the open/read failed; `err` is the errno the
+///     failing call reported (copied at the failure site, never read from the
+///     ambient errno afterwards). A non-regular file (FIFO, device) reports
+///     EINVAL.
+/// Callers distinguish absence (ENOENT/ENOTDIR) from refusal (EACCES/EPERM);
+/// the plain ifstream-based read_file_prefix cannot.
+struct CappedRead {
+    std::optional<std::string> data;
+    int err = 0;
+    bool oversized = false;
+};
+
+/// Result of ProbeHost::list_dir: the entry NAMES of one directory (no `.`/`..`,
+/// no stat, no filtering), in readdir order. `err` is the open errno (0 on
+/// success), so an absent directory (ENOENT/ENOTDIR) is distinguishable from
+/// one the agent may not list (EACCES/EPERM). `truncated` is set when
+/// `max_entries` was reached with entries still unread: `names` is then a
+/// prefix and the caller must report an incomplete scan, never a clean one.
+struct DirListing {
+    std::vector<std::string> names;
+    int err = 0;
+    bool truncated = false;
+};
+
 /// I/O the engine and interpreters may perform. Filesystem operations have
 /// working defaults (licensing_probes.cpp, std::filesystem — bounded);
 /// registry operations default to "absent" and are overridden by the Windows
@@ -81,6 +109,19 @@ public:
     /// First max_bytes of a file, or nullopt when unreadable.
     virtual std::optional<std::string> read_file_prefix(std::string_view path,
                                                         std::size_t max_bytes);
+    /// Whole regular file up to `cap` bytes with errno-aware failure (see
+    /// CappedRead). The final path component IS followed (Leaf::follow): every
+    /// consumer reads an admin/root-owned tree (/etc/pki/entitlement,
+    /// /Applications/*.app) and the cap + regular-file check bound what a link
+    /// there can cost. POSIX implementation: yuzu::shared::read_file; the
+    /// Windows default is a plain ifstream read with err 0 (Windows never calls
+    /// it).
+    virtual CappedRead read_file_capped(std::string_view path, std::size_t cap);
+    /// Entry names of one directory, errno-aware and bounded (see DirListing).
+    /// The leaf is followed (Leaf::follow), same reasoning as read_file_capped.
+    /// POSIX implementation: yuzu::shared::open_dir + readdir on the fd; the
+    /// Windows default is a directory_iterator walk with err 0.
+    virtual DirListing list_dir(std::string_view path, std::size_t max_entries);
 
     /// Collection time (UTC epoch seconds) — virtual so tests can pin it and
     /// countdown→absolute-date conversions stay deterministic per run.

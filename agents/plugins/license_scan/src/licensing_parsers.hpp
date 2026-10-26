@@ -559,24 +559,31 @@ inline std::string plist_string_value(std::string_view xml, std::string_view key
 // ── entitlement_certs outcome decision (pure seam) ─────────────────────────
 
 /// Classifies the outcome of the Linux `entitlement_certs` surface scan from
-/// three plain facts, so the decision is unit-testable without a real
-/// `/etc/pki/entitlement` directory or an `openssl` subprocess. Mirrors
-/// `run_entitlement_certs_surface`'s (licensing_linux.cpp) four-way branch
-/// exactly -- kept here rather than inline so a future refactor of that
-/// impure shell can't silently regress either of the two honest-degrade
-/// invariants it encodes:
-///   - a scan that stopped early (`budget_exhausted`) with certs left
-///     unexamined is NEVER reported clean, whatever was parsed before the
-///     deadline;
+/// four plain facts, so the decision is unit-testable without a real
+/// `/etc/pki/entitlement` directory. Mirrors `run_entitlement_certs_surface`'s
+/// (licensing_linux.cpp) branches exactly -- kept here rather than inline so a
+/// future refactor of that impure shell can't silently regress the
+/// honest-degrade invariants it encodes. Fixed precedence:
+/// permission_denied > budget_exhausted > parse_failed > parse_partial > ok.
+///   - a refusal (`permission_denied`: the agent could not list the directory,
+///     or could not read a certificate) is NEVER an empty or clean surface --
+///     "could not check" is not "nothing there". Whatever certs were parsed
+///     are still carried in `rows`;
+///   - a scan that stopped early (`budget_exhausted`: start gate, truncated
+///     listing, too many files or certs) with certs left unexamined is NEVER
+///     reported clean, whatever was parsed before it;
 ///   - a scan where at least one cert parsed AND at least one failed
 ///     (`any_parse_failure` with `emitted > 0`) is NEVER reported as a clean
 ///     success -- a lapsed or corrupt entitlement cert must not silently
 ///     vanish from this authoritative compliance surface. Kept distinct from
 ///     the total-failure case (`emitted == 0`) so an operator can tell "some
 ///     certs unreadable" from "couldn't read any of them".
-[[nodiscard]] inline ProbeOutcome entitlement_certs_outcome(bool budget_exhausted,
+[[nodiscard]] inline ProbeOutcome entitlement_certs_outcome(bool permission_denied,
+                                                             bool budget_exhausted,
                                                              std::size_t emitted,
                                                              bool any_parse_failure) {
+    if (permission_denied)
+        return ProbeOutcome{"entitlement_certs", false, emitted, "cert_permission_denied"};
     if (budget_exhausted)
         return ProbeOutcome{"entitlement_certs", false, emitted, "cert_scan_budget_exhausted"};
     if (emitted == 0 && any_parse_failure)
@@ -584,6 +591,17 @@ inline std::string plist_string_value(std::string_view xml, std::string_view key
     if (any_parse_failure)
         return ProbeOutcome{"entitlement_certs", false, emitted, "cert_parse_partial"};
     return ProbeOutcome{"entitlement_certs", true, emitted, {}};
+}
+
+/// True when any outcome is a refusal reported by `entitlement_certs_outcome`
+/// (`cert_permission_denied`). The plugin maps it to PERMISSION_DENIED instead
+/// of the generic CONSTRAINED surface error.
+[[nodiscard]] inline bool has_permission_denied_outcome(const std::vector<ProbeOutcome>& outcomes) {
+    for (const auto& o : outcomes) {
+        if (!o.ok && o.error == "cert_permission_denied")
+            return true;
+    }
+    return false;
 }
 
 // ── per_user_hives outcome decision (pure seam) ────────────────────────────
