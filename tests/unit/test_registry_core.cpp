@@ -2061,6 +2061,13 @@ TEST_CASE("registry core: names_equal_ascii_ci folds A-Z only", "[registry][core
     // the characters between 'Z' and 'a' are not letters
     CHECK_FALSE(names_equal_ascii_ci("[", "{"));
     CHECK_FALSE(names_equal_ascii_ci("@", "`"));
+    // a name is never equated with itself plus a NUL, in either order (the kernel name carries the NUL, the
+    // requested one does not, and the reverse)
+    CHECK_FALSE(names_equal_ascii_ci("L", std::string_view{"L\0", 2}));
+    CHECK_FALSE(names_equal_ascii_ci(std::string_view{"L\0", 2}, "L"));
+    // U+FFFD on the requested side: equal only to the same bytes, never to the plain name
+    CHECK(names_equal_ascii_ci("L\xEF\xBF\xBD", "L\xEF\xBF\xBD"));
+    CHECK_FALSE(names_equal_ascii_ci("L\xEF\xBF\xBD", "L"));
 }
 
 TEST_CASE("registry fast_open_hive: HKLM and HKU only", "[registry][core]") {

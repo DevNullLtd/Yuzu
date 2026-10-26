@@ -995,6 +995,18 @@ invocation selects `--suite platform` instead of `--suite docs` (the
 `assert-suite-cover.py` guard names `--exclude-suite docs`, so a missed
 label still fails loud.
 
+`Test (non-pg suites)` also carries the registry plugin's real-registry cases (#6488). It sets
+`YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1`, so a case that would skip (no `registry.dll`, or a process that
+cannot write `HKLM`; the job runs as LOCAL SYSTEM, which can) fails instead. The job-level
+`YUZU_TEST_REGISTRY_SCOPE` (`<run id>-<attempt>-<build type>`) puts every scratch key under
+`YuzuTest-<scope>-`, so two test phases sharing a box through the 2-slot gate judge only their own keys.
+Before the suite, `Self-test the registry leftover check` plants a probe key and proves both decisions of
+`scripts/ci/check-registry-test-leftovers.ps1` (the probe's own scope: exit 1 with an `::error` naming it; any
+other scope: exit 0 with a `::warning`); after it, `Assert this job left no YuzuTest-* registry keys behind` runs
+the same script with the job's scope. It reports and never deletes (a leftover can be a registry link, and a
+tree delete follows links), so a key orphaned by a cancelled job stays as a warning in later jobs until a human
+removes it.
+
 `nightly.yml`'s `windows-asan` job now joins this same `with-test-slot.sh 2`
 gate and carries `--timeout-multiplier 2` (#4018) — previously it ran
 ungated, with no multiplier, on the shared 4-runner Wee Tam box. It shares

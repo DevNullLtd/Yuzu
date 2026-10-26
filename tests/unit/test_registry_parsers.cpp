@@ -15,7 +15,6 @@
 #include <string_view>
 #include <vector>
 
-#include "registry_core.hpp" // names_equal_ascii_ci
 #include "registry_parsers.hpp"
 
 using namespace yuzu::registry;
@@ -667,7 +666,4 @@ TEST_CASE("registry kernel_name_well_formed: no NUL unit, no lone surrogate; a p
     CHECK_FALSE(kernel_name_well_formed(u"\xD800"));
     CHECK_FALSE(kernel_name_well_formed(std::u16string_view{u"L\0", 2}));
     CHECK_FALSE(kernel_name_well_formed(std::u16string_view{u"\0L", 2}));
-    SECTION("the compare never equates a name with the same name plus a NUL") {
-        CHECK_FALSE(names_equal_ascii_ci("L", std::string_view{"L\0", 2}));
-    }
 }

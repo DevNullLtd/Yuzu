@@ -137,7 +137,7 @@ security-posture plugin rows (the read-only posture plugins and the mutating reg
 Forensics/per-user-software-data). Walking only
 the first silently skips every access-control and request-admission chokepoint, which is where the
 highest-severity rows live: the authz-topology floor, dispatch confinement, dispatch targeting, the
-pre-auth body cap, and the ADR-1005 spine; skipping the third silently skips every read-only
+pre-auth body cap, and the ADR-1005 spine; skipping the third silently skips every
 security-posture plugin invariant; skipping the fourth silently skips the Forensics-class plugin
 rows (e.g. `browser_inventory`'s privacy contract). A row that is never opened routes nobody,
 which defeats the row's only job.

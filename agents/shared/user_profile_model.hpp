@@ -207,9 +207,10 @@ struct ProfileInfo {
 
 /// Folds ESC and the Unicode line breaks U+0085 (UTF-8 `C2 85`), U+2028 and U+2029 (`E2 80 A8` / `E2 80 A9`) to a
 /// single '_' each, in place. A terminal reads ESC as an escape introducer and a Unicode-aware splitter (Python's
-/// str.splitlines, a log viewer) reads the others as line ends, so none may survive in a rendered field. The same set
-/// as log_key_token (common/include/yuzu/log_token.hpp), which stays its own copy. Other control bytes (a tab in a
-/// process row) are deliberately left alone.
+/// str.splitlines, a log viewer) reads the others as line ends, so none may survive in a rendered field. The three
+/// Unicode line breaks are the set log_key_token (common/include/yuzu/log_token.hpp) folds; log_key_token also folds
+/// every C0 byte and DEL, this folds only ESC, so a tab in a process row stays. log_key_token is not reused on
+/// purpose: agents/shared stays free of common/include, and it would fold those tabs too.
 inline void fold_line_breaks(std::string& s) {
     std::size_t w = 0;
     for (std::size_t i = 0; i < s.size(); ++w) {

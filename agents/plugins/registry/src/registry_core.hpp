@@ -300,8 +300,8 @@ struct Opened {
 /// equates two names the kernel keeps distinct. A name that differs only in non-ASCII case compares unequal:
 /// the fast open declines and the walk's own name test (leaf_name_check) refuses it.
 [[nodiscard]] inline bool names_equal_ascii_ci(std::string_view a, std::string_view b) {
-    const auto fold = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; };
-    return std::equal(a.begin(), a.end(), b.begin(), b.end(), [&](char x, char y) { return fold(x) == fold(y); });
+    return std::equal(a.begin(), a.end(), b.begin(), b.end(),
+                      [](char x, char y) { return detail::lower_ascii(x) == detail::lower_ascii(y); });
 }
 
 /// The fast open (see the file banner). ACCEPT => `fast` is set and `leaf` is the checked handle; every

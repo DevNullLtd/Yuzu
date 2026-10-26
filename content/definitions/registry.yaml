@@ -6,7 +6,7 @@ kind: InstructionDefinition
 metadata:
   id: windows.registry.get_value
   displayName: Get Registry Value
-  version: 1.0.0
+  version: 1.1.0
   description: >
     Read a value from the Windows registry. Value data is decoded for
     REG_SZ/REG_EXPAND_SZ/REG_DWORD/REG_QWORD; every other type, including

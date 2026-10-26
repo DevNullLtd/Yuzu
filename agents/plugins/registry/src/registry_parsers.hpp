@@ -131,15 +131,24 @@ inline constexpr std::string_view kErrInvalidHive = "error|invalid hive (use HKL
     return std::unexpected{kErrInvalidHive};
 }
 
+namespace detail {
+
+/// The one ASCII fold the plugin uses: A-Z to a-z, every other byte (including a non-ASCII one) unchanged. A strict
+/// subset of the kernel's case folding, so a compare built on it never equates two names the kernel keeps distinct.
+[[nodiscard]] constexpr char lower_ascii(char c) noexcept {
+    return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c;
+}
+
+} // namespace detail
+
 /// L7: whether an access names a path the agent log should note (the Run keys and the service tree under HKLM).
 /// ASCII-case-insensitive prefix match on the raw, not yet validated, key; no copy of it.
 [[nodiscard]] inline bool is_sensitive_hklm_path(std::string_view hive, std::string_view key_path) noexcept {
     if (hive != "HKLM") return false;
     const auto starts_ci = [&](std::string_view upper_prefix) {
         return key_path.size() >= upper_prefix.size() &&
-               std::equal(upper_prefix.begin(), upper_prefix.end(), key_path.begin(), [](char p, char c) {
-                   return p == (c >= 'a' && c <= 'z' ? static_cast<char>(c - 32) : c);
-               });
+               std::equal(upper_prefix.begin(), upper_prefix.end(), key_path.begin(),
+                          [](char p, char c) { return detail::lower_ascii(p) == detail::lower_ascii(c); });
     };
     return starts_ci("SOFTWARE\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\RUN") ||
            starts_ci("SYSTEM\\CURRENTCONTROLSET\\SERVICES");
@@ -206,8 +215,7 @@ inline void put_le(std::vector<std::uint8_t>& out, std::uint64_t v, int bytes) {
 /// ASCII-only lower-casing (registry key and value names compare case-insensitively).
 [[nodiscard]] inline std::string fold_ascii(std::string_view s) {
     std::string o{s};
-    for (char& c : o)
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+    for (char& c : o) c = lower_ascii(c);
     return o;
 }
 
@@ -524,7 +532,7 @@ struct AuditRecord {
 /// The front half of set_value: validate, encode, and record the type and new bytes on the audit record.
 /// `err` is empty on success. A missing or misspelt `value` / `data_hex` parameter arrives here as an empty string,
 /// so an empty text is a valid empty REG_SZ / REG_BINARY (and an invalid REG_DWORD); a REG_MULTI_SZ record
-/// separator is LF only (a CR is a control byte the record refuses).
+/// separator is LF only (a CR stays inside its record).
 struct PreparedSet {
     std::string_view err;
     std::optional<std::uint32_t> type;

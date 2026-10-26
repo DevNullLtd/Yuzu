@@ -9,11 +9,14 @@
  * elevation WARN and skip, and a skip is NOT evidence: YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1 (CI's Windows leg,
  * #6488, and the evidence runs) turns every skip into a FAIL -- see skip_or_fail(). Off Windows this TU pins
  * the planned-stub contract of the loaded plugin and the ABI-containment catch of its execute() (the #else
- * branch).
+ * branch). The last case, on every host, pins the scratch-key prefix helper the per-job leftover check relies on.
  */
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
+#include <string_view>
+
+#include "test_helpers.hpp"
 
 #ifdef _WIN32
 
@@ -34,7 +37,6 @@
 #include <win_reg_handle.hpp>
 
 #include "local_dispatcher.hpp"
-#include "test_helpers.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -976,3 +978,20 @@ TEST_CASE("registry plugin: an exception inside an off-Windows dispatch is conta
 }
 
 #endif // _WIN32
+
+// ═════════════════════════════════════════════════════════════════════════
+// every host: the scratch-key namespace CI's per-job leftover check keys on (#6488)
+// ═════════════════════════════════════════════════════════════════════════
+
+// scripts/ci/check-registry-test-leftovers.ps1 fails a job on a key named `YuzuTest-<scope>-*`, so a fixture whose
+// name does not carry the scope in exactly that form is invisible to it. The fixtures take their prefix from
+// registry_scratch_prefix(), and tests/test_registry_definition.py pins that no fixture spells the stem itself.
+TEST_CASE("registry_scratch_prefix puts the CI scope between the fixed stem and the salt", "[registry][scratch]") {
+    const std::string stem{"YuzuTest"};
+    const std::string bare = yuzu::test::registry_scratch_prefix(nullptr);
+    CHECK(bare == stem + "-");
+    CHECK(yuzu::test::registry_scratch_prefix("") == bare); // an empty scope is no scope
+    CHECK(yuzu::test::registry_scratch_prefix("abc") == stem + "-abc-");
+    // the shape CI sets: <run id>-<attempt>-<build type>
+    CHECK(yuzu::test::registry_scratch_prefix("123-2-debug") == stem + "-123-2-debug-");
+}
