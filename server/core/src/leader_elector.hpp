@@ -57,7 +57,9 @@
 #include "pg/pg_raii.hpp"
 #include "pg/pg_session_advisory_lock.hpp"
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -74,8 +76,51 @@ inline constexpr const char* kLeaderElectorStore = "leader_elector";
 /// background leader"; per-family leadership is deliberately NOT built).
 inline constexpr const char* kServerBackgroundLeaderLock = "server_background_leader";
 
+/// WS-11 (#4014): the CLOSED sets of causes the elector counts, with their
+/// exported label values. These arrays are the single source of truth for the
+/// `cause` label of `yuzu_server_leader_acquire_failures_total` /
+/// `yuzu_server_leader_lost_total` (`leader_metrics.hpp` seeds and publishes
+/// from them), so a count site, the exporter and the docs cannot drift.
+///
+/// An acquire FAILURE is an infrastructure fault. The normal follower outcome
+/// -- another replica holds the advisory lock (try-lock answered 'f') -- is
+/// DELIBERATELY not a failure and has no cause here.
+enum class AcquireFailure : std::size_t {
+    Connect = 0,     ///< No usable dedicated connection (open failed / fail-closed config).
+    LockQuery,       ///< The try-lock QUERY itself failed (transport error, not 't'/'f').
+    LockGuard,       ///< Lock granted but the release guard could not be constructed.
+    EpochRecord,     ///< Lock granted but the epoch could not be minted/recorded/parsed.
+};
+inline constexpr std::size_t kAcquireFailureCount = 4;
+inline constexpr std::array<const char*, kAcquireFailureCount> kAcquireFailureLabels = {
+    "connect", "lock_query", "lock_guard", "epoch_record"};
+
+/// Why leadership that WAS held was dropped. A failed heartbeat always drops
+/// leadership, so `LivenessFailed` is also the heartbeat-failure count.
+enum class LeadershipLoss : std::size_t {
+    LivenessFailed = 0, ///< The heartbeat / already-leader `SELECT 1` failed.
+    Resigned,           ///< Voluntary `resign()` while leading.
+};
+inline constexpr std::size_t kLeadershipLossCount = 2;
+inline constexpr std::array<const char*, kLeadershipLossCount> kLeadershipLossLabels = {
+    "liveness_failed", "resigned"};
+
 class LeaderElector {
 public:
+    /// A point-in-time copy of the elector's observability state (WS-11, #4014).
+    /// Plain values: a consumer holds no reference to the elector, so it cannot
+    /// reach a `mu_`-taking accessor (`is_open()`) from a scrape path.
+    struct Stats {
+        bool leader = false;
+        std::int64_t epoch = 0;         ///< Epoch this process leads at; 0 when not leading.
+        std::uint64_t acquired = 0;     ///< Leadership acquisitions by this process.
+        std::array<std::uint64_t, kAcquireFailureCount> acquire_failed{}; ///< By AcquireFailure.
+        std::array<std::uint64_t, kLeadershipLossCount> lost{};           ///< By LeadershipLoss.
+        /// `steady_clock` nanoseconds (since its epoch) of the last query the
+        /// dedicated connection answered successfully; 0 = never.
+        std::int64_t last_ok_steady_ns = 0;
+    };
+
     struct Config {
         std::string dsn;       ///< DSN for the dedicated coordination connection.
         std::string holder_id; ///< This process's identity (e.g. a boot-time random hex).
@@ -130,6 +175,20 @@ public:
     /// call when not leader. Leaves the connection open.
     void resign();
 
+    /// WS-11 (#4014): a lock-free snapshot of the observability counters and the
+    /// leadership belief. NEVER takes `mu_` (the election loop holds it across
+    /// blocking libpq calls; a /metrics scrape must not be able to stall behind
+    /// one -- the same rule as `is_leader()`/`epoch()`), so it is safe to call
+    /// from a scrape handler. Counters are relaxed atomics: each value is
+    /// individually exact, the set is not a single atomic cut (fine for
+    /// monotonic counters read by `increase()`).
+    ///
+    /// `is_leader` here is the replica's BELIEF (the attempt gate), not proof of
+    /// leadership: correctness is the epoch fence in a leader-driven claim's
+    /// write. `last_ok_steady_ns` is what makes a stale belief visible -- it stops
+    /// advancing when the dedicated connection stops answering.
+    [[nodiscard]] Stats stats() const noexcept;
+
     /// THE FENCE, as an SQL boolean expression to EMBED in a side-effecting
     /// claim's WRITE statement (its `WHERE`/guard). Returns SQL of the form:
     ///   ((SELECT current_leader_epoch FROM leader_elector.leader_state
@@ -182,7 +241,11 @@ public:
 
 private:
     bool connect_locked();          ///< (Re)establish the dedicated connection + run migrations.
-    void drop_leadership_locked();  ///< Release the lock guard and clear the cached epoch.
+    /// Release the lock guard and clear the cached epoch. With a `cause`, counts a
+    /// leadership LOSS -- but only if leadership was actually held (`epoch_` set),
+    /// so a drop on a follower or in an aborted acquire can never inflate it.
+    void drop_leadership_locked(std::optional<LeadershipLoss> cause = std::nullopt);
+    void note_ok_locked() noexcept;  ///< Stamp "the connection just answered a query".
 
     Config cfg_;
     bool name_valid_ = false;                 ///< cfg_.lock_name passed validation.
@@ -202,6 +265,13 @@ private:
     /// libpq probe stalled under `mu_` cannot block a worker tick's leadership
     /// read. `epoch_` above stays the writer's authoritative state under `mu_`.
     std::atomic<std::int64_t> live_epoch_{0};
+
+    // WS-11 (#4014) observability counters. Written only under `mu_` (plain
+    // fetch_add, no new locking), read lock-free by `stats()`.
+    std::atomic<std::uint64_t> acquired_{0};
+    std::array<std::atomic<std::uint64_t>, kAcquireFailureCount> acquire_failed_{};
+    std::array<std::atomic<std::uint64_t>, kLeadershipLossCount> lost_{};
+    std::atomic<std::int64_t> last_ok_steady_ns_{0}; ///< 0 = never answered.
 };
 
 } // namespace yuzu::server

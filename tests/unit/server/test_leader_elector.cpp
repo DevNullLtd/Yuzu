@@ -22,6 +22,7 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -30,6 +31,8 @@
 #include <string>
 #include <thread>
 
+using yuzu::server::AcquireFailure;
+using yuzu::server::LeadershipLoss;
 using yuzu::server::background_job_class;
 using yuzu::server::LeaderElector;
 using yuzu::server::kServerBackgroundLeaderLock;
@@ -81,6 +84,22 @@ int guarded_insert(PGconn* conn, const std::string& fence) {
     return std::atoi(PQcmdTuples(r.get()));
 }
 
+// WS-11 (#4014) Stats readers: index by the closed cause enums so a test names the
+// cause it asserts instead of a bare array slot.
+std::uint64_t failed(const LeaderElector::Stats& s, AcquireFailure c) {
+    return s.acquire_failed[static_cast<std::size_t>(c)];
+}
+std::uint64_t lost(const LeaderElector::Stats& s, LeadershipLoss c) {
+    return s.lost[static_cast<std::size_t>(c)];
+}
+bool no_failures(const LeaderElector::Stats& s) {
+    return std::all_of(s.acquire_failed.begin(), s.acquire_failed.end(),
+                       [](std::uint64_t v) { return v == 0; });
+}
+bool no_losses(const LeaderElector::Stats& s) {
+    return std::all_of(s.lost.begin(), s.lost.end(), [](std::uint64_t v) { return v == 0; });
+}
+
 } // namespace
 
 TEST_CASE("LeaderElector migrates schema and starts non-leader", "[pg][store][leader-elector]") {
@@ -101,8 +120,27 @@ TEST_CASE("LeaderElector acquires leadership and mints an epoch", "[pg][store][l
     CHECK(*e.epoch() >= 1);
     // Re-acquire while already leader keeps the same epoch (liveness re-check).
     const auto first = *e.epoch();
+    const auto st1 = e.stats();
     REQUIRE(e.try_acquire());
     CHECK(*e.epoch() == first);
+
+    // WS-11 (#4014) stats: one acquisition, leading at that epoch, the connection
+    // has answered, nothing failed or was lost.
+    CHECK(st1.leader);
+    CHECK(st1.epoch == first);
+    CHECK(st1.acquired == 1);
+    CHECK(st1.last_ok_steady_ns != 0);
+    CHECK(no_failures(st1));
+    CHECK(no_losses(st1));
+    // The already-leader re-check is a liveness probe, NOT a new acquisition ...
+    const auto st2 = e.stats();
+    CHECK(st2.acquired == 1);
+    // ... and it STAMPS last_ok (strictly later): dropping that stamp would let the
+    // age gauge grow on a healthy leader and fire YuzuLeaderCoordinationStale.
+    CHECK(st2.last_ok_steady_ns > st1.last_ok_steady_ns);
+    // heartbeat() stamps it too (a separate site from try_acquire's liveness check).
+    REQUIRE(e.heartbeat());
+    CHECK(e.stats().last_ok_steady_ns > st2.last_ok_steady_ns);
 }
 
 TEST_CASE("LeaderElector refuses a second elector while the first holds",
@@ -120,6 +158,23 @@ TEST_CASE("LeaderElector refuses a second elector while the first holds",
     CHECK_FALSE(b.try_acquire());
     CHECK_FALSE(b.is_leader());
     CHECK_FALSE(b.epoch().has_value());
+
+    // WS-11 (#4014): a refused lock is the NORMAL follower outcome, not a failure
+    // (it happens every poll on every follower; counting it would make the
+    // failures counter a heartbeat of noise). But the connection DID answer, so
+    // last_ok is stamped -- a healthy follower is not "stale".
+    const auto sb = b.stats();
+    CHECK_FALSE(sb.leader);
+    CHECK(sb.epoch == 0);
+    CHECK(sb.acquired == 0);
+    CHECK(no_failures(sb));
+    CHECK(no_losses(sb));
+    CHECK(sb.last_ok_steady_ns != 0);
+    CHECK_FALSE(b.try_acquire());
+    CHECK(b.stats().last_ok_steady_ns > sb.last_ok_steady_ns); // the 'f' answer stamps it
+    CHECK(no_failures(b.stats()));
+    // And the leader's own view is unaffected by a refused peer.
+    CHECK(a.stats().acquired == 1);
 }
 
 TEST_CASE("LeaderElector epoch is strictly monotonic across handover",
@@ -237,6 +292,12 @@ TEST_CASE("LeaderElector follower recovers after its backend is terminated (F1)"
     CHECK(led);
     CHECK(a.is_leader());
     CHECK(a.epoch().has_value());
+    // WS-11 (#4014): the heal went through the failed try-lock QUERY -- the only
+    // way a follower on a dead connection recovers -- so it is counted by cause.
+    const auto sa = a.stats();
+    CHECK(failed(sa, AcquireFailure::LockQuery) >= 1);
+    CHECK(lost(sa, LeadershipLoss::LivenessFailed) == 0); // it never led before the kill
+    CHECK(sa.acquired == 1);
 }
 
 TEST_CASE("LeaderElector heartbeat tracks leadership", "[pg][store][leader-elector]") {
@@ -247,6 +308,34 @@ TEST_CASE("LeaderElector heartbeat tracks leadership", "[pg][store][leader-elect
     CHECK(a.heartbeat()); // leader, connection live
     a.resign();
     CHECK_FALSE(a.heartbeat()); // resigned
+}
+
+TEST_CASE("LeaderElector counts a resign only when leadership was held (WS-11)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    LeaderElector a(cfg(db.dsn(), "holder-a"));
+    REQUIRE(a.is_open());
+
+    // resign() on a FOLLOWER counts nothing -- ServerImpl::stop() calls it
+    // unconditionally, so a miscount here would put a phantom loss on every
+    // follower's clean shutdown.
+    a.resign();
+    CHECK(no_losses(a.stats()));
+
+    REQUIRE(a.try_acquire());
+    a.resign();
+    const auto st = a.stats();
+    CHECK(lost(st, LeadershipLoss::Resigned) == 1);
+    CHECK(lost(st, LeadershipLoss::LivenessFailed) == 0);
+    CHECK_FALSE(st.leader);
+    CHECK(st.epoch == 0);
+
+    a.resign(); // already resigned: still exactly one
+    CHECK(lost(a.stats(), LeadershipLoss::Resigned) == 1);
+
+    // Re-leading is a second acquisition.
+    REQUIRE(a.try_acquire());
+    CHECK(a.stats().acquired == 2);
 }
 
 TEST_CASE("LeaderElector heartbeat drops leadership after its backend is terminated (#4013)",
@@ -278,6 +367,16 @@ TEST_CASE("LeaderElector heartbeat drops leadership after its backend is termina
     CHECK(dropped);
     CHECK_FALSE(a.is_leader());
     CHECK_FALSE(a.epoch().has_value());
+    // WS-11 (#4014): the failed heartbeat is exactly one liveness loss (this IS the
+    // heartbeat-failure counter: a failed heartbeat always drops leadership), and
+    // the acquisition tally has not moved yet.
+    {
+        const auto st = a.stats();
+        CHECK(lost(st, LeadershipLoss::LivenessFailed) == 1);
+        CHECK(lost(st, LeadershipLoss::Resigned) == 0);
+        CHECK(st.acquired == 1);
+        CHECK_FALSE(st.leader);
+    }
 
     // And it heals: a later acquire re-leads on the reconnected backend once the
     // dead session's advisory lock is gone.
@@ -290,6 +389,106 @@ TEST_CASE("LeaderElector heartbeat drops leadership after its backend is termina
     CHECK(led);
     CHECK(a.is_leader());
     CHECK(a.epoch().has_value());
+    CHECK(a.stats().acquired == 2); // re-leading is a new acquisition
+    CHECK(lost(a.stats(), LeadershipLoss::LivenessFailed) == 1); // and the loss is not re-counted
+}
+
+TEST_CASE("LeaderElector try_acquire's own liveness check counts a loss (WS-11)",
+          "[pg][store][leader-elector]") {
+    // The election loop calls heartbeat() while leading, but try_acquire() has its OWN
+    // already-leader liveness branch (a separate count site). Drive that one: kill the
+    // leader's backend, then keep calling try_acquire() instead of heartbeat().
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    LeaderElector a(cfg(db.dsn(), "holder-a"));
+    REQUIRE(a.try_acquire());
+    REQUIRE(a.stats().acquired == 1);
+
+    auto killer = connect(db.dsn());
+    PgResult k{PQexec(killer.get(),
+                      "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                      "WHERE datname = current_database() AND pid <> pg_backend_pid()")};
+    REQUIRE(k.status() == PGRES_TUPLES_OK);
+
+    // pg_terminate_backend is asynchronous: the victim may answer one more SELECT 1.
+    // Poll until the loss is observed, then until the elector has re-led.
+    bool lost_seen = false;
+    for (int i = 0; i < 80 && !lost_seen; ++i) {
+        (void)a.try_acquire();
+        lost_seen = lost(a.stats(), LeadershipLoss::LivenessFailed) >= 1;
+        if (!lost_seen)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    REQUIRE(lost_seen);
+    for (int i = 0; i < 80 && !(a.is_leader() && a.stats().acquired == 2); ++i) {
+        (void)a.try_acquire();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    const auto st = a.stats();
+    CHECK(lost(st, LeadershipLoss::LivenessFailed) == 1);
+    CHECK(lost(st, LeadershipLoss::Resigned) == 0);
+    CHECK(st.acquired == 2);
+    CHECK(a.is_leader());
+}
+
+TEST_CASE("LeaderElector counts a connect failure when the post-liveness reconnect fails (WS-11)",
+          "[pg][store][leader-elector]") {
+    // The other connect-failure site: the leader's liveness check fails, leadership is
+    // dropped, and the immediate reconnect ALSO fails. Make that real by forbidding new
+    // connections to the (ephemeral) database, then terminating the elector's backend.
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    LeaderElector a(cfg(db.dsn(), "holder-a"));
+    REQUIRE(a.try_acquire());
+
+    auto admin = connect(db.dsn()); // stays up: ALLOW_CONNECTIONS only gates NEW sessions
+    PgResult name{PQexec(admin.get(), "SELECT current_database()")};
+    REQUIRE(name.status() == PGRES_TUPLES_OK);
+    const std::string dbname = PQgetvalue(name.get(), 0, 0);
+    const std::string quoted = "\"" + dbname + "\"";
+    // ALTER DATABASE ... ALLOW_CONNECTIONS cannot target the session's own database, so it
+    // runs from the suite's maintenance database (the same DSN the fixture clones from).
+    const char* base_dsn = std::getenv("YUZU_TEST_POSTGRES_DSN");
+    REQUIRE(base_dsn != nullptr);
+    auto maint = connect(base_dsn);
+    PgResult deny{PQexec(maint.get(),
+                         ("ALTER DATABASE " + quoted + " WITH ALLOW_CONNECTIONS false").c_str())};
+    REQUIRE(deny.status() == PGRES_COMMAND_OK);
+    PgResult k{PQexec(admin.get(),
+                      "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                      "WHERE datname = current_database() AND pid <> pg_backend_pid()")};
+    REQUIRE(k.status() == PGRES_TUPLES_OK);
+
+    // pg_terminate_backend is asynchronous: poll try_acquire() (its own liveness branch)
+    // until the call that OBSERVES the loss. That same call drops leadership and attempts
+    // the reconnect, which must fail -- so the connect failure is counted by THAT call
+    // (the post-liveness site), not merely by a later call's `!open_` check.
+    bool lost_seen = false;
+    for (int i = 0; i < 80 && !lost_seen; ++i) {
+        (void)a.try_acquire();
+        lost_seen = lost(a.stats(), LeadershipLoss::LivenessFailed) >= 1;
+        if (!lost_seen)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    REQUIRE(lost_seen);
+    CHECK(failed(a.stats(), AcquireFailure::Connect) == 1);
+    CHECK_FALSE(a.is_leader());
+    CHECK_FALSE(a.is_open());
+    // The next attempt finds the elector not open and counts again (the top-of-function site).
+    CHECK_FALSE(a.try_acquire());
+    CHECK(failed(a.stats(), AcquireFailure::Connect) == 2);
+    CHECK(lost(a.stats(), LeadershipLoss::LivenessFailed) == 1); // not re-counted
+
+    // Heal: re-allow connections; the elector reconnects and leads again.
+    PgResult allow{PQexec(maint.get(),
+                          ("ALTER DATABASE " + quoted + " WITH ALLOW_CONNECTIONS true").c_str())};
+    REQUIRE(allow.status() == PGRES_COMMAND_OK);
+    bool led = false;
+    for (int i = 0; i < 80 && !led; ++i) {
+        led = a.try_acquire();
+        if (!led)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    CHECK(led);
+    CHECK(a.stats().acquired == 2);
 }
 
 TEST_CASE("LeaderElector releases the advisory lock when epoch minting fails (#4013)",
@@ -307,6 +506,18 @@ TEST_CASE("LeaderElector releases the advisory lock when epoch minting fails (#4
     CHECK_FALSE(a.try_acquire()); // took the lock, failed to mint the epoch
     CHECK_FALSE(a.is_leader());
     CHECK_FALSE(a.epoch().has_value());
+    // WS-11 (#4014): one epoch_record failure; leadership was never held, so NO
+    // loss is counted (the abort path must not inflate lost_total), and no
+    // acquisition happened.
+    {
+        const auto st = a.stats();
+        CHECK(failed(st, AcquireFailure::EpochRecord) == 1);
+        CHECK(failed(st, AcquireFailure::Connect) == 0);
+        CHECK(failed(st, AcquireFailure::LockQuery) == 0);
+        CHECK(no_losses(st));
+        CHECK(st.acquired == 0);
+        CHECK_FALSE(st.leader);
+    }
 
     // Prove the lock did NOT leak: restore the sequence, and a SECOND elector can
     // now acquire — only possible if a released the session advisory lock.
@@ -354,6 +565,7 @@ TEST_CASE("LeaderElector lock-free reads run concurrently with the election writ
         while (!stop.load(std::memory_order_acquire)) {
             (void)e.is_leader();
             (void)e.epoch();
+            (void)e.stats(); // WS-11: the /metrics scrape path, concurrent with the writer
             reads.fetch_add(1, std::memory_order_relaxed);
         }
     });
@@ -366,6 +578,13 @@ TEST_CASE("LeaderElector lock-free reads run concurrently with the election writ
     CHECK(reads.load() > 0);                        // the reader actually ran
     CHECK(e.is_leader() == e.epoch().has_value());  // quiescent: internally consistent
     CHECK_FALSE(e.is_leader());                     // the last write was resign()
+    // Quiescent stats are consistent with the writer's history: 50 attempts each
+    // acquired (or the first did and each later one re-acquired after resign) and
+    // each resign counted a loss while leading.
+    const auto st = e.stats();
+    CHECK(st.acquired == lost(st, LeadershipLoss::Resigned));
+    CHECK(st.acquired >= 1);
+    CHECK_FALSE(st.leader);
 }
 
 TEST_CASE("LeaderElector distinct lock names hold independent locks",
@@ -402,6 +621,18 @@ TEST_CASE("LeaderElector fails closed on an empty dsn (no libpq-default fallback
     LeaderElector e(LeaderElector::Config{.dsn = "", .holder_id = "holder-a"});
     CHECK_FALSE(e.is_open());
     CHECK_FALSE(e.try_acquire());
+    // WS-11 (#4014): a never-open elector is visible as a CONNECT failure per
+    // attempt, never as a leader, and last_ok stays "never" (absent-not-zero in
+    // the exported gauge) -- this is the YuzuLeaderNoLeader scenario.
+    const auto st = e.stats();
+    CHECK(failed(st, AcquireFailure::Connect) == 1);
+    CHECK(st.last_ok_steady_ns == 0);
+    CHECK_FALSE(st.leader);
+    CHECK(st.epoch == 0);
+    CHECK(st.acquired == 0);
+    CHECK(no_losses(st));
+    CHECK_FALSE(e.try_acquire());
+    CHECK(failed(e.stats(), AcquireFailure::Connect) == 2);
 }
 
 TEST_CASE("LeaderElector fails closed on an empty holder_id",
