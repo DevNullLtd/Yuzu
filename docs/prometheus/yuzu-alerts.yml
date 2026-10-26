@@ -2934,7 +2934,7 @@ groups:
             replica that is often its own previous connection after a network
             blip. Terminate only that backend (pg_terminate_backend; read the
             runbook first; terminating a live leader's backend forces a failover
-            with a few seconds of unfenced overlap, absorbed only by the agent's
+            with up to about 8 seconds of unfenced overlap, absorbed only by the agent's
             command_id dedup). Silence this alert, scoped
             to the job, for planned Postgres maintenance of 5 minutes or more,
             with an end time at the window plus about 10 minutes, and confirm

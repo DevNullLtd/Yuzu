@@ -974,8 +974,9 @@ re-publish — pauses.)
 
 Running more than one server replica is **not supported today** (the safe-to-scale gate in
 `docs/ha-delivery-matrix.md` is not lifted); the multi-replica wording below is for pilots and
-pre-GA testing. On the supported single-server deployment only `YuzuLeaderNoLeader` and
-`YuzuLeaderCoordinationStale` can fire.
+pre-GA testing. On the supported single-server deployment `YuzuLeaderSplitBrain` cannot fire (one
+series); in practice only `YuzuLeaderNoLeader` and `YuzuLeaderCoordinationStale` fire, and
+`YuzuLeaderFlapping` only on a Postgres connection flap or a restart loop whose acquire is delayed.
 
 Each replica exposes the elector's state as `yuzu_server_leader_*` series on its
 own `/metrics` (reference: [metrics.md](metrics.md) "Leader election metrics"),
@@ -1017,7 +1018,7 @@ that holds it).
   *in its own database*, so the epoch fence does **not** span them: both
   replicas run every leader-only pass, and on a forked database the same
   scheduled occurrence can be sent twice (only the agent's `command_id` dedup,
-  which is effectively-once, absorbs it). First establish **which database is
+  which is effectively-once, absorbs it). Then establish **which database is
   authoritative**: `patronictl list`, and compare
   `SELECT system_identifier FROM pg_control_system();` on each side (two different
   identifiers are two different clusters; hostnames, aliases and a VIP can make
@@ -1059,7 +1060,7 @@ that holds it).
   terminated: `SELECT pg_terminate_backend(<pid>);` (this needs superuser or
   membership of `pg_signal_backend`), after which a replica acquires within one
   election cycle. Terminating a *live* leader's backend forces a failover. Fenced claims stay
-  safe; for the few seconds before the old leader notices, its unfenced passes
+  safe; for up to about 8 seconds (one heartbeat interval, plus any pass already in flight) before the old leader notices, its unfenced passes
   (schedule tick, policy dispatch, quarantine reconcile, CRL re-publish) can
   overlap the successor's, and any duplicate dispatch is absorbed only by the
   agent's `command_id` dedup. During a restart of the only replica the series is
