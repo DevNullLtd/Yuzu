@@ -2896,6 +2896,32 @@ TEST_CASE("registry core: values added to an ancestor after the vet count toward
     }
 }
 
+TEST_CASE("registry core: a tree that grows by one node after the vet and reaches the bound stops before its root",
+          "[registry][core][recursive]") {
+    // The vet sees T, Big and kMaxTreeNodes - 2 values: kMaxTreeNodes nodes, within the bound. One more value lands on Big
+    // once the delete phase opens it, so Big's removal brings the walk's total to exactly kMaxTreeNodes and T (no values of
+    // its own) would be node 10,001: the walk stops there, T stays.
+    FakeRegistry reg;
+    reg.key("T\\Big");
+    for (std::size_t i = 0; i < kMaxTreeNodes - 2; ++i) reg.put("T\\Big", "v" + std::to_string(i), kRegDword, dword(1));
+    bool grown = false;
+    SecondOpen second;
+    reg.before = [&](const std::string& ev) {
+        if (grown || ev != "open_sub:Big" || !second(ev)) return;
+        grown = true;
+        reg.put("T\\Big", "extra", kRegDword, dword(1));
+    };
+    const auto o = delete_key_tree(reg, FakeRegistry::kRoot, "T", false, true, false);
+    REQUIRE(grown);
+    // mutant: the running-total check at a key's own delete is `>`, so T is removed as the 10,001st node
+    CHECK(o.result == "failed"); // Big's NtDeleteKey was issued before the stop
+    CHECK(o.reason == "concurrent_change");
+    CHECK(o.counted_keys == 1);
+    CHECK(o.counted_values == kMaxTreeNodes - 1);
+    CHECK_FALSE(reg.exists("T\\Big"));
+    CHECK(reg.exists("T"));
+}
+
 TEST_CASE("registry core: a recursive delete of a link leaf removes the link object only",
           "[registry][core][recursive]") {
     const bool fast = GENERATE(false, true);
@@ -3153,6 +3179,20 @@ TEST_CASE("registry core: render_user_write orders the hive lines the race warni
         CHECK(out.lines[1] == "error|flush_failed:access_denied");
         CHECK(out.rc == 1);
     }
+    SECTION("a failed write whose hive then failed to unload keeps its own reason; only a write that succeeded is relabelled") {
+        // mutant: hive_unload_failed overwrites the reason of any write, so a failed write loses its token
+        HiveFacts hf;
+        hf.unload_failed = true;
+        hf.mount_name = "YUZU_HIVE_x";
+        WriteOutcome wo = ok_write();
+        wo.fail("flush_failed:access_denied", true);
+        const auto out = render_user_write(user_record(), wo, hf, kSid);
+        REQUIRE(out.lines.size() == 3);
+        CHECK(starts(out.lines[0], "warning|hive_unload_failed:"));
+        CHECK(starts(out.lines[1], "audit|op=set_user_value|hive=HKU|result=failed|reason=flush_failed:access_denied|"));
+        CHECK(out.lines[2] == "error|flush_failed:access_denied");
+        CHECK(out.rc == 1);
+    }
 }
 
 // ── apply ────────────────────────────────────────────────────────────────
@@ -3231,6 +3271,9 @@ std::string long_name(char fill, std::size_t index) {
 }
 
 } // namespace
+
+// The safe default: an ApplyOptions nobody filled in is a dry run (every test below passes both flags explicitly).
+static_assert(ApplyOptions{}.dry_run, "ApplyOptions defaults to a dry run");
 
 TEST_CASE("registry apply: a dry run gives the real run's verdicts item for item and changes nothing",
           "[registry][core][apply]") {
@@ -3520,6 +3563,83 @@ TEST_CASE("registry apply: delete_key vets EVERY value of the leaf before it del
     }
     CHECK(reg.exists("Software\\Leaf"));
     CHECK(reg.calls("delete_key_by_handle") == 0);
+}
+
+TEST_CASE("registry apply: delete_key refuses a value that was enumerated and then vanished in both modes",
+          "[registry][core][apply]") {
+    // The enumeration is exact, so the name itself round-trips: a query that cannot find it means the value was removed
+    // under us. That is concurrent_change, never "nothing to restore" -- the undo manifest would silently lack the row.
+    const bool dry = GENERATE(true, false);
+    FakeRegistry reg;
+    reg.put("Software\\Leaf", "a", kRegDword, dword(1));
+    reg.put("Software\\Leaf", "gone", kRegDword, dword(2));
+    reg.put("Software\\Leaf", "z", kRegDword, dword(3));
+    reg.inject["query_value:gone"] = kErrorFileNotFound;
+    // mutant: the vanished value is accepted and the key is deleted (or would be) without a row for it
+    const auto run = run_plan(reg, json::array({del_key_item("Software\\Leaf")}), dry);
+    CHECK(run.verdict(0) == "refused");
+    CHECK(run.reason(0) == "concurrent_change");
+    CHECK(run.undo.empty());
+    CHECK(reg.exists("Software\\Leaf"));
+    CHECK(reg.get("Software\\Leaf", "gone") != nullptr);
+    CHECK(reg.calls("delete_key_by_handle") == 0);
+}
+
+TEST_CASE("registry apply: a row that exactly fits the remaining budget is kept and the manifest stays complete",
+          "[registry][core][apply]") {
+    // 128 rows of a 32-byte name, 4,000 data bytes and kUndoRowOverhead cost 4,096 each: the 128th takes exactly what is
+    // left of kCaptureTotalCap, and a row that fits to the byte is retained.
+    constexpr std::size_t kRows = 128, kNameBytes = 32, kDataBytes = 4000;
+    static_assert(kRows * (kNameBytes + kDataBytes + kUndoRowOverhead) == kCaptureTotalCap);
+    const bool dry = GENERATE(true, false);
+    FakeRegistry reg;
+    for (std::size_t i = 0; i < kRows; ++i)
+        reg.put("Software\\Fit", std::string(kNameBytes - 3, 'n') + std::to_string(1000 + i).substr(1), kRegBinary,
+                Bytes(kDataBytes, 7));
+    // mutant: the budget refuses a row whose cost equals what remains (>= for >), dropping the 128th
+    const auto run = run_plan(reg, json::array({del_key_item("Software\\Fit")}), dry);
+    REQUIRE(run.verdict(0) == (dry ? "would_apply" : "applied"));
+    CHECK(run.undo_complete());
+    CHECK(run.undo.size() == (dry ? 0u : kRows));
+    if (!dry) CHECK(run.undo.back()[4].find('~') == std::string::npos); // the last row kept its bytes
+}
+
+TEST_CASE("registry apply: a key op opens its key without the right to set values; a value op asks for it",
+          "[registry][core][apply]") {
+    // mutant: every item opens its key with KEY_SET_VALUE, whatever the op
+    const bool fast = GENERATE(true, false);
+    const bool dry = GENERATE(true, false);
+    INFO((fast ? "fast open" : "walk") << (dry ? ", dry run" : ", real run"));
+    const auto leaf_masks = [](const FakeRegistry& r) { // the mask of every open, as a number
+        std::vector<std::uint32_t> out;
+        for (const auto& m : r.masks) out.push_back(static_cast<std::uint32_t>(std::stoul(m.substr(m.rfind(':') + 1), nullptr, 16)));
+        return out;
+    };
+    SECTION("create_key and delete_key") {
+        FakeRegistry reg;
+        reg.key("Software\\Made");
+        reg.put("Software\\Gone", "g", kRegDword, dword(1));
+        const auto run = run_plan(reg, json::array({make_key_item("Software\\Made"), del_key_item("Software\\Gone")}), dry, true, fast);
+        REQUIRE(run.verdicts() == std::vector<std::string>{dry ? "would_apply" : "applied", dry ? "would_apply" : "applied"});
+        REQUIRE_FALSE(reg.masks.empty());
+        for (const auto mask : leaf_masks(reg)) CHECK((mask & kKeySetValue) == 0);
+        if (fast) {
+            CHECK(std::ranges::find(reg.masks, "open_path:Software\\Made:0x1") != reg.masks.end());
+            CHECK(std::ranges::find(reg.masks, "open_path:Software\\Gone:0x10009") != reg.masks.end());
+        }
+    }
+    SECTION("set_value and delete_value") {
+        FakeRegistry reg;
+        reg.put("Software\\Acme", "a", kRegDword, dword(1));
+        reg.put("Software\\Other", "b", kRegDword, dword(1));
+        const auto run = run_plan(reg, json::array({set_item("Software\\Acme", "a", "2", "REG_DWORD"),
+                                                    del_value_item("Software\\Other", "b")}), dry, true, fast);
+        REQUIRE(run.out.rc == 0);
+        if (fast) {
+            CHECK(std::ranges::find(reg.masks, "open_path:Software\\Acme:0x3") != reg.masks.end());
+            CHECK(std::ranges::find(reg.masks, "open_path:Software\\Other:0x3") != reg.masks.end());
+        }
+    }
 }
 
 // A value whose RAW UTF-16 name is a lone surrogate (L"V\xD800") enumerates lossily as "V<U+FFFD>", the same bytes as
@@ -3918,6 +4038,25 @@ TEST_CASE("registry apply: each item's rows go out as it concludes and a sink fa
         CHECK(std::ranges::find(run.out.lines, std::string{exception_audit_line("apply")}) == run.out.lines.end());
         CHECK_FALSE(untouched(reg, "Software\\B"));
         CHECK(untouched(reg, "Software\\C"));
+        CHECK(reg.calls("open_path:Software\\C") == 0);
+    }
+    SECTION("a sink failure on an undo row stops the plan: no later item is opened or changed and no summary goes out") {
+        // mutant: an undo-row sink failure only sets the answer to 1 and the plan carries on
+        FakeRegistry reg;
+        build(reg);
+        RecordingCtx ctx;
+        ctx.fails = [n = 0](std::string_view t) mutable { return t.rfind("undo|", 0) == 0 && n++ == 0; };
+        const auto run = run_plan(reg, plan, false, false, true, &ctx);
+        CHECK(run.out.rc == 1);
+        CHECK(run.audits.size() == 1); // item 0 only: its audit line is out
+        CHECK(run.items.size() == 1);
+        CHECK(run.undo.empty());       // the first undo row failed and the second was never offered
+        CHECK(run.summary.empty());
+        CHECK(run.out.lines.back() == "error|exception");
+        CHECK_FALSE(reg.exists("Software\\Del")); // item 0 ran before its rows went out
+        CHECK(untouched(reg, "Software\\B"));
+        CHECK(untouched(reg, "Software\\C"));
+        CHECK(reg.calls("open_path:Software\\B") == 0);
         CHECK(reg.calls("open_path:Software\\C") == 0);
     }
     SECTION("a sink that fails on the first audit line: the failure propagates and nothing after item 0 runs") {

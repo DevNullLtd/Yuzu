@@ -102,6 +102,8 @@ TEST_CASE("registry parse_plan: a plan that is not a flat bounded array of objec
         text += std::string(kMaxPlanBytes, ' ');
         CHECK(text.size() > kMaxPlanBytes);
         CHECK(parse_plan(text).error == "invalid_plan:plan_too_large");
+        text.resize(kMaxPlanBytes + 1);
+        CHECK(parse_plan(text).error == "invalid_plan:plan_too_large"); // one byte past the bound
         text.resize(kMaxPlanBytes);
         CHECK(parse_plan(text).error.empty()); // exactly the bound is allowed (trailing whitespace)
     }

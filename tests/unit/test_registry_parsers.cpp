@@ -800,3 +800,24 @@ TEST_CASE("registry kernel_name_well_formed: no NUL unit, no lone surrogate; a p
     CHECK_FALSE(well_formed(std::u16string_view{u"L\0", 2}));
     CHECK_FALSE(well_formed(std::u16string_view{u"\0L", 2}));
 }
+
+TEST_CASE("registry kernel_name_well_formed: a high surrogate pairs only with a low one, at both ends of each range",
+          "[registry][parsers]") {
+    // the unit after a high surrogate must be DC00..DFFF: below it and above it are both lone highs
+    CHECK_FALSE(well_formed(u"\xD800\xDBFF")); // another high
+    CHECK_FALSE(well_formed(u"\xD800\xE000")); // the first unit above the low range
+    CHECK_FALSE(well_formed(u"\xD800\xFFFF"));
+    CHECK(well_formed(u"\xD800\xDC00"));       // the first pair
+    CHECK(well_formed(u"\xD800\xDFFF"));
+    // the last high surrogate is DBFF: alone it is lone, with a low after it it is a pair
+    CHECK_FALSE(well_formed(u"\xDBFF"));
+    CHECK(well_formed(u"\xDBFF\xDFFF"));
+    CHECK(well_formed(u"\xDBFF\xDC00"));
+    // and the unit just past each range is an ordinary character
+    CHECK(well_formed(u"\xD7FF"));
+    CHECK(well_formed(u"\xE000"));
+}
+
+// ERROR_INVALID_DATA: what an exact enumeration answers for a raw name that is not well-formed UTF-16
+// (Win32Registry::enumerated_name). registry_win.cpp pins the number on Windows only; this pins it on every host.
+static_assert(kErrorInvalidData == 13, "ERROR_INVALID_DATA");
