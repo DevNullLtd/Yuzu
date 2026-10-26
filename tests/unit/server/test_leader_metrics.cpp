@@ -246,34 +246,92 @@ TEST_CASE("leader metrics: last_ok_age is absent until a success and computed fr
     CHECK(has_line(scrape(m), "yuzu_server_leader_last_ok_age_seconds 0"));
 }
 
-TEST_CASE("leader metrics: concurrent scrapes never double-count (TSan-oriented, non-binding)",
+TEST_CASE("leader metrics: simultaneous scrapes of one snapshot count it exactly once",
           "[leader-metrics][leader-elector]") {
-    // The binding idempotence test is the sequential one above. This case is a
-    // race exerciser for the nightly TSan leg: two scrape threads publish a
-    // growing snapshot through ONE publisher; the final value must equal the
-    // final snapshot. (Removing the publisher's mutex is caught by TSan, not here.)
-    yuzu::MetricsRegistry m;
-    seed_leader_metrics(m);
-    LeaderMetricsPublisher pub;
-    std::atomic<std::uint64_t> shared_acquired{0};
+    // BINDING test for the publisher mutex. Counter has no set(), so publish()
+    // syncs by `target - value()` and the read-then-increment is a LOGICAL race
+    // that ThreadSanitizer cannot see (every underlying operation is internally
+    // locked): without the publisher's mutex, two scrapes that read value()==0
+    // together each add 1 and the counter reads 2. Eight threads are released
+    // together by a spin barrier, one publish each, over a FRESH registry per
+    // round, so the interleaving is hit often enough to be a reliable detector;
+    // with the mutex the result is exactly 1 in every round.
+    constexpr int kRounds = 5000;
+    constexpr int kThreads = 8;
+    int miscounted = 0;
+    for (int round = 0; round < kRounds; ++round) {
+        yuzu::MetricsRegistry m;
+        seed_leader_metrics(m);
+        LeaderMetricsPublisher pub;
+        LeaderElector::Stats snapshot;
+        snapshot.acquired = 1;
 
-    auto scraper = [&] {
-        for (int i = 0; i < 2000; ++i) {
-            LeaderElector::Stats s;
-            s.acquired = shared_acquired.load();
-            pub.publish(m, s, 0, kSec);
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+        std::vector<std::thread> threads;
+        // Joins on EVERY exit path (a throwing REQUIRE/CHECK or a failed thread
+        // constructor must not leave a joinable std::thread to terminate()).
+        struct JoinAll {
+            std::atomic<bool>& go;
+            std::vector<std::thread>& threads;
+            ~JoinAll() {
+                go.store(true);
+                for (auto& t : threads)
+                    if (t.joinable())
+                        t.join();
+            }
+        } join_all{go, threads};
+
+        for (int i = 0; i < kThreads; ++i) {
+            threads.emplace_back([&] {
+                ready.fetch_add(1);
+                while (!go.load())
+                    std::this_thread::yield();
+                pub.publish(m, snapshot, 0, kSec);
+            });
         }
-    };
-    std::thread a(scraper), b(scraper);
-    for (int i = 0; i < 2000; ++i)
-        shared_acquired.fetch_add(1);
-    a.join();
-    b.join();
+        while (ready.load() < kThreads)
+            std::this_thread::yield();
+        go.store(true);
+        for (auto& t : threads)
+            t.join();
 
-    LeaderElector::Stats last;
-    last.acquired = shared_acquired.load();
-    pub.publish(m, last, 0, kSec);
-    CHECK(has_line(scrape(m), "yuzu_server_leader_acquired_total 2000"));
+        if (!has_line(scrape(m), "yuzu_server_leader_acquired_total 1"))
+            ++miscounted;
+    }
+    CHECK(miscounted == 0);
+}
+
+TEST_CASE("leader metrics: the cause label arrays are tied to the enumerators",
+          "[leader-metrics][leader-elector]") {
+    // The compile-time half is the static_asserts in leader_elector.hpp (count ==
+    // last enumerator + 1, every label non-empty); this is the runtime echo, with
+    // the labels pairwise distinct so two causes can never share a series.
+    std::set<std::string> acquire;
+    for (const char* l : kAcquireFailureLabels) {
+        REQUIRE(l != nullptr);
+        acquire.insert(l);
+    }
+    CHECK(acquire.size() == kAcquireFailureCount);
+    std::set<std::string> loss;
+    for (const char* l : kLeadershipLossLabels) {
+        REQUIRE(l != nullptr);
+        loss.insert(l);
+    }
+    CHECK(loss.size() == kLeadershipLossCount);
+}
+
+TEST_CASE("leader metrics: the scrape clock and the stamp clock are the same function",
+          "[leader-metrics][leader-elector]") {
+    // The age is `now - last_ok`; both must come from LeaderElector::steady_now_ns
+    // (a different clock or unit on one side yields a garbage age). Never 0: 0 is
+    // the "never answered" sentinel in Stats.
+    const auto a = LeaderElector::steady_now_ns();
+    const auto b = LeaderMetricsPublisher::steady_now_ns();
+    CHECK(a > 0);
+    CHECK(b >= a);
+    const auto code = strip_line_comments(read_src("leader_metrics.hpp"));
+    CHECK(code.find("std::chrono") == std::string::npos);
 }
 
 TEST_CASE("leader metrics: every cause enumerator has a count site in leader_elector.cpp",

@@ -23385,6 +23385,16 @@ private:
     // in stop() before ~ServerImpl (a joinable std::thread destructor terminates).
     // FencedLeaderOnly background loops (schedule/policy/quarantine/CRL) gate on
     // leader_elector_->is_leader() via leader_gate.hpp — slice 3.2.
+    //
+    // BORROWED by the /metrics handler (WS-11, #4014): `health::Deps::leader_elector`
+    // and `::leader_loop_errors` are raw pointers to the next two members, copied
+    // into the route lambda. This is NOT guaranteed by declaration order (these
+    // are declared after web_server_/web_thread_, so they are destroyed BEFORE
+    // them); it is guaranteed by stop(), which joins web_thread_ (or _Exit()s on
+    // its timeout) before any member is destroyed, and ~ServerImpl always calls
+    // stop() first. That join comes AFTER resign() and the leader_thread_ join, so
+    // a scrape may overlap resign(): safe because stats() is lock-free and the
+    // elector is still alive. Do not reorder stop().
     std::unique_ptr<LeaderElector> leader_elector_;
     /// WS-11 (#4014): election-loop iterations that threw. A plain atomic the loop
     /// increments (never the MetricsRegistry -- see the loop's catch blocks); the

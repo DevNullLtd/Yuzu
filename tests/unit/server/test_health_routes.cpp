@@ -1693,6 +1693,15 @@ TEST_CASE("health_routes: leader wiring pins -- /metrics reads the elector only 
     const auto flat = squeeze_ws(code);
     CHECK(flat.find("{\"leader") == std::string::npos);
     CHECK(flat.find("deps.leader_elector&&") == std::string::npos);
+    // The scrape-time age is `now - last_ok`. The handler must hand the publisher
+    // the Stats snapshot AND the elector's own clock, as the last argument: a 0 or
+    // a different clock here pins the age at 0 (or garbage) and silently kills
+    // YuzuLeaderCoordinationStale, and the closed non-open elector these route
+    // tests can build never has a last_ok to expose it. Pinned lexically.
+    CHECK(flat.find("leader_publisher->publish(*deps.metrics,deps.leader_elector->stats(),") !=
+          std::string::npos);
+    CHECK(flat.find("yuzu::server::LeaderMetricsPublisher::steady_now_ns());") != std::string::npos);
+    CHECK(count_of(flat, "steady_now_ns()") == 1);
 
     const auto server = squeeze_ws(strip_comments(read_server_src("server.cpp")));
     const auto occurrences = [&](const std::string& needle) {

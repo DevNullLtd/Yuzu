@@ -36,7 +36,8 @@
 
 #include <yuzu/metrics.hpp>
 
-#include <chrono>
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 
@@ -105,10 +106,9 @@ inline void seed_leader_metrics(MetricsRegistry& m) {
 class LeaderMetricsPublisher {
 public:
     /// Monotonic "now" in the SAME clock/units as `Stats::last_ok_steady_ns`.
+    /// Delegates to the elector so the stamp and the age read ONE clock/unit.
     [[nodiscard]] static std::int64_t steady_now_ns() noexcept {
-        return std::chrono::duration_cast<std::chrono::nanoseconds>(
-                   std::chrono::steady_clock::now().time_since_epoch())
-            .count();
+        return LeaderElector::steady_now_ns();
     }
 
     /// Sets the gauges and syncs the counters. `loop_errors` is the monotonic

@@ -105,6 +105,28 @@ inline constexpr std::size_t kLeadershipLossCount = 2;
 inline constexpr std::array<const char*, kLeadershipLossCount> kLeadershipLossLabels = {
     "liveness_failed", "resigned"};
 
+// A hand-written count and a hand-written label list can drift apart: a brace
+// list shorter than its std::array leaves the tail slots nullptr, which would
+// become `std::string(nullptr)` when the exporter builds the `cause` label at
+// boot. Tie the counts to the last enumerator and require every label present.
+namespace leader_label_detail {
+template <std::size_t N>
+constexpr bool all_labels_present(const std::array<const char*, N>& labels) {
+    for (const char* label : labels)
+        if (label == nullptr || label[0] == '\0')
+            return false;
+    return true;
+}
+} // namespace leader_label_detail
+static_assert(static_cast<std::size_t>(AcquireFailure::EpochRecord) + 1 == kAcquireFailureCount,
+              "kAcquireFailureCount must equal the number of AcquireFailure enumerators");
+static_assert(static_cast<std::size_t>(LeadershipLoss::Resigned) + 1 == kLeadershipLossCount,
+              "kLeadershipLossCount must equal the number of LeadershipLoss enumerators");
+static_assert(leader_label_detail::all_labels_present(kAcquireFailureLabels),
+              "every AcquireFailure needs a non-empty exported label");
+static_assert(leader_label_detail::all_labels_present(kLeadershipLossLabels),
+              "every LeadershipLoss needs a non-empty exported label");
+
 class LeaderElector {
 public:
     /// A point-in-time copy of the elector's observability state (WS-11, #4014).
@@ -120,6 +142,12 @@ public:
         /// dedicated connection answered successfully; 0 = never.
         std::int64_t last_ok_steady_ns = 0;
     };
+
+    /// Monotonic "now" in the units and clock of `Stats::last_ok_steady_ns` (never
+    /// 0: 0 is that field's "never answered" sentinel). The ONE place the elector
+    /// stamps and a scrape-time age computation read the clock, so they cannot
+    /// disagree on the clock or the unit.
+    [[nodiscard]] static std::int64_t steady_now_ns() noexcept;
 
     struct Config {
         std::string dsn;       ///< DSN for the dedicated coordination connection.

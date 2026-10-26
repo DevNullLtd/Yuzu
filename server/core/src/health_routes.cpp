@@ -26,9 +26,9 @@
 #include "fleet_topology_store.hpp"
 #include "guaranteed_state_store.hpp"
 #include "instruction_store.hpp"
-#include "leader_elector.hpp"  // HA WS-11: LeaderElector::Stats (stats() only)
-#include "leader_metrics.hpp"  // HA WS-11
 #include "inventory_store.hpp"
+#include "leader_elector.hpp" // HA WS-11: LeaderElector::Stats (stats() only)
+#include "leader_metrics.hpp" // HA WS-11
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
 #include "nvd_db.hpp"

@@ -358,13 +358,20 @@ TEST_CASE("LeaderElector heartbeat drops leadership after its backend is termina
     // review K4). The first false drops leadership + reconnects; epoch_ is then
     // nullopt so every subsequent heartbeat() stays false.
     bool dropped = false;
+    // A FAILED probe must not count as the connection having answered: capture
+    // last_ok before each call and require it unchanged on the call that returns
+    // false (a successful call, by contrast, strictly advances it).
+    std::int64_t last_ok_before_failure = 0;
     for (int i = 0; i < 40 && !dropped; ++i) {
+        last_ok_before_failure = a.stats().last_ok_steady_ns;
         if (!a.heartbeat())
             dropped = true;
         else
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     CHECK(dropped);
+    CHECK(last_ok_before_failure != 0);
+    CHECK(a.stats().last_ok_steady_ns == last_ok_before_failure);
     CHECK_FALSE(a.is_leader());
     CHECK_FALSE(a.epoch().has_value());
     // WS-11 (#4014): the failed heartbeat is exactly one liveness loss (this IS the
@@ -569,6 +576,13 @@ TEST_CASE("LeaderElector lock-free reads run concurrently with the election writ
             reads.fetch_add(1, std::memory_order_relaxed);
         }
     });
+    // Joins on every exit path: a throw out of try_acquire()/resign() below must
+    // not leave a joinable std::thread to terminate() the whole test binary.
+    yuzu::test::ScopeExit join_reader{[&] {
+        stop.store(true, std::memory_order_release);
+        if (reader.joinable())
+            reader.join();
+    }};
     for (int i = 0; i < 50; ++i) {
         (void)e.try_acquire();
         e.resign();

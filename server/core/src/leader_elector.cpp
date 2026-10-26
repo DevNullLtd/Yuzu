@@ -200,13 +200,15 @@ void LeaderElector::drop_leadership_locked(std::optional<LeadershipLoss> cause) 
     live_epoch_.store(0, std::memory_order_release);
 }
 
+std::int64_t LeaderElector::steady_now_ns() noexcept {
+    const std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+    return ns > 0 ? ns : 1; // 0 is the "never answered" sentinel
+}
+
 void LeaderElector::note_ok_locked() noexcept {
-    std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                          std::chrono::steady_clock::now().time_since_epoch())
-                          .count();
-    if (ns <= 0)
-        ns = 1; // 0 is the "never" sentinel
-    last_ok_steady_ns_.store(ns, std::memory_order_relaxed);
+    last_ok_steady_ns_.store(steady_now_ns(), std::memory_order_relaxed);
 }
 
 LeaderElector::Stats LeaderElector::stats() const noexcept {
@@ -334,9 +336,12 @@ bool LeaderElector::try_acquire() {
     // Publish the minted epoch (slice 3.2, #4013). Minted epochs are >= 1, so a
     // non-zero value unambiguously means "leader at this epoch" to a lock-free
     // reader. Release-ordered to pair with the acquire loads in is_leader/epoch.
-    live_epoch_.store(*epoch_, std::memory_order_release);
+    // The acquisition is counted and the answer stamped BEFORE the publish, so a
+    // lock-free reader that observes the new leadership also observes
+    // acquired >= 1 and a non-zero last_ok (never is_leader=1 with acquired=0).
     acquired_.fetch_add(1, std::memory_order_relaxed);
     note_ok_locked();
+    live_epoch_.store(*epoch_, std::memory_order_release);
     // holder_id (boot-random, not a secret) is logged once per acquire so a
     // `leader_state.holder_id` row is attributable to a process from its logs
     // (WS-11: it is deliberately NOT a metric label -- a per-boot value would be
@@ -379,7 +384,6 @@ void LeaderElector::resign() {
     if (epoch_.has_value())
         spdlog::info("leader_elector: resigning leadership '{}'", cfg_.lock_name);
     drop_leadership_locked(LeadershipLoss::Resigned); // counts only if leadership was held
-
 }
 
 std::string LeaderElector::epoch_fence_sql(const std::string& lock_name, std::int64_t epoch) {
