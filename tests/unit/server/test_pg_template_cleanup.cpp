@@ -26,6 +26,7 @@
 
 #if defined(YUZU_TEST_ENABLE_PG)
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -61,6 +62,9 @@ public:
         // drops any clone. All libpq work runs here, while TLS is alive.
         yuzu::test::SharedPgDbRegistry::cleanup_all_shared();
         yuzu::test::PgTestTemplate::drop_all_built();
+        // Last: nothing above may still need the shared admin connection, and
+        // this is the one point where libpq's TLS stack is guaranteed alive.
+        yuzu::test::AdminConn::close();
     }
 };
 
@@ -341,6 +345,42 @@ TEST_CASE("SharedPgDbRegistry drains the pool before dropping its shared clone",
     CHECK_FALSE(state->pool.has_value());
     CHECK_FALSE(database_exists(admin, db_name));
     yuzu::test::PgTestTemplate::drop_built(key);
+}
+
+TEST_CASE("PostgresTestDb: CREATE and DROP run through the shared admin connection",
+          "[pg][template]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    }
+    const std::string admin = yuzu::test::pg_admin_dsn_env();
+    const auto connects_before = yuzu::test::AdminConn::connects();
+
+    std::string first_name;
+    {
+        yuzu::test::PostgresTestDb first;
+        INFO("first db error: " << first.error());
+        REQUIRE(first.available());
+        first_name = first.db_name();
+        CHECK(database_exists(admin, first_name));
+    }
+    CHECK_FALSE(database_exists(admin, first_name)); // the DROP landed
+    // The CREATE and DROP above went through the shared slot: it opened at
+    // most one connection (none if an earlier test already opened it).
+    const auto connects_after_first = yuzu::test::AdminConn::connects();
+    CHECK(connects_after_first == std::max<std::uint64_t>(connects_before, 1));
+
+    std::string second_name;
+    {
+        yuzu::test::PostgresTestDb second;
+        INFO("second db error: " << second.error());
+        REQUIRE(second.available());
+        second_name = second.db_name();
+        CHECK(second_name != first_name);
+        CHECK(database_exists(admin, second_name));
+    }
+    CHECK_FALSE(database_exists(admin, second_name));
+    // ...and reused it: no second admin connect for the second database.
+    CHECK(yuzu::test::AdminConn::connects() == connects_after_first);
 }
 
 TEST_CASE("sweep_stale_test_databases: end-to-end against a live instance", "[pg][template]") {

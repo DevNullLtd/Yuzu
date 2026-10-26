@@ -564,9 +564,135 @@ private:
 
 class PgTestTemplate;
 
+/// Process-wide admin connection behind PostgresTestDb's CREATE / DROP DATABASE.
+///
+/// A fresh admin connect per statement was the largest single connection
+/// source on a clone-heavy [pg] shard (two per test database; on Windows every
+/// connection forks a postgres.exe). One connection is
+/// opened lazily, guarded by a mutex held across every PQexec (a PGconn is not
+/// thread-safe), and reused. PROCESS-LOCAL by design: never shared across
+/// processes or runner agents.
+///
+/// close() is called from the Catch2 testRunEnded listener
+/// (test_pg_template_cleanup.cpp), after the last drop and while libpq's TLS
+/// stack is alive, and NEVER from a static destructor (see
+/// PgTestTemplate::drop_all_built). The state is deliberately never destroyed,
+/// so a run that skips the listener still has no exit-time PQfinish; the
+/// process exit closes the socket. After close() every exec() falls back to a
+/// one-shot connect-run-disconnect and the shared connection is never reopened.
+///
+/// The backend sits idle on the admin database, which the backend-killing
+/// tests never target (they scope by datname = current_database(), a pid or an
+/// application_name).
+class AdminConn {
+public:
+    /// One statement's outcome. `connected` false: `error` is the connect
+    /// failure; else `ok` false: `error` is the statement failure, `in_use` is
+    /// SQLSTATE 55006 (object_in_use).
+    struct Outcome {
+        bool connected{false};
+        bool ok{false};
+        bool in_use{false};
+        std::string error;
+    };
+
+    /// Run `sql` on the shared connection (one-shot after close()). A statement
+    /// is retried here only when the shared link was found dead; any other
+    /// retry policy (55006) belongs to the caller.
+    static Outcome exec(const std::string& dsn, const std::string& sql) {
+        State& s = state();
+        std::unique_lock<std::mutex> lock(s.mu);
+        if (s.closed) {
+            lock.unlock();
+            yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+            return run(conn, sql);
+        }
+        if (s.conn && s.dsn != dsn)
+            s.conn.reset();
+        const bool reused = static_cast<bool>(s.conn);
+        if (!reused) {
+            s.conn = yuzu::server::pg::PgConn{PQconnectdb(dsn.c_str())};
+            s.dsn = dsn;
+            ++s.connects;
+        }
+        Outcome out = run(s.conn, sql);
+        if (!out.connected && reused) {
+            // The backend died since the last statement (a restarted server):
+            // reconnect once, then fail as a first connect would. Safe to
+            // re-run: a CREATE that did land fails loudly (42P04), a DROP is
+            // IF EXISTS.
+            s.conn = yuzu::server::pg::PgConn{PQconnectdb(dsn.c_str())};
+            ++s.connects;
+            out = run(s.conn, sql);
+        }
+        return out;
+    }
+
+    /// Finish the shared connection and refuse to reopen it. Idempotent.
+    static void close() noexcept {
+        State& s = state();
+        const std::lock_guard<std::mutex> lock(s.mu);
+        s.conn.reset();
+        s.closed = true;
+    }
+
+    /// Connections the shared slot has opened; lets a test prove statements ran
+    /// through it instead of a fresh connect each. Test observability only,
+    /// not a contract.
+    static std::uint64_t connects() {
+        State& s = state();
+        const std::lock_guard<std::mutex> lock(s.mu);
+        return s.connects;
+    }
+
+private:
+    struct State {
+        std::mutex mu;
+        yuzu::server::pg::PgConn conn;
+        std::string dsn;
+        std::uint64_t connects{0};
+        bool closed{false};
+    };
+    // Intentionally leaked: a function-local static would PQfinish from its
+    // static destructor, where OpenSSL may already be gone.
+    static State& state() {
+        static State* s = new State;
+        return *s;
+    }
+
+    /// Run `sql` on `conn` (null-safe); a connection that is not OK is
+    /// finished so the next call reconnects.
+    static Outcome run(yuzu::server::pg::PgConn& conn, const std::string& sql) {
+        Outcome o;
+        if (PQstatus(conn.get()) != CONNECTION_OK) {
+            o.error = PQerrorMessage(conn.get());
+            conn.reset();
+            return o;
+        }
+        o.connected = true;
+        yuzu::server::pg::PgResult res{PQexec(conn.get(), sql.c_str())};
+        o.ok = res.ok();
+        if (!o.ok) {
+            if (PQstatus(conn.get()) != CONNECTION_OK) {
+                // Link lost mid-statement: report it as a connection failure
+                // and drop the handle so the next call reconnects.
+                o.connected = false;
+                o.error = PQerrorMessage(conn.get());
+                conn.reset();
+                return o;
+            }
+            const char* sqlstate = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+            o.in_use = sqlstate != nullptr && std::string_view(sqlstate) == "55006";
+            o.error = PQerrorMessage(conn.get());
+        }
+        return o;
+    }
+};
+
 /// RAII fixture for an ephemeral, uniquely-named Postgres database.
 ///
-/// Connects to YUZU_TEST_POSTGRES_DSN, issues `CREATE DATABASE
+/// Connects to YUZU_TEST_POSTGRES_DSN (through the process-wide AdminConn, not
+/// a connection per database), issues `CREATE DATABASE
 /// yuzu_test_<epoch>_<salt>_<n>`, and exposes a rewritten conninfo (`dsn()`)
 /// pointing at it; the destructor drops the database (`WITH (FORCE)`, so a
 /// leaked test connection cannot keep it alive). Name uniqueness uses the
@@ -593,20 +719,19 @@ public:
             return;
         if (db_name_.empty() || admin_dsn_.empty())
             return;
-        yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn_.c_str())};
-        if (PQstatus(conn.get()) != CONNECTION_OK) {
+        // FORCE (PG 13+; every supported leg pins 16): terminate any
+        // connection a test leaked so the drop cannot fail and pile up
+        // databases on the shared instance.
+        const std::string drop = "DROP DATABASE IF EXISTS \"" + db_name_ + "\" WITH (FORCE)";
+        const AdminConn::Outcome out = AdminConn::exec(admin_dsn_, drop);
+        if (!out.connected) {
             // Can't throw from a dtor — but a silent failure piles leaked
             // yuzu_test_* databases onto a shared instance; say so.
             log_leak("teardown admin connect failed", nullptr);
             return;
         }
-        // FORCE (PG 13+; every supported leg pins 16): terminate any
-        // connection a test leaked so the drop cannot fail and pile up
-        // databases on the shared instance.
-        const std::string drop = "DROP DATABASE IF EXISTS \"" + db_name_ + "\" WITH (FORCE)";
-        yuzu::server::pg::PgResult res{PQexec(conn.get(), drop.c_str())};
-        if (!res.ok())
-            log_leak("DROP DATABASE failed", PQerrorMessage(conn.get()));
+        if (!out.ok)
+            log_leak("DROP DATABASE failed", out.error.c_str());
     }
 
     PostgresTestDb(const PostgresTestDb&) = delete;
@@ -648,30 +773,27 @@ private:
         admin_dsn_ = admin;
         db_name_ = unique_db_name();
 
-        // RAII owners (server/core/src/pg/pg_raii.hpp): an allocation throw
-        // while building error_ must not leak the admin connection/result.
-        yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn_.c_str())};
-        if (PQstatus(conn.get()) != CONNECTION_OK) {
-            error_ = std::string("admin connect failed: ") + PQerrorMessage(conn.get());
-            return;
-        }
         std::string create = "CREATE DATABASE \"" + db_name_ + "\"";
         if (tpl_name != nullptr)
             create += " TEMPLATE \"" + *tpl_name + "\"";
         // Clone-from-template refuses while ANY connection to the template
         // is open (SQLSTATE 55006). The builder's PgPool has PQfinish()ed by
         // the time ensure() returns, but the backend teardown can lag a
-        // moment — retry briefly instead of failing the fixture.
+        // moment; retry briefly instead of failing the fixture. Each attempt
+        // takes the shared admin connection's lock on its own, so the sleep
+        // never holds up another thread's CREATE/DROP.
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         for (;;) {
-            yuzu::server::pg::PgResult res{PQexec(conn.get(), create.c_str())};
-            if (res.ok())
+            const AdminConn::Outcome out = AdminConn::exec(admin_dsn_, create);
+            if (!out.connected) {
+                error_ = std::string("admin connect failed: ") + out.error;
+                return;
+            }
+            if (out.ok)
                 break;
-            const char* sqlstate = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
-            const bool in_use = sqlstate != nullptr && std::string_view(sqlstate) == "55006";
-            if (!in_use || std::chrono::steady_clock::now() >= deadline) {
-                error_ = std::string("CREATE DATABASE failed: ") + PQerrorMessage(conn.get());
-                if (in_use)
+            if (!out.in_use || std::chrono::steady_clock::now() >= deadline) {
+                error_ = std::string("CREATE DATABASE failed: ") + out.error;
+                if (out.in_use)
                     error_ += " — the template stayed busy past the 5s retry window; a "
                               "template setup callback may have leaked a connection (e.g. a "
                               "store background thread holding a pool lease)";
@@ -679,7 +801,6 @@ private:
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        conn.reset();
 
         dsn_ = rewrite_dbname(admin_dsn_, db_name_);
         if (dsn_.empty()) {
