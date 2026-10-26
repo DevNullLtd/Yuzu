@@ -193,13 +193,18 @@ const out = {};
       '/r3': { get: { summary: 'throws', tags: ['Rec'], responses: refResp('D') } },
       '/w1': { get: { summary: 'wide', tags: ['Big'], responses: refResp('Wide') } },
       '/w2': { get: { summary: 'deep', tags: ['Big'], responses: refResp('L0') } },
+      '/m1': { get: { summary: 'combo', tags: ['Big'], responses: refResp('Detail') } },
+      '/m2': { get: { summary: 'loopall', tags: ['Big'], responses: refResp('SelfAll') } },
       '/n': { get: { summary: 'nested', tags: ['Big'], responses: R({ content: { 'application/json': { schema: { type: 'object', properties: { outer: { type: 'object', properties: { inner: { type: 'string' } } } } } } } }) } }
     },
     components: { schemas: Object.assign({
       C: { oneOf: [{ $ref: '#/components/schemas/C' }] },
       A: { oneOf: [{ $ref: '#/components/schemas/B' }] }, B: { anyOf: [{ $ref: '#/components/schemas/A' }] },
       D: { oneOf: [null] },
-      Wide: { type: 'object', properties: wideProps } }, chain) }
+      Wide: { type: 'object', properties: wideProps },
+      Row: { type: 'object', properties: { name: { type: 'string' }, steps: { type: 'array', items: { type: 'string' } } }, required: ['name'] },
+      Detail: { allOf: [{ $ref: '#/components/schemas/Row' }, { type: 'object', properties: { yaml_source: { type: 'string' } }, required: ['yaml_source'] }] },
+      SelfAll: { allOf: [{ $ref: '#/components/schemas/SelfAll' }, { type: 'object', properties: { own: { type: 'string' } } }] } }, chain) }
   };
   await reload({ status: 200, body: spec2 });
   const opRow = name => root.byClass('sw-op').filter(r => r.textContent.includes(name))[0];
@@ -222,6 +227,13 @@ const out = {};
   opRow('wide').byClass('sw-op-h')[0].click();
   out.wide_rows = opRow('wide').byClass('sw-name').length;
   out.wide_note = opRow('wide').textContent.includes('Truncated: at least 1000 more fields');
+  // A model written as allOf of several members lists every member's fields (and a member that
+  // is the schema itself adds nothing and does not loop).
+  opRow('combo').byClass('sw-op-h')[0].click();
+  out.allof_names = opRow('combo').byClass('sw-name').map(e => e.textContent.trim());
+  out.allof_required = opRow('combo').byClass('pill').map(e => e.textContent).filter(t => t === 'required').length;
+  opRow('loopall').byClass('sw-op-h')[0].click();
+  out.allof_self_names = opRow('loopall').byClass('sw-name').map(e => e.textContent.trim());
   opRow('deep').byClass('sw-op-h')[0].click();
   out.deep_rows = opRow('deep').byClass('sw-name').length;
   out.deep_note = /Truncated: at least \d+ more fields/.test(opRow('deep').textContent);
@@ -371,6 +383,10 @@ const out = {};
   rm.selectedIndex = 0; rm.fire('change');
   out.r_panels = root.byTag('section').length;
   out.r_expect_panels = new Set(Object.keys(real.paths).flatMap(p => M.map(m => real.paths[p][m]).filter(o => o && typeof o === 'object').map(o => (o.tags && o.tags[0]) || 'Untagged'))).size;
+  // WorkflowDetail is allOf [WorkflowRow, {yaml_source}]: the page must list the row's fields too.
+  const wfRow = rr.filter(r => pathOf(r) === '/workflows/{id}' && r.textContent.startsWith('GET'))[0];
+  wfRow.byClass('sw-op-h')[0].click();
+  out.r_wf_names = wfRow.byClass('sw-name').map(e => e.textContent.trim());
   out.r_console_errors = consoleErrors.length;
   out.r_guides = root.byClass('sw-gbtn').length;
   out.r_expect_guides = (real.tags || []).filter(t => t['x-yuzu-guide']).length;
@@ -492,6 +508,9 @@ def main():
     check(out["model_d_closed"] == "false/Show fields/true", "a failed model block must still close: %r" % out["model_d_closed"])
     # Breadth: wide and deep acyclic schemas stop at the budget and say so.
     check(out["wide_rows"] == 2000 and out["wide_note"], "a 3000-field schema must stop at 2000 rows and say 1000 more: %r" % out["wide_rows"])
+    check(out["allof_names"] == ["name", "steps", "yaml_source"] and out["allof_required"] >= 2,
+          "an allOf of several members must list the merged fields, with required: %r" % out["allof_names"])
+    check(out["allof_self_names"] == ["own"], "an allOf member that names its own schema must be skipped, not looped: %r" % out["allof_self_names"])
     check(out["deep_rows"] == 2000 and out["deep_note"], "a wide 8-level chain must stop at 2000 rows with a note: %r" % out["deep_rows"])
     check(not out["small_note"], "a small schema must not carry a truncation note")
     check(out["indent_nbsp"], "nested rows must indent with three U+00A0 characters (UTF-8 survived the pipe)")
@@ -559,6 +578,8 @@ def main():
     check(out["r_panels"] == out["r_expect_panels"] and out["r_guides"] == out["r_expect_guides"] and out["r_guides"] > 0,
           "one panel per group and a Guide button for every group that has one: %r/%r guides %r/%r" % (
               out["r_panels"], out["r_expect_panels"], out["r_guides"], out["r_expect_guides"]))
+    check(all(n in out["r_wf_names"] for n in ("name", "steps", "yaml_source")),
+          "GET /workflows/{id} (an allOf of two members) must list name, steps and yaml_source: %r" % out["r_wf_names"])
     check(out["r_console_errors"] == 0, "the real document must draw without a console error: %r" % out["r_console_errors"])
     if errors:
         print("FAIL")

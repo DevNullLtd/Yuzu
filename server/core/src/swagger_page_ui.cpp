@@ -188,12 +188,37 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
   // document: the largest block has 97 rows, so this cap is about twenty times that.
   var MAX_ROWS = 2000;
 
+  // allOf -> one schema. Every member is followed through its $ref and its properties and
+  // required lists are merged in order, so a model written as "row plus extra fields" lists
+  // all of them. Members already open above (seen) or deeper than 8 levels contribute nothing,
+  // which bounds a cyclic spec.
+  function flat(s, seen, depth) {
+    if (!s || !s.allOf || !s.allOf.length) return s || {};
+    var out = {}, props = {}, req = [];
+    Object.keys(s).forEach(function (k) { if (k !== 'allOf') out[k] = s[k]; });
+    Object.keys(s.properties || {}).forEach(function (k) { props[k] = s.properties[k]; });
+    req = (s.required || []).slice();
+    if ((depth || 0) < 8) {
+      s.allOf.forEach(function (m) {
+        var n = m && m.$ref ? refName(m.$ref) : null;
+        if (n && seen && seen.indexOf(n) >= 0) return;
+        var f = flat(deref(m, seen), n ? (seen || []).concat([n]) : seen, (depth || 0) + 1);
+        Object.keys(f.properties || {}).forEach(function (k) { if (!Object.prototype.hasOwnProperty.call(props, k)) props[k] = f.properties[k]; });
+        (f.required || []).forEach(function (k) { if (req.indexOf(k) < 0) req.push(k); });
+        ['type', 'description', 'oneOf', 'anyOf', 'items', 'enum'].forEach(function (k) { if (out[k] === undefined && f[k] !== undefined) out[k] = f[k]; });
+      });
+    }
+    if (Object.keys(props).length) out.properties = props;
+    if (req.length) out.required = req;
+    return out;
+  }
+
   // Schema -> table rows. depth/seen guard against recursion; budget bounds the row count.
   function schemaRows(s, depth, seen, req, out, indent, budget) {
     var base = s.allOf && s.allOf.length === 1 && !s.properties ? s.allOf[0] : s;
     var n = base.$ref ? refName(base.$ref) : null;
-    var d = deref(base, seen);
     var nseen = n ? (seen || []).concat([n]) : seen;
+    var d = flat(deref(base, seen), nseen, 0);
     if (d.type === 'array' && d.items) { return schemaRows(d.items, depth, nseen, req, out, indent, budget); }
     var props = d.properties || {};
     var required = d.required || [];
@@ -209,8 +234,8 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
       ]);
       out.push(tr);
       var inner = p.items ? p.items : p;
-      var innerD = deref(inner, nseen);
-      if (depth < 5 && (innerD.properties || (innerD.allOf && innerD.allOf.length === 1))) {
+      var innerD = flat(deref(inner, nseen), nseen, 0);
+      if (depth < 5 && innerD.properties) {
         schemaRows(inner, depth + 1, nseen, false, out, indent + 1, budget);
       }
     });
