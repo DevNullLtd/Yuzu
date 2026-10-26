@@ -47,6 +47,7 @@ import importlib.util
 import io
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -831,6 +832,41 @@ def main() -> int:
         if not ok:
             _fail("a generated *.pb.h (or an unresolved ANGLE include) hard-failed - the "
                   "allowlist/angle exemption is gone", failures)
+
+        # 22. PARSER COST + CONTROLS. The gate runs in CI over repo files: a pathological line
+        #     must never hang it. The first draft of the same-line-comment support was a nested
+        #     quantifier that backtracked catastrophically on many closed comments followed by
+        #     a non-include (it hung for >120 s). `re` holds the GIL while backtracking, so a
+        #     thread cannot be timed out - the probe runs the parse in a SUBPROCESS with a hard
+        #     timeout, so a regression FAILS instead of wedging CI.
+        (src / "slow_routes.cpp").write_text("/* x */ " * 20000 + "int x;\n", encoding="utf-8")
+        probe_code = (
+            "import importlib.util, sys\n"
+            "spec = importlib.util.spec_from_file_location('c', sys.argv[1])\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "print(len(m.parse_includes(__import__('pathlib').Path(sys.argv[2]))))\n")
+        try:
+            done = subprocess.run([sys.executable, "-B", "-I", "-c", probe_code, str(CHECKER_PATH),
+                                   str(src / "slow_routes.cpp")], capture_output=True, text=True,
+                                  timeout=20)
+            if done.returncode != 0 or done.stdout.strip() != "0":
+                _fail(f"parse_includes on 20000 closed comments returned rc={done.returncode} "
+                      f"out={done.stdout.strip()!r} err={done.stderr.strip()[:200]!r} (expected 0 includes)",
+                      failures)
+        except subprocess.TimeoutExpired:
+            _fail("parse_includes did not finish 20000 closed comments on one line within 20 s - the "
+                  "include regex is superlinear again (ReDoS) and would hang CI", failures)
+        # semantic controls: what is and is NOT an include after leading comments
+        for line, want in (
+                ('/* a */ #include "x.h"', [(False, "x.h")]),
+                ('  /* a */  /* b */   #  include <y.h>', [(True, "y.h")]),
+                ('/* unterminated #include "x.h"', []),
+                ('/* a */ int x; #include "q.h"', []),
+                ('// #include "x.h"', [])):
+            (src / "ctl_routes.cpp").write_text(line + "\n", encoding="utf-8")
+            got = mod.parse_includes(src / "ctl_routes.cpp")
+            if got != want:
+                _fail(f"parse_includes({line!r}) -> {got!r}, expected {want!r}", failures)
 
     # 19. run_check() WIRING: every check above exercises a helper or a constant in
     #     isolation, so nothing observed how run_check() CONSUMES them - deleting a lane's

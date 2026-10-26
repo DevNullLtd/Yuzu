@@ -709,9 +709,12 @@ STORE_DEFINITION_FREE_TUS = [
     "server/core/src/workflows_ui.cpp",
 ]
 
-# `#include` / the `%:include` digraph, optionally preceded on the SAME line by complete
-# `/* ... */` comments (`/* c */ #include "x_store.hpp"` is a real include).
-_INCLUDE_RE = re.compile(r'^\s*(?:/\*.*?\*/\s*)*(?:#|%:)\s*include\s*(<[^>]+>|"[^"]+")')
+# `#include` / the `%:include` digraph. Complete `/* ... */` comments before it on the
+# SAME line (`/* c */ #include "x_store.hpp"` is a real include) are removed by
+# `_strip_leading_block_comments` first - NOT folded into this regex: the nested
+# quantifier `(?:/\*.*?\*/\s*)*` backtracks catastrophically on a line of many closed
+# comments that is not an include (measured: it hung), and this script gates CI.
+_INCLUDE_RE = re.compile(r'^\s*(?:#|%:)\s*include\s*(<[^>]+>|"[^"]+")')
 # Backslash-newline is deleted by translation phase 2, BEFORE preprocessing, so
 # `#include \` + newline + `"x_store.hpp"` is one include line.
 _LINE_CONTINUATION_RE = re.compile(r'\\\r?\n')
@@ -725,6 +728,24 @@ GENERATED_HEADER_SUFFIXES = (".pb.h",)
 def gh(kind, msg):
     # stderr, matching check-api-parity.py's convention.
     print(f"::{kind}::{msg}", file=sys.stderr, flush=True)
+
+
+def _strip_leading_block_comments(line: str) -> str:
+    """Drop complete `/* ... */` comments (and the whitespace around them) from the START
+    of `line`. Strictly linear in the line length (index-based: no repeated slicing). An
+    unterminated `/*` is left as-is (the include regex then simply does not match, which is
+    the conservative reading of a comment that continues onto the next line)."""
+    n = len(line)
+    i = 0
+    while True:
+        while i < n and line[i].isspace():
+            i += 1
+        if not line.startswith("/*", i):
+            return line[i:]
+        end = line.find("*/", i + 2)
+        if end < 0:
+            return line
+        i = end + 2
 
 
 def parse_includes(path: Path):
@@ -742,7 +763,7 @@ def parse_includes(path: Path):
     text = path.read_text(encoding="utf-8-sig", errors="replace")
     text = _LINE_CONTINUATION_RE.sub("", text)
     for line in text.splitlines():
-        m = _INCLUDE_RE.match(line)
+        m = _INCLUDE_RE.match(_strip_leading_block_comments(line))
         if not m:
             continue
         spelling = m.group(1)
