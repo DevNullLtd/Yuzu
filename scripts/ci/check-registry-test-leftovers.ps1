@@ -35,8 +35,7 @@ param(
 $prefix = "YuzuTest-$Scope-"
 $roots = 'HKLM:\SOFTWARE', 'HKLM:\SOFTWARE\Wow6432Node', 'HKCU:\Software'
 $all = @(Get-ChildItem -Path $roots -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like 'YuzuTest-*' })
-$mine = @($all | Where-Object { $_.PSChildName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) })
-$others = @($all | Where-Object { -not $_.PSChildName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) })
+$mine, $others = $all.Where({ $_.PSChildName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) }, 'Split')
 foreach ($k in $others) { Write-Host "::warning::registry key from another job or a cancelled run, not removed: $($k.Name)" }
 if ($mine.Count -gt 0) {
     foreach ($k in $mine) { Write-Host "::error::leftover registry key $($k.Name)" }

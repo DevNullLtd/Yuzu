@@ -1710,12 +1710,7 @@ jobs:
       # Belt-and-suspenders with Start-PinnedRunner.ps1: every Wee Tam job
       # explicitly carries the 16-thread width of its assigned CCD.
       YUZU_BUILD_JOBS: "16"
-      # #6488: names this job's scratch registry keys YuzuTest-<scope>-<salt>... (tests/unit/test_helpers.hpp
-      # registry_scratch_prefix), so the leftover-key check after the test step (and its self-test before it:
-      # scripts/ci/check-registry-test-leftovers.ps1) judges THIS job only: with-test-slot.sh 2 lets two test phases
-      # share one Wee Tam box at once, and the four runner agents share one OS identity, so a machine-wide YuzuTest-*
-      # scan would call a concurrent job's live keys a leak. Digits and debug/release: registry-name-safe. One
-      # definition for all three steps, so they cannot drift apart.
+      # #6488: per-job registry key scope; see scripts/ci/check-registry-test-leftovers.ps1
       YUZU_TEST_REGISTRY_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.build_type }}
     defaults:
       run:
@@ -2033,14 +2028,7 @@ jobs:
           echo "PGCONNECT_TIMEOUT=30" >> "$GITHUB_ENV"
           echo "PGCONNECT_TIMEOUT=30 appended to GITHUB_ENV for the later steps"
 
-      # #6488: the leftover check after the suite is only worth having if it can fail, and a leak-free run never
-      # exercises its failing arm. So before the suite (fail fast, never confused with a real leak) plant ONE probe key
-      # outside this job's scope namespace (YuzuTest-selftest-<scope>-probe), then run the real script as a child with
-      # (a) the scope that probe belongs to: it must exit 1 and name the probe in an ::error line; and (b) this job's
-      # own scope: the probe is then another job's key, so it must exit 0 and name the probe in a ::warning. The
-      # probe is removed in finally (that exact key; it has no subkeys, so no recursive delete); the run's real
-      # fixtures never share its prefix, so the later scan never sees it as this job's. The child's output is echoed
-      # with its :: prefix defused, so the expected ::error does not show as an annotation on a green job.
+      # #6488: proves both decisions of the leftover check; see scripts/ci/check-registry-test-leftovers.ps1
       - name: Self-test the registry leftover check
         shell: pwsh
         run: |
@@ -2048,30 +2036,22 @@ jobs:
           $script = './scripts/ci/check-registry-test-leftovers.ps1'
           $probe = "YuzuTest-selftest-$scope-probe"
           $probePath = "HKCU:\Software\$probe"
-          $problems = @()
+          function Arm($s, $want, $pat, $name) {
+            $out = & pwsh -NoProfile -NonInteractive -File $script -Scope $s 2>&1 | Out-String
+            $rc = $LASTEXITCODE
+            Write-Host ($out -replace '::(error|warning)::', 'child $1: ')
+            if ($rc -ne $want -or $out -notmatch $pat) {
+              throw "registry leftover check self-test, $name arm: expected exit $want naming $probe, got exit $rc"
+            }
+          }
           New-Item -Path $probePath -Force | Out-Null
           try {
-            $out = & pwsh -NoProfile -NonInteractive -File $script -Scope "selftest-$scope" 2>&1 | Out-String
-            $rc = $LASTEXITCODE
-            Write-Host ($out -replace '::(error|warning)::', 'child $1: ')
-            if ($rc -ne 1 -or $out -notmatch ('::error::leftover registry key .*' + [regex]::Escape($probe))) {
-              $problems += "own-scope arm: expected exit 1 and an ::error naming $probe, got exit $rc"
-            }
-            $out = & pwsh -NoProfile -NonInteractive -File $script -Scope $scope 2>&1 | Out-String
-            $rc = $LASTEXITCODE
-            Write-Host ($out -replace '::(error|warning)::', 'child $1: ')
-            if ($rc -ne 0 -or $out -notmatch ('::warning::.*' + [regex]::Escape($probe))) {
-              $problems += "other-scope arm: expected exit 0 and a ::warning naming $probe, got exit $rc"
-            }
+            Arm "selftest-$scope" 1 ('::error::leftover registry key .*' + [regex]::Escape($probe)) 'own-scope'
+            Arm $scope 0 ('::warning::.*' + [regex]::Escape($probe)) 'other-scope'
           } finally {
             Remove-Item -LiteralPath $probePath
           }
-          if ($problems.Count -gt 0) {
-            foreach ($p in $problems) { Write-Host "::error::registry leftover check self-test: $p" }
-            exit 1
-          }
           Write-Host 'registry leftover check self-test: both decisions hold'
-          exit 0
 
       # Windows CI test-phase restructuring (#3443, 2026-08-28): mirrors the
       # Linux job's non-pg/pg-shards/pg-smoke split — see docs/ci-architecture.md
@@ -2159,8 +2139,6 @@ jobs:
         shell: pwsh
         run: |
           ./scripts/ci/check-registry-test-leftovers.ps1 -Scope $env:YUZU_TEST_REGISTRY_SCOPE
-          # the runner wraps this script and exits with $LASTEXITCODE; say it, so the script's verdict is the step's
-          exit $LASTEXITCODE
 
       # if: matrix.pg_mode == 'full' — see the Resolve step above; PRs are
       # debug-only (exclude: above), so PR coverage is unaffected. k=2 was

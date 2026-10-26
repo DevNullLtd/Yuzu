@@ -991,7 +991,6 @@ TEST_CASE("registry_scratch_prefix puts the CI scope between the fixed stem and 
     const std::string bare = yuzu::test::registry_scratch_prefix(nullptr);
     CHECK(bare == stem + "-");
     CHECK(yuzu::test::registry_scratch_prefix("") == bare); // an empty scope is no scope
-    CHECK(yuzu::test::registry_scratch_prefix("abc") == stem + "-abc-");
     // the shape CI sets: <run id>-<attempt>-<build type>
     CHECK(yuzu::test::registry_scratch_prefix("123-2-debug") == stem + "-123-2-debug-");
 }
