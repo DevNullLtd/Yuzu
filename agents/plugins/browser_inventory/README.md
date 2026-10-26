@@ -127,7 +127,7 @@ Neither action takes parameters.
 
 ### Outputs
 
-Pipe-delimited rows. Every action's stream leads with a `status|<action>|<supported|constrained>|<reason>` row (CC-07 typed-status pairing), followed by zero or more data rows discriminated by their own leading tag (`browser|...`, `profile|...`); every untrusted string field (usernames, profile directory and display names) is escaped through `safe_output_field`. A directory or file that cannot be opened or read anywhere in the walk (`ConstraintAccumulator`) sets the action's `status` row to `constrained` with the accumulated reason — a genuinely absent browser install or user directory is never treated as a failure, only as fewer rows.
+Pipe-delimited rows. Every action's stream leads with a `status|<action>|<supported|constrained|unsupported>|<reason>` row (CC-07 typed-status pairing; `unsupported` is the macOS and Windows placeholder, `<os>:planned`), followed by zero or more data rows discriminated by their own leading tag (`browser|...`, `profile|...`); every untrusted string field (usernames, profile directory and display names) is escaped through `safe_output_field`. A directory or file that cannot be opened or read anywhere in the walk (`ConstraintAccumulator`) sets the action's `status` row to `constrained` with the accumulated reason — a genuinely absent browser install or user directory is never treated as a failure, only as fewer rows.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`crossplatform.browser_inventory.browsers` — `row_kind|field_1|field_2|field_3`**

@@ -259,11 +259,11 @@
       "runs_as": "n/a (the leg reads nothing, caveat 1)"
     },
     {
-      "grant": "None expected: the stock install trees under `/usr`, `/opt` and `/var/opt/java` are world-readable (0755 directories, 0644 `release` files)",
+      "grant": "None expected: the stock install trees under `/usr`, `/opt` and `/var/opt/java` are expected to be world-readable (0755 directories, 0644 `release` files; inferred, not measured as `yuzu-agent`)",
       "if_refused": "`status|<action>|constrained|linux:runtimes:permission_denied`; rows read before the refusal are still returned, and a later readable root never hides it",
-      "measured": "Walked trees are captured as test fixtures (`tests/unit/fixtures/wave10/runtimes/linux/provenance.txt`); the live sample was taken as `euid 0` in a container, not as `yuzu`",
+      "measured": "Walked trees are captured as test fixtures (`tests/unit/fixtures/wave10/runtimes/linux/provenance.txt`); the live sample was taken as `euid 0` in a container, not as `yuzu-agent`",
       "os": "Linux",
-      "runs_as": "agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`)"
+      "runs_as": "agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`)"
     }
   ],
   "readme": "agents/plugins/runtimes/README.md",

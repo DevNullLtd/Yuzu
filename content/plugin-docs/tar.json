@@ -1975,11 +1975,11 @@
   },
   "privileges": [
     {
-      "grant": "**None beyond install-time grants.** `SeBackupPrivilege` and the ETW-enabling group membership are already provisioned; the `software` source needs no extra privilege beyond the account's existing registry-read access. The `netqual` source needs an elevated agent: a non-elevated agent records nothing and `status` reports `netqual_capture_method=none`.",
-      "if_refused": "Not observed in this capture. The Windows legs never fall back to a poll (they are all `supported`, not `constrained`) — a refused read would surface as an `error|` line from the underlying Win32 call, not a degrade.",
+      "grant": "**None beyond the service account's own rights.** LocalSystem already satisfies the ETW session requirements; the `software` source needs no extra privilege beyond the account's existing registry-read access. The `netqual` source needs an elevated agent: a non-elevated agent records nothing and `status` reports `netqual_capture_method=none`.",
+      "if_refused": "Not observed in this capture. Not every Windows leg is plain `supported`: `process` falls back to a `CreateToolhelp32Snapshot` poll if the ETW session cannot start, and `netqual` and `power` are `constrained`. For the other Windows legs a refused read is expected to surface as an `error|` line from the underlying Win32 call rather than a degrade (inferred from the code, not shown in the capture).",
       "measured": "2026-09-07, bare-metal, captured as `SYSTEM` — broader privilege than the deployed service account; no OS-level read was reached in this capture (see Caveats)",
       "os": "Windows",
-      "runs_as": "Agent service account, granted `SeBackupPrivilege` (read regardless of DACL) and `Performance Log Users` group membership (the `tar.*` row of `docs/agent-privilege-model.md`)"
+      "runs_as": "Agent service account (LocalSystem today, #1442; the `tar.*` row of `docs/agent-privilege-model.md` lists `SeBackupPrivilege` and `Performance Log Users` for the intended account, but no TAR source enables `SeBackupPrivilege`)"
     },
     {
       "grant": "Endpoint Security process capture needs root **and** the `com.apple.developer.endpoint-security.client` entitlement; without both, `es_new_client`/`es_subscribe` fails and the process/tcp legs self-heal to the `KERN_PROC_ALL`/`proc_pidfdinfo` poll (`ProcEsCollector::start`). The `nstat` flow source (`tcp`, `netqual`) likewise needs root for system-wide visibility.",
@@ -1989,11 +1989,11 @@
       "runs_as": "**root** (LaunchDaemon, no `UserName`; see the TL;DR and the `tar.*` row of `docs/agent-privilege-model.md`)"
     },
     {
-      "grant": "None beyond the binary capability. Service enumeration (`systemctl`) runs as bounded argv under the agent account, not elevated.",
+      "grant": "A file capability on the binary does not take effect under the packaged unit's `NoNewPrivileges=true`, so on the packaged unit the working route is `AmbientCapabilities=CAP_DAC_READ_SEARCH` in a drop-in (not measured for this plugin). Service enumeration (`systemctl`) runs as bounded argv under the agent account, not elevated.",
       "if_refused": "Not observed in this capture.",
-      "measured": "2026-09-06, container, captured at **euid 0 (root)** — broader than the deployed `cap_dac_read_search` account.",
+      "measured": "2026-09-06, container, captured at **euid 0 (root)** — broader than the deployed unprivileged account.",
       "os": "Linux",
-      "runs_as": "Agent account with `cap_dac_read_search` set on the binary (the `tar.*` row of `docs/agent-privilege-model.md`); not root"
+      "runs_as": "Agent account (`yuzu-agent` on the packaged unit); not root. The `tar.*` row of `docs/agent-privilege-model.md` assumes `cap_dac_read_search` set on the binary by `scripts/install-agent-user.sh`"
     }
   ],
   "readme": "agents/plugins/tar/README.md",

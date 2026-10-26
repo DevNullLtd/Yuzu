@@ -58,7 +58,7 @@ no events, so a quiet first tick is not evidence about the past.
 | Did the device sleep, wake, change power source, or have media attached? | `sql` over `$Power_Live`, `$Removable_Live` | `capture_gap` rows mark any stretch the agent could not see. |
 | Who is on the network segment, what did it resolve, which shares are mapped? | `recent_arp`, `recent_dns`, `recent_mapdrive`, or `query` with type arp, dns or mapdrive | `dns` is Windows only; `mapdrive` outbound live only on macOS. These are device-state sources: they are never part of the default `query` feed. |
 | Anything else in the warehouse | `sql` | A single SELECT against `$`-prefixed tables, validated by `validate_and_translate_sql` and run through the read-only `execute_user_query`. The `usage` tables are not queryable here. |
-| Pull a time range out for another tool | `export` | JSON array of events, same filters as `query`, capped at 10000. |
+| Pull a time range out for another tool | `export` | JSON array of events, same filters as `query`. `limit` defaults to 1000; a value above 10000 (or zero or less) falls back to 1000. |
 
 What a result proves. A row says the collector saw that change at that tick; it does not say nothing
 else happened. An empty table on a `planned` leg means TAR is not collecting there, never that
@@ -119,8 +119,9 @@ empty); `n/a` means the source does not apply to that OS. The table is read from
 - **`mapdrive` history backfill.** A one-time historical pass runs at agent init. A profile it could
   not read is retried individually, at most 7 attempts in total and no more than once per 24 hours,
   until it resolves or is abandoned. A hive mount that exceeds its 30 s bound ends that run's
-  mounting; its thread cannot be stopped, so the plugin module is pinned in memory and no further
-  hive is read until the agent restarts if the pin fails. `purge_source mapdrive` also clears the
+  mounting. The stuck mount's thread cannot be stopped, so the plugin module is pinned in memory
+  before the first mount; if the pin fails no hive is read, and while a stuck mount is still running
+  later runs do not start new mounts. `purge_source mapdrive` also clears the
   pending-retry list so a retry cannot re-insert purged rows.
 - **`registry`.** Values are stored unmasked and rows carry `actor_pid` 0; see Caveats.
 
@@ -160,7 +161,8 @@ flowchart TD
   A --> H[("Hourly, daily and monthly tables")]
   A --> C{"run_retention: clock guard on time-based tiers"}
   C -->|"plausible clock"| X["Delete aged rows, at most 5000 per table per pass"]
-  C -->|"anomaly"| N["Decline that table and count it in status"]
+  C -->|"anomaly, first time seen"| N["Decline that table and count it in status"]
+  C -->|"same anomaly seen again"| X
 ```
 
 Collectors write only the difference from the last complete snapshot, and a failed or partial read
@@ -168,7 +170,9 @@ keeps the old baseline rather than inventing events. Aggregation always runs bef
 tier is consumed before the tier below it can be trimmed. The clock guard declines a time-based pass
 that looks like a wall-clock jump (a pass that would wipe a table, more than 30 days since the last
 pass, a stored reading ahead of now, or no stored reading) and counts it in
-`retention_guard_declines_total`; row-count trimming needs no clock and is not guarded.
+`retention_guard_declines_total`. It declines once per distinct anomaly: while the same anomaly
+persists, later passes delete again but never more than 5000 rows per table per pass. Row-count
+trimming needs no clock and is not clock-guarded, though it has the same per-pass cap.
 
 #### Disable, then purge a source
 
@@ -189,15 +193,15 @@ sequenceDiagram
   else flag still true
     P-->>Op: error source_not_paused
   else flag confirmed false
-    P->>DB: delete every tier, commit, truncate the WAL
+    P->>DB: delete every tier, commit, truncate the write-ahead log
     P-->>Op: JSON with rows_deleted and status purged
   end
 ```
 
 The enable check and the delete happen under the same collector lock that `configure` takes, so a
 concurrent re-enable cannot slip between them and have a collecting source purged. An unreadable
-flag is treated as unconfirmed and refused, never as disabled. The best-effort WAL truncation
-clears the purged pages from the write-ahead log so the erasure is complete.
+flag is treated as unconfirmed and refused, never as disabled. The best-effort truncation of the
+SQLite write-ahead log (WAL) clears the purged pages from that log so the erasure is complete.
 
 #### Cursor source states
 
@@ -214,7 +218,7 @@ stateDiagram-v2
 ```
 
 `power`, `removable` and `registry` keep one saved position each in the `tar_cursor` table (readable
-through `sql`). A transient read failure throws `IncompleteCaptureError`, which keeps the cursor so
+through `sql`). A transient read failure raises an incomplete-capture error (`IncompleteCaptureError`), which keeps the cursor so
 the next tick retries from the same place. A lost cursor or wrapped log writes a single
 `capture_gap` row and re-baselines at the log's current end, never a replay from zero, and the
 window of a disable is likewise reported only as a gap, never as its own events.
@@ -254,9 +258,9 @@ window of a disable is likewise reported only as a gap, never as its own events.
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | Agent service account, granted `SeBackupPrivilege` (read regardless of DACL) and `Performance Log Users` group membership (the `tar.*` row of `docs/agent-privilege-model.md`) | **None beyond install-time grants.** `SeBackupPrivilege` and the ETW-enabling group membership are already provisioned; the `software` source needs no extra privilege beyond the account's existing registry-read access. The `netqual` source needs an elevated agent: a non-elevated agent records nothing and `status` reports `netqual_capture_method=none`. | 2026-09-07, bare-metal, captured as `SYSTEM` — broader privilege than the deployed service account; no OS-level read was reached in this capture (see Caveats) | Not observed in this capture. The Windows legs never fall back to a poll (they are all `supported`, not `constrained`) — a refused read would surface as an `error\|` line from the underlying Win32 call, not a degrade. |
+| Windows | Agent service account (LocalSystem today, #1442; the `tar.*` row of `docs/agent-privilege-model.md` lists `SeBackupPrivilege` and `Performance Log Users` for the intended account, but no TAR source enables `SeBackupPrivilege`) | **None beyond the service account's own rights.** LocalSystem already satisfies the ETW session requirements; the `software` source needs no extra privilege beyond the account's existing registry-read access. The `netqual` source needs an elevated agent: a non-elevated agent records nothing and `status` reports `netqual_capture_method=none`. | 2026-09-07, bare-metal, captured as `SYSTEM` — broader privilege than the deployed service account; no OS-level read was reached in this capture (see Caveats) | Not observed in this capture. Not every Windows leg is plain `supported`: `process` falls back to a `CreateToolhelp32Snapshot` poll if the ETW session cannot start, and `netqual` and `power` are `constrained`. For the other Windows legs a refused read is expected to surface as an `error\|` line from the underlying Win32 call rather than a degrade (inferred from the code, not shown in the capture). |
 | macOS | **root** (LaunchDaemon, no `UserName`; see the TL;DR and the `tar.*` row of `docs/agent-privilege-model.md`) | Endpoint Security process capture needs root **and** the `com.apple.developer.endpoint-security.client` entitlement; without both, `es_new_client`/`es_subscribe` fails and the process/tcp legs self-heal to the `KERN_PROC_ALL`/`proc_pidfdinfo` poll (`ProcEsCollector::start`). The `nstat` flow source (`tcp`, `netqual`) likewise needs root for system-wide visibility. | 2026-09-07, bare-metal, captured at **euid 501**, an ordinary user account; the root LaunchDaemon path was not exercised by this capture. | A missing entitlement/privilege never blocks the leg outright — it logs a warning and falls back to the poll (`ProcEsCollector::start`). |
-| Linux | Agent account with `cap_dac_read_search` set on the binary (the `tar.*` row of `docs/agent-privilege-model.md`); not root | None beyond the binary capability. Service enumeration (`systemctl`) runs as bounded argv under the agent account, not elevated. | 2026-09-06, container, captured at **euid 0 (root)** — broader than the deployed `cap_dac_read_search` account. | Not observed in this capture. |
+| Linux | Agent account (`yuzu-agent` on the packaged unit); not root. The `tar.*` row of `docs/agent-privilege-model.md` assumes `cap_dac_read_search` set on the binary by `scripts/install-agent-user.sh` | A file capability on the binary does not take effect under the packaged unit's `NoNewPrivileges=true`, so on the packaged unit the working route is `AmbientCapabilities=CAP_DAC_READ_SEARCH` in a drop-in (not measured for this plugin). Service enumeration (`systemctl`) runs as bounded argv under the agent account, not elevated. | 2026-09-06, container, captured at **euid 0 (root)** — broader than the deployed unprivileged account. | Not observed in this capture. |
 
 Binaries/subprocesses/network: `systemctl list-units --type=service --all --plain --no-pager --no-legend` and
 `launchctl list` (both through the shared bounded-argv runner `yuzu::agent::run_bounded_subprocess`,

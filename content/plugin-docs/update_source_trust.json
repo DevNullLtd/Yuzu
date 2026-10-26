@@ -222,9 +222,9 @@
     {
       "grant": "None to read",
       "if_refused": "`CONSTRAINED` / partial with a `linux:apt_sources:<detail>` or `linux:apt_keyring:<detail>` token (or `linux:rpm_repo:<detail>` when the `/etc/yum.repos.d` listing itself is refused); the unreadable source is absent from the rows, never reported as unsigned or absent",
-      "measured": "Not measured on the `yuzu` account: the only capture (`docs/samples/linux.txt`) ran as root in a container, which bypasses permission bits, so it proves the read path and the row shapes, not the grant",
+      "measured": "Not measured on the `yuzu-agent` account: the only capture (`docs/samples/linux.txt`) ran as root in a container, which bypasses permission bits, so it proves the read path and the row shapes, not the grant",
       "os": "Linux",
-      "runs_as": "agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`)"
+      "runs_as": "agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`)"
     }
   ],
   "readme": "agents/plugins/update_source_trust/README.md",

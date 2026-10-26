@@ -31,7 +31,7 @@ flowchart LR
 |---|---|---|
 | Which .NET shared frameworks and SDKs are installed, and at what exact version? (`dotnet`) | One row per framework or SDK version directory under the three roots, including hosts where no package manager owns the install | Nothing: one `unsupported` row, result status `UNAVAILABLE` |
 | Which JVMs are installed, JDK or JRE, which version, from which vendor? (`jvm`) | One row per home under the four roots; flavour and vendor come from the `release` file, so Debian and SUSE builds report flavour `unmodelled` | Nothing, as above |
-| Is this host running an end-of-life runtime? | Yes, by comparing the `version` column against your own support list; the plugin attaches no verdict | Not answerable |
+| Is an end-of-life runtime installed on this host? | Yes, by comparing the `version` column against your own support list; the plugin attaches no verdict | Not answerable |
 
 What a result proves. `supported` with zero runtime rows means none was found at the standard roots; it does not mean none is installed (a runtime in `/usr/java`, under a version manager in a home directory or in a custom prefix is not walked). `constrained` means a read failed, was skipped (a network mount) or hit a cap, so the rows may be incomplete; read the reason tokens before trusting a negative. A runtime reachable only through a symlinked alias entry can be missed (caveat 2). For the packaged-application view use `installed_apps`; for a licensing probe use `license_scan`.
 
@@ -49,7 +49,7 @@ flowchart TD
   Q -- absent --> R
   Q -- refused or failed --> F[Record the failure token]
   Q -- opened --> W[List entries and read release files within the caps]
-  W --> B{Row, byte or entry cap reached?}
+  W --> B{Whole-walk row, byte or visited-entry budget spent?}
   B -- yes --> RC[Stop the walk and record row_cap]
   B -- no --> R
   SK --> R
@@ -58,7 +58,7 @@ flowchart TD
   RC --> D
 ```
 
-The mount table is read once per dispatch. A candidate on a network mount is never touched, because an open on a dead hard mount would pin one of the agent's shared command workers. The caps apply across all roots and nesting levels together, so a large tree ends the walk with `row_cap` and a `CONSTRAINED` result rather than a silent truncation.
+The mount table is read once per dispatch. A candidate on a network mount is never touched, because an open on a dead hard mount would pin one of the agent's shared command workers. The caps apply across all roots and nesting levels together, so a large tree ends the walk with `row_cap` and a `CONSTRAINED` result rather than a silent truncation. A single directory that exceeds its own entry cap also records `row_cap`, but the walk carries on with the remaining directories.
 
 #### How a JVM home becomes a row
 
@@ -98,7 +98,7 @@ A home with no `release` file is only reported when a java binary proves it is a
 |---|---|---|---|---|
 | Windows | n/a (the leg reads nothing, caveat 1) | n/a | n/a | n/a (the placeholder answers `status\|<action>\|unsupported\|windows:planned`, result status `UNAVAILABLE`) |
 | macOS | n/a (the leg reads nothing, caveat 1) | n/a | n/a | n/a (the placeholder answers `status\|<action>\|unsupported\|macos:planned`, result status `UNAVAILABLE`) |
-| Linux | agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`) | None expected: the stock install trees under `/usr`, `/opt` and `/var/opt/java` are world-readable (0755 directories, 0644 `release` files) | Walked trees are captured as test fixtures (`tests/unit/fixtures/wave10/runtimes/linux/provenance.txt`); the live sample was taken as `euid 0` in a container, not as `yuzu` | `status\|<action>\|constrained\|linux:runtimes:permission_denied`; rows read before the refusal are still returned, and a later readable root never hides it |
+| Linux | agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`) | None expected: the stock install trees under `/usr`, `/opt` and `/var/opt/java` are expected to be world-readable (0755 directories, 0644 `release` files; inferred, not measured as `yuzu-agent`) | Walked trees are captured as test fixtures (`tests/unit/fixtures/wave10/runtimes/linux/provenance.txt`); the live sample was taken as `euid 0` in a container, not as `yuzu-agent` | `status\|<action>\|constrained\|linux:runtimes:permission_denied`; rows read before the refusal are still returned, and a later readable root never hides it |
 
 No external binaries, no subprocesses, no shell-out, no network use: the plugin opens directories and reads files only. Every directory is opened `O_NOFOLLOW` hop by hop and listed with a per-directory entry cap of 16,384; a `release` read is bounded to 64 KiB and each recognised value to 256 bytes; one action's whole walk is bounded to 4,096 rows, 1 MiB of row text and 65,536 directory entries visited (`row_cap`). A root on, under or containing a network mount (by filesystem type, from `/proc/self/mountinfo`) is not opened and records `network_fs_skipped`; caveat 5 lists what that guard cannot see.
 

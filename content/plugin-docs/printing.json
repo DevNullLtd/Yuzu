@@ -442,7 +442,7 @@
       "runs_as": "agent service account (SYSTEM today)"
     },
     {
-      "grant": "None to read. `clear_queue` sends `Authorization: PeerCred` with the agent's own user name, but cupsd authorises from the socket's real peer credentials; the cupsd policy for cancelling a job the caller does not own is unmeasured for a root caller",
+      "grant": "None to read. `clear_queue` sends `Authorization: PeerCred` with the agent's own user name, and the plugin's notes record that on macOS cupsd reads the socket's peer credentials only when that header is present; the cupsd policy for cancelling a job the caller does not own is unmeasured for a root caller",
       "if_refused": "n/a for reads, which do not fail closed. `clear_queue` with no CUPS socket is `PERMISSION_DENIED` (`refused`); a 401/403 or IPP forbidden from cupsd is the same",
       "measured": "Reads on a Mac with no printers configured; see Sample output",
       "os": "macOS",

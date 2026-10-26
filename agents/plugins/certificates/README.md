@@ -14,7 +14,7 @@
 
 ## How it works
 
-`list` and `details` read the certificates held in the operating system's own trust stores and emit one eight-field row per certificate; `list` returns every match (filtered by `store` and `expiring_within_days`) and `details` returns the row whose SHA-1 thumbprint matches, or `status|not_found`. `delete` removes one certificate by thumbprint from one store. It validates the thumbprint as 40 hex characters first, acts on exactly one named store, and reports `status|deleted`, `status|not_found` or an `error|...` line with a non-zero exit. The plugin does not build or validate a trust chain, check revocation, import or renew certificates, or read stores other than those named below.
+`list` and `details` read the certificates held in the operating system's own trust stores and emit one eight-field row per certificate; `list` returns every match (filtered by `store` and `expiring_within_days`) and `details` returns the row whose SHA-1 thumbprint matches, or `status|not_found`. `delete` removes one certificate by thumbprint from one store. It validates the thumbprint as 40 hex characters first, acts on exactly one named store, and reports `status|deleted`, `status|not_found`, `status|delete_failed` (Windows and Linux, when the removal itself fails) or an `error|...` line with a non-zero exit. The plugin does not build or validate a trust chain, check revocation, import or renew certificates, or read stores other than those named below.
 
 Windows reads the CryptoAPI stores `MY`, `ROOT`, `CA` and `Trust` in process under the LocalMachine hive; a read falls back to CurrentUser if LocalMachine cannot be opened and says so, but `delete` never falls back. Linux reads the `.pem` and `.crt` files directly under `/etc/ssl/certs` and parses them in process with libcrypto; only the first certificate in each file is read. macOS reads `System.keychain` and `SystemRootCertificates.keychain` in process through the Security framework (15 seconds per keychain) and the console user's login keychain through a subprocess: `launchctl asuser` and `sudo -u` run `security find-certificate`, and each returned block is parsed by `/usr/bin/openssl`. Before that spawn the agent re-checks the owner of `/dev/console` and refuses to read if it changed. Every macOS action runs inside a shared 60-second budget, so a wedged directory service shows as a `not_available` row with `CONSTRAINED` status rather than a hang.
 
@@ -88,12 +88,15 @@ sequenceDiagram
   S->>A: delete thumbprint, store
   A->>A: validate thumbprint, refuse root, login, all
   A->>K: read keychain, is the certificate present?
-  K-->>A: absent
-  A-->>S: status not_found
-  A->>K: security delete-certificate
-  A->>K: read keychain again
-  K-->>A: still present or unreadable
-  A-->>S: error, or status deleted when gone
+  alt "provably absent"
+    K-->>A: absent
+    A-->>S: status not_found
+  else "present, or the read was not definitive"
+    A->>K: security delete-certificate
+    A->>K: read keychain again
+    K-->>A: still present or unreadable
+    A-->>S: error, or status deleted when gone
+  end
 ```
 
 The first absent answer short-circuits to `not_found` only when the read was definitive. Exit code zero from `security` is never trusted on its own: if the keychain cannot be re-read, or still holds the certificate, the result is an `error` and the exit code is non-zero.

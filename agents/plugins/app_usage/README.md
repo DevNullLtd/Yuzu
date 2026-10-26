@@ -18,9 +18,9 @@
 
 - `summary` totals the trailing `days` (default 30, 1-365) per executable, ranks them by `run_time` or `run_count` (`by`), returns the top `top` (default 25, 1-500) and adds a distinct-user count per executable. It leads with one `meta` row carrying the fold's own health counters: coverage start, open runs, unmatched stops, clock anomalies, capture gaps and whether the feeder is running.
 - `last_used` returns, per executable, first and last seen across everything TAR still retains, plus runs and seconds over the trailing 30 UTC days. `exe` narrows it to one executable and is reduced to a lowercase basename by the same rule TAR writes under. It is also the action the daily inventory sync calls.
-- `foreground` always answers "not captured" (constrained, rc 0): no source of focus time exists on any OS.
+- `foreground` always answers "not captured" (constrained, rc 0): this plugin does not capture focus time, and the TAR data it reads has none either.
 
-Every action first checks that the file opens and passes a quick integrity check, then reads the `usage_enabled` setting and the `usage_daily` table, and reports a typed reason instead of an empty result when the source is off, mis-set or missing. It is deliberately not a monitor: it never writes `tar.db`, never selects a pid, command line or user name (users appear only as a count), and never accepts a database path from the caller.
+`summary` and `last_used` first check that the file opens and passes a quick integrity check (`foreground` opens nothing), then read the `usage_enabled` setting and the `usage_daily` table, and reports a typed reason instead of an empty result when the source is off, mis-set or missing. It is deliberately not a monitor: it never writes `tar.db`, never selects a pid, command line or user name (users appear only as a count), and never accepts a database path from the caller.
 
 ```mermaid
 flowchart LR
@@ -43,7 +43,7 @@ flowchart LR
 | Can I trust the numbers on this host? | `summary`, the `meta` row | Coverage start, capture gaps, clock anomalies, open runs and `feeder_enabled`. |
 | How long was an application in the foreground? | none | `foreground` always reports not captured. |
 
-Per OS: on Windows the runs come from process start and stop events and on Linux from `/proc` (executable names are truncated to 15 characters there); both are `supported`. On macOS they come from Endpoint Security when the agent holds that entitlement and from polling otherwise, so short-lived processes can be missed and the timestamps are coarser; this is why macOS is `constrained`. You get no data, only a typed row saying why, when `tar.db` does not exist, fails its integrity check, or has the usage or process source switched off.
+Per OS: on Windows the runs come from process start and stop events and on Linux from `/proc` (executable names are truncated to 15 characters there); both are `supported`. On macOS they come from Endpoint Security when the agent holds that entitlement and from polling otherwise, so short-lived processes can be missed and the timestamps are coarser; this is why macOS is `constrained`. You get no data, only a typed row saying why, when `tar.db` does not exist, fails its integrity check, or has the usage source switched off; `last_used` also answers with a typed row when TAR's process or usage feeder is stopped, while `summary` only reports that in its `meta` row.
 
 What a result does and does not prove: a populated `summary` on a healthy host lists the executables TAR saw run, over at most the last 31 days. It is wall-clock run time of the process, not interactive use, and it never says who used it beyond a count of accounts. History starts when the fold started; there is no "since install" figure. Use `summary` for a ranked picture, `last_used` for one executable or the full list, and read the `meta` row before treating either as complete.
 
@@ -60,12 +60,13 @@ flowchart TD
   C -->|"unreadable or odd value"| D2["constrained: usage_source_errored"]
   C -->|"true or absent"| F{"last_used only: usage_feeder_enabled true?"}
   F -->|"false or absent"| D3["constrained: usage_feeder_disabled"]
+  F -->|"unreadable or odd value"| D5["constrained: usage_feeder_errored"]
   F -->|"true, or summary"| T{"usage_daily table exists?"}
   T -->|"no"| D4["constrained: usage_schema_missing"]
   T -->|"yes"| Q["query, rows, OK"]
 ```
 
-Every action runs these gates in this order and stops at the first one that fails; only the last box returns data. The feeder check applies to `last_used` only, because a stopped fold would otherwise keep serving an ageing window as if it were live; `summary` reports the same fact in its `meta` row instead.
+`summary` and `last_used` run these gates in this order and stop at the first one that fails; only the last box returns data. The feeder check applies to `last_used` only, because a stopped fold would otherwise keep serving an ageing window as if it were live; `summary` reports the same fact in its `meta` row instead.
 
 #### From process start to a row
 
@@ -114,7 +115,7 @@ TAR is the only writer; `app_usage` only reads aggregates, so a pid, command lin
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, `#1442`) | None — opening `tar.db` read-only needs only whatever access LocalSystem already has (the file is created and owned by the agent via the `tar` plugin) | captured 2026-09-15 as interactive user (elevated) (`docs/samples/windows.txt`) — the capture ran under the operator's own elevated session, not the agent's LocalSystem posture | result status `UNAVAILABLE`/`PARTIAL`, row `constrained\|tar_db_unavailable\|<path>\|<sqlite error>` |
 | macOS | agent daemon, root — the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md` "macOS is the current exception", required today for TAR's Endpoint Security client) | None beyond that — the read-only open needs no additional entitlement of its own | captured 2026-09-15 at euid 501 (`docs/samples/macos.txt`) — a lower-privilege posture than the agent's actual root LaunchDaemon; no live `tar.db` at the default path on the capture host | result status `UNAVAILABLE`/`PARTIAL`, row `constrained\|tar_db_unavailable\|<path>\|<sqlite error>`; a schema-missing or disabled host instead reports `CONSTRAINED`/`PARTIAL`, row `constrained\|usage_schema_missing` / `constrained\|usage_source_disabled` |
-| Linux | agent daemon, dedicated unprivileged `yuzu` account by design (`docs/agent-privilege-model.md` TL;DR) | None — same read-only open | captured 2026-09-15 (`docs/samples/linux.txt`) | same shape as Windows/macOS |
+| Linux | agent daemon, dedicated unprivileged `yuzu-agent` account on the packaged unit (`docs/agent-privilege-model.md` TL;DR) | None — same read-only open | captured 2026-09-15 (`docs/samples/linux.txt`) | same shape as Windows/macOS |
 
 No external binaries, no subprocesses, no network access — every branch is a `sqlite3_*` call against an already-open handle; no `popen`/`CreateProcess`/socket call appears anywhere in `app_usage_plugin.cpp` or `app_usage_parsers.hpp`.
 
@@ -254,7 +255,7 @@ constrained|foreground_not_captured|user-context-bridge roadmap (session-scope a
 ## Caveats and known gaps
 
 1. **History is forward-only and bounded.** `usage_daily` holds rows only from when the `usage` fold started on the host and TAR prunes it on a 31-day default, so a new agent or a source switched on late has no history for the gap. `summary` takes first and last seen from the requested window; `last_used` takes them from every retained row; neither is a lifetime figure.
-2. **`foreground` is always constrained.** No source of per-session focus time exists on any OS, so every call reports `CONSTRAINED`/`foreground_not_captured` with rc 0 and never a hard failure. Nothing here can answer "how long was it in use".
+2. **`foreground` is always constrained.** This plugin does not capture per-session focus time (the TAR data it reads has none), so every call reports `CONSTRAINED`/`foreground_not_captured` with rc 0 and never a hard failure. Nothing here can answer "how long was it in use".
 3. **macOS granularity follows TAR's process source.** `usage_daily` is derived from the process fold, so without the Endpoint Security entitlement TAR polls, which can miss short-lived processes and coarsens `first_seen`, `last_seen` and `run_count`. The plugin cannot tell which regime produced a row.
 4. **Only as fresh as the feeder, and the unfiltered scan is not cost-bounded.** `last_used` refuses a stopped feeder, but `summary` still returns `OK` over a frozen window, so read `feeder_enabled` and the coverage fields in its `meta` row. The 5000-row cap limits what is returned, not the scan and sort the unfiltered `last_used` query performs before the limit.
 5. **Samples show only the failure path.** No capture host had a live `tar.db`, so every sample is `tar_db_unavailable` plus the constant `foreground` answer; a successful row has not been captured, and the Windows sample predates the owner check on `tar.db` and its sidecar files. Row shapes are as specified by the generated tables and the parser tests.

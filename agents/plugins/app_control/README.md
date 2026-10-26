@@ -19,7 +19,7 @@ The two actions report how Windows application control is *configured* on the de
 - `wdac_policy` enumerates every value under `HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy` (bounded: 256 values, 4 KiB each) and gives one of them, `VerifiedAndReputablePolicyState`, a named state. It then lists the `*.cip` files in `%SystemRoot%\System32\CodeIntegrity\CiPolicies\Active` (file stem only, never contents, at most 64 files, more reports `row_cap`) and checks, by stat only, whether the legacy single-policy file `System32\CodeIntegrity\SiPolicy.p7b` exists.
 - `applocker_policy` runs one bounded CIM query (15 second enumeration deadline) for `MSFT_ApplockerPolicy` in `root\StandardCimv2\Security\ApplicationControl`. When that gives no usable row, because the namespace or class is missing, the answer is empty, or the query fails, it walks `HKLM\SOFTWARE\Policies\Microsoft\Windows\SrpV2` and reports one row per rule collection (`Appx`, `Dll`, `Exe`, `Msi`, `Script`) with its `EnforcementMode` and rule-subkey count.
 
-The one naming trap is in the `state` column of `wdac_policy`. `VerifiedAndReputablePolicyState` is the **Smart App Control** setting, not the state of the listed `.cip` policies, and its values map as 0 `disabled`, 1 `enforced` (Smart App Control is on) and 2 `audit` (Smart App Control's evaluation mode, which observes without blocking; it is not WDAC audit mode). Any other value, and every other registry value under `CI\Policy`, reads `unmodelled`.
+The one naming trap is in the `state` column of `wdac_policy`. `VerifiedAndReputablePolicyState` is the **Smart App Control** setting, not the state of the listed `.cip` policies, and its values map as 0 `disabled`, 1 `enforced` (Smart App Control is on) and 2 `audit` (Smart App Control's evaluation mode, which observes without blocking; it is not WDAC audit mode). Only 0 was observed on hardware; 1 and 2 follow Microsoft's documentation and are untested. Any other value, and every other registry value under `CI\Policy`, reads `unmodelled`.
 
 What it is not: no policy change of any kind, no PowerShell (`Get-AppLockerPolicy` is not used), no raw COM and no subprocess. It reports the state of an OS-native control and is not EDR-class telemetry.
 
@@ -28,8 +28,8 @@ What it is not: no policy change of any kind, no PowerShell (`Get-AppLockerPolic
 | Question | Where the answer is | What it does not tell you |
 |---|---|---|
 | Is Smart App Control off, evaluating or on? | `wdac_policy` row `wdac\|VerifiedAndReputablePolicyState\|<n>\|disabled`, `audit` or `enforced` | Anything about WDAC policies you or your organisation deployed |
-| Does this device carry WDAC policy files? | `wdac_cip\|<stem>\|present` rows, or `wdac_cip\|none\|absent` | Whether a listed policy is enforced or audit-only, what it allows, or whether it is a Windows default or an organisation policy (the capture host listed eight default files) |
-| Is AppLocker configured, and in what mode per collection? | `applocker_policy` rows: mode `audit` or `enforced` and a rule count per collection | Whether the Application Identity service is running (rules apply only while it does), or a policy delivered another way such as MDM |
+| Does this device carry WDAC policy files? | `wdac_cip\|<stem>\|present` rows, or `wdac_cip\|none\|absent` | Whether a listed policy is enforced or audit-only, what it allows, or whether it is a Windows default or an organisation policy (the capture host listed eight GUID-named files, which the capture notes describe as Windows defaults) |
+| Is AppLocker configured, and in what mode per collection? | `applocker_policy` rows: mode `audit` or `enforced` (SrpV2 registry only; `absent` for a collection that is not configured, `unmodelled` for any other value and for every row from the CIM class) and a rule count per collection | Whether the Application Identity service is running (rules apply only while it does), or a policy delivered another way such as MDM |
 | Is WDAC enforcing on this device? | Not answerable | The plugin never reads the mode inside a policy file, so presence of a `.cip` file is the most it can say |
 
 How to read the `wdac_policy` rows:
@@ -52,7 +52,7 @@ A clean `OK` result means every read the plugin attempted was answered. It is th
 ```mermaid
 flowchart TD
   Q["CIM query: MSFT_ApplockerPolicy in the ApplicationControl namespace"] --> R{"Result"}
-  R -- "at least one row maps" --> C["Rows from CIM, mode unmodelled, provenance cim_msft_applockerpolicy"]
+  R -- "at least one row maps" --> C["Rows from CIM, mode unmodelled; OK with provenance cim_msft_applockerpolicy, or CONSTRAINED if a row was unrecognised or the result hit the row cap (SrpV2 is not walked)"]
   R -- "namespace or class missing, no usable row, or a failure" --> S["Walk the SrpV2 registry key, one row per collection"]
   S --> T{"What did the walk and the CIM query record?"}
   T -- "rows, no failure" --> U["OK, provenance registry_srpv2"]
@@ -124,7 +124,7 @@ Pipe-delimited rows via `write_output()`, the first field naming the row kind (`
 
 ### Result status
 
-`applocker_policy` falls back to the `SrpV2` registry walk only when the CIM answer is `class_absent`, and that is stage-aware: only `WBEM_E_INVALID_NAMESPACE` (`0x8004100e`) from `wmi_connect_failed_*`, or `WBEM_E_INVALID_CLASS` (`0x80041010`) from `wmi_query_failed_*` or from a `wmi_next_failed_*` that struck before any row was returned, is absence. The same HRESULT at any other stage (for example `wmi_next_failed_0x8004100e`, or `wmi_next_failed_0x80041010` after a row came back) is a fault and stays `CONSTRAINED`; `WBEM_E_NOT_FOUND` (`0x80041002`) is always a fault.
+`applocker_policy` walks the `SrpV2` registry key whenever no CIM row mapped (the class is absent, the result is empty, or the query failed or was refused); a CIM failure keeps the final status non-`OK`. Whether the CIM answer counts as `class_absent` is stage-aware: only `WBEM_E_INVALID_NAMESPACE` (`0x8004100e`) from `wmi_connect_failed_*`, or `WBEM_E_INVALID_CLASS` (`0x80041010`) from `wmi_query_failed_*` or from a `wmi_next_failed_*` that struck before any row was returned, is absence. The same HRESULT at any other stage (for example `wmi_next_failed_0x8004100e`, or `wmi_next_failed_0x80041010` after a row came back) is a fault and stays `CONSTRAINED`; `WBEM_E_NOT_FOUND` (`0x80041002`) is always a fault.
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
@@ -201,7 +201,7 @@ applocker_policy|unsupported|windows_only_concept
 ## Caveats and known gaps
 
 1. **Read-only posture only; #282 stays open.** The plugin refs #282 and does not close it: the issue also asks for `add_rule`, `remove_rule` and `get_blocked_events` (`docs/enterprise-parity-plan.md` Phase 12.11) and a Linux fapolicyd leg, none of which exist. Rule changes would be Destructive-class actions in a separate change, and this plugin is not EDR-class telemetry (`docs/roadmap.md` Phase 18 excludes re-implementing EDR at the agent).
-2. **Configuration is reported, not proof of enforcement.** An `enforced` AppLocker mode is what the policy is configured to do; the Application Identity service (AppIDSvc), which applies the rules, is not read, so a stopped or disabled service leaves rules unapplied under an `enforced` row. Only `VerifiedAndReputablePolicyState` (0 off, 1 on, 2 evaluation) and AppLocker `EnforcementMode` (0 audit, 1 enforce) are mapped; `.cip` files are listed by name only and their contents are never parsed.
+2. **Configuration is reported, not proof of enforcement.** An `enforced` AppLocker mode is what the policy is configured to do; the Application Identity service (AppIDSvc), which applies the rules, is not read, so a stopped or disabled service leaves rules unapplied under an `enforced` row. Only `VerifiedAndReputablePolicyState` (0 off, 1 on, 2 evaluation; only 0 was observed on hardware) and AppLocker `EnforcementMode` (0 audit, 1 enforce) are mapped; `.cip` files are listed by name only and their contents are never parsed.
 3. **The CIM property names remain unverified on hardware.** The AppLocker provider namespace does not exist on the capture host (Windows 11 Pro 10.0.26200, no AppLocker policy configured), where the bounded WMI helper returned `wmi_connect_failed_0x8004100e`, so `applocker_policy` fell back to the `SrpV2` walk and read `applocker|none|absent|0` (`tests/unit/fixtures/wave8/app_control/windows/applocker_wmi_probe.txt`). `Collection`, `EnforcementMode` and `RuleCount` are assumed by `parse_cim_applocker_row` (a row lacking any of them is reported `cim_row_unrecognised`, never guessed), CIM-sourced rows report their mode `unmodelled`, and the `SrpV2` collection layout has never been read on an AppLocker-configured host. A policy delivered outside the `SrpV2` key, for example by MDM, is not read, so such a host also reads `applocker|none|absent|0`.
 4. **Linux and macOS are placeholders by design.** The plugin loads everywhere, so an unscoped or mixed-fleet dispatch records exit code 1 (`UNAVAILABLE`) on a Linux or macOS agent; scope dispatches to Windows. Dispatching needs `Security:Read`, and the stored rows are read under `Response:Read` and the caller's group scope.
 

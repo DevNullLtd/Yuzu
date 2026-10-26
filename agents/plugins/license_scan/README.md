@@ -16,7 +16,7 @@
 
 `list` and `surfaces` run the same sweep of detection surfaces for the host's OS; they differ only in what they print. `list` prints every detected `lic|` licence record first and then one `probe_status|<surface>|ok|<rows>` (or `|error|<reason>`) line per surface it tried. `surfaces` prints only the `probe_status|` lines, so it answers "which surfaces could be read, and why not" without returning the licence inventory. Both always return rc 0: success means the sweep finished, not that every surface answered, so the `probe_status|` lines are the real health signal.
 
-Surfaces run in a fixed order, most authoritative first.
+Surfaces run in a fixed order, listed below. The order is not strictly by authority: on Linux the package-metadata surface runs before the authoritative certificate and FlexLM surfaces.
 
 - **Windows.** WMI `SoftwareLicensingProduct` (`slp_wmi`, the operating system's own licence state for Windows, Office and Microsoft server products); the Office Click-to-Run configuration (`office_c2r`); a table of vendor registry and file presence checks (SQL Server, Exchange, Visual Studio, Autodesk, Veeam, Acronis, antivirus suites, VMware Workstation, WinRAR, and a few open-source tools); then, for each local profile, per-user registry hives (`per_user_hives`) and per-user licence files (`per_user_files`, JetBrains keys and the Adobe Creative Cloud sign-in artefact).
 - **Linux.** Package metadata (`pkg_metadata`, `rpm` or else `dpkg-query` plus the Debian copyright headers), Red Hat entitlement certificates (`entitlement_certs`, parsed with `openssl`), then FlexLM `.lic` files in seven conventional directories (`flexlm_lic`).
@@ -45,15 +45,15 @@ flowchart TD
 |---|---|---|---|
 | Is the operating system or Office activated, and how (KMS, MAK, OEM, retail)? | Yes, from `slp_wmi`: authoritative status, channel, evaluation end, grace expiry and the last five characters of the product key. | No. | No. |
 | Is a subscription about to lapse? | Office subscription type only (from the Click-to-Run SKU, status `unknown`); the OS reports an evaluation end or grace expiry where it has one. | No. | Yes for Red Hat subscriptions (`entitlement_certs`, certificate expiry) and for FlexLM features that carry an expiry date. |
-| Is a particular vendor product installed, and what licence class is it likely to be? | Presence of the listed vendor products with a type and confidence. A few interpreters (VMware Workstation, WinRAR) report `licensed` or `trial` from a serial or evaluation marker, at `probable` or `heuristic` confidence only. | Office volume licence plist and Parallels presence; App Store apps with a receipt. | Package-declared licence class for every installed package that declares one (`open_source`, `freeware` or `unknown`). |
+| Is a particular vendor product installed, and what licence class is it likely to be? | Presence of the listed vendor products with a type and confidence. A few interpreters go further: VMware Workstation reports `licensed` when a `Serial` registry value exists, and WinRAR reports `licensed` when a `rarreg.key` file sits beside the executable and `trial` when none is found (an absence, not an evaluation marker). These are at `probable` or `heuristic` confidence only. | Office volume licence plist and Parallels presence; App Store apps with a receipt. | Package-declared licence class (`open_source`, `freeware` or `unknown`): every installed package on rpm hosts, and on dpkg hosts only packages with a machine-readable (DEP-5) copyright header. |
 | Is a user holding a personal licence on a shared machine? | Visual Studio and JetBrains keys and the Adobe sign-in artefact, tagged `user_scope=user`. | No. | No. |
 | Which action? | `list` for the inventory; `surfaces` to see which sources answered. | Same. | Same. |
 
 What a result does and does not prove:
 
 - **`licensed` is only as strong as its `source` and `confidence`.** `os_licensing_api` and `entitlement_cert` with `authoritative` are the operating system's or the certificate's own word. A macOS record is `licensed` because an App Store receipt file exists (`probable`); the receipt is not validated.
-- **No record is not "no licence".** Only the listed products and file locations are checked, and a surface that cannot be read says so in its `probe_status` line instead of returning an empty success.
-- **Package licence data is a classification, not compliance.** On Linux every installed package that declares a licence yields a record with status `unknown`; there is no lapse detection.
+- **No record is not "no licence".** Only the listed products and file locations are checked, and only some surfaces report a failed read in their `probe_status` line (`slp_wmi`, `pkg_metadata`, `entitlement_certs` and the per-user surfaces). On macOS, and for the registry, file-presence and FlexLM probes, an unreadable path reports `ok` with zero rows.
+- **Package licence data is a classification, not compliance.** On Linux, every installed rpm package (and every dpkg package with a DEP-5 copyright header) yields a record with status `unknown`; there is no lapse detection.
 
 ### Diagrams
 
@@ -65,7 +65,7 @@ flowchart LR
   G -- "slp_wmi, pkg_metadata, mas_receipt, entitlement_certs or flexlm_lic" --> SK["Skip this cycle, keep last good state"]
   G -- "per_user_hives, per_user_files or any other surface" --> OK["Cycle proceeds, rows kept"]
   G -- "no error" --> OK
-  OK --> BL["Blob capped at 10,000 records and 1 MiB, then ingested"]
+  OK --> BL["Skipped at 10,000 or more records or over 1 MiB, otherwise ingested"]
 ```
 
 The daily sync reads the `probe_status|` text, not the typed result status. An error on one of five surfaces makes it skip the cycle rather than replace stored licences with an incomplete picture. A degraded per-user surface, or an error on a vendor presence row, never blocks the sync, and the typed result status of the live command is `CONSTRAINED` in both cases.
@@ -78,7 +78,7 @@ The daily sync reads the `probe_status|` text, not the typed result status. An e
 | `entitlement_certs` | Linux | authoritative | Red Hat subscription expiry |
 | `flexlm_lic` | Linux | authoritative | FlexLM feature expiry |
 | `office_c2r`, vendor registry rows | Windows | probable or heuristic | Product present, likely licence type |
-| `per_user_hives`, `per_user_files` | Windows | heuristic | A per-user key or artefact is present |
+| `per_user_hives`, `per_user_files` | Windows | heuristic; probable for a JetBrains key file | A per-user key or artefact is present |
 | `pkg_metadata` | Linux | probable (rpm) or heuristic (dpkg) | Declared licence class of an installed package |
 | `mas_receipt`, `vendor_plists` | macOS | probable or heuristic | App Store receipt present, vendor plist present |
 
@@ -104,7 +104,7 @@ The daily sync reads the `probe_status|` text, not the typed result status. An e
 |---|---|---|---|---|
 | Windows | Agent service account, LocalSystem today. | **None.** Machine-scope surfaces need only the account's existing registry-read access. The per-user offline-hive fallback uses `SeBackupPrivilege` and `SeRestorePrivilege`, which the agent account already holds (`docs/agent-privilege-model.md`). | Bare-metal Windows (NT 10.0.26200) as `SYSTEM`, 2026-09-07. That capture shows machine-scope records only (`user_scope` is `machine` on every row) and predates the default-on hive-file guard for the offline arm. | `slp_wmi` errors (a `wmi_*` token or `row_cap_exceeded`) block the daily sync. `per_user_hives` degrades to `privilege_missing`, `hive_file_refused`, `hive_unload_failed` or `profile_list_truncated` without blocking it; `hive_file_refused` is the aggregate reason when the offline hive-file guard refuses any profile's hive, and the per-profile SID and the guard's token go to the agent log at `warn`, never into a row. An unreadable profile list reports `profile_list_unreadable` on both per-user surfaces. |
 | macOS | Agent LaunchDaemon, which runs as **root** today (no `UserName` key, `docs/agent-privilege-model.md`). | **None.** `mas_receipt` and `vendor_plists` are ordinary filesystem globs and plist reads. | Bare-metal macOS 26.6.2 as an ordinary user (euid 501), 2026-09-07, so the plugin is shown to need none of the daemon's root grant. | There is no coded refusal path: an unreadable file or an absent glob match reports a structural zero-row `ok`, never an error. |
-| Linux | Agent daemon, an unprivileged account by design (`docs/agent-privilege-model.md`). | **None.** Package databases, FlexLM `.lic` files and the RHEL certificates under `/etc/pki/entitlement` are world-readable on a standard install; the `-key.pem` files are skipped. | Debian 13 container, euid 0, 2026-09-06. Not representative of the unprivileged account, but no privilege is needed either way. | `entitlement_certs` reports `openssl_unavailable` when certificates exist but `openssl` is missing, and `cert_parse_failed`, `cert_parse_partial` or `cert_scan_budget_exhausted` when parsing falls short. `pkg_metadata` reports `dpkg_query_failed` or `output_truncated`. |
+| Linux | Agent daemon, an unprivileged account by design (`docs/agent-privilege-model.md`). | **None.** Package databases, FlexLM `.lic` files and the RHEL certificates under `/etc/pki/entitlement` are expected to be world-readable on a standard install (not measured as the unprivileged account); the `-key.pem` files are skipped. | Debian 13 container, euid 0, 2026-09-06. Not representative of the unprivileged account, but no privilege is needed either way. | `entitlement_certs` reports `openssl_unavailable` when certificates exist but `openssl` is missing, and `cert_parse_failed`, `cert_parse_partial` or `cert_scan_budget_exhausted` when parsing falls short. `pkg_metadata` reports `dpkg_query_failed` or `output_truncated`. |
 
 Subprocesses: Linux only, `rpm`, `dpkg-query` and `openssl` through the bounded argv runner (no shell, 20 s per call, and a 60 s start-gate budget for the whole certificate loop, so a run can finish up to one certificate's cost over it). Windows and macOS spawn nothing. No network use on any OS.
 
@@ -141,7 +141,7 @@ The reason tokens that appear in a `probe_status|<surface>|error|<reason>` line 
 ### Where the data goes
 
 - **Instruction result.** When dispatched directly (no instruction definition ships for this plugin, so use the generic command or MCP execute path), the rows travel over the agent's mTLS gRPC channel as the command response and land in the standard `ResponseStore`, kept 90 days by default and read through `GET /api/v1/responses/{id}`.
-- **Daily sync (`software_licensing` source).** `list` output feeds a 24 h scheduled sync. An `error` on `slp_wmi`, `pkg_metadata`, `mas_receipt`, `entitlement_certs` or `flexlm_lic` makes it skip the cycle and keep the last good state; errors on any other surface do not. The blob is capped at 10,000 records and 1 MiB (2 MiB for the raw capture), and an over-cap cycle is skipped rather than sent truncated.
+- **Daily sync (`software_licensing` source).** `list` output feeds a 24 h scheduled sync. An `error` on `slp_wmi`, `pkg_metadata`, `mas_receipt`, `entitlement_certs` or `flexlm_lic` makes it skip the cycle and keep the last good state; errors on any other surface do not. A cycle with 10,000 or more records, a blob over 1 MiB, or a raw capture over 2 MiB is skipped rather than sent truncated.
 - **Server store.** The blob is parsed and ingested into `SoftwareLicensingStore`.
 - **REST.** `GET /api/v1/sle/agents/{agent_id}` returns the device's detected licences (product, type, channel, state, expiry, confidence, `exe_hints` and the per-user `user_scope` and `user_ref`), gated `SoftwareLicensing:Read` scoped to the device and audited per open. `DELETE /api/v1/sle/agents/{agent_id}` is decommission erasure and needs `SoftwareLicensing:Delete`, `Inventory:Delete` and `GuaranteedState:Delete`.
 - **MCP.** The `query_software_licenses` tool, gated `SoftwareLicensing:Read` with confined scope, reads the same store, not a live dispatch.

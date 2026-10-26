@@ -557,7 +557,7 @@
       "if_refused": "Same as Windows",
       "measured": "2026-09-07 in a container at euid 0, more privileged than the production account",
       "os": "Linux",
-      "runs_as": "Dedicated unprivileged account (`yuzu`; `docs/agent-privilege-model.md`)"
+      "runs_as": "Dedicated unprivileged account (`yuzu-agent` on the packaged unit; `docs/agent-privilege-model.md`)"
     }
   ],
   "readme": "agents/plugins/asset_tags/README.md",

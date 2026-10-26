@@ -279,7 +279,7 @@
       "definition_id": "crossplatform.platform_security.secure_boot"
     }
   ],
-  "outputs_note": "Pipe-delimited rows written via `write_output()`, in read order. The first field is the fixed action literal (`secure_boot` or `code_integrity`), then `<os>`, `<key>`, `<raw>` and `<state>`. `<raw>` is `-` when nothing was read (`absent`, `unreadable`, `unsupported`); a raw value that was read passes through the shared untrusted-output escaper, which turns a backslash into `/` and escapes a pipe.\n\n- **Row order.** Linux `secure_boot` writes `secure_boot` then `setup_mode`; Linux `code_integrity` writes `lsm` then `lockdown`; macOS writes `gatekeeper` then `sip`.\n- **Windows row count.** Rows can outnumber the named values, because every `CI\\Policy` value is listed, sorted by name, with the one modelled value mapped and the rest `unmodelled`.\n- **Return codes.** The action returns 0 for every data-level outcome; only an internal exception returns 1, with the single two-field row `constrained|internal_error`.",
+  "outputs_note": "Pipe-delimited rows written via `write_output()`, in read order. The first field is the fixed action literal (`secure_boot` or `code_integrity`), then `<os>`, `<key>`, `<raw>` and `<state>`. `<raw>` is `-` when nothing was read (`absent`, `unreadable`, `unsupported`); a raw value that was read passes through the shared untrusted-output escaper, which turns a backslash into `/` and escapes a pipe.\n\n- **Row order.** Linux `secure_boot` writes `secure_boot` then `setup_mode`; Linux `code_integrity` writes `lsm` then `lockdown`; macOS writes `gatekeeper` then `sip`.\n- **Windows row count.** Rows can outnumber the named values, because every `CI\\Policy` value is listed, sorted by name, with the one modelled value mapped and the rest `unmodelled`.\n- **Return codes.** The action returns 0 for every data-level outcome; an unknown action name returns 1 with the single row `unknown action: <name>`, and an internal exception returns 1 with the single two-field row `constrained|internal_error`.",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -289,7 +289,7 @@
     {
       "grant": "None documented for this plugin (`docs/agent-privilege-model.md`); HKLM `Control` reads are not expected to need elevation",
       "if_refused": "For a per-VALUE read, `ERROR_FILE_NOT_FOUND`/`ERROR_PATH_NOT_FOUND` reports the row `absent` with no token. For a KEY OPEN, the same two codes report `absent` only for `SecureBoot\\State`, `CI\\Policy`, `DeviceGuard` and its HVCI scenario subkey; `Lsa` has no evidenced not-found case, so the identical codes there report `unreadable` with `lsa:key_missing`. `ERROR_ACCESS_DENIED` reports `unreadable` with `<name>:access_denied` and the action reports `PERMISSION_DENIED`/`PARTIAL`; any other Win32 error reports `unreadable` with `<name>:win32_<n>`",
-      "measured": "`NT AUTHORITY\\SYSTEM` on a bare-metal Windows 11 Pro lab host (10.0.26200), 2026-09-21: the per-key probe results are recorded in the `platform_security_win.cpp` banner (`docs/samples/windows.txt`)",
+      "measured": "`NT AUTHORITY\\SYSTEM` on a bare-metal Windows 11 Pro host (10.0.26200), 2026-09-21: `SecureBoot\\State` `UEFISecureBootEnabled` was 1 (Secure Boot on; the off state was never captured), `CI\\Policy` held 4 `REG_DWORD` values, the `DeviceGuard`, HVCI and `LsaCfgFlags` values were absent (no VBS, HVCI or Credential Guard on state was ever measured); the sample is `docs/samples/windows.txt`",
       "os": "Windows",
       "runs_as": "agent service account (LocalSystem today, #1442)"
     },
@@ -303,7 +303,7 @@
     {
       "grant": "None documented for this plugin (`docs/agent-privilege-model.md`)",
       "if_refused": "`EACCES`/`EPERM` reports the row `unreadable` with `<key>:eacces` and the action reports `PERMISSION_DENIED`/`PARTIAL`. `ENOENT` reports `absent` with no token only when the parent surface is confirmed present (securityfs mounted; for efivars, `/sys/firmware/efi` absent or efivarfs mounted); otherwise it is remapped to `ENODEV` and reports `unreadable` with `<key>:errno_19`. Any other errno reports `unreadable` with `<key>:errno_<n>`",
-      "measured": "Container (Docker VM on a Mac host), root, 2026-09-23: real capture of the built `.so` (`docs/samples/linux.txt`). The container has no `/sys/firmware/efi` and no securityfs, so `secure_boot` reads `absent` (the gap in caveat 1) and `code_integrity` reads `unreadable` with `errno_19`; no real Secure Boot value or lockdown mode has been captured",
+      "measured": "aarch64 Debian 13 container, root, 2026-09-23: real capture of the built `.so` (`docs/samples/linux.txt`). `secure_boot` reads `absent` (the gap in caveat 1) and `code_integrity` reads `unreadable` with `errno_19`, which the plugin reports when securityfs is not mounted, so the container is inferred to have no securityfs and no EFI variables (the mounts themselves were not recorded); no real Secure Boot value or lockdown mode has been captured",
       "os": "Linux",
       "runs_as": "agent daemon, dedicated unprivileged account (the agent never runs as root on Linux)"
     }

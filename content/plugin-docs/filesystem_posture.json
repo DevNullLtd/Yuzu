@@ -80,7 +80,7 @@
     }
   ],
   "caveats": [
-    "**Quotas and Linux snapshots report less than their names suggest.** Quota reporting is volume-level on every OS and never per-identity; on APFS that is structural, because `quotactl` returns `ENOTSUP` on every APFS mount while succeeding on HFS+, and on Linux only the user-quota format is probed. Linux `snapshots` reports capability, not inventory: it cannot list unmounted btrfs snapshots (needs `CAP_SYS_ADMIN` through `BTRFS_IOC_TREE_SEARCH`) or tell an LVM snapshot volume from a dm-crypt, multipath or integrity target (needs a `DM_TABLE_STATUS` ioctl), and this plugin issues neither.",
+    "**Quotas and Linux snapshots report less than their names suggest.** Quota reporting is volume-level on every OS and never per-identity; on APFS that is structural: the macOS leg reads the volume quota with `getattrlist` and never calls `quotactl`, and the source comment says `quotactl` returns `ENOTSUP` on every APFS mount while succeeding on HFS+ (an OS behaviour the plugin does not itself exercise), and on Linux only the user-quota format is probed. Linux `snapshots` reports capability, not inventory: it cannot list unmounted btrfs snapshots (needs `CAP_SYS_ADMIN` through `BTRFS_IOC_TREE_SEARCH`) or tell an LVM snapshot volume from a dm-crypt, multipath or integrity target (needs a `DM_TABLE_STATUS` ioctl), and this plugin issues neither.",
     "**A typical Windows host returns `CONSTRAINED` for `quotas`, and the captured `mounts` run was too.** Every NTFS volume with no drive letter (recovery and similar partitions) gets an `unavailable` quota row, which marks the run `windows:dskquota`; in the captured `mounts` run every row carried a size and filesystem type yet the run was `windows:volume_enum`, because the code treats an empty mount-path list as a failed lookup. Read the per-row state rather than the run status alone.",
     "**Windows VSS enumeration has no deadline.** `CreateVssBackupComponents`, `Query` and `Next` are synchronous COM calls with no timeout, run on a bounded agent dispatch-pool worker shared with quarantine and containment dispatch. A wedged VSS service or a hung third-party backup provider parks that worker, so prefer on-demand `snapshots` over a frequent schedule on hosts running third-party backup software.",
     "**Linux `mounts` omits capacity for network filesystems.** `nfs`, `nfs3`, `nfs4`, `cifs`, `smb3`, `smbfs`, `afs`, `ceph`, `glusterfs`, `9p`, `virtiofs`, `lustre`, `beegfs`, `gfs2`, `ocfs2`, `gpfs`, `panfs`, `vboxsf`, `vmhgfs`, `prl_fs`, `autofs`, and network-backed `fuse.*` mounts (`sshfs`, `s3fs`, `davfs`, `rclone`, `cephfs`, `ceph-fuse`, `glusterfs`, `nfs`, `smb`, `vmhgfs-fuse`, `prl_fsd`; the list is `agents/shared/network_fstype.hpp`) are still listed, but their capacity columns read `-`, because a `statvfs` against an unreachable server blocks the dispatch worker indefinitely.",
@@ -399,9 +399,9 @@
   },
   "privileges": [
     {
-      "grant": "`mounts`, `quotas`: **none** (`FindFirstVolumeW`, `GetVolumeInformationW`, `GetDiskFreeSpaceExW`; `IDiskQuotaControl` opened read-only). `snapshots`: **Administrative rights** for `CreateVssBackupComponents` and `IVssBackupComponents::Query`; LocalSystem has them, so it succeeds with no extra grant today",
+      "grant": "`mounts`, `quotas`: **none** (`FindFirstVolumeW`, `GetVolumeInformationW`, `GetDiskFreeSpaceExW`; `IDiskQuotaControl` opened read-only; this is what the code requires, and a non-Administrator quota query may still be refused per volume, as the privilege model notes). `snapshots`: **Administrative rights** for `CreateVssBackupComponents` and `IVssBackupComponents::Query`; LocalSystem has them, so it succeeds with no extra grant today",
       "if_refused": "`quotas`: per-volume state `permission_denied` (`E_ACCESSDENIED`); `snapshots`: whole-run `PERMISSION_DENIED` with a `none` row naming the HRESULT, never an empty snapshot set",
-      "measured": "2026-09-03 on a lab host: `NT AUTHORITY\\SYSTEM` succeeds (3 shadow copies found); `NT AUTHORITY\\LOCAL SERVICE` and `NT AUTHORITY\\NETWORK SERVICE` both fail `E_ACCESSDENIED`; `NT SERVICE\\YuzuAgent` not measured. Sample capture 2026-09-07 as `SYSTEM`, bare metal",
+      "measured": "2026-09-03 on a bare-metal Windows host: `NT AUTHORITY\\SYSTEM` succeeds (3 shadow copies found); `NT AUTHORITY\\LOCAL SERVICE` and `NT AUTHORITY\\NETWORK SERVICE` both fail `E_ACCESSDENIED`; `NT SERVICE\\YuzuAgent` not measured. Sample capture 2026-09-07 as `SYSTEM`, bare metal",
       "os": "Windows",
       "runs_as": "agent service account; LocalSystem today, not yet the intended `NT SERVICE\\YuzuAgent` (see `docs/agent-privilege-model.md`)"
     },
@@ -417,7 +417,7 @@
       "if_refused": "`quotas`: `PERMISSION_DENIED` when every probed device returns `EPERM`/`EACCES`; `mounts` and `snapshots` make no privileged call, so a failed read there degrades to `CONSTRAINED`",
       "measured": "2026-09-06 in a container as root, so the unprivileged-account answers are not evidenced",
       "os": "Linux",
-      "runs_as": "dedicated unprivileged account (`yuzu`; `docs/agent-privilege-model.md`)"
+      "runs_as": "dedicated unprivileged account (`yuzu-agent` on the packaged unit; `docs/agent-privilege-model.md`)"
     }
   ],
   "readme": "agents/plugins/filesystem_posture/README.md",

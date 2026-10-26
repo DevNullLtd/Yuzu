@@ -24,7 +24,7 @@ flowchart LR
   TS --> PUSH["push_asset_tags_to_agent: reads all four values, system push"]
   PUSH -->|"gRPC mTLS"| HOST["Agent plugin host"]
   OP["Operator or workflow: status, get, changes (Tag.Read)"] --> HOST
-  HOST --> EX["asset_tags.execute: same local_json_store leg on Windows, macOS, Linux"]
+  HOST --> EX["asset_tags.execute: same local JSON file read and write on Windows, macOS, Linux"]
   EX --> FILE[("data_dir/asset_tags.json")]
   EX --> ROWS["rows plus typed status (sync only)"]
   ROWS --> RS[("ResponseStore")]
@@ -102,7 +102,7 @@ stateDiagram-v2
 |---|---|---|---|---|
 | Windows | Agent service account: LocalSystem today, not yet the intended `NT SERVICE\YuzuAgent` (`docs/agent-privilege-model.md`) | None. Plain file I/O under `<data_dir>`; the shared writer calls `ReplaceFileW`, which needs no extra privilege | 2026-09-07 on bare metal as SYSTEM | No refusal path exists. A write failure is logged and reported as `CONSTRAINED` / `persist_failed` on `sync`; an unreadable or corrupt state file is logged and ignored |
 | macOS | Agent daemon as root: the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md`) | None | 2026-09-07 on bare metal at euid 501, unprivileged and not the production root daemon | Same as Windows |
-| Linux | Dedicated unprivileged account (`yuzu`; `docs/agent-privilege-model.md`) | None | 2026-09-07 in a container at euid 0, more privileged than the production account | Same as Windows |
+| Linux | Dedicated unprivileged account (`yuzu-agent` on the packaged unit; `docs/agent-privilege-model.md`) | None | 2026-09-07 in a container at euid 0, more privileged than the production account | Same as Windows |
 
 No external binaries, no subprocesses, no network access: every action is an in-process read or write of one local JSON file under the agent data directory. `docs/agent-privilege-model.md` has no row for this plugin because it needs nothing beyond that.
 

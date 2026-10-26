@@ -757,7 +757,7 @@
       "definition_id": "device.users.sessions"
     }
   ],
-  "outputs_note": "Rows are pipe-delimited, one per record, and start with a literal discriminator (`user`, `session`, `local_user`, `admin`, `group_member`, `primary_user` or `session_history`). `logged_on`, `sessions` and `group_members` write zero rows, not a placeholder, when there is nothing to report; only the typed result status separates a degraded read from a clean empty one. A query-level problem (missing or invalid parameter, group not found, tool not found) writes a single `<action>|error|<message>` row. `local_users` varies its field count by OS: Windows and Linux rows carry four data fields, macOS rows carry five (`console_state` is appended). On Linux, `last_logon` is the account's `lastlog` line verbatim, not the formatted timestamp the table below describes (caveat 4). On Linux and macOS `session_history` writes `last`'s columns into the declared fields in a different order (caveat 1), and `sessions` always reports state `Active` on those two systems.",
+  "outputs_note": "Rows are pipe-delimited, one per record, and start with a literal discriminator (`user`, `session`, `local_user`, `admin`, `group_member`, `primary_user` or `session_history`). `logged_on`, `sessions` and `group_members` write zero rows, not a placeholder, when there is nothing to report; only the typed result status separates a degraded read from a clean empty one. A query-level problem (missing or invalid parameter, group not found, tool not found) writes a single `<discriminator>|error|<message>` row (for example `group_member|error|Group not found: x` or `admin|error|query failed`; on Linux an unreadable `/etc/passwd` writes `local_user|error|false|Never|<message>`). `local_users` varies its field count by OS: Windows and Linux rows carry four data fields, macOS rows carry five (`console_state` is appended). On Linux, `last_logon` is the account's `lastlog` line verbatim, not the formatted timestamp the table below describes (caveat 4). On Linux and macOS `session_history` writes `last`'s columns into the declared fields in a different order (caveat 1), and `sessions` always reports state `Active` on those two systems.",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -765,7 +765,7 @@
   },
   "privileges": [
     {
-      "grant": "None for the five actions that use WTS and NetAPI calls. `session_history`, and the first path of `primary_user`, read the Security event log, which needs Security-log read access: LocalSystem has it, and the intended virtual account is a member of `Event Log Readers` (`docs/agent-privilege-model.md`; not measured under that account)",
+      "grant": "None for the five actions that use WTS and NetAPI calls. `session_history`, and the first path of `primary_user`, read the Security event log, which needs Security-log read access: LocalSystem has it. For the intended virtual account the privilege model lists `Event Log Readers` membership, and says the Security log additionally needs `SeSecurityPrivilege` (`docs/agent-privilege-model.md`; not measured under that account)",
       "if_refused": "`session_history` reports `PERMISSION_DENIED` with `users_win_events:access_denied` and an `error` row; `primary_user` falls back to the ProfileList registry (see the diagram above)",
       "measured": "Sample captured as `SYSTEM` on bare metal",
       "os": "Windows",
@@ -781,9 +781,9 @@
     {
       "grant": "None for the native legs (`utmp`, `getgrnam`, `getpwuid`, `/etc/passwd`). `w`, `last` and `lastlog` must be installed; they read the login records the OS keeps (`utmp`, `wtmp`, `lastlog`)",
       "if_refused": "A missing or failed tool is forwarded as `UNAVAILABLE` or `CONSTRAINED`; `logged_on`, `local_admins` and `group_members` do not depend on a tool and are unaffected",
-      "measured": "Sample captured as `euid 0` in a minimal container with neither `last` nor `lastlog`; not measured as `yuzu`",
+      "measured": "Sample captured as `euid 0` in a minimal container with neither `last` nor `lastlog`; not measured as `yuzu-agent`",
       "os": "Linux",
-      "runs_as": "agent daemon, dedicated unprivileged account (`yuzu`; `yuzu-agent` on the packaged unit), never root by design; the privilege model has no row for this plugin"
+      "runs_as": "agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design; the privilege model has no row for this plugin"
     }
   ],
   "readme": "agents/plugins/users/README.md",

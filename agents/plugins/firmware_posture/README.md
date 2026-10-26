@@ -14,7 +14,7 @@
 
 ## How it works
 
-`firmware` reports what the host's own firmware says about itself and changes nothing: the vendor, version and release date of the BIOS or system firmware and, on Linux only, whether the fwupd service knows of a firmware update waiting for a device. The action takes no parameters and returns rows of the form `firmware|<field>|<value>|<source>`. Every leg is an in-process read (rung 1); no `wmic`, `dmidecode`, `fwupdmgr` or `ioreg` is ever run.
+`firmware` reports what the host's own firmware says about itself and changes nothing: the vendor, version and release date of the BIOS or system firmware and, on Linux only, whether the fwupd service knows of a firmware update waiting for a device. The action takes no parameters and returns rows of the form `firmware|<field>|<value>|<source>`. Every leg is an in-process read (no helper program is started); no `wmic`, `dmidecode`, `fwupdmgr` or `ioreg` is ever run.
 
 - **Windows** asks two sources and reports both, so a disagreement between them is visible. `wmi` is a bounded `Win32_BIOS` query for exactly `Manufacturer`, `SMBIOSBIOSVersion` and `ReleaseDate`. `smbios` reads the raw SMBIOS table with `GetSystemFirmwareTable('RSMB')` and parses its type-0 record: vendor, version, release date, ROM size, and the BIOS and embedded-controller release numbers. The WMI array column `BIOSVersion` is not read, so no `bios_version_list` row exists.
 - **Linux** reads the four `/sys/class/dmi/id/bios_*` files (vendor, version, date, release), each once with a 4 KiB bound, then asks fwupd on the system D-Bus. It calls `GetDevices`, then `GetUpgrades` for each device flagged updatable, inside one 5 second budget for the whole fwupd read, and reports one `fwupd_device` row per device (at most 256) plus one aggregate `update_pending` row. sd-bus comes from the system package `libsystemd`, never from `vcpkg.json`; a build without it reports `update_pending` as `unreadable` with `fwupd:not_built`.
@@ -27,7 +27,7 @@ Every fact reads as exactly one of four things: a **value**; **`absent`** (the O
 | Question | Answer from | Windows | macOS | Linux |
 |---|---|---|---|---|
 | Which firmware version is this device on, and does it match the fleet baseline? | `version` | WMI and SMBIOS, two independent reads | `/rom` on Intel, an iBoot tag such as `mBoot-18000.161.10` on Apple Silicon | `bios_version` from DMI; `absent` in containers and some VMs |
-| How old is the firmware? | `release_date` (`YYYY-MM-DD` when the source used a recognised date shape) | yes | Intel only; always `absent` on Apple Silicon | yes, when DMI exists |
+| How old is the firmware? | `release_date` (`YYYY-MM-DD` when the source used a recognised date shape) | yes | Intel only; `absent` on Apple Silicon (if the architecture check itself fails, the Mac is treated as Intel and the row reads `unreadable`) | yes, when DMI exists |
 | Who made it, and what model is it? | `vendor`, `model` | vendor only | vendor and `hw.model` | vendor only |
 | Is a firmware update waiting? | `update_pending` | not reported | not reported | yes, when fwupd is present and reachable |
 | Which components other than the BIOS carry updatable firmware? | `fwupd_device` rows | no | no | yes, one row per fwupd device |
@@ -40,7 +40,7 @@ Every fact reads as exactly one of four things: a **value**; **`absent`** (the O
 | `no` | Every updatable device answered with no release, or fwupd lists no updatable device. |
 | `unknown` | An updatable device could not be asked (the call failed or the 5 second budget ran out) and no other device said `yes`. |
 | `unavailable` | The system bus answered and fwupd is not on it. |
-| `unreadable` | The bus could not be opened, a call failed, or the build has no libsystemd. |
+| `unreadable` | The bus could not be opened, the device list (`GetDevices`) failed or came back malformed, or the build has no libsystemd. A failed per-device `GetUpgrades` gives `unknown`, not `unreadable`. |
 
 A device that is not updatable shows `update_pending=unknown` on its own `fwupd_device` row because it is never asked, and that does not change the aggregate. The verdict reflects whatever update metadata the fwupd daemon already holds; the plugin never asks fwupd to refresh it.
 
@@ -87,7 +87,7 @@ flowchart TD
   E --> F["Rows: vendor, version, release_date, version_source, model"]
 ```
 
-A missing `/chosen` or root node is never expected on any Mac, so it always reads `unreadable` with an `iokit:<path>:lookup_failed` token. `version_source` names the node and key that carried the version, so a consumer can tell an Intel `/rom` version from an Apple Silicon iBoot tag.
+A missing `/chosen` or root node is never expected on any Mac, so it always adds an `iokit:<path>:lookup_failed` token and the status is `CONSTRAINED`. A field row reads `unreadable` only when it had no other source: on an Intel Mac the version and vendor can still come from `/rom`, while the Apple Silicon version (from `/chosen`) and vendor (from the root node) cannot. `version_source` names the node and key that carried the version, so a consumer can tell an Intel `/rom` version from an Apple Silicon iBoot tag.
 
 ## OS capability
 
@@ -108,9 +108,9 @@ A missing `/chosen` or root node is never expected on any Mac, so it always read
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, #1442) | None documented for this plugin (`docs/agent-privilege-model.md`) | Captured as `NT AUTHORITY\SYSTEM` on a bare-metal host: `Win32_BIOS`, the `GetSystemFirmwareTable('RSMB')` size and the type-0 rows (`docs/samples/windows.txt`). Not measured: a non-SYSTEM identity. | `ERROR_ACCESS_DENIED` or a WBEM access-denied HRESULT reports the row `unreadable` and the action `PERMISSION_DENIED`/`PARTIAL`; any other failure reports `<source>:<cause>` (`smbios:win32_<n>`, `wmi:<token>`) |
 | macOS | agent daemon, root today (the LaunchDaemon carries no `UserName` key, see `docs/agent-privilege-model.md`); the IODeviceTree plane is world-readable | None: no read needed a privilege | 2026-10-03, bare-metal Apple Silicon (Mac16,10, macOS 26.6.2), unprivileged (euid 501), real capture (`docs/samples/macos.txt`). No root run was captured, so root is the documented production default, not a measured one. The Intel `/rom` keys are unverified on hardware. | A key that exists but is not text reads `unreadable` on that field; a failed IOKit node lookup reads `unreadable` with an `iokit:<path>:lookup_failed` token, except `/rom` on Apple Silicon, which does not exist there and reads `absent` |
-| Linux | agent daemon, dedicated unprivileged account, never root by design (`docs/agent-privilege-model.md`) | None for the `bios_*` DMI attributes (kernel mode 0444; not measured, the Docker VM used for capture has no `/sys/class/dmi`). The fwupd calls are read methods on the system bus. | fwupd 1.9.28 replies captured as root (euid 0) in a fedora:40 container and the no-daemon `ServiceUnknown` path in a debian:12 container (`tests/unit/fixtures/wave8/firmware_posture/linux/`); the built `.so` run against a no-DMI container with no system bus is captured (`docs/samples/linux.txt`). A non-root caller and a populated-DMI host are unverified. | `EACCES`/`EPERM` on a DMI file reports it `unreadable` with `dmi:<file>:eacces` and the action `PERMISSION_DENIED`; a D-Bus `AccessDenied` reports `fwupd:<call>:permission_denied`; an absent file or a daemon the bus reports as not installed is a state, never a failure; a bus that cannot be opened is a failure |
+| Linux | agent daemon, dedicated unprivileged account, never root by design (`docs/agent-privilege-model.md`) | None for the `bios_*` DMI attributes (kernel mode 0444; not measured, the capture container has no `/sys/class/dmi`). The fwupd calls are read methods on the system bus. | fwupd 1.9.28 replies captured as root (euid 0) in a fedora:40 container and the no-daemon `ServiceUnknown` path in a debian:12 container (`tests/unit/fixtures/wave8/firmware_posture/linux/`); the built `.so` run against a no-DMI container with no system bus is captured (`docs/samples/linux.txt`). A non-root caller and a populated-DMI host are unverified. | `EACCES`/`EPERM` on a DMI file reports it `unreadable` with `dmi:<file>:eacces` or `dmi:<file>:eperm` and the action `PERMISSION_DENIED`; a D-Bus `AccessDenied` reports `fwupd:<call>:permission_denied`; an absent file or a daemon the bus reports as not installed is a state, never a failure; a bus that cannot be opened is a failure |
 
-Binaries and subprocesses: none. Every leg is an in-process read (WMI and the firmware table API, sysfs and sd-bus, IOKit and `sysctlbyname`). Network: none; the fwupd call is a local D-Bus method call, and the daemon may itself reach a remote metadata service, which this plugin neither triggers nor observes.
+Binaries and subprocesses: none. Every leg is an in-process read (WMI and the firmware table API, sysfs and sd-bus, IOKit and `sysctlbyname`). Network: none; the fwupd call is a local D-Bus method call, and the daemon may itself reach a remote metadata service, which this plugin does not request (it only calls `GetDevices` and `GetUpgrades`) and does not observe.
 
 ## Data contract
 
