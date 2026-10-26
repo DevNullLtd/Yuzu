@@ -945,6 +945,143 @@ def main() -> int:
             _fail("a generated *.pb.h (or an unresolved ANGLE include) hard-failed - the "
                   "allowlist/angle exemption is gone", failures)
 
+
+        # ===== QE gate-8 round-6 KILL FIXTURES =====
+        INC_ = b'#include "hid_store.hpp"\n'
+        qe_forms = {
+            # name: (bytes, fires)
+            "qe_empty_line_comment_then_include": (b'//\n' + INC_, True),
+            "qe_slash_star_slash_hides": (b'/*/\n' + INC_ + b'*/\nint z;\n', False),
+            "qe_block_then_stray_star_slash": (b'/*a*/*/\n' + INC_, True),
+            "qe_adjacent_block_comments": (b'/* a *//* b */' + INC_, True),
+            "qe_unterminated_comment_include_on_next_line": (b'/* x\n' + INC_, False),
+            "qe_slash_before_charlit_hides": (b"int c = n/'\"'; /* open\n" + INC_ + b"*/ int z;\n", False),
+            "qe_empty_string_then_comment_hides": (b'const char* e = ""; /* open\n' + INC_ + b'*/ int z;\n', False),
+            "qe_uR_raw": (b'const char16_t* r = uR"x(a" /* b)x";\n' + INC_, True),
+            "qe_UR_raw": (b'const char32_t* r = UR"x(a" /* b)x";\n' + INC_, True),
+            "qe_raw_delim16": (b'const char* r = R"0123456789abcdef(a" /* b)0123456789abcdef";\n' + INC_, True),
+            "qe_raw_at_file_start": (b'R"x(a" /* b)x"\n' + INC_ + b'int z', True),
+            "qe_ident_R_then_string_hides": (b'const char* s = FOOR"x(a"; /* open\n' + INC_ + b'*/ int z;\n', False),
+            "qe_char_at_file_start": (b"'a /* c\n" + INC_ + b"*/ x", True),
+            "qe_utf8_ident_digit_separator_hides": ("int n = 1\u00e9'0; /* hides\n".encode() + INC_ + b"*/ int z;\n", False),
+            "qe_string_at_file_start_hides": (b'"x(" /* hides\n' + INC_ + b'*/ R', False),
+            "qe_unterminated_str_in_if0_then_comment_hides": (b'#if 0\nsay "hi\n#endif\n/* open\n' + INC_ + b'*/\n', False),
+            "qe_unterminated_chr_in_if0_then_comment_hides": (b"#if 0\nsay 'hi\n#endif\n/* open\n" + INC_ + b"*/\n", False),
+            "qe_chr_escaped_quote_hides": (b"char q = '\\''; /* hides\n" + INC_ + b"*/ int z;\n", False),
+            "qe_chr_escaped_backslash_hides": (b"char q = '\\\\'; /* hides\n" + INC_ + b"*/ int z;\n", False),
+            "qe_hex_digit_separator_hides": (b"int n = 0xFF'FF; /* hides\n" + INC_ + b"*/ int z;\n", False),
+            "qe_underscore_digit_separator_hides": (b"int n = 1_'0; /* hides\n" + INC_ + b"*/ int z;\n", False),
+            "qe_tab_trailing_continuation": (b'#include \\\t\n"hid_store.hpp"\n', True),
+            "qe_lone_cr_newline": (b'int x;\r' + INC_, True),
+            "qe_lone_cr_after_comment": (b'// c\r' + INC_, True),
+            "qe_utf16le_lone_cr": (b'\xff\xfe' + ('int x;\r' + INC_.decode()).encode('utf-16-le'), True),
+            "qe_latin1_byte_in_comment": (b'// caf\xe9\n' + INC_, True),
+            "qe_utf16_odd_tail": (b'\xff\xfe' + INC_.decode().encode('utf-16-le') + b'\x00', True),
+            "qe_utf16_lone_surrogate": (b'\xff\xfe' + INC_.decode().encode('utf-16-le') + b'\x00\xd8', True),
+            "qe_include_then_eof_comment_no_newline": (b'#include "hid_store.hpp" // c', True),
+            "qe_ws_tab_before_hash": (b'\t' + INC_, True),
+            "qe_ws_vt_before_hash": (b'\x0b' + INC_, True),
+            "qe_ws_tab_hash_include": (b'#\tinclude "hid_store.hpp"\n', True),
+            "qe_ws_vt_hash_include": (b'#\x0binclude "hid_store.hpp"\n', True),
+            "qe_ws_ff_hash_include": (b'#\x0cinclude "hid_store.hpp"\n', True),
+            "qe_ws_tab_include_name": (b'#include\t"hid_store.hpp"\n', True),
+            "qe_ws_vt_include_name": (b'#include\x0b"hid_store.hpp"\n', True),
+            "qe_ws_ff_include_name": (b'#include\x0c"hid_store.hpp"\n', True),
+        }
+        for form, (raw_, fires_) in qe_forms.items():
+            (src / f"{form}_routes.cpp").write_bytes(raw_)
+            # GCC does not decode UTF-16 source (MSVC does); the checker does, deliberately, so the
+            # UTF-16 forms are the only ones the GCC oracle cannot judge.
+            if gxx and "utf16" not in form:
+                dep_ = subprocess.run([gxx, "-std=gnu++23", "-MM", "-MG", "-I", str(src),
+                                       str(src / f"{form}_routes.cpp")], capture_output=True, text=True,
+                                      errors="replace")
+                if ("hid_store.hpp" in dep_.stdout) != fires_:
+                    _fail(f"QE: the compiler disagrees with the expectation for {form!r} "
+                          f"(g++ {'lists' if 'hid_store.hpp' in dep_.stdout else 'does not list'} it, "
+                          f"expected fires={fires_})", failures)
+            with contextlib.redirect_stderr(io.StringIO()):
+                ok_ = mod.check_family(f"qe-{form}", [f"server/core/src/{form}_routes.cpp"],
+                                       roots=roots, patterns=mod.FORBIDDEN_HEADER_PATTERNS)
+            if fires_ and ok_:
+                _fail(f"QE: parser missed {form!r}", failures)
+            if not fires_ and not ok_:
+                _fail(f"QE: parser over-fired on {form!r}", failures)
+        # return-value controls: blank-mode newline/EOF behaviour, CRLF handed straight in, raw EOF
+        for text_, want_ in (("char c = 'a\nint x;", "char c = ''\nint x;"),
+                             ('s = "abc\nint x;', 's = ""\nint x;'),
+                             ('s = "abc', 's = ""'), ("c = 'a", "c = ''"),
+                             ("int a; // c", "int a;  "),
+                             ("#define X \\\r\n 1", "#define X  1"),
+                             ('R"x(a\n/* c\nint z;', 'R""')):
+            if mod._strip_comments(text_) != want_:
+                _fail(f"QE: _strip_comments({text_!r}) -> {mod._strip_comments(text_)!r}, want {want_!r}", failures)
+        # resolution-order / reach controls
+        (src / "sub").mkdir(exist_ok=True)
+        (src / "sub" / "dup.hpp").write_text("#pragma once\n", encoding="utf-8")
+        (inc / "dup.hpp").write_text('#pragma once\n#include "evil_store.hpp"\n', encoding="utf-8")
+        (src / "sub" / "sibling_user.hpp").write_text('#pragma once\n#include "dup.hpp"\n', encoding="utf-8")
+        (src / "res_order_routes.cpp").write_text('#include "sub/sibling_user.hpp"\n', encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok_ = mod.check_family("qe-order", ["server/core/src/res_order_routes.cpp"], roots=roots,
+                                   patterns=mod.FORBIDDEN_HEADER_PATTERNS)
+        if not ok_:
+            _fail("QE: includer-directory-first resolution lost (sibling dup.hpp shadowed by include root)", failures)
+        (src / "sub" / "clean_peer.hpp").write_text("#pragma once\n", encoding="utf-8")
+        (src / "sub" / "uses_peer.hpp").write_text('#pragma once\n#include "clean_peer.hpp"\n', encoding="utf-8")
+        (src / "sub" / "uses_src_rel.hpp").write_text('#pragma once\n#include "evil_store.hpp"\n', encoding="utf-8")
+        (src / "sibling_routes.cpp").write_text('#include "sub/uses_peer.hpp"\n', encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok_ = mod.check_family("qe-sib", ["server/core/src/sibling_routes.cpp"], roots=roots)
+        if not ok_:
+            _fail("QE: a sibling include (same directory as the includer) hard-failed", failures)
+        (src / "srcrel_routes.cpp").write_text('#include "sub/clean_peer.hpp"\n', encoding="utf-8")
+        (src / "sub" / "uses_srcrel.hpp").write_text('#pragma once\n#include "sub/clean_peer.hpp"\n', encoding="utf-8")
+        (src / "srcrel2_routes.cpp").write_text('#include "sub/uses_srcrel.hpp"\n', encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok_ = mod.check_family("qe-srcrel", ["server/core/src/srcrel2_routes.cpp"], roots=roots)
+        if not ok_:
+            _fail("QE: a src-relative quote include (resolved only via server_src) hard-failed", failures)
+        (common / "cm_store.hpp").write_text("#pragma once\n", encoding="utf-8")
+        (src / "angle_common_routes.cpp").write_text("#include <cm_store.hpp>\n", encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok_ = mod.check_family("qe-angcommon", ["server/core/src/angle_common_routes.cpp"], roots=roots,
+                                   patterns=mod.FORBIDDEN_HEADER_PATTERNS)
+        if ok_:
+            _fail("QE: an angle include resolving only in common/include was not walked", failures)
+        # unresolved-error content and dedupe granularity
+        (src / "bad1.hpp").write_text('#pragma once\n#include "nosuch_a.hpp"\n#include "nosuch_b.hpp"\n', encoding="utf-8")
+        (src / "bad2.hpp").write_text('#pragma once\n#include "nosuch_a.hpp"\n', encoding="utf-8")
+        (src / "dd_routes.cpp").write_text('#include "bad1.hpp"\n#include "bad2.hpp"\n', encoding="utf-8")
+        cap_ = io.StringIO()
+        with contextlib.redirect_stderr(cap_):
+            mod.check_family("qe-dd", ["server/core/src/dd_routes.cpp"], roots=roots)
+        if cap_.getvalue().count("could not resolve quote-include") != 3:
+            _fail("QE: expected 3 distinct (includer,spelling) unresolved errors, got "
+                  f"{cap_.getvalue().count('could not resolve quote-include')}", failures)
+        if '"nosuch_a.hpp"' not in cap_.getvalue() or "server/core/src/bad1.hpp" not in cap_.getvalue().replace("\\", "/"):
+            _fail("QE: the unresolved-include error no longer names the spelling and the includer", failures)
+        seen_ = set()
+        with contextlib.redirect_stderr(io.StringIO()):
+            r1_ = mod.report_unresolved("l", "t", [(src / "bad2.hpp", "nosuch_a.hpp")], roots, seen_)
+            r2_ = mod.report_unresolved("l", "t", [(src / "bad2.hpp", "nosuch_a.hpp")], roots, seen_)
+        if r1_ or r2_:
+            _fail("QE: report_unresolved must return False for a repeated (deduped) unresolved include too", failures)
+        for lane_, fn_ in (("impl-purity", lambda: mod.check_impl_purity(
+                                [f"server/core/src/dfan{k}_api.cpp" for k in range(3)], roots=roots)),
+                           ("abstract-header", lambda: mod.check_abstract_headers_store_type_free(
+                                [f"server/core/src/dfan{k}_api.hpp" for k in range(3)], roots=roots))):
+            ext_ = "cpp" if lane_ == "impl-purity" else "hpp"
+            for k in range(3):
+                (src / f"dfan{k}_api.{ext_}").write_text('#pragma once\n#include "bad2.hpp"\n', encoding="utf-8")
+            cap2_ = io.StringIO()
+            with contextlib.redirect_stderr(cap2_):
+                fn_()
+            if cap2_.getvalue().count("could not resolve quote-include") != 1:
+                _fail(f"QE: {lane_} lane did not dedupe a shared unresolved include "
+                      f"(got {cap2_.getvalue().count('could not resolve quote-include')})", failures)
+        # ===== end QE kill fixtures =====
+
         # 22. PARSER + COMMENT-STRIPPER COST. The gate runs in CI over repo files: a pathological
         #     header must never hang it. Earlier drafts were superlinear in two places: a nested
         #     quantifier in the include regex (hung >120 s on 20000 closed comments) and
@@ -958,6 +1095,7 @@ def main() -> int:
             "string_openers": '"' * 200000 + "\n",
             "line_continuations": "\\\n" * 200000 + "int x;\n",
             "comment_then_include": "/* x */ " * 20000 + '#include "a.hpp"\n',
+            "raw_openers": 'R"' * 200000 + "\n",
         }
         probe_code = (
             "import importlib.util, pathlib, sys\n"
