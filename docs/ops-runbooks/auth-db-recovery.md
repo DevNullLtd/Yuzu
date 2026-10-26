@@ -842,7 +842,7 @@ sudo systemctl restart yuzu-server
 
 ## Step-up returns 503 while the authentication store is unavailable
 
-The 37 routes that need a fresh MFA step-up (token, session, engine-principal,
+The 41 routes that need a fresh MFA step-up (token, session, engine-principal,
 RBAC and Guardian writes, password reset and the others listed in the
 [REST API reference](../user-manual/rest-api.md#step-up-envelope-on-high-risk-endpoints))
 check the caller's MFA state before the route runs. Other mutating routes and all
@@ -1049,7 +1049,7 @@ authentication store or reset the affected account. Know its limits:
   elevation still asks for a fresh proof and still fails if the store cannot be
   read.
 - **SAML sessions pass too.** The window check precedes the SAML denial, so while
-  the window is `0` or less a SAML session reaches all 37 routes instead of
+  the window is `0` or less a SAML session reaches all 41 routes instead of
   getting its `403`.
 - **Step-up evidence thins out.** While the window is `0` or less, no stale proof
   is refused, so none is recorded as a `mfa.step_up.required` row (passes never

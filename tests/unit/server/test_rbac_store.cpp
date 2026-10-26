@@ -320,8 +320,9 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     // +Directory +Enrollment +OidcConfig (#4031 prerequisite fix — Directory was
     // referenced by discovery_routes.cpp but never seeded; Enrollment/OidcConfig
     // are the two new #4031 route securables) = 36,
-    // +Forensics (37th) +Decommission (38th, Wave 7 PR7.2) = 38.
-    REQUIRE(types.size() == 38);
+    // +Forensics (37th) +Decommission (38th, Wave 7 PR7.2) = 38,
+    // +RevocationSource (ADR-0070 R1, slice 2b-1a) = 39.
+    REQUIRE(types.size() == 39);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -356,9 +357,27 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     CHECK(has("AnalyticsConfig")); // #4028: analytics fragment
     CHECK(has("Forensics")); // Wave 7 forensics class (execution_artifacts, app_usage)
     CHECK(has("Decommission")); // Wave 7 PR7.2: whole-device erasure cascade
+    CHECK(has("RevocationSource")); // ADR-0070 R1: registered CRL sources (admin-only)
     CHECK(has("Directory"));   // #4031 prerequisite fix — AD/Entra directory-sync
     CHECK(has("Enrollment"));  // #4031: auto-approve rules + pending-agent visibility
     CHECK(has("OidcConfig"));  // #4031: OIDC SSO config read (deliberately not "Directory")
+}
+
+// ADR-0070 R1: `RevocationSource` is seeded to Administrator and to NO other role (the surface is
+// also behind the durable-administrator predicate, but a seed that reached another role would
+// widen the egress-target registry to it under RBAC on).
+TEST_CASE("RbacStore: RevocationSource is seeded to Administrator only", "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    CHECK(role_grants(store, "Administrator", "RevocationSource", "Read"));
+    CHECK(role_grants(store, "Administrator", "RevocationSource", "Write"));
+    for (const auto& role : store.list_roles()) {
+        if (role.name == "Administrator")
+            continue;
+        for (const char* op : {"Read", "Write", "Execute", "Delete", "Approve", "Push", "Attest"}) {
+            INFO("role=" << role.name << " op=" << op);
+            CHECK(role_denies(store, role.name, "RevocationSource", op));
+        }
+    }
 }
 
 TEST_CASE("RbacStore: seed data — operations", "[rbac_store][pg]") {
@@ -393,12 +412,13 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Administrator");
-    // 38 types * 5 CRUD ops = 190 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 191), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2, = 192), plus a single ApiToken:Rotate
-    // grant (P2 #11, SOC 2 CC6.3) = 193 permissions total. Push, Attest, and
+    // 39 types * 5 CRUD ops = 195 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 196), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2, = 197), plus a single ApiToken:Rotate
+    // grant (P2 #11, SOC 2 CC6.3) = 198 permissions total. Push, Attest, and
     // Rotate are deliberately NOT cross-seeded on other securables — see the
-    // rationale in rbac_store.cpp seed_defaults(). (38th: Decommission, Wave 7
+    // rationale in rbac_store.cpp seed_defaults(). (39th: RevocationSource,
+    // ADR-0070 R1, slice 2b-1a; 38th: Decommission, Wave 7
     // PR7.2; 37th: Forensics, Wave 7 forensics class; 36th-34th: Directory/
     // Enrollment/OidcConfig, #4031; 33rd-30th: TlsConfig/PluginSigning/
     // ServerConfig/AnalyticsConfig, #4028 Settings read-twins; 29th:
@@ -408,7 +428,7 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
     // PluginConfig, PR1.9a peer finding PLAN-001; 23rd: EnginePrincipal,
     // #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st: SoftwareLicensing,
     // ADR-0024.)
-    CHECK(perms.size() == 193);
+    CHECK(perms.size() == 198);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 

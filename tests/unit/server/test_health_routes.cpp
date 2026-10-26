@@ -381,6 +381,9 @@ TEST_CASE("health_routes: GET /readyz with every store pointer null reports "
     CHECK(std::find(failed.begin(), failed.end(), "response_store") != failed.end());
     CHECK(std::find(failed.begin(), failed.end(), "api_token_store") != failed.end());
     CHECK(std::find(failed.begin(), failed.end(), "fleet_topology_store") != failed.end());
+    // ADR-0070 R1: the registered-CRL-source store is GATING (fail-closed at boot), unlike the
+    // /crypto layout store: a null pointer here is a failed store, never a "degraded" notice.
+    CHECK(std::find(failed.begin(), failed.end(), "revocation_source_store") != failed.end());
     CHECK(std::find(failed.begin(), failed.end(), "pg_pool") != failed.end());
     // scim_store's check is opt-in gated (cfg.scim_enable defaults false) —
     // must NOT appear in failed_stores despite the pointer being null.

@@ -1449,7 +1449,7 @@ review, as a new egress surface.
 **Decided (ADR-0070 D12, `0070:947-948`):** a Postgres store for registered CAs and CRL entries,
 separate from `ca_store`, in the readiness conjunction.
 
-**Proposed:** `RevocationSourceStore`, schema `revocation_source`. It never touches `ca_store`
+**Proposed:** `RevocationSourceStore`, schema `revocation_source_store`. It never touches `ca_store`
 (D6, `0070:632-639`).
 
 | Table | Key | Columns |

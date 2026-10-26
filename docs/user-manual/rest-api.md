@@ -372,6 +372,8 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | any | `/api/v1/dex/score-policy` | 320 KiB | `dex_score_policy` | The fourth `requires_measurable=true` class. `PUT`'s body IS the score policy document, which the handler caps at 256 KiB (`kDexScorePolicyMaxBytes`); 320 KiB leaves framing headroom, so a legitimate document is never refused here. `GET` and `DELETE` are bodyless siblings sharing the class. The permission gate runs in the handler, after the body is buffered (a cookie session's same-site gate runs earlier, pre-routing), so an unmeasurable (chunked) body is refused up front with `411`. |
 | any | `/api/v1/crypto` | 16 KiB | `crypto` | The `/crypto` REST v1 subtree. The only body-bearing route is `PUT /api/v1/crypto/dashboard/layout` (at most 64 catalogue ids, about 4.4 KiB even fully escaped); 16 KiB mirrors the handler's own `kLayoutBodyMaxBytes` exactly. Any method, because every sibling is a bodyless GET and shares the prefix. |
 | any | `/api/v1/config` | 16 KiB | `config` | The runtime-configuration REST v1 subtree. The only body-bearing route is `PUT /api/v1/config/{key}` (`{"value": ...}`, one scalar: an integer, a flag, a log level, a tag key, an OIDC client secret or a string holding a short JSON array); 16 KiB is far above any legal value. Any method, because the sibling `GET /api/v1/config` is bodyless and shares the prefix. The legacy `PUT /api/config/{key}` stays on the catch-all. |
+| any | `/api/v1/crypto/revocation-sources` | 128 KiB | `crypto_revocation_sources` | ADR-0070 R1 registered CRL sources: `POST` and `PUT` carry `{name, ca_certificates (up to 8 PEM certificates), crl_urls (up to 8 URLs of up to 2,048 bytes)}`. 128 KiB mirrors the handler's own `revocation_source::kBodyMaxBytes` exactly (a `static_assert` pins the pair) and outranks the 16 KiB `/api/v1/crypto` row for this subtree only (longest match). |
+| any | `/api/v1/crypto/revocation-sources` | 192 KiB | `crypto_revocation_sources` | ADR-0070 R1 registered CRL sources: `POST` and `PUT` carry `{name, ca_certificates (up to 8 PEM certificates), crl_urls (up to 8 URLs of up to 2,048 bytes)}`. 192 KiB mirrors the handler's own `revocation_source::kBodyMaxBytes` exactly (a `static_assert` pins the pair) and outranks the 16 KiB `/api/v1/crypto` row for this subtree only (longest match). |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `tar_dashboard_sql`/`tar_result_set_sql` history above is a shipped example).
@@ -1710,7 +1712,7 @@ curl -s -X POST \
 
 `audit_emitted` and the `Sec-Audit-Failed: true` header have the same semantics as the session-revoke routes above — `false` means the unlock completed but the audit row was lost, degrading the CC6.3 evidence chain for that request.
 
-**Errors:** `400`: username empty or malformed (e.g. contains a reserved `:`); `401`: MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403`: caller lacks `UserManagement:Write`, or a SAML session (step-up is not available for SAML sessions, unless `--mfa-step-up-window-secs` is `0` or less, which lets SAML sessions through on the 37 step-up-gated routes); `500`: the AuthDB (Postgres) write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503`: the lockout subsystem is not wired (no `AuthDB`).
+**Errors:** `400`: username empty or malformed (e.g. contains a reserved `:`); `401`: MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403`: caller lacks `UserManagement:Write`, or a SAML session (step-up is not available for SAML sessions, unless `--mfa-step-up-window-secs` is `0` or less, which lets SAML sessions through on the 41 step-up-gated routes); `500`: the AuthDB (Postgres) write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503`: the lockout subsystem is not wired (no `AuthDB`).
 
 **Audit:** a successful unlock emits `auth.lockout.cleared` with `result=ok`, `target_type=User`, `target_id=<username>`, `detail=admin_unlock`. A failed write emits the same verb with `result=error`. Note that a lockout cleared automatically (no operator action) emits `auth.lockout.cleared` with `result=ok` and `detail=reset_on_successful_login` when the user next logs in successfully; the threshold crossing itself emits `auth.lockout.applied`. These two verbs are the durable CC6.3 evidence; blocked-while-locked attempts are tracked only via the `yuzu_auth_lockout_blocked_total` metric (no per-attempt audit row **or** analytics event) to avoid amplification under a sustained brute-force.
 
@@ -8025,6 +8027,103 @@ Errors: `401`, `403` (no `Inventory:Read`, written by the gate, or a confined ca
 
 The `/fragments/crypto/dashboard`, `/fragments/crypto/widget/{id}` and `/fragments/crypto/ca/certificates` fragments render the same data for the page (always HTTP 200, a note on refusal and a banner on degrade) and write the same audit verbs; for a service-scoped token, or an MCP token whose tier refuses the layout read, `/fragments/crypto/dashboard` draws the default layout read-only and never reads the minting operator's saved layout (the layout routes refuse the same tokens); the dashboard fragment writes one row per source per draw (see [crypto.md](crypto.md#audit)). `/fragments/crypto/ca/certificates` is the page's twin of the filtered `GET /api/v1/ca/issued` and needs `Security:Read`.
 
+#### Revocation sources (registered CRL sources)
+
+A **revocation source** is one certificate authority (its CA certificates) plus the CRL URLs the server may fetch for it (ADR-0070 R1). This release **registers** sources only: nothing is fetched and no certificate is judged yet, so `crl_status` reads `no_crl_fetched` and every `fetch_status.state` reads `never_fetched`. A source in this list is not evidence that any certificate was checked. Scope: facts only; the only built-in checks are D13's named rules and windows, each shown with its criterion.
+
+**Permission.** The surface is **admin-only in both RBAC states and not grantable**. Every route needs the `RevocationSource` securable (`Read` for the two reads, `Write` for the other four; removal and the reset are a `Write`, there is no `Delete`) **and** a durable Administrator role (the same `is_rbac_administrator` check as the RBAC grant routes). A custom role granted `RevocationSource:Read` or `:Write` is still refused. With RBAC off, `Write` is admin-only already and `Read` is in the [authorization topology floor](rbac.md#the-authorization-topology-floor-2376). A service-scoped API token and an MCP-tier bearer token (of any tier) are refused `403`. Mutations also need MFA step-up when the caller has an enrolled factor and its proof is stale, and a cookie session must be same-site. An MCP-tier bearer token of any tier is refused on these REST routes; the MCP twins are the route for an MCP caller, where a supervised token needs an approval ticket for each mutation (see the [MCP tools](mcp.md)).
+
+| Method and path | MCP twin | Permission |
+|---|---|---|
+| `GET /api/v1/crypto/revocation-sources` | `list_revocation_sources` | `RevocationSource:Read` |
+| `GET /api/v1/crypto/revocation-sources/{id}` | `get_revocation_source` | `RevocationSource:Read` |
+| `POST /api/v1/crypto/revocation-sources` | `register_revocation_source` | `RevocationSource:Write` |
+| `PUT /api/v1/crypto/revocation-sources/{id}` | `update_revocation_source` | `RevocationSource:Write` |
+| `DELETE /api/v1/crypto/revocation-sources/{id}` | `remove_revocation_source` | `RevocationSource:Write` |
+| `POST /api/v1/crypto/revocation-sources/{id}/reset-high-water` | `reset_revocation_source_high_water` | `RevocationSource:Write` |
+
+##### `POST /api/v1/crypto/revocation-sources`
+
+Registers a CA and its CRL URLs. `PUT` replaces a source with the same body. `PUT` REQUIRES `expected_config_version` (the source's `config_version` as you last read it; on both REST and MCP): if the configuration would change and the source has moved on since, the call is `409` and replaces nothing. A body equal to the stored configuration is a no-op success whatever version it names, so retrying your own committed change is safe.
+
+```json
+{
+  "name": "Corp issuing CA",
+  "ca_certificates": ["-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n"],
+  "crl_urls": [
+    {"url": "http://crl.example.com/ca.crl", "confirmed_address_classes": ["public"]}
+  ]
+}
+```
+
+- `name`: 1 to 128 bytes of UTF-8 without control characters (free text, escaped on render).
+- `ca_certificates`: 1 to 8 PEM `CERTIFICATE` blocks, one per string, nothing else in the string. Each must parse, be a CA (`basicConstraints` `cA=TRUE`) and carry `cRLSign` if it has a key usage extension. **All must share one subject Name**: a source is one CA, and several keys let a CA renewal keep verifying. The server keeps each certificate's SHA-256, subject key identifier and public-key hash, and the subject Name hash.
+- `crl_urls`: 1 to 8 objects. `url` is `http` or `https`, with a host, no userinfo, no fragment, at most 2,048 bytes, ASCII only (give an internationalised host as punycode); `file:`, LDAP, UNC and anything else is refused.
+- **The host is resolved at registration**, and every address it resolves to is classified. **Refused with no override** (also by the fetcher on every fetch): unspecified, link-local, cloud-metadata, multicast and reserved addresses, **loopback**, and **every address this server is bound to or listening on** (a wildcard bind covers every local interface address). In an HA deployment the last refusal covers only the replica that handled the request, not the other replicas' addresses; only an administrator can register a URL, so reaching another replica's listener needs an administrator to name it.
+- **NAT64 prefixes: IPv6 hosts are judged by the IPv4 address they embed. The check uses the prefixes the operator declared (`--oidc-nat64-prefix`) AND those the network advertises for `ipv4only.arpa` (RFC 7050), through ONE process-wide cache shared with the OIDC client that never shrinks (a prefix, once learned, is kept until restart). The declared and the discovered prefixes are judged separately: a prefix the network advertises can make an address LESS permitted, never more (a discovered unique-local prefix does not turn a unique-local host into "public"), and every class either view yields must be confirmed. If a refresh of the discovery fails the check still applies everything learned before and writes `nat64=stale` into the audit row; if NO lookup has ever answered (or the learned set overflowed its bound of 64) an IPv6 destination is refused with a retryable 503, because "unknown" must not read as "no translator".
+- **Any other class must be confirmed.** `confirmed_address_classes` lists the classes you accept the server fetching from: `public`, `private`, `carrier-grade-nat`, `unique-local`, `non-global`. Omit it and the request is refused `400` with the classes the host resolves to; resend with them. They are stored with the URL, and the fetcher refuses an address outside them (an address class that later changes is refused, not followed).
+- At most **64** sources, **one per CA**: registering a CA that is already registered is `409` and names the existing source in `error.remediation`.
+- **No outbound proxy is used** in this release: a site whose only route out is a proxy cannot fetch CRLs yet.
+
+Example:
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d @source.json https://yuzu.example.com/api/v1/crypto/revocation-sources
+```
+
+Response `201` (`Location` names the source):
+
+```json
+{
+  "data": {
+    "id": 3,
+    "name": "Corp issuing CA",
+    "ca_subject_name_sha256": "9f1c...e2",
+    "config_version": 1,
+    "created_by": "alice",
+    "created_at": "2026-10-23T09:00:00Z",
+    "updated_at": "2026-10-23T09:00:00Z",
+    "held_crl_count": 0,
+    "crl_status": "no_crl_fetched",
+    "ca_certificates": [{"cert_sha256": "4b0a...91", "ski": "6d2e...c7", "spki_sha256": "a83f...10"}],
+    "crl_urls": [{
+      "id": 5, "url": "http://crl.example.com/ca.crl", "host": "crl.example.com",
+      "confirmed_address_classes": ["public"],
+      "fetch_status": {"state": "never_fetched", "last_attempt_at": null, "last_success_at": null,
+                        "last_failure_cause": null, "consecutive_failures": 0, "next_attempt_at": null}
+    }]
+  },
+  "meta": {"api_version": "v1"}
+}
+```
+
+##### `GET /api/v1/crypto/revocation-sources`
+
+The list is `{data: {sources[], total, max_sources, crl_past_next_update}}`. `crl_past_next_update` counts the sources whose held CRL is past its `nextUpdate`; it is `0` until the fetcher holds CRLs. A degraded store answers `503` with `retry_after_ms: 5000`, never an empty list.
+
+##### `GET /api/v1/crypto/revocation-sources/{id}`
+
+One source, as in the example above, with its CA certificates, URLs, confirmed address classes and fetch status. An unknown id is `404`.
+
+##### `PUT /api/v1/crypto/revocation-sources/{id}`
+
+Replaces the source's name, CA certificates and URLs; this is how a renewed CA key is added. The new certificates must name the **same subject** as the registered source (a different subject is `400`: register that CA as its own source). A URL absent from the body is deleted with its fetch status and every CRL held from it; a key absent from the body deletes every CRL that verified only under it (nothing is held in this release). The CA's anti-rollback marks are never touched. The call is **idempotent**: a body equal to the stored configuration changes nothing and leaves `config_version` unchanged (`changed: false`). The response is the source plus `changed`, `dropped_urls`, `dropped_ca_certificates` and `crls_deleted`.
+
+##### `DELETE /api/v1/crypto/revocation-sources/{id}`
+
+Removes the source with its URLs, held CRLs and entries. Certificates it covered then read "issuer not registered". The CA's anti-rollback marks **survive**, so removing and re-registering a CA cannot accept an older CRL. A repeat answers `404`.
+
+##### `POST /api/v1/crypto/revocation-sources/{id}/reset-high-water`
+
+Resets the CA's anti-rollback marks and discards the source's held CRLs. Use it only after confirming that the CA's clock or CRL numbering moved backwards on purpose: until the next CRL is accepted the CA's certificates read "revocation not checked", and the reset opens a **replay window** (a CRL that verifies and is dated at or after the reset is accepted whatever its number). The optional body `{"reset_at": "<RFC 3339 UTC>"}` (no later than the server clock; default now) sets the floor: a value below the CA's current `thisUpdate` widens the window to everything since it. The response echoes the window: `{reset_at, crls_deleted, replay_window_opens_at, pinned}` (`pinned` is true when `pin_crl_sha256` was recorded). **Before a reset, `PUT` the CA's new certificates first**: a reset removes the held CRLs, and a CRL signed by a key you have not registered yet cannot be accepted afterwards. The call is **not idempotent**: each call sets a new `reset_at` and deletes the held CRLs again. The optional body field `pin_crl_sha256` (64 hex) names the only first CRL to accept afterwards. The reset also clears each scope's CRL number and `thisUpdate`, keeps `reset_at` permanently and bumps `config_version`. A reset whose outcome is unknown can be checked by reading the source: `high_water.reset_at` (null until the first reset) and `high_water.pinned_crl_sha256`.
+
+##### Audit, errors and degrade
+
+- **Audit:** reads write `crypto.revocation_source.list` / `.view` and **fail closed** on REST (a row that does not persist answers `503` with `Sec-Audit-Failed: true` and no data). Mutations write `crypto.revocation_source.register` / `.update` / `.remove` / `.reset_high_water` with **no audit row, no mutation**: an `attempted` row first (if it cannot be stored the answer is `503` and nothing changes), then the outcome row. A lost outcome row keeps the `2xx`, sets `Sec-Audit-Failed: true` and adds `audit_persisted: false`; an `attempted` row with no outcome row means the outcome was not recorded, not that the change was not applied. See the [audit log catalogue](audit-log.md).
+- **Errors** are the A4 envelope: `400` (a field outside its rule, including a missing `expected_config_version`; `remediation` names the parameter), `401` (including a stale MFA step-up proof: `meta.challenge_url`), `403` (`error.message` says an administrator role is required; an MCP-tier token is refused), `404` (no such source, or a non-numeric id), `409` (CA already registered, 64 sources, or a stale `expected_config_version` whose `remediation` names the current one), `413` (body over 192 KiB), `503` (`retry_after_ms: 5000`: store degraded, the `attempted` audit row could not be written, the change outcome is unknown, **this server's own addresses could not be determined, or a name lookup timed out / had no capacity** (nothing was registered; retry); read the source to check an unknown outcome).
+
+
 ---
 
 ### Result Sets
@@ -9572,7 +9671,7 @@ answers `503` with `retry_after_ms: 2000`.
 `success` or `failure` row once the store answers. If the `attempted` row cannot be saved, the route
 answers `503` and makes no change. Audit actions: `plugin_config.set`, `plugin_config.delete`,
 `plugin_secret.set`, `plugin_secret.delete`, `plugin_config.kill_switch.set` (see
-[Audit Log](audit-log.md)). Request bodies over 128 KiB are refused with `413`.
+[Audit Log](audit-log.md)). Request bodies over 192 KiB are refused with `413`.
 
 **Secrets are write-only.** You can set or delete a secret, but no REST route or MCP tool ever returns
 its value. Secret responses carry metadata only.
@@ -10862,7 +10961,7 @@ These endpoints drive the **Settings → Security and sign-in → Two-factor sig
 **`POST /api/settings/mfa/recovery-codes`** — Regenerate the 10 recovery codes.
 
 - **Permission:** Admin only. Requires existing enrollment.
-- **Step-up:** one of the 37 routes in the [step-up list](#step-up-envelope-on-high-risk-endpoints), checked before the permission check: an MFA-enrolled session whose proof is older than `mfa_step_up_window_secs` receives `401` `mfa_step_up_required`. The Settings MFA panel cannot yet prompt for the code: the button shows a toast and the operator signs in again (a just-enrolled administrator is covered inside the window, for the confirming session only, by the proof recorded at enrolment confirmation). An account with no MFA enrolled is not affected.
+- **Step-up:** one of the 41 routes in the [step-up list](#step-up-envelope-on-high-risk-endpoints), checked before the permission check: an MFA-enrolled session whose proof is older than `mfa_step_up_window_secs` receives `401` `mfa_step_up_required`. The Settings MFA panel cannot yet prompt for the code: the button shows a toast and the operator signs in again (a just-enrolled administrator is covered inside the window, for the confirming session only, by the proof recorded at enrolment confirmation). An account with no MFA enrolled is not affected.
 - **Effect:** Atomic DELETE + 10×INSERT inside a Postgres transaction, serialized on the caller's `auth.users` row (`SELECT … FOR UPDATE`) so two concurrent regenerations cannot interleave (#3779). All prior codes (consumed and unconsumed) are invalidated. If the account has been deactivated, the codes are **not** reissued and the request fails.
 - **Response (200):** HTML fragment with the fresh 10 codes as a one-time reveal. Same `Cache-Control: no-store` headers.
 - **Audit:** `mfa.recovery_codes.generated` / `ok` (detail = `10 codes issued (rotation)`).
@@ -10870,7 +10969,7 @@ These endpoints drive the **Settings → Security and sign-in → Two-factor sig
 **`POST /api/settings/mfa/disable`** — Clear MFA state for the logged-in admin.
 
 - **Permission:** Admin only.
-- **Step-up:** one of the 37 routes in the [step-up list](#step-up-envelope-on-high-risk-endpoints), checked before the permission check: an MFA-enrolled session whose proof is older than `mfa_step_up_window_secs` receives `401` `mfa_step_up_required`. The Settings MFA panel cannot yet prompt for the code: the button shows a toast and the operator signs in again (a just-enrolled administrator is covered inside the window, for the confirming session only, by the proof recorded at enrolment confirmation). An account with no MFA enrolled is not affected.
+- **Step-up:** one of the 41 routes in the [step-up list](#step-up-envelope-on-high-risk-endpoints), checked before the permission check: an MFA-enrolled session whose proof is older than `mfa_step_up_window_secs` receives `401` `mfa_step_up_required`. The Settings MFA panel cannot yet prompt for the code: the button shows a toast and the operator signs in again (a just-enrolled administrator is covered inside the window, for the confirming session only, by the proof recorded at enrolment confirmation). An account with no MFA enrolled is not affected.
 - **Effect:** Atomic UPDATE users (clears `mfa_totp_secret`, `mfa_enrolled_at`; stamps `mfa_disabled_at`) + DELETE `mfa_recovery_codes` inside a `BEGIN IMMEDIATE / COMMIT` transaction. **Self-target guard (PR 3):** while `--mfa-enforcement` protects the caller's role (`required` → all roles; `admin-only` → admins), the disable is refused — the operator cannot strip the MFA that policy requires of them.
 - **Response (200):** HTML fragment showing the "Not enrolled" state, or, when the self-target guard fires, the unchanged "Enabled" fragment with an inline "MFA is required by policy" message.
 - **Audit:** `mfa.disabled` / `ok` (or `error` on DB failure, or `error` + detail `blocked: mfa_enforcement=<mode>` when the self-target guard refuses the disable).
@@ -13228,11 +13327,11 @@ curl -s -X POST https://yuzu.example.com/login/mfa/stepup \
 
 #### Step-up envelope on high-risk endpoints
 
-A fresh MFA proof is required on 37 named high-risk routes (listed below) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`; un-enrolled accounts and API-token and MCP-token callers pass, and engine principals are denied. The three JIT-elevation routes, whose handlers apply their own stricter check, are separate. Other mutating routes and all MCP tools are not MFA-step-up gated in this release. The 37 are checked by one central step-up check that runs after the session is resolved and after the server-wide same-site check (a cross-site or header-less cookie write is answered `403` `cross-site request refused` before it), and **before** the route's own authorization, own same-site copy and body checks. These routes return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs` (the JIT-elevation routes at the end of this list use a 300s window instead when that flag is `0` or less; a positive value is used as it is).
+A fresh MFA proof is required on 41 named high-risk routes (listed below) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`; un-enrolled accounts and API-token and MCP-token callers pass, and engine principals are denied. The three JIT-elevation routes, whose handlers apply their own stricter check, are separate. Other mutating routes and all MCP tools are not MFA-step-up gated in this release. The 41 are checked by one central step-up check that runs after the session is resolved and after the server-wide same-site check (a cross-site or header-less cookie write is answered `403` `cross-site request refused` before it), and **before** the route's own authorization, own same-site copy and body checks. These routes return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs` (the JIT-elevation routes at the end of this list use a 300s window instead when that flag is `0` or less; a positive value is used as it is).
 
 Other outcomes of that check:
 
-- `403` for a SAML session (no SAML MFA attestation in this release; the remediation says SAML sessions cannot satisfy step-up, re-authenticating does not help, and to use an existing untiered, unscoped API token where the route accepts one, or ask an administrator). The escape hatch precedes this denial, so with `--mfa-step-up-window-secs` at `0` or less SAML sessions pass all 37 routes. Also `403` for an engine principal on every one of the 37 routes, regardless of its grants (audited as `mfa.step_up.required` with `result=error` and `reason=engine_principal_denied`; the body carries `meta.mfa_step_up_required: false` and no `challenge_url`). Once its credential resolves, an engine principal is refused before any role grant is consulted and without any MFA store read, even when `--mfa-step-up-window-secs` is `0`; it can never satisfy a TOTP challenge. During a database outage the pre-routing authentication cannot resolve the credential (an engine token reads the store on every request; a cookie session is served from the validation cache for about 30 seconds of a stall and is in the same position only once that cache lapses), so the request is answered as an unauthenticated one: `401` `unauthorized` (a JSON body on `/api/`, `/events` and `/mcp/` paths; other paths, such as `/fragments/`, get a redirect or `HX-Redirect`) without the step-up envelope, the engine quota or a step-up audit row. The checks that precede the denial are the pre-routing gates (on-behalf rejection, the rate limit, the `401` for no session and the engine quota `429`) and the unwired-store `503` below, which answers every caller class. On these 37 routes this replaces the per-route handler denial (a `result=denied` audit row with detail `engine_session_denied` and the body text `engine principals cannot access this endpoint`), which is no longer produced there; update SIEM rules keyed on it.
+- `403` for a SAML session (no SAML MFA attestation in this release; the remediation says SAML sessions cannot satisfy step-up, re-authenticating does not help, and to use an existing untiered, unscoped API token where the route accepts one, or ask an administrator). The escape hatch precedes this denial, so with `--mfa-step-up-window-secs` at `0` or less SAML sessions pass all 41 routes. Also `403` for an engine principal on every one of the 41 routes, regardless of its grants (audited as `mfa.step_up.required` with `result=error` and `reason=engine_principal_denied`; the body carries `meta.mfa_step_up_required: false` and no `challenge_url`). Once its credential resolves, an engine principal is refused before any role grant is consulted and without any MFA store read, even when `--mfa-step-up-window-secs` is `0`; it can never satisfy a TOTP challenge. During a database outage the pre-routing authentication cannot resolve the credential (an engine token reads the store on every request; a cookie session is served from the validation cache for about 30 seconds of a stall and is in the same position only once that cache lapses), so the request is answered as an unauthenticated one: `401` `unauthorized` (a JSON body on `/api/`, `/events` and `/mcp/` paths; other paths, such as `/fragments/`, get a redirect or `HX-Redirect`) without the step-up envelope, the engine quota or a step-up audit row. The checks that precede the denial are the pre-routing gates (on-behalf rejection, the rate limit, the `401` for no session and the engine quota `429`) and the unwired-store `503` below, which answers every caller class. On these 41 routes this replaces the per-route handler denial (a `result=denied` audit row with detail `engine_session_denied` and the body text `engine principals cannot access this endpoint`), which is no longer produced there; update SIEM rules keyed on it.
 - `503` when the server has no wired authentication store (for any caller, including a token caller and a disabled window), or when the store cannot be read or the stored second factor cannot be decrypted (for a local session; API-token and MCP-token callers pass before any store read, and an OIDC session is judged on its identity-provider assertion). A `503` still carries `meta.mfa_step_up_required: true`, with no `challenge_url`; a client must treat a `503` as "retry shortly" and prompt for a code only on a `401`. Any other failure to read the enrollment state of a local session is a `401` whose remediation names the store.
 - A refusal carries an `X-Correlation-Id` response header equal to the body's `error.correlation_id`, and the audit row of a refusal made by the central check carries `cid=<id>` (the same value) and `stage=pre_authz` in the `mfa.step_up.required` row's `detail`, so the response is joinable to its row. The detail of a stale or absent proof is `user=<name> age_secs=<n> window_secs=<n> cid=<id> stage=pre_authz` (`age_secs=-1` when the session has no proof); every other refusal is `user=<name> reason=<token> cid=<id> stage=pre_authz`. The gate the three JIT-elevation handlers apply in their own handler writes the same fields without `cid=` or `stage=`, so only the central check's rows join by correlation id. The row is best effort, and the central check writes none for a request with no session (counted on the metric only; pre-routing answers anonymous requests first). An over-cap request body is refused `413` before the step-up check runs.
 - **Dashboard controls.** The `/fragments/...` and `/api/settings/...` routes below answer in the same envelope. When the request carries `HX-Request` (an htmx control, on these routes or on an `/api/v1/` route such as `DELETE /api/v1/sessions`) the response also carries an `HX-Trigger` error toast whose text is the envelope's `message`; a `fetch` request has no such header and gets no toast. The Guardian page's Edit and Delete controls use `fetch` through the shared dialog, which prompts for a code on a `401` envelope and shows the `message` of a `403` or `503` inside the dialog. See [Authentication](authentication.md) for the prompts each dashboard control raises.
@@ -13255,6 +13354,10 @@ The server refuses to start (exit status `1`) if a mutating route is registered 
 - `POST /api/v1/guaranteed-state/push` (fan out Guardian rules)
 - `POST /api/v1/guaranteed-state/policy-generation/raise` (raise the Guardian policy generation)
 - `PUT /api/v1/config/{key}` (write a runtime-configuration override; its legacy twin `PUT /api/config/{key}` is not step-up gated)
+- `POST /api/v1/crypto/revocation-sources` (register a CRL source)
+- `PUT /api/v1/crypto/revocation-sources/{id}` (replace a CRL source)
+- `DELETE /api/v1/crypto/revocation-sources/{id}` (remove a CRL source)
+- `POST /api/v1/crypto/revocation-sources/{id}/reset-high-water` (reset a CA's CRL anti-rollback marks)
 - `POST /api/settings/api-tokens` (mint an API token from the dashboard)
 - `DELETE /api/settings/api-tokens/{id}` (revoke an API token from the dashboard)
 - `POST /api/settings/mfa/recovery-codes` (regenerate your MFA recovery codes from the dashboard)

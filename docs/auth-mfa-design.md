@@ -3,8 +3,8 @@
 Status: **PR 1 + PR 2 + PR 3 of 3 shipped (v0.13+), plus the at-rest
 encryption follow-up SHIPPED (2026-07-16)** — self-service
 enrollment, login challenge, recovery codes (PR 1); step-up on 11
-high-risk REST + Settings surfaces (PR 2; since extended to 37 mutating
-routes, 37 enforced at one chokepoint, see "Step-up chokepoint" below); OIDC `amr` short-circuit plus
+high-risk REST + Settings surfaces (PR 2; since extended to 41 mutating
+routes, 41 enforced at one chokepoint, see "Step-up chokepoint" below); OIDC `amr` short-circuit plus
 enforcement modes (`admin-only` / `required`) with login-time enrollment
 bootstrap (PR 3). The MFA ladder is complete. `mfa_totp_secret` at-rest
 encryption landed as part of the `AuthDB`/`ScimStore` ADR-0006 Postgres
@@ -368,7 +368,7 @@ destructive as updating one), keeping the count at eleven.
 The eleven-site count above describes PR 2. The gated set has since grown
 (engine-principal, RBAC assignment and enforcement toggle, password reset,
 unlock, Guardian guard update / delete, MFA recovery-code regeneration and
-MFA disable, and others) to 40 mutating routes, 37 enforced by one
+MFA disable, and others) to 44 mutating routes, 41 enforced by one
 chokepoint and three, the JIT-elevation routes, by their own stricter
 handler gate. Other mutating routes (73 REST rows are still
 `kPendingRuling`) and all MCP tools are not MFA-step-up gated in this
