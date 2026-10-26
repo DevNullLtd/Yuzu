@@ -612,6 +612,7 @@ public:
         if (!reused) {
             s.dsn = dsn; // before the handle: a throw here must not leave a conn under a stale DSN
             s.conn = yuzu::server::pg::PgConn{PQconnectdb(dsn.c_str())};
+            s.pid = PQbackendPID(s.conn.get());
             ++s.connects;
         }
         ++s.statements;
@@ -621,9 +622,14 @@ public:
             // reconnect once, then fail as a first connect would. Safe to
             // re-run: a CREATE that did land fails loudly (42P04), a DROP is
             // IF EXISTS.
-            std::fprintf(stderr, "AdminConn: shared admin link was dead (%s); reconnecting\n",
-                         out.error.substr(0, out.error.find('\n')).c_str());
+            // The dead backend's pid lets a CI log be matched against the server
+            // log to find out what terminated it.
+            std::fprintf(stderr,
+                         "AdminConn: shared admin link (backend pid %d) was dead (%s); "
+                         "reconnecting\n",
+                         s.pid, out.error.substr(0, out.error.find('\n')).c_str());
             s.conn = yuzu::server::pg::PgConn{PQconnectdb(dsn.c_str())};
+            s.pid = PQbackendPID(s.conn.get());
             ++s.connects;
             out = run(s.conn, sql);
         }
@@ -675,6 +681,7 @@ private:
         std::mutex mu;
         yuzu::server::pg::PgConn conn;
         std::string dsn;
+        int pid{0}; // server backend pid of `conn` when it was opened (0: none or connect failed)
         std::uint64_t connects{0};
         std::uint64_t statements{0};
         bool closed{false};
