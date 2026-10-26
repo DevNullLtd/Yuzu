@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <format>
+#include <set>
 #include <string>
 
 namespace yuzu::tar {
@@ -247,9 +248,10 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
                                         encode_registry_baseline(diff.baseline)});
 
             // A root that could not be read, or child keys that deny access, are a blind
-            // spot the operator must be able to see: one gap row when it starts or changes,
-            // none while it holds steady. The cursor commits with the row, so a replay
-            // cannot lose or duplicate it.
+            // spot the operator must be able to see: one gap row when the root becomes
+            // unreadable or a child key is newly denied, none while it holds steady, shrinks
+            // or clears. The cursor commits with the row, so a replay cannot lose or
+            // duplicate it.
             if (rd.status == RegistryReadStatus::Unreadable) {
                 if (st.status != "unreadable")
                     rows.push_back(registry_gap_row(
@@ -261,12 +263,25 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
             } else {
                 std::sort(rd.skipped.begin(), rd.skipped.end());
                 rd.skipped.erase(std::unique(rd.skipped.begin(), rd.skipped.end()), rd.skipped.end());
-                if (!rd.skipped.empty() && rd.skipped != st.skipped)
+                // A gap is a GAIN: a denied child the stored set does not hold. A Capped read
+                // stops its walk early, so its list is partial -- it may add to the stored set
+                // but never shrinks it, else the next Complete read would look like a change
+                // and report an unchanged set again. (The diff above was given the read's own
+                // list: its Capped handling already keeps the unvisited keys.)
+                std::set<std::string> known(st.skipped.begin(), st.skipped.end());
+                bool gained = false;
+                for (const auto& s : rd.skipped)
+                    if (known.insert(s).second)
+                        gained = true;
+                if (rd.status == RegistryReadStatus::Capped)
+                    st.skipped.assign(known.begin(), known.end());
+                else
+                    st.skipped = std::move(rd.skipped);
+                if (gained)
                     rows.push_back(registry_gap_row("unreadable",
                                                     root + ":" + std::to_string(read_end),
-                                                    denied_children_detail(root, rd.skipped), now,
+                                                    denied_children_detail(root, st.skipped), now,
                                                     snapshot_id));
-                st.skipped = std::move(rd.skipped);
             }
 
             st.read_start = read_start;

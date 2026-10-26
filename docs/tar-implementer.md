@@ -422,9 +422,10 @@ cursor.** What it adds to the pattern:
   fabricate a deletion. Unreadable means the ROOT could not be read: a child key
   that denies access is listed in the read's `skipped` set instead, the rest of
   the root is read as usual, and the diff keeps what the baseline holds beneath
-  the denied key. A root going Unreadable, or the denied set appearing or
-  changing, writes one `gap:unreadable:<root>` row; the set is kept in the
-  cursor so a steady state writes nothing.
+  the denied key. A root going Unreadable, or the denied set gaining a member,
+  writes one `gap:unreadable:<root>` row; the set is kept in the cursor so a
+  steady state, a shrink or a clear writes nothing. A Capped read's list is
+  partial, so it can add to the stored set but never shrinks it.
 - **Rows land in the tick that observes the change.** A diff row is stamped with
   the end of the read that saw it and written in that tick's transaction.
   `actor_pid`/`actor_image` are in the schema but hold `0`/`''` until a later

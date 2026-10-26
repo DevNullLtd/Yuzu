@@ -617,7 +617,7 @@ struct RegistryRootState {
     std::int64_t read_end{0};
     std::string status; // complete | absent | unreadable | capped | due
     bool armed{true};
-    std::vector<std::string> skipped; // denied child keys of the last read (sorted): a change is a gap
+    std::vector<std::string> skipped; // denied child keys (sorted; a Capped read only adds): a new member is a gap
     bool operator==(const RegistryRootState&) const = default;
 };
 

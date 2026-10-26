@@ -801,7 +801,7 @@ TEST_CASE("registry source: read statuses; status keys; fair root scheduling",
     }
 }
 
-TEST_CASE("registry source: a denied child key and an unreadable root each write one gap row when they start or change",
+TEST_CASE("registry source: an unreadable root and a denied child set that gains a member each write one gap row",
           "[tar][registry][lifecycle]") {
     auto t = make_db();
     Fake f;
@@ -887,6 +887,82 @@ TEST_CASE("registry source: a denied child key and an unreadable root each write
     CHECK(gap_count() == 4);
 }
 
+TEST_CASE("registry source: the denied child set writes a gap only when it gains a member; a Capped read never shrinks it",
+          "[tar][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    const std::string a = kRoot + "\\A", b = kRoot + "\\B", c = kRoot + "\\C", d = kRoot + "\\D";
+    auto gap_count = [&] {
+        return std::stoll(q(t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'")
+                             .rows.at(0).at(0));
+    };
+    auto last_gap = [&] {
+        return q(t.db, "SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
+                       "ORDER BY id DESC LIMIT 1").rows.at(0).at(0);
+    };
+    auto stored = [&] { return read_cursor(t.db).roots.at(kRoot).skipped; };
+    // One tick over an unchanged root whose read has the given status and denied children.
+    auto next_tick = [&](RegistryReadStatus status, std::vector<std::string> denied) {
+        auto r = svc(1);
+        r.status = status;
+        r.skipped = std::move(denied);
+        f.reads[kRoot] = std::move(r);
+        f.clock += 100 * SEC;
+        f.dirty->mark(kRoot, f.clock);
+        return tick(t.db, *src);
+    };
+    using S = RegistryReadStatus;
+
+    SECTION("Complete{A,B} -> Capped{A} -> Complete{A,B} writes ONE gap row, and the Capped tick keeps {A,B}") {
+        next_tick(S::Complete, {a, b});
+        CHECK(gap_count() == 1);
+        CHECK_THAT(last_gap(), ContainsSubstring("2 child key(s)"));
+
+        // The Capped walk stopped early and only reached A: B is not proven readable.
+        CHECK(next_tick(S::Capped, {a}).events_emitted == 0);
+        CHECK(stored() == std::vector<std::string>{a, b});
+        CHECK(read_cursor(t.db).roots.at(kRoot).status == "capped");
+
+        CHECK(next_tick(S::Complete, {a, b}).events_emitted == 0); // the unchanged set is not re-reported
+        CHECK(gap_count() == 1);
+        CHECK(stored() == std::vector<std::string>{a, b});
+    }
+
+    SECTION("a Capped read that reaches a new denied child adds it and writes one gap naming the stored set") {
+        next_tick(S::Complete, {a, b});
+        CHECK(next_tick(S::Capped, {a, c}).events_emitted == 1);
+        CHECK(gap_count() == 2);
+        CHECK_THAT(last_gap(), ContainsSubstring("3 child key(s)"));
+        CHECK(stored() == std::vector<std::string>{a, b, c});
+        CHECK(next_tick(S::Complete, {a, b, c}).events_emitted == 0);
+        CHECK(gap_count() == 2);
+    }
+
+    SECTION("a shrink writes nothing, to a different non-empty set or to none; a member denied again is a new gain") {
+        next_tick(S::Complete, {a, b});
+        CHECK(gap_count() == 1);
+        CHECK(next_tick(S::Complete, {a}).events_emitted == 0);
+        CHECK(gap_count() == 1);
+        CHECK(stored() == std::vector<std::string>{a});
+        CHECK(next_tick(S::Complete, {}).events_emitted == 0);
+        CHECK(gap_count() == 1);
+        CHECK(stored().empty());
+        CHECK(next_tick(S::Complete, {b}).events_emitted == 1);
+        CHECK(gap_count() == 2);
+        CHECK(stored() == std::vector<std::string>{b});
+    }
+
+    SECTION("the detail names the first three denied children and counts the rest") {
+        next_tick(S::Complete, {d, c, b, a}); // the reader's order is not the display order
+        REQUIRE(gap_count() == 1);
+        const std::string detail = last_gap();
+        CHECK_THAT(detail, ContainsSubstring("(4 child key(s) denied read access"));
+        CHECK_THAT(detail, ContainsSubstring(a + "; " + b + "; " + c + "; +1 more"));
+        CHECK_THAT(detail, !ContainsSubstring(d));
+    }
+}
+
 TEST_CASE("registry source: with a budget admitting one root per tick every root is read within n ticks (R15)",
           "[tar][registry][lifecycle]") {
     auto t = make_db();
@@ -915,6 +991,41 @@ TEST_CASE("registry source: with a budget admitting one root per tick every root
         seen.insert(f.read_calls[0]);
     }
     CHECK(seen == std::set<std::string>(roots.begin(), roots.end()));
+}
+
+TEST_CASE("registry source: a root that stays Unreadable under budget pressure keeps its status and writes ONE gap (R15)",
+          "[tar][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto reader = f.reader();
+    auto inner = reader.read_subtree;
+    reader.read_subtree = [&f, inner](const std::string& root, std::int64_t deadline) {
+        auto r = inner(root, deadline);
+        f.clock += 11 * SEC; // exhausts the 10 s budget after every root
+        return r;
+    };
+    auto src = make_registry_cursor_source(scope2(), std::move(reader));
+    SubtreeRead bad;
+    bad.status = RegistryReadStatus::Unreadable;
+    f.reads[kRoot] = bad; // A: unreadable on every read
+    f.reads[kRoot2] = complete({{kRoot2 + "\\S", {{"Count", vread(4, dword(1))}}}}); // B: readable, due every tick
+
+    // The budget admits one root per tick and the start index rotates, so A is read on ticks
+    // 0 and 2 and deadline-skipped on ticks 1 and 3. A skipped Unreadable root must stay
+    // "unreadable": if it flapped to "due", its next Unreadable read would look like a new
+    // loss and write the gap again.
+    for (int i = 0; i < 4; ++i) {
+        f.read_calls.clear();
+        f.dirty->mark(kRoot2, f.clock);
+        tick(t.db, *src);
+        REQUIRE(f.read_calls.size() == 1);
+        CHECK(f.read_calls[0] == (i % 2 == 0 ? kRoot : kRoot2));
+        CHECK(read_cursor(t.db).roots.at(kRoot).status == "unreadable");
+    }
+    const auto gaps = q(t.db, "SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'");
+    REQUIRE(gaps.rows.size() == 1);
+    CHECK_THAT(gaps.rows[0][0], ContainsSubstring("gap:unreadable:" + kRoot + " (the root could not be read"));
+    CHECK(count_rows(t.db) == 1); // B's unchanged reads wrote nothing
 }
 
 TEST_CASE("registry source: a control-set switch re-baselines CurrentControlSet roots; a failed read does not",
@@ -992,6 +1103,46 @@ struct TestKey {
         if (h != nullptr)
             RegCloseKey(h);
         RegDeleteTreeW(HKEY_LOCAL_MACHINE, path.c_str());
+    }
+};
+
+// A registry symbolic-link key under `parent`. RegDeleteKeyW cannot delete one (it opens the
+// subkey without REG_OPTION_OPEN_LINK, so it never reaches the link itself), and a surviving
+// link makes the parent TestKey's RegDeleteTreeW fail, stranding the salted HKLM key for every
+// later job on the shared CI identity. remove() opens the link AS the link and deletes it with
+// ntdll's NtDeleteKey. It is idempotent, and the destructor calls it, so a REQUIRE that fails
+// between the link's creation and the end of the test still removes it. Declare it AFTER the
+// TestKey that owns `parent`, so it is destroyed first.
+struct LinkKey {
+    HKEY parent;
+    std::wstring name;
+    bool removed{false};
+    LinkKey(HKEY p, std::wstring n) : parent(p), name(std::move(n)) {}
+    LinkKey(const LinkKey&) = delete;
+    LinkKey& operator=(const LinkKey&) = delete;
+    ~LinkKey() { remove(); }
+
+    // 0 on success, or when the link does not exist; else the Win32 error from the open or
+    // the NTSTATUS from NtDeleteKey.
+    LONG remove() {
+        if (removed)
+            return 0;
+        HKEY h = nullptr;
+        const LONG opened = RegOpenKeyExW(parent, name.c_str(), REG_OPTION_OPEN_LINK, DELETE, &h);
+        if (opened == ERROR_FILE_NOT_FOUND) {
+            removed = true;
+            return 0;
+        }
+        if (opened != ERROR_SUCCESS)
+            return opened;
+        using NtDeleteKeyFn = LONG(NTAPI*)(HANDLE); // NTSTATUS is a LONG
+        const auto nt_delete_key = reinterpret_cast<NtDeleteKeyFn>(
+            reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtDeleteKey")));
+        const LONG status = nt_delete_key != nullptr ? nt_delete_key(h) : ERROR_PROC_NOT_FOUND;
+        RegCloseKey(h); // the key goes when its last handle closes
+        if (status == 0)
+            removed = true;
+        return status;
     }
 };
 
@@ -1180,6 +1331,8 @@ TEST_CASE("registry live: a symbolic-link key is read as the link and never foll
     RegCloseKey(target);
 
     // A volatile link key `Link` pointing at Target (the link's value is the NT path, no NUL).
+    // The owner exists before the key does, so every exit path below removes the link.
+    LinkKey link_key(key.h, L"Link");
     const std::wstring nt_target = L"\\Registry\\Machine\\" + key.path + L"\\Target";
     HKEY link = nullptr;
     REQUIRE(RegCreateKeyExW(key.h, L"Link", 0, nullptr, REG_OPTION_CREATE_LINK | REG_OPTION_VOLATILE,
@@ -1202,8 +1355,8 @@ TEST_CASE("registry live: a symbolic-link key is read as the link and never foll
     CHECK_FALSE(link_values.contains("Secret"));
     CHECK(r.keys.at(root + "\\Target").contains("Secret")); // read once, as the key it is
 
-    // Remove the link itself, so the cleanup's tree walk is never asked to follow it.
-    RegDeleteKeyW(key.h, L"Link");
+    // Remove the link itself (as the link, never through it) before the parent's tree delete.
+    REQUIRE(link_key.remove() == 0);
 }
 
 TEST_CASE("registry live: stop is idempotent and destruction after stop is clean",
