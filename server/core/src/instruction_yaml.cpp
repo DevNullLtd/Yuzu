@@ -216,7 +216,7 @@ std::vector<std::string> validate_definition_yaml(const std::string& yaml_source
     if (f.action.empty())
         errors.push_back("Missing spec.execution.action (or spec.action) field");
     // Explicit-id charset/length gate, byte-identical to the store's
-    // create_definition_impl (instruction_store.cpp) so validate-pass ⇒
+    // validate_and_prepare (instruction_store.cpp) so validate-pass ⇒
     // save-pass holds for the id too: an operator-supplied metadata.id with a
     // space or >128 bytes is rejected on Save, so validate must reject it
     // here (Doomgoose blocker on #2010 — the id gate re-broke the #1993
@@ -237,12 +237,12 @@ std::vector<std::string> validate_definition_yaml(const std::string& yaml_source
             }
         }
         // Same contract, second rule on the id (#2442): the store refuses the
-        // reserved MCP namespace on Save, so validate must refuse it here.
+        // reserved namespaces (`mcp.`, `guardian.`) on Save, so validate must refuse it here.
         // Both sides call the ONE predicate rather than copying it — the
         // charset gate above was copied, and copying is how this contract broke
         // on #2010 and again when the reservation first landed.
         if (is_reserved_definition_id(f.id))
-            errors.push_back(std::string(kReservedDefinitionIdError));
+            errors.push_back(std::string(reserved_definition_id_error(f.id)));
     }
     // Enum checks match the store/JSON-route error strings byte-for-byte so
     // one denial has one shape everywhere (governance cons-S3).

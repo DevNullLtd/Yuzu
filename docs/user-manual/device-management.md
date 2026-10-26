@@ -412,7 +412,7 @@ direct and gateway paths.
 corrupted, the agent transparently re-provisions on its next enrollment: it
 generates a fresh keypair + CSR and the server issues a **new** leaf with a
 **new serial**. The previous serial remains in the server's issued-cert inventory
-(`GET /api/v1/ca/issued`) as an orphaned row that no live agent holds — this is
+(`GET /api/v1/ca/issued`, which a management-group-confined account, or one with no `Inventory:Read` grant, is refused) as an orphaned row that no live agent holds — this is
 harmless, but if you reconcile the inventory you should expect one orphan per
 key-loss event and may revoke it for tidiness. No manual re-enrollment is needed.
 The same happens when the key is unreadable or unparseable at startup, or when

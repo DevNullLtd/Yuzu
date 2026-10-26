@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 6255117edeb8
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-22 · euid 501 · leg-hash 8e63a482f476
 == action=get_value hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" name=ProductName
 registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists
 [result_status] UNDECLARED / UNKNOWN / 

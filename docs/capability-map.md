@@ -703,7 +703,7 @@ gRPC streaming delivers output in real time.
 
 ### 12.5 Registry Key/Value Write/Delete :white_check_mark: `T2`
 
-`registry` plugin with `set_value`, `delete_value`, and `delete_key` actions. Support REG_SZ and REG_DWORD types.
+`registry` plugin (2.0.0) with `set_value` (all six value types, from text or exact `data_hex` bytes, read-back verified), `delete_value` and `delete_key` (a key with no subkeys; it counts the values the key held, `counted_values`, and reports no contents). Every mutation runs on a handle checked for registry links (one canonical-name-checked open on HKLM and HKU, a component walk otherwise or as the fallback), and each emits an audit line that the server records as a `registry.write` row when the agent (registry 2.0.0) stamps the action; the row carries the old and new value as raw hex (256 bytes at most), which can contain secrets: the product owner accepted this risk on 2026-10-20 and masking is a planned later change. *(Evidence: `agents/plugins/registry/src/registry_core.hpp`, `registry_win.cpp`, `server/core/src/plugin_result_audit.hpp`.)*
 
 ### 12.6 Registry Enumeration :white_check_mark: `T2`
 
@@ -1396,7 +1396,7 @@ Cohort-floor suppression on fleet/group app-perf reads (the floor is one device 
 
 ### 32.7 Experience Scoring and Sentiment :large_orange_diamond: `T3` *(verified 2026-10-14)*
 
-Partly implemented — deliberately narrow. A transparent, decomposed secondary composite (0-100 stability score with its named deductions) is published beside the measured rates and intervals on `GET /api/v1/dex/apps` / `list_dex_apps`; nothing in the product acts on it. The tier edges, tier names, deduction weights and per-application overrides are customer-defined policy, persisted as one document under a single runtime-config key, read by every instance (typically within 5 seconds; each instance refreshes at most every 5 seconds while it serves requests, and the policy in use is up to 60 seconds old when the store is unreadable) and named on the Apps payload (`policy`, and `profile` per application; weights and per-application override values are not echoed); the cohort floor and the statistics are not settings. Only the read side ships so far: the route that writes the policy follows. Opaque composite experience scores and sentiment scoring (which would additionally need the §14.4 survey primitive as an input) remain out.
+Partly implemented — deliberately narrow. A transparent, decomposed secondary composite (0-100 stability score with its named deductions) is published beside the measured rates and intervals on `GET /api/v1/dex/apps` / `list_dex_apps`; nothing in the product acts on it. The tier edges, tier names, deduction weights and per-application overrides are customer-defined policy, persisted as one document under a single runtime-config key, read by every instance (typically within 5 seconds; each instance refreshes at most every 5 seconds while it serves requests, and the policy in use is up to 60 seconds old when the store is unreadable) and named on the Apps payload (`policy`, and `profile` per application; weights and per-application override values are not echoed); the cohort floor and the statistics are not settings. The write side ships as `PUT` and `DELETE /api/v1/dex/score-policy` (#6086); the MCP twins (#6087) and a Settings page follow. Opaque composite experience scores and sentiment scoring (which would additionally need the §14.4 survey primitive as an input) remain out.
 
 ---
 

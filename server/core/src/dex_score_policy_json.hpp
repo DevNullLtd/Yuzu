@@ -9,11 +9,11 @@
  * headers and the shared log_token helper. No I/O, no clock, no store.
  *
  * ONE DOCUMENT, ONE KEY, ONE WRITER. The whole policy is a single JSON document
- * stored under the runtime-config key kDexScorePolicyKey. It is to be written
- * only by the policy writer (a later change: validate, persist the canonical
- * text); the generic runtime-config write already refuses the key, so no other
- * path can leave the document half-edited. Every server instance reads the same
- * row.
+ * stored under the runtime-config key kDexScorePolicyKey. It is written only by
+ * the policy writer (apply_dex_score_policy, dex_score_policy_writer.hpp:
+ * validate, persist the canonical text); the generic runtime-config write
+ * refuses the key, so no other path can leave the document half-edited. Every
+ * server instance reads the same row.
  *
  * NOT part of the document: the cohort floor and the statistics. They are fixed
  * constants of the score, not settings.
@@ -79,8 +79,9 @@ inline constexpr std::string_view kDexScorePolicyKey = "dex_score_policy";
 inline constexpr std::int64_t kDexScorePolicyVersion = 1;
 /// Revision reported when no document is stored.
 inline constexpr std::string_view kDexScorePolicyDefaultRevision = "default";
-/// Largest stored text that is parsed. A legitimate document is about 100 KB at the
-/// override limit; anything larger is refused unread.
+/// Largest stored text that is parsed. A legitimate document is about 130 KB at the
+/// override limit (at most about 185 KB when image keys and names need escaping); anything
+/// larger is refused unread.
 inline constexpr std::size_t kDexScorePolicyMaxBytes = 256 * 1024;
 
 /// A document that is not the expected shape. `field` is the dotted path of the
@@ -407,6 +408,43 @@ dex_score_policy_from_json(const nlohmann::json& doc) {
     return "overrides";
 }
 
+/// Validate a policy document text whole: the size cap, JSON parse, version (read before the
+/// strict parse), strict parse and range validator, in that order. The one validation both
+/// the reader (dex_policy_in_force_from_stored) and the writer use, so a text the writer
+/// accepts is a text the reader serves, and the two never word a refusal differently.
+/// On refusal `.field` is the dotted path of the offending value ("document" for the root) and
+/// `.message` is the fault string the reader reports: "oversized at document: ...",
+/// "unparseable at <path>: <msg>", "unsupported_version at version: N above the supported 1" or
+/// "<validator token> at <path>".
+[[nodiscard]] inline std::expected<DexScorePolicy, DexPolicyParseError>
+dex_score_policy_validate_text(const std::string& text) {
+    using Err = DexPolicyParseError;
+    if (text.size() > kDexScorePolicyMaxBytes)
+        return std::unexpected(Err{"document", "oversized at document: more than " +
+                                                   std::to_string(kDexScorePolicyMaxBytes) +
+                                                   " bytes"});
+    const auto doc = nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
+    if (doc.is_discarded())
+        return std::unexpected(Err{"document", "unparseable at document: not valid JSON"});
+    // A newer document may carry keys this reader does not know, so its version is read
+    // BEFORE the strict parse: it falls back whole, never half-applied. A malformed
+    // version falls through to the parser, which reports it at `version`.
+    if (const auto v = dex_score_policy_document_version(doc); v && *v > kDexScorePolicyVersion)
+        return std::unexpected(Err{"version", "unsupported_version at version: " +
+                                                  std::to_string(*v) + " above the supported " +
+                                                  std::to_string(kDexScorePolicyVersion)});
+    auto parsed = dex_score_policy_from_json(doc);
+    if (!parsed)
+        return std::unexpected(Err{parsed.error().field, "unparseable at " + parsed.error().field +
+                                                             ": " + parsed.error().message});
+    if (const auto f = dex_score_policy_fault(*parsed)) {
+        const std::string field = dex_policy_fault_field(*f);
+        return std::unexpected(
+            Err{field, std::string(dex_policy_fault_label(f->fault)) + " at " + field});
+    }
+    return parsed;
+}
+
 /// The policy to score under for a stored text. nullopt or empty is the shipped
 /// defaults with no fault. Unparseable or invalid text is the shipped defaults
 /// with `fault` naming why; the revision is that of the text as stored, so an
@@ -418,37 +456,28 @@ dex_policy_in_force_from_stored(const std::optional<std::string>& stored) {
     if (!stored || stored->empty())
         return out;
     out.revision = dex_score_policy_revision(*stored);
-    if (stored->size() > kDexScorePolicyMaxBytes) {
-        out.fault = "oversized at document: more than " +
-                    std::to_string(kDexScorePolicyMaxBytes) + " bytes";
+    auto v = dex_score_policy_validate_text(*stored);
+    if (!v) {
+        out.fault = std::move(v.error().message);
         return out;
     }
-    const auto doc = nlohmann::json::parse(*stored, nullptr, /*allow_exceptions=*/false);
-    if (doc.is_discarded()) {
-        out.fault = "unparseable at document: not valid JSON";
-        return out;
-    }
-    // A newer document may carry keys this reader does not know, so its version is read
-    // BEFORE the strict parse: it falls back whole, never half-applied. A malformed
-    // version falls through to the parser, which reports it at `version`.
-    if (const auto v = dex_score_policy_document_version(doc); v && *v > kDexScorePolicyVersion) {
-        out.fault = "unsupported_version at version: " + std::to_string(*v) +
-                    " above the supported " + std::to_string(kDexScorePolicyVersion);
-        return out;
-    }
-    auto parsed = dex_score_policy_from_json(doc);
-    if (!parsed) {
-        out.fault = "unparseable at " + parsed.error().field + ": " + parsed.error().message;
-        return out;
-    }
-    if (const auto f = dex_score_policy_fault(*parsed)) {
-        out.fault = std::string(dex_policy_fault_label(f->fault)) + " at " +
-                    dex_policy_fault_field(*f);
-        return out;
-    }
-    out.policy = std::move(*parsed);
+    out.policy = std::move(*v);
     out.source = "custom";
     return out;
+}
+
+/// The hint a refusal carries when `field` names a key of the Apps read-model policy block
+/// (tiers.<tier>.{edge,name}, source, revision, fault) rather than of the stored document:
+/// that block is a projection, and sending it back is the likeliest way to get a refusal.
+/// Empty for every other field.
+[[nodiscard]] inline std::string_view
+dex_score_policy_projection_remediation(std::string_view field) noexcept {
+    for (const std::string_view f : {"tiers.excellent", "tiers.good", "tiers.fair", "tiers.poor",
+                                     "source", "revision", "fault", "policy"})
+        if (field == f)
+            return "the Apps policy block is a projection; send the stored shape "
+                   "(tiers.edges, tiers.names, weights, overrides)";
+    return {};
 }
 
 } // namespace yuzu::server

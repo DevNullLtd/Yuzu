@@ -95,6 +95,7 @@ struct TarHarness {
     };
     std::vector<AuditRow> audit_log;
     DispatchCaller last_dispatch_caller; // #3133: observes what dispatch actually received
+    std::unordered_map<std::string, std::string> last_dispatch_params; // what the last dispatch carried
 
     TarHarness() {
         auto auth = [this](const httplib::Request&,
@@ -170,6 +171,7 @@ struct TarHarness {
                                const DispatchCaller& caller)
             -> yuzu::server::ConfinedDispatchOutcome {
             last_dispatch_caller = caller;
+            last_dispatch_params = params;
             const auto it = params.find("sql");
             const bool is_proc =
                 it != params.end() && it->second.find("$Process_Live") != std::string::npos;
@@ -573,6 +575,23 @@ TEST_CASE("tar routes: every dispatch carries the real caller, never a system on
         CHECK_FALSE(h.last_dispatch_caller.system);
         CHECK(h.last_dispatch_caller.principal == "alice");
     }
+}
+
+// PR11.8: the registry source joins the Push allowlist. The allowlist exists so an arbitrary
+// token is never interpolated into the `<src>_enabled` configure key.
+TEST_CASE("tar routes: capture-sources/push allows registry and still refuses unknown tokens",
+          "[tar][routes][capture-sources]") {
+    TarHarness h;
+    h.session_user = "alice";
+    (void)h.sink.Post("/fragments/tar/capture-sources/push?device=dev-A&changes=registry%3Doff", "");
+    REQUIRE(h.last_dispatch_params.contains("registry_enabled"));
+    CHECK(h.last_dispatch_params.at("registry_enabled") == "false");
+
+    h.last_dispatch_params.clear();
+    (void)h.sink.Post("/fragments/tar/capture-sources/push?device=dev-A&changes=registryx%3Doff", "");
+    CHECK(h.last_dispatch_params.empty()); // an unknown token never reaches dispatch
+    (void)h.sink.Post("/fragments/tar/capture-sources/push?device=dev-A&changes=registry%3Dmaybe", "");
+    CHECK(h.last_dispatch_params.empty()); // nor does a value other than on/off
 }
 
 // #1647: a DROPPED (returns-false) audit row is the realistic failure path (audit DB

@@ -65,6 +65,10 @@ struct Model {
     Root root;
     Crl crl;
     bool inventory_error{false}; ///< list_issued() failed
+    /// Non-empty = the caller may not list the issued certificates (confined view, or the
+    /// access check is degraded or unwired): `issued` is left empty and this note renders in
+    /// place of the table. The CA metadata, CRL figures and import form still render.
+    std::string inventory_note;
     std::vector<IssuedRow> issued;
     std::size_t panel_limit{500}; ///< rows requested; hitting it shows the cap banner
     std::int64_t now{0};          ///< epoch seconds, for the Expired rule

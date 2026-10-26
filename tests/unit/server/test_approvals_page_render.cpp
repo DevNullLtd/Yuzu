@@ -9,6 +9,8 @@
  * snapshot would only churn.
  */
 
+#include "approval_manager.hpp"
+#include "sha256_hex.hpp"
 #include "approvals_page_render.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -270,4 +272,513 @@ TEST_CASE("approvals_page_render: an mcp ticket is named after its tool without 
 
     NameLookupMemo bare;
     CHECK(approval_display_name("def-42", bare) == "def-42");
+}
+
+// -- Bound tickets (#6062): the reviewer reads the frozen request ------------------------
+
+namespace {
+
+constexpr const char* kDigest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+ApprovalRowView bound_row(const std::string& request_json) {
+    auto r = make_row("b1", "pending");
+    r.definition_id = "guardian.deploy.r1";
+    r.request_json = request_json;
+    r.request_digest = kDigest;
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("summarize_bound_request: definition name+hash, targets and parameters, one fact per line",
+          "[ui][approvals][render][bound]") {
+    const auto text = summarize_bound_request(
+        R"({"definition":{"name":"Block RDP","hash":"abc123"},"params":{"port":3389,"mode":"strict"},)"
+        R"("targets":["host-1","host-2"]})",
+        kDigest);
+    CHECK(text.find("Definition: Block RDP\nHash: abc123\n") != std::string::npos);
+    CHECK(text.find("Targets (2):\n  host-1\n  host-2\n") != std::string::npos);
+    CHECK(text.find("Parameters:\n  mode: strict\n  port: 3389\n") != std::string::npos);
+    CHECK(text.find(std::string("Digest: sha256:") + kDigest + "\n") != std::string::npos);
+    // The raw document is never echoed.
+    CHECK(text.find("{\"") == std::string::npos);
+}
+
+TEST_CASE("summarize_bound_request: every other top-level field is listed, nothing is hidden",
+          "[ui][approvals][render][bound]") {
+    const auto text = summarize_bound_request(
+        R"({"definition":{"name":"n","hash":"h"},"targets":"group:servers","params":{},)"
+        R"("rollout":{"waves":3},"dry_run":false})",
+        "");
+    CHECK(text.find("Targets: group:servers\n") != std::string::npos);
+    CHECK(text.find("Parameters: none\n") != std::string::npos);
+    CHECK(text.find("Other fields:\n  dry_run: false\n  rollout: {\"waves\":3}\n") !=
+          std::string::npos);
+    CHECK(text.find("Digest:") == std::string::npos); // none supplied
+}
+
+TEST_CASE("summarize_bound_request: a missing part reads as not stated, never as empty-and-fine",
+          "[ui][approvals][render][bound]") {
+    const auto text = summarize_bound_request(R"({"other":1})", kDigest);
+    CHECK(text.find("Definition: (not stated in the request)\n") != std::string::npos);
+    CHECK(text.find("Targets: (not stated in the request)\n") != std::string::npos);
+    CHECK(text.find("Parameters: none stated\n") != std::string::npos);
+}
+
+TEST_CASE("summarize_bound_request: a value cannot forge a line of the summary",
+          "[ui][approvals][render][bound]") {
+    // A parameter value with a newline and a fake header, and a key doing the same.
+    const auto text = summarize_bound_request(
+        R"({"definition":{"name":"Safe","hash":"h"},"targets":["t"],)"
+        R"j("params":{"note":"x\nDefinition: Evil (hash 000)","k\nTargets (0): ":"v"}})j",
+        "");
+    // Exactly one line starts with each header; the injected text stays on its own line,
+    // escaped.
+    std::size_t def_lines = 0, tgt_lines = 0;
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        const auto eol = text.find('\n', pos);
+        const auto line = text.substr(pos, eol - pos);
+        if (line.rfind("Definition:", 0) == 0) ++def_lines;
+        if (line.rfind("Targets", 0) == 0) ++tgt_lines;
+        pos = eol == std::string::npos ? text.size() : eol + 1;
+    }
+    CHECK(def_lines == 1);
+    CHECK(tgt_lines == 1);
+    CHECK(text.find("x\\nDefinition: Evil") != std::string::npos);
+}
+
+TEST_CASE("summarize_bound_request: bounded per value, per section and in total",
+          "[ui][approvals][render][bound]") {
+    const std::string big(5000, 'a');
+    const auto one = summarize_bound_request(
+        std::string(R"({"definition":{"name":")") + big + R"(","hash":"h"},"targets":[],"params":{}})",
+        "");
+    CHECK(one.size() < 1000);
+    CHECK(one.find("\xE2\x80\xA6") != std::string::npos); // truncated with an ellipsis
+
+    std::string many = R"({"definition":{"name":"n","hash":"h"},"targets":["t"],"params":{)";
+    for (int i = 0; i < 100; ++i)
+        many += std::string(i ? "," : "") + "\"p" + std::to_string(1000 + i) + "\":1";
+    many += "}}";
+    const auto capped = summarize_bound_request(many, "");
+    CHECK(capped.find("... and 60 more") != std::string::npos);
+    CHECK(capped.size() <= 6100);
+}
+
+TEST_CASE("summarize_bound_request: unreadable input is a fixed notice, never a partial render",
+          "[ui][approvals][render][bound]") {
+    for (const char* bad : {"", "not json", "[1,2]", "\"str\"", "null", "{\"unterminated\":"}) {
+        const auto text = summarize_bound_request(bad, kDigest);
+        CHECK(text == "The stored request could not be read. Do not approve this request.");
+    }
+}
+
+TEST_CASE("approvals_page_render: a bound row carries data-request/data-digest and a Bound tag; "
+          "an unbound row carries neither",
+          "[ui][approvals][render][bound]") {
+    auto bound = bound_row(R"({"definition":{"name":"Block RDP","hash":"abc"},"targets":["h1"]})");
+    auto plain = make_row("p1", "pending");
+    const auto html = render_approvals_page(make_view({bound, plain}));
+    REQUIRE(count_of(html, "<tr class=\"row\"") == 2);
+    CHECK(count_of(html, " data-request=\"") == 1);
+    CHECK(count_of(html, std::string(" data-digest=\"") + kDigest + "\"") == 1);
+    CHECK(count_of(html, "<span class=\"tag\">Bound</span>") == 1);
+    CHECK(html.find("Definition: Block RDP\nHash: abc") != std::string::npos);
+    // Neither the raw document nor its key syntax reaches the markup.
+    CHECK(html.find("{&quot;definition") == std::string::npos);
+    CHECK(html.find("{\"definition") == std::string::npos);
+}
+
+TEST_CASE("approvals_page_render: markup in the frozen request is escaped, in the attribute and "
+          "everywhere else",
+          "[ui][approvals][render][bound]") {
+    auto r = bound_row(
+        R"({"definition":{"name":"<script>alert(1)</script>","hash":"\" onmouseover=\"x"},)"
+        R"("targets":["<img src=x onerror=y>"],"params":{"<b>k</b>":"v' onfocus='z"}})");
+    const auto html = render_approvals_page(make_view({r}));
+    CHECK(html.find("<script") == std::string::npos);
+    CHECK(html.find("<img") == std::string::npos);
+    CHECK(html.find("<b>k") == std::string::npos);
+    CHECK(html.find("&lt;script&gt;") != std::string::npos);
+    // A quote in a value cannot terminate the data-request attribute: the only
+    // `onmouseover=` present is inside the escaped attribute value.
+    CHECK(html.find("\" onmouseover=\"") == std::string::npos);
+    CHECK(html.find("&quot;") != std::string::npos);
+}
+
+TEST_CASE("approvals_page_render: data-excluded marks a row the viewer may not approve",
+          "[ui][approvals][render][bound]") {
+    auto r = bound_row(R"({"definition":{"name":"n","hash":"h"}})");
+    r.excluded = true;
+    auto plain = make_row("p1", "pending");
+    const auto html = render_approvals_page(make_view({r, plain}));
+    CHECK(count_of(html, " data-excluded=\"1\"") == 1);
+    CHECK(count_of(html, " data-excluded=\"0\"") == 1);
+}
+
+TEST_CASE("bound_request_is_readable: bounded size, bounded depth, a JSON object",
+          "[ui][approvals][render][bound]") {
+    using yuzu::server::bound_request_is_readable;
+    using yuzu::server::kMaxRequestJsonBytes;
+    using yuzu::server::kMaxRequestJsonDepth;
+    CHECK(bound_request_is_readable(R"({"k":1})"));
+    CHECK_FALSE(bound_request_is_readable(""));
+    CHECK_FALSE(bound_request_is_readable("[1]"));
+    CHECK_FALSE(bound_request_is_readable("not json"));
+    CHECK_FALSE(bound_request_is_readable(std::string(kMaxRequestJsonBytes + 1, ' ')));
+
+    // Container depth counts the object: object + 15 arrays = 16 is the deepest accepted.
+    const auto nested = [](std::size_t arrays) {
+        return std::string(R"({"k":)") + std::string(arrays, '[') + std::string(arrays, ']') + "}";
+    };
+    CHECK(bound_request_is_readable(nested(kMaxRequestJsonDepth - 1)));
+    CHECK_FALSE(bound_request_is_readable(nested(kMaxRequestJsonDepth)));
+    // Brackets inside a string literal (even an escaped quote before them) are not depth.
+    // Held in a variable: MSVC mis-lexes this raw literal when it sits inside the CHECK macro
+    // argument (it reads the "[[" as an attribute opener).
+    const std::string brackets_in_string = R"({"k":"[[[[[[[[[[[[[[[[[[[[\"[[[[["})";
+    CHECK(bound_request_is_readable(brackets_in_string));
+}
+
+TEST_CASE("summarize_bound_request: an oversized or hostile-deep request takes the notice path "
+          "without being expanded",
+          "[ui][approvals][render][bound]") {
+    const std::string notice = "The stored request could not be read. Do not approve this request.";
+    // Exactly the 16 KiB cap, all of it one 8192-deep array. WHAT THIS PROVES: such a request
+    // takes the fixed notice path. WHAT IT DOES NOT PROVE: that the lexical pre-scan is what
+    // stops it. On this 8 MB test stack, with an iterative parser and a top-level array that
+    // fails the "is an object" test anyway, deleting the pre-scan leaves these assertions green
+    // (equivalent mutant), so the cs-1 stack-overflow property is not observable by a unit
+    // test; it rests on the code review and on bound_request_is_readable's own bound tests.
+    const std::string deep(8192, '[');
+    const std::string deep_doc = deep + std::string(8192, ']');
+    CHECK(summarize_bound_request(deep_doc, kDigest) == notice);
+    CHECK(summarize_bound_request(std::string(R"({"k":)") + deep + std::string(8192, ']') + "}",
+                                  kDigest) == notice);
+    // A plain escaped literal, not a raw one: MSVC mis-lexes the raw form inside a CHECK argument.
+    CHECK(summarize_bound_request(std::string("{\"k\":\"") + std::string(20000, 'a') + "\"}",
+                                  kDigest) == notice);
+}
+
+TEST_CASE("approvals_page_render: data-unreadable marks a bound row whose request cannot be read, "
+          "and only that row",
+          "[ui][approvals][render][bound]") {
+    auto bad = bound_row("not json");
+    auto good = bound_row(R"({"definition":{"name":"n","hash":"h"}})");
+    good.id = "g1";
+    auto plain = make_row("p1", "pending");
+    const auto html = render_approvals_page(make_view({bad, good, plain}));
+    CHECK(count_of(html, " data-unreadable=\"1\"") == 1);
+}
+
+TEST_CASE("summarize_bound_request: a cut summary says so and keeps the whole digest line",
+          "[ui][approvals][render][bound]") {
+    // A real digest of the exact bytes, not the empty/fixed placeholder the older tests pass.
+    const auto digest_of = [](const std::string& text) { return *yuzu::server::sha256_hex(text); };
+
+    SECTION("nothing cut: no Shortened line") {
+        const std::string req = R"({"definition":{"name":"n","hash":"h"},"targets":["t"],"params":{"a":1}})";
+        const auto d = summarize_bound_request_detail(req, digest_of(req));
+        CHECK(d.readable);
+        CHECK_FALSE(d.shortened);
+        CHECK(d.text.find("Shortened:") == std::string::npos);
+    }
+    SECTION("a value over 512 bytes") {
+        const std::string req = std::string(R"({"definition":{"name":"n","hash":"h"},"targets":["t"],"params":{"a":")") +
+                                std::string(600, 'x') + "\"}}";
+        const auto d = summarize_bound_request_detail(req, digest_of(req));
+        CHECK(d.shortened);
+        CHECK(d.text.find("Shortened:") != std::string::npos);
+        CHECK(d.text.find("Digest: sha256:" + digest_of(req) + "\n") != std::string::npos);
+    }
+    SECTION("more than 40 targets") {
+        std::string req = R"({"definition":{"name":"n","hash":"h"},"params":{},"targets":[)";
+        for (int i = 0; i < 60; ++i)
+            req += std::string(i ? "," : "") + "\"h" + std::to_string(i) + "\"";
+        req += "]}";
+        const auto d = summarize_bound_request_detail(req, digest_of(req));
+        CHECK(d.shortened);
+        CHECK(d.text.find("... and 20 more") != std::string::npos);
+        CHECK(d.text.find("Shortened:") != std::string::npos);
+    }
+    SECTION("the 6000-byte total cut can never chop the Shortened line or the Digest line") {
+        // 40 params of 400 bytes each is ~16 KiB of body, cut by the total bound.
+        std::string req = R"({"definition":{"name":"n","hash":"h"},"targets":["t"],"params":{)";
+        for (int i = 0; i < 40; ++i)
+            req += std::string(i ? "," : "") + "\"p" + std::to_string(100 + i) + "\":\"" +
+                   std::string(380, 'v') + "\"";
+        req += "}}";
+        REQUIRE(req.size() <= yuzu::server::kMaxRequestJsonBytes);
+        const auto digest = digest_of(req);
+        const auto d = summarize_bound_request_detail(req, digest);
+        CHECK(d.shortened);
+        CHECK(d.text.size() <= 6100);
+        CHECK(d.text.find("Shortened:") != std::string::npos);
+        // The full 64-hex digest, intact, as the last line.
+        const std::string last = "Digest: sha256:" + digest + "\n";
+        REQUIRE(d.text.size() >= last.size());
+        CHECK(d.text.compare(d.text.size() - last.size(), last.size(), last) == 0);
+    }
+}
+
+TEST_CASE("summarize_bound_request: keys NESTED in definition are listed too; nested keys in a "
+          "value are visible unless the value is cut",
+          "[ui][approvals][render][bound]") {
+    const auto text = summarize_bound_request(
+        R"({"definition":{"name":"Block RDP","hash":"abc","signer":"ops","rules":[{"id":1}]},)"
+        R"("targets":["t"],"params":{"outer":{"inner":{"deep_key":"deep_value"}}}})",
+        "");
+    CHECK(text.find("Definition: Block RDP\nHash: abc\n") != std::string::npos);
+    CHECK(text.find("Definition fields:\n  rules: [{\"id\":1}]\n  signer: ops\n") !=
+              std::string::npos);
+    // A nested object is shown as compact JSON, so its keys are on the page.
+    CHECK(text.find("outer: {\"inner\":{\"deep_key\":\"deep_value\"}}") != std::string::npos);
+}
+
+TEST_CASE("approvals_page_render: data-shortened marks only a row whose summary was cut",
+          "[ui][approvals][render][bound]") {
+    auto cut = bound_row(std::string(R"({"definition":{"name":"n","hash":"h"},"params":{"a":")") +
+                         std::string(700, 'z') + "\"}}");
+    auto whole = bound_row(R"({"definition":{"name":"n","hash":"h"}})");
+    whole.id = "w1";
+    const auto html = render_approvals_page(make_view({cut, whole}));
+    CHECK(count_of(html, " data-shortened=\"1\"") == 1);
+}
+
+TEST_CASE("summarize_bound_request: the summary is display-safe (ASCII only), whatever the request "
+          "carries",
+          "[ui][approvals][render][bound]") {
+    // U+202E RIGHT-TO-LEFT OVERRIDE, U+2066 LEFT-TO-RIGHT ISOLATE, U+2028 LINE SEPARATOR, U+0085
+    // NEXT LINE, raw (UTF-8) in the document, in a name, a hash, a target, a key and a value.
+    const std::string rlo = "\xE2\x80\xAE", lri = "\xE2\x81\xA6", ls = "\xE2\x80\xA8",
+                      nel = "\xC2\x85";
+    const std::string req = R"({"definition":{"name":"n)" + rlo + "x" + lri + R"(","hash":"h)" + ls +
+                            R"(h"},"targets":["t)" + nel + R"(t","u)" + rlo + R"("],"params":{"k)" +
+                            ls + R"(k":"v)" + lri + R"("}})";
+    const auto text = summarize_bound_request(req, kDigest);
+
+    for (const unsigned char c : text)
+        CHECK((c == '\n' || (c >= 0x20 && c < 0x7F)));  // no raw control or non-ASCII byte at all
+    CHECK(text.find("\\u202e") != std::string::npos);   // shown as a visible escape instead
+    CHECK(text.find("\\u2066") != std::string::npos);
+    CHECK(text.find("\\u2028") != std::string::npos);
+    CHECK(text.find("\\u0085") != std::string::npos);
+    CHECK(text.find(rlo) == std::string::npos);
+    CHECK(text.find(ls) == std::string::npos);
+}
+
+TEST_CASE("summarize_bound_request: one field per line, so a value cannot pose as another field",
+          "[ui][approvals][render][bound]") {
+    const std::string real = kDigest;
+    // A name that imitates the hash suffix, a target that imitates two targets, a parameter
+    // value that carries a newline and a fake Digest line, and a key doing the same.
+    const std::string req =
+        R"j({"definition":{"name":"ok (hash AAAA)","hash":"REAL"},)j"
+        R"j("targets":["a, b"],)j"
+        R"j("params":{"note":"x\nDigest: sha256:)j" + std::string(64, 'f') + R"j(","k\nHash: forged":"v"}})j";
+    const auto text = summarize_bound_request(req, real);
+
+    std::vector<std::string> lines;
+    for (std::size_t pos = 0; pos < text.size();) {
+        const auto eol = text.find('\n', pos);
+        lines.push_back(text.substr(pos, eol - pos));
+        pos = eol == std::string::npos ? text.size() : eol + 1;
+    }
+    const auto starting = [&](const std::string& prefix) {
+        std::size_t n = 0;
+        for (const auto& l : lines)
+            if (l.rfind(prefix, 0) == 0)
+                ++n;
+        return n;
+    };
+    CHECK(starting("Definition:") == 1);
+    CHECK(starting("Hash:") == 1);
+    CHECK(starting("Digest:") == 1);
+    CHECK(starting("Targets") == 1);
+    // The imitation stays inside its own line; the real hash is its own line.
+    CHECK(text.find("Definition: ok (hash AAAA)\nHash: REAL\n") != std::string::npos);
+    // The comma in a target does not read as two targets: it is one indented line.
+    CHECK(text.find("Targets (1):\n  a, b\n") != std::string::npos);
+    // The injected Digest/Hash text is escaped on the line of the value that carried it.
+    CHECK(text.find("note: x\\nDigest: sha256:" + std::string(64, 'f')) != std::string::npos);
+    CHECK(text.find("k\\nHash: forged") != std::string::npos);
+    // The one genuine Digest line is last and is the real digest.
+    CHECK(lines.back() == "Digest: sha256:" + real);
+}
+
+// -- summary section starvation (Gate 8 g8r3-up-1): independent budgets ----------------
+
+namespace {
+
+std::string padded(const std::string& prefix, std::size_t n, std::size_t bytes) {
+    std::string out = "{";
+    for (std::size_t i = 0; i < n; ++i)
+        out += std::string(i ? "," : "") + "\"" + prefix + std::to_string(100 + i) + "\":\"" +
+               std::string(bytes, 'v') + "\"";
+    return out + "}";
+}
+
+// A request in which each named section is either padded to overflow its own budget or small.
+// `scale` is how many entries a padded section holds (kept small enough for all four at once to
+// stay under the 16 KiB request cap, which the summary also enforces).
+std::string starvation_request(bool pad_definition, bool pad_targets, bool pad_params,
+                               bool pad_other, std::size_t def_n, std::size_t tgt_n,
+                               std::size_t par_n, std::size_t oth_n) {
+    std::string def = pad_definition ? padded("df", def_n, 300) : R"({"df":"x"})";
+    // The definition object carries name and hash too.
+    def = R"({"name":"Block RDP","hash":"abc",)" + def.substr(1);
+    std::string targets = "[";
+    const std::size_t n = pad_targets ? tgt_n : 2;
+    for (std::size_t i = 0; i < n; ++i)
+        targets += std::string(i ? "," : "") + "\"host-" + std::to_string(i) + "-" +
+                   (pad_targets ? std::string(500, 't') : "") + "\"";
+    targets += "]";
+    const std::string params = pad_params ? padded("pp", par_n, 400) : R"({"port":3389})";
+    const std::string other = pad_other ? padded("ot", oth_n, 400) : R"({"flag":true})";
+    // `other` keys are merged at the top level.
+    return R"({"definition":)" + def + R"(,"targets":)" + targets + R"(,"params":)" + params + "," +
+           other.substr(1, other.size() - 2) + "}";
+}
+
+} // namespace
+
+TEST_CASE("summarize_bound_request: no section can starve another; each says when it is cut",
+          "[ui][approvals][render][bound]") {
+    const auto digest_of = [](const std::string& t) { return *yuzu::server::sha256_hex(t); };
+    struct Case {
+        const char* name;
+        bool def, targets, params, other;
+        std::size_t def_n, tgt_n, par_n, oth_n;
+    };
+    for (const Case c : {
+             // Each alone, at the size that overflows its budget the most (and, for the
+             // definition, the 40 x 300 bytes of Gate 8's counterexample).
+             Case{"definition fields", true, false, false, false, 40, 0, 0, 0},
+             Case{"targets", false, true, false, false, 0, 12, 0, 0},
+             Case{"parameters", false, false, true, false, 0, 0, 30, 0},
+             Case{"other fields", false, false, false, true, 0, 0, 0, 30},
+             // All four at once, each still over its own budget.
+             Case{"all four at once", true, true, true, true, 12, 5, 8, 8}}) {
+        DYNAMIC_SECTION(c.name << " padded") {
+            const auto req = starvation_request(c.def, c.targets, c.params, c.other, c.def_n,
+                                                c.tgt_n, c.par_n, c.oth_n);
+            REQUIRE(req.size() <= yuzu::server::kMaxRequestJsonBytes);
+            const auto digest = digest_of(req);
+            const auto d = summarize_bound_request_detail(req, digest);
+            REQUIRE(d.readable);
+            // Every essential heading survives whatever the other sections hold.
+            CHECK(d.text.find("Definition: Block RDP\nHash: abc\n") != std::string::npos);
+            CHECK(d.text.find("Targets (") != std::string::npos);
+            CHECK(d.text.find("Parameters:\n") != std::string::npos);
+            CHECK(d.text.find("Definition fields:\n") != std::string::npos);
+            CHECK(d.text.find("Other fields:\n") != std::string::npos);
+            // Small sections are shown IN FULL, not trimmed by a big neighbour.
+            if (!c.params)
+                CHECK(d.text.find("  port: 3389\n") != std::string::npos);
+            if (!c.targets)
+                CHECK(d.text.find("  host-0-\n  host-1-\n") != std::string::npos);
+            if (!c.other)
+                CHECK(d.text.find("  flag: true\n") != std::string::npos);
+            if (!c.def)
+                CHECK(d.text.find("  df: x\n") != std::string::npos);
+            // A padded section says so on its own line.
+            const bool any_padded = c.def || c.targets || c.params || c.other;
+            CHECK(any_padded);
+            CHECK(d.shortened);
+            CHECK(count_of(d.text, "(section limit)") >=
+                  static_cast<std::size_t>(c.def) + c.targets + c.params + c.other);
+            CHECK(d.text.find("Shortened:") != std::string::npos);
+            // The footer is intact and last, and the bound holds.
+            const std::string last = "Digest: sha256:" + digest + "\n";
+            REQUIRE(d.text.size() >= last.size());
+            CHECK(d.text.compare(d.text.size() - last.size(), last.size(), last) == 0);
+            CHECK(d.text.size() <= 6000);
+        }
+    }
+}
+
+TEST_CASE("summarize_bound_request: a section whose first entry alone exceeds its budget still "
+          "keeps its heading and says nothing was shown",
+          "[ui][approvals][render][bound]") {
+    // One target of 500 bytes fits (budget 1700); one definition field of 2 x 512 bytes cannot
+    // fit its 600-byte budget with its key.
+    const std::string key(512, 'k'), val(512, 'v');
+    const std::string req = R"({"definition":{"name":"n","hash":"h","KEY":"VAL"},"targets":["t"],"params":{}})";
+    std::string big = req;
+    big.replace(big.find("KEY"), 3, key);
+    big.replace(big.find("VAL"), 3, val);
+    const auto d = summarize_bound_request_detail(big, "");
+    CHECK(d.text.find("Definition fields:\n  ... 1 entries, none shown (section limit)\n") !=
+          std::string::npos);
+    CHECK(d.text.find("Targets (1):\n  t\n") != std::string::npos);
+}
+
+// -- summary order and exact budget boundaries (Gate 8 g8r4-qe-2/3) -------------------------
+
+TEST_CASE("summarize_bound_request: section ORDER is Definition, Hash, Targets, Parameters, then "
+          "Definition fields, then Other fields",
+          "[ui][approvals][render][bound]") {
+    const auto text = summarize_bound_request(
+        R"({"definition":{"name":"n","hash":"h","extra":"e"},"targets":["t"],"params":{"p":1},)"
+        R"("other":2})",
+        kDigest);
+    const auto at = [&](const char* needle) {
+        const auto pos = text.find(needle);
+        REQUIRE(pos != std::string::npos);
+        return pos;
+    };
+    CHECK(at("Definition: n\n") < at("Hash: h\n"));
+    CHECK(at("Hash: h\n") < at("Targets (1):\n"));
+    CHECK(at("Targets (1):\n") < at("Parameters:\n"));
+    CHECK(at("Parameters:\n") < at("Definition fields:\n"));
+    CHECK(at("Definition fields:\n") < at("Other fields:\n"));
+    CHECK(at("Other fields:\n") < at("Digest: sha256:"));
+}
+
+namespace {
+// A request whose targets are the given strings (each becomes one "  <value>\n" line).
+std::string targets_request(const std::vector<std::string>& values) {
+    std::string t = "[";
+    for (std::size_t i = 0; i < values.size(); ++i)
+        t += std::string(i ? "," : "") + "\"" + values[i] + "\"";
+    return R"({"definition":{"name":"n","hash":"h"},"targets":)" + t + "]}";
+}
+} // namespace
+
+TEST_CASE("summarize_bound_request: the Targets budget (1700 bytes of whole lines) is exact, on the "
+          "ESCAPED bytes",
+          "[ui][approvals][render][bound]") {
+    // A target of 97 characters is a 100-byte line ("  " + value + "\n"): 17 of them are exactly
+    // the 1700-byte budget.
+    const std::string v97(97, 'a');
+    SECTION("exactly at the budget: all 17 shown, no omission note") {
+        const auto text = summarize_bound_request(targets_request(std::vector<std::string>(17, v97)), "");
+        CHECK(count_of(text, "  " + v97 + "\n") == 17);
+        CHECK(text.find("more not shown") == std::string::npos);
+    }
+    SECTION("one entry over: 17 shown and an explicit note for the 18th") {
+        const auto text = summarize_bound_request(targets_request(std::vector<std::string>(18, v97)), "");
+        CHECK(count_of(text, "  " + v97 + "\n") == 17);
+        CHECK(text.find("  ... and 1 more not shown (section limit)\n") != std::string::npos);
+    }
+    SECTION("one BYTE over: a 101-byte line after sixteen 100-byte lines is cut") {
+        auto values = std::vector<std::string>(16, v97);
+        values.push_back(std::string(98, 'b'));
+        const auto text = summarize_bound_request(targets_request(values), "");
+        CHECK(count_of(text, "  " + v97 + "\n") == 16);
+        CHECK(text.find(std::string(98, 'b')) == std::string::npos);
+        CHECK(text.find("  ... and 1 more not shown (section limit)\n") != std::string::npos);
+    }
+    SECTION("budgeted on the escaped form: 93 raw bytes that escape to 101 are cut") {
+        // 89 'a' plus two U+00E9 is 93 UTF-8 bytes (a 96-byte line, which would fit after
+        // sixteen 100-byte lines) but escapes to 89 + 2 x 6 = 101 bytes (a 104-byte line, which
+        // does not).
+        auto values = std::vector<std::string>(16, v97);
+        values.push_back(std::string(89, 'a') + "\xC3\xA9\xC3\xA9");
+        const auto text = summarize_bound_request(targets_request(values), "");
+        CHECK(count_of(text, "  " + v97 + "\n") == 16);
+        CHECK(text.find("\\u00e9") == std::string::npos);
+        CHECK(text.find("  ... and 1 more not shown (section limit)\n") != std::string::npos);
+    }
 }
