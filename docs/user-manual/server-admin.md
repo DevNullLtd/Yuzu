@@ -1029,8 +1029,10 @@ that holds it).
   whichever primary the DSN resolves to. Only when every replica
   shares **one** database is the stale replica the one whose
   `yuzu_server_leader_epoch` differs from `leader_state.current_leader_epoch`;
-  restart it. Within one database fenced claims stay safe and what runs twice is
-  the unfenced background passes. **What it does not catch:** a *paused*
+  restart it. Within one database fenced claims stay safe (assuming no committed
+  transaction was lost on a promotion, that is, synchronous replication, the
+  shipped quorum default; the fence is not claimed safe across a lossy
+  asynchronous promotion) and what runs twice is the unfenced background passes. **What it does not catch:** a *paused*
   ex-leader (the case the epoch fence exists for) — its process is frozen, so its
   series goes stale, not `1`. That case is covered by
   `YuzuLeaderCoordinationStale` and by the fence itself. This alert is verified

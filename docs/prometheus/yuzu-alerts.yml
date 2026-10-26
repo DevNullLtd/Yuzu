@@ -2823,13 +2823,18 @@ groups:
   #  - `yuzu_server_leader_is_leader` is the replica's BELIEF (the attempt gate),
   #    not proof. Correctness for a leader-driven claim is the epoch fence in
   #    its WRITE (leader_elector.hpp), never this gauge. The fence is PER
-  #    DATABASE (see YuzuLeaderSplitBrain).
+  #    DATABASE (see YuzuLeaderSplitBrain) and assumes no committed transaction
+  #    is lost on a promotion (synchronous replication, the shipped quorum
+  #    default): under asynchronous replication, or a degraded non-strict quorum,
+  #    a lagging promotion could re-mint an epoch, and "fenced claims remain
+  #    safe" below is NOT claimed for that case.
   #  - Single replica (the supported default): SplitBrain cannot fire (one
   #    series), NoLeader fires only if the elector never leads (loops paused),
   #    Flapping usually does NOT see a single replica's restart loop (see that
-  #    rule; YuzuServerRestartLoop is the rule for it). A server with no elector exports no series, so every expression is
-  #    empty -- no false page, and deliberately NO absent() rule (a Prometheus
-  #    that does not scrape Yuzu would page forever).
+  #    rule; YuzuServerRestartLoop is the rule for it). A server with no
+  #    elector exports no series, so every expression is empty -- no false page,
+  #    and deliberately NO absent() rule (a Prometheus that does not scrape Yuzu
+  #    would page forever).
   #  - /readyz does NOT consult the elector (leadership is not readiness, #4014):
   #    a replica that cannot lead is a ready follower. These alerts are therefore
   #    the ONLY signal that the five FencedLeaderOnly passes (schedule tick,
