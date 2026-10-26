@@ -2053,8 +2053,10 @@ jobs:
               }
             }
           }
+          # no -Force: a probe that already exists fails the step and, not in $made, is never removed by it
+          $made = @()
           try {
-            foreach ($root in $probes.Keys) { New-Item -Path (Join-Path $root $probes[$root]) -Force | Out-Null }
+            foreach ($root in $probes.Keys) { $p = Join-Path $root $probes[$root]; New-Item -Path $p | Out-Null; $made += $p }
             Arm "selftest-$scope" 1 '::error::leftover registry key ' 'own-scope'
             Arm $scope 0 '::warning::' 'other-scope'
             foreach ($root in $probes.Keys) {
@@ -2063,10 +2065,7 @@ jobs:
               }
             }
           } finally {
-            foreach ($root in $probes.Keys) {
-              $path = Join-Path $root $probes[$root]
-              if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }
-            }
+            foreach ($p in $made) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p } }
           }
           Write-Host 'registry leftover check self-test: both decisions hold'
           exit 0

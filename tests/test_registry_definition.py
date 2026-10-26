@@ -11,6 +11,7 @@ Runnable standalone: `python3 tests/test_registry_definition.py` (how meson runs
 pytest-style file with no runner would execute zero assertions and always exit 0).
 """
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -146,13 +147,22 @@ class RegistryDefinitionPins(unittest.TestCase):
         # tests/unit/test_helpers.hpp registry_scratch_prefix() is the one place the `YuzuTest-` stem is written: it
         # adds the CI job scope that scripts/ci/check-registry-test-leftovers.ps1 keys on (#6488). A fixture that
         # spells its own "YuzuTest-..." key bypasses the scope, so a key it leaks is invisible to the per-job check.
+        # Lexical: the quoted and backslash-prefixed spellings in code lines (comments are skipped).
         fixtures = sorted((REPO_ROOT / "tests" / "unit").glob("test_registry_*.cpp"))
         self.assertTrue(fixtures)
         for path in fixtures:
             with self.subTest(file=path.name):
                 lines = [n for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
-                         if '"YuzuTest-' in line]
+                         if not line.strip().startswith(("//", "*")) and re.search(r'["\\]YuzuTest-', line)]
                 self.assertEqual(lines, [], "build the key name from yuzu::test::registry_scratch_prefix()")
+
+    def test_the_scope_variable_is_spelt_the_same_by_its_producer_and_consumers(self):
+        # Lexical pin: CI sets YUZU_TEST_REGISTRY_SCOPE, the fixtures read it and the leftover check is handed it; a
+        # rename in one place would leave the check judging a scope no fixture uses.
+        for rel in ("tests/unit/test_helpers.hpp", ".github/workflows/ci.yml",
+                    "scripts/ci/check-registry-test-leftovers.ps1"):
+            with self.subTest(file=rel):
+                self.assertIn("YUZU_TEST_REGISTRY_SCOPE", (REPO_ROOT / rel).read_text(encoding="utf-8"))
 
     def test_the_writers_are_classified_destructive_for_the_risk_gate(self):
         overrides = json.loads((REPO_ROOT / "scripts" / "test" / "instructions-risk-classification.json")

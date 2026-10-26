@@ -11,6 +11,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -261,9 +262,16 @@ TEST_CASE("registry audit_token: neutralises everything that could forge a field
     CHECK(audit_token("\\") == "_");
     CHECK(audit_token("a\\b\\") == "a\\b_");
     CHECK(audit_token("Caf\xC3\xA9") == "Caf\xC3\xA9");                   // valid UTF-8 survives
-    // ESC and the Unicode line breaks cannot split a line for a Unicode-aware reader either (UP-9).
+    // ESC, the other C0 separators, DEL, C1 and the Unicode line breaks cannot split a line for a Unicode-aware reader
+    // or start a terminal escape either (#6492 Gate 4 UP-9).
     CHECK(audit_token("a\x1b[31mb") == "a_[31mb");
+    CHECK(audit_token("a\x0b" "b\x0c" "c") == "a_b_c");                   // VT, FF
+    CHECK(audit_token("a\x1c" "b\x1d" "c\x1e" "d") == "a_b_c_d");         // FS, GS, RS
+    CHECK(audit_token("a\x7f" "b") == "a_b");                              // DEL
+    CHECK(audit_token("a\tb") == "a_b");                                   // log_token folds TAB here (sanitize_field keeps it)
     CHECK(audit_token("a\xC2\x85" "b") == "a_b");          // U+0085
+    CHECK(audit_token("a\xC2\x9B" "31mb") == "a_31mb");    // C1 CSI U+009B
+    CHECK(audit_token("a\xC2\x9D" "0b") == "a_0b");        // C1 OSC U+009D
     CHECK(audit_token("a\xE2\x80\xA8" "b") == "a_b");      // U+2028
     CHECK(audit_token("a\xE2\x80\xA9" "b") == "a_b");      // U+2029
     CHECK(audit_token("a\xE2\x80\xA7" "b") == "a\xE2\x80\xA7" "b"); // U+2027 is not a line break: kept
@@ -277,6 +285,35 @@ TEST_CASE("registry audit_token: neutralises everything that could forge a field
         const auto t = audit_token(s);
         CHECK(t == std::string(255, 'k') + "~" + std::to_string(s.size()));
     }
+    SECTION("the cap is measured after folding: 257 raw bytes holding two U+2028 fold to 253 and stay whole") {
+        const std::string raw = std::string(125, 'k') + "\xE2\x80\xA8" + std::string(126, 'k') + "\xE2\x80\xA8";
+        REQUIRE(raw.size() == 257);
+        CHECK(audit_token(raw) == std::string(125, 'k') + "_" + std::string(126, 'k') + "_");
+    }
+}
+
+TEST_CASE("registry get_value_error_line: grew-through-the-re-reads, not found, and every other code",
+          "[registry][parsers]") {
+    CHECK(get_value_error_line(kErrorMoreData, "K") ==
+          yuzu::profiles::render_user_key_error(yuzu::profiles::UserKeyStatus::value_changed_during_read, "K"));
+    CHECK(get_value_error_line(kErrorFileNotFound, "K") == "error|value not found");
+    CHECK(get_value_error_line(kErrorPathNotFound, "K") == "error|value not found");
+    CHECK(get_value_error_line(kErrorAccessDenied, "K") == "error|win32:5");
+    CHECK(get_value_error_line(1018, "K") == "error|win32:1018");
+}
+
+TEST_CASE("registry output row: a NUL in registry text does not cut the row at the C-string ABI",
+          "[registry][parsers]") {
+    using namespace std::string_view_literals;
+    // registry_win.cpp renders `value|<sanitize_field(text)>`; write_output hands the row on as a C string.
+    const std::string row = "value|" + yuzu::profiles::sanitize_field("A\0B\0\0"sv);
+    CHECK(row == "value|A_B");
+    CHECK(std::strlen(row.c_str()) == row.size());
+    yuzu::profiles::ProfileInfo info{"S-1-5-21-1", std::string{"j\0smith"sv}, std::string{"C:\\Users\\j\0smith"sv},
+                                     yuzu::profiles::HiveState::loaded};
+    const std::string prow = yuzu::profiles::render_profile_row(info);
+    CHECK(std::strlen(prow.c_str()) == prow.size());
+    CHECK(prow == "S-1-5-21-1|j_smith|C:\\Users\\j_smith|loaded");
 }
 
 TEST_CASE("registry render_audit_line: byte-exact grammar", "[registry][parsers]") {
@@ -652,18 +689,30 @@ TEST_CASE("registry is_sensitive_hklm_path: the Run keys and the service tree un
 
 // ── kernel_name_well_formed ─────────────────────────────────────────────
 
+namespace {
+// Both instantiations: char16_t on every host, and wchar_t (the shell's) where it is 16 bits.
+bool well_formed(std::u16string_view s) {
+    const bool got = kernel_name_well_formed(s);
+#if defined(_WIN32)
+    const std::wstring w(s.begin(), s.end());
+    CHECK(kernel_name_well_formed(std::wstring_view{w}) == got);
+#endif
+    return got;
+}
+} // namespace
+
 TEST_CASE("registry kernel_name_well_formed: no NUL unit, no lone surrogate; a pair and the empty name pass",
           "[registry][parsers]") {
-    CHECK(kernel_name_well_formed(u""));
-    CHECK(kernel_name_well_formed(u"L"));
-    CHECK(kernel_name_well_formed(u"\\REGISTRY\\MACHINE\\L\\Caf\u00e9"));
-    CHECK(kernel_name_well_formed(u"L\xD800\xDC00")); // a pair
-    CHECK_FALSE(kernel_name_well_formed(u"L\xD800"));  // lone high, at the end
-    CHECK_FALSE(kernel_name_well_formed(u"L\xD800x"));  // lone high, followed by a plain unit
-    CHECK_FALSE(kernel_name_well_formed(u"L\xD800\xD800\xDC00")); // a high before a pair
-    CHECK_FALSE(kernel_name_well_formed(u"L\xDC00"));  // lone low
-    CHECK_FALSE(kernel_name_well_formed(u"\xDC00\xD800")); // reversed pair
-    CHECK_FALSE(kernel_name_well_formed(u"\xD800"));
-    CHECK_FALSE(kernel_name_well_formed(std::u16string_view{u"L\0", 2}));
-    CHECK_FALSE(kernel_name_well_formed(std::u16string_view{u"\0L", 2}));
+    CHECK(well_formed(u""));
+    CHECK(well_formed(u"L"));
+    CHECK(well_formed(u"\\REGISTRY\\MACHINE\\L\\Caf\u00e9"));
+    CHECK(well_formed(u"L\xD800\xDC00")); // a pair
+    CHECK_FALSE(well_formed(u"L\xD800"));  // lone high, at the end
+    CHECK_FALSE(well_formed(u"L\xD800x"));  // lone high, followed by a plain unit
+    CHECK_FALSE(well_formed(u"L\xD800\xD800\xDC00")); // a high before a pair
+    CHECK_FALSE(well_formed(u"L\xDC00"));  // lone low
+    CHECK_FALSE(well_formed(u"\xDC00\xD800")); // reversed pair
+    CHECK_FALSE(well_formed(u"\xD800"));
+    CHECK_FALSE(well_formed(std::u16string_view{u"L\0", 2}));
+    CHECK_FALSE(well_formed(std::u16string_view{u"\0L", 2}));
 }

@@ -217,14 +217,13 @@ TEST_CASE("Win32Registry::create_sub opens a dangling registry link as the link 
         skip_or_fail("not elevated -- HKLM scratch not writable, create_sub link case");
         return;
     }
+    Win32Registry reg;
+    const Handle parent_handle = as_handle(parent.get());
+    LinkSweep sweep{reg, parent_handle}; // before the link exists, so a link made by a failing call goes too
     if (!make_machine_link(root + "\\Link", root + "\\Target")) { // Target is never created by this case
         skip_or_fail("could not create a registry link here");
         return;
     }
-
-    Win32Registry reg;
-    const Handle parent_handle = as_handle(parent.get());
-    LinkSweep sweep{reg, parent_handle};
 
     // Exactly the create open_checked issues for a missing component, with DELETE added so the link
     // object can be removed by handle below (the access mask does not change how a link is treated).
@@ -267,13 +266,13 @@ TEST_CASE("Win32Registry::final_name names the object a handle is bound to and t
         skip_or_fail("could not open the scratch parent");
         return;
     }
+    Win32Registry reg;
+    const Handle hklm = as_handle(HKEY_LOCAL_MACHINE);
+    LinkSweep sweep{reg, as_handle(parent.get())}; // before the link exists, so a link made by a failing call goes too
     if (!make_machine_link(root + "\\Link", root + "\\Target")) {
         skip_or_fail("could not create a registry link here");
         return;
     }
-    Win32Registry reg;
-    const Handle hklm = as_handle(HKEY_LOCAL_MACHINE);
-    LinkSweep sweep{reg, as_handle(parent.get())};
     const std::string machine = "\\REGISTRY\\MACHINE\\" + root;
 
     SECTION("a plain key is named by its own path, in the stored case") {
@@ -365,11 +364,11 @@ TEST_CASE("Win32Registry::final_name fails closed on a lone-surrogate key name, 
         CHECK(name.empty()); // a half-converted name is never handed back
     }
     SECTION("a link named for U+FFFD, standing for the lone-surrogate key, is refused and nothing is written") {
+        LinkSweep sweep{reg, as_handle(parent.get()), lookalike_utf8}; // before the link exists
         if (!make_machine_link(wroot + L"\\" + lookalike, wroot + L"\\" + lone)) {
             skip_or_fail("could not create a registry link here");
             return;
         }
-        LinkSweep sweep{reg, as_handle(parent.get()), lookalike_utf8};
         const std::vector<std::uint8_t> value{7, 0, 0, 0};
         // The requested path is plain UTF-8 (valid, passes validate_key_path): `<root>\L<U+FFFD>\Child`. The kernel
         // follows the ancestor link to `L<U+D800>\Child`; only the lone-surrogate rule keeps the fast open from

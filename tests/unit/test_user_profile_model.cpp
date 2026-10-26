@@ -12,12 +12,15 @@
 
 #include "user_profile_model.hpp"
 
+#include <yuzu/log_token.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace yuzu::profiles;
@@ -268,8 +271,16 @@ TEST_CASE("sanitize_field: ordinary text passes through unchanged", "[profiles]"
     CHECK(sanitize_field("alice") == "alice");
 }
 
-TEST_CASE("sanitize_field: folds ESC and the Unicode line breaks U+0085 U+2028 U+2029; nothing else", "[profiles]") {
+TEST_CASE("sanitize_field: folds C0 except TAB, DEL, C1, U+2028 and U+2029; nothing else", "[profiles]") {
     CHECK(sanitize_field("a\x1b[31mb") == "a_[31mb");
+    CHECK(sanitize_field("a\x0b" "b\x0c" "c") == "a_b_c");                  // VT, FF
+    CHECK(sanitize_field("a\x1c" "b\x1d" "c\x1e" "d") == "a_b_c_d");        // FS, GS, RS
+    CHECK(sanitize_field("a\x01" "b\x08" "c\x0e" "d\x1f" "e") == "a_b_c_d_e");
+    CHECK(sanitize_field("a\x7f" "b") == "a_b");                             // DEL
+    CHECK(sanitize_field("a\xC2\x9B" "31mb") == "a_31mb");                  // C1 CSI U+009B
+    CHECK(sanitize_field("a\xC2\x9D" "0;t\x07" "b") == "a_0;t_b");          // C1 OSC U+009D, then BEL
+    CHECK(sanitize_field("\xC2\x80\xC2\x9F") == "__");                       // both ends of the C1 range
+    CHECK(sanitize_field("\xC2\xA0\xC2\x7F") == "\xC2\xA0\xC2_");           // U+00A0 kept; C2 then DEL is not C1
     CHECK(sanitize_field("a\xC2\x85" "b") == "a_b");
     CHECK(sanitize_field("a\xE2\x80\xA8" "b") == "a_b");
     CHECK(sanitize_field("a\xE2\x80\xA9" "b") == "a_b");
@@ -279,6 +290,43 @@ TEST_CASE("sanitize_field: folds ESC and the Unicode line breaks U+0085 U+2028 U
     CHECK(sanitize_field("a\tb") == "a\tb");                                 // a tab passes (process rows carry them)
     CHECK(sanitize_field("Caf\xC3\xA9 \xE2\x80\xA7 \xC2\xA0") == "Caf\xC3\xA9 \xE2\x80\xA7 \xC2\xA0"); // other UTF-8 intact
     CHECK(sanitize_field("") == "");
+}
+
+TEST_CASE("sanitize_field: trailing NULs are dropped, an interior NUL folds to '_'", "[profiles]") {
+    using namespace std::string_view_literals;
+    CHECK(sanitize_field("A\0B"sv) == "A_B");       // would cut the row at the C-string ABI
+    CHECK(sanitize_field("abc\0"sv) == "abc");      // a REG_SZ stored with its terminator
+    CHECK(sanitize_field("abc\0\0\0"sv) == "abc"); // ...or with extra ones: no trailing '_'
+    CHECK(sanitize_field("\0a\0\0"sv) == "_a");
+    CHECK(sanitize_field("\0\0\0"sv) == "");
+    CHECK(sanitize_field("a|b\0c\0"sv) == "a_b_c");
+}
+
+// The documented lossy contract (registry README, get_value / enumerate_* descriptions): a rendered field is display
+// text, so two raw inputs that differ only in a folded character render the same and cannot be told apart.
+TEST_CASE("sanitize_field: distinct inputs that fold to the same text are equal after folding (lossy contract)",
+          "[profiles]") {
+    CHECK(sanitize_field("a\xE2\x80\xA8" "b") == sanitize_field("a_b")); // U+2028
+    CHECK(sanitize_field("a\xC2\x9B" "b") == sanitize_field("a_b"));     // C1
+    CHECK(sanitize_field("a\x0b" "b") == sanitize_field("a_b"));          // a C0 control
+    CHECK(sanitize_field("a|b") == sanitize_field("a_b"));
+}
+
+// fold_line_breaks keeps a set of its own on purpose (header comment); on the three Unicode line breaks it must agree
+// with log_key_token. They differ elsewhere: log_key_token folds TAB and passes C1 other than U+0085.
+TEST_CASE("fold_line_breaks agrees with log_key_token on U+0085, U+2028 and U+2029", "[profiles]") {
+    for (const std::string_view in : {"a\xC2\x85" "b", "a\xE2\x80\xA8" "b", "a\xE2\x80\xA9" "b"}) {
+        std::string folded{in};
+        fold_line_breaks(folded);
+        CHECK(folded == yuzu::log_key_token(in));
+    }
+    std::string tab = "a\tb", csi = "a\xC2\x9B" "b";
+    fold_line_breaks(tab);
+    fold_line_breaks(csi);
+    CHECK(tab == "a\tb");
+    CHECK(yuzu::log_key_token("a\tb") == "a_b");
+    CHECK(csi == "a_b");
+    CHECK(yuzu::log_key_token("a\xC2\x9B" "b") == "a\xC2\x9B" "b");
 }
 
 TEST_CASE("render_profile_row: ordinary profile", "[profiles]") {

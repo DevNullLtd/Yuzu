@@ -174,6 +174,7 @@ struct RegistryWriter {
     virtual long open_path(Handle root, std::string_view key_path, std::uint32_t access, Handle& out) = 0;
     /// NtQueryKey(KeyNameInformation): the canonical kernel name of the object `key` is bound to (UTF-8,
     /// e.g. `\REGISTRY\MACHINE\SOFTWARE\Acme`). Any failure, a name that does not fit included, is non-zero.
+    /// Exact: a name that does not round-trip UTF-16 to UTF-8 (a NUL, a lone surrogate) is a failure.
     virtual long final_name(Handle key, std::string& out) = 0;
     /// The kernel name of the predefined root `root`, cached by the shell. Only HKLM and HKU have one: HKCU
     /// resolves per calling user and HKCR is a merged view, so for them (and on any failure) it is non-zero.

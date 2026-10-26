@@ -104,12 +104,16 @@ enum class Hive { hklm, hkcu, hkcr, hku };
 /// unit, no lone surrogate. The canonical-name compare of the fast open runs on the UTF-8 form, and a lossy
 /// conversion would map a lone surrogate to U+FFFD, so a key one code unit away from the requested name could compare
 /// equal; a name that fails this is never compared (the fast open declines and the walk decides).
-[[nodiscard]] inline bool kernel_name_well_formed(std::u16string_view name) noexcept {
+/// A template over the 16-bit code unit so the Windows shell passes its wchar_t buffer as it is (no cast between the
+/// two character types) and the tests pass char16_t on every host.
+template <class C> [[nodiscard]] bool kernel_name_well_formed(std::basic_string_view<C> name) noexcept {
+    static_assert(sizeof(C) == 2, "a UTF-16 code unit");
+    const auto unit = [&](std::size_t i) { return static_cast<std::uint16_t>(name[i]); };
     for (std::size_t i = 0; i < name.size(); ++i) {
-        const char16_t u = name[i];
+        const std::uint16_t u = unit(i);
         if (u == 0) return false;
         if (u >= 0xD800 && u <= 0xDBFF) {
-            if (i + 1 >= name.size() || name[i + 1] < 0xDC00 || name[i + 1] > 0xDFFF) return false;
+            if (i + 1 >= name.size() || unit(i + 1) < 0xDC00 || unit(i + 1) > 0xDFFF) return false;
             ++i; // the pair
         } else if (u >= 0xDC00 && u <= 0xDFFF) {
             return false; // a low surrogate with no high before it
@@ -462,6 +466,19 @@ enum class Missing { key, value };
     }
 }
 
+/// get_value's line for a failed bounded read (`rc` from query_value_bounded): a value that kept growing through the
+/// re-reads is value_changed_during_read, FILE / PATH not found the 1.0.0 `error|value not found`, anything else
+/// `error|win32:<rc>`.
+[[nodiscard]] inline std::string get_value_error_line(long rc, std::string_view key) {
+    switch (rc) {
+    case kErrorMoreData:
+        return yuzu::profiles::render_user_key_error(yuzu::profiles::UserKeyStatus::value_changed_during_read, key);
+    case kErrorFileNotFound:
+    case kErrorPathNotFound: return "error|value not found";
+    default: return "error|win32:" + std::to_string(rc);
+    }
+}
+
 // ── previous-value capture ───────────────────────────────────────────────
 
 enum class OldState { absent, present, unreadable };
@@ -484,10 +501,11 @@ struct OldValue {
 
 // ── audit line ───────────────────────────────────────────────────────────
 
-/// Neutralises untrusted text for an `audit|k=v|...` line: invalid UTF-8 -> '?', control bytes,
-/// space, '=' and ',' (yuzu::log_token) -> '_', and '|' -> '_' (log_token does not map the field
-/// separator) and U+0085 / U+2028 / U+2029 -> '_' (fold_line_breaks). A trailing backslash becomes '_' too. Over `cap` bytes it is cut on a character boundary and gets
-/// `~<total length>`.
+/// Neutralises untrusted text for an `audit|k=v|...` line: invalid UTF-8 -> '?', control bytes, DEL, space, '=' and
+/// ',' (yuzu::log_token) -> '_', and '|' -> '_' (log_token does not map the field separator).
+/// The C1 controls U+0080-U+009F (NEL U+0085 among them), U+2028 and U+2029 -> '_' too (fold_line_breaks; log_token
+/// passes every byte >= 0x80). A trailing backslash becomes '_'. Over `cap` bytes it is cut on a character boundary
+/// and gets `~<total length>`; the cap and `~<total>` are measured after folding.
 [[nodiscard]] inline std::string audit_token(std::string_view s, std::size_t cap = kAuditTokenCap) {
     std::string t;
     if (yuzu::shared::count_invalid_wire_bytes(s) == 0) { // well-formed (the usual case): no scrubbed copy
@@ -498,7 +516,7 @@ struct OldValue {
         t = yuzu::log_token(scrubbed);
     }
     std::replace(t.begin(), t.end(), '|', '_');
-    yuzu::profiles::fold_line_breaks(t); // log_token folds ESC but passes U+0085 / U+2028 / U+2029
+    yuzu::profiles::fold_line_breaks(t); // log_token folds C0 and DEL but passes C1, U+2028 and U+2029
     // A field that ends in a backslash would make the following separator read as an escaped `|` to the server's
     // splitter (result_parsing.hpp find_unescaped_pipe) and merge two cells.
     if (!t.empty() && t.back() == '\\') t.back() = '_';
@@ -532,7 +550,8 @@ struct AuditRecord {
 /// The front half of set_value: validate, encode, and record the type and new bytes on the audit record.
 /// `err` is empty on success. A missing or misspelt `value` / `data_hex` parameter arrives here as an empty string,
 /// so an empty text is a valid empty REG_SZ / REG_BINARY (and an invalid REG_DWORD); a REG_MULTI_SZ record
-/// separator is LF only (a CR stays inside its record).
+/// separator is LF only (a CR stays inside its record). `err` always views a static constant, never a member string,
+/// so a copy or move cannot dangle.
 struct PreparedSet {
     std::string_view err;
     std::optional<std::uint32_t> type;

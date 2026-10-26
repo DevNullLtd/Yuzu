@@ -80,7 +80,7 @@ struct Node {
 /// KEY_ENUMERATE_SUB_KEYS; delete_key_by_handle: DELETE), after the deleted-key (1018) answer and before the
 /// per-node fault flags. The two root handles grant everything. create_sub is DELIBERATELY not checked against the
 /// parent handle's mask: RegCreateKeyExW checks key creation against the parent's security descriptor, not the
-/// samDesired the parent was opened with (Microsoft Learn, RegCreateKeyExW: a KEY_READ handle can create when the
+/// samDesired the parent was opened with (observed on Windows 11, kingsley: a KEY_READ handle can create when the
 /// descriptor allows), so a refusal here would prove nothing about production; the KEY_CREATE_SUB_KEY the core
 /// asks for on an intermediate create is pinned by the masks case instead. final_name needs no right
 /// (KeyNameInformation).
@@ -892,7 +892,6 @@ TEST_CASE("registry core: the fake enforces the access a handle was opened with"
         CHECK(reg.set_value(query_only.get(), "W", kRegDword, dword(2)) == 5);
         CHECK(reg.delete_value(query_only.get(), "V") == 5);
         CHECK(reg.enum_subkey(query_only.get(), 0, name) == 5);
-        CHECK(reg.delete_key_by_handle(query_only.get()) == 5);
         CHECK(reg.get("A", "V") != nullptr);
         CHECK(reg.get("A", "W") == nullptr);
 

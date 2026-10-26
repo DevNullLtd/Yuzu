@@ -132,8 +132,7 @@ template <class F> [[nodiscard]] F ntdll_proc(const char* symbol) {
     // needs), and the bytes were written by the kernel, not through another C++ object.
     const auto* name = reinterpret_cast<const wchar_t*>(buf + sizeof name_bytes);
     const std::size_t n = name_bytes / sizeof(wchar_t);
-    static_assert(sizeof(wchar_t) == sizeof(char16_t));
-    if (!kernel_name_well_formed({reinterpret_cast<const char16_t*>(name), n})) return ERROR_INVALID_DATA;
+    if (!kernel_name_well_formed(std::wstring_view{name, n})) return ERROR_INVALID_DATA;
     if (std::all_of(name, name + n, [](wchar_t c) { return c > 0 && c < 0x80; })) { // the usual name: no NLS call
         out.resize(n);
         std::transform(name, name + n, out.begin(), [](wchar_t c) { return static_cast<char>(c); });
@@ -361,9 +360,9 @@ int do_get_value(yuzu::CommandContext& ctx, yuzu::Params params) {
     // (the bytes, the hex string, the sanitised copy).
     const Wide wname{val_name};
     QueryResult q;
-    if (query_value_bounded(kMaxWriteBytes, raw_query(opened.get(), wname.c_str()), q, kMaxWriteBytes) !=
-        ERROR_SUCCESS) {
-        ctx.write_output("error|value not found");
+    if (const long rc = query_value_bounded(kMaxWriteBytes, raw_query(opened.get(), wname.c_str()), q, kMaxWriteBytes);
+        rc != ERROR_SUCCESS) {
+        ctx.write_output(get_value_error_line(rc, t.key));
         return 1;
     }
     if (q.size > kMaxWriteBytes) {
