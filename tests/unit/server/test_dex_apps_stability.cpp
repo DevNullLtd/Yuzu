@@ -19,6 +19,8 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <set>
@@ -453,12 +455,41 @@ DexPolicyInForce policy_in_force(DexScorePolicy p) {
 // captured from it and pinned as a literal.
 constexpr const char* kBaseAppsJson =
     R"({"apps":[{"crashes":12,"distinct_devices":7,"distinct_devices_online":7,"hangs":3,"last_seen":"2026-10-14T00:00:00Z","profile":"default","rate_per_1000":{"estimate":300.0,"lower":167.9077226556663,"reliable":false,"upper":494.80437742971685},"score":{"band":"excellent","deductions":[{"assessed":true,"name":"breadth","points":8.4},{"assessed":true,"name":"crashes","points":0.8},{"assessed":true,"name":"hangs","points":0.096},{"assessed":false,"name":"regression","points":0.0}],"score":90.7,"withheld":null},"share_affected":{"estimate":0.14,"lower":0.06950833427016294,"reliable":false,"upper":0.2618619371058554},"subject":"a.exe","version_count":1,"versions":[],"versions_truncated":false}],"apps_total":0,"apps_truncated":false,"policy":{"fault":null,"revision":"default","source":"default","tiers":{"excellent":{"edge":90.0,"name":"excellent"},"fair":{"edge":60.0,"name":"fair"},"good":{"edge":75.0,"name":"good"},"poor":{"edge":0.0,"name":"poor"}}},"population":50,"population_basis":"windows_online","window":"7d"})";
+
+// Structural JSON equality: keys, types, integers, strings and bools exact; floats at a
+// 1e-12 relative tolerance. The rate and share bounds go through libm (lgamma/exp/log),
+// which differs across platforms in the last digits, so a byte compare is not portable.
+bool json_near(const nlohmann::json& a, const nlohmann::json& b) {
+    if (a.is_number_float() && b.is_number_float()) {
+        const double x = a.get<double>(), y = b.get<double>();
+        return x == y || std::abs(x - y) <= 1e-12 * std::abs(y);
+    }
+    if (a.type() != b.type())
+        return false;
+    if (a.is_object()) {
+        if (a.size() != b.size())
+            return false;
+        for (const auto& [k, v] : a.items())
+            if (!b.contains(k) || !json_near(v, b.at(k)))
+                return false;
+        return true;
+    }
+    if (a.is_array()) {
+        if (a.size() != b.size())
+            return false;
+        for (std::size_t i = 0; i < a.size(); ++i)
+            if (!json_near(a[i], b[i]))
+                return false;
+        return true;
+    }
+    return a == b;
+}
 } // namespace
 
 TEST_CASE("apps model: the default policy reproduces the base build's JSON byte for byte",
           "[dex][apps_model]") {
     const auto m = dex_apps_model_from_rows("7d", {total_row("a.exe", 12, 3, 7, 10, 3)}, 50, def());
-    CHECK(dex_apps_json(m) == kBaseAppsJson);
+    CHECK(json_near(nlohmann::json::parse(dex_apps_json(m)), nlohmann::json::parse(kBaseAppsJson)));
 }
 
 TEST_CASE("apps model: the policy's interval confidence sets the share and rate intervals",

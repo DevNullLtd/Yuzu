@@ -701,8 +701,11 @@ TEST_CASE("DexStats: the confidence parameter on dex_proportion and dex_rate", "
 
 TEST_CASE("DexStats: default outputs match pinned-base raw values", "[dex][stats]") {
     // Literals captured from the unmodified base build (before the confidence
-    // parameter existed); exact equality, no tolerance. Inputs: dex_proportion(81, 263),
-    // dex_rate(15, 1.0), dex_rate(2'000'000, 1.0).
+    // parameter existed). Inputs: dex_proportion(81, 263), dex_rate(15, 1.0),
+    // dex_rate(2'000'000, 1.0). The Wilson bounds and the rate estimate are pure IEEE
+    // arithmetic (+ - * / sqrt) and stay exact. The Poisson bounds go through libm
+    // (lgamma/exp/log in gamma_quantile), which differs across platforms in the last
+    // digits, so they compare at a 1e-12 relative tolerance.
     constexpr double kPropLower = 0.25528851987827422;
     constexpr double kPropEst = 0.30798479087452474;
     constexpr double kPropUpper = 0.36620957698280004;
@@ -720,11 +723,11 @@ TEST_CASE("DexStats: default outputs match pinned-base raw values", "[dex][stats
         CHECK(p->lower == kPropLower);
         CHECK(p->estimate == kPropEst);
         CHECK(p->upper == kPropUpper);
-        CHECK(r->lower == kRateLower);
+        CHECK(r->lower == Approx(kRateLower).epsilon(1e-12).margin(0));
         CHECK(r->estimate == kRateEst);
-        CHECK(r->upper == kRateUpper);
-        CHECK(b->lower == kBigLower);
-        CHECK(b->upper == kBigUpper);
+        CHECK(r->upper == Approx(kRateUpper).epsilon(1e-12).margin(0));
+        CHECK(b->lower == Approx(kBigLower).epsilon(1e-12).margin(0));
+        CHECK(b->upper == Approx(kBigUpper).epsilon(1e-12).margin(0));
     }
 }
 
