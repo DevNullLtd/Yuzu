@@ -76,7 +76,7 @@ yuzu::license_scan::SurfaceRun collect_surfaces() {
 // A refusal (cert_permission_denied: the agent may not list /etc/pki/entitlement
 // or read a certificate in it) is reported as PERMISSION_DENIED -- distinct from
 // the generic CONSTRAINED surface error so a consumer reading this seam can tell
-// "could not check" from "the check failed" (SAM.10). The mapping is the pure
+// "could not check" from "the check failed". The mapping is the pure
 // surface_result_status (licensing_parsers.hpp, unit-tested); this is the shell
 // both actions share.
 void propagate_surface_status(yuzu::CommandContext& ctx,

@@ -1,4 +1,4 @@
-# license_scan macOS fixtures (SAM.10)
+# license_scan macOS fixtures
 
 Real captures from this Mac (`braga.local`, macOS 26.6.2 `25G83`, arm64),
 2026-10-26. Every file here is the raw bytes of a binary (`bplist00`)

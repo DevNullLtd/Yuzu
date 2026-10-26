@@ -1,5 +1,5 @@
 /**
- * test_licensing_bplist.cpp -- licensing_bplist.hpp (SAM.10), the bounded
+ * test_licensing_bplist.cpp -- licensing_bplist.hpp, the bounded
  * top-level string lookup that lets the license_scan macOS leg read the
  * identity of a binary (bplist00) Info.plist.
  *
@@ -46,6 +46,13 @@ namespace fs = std::filesystem;
 using yuzu::license_scan::bplist_string_for_key;
 using yuzu::license_scan::kBplistMaxObjects;
 using yuzu::license_scan::kBplistMaxStringBytes;
+
+// The numeric policy, pinned by literal: every boundary case below is written through
+// these constants, so without this a change of the cap would move those tests with it
+// and nothing would fail.
+static_assert(kBplistMaxObjects == 65536, "bplist object cap is policy: change it deliberately");
+static_assert(kBplistMaxStringBytes == 64 * 1024,
+              "bplist string cap is policy: change it deliberately");
 
 namespace {
 

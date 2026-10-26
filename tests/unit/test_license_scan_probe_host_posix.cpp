@@ -1,6 +1,6 @@
 /**
  * test_license_scan_probe_host_posix.cpp -- the errno-aware ProbeHost
- * primitives read_file_capped / list_dir (SAM.10), exercised against a real
+ * primitives read_file_capped / list_dir, exercised against a real
  * temp tree so the contract the Linux entitlement_certs surface relies on is
  * pinned: an ABSENT path (ENOENT/ENOTDIR) and a REFUSED one (EACCES/EPERM) are
  * distinguishable, an oversized file is never a truncated read, and a listing

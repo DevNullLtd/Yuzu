@@ -378,7 +378,7 @@ SUPPORTED/rung 3 to CONSTRAINED/rung 2 — the
 acquisition mechanism improved, but the underlying capability was already
 limited (declared-licence classification only, no lapse detection for
 pkg_metadata), and the descriptor now says so honestly instead of
-overclaiming SUPPORTED. SAM.10 then removed the `entitlement_certs` spawn
+overclaiming SUPPORTED. A later change then removed the `entitlement_certs` spawn
 sites outright: the two `openssl x509 -enddate` argv runs per certificate
 (`license_scan/run_entitlement_certs_surface_linux#1` and `#2`) are replaced
 by an in-process libcrypto PEM read (`licensing_x509.hpp`, rung 1, no

@@ -42,7 +42,7 @@ namespace {
 
 // An Info.plist is a few KiB to ~60 KiB (Word's XML is the largest seen); the
 // cap bounds a hostile or runaway file. Oversized/unreadable/undecodable falls
-// back to the bundle name, as it always has.
+// back to the bundle name (the pre-existing fallback).
 constexpr std::size_t kInfoPlistCapBytes = 4 * 1024 * 1024;
 
 std::string bundle_name_from_app_path(const std::string& app_path) {

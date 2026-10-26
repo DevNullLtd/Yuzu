@@ -111,12 +111,13 @@ public:
     virtual std::optional<std::string> read_file_prefix(std::string_view path,
                                                         std::size_t max_bytes);
     /// Whole regular file up to `cap` bytes with errno-aware failure (see
-    /// CappedRead). The final path component IS followed (Leaf::follow): every
-    /// consumer reads an admin/root-owned tree (/etc/pki/entitlement,
-    /// /Applications/*.app) and the cap + regular-file check bound what a link
-    /// there can cost. POSIX implementation: yuzu::shared::read_file; the
-    /// Windows default is a fail-closed stub (err = EIO; Windows never calls
-    /// it).
+    /// CappedRead). The final path component IS followed (Leaf::follow). The
+    /// trees read are /etc/pki/entitlement (root-owned) and /Applications/*.app,
+    /// which is admin-writable (/Applications is root:admin 775 -- a local admin
+    /// can link Contents/Info.plist elsewhere); the cap and the regular-file
+    /// check bound what such a link costs. POSIX implementation:
+    /// yuzu::shared::read_file; the Windows default is a fail-closed stub
+    /// (err = EIO; Windows never calls it).
     virtual CappedRead read_file_capped(std::string_view path, std::size_t cap);
     /// Entry names of one directory, errno-aware and bounded (see DirListing).
     /// The leaf is followed (Leaf::follow), same reasoning as read_file_capped.

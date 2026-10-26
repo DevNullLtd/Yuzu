@@ -1,6 +1,6 @@
 /**
  * test_license_scan_surfaces.cpp -- the per-OS surface "shells" of the
- * license_scan plugin (SAM.10), driven through a controlled ProbeHost.
+ * license_scan plugin, driven through a controlled ProbeHost.
  *
  * The pure seams (licensing_x509.hpp, licensing_bplist.hpp,
  * entitlement_certs_outcome) have their own suites; what those cannot prove is

@@ -1,5 +1,5 @@
 /**
- * test_licensing_x509.cpp -- vectors for licensing_x509.hpp (SAM.10), the pure
+ * test_licensing_x509.cpp -- vectors for licensing_x509.hpp, the pure
  * in-process PEM -> notAfter reader that replaced the `openssl x509 -enddate`
  * subprocess on the license_scan Linux entitlement_certs surface.
  *
@@ -16,16 +16,21 @@
  *       -keyout /dev/null -subj "/CN=<name>" -not_before <nb> -not_after <na>
  *
  *   name      notBefore         notAfter          encoding         wire (epoch at 00:00:00 UTC)
- *   sam10-a   20250101000000Z   20270304120000Z   UTCTime          1804118400  (date -u of 2027-03-04)
- *   sam10-b   20250101000000Z   20281231235959Z   UTCTime          1861833600
- *   sam10-c   20250101000000Z   20260101000000Z   UTCTime          1767225600
- *   sam10-d   20250101000000Z   21000101000000Z   GeneralizedTime  4102444800
- *   sam10-e   19600101000000Z   19691231000000Z   UTCTime          (before the epoch: refused)
+ *   vec-a     20250101000000Z   20270304120000Z   UTCTime          1804118400  (date -u of 2027-03-04)
+ *   vec-b     20250101000000Z   20281231235959Z   UTCTime          1861833600
+ *   vec-c     20250101000000Z   20260101000000Z   UTCTime          1767225600
+ *   vec-d     20250101000000Z   21000101000000Z   GeneralizedTime  4102444800
+ *   vec-e     19600101000000Z   19691231000000Z   UTCTime          (before the epoch: refused)
  *
  * Expected values were computed independently of the code under test with
  * Python `calendar.timegm((Y, M, D, 0, 0, 0))`, and the notAfter of each
  * certificate confirmed with `openssl x509 -noout -enddate` /
  * `openssl asn1parse`.
+ *
+ * The ENCRYPTED-header vector is SYNTHETIC too: a CERTIFICATE block carrying
+ * `Proc-Type: 4,ENCRYPTED` / `DEK-Info:` headers over 32 zero bytes of base64.
+ * The reader must reject it before any decryption is attempted, so no real
+ * ciphertext is needed.
  *
  * The ENTITLEMENT DATA / RSA SIGNATURE blocks are SYNTHETIC (a base64 of a
  * plain sentence, no key material): they reproduce the shape of a Red Hat
@@ -45,63 +50,63 @@ using yuzu::license_scan::PemNotAfter;
 namespace {
 
 constexpr const char* kCertA = R"(-----BEGIN CERTIFICATE-----
-MIIBejCCAR+gAwIBAgIUErPFZG+tXlGd7jAGQUOJxOYYL+MwCgYIKoZIzj0EAwIw
-EjEQMA4GA1UEAwwHc2FtMTAtYTAeFw0yNTAxMDEwMDAwMDBaFw0yNzAzMDQxMjAw
-MDBaMBIxEDAOBgNVBAMMB3NhbTEwLWEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC
-AAS7cbHHKFc0DycuXJcynDgJkXpW1bHT7Ab/SXVLKxsArDn65ZW6HndpT/5sEXuW
-rYj5G7fKEF9fB1GqqQl42v6Yo1MwUTAdBgNVHQ4EFgQUe9jUh5URCGln+inE8CnT
-dkuYA2AwHwYDVR0jBBgwFoAUe9jUh5URCGln+inE8CnTdkuYA2AwDwYDVR0TAQH/
-BAUwAwEB/zAKBggqhkjOPQQDAgNJADBGAiEA5cZ0ujBp7EQ3Gf/GDdL7adHS8J3B
-2KSyJ30d+efrGmwCIQDLuuO8ASAcRspYmRewnUuWJqHYgDWVzSF10b3I8w3/Cw==
+MIIBdTCCARugAwIBAgIUejCOkM8eyApdOeDppHzps96mzcQwCgYIKoZIzj0EAwIw
+EDEOMAwGA1UEAwwFdmVjLWEwHhcNMjUwMTAxMDAwMDAwWhcNMjcwMzA0MTIwMDAw
+WjAQMQ4wDAYDVQQDDAV2ZWMtYTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABLOd
+yQNNWnAknpSw3pCVtj8fmMoBNRqWXzkZpOmxVheyOVuUKT2GtVjV0FPGItXiaH/J
+LEtNrq8KOW+8zWw1XNajUzBRMB0GA1UdDgQWBBS/RlvsrG9pxajxItoVeUDX7o9k
+PDAfBgNVHSMEGDAWgBS/RlvsrG9pxajxItoVeUDX7o9kPDAPBgNVHRMBAf8EBTAD
+AQH/MAoGCCqGSM49BAMCA0gAMEUCIQCfYxpVoN54hV452cG/sGXZoV+HoBwcd7vn
+gDVLoL30dQIgaTGJkGC/1H39PtQAUc2uoj8P8oxAfRyfNByqNDpbJas=
 -----END CERTIFICATE-----
 )";
 
 constexpr const char* kCertB = R"(-----BEGIN CERTIFICATE-----
-MIIBejCCAR+gAwIBAgIUG2hF+CO5yCUdiklVS1nEt54UaUIwCgYIKoZIzj0EAwIw
-EjEQMA4GA1UEAwwHc2FtMTAtYjAeFw0yNTAxMDEwMDAwMDBaFw0yODEyMzEyMzU5
-NTlaMBIxEDAOBgNVBAMMB3NhbTEwLWIwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC
-AARou+gyal15dHQtIQ2Rh/qk9upcgB5vpxSbYsqq5xmDxKazQqNzEtnAQly31wbl
-CW8rk+JjdIscH4TZgIXBZjhYo1MwUTAdBgNVHQ4EFgQU7u110fvuqDuGG+mDlj9R
-K+4wkgAwHwYDVR0jBBgwFoAU7u110fvuqDuGG+mDlj9RK+4wkgAwDwYDVR0TAQH/
-BAUwAwEB/zAKBggqhkjOPQQDAgNJADBGAiEA2FwkyfUv+Mi3+HbtkxNFn5cFsqxq
-1IjYrPzVzRJcoUICIQDr635iRaHq+Q0pJ+JV6M1Vx1nbADaHCB1Jj88gf+wTqA==
+MIIBdTCCARugAwIBAgIULQ9OboABxbWpSPdL6lSxD9PlCAMwCgYIKoZIzj0EAwIw
+EDEOMAwGA1UEAwwFdmVjLWIwHhcNMjUwMTAxMDAwMDAwWhcNMjgxMjMxMjM1OTU5
+WjAQMQ4wDAYDVQQDDAV2ZWMtYjBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABAfz
+gnJeSi7mFXo0TuSlkHAmgIuZozJPAYi6/uPUUitq9sajFWP6iHtRnlZReoaaqBS3
+RjvdCzfN3LCnrQ2g5UejUzBRMB0GA1UdDgQWBBSVpaOJdtOCpDr8TMKasSvGcJUU
+OzAfBgNVHSMEGDAWgBSVpaOJdtOCpDr8TMKasSvGcJUUOzAPBgNVHRMBAf8EBTAD
+AQH/MAoGCCqGSM49BAMCA0gAMEUCIQCdnMYUx4nTloLGFhr4hl9W0UCRR8381OMY
+Jp/hhoKbQAIgSKoYyX08hbnlJ9UmsAbhFO8t2x3j+cgwfFE/FwlwZfg=
 -----END CERTIFICATE-----
 )";
 
 constexpr const char* kCertC = R"(-----BEGIN CERTIFICATE-----
-MIIBeTCCAR+gAwIBAgIULDo9j7hKsENBKP88Cw7e9FwExQ0wCgYIKoZIzj0EAwIw
-EjEQMA4GA1UEAwwHc2FtMTAtYzAeFw0yNTAxMDEwMDAwMDBaFw0yNjAxMDEwMDAw
-MDBaMBIxEDAOBgNVBAMMB3NhbTEwLWMwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC
-AASPZOcZlvYOzSXEiQNyClG62jbH/L1ukSsg0ke6lU3q1W37WLsnw2NdnKMkAfk7
-qwQ4BbcJEUbVs+NDhLDi++kpo1MwUTAdBgNVHQ4EFgQUHzNX+dLOY+n/XcoHtypa
-Zekhs5UwHwYDVR0jBBgwFoAUHzNX+dLOY+n/XcoHtypaZekhs5UwDwYDVR0TAQH/
-BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiEA9+dJgYbyXj5OOjUKj4EawU50qYB8
-3TbPJM+nY/5f6HsCICI0qLsd3Vwp26okKdnjqCSaXlYVJKuHyEcz9PXIw7mQ
+MIIBdTCCARugAwIBAgIUKsJdM+9HqYmP6bhDLh2BLSPFxYkwCgYIKoZIzj0EAwIw
+EDEOMAwGA1UEAwwFdmVjLWMwHhcNMjUwMTAxMDAwMDAwWhcNMjYwMTAxMDAwMDAw
+WjAQMQ4wDAYDVQQDDAV2ZWMtYzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABDil
+8GoAX1fXot0p9HNwI26ZVTbd0BPm9oBWyG7PFyBmmOER5gOX6VZ9zY8s3GLdNplj
+ZED5opEJLaTDJtQYLiejUzBRMB0GA1UdDgQWBBQOBGSz4xOYWOVD6OeHf9lcLoew
+ZTAfBgNVHSMEGDAWgBQOBGSz4xOYWOVD6OeHf9lcLoewZTAPBgNVHRMBAf8EBTAD
+AQH/MAoGCCqGSM49BAMCA0gAMEUCIQC4NayBhsD+W9ze7erd1x4e/Wrla+8le+ds
+rPVXE4L+cgIgRfJz3fCPA6ZE+vXHvj6hB91XILT4mGWT0Cu9C3WhhRs=
 -----END CERTIFICATE-----
 )";
 
 constexpr const char* kCertD2100 = R"(-----BEGIN CERTIFICATE-----
-MIIBfDCCASGgAwIBAgIUaedAmIAiPL6rM288ZJvLbCN9RuowCgYIKoZIzj0EAwIw
-EjEQMA4GA1UEAwwHc2FtMTAtZDAgFw0yNTAxMDEwMDAwMDBaGA8yMTAwMDEwMTAw
-MDAwMFowEjEQMA4GA1UEAwwHc2FtMTAtZDBZMBMGByqGSM49AgEGCCqGSM49AwEH
-A0IABNQf0U9qemoxRWiVOFRrwtZrXuYAaJbq/WCeQR+Y1vPwVnW0EyjZaD48NtW3
-lErRQIcvgiGISgGAcu1v4npLpnqjUzBRMB0GA1UdDgQWBBQgj1pDhPUoOyNGLz6k
-qGASUM9jkjAfBgNVHSMEGDAWgBQgj1pDhPUoOyNGLz6kqGASUM9jkjAPBgNVHRMB
-Af8EBTADAQH/MAoGCCqGSM49BAMCA0kAMEYCIQCTI997wmQgKpChyE308AJrL9KL
-/GC1s+4mp3uPMqrJzgIhAMIT8Et4lMjYHR3Oebhucb2OGBpt2c+3TJek1Kz7lUyL
+MIIBdjCCAR2gAwIBAgIUaNceqrGQOFdHh6VFONJG94qnwCUwCgYIKoZIzj0EAwIw
+EDEOMAwGA1UEAwwFdmVjLWQwIBcNMjUwMTAxMDAwMDAwWhgPMjEwMDAxMDEwMDAw
+MDBaMBAxDjAMBgNVBAMMBXZlYy1kMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE
+T0DO8aGQgOc9IF9jBZ+LzoLg9jax60l21NoXofjZQ8iyeP4yzgYKjuI4pzyfY0S2
+l8hkcetLe0Y2GNreGKMtT6NTMFEwHQYDVR0OBBYEFC5gyUWAEil/2O3FE6BR3FDk
+Y/wUMB8GA1UdIwQYMBaAFC5gyUWAEil/2O3FE6BR3FDkY/wUMA8GA1UdEwEB/wQF
+MAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIgJn83dTUs2Vh0F+iRFCEUNYU0Tib5PDjH
+M2cU1aDJtMoCIH7REMkMnM+qvAgmDlxnJxmcIWhdN8tr6WL3e85jTri6
 -----END CERTIFICATE-----
 )";
 
 // notAfter 1969-12-31: an epoch <= 0 has no wire encoding, so it is refused.
 constexpr const char* kCertPreEpoch = R"(-----BEGIN CERTIFICATE-----
-MIIBejCCAR+gAwIBAgIUFQ47aRRKHLNR2nDeSqXY8i3sNEMwCgYIKoZIzj0EAwIw
-EjEQMA4GA1UEAwwHc2FtMTAtZTAeFw02MDAxMDEwMDAwMDBaFw02OTEyMzEwMDAw
-MDBaMBIxEDAOBgNVBAMMB3NhbTEwLWUwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC
-AAQzsz/Ene6DKiExxaY7wJZU2xcWlu2VHWyC3MGWu3PSWvkg/dyn9w+2gxXMpB7S
-YRNUT9guq+cwTeNBEybg8GQfo1MwUTAdBgNVHQ4EFgQUl9TcdlhF2RMWXsHeIsz2
-HyjoIiMwHwYDVR0jBBgwFoAUl9TcdlhF2RMWXsHeIsz2HyjoIiMwDwYDVR0TAQH/
-BAUwAwEB/zAKBggqhkjOPQQDAgNJADBGAiEAnFs8LV2bVxKu7Ar3WMZ3L75gJ+5Y
-N2JE2DQA3aHuQfcCIQCoQmbRfj87bVV5TwJqbzlKs+2xaM2o044JJyfUrbL+fg==
+MIIBdDCCARugAwIBAgIUJVmd56d4zxr5RtunFc+8gVsHBIQwCgYIKoZIzj0EAwIw
+EDEOMAwGA1UEAwwFdmVjLWUwHhcNNjAwMTAxMDAwMDAwWhcNNjkxMjMxMDAwMDAw
+WjAQMQ4wDAYDVQQDDAV2ZWMtZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABASp
+VKv4IkQekNmdKvuQdL66MjTWVRFyyB4WuNKdzusVPk4Bgm0hwQa3DK69W4VydX6m
+nNB2eQd+EZ8WTj4+JaejUzBRMB0GA1UdDgQWBBTqkD2ESX/zAxT5e9LNLr3HvPMm
+NDAfBgNVHSMEGDAWgBTqkD2ESX/zAxT5e9LNLr3HvPMmNDAPBgNVHRMBAf8EBTAD
+AQH/MAoGCCqGSM49BAMCA0cAMEQCIFgchyqAQYPgDBysRvVp04KdnNWJdzBB50r6
+5RGaETuOAiAQBbzbZypSJQcNros+X3eKLtD1YO69HlQzWYpB6VlJgg==
 -----END CERTIFICATE-----
 )";
 
@@ -236,4 +241,29 @@ TEST_CASE("licensing_x509: a notAfter before the Unix epoch is a failure with no
     const PemNotAfter mixed = parse_pem_not_after(std::string(kCertPreEpoch) + kCertA, 16);
     CHECK(mixed.expires_wire == std::vector<std::string>{kWireA});
     CHECK(mixed.parse_failure);
+}
+
+TEST_CASE("licensing_x509: an ENCRYPTED block is a parse failure and never a passphrase prompt",
+          "[licensing][x509]") {
+    // Without a password callback OpenSSL's default one reads a passphrase from
+    // the process's stdin (a daemon holding an open pipe blocks on it). The
+    // no-op callback must make this fail fast instead. Nothing here touches
+    // stdin or a terminal; the case also holds when stdin is an open pipe.
+    const std::string encrypted =
+        "-----BEGIN CERTIFICATE-----\n"
+        "Proc-Type: 4,ENCRYPTED\n"
+        "DEK-Info: AES-128-CBC,00112233445566778899AABBCCDDEEFF\n"
+        "\n" +
+        std::string(43, 'A') + "=\n"
+        "-----END CERTIFICATE-----\n";
+
+    const PemNotAfter alone = parse_pem_not_after(encrypted, 16);
+    CHECK(alone.expires_wire.empty());
+    CHECK(alone.parse_failure);
+    CHECK_FALSE(alone.cert_cap_hit);
+
+    // A readable certificate before it is kept; the encrypted one fails the file.
+    const PemNotAfter after = parse_pem_not_after(std::string(kCertA) + encrypted, 16);
+    CHECK(after.expires_wire == std::vector<std::string>{kWireA});
+    CHECK(after.parse_failure);
 }

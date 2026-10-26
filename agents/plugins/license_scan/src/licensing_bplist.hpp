@@ -1,6 +1,6 @@
 /**
  * licensing_bplist.hpp — bounded top-level string lookup in a binary property
- * list (`bplist00`), for the license_scan macOS mas_receipt surface (SAM.10).
+ * list (`bplist00`), for the license_scan macOS mas_receipt surface.
  *
  * PURE and plugin-local: bytes in, optional<string> out. No filesystem, no
  * CoreFoundation, no allocation beyond the returned string. It reads exactly

@@ -235,9 +235,8 @@ constexpr std::size_t kMaxCertsPerFile = 16;         // a 17th cert in one file 
 // open/read carry no deadline, O_NONBLOCK is inert on regular files) can
 // overrun it. /etc/pki/entitlement is a fixed root-owned path on the root
 // filesystem by subscription-manager's contract, so no mount-table guard here
-// (the README names this residual, same shape as runtimes/#4875). With the
-// in-process reads below the budget only bounds a slow filesystem, not a
-// subprocess; it replaces the 60 s gate the openssl runs needed.
+// (the README names this residual, same shape as runtimes/#4875). The reads
+// below are in-process, so the budget only bounds a slow filesystem.
 constexpr std::chrono::seconds kEntitlementCertsScanBudget{10};
 
 bool is_refusal(int err) {

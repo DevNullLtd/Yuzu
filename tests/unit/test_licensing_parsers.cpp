@@ -451,7 +451,7 @@ TEST_CASE("vocabulary helpers pin the §3.2 sets exactly", "[licensing][record]"
     CHECK_FALSE(is_valid_confidence("certain"));      // ditto
 }
 
-// ── entitlement_certs_outcome (pure decision seam, Wave 4 PR4.3b gate-3; SAM.10) ───
+// ── entitlement_certs_outcome (pure decision seam, Wave 4 PR4.3b gate-3) ───
 
 TEST_CASE("entitlement_certs_outcome: a budget-exhausted scan is never clean",
           "[licensing][entitlement_certs]") {

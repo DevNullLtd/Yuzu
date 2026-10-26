@@ -102,11 +102,16 @@ TEST_CASE("license_scan plugin: surfaces reports probe_status diagnostics via Lo
     CHECK(result.captured.find("probe_status|") != std::string::npos);
 
     // The typed ABI4 status the dispatch reported must be the one the probe_status
-    // lines imply (SAM.10): a refusal is PERMISSION_DENIED, any other failed surface
+    // lines imply: a refusal is PERMISSION_DENIED, any other failed surface
     // CONSTRAINED, an all-ok run leaves it UNDECLARED. Derived here from the output
-    // text, independently of surface_result_status, so a dropped or mis-wired
-    // propagate_surface_status call fails on any host that has a failing surface.
-    // (The precedence itself is pinned on the pure seam in test_licensing_parsers.cpp.)
+    // text, independently of surface_result_status.
+    //
+    // What this pins: the mapping, but only on a host that actually has a refused
+    // or failed surface. On a clean host (every CI runner) only the UNDECLARED arm
+    // runs, which a dropped propagate_surface_status call also yields, so this does
+    // not catch that deletion there. Delivery of the typed status through both the
+    // list and surfaces actions is closed by the real-host refusal probe recorded
+    // in the PR body, and the precedence by the pure seam in test_licensing_parsers.cpp.
     {
         INFO("full captured output: " << result.captured);
         const bool refused =
@@ -144,7 +149,7 @@ TEST_CASE("license_scan plugin: surfaces reports probe_status diagnostics via Lo
     INFO("full captured output: " << result.captured);
     CHECK(result.captured.find("probe_status|pkg_metadata|ok|") != std::string::npos);
 
-    // entitlement_certs is read in-process (licensing_x509.hpp, SAM.10): the
+    // entitlement_certs is read in-process (licensing_x509.hpp): the
     // surface always reports, the retired openssl-CLI token can never appear,
     // and on a host without /etc/pki/entitlement the line is exactly the
     // structural-empty success -- an absent directory is ENOENT, not an error.

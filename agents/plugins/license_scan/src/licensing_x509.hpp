@@ -1,6 +1,6 @@
 /**
  * licensing_x509.hpp — pure, in-process PEM → certificate expiry (`notAfter`)
- * for the license_scan Linux entitlement_certs surface (SAM.10).
+ * for the license_scan Linux entitlement_certs surface.
  *
  * Replaces the two `openssl x509 -noout -enddate` subprocess runs per
  * certificate with libcrypto called in this process (rung 1): PEM bytes in,
@@ -26,7 +26,9 @@
  *   - a certificate whose notAfter cannot be converted, or is before the Unix
  *     epoch, is `parse_failure` for that certificate and contributes no row;
  *   - more than `max_certs` certificates sets `cert_cap_hit` (certificates
- *     left unexamined) and stops.
+ *     left unexamined) and stops;
+ *   - an ENCRYPTED block (`Proc-Type: 4,ENCRYPTED`) is a parse failure, never
+ *     a passphrase prompt on stdin (x509_detail::no_password).
  * Non-certificate PEM blocks (the ENTITLEMENT DATA / RSA SIGNATURE blocks Red
  * Hat appends to entitlement certificates) are skipped by PEM_read_bio_X509's
  * own name matching, not treated as errors.
@@ -100,6 +102,15 @@ using X509Ptr = std::unique_ptr<X509, X509Deleter>;
         static_cast<unsigned>(tm_val.tm_mday)));
 }
 
+/// pem_password_cb that supplies no password. Without it PEM_read_bio_X509
+/// falls back to OpenSSL's default callback, which prompts on the process's
+/// stdin for an ENCRYPTED block; returning 0 makes PEM_do_header fail with
+/// PEM_R_BAD_PASSWORD_READ instead, which parse_pem_not_after reports as a
+/// parse failure.
+inline int no_password(char* /*buf*/, int /*size*/, int /*rwflag*/, void* /*userdata*/) noexcept {
+    return 0;
+}
+
 /// True when the most recent queued error is "no PEM start line" — the one
 /// clean end-of-input signal PEM_read_bio_X509 gives.
 [[nodiscard]] inline bool last_error_is_clean_eof() noexcept {
@@ -110,7 +121,8 @@ using X509Ptr = std::unique_ptr<X509, X509Deleter>;
 } // namespace x509_detail
 
 /// Every certificate's notAfter in `pem`, in file order, up to `max_certs`.
-/// Never throws and never touches the filesystem or a subprocess.
+/// Never throws on malformed input (only allocation failure can throw) and
+/// never touches the filesystem or a subprocess.
 [[nodiscard]] inline PemNotAfter parse_pem_not_after(std::string_view pem, std::size_t max_certs) {
     PemNotAfter out;
     if (pem.empty() || pem.size() > static_cast<std::size_t>(INT_MAX)) {
@@ -127,7 +139,8 @@ using X509Ptr = std::unique_ptr<X509, X509Deleter>;
 
     std::size_t read_ok = 0; // certificates decoded, whether or not notAfter converted
     for (;;) {
-        x509_detail::X509Ptr cert(PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr));
+        x509_detail::X509Ptr cert(
+            PEM_read_bio_X509(bio.get(), nullptr, x509_detail::no_password, nullptr));
         if (!cert) {
             if (!x509_detail::last_error_is_clean_eof())
                 out.parse_failure = true;

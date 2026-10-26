@@ -27,7 +27,7 @@
 #else
 #include <dirent.h>
 
-#include <posix_secure_read.hpp> // errno-aware bounded file read + directory open (SAM.10)
+#include <posix_secure_read.hpp> // errno-aware bounded file read + directory open
 #endif
 
 namespace yuzu::license_scan {
