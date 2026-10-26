@@ -14,24 +14,96 @@
 
 ## How it works
 
-Every action funnels its `path`/`root`/`directory` parameter through `validate_path` or `validate_path_or_parent`, which resolve symlinks via `fs::canonical` and, when `base_dir` is set, refuse anything that resolves outside it (`validate_path`, `validate_path_or_parent`). Reads never touch the target; the three write actions (`replace`, `write_content` on an existing file, `delete_lines`) go through `atomic_write_file` — writes stage through a randomly-named, exclusively-created sibling temp that is fsync'd (POSIX only — `F_FULLFSYNC`, then `fsync`, on macOS; the Windows leg writes through `std::ofstream` and does not fsync) and renamed into place (`agents/shared/atomic_file_write.hpp`) at the ordinary `0666 & ~umask` creation mode for a new file; an existing regular file keeps its rwx bits on POSIX (owner, group, ACLs and hard links are not preserved — the rename replaces the inode); a pre-existing file at the temp path fails the write rather than being followed or overwritten — while `append`, `create_temp`, `create_temp_dir`, and a fresh `write_content` open the target directly. `file_hash`/`find_by_hash` hash in-process via BCrypt on Windows (`compute_hash_win`) and by exec'ing an absolute-path `sha256sum`/`sha1sum`/`shasum` through the bounded subprocess runner on POSIX, never a shell (`compute_hash_unix`). `get_signature`/`get_version_info` are Windows/macOS-only: native `WinVerifyTrust`/`GetFileVersionInfoW` calls on Windows (`do_get_signature`, `do_get_version_info`), `/usr/bin/codesign`/`/usr/bin/plutil` exec'd through the same runner on macOS, each preceded by a BR-006 immediate re-validate-before-exec check that narrows (but does not eliminate) a TOCTOU window (the re-validate step in `do_get_signature`/`do_get_version_info`); both report an honest unsupported/`not_available` result on Linux (the final `#else` of `do_get_signature`/`do_get_version_info`). `search_dir`/`search`/`replace` share a ReDoS guard that rejects nested-quantifier regexes (`has_nested_quantifiers`); `search_dir`'s glob mode uses a hand-rolled matcher (`glob_match`).
+The filesystem plugin reads, inspects and edits files on the device the agent runs on. Its 16 actions fall into four groups: look (`exists`, `list_dir`, `read`, `search`, `search_dir`), identify (`file_hash`, `find_by_hash`, `get_signature`, `get_version_info`, `get_acl`), create (`create_temp`, `create_temp_dir`) and change (`write_content`, `replace`, `append`, `delete_lines`). Every action first turns the caller's path into its canonical form, following symlinks, and, if the caller also passes `base_dir`, refuses a path that resolves outside that directory. Reads never alter the target. Changes to an existing file (`replace`, `delete_lines`, and `write_content` with `overwrite=true`) are written to a new sibling file and renamed over the target, so a reader sees either the old or the new content. `append`, `write_content` creating a new file, and the temp-file actions open the target directly. It is deliberately not a file manager: there is no whole-file delete, rename or copy, and no ACL write; `get_acl` only reads.
 
-`get_acl` reads the extended ACL with a different native call per OS, then prints the same `ace|<type>|<principal>|<perms>|<flags>` row shape. Windows calls `GetNamedSecurityInfoW` for `OWNER|DACL`, emits the SDDL string and the DACL control flags, and walks the ACEs with `GetAce`, resolving each SID with `LookupAccountSidW` (falling back to the string SID). Linux reads the `system.posix_acl_access` attribute and, for a directory, `system.posix_acl_default` with `getxattr` (glibc, no libacl), decoding the binary value in the pure `filesystem_acl_parsers.hpp`; user and group ids are resolved with `getpwuid_r`/`getgrgid_r`. macOS calls `acl_get_file(ACL_TYPE_EXTENDED)` and parses the text from `acl_to_text`; a file with no extended ACL returns `ENOENT`, reported as `acl|none|-`. On Linux and macOS the whole ACL is acquired before any row is written, so a failure is one `error|` row and never a partial listing.
+How the main actions work:
 
-The plugin deliberately never calls a typed result-status setter — no `set_result_status`/`yuzu_ctx_set_result_status` call exists anywhere in `filesystem_plugin.cpp` — so every action's outcome is carried entirely in its pipe-delimited rows and return code; see *Result status* below. It also deliberately stops at line-range deletion and ACL *reads* (see the `get_acl` paragraph above): there is no whole-file delete, no rename, and no ACL/DACL *write* action anywhere in the action list.
+- **Hashing.** `file_hash` and `find_by_hash` hash in process on Windows (BCrypt). On macOS and Linux they run `shasum` or `sha256sum`/`sha1sum` by absolute path, with no shell, through the bounded subprocess runner (`compute_hash_unix`, 300 second deadline per file).
+- **Signature and version.** `get_signature` and `get_version_info` exist on Windows and macOS only. Windows uses `WinVerifyTrust` and `GetFileVersionInfoW` in process; macOS runs `/usr/bin/codesign` and `/usr/bin/plutil` through the same runner, re-validating the path immediately before the exec. On Linux both answer `error|` with a non-zero return code.
+- **Search.** `search`, `search_dir` and `replace` reject regexes with nested quantifiers (`has_nested_quantifiers`) to avoid catastrophic backtracking, and limit patterns to 256 characters. `search_dir` matches entry names only, as a glob (`glob_match`) or a regex, never file contents.
+- **Atomic writes.** The temporary file is created exclusively with a random name, written, flushed to disk with `fsync` on macOS and Linux (`F_FULLFSYNC` first on macOS; the Windows leg does not fsync), then renamed into place (`atomic_write_file`). A new file gets the usual `0666` minus umask; an existing file keeps its permission bits on POSIX, but its owner, group, ACLs and hard links are not carried over because the rename replaces the file. A leftover file at the temp path fails the write rather than being followed.
+- **`get_acl`.** Each OS reads its native ACL (see the table below) and prints it in the same `ace|<type>|<principal>|<access>|<flags>` row shape.
+
+The plugin never sets a typed result status; every outcome is carried in its rows and return code (see Result status).
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow<br/>dispatches definition] --> SRV[Server<br/>authz: FileRetrieval.Read/Write/Delete<br/>ExecuteGate: None or AdminOrApproval]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[filesystem.execute]
-  EX --> VAL[validate_path / validate_path_or_parent<br/>fs::canonical + optional base_dir]
-  VAL --> WIN[Windows leg<br/>native std::filesystem / BCrypt /<br/>WinVerifyTrust / GetFileVersionInfoW / win32 ACL]
-  VAL --> MAC[macOS leg<br/>native std::filesystem +<br/>subprocess_runner: shasum / codesign / plutil]
-  VAL --> LIN[Linux leg<br/>native std::filesystem +<br/>subprocess_runner: sha256sum / sha1sum]
-  WIN & MAC & LIN --> ROWS[pipe rows<br/>no typed result status]
-  ROWS --> RS[(ResponseStore<br/>90-day default retention)]
-  RS --> API[REST /api/responses · MCP execute_instruction]
+  OP["Operator or workflow"] --> SRV["Server: authz FileRetrieval Read, Write or Delete, gate None or AdminOrApproval"]
+  SRV -- "gRPC mTLS" --> HOST["Agent plugin host"] --> EX["filesystem.execute"]
+  EX --> VAL["validate_path: canonical path, optional base_dir"]
+  VAL --> WIN["Windows leg: std::filesystem, BCrypt, WinVerifyTrust, version info, Win32 ACL"]
+  VAL --> MAC["macOS leg: std::filesystem, shasum, codesign, plutil, ACL"]
+  VAL --> LIN["Linux leg: std::filesystem, sha256sum, sha1sum, xattr ACL"]
+  WIN --> ROWS["Pipe rows, result status UNDECLARED"]
+  MAC --> ROWS
+  LIN --> ROWS
+  ROWS --> RS[("ResponseStore, 90 day default retention")] --> API["REST /api/responses, MCP execute_instruction"]
 ```
+
+### What you can decide with it
+
+| Question | Action | What you get and its limits |
+|---|---|---|
+| Is there a file or directory here, and how big? | `exists`, `list_dir` | `exists` reports `true` or `false`, the type and size. `list_dir` returns one `entry` row per item and stops at 1000 entries with a `warning\|` row. |
+| What does this text file say? | `read`, `search` | `read` returns up to 10000 lines per call from a 1-based offset and refuses a file whose first 512 bytes contain a NUL byte; `search` returns up to 10000 matching lines. Both refuse a file over 100 MB. |
+| Where is a directory or file named like this? | `search_dir` | Name matches under a root, depth up to 20, up to 1000 results. It does not look inside files. |
+| Is this the file I expect, or does a known file exist anywhere here? | `file_hash`, `find_by_hash` | SHA-256 or SHA-1 of one file (up to 10 GB). `find_by_hash` sweeps a directory tree for a SHA-256, see Caveat 2 for what a "no match" means. |
+| Is it signed, and which version is it? | `get_signature`, `get_version_info` | Windows and macOS only, with narrow meanings (Caveat 5). Linux has no equivalent and answers an error. |
+| Who can touch it? | `get_acl` | Per-OS decode below. |
+| Make a change | `write_content`, `replace`, `append`, `delete_lines`, `create_temp`, `create_temp_dir` | See the safe workflow below. All need an administrator or an approval. |
+
+**Safe workflow for changes.** There is no backup and no undo: a change overwrites the file, and the old content is gone unless you kept a copy elsewhere. Work in this order: confirm the target with `exists` and `read` (or `search` to find the line); use `replace` with `dry_run=true` to see how many replacements it would make, since the other change actions have no preview; apply the change; verify by `read`, `search` or `file_hash`. Target rules: the path must already exist, except `write_content` with `create=true`, whose parent directory must exist. `write_content` refuses to touch an existing file unless `overwrite=true`, and refuses to create one unless `create=true`. `replace`, `append` and `delete_lines` need a regular file, and the text actions treat the file as lines (`delete_lines` rewrites the file so it always ends with a newline). With `regex=true`, `replace` expands `$1`-style references in the replacement only when `max_replacements` is 0; with a limit it inserts the replacement text literally, so the same replacement string can behave differently with and without a limit.
+
+**`get_acl` by OS.**
+
+| OS | Source | What you see | Not shown |
+|---|---|---|---|
+| Windows | `GetNamedSecurityInfoW` owner and DACL | `sddl`, `control` flags, one `ace` row per entry (allow, deny, conditional and object types; principal as `DOMAIN\name` or SID; hex access mask; inherit flags) | The SACL (needs `SeSecurityPrivilege`); condition expressions are ignored. A NULL DACL (everyone allowed) prints no `ace` rows. |
+| Linux | `system.posix_acl_access` and, for a directory, `system.posix_acl_default` | owner, group, `permissions`, `mode`, `acl\|none\|extended`, one `ace` row per entry | An ACL over 64 KiB is an error. Only the first 64 distinct ids are resolved to names; the rest print as numbers. |
+| macOS | `acl_get_file(ACL_TYPE_EXTENDED)` | owner, group, `permissions`, `mode`, `acl` row, one `ace` row per entry in stored order | No extended ACL, and also FAT or exFAT volumes, print `acl\|none`. An unresolved principal prints as its UUID. |
+
+On Linux and macOS the whole ACL is read before any row is written, so a failure is one `error|` row. On Windows an error part-way through the entries can follow rows already written.
+
+### Diagrams
+
+#### Write path
+
+```mermaid
+sequenceDiagram
+  participant S as Server
+  participant P as filesystem plugin
+  participant D as Disk
+  S->>P: replace with path, search, replacement, optional base_dir
+  P->>D: canonicalize path, check base_dir, regular file, size cap
+  D-->>P: file bytes read into memory
+  P->>P: match and substitute in memory
+  alt dry_run is true or nothing matched
+    P-->>S: replacements_made and sizes, file untouched
+  else changes to write
+    P->>D: create sibling temp exclusively, write, fsync, rename over target
+    P-->>S: replacements_made and sizes
+  end
+```
+
+`replace`, `delete_lines` and `write_content` on an existing file all follow the atomic path above. `append` and `write_content` on a new file skip the temp-and-rename step and write straight into the target, so an interrupted write can leave a partial file. The size cap is checked before anything is read, and the result is built entirely in memory.
+
+#### find_by_hash
+
+```mermaid
+flowchart TD
+  W["Walk the tree up to max_depth"] --> F{"Regular file?"}
+  F -- "no" --> N["Skip silently"]
+  F -- "yes" --> Z{"Empty, or over 10 GB?"}
+  Z -- "yes" --> N
+  Z -- "no" --> H["Hash the file with SHA-256"]
+  H --> E{"Hash produced?"}
+  E -- "no" --> N
+  E -- "yes" --> M{"Equals the target hash?"}
+  M -- "no" --> N
+  M -- "yes" --> R["Emit a match row, stop after 100 matches"]
+```
+
+Every skip is silent. A file that cannot be read, a hash tool that fails or exceeds its deadline, and a directory the agent cannot enter all take the "skip silently" path, so a result of `matches_found|0` can mean "not there" or "could not look".
 
 ## OS capability
 
@@ -60,11 +132,13 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | **LocalSystem today** (`docs/agent-privilege-model.md:70`, tracked #1442; target is the virtual service account `NT SERVICE\YuzuAgent`) | None for any read action. `write_content`/`replace`/`append`/`delete_lines` against a path the running account cannot already write need that account to be an `Administrators` member; default install grants nothing (`docs/agent-privilege-model.md:118`) | 2026-10-04, bare metal, as `LocalSystem (elevated)` (`docs/samples/windows.txt:1`) | a single `error\|<message>` line + return code 1 (e.g. `error\|GetNamedSecurityInfo failed (error N)`) — no typed status is set |
-| macOS | **root** — the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md:14`) | None for any read action. Write actions against a path with no operator-authored per-path sudo entry are refused by the OS itself at `open()`/`rename()`; default install grants nothing (`docs/agent-privilege-model.md:118`) | 2026-10-04, bare metal, **unprivileged** at euid 501 (jsmith) — the capture ran through `LocalDispatcher`/`PluginHandle::load`, not the real root daemon (`docs/samples/macos.txt:1`) | same `error\|<message>` + rc 1 shape |
-| Linux | `yuzu` unprivileged system account (`docs/agent-privilege-model.md:12,52`) | None for any read action. Write actions against system paths need an operator-authored per-path sudo entry; default install grants nothing (`docs/agent-privilege-model.md:118`) | 2026-10-04, container, as euid 0 (root) (`docs/samples/linux.txt:1`) — also not the least-privilege `yuzu` account | same `error\|<message>` + rc 1 shape |
+| Windows | **LocalSystem today** (`docs/agent-privilege-model.md`, tracked #1442; the target is the virtual service account `NT SERVICE\YuzuAgent`) | None for any read action. `write_content`, `replace`, `append` and `delete_lines` against a path the running account cannot already write need that account to be an `Administrators` member; the default install grants nothing | 2026-10-04, bare metal, as `LocalSystem (elevated)` | a single `error\|<message>` line and return code 1 (for example `error\|GetNamedSecurityInfo failed (error N)`); no typed status is set |
+| macOS | **root** today: the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md`) | None for any read action. Write actions against a path with no operator-authored per-path sudo entry are refused by the OS at `open()` or `rename()`; the default install grants nothing | 2026-10-04, bare metal, **unprivileged** at euid 501; the capture ran through `LocalDispatcher`, not the root daemon | same `error\|<message>` and return code 1 |
+| Linux | `yuzu` unprivileged system account (`docs/agent-privilege-model.md`) | None for any read action. Write actions against system paths need an operator-authored per-path sudo entry; the default install grants nothing | 2026-10-04, container, as euid 0 (root), so not the least-privilege `yuzu` account | same `error\|<message>` and return code 1 |
 
-Subprocesses: `shasum` (macOS) / `sha256sum`, `sha1sum` (Linux) for `file_hash`/`find_by_hash` (`compute_hash_unix`); `/usr/bin/codesign` for macOS `get_signature` (`do_get_signature`); `/usr/bin/plutil` for macOS `get_version_info` (`do_get_version_info`) — every one invoked by absolute path with no shell, through `yuzu::agent::run_bounded_subprocess`. No network access on any OS.
+Subprocesses: `shasum` (macOS) and `sha256sum`/`sha1sum` (Linux) for `file_hash` and `find_by_hash` (`compute_hash_unix`); `/usr/bin/codesign` for macOS `get_signature` (`do_get_signature`); `/usr/bin/plutil` for macOS `get_version_info` (`do_get_version_info`). Every one is invoked by absolute path with no shell through `yuzu::agent::run_bounded_subprocess`. No network access on any OS.
+
+Who may run what is decided by the compiled capability row, not by the header's role line. The plugin description says "admin-only", but the read actions run for `endpoint-operator` as well as `endpoint-admin`; the write actions, `create_temp`, `create_temp_dir` and `find_by_hash` carry the `AdminOrApproval` gate. `permissions.executeRoles` in the definition YAML is documentation only and is not an access-control guarantee.
 
 ## Data contract
 
@@ -149,7 +223,9 @@ Subprocesses: `shasum` (macOS) / `sha256sum`, `sha1sum` (Linux) for `file_hash`/
 
 ### Outputs
 
-Every action writes pipe-delimited `key|value` lines via `ctx.write_output()`. A *repeating* row (`list_dir`'s entries, `get_acl`'s ACEs (every OS), `search`/`search_dir`/`find_by_hash`'s matches, `read`'s lines) is prefixed with a literal discriminator word naming the row's kind, then its fields; a single-value field is its own `key|value` line with no discriminator. There is no shared placeholder row for "found nothing" — a zero-hit action reports only its trailing count (`total_matches|0`, `matches_found|0`) with no rows above it. Failure always ends with an `error|<message>` line and a non-zero return code, never a placeholder success row (see *Result status*); on Windows `get_acl` the SDDL, control and earlier ACE rows may already have been written before a mid-walk failure (`GetAce`, `GetAclInformation`, a malformed ACE). For `get_acl` the `ace` row is repeating on every OS (`ace|<type>|<principal>|<access>|<flags>`, `-` for an empty field; `<access>` is the permission text on Linux and macOS and a hex access mask on Windows, `-` for an ACE type the plugin does not decode); `acl|<none|extended|unsupported>|<acl flags or ->` (Linux, macOS) and `control|<flags or ->` (Windows) are single-value rows.
+Every action writes pipe-delimited lines. A repeating row (`list_dir`'s `entry` rows, `get_acl`'s `ace` rows on every OS, `search_dir`'s `result` rows, `find_by_hash`'s `match` rows, `read`'s and `search`'s line rows) starts with a literal word naming its kind, then its fields; a single-value field is its own `key|value` line. There is no placeholder row for "found nothing": a zero-hit action reports only its trailing count (`total_matches|0`, `matches_found|0`). Failure always ends with an `error|<message>` line and a non-zero return code, never a placeholder success row (see Result status). For `get_acl` the `ace` row is `ace|<type>|<principal>|<access>|<flags>`, with `-` for an empty field and `<access>` as permission text on Linux and macOS but a hex access mask on Windows; `acl|<none|extended|unsupported>|<acl flags or ->` (Linux, macOS) and `control|<flags or ->` (Windows) are single-value rows.
+
+Two places where the emitted rows and the declared columns differ, so match on the emitted names. `delete_lines` emits `lines_deleted`, `total_lines_before` and `total_lines_after`, while its definition declares `lines_before` and `lines_after`. `append`'s `total_size` is not the size after the append (see Caveat 3).
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`device.filesystem.append` — `status|bytes_appended|total_size`**
@@ -315,15 +391,17 @@ Every action writes pipe-delimited `key|value` lines via `ctx.write_output()`. A
 
 ### Result status
 
-This plugin does not set a typed result status — no `set_result_status`/`yuzu_ctx_set_result_status` call exists in `filesystem_plugin.cpp` — so the agent records `UNDECLARED`, and every sample capture below shows `UNDECLARED / UNKNOWN /`. A refusal (bad path, missing parameter, wrong file type, tool failure) is instead reported as a single `error|<message>` output line with return code 1; a caller must parse that line, not a status field, to detect failure.
+| Status | Completeness | Provenance | When |
+|---|---|---|---|
+| `UNDECLARED` | `UNKNOWN` | (empty) | every action on every OS: the plugin never sets a typed result status. A refusal (bad path, missing parameter, wrong file type, tool failure) is one `error\|<message>` output line with return code 1, so a caller must parse that line, not a status field, to detect failure |
 
 ### Where the data goes
 
-- **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention, `server/core/src/response_store.hpp:8,152`), queryable at `/api/responses/{id}`.
-- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — grepping the server tree for `device.filesystem.` and for the plugin name outside the capability catalogue and generic result-parsing table (`server/core/src/result_parsing.hpp:66`) finds no sync-source, TAR, or DEX consumer. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its 16 definitions.
-- **Sensitivity.** `get_acl` rows carry local account names (`owner`/`group` on Linux and macOS, and the principal of every `ace` row on all three OSes — potentially real usernames, not just built-in principals) and `get_version_info`/`get_signature` rows name specific installed software (`company_name`, `product_name`, `file_description`) — an installed-software inventory by another route; every action's `path`/`content` fields carry whatever the operator pointed at, which can include usernames embedded in home-directory paths or arbitrary personal data in file contents.
-- **Siblings:** `filesystem_posture.mounts`/`.quotas`/`.snapshots` — a separate, similarly-named, read-only plugin (mount/quota/snapshot inventory only; no read-file, hash, or write actions) — do not confuse the two (see Caveats). Two shipped workflow definitions chain this plugin's actions: `workflow.config_search_and_replace` (`content/definitions/t2_chaining_examples.yaml:15`) searches a config file then dispatches `filesystem.replace`, and `workflow.version_compliance_check` (`content/definitions/t2_chaining_examples.yaml:206`) dispatches `filesystem.get_version_info` and compares the result against a minimum version.
-- **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.filesystem.file_hash")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
+- **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention), queryable at `/api/responses/{id}`.
+- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX or metrics: no sync source, TAR or DEX consumer reads `device.filesystem.*` results, only the generic result parser does. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its 16 definitions.
+- **Sensitivity.** `get_acl` rows carry local account names (`owner` and `group` on Linux and macOS, and the principal of every `ace` row on all three OSes), potentially real usernames. `get_version_info` and `get_signature` rows name specific installed software (`company_name`, `product_name`, `file_description`), an installed-software inventory by another route. `read`, `search` and `write_content` carry whatever the operator pointed them at, which can include credentials or personal data in file contents or usernames in paths.
+- **Siblings:** `filesystem_posture.mounts`, `.quotas` and `.snapshots` are a separate, similarly named, read-only plugin (mount, quota and snapshot inventory only; no read, hash or write actions); do not confuse the two. Two shipped workflow definitions chain this plugin's actions: `workflow.config_search_and_replace` (in `t2_chaining_examples.yaml`) searches a config file then dispatches `replace`, and `workflow.version_compliance_check` dispatches `get_version_info` and compares the result against a minimum version.
+- **MCP / REST.** Discover: `discover_plugins` (summary), then `yuzu://plugin-docs` (this page as data), then `discover_instructions` or `get_definition("device.filesystem.file_hash")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
@@ -674,11 +752,11 @@ total_lines_after|1
 
 ## Caveats and known gaps
 
-1. **`executeRoles` in the YAML is advisory, not enforced.** Since #1398, raw dispatch authorizes on the compiled `(plugin,action)` pair's securable/operation plus its `ExecuteGate` — `permissions.executeRoles` in `InstructionDefinition` YAML is retired to documentation only (`changelog.d/1398-dispatch-approval-gate.security.md`). Do not treat the Roles row above as an access-control guarantee; the real gate is the Security row.
-2. **`delete_lines`'s output field names don't match its own YAML.** The plugin emits `lines_deleted|total_lines_before|total_lines_after` (`do_delete_lines`), but `content/definitions/t2_capabilities.yaml:571-576` declares `lines_deleted`/`lines_before`/`lines_after` — a genuine drift between the shipped result and its own schema. This README's Outputs table uses the runtime field names; `t2_capabilities.yaml` is out of this PR's ownership scope, so the mismatch is flagged here rather than silently "corrected" in either direction.
-3. **The tests beside this plugin are easy to misread as coverage of the real plugin, and only `replace` and `get_acl` run through it.** `filesystem_posture` is a separate, read-only plugin for `mounts`/`quotas`/`snapshots` with a confusingly similar name; two of its test files (`test_filesystem_posture_local_dispatcher.cpp`, `test_filesystem_posture_parsers.cpp`) sit alongside this plugin's own tests in `tests/unit/` and are not filesystem's own coverage — see *Source and tests*. Of this plugin's own tests, `tests/unit/test_filesystem_local_dispatcher.cpp` loads `filesystem.dylib`/`.so`/`.dll` via `LocalDispatcher` and drives `replace` through `atomic_write_file` (the replacement lands by rename onto a new inode, the retired fixed `.yuzu_tmp` name is never touched, no temp survives, creation mode follows the umask), and `tests/unit/test_filesystem_get_acl_dispatcher.cpp` does the same for `get_acl`. Every other action is covered only by `test_filesystem_actions.cpp` and `test_filesystem_read.cpp`, which replicate the plugin's helper logic (`validate_path`, `glob_match`, etc.) in the test TU's own anonymous namespace (`tests/unit/test_filesystem_actions.cpp:12-13`, `tests/unit/test_filesystem_read.cpp:5-6`) — a regression in the real `.cpp` that the replica doesn't share would not be caught by those suites. `atomic_write_file` is not replicated: it is a thin adapter over the production `yuzu::shared::write_file_atomic`, and the test-local adapter in `test_filesystem_actions.cpp` calls that same primitive.
-4. **macOS/Linux `get_signature`/`get_version_info`'s TOCTOU re-check is a narrowing, not a fix.** The BR-006 comments in the code say so explicitly: an unprivileged writer inside `base_dir` can still win a race between the re-validate call and codesign's/plutil's own `open()`, because both are path-based external tools (the re-validate step in `do_get_signature`/`do_get_version_info`). `base_dir` must not be writable by lower-privileged principals.
-5. **`get_acl` decodes what the OS reports and no more.** Object ACEs are decoded by layout only; conditional ACE expressions are not decoded (the SID and mask are real, the condition blob is ignored), and any other undecoded Windows type prints `other` with principal and mask `-`. The SACL is not read (it needs `SeSecurityPrivilege`). A Windows file with a NULL DACL (no ACL, everyone allowed) reports the SDDL and control rows and no ACE rows. A failure returns an `error|` row and a non-zero code: on Linux and macOS before any row (the whole ACL is acquired first), on Windows possibly after the SDDL and earlier ACE rows. On Linux, when an ACL exists the `permissions|`/`mode|` group bits are the ACL mask, and `acl|none` means no extended entries beyond the mode bits. A POSIX ACL over 64 KiB is `error|acl too large (over 64 KiB)`. Qualifier names are resolved once per distinct id and only for the first 64 ids; the rest print the numeric id, because name lookup goes through NSS, which has no deadline (a dead directory service can still stall the owner and group lookups). On macOS, names resolve through membership lookups inside `acl_to_text`, which are also unbounded; entries are listed in the order the OS stores them (deny first in the sample), an unresolved principal is its UUID, and `ENOENT` (no ACL, and also what FAT and exFAT volumes return) is `acl|none`. The stat and the ACL read are separate path lookups, so a path swapped between them can mix two files' answers (the same `base_dir` posture as the other actions). Free-text fields are escaped for the row grammar: CR/LF fold to a space, pipes are escaped and a trailing backslash becomes `/`.
+1. **Size and count limits apply, and most stop without a marker.** `read`, `search`, `replace` and `delete_lines` refuse a file over 100 MB, and `write_content` refuses content over 100 MB, each with an `error|` row; `file_hash` refuses a file over 10 GB; `append` has no size check. `list_dir` stops at 1000 entries and says so with a `warning|` row, but `search_dir` (at most 1000 results) and `search` (at most 10000 lines) simply stop at their cap, so a count equal to the cap means there may be more.
+2. **`find_by_hash` is a bounded sweep, not proof of absence.** It stops silently after 100 matches, goes at most 10 levels deep (default 3), skips empty files and files over 10 GB, and skips any file or directory it cannot read or hash, including a hash that exceeds its 300 second deadline on macOS and Linux. `matches_found|0` therefore means "not found among what could be read", and on macOS and Linux each candidate costs one hash subprocess.
+3. **`append` reports a stale `total_size`.** The size is read while the written bytes are still buffered, so on the captured 20-byte file it reported `total_size|20` after appending 22 bytes; treat it as the size before the append and use `exists` or `read` to get the real size. Because the same check runs before the buffer is flushed, a write failure at flush time (for example a full disk) can still print `status|ok`.
+4. **`base_dir` is the caller's own narrowing, and path checks leave a small race.** It is an optional parameter on each request, not an agent-side policy, so a request that omits it is not restricted, and `find_by_hash` and `create_temp` do not take it at all. The re-validation just before `codesign` and `plutil` narrows but cannot close the window in which a writer inside `base_dir` swaps the path for a symlink, so `base_dir` must not be writable by lower-privileged principals.
+5. **Signature and version answers are narrow.** On Windows `get_signature` verifies only an embedded Authenticode signature and does not check revocation, so a file signed through a Windows catalog (as many operating-system binaries are, including `notepad.exe` in the captured sample) reports `unsigned`. On macOS `valid` means the code signature's seal is intact, not that the code is trusted or notarized, and a timed-out or truncated `codesign` or `plutil` run is reported as `unknown` or `not_available` rather than as a failure.
 
 ## Source and tests
 
