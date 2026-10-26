@@ -234,7 +234,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
     var d = flat(deref(inner), seen, 0, { n: 0 });
     var alts = d.oneOf || d.anyOf;
     if (alts && alts.length) {
-      if (d.xCut && !d.properties) budget.skipped++; // with properties, schemaRows below counts it
+      if (d.xCut && !d.properties) budget.skipped++;
       var akids = [h('div', 'sw-schema-head', [pill(d.oneOf ? 'one of' : 'any of', 'info mono'), d.description ? h('span', 'mut', [d.description]) : null])];
       // Properties declared beside the alternatives apply to every option; show them first.
       var shared = d.properties ? schemaRows(s, 0, seen, false, [], 0, budget) : [];
