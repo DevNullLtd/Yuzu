@@ -194,8 +194,9 @@ enum class GuardCheck { kOk, kFailed, kInconclusive };
 // is ENABLE ALWAYS ('A'), is a ROW BEFORE UPDATE trigger (tgtype & 19 = 19) with no WHEN
 // clause, lists all five guarded columns, and calls the pinned function body. A missing
 // sessions table (a rename fault, a drop) is INCONCLUSIVE rather than a failure: it is
-// not evidence about the trigger and every session query fails on it anyway.
-GuardCheck check_rebind_guard(PGconn* conn) {
+// not evidence about the trigger and every session query fails on it anyway. When `cause` is
+// given, an inconclusive result describes why (SQLSTATE and server message, or the row count).
+GuardCheck check_rebind_guard(PGconn* conn, std::string* cause = nullptr) {
     PgResult r = exec_params(
         conn,
         "SELECT COALESCE(t.tgenabled = 'A' "
@@ -217,10 +218,23 @@ GuardCheck check_rebind_guard(PGconn* conn) {
         "LEFT JOIN pg_proc p ON p.oid = t.tgfoid "
         "WHERE n.nspname = 'session_store' AND c.relname = 'sessions' AND c.relkind = 'r'",
         std::vector<std::string>{std::string(kRebindGuardBody)});
-    if (r.status() != PGRES_TUPLES_OK)
+    if (r.status() != PGRES_TUPLES_OK) {
+        if (cause) {
+            const char* state = PQresultErrorField(r.get(), PG_DIAG_SQLSTATE);
+            std::string msg = PQerrorMessage(conn);
+            while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r'))
+                msg.pop_back();
+            *cause = std::string("catalog query failed, SQLSTATE ") + (state ? state : "none") +
+                     ": " + msg;
+        }
         return GuardCheck::kInconclusive;
-    if (PQntuples(r.get()) != 1)
+    }
+    if (PQntuples(r.get()) != 1) {
+        if (cause)
+            *cause = "catalog query returned " + std::to_string(PQntuples(r.get())) +
+                     " rows for session_store.sessions, expected 1";
         return GuardCheck::kInconclusive;
+    }
     return std::string_view(PQgetvalue(r.get(), 0, 0)) == "t" ? GuardCheck::kOk
                                                               : GuardCheck::kFailed;
 }
@@ -694,9 +708,14 @@ void SessionStore::revalidate_rebind_guard_if_due(PGconn* conn) const {
     if (!next_validation_steady_ms_.compare_exchange_strong(
             due, now + validation_memo_ms_.load(std::memory_order_relaxed)))
         return;
-    const GuardCheck verdict = force_inconclusive_for_test_.load(std::memory_order_relaxed)
-                                   ? GuardCheck::kInconclusive
-                                   : check_rebind_guard(conn);
+    std::string cause;
+    GuardCheck verdict;
+    if (force_inconclusive_for_test_.load(std::memory_order_relaxed)) {
+        verdict = GuardCheck::kInconclusive;
+        cause = "forced by the test seam";
+    } else {
+        verdict = check_rebind_guard(conn, &cause);
+    }
     switch (verdict) {
     case GuardCheck::kOk:
         last_validation_inconclusive_.store(false, std::memory_order_release);
@@ -709,9 +728,15 @@ void SessionStore::revalidate_rebind_guard_if_due(PGconn* conn) const {
     case GuardCheck::kInconclusive:
         // Not evidence about the trigger (query error, table unreachable): retry on the
         // next find rather than waiting out the memo and do not latch. The row is still served,
-        // but flagged `guard_unverified` so a binding decision refuses this read.
-        last_validation_inconclusive_.store(true, std::memory_order_release);
-        next_validation_steady_ms_.store(0, std::memory_order_relaxed);
+        // but flagged `guard_unverified` so a binding decision refuses this read. The cause is
+        // logged once per episode (on the transition), not on every retry. The memo reset is a
+        // release store so a thread that wins the CAS at 0 also sees the flag stored above.
+        if (!last_validation_inconclusive_.exchange(true, std::memory_order_acq_rel))
+            spdlog::warn("SessionStore: the rebind-guard check could not run ({}); local MFA "
+                         "binding reads are refused as unavailable until a check succeeds, "
+                         "session validation is unaffected",
+                         cause);
+        next_validation_steady_ms_.store(0, std::memory_order_release);
         return;
     }
 }

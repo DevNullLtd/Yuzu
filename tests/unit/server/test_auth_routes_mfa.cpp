@@ -2410,6 +2410,9 @@ TEST_CASE("an inconclusive rebind-guard validation refuses that one local proof 
     CHECK(raw.source == auth::DurableMfaProof::Source::kRow);
     CHECK(raw.guard_unverified);
     CHECK(h.sessions->rebind_guard_ok());
+    // Liveness (the Settings enrolment gate) is not a binding read and is not refused.
+    CHECK(h.auth_mgr.durable_session_liveness(token, "admin") ==
+          auth::DurableSessionLiveness::kLive);
 
     const double validate_before = degrade("validate");
     const double latch_before = degrade("rebind_guard");
@@ -2437,8 +2440,10 @@ TEST_CASE("an inconclusive rebind-guard validation refuses that one local proof 
         CHECK(res->status == 200);
     }
 
-    // The next read validates afresh: the local approver is admitted again.
+    // The next read validates afresh: the local approver is admitted again, and a confirmed read
+    // counts no degrade.
     h.sessions->set_binding_validation_inconclusive_for_test(false);
+    const double validate_unverified = degrade("validate");
     {
         auto fx = fx_for(false);
         const auto ticket = fx->submit();
@@ -2447,6 +2452,7 @@ TEST_CASE("an inconclusive rebind-guard validation refuses that one local proof 
         CHECK(res->status == 200);
         CHECK(fx->status_of(ticket) == "approved");
     }
+    CHECK(degrade("validate") == validate_unverified);
 }
 
 // Enrol then approve at once, through the real enrolment route and the real approval route:

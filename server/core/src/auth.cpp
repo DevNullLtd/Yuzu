@@ -2018,8 +2018,9 @@ DurableMfaProof AuthManager::read_durable_mfa_proof(const std::string& token,
     if (f.row.username != expected_username)
         return {DurableMfaProof::Source::kAbsent, 0, 0};
     // The row is returned as read. Whether its stored generation may be trusted as a binding
-    // is the caller's decision (`stored_binding_trustworthy`): the binding applies to a local
-    // session only, so an OIDC approver reading its IdP-seeded proof is not refused for it.
+    // is the caller's decision (`stored_binding_trustworthy` for the sticky latch,
+    // `stored_binding_read_confirmed` for this read's `guard_unverified`): the binding applies to
+    // a local session only, so an OIDC approver reading its IdP-seeded proof is not refused.
     return {.source = DurableMfaProof::Source::kRow,
             .mfa_verified_ms = f.row.mfa_verified_ms,
             .db_now_ms = f.db_now_ms,
@@ -2046,9 +2047,14 @@ bool AuthManager::stored_binding_read_confirmed(const DurableMfaProof& proof) co
     // One catalog validation that could not run: not evidence the trigger is gone, so this is a
     // transient degrade of this read (counted as a validate degrade, retried by the caller), not
     // the sticky `rebind_guard` latch.
-    spdlog::warn("stored_binding_read_confirmed: the session store's rebind guard could not be "
-                 "validated for this read - refusing it as unavailable");
     note_session_store_degrade("validate");
+    // Logged on the first refusal and every kUnverifiedReadLogEvery-th after it, so a persistent
+    // catalog fault cannot become a log storm; the cause is logged once by the session store.
+    const auto n = unverified_read_refusals_.fetch_add(1, std::memory_order_relaxed);
+    if (n % kUnverifiedReadLogEvery == 0)
+        spdlog::warn("stored_binding_read_confirmed: the session store's rebind guard could not be "
+                     "validated - refusing local binding reads as unavailable ({} so far)",
+                     n + 1);
     return false;
 }
 

@@ -1801,6 +1801,10 @@ private:
     /// counters). No-op when no MetricsRegistry is wired (tests/CLI).
     void note_session_store_degrade(const char* op) const;
 
+    /// `stored_binding_read_confirmed` logs its first refusal and every this-many-th after it.
+    static constexpr std::uint64_t kUnverifiedReadLogEvery = 100;
+    mutable std::atomic<std::uint64_t> unverified_read_refusals_{0};
+
     /// Reconstruct a cache `Session` from a durable `SessionRow` PLUS the DB
     /// clock at read time (`db_now_ms`, from `SessionStore::find`). Sets the
     /// authored wall-clock absolutes AND the local monotonic steady deadlines

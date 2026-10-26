@@ -1740,8 +1740,9 @@ with no enrolled factor, API tokens and SSO sessions are not affected by this. T
 cannot be reconstructed. Repairing the trigger is not enough; the restart is the gate back in.
 
 **What the gauge can and cannot tell you.** It reads an in-process flag that a request-driven
-validation sets (at most one catalog query per minute per process, on an MFA status read for `auth`
-and a session lookup for `session`). A tampering that is in place when a validation runs (the trigger
+validation sets (at most one catalog query per minute per process while checks succeed, on an MFA
+status read for `auth` and a session lookup for `session`; a check that could not run is retried on the
+next read until one succeeds). A tampering that is in place when a validation runs (the trigger
 missing, disabled, replica-only, or its function altered) makes every local binding decision fail
 closed until the server restarts, and the boot check must pass before it serves again. A disable,
 change and re-enable completed entirely between two validations is not observable by this mechanism,

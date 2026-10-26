@@ -195,7 +195,7 @@ struct FoundSession {
     /// check is not evidence the trigger is gone, and validate and liveness do not read the
     /// binding. A caller that treats `row.mfa_factor_gen` as a binding MUST refuse this read
     /// (transient, retryable) rather than trust a generation the guard has not been confirmed
-    /// to protect. Distinct from `rebind_guard_ok()`, which is the sticky definite failure.
+    /// to protect. Distinct from `rebind_guard_ok()` reading false, the sticky definite failure.
     bool guard_unverified{false};
 };
 
@@ -288,7 +288,8 @@ public:
     /// Fetch one session by token hash, WITH the DB clock at read time in the same
     /// atomic SELECT. nullopt = definitively absent; unexpected = DB degraded (the
     /// caller must NOT treat this as "invalid session", and must NOT treat a
-    /// missing db_now_ms as 0 — both fail the request instead).
+    /// missing db_now_ms as 0 — both fail the request instead). A served row carries
+    /// `guard_unverified` while the rebind-guard check cannot run (see `FoundSession`).
     [[nodiscard]] std::expected<std::optional<FoundSession>, Error>
     find(const std::string& token_hash) const;
 
@@ -345,7 +346,8 @@ public:
 private:
     /// Re-run the trigger validation on the caller's lease when the memo has
     /// expired (at most one thread per expiry). Flips `rebind_guard_ok_` false,
-    /// stickily, on a definite failure; an inconclusive check changes nothing.
+    /// stickily, on a definite failure; an inconclusive check latches nothing but flags the
+    /// reads that follow `guard_unverified` (and retries on the next find) until a check succeeds.
     void revalidate_rebind_guard_if_due(PGconn* conn) const;
 
     pg::PgPool& pool_;

@@ -1238,7 +1238,7 @@ TEST_CASE("SessionStore v3: a validation that cannot run flags that read and onl
     CHECK_FALSE((*clean)->guard_unverified);
 
     store.set_binding_validation_inconclusive_for_test(true);
-    for (int i = 0; i < 2; ++i) { // retried on every find, never memoised away
+    for (int i = 0; i < 2; ++i) { // each find validates again (memo 0)
         auto flagged = store.find("h1");
         REQUIRE(flagged.has_value());
         REQUIRE(flagged->has_value());
@@ -1259,6 +1259,32 @@ TEST_CASE("SessionStore v3: a validation that cannot run flags that read and onl
         pool, "ALTER TABLE session_store.sessions DISABLE TRIGGER sessions_mfa_rebind_guard"));
     REQUIRE(store.find("h1").has_value());
     CHECK_FALSE(store.rebind_guard_ok());
+}
+
+TEST_CASE("SessionStore v3: an inconclusive validation is retried on the next find even inside "
+          "a long memo",
+          "[session_store][pg][mfa_binding]") {
+    // The reset of the pending deadline is what makes the retry immediate: with a one-hour memo
+    // the second find validates only because the inconclusive first one cleared it.
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create(make_params("h1", "oli")).has_value());
+    store.set_binding_validation_memo_for_test(std::chrono::hours{1}); // clears the deadline
+
+    store.set_binding_validation_inconclusive_for_test(true);
+    auto flagged = store.find("h1");
+    REQUIRE(flagged.has_value());
+    REQUIRE(flagged->has_value());
+    CHECK((*flagged)->guard_unverified);
+
+    store.set_binding_validation_inconclusive_for_test(false);
+    auto next = store.find("h1");
+    REQUIRE(next.has_value());
+    REQUIRE(next->has_value());
+    CHECK_FALSE((*next)->guard_unverified); // validated at once, not after the hour
+    CHECK(store.rebind_guard_ok());
 }
 
 TEST_CASE("SessionStore v3: a tamper that is undone between two validations is not observable",
