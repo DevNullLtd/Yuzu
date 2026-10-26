@@ -213,3 +213,61 @@ TEST_CASE("send-map: boot_epoch/emit_seq round-trip through the wire and default
     CHECK(parsed.emit_seq() == 0x1'0000'0001ULL);
     CHECK(parsed.event_id() == "evt");
 }
+
+TEST_CASE("send-map: the ordering pair is emitted iff boot_epoch and seq are both nonzero",
+          "[spark][sendmap]") {
+    const auto make = [](OutboxDomain d, std::uint64_t boot_epoch, std::uint64_t seq) {
+        OutboxEntry e;
+        switch (d) {
+        case OutboxDomain::Compliance:
+            e = OutboxEntry::compliance("r", 1, "id", kEnq, GuardDrift{});
+            break;
+        case OutboxDomain::Health:
+            e = OutboxEntry::health("r", 1, "id", kEnq, /*healthy=*/false, "io");
+            break;
+        case OutboxDomain::Lifecycle:
+            e = OutboxEntry::lifecycle("r", 1, "id", kEnq, "armed", "file", "n");
+            break;
+        }
+        e.boot_epoch = boot_epoch;
+        e.seq = seq;
+        return e;
+    };
+
+    for (const auto d : {OutboxDomain::Compliance, OutboxDomain::Health, OutboxDomain::Lifecycle}) {
+        const auto both = guardian_outbox_entry_to_event(make(d, 1'790'000'000ULL, 42), "linux");
+        CHECK(both.boot_epoch() == 1'790'000'000ULL);
+        CHECK(both.emit_seq() == 42);
+
+        // Half a pair never reaches the wire: the server would order on a lone ordinal.
+        const auto no_epoch = guardian_outbox_entry_to_event(make(d, 0, 42), "linux");
+        CHECK(no_epoch.boot_epoch() == 0);
+        CHECK(no_epoch.emit_seq() == 0);
+        const auto no_seq = guardian_outbox_entry_to_event(make(d, 1'790'000'000ULL, 0), "linux");
+        CHECK(no_seq.boot_epoch() == 0);
+        CHECK(no_seq.emit_seq() == 0);
+    }
+}
+
+TEST_CASE("send-map: journal provenance neither suppresses nor creates the ordering pair",
+          "[spark][sendmap]") {
+    // journal_batch_key is also set on LIVE entries (backfill_batch_provenance), so it is not a
+    // replay discriminator: the pair follows boot_epoch/seq alone. Paged entries carry
+    // boot_epoch 0 from the runtime, which is what keeps them off the wire.
+    auto live = OutboxEntry::lifecycle("r", 1, "evt", kEnq, "errored", "file", "n");
+    live.boot_epoch = 7;
+    live.seq = 9;
+    live.journal_batch_key = "lc:deadbeefdeadbeef:000000000042";
+    live.journal_last_in_batch = true;
+    const auto live_ev = guardian_outbox_entry_to_event(live, "linux");
+    CHECK(live_ev.boot_epoch() == 7);
+    CHECK(live_ev.emit_seq() == 9);
+
+    auto paged = OutboxEntry::lifecycle("r", 1, "evt", kEnq, "armed", "file", "n");
+    paged.boot_epoch = 0;
+    paged.seq = 9; // the page-time hold key
+    paged.journal_batch_key = "lc:deadbeefdeadbeef:000000000042";
+    const auto paged_ev = guardian_outbox_entry_to_event(paged, "linux");
+    CHECK(paged_ev.boot_epoch() == 0);
+    CHECK(paged_ev.emit_seq() == 0);
+}

@@ -357,6 +357,39 @@ TEST_CASE("#3972: OutboxEntry::seq defaults to 0 (unstamped) on every factory", 
     CHECK(OutboxEntry::lifecycle("a", 1, "l1", 102, "armed").seq == 0);
 }
 
+TEST_CASE("UP-14: OutboxEntry::boot_epoch defaults to 0 (no wire pair) on every factory",
+          "[spark][outbox][emit_seq]") {
+    CHECK(comp("a", 1, "e1", 100, "x").boot_epoch == 0);
+    CHECK(OutboxEntry::health("a", 1, "h1", 101, false, "io").boot_epoch == 0);
+    CHECK(OutboxEntry::lifecycle("a", 1, "l1", 102, "armed").boot_epoch == 0);
+}
+
+TEST_CASE("UP-14: a coalesce replaces the whole entry, so it carries the newer seq and its epoch",
+          "[spark][outbox][emit_seq]") {
+    GuardianOutbox ob{8};
+    auto first = compq("a", "e1", 5);
+    first.boot_epoch = 77;
+    auto other = compq("b", "e2", 6);
+    other.boot_epoch = 77;
+    REQUIRE(ob.enqueue(std::move(first)));
+    REQUIRE(ob.enqueue(std::move(other)));
+
+    auto newer = compq("a", "e3", 9);
+    newer.boot_epoch = 77;
+    REQUIRE(ob.enqueue(std::move(newer))); // coalesces over "a"
+    REQUIRE(ob.size() == 2);
+    auto head = ob.front_copy();
+    REQUIRE(head);
+    CHECK(head->rule_id == "a"); // position kept
+    CHECK(head->seq == 9);
+    CHECK(head->boot_epoch == 77);
+    // front_copy is what a Retain resend re-copies: the pair survives it unchanged.
+    auto again = ob.front_copy();
+    REQUIRE(again);
+    CHECK(again->seq == head->seq);
+    CHECK(again->boot_epoch == head->boot_epoch);
+}
+
 TEST_CASE("#3972: front_seq reports the head's seq; a coalesce replaces it and keeps position",
           "[spark][outbox]") {
     GuardianOutbox ob{8};

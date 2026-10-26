@@ -3915,9 +3915,12 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         spark_backend_->bind_consumer(consumer_id);
 
         spark_scheduler_ = std::make_unique<ConvergenceScheduler>(*spark_runtime_);
-        // Wrap the send so that after a PAGED batch's LAST entry is delivered, its best-effort
-        // sent-label is written (item 7 PR-Ag). Live / compliance / health entries carry no
-        // batch key → no-op.
+        // Wrap the send so that after a batch's LAST entry is delivered, its best-effort
+        // sent-label is written (item 7 PR-Ag). That covers PAGED entries AND live lifecycle
+        // entries once their batch is persisted (backfill_batch_provenance stamps the key on
+        // them too); compliance / health entries never carry a batch key → no-op. The key is
+        // therefore NOT a replay marker: whether an entry carries a wire ordering pair is
+        // decided by OutboxEntry::boot_epoch (0 on paged entries), not by this key.
         //
         // Captures the journal HANDLE, not `this` (C0 #2298): re-reading the lifecycle_journal_
         // member from wherever this wrap runs would be an unlocked read of engine state, and
