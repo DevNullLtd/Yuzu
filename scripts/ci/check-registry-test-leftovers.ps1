@@ -35,12 +35,15 @@ param(
 
 $prefix = "YuzuTest-$Scope-"
 $roots = 'HKLM:\SOFTWARE', 'HKLM:\SOFTWARE\Wow6432Node', 'HKCU:\Software'
-$all = @(Get-ChildItem -Path $roots -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like 'YuzuTest-*' })
+$failed = @()
+$all = @(foreach ($root in $roots) {
+    try { Get-ChildItem -LiteralPath $root -ErrorAction Stop | Where-Object { $_.PSChildName -like 'YuzuTest-*' } }
+    catch [System.Management.Automation.ItemNotFoundException] { }   # a root this OS does not have holds nothing
+    catch { $failed += $root; Write-Host "::error::could not list $root so its leftovers are unknown: $($_.Exception.Message)" }
+})
 $mine, $others = $all.Where({ $_.PSChildName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) }, 'Split')
 foreach ($k in $others) { Write-Host "::warning::registry key from another job or a cancelled run, not removed: $($k.Name)" }
-if ($mine.Count -gt 0) {
-    foreach ($k in $mine) { Write-Host "::error::leftover registry key $($k.Name)" }
-    exit 1
-}
+foreach ($k in $mine) { Write-Host "::error::leftover registry key $($k.Name)" }
+if ($mine.Count -gt 0 -or $failed.Count -gt 0) { exit 1 }
 Write-Host 'no YuzuTest-* keys left by this job'
 exit 0

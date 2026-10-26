@@ -1000,10 +1000,10 @@ label still fails loud.
 cannot write `HKLM`; the job runs as LOCAL SYSTEM, which can) fails instead. The job-level
 `YUZU_TEST_REGISTRY_SCOPE` (`<run id>-<attempt>-<build type>`) puts every scratch key under
 `YuzuTest-<scope>-`, so two test phases sharing a box through the 2-slot gate judge only their own keys.
-Before the suite, `Self-test the registry leftover check` plants a probe key and proves both decisions of
+Before the suite, `Self-test the registry leftover check` plants a probe key under each root the script scans and proves both decisions of
 `scripts/ci/check-registry-test-leftovers.ps1` (the probe's own scope: exit 1 with an `::error` naming it; any
 other scope: exit 0 with a `::warning`); after it, `Assert this job left no YuzuTest-* registry keys behind` runs
-the same script with the job's scope. It reports and never deletes (a leftover can be a registry link, and a
+the same script with the job's scope; a root it cannot list fails the step (a missing root is skipped). It reports and never deletes (a leftover can be a registry link, and a
 tree delete follows links), so a key orphaned by a cancelled job stays as a warning in later jobs until a human
 removes it.
 
