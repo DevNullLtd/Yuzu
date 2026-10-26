@@ -177,10 +177,10 @@ S-1-5-21-1111111111-2222222222-3333333333-1001|jsmith|C:\Users\jsmith|loaded
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=set_user_value username=jsmith key=Software\YuzuCaptureTmp name=probe value=1
-[not captured] Mutating/Irreversible: not executed on a live host
+[not captured] Mutating/Irreversible: added in registry 2.1.0 after this leg's 2026-10-23 capture; captured on a Windows host later
 
 == action=delete_user_value username=jsmith key=Software\YuzuCaptureTmp name=probe
-[not captured] Destructive/Irreversible: not executed on a live host
+[not captured] Destructive/Irreversible: added in registry 2.1.0 after this leg's 2026-10-23 capture; captured on a Windows host later
 
 == action=apply plan=[{"op":"create_key","key":"SOFTWARE\\YuzuCaptureTmp"}]
-[not captured] Destructive/Irreversible: not executed on a live host
+[not captured] Destructive/Irreversible: added in registry 2.1.0 after this leg's 2026-10-23 capture; captured on a Windows host later

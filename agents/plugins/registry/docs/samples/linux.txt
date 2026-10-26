@@ -39,10 +39,10 @@ registry|unsupported|Windows registry is not available on this platform
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=set_user_value username=jsmith key=Software\YuzuCaptureTmp name=probe value=1
-[not captured] Mutating/Irreversible: not executed on a Linux host (the registry 2.1.0 actions were added after this leg's 2026-10-22 capture)
+[not captured] Mutating/Irreversible: added in registry 2.1.0 after this leg's 2026-10-22 capture; captured on a Linux host later
 
 == action=delete_user_value username=jsmith key=Software\YuzuCaptureTmp name=probe
-[not captured] Destructive/Irreversible: not executed on a Linux host (the registry 2.1.0 actions were added after this leg's 2026-10-22 capture)
+[not captured] Destructive/Irreversible: added in registry 2.1.0 after this leg's 2026-10-22 capture; captured on a Linux host later
 
 == action=apply plan=[{"op":"create_key","key":"SOFTWARE\\YuzuCaptureTmp"}]
-[not captured] Destructive/Irreversible: not executed on a Linux host (the registry 2.1.0 actions were added after this leg's 2026-10-22 capture)
+[not captured] Destructive/Irreversible: added in registry 2.1.0 after this leg's 2026-10-22 capture; captured on a Linux host later

@@ -482,10 +482,12 @@ metadata:
     refusal the counts are what the vet counted; on a real run they are what the delete removed (exact when it
     succeeds, the partial total when it stopped), so they can exceed a dry run's. A non-recursive delete of a key
     holding more than 10,000 values removes only that key and its own values. MIXED FLEETS: an agent running
-    registry 2.0.x reads neither `recursive` nor `dry_run`: sent dry_run=true it DELETES a key that has no
-    subkeys (a key with subkeys is refused as key_has_subkeys). The server does not compare plugin versions at
-    dispatch (#6484), so upgrade the agents to registry 2.1.0 before using either flag, and scope any preview to
-    a tag that marks devices verified at 2.1.0. Windows-only.
+    registry 1.x or 2.0.x (every agent released before 2.1.0, v0.14.1 included) reads neither `recursive` nor
+    `dry_run`: sent dry_run=true it DELETES a key that has no subkeys (a key with subkeys is refused), and a bare
+    `status|ok` or a `dry_run|0` row in answer to dry_run=true means the key was deleted. The server does not
+    compare plugin versions at dispatch (#6484), so upgrade the server, then the agents to registry 2.1.0 before
+    using either flag, scope any preview to a tag that marks devices verified at 2.1.0, and until then use the
+    delete_key kill switch as the stop-gap. Windows-only.
   tags: [registry, windows, configuration]
 spec:
   type: action
@@ -517,8 +519,9 @@ spec:
           "true" deletes every subkey and value beneath the key as well; "false" (the default) refuses a key
           that has subkeys. The tree is vetted first (at most 10,000 keys and values and 600 levels, else
           tree_too_large with nothing deleted; a registry link inside it is refused as key_is_link), and the
-          counts of a dry run are a snapshot. Any other spelling is refused as invalid_data. Needs registry 2.1.0
-          on the agent: registry 2.0.x ignores it.
+          counts of a dry run are a snapshot. Any other spelling is refused as invalid_data (the direct command
+          route, which has no enum, also accepts 1 and 0). Needs registry 2.1.0 on the agent: registry 1.x and
+          2.0.x ignore it.
         default: "false"
         validation:
           enum: ["true", "false"]
@@ -527,8 +530,9 @@ spec:
         displayName: Dry Run
         description: >
           "true" counts what a real run would remove (with `recursive`, the vetted tree) and deletes nothing;
-          "false" (the default) deletes. Needs registry 2.1.0 on the agent: an agent at registry 2.0.x ignores
-          this flag and DELETES a key that has no subkeys, so upgrade agents first (docs/user-manual/upgrading.md).
+          "false" (the default) deletes. Any other spelling is refused as invalid_data (the direct command route
+          also accepts 1 and 0). Needs registry 2.1.0 on the agent: an agent at registry 1.x or 2.0.x ignores this
+          flag and DELETES a key that has no subkeys, so upgrade agents first (docs/user-manual/upgrading.md).
         default: "false"
         validation:
           enum: ["true", "false"]
@@ -542,7 +546,7 @@ spec:
         platforms: [windows]
       - name: counted_keys
         type: int32
-        description: 'Keys in the subtree, the target included: on a real run what the delete REMOVED (exact when it succeeds, the partial total when it stopped), on a dry run or a refusal what the vet counted (a lower bound when capped is 1). A non-recursive delete counts the target alone, so 1. Values: a non-negative integer.'
+        description: 'Keys in the subtree, the target included: on a real run what the delete REMOVED (exact when it succeeds, the partial total when it stopped), on a dry run what the vet counted (a lower bound when capped is 1). A non-recursive delete counts the target alone, so 1. Emitted on success only: a refusal carries its counts in the audit row (counted_keys=). Values: a non-negative integer.'
         example: "4"
         platforms: [windows]
       - name: counted_values
@@ -557,7 +561,7 @@ spec:
         platforms: [windows]
       - name: capped
         type: bool
-        description: 'Whether the vet or the value enumeration stopped at its bound (10,000 keys and values, 600 levels), making the counts a lower bound; reported on a dry run, a refusal as tree_too_large, or a non-recursive delete of a key holding more than 10,000 values (it removes that key with all its values). A real recursive delete past the bound is refused, never capped. Values: 1 (capped), 0 (complete) — a digit, never true/false.'
+        description: 'Whether the vet or the value enumeration stopped at its bound (10,000 keys and values, 600 levels), making the counts a lower bound; reported on a dry run or a non-recursive delete of a key holding more than 10,000 values (it removes that key with all its values). A real recursive delete past the bound is refused as tree_too_large, never capped: that refusal says capped=1 in its audit row only. Values: 1 (capped), 0 (complete) — a digit, never true/false.'
         example: "0"
         platforms: [windows]
   approval:
@@ -694,14 +698,15 @@ metadata:
     Write a registry value into a specific user's hive. Resolves the target profile via ProfileList (by
     username or an explicit SID), then writes through the live HKEY_USERS\<SID> hive if the user is logged in,
     or loads that profile's NTUSER.DAT as a fallback. The offline load runs behind the shared hive-file guard
-    (reparse ancestors, ownership, transaction-log sidecars and the file identity after the load are checked
-    first), the write is verified by reading it back, and the key is flushed to disk before the hive unloads (a
+    (reparse ancestors, a second hard link, ownership, transaction-log sidecars and the file identity after the
+    load are checked first), the write is verified by reading it back, and the key is flushed to disk before the hive unloads (a
     flush that fails fails the write). SeBackupPrivilege and SeRestorePrivilege are needed only for the offline
     fallback. A hive that is loaded after the write returned is reported as a warning; a logon that failed while
     the hive was mounted leaves no trace. Same types, encoding and verification as set_value. A `registry.write`
     audit row records the previous and new values (hex, capped at 256 bytes; they can contain secrets: the
-    product owner accepted this risk on 2026-10-20 and masking is a planned later change). Needs registry 2.1.0
-    on the agent: an agent at registry 2.0.x answers `error|unknown action`. Windows-only.
+    product owner accepted this risk on 2026-10-20 and masking is a planned later change), and the `value` and
+    `data_hex` parameters are stored unredacted in the execution's parameter_values. Needs registry 2.1.0 on the
+    agent: an agent at registry 1.x or 2.0.x answers `error|unknown action`. Windows-only.
   tags: [registry, windows, per-user, configuration]
 spec:
   type: action
@@ -794,8 +799,8 @@ metadata:
   description: >
     Delete a registry value from a specific user's hive; the key itself is left in place. Same profile
     resolution, live-or-offline hive path, hive-file guard, read-back verification, flush and audit row as
-    set_user_value. Needs registry 2.1.0 on the agent: an agent at registry 2.0.x answers
-    `error|unknown action`. Windows-only.
+    set_user_value (the deleted value's previous data is in that row and in the response). Needs registry 2.1.0
+    on the agent: an agent at registry 1.x or 2.0.x answers `error|unknown action`. Windows-only.
   tags: [registry, windows, per-user, configuration]
 spec:
   type: action
@@ -884,14 +889,27 @@ metadata:
     backslash, or a value named `-`, which a row uses for the default value) is refused as unrepresentable_name
     before anything is changed, including the name of any value of a key an item would delete, whose raw UTF-16
     name must also be well-formed (a lone surrogate or a NUL has no exact UTF-8 spelling and is refused the same
-    way, in a dry run too; a value really named with U+FFFD is fine). THE UNDO BUDGET:
-    one 512 KiB budget charges every byte the manifest retains (previous values, names and a fixed cost per row);
-    a deleted key's values are all vetted but only as many as fit are returned, and when anything was cut the
-    summary says undo_complete=0, in the dry run too, before anything is changed. Rows: one `item` per plan item,
-    an `undo` row per retained value of each deleted key, one `audit` row per item that ran or was refused
-    (recorded server-side as `registry.write`; three 256-item plans inside one minute exceed the server's 600
-    rows per agent per minute and the later rows are suppressed), and a closing `summary`. Needs registry 2.1.0
-    on the agent: an agent at registry 2.0.x answers `error|unknown action`. Windows-only.
+    way, in a dry run too; a value really named with U+FFFD is fine). Two value items on one key are also
+    dependent_items whenever either name holds a non-ASCII character (Windows folds value-name case with a
+    Unicode table the parser cannot reproduce). THE UNDO BUDGET: one 512 KiB budget charges every byte the
+    manifest retains (previous values up to 4,096 bytes each, names and a fixed cost per row); a deleted key's
+    values are all vetted but only as many as fit are returned, and when anything was cut the summary says
+    undo_complete=0, in the dry run too, before anything is changed. THE UNDO CONTRACT: undo only `applied`
+    items and `failed` ones with created above 0 or a mutation, in REVERSE item order; recreate a deleted key
+    from its delete_key item (a key that held no values has no undo rows), then replay its undo rows in a
+    second plan (a value whose name holds a non-ASCII character in a plan of its own when the key has other
+    undo rows). The manifest restores VALUES only: a deleted key's owner, DACL, SACL, class and volatility are
+    not captured, so a recreated key gets the parent's inherited security. It is a snapshot taken at capture:
+    a value another writer changes between the capture and the change is lost or stale even with
+    undo_complete=1. An item refused before its previous value was read shows "-" there, never "absent".
+    Rows, written as each item concludes so a later failure never takes back an earlier item's rows: one
+    `audit` row per item that ran or was refused (recorded server-side as `registry.write`; a dry run's rows say
+    dry_run=1 and record no change; three 256-item plans inside one minute exceed the server's 600 rows per
+    agent per minute and the later rows are suppressed), its `item` row and, for a deleted key, its `undo` rows,
+    then a closing `summary`. The plan parameter, with every value in it, is stored unredacted in the
+    execution's parameter_values, and the reply holds previous values (secrets included) for Response:Read
+    holders. Needs registry 2.1.0 on the agent: an agent at registry 1.x or 2.0.x answers `error|unknown
+    action`. Windows-only.
   tags: [registry, windows, configuration, bulk]
 spec:
   type: action
@@ -915,7 +933,7 @@ spec:
           captured empty value round-trip. delete_value takes key and name; create_key and delete_key take key
           only (delete_key is NOT recursive and refuses a link). A set_value or create_key item whose first key
           component does not already exist directly under the hive is refused root_level_create, in a dry run and
-          a real run alike. An agent still on registry 2.0.x answers `error|unknown action`.
+          a real run alike. An agent still on registry 1.x or 2.0.x answers `error|unknown action`.
         validation:
           maxLength: 65536
       dry_run:
@@ -923,7 +941,8 @@ spec:
         displayName: Dry Run
         description: >
           "true" (the default) reports every item's verdict and changes nothing; "false" applies the plan. Any
-          other spelling is refused as invalid_data.
+          other spelling is refused as invalid_data (the direct command route, which has no enum, also accepts 1
+          and 0).
         default: "true"
         validation:
           enum: ["true", "false"]
@@ -991,12 +1010,12 @@ spec:
         platforms: [windows]
       - name: field_10
         type: string
-        description: 'item: the previous value state (absent, present, unreadable) for value ops. audit: dry_run=.'
+        description: 'item: the previous value state (absent, present, unreadable) for value ops; "-" for a key op and for an item refused before its previous value was read (never read as absent). audit: dry_run=.'
         example: present
         platforms: [windows]
       - name: field_11
         type: string
-        description: 'item: the previous value type. audit: counted_keys=.'
+        description: 'item: the previous value type. audit: counted_keys= ("-" for a delete_key that was invalid or whose open failed).'
         example: REG_SZ
         platforms: [windows]
       - name: field_12
