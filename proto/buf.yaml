@@ -21,9 +21,11 @@ breaking:
     # also means removing its server/gateway handler (it then answers
     # UNIMPLEMENTED). If a deletion reaches dev anyway, revert it. A
     # deliberate removal needs a new owner ruling and an `ignore_only` entry
-    # scoped to one rule and one file, removed once the deletion is on main:
-    # a stale entry silently re-allows `reserved` deletes in that file. Do
-    # not edit this list to get a PR green (#6552 tracks pinning it).
+    # scoped to one rule and one file, removed once the deletion is on main.
+    # A stale entry silently re-allows that rule's deletions in that file:
+    # for fields and enum values only with `reserved` (WIRE_JSON still
+    # applies), for every other kind outright. Do not edit this block to
+    # get a PR green (#6552 tracks pinning this block).
     - FILE_NO_DELETE
     - MESSAGE_NO_DELETE
     - ENUM_NO_DELETE
