@@ -1442,7 +1442,7 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
                 "  bool_or(agent_id = ANY($6::text[])) AS o"
                 " FROM guaranteed_state_store.guardian_observations"
                 " WHERE obs_type IN ('process.crashed', 'process.hung')"
-                "  AND observed_at >= $1 AND platform = $2"
+                "  AND observed_at >= $1 AND ($2::text = '' OR platform = $2::text)"
                 " GROUP BY subject, version, agent_id),"
                 "tc AS ("
                 " SELECT subject, COUNT(DISTINCT agent_id) AS dev, SUM(c) + SUM(h) AS ev"
