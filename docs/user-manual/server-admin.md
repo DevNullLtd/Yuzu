@@ -1001,7 +1001,7 @@ empty. Configure an `up{job="<your server job>"} == 0` alert (the shipped scrape
 name the job `yuzu-server`; use yours, with a `for:` of a few scrape intervals) and probe `/readyz`
 from a blackbox exporter or your load balancer as the backstop. A hung scrape becomes
 `up == 0` only after Prometheus's `scrape_timeout`. No server dead-man's-switch rule ships:
-#2956 tracked it and was folded into the open #2459.
+#2956 tracked it and was closed without building it.
 
 Find the replica that is the leader with
 `yuzu_server_leader_is_leader == 1`; the cluster's authoritative record is

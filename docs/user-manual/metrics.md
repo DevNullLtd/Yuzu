@@ -191,7 +191,7 @@ background loop is therefore visible **only** through these series and the
 successful scrape: when the whole Postgres primary stalls (its kernel still
 acknowledging packets) the `/metrics` handler's own database queries hang, the
 scrape fails and every leader series goes stale together. No server
-`up == 0` alert ships (#2956 tracked it and was folded into the open #2459), so
+`up == 0` alert ships (#2956 tracked it and was closed without building it), so
 configure one on your own scrape job as the backstop. Not yet shipped (tracked): remediation-claim
 lifecycle counters (#6526) and a CRL `nextUpdate` freshness gauge (#6527).
 

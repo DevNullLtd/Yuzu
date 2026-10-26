@@ -2841,8 +2841,8 @@ groups:
   #    series goes stale at once, so every rule below evaluates EMPTY. The
   #    backstop is an `up == 0` alert on the server job (substitute YOUR scrape
   #    job name) plus /readyz: NO such rule ships (no rule in this file is a
-  #    dead-man's-switch for the server process; #2956 tracked it and was folded
-  #    into the open #2459), so configure one.
+  #    dead-man's-switch for the server process; #2956 tracked it and was closed
+  #    without building it), so configure one.
   - name: yuzu-ha-leader
     rules:
       - alert: YuzuLeaderSplitBrain
