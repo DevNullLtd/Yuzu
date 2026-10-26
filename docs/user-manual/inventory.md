@@ -1214,10 +1214,12 @@ points. It never lands in the generic inventory store, on either path.
   and a store that failed to open would otherwise acknowledge the blob with no rows.
 - **Capability advertisement.** The server lists `certificate_inventory_v1` in
   `RegisterResponse.server_capabilities` (field 9) on both direct registration and the gateway
-  `ProxyRegister` path, and only while the certificate inventory store is open. An agent sends
-  the source only to a server that lists it, so an older server, or one whose store is not open,
-  never receives it. The gateway relays the field unchanged.
-- **Deploy order.** Upgrade servers before agents. `certificate_inventory` is in the
+  `ProxyRegister` path. It is set when the certificate inventory store opens at server start (a
+  server whose store does not open refuses to start). An agent sends the source only to a server
+  that lists it, so an older server never receives it. Agent-side gating arrives with the agent
+  collector (2a-2e). The gateway relays the field only from this release on: an older gateway
+  drops it, so agents behind it never send the source until the gateway is upgraded too.
+- **Deploy order.** Upgrade gateways with or before servers, and servers before agents. `certificate_inventory` is in the
   typed set from the typed-source read filter change, so even a gateway-proxied blob
   reaching a server without this store is not stored in the generic store.
 

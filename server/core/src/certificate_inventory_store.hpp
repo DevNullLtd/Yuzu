@@ -46,7 +46,8 @@
 /// This PR ships no read surface; a store that failed to open is visible on `/readyz`.
 ///
 /// CAPABILITY. The server advertises `certificate_inventory_v1` (`yuzu/server_capabilities.hpp`) in
-/// `RegisterResponse.server_capabilities` on both Register and ProxyRegister, only while `is_open()`:
+/// `RegisterResponse.server_capabilities` on both Register and ProxyRegister when `is_open()` (set
+/// once when the store opens at server start; the server refuses to start if it cannot open):
 /// never advertise a source the server cannot ingest typed.
 ///
 /// Registered in the agent-decommission cascade (`AgentDecommissionStores::certificate_inventory`,
