@@ -1212,6 +1212,11 @@ points. It never lands in the generic inventory store, on either path.
   [Metrics](metrics.md)). The store (`certificate_inventory_store`) is a `/readyz` and
   `/healthz` component: the server refuses to start if its schema cannot be created,
   and a store that failed to open would otherwise acknowledge the blob with no rows.
+- **Capability advertisement.** The server lists `certificate_inventory_v1` in
+  `RegisterResponse.server_capabilities` (field 9) on both direct registration and the gateway
+  `ProxyRegister` path, and only while the certificate inventory store is open. An agent sends
+  the source only to a server that lists it, so an older server, or one whose store is not open,
+  never receives it. The gateway relays the field unchanged.
 - **Deploy order.** Upgrade servers before agents. `certificate_inventory` is in the
   typed set from the typed-source read filter change, so even a gateway-proxied blob
   reaching a server without this store is not stored in the generic store.

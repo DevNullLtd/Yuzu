@@ -118,6 +118,12 @@ message RegisterResponse {
   // the agent can pin the server's CA and present a complete chain. Canonical
   // field 8.
   string issued_ca_chain = 8;
+
+  // Ingest features this server can accept typed, as stable capability tokens (today:
+  // "certificate_inventory_v1"). An agent sends a capability-gated daily-sync source only to
+  // a server that lists it here; an absent value (older server, or a feature whose store is
+  // not open) means the agent must not send that source. Canonical field 9.
+  repeated string server_capabilities = 9;
 }
 
 // ── Heartbeat ─────────────────────────────────────────────────────────────────

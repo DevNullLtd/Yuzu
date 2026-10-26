@@ -57,6 +57,7 @@
 #include "nvd_db.hpp"
 
 #include <yuzu/log_token.hpp>
+#include <yuzu/server_capabilities.hpp>
 
 namespace yuzu::server::detail {
 
@@ -871,6 +872,9 @@ enrolled:
     response->set_session_id(session_id);
     response->set_accepted(true);
     response->set_enrollment_status("enrolled");
+    // Advertise only the ingest features whose store is open (fail closed).
+    if (certificate_inventory_store_ && certificate_inventory_store_->is_open())
+        response->add_server_capabilities(::yuzu::kServerCapCertificateInventoryV1);
 
     // PR3: if the agent sent a CSR and a signer is wired (the CA is active), sign
     // a per-agent client leaf bound to agent_id and return it; the agent persists

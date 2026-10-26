@@ -59,6 +59,16 @@ issued_cert_fields_survive_register_response_roundtrip_test() ->
     ?assertEqual(maps:get(issued_ca_chain, Resp),
                  maps:get(issued_ca_chain, Decoded, undefined)).
 
+%% The server advertises ingest capabilities in RegisterResponse field 9; the gateway
+%% decodes the upstream response and re-encodes it for the agent, so gpb must carry it.
+server_capabilities_survive_register_response_roundtrip_test() ->
+    Resp = #{session_id => <<"s1">>,
+             accepted => true,
+             server_capabilities => [<<"certificate_inventory_v1">>]},
+    Decoded = agent_pb:decode_msg(agent_pb:encode_msg(Resp, ?REGISTER_RESP), ?REGISTER_RESP),
+    ?assertEqual([<<"certificate_inventory_v1">>],
+                 maps:get(server_capabilities, Decoded, [])).
+
 %% Wire compatibility: bytes encoded by a producer that DOES know csr_pem
 %% (field 7) must decode with csr_pem present — i.e. the field number matches
 %% the canonical yuzu.agent.v1 proto (7). A mismatch would silently drop the

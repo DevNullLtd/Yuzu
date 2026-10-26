@@ -40,6 +40,7 @@
 #include "peer_ip.hpp"
 
 #include <yuzu/log_token.hpp>
+#include <yuzu/server_capabilities.hpp>
 
 namespace yuzu::server::detail {
 
@@ -1359,6 +1360,9 @@ gw_enrolled:
 
     response->set_session_id(session_id);
     response->set_accepted(true);
+    // Advertise only the ingest features whose store is open (fail closed); the gateway relays it.
+    if (certificate_inventory_store_ && certificate_inventory_store_->is_open())
+        response->add_server_capabilities(::yuzu::kServerCapCertificateInventoryV1);
     response->set_enrollment_status("enrolled");
 
     // PR5d: mirror the direct Register path — if the agent sent a CSR and the

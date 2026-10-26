@@ -2415,6 +2415,11 @@ std::string make_cert_inventory_blob() {
            "loc|" + sha + "|LocalMachine\\\\Root|\n";
 }
 
+bool advertises_cert_inventory(const apb::RegisterResponse& r) {
+    return std::find(r.server_capabilities().begin(), r.server_capabilities().end(),
+                     "certificate_inventory_v1") != r.server_capabilities().end();
+}
+
 bool cert_inventory_nacked(const apb::InventoryAck& ack) {
     return std::find(ack.need_full().begin(), ack.need_full().end(), "certificate_inventory") !=
            ack.need_full().end();
@@ -2443,6 +2448,7 @@ TEST_CASE("ReportInventory (direct): certificate_inventory is stored, then erase
     apb::RegisterResponse resp;
     REQUIRE(h.svc.Register(/*context=*/nullptr, &req, &resp).ok());
     REQUIRE(resp.accepted());
+    CHECK(advertises_cert_inventory(resp)); // store open => capability advertised
 
     apb::InventoryReport rpt;
     rpt.set_session_id(resp.session_id());
@@ -2462,6 +2468,67 @@ TEST_CASE("ReportInventory (direct): certificate_inventory is stored, then erase
     CHECK(rc->agent_state + rc->store_state + rc->cert_location + rc->cert_fact + rc->cert_san +
               rc->cert_eku + rc->cert_cdp ==
           0);
+}
+
+TEST_CASE("Register / ProxyRegister: certificate_inventory_v1 is advertised only while the store is "
+          "open",
+          "[pg][agent_service][gateway][certinv]") {
+    using yuzu::server::CertificateInventoryStore;
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    YUZU_REQUIRE_PG_DB_TPL(db, cert_inventory_composition_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    // A store on an unreachable pool never opens: it is wired but must not be advertised.
+    yuzu::server::pg::PgPool dead{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope connect_timeout=1", .size = 1}};
+    CertificateInventoryStore closed{dead};
+    REQUIRE_FALSE(closed.is_open());
+
+    auto register_direct = [&](const char* id) {
+        auto raw = mint_enrollment_token(h.auth_mgr, id, /*max_uses=*/1, std::chrono::hours(1));
+        apb::RegisterRequest req;
+        req.mutable_info()->set_agent_id(id);
+        req.mutable_info()->set_hostname("host");
+        req.mutable_info()->mutable_platform()->set_os("linux");
+        req.mutable_info()->mutable_platform()->set_arch("x86_64");
+        req.set_enrollment_token(raw);
+        apb::RegisterResponse resp;
+        REQUIRE(h.svc.Register(/*context=*/nullptr, &req, &resp).ok());
+        REQUIRE(resp.accepted());
+        return resp;
+    };
+    auto register_proxy = [&](const char* id) {
+        auto reg = make_gw_register(h.auth_mgr, id, /*csr_pem=*/"");
+        apb::RegisterResponse resp;
+        REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &reg, &resp).ok());
+        REQUIRE(resp.accepted());
+        return resp;
+    };
+
+    // No store wired: not advertised.
+    CHECK_FALSE(advertises_cert_inventory(register_direct("cap-direct-none")));
+    CHECK_FALSE(advertises_cert_inventory(register_proxy("cap-proxy-none")));
+
+    // Wired but closed: not advertised.
+    h.svc.set_certificate_inventory_store(&closed);
+    gateway_svc.set_certificate_inventory_store(&closed);
+    CHECK_FALSE(advertises_cert_inventory(register_direct("cap-direct-closed")));
+    CHECK_FALSE(advertises_cert_inventory(register_proxy("cap-proxy-closed")));
+
+    // Open store: advertised on both paths.
+    CertificateInventoryStore open{pool};
+    REQUIRE(open.is_open());
+    h.svc.set_certificate_inventory_store(&open);
+    gateway_svc.set_certificate_inventory_store(&open);
+    CHECK(advertises_cert_inventory(register_direct("cap-direct-open")));
+    CHECK(advertises_cert_inventory(register_proxy("cap-proxy-open")));
+
+    h.svc.set_certificate_inventory_store(nullptr);
+    gateway_svc.set_certificate_inventory_store(nullptr);
 }
 
 TEST_CASE("ProxyInventory (gateway): certificate_inventory reaches the typed store, never the "
@@ -2487,6 +2554,7 @@ TEST_CASE("ProxyInventory (gateway): certificate_inventory reaches the typed sto
     apb::RegisterResponse rresp;
     REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &reg, &rresp).ok());
     REQUIRE(rresp.accepted());
+    CHECK(advertises_cert_inventory(rresp)); // store open => capability advertised
 
     apb::InventoryReport rpt;
     rpt.set_session_id(rresp.session_id());
