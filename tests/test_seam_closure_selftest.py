@@ -177,6 +177,65 @@ EXPECTED_FORBIDDEN_HEADER_PATTERNS = [
     # comment on this pair for the full rationale.
     "schedule_engine.hpp",
     "workflow_engine.hpp",
+    # WS-A4 S0: Postgres-backed / store-fronting headers the `*_store.hpp` and
+    # `pg/*.hpp` patterns are blind to - see check-seam-closure.py's own comment
+    # for the rationale and for the in-memory engines deliberately NOT listed.
+    "execution_tracker.hpp",
+    "auth_db.hpp",
+    "approval_manager.hpp",
+    "directory_sync.hpp",
+    "update_registry.hpp",
+    "patch_manager.hpp",
+    "deployment_engine.hpp",
+]
+# WS-A4 S0: the new patterns, named separately so probe 17 can prove each one fires.
+S0_NEW_FORBIDDEN_HEADERS = [
+    "execution_tracker.hpp", "auth_db.hpp", "approval_manager.hpp",
+    "directory_sync.hpp", "update_registry.hpp", "patch_manager.hpp",
+    "deployment_engine.hpp",
+]
+# WS-A4 S0: store-free presentation TUs - clean-by-gate, not by convention.
+EXPECTED_STORE_FREE_PRESENTATION_TUS = [
+    "server/core/src/access_audit_ui.cpp",
+    "server/core/src/access_tokens_ui.cpp",
+    "server/core/src/access_ui.cpp",
+    "server/core/src/approvals_ui.cpp",
+    "server/core/src/developer_ui.cpp",
+    "server/core/src/device_data_routes.cpp",
+    "server/core/src/executions_ui.cpp",
+    "server/core/src/groups_routes.cpp",
+    "server/core/src/groups_ui.cpp",
+    "server/core/src/guardian_page_ui.cpp",
+    "server/core/src/guardian_ui.cpp",
+    "server/core/src/help_ui.cpp",
+    "server/core/src/home_ui.cpp",
+    "server/core/src/instruction_ui.cpp",
+    "server/core/src/integrations_routes.cpp",
+    "server/core/src/integrations_ui.cpp",
+    "server/core/src/kek_routes.cpp",
+    "server/core/src/legacy_events_routes.cpp",
+    "server/core/src/login_ui.cpp",
+    "server/core/src/mcp_disabled_routes.cpp",
+    "server/core/src/nvd_routes.cpp",
+    "server/core/src/pki_routes.cpp",
+    "server/core/src/preflight_ui.cpp",
+    "server/core/src/settings_data_ui.cpp",
+    "server/core/src/settings_general_ui.cpp",
+    "server/core/src/settings_pki_ui.cpp",
+    "server/core/src/settings_plugins_ui.cpp",
+    "server/core/src/settings_security_ui.cpp",
+    "server/core/src/settings_ui.cpp",
+    "server/core/src/tar_page_ui.cpp",
+    "server/core/src/tar_timeline_page_ui.cpp",
+    "server/core/src/tar_tree_routes.cpp",
+    "server/core/src/viz_host_page_ui.cpp",
+    "server/core/src/viz_page_ui.cpp",
+    "server/core/src/workflows_ui.cpp",
+]
+# The two TUs that were clean only under the pre-S0 patterns: must NEVER be enrolled.
+S0_DELIBERATELY_NOT_STORE_FREE = [
+    "server/core/src/approval_routes.cpp",
+    "server/core/src/enrollment_directory_routes.cpp",
 ]
 # --- Impl-purity rule constants (ADR-0031 WS-A4, Fable review). Pinned so a
 # --- narrowing (dropping an impl TU, weakening the presentation-header set, or
@@ -217,7 +276,9 @@ EXPECTED_ABSTRACT_API_HEADERS = [
 ]
 EXPECTED_EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
                                     "AgentRegistry", "ExecutionTracker", "PgPool",
-                                    "ScheduleEngine", "WorkflowEngine"]
+                                    "ScheduleEngine", "WorkflowEngine",
+                                    "ApprovalManager", "DirectorySync", "UpdateRegistry",
+                                    "PatchManager"]
 
 
 def _fail(msg: str, failures: list) -> None:
@@ -282,6 +343,23 @@ def main() -> int:
     if mod.EXTRA_STORE_TYPE_TOKENS != EXPECTED_EXTRA_STORE_TYPE_TOKENS:
         _fail(f"EXTRA_STORE_TYPE_TOKENS {mod.EXTRA_STORE_TYPE_TOKENS!r} != "
               f"frozen {EXPECTED_EXTRA_STORE_TYPE_TOKENS!r}", failures)
+
+    # 2d. WS-A4 S0: the store-free presentation list is pinned, is disjoint from every
+    #     FAMILIES set (a TU enforced twice is a silent ownership ambiguity), and never
+    #     contains the two TUs that were clean only under the pre-S0 patterns.
+    if mod.STORE_FREE_PRESENTATION_TUS != EXPECTED_STORE_FREE_PRESENTATION_TUS:
+        _fail(f"STORE_FREE_PRESENTATION_TUS {mod.STORE_FREE_PRESENTATION_TUS!r} != "
+              f"frozen {EXPECTED_STORE_FREE_PRESENTATION_TUS!r}", failures)
+    family_tus = {t for spec in mod.FAMILIES.values() for t in spec["tus"]}
+    overlap = sorted(set(mod.STORE_FREE_PRESENTATION_TUS) & family_tus)
+    if overlap:
+        _fail(f"STORE_FREE_PRESENTATION_TUS overlaps a FAMILIES set: {overlap!r}", failures)
+    for rel in S0_DELIBERATELY_NOT_STORE_FREE:
+        if rel in mod.STORE_FREE_PRESENTATION_TUS:
+            _fail(f"{rel} was clean only under the pre-S0 patterns and must not be in "
+                  f"STORE_FREE_PRESENTATION_TUS", failures)
+    if len(set(mod.STORE_FREE_PRESENTATION_TUS)) != len(mod.STORE_FREE_PRESENTATION_TUS):
+        _fail("STORE_FREE_PRESENTATION_TUS contains a duplicate entry", failures)
 
     # 3. Missing-family-member HARD ERROR: a declared TU that does not exist
     #    on disk must fail the family check, never be silently skipped.
@@ -554,6 +632,40 @@ def main() -> int:
         elif "BazStore" not in captured16.getvalue():
             _fail(f"literal-over-strip probe fired but did not name the token; stderr: "
                   f"{captured16.getvalue()!r}", failures)
+
+        # 17. WS-A4 S0 POSITIVE PROBE, one per new pattern: a synthetic route TU that
+        #     includes a header named exactly like each new forbidden header must be
+        #     flagged with the REAL shipped pattern list. Proves every added entry is
+        #     live (not a typo that matches nothing) - a dead pattern is the "gate
+        #     quietly covers less than it claims" defect this checker exists to prevent.
+        for hdr in S0_NEW_FORBIDDEN_HEADERS:
+            stem = hdr[:-4]
+            (src / hdr).write_text("#pragma once\nclass S0Probe {};\n", encoding="utf-8")
+            (src / f"s0_{stem}_routes.cpp").write_text(f'#include "{hdr}"\nint main() {{}}\n',
+                                                       encoding="utf-8")
+            captured17 = io.StringIO()
+            with contextlib.redirect_stderr(captured17):
+                ok = mod.check_family(f"s0-probe-{stem}",
+                                      [f"server/core/src/s0_{stem}_routes.cpp"],
+                                      roots=roots, patterns=mod.FORBIDDEN_HEADER_PATTERNS)
+            if ok:
+                _fail(f"check_family did not fire on a synthetic TU including {hdr} - the "
+                      f"WS-A4 S0 pattern is inert", failures)
+            elif hdr not in captured17.getvalue():
+                _fail(f"S0 probe for {hdr} fired but did not name it; stderr: "
+                      f"{captured17.getvalue()!r}", failures)
+
+        # 18. WS-A4 S0 TOKEN PROBE: each new type-name token must fire in an abstract header.
+        for tok in ("ApprovalManager", "DirectorySync", "UpdateRegistry", "PatchManager"):
+            (src / f"abs_s0_{tok}_api.hpp").write_text(
+                f"#pragma once\nclass {tok};\nint use_it({tok}* p);\n", encoding="utf-8")
+            captured18 = io.StringIO()
+            with contextlib.redirect_stderr(captured18):
+                ok = mod.check_abstract_headers_store_type_free(
+                    [f"server/core/src/abs_s0_{tok}_api.hpp"], roots=roots)
+            if ok or tok not in captured18.getvalue():
+                _fail(f"abstract-header probe did not fire / name the WS-A4 S0 token {tok!r}",
+                      failures)
 
     if failures:
         print(f"\n{len(failures)} seam-closure self-test failure(s).", file=sys.stderr)

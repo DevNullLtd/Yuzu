@@ -175,6 +175,26 @@ FORBIDDEN_HEADER_PATTERNS = [
     # to close, just for a different store header naming convention.
     "schedule_engine.hpp",
     "workflow_engine.hpp",
+    # WS-A4 S0 (Fable review of the WS-A4 plan, 2026-10-26): store-layer headers
+    # the three basename/dir patterns above are blind to — each is Postgres-backed
+    # (`PgPool`) or fronts a store, yet is named neither `*_store.hpp` nor
+    # `pg/*.hpp`. Before this, two unenforced-but-"clean" route TUs
+    # (`approval_routes.cpp` -> `approval_manager.hpp` + `auth_db.hpp`,
+    # `enrollment_directory_routes.cpp` -> `directory_sync.hpp`) read as clean only
+    # BECAUSE of this gap, and the auth / executions / approvals families could not
+    # be gated at all. Deliberately NOT listed: `scope_engine.hpp`,
+    # `oidc_provider.hpp`, `saml_provider.hpp`, `response_templates_engine.hpp`,
+    # `auto_approve.hpp`, `visualization_engine.hpp` — in-memory/pure engines with no
+    # store dependency (`visualization_engine.hpp` already reaches
+    # `response_store.hpp`, so it is caught transitively); listing them would make
+    # this a "server-state class" ban, which is not what the gate claims.
+    "execution_tracker.hpp",
+    "auth_db.hpp",
+    "approval_manager.hpp",
+    "directory_sync.hpp",
+    "update_registry.hpp",
+    "patch_manager.hpp",
+    "deployment_engine.hpp",
 ]
 
 # ── Impl-purity rule (ADR-0031 WS-A4, Fable review) ──────────────────────────
@@ -294,9 +314,15 @@ STORE_TYPE_TOKEN_RE = re.compile(r"\b[A-Z][A-Za-z0-9_]*Store\b")
 # TYPE-NAME-in-code probe (a forward-declared `class ScheduleEngine;` plus a
 # `list_schedules(ScheduleEngine*, …)` signature names the type without
 # including its header).
+#
+# WS-A4 S0: `ApprovalManager`, `DirectorySync`, `UpdateRegistry`, `PatchManager` —
+# the type-name twins of the new `FORBIDDEN_HEADER_PATTERNS` entries above (same
+# Postgres-backed, not-`*Store`-named class gap).
 EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
                            "AgentRegistry", "ExecutionTracker", "PgPool",
-                           "ScheduleEngine", "WorkflowEngine"]
+                           "ScheduleEngine", "WorkflowEngine",
+                           "ApprovalManager", "DirectorySync", "UpdateRegistry",
+                           "PatchManager"]
 
 # `<httplib.h>` allowlist for the impl-purity scan: one PRE-EXISTING core coupling.
 # `event_bus.hpp` is a CORE SSE primitive (the legacy `GET /events` content-provider
@@ -313,11 +339,11 @@ EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
 IMPL_HTTPLIB_ALLOWED = {"server/core/src/event_bus.hpp"}  # root-relative, exact file only
 
 # ── Family definitions ────────────────────────────────────────────────────
-# Nine families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
+# Ten families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
 # #4250, the SECOND family), `compliance` (the THIRD, #4337), `device`
 # (the FOURTH, #4484), `dex` (the FIFTH — the DEX signals seam), `dex_perf`
 # (the SIXTH — the DEX app-perf-over-time seam), `schedule` (the SEVENTH),
-# `workflow` (the EIGHTH) and `guardian` (the NINTH). Each set covers the
+# `workflow` (the EIGHTH), `guardian` (the NINTH) and `crypto` (the TENTH). Each set covers the
 # presentation-side TUs plus BOTH halves of the seam header pair: the
 # abstract `*_api.hpp` and the core-only `*_api_local.hpp` (#4249). Enforcing
 # the local header pins its own purity (forward decls only); it cannot
@@ -575,6 +601,63 @@ FAMILIES = {
         ],
     },
 }
+
+# ── Store-free presentation TUs (WS-A4 S0, Fable review of the WS-A4 plan) ───
+# NOT a seam family: no `*Api` is involved and the count in FAMILIES (which the
+# docstring and the selftest pin) is unchanged. These are route/renderer TUs whose
+# include closure was ALREADY free of every forbidden header when this list was
+# written — they are fed by injected `std::function` providers (the
+# `docs/api-twin-recipe.md` style) or render from plain view types. Until now they
+# were clean by CONVENTION only; enrolling them turns that into a gate, so a future
+# edit that adds a store include to any of them fails CI instead of passing
+# silently. Zero refactor cost — it only locks in what is already true.
+#
+# Membership rule: a `*_routes.cpp` / `*_ui.cpp` whose closure is clean under the
+# CURRENT `FORBIDDEN_HEADER_PATTERNS` and which no FAMILIES entry already enforces.
+# `approval_routes.cpp` and `enrollment_directory_routes.cpp` are deliberately NOT
+# here: they were clean only under the pre-S0 patterns (they reach
+# `approval_manager.hpp`/`auth_db.hpp` and `directory_sync.hpp`). New unenforced
+# clean TUs are NOT auto-enrolled — add them here when they are written.
+# Being clean says nothing about being SEAMED: a TU here may still reach its data
+# through a provider closure that wraps a raw store in `server.cpp`; that is the
+# per-family seam work this list does not claim to have done.
+STORE_FREE_PRESENTATION_TUS = [
+    "server/core/src/access_audit_ui.cpp",
+    "server/core/src/access_tokens_ui.cpp",
+    "server/core/src/access_ui.cpp",
+    "server/core/src/approvals_ui.cpp",
+    "server/core/src/developer_ui.cpp",
+    "server/core/src/device_data_routes.cpp",
+    "server/core/src/executions_ui.cpp",
+    "server/core/src/groups_routes.cpp",
+    "server/core/src/groups_ui.cpp",
+    "server/core/src/guardian_page_ui.cpp",
+    "server/core/src/guardian_ui.cpp",
+    "server/core/src/help_ui.cpp",
+    "server/core/src/home_ui.cpp",
+    "server/core/src/instruction_ui.cpp",
+    "server/core/src/integrations_routes.cpp",
+    "server/core/src/integrations_ui.cpp",
+    "server/core/src/kek_routes.cpp",
+    "server/core/src/legacy_events_routes.cpp",
+    "server/core/src/login_ui.cpp",
+    "server/core/src/mcp_disabled_routes.cpp",
+    "server/core/src/nvd_routes.cpp",
+    "server/core/src/pki_routes.cpp",
+    "server/core/src/preflight_ui.cpp",
+    "server/core/src/settings_data_ui.cpp",
+    "server/core/src/settings_general_ui.cpp",
+    "server/core/src/settings_pki_ui.cpp",
+    "server/core/src/settings_plugins_ui.cpp",
+    "server/core/src/settings_security_ui.cpp",
+    "server/core/src/settings_ui.cpp",
+    "server/core/src/tar_page_ui.cpp",
+    "server/core/src/tar_timeline_page_ui.cpp",
+    "server/core/src/tar_tree_routes.cpp",
+    "server/core/src/viz_host_page_ui.cpp",
+    "server/core/src/viz_page_ui.cpp",
+    "server/core/src/workflows_ui.cpp",
+]
 
 _INCLUDE_RE = re.compile(r'^\s*#\s*include\s*(<[^>]+>|"[^"]+")')
 
@@ -866,6 +949,8 @@ def run_check() -> int:
         checked += 1
         if not check_family(name, spec["tus"]):
             ok = False
+    if not check_family("store_free_presentation", STORE_FREE_PRESENTATION_TUS):
+        ok = False
     impl_ok = check_impl_purity(IMPL_TUS)
     if not impl_ok:
         ok = False
@@ -875,6 +960,7 @@ def run_check() -> int:
     if ok:
         print(f"check-seam-closure: OK ({checked} famil"
               f"{'y' if checked == 1 else 'ies'} header-closure checked + "
+              f"{len(STORE_FREE_PRESENTATION_TUS)} store-free presentation TUs checked + "
               f"{len(IMPL_TUS)} impl TUs impl-purity checked + "
               f"{len(ABSTRACT_API_HEADERS)} abstract headers store-type-free checked; "
               f"all closures free of store-layer / core-only `*_api_local.hpp` headers, "
