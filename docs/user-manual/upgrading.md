@@ -504,30 +504,50 @@ unwired-store refusals still apply and are still recorded. The JIT-elevation rou
 window when it is positive, else 300 s). The new alert `YuzuStepUpWindowDisabled` fires while the
 window is 0 or less. This release has no supported return to v0.14.1 (see "Deployment contract (hard cutover)"). v0.14.1 does not gate the two Settings routes or the four existing routes listed under "What is newly gated" above in their handlers, and it does not have the six routes that are new in this release. A server whose `/metrics` lacks `yuzu_auth_mfa_step_up_gate_total` and `yuzu_auth_mfa_step_up_window_seconds` has no step-up gate on these routes at all, and `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled` cannot fire there: their silence is not evidence that the gate is on.
 
-## ⚠️ Breaking: MFA proofs are bound to the factor they were earned with; hard cutover from a fresh auth and session database (#6079)
+## ⚠️ Breaking: MFA proofs are bound to the factor they were earned with; hard cutover with no upgrade path or rollback (#6079)
 
-**This build is a hard cutover from a fresh auth and session database.** It has no upgrade path, no
-rolling or mixed-version window (mixed-version operation is unsupported) and no rollback guarantee. "Fresh
-auth and session database" means the `auth` and `session_store` schemas start empty under this build; it does
-not mean dropping audit or fleet data, which live in other schemas, and a new Postgres database is not
-required. On a database carried over from an earlier build, the `auth` v3 migration starts every existing row at factor
-generation `0` and the trigger advances it only from the next enrolment change, so an account that was
-already enrolled reads generation `0`, is refused `503` `mfa_proof_unavailable` (sticky, no
-`retry_after_ms`) on the 34 ordinary step-up routes, the 2 factor-credential routes and approve and reject,
-and stays refused until `yuzu-server --mfa-reset <user>` clears its factor (the user enrols again at next
-sign-in). Settings self-disable and recovery-code regeneration are refused for such an account too, and an
-administrator API token still passes step-up.
+**This build is a hard cutover.** It has no upgrade path, no rolling or mixed-version window (mixed-version
+operation is unsupported) and no rollback: the only way back is restoring the backup taken in step 2 below.
+The `auth` v3 migration seeds nothing and starts every existing row at factor generation `0`; the trigger
+advances it only from the next enrolment change. So an account that was already enrolled reads generation
+`0`, is refused `503` `mfa_proof_unavailable` (sticky, no `retry_after_ms`) on the 37 step-up routes (the 35
+ordinary rows, approve and reject among them, and the 2 factor-credential routes) and stays refused until
+`yuzu-server --mfa-reset <user>` clears its factor. Settings self-disable and recovery-code regeneration are
+two of those routes, so such an account cannot use them to recover, and an administrator API token still
+passes step-up.
 
-**Before you cut over.** List the enrolled accounts that will read generation `0` on a carried-over database:
+**Before you cut over.** While the previous build is still running, list the accounts that are enrolled
+(that build has no `mfa_factor_gen` column, so the query cannot test it; after the migration every one of
+these rows reads generation `0`):
 
 ```sql
-SELECT username FROM auth.users WHERE mfa_enrolled_at IS NOT NULL AND mfa_factor_gen <= 0;
+SELECT username FROM auth.users WHERE mfa_enrolled_at IS NOT NULL;
 ```
 
-Run `yuzu-server --mfa-reset <user>` for each enrolled administrator before you rely on step-up, or keep an
-administrator API token to hand. Recovery needs a host shell on the server, the Postgres DSN and the keys
-directory (`docs/ops-runbooks/auth-db-recovery.md`, "The `--mfa-reset` CLI (audited)"), so an affected user
-cannot recover on their own.
+**Supported procedure for an existing deployment.**
+
+1. Stop every server replica.
+2. Back up the `auth` and `session_store` schemas, for example
+   `pg_dump "$YUZU_POSTGRES_DSN" --schema=auth --schema=session_store > yuzu-auth-before-6079.sql`.
+3. Start the new build. The migrations run at the first start and seed nothing.
+4. Run the post-start check, which lists the enrolled accounts that still read generation `0`:
+
+   ```sql
+   SELECT username FROM auth.users WHERE mfa_enrolled_at IS NOT NULL AND mfa_factor_gen <= 0;
+   ```
+
+5. Run `yuzu-server --mfa-reset <user>` on the host for each enrolled operator, administrators first (or keep
+   an administrator API token to hand). It needs a host shell on the server, the Postgres DSN and the keys
+   directory (`docs/ops-runbooks/auth-db-recovery.md`, "The `--mfa-reset` CLI (audited)"), so an affected user
+   cannot recover on their own. The user enrols again at next sign-in only under `--mfa-enforcement=required`
+   or `admin-only`.
+
+Until step 5 is done for an account, the 37 step-up routes (approve and reject included) answer `503`
+`mfa_proof_unavailable` for it.
+
+Starting with empty `auth` and `session_store` schemas instead is an operator choice for a deployment that
+has no enrolled operators. It discards every local account, password, MFA enrolment and session, so do not
+choose it for a deployment whose operators you cannot re-create.
 
 **What changed.** A step-up proof of a local, MFA-enrolled account now counts only for the factor
 that was enrolled when the code was verified. The central step-up check (the 34 ordinary rows), JIT
@@ -1460,6 +1480,7 @@ customer-distribution lane. Before switching lanes, read the
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The built-in server certificate is re-issued once with a server identity URI (#6016).** Same root, same key, so existing `mgmt_peer_pins` stay valid and the gateway needs no action for the re-issue. The gateway in this release can also admit the server by that identity (`mgmt_peer_auth_mode`, `mgmt_peer_identity`, `mgmt_peer_denied`; new reasons on `yuzu_gw_mgmt_auth_rejected_total`, new counter `yuzu_gw_mgmt_auth_admitted_total`, new alert `YuzuServerIdentityUriAbsent`): the identity is an explicit opt-in: the shipped reference configs and an unset mode are all `pin`, so nothing changes until you set `identity_or_pin` or `identity`. The old certificate shows as revoked with reason `superseded` in the CA inventory and the next CRL (bookkeeping, not a compromise). New audit action `server.default_certs_server_identity_upgraded`, new gauge `yuzu_server_identity_uri_present`. See [Authorizing the server by its identity](gateway.md#authorizing-the-server-by-its-identity) and "Behaviour change: the built-in server certificate is re-issued once with a server identity URI". |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Breaking, fresh deployment only: stored responses of Forensics-tier plugins are served only to callers holding `Forensics:Read` (#4990).** Applies to every stored-response read path (REST, MCP, dashboard) and to the server-side consumers of those rows (bundle collation, result-set membership, policy checks, the live output stream, execution error text), with the limits listed under "Known limits" in that section; other readers see the rows as absent, with counts and caps computed over what they may read, so an empty result no longer implies no data. Viewer, Operator, PlatformEngineer and ITServiceOwner, and with RBAC off every non-administrator session, no longer see these rows. New built-in `ForensicsAnalyst` role (read-only, assign it fleet-wide with RBAC on) and new audit action `response.forensics.read`. A read whose authority cannot be determined is refused with a retryable error rather than a partial result. This release is a hard cutover: it supports initial deployment into a fresh database only and provides no upgrade path from an earlier server's database (see "Deployment contract" in the section; the agent and gateway columns above are the minimum agent and gateway versions, not a supported upgrade starting point for the database). See "Behaviour change: stored responses of Forensics-tier plugins need `Forensics:Read` (#4990, fresh deployment only)". |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **MFA step-up is enforced by one central check on 37 named routes, before the route's own checks (breaking order of checks; server restart only, no agent or gateway change, no migration).** A stale or missing MFA proof is now answered with the `401` step-up envelope before the route's own `403` (permission, `token_session`, `not_local`; a cross-site cookie write is answered `403` by the server-wide same-site check before the step-up check); engine principals receive `403` on every step-up-gated route regardless of grants (audited as `mfa.step_up.required`, no longer as the per-route handler denial row); a server with no wired authentication store answers `503` on these routes, and an unreadable store answers `503` to local sessions; `POST /api/settings/mfa/recovery-codes` and `POST /api/settings/mfa/disable` are newly gated; SAML sessions still cannot satisfy step-up (`403`, unless the window is disabled with `--mfa-step-up-window-secs 0`). The server now exits with status `1` at boot when a mutating route has no step-up classification, which can only happen on a fork or custom build (a restart policy turns it into a restart loop; roll back to recover). Other mutating routes and all MCP tools are not MFA-step-up gated in this release. New metric `yuzu_auth_mfa_step_up_gate_total` and alerts `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled`. See [Breaking: MFA step-up is checked once](#breaking-mfa-step-up-is-checked-once-before-the-routes-own-checks-and-two-more-routes-need-a-fresh-proof). |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **MFA proofs are bound to the factor they were earned with, and approve and reject require an enrolled factor (hard cutover; migration required: `auth` v3 and `session_store` v2; no rollback; no agent or gateway change; #6079).** No rolling or mixed-version window: stop every server replica, back up the `auth` and `session_store` schemas, start the new build, then run `yuzu-server --mfa-reset <user>` for each account listed by the post-start check, because an account that was already enrolled is refused `503` `mfa_proof_unavailable` on the 37 step-up routes until then. See "Breaking: MFA proofs are bound to the factor they were earned with" above. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Seven runtime-config keys are administrator-only on `PUT /api/config/{key}` (breaking for non-administrator and MCP-tier callers; server restart only, no agent or gateway change, no migration).** `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`, `dex_cohort_export_key` and `audit_retention_days` now answer `403` to a supervised-tier MCP token and, with RBAC on, to a non-administrator role that holds `Infrastructure:Write`; every other config key is unchanged. Server restart only; see the first section on this page. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The runtime-configuration read shows a caller only the overrides it could write (breaking for MCP-tier and non-administrator readers; server restart only, no agent or gateway change, no migration).** `GET /api/config`, `GET /api/v1/config` and the MCP tool `get_runtime_config` leave out the `oidc_*`, `plugin_signing_required`, DEX alert and `audit_retention_days` overrides unless the caller could write them; an administrator account's `GET /api/config` body is unchanged apart from `log_level` reading `warn`. `heartbeat_timeout` is limited to 30 to 86400 seconds on every write route. Mixed-version fleets are not a concern (server-side only). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The activity-record feature is renamed Echo (breaking; hard cut, no aliases).** The agent plugin is `echo` (was `tar`), and the REST routes, MCP tools, metrics, audit actions, instruction ids, heartbeat tags and the result-set matcher kind carry the new name. **Upgrade the server before the agents:** the server accepts an agent that still reports `tar` and writes the old name on the wire to it (an upgrade-window shim, also on the gateway directory route), but an upgraded agent talking to a server that has not been upgraded has no fallback and every Echo dispatch to it is refused with `plugin_not_found`. Deliver the agent by package installer: an OTA update replaces the binary only, and the agent defers adopting `tar.db` as `echo.db` until `echo.<ext>` is installed. A carried-forward server database (not a supported upgrade path under the deployment contract) has its stored references rewritten in eleven stores on the first start. See "Behaviour change: the activity-record feature is renamed Echo (tar.db adopted as echo.db; stored references migrated)". |

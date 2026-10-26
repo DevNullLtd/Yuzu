@@ -365,7 +365,11 @@ through `auth_sql::soft_delete_user_in_txn`, and ends the account's sessions in 
 SEPARATE step (outcome `deactivated_but_session_wipe_failed` when that step fails).
 Reactivation (`AuthManager::reactivate_user`) ends the account's cached and durable
 sessions BEFORE it sets the account active again, and does not restore the factor; if
-the durable wipe fails it returns false and the account stays inactive (the wipe is unconditional: called on an already-active account it also ends that account's sessions; the real callers pass inactive accounts; see
+the durable wipe fails it returns false and the account stays inactive. After the durable wipe succeeds, and
+before the account is set active, it drops the user's cached sessions again, so no cached copy survives on this
+replica; other replicas drop theirs on the wipe's generation bump within the cache bound (about 1 s, 30 s while the
+poll fails). The wipe is unconditional: called on an already-active account it also ends that account's sessions;
+the real callers pass inactive accounts (see
 "Deprovision and reactivation" below for the SCIM consequence). A NEW factor-clear path
 outside the owner or the deactivation helper is CRITICAL. It is the same kind of ADR-0012 §3 query owner as
 `CredentialChangeOwner`: one pool lease, one `with_txn_for`, schema-qualified SQL
@@ -376,9 +380,9 @@ the CLI, that is no longer the row's → factor changed, nothing written); the
 factor `UPDATE` and the `DELETE` of the recovery codes; `DELETE` of every durable
 session of the account (the shared `session_store_sql_helpers.hpp` statement), only
 when a verified factor was cleared or the CLI asks for the fail-safe; the success
-audit row via `AuditStore::log_in_txn`; and, last and only when sessions were
-deleted, the `session_meta` write-generation bump (a cancelled enrolment deletes none
-and bumps none). Lock order, identical to `CredentialChangeOwner`: `auth.users` row →
+audit row via `AuditStore::log_in_txn`; and, last and only when the session-delete
+step ran, the `session_meta` write-generation bump (a cancelled enrolment skips that
+step and bumps none). Lock order, identical to `CredentialChangeOwner`: `auth.users` row →
 `session_store.sessions` rows → `audit_events` INSERT → `session_meta`
 `write_generation`. Any failure rolls everything back: there is no torn state and
 no compensating write. The audit INSERT is inside the transaction, so a failed
@@ -388,11 +392,12 @@ store unavailable (nothing written unless the connection was lost at COMMIT: the
 transaction may then have committed, every effect landing together, including the
 owner's `ok` audit row, while the Settings handler also writes its own `error` row)
 and audit unavailable. `kWriteTimeout` is 1500 ms and is the `lock_timeout`, so it
-bounds each LOCK WAIT inside the transaction, not the transaction as a whole (no
-`statement_timeout` is set). It is strictly below `recheck_role_locked`'s 2000 ms, so
+bounds each LOCK WAIT inside the transaction, not the transaction as a whole (the owner sets no
+`statement_timeout` of its own; the pool's per-connection default of 30 s bounds each statement, so the
+transaction is bounded per statement and per lock wait, not as a whole). It is strictly below `recheck_role_locked`'s 2000 ms, so
 a same-account sign-in queued behind a clear that is stuck on a lock waits out that
 abort instead of failing closed and sweeping the account's sessions; a clear stalled
-in a statement rather than a lock wait is not bounded by it.
+in a statement rather than a lock wait is not bounded by it, only by the pool's 30 s statement default.
 
 **Enrolment checks the durable session; a cached survivor cannot enrol.** The Settings replica drops its own
 cached sessions for the account after the commit and the CLI is a one-shot with no cache, but another replica
@@ -406,11 +411,19 @@ absent, lapsed (against the database clock), another account's, or a token that 
 exactly like "no session": `401` with an empty body, nothing minted or written, no audit row. A read that fails
 is answered with the handlers' own "MFA backend unavailable" fragment (status `200`), nothing written, no
 audit row, and counts `yuzu_auth_session_store_degrade_total{op="validate"}`. API, MCP and engine-token sessions
-have no durable row and are re-validated against their own store on every request, so they skip the check; a
-cookie-less local session is refused. A cached survivor on another replica therefore can no longer enrol an
-authenticator on the cleared account. The approver and step-up gates were never reachable this way: they read the
-durable proof per decision. What remains is the accepted cache bound (SOC 2 residual (b)) for the OTHER routes the
-survivor's role reaches: for that window it can use them as it could before the clear. When a clear is made for
+have no durable row and are re-validated against the token store on every request (that store keeps a per-replica
+cache bounded by its TTL, `ApiTokenStore::kTokenCacheTtl`, 60 s), so they skip the check; a bearer token that passes the
+route's admin gate may still start MFA enrolment (unchanged by #6079); a cookie-less local session is refused. A cached survivor on another replica therefore can no longer enrol an
+authenticator on the cleared account. The closure covers requests that start after the clear: a request that
+passed the liveness check BEFORE the revocation can still complete (the in-flight mechanism of "Accepted residual
+(R14)" below remains an accepted residual, not newly closed), and an unenrolled account's cached survivor can still
+generate recovery-code rows that no factor can use or cancel a provisional enrolment (it holds no factor, so no
+attacker-held factor results; `step_up_gate.cpp`, "a user who is not enrolled passes"). The approver gate refuses an
+account with no enrolled factor, so a cached survivor of a cleared account never passes it, but the central step-up
+check admits an account with no enrolled factor on the 35 ordinary rows and on the 2 factor-credential rows alike,
+so a cached survivor reaches those routes like every other role-permitted route. What remains is the accepted
+cache bound (SOC 2 residual (b)) for the OTHER routes the survivor's role reaches: for that window it can use them
+as it could before the clear. When a clear is made for
 suspected compromise the operator still ends the account's sessions or restarts the other replicas (runbook,
 "Ending the sessions by hand") to bound those routes.
 
@@ -1045,10 +1058,10 @@ gate applied.
   `ENABLE ALWAYS` so it fires under every `session_replication_role`) by exactly one whenever
   `mfa_enrolled_at` changes: enrolment, clear, soft delete, or a direct UPDATE by any binary. Application
   code never writes it. It is not advanced by a provisional secret, a TOTP counter advance, recovery-code
-  regeneration or a `SecretCodec` re-encryption. The migration seeds nothing (a hard cutover from a fresh auth and session database): every existing row
+  regeneration or a `SecretCodec` re-encryption. The migration seeds nothing (a hard cutover, see "Rollout and cutover" below): every existing row
   starts at `0` and the trigger advances it from the next enrolment change, so an account that was already
   enrolled on a carried-over database reads generation `0`, is refused `503` `mfa_proof_unavailable`, and
-  must have its factor cleared with `yuzu-server --mfa-reset <user>` (the user enrols again at next sign-in).
+  must have its factor cleared with `yuzu-server --mfa-reset <user>` (under `--mfa-enforcement=required` or `admin-only` the user enrols again at next sign-in).
 - **The session side is guarded too.** `session_store.sessions.mfa_factor_gen` and `mfa_bind_seq`
   (session_store migration v2) hold the bound proof. The trigger `sessions_mfa_rebind_guard`
   (`ENABLE ALWAYS`) sets `mfa_factor_gen` to `0` ("unbound") on any write of a proof or identity column
@@ -1153,13 +1166,17 @@ gate applied.
 
 #### Rollout and cutover
 
-This build is a hard cutover from a fresh auth and session database. It has no upgrade path, no
-rolling or mixed-version window and no rollback guarantee.
+This build is a hard cutover. It has no upgrade path, no rolling or mixed-version window and no
+rollback. The supported procedure for an existing deployment (stop every replica, back up the `auth` and
+`session_store` schemas, start the new build, list the accounts still at generation `0`, run
+`yuzu-server --mfa-reset <user>` for each enrolled operator) is in `docs/user-manual/upgrading.md`. Starting
+with empty `auth` and `session_store` schemas is an operator choice for a deployment with no enrolled
+operators; it discards local accounts, passwords, MFA enrolments and sessions.
 
 | State | Behaviour |
 |---|---|
 | Fresh database | Full closure on every gate. Every row starts at generation `0` and the trigger advances it from the first enrolment. |
-| Carried-over database with an already-enrolled account | The `auth` v3 migration seeds nothing, so the account reads generation `0` and is refused `503` `mfa_proof_unavailable` until `yuzu-server --mfa-reset <user>` clears its factor (the user enrols again at next sign-in). |
+| Carried-over database with an already-enrolled account | The `auth` v3 migration seeds nothing, so the account reads generation `0` and is refused `503` `mfa_proof_unavailable` until `yuzu-server --mfa-reset <user>` clears its factor (under `--mfa-enforcement=required` or `admin-only` the user enrols again at next sign-in). |
 | Trigger dropped, disabled, replica-only or body replaced | Boot refuses (only `--mfa-reset` and `--break-glass-arm` open their bootstrap `AuthDB` past it, and report the binding not enforced). While running, a validation that observes it fails every local binding decision closed (sticky). Changes made while it was not firing are not reconstructable: end the affected accounts' sessions (runbook). |
 | Coherent offline restore | The accepted ADR-2002 checkpoint class. After ANY restore of the auth schema end every session (a restart does not). |
 
@@ -1329,8 +1346,8 @@ Consequences, each deliberate:
   pass, about 15 minutes at most, and a forward step only when it exceeds about a year). The check is an admission boundary: a clearance committed before the read is honoured, one
   committed after it is seen from the next request, and the two session resolves on the route are not
   atomic.
-- **Cutover.** The enrolled-factor requirement is a property of this build. This build is a hard cutover from
-  a fresh auth and session database: there is no upgrade or mixed-version path, and the rollout rules for the factor-generation
+- **Cutover.** The enrolled-factor requirement is a property of this build. This build is a hard
+  cutover: there is no upgrade, mixed-version or rollback path, and the rollout rules for the factor-generation
   binding are listed in "Rollout and cutover" under "Factor-generation binding of MFA proofs" above.
   Endpoint agents are unaffected.
 - **Fail closed.** An unresolvable session (the "degraded session read", #4128) answers `503` and the
@@ -2697,9 +2714,11 @@ the same audit behavior described below, not a silent no-op:
   login, the same posture as any other de-enrolled account; SCIM never
   resurrects a stale second factor. **Reactivation ends the account's
   sessions first** (`AuthManager::reactivate_user`: cached and durable
-  sessions are deleted BEFORE the account becomes active again, so there is no
-  instant at which it is active and still holds a session from before it was
-  deactivated). If the durable wipe fails the account is left inactive and
+  sessions are deleted BEFORE the account becomes active again, and the cache is
+  dropped once more after the durable delete, so there is no instant at which it
+  is active and still holds a session from before it was deactivated on this
+  replica; other replicas drop theirs within the cache bound, about 1 s and 30 s
+  while their session-generation poll fails). If the durable wipe fails the account is left inactive and
   the call returns `500` (`failed to reactivate the underlying account` on
   `PATCH`/`PUT`, `failed to revive the underlying account` on a `POST` revive)
   with an audit failure row (`scim.user.reactivated` or

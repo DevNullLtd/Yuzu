@@ -3,8 +3,8 @@
 Status: **PR 1 + PR 2 + PR 3 of 3 shipped (v0.13+), plus the at-rest
 encryption follow-up SHIPPED (2026-07-16)** — self-service
 enrollment, login challenge, recovery codes (PR 1); step-up on 11
-high-risk REST + Settings surfaces (PR 2; since extended to 37 mutating
-routes, 37 enforced at one chokepoint, see "Step-up chokepoint" below); OIDC `amr` short-circuit plus
+high-risk REST + Settings surfaces (PR 2; since extended to 40 mutating
+routes, 37 enforced at one chokepoint and three by their own JIT-elevation gate, see "Step-up chokepoint" below); OIDC `amr` short-circuit plus
 enforcement modes (`admin-only` / `required`) with login-time enrollment
 bootstrap (PR 3). The MFA ladder is complete. `mfa_totp_secret` at-rest
 encryption landed as part of the `AuthDB`/`ScimStore` ADR-0006 Postgres

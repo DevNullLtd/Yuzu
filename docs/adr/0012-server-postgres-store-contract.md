@@ -335,7 +335,9 @@ that lifecycle is pre-existing and outside this owner. The owner is the same sha
 `CredentialChangeOwner` above: one `pool.with_txn_for(kWriteTimeout)` on one lease, schema-qualified SQL
 across three schemas, no nested acquire. In order: `set_config('lock_timeout', ..., true)` (transaction
 scoped, so it bounds every lock wait that follows and never leaks to the pooled connection; it is a
-per-lock-wait bound, not a bound on the transaction, and no `statement_timeout` is set);
+per-lock-wait bound, not a bound on the transaction; the owner sets no `statement_timeout` of its own, and the
+pool's per-connection default of 30 s (`PgPool::Options::statement_timeout_ms`, overridable through the DSN
+`options`) bounds each statement, so the transaction is bounded per statement and per lock wait, not as a whole);
 `SELECT ... FROM auth.users ... FOR UPDATE` (classification under the lock: no active row is not found, and
 an admitted factor generation, passed by Settings and not by the CLI, that is no longer the row's is
 factor changed, with nothing written); the factor `UPDATE` and the `DELETE FROM auth.mfa_recovery_codes`;

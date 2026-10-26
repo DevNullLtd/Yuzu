@@ -220,18 +220,19 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   `--mfa-reset` clear:** ONE transaction on one
   lease (lock the `auth.users` row, compare the admitted generation, clear the
   factor, delete the recovery codes and every durable session, insert the
-  audit row, bump the session write-generation last and only when sessions were
-  deleted), where any failure, the
+  audit row, bump the session write-generation last and only when the
+  session-delete step ran), where any failure, the
   audit INSERT included, rolls everything back. Account deactivation also clears
   the factor and the recovery codes, through `auth_sql::soft_delete_user_in_txn`,
   and ends sessions in a separate step (outcome `deactivated_but_session_wipe_failed`);
   `AuthManager::reactivate_user` ends the account's cached and durable sessions BEFORE
-  it reactivates (a failed durable wipe returns false and leaves the account
-  inactive) and restores no factor. A NEW factor-clear path outside the owner or the
+  it reactivates, dropping the cached copies again after the durable wipe and
+  before `AuthDB::reactivate_user` (a failed durable wipe returns false and leaves the
+  account inactive) and restores no factor. A NEW factor-clear path outside the owner or the
   deactivation helper, or a
   clear split across transactions, is CRITICAL; `AuthDB::mfa_disable` is a
   test-fixture un-enrol with no route or CLI caller.** The auth v3 migration
-  seeds nothing (a hard cutover from a fresh auth and session database): every existing row
+  seeds nothing (a hard cutover with no upgrade path, mixed-version window or rollback): every existing row
   starts at generation `0`. **A PR that writes `mfa_factor_gen`,
   weakens the trigger or its pinned-body check, publishes a verifier's success
   before COMMIT, takes the verification instant after the crypto check, or

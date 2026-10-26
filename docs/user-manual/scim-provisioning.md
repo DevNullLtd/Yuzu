@@ -26,8 +26,10 @@ using a bearer token you configure. From then on:
   sign in via SSO.
 - **Employee terminated / unassigned from the app in the IdP** → the IdP
   calls `PATCH`, `PUT` (or `DELETE`) → the Yuzu account is disabled
-  immediately, and any active session for that user is revoked. No admin
-  has to remember to go disable the account by hand.
+  immediately, and on deactivation any active session for that user is
+  revoked (the session wipe is a separate step that can fail; residual (f) of
+  the SOC 2 readiness doc, outcome `deactivated_but_session_wipe_failed`). No
+  admin has to remember to go disable the account by hand.
 - **Employee later re-assigned / re-hired** → the IdP re-activates the same
   SCIM resource → the Yuzu account is restored (any stale account lockout
   is cleared). The user re-enrolls MFA on their next login — a reactivation
@@ -612,7 +614,9 @@ time they sign in.
 Reactivation ends the account's sessions first. Before the account becomes
 active again, Yuzu deletes any session it still holds (cached and durable), so
 a session that survived an earlier deactivation whose session wipe failed
-cannot outlive the reactivation. If that durable wipe fails, the account is
+cannot outlive the reactivation: the wipe is unconditional, it also drops this server's cached copy again
+after the durable delete, and other servers drop theirs within the session cache bound (about one second, 30
+seconds while a server's session-generation poll is failing). If that durable wipe fails, the account is
 left **inactive** and the call (a `PATCH` or `PUT` with `active:true`, or a
 `POST` that revives a deprovisioned user) answers **`500`**
 (`failed to reactivate the underlying account`, or `failed to revive the

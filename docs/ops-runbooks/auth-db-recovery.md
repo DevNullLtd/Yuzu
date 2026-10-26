@@ -404,7 +404,7 @@ Step 3 is the one people skip. It is the only cheap check that distinguishes
 "restored correctly" from "restored, and every MFA user will be locked out the
 moment they try to log in".
 
-**Enrolled accounts at generation 0 (#6079).** An enrolled account whose factor generation is not positive (`SELECT username FROM auth.users WHERE mfa_enrolled_at IS NOT NULL AND mfa_factor_gen <= 0;`) is refused `503` `mfa_proof_unavailable` on approve and reject and on the 34 ordinary step-up routes until `yuzu-server --mfa-reset <user>` clears its factor (the user enrols again at next sign-in). The command needs a host shell, the Postgres DSN and the keys directory, so an affected user cannot recover on their own; an administrator API token still passes step-up while this is being done.
+**Enrolled accounts at generation 0 (#6079).** An enrolled account whose factor generation is not positive (`SELECT username FROM auth.users WHERE mfa_enrolled_at IS NOT NULL AND mfa_factor_gen <= 0;`) is refused `503` `mfa_proof_unavailable` on approve and reject, on the 35 ordinary step-up routes and on the 2 factor-credential routes (Settings recovery-code regeneration, `POST /api/settings/mfa/recovery-codes`, and MFA disable, `POST /api/settings/mfa/disable`) until `yuzu-server --mfa-reset <user>` clears its factor (under `--mfa-enforcement=required` or `admin-only` the user enrols again at next sign-in). The command needs a host shell, the Postgres DSN and the keys directory, so an affected user cannot recover on their own; an administrator API token still passes step-up while this is being done.
 
 ## Sessions are durable
 
@@ -870,8 +870,11 @@ remaining window at once, restart the other replicas or run the delete below and
 account transaction, and ends its sessions in a SEPARATE step. If that step failed, the outcome is
 `deactivated_but_session_wipe_failed` (also the `outcome` label of `yuzu_scim_compensation_failed_total`).
 Reactivation (`AuthManager::reactivate_user`) now deletes the account's cached and durable sessions BEFORE it
-sets the account active again, so a session that survived the failed wipe is gone by the time the account
-can sign in, and no manual step is needed. It does not restore any factor. If the durable wipe itself
+sets the account active again, and drops this server's cached copy again after the durable delete, so a session that
+survived the failed wipe is gone by the time the account can sign in, on this replica, and on other replicas within the
+session cache bound (about 1 s, 30 s while a replica's session-generation poll is failing); no manual step is needed.
+The wipe is unconditional (it also ends the sessions of an already-active account; real SCIM callers pass inactive
+accounts only). It does not restore any factor. If the durable wipe itself
 fails, the reactivation logs an error, returns false and leaves the account inactive; SCIM turns that into a
 `500` with an audit failure row (`scim.user.reactivated` or `scim.user.provisioned`, `result=failure`), so the
 IdP retries. For a reactivation made any other way, retry it. After a deactivation that reported
@@ -908,7 +911,9 @@ The handler records `result=error` (`disable failed`) for a storage failure, `re
 that changed under it, and `result=error` with `blocked: mfa_enforcement=<mode>` when policy forbids
 disabling MFA on that account (a policy refusal, not a failed clear). It writes **no row** when the audit
 store was the failure, or when the account was not found (the page says "Could not disable MFA: the
-account was not found. Nothing was changed."). The `--mfa-reset` command writes no row when it fails and
+account was not found. Nothing was changed."). The `--mfa-reset` command writes no row when it fails, except when
+the connection was lost at COMMIT (the clear and its `mfa.reset.breakglass` row may then have landed, and its
+message says to check the account's MFA status and that row before re-running), and
 emits no metric at all: its exit status and its stderr and log line are the signal. A Settings clear
 is counted: `yuzu_auth_mfa_disable_total{result}` (`ok|not_found|factor_changed|store_unavailable|audit_unavailable`)
 adds one per outcome, so a rise in `store_unavailable` or `audit_unavailable` is the cheap first signal that
@@ -940,8 +945,10 @@ signal only: a lost-COMMIT acknowledgement is counted `store_unavailable` even i
 `--mfa-reset` CLI still exports nothing. The evidence is the audit rows, that log line, and `yuzu_server_audit_emit_failed_total` when the audit
 INSERT was reached.
 The 1500 ms write timeout is a bound on each lock wait inside the transaction (`lock_timeout`), not on the
-whole transaction, and no `statement_timeout` is set, so a stalled statement is bounded by the connection
-and the database, not by that figure.
+whole transaction. The owner sets no `statement_timeout` of its own; the pool's per-connection default of 30 s
+bounds each statement (the serving pool and the `--mfa-reset` pool both use it, unless the DSN's `options`
+overrides it), so the transaction is bounded per statement and per lock wait, not as a whole, and a stalled
+statement is bounded by that default, not by the 1500 ms figure.
 
 **Finding a clear whose outcome is unknown.** Every clear writes an `attempted` intent row first, so a clear that was
 requested but never reported its outcome (the process died after the clear, or the outcome write failed) leaves an
