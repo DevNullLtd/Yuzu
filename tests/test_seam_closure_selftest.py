@@ -187,12 +187,13 @@ EXPECTED_FORBIDDEN_HEADER_PATTERNS = [
     "update_registry.hpp",
     "patch_manager.hpp",
     "deployment_engine.hpp",
+    "nvd_db.hpp",
 ]
 # WS-A4 S0: the new patterns, named separately so probe 17 can prove each one fires.
 S0_NEW_FORBIDDEN_HEADERS = [
     "execution_tracker.hpp", "auth_db.hpp", "approval_manager.hpp",
     "directory_sync.hpp", "update_registry.hpp", "patch_manager.hpp",
-    "deployment_engine.hpp",
+    "deployment_engine.hpp", "nvd_db.hpp",
 ]
 # WS-A4 S0: store-free presentation TUs - clean-by-gate, not by convention.
 EXPECTED_STORE_FREE_PRESENTATION_TUS = [
@@ -216,7 +217,6 @@ EXPECTED_STORE_FREE_PRESENTATION_TUS = [
     "server/core/src/legacy_events_routes.cpp",
     "server/core/src/login_ui.cpp",
     "server/core/src/mcp_disabled_routes.cpp",
-    "server/core/src/nvd_routes.cpp",
     "server/core/src/pki_routes.cpp",
     "server/core/src/preflight_ui.cpp",
     "server/core/src/settings_data_ui.cpp",
@@ -232,10 +232,12 @@ EXPECTED_STORE_FREE_PRESENTATION_TUS = [
     "server/core/src/viz_page_ui.cpp",
     "server/core/src/workflows_ui.cpp",
 ]
-# The two TUs that were clean only under the pre-S0 patterns: must NEVER be enrolled.
+# TUs that were clean only under the pre-S0 patterns: must not be enrolled while their
+# closure still reaches the header named (approval_manager/auth_db, directory_sync, nvd_db).
 S0_DELIBERATELY_NOT_STORE_FREE = [
     "server/core/src/approval_routes.cpp",
     "server/core/src/enrollment_directory_routes.cpp",
+    "server/core/src/nvd_routes.cpp",
 ]
 # --- Impl-purity rule constants (ADR-0031 WS-A4, Fable review). Pinned so a
 # --- narrowing (dropping an impl TU, weakening the presentation-header set, or
@@ -278,7 +280,7 @@ EXPECTED_EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthD
                                     "AgentRegistry", "ExecutionTracker", "PgPool",
                                     "ScheduleEngine", "WorkflowEngine",
                                     "ApprovalManager", "DirectorySync", "UpdateRegistry",
-                                    "PatchManager"]
+                                    "PatchManager", "NvdDatabase"]
 
 
 def _fail(msg: str, failures: list) -> None:
@@ -357,7 +359,8 @@ def main() -> int:
     for rel in S0_DELIBERATELY_NOT_STORE_FREE:
         if rel in mod.STORE_FREE_PRESENTATION_TUS:
             _fail(f"{rel} was clean only under the pre-S0 patterns and must not be in "
-                  f"STORE_FREE_PRESENTATION_TUS", failures)
+                  f"STORE_FREE_PRESENTATION_TUS while its closure reaches a store-backed header",
+                  failures)
     if len(set(mod.STORE_FREE_PRESENTATION_TUS)) != len(mod.STORE_FREE_PRESENTATION_TUS):
         _fail("STORE_FREE_PRESENTATION_TUS contains a duplicate entry", failures)
 
@@ -656,7 +659,8 @@ def main() -> int:
                       f"{captured17.getvalue()!r}", failures)
 
         # 18. WS-A4 S0 TOKEN PROBE: each new type-name token must fire in an abstract header.
-        for tok in ("ApprovalManager", "DirectorySync", "UpdateRegistry", "PatchManager"):
+        for tok in ("ApprovalManager", "DirectorySync", "UpdateRegistry", "PatchManager",
+                    "NvdDatabase"):
             (src / f"abs_s0_{tok}_api.hpp").write_text(
                 f"#pragma once\nclass {tok};\nint use_it({tok}* p);\n", encoding="utf-8")
             captured18 = io.StringIO()
@@ -666,6 +670,61 @@ def main() -> int:
             if ok or tok not in captured18.getvalue():
                 _fail(f"abstract-header probe did not fire / name the WS-A4 S0 token {tok!r}",
                       failures)
+
+    # 19. run_check() WIRING (Gate 2 S0-2): every check above exercises a helper or a
+    #     constant in isolation, so nothing observed how run_check() CONSUMES them -
+    #     deleting the store-free lane's call, passing it `[]`, overriding its patterns,
+    #     or turning a FAMILIES loop body into `pass` all left both scripts green. Swap the
+    #     three check functions for recorders and assert run_check() calls each with exactly
+    #     the module's own list and no override, and that a failing lane fails the run.
+    real_fns = (mod.check_family, mod.check_impl_purity, mod.check_abstract_headers_store_type_free)
+    try:
+        for failing_name in (None, "store_free_presentation", "network"):
+            seen_family: dict = {}
+            seen_other: dict = {}
+
+            def fake_family(name, tus, *a, _failing=failing_name, **kw):
+                seen_family[name] = (list(tus), a, dict(kw))
+                return name != _failing
+
+            def fake_impl(tus, *a, **kw):
+                seen_other["impl"] = (list(tus), a, dict(kw))
+                return True
+
+            def fake_abstract(headers, *a, **kw):
+                seen_other["abstract"] = (list(headers), a, dict(kw))
+                return True
+
+            mod.check_family = fake_family
+            mod.check_impl_purity = fake_impl
+            mod.check_abstract_headers_store_type_free = fake_abstract
+            captured19 = io.StringIO()
+            with contextlib.redirect_stdout(captured19), contextlib.redirect_stderr(io.StringIO()):
+                rc = mod.run_check()
+            want = {name: spec["tus"] for name, spec in mod.FAMILIES.items()}
+            want["store_free_presentation"] = mod.STORE_FREE_PRESENTATION_TUS
+            if set(seen_family) != set(want):
+                _fail(f"run_check() checked families {sorted(seen_family)!r}, expected "
+                      f"{sorted(want)!r} (failing={failing_name!r})", failures)
+            for name, tus in want.items():
+                got = seen_family.get(name)
+                if got is None:
+                    continue
+                if got[0] != list(tus) or got[1] or got[2]:
+                    _fail(f"run_check() called check_family({name!r}) with {got!r}, expected "
+                          f"exactly the module list and NO extra args/overrides", failures)
+            if seen_other.get("impl", (None,))[0] != list(mod.IMPL_TUS) or \
+                    seen_other.get("abstract", (None,))[0] != list(mod.ABSTRACT_API_HEADERS):
+                _fail("run_check() did not pass IMPL_TUS / ABSTRACT_API_HEADERS to its checks", failures)
+            if (rc == 0) != (failing_name is None):
+                _fail(f"run_check() returned {rc} with check_family({failing_name!r}) failing - a "
+                      f"failing lane must fail the run, and a clean run must return 0", failures)
+            if failing_name is None and f"{len(mod.STORE_FREE_PRESENTATION_TUS)} store-free" \
+                    not in captured19.getvalue():
+                _fail("run_check() OK line does not report the store-free TU count", failures)
+    finally:
+        (mod.check_family, mod.check_impl_purity,
+         mod.check_abstract_headers_store_type_free) = real_fns
 
     if failures:
         print(f"\n{len(failures)} seam-closure self-test failure(s).", file=sys.stderr)

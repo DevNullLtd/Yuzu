@@ -87,7 +87,10 @@ FAMILY COVERAGE: today this checks ten families — `network`, `verify`, `compli
 `device`, `dex`, `dex_perf`, `schedule`, `workflow`, `guardian` and `crypto` — each contributing its dashboard/UI, REST-route (or seamed routes)
 and model translation units, plus the abstract in-process API header and (since
 #4249) the core-only `*_api_local.hpp` factory header. The exact per-family TU
-set is the FAMILIES dict below. Each family's REST-handler TWIN registrations
+set is the FAMILIES dict below. Separately, `STORE_FREE_PRESENTATION_TUS` (WS-A4 S0,
+NOT a family and not counted above) enrols route/renderer TUs that were already store-free,
+so they stay so; and S0 widened `FORBIDDEN_HEADER_PATTERNS` to the store-backed headers the
+`*_store.hpp` glob missed. Each family's REST-handler TWIN registrations
 live inside `rest_api_v1.cpp` (or the family's own routes TU), and its MCP-tool
 twin inside `mcp_server.cpp` - BOTH are
 multi-family translation units that legitimately hold real store access for
@@ -176,7 +179,7 @@ FORBIDDEN_HEADER_PATTERNS = [
     "schedule_engine.hpp",
     "workflow_engine.hpp",
     # WS-A4 S0 (Fable review of the WS-A4 plan, 2026-10-26): store-layer headers
-    # the three basename/dir patterns above are blind to — each is Postgres-backed
+    # the `*_store.hpp` / `pg/*.hpp` / `agent_registry.hpp` patterns above are blind to — each is Postgres-backed
     # (`PgPool`) or fronts a store, yet is named neither `*_store.hpp` nor
     # `pg/*.hpp`. Before this, two unenforced-but-"clean" route TUs
     # (`approval_routes.cpp` -> `approval_manager.hpp` + `auth_db.hpp`,
@@ -195,6 +198,12 @@ FORBIDDEN_HEADER_PATTERNS = [
     "update_registry.hpp",
     "patch_manager.hpp",
     "deployment_engine.hpp",
+    # `NvdDatabase` wraps a raw `sqlite3*` (the NVD CVE database) but is named
+    # `*_db.hpp`, so no pattern above saw it. Found by the Gate 2 review of this very
+    # change: the first draft of `STORE_FREE_PRESENTATION_TUS` enrolled
+    # `nvd_routes.cpp` as "store-free" although it calls
+    # `deps.nvd_db->match_inventory(...)`.
+    "nvd_db.hpp",
 ]
 
 # ── Impl-purity rule (ADR-0031 WS-A4, Fable review) ──────────────────────────
@@ -285,10 +294,12 @@ ABSTRACT_API_HEADERS = [
 #     serializer before PR #4582.
 #   - store/infra CLASS names the "Store" suffix misses: `AuthDB`, `AgentRegistry`,
 #     `ExecutionTracker`, `PgPool` — data/identity/registry/pool types that must
-#     never surface in an abstract seam header (some, e.g. auth_db.hpp /
-#     execution_tracker.hpp, are not even in FORBIDDEN_HEADER_PATTERNS, so this
-#     name probe is their only guard). Added per the #4582 Fable review; verified
-#     absent from all five abstract-header closures today (no false-fire).
+#     never surface in an abstract seam header. (auth_db.hpp / execution_tracker.hpp
+#     were once absent from FORBIDDEN_HEADER_PATTERNS, making this probe their only
+#     guard; WS-A4 S0 added both there. The name probe stays load-bearing: a bare
+#     forward declaration names the type WITHOUT including its header, which the
+#     header patterns cannot see.) Added per the #4582 Fable review; verified
+#     absent from all abstract-header closures today (no false-fire).
 #   - `AppPerfFleetRow` (from app_perf_fleet_store.hpp) — the DexPerfApi seam's own
 #     raw B2 store row. It carries per-`(version,day)` histogram arrays the
 #     `kDexCohortFloor` suppression must apply to BEFORE anything crosses the
@@ -315,14 +326,14 @@ STORE_TYPE_TOKEN_RE = re.compile(r"\b[A-Z][A-Za-z0-9_]*Store\b")
 # `list_schedules(ScheduleEngine*, …)` signature names the type without
 # including its header).
 #
-# WS-A4 S0: `ApprovalManager`, `DirectorySync`, `UpdateRegistry`, `PatchManager` —
-# the type-name twins of the new `FORBIDDEN_HEADER_PATTERNS` entries above (same
-# Postgres-backed, not-`*Store`-named class gap).
+# WS-A4 S0: `ApprovalManager`, `DirectorySync`, `UpdateRegistry`, `PatchManager`,
+# `NvdDatabase` — the type-name twins of the new `FORBIDDEN_HEADER_PATTERNS` entries
+# above (same store-backed, not-`*Store`-named class gap).
 EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
                            "AgentRegistry", "ExecutionTracker", "PgPool",
                            "ScheduleEngine", "WorkflowEngine",
                            "ApprovalManager", "DirectorySync", "UpdateRegistry",
-                           "PatchManager"]
+                           "PatchManager", "NvdDatabase"]
 
 # `<httplib.h>` allowlist for the impl-purity scan: one PRE-EXISTING core coupling.
 # `event_bus.hpp` is a CORE SSE primitive (the legacy `GET /events` content-provider
@@ -614,9 +625,10 @@ FAMILIES = {
 #
 # Membership rule: a `*_routes.cpp` / `*_ui.cpp` whose closure is clean under the
 # CURRENT `FORBIDDEN_HEADER_PATTERNS` and which no FAMILIES entry already enforces.
-# `approval_routes.cpp` and `enrollment_directory_routes.cpp` are deliberately NOT
-# here: they were clean only under the pre-S0 patterns (they reach
-# `approval_manager.hpp`/`auth_db.hpp` and `directory_sync.hpp`). New unenforced
+# `approval_routes.cpp`, `enrollment_directory_routes.cpp` and `nvd_routes.cpp` are
+# deliberately NOT here: they were clean only under the pre-S0 patterns (they reach
+# `approval_manager.hpp`/`auth_db.hpp`, `directory_sync.hpp` and `nvd_db.hpp`
+# respectively - the last a raw `sqlite3*` the first draft of this list missed). New unenforced
 # clean TUs are NOT auto-enrolled — add them here when they are written.
 # Being clean says nothing about being SEAMED: a TU here may still reach its data
 # through a provider closure that wraps a raw store in `server.cpp`; that is the
@@ -642,7 +654,6 @@ STORE_FREE_PRESENTATION_TUS = [
     "server/core/src/legacy_events_routes.cpp",
     "server/core/src/login_ui.cpp",
     "server/core/src/mcp_disabled_routes.cpp",
-    "server/core/src/nvd_routes.cpp",
     "server/core/src/pki_routes.cpp",
     "server/core/src/preflight_ui.cpp",
     "server/core/src/settings_data_ui.cpp",
