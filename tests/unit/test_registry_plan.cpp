@@ -335,6 +335,7 @@ TEST_CASE("registry parse_plan: items whose verdicts would depend on each other 
         // mutant: the ASCII fold alone (Windows folds the case of \xC3\x84rger and \xC3\xA4rger into one value name)
         CHECK(err(json::array({item("delete_value", "Software\\A", "\xC3\x84rger"), set_item("Software\\A", "\xC3\xA4rger", "1")})) == "dependent_items:0:1");
         CHECK(err(json::array({set_item("Software\\A", "plain", "1"), set_item("Software\\A", "caf\xC3\xA9", "2")})) == "dependent_items:0:1");
+        CHECK(err(json::array({set_item("Software\\A", "caf\xC3\xA9", "1"), set_item("Software\\A", "plain", "2")})) == "dependent_items:0:1"); // non-ASCII first
         CHECK(err(json::array({set_item("Software\\A", "caf\xC3\xA9", "1"), set_item("Software\\B", "caf\xC3\xA9", "2")})).empty()); // other key
         CHECK(err(json::array({set_item("Software\\A", "alpha", "1"), set_item("Software\\A", "beta", "2")})).empty()); // pure ASCII
     }

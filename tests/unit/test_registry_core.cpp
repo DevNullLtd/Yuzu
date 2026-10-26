@@ -3961,6 +3961,30 @@ TEST_CASE("registry apply: each item's rows go out as it concludes and a sink fa
         CHECK(ctx.lines[6] == exception_audit_line("apply"));
         CHECK(ctx.lines[7] == "error|exception");
     }
+    SECTION("an exception at item 1 leaves item 0's rows ahead of the fixed line and no handle open") {
+        // mutant: the rows are held until the end of the plan, or until the next item concludes
+        FakeRegistry reg;
+        build(reg);
+        reg.before = [](const std::string& ev) {
+            if (ev == "set_value:v") throw std::runtime_error("injected");
+        };
+        RecordingCtx ctx;
+        try {
+            (void)run_apply(ctx, reg, FakeRegistry::kRoot, plan_of(plan), ApplyOptions{false, false}, true);
+            FAIL("no exception");
+        } catch (const std::runtime_error&) {
+            report_exception(ctx, "apply");
+        }
+        CHECK(reg.open.empty());
+        REQUIRE(ctx.lines.size() == 6);
+        CHECK(starts(ctx.lines[0], "audit|op=apply.delete_key|"));
+        CHECK(starts(ctx.lines[1], "item|0|"));
+        CHECK(starts(ctx.lines[2], "undo|0|a|"));
+        CHECK(starts(ctx.lines[3], "undo|0|b|"));
+        CHECK(ctx.lines[4] == exception_audit_line("apply"));
+        CHECK(ctx.lines[5] == "error|exception");
+        CHECK(untouched(reg, "Software\\B"));
+    }
 }
 
 TEST_CASE("registry apply: an item refused before its capture shows old_state - and never absent",
@@ -3973,27 +3997,39 @@ TEST_CASE("registry apply: an item refused before its capture shows old_state - 
     reg.put("Software\\Shut", "x", kRegDword, dword(1));
     reg.key("Software\\Locked")->deny_open = true;
     reg.key("Software\\Shut")->deny_open = true;
+    reg.put("Software\\Parent", "p", kRegDword, dword(1));
+    reg.key("Software\\Parent\\Child");
+    reg.put("Software\\Odd", "a", kRegDword, dword(1));
+    reg.put("Software\\Odd", "n", 0 /*REG_NONE*/, B({1}));
     const auto run = run_plan(reg,
                               json::array({
                                   set_item("Software\\Acme", "v", "x", "REG_NOPE"), // invalid_type: refused by the parser
                                   del_value_item("Software\\Locked", "w"),           // its open is refused
                                   del_key_item("Software\\Shut"),                    // its open is refused
                                   del_value_item("Software\\Acme", "gone"),          // read: absent is a fact
+                                  del_key_item("Software\\Parent"),                  // a subkey: its values never counted
+                                  del_key_item("Software\\Odd"),                     // the vet refused part-way
                               }),
                               dry, true);
-    REQUIRE(run.verdicts() == std::vector<std::string>{"refused", "refused", "refused", "refused"});
+    REQUIRE(run.verdicts() ==
+            std::vector<std::string>{"refused", "refused", "refused", "refused", "refused", "refused"});
     CHECK(run.reason(0) == "invalid_type");
     CHECK(run.reason(1) == "access_denied");
     CHECK(run.reason(2) == "access_denied");
     CHECK(run.reason(3) == "value_not_found");
+    CHECK(run.reason(4) == "key_has_subkeys");
+    CHECK(run.reason(5) == "unsupported_old_type");
     CHECK(run.items[0][10] == "-");
     CHECK(run.items[1][10] == "-");
     CHECK(run.items[3][10] == "absent");
-    REQUIRE(run.audits.size() == 4);
+    REQUIRE(run.audits.size() == 6);
     CHECK(run.audits[0].find("|old_state=-|") != std::string::npos);
     CHECK(run.audits[1].find("|old_state=-|") != std::string::npos);
     CHECK(run.audits[2].find("|counted_keys=-|counted_values=-|capped=-|") != std::string::npos);
     CHECK(run.audits[3].find("|old_state=absent|") != std::string::npos);
+    // mutant: counted_values/capped rendered whenever the key was opened (0, or a partial count, for values never read)
+    CHECK(run.audits[4].find("|counted_keys=1|counted_values=-|capped=-|") != std::string::npos);
+    CHECK(run.audits[5].find("|counted_keys=1|counted_values=-|capped=-|") != std::string::npos);
     CHECK(reg.get("Software\\Acme", "v") != nullptr);
 }
 
@@ -4016,6 +4052,25 @@ TEST_CASE("registry apply: a refused creating item rolls back the keys it made b
     CHECK_FALSE(existed_at_row);
     CHECK_FALSE(reg.exists("Software\\New"));
     CHECK(run.undo_complete());
+    CHECK(run.out.rc == 1);
+}
+
+TEST_CASE("registry apply: a refused creating item whose rollback keeps a key reports failed with the residue",
+          "[registry][core][apply]") {
+    // mutant: the refusal-time rollback's residue is ignored (verdict refused, created 0, or undo_complete left 1)
+    FakeRegistry reg;
+    reg.key("Software");
+    reg.inject["query_value:v"] = 5; // the capture on the NEW leaf is refused
+    reg.before = [&reg](const std::string& ev) { // another party writes into the key the walk just made
+        if (ev == "create_sub:Deep") reg.put("Software\\New", "stranger", kRegDword, dword(7));
+    };
+    const auto run = run_plan(reg, json::array({set_item("Software\\New\\Deep", "v", "1")}), false, false, true);
+    CHECK(run.verdict(0) == "failed");
+    CHECK(run.reason(0) == "access_denied");
+    CHECK(run.items[0][9] == "1"); // New stayed (it holds the stranger's value); Deep was removed
+    CHECK(reg.exists("Software\\New"));
+    CHECK_FALSE(reg.exists("Software\\New\\Deep"));
+    CHECK_FALSE(run.undo_complete()); // created < missing: the row cannot name which key stayed
     CHECK(run.out.rc == 1);
 }
 

@@ -699,6 +699,10 @@ inline void count_values_into(RegistryWriter& reg, Handle h, TreeCount& c) {
     return c;
 }
 
+/// The mask both the vet (count_tree) and the delete walk (delete_subtree) open every child with: they must match, so a
+/// child whose ACL denies the delete is refused by the vet before anything is removed.
+inline constexpr std::uint32_t kDeleteWalkAccess = kAccessDelete | kKeyQueryValue | kKeyEnumerateSubKeys;
+
 /// The VET of a recursive delete: counts `h` and everything beneath it, depth first. Every child is opened from its
 /// parent's handle with REG_OPTION_OPEN_LINK and probed for a link; a link inside the tree fails the walk closed
 /// (key_is_link), because nothing may be deleted through a redirect; a child whose raw name is not well-formed UTF-16
@@ -726,9 +730,9 @@ inline void count_tree(RegistryWriter& reg, Handle h, TreeCount& c, unsigned dep
             return;
         }
         Handle child = 0;
-        // The delete walk's own mask (DELETE included), so a child whose ACL denies the delete refuses here, before
-        // anything is deleted, instead of stopping the real delete part-way.
-        if (const long orc = reg.open_sub(h, name, kAccessDelete | kKeyQueryValue | kKeyEnumerateSubKeys, child);
+        // The delete walk's own mask, so a child whose ACL denies the delete refuses here, before anything is deleted,
+        // instead of stopping the real delete part-way.
+        if (const long orc = reg.open_sub(h, name, kDeleteWalkAccess, child);
             orc != kErrorSuccess) {
             c.error = rc_token(orc, Missing::key);
             return;
@@ -764,7 +768,7 @@ inline void delete_subtree(RegistryWriter& reg, Handle h, TreeCount& d, unsigned
             return;
         }
         Handle child = 0;
-        if (const long orc = reg.open_sub(h, name, kAccessDelete | kKeyQueryValue | kKeyEnumerateSubKeys, child);
+        if (const long orc = reg.open_sub(h, name, kDeleteWalkAccess, child);
             orc != kErrorSuccess) {
             d.error = rc_token(orc, Missing::key);
             return;
@@ -1053,7 +1057,7 @@ struct ItemFacts {
         if (!f.leaf_error.empty()) return f.leaf_error;
         if (f.leaf_capped) return std::string{kTokTreeTooLarge};
         return {};
-    case PlanOp::count_: return std::string{kTokInvalidData}; // not an op: parse_plan never yields it
+    case PlanOp::count_: return std::string{kTokInvalidData}; // unreachable: parse_plan never yields it
     }
     return {};
 }
@@ -1170,8 +1174,10 @@ struct ApplyOptions {
 /// bounds: README "apply".
 ///
 /// STREAMED: each item's rows go out AS THE ITEM CONCLUDES, before the next item opens anything: its audit line, then its
-/// item row, then (a delete_key that mutated) its undo rows; the summary row comes last. So whatever stops the plan
-/// later (an exception, a dead agent) cannot take back the evidence and the undo manifest of the items already done. A
+/// item row, then (a delete_key that mutated) its undo rows; the summary row comes last. So a later exception inside the
+/// plugin, or a failed output channel, cannot take back the rows already written. NOT durable against agent death: the
+/// agent buffers them and sends at command end or each 64 KiB (agent.cpp kOutputFlushThreshold; the ABI has no flush),
+/// so an agent that dies mid-plan loses whatever it had not sent (all of it for a plan under 64 KiB of output). A
 /// sink failure follows LineSink's rule and STOPS the plan: nothing after that item is opened or mutated, and the answer
 /// is 1. The handles are closed when this returns (the map dies with it).
 template <class Ctx>
@@ -1294,6 +1300,7 @@ template <class Ctx>
         // The previous value and the delete_key counts are facts only when they were read (a handle was captured on, or
         // the key is known missing): an item refused BEFORE that (invalid, or its open failed) shows `-`, never
         // `old_state=absent`, which the undo table reads as "delete it". The dry run reads the same facts as the real run.
+        // A new pre-capture refusal added to refusal_reason must also clear facts_read.
         const bool facts_read = item.invalid.empty() && facts.open_error.empty();
         if (value_op && facts_read) {
             row.value_op = true;
@@ -1302,8 +1309,12 @@ template <class Ctx>
         }
         if (item.op == PlanOp::delete_key && facts_read) {
             au.counted_keys = facts.key_exists ? 1 : 0;
-            au.counted_values = static_cast<long long>(facts.leaf_value_count);
-            au.capped = facts.leaf_capped ? 1 : 0;
+            // The values were counted only when the vet ran to its end or its bound: a key with subkeys, or a leaf whose
+            // enumeration or vet refused, keeps `-` (not read), never a partial or zero count.
+            if (!facts.has_subkeys && facts.leaf_error.empty()) {
+                au.counted_values = static_cast<long long>(facts.leaf_value_count);
+                au.capped = facts.leaf_capped ? 1 : 0;
+            }
         }
 
         std::string verdict;
@@ -1347,7 +1358,7 @@ template <class Ctx>
             // checked -- and a re-query would prove only that it is open.
             case PlanOp::create_key: wo.result = "ok"; break;
             case PlanOp::delete_key: wo = delete_key_on(reg, h, false); break;
-            case PlanOp::count_: break; // not an op (parse_plan never yields it): fails below
+            case PlanOp::count_: break; // unreachable: parse_plan never yields it
             }
             if (creating_op) handle->commit(); // the item is over, whatever it concluded: the keys it made stay
             row.verify = wo.verify;

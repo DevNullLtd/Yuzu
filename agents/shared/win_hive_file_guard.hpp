@@ -70,9 +70,10 @@ struct HiveFileFacts {
     std::size_t depth = 0;
     bool ancestor_reparse = false;
     bool is_reparse = false;
-    /// The leaf's own link count is not exactly 1: a second name means the path may be a hard link
-    /// to another hive file (a SYSTEM write through it lands there); 0 means the count was not
-    /// read, refused the same way (fail closed).
+    /// The leaf has a link count other than 1: a second name means the path may be a hard link to
+    /// another hive file (a SYSTEM write through it lands there). A failed read is
+    /// hive_stat_failed:win32_<n>, never this; LeafFacts::links defaults to 0, so a probe that
+    /// never sets it fails closed here.
     bool leaf_hardlinked = false;
     bool is_directory = false;
     bool is_disk_file = true;
@@ -171,7 +172,7 @@ struct LeafFacts {
     std::uint32_t attributes = 0;
     bool is_disk_file = true;
     std::uint64_t size = 0;
-    std::uint32_t links = 1; // BY_HANDLE_FILE_INFORMATION::nNumberOfLinks
+    std::uint32_t links = 0; // BY_HANDLE_FILE_INFORMATION::nNumberOfLinks; 0 (never set) is refused: fail closed
     std::string owner_sid;
     bool final_path_matches = true;
     FileId id;

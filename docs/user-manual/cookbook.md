@@ -559,9 +559,12 @@ administrator or an approval; it needs registry 2.1.0 on the agent (see [Upgradi
    (`old_state`, `old_type`, `old_hex`) and `undo` rows are the only copy of the previous values.
 3. **Undo**, in reverse item order, only for items that say `applied` (or `failed` with a change): recreate
    `SOFTWARE\AcmeLegacy` with `create_key`, then in a second plan one `set_value` per `undo` row of item 1
-   (`name`, `type`, hex as `data_hex`); for item 0, `set_value` with `data_hex` set to `old_hex` when `old_state` is
-   `present`, or `delete_value` when it is `absent` (then `delete_key` too when its `created` is 1). The undo restores values only, not the deleted key's
-   security or volatility (the registry README, "Undoing a plan").
+   (`name`, `type`, hex as `data_hex`); for item 0, `set_value` with `type` = `old_type` and `data_hex` = `old_hex`
+   when `old_state` is `present`, or `delete_value` when it is `absent`. A row `name` of `-` is the default value:
+   omit `name` for it (a plan refuses `-`). When item 0's `created` is above 0, remove the keys it made with
+   `delete_key` in plans of their own, one call per level, deepest first (a value op and a key op on one key are
+   `dependent_items`). The undo restores values only, not the deleted key's security or volatility (the registry
+   README, "Undoing a plan").
 
 ---
 

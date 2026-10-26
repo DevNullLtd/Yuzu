@@ -470,8 +470,9 @@ metadata:
     checked handle (one canonical-name-checked open, with a component walk as the fallback) and a registry
     symbolic link in the path is refused, never followed (the key AT the path may itself be a link: the link
     object is removed and its target is untouched). A recursive delete first VETS the whole tree: every child is
-    opened from its parent's handle and probed for a link, and a link anywhere in the tree is refused as
-    key_is_link with nothing deleted (a key whose raw UTF-16 name is not well-formed, which no UTF-8 name can
+    opened from its parent's handle with the delete's own access and probed for a link, and a link anywhere in
+    the tree is refused as key_is_link with nothing deleted (a child whose ACL denies the delete, as
+    access_denied, in a dry run too; a key whose raw UTF-16 name is not well-formed, which no UTF-8 name can
     open exactly, as unrepresentable_name). It then removes the tree post-order, each key by its own handle (no
     RegDeleteTreeW, which follows links), re-checking every key it finds for a link: a link planted since the
     vet stops the delete as key_is_link, and a tree that grew past the vet's bound stops it as concurrent_change,
@@ -699,10 +700,10 @@ metadata:
     username or an explicit SID), then writes through the live HKEY_USERS\<SID> hive if the user is logged in,
     or loads that profile's NTUSER.DAT as a fallback. The offline load runs behind the shared hive-file guard
     (reparse ancestors, a second hard link, ownership, transaction-log sidecars and the file identity after the
-    load are checked first), the write is verified by reading it back, and the key is flushed to disk before the hive unloads (a
-    flush that fails fails the write). SeBackupPrivilege and SeRestorePrivilege are needed only for the offline
-    fallback. A hive that is loaded after the write returned is reported as a warning; a logon that failed while
-    the hive was mounted leaves no trace. Same types, encoding and verification as set_value. A `registry.write`
+    load are checked first), the write is verified by reading it back, and the key is flushed to disk before the
+    hive unloads (a flush that fails fails the write). SeBackupPrivilege and SeRestorePrivilege are needed only
+    for the offline fallback. A hive that is loaded after the write returned is reported as a warning; a logon
+    that failed while the hive was mounted leaves no trace. Same types, encoding and verification as set_value. A `registry.write`
     audit row records the previous and new values (hex, capped at 256 bytes; they can contain secrets: the
     product owner accepted this risk on 2026-10-20 and masking is a planned later change), and the `value` and
     `data_hex` parameters are stored unredacted in the execution's parameter_values. Needs registry 2.1.0 on the
@@ -902,8 +903,10 @@ metadata:
     not captured, so a recreated key gets the parent's inherited security. It is a snapshot taken at capture:
     a value another writer changes between the capture and the change is lost or stale even with
     undo_complete=1. An item refused before its previous value was read shows "-" there, never "absent".
-    Rows, written as each item concludes so a later failure never takes back an earlier item's rows: one
-    `audit` row per item that ran or was refused (recorded server-side as `registry.write`; a dry run's rows say
+    Rows are written as each item concludes, so a later exception inside the plugin or a failed output channel
+    cannot take back rows already written; the agent sends output at command end or each 64 KiB, so an agent
+    that dies mid-plan loses whatever it had not sent (for a smaller plan, all of it): read the keys back with a
+    dry run before replaying anything. The rows: one `audit` row per item that ran or was refused (recorded server-side as `registry.write`; a dry run's rows say
     dry_run=1 and record no change; three 256-item plans inside one minute exceed the server's 600 rows per
     agent per minute and the later rows are suppressed), its `item` row and, for a deleted key, its `undo` rows,
     then a closing `summary`. The plan parameter, with every value in it, is stored unredacted in the

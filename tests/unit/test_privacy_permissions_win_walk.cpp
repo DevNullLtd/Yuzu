@@ -618,6 +618,7 @@ struct FakeHiveFileProbe final : win::HiveFileProbe {
     std::vector<std::wstring> trace; // every probe question, in order, with its path arguments
 
     FakeHiveFileProbe() {
+        leaf.links = 1; // an accepting leaf: LeafFacts defaults to 0, which the guard refuses
         leaf.owner_sid = kProfileSid;
         leaf.id = {7, {1, 2, 3}};
     }
@@ -828,8 +829,16 @@ TEST_CASE("hive guard: each leaf fact the probe reports reaches its own refusal"
         CHECK(r.before() == "hive_hardlinked");
         CHECK_FALSE(r.guard.snapshot.has_value()); // refused: nothing for after_load to accept
     }
-    SECTION("a link count that was not read (0) fails closed") {
+    SECTION("a link count of 0 fails closed") {
         r.probe.leaf.links = 0;
+        CHECK(r.before() == "hive_hardlinked");
+    }
+    SECTION("a probe that never sets the link count fails closed (LeafFacts defaults to 0)") {
+        // mutant: LeafFacts::links defaults to 1, the accepting value
+        win::LeafFacts unset;
+        unset.owner_sid = kProfileSid;
+        unset.id = {7, {1, 2, 3}};
+        r.probe.leaf = unset;
         CHECK(r.before() == "hive_hardlinked");
     }
     SECTION("a single-link leaf is accepted") {

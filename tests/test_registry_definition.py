@@ -296,8 +296,8 @@ class RegistryPerUserFlushWiring(unittest.TestCase):
         start = src.index("int do_user_write(")
         body = src[start:src.index("\n}\n", start)]
         self.assertRegex(body, r"const bool flush = report\.mounted_offline;")
-        self.assertRegex(body, r"delete_value_verified\([^;]*/\*fast_eligible=\*/false, flush\)")
-        self.assertRegex(body, r"set_value_verified\([^;]*/\*fast_eligible=\*/false, flush\)")
+        self.assertRegex(body, r"delete_value_verified\([^;:]*/\*fast_eligible=\*/false, flush\)")
+        self.assertRegex(body, r"set_value_verified\([^;:]*/\*fast_eligible=\*/false, flush\)")
 
 
 if __name__ == "__main__":
