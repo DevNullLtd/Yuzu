@@ -823,6 +823,8 @@ def main() -> int:
             "alnum_char_literal_after_return_then_comment_hides_include": ("char f() { return'a'; } /* hides\n#include \"hid_store.hpp\"\n*/ int z;\n", False),
             # a hex separator chain whose later segment starts with a LETTER is still one pp-number
             "hex_separator_chain_then_comment_hides_include": ("int n = 0xAB'CD'EF; /* hides\n#include \"hid_store.hpp\"\n*/ int z;\n", False),
+            # backslash-newline INSIDE a raw string is kept by the compiler (shape B of the fuzz)
+            "raw_string_keeps_its_backslash_newline": ('const char* r = R"()\\\n"/*)";\n#include "hid_store.hpp"\n/* x */\n', True),
             # hide: NOT includes to the compiler
             "line_comment": ('// #include "hid_store.hpp"\nint x;\n', False),
             "line_comment_continued_over_include": ('// c \\\n#include "hid_store.hpp"\nint x;\n', False),
@@ -1095,7 +1097,7 @@ def main() -> int:
             "string_openers": '"' * 200000 + "\n",
             "line_continuations": "\\\n" * 200000 + "int x;\n",
             "comment_then_include": "/* x */ " * 20000 + '#include "a.hpp"\n',
-            "raw_openers": 'R"' * 200000 + "\n",
+            "raw_openers": 'LR"' * 100000 + "\n",  # every LR" is a valid opener; the delimiter cap bounds each scan
         }
         probe_code = (
             "import importlib.util, pathlib, sys\n"

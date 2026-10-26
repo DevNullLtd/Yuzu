@@ -47,8 +47,8 @@ ALSO NOT CAUGHT (found in the WS-A4 S0 review, each reproduced on a scratch tree
      `import` - cross-checked against `g++ -MM -MG` (a fuzz of ~100k files found six hiding
      shapes in an earlier draft; five are fixed and pinned). It still extracts NOTHING from a
      macro-built include (`#include SOME_MACRO`) or a `##`-spliced one, cannot see an include
-     guarded away by `__has_include`, and has one contrived residual (a backslash-newline
-     INSIDE a raw string; see `strip_comments`). Conversely an `#include` line inside `#if 0`
+     guarded away by `__has_include`. A backslash-newline INSIDE a raw string is handled by
+     lexing such files twice and taking the union (see `strip_comments`). Conversely an `#include` line inside `#if 0`
      or alone on a line inside a raw string IS extracted and can false-FAIL (conservative).
      THREAT MODEL: this is a regression lock against honest mistakes and refactors, not a proof
      against an author deliberately contorting source to hide a store include (a macro include
@@ -762,7 +762,7 @@ def _is_ident_char(ch: str) -> bool:
     return ch.isalnum() or ch == "_"
 
 
-def strip_comments(text: str, blank_strings: bool) -> str:
+def strip_comments(text: str, blank_strings: bool, join_splices: bool = True) -> str:
     """ONE LINEAR PASS over `text`: every `//` and `/* ... */` comment becomes a single space;
     string, char and raw-string literals are skipped, so a `//` or `/*` INSIDE one is never
     read as a comment; with `blank_strings` their contents are replaced by `""` / `''`.
@@ -783,20 +783,18 @@ def strip_comments(text: str, blank_strings: bool) -> str:
     a splice with FF/VT before the newline, `#import`, and a splice inside a raw string - five
     are fixed and pinned; a fresh 9000-file re-run found none.
 
-    KNOWN RESIDUAL (not fixed, contrived): phase-2 splices are removed BEFORE raw strings are
-    lexed, but the compiler keeps a backslash-newline INSIDE a raw string. So
-    a raw string whose body contains a backslash immediately followed by a newline and then
-    `"/*` (the body `)` + backslash + newline + `"/*`, closed by `)"`), followed by an include and
-    a later `*/`, makes this lexer close the raw string early and open a comment that hides the
-    include. It needs a raw string holding a
-    backslash-newline followed by a comment opener, and no real code does that; it is documented
-    rather than built (splice-aware lexing is the next step if this lock ever needs to resist an
-    adversary - at which point asking the compiler (`g++ -MM -MG`) is the exact design).
+    RAW-STRING SPLICES: phase-2 splices are removed BEFORE raw strings are lexed, but the compiler
+    keeps a backslash-newline INSIDE a raw string, so `R"()` + backslash + newline + `"/*)"` would
+    make the joined lexing close the raw string early and open a comment that hides a following
+    include. `parse_includes` closes this by lexing a file that contains `R"` a second time WITHOUT
+    the splice join and taking the union of both results (union = never hides, only possibly
+    over-extracts). `strip_comments` itself (also used for the type-token probe) still joins.
 
     An include on its own line inside `#if 0` or a raw string is still extracted (the
     conservative direction: a possible false FAIL, never a hidden include). An unterminated
     `/*` consumes the rest of the file (the compiler rejects such a file)."""
-    text = _LINE_CONTINUATION_RE.sub("", text)
+    if join_splices:
+        text = _LINE_CONTINUATION_RE.sub("", text)
     n = len(text)
     out: list[str] = []
     last = 0
@@ -912,13 +910,22 @@ def parse_includes(path: Path):
     Over-extracted (the conservative direction, a possible false FAIL): an `#include` line
     inside `#if 0` or inside a raw string literal."""
     out = []
-    text = strip_comments(_read_source(path), blank_strings=False)
-    for line in text.split("\n"):
-        m = _INCLUDE_RE.match(line)
-        if not m:
-            continue
-        spelling = m.group(1)
-        out.append((spelling.startswith("<"), spelling[1:-1]))
+    raw = _read_source(path)
+    variants = [strip_comments(raw, blank_strings=False)]
+    if 'R"' in raw:
+        # The compiler keeps a backslash-newline INSIDE a raw string, but phase 2 (the splice join)
+        # runs before our lexer can know it is in one. For a file that has a raw-string opener, also
+        # lex WITHOUT the join and take the UNION: it can only ADD extractions (never hide one), so
+        # the worst case is a possible false FAIL in a contrived file, not a missed include.
+        variants.append(strip_comments(raw, blank_strings=False, join_splices=False))
+    for text in variants:
+        for line in text.split("\n"):
+            m = _INCLUDE_RE.match(line)
+            if not m:
+                continue
+            item = (m.group(1).startswith("<"), m.group(1)[1:-1])
+            if item not in out:
+                out.append(item)
     return out
 
 
