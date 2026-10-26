@@ -517,6 +517,14 @@ unlimited/no-expiry behaviour, or size them to the rollout window and the number
 
 **No action on upgrade.** There is no schema change. No policy written by an earlier release exists to migrate (a row placed by a direct database write is read as any other document).
 
+## Behaviour change: the DEX score policy document gains model parameters and version 2
+
+**What changed.** The score policy can now set the per-device event cap, the regression full-weight and start ratios (each globally and per application) and the interval confidence level (globally). The canonical text stays version 1 and byte-identical, with the same revision, until one of them differs from its default (5, 3.0, 1.0, 0.95) or a per-application override sets one, even at the global value, because that pins the application. The writer then stores version 2, with a `model` object. A version 1 document that carries `model` is refused. With the defaults every score, interval and band is exactly what the previous release produced.
+
+**The rule.** A server on the previous release meets a version 2 document as `unsupported_version at version: 2 above the supported 1`. It scores under the shipped defaults with that fault on every Apps response and never applies part of the document. So do not set a model parameter during a rolling upgrade or rollback. After a rollback, reset the policy (`DELETE /api/v1/dex/score-policy`) or save it again without the model parameters.
+
+**No action on upgrade.** There is no schema change. A stored version 1 document stays valid and is read as before.
+
 ## ⚠️ Breaking: `POST` and `DELETE /api/v1/quarantine` now apply the dispatch approval check (#6065)
 
 **What changed.** `POST /api/v1/quarantine` (and the dashboard's Quarantine device button, which calls it) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, after the scoped `Security:Execute` gate and the `whitelist` validation and before any record is written. `DELETE /api/v1/quarantine/{agent_id}` (the Release from quarantine button) now runs the same check for the plugin's `unquarantine` action, after the scoped gate and before the `attempt` audit row and the release. Neither depends on any approval-workflow setting.

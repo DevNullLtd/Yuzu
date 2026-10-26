@@ -633,3 +633,81 @@ TEST_CASE("DexStats: dex_rate_ratio with a lowered minimum exposure", "[dex][sta
     REQUIRE(dflt);
     CHECK(dflt->estimate == dex_rate_ratio(12, 15.0, 5, 12.0, kDexRateRatioMinExposure)->estimate);
 }
+
+// -- AP-2.17 confidence level --------------------------------------------------
+
+TEST_CASE("DexStats: z_for_confidence pins the default and solves the rest", "[dex][stats]") {
+    // The default level takes the pinned value, so it is bit-identical to kDexStatsZ.
+    CHECK(dex_stats_detail::z_for_confidence(kDexStatsConfidence) == kDexStatsZ);
+    CHECK(dex_stats_detail::z_for_confidence(0.90) == Approx(1.6448536269514722).epsilon(1e-12));
+    CHECK(dex_stats_detail::z_for_confidence(0.99) == Approx(2.5758293035489004).epsilon(1e-12));
+    // The solved value satisfies the identity the pinned z is checked against.
+    for (double c : {0.5, 0.8, 0.999}) {
+        const double z = dex_stats_detail::z_for_confidence(c);
+        CHECK(std::isfinite(z));
+        CHECK(0.5 * std::erfc(-z / std::sqrt(2.0)) == Approx(1.0 - (1.0 - c) / 2.0).epsilon(1e-12));
+    }
+    CHECK(dex_stats_detail::z_for_confidence(0.5) == Approx(0.6744897501960817).epsilon(1e-12));
+    CHECK(dex_stats_detail::z_for_confidence(0.999) == Approx(3.2905267314919255).epsilon(1e-12));
+}
+
+TEST_CASE("DexStats: dex_stats_confidence_valid pins the closed bounds", "[dex][stats]") {
+    CHECK(dex_stats_confidence_valid(0.5));
+    CHECK(dex_stats_confidence_valid(0.95));
+    CHECK(dex_stats_confidence_valid(0.999));
+    CHECK_FALSE(dex_stats_confidence_valid(0.4999999));
+    CHECK_FALSE(dex_stats_confidence_valid(0.9990001));
+    CHECK_FALSE(dex_stats_confidence_valid(1.0));
+    CHECK_FALSE(dex_stats_confidence_valid(0.0));
+    CHECK_FALSE(dex_stats_confidence_valid(std::numeric_limits<double>::quiet_NaN()));
+    CHECK_FALSE(dex_stats_confidence_valid(kInf));
+    CHECK_FALSE(dex_stats_confidence_valid(-kInf));
+}
+
+TEST_CASE("DexStats: the confidence parameter on dex_proportion and dex_rate", "[dex][stats]") {
+    // The default level is bit-identical to omitting it.
+    const auto p95 = dex_proportion(81, 263);
+    const auto p95e = dex_proportion(81, 263, 0.95);
+    REQUIRE((p95 && p95e));
+    CHECK(p95e->lower == p95->lower);
+    CHECK(p95e->upper == p95->upper);
+    CHECK(p95e->estimate == p95->estimate);
+    // A lower level is strictly inside, a higher one strictly outside.
+    const auto p90 = dex_proportion(81, 263, 0.90);
+    const auto p99 = dex_proportion(81, 263, 0.99);
+    REQUIRE((p90 && p99));
+    CHECK(p90->lower > p95->lower);
+    CHECK(p90->upper < p95->upper);
+    CHECK(p99->lower < p95->lower);
+    CHECK(p99->upper > p95->upper);
+    CHECK(p90->estimate == p95->estimate);
+
+    const auto r95 = dex_rate(15, 1.0);
+    const auto r95e = dex_rate(15, 1.0, 0.95);
+    const auto r99 = dex_rate(15, 1.0, 0.99);
+    REQUIRE((r95 && r95e && r99));
+    CHECK(r95e->lower == r95->lower);
+    CHECK(r95e->upper == r95->upper);
+    CHECK(r99->lower < r95->lower);
+    CHECK(r99->upper > r95->upper);
+    // Above the exact-kernel limit the closed form takes the level's own quantile.
+    const auto big95 = dex_rate(2'000'000, 1.0);
+    const auto big90 = dex_rate(2'000'000, 1.0, 0.90);
+    REQUIRE((big95 && big90));
+    CHECK(big90->lower > big95->lower);
+    CHECK(big90->upper < big95->upper);
+    CHECK(big90->estimate == big95->estimate);
+}
+
+TEST_CASE("DexStats: an invalid confidence is nullopt, the same counts at 0.95 are not",
+          "[dex][stats]") {
+    CHECK(dex_proportion(7, 50));
+    CHECK(dex_rate(15, 1.0));
+    for (double bad : {0.4, 0.9995, 1.0, std::numeric_limits<double>::quiet_NaN(), kInf}) {
+        INFO("confidence " << bad);
+        CHECK_FALSE(dex_proportion(7, 50, bad));
+        CHECK_FALSE(dex_rate(15, 1.0, bad));
+    }
+    CHECK(dex_proportion(7, 50, 0.5));
+    CHECK(dex_proportion(7, 50, 0.999));
+}

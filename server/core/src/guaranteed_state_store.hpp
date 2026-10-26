@@ -309,7 +309,11 @@ public:
     /// qualifying application before the cut) and up to `version_limit`
     /// version rows (most devices affected first). `per_device_cap` caps each
     /// device's events in the `capped_*` sums (the stability score's caller
-    /// duty). `online_agent_ids` is the population the share, rate and score are
+    /// duty); `per_subject_caps` (exact ASCII-lowercased image name, cap) replace
+    /// it for the subjects they name: a subject matches when its ASCII-lowercase
+    /// fold (A-Z to a-z, nothing else, byte-identical to the policy resolver's
+    /// fold) equals the key, so a subject stored as "CapMe.EXE" gets the
+    /// override for "capme.exe". `online_agent_ids` is the population the share, rate and score are
     /// divided by: the `*_online` row figures and `capped_*` cover only those
     /// devices (so they are members of it), while `crashes`, `hangs` and
     /// `affected_devices` stay window-wide. At most `kDexAppsConcurrentReads`
@@ -322,7 +326,9 @@ public:
     std::optional<std::vector<DexAppStabilityRow>>
     dex_app_stability_checked(const std::string& since, const std::string& platform, int app_limit,
                               int version_limit, std::int64_t per_device_cap,
-                              const std::vector<std::string>& online_agent_ids) const;
+                              const std::vector<std::string>& online_agent_ids,
+                              const std::vector<std::pair<std::string, std::int64_t>>&
+                                  per_subject_caps = {}) const;
     std::vector<DexAppCrashCount> dex_device_top_apps(const std::string& agent_id,
                                                       const std::string& since = "",
                                                       int limit = 50) const;

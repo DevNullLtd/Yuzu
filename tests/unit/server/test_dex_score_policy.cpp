@@ -122,6 +122,10 @@ TEST_CASE("policy: the default validates and reproduces the stability score bit-
     CHECK(eff.tiers.names[1] == "good");
     CHECK(eff.tiers.names[2] == "fair");
     CHECK(eff.tiers.names[3] == "poor");
+    CHECK(d.model == kStabilityModel);
+    CHECK(d.interval_confidence == kDexStatsConfidence);
+    CHECK(eff.model == kStabilityModel);
+    CHECK(eff.interval_confidence == kDexStatsConfidence);
     for (auto b : {StabilityBand::Excellent, StabilityBand::Good, StabilityBand::Fair,
                    StabilityBand::Poor})
         CHECK(dex_tier_name(eff.tiers, b) == stability_band_label(b));
@@ -754,4 +758,141 @@ TEST_CASE("policy: the rank-flip helper accepts the global weights", "[dex][poli
     CHECK(f->first == 0);
     CHECK(f->second == 1);
     CHECK_FALSE(stability_rank_flip({x, y}, kFloor, base.weights, base.weights).has_value());
+}
+
+// -- AP-2.17 model parameters --------------------------------------------------
+
+namespace {
+DexScorePolicy with_model(std::int64_t cap, double full, double start) {
+    auto p = defaults();
+    p.model = StabilityModel{cap, full, start};
+    return p;
+}
+} // namespace
+
+TEST_CASE("policy: the validator refuses each model parameter outside its range",
+          "[dex][policy]") {
+    for (const std::int64_t cap : {std::int64_t{0}, std::int64_t{1001}, std::int64_t{-1}})
+        require_fault(with_model(cap, 3.0, 1.0), DexPolicyFault::EventCapOutOfRange);
+    require_fault(with_model(5, 3.0, 0.9), DexPolicyFault::RegressionRatioOutOfRange);
+    require_fault(with_model(5, 1000.5, 1.0), DexPolicyFault::RegressionRatioOutOfRange);
+    require_fault(with_model(5, 3.0, kNaN), DexPolicyFault::RegressionRatioOutOfRange);
+    require_fault(with_model(5, kNaN, 1.0), DexPolicyFault::RegressionRatioOutOfRange);
+    require_fault(with_model(5, kInf, 1.0), DexPolicyFault::RegressionRatioOutOfRange);
+    require_fault(with_model(5, 0.5, 1.0), DexPolicyFault::RegressionRatioOutOfRange);
+    require_fault(with_model(5, 2.0, 2.0), DexPolicyFault::RegressionRatiosNotAscending);
+    require_fault(with_model(5, 1.5, 2.0), DexPolicyFault::RegressionRatiosNotAscending);
+    for (const double c : {0.4, 1.0, kNaN, kInf, 0.9995}) {
+        auto p = defaults();
+        p.interval_confidence = c;
+        require_fault(p, DexPolicyFault::IntervalConfidenceOutOfRange);
+    }
+    // The first failing parameter wins: cap, then the ratios' range, then their order.
+    require_fault(with_model(0, 0.5, 2.0), DexPolicyFault::EventCapOutOfRange);
+    require_fault(with_model(5, 1.5, 0.5), DexPolicyFault::RegressionRatioOutOfRange);
+    // The model is checked after weights and before the override count and confidence.
+    {
+        auto p = with_model(0, 3.0, 1.0);
+        p.weights.breadth = -1.0;
+        require_fault(p, DexPolicyFault::WeightInvalid);
+    }
+    {
+        auto p = with_model(0, 3.0, 1.0);
+        p.interval_confidence = 2.0;
+        for (std::size_t i = 0; i < kDexPolicyMaxOverrides + 1; ++i)
+            p.overrides.push_back(ov("app" + std::to_string(i) + ".exe"));
+        require_fault(p, DexPolicyFault::EventCapOutOfRange);
+        p.model = kStabilityModel;
+        require_fault(p, DexPolicyFault::IntervalConfidenceOutOfRange);
+        p.interval_confidence = kDexStatsConfidence;
+        require_fault(p, DexPolicyFault::TooManyOverrides);
+    }
+}
+
+TEST_CASE("policy: the model's acceptance boundaries validate", "[dex][policy]") {
+    CHECK_FALSE(dex_score_policy_fault(with_model(1, 3.0, 1.0)).has_value());
+    CHECK_FALSE(dex_score_policy_fault(with_model(1000, 3.0, 1.0)).has_value());
+    CHECK_FALSE(dex_score_policy_fault(with_model(5, 1000.0, 1.0)).has_value());
+    CHECK_FALSE(dex_score_policy_fault(with_model(5, 1000.0, 999.0)).has_value());
+    for (const double c : {0.5, 0.999}) {
+        auto p = defaults();
+        p.interval_confidence = c;
+        CHECK_FALSE(dex_score_policy_fault(p).has_value());
+    }
+}
+
+TEST_CASE("policy: an override's model is checked against the inherited values at its index",
+          "[dex][policy]") {
+    auto p = with_model(5, 3.0, 1.5);
+    auto lowered = ov("app.exe");
+    lowered.regression_full_ratio = 1.2; // below the inherited start of 1.5
+    p.overrides = {ov("other.exe"), lowered};
+    require_fault(p, DexPolicyFault::RegressionRatiosNotAscending, 1);
+    // A start raised past the inherited full ratio is the same refusal.
+    auto q = defaults();
+    auto raised = ov("app.exe");
+    raised.regression_start_ratio = 3.5;
+    q.overrides = {raised};
+    require_fault(q, DexPolicyFault::RegressionRatiosNotAscending, 0);
+    // Both set, ascending: valid even though neither alone would be.
+    raised.regression_full_ratio = 6.0;
+    q.overrides = {raised};
+    CHECK_FALSE(dex_score_policy_fault(q).has_value());
+    // An out-of-range override value is reported at the override.
+    auto cap = ov("app.exe");
+    cap.per_device_event_cap = 0;
+    q.overrides = {ov("x.exe"), cap};
+    require_fault(q, DexPolicyFault::EventCapOutOfRange, 1);
+    cap.per_device_event_cap = 1000;
+    q.overrides = {cap};
+    CHECK_FALSE(dex_score_policy_fault(q).has_value());
+}
+
+TEST_CASE("policy: the resolver merges the model per field", "[dex][policy]") {
+    auto p = with_model(6, 4.0, 1.5);
+    p.interval_confidence = 0.9;
+    auto capped = ov("capme.exe");
+    capped.per_device_event_cap = 3;
+    auto ratios = ov("ratios.exe");
+    ratios.regression_start_ratio = 2.0;
+    ratios.regression_full_ratio = 5.0;
+    p.overrides = {capped, ratios};
+    REQUIRE_FALSE(dex_score_policy_fault(p).has_value());
+
+    const auto c = resolve_dex_score_policy(p, "CapMe.EXE");
+    CHECK(c.profile == DexPolicyProfile::Override);
+    CHECK(c.model == (StabilityModel{3, 4.0, 1.5})); // only the cap is the override's
+    const auto r = resolve_dex_score_policy(p, "ratios.exe");
+    CHECK(r.profile == DexPolicyProfile::Override);
+    CHECK(r.model == (StabilityModel{6, 5.0, 2.0}));
+    const auto other = resolve_dex_score_policy(p, "unmatched.exe");
+    CHECK(other.profile == DexPolicyProfile::Default);
+    CHECK(other.model == (StabilityModel{6, 4.0, 1.5}));
+    // The confidence level is the global one everywhere.
+    for (const auto* e : {&c, &r, &other})
+        CHECK(e->interval_confidence == 0.9);
+
+    // Setting only the cap inherits the shipped ratios: {3, 3.0, 1.0}.
+    auto q = defaults();
+    q.overrides = {capped};
+    CHECK(resolve_dex_score_policy(q, "capme.exe").model == (StabilityModel{3, 3.0, 1.0}));
+}
+
+TEST_CASE("policy: dex_score_under_policy scores under the effective model", "[dex][policy]") {
+    auto p = defaults();
+    auto capped = ov("capme.exe");
+    capped.per_device_event_cap = 10;
+    capped.regression_full_ratio = 2.0;
+    p.overrides = {capped};
+    REQUIRE_FALSE(dex_score_policy_fault(p).has_value());
+    const auto eff = resolve_dex_score_policy(p, "capme.exe");
+    // 7 capped crashes on one device: inconsistent at the default cap, scored at 10.
+    const auto in = mk(10, 1, 7, 0, Rr{2.0, 4.0});
+    CHECK(std::string(dex_score_under_policy(in, kFloor, resolve_dex_score_policy(p, "x.exe"))
+                          .withheld) == "inconsistent");
+    const auto scored = dex_score_under_policy(in, kFloor, eff);
+    REQUIRE(scored.score.has_value());
+    CHECK(scored.deductions[3].points == 12.0); // full weight at the override's ratio of 2
+    const auto direct = compute_stability_score(in, kFloor, eff.weights, eff.tiers.edges, eff.model);
+    CHECK(*scored.score == *direct.score);
 }

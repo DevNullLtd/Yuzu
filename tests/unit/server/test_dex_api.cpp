@@ -41,6 +41,7 @@
 #include <string>
 #include <vector>
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 using yuzu::server::build_dex_device_score_model;
@@ -49,6 +50,7 @@ using yuzu::server::GuaranteedStateEventRow;
 using yuzu::server::GuaranteedStateStore;
 using yuzu::server::make_local_dex_api;
 using yuzu::server::pg::PgPool;
+using Catch::Approx;
 
 namespace {
 
@@ -1038,4 +1040,74 @@ TEST_CASE("DexApi: apps read over its concurrency budget is refused as a degrade
     store.set_apps_read_budget_for_test(1);
     CHECK_FALSE(api->apps("7d").degraded);
     CHECK_FALSE(api->apps("7d").degraded);
+}
+
+// -- AP-2.17 model parameters --------------------------------------------------
+
+// The per-device event cap reaches the store per application: capme.exe has 7 crashes on
+// a1 and 1 on a2 (both in fleet20's online set, so the affected devices are all online and
+// the score is published). The crashes deduction is 20 * capped / (20 * cap).
+TEST_CASE("DexApi: a per-application event cap override reaches the store", "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    int n = 0;
+    auto id = [&] { return "cap" + std::to_string(++n); };
+    for (int i = 0; i < 7; ++i)
+        seed_obs_v(store, id(), "a1", "capme.exe", "process.crashed", "1.0", kTs);
+    seed_obs_v(store, id(), "a2", "capme.exe", "process.crashed", "1.0", kTs);
+    // The store keeps a subject's bytes, so this is its own row; the policy still folds
+    // its name to capme.exe.
+    for (int i = 0; i < 3; ++i)
+        seed_obs_v(store, id(), "a3", "CapMe.EXE", "process.crashed", "1.0", kTs);
+    using yuzu::server::DexAppsModel;
+    using yuzu::server::DexPolicyInForce;
+    using yuzu::server::DexPolicyProfile;
+
+    const auto apps_under = [&](const std::string& doc) {
+        auto fn = [doc]() -> std::expected<DexPolicyInForce, std::string> {
+            return yuzu::server::dex_policy_in_force_from_stored(doc);
+        };
+        return make_local_dex_api(&store, fleet20, fn)->apps("7d");
+    };
+    const auto row = [](const DexAppsModel& m, const std::string& subject) -> decltype(m.apps.front()) {
+        const auto it = std::find_if(m.apps.begin(), m.apps.end(),
+                                     [&](const auto& a) { return a.subject == subject; });
+        REQUIRE(it != m.apps.end());
+        return *it;
+    };
+    const auto crashes_points = [](const auto& a) {
+        REQUIRE(a.figures.score.score.has_value());
+        return a.figures.score.deductions[1].points;
+    };
+
+    // Default policy (cap 5): 5 + 1 capped crashes for capme.exe, 3 for the unfolded subject.
+    const auto base = make_local_dex_api(&store, fleet20)->apps("7d");
+    REQUIRE_FALSE(base.degraded);
+    CHECK(crashes_points(row(base, "capme.exe")) == Approx(20.0 * 6 / (20 * 5)));
+    CHECK(crashes_points(row(base, "CapMe.EXE")) == Approx(20.0 * 3 / (20 * 5)));
+    CHECK(row(base, "capme.exe").profile == DexPolicyProfile::Default);
+    const double app_exe_base = crashes_points(row(base, "app.exe"));
+
+    // An override for capme.exe: 2 + 1 capped crashes, over 20 * 2.
+    const auto over = apps_under(
+        R"({"version":2,"overrides":[{"image":"capme.exe","model":{"per_device_event_cap":2}}]})");
+    REQUIRE_FALSE(over.degraded);
+    CHECK(over.policy.fault.empty());
+    CHECK(crashes_points(row(over, "capme.exe")) == Approx(20.0 * 3 / (20 * 2)));
+    CHECK(row(over, "capme.exe").profile == DexPolicyProfile::Override);
+    // The ASCII fold in SQL and in the resolver agree: the unfolded subject gets the override too.
+    CHECK(crashes_points(row(over, "CapMe.EXE")) == Approx(20.0 * 2 / (20 * 2)));
+    CHECK(row(over, "CapMe.EXE").profile == DexPolicyProfile::Override);
+    // Other applications keep the global cap.
+    CHECK(crashes_points(row(over, "app.exe")) == Approx(app_exe_base));
+    CHECK(row(over, "app.exe").profile == DexPolicyProfile::Default);
+
+    // A global cap of 1 with no override: 1 + 1 capped crashes, over 20 * 1.
+    const auto glob = apps_under(R"({"version":2,"model":{"per_device_event_cap":1}})");
+    REQUIRE_FALSE(glob.degraded);
+    CHECK(crashes_points(row(glob, "capme.exe")) == Approx(20.0 * 2 / (20 * 1)));
+    CHECK(row(glob, "capme.exe").profile == DexPolicyProfile::Default);
 }

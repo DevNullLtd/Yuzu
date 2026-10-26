@@ -197,9 +197,10 @@ DexStabilityFigures apps_figures(const DexAppStabilityRow& r, std::optional<int6
     // population's own ids; if a caller breaks that, the share is withheld
     // and the score reads `inconsistent`. A refusal, not a failure.
     if (population && *population > 0 && affected >= 0 && affected <= *population) {
-        f.share_affected = dex_proportion(affected, *population);
+        f.share_affected = dex_proportion(affected, *population, eff.interval_confidence);
         if (events >= 0)
-            f.rate_per_1000 = dex_rate(events, static_cast<double>(*population) / 1000.0);
+            f.rate_per_1000 =
+                dex_rate(events, static_cast<double>(*population) / 1000.0, eff.interval_confidence);
     }
     StabilityInputs in;
     in.reporting_devices = population.value_or(0);
@@ -342,9 +343,15 @@ DexAppsModel build_dex_apps_model(GuaranteedStateStore* store, const std::string
     // Windows-scoped, and the share numerators drawn from the same online ids
     // whose count is the population.
     static const std::vector<std::string> kNoIds;
-    const auto rows = store->dex_app_stability_checked(since, "windows", kDexAppsLimit, kDexAppsVersionCap,
-                                                       kStabilityPerDeviceEventCap,
-                                                       online_windows ? *online_windows : kNoIds);
+    // The cap the store applies per subject: the global one, and an override's own for
+    // the applications it names (o.image is already the ASCII-lowercased key).
+    std::vector<std::pair<std::string, int64_t>> subject_caps;
+    for (const auto& o : policy.policy.overrides)
+        if (o.per_device_event_cap)
+            subject_caps.emplace_back(o.image, *o.per_device_event_cap);
+    const auto rows = store->dex_app_stability_checked(
+        since, "windows", kDexAppsLimit, kDexAppsVersionCap, policy.policy.model.per_device_event_cap,
+        online_windows ? *online_windows : kNoIds, subject_caps);
     if (!rows) {
         m.degraded = true;
         return m;

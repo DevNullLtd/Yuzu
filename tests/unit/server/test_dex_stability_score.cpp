@@ -568,3 +568,139 @@ TEST_CASE("stability: rank flip ties are equal at the display precision", "[dex]
     CHECK(narrow->first == 0);
     CHECK(narrow->second == 1);
 }
+
+// -- AP-2.17 model parameters ------------------------------------------------
+
+namespace {
+StabilityModel model(std::int64_t cap, double full, double start) {
+    return StabilityModel{cap, full, start};
+}
+double regression_points(const StabilityScore& r) {
+    REQUIRE(r.deductions.size() == 4);
+    return r.deductions[3].points;
+}
+} // namespace
+
+TEST_CASE("stability model: the default model is byte-identical to no model", "[dex][stability]") {
+    const std::vector<StabilityInputs> inputs = {
+        mk(50, 7, 12, 3),
+        mk(1000, 100, 300, 0),
+        mk(10, 1, 1, 0, Rr{2.0, 4.5}),
+        mk(10, 2, 5, 5, Rr{1.5, 1.5}),
+        mk(10, 2, 3, 3, Rr{0.0, 0.9}),
+        mk(7, 7, 35, 35, Rr{9.0, kInf}),
+        mk(10, 11, 0),  // inconsistent
+        mk(0, 0, 0),    // no_population
+    };
+    CHECK(kStabilityModel.per_device_event_cap == 5);
+    CHECK(kStabilityModel.regression_full_ratio == 3.0);
+    CHECK(kStabilityModel.regression_start_ratio == 1.0);
+    const StabilityBandEdges e = kStabilityBandEdges;
+    for (const auto& in : inputs) {
+        const auto a = compute_stability_score(in, kFloor, kStabilityWeights, e);
+        const auto b = compute_stability_score(in, kFloor, kStabilityWeights, e, kStabilityModel);
+        REQUIRE(a.score.has_value() == b.score.has_value());
+        if (a.score) {
+            CHECK(*a.score == *b.score); // operator==, not Approx
+            CHECK(*a.band == *b.band);
+        }
+        CHECK(std::string(a.withheld) == std::string(b.withheld));
+        REQUIRE(a.deductions.size() == b.deductions.size());
+        for (std::size_t i = 0; i < a.deductions.size(); ++i) {
+            CHECK(a.deductions[i].points == b.deductions[i].points);
+            CHECK(a.deductions[i].assessed == b.deductions[i].assessed);
+        }
+    }
+}
+
+TEST_CASE("stability model: known answers at non-default values", "[dex][stability]") {
+    // Cap 10 halves the crash intensity: 20 * 300 / (1000 * 10) = 0.6 (1.2 at cap 5).
+    const auto in = mk(1000, 100, 300, 0);
+    CHECK(compute_stability_score(in, kFloor).deductions[1].points == Approx(1.2));
+    const auto c10 = compute_stability_score(in, kFloor, kStabilityWeights, kStabilityBandEdges,
+                                             model(10, 3.0, 1.0));
+    REQUIRE(c10.score.has_value());
+    CHECK(c10.deductions[1].points == Approx(0.6));
+    CHECK(*c10.score == Approx(100.0 - 6.0 - 0.6));
+
+    const auto reg = [](double lo, double hi, double full, double start) {
+        return compute_stability_score(mk(10, 1, 1, 0, Rr{lo, hi}), kFloor, kStabilityWeights,
+                                       kStabilityBandEdges, model(5, full, start));
+    };
+    // full 2.0, start 1.0: a lower bound of 2 takes the full 12 points.
+    CHECK(regression_points(reg(2.0, 4.5, 2.0, 1.0)) == Approx(12.0));
+    // start 1.5, full 3.0: nothing at the start, half way at 2.25.
+    CHECK(regression_points(reg(1.5, 1.5, 3.0, 1.5)) == 0.0);
+    CHECK(regression_points(reg(2.25, 3.0, 3.0, 1.5)) == Approx(6.0));
+    // start 2.0, full 2.5 saturates at 2.5.
+    CHECK(regression_points(reg(2.5, 9.0, 2.5, 2.0)) == Approx(12.0));
+    // Below the start an interval earns nothing, whatever its upper bound.
+    CHECK(regression_points(reg(1.9, 9.0, 2.5, 2.0)) == 0.0);
+}
+
+TEST_CASE("stability model: inconsistency and the overflow guard use the model's cap",
+          "[dex][stability]") {
+    // One affected device with 7 capped crashes: over A * 5, within A * 10.
+    const auto in = mk(10, 1, 7);
+    require_withheld(compute_stability_score(in, kFloor), "inconsistent");
+    CHECK(compute_stability_score(in, kFloor, kStabilityWeights, kStabilityBandEdges,
+                                  model(10, 3.0, 1.0))
+              .score.has_value());
+    // The multiply is skipped when it would overflow, and the test divides by the
+    // model's cap: A = INT64_MAX / 10 is checkable at cap 5 and 10 but not at 20.
+    constexpr std::int64_t kMax = (std::numeric_limits<std::int64_t>::max)();
+    const std::int64_t a = kMax / 10;
+    const auto big = mk(kMax, a, a * 5 + 1);
+    require_withheld(compute_stability_score(big, kFloor), "inconsistent");
+    CHECK(compute_stability_score(big, kFloor, kStabilityWeights, kStabilityBandEdges,
+                                  model(10, 3.0, 1.0))
+              .score.has_value());
+    CHECK(compute_stability_score(big, kFloor, kStabilityWeights, kStabilityBandEdges,
+                                  model(20, 3.0, 1.0))
+              .score.has_value());
+}
+
+TEST_CASE("stability model: validity bounds are exact", "[dex][stability]") {
+    CHECK(stability_model_valid(kStabilityModel));
+    CHECK(stability_model_valid(model(1, 3.0, 1.0)));
+    CHECK(stability_model_valid(model(1000, 3.0, 1.0)));
+    CHECK(stability_model_valid(model(5, 1000.0, 1.0)));
+    CHECK(stability_model_valid(model(5, 1000.0, 999.0)));
+    CHECK_FALSE(stability_model_valid(model(0, 3.0, 1.0)));
+    CHECK_FALSE(stability_model_valid(model(-1, 3.0, 1.0)));
+    CHECK_FALSE(stability_model_valid(model(1001, 3.0, 1.0)));
+    CHECK_FALSE(stability_model_valid(model(5, 3.0, 0.5)));
+    CHECK_FALSE(stability_model_valid(model(5, 3.0, kNaN)));
+    CHECK_FALSE(stability_model_valid(model(5, 3.0, 1000.5)));
+    CHECK_FALSE(stability_model_valid(model(5, 1.0, 1.0)));  // full == start
+    CHECK_FALSE(stability_model_valid(model(5, 2.0, 2.5)));  // full < start
+    CHECK_FALSE(stability_model_valid(model(5, kInf, 1.0)));
+    CHECK_FALSE(stability_model_valid(model(5, kNaN, 1.0)));
+    CHECK_FALSE(stability_model_valid(model(5, 1000.5, 1.0)));
+}
+
+TEST_CASE("stability model: an invalid model is withheld invalid_model, in its place in the order",
+          "[dex][stability]") {
+    const auto score = [](const StabilityInputs& in, const StabilityModel& m,
+                          const StabilityWeights& w = kStabilityWeights,
+                          const StabilityBandEdges& e = kStabilityBandEdges) {
+        return compute_stability_score(in, kFloor, w, e, m);
+    };
+    const auto ok = mk(10, 1, 1);
+    for (const auto& m : {model(0, 3.0, 1.0), model(1001, 3.0, 1.0), model(5, 3.0, 0.5),
+                          model(5, 3.0, kNaN), model(5, 1.0, 1.0), model(5, kInf, 1.0),
+                          model(5, 1001.0, 1.0)}) {
+        INFO("cap " << m.per_device_event_cap << " full " << m.regression_full_ratio << " start "
+                    << m.regression_start_ratio);
+        require_withheld(score(ok, m), "invalid_model");
+    }
+    const auto bad = model(0, 3.0, 1.0);
+    // After no_population, invalid_weights and invalid_edges ...
+    require_withheld(score(mk(0, 0, 0), bad), "no_population");
+    require_withheld(score(ok, bad, StabilityWeights{-1, 20, 8, 12}), "invalid_weights");
+    require_withheld(score(ok, bad, kStabilityWeights, StabilityBandEdges{50, 75, 60}),
+                     "invalid_edges");
+    // ... and before inconsistent.
+    require_withheld(score(mk(10, 11, 0), bad), "invalid_model");
+    require_withheld(score(mk(10, 11, 0), kStabilityModel), "inconsistent");
+}
