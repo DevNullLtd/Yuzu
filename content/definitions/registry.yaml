@@ -703,9 +703,10 @@ metadata:
     load are checked first), the write is verified by reading it back, and the key is flushed to disk before the
     hive unloads (a flush that fails fails the write). SeBackupPrivilege and SeRestorePrivilege are needed only
     for the offline fallback. A hive that is loaded after the write returned is reported as a warning; a logon
-    that failed while the hive was mounted leaves no trace. Same types, encoding and verification as set_value. A `registry.write`
-    audit row records the previous and new values (hex, capped at 256 bytes; they can contain secrets: the
-    product owner accepted this risk on 2026-10-20 and masking is a planned later change), and the `value` and
+    that failed while the hive was mounted leaves no trace. Same types, encoding and verification as
+    set_value. A `registry.write` audit row records the previous and new values (hex, capped at 256 bytes;
+    they can contain secrets: the product owner accepted this risk on 2026-10-20 and masking is a planned
+    later change), and the `value` and
     `data_hex` parameters are stored unredacted in the execution's parameter_values. Needs registry 2.1.0 on the
     agent: an agent at registry 1.x or 2.0.x answers `error|unknown action`. Windows-only.
   tags: [registry, windows, per-user, configuration]
