@@ -576,12 +576,32 @@ TEST_CASE("TAR look-again reads guaranteed depth, not the limit",
         tier("B", "live", "rows", 100),
         tier("C", "live", "rows", 100),
         tier("C", "daily", "seconds", 2592000, 2592000),
+        // larger guaranteed depth listed first: the cell must be the max, not the last value
+        tier("D", "monthly", "seconds", 31536000, 28857600),
+        tier("D", "daily", "seconds", 2592000, 2592000),
     })));
     const auto t = html.substr(html.find("<caption"));
     CHECK(has(t, "<td class=\"look\">11 months</td>"));
     CHECK(has(t, "<td>12 months</td>"));
     CHECK(count_sub(t, "Row count only") == 1);
     CHECK(has(t, "<td class=\"look\">30 days</td>"));
+    const auto d = t.find(">D<");
+    REQUIRE(d != std::string::npos);
+    const auto row = t.substr(d, t.find("</tr>", d) - d);
+    CHECK(has(row, "<td class=\"look\">11 months</td>"));
+    CHECK_FALSE(has(row, "<td class=\"look\">30 days</td>"));
+}
+
+TEST_CASE("TAR hint copy renders the supplied tick and each fixed clause",
+          "[settings][settings_model][retention][tar]") {
+    const auto html = sm::render_retention_table(retention_with_tar(
+        nlohmann::json::array({tier("A", "hourly", "seconds", 86400, 82800)}), 123));
+    const auto t = html.substr(html.find("<caption"));
+    CHECK(has(t, "pruned every 123 s"));
+    CHECK_FALSE(has(t, "every 900 s"));
+    for (const char* n : {"agent's clock", "31-day worst-case", "not a deeper tier", "never pruned",
+                          "not per-device"})
+        CHECK(has(t, n));
 }
 
 TEST_CASE("TAR tier css block is tokens only", "[settings][settings_model][retention][tar][css]") {
