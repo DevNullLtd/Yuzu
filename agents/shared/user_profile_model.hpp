@@ -211,7 +211,7 @@ struct ProfileInfo {
 /// OSC as escape introducers and a Unicode-aware splitter (Python's str.splitlines, a log viewer) reads the C0
 /// separators, NEL and U+2028 / U+2029 as line ends, so none may survive in a rendered field. Every other byte,
 /// truncated or invalid UTF-8 included, is left as it is. log_key_token (common/include/yuzu/log_token.hpp) folds
-/// every C0 byte, DEL and U+0085 / U+2028 / U+2029; this also folds C1, and keeps TAB because process rows carry it.
+/// every C0 byte, DEL and U+0085 / U+2028 / U+2029; this also folds C1, and keeps TAB: it is neither a line nor an escape boundary.
 /// log_key_token is not reused on purpose: agents/shared stays free of common/include, and it would fold those tabs.
 /// Lossy by design: "a<U+2028>b", "a<U+009B>b", "a<VT>b" and "a_b" all render as "a_b".
 inline void fold_line_breaks(std::string& s) {
@@ -261,7 +261,8 @@ inline void fold_line_breaks(std::string& s) {
 /// column one position right of its header.
 [[nodiscard]] inline std::string render_profile_row(const ProfileInfo& info) {
     auto field = [](std::string_view v) -> std::string {
-        return v.empty() ? std::string{"-"} : sanitize_field(v);
+        auto s = sanitize_field(v);
+        return s.empty() ? std::string{"-"} : s;
     };
     std::string out = field(info.sid);
     out += '|';

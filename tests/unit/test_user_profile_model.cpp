@@ -339,6 +339,11 @@ TEST_CASE("render_profile_row: empty fields render as '-'", "[profiles]") {
     CHECK(render_profile_row(info) == std::string{kAliceSid} + "|-|-|not_loaded");
 }
 
+TEST_CASE("render_profile_row: a field of only NULs renders as '-'", "[profiles]") {
+    ProfileInfo info{std::string{kAliceSid}, std::string("\0\0", 2), "", HiveState::not_loaded};
+    CHECK(render_profile_row(info) == std::string{kAliceSid} + "|-|-|not_loaded");
+}
+
 TEST_CASE("render_profile_row: a value containing '|' cannot forge a column", "[profiles]") {
     // Regression pin: registry_plugin.cpp's original sanitize_field only
     // covered the unknown-action error string, so a profile name/path
@@ -546,6 +551,9 @@ TEST_CASE("render_user_key_error: every status, exact strings", "[profiles]") {
           "error|value exceeds 1 MiB limit");
     CHECK(render_user_key_error(UserKeyStatus::value_malformed, "K") ==
           "error|value size too small for its declared type");
+    CHECK(render_user_key_error(UserKeyStatus::value_changed_during_read, "K") ==
+          "error|value changed while reading -- a concurrent writer kept growing it faster "
+          "than the bounded retry could keep up; retry the read");
     // Key-absent and value-absent stay deliberately identical: up-S4 asks only
     // that INFRASTRUCTURE errors be separated from absence.
     CHECK(render_user_key_error(UserKeyStatus::key_not_found, "K") ==

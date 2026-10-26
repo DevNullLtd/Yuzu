@@ -157,12 +157,12 @@ class RegistryDefinitionPins(unittest.TestCase):
                 self.assertEqual(lines, [], "build the key name from yuzu::test::registry_scratch_prefix()")
 
     def test_the_scope_variable_is_spelt_the_same_by_its_producer_and_consumers(self):
-        # Lexical pin: CI sets YUZU_TEST_REGISTRY_SCOPE, the fixtures read it and the leftover check is handed it; a
-        # rename in one place would leave the check judging a scope no fixture uses.
-        for rel in ("tests/unit/test_helpers.hpp", ".github/workflows/ci.yml",
-                    "scripts/ci/check-registry-test-leftovers.ps1"):
+        # Lexical pin: CI sets YUZU_TEST_REGISTRY_SCOPE and the fixtures read it; a rename in one place would leave the
+        # leftover check (handed the scope as -Scope) judging a scope no fixture uses.
+        for rel, spelling in (("tests/unit/test_helpers.hpp", 'getenv("YUZU_TEST_REGISTRY_SCOPE")'),
+                              (".github/workflows/ci.yml", "YUZU_TEST_REGISTRY_SCOPE: ")):
             with self.subTest(file=rel):
-                self.assertIn("YUZU_TEST_REGISTRY_SCOPE", (REPO_ROOT / rel).read_text(encoding="utf-8"))
+                self.assertIn(spelling, (REPO_ROOT / rel).read_text(encoding="utf-8"))
 
     def test_the_writers_are_classified_destructive_for_the_risk_gate(self):
         overrides = json.loads((REPO_ROOT / "scripts" / "test" / "instructions-risk-classification.json")

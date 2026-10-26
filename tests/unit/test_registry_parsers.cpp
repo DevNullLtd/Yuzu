@@ -309,11 +309,11 @@ TEST_CASE("registry output row: a NUL in registry text does not cut the row at t
     const std::string row = "value|" + yuzu::profiles::sanitize_field("A\0B\0\0"sv);
     CHECK(row == "value|A_B");
     CHECK(std::strlen(row.c_str()) == row.size());
-    yuzu::profiles::ProfileInfo info{"S-1-5-21-1", std::string{"j\0smith"sv}, std::string{"C:\\Users\\j\0smith"sv},
+    yuzu::profiles::ProfileInfo info{"S-1-5-21-1", std::string{"j\0smith"sv}, std::string{"C:\\Users\\j\0smith"sv}, // personal-data-ok: synthetic fixture account, not a real user
                                      yuzu::profiles::HiveState::loaded};
     const std::string prow = yuzu::profiles::render_profile_row(info);
     CHECK(std::strlen(prow.c_str()) == prow.size());
-    CHECK(prow == "S-1-5-21-1|j_smith|C:\\Users\\j_smith|loaded");
+    CHECK(prow == "S-1-5-21-1|j_smith|C:\\Users\\j_smith|loaded"); // personal-data-ok: synthetic fixture account, not a real user
 }
 
 TEST_CASE("registry render_audit_line: byte-exact grammar", "[registry][parsers]") {
