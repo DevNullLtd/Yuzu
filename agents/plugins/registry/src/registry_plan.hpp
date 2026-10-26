@@ -182,8 +182,8 @@ namespace detail {
             item.invalid = std::string{kTokUnrepresentableName};
         } else if (!value_op) {
             if (!item.name.empty()) item.invalid = std::string{kTokInvalidValueName};
-        } else if (const auto e = validate_value_name(item.name); !e.empty()) {
-            item.invalid = std::string{e};
+        } else if (const auto name_err = validate_value_name(item.name); !name_err.empty()) {
+            item.invalid = std::string{name_err};
         } else if (!representable(item.name)) {
             item.invalid = std::string{kTokUnrepresentableName};
         }
