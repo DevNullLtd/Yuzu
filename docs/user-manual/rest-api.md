@@ -5580,7 +5580,9 @@ set (20,000 runs) before this limit can apply.
 
 These are the registry **defaults** an agent of this server's release applies (agents on other
 releases may differ), not per-device readings: TAR prunes on the agent, so the server has no
-live value. A paused or errored source is never pruned (per-device paused sources: [`GET /api/v1/tar/retention-paused`](#get-apiv1tarretention-paused)); while the agent is running, rows may
+live value. Every source's tiers are declared on every OS; where a source does not run on the
+agent's OS (see the OS compatibility matrix in the TAR manual) its tier applies to an empty
+table. A paused or errored source is never pruned (per-device paused sources: [`GET /api/v1/tar/retention-paused`](#get-apiv1tarretention-paused)); while the agent is running, rows may
 outlive their limit by up to `tick_seconds` (an offline agent or a disabled plugin prunes
 nothing), longer when the retention clock guard declines a prune, shorter by any plausible
 forward skew of the endpoint clock, which the guard does not decline (the depth is measured on

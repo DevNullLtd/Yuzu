@@ -135,6 +135,6 @@ TEST_CASE("tar_retention_tiers.tsv matches capture_sources() retention defaults"
     CHECK(table_rows.count(Row{"perf", "live", "seconds", 604800}) == 1);
     CHECK(table_rows.count(Row{"process", "monthly", "seconds", 31536000}) == 1);
     CHECK(table_rows.count(Row{"netqual", "boot", "rows", 400}) == 1);
-    CHECK(table_sources.size() == 16);
-    CHECK(table_rows.size() == 36);
+    CHECK(table_sources.size() == 17);
+    CHECK(table_rows.size() == 37);
 }

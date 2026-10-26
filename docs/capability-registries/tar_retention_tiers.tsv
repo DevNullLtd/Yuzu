@@ -33,5 +33,6 @@ mapdrive	live	rows	5000
 mapdrive	hourly	seconds	86400
 power	live	rows	20000
 removable	live	rows	20000
+registry	live	rows	500000
 usage	live	rows	200000
 usage	daily	seconds	2678400
