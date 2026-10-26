@@ -855,8 +855,7 @@ TEST_CASE("smbios is_placeholder: exact case-insensitive table plus empty", "[sm
                            "Base Board", "Chassis Serial Number", "Chassis Version",
                            "Chassis Manufacture", "Asset Tag", "No Asset Tag",
                            "No Asset Information", "Not Applicable", "OEM", "0123456789",
-                           "1234567890", "NULL", "Empty", "SKU", "Family", "x.x",
-                           "Type1ProductConfigId", "Standard", "Default"};
+                           "1234567890", "SKU", "x.x", "Type1ProductConfigId"};
     for (const char* p : table) {
         INFO(p);
         CHECK(sm::is_placeholder(p));

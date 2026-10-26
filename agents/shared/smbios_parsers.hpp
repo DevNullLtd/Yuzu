@@ -40,6 +40,7 @@
 // field is read only when the Length covers it.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -169,23 +170,11 @@ struct View {
     }
 };
 
-template <class T> Entry<T> malformed_entry() {
-    Entry<T> e;
-    e.status = Status::malformed;
-    return e;
-}
-template <class T> Entry<T> ok_entry(T&& d) {
-    Entry<T> e;
-    e.status = Status::ok;
-    e.data = std::move(d);
-    return e;
-}
-
 inline Entry<Type0> decode_type0(const View& v) {
-    if (v.len < 0x12) return malformed_entry<Type0>();
+    if (v.len < 0x12) return {Status::malformed, {}};
     Type0 d;
     if (!v.str(4, d.vendor) || !v.str(5, d.version) || !v.str(8, d.release_date))
-        return malformed_entry<Type0>();
+        return {Status::malformed, {}};
     const unsigned rom = v.u8(9);
     if (rom != 0xFF) {
         d.rom_size_bytes = static_cast<std::uint64_t>(rom + 1) * 64ull * 1024ull;
@@ -207,15 +196,15 @@ inline Entry<Type0> decode_type0(const View& v) {
         d.ec_major = rel(0x16);
         d.ec_minor = rel(0x17);
     }
-    return ok_entry(std::move(d));
+    return {Status::ok, std::move(d)};
 }
 
 inline Entry<Type1> decode_type1(const View& v) {
-    if (v.len < 0x08) return malformed_entry<Type1>();
+    if (v.len < 0x08) return {Status::malformed, {}};
     Type1 d;
     if (!v.str(4, d.manufacturer) || !v.str(5, d.product) || !v.str(6, d.version) ||
         !v.str(7, d.serial))
-        return malformed_entry<Type1>();
+        return {Status::malformed, {}};
     if (v.len >= 0x19) { // SMBIOS 2.1+: UUID
         std::array<std::uint8_t, 16> u{};
         bool all00 = true, allff = true;
@@ -227,28 +216,28 @@ inline Entry<Type1> decode_type1(const View& v) {
         if (!all00 && !allff) d.uuid = u; // all-00 = not set, all-FF = not present
     }
     if (v.len >= 0x1B && (!v.str(0x19, d.sku) || !v.str(0x1A, d.family))) // SMBIOS 2.4+
-        return malformed_entry<Type1>();
-    return ok_entry(std::move(d));
+        return {Status::malformed, {}};
+    return {Status::ok, std::move(d)};
 }
 
 inline Entry<Type2> decode_type2(const View& v) {
-    if (v.len < 0x08) return malformed_entry<Type2>();
+    if (v.len < 0x08) return {Status::malformed, {}};
     Type2 d;
     if (!v.str(4, d.manufacturer) || !v.str(5, d.product) || !v.str(6, d.version) ||
         !v.str(7, d.serial))
-        return malformed_entry<Type2>();
-    if (v.len >= 0x09 && !v.str(8, d.asset_tag)) return malformed_entry<Type2>();
-    return ok_entry(std::move(d));
+        return {Status::malformed, {}};
+    if (v.len >= 0x09 && !v.str(8, d.asset_tag)) return {Status::malformed, {}};
+    return {Status::ok, std::move(d)};
 }
 
 inline Entry<Type3> decode_type3(const View& v) {
-    if (v.len < 0x09) return malformed_entry<Type3>();
+    if (v.len < 0x09) return {Status::malformed, {}};
     Type3 d;
     if (!v.str(4, d.manufacturer) || !v.str(6, d.version) || !v.str(7, d.serial) ||
         !v.str(8, d.asset_tag))
-        return malformed_entry<Type3>();
+        return {Status::malformed, {}};
     d.chassis_type = v.u8(5) & 0x7Fu;
-    return ok_entry(std::move(d));
+    return {Status::ok, std::move(d)};
 }
 
 // DSP0134 7.5.6-7.5.8: a count byte of 0 is unknown; 0xFF defers to the 2-byte count, whose 0
@@ -265,16 +254,16 @@ inline std::optional<unsigned> processor_count(const View& v, std::size_t byte_a
 }
 
 inline Entry<Type4> decode_type4(const View& v) {
-    if (v.len < 0x1A) return malformed_entry<Type4>();
+    if (v.len < 0x1A) return {Status::malformed, {}};
     Type4 d;
-    if (!v.str(4, d.socket_designation)) return malformed_entry<Type4>();
+    if (!v.str(4, d.socket_designation)) return {Status::malformed, {}};
     for (std::size_t i = 0; i < 8; ++i) d.processor_id[i] = static_cast<std::uint8_t>(v.u8(8 + i));
     d.family = v.u8(6);
     if (d.family == 0xFE && v.len >= 0x2A) d.family = v.u16(0x28); // Processor Family 2
     d.populated = (v.u8(0x18) & 0x40u) != 0;
     d.core_count = processor_count(v, 0x23, 0x2A);
     d.thread_count = processor_count(v, 0x25, 0x2E);
-    return ok_entry(std::move(d));
+    return {Status::ok, std::move(d)};
 }
 
 // DSP0134 7.18.14: speed word 0 = unknown, 0xFFFF = see the extended dword (bit 31 reserved).
@@ -290,12 +279,12 @@ inline std::optional<unsigned> memory_speed(const View& v, std::size_t word_at, 
 }
 
 inline Entry<Type17> decode_type17(const View& v) {
-    if (v.len < 0x15) return malformed_entry<Type17>();
+    if (v.len < 0x15) return {Status::malformed, {}};
     Type17 d;
     if (v.len >= 0x1B &&
         (!v.str(0x17, d.manufacturer) || !v.str(0x18, d.serial) || !v.str(0x1A, d.part_number)))
-        return malformed_entry<Type17>();
-    if (!v.str(0x10, d.locator) || !v.str(0x11, d.bank_locator)) return malformed_entry<Type17>();
+        return {Status::malformed, {}};
+    if (!v.str(0x10, d.locator) || !v.str(0x11, d.bank_locator)) return {Status::malformed, {}};
     const unsigned size = v.u16(0x0C);
     d.populated = size != 0;
     if (size == 0) d.size_bytes = 0;
@@ -309,7 +298,7 @@ inline Entry<Type17> decode_type17(const View& v) {
     if (v.len >= 0x13) d.memory_type = v.u8(0x12);
     d.speed_mts = memory_speed(v, 0x15, 0x54);
     d.configured_speed_mts = memory_speed(v, 0x20, 0x58);
-    return ok_entry(std::move(d));
+    return {Status::ok, std::move(d)};
 }
 
 template <class T> void push_capped(std::vector<Entry<T>>& vec, bool& cap_hit, Entry<T>&& e) {
@@ -394,22 +383,18 @@ template <class T> void push_capped(std::vector<Entry<T>>& vec, bool& cap_hit, E
 /// True when `s` (right-trimmed, ASCII case-insensitive) is empty or one of the OEM filler strings
 /// firmware ships instead of real data. The walker returns raw strings; legs call this.
 [[nodiscard]] inline bool is_placeholder(std::string_view s) {
-    static constexpr std::array<std::string_view, 31> kPlaceholders{
+    static constexpr std::array<std::string_view, 26> kPlaceholders{
         "Default string", "To Be Filled By O.E.M.", "None", "Not Specified", "Not Available",
         "N/A", "Unknown", "Undefined", "System Serial Number", "System Product Name",
         "System manufacturer", "System Version", "Base Board", "Chassis Serial Number",
         "Chassis Version", "Chassis Manufacture", "Asset Tag", "No Asset Tag",
-        "No Asset Information", "Not Applicable", "OEM", "0123456789", "1234567890", "NULL",
-        "Empty", "SKU", "Family", "x.x", "Type1ProductConfigId", "Standard", "Default"};
+        "No Asset Information", "Not Applicable", "OEM", "0123456789", "1234567890", "SKU",
+        "x.x", "Type1ProductConfigId"};
     const std::string t = rtrim(s);
     if (t.empty()) return true;
     auto lower = [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; };
-    for (std::string_view p : kPlaceholders) {
-        if (p.size() != t.size()) continue;
-        bool same = true;
-        for (std::size_t i = 0; same && i < p.size(); ++i) same = lower(p[i]) == lower(t[i]);
-        if (same) return true;
-    }
+    for (std::string_view p : kPlaceholders)
+        if (std::ranges::equal(p, t, {}, lower, lower)) return true;
     return false;
 }
 
