@@ -208,12 +208,7 @@ public:
     }
     void resume() {
         std::lock_guard lock(mu_);
-        q_.clear();
-        accepting_ = true;
-    }
-    void clear() {
-        std::lock_guard lock(mu_);
-        q_.clear();
+        accepting_ = true; // nothing was stored while paused: the queue is already empty
     }
 
     [[nodiscard]] std::size_t size() const {
@@ -267,7 +262,6 @@ struct RegistryReader {
     std::function<bool(const std::string&)> rearm;
     std::function<void()> start;           // open the ETW session; failure is degrade, not error
     std::function<void()> stop;            // idempotent
-    std::function<void()> tick_committed;  // per-tick housekeeping after a COMMITTED tick
     std::shared_ptr<RegistryDirtyTable> dirty; // shared with the watcher
     std::shared_ptr<RegistryEtwBuffer> buffer; // shared with the ETW callback
 };
@@ -299,7 +293,6 @@ private:
     // Pending "owed" gap, cleared only after the commit that reports it (R-003).
     bool pending_gap_{false};
     GapCause gap_cause_{GapCause::Disabled};
-    bool restarted_{false};   // the buffer was lost across a restart; finalised rows say so
     bool force_all_{false};   // first tick after a restart reads every root
     std::int64_t events_since_{0}; // the buffer holds nothing from before this instant (0 = n/a)
     bool was_disabled_{false};

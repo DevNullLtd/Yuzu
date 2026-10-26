@@ -52,7 +52,6 @@
 #include <set>
 #include <string>
 #include <string_view>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -612,9 +611,7 @@ struct RegistryEtwEvent {
     std::uint64_t seq{0}; // assigned by the buffer
     std::int64_t ts100ns{0};
     std::uint32_t pid{0};
-    std::uint32_t tid{0};
     std::string image;
-    std::uint64_t key_object{0}; // dedupe only -- no inference is drawn from it
     RegistryEtwOp op{RegistryEtwOp::Set};
     std::string value;
     std::uint32_t type{0};
@@ -626,15 +623,12 @@ struct LossEpoch {
     bool operator==(const LossEpoch&) const = default;
 };
 
-[[nodiscard]] inline bool window_intersects(const RegistryWindow& w, const LossEpoch& e) {
-    return e.lo <= w.hi && e.hi > w.lo;
-}
-
+/// Does any epoch touch the candidate's window (lo, hi]? An epoch starting at hi
+/// does; one ending at lo does not.
 [[nodiscard]] inline bool intersects_loss(const RegistryCandidate& c,
                                           const std::vector<LossEpoch>& epochs) {
-    const RegistryWindow w{c.window_lo, c.window_hi};
     return std::any_of(epochs.begin(), epochs.end(),
-                       [&](const LossEpoch& e) { return window_intersects(w, e); });
+                       [&](const LossEpoch& e) { return e.lo <= c.window_hi && e.hi > c.window_lo; });
 }
 
 /// Appends an epoch; past kLossEpochCap everything collapses into one covering
@@ -667,22 +661,6 @@ struct Attribution {
     std::size_t n_pids{0};
     std::size_t n_events{0};
 };
-
-/// Drops repeated deliveries of one event (same ts, pid, tid, key object, op, value).
-[[nodiscard]] inline std::vector<RegistryEtwEvent>
-dedupe_registry_events(std::vector<RegistryEtwEvent> events) {
-    std::set<std::tuple<std::int64_t, std::uint32_t, std::uint32_t, std::uint64_t, int,
-                        std::string>>
-       seen;
-    std::vector<RegistryEtwEvent> out;
-    out.reserve(events.size());
-    for (auto& e : events) {
-        if (seen.emplace(e.ts100ns, e.pid, e.tid, e.key_object, static_cast<int>(e.op), e.value)
-               .second)
-            out.push_back(std::move(e));
-    }
-    return out;
-}
 
 /// Matches write events to a candidate on signature and window (see the header
 /// comment for what this establishes). `key_removed` is never attributed: a
@@ -726,7 +704,6 @@ dedupe_registry_events(std::vector<RegistryEtwEvent> events) {
 
 struct StitchFlags {
     bool etw_running{true};
-    bool restarted{false};        // the event buffer was discarded since the candidates were read
     std::int64_t events_since{0}; // the buffer holds nothing from before this instant (0 = n/a)
 };
 
@@ -760,10 +737,11 @@ inline std::string rk_escape(std::string_view s) {
 
 } // namespace registry_detail
 
-/// Diff-row key: independent of attribution (so a retry after a restart re-derives
-/// the same key whatever the buffer then holds) and length-framed so key/value
-/// cannot be re-split into another pair. NUL (legal in a registry name) and '\' are escaped, as the store refuses
-/// a NUL-bearing key.
+/// Diff-row key: independent of attribution, so a replay that re-derives a different
+/// one (the event buffer is in memory and does not survive a restart) writes the same
+/// key and is a silent no-op, never a collision. Length-framed so key/value cannot be
+/// re-split into another pair. NUL (legal in a registry name) and '\' are escaped, as
+/// the store refuses a NUL-bearing key.
 [[nodiscard]] inline std::string registry_diff_record_key(std::string_view source,
                                                           std::int64_t read_end,
                                                           std::string_view action,
@@ -833,15 +811,15 @@ registry_row_from_candidate(const RegistryCandidate& c, std::uint32_t actor_pid,
 /// Finalises every held candidate whose window closed at least kEtwSettle100ns
 /// before `now` (a late event for a write just before the read can still arrive
 /// that long after it); the rest stay held. Order of precedence for the marker:
-/// buffer discarded (lost-restart) > session down (off) > loss over the window
-/// (degraded) > the correlation outcome.
+/// the buffer holds nothing from before the window opened (lost-restart: a restart
+/// or a re-enable) > session down (off) > loss over the window (degraded) > the
+/// correlation outcome.
 [[nodiscard]] inline StitchResult
 stitch_registry_tick(const std::vector<RegistryCandidate>& candidates,
-                     const std::vector<RegistryEtwEvent>& raw_events,
+                     const std::vector<RegistryEtwEvent>& events,
                      const std::vector<LossEpoch>& epochs, const StitchFlags& flags,
                      std::int64_t now, std::int64_t snapshot_id) {
     StitchResult out;
-    const auto events = dedupe_registry_events(raw_events);
     for (const auto& c : candidates) {
         if (now - c.window_hi < kEtwSettle100ns) {
             out.held_next.push_back(c);
@@ -850,7 +828,7 @@ stitch_registry_tick(const std::vector<RegistryCandidate>& candidates,
         std::uint32_t pid = 0;
         std::string image;
         std::string detail;
-        if (flags.restarted || c.window_lo < flags.events_since) {
+        if (c.window_lo < flags.events_since) {
             detail = "attr:lost-restart";
             ++out.counters.none;
         } else if (!flags.etw_running) {

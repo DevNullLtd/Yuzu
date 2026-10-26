@@ -1870,10 +1870,9 @@ std::expected<void, TarDatabase::CursorInsertError> TarDatabase::insert_registry
                     }
                     // Ignored: a legitimate replay, or a collision. Only the stored
                     // IDENTITY (what changed) can tell them apart -- never the actor
-                    // or detail columns: attribution is re-derived from an in-memory
-                    // buffer, so a replay may name a different writer (or none), and
-                    // that is not identity and must not wedge the source on a permanent
-                    // KeyCollision.
+                    // or detail columns, which are not identity and must not wedge
+                    // the source on a permanent KeyCollision (the key is attribution-
+                    // independent: see registry_diff_record_key).
                     sqlite3_reset(dup.get());
                     sqlite3_clear_bindings(dup.get());
                     bind_text(dup.get(), 1, ev.record_key);

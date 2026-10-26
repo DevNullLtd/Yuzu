@@ -595,9 +595,8 @@ public:
      * transaction: a baseline can never advance without the rows it explains, nor
      * the rows without the baseline (a failed commit rolls all three back).
      * The collision check compares IDENTITY columns only (what changed), never
-     * the actor/detail columns: the record_key does not depend on attribution, so a
-     * replay that re-derives a different attribution (the event buffer is in
-     * memory and does not survive a restart) is a silent no-op.
+     * the actor/detail columns (the key is attribution-independent: see
+     * registry_diff_record_key).
      */
     std::expected<void, CursorInsertError> insert_registry_events_and_cursor(
         const std::vector<RegistryEvent>& events, const std::string& cursor_json,

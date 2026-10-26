@@ -454,36 +454,11 @@ cursor.** What it adds to the pattern:
   hive loading and that read, up to one slow interval, are folded into the
   baseline and are not recorded; no per-root gap row is written, since a logon
   would add one per root per user.
-- **Rows land one tick after the one that observes the change.** A diff produces
-  a *candidate*, not a row. It is stamped with the end of the read that saw it and
-  with the time window in which the write must have happened
-  (`candidate_window`: from the root's last COMPLETE read start to this read's
-  end, tightened to the notify burst +/- 1 s when the key watch triggered the
-  read). It is HELD in the cursor row until `kEtwSettle100ns` (5 s) after that
-  window closed, because an event can trail its write by that long, and only then
-  does `stitch_registry_tick` write it with the attribution outcome in `detail`.
-  The row's `record_key` never depends on attribution, and the store's collision
-  check compares identity columns only, so a replay that attributes differently
-  is a silent no-op, not a collision.
-- **Who wrote it is correlated, never read off an event.** A write-only
-  Kernel-Registry ETW session (mask `0x4300`: SetValueKey, DeleteValueKey,
-  DeleteKey; never OpenKey or CreateKey) delivers the writer's pid and the value
-  name, type and size, but its key-name field is empty on most events.
-  `attribute_candidate` therefore matches a candidate to events on case-folded
-  value name, type, size and the (lo, hi] window, and names a writer ONLY when
-  exactly one pid matches; `key_removed` is never attributed. The marker
-  precedence is lost-restart > off > degraded > corr / ambiguous / none. Every
-  sentence in the user manual must keep saying "a lead to verify, not proof":
-  a change made without a value-write event (a hive load, a restore) is
-  correlated to an unrelated same-signature writer in its window.
-- **Loss is a window, not a flag.** A buffer eviction (oldest first; its
-  timestamps widen a drop range), the kernel's `EventsLost` /
-  `RealTimeBuffersLost`, a callback decode failure and a failed session query
-  each become a `LossEpoch` in the cursor plus one `gap:loss:<n>` row; a
-  candidate whose window intersects an epoch is written `attr:degraded`. The
-  counters, the drop range and the buffer's retirement advance only AFTER the
-  event+cursor transaction commits, like the dirty flags: a failed commit
-  re-derives and re-reports all of it.
+- **Rows land one tick after the one that observes the change, and the writer is
+  correlated, not verified.** The mechanism, the `attr:*` precedence, loss epochs and
+  exactly what an attribution does and does not establish are written once, in the
+  banner of `tar_registry_parsers.hpp` (the row key: `registry_diff_record_key`). Every
+  user-manual sentence must keep saying "a lead to verify, not proof".
 - **`RegistryEtwBuffer` is not `BoundedPendingQueue`.** It releases by sequence
   identity like `ack_through`, but selectively: after a commit it retires the
   events older than the minimum root `window_base` (`retention_watermark`) that

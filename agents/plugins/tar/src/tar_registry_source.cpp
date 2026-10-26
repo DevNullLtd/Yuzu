@@ -84,11 +84,12 @@ void RegistryCursorSource::start(TarDatabase& db) {
     if (!cursor || cursor->has_value()) {
         pending_gap_ = true;
         gap_cause_ = GapCause::Restart;
-        restarted_ = true;
         force_all_ = true;
     }
     reader_.start(); // a session that cannot open degrades to the key watch (rows attr:off)
-    events_since_ = reader_.etw_running() ? reader_.now_ts() : 0;
+    // Nothing before this instant is in the buffer: every candidate read earlier (the held
+    // ones, and the force_all_ reconcile reads) finalises as lost-restart.
+    events_since_ = reader_.now_ts();
     last_query_ts_ = events_since_;
     ensure_watch(scope_.roots_for(reader_.loaded_sids()));
 }
@@ -96,7 +97,6 @@ void RegistryCursorSource::start(TarDatabase& db) {
 void RegistryCursorSource::stop() noexcept {
     try {
         reader_.stop();
-        reader_.buffer->clear();
     } catch (...) {
         // stop() must not throw (tar_cursor.hpp); nothing left to release.
     }
@@ -351,7 +351,7 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
         std::vector<RegistryCandidate> candidates = std::move(cur.held);
         for (auto& c : fresh_candidates)
             candidates.push_back(std::move(c));
-        const StitchFlags flags{reader_.etw_running(), restarted_, events_since_};
+        const StitchFlags flags{reader_.etw_running(), events_since_};
         StitchResult stitched =
            stitch_registry_tick(candidates, batch.items, epochs, flags, now, snapshot_id);
         for (auto& r : stitched.rows)
@@ -380,9 +380,7 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
         rb.active = false; // committed: the dirty flags stay consumed
 
         // Only now may the transient state move (a failed commit re-derives all of it: the
-        // dirty flags above, the buffer, the loss counters and the totals stay untouched,
-        // and the replay's rows carry the same record_keys, since identity excludes the
-        // attribution).
+        // dirty flags above, the buffer, the loss counters and the totals stay untouched).
         reader_.buffer->retire(batch.last_seq, [&](const RegistryEtwEvent& e) {
             return release_event(e, watermark, cur.held);
         });
@@ -392,12 +390,10 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
         query_failures_ += fail_now;
         last_query_ts_ = now;
         pending_gap_ = false;
-        restarted_ = false;
         force_all_ = false;
         totals_.attributed += stitched.counters.attributed;
         totals_.ambiguous += stitched.counters.ambiguous;
         totals_.none += stitched.counters.none;
-        reader_.tick_committed();
 
         // Status keys (always written, skipped when unchanged).
         std::size_t unarmed = 0, unreadable = 0, capped = 0;
@@ -525,18 +521,6 @@ bool prop_u32(EVENT_RECORD* rec, const wchar_t* name, std::uint32_t& out) {
     return true;
 }
 
-bool prop_u64(EVENT_RECORD* rec, const wchar_t* name, std::uint64_t& out) {
-    PROPERTY_DATA_DESCRIPTOR pdd{};
-    pdd.PropertyName = reinterpret_cast<ULONGLONG>(name);
-    pdd.ArrayIndex = ULONG_MAX;
-    ULONGLONG val = 0;
-    if (TdhGetProperty(rec, 0, nullptr, 1, &pdd, sizeof(val), reinterpret_cast<PBYTE>(&val)) !=
-        ERROR_SUCCESS)
-        return false;
-    out = val;
-    return true;
-}
-
 // ValueName; the default value ("") is a legitimate 2-byte (NUL only) property.
 bool prop_string(EVENT_RECORD* rec, const wchar_t* name, std::string& out) {
     PROPERTY_DATA_DESCRIPTOR pdd{};
@@ -559,7 +543,7 @@ bool prop_string(EVENT_RECORD* rec, const wchar_t* name, std::string& out) {
 
 // Owns a started trace session: its handle and the EVENT_TRACE_PROPERTIES block (with
 // the session name behind it) every ControlTrace call needs. reset() stops the session
-// by handle. Move-only; the destructor is the safety net, WinEtw::stop() orders teardown.
+// by handle. The destructor is the safety net, WinEtw::stop() orders teardown.
 struct TraceSession {
     TRACEHANDLE h = 0;
     std::vector<BYTE> buf; // EVENT_TRACE_PROPERTIES + the session name
@@ -567,15 +551,6 @@ struct TraceSession {
     TraceSession() = default;
     TraceSession(const TraceSession&) = delete;
     TraceSession& operator=(const TraceSession&) = delete;
-    TraceSession(TraceSession&& o) noexcept : h(std::exchange(o.h, TRACEHANDLE{0})), buf(std::move(o.buf)) {}
-    TraceSession& operator=(TraceSession&& o) noexcept {
-        if (this != &o) {
-            reset();
-            h = std::exchange(o.h, TRACEHANDLE{0});
-            buf = std::move(o.buf);
-        }
-        return *this;
-    }
     ~TraceSession() { reset(); }
 
     EVENT_TRACE_PROPERTIES* props() { return reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buf.data()); }
@@ -607,14 +582,6 @@ struct TraceConsumer {
     TraceConsumer() = default;
     TraceConsumer(const TraceConsumer&) = delete;
     TraceConsumer& operator=(const TraceConsumer&) = delete;
-    TraceConsumer(TraceConsumer&& o) noexcept : h(std::exchange(o.h, INVALID_PROCESSTRACE_HANDLE)) {}
-    TraceConsumer& operator=(TraceConsumer&& o) noexcept {
-        if (this != &o) {
-            reset();
-            h = std::exchange(o.h, INVALID_PROCESSTRACE_HANDLE);
-        }
-        return *this;
-    }
     ~TraceConsumer() { reset(); }
 
     void reset() noexcept {
@@ -637,8 +604,12 @@ struct WinEtw {
     std::atomic<bool> running{false};
     std::atomic<std::uint64_t> decode_failed{0};
     std::unordered_map<std::uint32_t, std::string> pid_name; // ProcessTrace thread only
-    std::atomic<bool> names_stale{false}; // set by the collect tick, honoured by the callback
+    std::int64_t pid_name_flushed{0};                        // ProcessTrace thread only
     static constexpr std::size_t kPidNameCap = 65536;
+    // A pid can be reused, so a cached name goes stale. Flushed this often (FILETIME), which
+    // is the default slow tick (tar.yaml slow_interval): a reused pid names stale for at
+    // most one tick at the default cadence.
+    static constexpr std::int64_t kPidNameFlush100ns = 300LL * 10'000'000;
 
     ~WinEtw() { stop(); }
 
@@ -663,7 +634,7 @@ struct WinEtw {
                 return;
             RegistryEtwEvent ev;
             std::uint32_t status = 0;
-            if (!prop_u32(rec, L"Status", status) || !prop_u64(rec, L"KeyObject", ev.key_object)) {
+            if (!prop_u32(rec, L"Status", status)) {
                 self->decode_failed.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
@@ -671,7 +642,6 @@ struct WinEtw {
                 return; // the operation failed: nothing changed
             ev.ts100ns = rec->EventHeader.TimeStamp.QuadPart;
             ev.pid = rec->EventHeader.ProcessId;
-            ev.tid = rec->EventHeader.ThreadId;
             if (id == kEvDeleteKey) {
                 ev.op = RegistryEtwOp::DeleteKey;
             } else {
@@ -684,8 +654,10 @@ struct WinEtw {
                     return;
                 }
             }
-            if (self->names_stale.exchange(false, std::memory_order_relaxed))
-                self->pid_name.clear(); // a reused pid names stale for at most one tick
+            if (ev.ts100ns - self->pid_name_flushed > kPidNameFlush100ns) {
+                self->pid_name.clear();
+                self->pid_name_flushed = ev.ts100ns;
+            }
             auto it = self->pid_name.find(ev.pid);
             if (it == self->pid_name.end()) {
                 if (self->pid_name.size() >= kPidNameCap)
@@ -711,7 +683,10 @@ struct WinEtw {
             const std::size_t name_bytes = (session_name.size() + 1) * sizeof(wchar_t);
             session.init(name_bytes);
             ULONG rc = StartTraceW(&session.h, session_name.c_str(), session.props());
-            if (rc == ERROR_ALREADY_EXISTS) { // a stale session from a crashed predecessor
+            // Pid reuse after a crash: a session is a kernel object that outlives its process,
+            // so the predecessor's carries this pid's name. Stop it and retry once, else this
+            // run is attr:off and the leaked session runs until reboot.
+            if (rc == ERROR_ALREADY_EXISTS) {
                 ControlTraceW(0, session_name.c_str(), session.props(), EVENT_TRACE_CONTROL_STOP);
                 session.init(name_bytes);
                 rc = StartTraceW(&session.h, session_name.c_str(), session.props());
@@ -1213,7 +1188,6 @@ RegistryReader make_windows_registry_reader() {
         etw->stop();
         watcher->shutdown();
     };
-    r.tick_committed = [etw] { etw->names_stale.store(true, std::memory_order_relaxed); };
     return r;
 }
 

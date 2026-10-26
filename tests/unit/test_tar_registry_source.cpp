@@ -112,14 +112,11 @@ RegistryCandidate cand(std::string action, std::string value, std::uint32_t type
 
 RegistryEtwEvent ev(std::int64_t ts, std::uint32_t pid, RegistryEtwOp op, std::string value,
                     std::uint32_t type = 4, std::uint32_t size = 4,
-                    std::string image = "svc.exe", std::uint64_t key_object = 1,
-                    std::uint32_t tid = 1) {
+                    std::string image = "svc.exe") {
     RegistryEtwEvent e;
     e.ts100ns = ts;
     e.pid = pid;
-    e.tid = tid;
     e.image = std::move(image);
-    e.key_object = key_object;
     e.op = op;
     e.value = std::move(value);
     e.type = type;
@@ -495,23 +492,15 @@ TEST_CASE("attribute_candidate: correlation on value name, type, size and window
     }
     SECTION("key_removed is never attributed, even beside a DeleteKey and a matching DeleteValue") {
         const auto kr = cand("key_removed", "", 0, 0, 100, 200);
-        CHECK(attribute_candidate(kr, {ev(150, 9, RegistryEtwOp::DeleteKey, "", 0, 0, "x.exe", 55),
-                                       ev(150, 9, RegistryEtwOp::DeleteValue, "", 0, 0, "x.exe", 55)})
+        CHECK(attribute_candidate(kr, {ev(150, 9, RegistryEtwOp::DeleteKey, "", 0, 0, "x.exe"),
+                                       ev(150, 9, RegistryEtwOp::DeleteValue, "", 0, 0, "x.exe")})
                  .kind == AttributionKind::None);
     }
 }
 
-TEST_CASE("dedupe_registry_events drops a repeated delivery of one event", "[tar][registry][pure]") {
-    const auto e = ev(105, 5, RegistryEtwOp::Set, "Start");
-    auto other_tid = e;
-    other_tid.tid = 2; // a different thread's write is a different event
-    const auto out = dedupe_registry_events({e, e, other_tid});
-    CHECK(out.size() == 2);
-}
-
 TEST_CASE("stitch_registry_tick: rows, counters, the settle hold and what is NOT recorded",
           "[tar][registry][pure]") {
-    const StitchFlags on{true, false, 0};
+    const StitchFlags on{true, 0};
     const std::int64_t now = 1000 * SEC;
     const auto c = cand("changed", "Start", 4, 4, 100 * SEC, 110 * SEC);
 
@@ -523,9 +512,9 @@ TEST_CASE("stitch_registry_tick: rows, counters, the settle hold and what is NOT
     }
     SECTION("two keys, one pid: only the in-scope candidate is attributed, `Secret` gets no row") {
         const auto evs = std::vector<RegistryEtwEvent>{
-           ev(101 * SEC, 5, RegistryEtwOp::Set, "Start", 4, 4, "p.exe", 10),
-           ev(102 * SEC, 5, RegistryEtwOp::Set, "Start", 4, 4, "p.exe", 20),
-           ev(103 * SEC, 5, RegistryEtwOp::Set, "Secret", 1, 8, "p.exe", 20)};
+           ev(101 * SEC, 5, RegistryEtwOp::Set, "Start", 4, 4, "p.exe"),
+           ev(102 * SEC, 5, RegistryEtwOp::Set, "Start", 4, 4, "p.exe"),
+           ev(103 * SEC, 5, RegistryEtwOp::Set, "Secret", 1, 8, "p.exe")};
         const auto r = stitch_registry_tick({c}, evs, {}, on, now, 1);
         REQUIRE(r.rows.size() == 1);
         CHECK(r.rows[0].actor_pid == 5);
@@ -547,16 +536,10 @@ TEST_CASE("stitch_registry_tick: rows, counters, the settle hold and what is NOT
     SECTION("key_removed stays attr:none even with an in-window DeleteKey from the same handle") {
         const auto kr = cand("key_removed", "", 0, 0, 100 * SEC, 110 * SEC);
         const auto r = stitch_registry_tick(
-           {kr}, {ev(105 * SEC, 9, RegistryEtwOp::DeleteKey, "", 0, 0, "x.exe", 55)}, {}, on, now, 1);
+           {kr}, {ev(105 * SEC, 9, RegistryEtwOp::DeleteKey, "", 0, 0, "x.exe")}, {}, on, now, 1);
         REQUIRE(r.rows.size() == 1);
         CHECK(r.rows[0].detail == "attr:none");
         CHECK(r.rows[0].actor_pid == 0);
-    }
-    SECTION("duplicate delivery is one attribution") {
-        const auto e = ev(105 * SEC, 5, RegistryEtwOp::Set, "Start");
-        const auto r = stitch_registry_tick({c}, {e, e}, {}, on, now, 1);
-        REQUIRE(r.rows.size() == 1);
-        CHECK(r.rows[0].detail == "attr:corr");
     }
     SECTION("settle hold: 4 s after the window stays held, 5 s finalises") {
         const auto held = stitch_registry_tick({c}, {}, {}, on, c.window_hi + 4 * SEC, 1);
@@ -578,13 +561,13 @@ TEST_CASE("stitch_registry_tick: rows, counters, the settle hold and what is NOT
     SECTION("precedence: lost-restart > off > degraded > the correlation outcome") {
         const auto evs = std::vector<RegistryEtwEvent>{ev(105 * SEC, 5, RegistryEtwOp::Set, "Start")};
         const std::vector<LossEpoch> hit{{101 * SEC, 102 * SEC}};
-        auto r = stitch_registry_tick({c}, evs, hit, StitchFlags{false, false, 0}, now, 1);
+        auto r = stitch_registry_tick({c}, evs, hit, StitchFlags{false, 0}, now, 1);
         CHECK(r.rows[0].detail == "attr:off"); // off beats degraded
         CHECK(r.rows[0].actor_pid == 0);
-        r = stitch_registry_tick({c}, evs, hit, StitchFlags{false, true, 0}, now, 1);
-        CHECK(r.rows[0].detail == "attr:lost-restart"); // lost-restart beats off
         // the buffer began after the window opened -> the early part of the window is unobserved
-        r = stitch_registry_tick({c}, evs, {}, StitchFlags{true, false, 105 * SEC}, now, 1);
+        r = stitch_registry_tick({c}, evs, hit, StitchFlags{false, 105 * SEC}, now, 1);
+        CHECK(r.rows[0].detail == "attr:lost-restart"); // lost-restart beats off
+        r = stitch_registry_tick({c}, evs, {}, StitchFlags{true, 105 * SEC}, now, 1);
         CHECK(r.rows[0].detail == "attr:lost-restart");
         CHECK(r.rows[0].actor_pid == 0);
     }
@@ -599,7 +582,7 @@ TEST_CASE("stitch_registry_tick: rows, counters, the settle hold and what is NOT
         const auto corr = stitch_registry_tick({c}, {ev(105 * SEC, 5, RegistryEtwOp::Set, "Start")}, {},
                                                on, now, 1);
         const auto none = stitch_registry_tick({c}, {}, {}, on, now, 1);
-        const auto off = stitch_registry_tick({c}, {}, {}, StitchFlags{false, false, 0}, now, 1);
+        const auto off = stitch_registry_tick({c}, {}, {}, StitchFlags{false, 0}, now, 1);
         REQUIRE(corr.rows.size() == 1);
         CHECK(corr.rows[0].record_key == none.rows[0].record_key);
         CHECK(corr.rows[0].record_key == off.rows[0].record_key);
@@ -619,11 +602,11 @@ TEST_CASE("loss epochs: age out, intersect on a (lo, hi] window, collapse past t
     CHECK(epochs[0].lo == 10);
     CHECK(epochs[0].hi == 100 + 63 * 10 + 5);
 
-    const RegistryWindow w{100, 200};
-    CHECK(window_intersects(w, LossEpoch{200, 300}));       // the epoch starts at the window's end
-    CHECK_FALSE(window_intersects(w, LossEpoch{201, 300})); // after it
-    CHECK_FALSE(window_intersects(w, LossEpoch{50, 100}));  // ends where the window opens
-    CHECK(window_intersects(w, LossEpoch{50, 101}));
+    const auto w = cand("changed", "v", 4, 4, 100, 200); // the window (100, 200]
+    CHECK(intersects_loss(w, {LossEpoch{200, 300}}));       // the epoch starts at the window's end
+    CHECK_FALSE(intersects_loss(w, {LossEpoch{201, 300}})); // after it
+    CHECK_FALSE(intersects_loss(w, {LossEpoch{50, 100}}));  // ends where the window opens
+    CHECK(intersects_loss(w, {LossEpoch{50, 101}}));
 }
 
 TEST_CASE("RegistryEtwBuffer retires by sequence identity and counts what it evicts (R4)",
@@ -661,7 +644,7 @@ TEST_CASE("RegistryEtwBuffer retires by sequence identity and counts what it evi
         CHECK(b.drop_info().ts_hi == 0);
         CHECK(b.drop_info().count == 3); // the count is cumulative
     }
-    SECTION("pause discards and refuses; resume clears and accepts again") {
+    SECTION("pause discards and refuses; resume accepts again") {
         RegistryEtwBuffer b;
         b.push(ev(1, 1, RegistryEtwOp::Set, "v"));
         b.pause();
@@ -672,8 +655,6 @@ TEST_CASE("RegistryEtwBuffer retires by sequence identity and counts what it evi
         b.resume();
         b.push(ev(3, 1, RegistryEtwOp::Set, "v"));
         CHECK(b.size() == 1);
-        b.clear();
-        CHECK(b.size() == 0);
     }
     SECTION("the bounded wait sees a matching event and never polls") {
         RegistryEtwBuffer b;
@@ -890,7 +871,6 @@ struct Fake {
     std::vector<std::vector<std::string>> watch_calls;
     std::shared_ptr<RegistryDirtyTable> dirty = std::make_shared<RegistryDirtyTable>();
     std::shared_ptr<RegistryEtwBuffer> buffer = std::make_shared<RegistryEtwBuffer>();
-    int tick_commits{0};
 
     RegistryReader reader() {
         RegistryReader r;
@@ -917,7 +897,6 @@ struct Fake {
         r.rearm = [this](const std::string& root) { return !unarmed.contains(root); };
         r.start = [] {};
         r.stop = [] {};
-        r.tick_committed = [this] { ++tick_commits; };
         return r;
     }
 };
@@ -1029,7 +1008,6 @@ TEST_CASE("registry source: baseline tick writes baselines and no rows; a change
     CHECK(base_row->has_value());
     CHECK(f.watch_calls.size() == 1);
     CHECK(read_cursor(t.db).roots.at(kRoot).window_base != 0); // the next window starts at this read
-    CHECK(f.tick_commits == 1);
 
     // A change under a notify burst is HELD with the burst's window (first notify and last,
     // each +/- 1 s): nothing is written yet, and only that root's baseline is rewritten.
@@ -1163,7 +1141,6 @@ TEST_CASE("registry source: a failed commit rolls back in memory and replays cle
     const std::string cursor_before = *t.db.get_cursor("registry").value();
     const std::string baseline_before = *t.db.try_get_state("registry:" + kRoot).value();
     const auto buffered = src->buffer_for_test().size();
-    const int commits_before = f.tick_commits;
 
     // The next tick finalises the held candidate (a row to insert) and re-reads the root,
     // under a loss the session reports; the commit fails.
@@ -1178,7 +1155,6 @@ TEST_CASE("registry source: a failed commit rolls back in memory and replays cle
     CHECK(*t.db.try_get_state("registry:" + kRoot).value() == baseline_before); // and the baseline
     CHECK(count_rows(t.db) == 0);
     CHECK(src->buffer_for_test().size() == buffered); // nothing retired from the buffer
-    CHECK(f.tick_commits == commits_before);          // and no housekeeping for a tick that did not commit
     CHECK(f.dirty->peek_dirty(kRoot));                // the root is dirty again (R7)
     const auto retaken = f.dirty->take(kRoot);
     CHECK(retaken.first == T0 + 290 * SEC); // with its original burst start
@@ -1504,16 +1480,22 @@ TEST_CASE("registry source: read statuses; status keys; fair root scheduling",
         f.clock = T0 + 60 * SEC;
         tick(t.db, *src);
         CHECK(t.db.get_config("registry_capture_method", "") == "notify+etw");
-    }
 
-    SECTION("attribution counters and the event count accumulate across ticks") {
-        const auto held = baseline_then_change(t, f, *src, 1, 2);
-        src->push_event_for_test(ev(held.window_lo + SEC / 2, 5, RegistryEtwOp::Set, "Start"));
-        src->push_event_for_test(ev(held.window_lo + SEC / 2, 5, RegistryEtwOp::Set, "Unrelated"));
+        // The non-zero path: one change explained by a pushed event, then one that no event
+        // explains. The event count reports the buffer's pushes, and the attribution counters
+        // accumulate across committed ticks.
+        f.clock = T0 + 100 * SEC;
+        f.reads[kRoot] = svc(2);
+        burst(f, kRoot, T0 + 97 * SEC, T0 + 98 * SEC);
+        tick(t.db, *src);
+        const auto held = read_cursor(t.db).held;
+        REQUIRE(held.size() == 1);
+        src->push_event_for_test(ev(held[0].window_lo + SEC / 2, 5, RegistryEtwOp::Set, "Start"));
+        src->push_event_for_test(ev(held[0].window_lo + SEC / 2, 5, RegistryEtwOp::Set, "Unrelated"));
         f.clock = T0 + 300 * SEC;
         tick(t.db, *src);
-        CHECK(t.db.get_config("registry_attr_attributed", "") == "1");
         CHECK(t.db.get_config("registry_etw_events", "") == "2");
+        CHECK(t.db.get_config("registry_attr_attributed", "") == "1");
         f.clock = T0 + 400 * SEC;
         f.reads[kRoot] = svc(3);
         burst(f, kRoot, T0 + 390 * SEC, T0 + 391 * SEC);
