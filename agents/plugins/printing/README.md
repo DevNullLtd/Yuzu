@@ -14,16 +14,88 @@
 
 ## How it works
 
-`printers` and `jobs` are plain IPP reads: encode a request (RFC 8010, no libcups — `printing_ipp.hpp` is a from-scratch minimal codec), send it over the CUPS Unix domain socket (falling back to `localhost:631` over TCP when no socket is found), decode the response, and format the rows. On Windows the same two actions go through winspool (`EnumPrintersW`/`EnumJobsW`) instead of IPP; there is no libcups dependency on any platform. The plugin keeps no history: `jobs` only ever reports not-completed jobs, and nothing here retains a record of a job once it leaves the queue. `clear_queue` is the plugin's only mutation — it cancels exactly one job id (`SetJobW(JOB_CONTROL_CANCEL)` on Windows, IPP `Cancel-Job` over the same CUPS Unix socket on macOS/Linux), never a purge-all; a human resubmitting the document from their own application is the real-world path back, not a Yuzu dispatch. The named `printer` must hold the job, on every OS. Windows: the spooler itself looks the job up on that printer. macOS/Linux: cupsd's own `Cancel-Job` looks a job up by id alone and ignores the printer, so a nonexistent printer name with a valid id would otherwise cancel that job and report success; the agent therefore first lists the named printer's not-completed jobs and sends `Cancel-Job` only for an id that is on that list and whose own printer URI names that printer (compared case-insensitively, as cupsd resolves names); a job that is listed with no printer URI to confirm its printer is reported as an `error` and never cancelled. The check and the cancel are two requests, so a job that its owner or an administrator moves to another queue in between is still cancelled by id.
+`printers` lists the print queues on the device and `jobs` lists the jobs that have not finished; both only read. `clear_queue` is the one action that changes anything: it cancels exactly one job, named by printer and job id, and never purges a queue. The plugin keeps no history, so a job that has finished, failed or been cancelled drops out of `jobs` and cannot be looked up again.
+
+On macOS and Linux the plugin speaks IPP (RFC 8010, a small built-in encoder and decoder, no libcups) to the local CUPS daemon over its Unix socket. Reads fall back to `localhost:631` over TCP when no socket exists; `clear_queue` never does and is refused instead. On Windows the same reads call winspool (`EnumPrintersW`, `EnumJobsW`) in process.
+
+`clear_queue` insists that the named printer really holds the job. On Windows the spooler looks the job up on the opened printer. On macOS and Linux cupsd's `Cancel-Job` looks a job up by id alone and ignores the printer, so the agent first asks for that printer's not-completed jobs and sends `Cancel-Job` only for an id that is listed there with a job printer URI naming that printer (compared case-insensitively). A job that is listed but carries no printer URI to confirm it is reported as an error and left alone. The check and the cancel are two requests, so a job moved to another queue between them is still cancelled by id. Cancelling cannot be undone from Yuzu: no action re-queues a job, so the way back is the user printing the document again from their own application.
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Inventory.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[printing.execute]
-  EX --> WIN[Windows leg<br/>winspool EnumPrintersW/EnumJobsW]
-  EX --> POSIX[macOS + Linux leg<br/>IPP over the CUPS Unix socket]
-  WIN & POSIX --> ROWS[rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator or workflow"] --> SRV["Server authz; reads: Inventory.Read; clear_queue: Infrastructure.Write, AdminOrApproval"]
+  SRV -- "gRPC mTLS" --> HOST["Agent plugin host"] --> EX["printing.execute"]
+  EX --> WIN["Windows leg; winspool"]
+  EX --> POSIX["macOS and Linux leg; IPP over the CUPS Unix socket"]
+  WIN --> ROWS["Rows and typed result status"]
+  POSIX --> ROWS
+  ROWS --> RS[("ResponseStore")] --> API["REST api/responses"]
 ```
+
+The diagram shows the path every action takes. Reads need only the Inventory read permission; `clear_queue` needs write on the Infrastructure securable, is classed Destructive and Irreversible, and is gated on an administrator or an approval. The server records the audit row for the dispatch; the plugin writes none.
+
+### What you can decide with it
+
+| Question | Action | Windows | macOS | Linux |
+|---|---|---|---|---|
+| Which printers does this device have, which is the default, and are they stopped? | `printers` | Name, state, default flag, driver and port, queued job count. No printer-state reasons (winspool has none). | Name, state, reasons, default flag, make and model, URI, queued job count from CUPS. | Same as macOS. |
+| What is waiting to print, for whom? | `jobs` (optionally one `printer`) | Jobs per printer with owner, document title, status, submit time and size. | The same from CUPS `Get-Jobs` with `which-jobs=not-completed`. | Same as macOS. |
+| Is a queue stuck? | `jobs`, then `printers` | A job that stays `pending`, `held` or `stopped` across two reads, on a printer whose `state` is `stopped`. | Same. | Same. |
+| Remove one stuck job | `clear_queue` | Cancels if the agent identity may cancel that job. | Same, subject to the cupsd policy below. | Reliable only for a job the agent's own account owns; another user's job is usually refused. |
+
+Safe workflow for `clear_queue`: run `jobs` to read the exact `printer` and `job_id`, dispatch `clear_queue` to that one device with those two values, then run `jobs` again. `canceled` means the spooler or cupsd accepted the request, not that the job has left the queue; an actively printing job can take a moment. There is no preview and no undo. Only one device and one job id per dispatch are accepted, and a scope or broadcast dispatch of this action is refused by the server.
+
+What a result does and does not prove:
+
+- An empty `printer|none` or `job|none` with status `OK` means the spooler answered and listed nothing. It is not a failure; failures are `unavailable` rows with `CONSTRAINED` status.
+- The plugin sees only what the local spooler holds. A job already handed to a network printer, a direct-IP printer, or a print server elsewhere is not on this device's queue.
+- There is no job history, no page counts and no cost data, so it cannot answer "what was printed last week".
+- `jobs.document` is the user's document title and is user content (see Sensitivity).
+
+### Diagrams
+
+`clear_queue` on macOS and Linux is a two-request sequence with a binding check in front of the cancel:
+
+```mermaid
+sequenceDiagram
+  participant S as Server
+  participant A as Agent printing plugin
+  participant C as cupsd
+  S->>A: clear_queue printer, job_id
+  A->>A: validate printer name and job id
+  A->>A: find CUPS Unix socket, resolve own user name
+  A->>C: Get-Jobs on the named printer, not-completed
+  C-->>A: jobs with job-printer-uri
+  A->>A: job listed and its URI names this printer?
+  A->>C: Cancel-Job job_id with PeerCred header
+  C-->>A: status
+  A-->>S: row printer, job_id, outcome, detail
+```
+
+Nothing is sent to cupsd until the name and id validate and a socket and local identity exist. If the listing does not hold the job on that printer, the sequence ends after the first request with `not_found` and no cancel is sent. cupsd authorises the cancel from the real peer credentials of the socket; the `Authorization: PeerCred` header is accepted but is not what grants access.
+
+The outcome of a dispatch, on every OS, reduces to four values:
+
+```mermaid
+flowchart TD
+  IN["clear_queue dispatched"] --> V{"printer and job_id valid?"}
+  V -- "no" --> E1["error: missing_printer, invalid_job_id, invalid_printer"]
+  V -- "yes" --> P{"printer exists and holds the job?"}
+  P -- "printer or job missing" --> NF["not_found"]
+  P -- "cannot tell" --> E2["error: transport, decode or unexpected status"]
+  P -- "yes" --> A{"caller may cancel it?"}
+  A -- "no" --> R["refused"]
+  A -- "yes" --> OK["canceled"]
+```
+
+Use this tree to read the table below: `canceled` is the only success, `not_found` and `refused` are definite answers, and `error` means the plugin could not reach an answer (nothing is known about the job).
+
+| Outcome | Result status | Completeness | Detail token | What to do |
+|---|---|---|---|---|
+| `canceled` | `OK` | full | `-` | Confirm with `jobs`. |
+| `not_found` | `UNAVAILABLE` | full | `<os>:cups:not_found`, or `windows:winspool:printer_not_found` for a plain local name | The printer does not exist, or the job is not on it (finished, already cancelled, or on another queue). Re-read `jobs`. |
+| `not_found` | `UNAVAILABLE` | partial | `windows:winspool:job_not_found`, or `windows:winspool:printer_not_found` for a name with a path separator or colon | Windows reported no such job, or a remote-looking name that may only be an unreachable server. Not definitive. |
+| `refused` | `PERMISSION_DENIED` | full | `<os>:cups:access_denied`, `windows:winspool:access_denied`, or `<os>:cups:socket_unavailable` | The agent's identity is not allowed to cancel this job, or no CUPS socket exists. Nothing was cancelled. |
+| `error` | `UNAVAILABLE` | partial | `missing_printer`, `invalid_job_id`, `invalid_printer`, `<os>:cups:connect_failed`, `decode_failed`, `no_identity`, `unexpected_status`, `windows:winspool:open_printer_failed`, `set_job_failed` | The request was malformed or the spooler did not give a usable answer. The job state is unknown; read `jobs` before retrying. |
 
 ## OS capability
 
@@ -49,11 +121,11 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account | None for reads — `EnumPrintersW`/`EnumJobsW`/`OpenPrinterW` need no elevated right (measured under admin and `SYSTEM` only). `clear_queue` opens the printer with `PRINTER_ACCESS_USE`; cancel was measured only under Administrators and `SYSTEM` (both already elevated), and a least-privileged identity cancelling any job (its own or another user's) is **not** measured — see `docs/agent-privilege-model.md`. `EnumPrintersW` (the only call at risk of blocking against an unreachable network print server — `PRINTER_ENUM_CONNECTIONS`) is bounded (`yuzu::shared::bounded_call`, 5s); the per-printer `OpenPrinterW`/`EnumJobsW` pair is deliberately NOT — bounding a call holding a live `HANDLE` the caller closes on return would race a timed-out detached thread against that close (see `enum_jobs_raw`'s own comment) — `EnumJobsW` instead caps at 5000 rows, not wall-clock time; a genuinely unreachable per-printer RPC can still hang (tracked as a follow-up, not closed here) | the-rig, `SYSTEM`, 2026-09-08 (`docs/samples/windows.txt`); `SYSTEM` and the admin SSH identity (reads and `clear_queue` cancel) | n/a — reads do not fail closed; a win32 failure or bounded-call timeout on `EnumPrintersW` reports `CONSTRAINED`, never a permission error. `clear_queue` is different: `ERROR_ACCESS_DENIED` from `OpenPrinterW` or `SetJobW` reports `PERMISSION_DENIED` (`refused`) |
-| macOS | agent daemon — **root** by documented exception (`docs/agent-privilege-model.md:14`: launchd's LaunchDaemon has no `UserName` key; the `_yuzu` unprivileged-account model is not yet applied on macOS), not the dedicated-unprivileged-account design line 12 describes for the other two platforms | None to read | this Mac, euid 501, 2026-09-14 (`docs/samples/macos.txt`) | n/a — reads do not fail closed |
-| Linux | agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md:12`) | None to read | container, euid 0, 2026-09-14 (`docs/samples/linux.txt`) | n/a — reads do not fail closed |
+| Windows | agent service account (SYSTEM today) | None for reads: `EnumPrintersW`, `EnumJobsW` and `OpenPrinterW` need no elevated right. `clear_queue` opens the printer with `PRINTER_ACCESS_USE`; cancel was measured only under Administrators and `SYSTEM`, so a least-privileged identity cancelling any job, its own or another user's, is unmeasured (`docs/agent-privilege-model.md`). `EnumPrintersW`, the one call that can block on an unreachable network print server, is bounded to 5 seconds. The per-printer `OpenPrinterW` and `EnumJobsW` pair is deliberately not bounded, because abandoning a call that holds a live handle would race the close; `EnumJobsW` instead stops at 5000 rows per printer, and a per-printer RPC to an unreachable server can still hang | `SYSTEM` and an administrator session, reads and `clear_queue` cancel; see Sample output | n/a for reads, which do not fail closed: a Win32 failure or timeout on `EnumPrintersW` reports `CONSTRAINED`. For `clear_queue`, `ERROR_ACCESS_DENIED` from `OpenPrinterW` or `SetJobW` reports `PERMISSION_DENIED` (`refused`) |
+| macOS | agent daemon, root (the LaunchDaemon has no `UserName` key; the dedicated-account model is not yet applied on macOS, see `docs/agent-privilege-model.md`) | None to read. `clear_queue` sends `Authorization: PeerCred` with the agent's own user name, but cupsd authorises from the socket's real peer credentials; the cupsd policy for cancelling a job the caller does not own is unmeasured for a root caller | Reads on a Mac with no printers configured; see Sample output | n/a for reads, which do not fail closed. `clear_queue` with no CUPS socket is `PERMISSION_DENIED` (`refused`); a 401/403 or IPP forbidden from cupsd is the same |
+| Linux | agent daemon, dedicated unprivileged account, never root by design (`docs/agent-privilege-model.md`) | None to read. `clear_queue` reliably cancels only a job the agent's own account owns: measured in a cupsd container, container root (a `SystemGroup` member) cancelled another user's job, but an unprivileged non-owning caller is refused with HTTP 403 before `Cancel-Job` is reached | Reads and cancel in a Debian cupsd container as root; the unprivileged refusal is from cupsd policy, see Sample output | n/a for reads, which do not fail closed. A refused cancel is `PERMISSION_DENIED` (`refused`) |
 
-No external binaries, no subprocesses, no shell-out — the IPP codec talks to cupsd's Unix socket (or `localhost:631` TCP, reads only) through `cpp-httplib` directly; Windows uses in-process winspool calls only. No network use beyond that local loopback/socket traffic — the CUPS socket carries no TLS by design (a local IPC channel, same trust boundary as any other local Unix socket).
+No external binaries, no subprocesses and no shell-out. The IPP codec talks to cupsd's Unix socket (or `localhost:631` over TCP, reads only) through cpp-httplib directly; Windows uses in-process winspool calls. No network use beyond that local socket and loopback traffic, and the CUPS socket carries no TLS because it is local IPC.
 
 ## Data contract
 
@@ -108,7 +180,7 @@ Every row is pipe-delimited, one row per printer/job. `printers`/`jobs` report `
 
 ### Result status
 
-`printers`/`jobs` set `OK`/`FULL` on every successful read, including a genuinely empty result (`printer|none`/`job|none`) — a read is never left `UNDECLARED`. Windows reports success or failure directly from the Win32 calls themselves (`EnumPrintersW`/`EnumJobsW`/`OpenPrinterW` — see Privileges and prerequisites for which of the three is actually bounded against a hang, and which is not); macOS/Linux additionally check the IPP response's own status code before trusting a zero-row result as "genuinely empty" — a request CUPS itself refuses (e.g. an unrecognised printer-uri) is `CONSTRAINED`, never reported as an empty queue. `clear_queue` never leaves `UNDECLARED` either: every exit path — parameter validation, transport, authorization, and the terminal cancel outcome — sets an explicit status.
+`printers` and `jobs` report `OK` / full on every successful read, including a genuinely empty result (`printer|none`, `job|none`). Windows reports success or failure from the Win32 calls themselves; macOS and Linux also check the IPP response's own status code before treating zero rows as empty, so a request CUPS refuses (for example an unrecognised printer URI) is `CONSTRAINED`, never an empty queue. `clear_queue` sets an explicit status on every exit path: parameter validation, transport, authorization and the final cancel outcome. The outcome table under Diagrams maps these onto the four `clear_queue` outcomes. The Windows sample under Sample output shows `UNDECLARED` for `printers` and `jobs` because it was captured before the Windows leg declared a status; the source sets one on every path, and a fresh capture reports it.
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
@@ -122,7 +194,7 @@ Every row is pipe-delimited, one row per printer/job. `printers`/`jobs` report `
 
 - **Instruction result.** Every row is server instruction-result data — the standard retention policy, served over REST `/api/responses`. Nothing here is a durable server-side table of its own.
 - **Not consumed by** daily-sync, TAR, DEX, or metrics — the plugin never runs on a schedule outside an explicit instruction dispatch, and there is no agent daily-sync source for print queues.
-- **Sensitivity.** `jobs.document` is the job's user-supplied document title/filename — it is treated as user content: instruction-result retention only, never forwarded to daily-sync, TAR, or DEX. `jobs.owner` is a local account name on the target device.
+- **Sensitivity.** `jobs.document` is the job's user-supplied document title or file name: user content, kept with instruction-result retention only and never forwarded to daily-sync, TAR or DEX. `jobs.owner` is a local account name on the device. A printer's `make_model` and `uri` can name an internal print server.
 - **Siblings:** `crossplatform.printing.printers`, `crossplatform.printing.jobs`.
 
 ## Sample output
@@ -179,7 +251,9 @@ job|ipp://localhost:631/printers/yuzu_test|1|-|-|pending|2026-09-14T17:27:40Z|10
 
 ## Caveats and known gaps
 
-1. **`jobs` reports only not-completed jobs; there is no completed-job history.** A job that has finished, failed, or was already cancelled by a previous call simply stops appearing — there is no lookup for it.
+1. **`jobs` shows only not-completed jobs and only the local spooler.** A finished, failed or cancelled job stops appearing and cannot be looked up, and a job already handed to a network or direct-IP printer is not on this device's queue.
+2. **Linux cancel is reliable only for the agent's own jobs.** The Linux agent runs unprivileged, so cupsd refuses a cancel of another user's job (HTTP 403) before `Cancel-Job` is reached; the leg is therefore declared constrained. The macOS cancel outcome for a job the caller does not own is unmeasured, and on Windows only Administrators and `SYSTEM` were measured.
+3. **Cancel is two requests on macOS and Linux.** The listing check and `Cancel-Job` are separate round trips, so a job moved to another queue in between is still cancelled by id. The result `canceled` means the request was accepted; an actively printing job can take a moment to leave the queue.
 
 ## Source and tests
 
