@@ -245,22 +245,6 @@ TEST_CASE("entitlement surface: an absent directory is ok|0 and nothing is read"
     CHECK(run_linux(never_configured).outcomes[0].ok);
 }
 
-TEST_CASE("entitlement surface: the directory is listed once with the 4096-entry limit, never globbed",
-          "[licensing][license_scan][surface][linux]") {
-    FakeProbeHost h;
-    add_file(h, "a.pem", kCertA);
-    const Run r = run_linux(h);
-    REQUIRE(h.listings.size() == 1);
-    CHECK(h.listings[0].path == kDir);
-    CHECK(h.listings[0].max_entries == kDirListCap);
-    CHECK(h.globs.empty());
-    CHECK(h.prefix_reads.empty());
-    REQUIRE(h.reads.size() == 1);
-    CHECK(h.reads[0].path == path_of("a.pem"));
-    CHECK(h.reads[0].cap == kPemFileCap);
-    CHECK(r.outcomes[0].ok);
-}
-
 TEST_CASE("entitlement surface: a directory the agent may not list is a refusal, never ok|0",
           "[licensing][license_scan][surface][linux]") {
     for (const int err : {EACCES, EPERM}) {
@@ -465,6 +449,13 @@ TEST_CASE("entitlement surface: a directory listing at the entry limit is comple
         CHECK(r.outcomes[0].error == "cert_scan_budget_exhausted");
         CHECK(r.outcomes[0].rows == 1); // what was seen is kept
         CHECK(r.records.size() == 1);
+        // the recorded requests: the directory listed once with the limit, never globbed,
+        // and the one certificate read through the capped reader (not the lossy prefix one)
+        REQUIRE(h.listings.size() == 1);
+        CHECK(h.listings[0].path == kDir);
+        CHECK(h.listings[0].max_entries == kDirListCap);
+        CHECK(h.globs.empty());
+        CHECK(h.prefix_reads.empty());
     }
 }
 
@@ -602,36 +593,16 @@ std::string read_fixture(const char* name) {
     return out;
 }
 
-// SYNTHETIC minimal bplist00 {key: value}: one-byte offsets and references, key and
-// value shorter than 15 bytes (single-byte length markers). Labelled SYNTHETIC: it
-// isolates one lookup outcome the three real captures do not cover.
-std::string tiny_bplist(const std::string& key, const std::string& value) {
-    REQUIRE(key.size() < 15);
-    REQUIRE(value.size() < 15);
-    std::string img = "bplist00";
-    const std::size_t dict_off = img.size();
-    img += static_cast<char>(0xD1); // dict, one entry
-    img += '\x01';                  // key reference
-    img += '\x02';                  // value reference
-    const std::size_t key_off = img.size();
-    img += static_cast<char>(0x50 | key.size());
-    img += key;
-    const std::size_t val_off = img.size();
-    img += static_cast<char>(0x50 | value.size());
-    img += value;
-    const std::size_t table_off = img.size();
-    img += static_cast<char>(dict_off);
-    img += static_cast<char>(key_off);
-    img += static_cast<char>(val_off);
-    img.append(6, '\0');            // 5 unused bytes + sort version
-    img += '\x01';                  // offset size
-    img += '\x01';                  // reference size
-    img.append(7, '\0');
-    img += '\x03';                  // 3 objects
-    img.append(8, '\0');            // top object 0
-    img.append(7, '\0');
-    img += static_cast<char>(table_off);
-    return img;
+// A real capture with one top-level key renamed in place (first byte 'C' -> 'X': same
+// length, so every offset stays valid): the decoder then sees that key as absent. The key
+// occurs exactly once in each capture as ASCII, which is REQUIRE'd so a rename cannot hit
+// the wrong bytes.
+std::string without_key(std::string plist, std::string_view key) {
+    const auto pos = plist.find(key);
+    REQUIRE(pos != std::string::npos);
+    REQUIRE(plist.find(key, pos + 1) == std::string::npos);
+    plist[pos] = 'X';
+    return plist;
 }
 
 std::string xml_plist(const std::vector<std::pair<std::string, std::string>>& kvs) {
@@ -691,29 +662,17 @@ TEST_CASE("mas_receipt surface: binary Info.plist identity reaches the row (real
     }
 }
 
-TEST_CASE("mas_receipt surface: asks for the receipt glob and each Info.plist with the 4 MiB cap",
-          "[licensing][license_scan][surface][macos]") {
-    FakeProbeHost h;
-    add_app(h, "/Applications/A.app", xml_plist({{"CFBundleName", "A"}}));
-    add_app(h, "/Applications/B.app", xml_plist({{"CFBundleName", "B"}}));
-    (void)run_mac(h);
-    REQUIRE(h.globs.size() == 1);
-    CHECK(h.globs[0] == kGlobPattern);
-    REQUIRE(h.reads.size() == 2);
-    CHECK(h.reads[0].path == plist_of("/Applications/A.app"));
-    CHECK(h.reads[1].path == plist_of("/Applications/B.app"));
-    for (const auto& rd : h.reads)
-        CHECK(rd.cap == kInfoPlistCap);
-    CHECK(h.prefix_reads.empty());
-}
-
 TEST_CASE("mas_receipt surface: a binary plist falls back from DisplayName to Name, version may be absent",
           "[licensing][license_scan][surface][macos]") {
     FakeProbeHost h;
-    add_app(h, "/Applications/Café.app", tiny_bplist("CFBundleName", "Cafe")); // SYNTHETIC
+    // Spotify's CFBundleName is "Spotify": with DisplayName and ShortVersionString renamed
+    // away, the product can only come from the Name fallback, never the directory "Café".
+    add_app(h, "/Applications/Café.app",
+            without_key(without_key(read_fixture("Spotify.Info.plist"), "CFBundleDisplayName"),
+                        "CFBundleShortVersionString"));
     const Run r = run_mac(h);
     REQUIRE(r.records.size() == 1);
-    CHECK(r.records[0].product == "Cafe"); // CFBundleName, not the bundle directory name
+    CHECK(r.records[0].product == "Spotify");
     CHECK(r.records[0].version.empty());
 }
 
@@ -740,7 +699,9 @@ TEST_CASE("mas_receipt surface: a plist that cannot be decoded falls back to the
     add_app_unreadable(h, "/Applications/Gone.app", ENOENT);
     add_app_unreadable(h, "/Applications/Denied.app", EACCES);
     add_app(h, "/Applications/Truncated.app", std::string("bplist00") + "xyz");          // undecodable binary
-    add_app(h, "/Applications/OtherKey.app", tiny_bplist("SomethingElse", "x"));         // SYNTHETIC: no name key
+    add_app(h, "/Applications/OtherKey.app",                                              // binary, no name key
+            without_key(without_key(read_fixture("Spotify.Info.plist"), "CFBundleDisplayName"),
+                        "CFBundleName"));
     add_app(h, "/Applications/NoNames.app", xml_plist({{"CFBundleShortVersionString", "2.0"}}));
     add_app(h, "/Applications/Big App.app", std::string(kInfoPlistCap + 1, ' '));        // oversized
     const Run r = run_mac(h);
@@ -752,9 +713,11 @@ TEST_CASE("mas_receipt surface: a plist that cannot be decoded falls back to the
     CHECK(r.records[3].product == "OtherKey");
     CHECK(r.records[4].product == "NoNames");
     CHECK(r.records[5].product == "Big App");
-    for (const auto& i : {0, 1, 2, 3, 5})
+    for (const auto& i : {0, 1, 2, 5})
         CHECK(r.records[static_cast<std::size_t>(i)].version.empty());
-    CHECK(r.records[4].version == "2.0"); // a readable plist's version is kept even without a name
+    // a readable plist's version is kept even without a name (binary and XML alike)
+    CHECK(r.records[3].version == "1.3.5.3058");
+    CHECK(r.records[4].version == "2.0");
 }
 
 TEST_CASE("mas_receipt surface: an Info.plist of exactly 4 MiB is decoded, one byte more is not",
@@ -768,6 +731,13 @@ TEST_CASE("mas_receipt surface: an Info.plist of exactly 4 MiB is decoded, one b
         const Run r = run_mac(h);
         REQUIRE(r.records.size() == 1);
         CHECK(r.records[0].product == "Decoded Name");
+        // the recorded requests: one receipt glob, one Info.plist read at the 4 MiB cap
+        REQUIRE(h.globs.size() == 1);
+        CHECK(h.globs[0] == kGlobPattern);
+        REQUIRE(h.reads.size() == 1);
+        CHECK(h.reads[0].path == plist_of("/Applications/Folder Name.app"));
+        CHECK(h.reads[0].cap == kInfoPlistCap);
+        CHECK(h.prefix_reads.empty());
     }
     {
         FakeProbeHost h;
