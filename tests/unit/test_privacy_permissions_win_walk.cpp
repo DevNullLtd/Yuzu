@@ -823,6 +823,28 @@ TEST_CASE("hive guard: each leaf fact the probe reports reaches its own refusal"
         r.probe.leaf.attributes = win::kFileAttributeReparsePoint;
         CHECK(r.before() == "hive_reparse_point");
     }
+    SECTION("a hard-linked leaf: a second name may be another hive file's (SG-1)") {
+        r.probe.leaf.links = 2;
+        CHECK(r.before() == "hive_hardlinked");
+        CHECK_FALSE(r.guard.snapshot.has_value()); // refused: nothing for after_load to accept
+    }
+    SECTION("a link count that was not read (0) fails closed") {
+        r.probe.leaf.links = 0;
+        CHECK(r.before() == "hive_hardlinked");
+    }
+    SECTION("a single-link leaf is accepted") {
+        r.probe.leaf.links = 1;
+        CHECK(r.before().empty());
+    }
+    SECTION("the hard link outranks the owner, kind and size refusals; a reparse leaf outranks it") {
+        r.probe.leaf.links = 2;
+        r.probe.leaf.owner_sid = "S-1-5-21-9-9-9-500";
+        r.probe.leaf.is_disk_file = false;
+        r.probe.leaf.size = win::kMaxHiveBytes + 1;
+        CHECK(r.before() == "hive_hardlinked");
+        r.probe.leaf.attributes = win::kFileAttributeReparsePoint;
+        CHECK(r.before() == "hive_reparse_point");
+    }
     SECTION("a directory") {
         r.probe.leaf.attributes = win::kFileAttributeDirectory;
         CHECK(r.before() == "hive_not_regular");

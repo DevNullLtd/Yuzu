@@ -603,7 +603,7 @@ TEST_CASE("RegOpenKeyExW(h, empty, KEY_CREATE_SUB_KEY) answers ERROR_ACCESS_DENI
     SECTION("a key that denies subkey creation") {
         Handle probe = 0;
         CHECK(reg.open_sub(locked_h, "", KEY_CREATE_SUB_KEY, probe) == ERROR_ACCESS_DENIED);
-        if (probe != 0) reg.close(probe);
+        const Owned probe_guard{reg, probe}; // 0 on the expected refusal: nothing to close
         CHECK(yuzu::registry::open_checked(reg, hklm, locked + "\\New", KEY_SET_VALUE | KEY_QUERY_VALUE, /*create=*/false,
                                            false, false, /*probe_create=*/true)
                   .error == "access_denied");
