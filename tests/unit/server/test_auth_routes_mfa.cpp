@@ -2371,6 +2371,84 @@ TEST_CASE("a latched rebind guard makes the local proof read unavailable and lea
     }
 }
 
+// One catalog validation that cannot run is a TRANSIENT, per-read fault: the local proof read is
+// refused as unavailable with the retry hint and counted as a `validate` degrade (never as the
+// sticky `rebind_guard` latch), the raw read the OIDC arm uses still returns the row, and the next
+// read validates afresh and passes.
+TEST_CASE("an inconclusive rebind-guard validation refuses that one local proof read and no "
+          "other (#6079)",
+          "[pg][mfa][routes][auth_routes][binding][approval_routes]") {
+    AuthRoutesHarness h;
+    yuzu::MetricsRegistry metrics;
+    h.auth_mgr.set_metrics_registry(&metrics);
+    auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+    const std::string token = cookie.substr(std::string("yuzu_session=").size());
+    httplib::Request req;
+    req.set_header("Cookie", cookie);
+    const auto session = h.auth_mgr.validate_session(token);
+    REQUIRE(session.has_value());
+
+    auto fx_for = [&](bool oidc_arm) {
+        return std::make_unique<yuzu::test::ApproverRouteFixture>(
+            h.auth_mgr, *h.auth_db.get(),
+            [&h, oidc_arm](const httplib::Request& r, const auth::Session& s) {
+                return oidc_arm ? h.auth_mgr.read_durable_mfa_proof(
+                                      AuthRoutes::extract_session_cookie(r), s.username)
+                                : h.auth_routes->durable_mfa_proof_for(r, s);
+            });
+    };
+    const auto degrade = [&](const char* op) {
+        return metrics.counter("yuzu_auth_session_store_degrade_total", {{"op", op}}).value();
+    };
+
+    h.sessions->set_binding_validation_memo_for_test(std::chrono::milliseconds{0});
+    h.sessions->set_binding_validation_inconclusive_for_test(true);
+
+    // The raw read serves the row and says its binding was not confirmed.
+    const auto raw = h.auth_mgr.read_durable_mfa_proof(token, "admin");
+    CHECK(raw.source == auth::DurableMfaProof::Source::kRow);
+    CHECK(raw.guard_unverified);
+    CHECK(h.sessions->rebind_guard_ok());
+
+    const double validate_before = degrade("validate");
+    const double latch_before = degrade("rebind_guard");
+    const auto local = h.auth_routes->durable_mfa_proof_for(req, *session);
+    CHECK(local.source == auth::DurableMfaProof::Source::kUnavailable);
+    CHECK_FALSE(local.binding_untrusted); // transient: the caller keeps its retry hint
+    CHECK(degrade("validate") == validate_before + 1.0);
+    CHECK(degrade("rebind_guard") == latch_before);
+
+    {
+        auto fx = fx_for(false);
+        const auto ticket = fx->submit();
+        auto res = fx->decide("approve", ticket, token);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(fx->status_of(ticket) == "pending");
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(body.at("error").at("retry_after_ms") == 5000);
+    }
+    { // an SSO approver's direct read is not refused for it
+        auto fx = fx_for(true);
+        const auto ticket = fx->submit();
+        auto res = fx->decide("approve", ticket, token);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+
+    // The next read validates afresh: the local approver is admitted again.
+    h.sessions->set_binding_validation_inconclusive_for_test(false);
+    {
+        auto fx = fx_for(false);
+        const auto ticket = fx->submit();
+        auto res = fx->decide("approve", ticket, token);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(fx->status_of(ticket) == "approved");
+    }
+}
+
 // Enrol then approve at once, through the real enrolment route and the real approval route:
 // the proof's instant precedes mfa_enrolled_at (it was captured before the enrolling UPDATE),
 // which the generation-bound approver gate admits by equality. This is the route-level proof for

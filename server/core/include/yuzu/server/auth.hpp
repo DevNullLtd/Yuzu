@@ -356,9 +356,10 @@ inline constexpr auto kWallSanitySkew = std::chrono::minutes(5);
 /// without Postgres), so that shape is a wiring fault and is reported as an unavailable read,
 /// never aged on a replica clock. A LOCAL session's read is also turned `kUnavailable` by
 /// `AuthRoutes::durable_mfa_proof_for` while the session store's rebind guard is not observed in
-/// force (`AuthManager::stored_binding_trustworthy`): a binding that cannot be trusted is never
-/// read as one. The raw `read_durable_mfa_proof` does not apply that, because an SSO session
-/// carries no binding.
+/// force (`AuthManager::stored_binding_trustworthy`), and for the one read whose validation could
+/// not run (`guard_unverified`, `AuthManager::stored_binding_read_confirmed`): a binding that
+/// cannot be trusted is never read as one. The raw `read_durable_mfa_proof` does not apply that,
+/// because an SSO session carries no binding.
 struct DurableMfaProof {
     enum class Source {
         kUnavailable, ///< read degraded or no store attached: fail closed, never "no proof"
@@ -378,6 +379,11 @@ struct DurableMfaProof {
     /// (`AuthRoutes::durable_mfa_proof_for`). That state is sticky until an operator repairs the
     /// guard and restarts, unlike a failed read, so a caller must not advertise a retry for it.
     bool binding_untrusted{false};
+    /// With `kRow` only: the session store's rebind guard could not be validated on this read (a
+    /// catalog query that did not run; see `FoundSession::guard_unverified`). The row is real and
+    /// an SSO approver may use it, but a LOCAL binding decision must refuse the read as
+    /// unavailable and transient (`AuthManager::stored_binding_read_confirmed`).
+    bool guard_unverified{false};
 };
 static_assert(DurableMfaProof{}.source == DurableMfaProof::Source::kUnavailable,
               "a default-constructed DurableMfaProof must refuse (fail closed)");
@@ -1050,6 +1056,12 @@ public:
     /// SSO approver reading its IdP-seeded proof does not. A false answer is logged and counted
     /// here (`yuzu_auth_session_store_degrade_total{op="rebind_guard"}`), the one site that does.
     [[nodiscard]] bool stored_binding_trustworthy() const;
+
+    /// The per-read companion of `stored_binding_trustworthy`: false when THIS read's rebind-guard
+    /// validation could not run (`DurableMfaProof::guard_unverified`), a transient condition the
+    /// next read re-checks. Logged and counted as a `validate` degrade, not as the sticky
+    /// `rebind_guard` latch. Same caller: `AuthRoutes::durable_mfa_proof_for`, local sessions only.
+    [[nodiscard]] bool stored_binding_read_confirmed(const DurableMfaProof& proof) const;
 
 private:
     /// Store-backed validate path (HA WS-1/1a): cache-first, then authoritative

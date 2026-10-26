@@ -292,6 +292,11 @@ auth::DurableMfaProof AuthRoutes::durable_mfa_proof_for(const httplib::Request& 
         !auth_mgr_.stored_binding_trustworthy())
         return auth::DurableMfaProof{.source = auth::DurableMfaProof::Source::kUnavailable,
                                      .binding_untrusted = true};
+    // One validation that could not run: this read alone is unavailable and transient (the
+    // caller keeps its retry hint); the next read validates afresh.
+    if (durable.source == auth::DurableMfaProof::Source::kRow &&
+        !auth_mgr_.stored_binding_read_confirmed(durable))
+        return auth::DurableMfaProof{.source = auth::DurableMfaProof::Source::kUnavailable};
     return durable;
 }
 

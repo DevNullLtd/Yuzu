@@ -679,6 +679,7 @@ SessionStore::find(const std::string& token_hash) const {
     FoundSession fs;
     fs.row = row_from(r.get(), 0);
     fs.db_now_ms = to_i64(PQgetvalue(r.get(), 0, kSessionRowColumns)); // db_now after the row cols
+    fs.guard_unverified = last_validation_inconclusive_.load(std::memory_order_acquire);
     return std::optional<FoundSession>{std::move(fs)};
 }
 
@@ -693,8 +694,12 @@ void SessionStore::revalidate_rebind_guard_if_due(PGconn* conn) const {
     if (!next_validation_steady_ms_.compare_exchange_strong(
             due, now + validation_memo_ms_.load(std::memory_order_relaxed)))
         return;
-    switch (check_rebind_guard(conn)) {
+    const GuardCheck verdict = force_inconclusive_for_test_.load(std::memory_order_relaxed)
+                                   ? GuardCheck::kInconclusive
+                                   : check_rebind_guard(conn);
+    switch (verdict) {
     case GuardCheck::kOk:
+        last_validation_inconclusive_.store(false, std::memory_order_release);
         return;
     case GuardCheck::kFailed:
         rebind_guard_ok_.store(false, std::memory_order_release);
@@ -703,7 +708,9 @@ void SessionStore::revalidate_rebind_guard_if_due(PGconn* conn) const {
         return;
     case GuardCheck::kInconclusive:
         // Not evidence about the trigger (query error, table unreachable): retry on the
-        // next find rather than waiting out the memo, and change nothing.
+        // next find rather than waiting out the memo and do not latch. The row is still served,
+        // but flagged `guard_unverified` so a binding decision refuses this read.
+        last_validation_inconclusive_.store(true, std::memory_order_release);
         next_validation_steady_ms_.store(0, std::memory_order_relaxed);
         return;
     }

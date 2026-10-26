@@ -190,6 +190,13 @@ struct AuthoredTimes {
 struct FoundSession {
     SessionRow row;
     std::int64_t db_now_ms{0};
+    /// True when the rebind guard's most recent validation could not run (a catalog query that
+    /// failed or returned no verdict) and has not since succeeded. The row is still served: the
+    /// check is not evidence the trigger is gone, and validate and liveness do not read the
+    /// binding. A caller that treats `row.mfa_factor_gen` as a binding MUST refuse this read
+    /// (transient, retryable) rather than trust a generation the guard has not been confirmed
+    /// to protect. Distinct from `rebind_guard_ok()`, which is the sticky definite failure.
+    bool guard_unverified{false};
 };
 
 class SessionStore {
@@ -296,6 +303,13 @@ public:
         return rebind_guard_ok_.load(std::memory_order_acquire);
     }
 
+    /// Test seam: make every trigger validation inconclusive (the catalog query "cannot run")
+    /// WITHOUT touching the sessions table, so the row SELECT after it still succeeds. Takes
+    /// effect at the next `find` that validates; pair with a zero memo.
+    void set_binding_validation_inconclusive_for_test(bool on) noexcept {
+        force_inconclusive_for_test_.store(on, std::memory_order_relaxed);
+    }
+
     /// Test seam: the interval between request-driven trigger validations (default
     /// 60 s), taking effect at the next `find` (the pending deadline is cleared).
     /// Zero validates on every `find`.
@@ -337,6 +351,10 @@ private:
     pg::PgPool& pool_;
     bool open_{false};
     mutable std::atomic<bool> rebind_guard_ok_{false};
+    /// The latest validation was inconclusive and none has succeeded since (see
+    /// `FoundSession::guard_unverified`). Cleared by a successful validation.
+    mutable std::atomic<bool> last_validation_inconclusive_{false};
+    std::atomic<bool> force_inconclusive_for_test_{false};
     mutable std::atomic<std::int64_t> next_validation_steady_ms_{0};
     std::atomic<std::int64_t> validation_memo_ms_{60'000};
 };

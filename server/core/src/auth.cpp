@@ -2020,8 +2020,11 @@ DurableMfaProof AuthManager::read_durable_mfa_proof(const std::string& token,
     // The row is returned as read. Whether its stored generation may be trusted as a binding
     // is the caller's decision (`stored_binding_trustworthy`): the binding applies to a local
     // session only, so an OIDC approver reading its IdP-seeded proof is not refused for it.
-    return {DurableMfaProof::Source::kRow, f.row.mfa_verified_ms, f.db_now_ms,
-            f.row.mfa_factor_gen};
+    return {.source = DurableMfaProof::Source::kRow,
+            .mfa_verified_ms = f.row.mfa_verified_ms,
+            .db_now_ms = f.db_now_ms,
+            .mfa_factor_gen = f.row.mfa_factor_gen,
+            .guard_unverified = f.guard_unverified};
 }
 
 bool AuthManager::stored_binding_trustworthy() const {
@@ -2034,6 +2037,18 @@ bool AuthManager::stored_binding_trustworthy() const {
     spdlog::warn("stored_binding_trustworthy: the session store's rebind guard is not in force - "
                  "failing closed");
     note_session_store_degrade("rebind_guard");
+    return false;
+}
+
+bool AuthManager::stored_binding_read_confirmed(const DurableMfaProof& proof) const {
+    if (!proof.guard_unverified)
+        return true;
+    // One catalog validation that could not run: not evidence the trigger is gone, so this is a
+    // transient degrade of this read (counted as a validate degrade, retried by the caller), not
+    // the sticky `rebind_guard` latch.
+    spdlog::warn("stored_binding_read_confirmed: the session store's rebind guard could not be "
+                 "validated for this read - refusing it as unavailable");
+    note_session_store_degrade("validate");
     return false;
 }
 

@@ -1194,9 +1194,8 @@ TEST_CASE("SessionStore v3: a validation that cannot run does not latch the flag
           "[session_store][pg][mfa_binding]") {
     // The documented asymmetry: BOOT refuses on an inconclusive check, a RUNNING store does not
     // flip the flag on one (the query failing is not evidence about the trigger) and retries on
-    // the next find rather than waiting out the memo. Not covered here: a catalog query that
-    // fails while the row SELECT after it succeeds. That read is served, by design (the
-    // auth-architecture "Enforcement of the triggers is checked, not assumed" section).
+    // the next find rather than waiting out the memo. A catalog query that fails while the row
+    // SELECT after it succeeds is the next case (the verdict rides on the read).
     YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     SessionStore store{pool};
@@ -1217,6 +1216,49 @@ TEST_CASE("SessionStore v3: a validation that cannot run does not latch the flag
     REQUIRE(found.has_value());
     REQUIRE(found->has_value());
     CHECK(store.rebind_guard_ok());
+}
+
+TEST_CASE("SessionStore v3: a validation that cannot run flags that read and only that read",
+          "[session_store][pg][mfa_binding]") {
+    // The catalog check cannot run but the sessions table is intact, so the row SELECT after it
+    // succeeds: the row is served (validate and liveness do not read the binding) and the read
+    // says so through `guard_unverified`, so a binding decision can refuse it. Nothing latches,
+    // and the next find that validates clears the flag.
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create(make_params("h1", "nia")).has_value());
+    REQUIRE(store.mark_mfa("h1", {3, db_now_ms(pool) - 1'000}).has_value());
+    store.set_binding_validation_memo_for_test(std::chrono::milliseconds{0});
+
+    auto clean = store.find("h1");
+    REQUIRE(clean.has_value());
+    REQUIRE(clean->has_value());
+    CHECK_FALSE((*clean)->guard_unverified);
+
+    store.set_binding_validation_inconclusive_for_test(true);
+    for (int i = 0; i < 2; ++i) { // retried on every find, never memoised away
+        auto flagged = store.find("h1");
+        REQUIRE(flagged.has_value());
+        REQUIRE(flagged->has_value());
+        CHECK((*flagged)->guard_unverified);
+        CHECK((*flagged)->row.mfa_factor_gen == 3); // the row itself is served as stored
+        CHECK(store.rebind_guard_ok());             // not latched
+    }
+
+    store.set_binding_validation_inconclusive_for_test(false);
+    auto recovered = store.find("h1");
+    REQUIRE(recovered.has_value());
+    REQUIRE(recovered->has_value());
+    CHECK_FALSE((*recovered)->guard_unverified);
+    CHECK(store.rebind_guard_ok());
+
+    // A definite failure still latches, and does not depend on the flag.
+    REQUIRE(exec_ok(
+        pool, "ALTER TABLE session_store.sessions DISABLE TRIGGER sessions_mfa_rebind_guard"));
+    REQUIRE(store.find("h1").has_value());
+    CHECK_FALSE(store.rebind_guard_ok());
 }
 
 TEST_CASE("SessionStore v3: a tamper that is undone between two validations is not observable",
