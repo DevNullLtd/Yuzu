@@ -1424,11 +1424,9 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
     std::vector<std::string> cap_values;
     std::vector<std::string_view> cap_subject_views, cap_value_views;
     cap_values.reserve(per_subject_caps.size());
-    for (const auto& entry : per_subject_caps)
-        cap_values.push_back(std::to_string(entry.second));
-    for (std::size_t i = 0; i < per_subject_caps.size(); ++i) {
-        cap_subject_views.emplace_back(per_subject_caps[i].first);
-        cap_value_views.emplace_back(cap_values[i]);
+    for (const auto& entry : per_subject_caps) {
+        cap_subject_views.emplace_back(entry.first);
+        cap_value_views.emplace_back(cap_values.emplace_back(std::to_string(entry.second)));
     }
     const std::string cap_subject_array = pg::to_text_array(cap_subject_views);
     const std::string cap_value_array = pg::to_text_array(cap_value_views);

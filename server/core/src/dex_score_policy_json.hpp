@@ -238,16 +238,12 @@ template <class I, class D>
     if (!*mo)
         return std::nullopt;
     const std::string p = join(path, "model");
-    if (confidence) {
-        if (const auto e = unknown_key(**mo, p,
-                                       {"per_device_event_cap", "regression_full_ratio",
-                                        "regression_start_ratio", "interval_confidence"}))
-            return e;
-    } else if (const auto e = unknown_key(**mo, p,
-                                          {"per_device_event_cap", "regression_full_ratio",
-                                           "regression_start_ratio"})) {
+    // interval_confidence is the global block's only; in an override it is an unknown key.
+    if (const auto e = unknown_key(**mo, p,
+                                   {"per_device_event_cap", "regression_full_ratio",
+                                    "regression_start_ratio",
+                                    confidence ? "interval_confidence" : "per_device_event_cap"}))
         return e;
-    }
     if (const auto it = (*mo)->find("per_device_event_cap"); it != (*mo)->end()) {
         if (!it->is_number_integer())
             return Err{join(p, "per_device_event_cap"), "must be an integer"};
