@@ -38,9 +38,10 @@
 // throws. "Durable" here means durable at the level SQLite reports: on macOS an fsync does
 // not flush the drive cache unless PRAGMA fullfsync is on, which is outside this check.
 // KvStore::open sets synchronous=FULL explicitly and reads it back, so the shipped store does
-// not rely on SQLite's compile-time default; DurabilityBelowFull can therefore only arise from
-// a store that rejects the pragma (a build or file system that cannot honour it). A restart
-// repeats that result; the remedy is a build or packaging fix, not an agent setting.
+// not rely on SQLite's compile-time default and DurabilityBelowFull is effectively unreachable
+// for it. It is a defensive safeguard that fires if a store reports a level below FULL (a
+// different IJournalStore implementation or a test double). If it ever appears in the log,
+// treat it as a defect and report it; there is no agent-side setting for it.
 //
 // A stored value that is present but unusable (unparseable, trailing bytes, embedded
 // NUL, out of range, at or above the ceiling, or one whose successor would reach the

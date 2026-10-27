@@ -256,10 +256,14 @@ std::expected<KvStore, KvStoreError> KvStore::open(const std::filesystem::path& 
     // Durability level (UP-14): set synchronous=FULL explicitly so the level does not depend on
     // SQLite's compile-time default (FULL, 2, in the shipped build, so this changes nothing there
     // for any consumer of this store). The Guardian boot-epoch claim refuses to issue an epoch
-    // unless pragma_synchronous() reports FULL or EXTRA. A refused pragma returns SQLITE_OK with
-    // the real level in the result row, so the level is read back. A failure here is logged and
-    // the store is still returned (config drift must not kill an agent); the epoch claim's own
-    // gate then refuses a store that is not FULL.
+    // unless pragma_synchronous() reports FULL or EXTRA. The read-back is a defensive check of
+    // this connection's setting, not proof of media durability: it cannot show that the file
+    // system honours fsync. (Unlike journal_mode, a refused synchronous change is not reported
+    // as SQLITE_OK with the real level; inside a transaction it fails with an error, which
+    // open()'s autocommit connection cannot reach. A build without PRAGMA support returns no
+    // row, so the level reads -1 and the epoch claim reports ReadFailed.) A failure here is
+    // logged and the store is still returned (config drift must not kill an agent); the epoch
+    // claim's own gate then refuses a store that is not FULL.
     {
         char* sync_err = nullptr;
         rc = sqlite3_exec(raw_db, "PRAGMA synchronous=FULL", nullptr, nullptr, &sync_err);

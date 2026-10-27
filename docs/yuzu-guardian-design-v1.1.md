@@ -1017,9 +1017,9 @@ Known limits of the boot epoch:
   within a few seconds before the restore or the epoch had been pinned ahead of the clock. A VM
   memory-snapshot revert continues with the same epoch and a lower `emit_seq` and involves no
   boot, so no claim runs.
-- An agent whose epoch claim fails (no store, a read or write failure, a store that refuses
-  `PRAGMA synchronous=FULL` (outcome `durability_below_full`; an unreadable pragma is
-  `read_failed`), or a clock reading at or above the 2^62 ceiling) sends the pair as 0/0 for the whole process lifetime, ordered by
+- An agent whose epoch claim fails (no store, a read or write failure, a store that reports a
+  `PRAGMA synchronous` level below FULL (outcome `durability_below_full`, not expected for the
+  agent's own store, which sets FULL at open; an unreadable pragma is `read_failed`), or a clock reading at or above the 2^62 ceiling) sends the pair as 0/0 for the whole process lifetime, ordered by
   the timestamp. Today this is visible only as an error-level `Guardian boot_epoch claim` log
   line.
 - Events replayed from the lifecycle journal carry 0/0, so a replayed event is not
