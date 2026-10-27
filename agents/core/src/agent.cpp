@@ -887,7 +887,13 @@ public:
         const auto now_unix_s = std::chrono::duration_cast<std::chrono::seconds>(
                                     std::chrono::system_clock::now().time_since_epoch())
                                     .count();
-        const auto boot_epoch_claim = claim_guardian_boot_epoch(kv_store_.get(), now_unix_s);
+        // UP-9: exclusive per-data-dir lock held for the life of the process (a member, so it
+        // outlives guardian_). The wait covers a service restart overlapping the old process's
+        // shutdown. A loser (or an unsupported file system) claims epoch 0 and emits 0/0.
+        guardian_instance_lock_ = GuardianInstanceLock::acquire(
+            cfg_.data_dir / "guardian_boot_epoch.lock", std::chrono::seconds{5});
+        const auto boot_epoch_claim =
+            claim_guardian_boot_epoch(kv_store_.get(), now_unix_s, guardian_instance_lock_);
         guardian_ =
             std::make_unique<GuardianEngine>(kv_store_.get(), cfg_.agent_id,
                                              /*prefer_spark=*/false, boot_epoch_claim.boot_epoch);
@@ -4385,6 +4391,9 @@ private:
     // pointers remain stable after map insertions.
     std::unordered_map<std::string, std::unique_ptr<PluginContextImpl>> per_plugin_ctx_;
     std::unique_ptr<KvStore> kv_store_;
+    // UP-9: single-writer guard for the Guardian boot epoch. Declared before guardian_, so it
+    // is destroyed after it and held until the engine is gone.
+    GuardianInstanceLock guardian_instance_lock_;
     // Drives interval / file-change / service-status triggers that plugins
     // register during init(). Owned here; a non-owning pointer is handed to
     // every per-plugin context so yuzu_register_trigger can reach it.

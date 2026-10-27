@@ -2,12 +2,28 @@
 
 #include <spdlog/spdlog.h>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <charconv>
 #include <cstddef>
 #include <optional>
 #include <string>
 #include <system_error>
+#include <thread>
 
 namespace yuzu::agent {
 
@@ -31,6 +47,8 @@ const char* outcome_name(Outcome o) noexcept {
         return "out_of_range";
     case Outcome::DurabilityBelowFull:
         return "durability_below_full";
+    case Outcome::InstanceLockNotHeld:
+        return "instance_lock_not_held";
     }
     return "unknown";
 }
@@ -162,6 +180,125 @@ GuardianBootEpochClaim claim_guardian_boot_epoch(IJournalStore* store,
     }
     log_claim(store, claim, d, now_unix_s);
     return claim;
+}
+
+namespace {
+
+const char* lock_state_name(GuardianInstanceLock::State st) noexcept {
+    switch (st) {
+    case GuardianInstanceLock::State::NotAcquired:
+        return "not_acquired";
+    case GuardianInstanceLock::State::Held:
+        return "held";
+    case GuardianInstanceLock::State::Contended:
+        return "contended";
+    case GuardianInstanceLock::State::Failed:
+        return "failed";
+    }
+    return "unknown";
+}
+
+constexpr std::intptr_t kNoHandle = -1;
+
+// One attempt. On success returns Held and stores the handle; otherwise Contended or Failed
+// and nothing is left open.
+GuardianInstanceLock::State try_lock_once(const std::filesystem::path& path,
+                                          std::intptr_t& handle) noexcept {
+#ifdef _WIN32
+    // Share mode 0: a second open of the same file fails with ERROR_SHARING_VIOLATION while
+    // this handle lives, and the OS closes it at process exit.
+    HANDLE h = ::CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return ::GetLastError() == ERROR_SHARING_VIOLATION
+                   ? GuardianInstanceLock::State::Contended
+                   : GuardianInstanceLock::State::Failed;
+    handle = reinterpret_cast<std::intptr_t>(h);
+    return GuardianInstanceLock::State::Held;
+#else
+    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return GuardianInstanceLock::State::Failed;
+    // flock locks belong to the open file description, so a second acquire in this same
+    // process (a second object, or a test) contends exactly like a second process would.
+    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        const int err = errno;
+        ::close(fd);
+        return err == EWOULDBLOCK ? GuardianInstanceLock::State::Contended
+                                  : GuardianInstanceLock::State::Failed;
+    }
+    handle = fd;
+    return GuardianInstanceLock::State::Held;
+#endif
+}
+
+} // namespace
+
+GuardianInstanceLock::GuardianInstanceLock(GuardianInstanceLock&& other) noexcept
+    : handle_(other.handle_), state_(other.state_) {
+    other.handle_ = kNoHandle;
+    other.state_ = State::NotAcquired;
+}
+
+GuardianInstanceLock& GuardianInstanceLock::operator=(GuardianInstanceLock&& other) noexcept {
+    if (this != &other) {
+        release();
+        handle_ = other.handle_;
+        state_ = other.state_;
+        other.handle_ = kNoHandle;
+        other.state_ = State::NotAcquired;
+    }
+    return *this;
+}
+
+GuardianInstanceLock::~GuardianInstanceLock() {
+    release();
+}
+
+void GuardianInstanceLock::release() noexcept {
+    if (handle_ != kNoHandle) {
+#ifdef _WIN32
+        ::CloseHandle(reinterpret_cast<HANDLE>(handle_));
+#else
+        ::close(static_cast<int>(handle_)); // also drops the flock
+#endif
+    }
+    handle_ = kNoHandle;
+    state_ = State::NotAcquired;
+}
+
+GuardianInstanceLock GuardianInstanceLock::acquire(const std::filesystem::path& path,
+                                                   std::chrono::milliseconds wait) noexcept {
+    GuardianInstanceLock lock;
+    try {
+        const auto deadline = std::chrono::steady_clock::now() + wait;
+        for (;;) {
+            lock.state_ = try_lock_once(path, lock.handle_);
+            if (lock.state_ != State::Contended || std::chrono::steady_clock::now() >= deadline)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        }
+    } catch (...) {
+        // sleep_for / clock cannot realistically throw; if they do the lock is not held.
+        lock.release();
+        lock.state_ = State::Failed;
+    }
+    return lock;
+}
+
+GuardianBootEpochClaim claim_guardian_boot_epoch(IJournalStore* store, std::int64_t now_unix_s,
+                                                 const GuardianInstanceLock& lock) noexcept {
+    if (store == nullptr || lock.held())
+        return claim_guardian_boot_epoch(store, now_unix_s);
+    try {
+        spdlog::error("Guardian boot_epoch claim: outcome={} boot_epoch=0 instance_lock={}; another "
+                      "agent process may be using this data directory, so this process emits "
+                      "unordered (0/0) events",
+                      outcome_name(Outcome::InstanceLockNotHeld), lock_state_name(lock.state()));
+    } catch (...) {
+        // Logging is best-effort and must never change the claim.
+    }
+    return {0, Outcome::InstanceLockNotHeld, 0};
 }
 
 } // namespace yuzu::agent

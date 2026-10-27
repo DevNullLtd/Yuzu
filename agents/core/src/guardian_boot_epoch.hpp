@@ -25,8 +25,9 @@
 // repeat it. Epoch 0 makes the engine emit the pair as 0/0, which a pair-comparing
 // server treats as unordered and orders by the timestamp key instead. 0 is returned for:
 // a null store, a read error (including an unreadable synchronous pragma), a write failure,
-// a clock term at or above the ceiling, and a store that REPORTS a durability level below
-// FULL (see below).
+// a clock term at or above the ceiling, a store that REPORTS a durability level below FULL
+// (see below), and, for the three-argument overload, an instance lock this process does not
+// hold (see SINGLE-WRITER GUARD).
 //
 // DURABILITY. The epoch write must be durable, or the next boot could re-issue an equal or
 // lower epoch for events already emitted under this one. Below FULL (PRAGMA synchronous OFF
@@ -54,15 +55,22 @@
 // 2^62 - 1 or more is unusable (its successor would reach the ceiling), so 2^62 - 1 is
 // the last epoch that can be claimed from a persisted value.
 //
-// SINGLE-WRITER ASSUMPTION. The claim is a plain read followed by a plain set(). It
-// assumes ONE agent process uses the KV file at a time. Nothing in the agent enforces
-// this: there is no instance lock, pidfile or data-directory mutex, and the KV file is in
-// WAL mode, which admits a second process. Each service manager starts one instance per
-// unit, but a manual run against the same --data-dir is not excluded. Two processes that
-// both read N would both claim N + 1 and draw emit_seq from 1, so their events carry equal
-// epochs and overlapping sequences that the server cannot tell apart. Accepted (the UP-14
-// residual-acceptance ruling) and recorded with the documented residual below; this
-// module adds no second mechanism.
+// SINGLE-WRITER GUARD. The claim is a plain read followed by a plain set(), so two processes
+// that both read N would both claim N + 1 and draw emit_seq from 1: equal epochs and
+// overlapping sequences that the server cannot tell apart (UP-9). The KV file is in WAL mode,
+// which admits a second process, so the store alone does not exclude one. The agent therefore
+// takes an exclusive, non-blocking advisory lock on `<data_dir>/guardian_boot_epoch.lock`
+// (GuardianInstanceLock below) and passes it to the three-argument claim overload, which
+// refuses (Outcome::InstanceLockNotHeld, epoch 0, nothing read or written) unless this
+// process holds it. The loser keeps running with epoch 0, so its events are unordered (0/0)
+// rather than colliding with the holder's. The lock is held for the life of the process and
+// the kernel drops it at exit, so a crash leaves no stale lock; acquisition retries for a
+// short bounded time so a service restart that overlaps the old process's shutdown still
+// claims. Limits: it excludes only processes that run this code (an older agent binary
+// sharing the data directory does not take it, so a mixed-version pair is still unguarded);
+// a file system that does not support the lock reports the claim as unordered (epoch 0)
+// rather than guessing; and the lock guards the epoch claim only, not the rest of the data
+// directory (the identity and command-dedup stores have never been exclusive).
 //
 // DOCUMENTED RESIDUAL. If the KV row is wiped AND the agent restarts within the same
 // wall-clock second as the previous boot, the new epoch equals the previous one (both
@@ -81,7 +89,9 @@
 #include <yuzu/agent/kv_store.hpp> // IJournalStore
 #include <yuzu/plugin.h>           // YUZU_EXPORT
 
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <string_view>
 
 namespace yuzu::agent {
@@ -103,6 +113,8 @@ struct GuardianBootEpochClaim {
         WriteFailed, ///< set() failed; epoch 0
         OutOfRange,  ///< clock term at or above the ceiling; epoch 0, nothing written
         DurabilityBelowFull, ///< store reports synchronous 0 or 1; epoch 0, nothing written
+        InstanceLockNotHeld, ///< another process holds the data-dir lock (or it could not be
+                             ///< taken); epoch 0, nothing read or written
     };
 
     std::uint64_t boot_epoch = 0; ///< 0 means unordered (any outcome except Claimed/Recovered)
@@ -110,9 +122,52 @@ struct GuardianBootEpochClaim {
     std::uint64_t persisted = 0; ///< the parsed stored value; 0 when absent or unusable
 };
 
+/// Process-lifetime exclusive advisory lock on a file, the single-writer guard for the boot
+/// epoch claim (see SINGLE-WRITER GUARD above). Move-only RAII: the handle is closed, and the
+/// lock dropped, on destruction. POSIX uses flock(LOCK_EX | LOCK_NB) on an O_CLOEXEC
+/// descriptor, so a spawned plugin never inherits and outlives it; Windows opens the file with
+/// share mode 0. Never throws. The handle is stored as an integer so the header carries no
+/// platform type.
+class YUZU_EXPORT GuardianInstanceLock {
+public:
+    enum class State {
+        NotAcquired, ///< default-constructed; no attempt made
+        Held,        ///< this object holds the lock
+        Contended,   ///< another holder (a second agent process, or another object) has it
+        Failed,      ///< the lock file could not be opened or locked for another reason
+    };
+
+    GuardianInstanceLock() noexcept = default;
+    GuardianInstanceLock(const GuardianInstanceLock&) = delete;
+    GuardianInstanceLock& operator=(const GuardianInstanceLock&) = delete;
+    GuardianInstanceLock(GuardianInstanceLock&& other) noexcept;
+    GuardianInstanceLock& operator=(GuardianInstanceLock&& other) noexcept;
+    ~GuardianInstanceLock();
+
+    /// Take the lock at `path`, creating the file if needed. When it is Contended, retry
+    /// every 100 ms until `wait` has elapsed (0 = a single attempt). Never throws.
+    [[nodiscard]] static GuardianInstanceLock
+    acquire(const std::filesystem::path& path,
+            std::chrono::milliseconds wait = std::chrono::milliseconds{0}) noexcept;
+
+    [[nodiscard]] State state() const noexcept { return state_; }
+    [[nodiscard]] bool held() const noexcept { return state_ == State::Held; }
+
+private:
+    void release() noexcept;
+
+    std::intptr_t handle_ = -1; ///< POSIX fd or Windows HANDLE; -1 = none
+    State state_ = State::NotAcquired;
+};
+
 /// Claim this boot's epoch. `now_unix_s` is the wall clock in whole seconds; a value
 /// <= 0 contributes 0 to the clock term. Never throws; logs one structured line.
 [[nodiscard]] YUZU_EXPORT GuardianBootEpochClaim
 claim_guardian_boot_epoch(IJournalStore* store, std::int64_t now_unix_s) noexcept;
+
+/// Production form: as above, but refuses (InstanceLockNotHeld, epoch 0, the store is not
+/// touched) unless `lock.held()`. A null store is NoStore regardless of the lock.
+[[nodiscard]] YUZU_EXPORT GuardianBootEpochClaim claim_guardian_boot_epoch(
+    IJournalStore* store, std::int64_t now_unix_s, const GuardianInstanceLock& lock) noexcept;
 
 } // namespace yuzu::agent

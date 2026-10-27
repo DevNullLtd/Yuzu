@@ -1003,10 +1003,13 @@ Known limits of the boot epoch:
 - If the KV row is wiped and the agent restarts within the same second as the previous boot,
   the new epoch equals the previous one and `emit_seq` restarts at 1 (accepted by the UP-14
   residual-acceptance ruling; the equal epoch is pinned by a test).
-- A single writer is assumed, not enforced: two agent processes on one data directory can claim
-  the same epoch and draw overlapping `emit_seq` values (accepted under the same ruling).
-  Each service manager starts one instance per unit, but a manual run against the same
-  `--data-dir` is not excluded.
+- A single writer is enforced for processes that run this code (UP-9): the agent holds an
+  exclusive advisory lock on `<data-dir>/guardian_boot_epoch.lock` for the life of the process,
+  and a second agent process on the same data directory claims no epoch (`instance_lock_not_held`)
+  and emits unordered 0/0 events instead of colliding with the first. The lock guards only the
+  epoch claim, not the rest of the data directory. It does not exclude an older agent binary
+  without the lock, so a mixed-version pair can still claim the same epoch and draw overlapping
+  `emit_seq` values; a file system that does not support the lock leaves the agent unordered.
 - A clock wrongly ahead at boot pins the epoch ahead, and it does not self-heal because the
   claim tracks the persisted value rather than the clock. A burst of restarts or a crash loop
   within the same second also pushes the epoch ahead of a correct clock until the clock catches

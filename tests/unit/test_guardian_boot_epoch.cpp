@@ -15,14 +15,17 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -576,22 +579,21 @@ private:
 
 } // namespace
 
-TEST_CASE("boot-epoch: two writers on one KV file can claim the SAME epoch (documented residual)",
+TEST_CASE("boot-epoch: the claim ALONE lets two writers on one KV file take the SAME epoch",
           "[guardian][boot_epoch]") {
-    // PINS A DOCUMENTED, ACCEPTED RESIDUAL (the UP-14 residual-acceptance ruling), NOT
-    // DESIRED BEHAVIOUR. Nothing in the agent enforces one process per data directory (see
-    // guardian_boot_epoch.hpp, SINGLE-WRITER ASSUMPTION), and the KV file is in WAL mode,
-    // which admits a second connection. If two writers both read N before either writes,
-    // both claim N + 1 and draw emit_seq from 1.
+    // PINS THE ARITHMETIC OF THE UNGUARDED CLAIM, NOT DESIRED PRODUCTION BEHAVIOUR. The
+    // two-argument claim is a plain read then a plain set(), and the KV file is in WAL mode,
+    // which admits a second connection. If two writers both read N before either writes, both
+    // claim N + 1 and draw emit_seq from 1. The production path closes this with the
+    // per-data-directory GuardianInstanceLock (UP-9, tests below), which lives outside the
+    // claim, so this test is expected to keep passing.
     //
     // The interleaving is SIMULATED: two real connections open one file (the WAL premise),
     // but the stale-read wrapper hands the second claim the row as it stood before the first
-    // claim's write, so no real race runs. This test pins the epoch arithmetic of the
-    // accepted residual only (both writers claim N + 1). It will NOT detect a later
-    // per-data-directory instance lock, which lives outside the claim; that needs a real
-    // two-process test. A compare-and-set INSIDE the claim goes through the store interface
-    // and would be expected to make this test fail, which is the intended signal to update
-    // the residual paragraph in guardian_boot_epoch.hpp and design document section 7.1.
+    // claim's write, so no real race runs. A compare-and-set INSIDE the claim goes through the
+    // store interface and would be expected to make this test fail, which is the intended
+    // signal to update the SINGLE-WRITER GUARD paragraph in guardian_boot_epoch.hpp and
+    // design document section 7.1.
     yuzu::test::TempDbFile db{"yuzu_test_boot_epoch_two_proc-"};
     auto kv_a = KvStore::open(db.path);
     auto kv_b = KvStore::open(db.path);
@@ -615,4 +617,139 @@ TEST_CASE("boot-epoch: two writers on one KV file can claim the SAME epoch (docu
     GuardianEmitSeqSource proc_a(a.boot_epoch);
     GuardianEmitSeqSource proc_b(b.boot_epoch);
     CHECK(proc_a.draw() == proc_b.draw()); // overlapping sequences: both draw 1
+}
+
+TEST_CASE("boot-epoch: a second holder of the instance lock is refused while the first lives",
+          "[guardian][boot_epoch][instance_lock]") {
+    yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
+    std::filesystem::create_directories(dir.path);
+    const auto lock_path = dir.path / "guardian_boot_epoch.lock";
+
+    auto first = GuardianInstanceLock::acquire(lock_path);
+    REQUIRE(first.held());
+    CHECK(first.state() == GuardianInstanceLock::State::Held);
+
+    // A second acquire contends exactly like a second agent process would (flock is per open
+    // file description; Windows share mode 0), including from this very process.
+    auto second = GuardianInstanceLock::acquire(lock_path);
+    CHECK_FALSE(second.held());
+    CHECK(second.state() == GuardianInstanceLock::State::Contended);
+
+    // A bounded wait on a lock that never frees still ends Contended.
+    auto waited = GuardianInstanceLock::acquire(lock_path, std::chrono::milliseconds{150});
+    CHECK(waited.state() == GuardianInstanceLock::State::Contended);
+}
+
+TEST_CASE("boot-epoch: releasing the instance lock lets the next process take it",
+          "[guardian][boot_epoch][instance_lock]") {
+    yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
+    std::filesystem::create_directories(dir.path);
+    const auto lock_path = dir.path / "guardian_boot_epoch.lock";
+
+    {
+        auto first = GuardianInstanceLock::acquire(lock_path);
+        REQUIRE(first.held());
+    } // destruction drops the lock, as process exit does after a crash
+    auto next = GuardianInstanceLock::acquire(lock_path);
+    CHECK(next.held());
+
+    // A moved-from lock owns nothing; the moved-to one keeps the lock.
+    GuardianInstanceLock moved = std::move(next);
+    CHECK(moved.held());
+    CHECK(next.state() == GuardianInstanceLock::State::NotAcquired); // NOLINT(bugprone-use-after-move)
+    CHECK(GuardianInstanceLock::acquire(lock_path).state() ==
+          GuardianInstanceLock::State::Contended);
+}
+
+TEST_CASE("boot-epoch: a bounded wait takes the lock once the holder lets go",
+          "[guardian][boot_epoch][instance_lock]") {
+    // The service-restart case: the old process is still shutting down when the new one
+    // starts, and the new one must still claim.
+    yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
+    std::filesystem::create_directories(dir.path);
+    const auto lock_path = dir.path / "guardian_boot_epoch.lock";
+
+    auto holder = std::make_unique<GuardianInstanceLock>(GuardianInstanceLock::acquire(lock_path));
+    REQUIRE(holder->held());
+
+    std::thread releaser([&holder] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{150});
+        holder.reset();
+    });
+    auto waiter = GuardianInstanceLock::acquire(lock_path, std::chrono::seconds{5});
+    releaser.join();
+    CHECK(waiter.held());
+}
+
+TEST_CASE("boot-epoch: an unopenable lock path is Failed, not Held",
+          "[guardian][boot_epoch][instance_lock]") {
+    yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
+    // The parent directory does not exist.
+    auto lock = GuardianInstanceLock::acquire(dir.path / "missing" / "guardian_boot_epoch.lock");
+    CHECK_FALSE(lock.held());
+    CHECK(lock.state() == GuardianInstanceLock::State::Failed);
+}
+
+TEST_CASE("boot-epoch: the guarded claim refuses without the lock and touches nothing",
+          "[guardian][boot_epoch][instance_lock]") {
+    yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
+    std::filesystem::create_directories(dir.path);
+    const auto lock_path = dir.path / "guardian_boot_epoch.lock";
+
+    FaultingStore s;
+    s.seed(dec(5));
+
+    SECTION("not held: epoch 0, store untouched, row unchanged") {
+        auto holder = GuardianInstanceLock::acquire(lock_path);
+        REQUIRE(holder.held());
+        auto loser = GuardianInstanceLock::acquire(lock_path);
+        REQUIRE_FALSE(loser.held());
+
+        const auto c = claim_guardian_boot_epoch(&s, kNow, loser);
+        CHECK(c.boot_epoch == 0);
+        CHECK(c.outcome == Outcome::InstanceLockNotHeld);
+        CHECK(s.get_calls == 0);
+        CHECK(s.set_calls == 0);
+        CHECK(s.stored() == std::optional<std::string>{dec(5)});
+    }
+    SECTION("default-constructed (never acquired) is not held either") {
+        GuardianInstanceLock none;
+        const auto c = claim_guardian_boot_epoch(&s, kNow, none);
+        CHECK(c.outcome == Outcome::InstanceLockNotHeld);
+        CHECK(s.set_calls == 0);
+    }
+    SECTION("held: the claim proceeds exactly as the unguarded one") {
+        auto lock = GuardianInstanceLock::acquire(lock_path);
+        REQUIRE(lock.held());
+        const auto c = claim_guardian_boot_epoch(&s, kNow, lock);
+        CHECK(c.outcome == Outcome::Claimed);
+        CHECK(c.boot_epoch == kNow); // max(5 + 1, clock)
+        CHECK(s.set_calls == 1);
+    }
+    SECTION("a null store is NoStore whatever the lock says") {
+        GuardianInstanceLock none;
+        CHECK(claim_guardian_boot_epoch(nullptr, kNow, none).outcome == Outcome::NoStore);
+    }
+}
+
+TEST_CASE("boot-epoch: two agents on one data directory cannot both claim an epoch",
+          "[guardian][boot_epoch][instance_lock]") {
+    // UP-9 end to end at the unit level: a real KvStore, two lock holders, two guarded claims.
+    // The first claims N + 1; the second is refused and stays unordered (0/0), so the two can
+    // no longer emit equal epochs with overlapping sequences.
+    yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
+    std::filesystem::create_directories(dir.path);
+    auto kv = KvStore::open(dir.path / "kv_store.db");
+    REQUIRE(kv.has_value());
+    const auto lock_path = dir.path / "guardian_boot_epoch.lock";
+
+    auto lock_a = GuardianInstanceLock::acquire(lock_path);
+    auto lock_b = GuardianInstanceLock::acquire(lock_path);
+    const auto a = claim_guardian_boot_epoch(&*kv, kNow, lock_a);
+    const auto b = claim_guardian_boot_epoch(&*kv, kNow, lock_b);
+
+    CHECK(a.outcome == Outcome::Claimed);
+    CHECK(a.boot_epoch != 0);
+    CHECK(b.outcome == Outcome::InstanceLockNotHeld);
+    CHECK(b.boot_epoch == 0);
 }

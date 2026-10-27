@@ -37,7 +37,8 @@ Invariants (the numbered rules below; each failure message starts with its rule 
       `stamp_emit_pair(ev, state_->emit_seq_source->boot_epoch, state_->emit_seq_source->draw())`
       and `set_common`'s is exactly `stamp_emit_pair(ev, e.boot_epoch, e.seq)`: swapping the
       arguments, a constant in place of `draw()`, or the wrong field is lexically distinct.
-  R3  agents/core/src/agent.cpp: the identifier assigned from `claim_guardian_boot_epoch(` is the
+  R3  agents/core/src/agent.cpp: the claim is the three-argument overload whose third argument
+      is `guardian_instance_lock_` (UP-9 single-writer guard); the identifier assigned from `claim_guardian_boot_epoch(` is the
       FOURTH argument of `std::make_unique<GuardianEngine>(` (third is the literal `false`) and
       the claim precedes the construction. TRIPWIRE ON KNOWN WRITERS (not a proof that no other
       serializer exists): `emit_guardian_event(` is called from exactly two places, the
@@ -367,6 +368,13 @@ def _rule3(t, out):
     if len(claims) != 1:
         out.append(f"R3: expected exactly one `<id> = claim_guardian_boot_epoch(` in {AGENT}, "
                    f"found {len(claims)}")
+    # UP-9: the one production claim must be the three-argument, lock-guarded overload; the
+    # two-argument form has no single-writer guard.
+    for (_, a0, a1) in call_sites(t, r"(?<![A-Za-z0-9_])claim_guardian_boot_epoch"):
+        cargs = split_args(t[a0:a1])
+        if len(cargs) != 3 or cargs[2] != "guardian_instance_lock_":
+            out.append(f"R3: claim_guardian_boot_epoch( in {AGENT} must pass `guardian_instance_lock_` "
+                       f"as its third argument (the UP-9 single-writer guard), got {cargs}")
     sites = call_sites(t, r"make_(?:unique|shared)<GuardianEngine>")
     if not sites:
         out.append(f"R3: no make_unique<GuardianEngine>( call in {AGENT}")
@@ -596,14 +604,17 @@ MUTATIONS = [
     ("R3 claim result not passed", AGENT,
      r"/\*prefer_spark=\*/false, boot_epoch_claim\.boot_epoch\)", "/*prefer_spark=*/false, 0)", 1, 0,
      "the fourth GuardianEngine argument"),
+    ("R3 claim without the instance lock", AGENT,
+     r"now_unix_s, guardian_instance_lock_\)", "now_unix_s)", 1, 0,
+     "must pass `guardian_instance_lock_` as its third argument"),
     ("R3 prefer_spark flipped", AGENT,
      r"/\*prefer_spark=\*/false, boot_epoch_claim", "/*prefer_spark=*/true, boot_epoch_claim", 1, 0,
      "the third GuardianEngine argument"),
     ("R3 claim moved after the construction", AGENT,
-     r"(const auto boot_epoch_claim = claim_guardian_boot_epoch\([^;]*\);)(\s*guardian_ =\s*std::make_unique<GuardianEngine>\([^;]*\);)",
+     r"(const auto boot_epoch_claim =\s*claim_guardian_boot_epoch\([^;]*\);)(\s*guardian_ =\s*std::make_unique<GuardianEngine>\([^;]*\);)",
      r"\2\n        \1", 1, 0, "does not precede make_unique<GuardianEngine>"),
     ("R3 claim call removed", AGENT,
-     r"const auto boot_epoch_claim = claim_guardian_boot_epoch\(kv_store_\.get\(\), now_unix_s\);", "",
+     r"const auto boot_epoch_claim =\s*claim_guardian_boot_epoch\(kv_store_\.get\(\), now_unix_s, guardian_instance_lock_\);", "",
      1, 0, "expected exactly one `<id> = claim_guardian_boot_epoch(`"),
     # R4
     ("R4 bare-Config executor construction (test seam)", ENGINE,
@@ -676,7 +687,7 @@ class GuardianEmitStampLexical(unittest.TestCase):
              r"stamp_emit_pair\(ev, state_->emit_seq_source->boot_epoch,\s*state_->emit_seq_source->draw\(\)\);",
              "// stamp_emit_pair(ev, boot_epoch, draw());", "R2: offer() in " + EXECUTOR),
             ("R3 claim only in a comment", AGENT,
-             r"const auto boot_epoch_claim = claim_guardian_boot_epoch\(kv_store_\.get\(\), now_unix_s\);",
+             r"const auto boot_epoch_claim =\s*claim_guardian_boot_epoch\(kv_store_\.get\(\), now_unix_s, guardian_instance_lock_\);",
              "// const auto boot_epoch_claim = claim_guardian_boot_epoch(kv_store_.get(), now_unix_s);",
              "expected exactly one `<id> = claim_guardian_boot_epoch(`"),
             ("R4 emit_seq_source only in a comment", ENGINE,
