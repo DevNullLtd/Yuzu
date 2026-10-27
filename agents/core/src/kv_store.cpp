@@ -254,8 +254,10 @@ std::expected<KvStore, KvStoreError> KvStore::open(const std::filesystem::path& 
     }
 
     // Durability level (UP-14): set synchronous=FULL explicitly so the level does not depend on
-    // SQLite's compile-time default (FULL, 2, in the shipped build, so this changes nothing there
-    // for any consumer of this store). The Guardian boot-epoch claim refuses to issue an epoch
+    // SQLite's compile-time default. If the connection already defaults to FULL (2), as the
+    // measured vcpkg build does, this preserves that setting; otherwise it raises the setting
+    // for every consumer of this connection (plugin KV, the Guardian journal, baselines, the
+    // boot epoch). The Guardian boot-epoch claim refuses to issue an epoch
     // unless pragma_synchronous() reports FULL or EXTRA. The read-back is a defensive check of
     // this connection's setting, not proof of media durability: it cannot show that the file
     // system honours fsync. (Unlike journal_mode, a refused synchronous change is not reported

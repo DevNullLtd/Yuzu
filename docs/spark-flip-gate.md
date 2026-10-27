@@ -2870,7 +2870,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
 - Merge gate for the agent change (UP-14; conditions the UP-14 SERVER change must meet before
   the agent change merges, in the fixed order census change, server change, agent change).
   This agent change activates ordering against a server that may already use the pair; it stays
-  blocked until the receiving change satisfies items 1 to 4 and the integrated range is reviewed.
+  blocked until the receiving change satisfies items 1 to 5 and the integrated range is reviewed.
   Status will be tracked on #5690 and in the agent change's pull request description (one
   checkbox per item) once that pull request exists:
   1. The comparator orders per (agent_id, rule_id), compares the pair only when both sides
@@ -2898,6 +2898,10 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
      actually describes; and the timeline of a previously undelivered older replay (an error at
      timestamp 100 replayed as 0/0 after a backward clock step, after a newer live compliant
      verdict at timestamp 90), in both arrival orders and with subsequent live events.
+     For every case above, tests show that stale state is not silently presented as the current
+     verdict. When the available ordering information cannot establish freshness, the server
+     exposes that uncertainty or obtains fresh state; timestamp fallback, metadata retention, or
+     documenting the selected result alone does not satisfy this criterion.
   5. The server change's hunk for fields 24 and 25 is the authority (the agreed split: the
      server change owns the fields); the agent change takes the server change's version of
      the hunk when it merges origin/dev. That comment must say boot_epoch is not guaranteed
