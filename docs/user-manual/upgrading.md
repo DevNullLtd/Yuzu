@@ -14,6 +14,29 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rollback.** Rolling an agent back to an earlier build restores the silent wipe: a directory it cannot list reads as empty again and the next sync replaces the host's stored entitlement rows with nothing.
 
+## New: leader-election metrics and alerts (HA WS-11, #4014)
+
+Additive; no behaviour change and no action is needed to keep a deployment working. Every server with a
+Postgres-backed elector now exposes seven `yuzu_server_leader_*` series on `/metrics` (reference:
+`docs/user-manual/metrics.md`, "Leader election metrics"), and `docs/prometheus/yuzu-alerts.yml` gains the
+`yuzu-ha-leader` group: `YuzuLeaderSplitBrain`, `YuzuLeaderNoLeader` and `YuzuLeaderCoordinationStale`
+(critical) and `YuzuLeaderFlapping` (warning). **Reload your Prometheus rule file to pick them up.** The
+alerts aggregate `sum by (job)`, so Prometheus must scrape each replica individually and unrelated Yuzu
+deployments sharing one Prometheus need separate `job`s. On a single-replica deployment `YuzuLeaderNoLeader`
+is the alert that can fire: it means the leader-only background passes are paused while `/readyz` stays
+green (leadership is deliberately not a readiness input). Runbook: `docs/user-manual/server-admin.md`,
+"Leader election: metrics and alerts (HA WS-11)". The thresholds are initial claims without fleet data.
+Two things to know: the `leader_elector: acquired leadership ... at epoch N` log line now ends with
+`(holder_id=srv-…)` (match on the prefix if you alert on that line), and no server `up == 0` alert ships, so
+configure one (these alerts need a successful scrape; see the runbook). If you ever run mixed versions of a
+multi-replica deployment (unsupported today), reload the rule file only after the last replica is upgraded, or
+silence `YuzuLeaderNoLeader` for the window: an old binary exports no `yuzu_server_leader_*` series, so an upgraded
+follower's `0` with an old leader's absent series sums to zero and the alert fires after 5 minutes. Silence it
+during planned Postgres maintenance longer than 5 minutes as well, scoped to the job and ending shortly after the
+window (the silence must expire), then confirm a replica reads `yuzu_server_leader_is_leader 1`.
+This does not lift the safe-to-scale gate (`docs/ha-delivery-matrix.md`); running a second replica is still
+unsupported.
+
 ## Behaviour change: `device.filesystem.find_by_hash` is bounded and reports what it skipped (#5624)
 
 **What changed.** The agent hashes in-process and stops at the first of 20 seconds, 50,000 entries visited, 4 GiB hashed or 100 matches. The limits are fixed; scan a large tree one subdirectory at a time. When anything was skipped or the search stopped early, a `truncated|<reason>|visited=N|...` row precedes `matches_found|N`. Any symlink counts, so most scans have one; scripts must not read it as a match. The result is `CONSTRAINED`/`PARTIAL` when a limit was hit, an entry was unreadable, a network mount, UNC share or non-fixed Windows drive was skipped, or the mount table could not be read (a `network_mount_guard|unavailable` row says so). Symlinks are no longer followed, so a symlink to the target file is not reported; empty files are now hashed. Agents and server may upgrade in either order.

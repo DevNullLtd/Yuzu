@@ -141,10 +141,59 @@ dispatch. See `docs/user-manual/instructions.md` "Execution semantics" and
 | `yuzu_server_command_outbox_audit_failed_total` | counter | The delivery loop's `command.outbox_delivered` audit row failed to persist (`AuditStore::log()` returned false). A background loop has no request to fail closed, so the dropped compliance row is surfaced here + a warn log rather than swallowed. Any non-zero value means delivery-outcome audit evidence is incomplete — alert on it. |
 | `yuzu_server_command_outbox_pending` | gauge | The current `pending`-occurrence backlog (delivery queue depth). **The primary signal that scheduled dispatch has stalled** — a stuck delivery loop (leadership never acquired, a persistently degraded gate) shows flat event counters everywhere else, so this gauge growing without bound is the tell. |
 
-Until a dedicated alert ships (tracked for WS-11), monitor this family
-manually: alert on `yuzu_server_command_outbox_pending` growing without
-bound, or on `yuzu_server_command_outbox_deliver_retry_total` climbing
-steadily.
+There is still no dedicated alert on this family: monitor it manually by
+alerting on `yuzu_server_command_outbox_pending` growing without bound, or on
+`yuzu_server_command_outbox_deliver_retry_total` climbing steadily. The most
+common cause of a stalled delivery loop (no replica holds leadership) IS
+covered, by `YuzuLeaderNoLeader` (see "Leader election metrics" below).
+
+## Leader election metrics (HA WS-11, #4014)
+
+Each server replica reports its own view of the fenced background-work leader
+elector (ADR-2002 §3/§6/§10) on its own `/metrics`. The series exist only on a
+server that has an elector (a Postgres-backed server); every series except
+`yuzu_server_leader_last_ok_age_seconds` (absent until the first success) is
+**seeded at 0** at boot so a later event shows as a rise.
+
+Because the counters are published at scrape time, a counter that already moved
+before the first scrape (the leadership acquired in the first seconds after boot)
+is first seen at its non-zero value, so `increase()` does not count that first
+event. They are published when
+`/metrics` is scraped, from a lock-free snapshot, so a stalled dedicated coordination
+connection can never stall a scrape and the age gauge keeps growing if the
+election loop wedges.
+
+**These series are per replica.** Scrape *each* replica directly (never through
+the load balancer) and put unrelated Yuzu deployments that share one Prometheus
+in separate `job`s. Do not sum them yourself except as the shipped alerts do
+(`sum by (job) (max by (job, instance) (yuzu_server_leader_is_leader))`).
+`/metrics` follows the access rule at the top of this page: a loopback source
+address is unauthenticated (the same posture as `yuzu_server_pg_reachable`),
+while a remote scraper needs a token or `--metrics-no-auth`. The series carry no
+identity, only counts and one epoch number.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_leader_is_leader` | gauge | `1` if this replica currently **believes** it holds leadership, else `0`. A belief, not proof: a wedged or partitioned leader keeps reading `1` until its heartbeat fails. Correctness of a leader-driven claim is the epoch fence in the claim's write, never this gauge. The leader is the `instance` reading `1`. Alerts: `YuzuLeaderSplitBrain` (more than one), `YuzuLeaderNoLeader` (none). |
+| `yuzu_server_leader_epoch` | gauge | The epoch this replica leads at; `0` when it is not leading. It is **not** the cluster's current epoch (a follower cannot know it without a database read): that is `leader_elector.leader_state.current_leader_epoch`. Seeded at 0 and set to 0 rather than absent when not leading, which is unambiguous because minted epochs start at 1. When every replica shares **one** database, a replica whose epoch differs from `leader_state.current_leader_epoch` is the stale leader; replicas on different databases each match their own database's `leader_state`, so this comparison shows nothing there (compare each replica's database instead). |
+| `yuzu_server_leader_acquired_total` | counter | Leadership acquisitions by this process. Each acquisition needs a prior loss or a process start, so a steep rise across a multi-replica deployment is churn. Alert: `YuzuLeaderFlapping` (a single replica's own restart loop is usually not visible here: a boot that acquires before its first scrape reads 1, so `increase()` sees no rise; use `YuzuServerRestartLoop`, which has its own documented limits). |
+| `yuzu_server_leader_acquire_failures_total{cause}` | counter | Acquire attempts that **failed on infrastructure**, by `cause`: `connect` (no usable dedicated connection: the connection could not be opened, the configuration failed closed, or the coordination schema migration failed), `lock_query` (the try-lock query itself failed), `lock_guard` (lock granted but the release guard could not be built; the connection is closed), `epoch_record` (lock granted but the epoch could not be minted, recorded or parsed; the lock is released). Another replica holding the lock is the **normal follower outcome** every ~5 s and is deliberately not counted. A `connect` count rising on a replica whose `yuzu_server_leader_is_leader` stays `0` is an elector that cannot open. |
+| `yuzu_server_leader_lost_total{cause}` | counter | Held leadership that was dropped, by `cause`: `liveness_failed` (the heartbeat or the already-leader liveness query failed; a failed heartbeat always drops leadership, so this **is** the heartbeat-failure count) or `resigned` (voluntary, at shutdown). Counted only when leadership was actually held, so a follower's clean shutdown adds nothing. |
+| `yuzu_server_leader_last_ok_age_seconds` | gauge | Seconds since this replica's dedicated coordination connection last **answered** a query successfully (a heartbeat, an acquire attempt that was answered either way, or an epoch recorded). **Absent until the first success** (absent, not 0). Computed at scrape time, so it keeps growing if the election loop wedges. A healthy replica stays well under ~10 s; connection-trouble backoff is capped at 30 s. Alert: `YuzuLeaderCoordinationStale` (`> 120` on a replica that still reads leader). |
+| `yuzu_server_leader_loop_errors_total` | counter | Election-loop iterations that threw an exception (logged as `leader_elector: election iteration threw`). Expected 0. |
+
+**What these do not cover, and why `/readyz` ignores the elector.** Leadership is
+not readiness: a replica that is not the leader, or whose elector never opened,
+is a ready follower and still serves every operator-synchronous path, so
+`/readyz` and `/health` deliberately do not consult the elector. A paused
+background loop is therefore visible **only** through these series and the
+`yuzu-ha-leader` alert group. Those alerts need a
+successful scrape: when the whole Postgres primary stalls (its kernel still
+acknowledging packets) the `/metrics` handler's own database queries hang, the
+scrape fails and every leader series goes stale together. No server
+`up == 0` alert ships (#2956 tracked it and was closed without building it), so
+configure one on your own scrape job as the backstop. Not yet shipped (tracked): remediation-claim
+lifecycle counters (#6526) and a CRL `nextUpdate` freshness gauge (#6527).
 
 ## Plugin-enablement store metrics (ADR-3006)
 
