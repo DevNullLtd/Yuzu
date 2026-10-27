@@ -1022,11 +1022,13 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     stores only (per-user stores are not collected in slice 2).
   - **R17 — the agents-before-servers window for `certificate_inventory` (owner, 2026-10-26;
     closed in code by a capability gate).** D12 says stray certificate rows must never be
-    readable and the mixed-version window is not acceptable for this source; that stands
-    unamended. A server older than the typed-source read filter (or rolled back below it) that
+    readable and the mixed-version window is not acceptable for this source; that stands,
+    with one exception: the owner-accepted L7 balancer residual named below (every backend at
+    2a-1 or later; never roll a backend back below 2a-1 while certificate-collecting agents
+    report). A server older than the typed-source read filter (or rolled back below it) that
     receives the agent's blob through a gateway would store it in the generic store, readable
     under `Infrastructure:Read`. The owner (liamsomerville) ruled on 2026-10-26 that the window is
-    closed in code, not by deploy order: the agent sends `certificate_inventory` only when the
+    closed in code, not by deploy order (bar the L7 residual below): the agent sends `certificate_inventory` only when the
     server's `RegisterResponse` advertises `certificate_inventory_v1` (new field
     `repeated string server_capabilities = 9`), and the server advertises it only while its
     certificate store opened. Absent means never sent, so the gate fails closed and is stateless.
@@ -1042,7 +1044,10 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     unknown one, rate-limited re-probe for admitted sessions only). Accepted residual (owner,
     2026-10-27): behind an L7 balancer that spreads one connection's requests across backends,
     every backend must run the 2a-1 typed-source reservation release (PR #6563) or later before
-    certificate-collecting agents are enabled; SOC 2 risk register, review-by 2027-01-31.
+    certificate-collecting agents are enabled, and no backend may be rolled back below it while
+    those agents report (the no-rollback condition: a rolled-back backend stores the blob in the
+    generic store, readable under `Infrastructure:Read`); SOC 2 risk register, review-by
+    2027-01-31. The SOC 2 risk entry ships in 2a-2a.
 - A capped or timed-out capture is reported `constrained`, and the report is never an
   empty success.
 - An empty blob is never sent for a failed or constrained capture (the ADR-0016
