@@ -5563,6 +5563,36 @@ is absent or not open, which is "unknown", not zero. The two differ after a runt
 `PUT /api/config/<key>`, which is stored but not applied (see
 [When a change takes effect](#when-a-change-takes-effect)).
 
+`tar` publishes the TAR warehouse retention tiers: `tick_seconds` (the agent's prune
+tick, 900) and `tiers`, one row per source and tier (`live`, `hourly`, `daily`, `monthly`,
+`boot`). Each row has `limit_kind` (`rows` or `seconds`), `limit`, `bucket_seconds` (the
+roll-up bucket: 0 for `live`/`boot`, 3600, 86400, or 2678400 for a month, the 31-day worst
+case) and `guaranteed_depth_seconds`. Roll-up rows age from the start of their bucket, so
+a time-based tier is guaranteed for `limit - bucket_seconds` (a 365-day monthly tier is
+guaranteed for 334 days). It is `null` for `rows` tiers, whose time depth depends on how
+fast a device writes. `guaranteed_depth_seconds` is a floor on how long a record is kept, not
+where it sits: a record is still in its finer tier until the coarser roll-up closes. It is a
+floor on rows that exist, not on coverage: after an agent is offline longer than a tier's
+roll-up catch-up window (2 h hourly, 2 d daily, about 62 d monthly) the missed span is a gap in
+that tier, not a deeper tier. The
+`usage`/`live` row is a backstop, not an operative bound: the usage fold bounds its own open
+set (20,000 runs) before this limit can apply.
+
+These are the registry **defaults** an agent of this server's release applies (agents on other
+releases may differ), not per-device readings: TAR prunes on the agent, so the server has no
+live value. Every source's tiers are declared on every OS; where a source does not run on the
+agent's OS (see the OS compatibility matrix in the TAR manual) its tier applies to an empty
+table. A paused or errored source is never pruned (per-device paused sources: [`GET /api/v1/tar/retention-paused`](#get-apiv1tarretention-paused)); while the agent is running, rows may
+outlive their limit by up to `tick_seconds` (an offline agent or a disabled plugin prunes
+nothing), longer when the retention clock guard declines a prune, shorter by any plausible
+forward skew of the endpoint clock, which the guard does not decline (the depth is measured on
+the agent's own clock), and longer still while a backlog drains through the per-pass delete cap
+(5,000 rows per table per tick). `tar` is `null` only if the server's embedded table cannot be read. A server older than this release omits `tar`; treat absent like `null`.
+
+The order of `tiers` is unspecified; match rows by (`source`, `tier`). Clients must tolerate
+unknown `tier` and `limit_kind` values: a new tier is an additive change. A per-device or
+server-enforced reading, if one ever ships, lands under a new key, never by redefining `tiers`.
+
 ```json
 {
   "data": {
@@ -5573,6 +5603,15 @@ is absent or not open, which is "unknown", not zero. The two differ after a runt
       "response_retention_days": 90,
       "audit_retention_days": 365,
       "guardian_event_retention_days": 30
+    },
+    "tar": {
+      "tick_seconds": 900,
+      "tiers": [
+        { "source": "process", "tier": "live", "limit_kind": "rows", "limit": 100000,
+          "bucket_seconds": 0, "guaranteed_depth_seconds": null },
+        { "source": "process", "tier": "daily", "limit_kind": "seconds", "limit": 2678400,
+          "bucket_seconds": 86400, "guaranteed_depth_seconds": 2592000 }
+      ]
     }
   },
   "meta": { "api_version": "v1" }

@@ -6,6 +6,12 @@
 
 #include <cctype>
 
+#include <spdlog/spdlog.h>
+
+namespace yuzu::server {
+extern const std::string kTarRetentionTiersTsv; // docs/capability-registries/tar_retention_tiers.tsv
+}
+
 namespace yuzu::server::settings_model {
 
 std::string sanitize_url_userinfo(std::string_view url) {
@@ -219,7 +225,19 @@ nlohmann::json build_mcp_settings(const Config& cfg) {
     return j;
 }
 
-nlohmann::json build_data_retention_settings(const Config& cfg, const RetentionEnforced& enforced) {
+const std::vector<tar_retention::TarRetentionTier>* embedded_tar_retention_tiers() {
+    static const auto parsed = [] {
+        auto p = tar_retention::parse_tar_retention_tiers(kTarRetentionTiersTsv);
+        if (!p)
+            spdlog::error("embedded TAR retention tier table is unreadable: {}", p.error());
+        return p;
+    }();
+    return parsed ? &*parsed : nullptr;
+}
+
+nlohmann::json build_data_retention_settings(
+    const Config& cfg, const RetentionEnforced& enforced,
+    const std::vector<tar_retention::TarRetentionTier>* tiers) {
     const auto opt = [](const std::optional<int>& v) {
         return v ? nlohmann::json(*v) : nlohmann::json(nullptr);
     };
@@ -230,6 +248,22 @@ nlohmann::json build_data_retention_settings(const Config& cfg, const RetentionE
     j["enforced"] = {{"response_retention_days", opt(enforced.response_retention_days)},
                      {"audit_retention_days", opt(enforced.audit_retention_days)},
                      {"guardian_event_retention_days", opt(enforced.guardian_event_retention_days)}};
+    if (!tiers) {
+        j["tar"] = nullptr;
+    } else {
+        auto rows = nlohmann::json::array();
+        for (const auto& t : *tiers) {
+            const auto depth = tar_retention::guaranteed_depth_seconds(t);
+            rows.push_back({{"source", t.source},
+                            {"tier", t.tier},
+                            {"limit_kind", t.row_count ? "rows" : "seconds"},
+                            {"limit", t.limit},
+                            {"bucket_seconds", tar_retention::bucket_seconds(t.tier)},
+                            {"guaranteed_depth_seconds",
+                             depth ? nlohmann::json(*depth) : nlohmann::json(nullptr)}});
+        }
+        j["tar"] = {{"tick_seconds", tar_retention::kTarRetentionTickSeconds}, {"tiers", rows}};
+    }
     return j;
 }
 
