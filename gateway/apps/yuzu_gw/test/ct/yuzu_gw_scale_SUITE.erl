@@ -1697,10 +1697,11 @@ host_facts() ->
 
 start_gateway(#{log := Log, fds := Fds, upstream_port := UpPort, n := N,
                 agent_port := AgentPort, agent6_port := Agent6Port, mgmt_port := MgmtPort} = Spec) ->
-    %% The production VM flags (config/vm.args.src) less the node name/cookie.
-    Args = ["+K", "true", "+A", "128", "+SDio", "128", "+P", "4194304", "+Q", "2097152",
-            "+MBas", "aobf", "+MBlmbcs", "512", "+MEas", "aobf",
-            "-env", "ERL_FULLSWEEP_AFTER", "20", "+zdbbl", "32768"],
+    %% The production VM flags: config/vm.args.src itself, less the node name
+    %% and cookie, read at each start so the gateway measured here cannot run
+    %% with flags the release does not ship (until 2026-10-27 this was a copied
+    %% list that missed the allocator flags added to vm.args.src).
+    Args = vm_args(),
     {ok, Peer} = ?PEER:start(gateway, #{fds => Fds, log => Log, args => Args}),
     track(gateway, Peer),
     Dual = N > env_int("YUZU_GW_SCALE_DUAL_STACK_ABOVE", ?DUAL_STACK_ABOVE),
@@ -1719,6 +1720,30 @@ start_gateway(#{log := Log, fds := Fds, upstream_port := UpPort, n := N,
                      end,
       mgmt_port => ?PEER:call(Peer, ranch, get_port, [{yuzu_grpc, mgmt}]),
       mem_baseline => ?PEER:call(Peer, ?PROBE, memory, [])}.
+
+%% The arguments in config/vm.args.src (the file the release renders into its
+%% vm.args), as an erl argument list: comments and blank lines dropped, the
+%% -name and -setcookie lines dropped (the peer nodes are not distributed),
+%% and each ${VAR:-default} replaced by its default. The file is found by
+%% walking up from the yuzu_gw application directory to the gateway project
+%% root; a missing file fails the case rather than measuring other flags.
+vm_args() ->
+    File = vm_args_file(filename:split(code:lib_dir(yuzu_gw))),
+    {ok, Bin} = file:read_file(File),
+    Lines = [string:trim(L) || L <- string:lexemes(binary_to_list(Bin), "\n")],
+    Kept = [L || L <- Lines, L =/= "", hd(L) =/= $#,
+                 not lists:prefix("-name", L), not lists:prefix("-setcookie", L)],
+    lists:append([string:lexemes(re:replace(L, "\\$\\{[A-Za-z0-9_]+:-([^}]*)\\}", "\\1",
+                                            [global, {return, list}]), " \t")
+                  || L <- Kept]).
+
+vm_args_file([]) -> ct:fail("idle/scale: config/vm.args.src not found above the yuzu_gw app dir");
+vm_args_file(Parts) ->
+    F = filename:join(filename:join(Parts), "config/vm.args.src"),
+    case filelib:is_regular(F) of
+        true -> F;
+        false -> vm_args_file(lists:droplast(Parts))
+    end.
 
 %% sys.config.prod's listeners and breaker settings, on loopback. The agent
 %% listener is plaintext unless Tls is a listener `tls' map (idle_memory: the

@@ -31,7 +31,8 @@ measures:
 
 - **gateway**: the `yuzu_gw` application with the listener settings of
   `config/sys.config.prod` (acceptors, HTTP/2 limits, connection limits), the
-  production VM flags of `config/vm.args.src`, and the production circuit
+  production VM flags (read from `config/vm.args.src` at each start, less the
+  node name and cookie; see "Idle memory per connection"), and the production circuit
   breaker settings. Two things differ from production: the listeners and the
   upstream hop are plaintext (TLS cost is not measured; the `idle_memory` case
   is the exception, see "Idle memory per connection"), and every port is
@@ -397,6 +398,14 @@ Limits:
   what is linear.
 - macOS's `os_anon` is the physical footprint, not Linux's `Anonymous`, and
   its socket figure is queued bytes only. Judge on Linux.
+- The allocator flags decide most of `os_anon`. Until 2026-10-27 the gateway
+  node ran with a copied list of VM flags that lacked the allocator flags
+  `vm.args.src` gained in the Phase 1b change (`+MHas ageffcbf +MHsbct 8
+  +MBsbct 16 +Muacful de +Mumadtn true`); it now reads `vm.args.src` itself. On
+  Rocky Linux 9 at 3,000 TLS agents with empty snapshots, the copied list gave
+  about 218 KiB of `os_anon` per connection and the release's flags about
+  80 KiB, with BEAM memory unchanged (about 43 KiB), so `os_anon` figures taken
+  with the harness before that date overstate the release's.
 
 ### The ceiling (ratchet)
 
