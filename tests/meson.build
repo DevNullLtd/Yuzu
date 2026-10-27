@@ -1499,6 +1499,7 @@ if build_server
       'unit/server/test_home_panels_routes.cpp', # HM-2: Dashboard policies + events fragments
       'unit/server/test_leader_elector.cpp',
       'unit/server/test_leader_gate.cpp',
+      'unit/server/test_leader_metrics.cpp', # HA WS-11 (#4014): yuzu_server_leader_* seed + scrape-time publisher
       'unit/server/test_coord_dsn.cpp',
       'unit/server/test_pg_reachability_probe.cpp', # HA WS-8: /readyz pg_reachable rule + probe
       'unit/server/test_multi_host_dsn.cpp', # HA WS-8: multi-host DSN target_session_attrs guard
@@ -3929,6 +3930,16 @@ test('same-site gate production wiring lexical selftest',
 test('alert runbook anchors resolve',
   _python3_test,
   args: [files('test_alert_runbook_anchors.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# HA WS-11 (#4014): the leader-election alerts, their promtool cases and the metrics reference may
+# name only series leader_metrics.hpp really exports (promtool cannot know the exporter), and the
+# reference must document every exported name and cause label. Source-text only, so Python.
+test('leader alert metric names match the exporter',
+  _python3_test,
+  args: [files('test_leader_alert_metric_names.py')],
   suite: 'docs',
   timeout: 30,
 )

@@ -2806,6 +2806,227 @@ groups:
         annotations:
           summary: "Yuzu PostgreSQL pool acquire p99 > 200ms"
 
+  # HA WS-11 (#4014, ADR-2002 §3/§6/§10/§11): the fenced LeaderElector, as each
+  # replica reports it on its own /metrics. READ BEFORE EDITING OR COPYING:
+  #
+  #  - Every threshold below (2m / 5m / 6-per-30m / 120s) is a CLAIM with no
+  #    fleet data behind it: no multi-replica deployment exists yet. They are
+  #    WS-9 calibration targets, not measured values -- do not copy a number.
+  #  - Aggregation is `sum by (job)` over `max by (job, instance)`. The inner
+  #    max collapses a duplicated series for ONE replica (two scrape paths, a
+  #    relabelled copy) so it cannot count as two leaders. This REQUIRES that
+  #    Prometheus scrapes EACH replica individually (never through the load
+  #    balancer) and that unrelated Yuzu deployments sharing one Prometheus use
+  #    separate `job`s (the shipped scrape configs all use `yuzu-server`, so a
+  #    second stack must be given another name); otherwise their leaders are
+  #    summed together.
+  #  - `yuzu_server_leader_is_leader` is the replica's BELIEF (the attempt gate),
+  #    not proof. Correctness for a leader-driven claim is the epoch fence in
+  #    its WRITE (leader_elector.hpp), never this gauge. The fence is PER
+  #    DATABASE (see YuzuLeaderSplitBrain) and assumes no committed transaction
+  #    is lost on a promotion (synchronous replication, the shipped quorum
+  #    default): under asynchronous replication, or a degraded non-strict quorum,
+  #    a lagging promotion could re-mint an epoch, and "fenced claims remain
+  #    safe" below is NOT claimed for that case.
+  #  - Single replica (the supported default): SplitBrain cannot fire (one
+  #    series), NoLeader fires only if the elector never leads (loops paused),
+  #    Flapping usually does NOT see a single replica's restart loop (see that
+  #    rule; YuzuServerRestartLoop is the rule for it). A server with no
+  #    elector exports no series, so every expression is empty -- no false page,
+  #    and deliberately NO absent() rule (a Prometheus that does not scrape Yuzu
+  #    would page forever).
+  #  - /readyz does NOT consult the elector (leadership is not readiness, #4014):
+  #    a replica that cannot lead is a ready follower. These alerts are therefore
+  #    the ONLY signal that the five FencedLeaderOnly passes (schedule tick,
+  #    policy dispatch, quarantine reconcile, command-outbox delivery and the
+  #    CRL re-publish) are paused or running on a stale belief.
+  #  - EVERY rule here needs a successful scrape. In a WHOLE-PRIMARY stall (the
+  #    primary freezes while its kernel keeps ACKing) the /metrics handler's own
+  #    pool queries hang too, the scrape fails, and every yuzu_server_leader_*
+  #    series goes stale at once, so every rule below evaluates EMPTY. The
+  #    backstop is an `up == 0` alert on the server job (substitute YOUR scrape
+  #    job name) plus /readyz: NO such rule ships (no rule in this file is a
+  #    dead-man's-switch for the server process; #2956 tracked it and was closed
+  #    without building it), so configure one.
+  - name: yuzu-ha-leader
+    rules:
+      - alert: YuzuLeaderSplitBrain
+        # More than one replica currently believes it leads, for 2m. WHAT THIS
+        # CATCHES: against the real elector the reachable >2m overlap is (a) two
+        # replicas on DIFFERENT databases (a split DSN, or a Patroni double-primary
+        # / forked database): each holds a valid lock and a valid epoch in ITS OWN
+        # database, so each believes it leads; or (b) an elector regression within
+        # one database. WHAT IT DOES NOT CATCH: a PAUSED ex-leader (the case the
+        # epoch fence exists for) -- its process is frozen, so its series goes
+        # STALE, not 1 (a failed scrape writes a staleness marker at once).
+        # THE EPOCH FENCE IS PER DATABASE: epoch_fence_sql() is a subselect on
+        # leader_elector.leader_state in the SAME database as the claim and the
+        # epoch comes from a per-database sequence, so it protects a leader-driven
+        # claim only against another replica of the same database. In cause (a)
+        # BOTH replicas pass their own fence and BOTH run every leader-only pass;
+        # on a forked database the same occurrence can be sent twice, absorbed only
+        # by the agent's command_id dedup (WS-0, effectively-once). In cause (b)
+        # the fence still holds for fenced claims and only the unfenced passes
+        # (schedule tick, policy dispatch, quarantine reconcile, CRL re-publish)
+        # run on both. `for: 2m` rides out a graceful handover (a resign sets 0
+        # before the successor acquires; heartbeat/poll cadence is 5s + up to 3s
+        # jitter). VERIFIED BY PROMTOOL UNIT CASES ONLY: a genuine two-leader state
+        # cannot be constructed against one database (the advisory lock prevents
+        # it), so there is no live end-to-end proof.
+        expr: |
+          sum by (job) (max by (job, instance) (yuzu_server_leader_is_leader)) > 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "More than one Yuzu server replica believes it is the leader ({{ $labels.job }})"
+          description: >-
+            Two or more replicas have reported yuzu_server_leader_is_leader = 1
+            for over 2 minutes. FIRST compare each replica's coordination
+            host/dbname (its startup log line). Replicas on different databases
+            (a split DSN, or a Patroni double-primary) each hold a valid lock and
+            epoch in their own database, so the epoch fence does NOT span them and
+            both replicas run every leader-only pass: first establish which
+            database is authoritative (patronictl list, and compare
+            SELECT system_identifier FROM pg_control_system() on each side; do
+            not demote on a log-line comparison alone), then fix the DSN, or
+            fence or demote the wrong primary, BEFORE restarting any replica. Only when all
+            replicas share one database is the stale one the replica whose
+            yuzu_server_leader_epoch differs from
+            leader_elector.leader_state.current_leader_epoch; restart it. Within
+            one database (with synchronous replication) fenced claims remain
+            safe and the unfenced background passes may be running twice.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#leader-election-metrics-and-alerts-ha-ws-11"
+
+      - alert: YuzuLeaderNoLeader
+        # No replica believes it leads, for 5m. The five FencedLeaderOnly passes
+        # are PAUSED (fail-closed: nothing double-dispatches, but scheduled
+        # dispatch, policy dispatch, quarantine re-application, the command
+        # outbox and the CRL re-publish are not running), while /readyz stays
+        # green and every replica keeps serving operators. This is the ONLY signal
+        # for that state, and also the case where a replica's elector never opened
+        # (acquire_failures_total{cause="connect"} rising), or a ZOMBIE lock
+        # holder: a backend still holding the advisory lock until Postgres notices
+        # its client is gone, so nobody can acquire. On a SINGLE replica the
+        # zombie is often the replica's OWN previous connection after a network
+        # blip. `for: 5m` >> the ~5-8s first acquire at boot and an ordinary
+        # failover. A restart removes the series (target down), so the expression
+        # is EMPTY, not 0, during it. FALSE-PAGE CASE: if only the LEADER's scrape
+        # target is down, the followers' zeros keep the sum at 0 although a leader
+        # is healthy; the description tells the operator to scrape each replica
+        # directly first. No `up`-based guard is added: it would also suppress the
+        # genuine case of a dead or partitioned leader host whose backend still
+        # holds the lock. A planned Postgres maintenance window longer than 5m
+        # fires this rule: silence it.
+        expr: |
+          sum by (job) (max by (job, instance) (yuzu_server_leader_is_leader)) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No Yuzu server replica is the leader ({{ $labels.job }}): fenced background loops are paused"
+          description: >-
+            No replica has believed it leads for over 5 minutes. The schedule
+            tick, policy dispatch, quarantine reconciler, command-outbox
+            delivery and CRL re-publish are paused on every replica. FIRST scrape
+            each replica's /metrics directly: if any replica reads
+            yuzu_server_leader_is_leader = 1 this is a scrape problem, not a
+            leader problem. Otherwise check the server log for "[HA]
+            leader_elector could not open its coordination connection", the
+            acquire_failures_total{cause} series, and pg_locks WHERE locktype =
+            'advisory' (select client_addr, backend_start and state_change too)
+            for a lock held by a backend that no live replica owns; on a single
+            replica that is often its own previous connection after a network
+            blip. Terminate only that backend (pg_terminate_backend; read the
+            runbook first; terminating a live leader's backend forces a failover
+            with up to about 8 seconds of unfenced overlap, absorbed only by the agent's
+            command_id dedup). Silence this alert, scoped
+            to the job, for planned Postgres maintenance of 5 minutes or more,
+            with an end time at the window plus about 10 minutes, and confirm
+            afterwards that a replica reads yuzu_server_leader_is_leader = 1.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#leader-election-metrics-and-alerts-ha-ws-11"
+
+      - alert: YuzuLeaderFlapping
+        # Leadership was acquired 6 or more times across the deployment in 30m.
+        # Each acquisition needs a prior loss or a process start, so repeated
+        # acquisitions across a MULTI-replica deployment mean a network flap, a
+        # Postgres failover loop or a handover loop. A SINGLE replica's restart
+        # loop is USUALLY not visible here: the counter is synced at scrape time,
+        # so a boot whose leadership is acquired before its first scrape reads 1
+        # with no rise. A boot whose acquire is delayed (slow or unreachable
+        # Postgres, a lock still held by the previous process) IS counted, so do
+        # not rely on this rule for that failure: YuzuServerRestartLoop is the
+        # rule for it (with its own documented limits). THRESHOLD IS A WS-9
+        # CALIBRATION CLAIM, not a measured value: increase() extrapolates to the
+        # window edges, and each boot of a rolling restart contributes one
+        # acquisition for whichever replica wins, so a single N-replica rolling
+        # upgrade can add up to N. 6 clears a rolling restart of up to 4 replicas
+        # with margin. `for: 0m` is deliberate: the 30m window already is the
+        # persistence; a counter reset (process restart) is handled by increase().
+        expr: |
+          sum by (job) (increase(yuzu_server_leader_acquired_total[30m])) >= 6
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu server leadership is flapping ({{ $labels.job }})"
+          description: >-
+            Leadership was acquired 6 or more times in 30 minutes. Compare with
+            YuzuServerPostgresUnreachable and the lost_total{cause} series: a
+            network or Postgres failover flap, or a handover loop between
+            replicas. (A single replica in a restart loop is usually not visible
+            to this rule; YuzuServerRestartLoop is the rule for that.)
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#leader-election-metrics-and-alerts-ha-ws-11"
+
+      - alert: YuzuLeaderCoordinationStale
+        # A replica that still BELIEVES it leads, but whose dedicated coordination
+        # connection has not answered a query for over 120s, for 2m. This is the
+        # only series that moves when the DEDICATED coordination connection wedges
+        # while /metrics still answers (a partition where the peer kernel keeps
+        # ACKing): heartbeat() blocks under the elector's mutex inside a libpq call
+        # that has NO client-side bound against a frozen-but-ACKing backend (~101s
+        # is the length of the pause measured in pg_reachability_probe.hpp, not a
+        # ceiling), the lock-free published epoch stays > 0, so sum(is_leader)
+        # stays 1 and BOTH SplitBrain and NoLeader are silent -- while the five
+        # FencedLeaderOnly passes keep ATTEMPTING on a replica that cannot commit.
+        # Fenced claims still cannot double-dispatch (the epoch predicate is
+        # evaluated in the claim's write on an ordinary pooled connection); the
+        # unfenced passes are what run blind. A healthy leader's age is bounded by
+        # the 5s + 3s-jitter heartbeat cadence plus one query, so well under 10s;
+        # 120s is more than 10x that. DETECTION TIME is age > 120s plus `for: 2m`
+        # plus a scrape interval, i.e. about 4-5 minutes into a freeze: a shorter
+        # freeze never alerts. last_ok_age is computed at SCRAPE time, so it keeps
+        # growing even when the election loop is wedged. BLIND SPOT: in a
+        # WHOLE-PRIMARY stall the scrape itself fails (see the group header), so
+        # this rule cannot evaluate; the `up == 0` backstop must catch that. Both
+        # series carry the same job/instance labels, so default all-label matching
+        # applies (no on()).
+        expr: |
+          yuzu_server_leader_last_ok_age_seconds > 120
+            and
+          yuzu_server_leader_is_leader == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Yuzu server {{ $labels.instance }} believes it leads but its coordination connection is stale"
+          description: >-
+            {{ $labels.instance }} still reports leadership, but its dedicated
+            coordination connection has not answered a query for over 2 minutes
+            (a wedged or partitioned Postgres connection). Its background passes
+            keep attempting, and its fenced claims cannot commit; the unfenced
+            passes may still succeed. Fenced claims remain safe.
+            Check connectivity from this replica to the Postgres primary. If the
+            primary is reachable, terminate this replica's stuck backend
+            (pg_stat_activity, pg_terminate_backend): that ends the lock and
+            unblocks the stale replica, which then drops its belief, though its
+            unfenced passes can briefly overlap the successor's (any duplicate
+            dispatch is absorbed only by the agent's command_id dedup);
+            otherwise restart the replica (it may need the supervisor's stop
+            timeout or a second signal while its coordination call is wedged),
+            then terminate the old backend if its advisory lock persists.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#leader-election-metrics-and-alerts-ha-ws-11"
+
   - name: yuzu-guardian
     rules:
       # yuzu_server_guardian_events_dropped_total is a cumulative-but-published-
