@@ -1577,28 +1577,88 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     REQUIRE(real["tar"].is_object());
     REQUIRE_FALSE(real["tar"]["tiers"].empty());
 
+    const auto set_of = [](const json& arr) {
+        std::set<std::string> out;
+        for (const auto& k : arr)
+            out.insert(k.get<std::string>());
+        return out;
+    };
+    // The JSON type a value has, as the OpenAPI `type` keyword spells it.
+    const auto type_of = [](const json& v) -> std::string {
+        if (v.is_number_integer())
+            return "integer";
+        if (v.is_string())
+            return "string";
+        if (v.is_object())
+            return "object";
+        if (v.is_array())
+            return "array";
+        return "other";
+    };
+
     // Every key the builder emits is declared; every key declared is emitted.
-    CHECK(keys_of(schema.at("properties")) == keys_of(real));
-    const json& tar = schema.at("properties").at("tar");
+    const json& props = schema.at("properties");
+    CHECK(keys_of(props) == keys_of(real));
+    for (const char* k : {"response_retention_days", "audit_retention_days",
+                          "guardian_event_retention_days"})
+        CHECK(props.at(k).value("type", "") == type_of(real.at(k)));
+
+    // `required` is the builder's keys minus `tar`: a server older than this release omits `tar`,
+    // and the manual tells clients to treat absent like null.
+    auto expected_required = keys_of(real);
+    expected_required.erase("tar");
+    CHECK(set_of(schema.at("required")) == expected_required);
+
+    // `enforced`: the same three keys, each a nullable integer, all required.
+    const json& enforced = props.at("enforced");
+    CHECK(keys_of(enforced.at("properties")) == keys_of(real["enforced"]));
+    CHECK(set_of(enforced.at("required")) == keys_of(real["enforced"]));
+    for (const auto& k : keys_of(real["enforced"])) {
+        CHECK(enforced.at("properties").at(k).value("type", "") == "integer");
+        CHECK(enforced.at("properties").at(k).value("nullable", false));
+    }
+
+    const json& tar = props.at("tar");
     CHECK(tar.value("nullable", false));
     CHECK(keys_of(tar.at("properties")) == keys_of(real["tar"]));
-    CHECK(tar.at("required") == json::array({"tick_seconds", "tiers"}));
+    CHECK(set_of(tar.at("required")) == keys_of(real["tar"]));
+    CHECK(tar.at("properties").at("tick_seconds").value("type", "") ==
+          type_of(real["tar"]["tick_seconds"]));
 
+    // Every real tier: the declared keys, the declared types, and a null depth exactly on rows
+    // tiers (so `nullable` is needed and is not decoration).
     const json& item = tar.at("properties").at("tiers").at("items");
-    const json& tier0 = real["tar"]["tiers"][0];
-    CHECK(keys_of(item.at("properties")) == keys_of(tier0));
-    std::set<std::string> required_keys;
-    for (const auto& k : item.at("required"))
-        required_keys.insert(k.get<std::string>());
-    CHECK(required_keys == keys_of(tier0));
+    CHECK(keys_of(item.at("properties")) == keys_of(real["tar"]["tiers"][0]));
+    CHECK(set_of(item.at("required")) == keys_of(real["tar"]["tiers"][0]));
+    bool saw_rows = false;
+    bool saw_seconds = false;
+    for (const auto& tier : real["tar"]["tiers"]) {
+        CHECK(keys_of(tier) == keys_of(item.at("properties")));
+        for (auto it = tier.begin(); it != tier.end(); ++it) {
+            if (it.key() == "guaranteed_depth_seconds")
+                continue;
+            CHECK(item.at("properties").at(it.key()).value("type", "") == type_of(it.value()));
+        }
+        const std::string kind = tier.at("limit_kind").get<std::string>();
+        if (kind == "rows") {
+            saw_rows = true;
+            CHECK(tier.at("guaranteed_depth_seconds").is_null());
+        } else {
+            saw_seconds = true;
+            CHECK(tier.at("guaranteed_depth_seconds").is_number_integer());
+        }
+    }
+    CHECK(saw_rows);
+    CHECK(saw_seconds);
+    const json& depth = item.at("properties").at("guaranteed_depth_seconds");
+    CHECK(depth.value("type", "") == "integer");
+    CHECK(depth.value("nullable", false));
 
-    // A rows tier reports a null depth, so the schema must allow null there.
-    CHECK(item.at("properties").at("guaranteed_depth_seconds").value("nullable", false));
-
-    // `tar` stays out of `required`: a server older than this release omits it, and the manual
-    // tells clients to treat absent like null.
-    for (const auto& k : schema.at("required"))
-        CHECK(k.get<std::string>() != "tar");
+    // The builder's `tar: null` branch (no table available) is the case `nullable` exists for.
+    const json no_table =
+        yuzu::server::settings_model::build_data_retention_settings(cfg, {}, nullptr);
+    REQUIRE(no_table.contains("tar"));
+    CHECK(no_table["tar"].is_null());
 }
 
 TEST_CASE("openapi_spec_json(): the data-retention operation documents the TAR tiers",

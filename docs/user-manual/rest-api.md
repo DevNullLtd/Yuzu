@@ -5556,8 +5556,8 @@ REST-only — see the #520 note above.
 
 Response, audit and Guardian-event data retention windows, in days.
 
-**Permission:** `ServerConfig:Read`. **Audit:** none — lowest sensitivity of the eight (a few
-integers).
+**Permission:** `ServerConfig:Read`. **Audit:** none — lowest sensitivity of the eight (integers
+and fixed registry strings).
 
 The top-level fields are the configured/stored values. `enforced` holds the window each store is
 actually applying, in days (`0` or less means rows never expire); a value is `null` when the store
