@@ -368,9 +368,14 @@ idle_sample(Ports) ->
       ms => erlang:system_time(millisecond)}.
 
 %% @doc This OS process's memory as the OS sees it, in bytes.
-%% Linux: /proc/self/smaps_rollup (rss, pss, anonymous = the private and shared
-%% anonymous pages, which is the budget's "OS anon") and /proc/self/status
-%% (RssAnon, RssFile, VmHWM). macOS: `ps' RSS and `footprint' (the physical
+%% Linux: /proc/self/status (RssAnon = the kernel's count of the process's
+%% anonymous resident pages, which is the budget's "OS anon"; RssFile, VmHWM)
+%% and /proc/self/smaps_rollup (rss, pss, smaps_anon = its Anonymous). The
+%% rollup is not the budget figure: it walks the mappings, and under the
+%% release's allocator flags (carriers mapped and unmapped every heartbeat) a
+%% read can miss some. On Rocky 9 (kernel 5.14) at 3,000 agents single reads
+%% fell as far as 63% below the RssAnon read in the same sample (2026-10-27),
+%% consistent with the walk dropping mmap_lock while a writer waits. macOS: `ps' RSS and `footprint' (the physical
 %% footprint: dirty anonymous plus compressed pages, the nearest macOS has to
 %% Linux's anonymous RSS). Elsewhere, or when a read fails: what was read.
 -spec os_memory() -> map().
@@ -383,7 +388,7 @@ os_memory() ->
 
 linux_memory() ->
     Rollup = kv_kb("/proc/self/smaps_rollup",
-                   [{"Rss", rss}, {"Pss", pss}, {"Anonymous", anon}, {"Pss_Anon", pss_anon},
+                   [{"Rss", rss}, {"Pss", pss}, {"Anonymous", smaps_anon}, {"Pss_Anon", pss_anon},
                     {"Private_Dirty", private_dirty}, {"Swap", swap}]),
     Status = kv_kb("/proc/self/status",
                    [{"VmRSS", vm_rss}, {"RssAnon", rss_anon}, {"RssFile", rss_file},

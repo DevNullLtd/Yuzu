@@ -921,14 +921,16 @@ window_steady(Acc, W, Tol) ->
               end, [beam_total, os_anon]).
 
 %% One sample as flat numbers: beam_<category>, process_count, port_count,
-%% os_rss, os_anon (Linux: smaps_rollup Anonymous; macOS: the physical
-%% footprint), os_<other keys>, socket_<key>, hb_buffer_bytes.
+%% os_rss, os_anon (Linux: RssAnon from /proc/self/status, not smaps_rollup's
+%% Anonymous, which misses mappings while carriers are mapped and unmapped;
+%% macOS: the physical footprint), os_<other keys>, socket_<key>,
+%% hb_buffer_bytes.
 idle_flat(#{beam := Beam, os := Os, sockets := Sock, heartbeat_buffer := Hb} = S) ->
     B = maps:from_list([{list_to_atom("beam_" ++ atom_to_list(K)), V} || {K, V} <- maps:to_list(Beam)]),
     O = maps:from_list([{list_to_atom("os_" ++ atom_to_list(K)), V}
                         || {K, V} <- maps:to_list(Os), is_integer(V)]),
     Anon = case Os of
-               #{anon := A} -> #{os_anon => A};
+               #{rss_anon := A} -> #{os_anon => A};
                #{phys_footprint := F} -> #{os_anon => F};
                _ -> #{}
            end,

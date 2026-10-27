@@ -330,9 +330,10 @@ Each sample, taken inside the gateway node (`yuzu_gw_scale_probe:idle_sample/1`)
 - `erlang:memory()` by category (`beam_total`, `beam_processes`,
   `beam_binary`, `beam_ets`, `beam_system`, `beam_code`, ...), the process and
   port counts;
-- the gateway OS process's memory: on Linux `/proc/self/smaps_rollup`
-  (`os_rss`, `os_pss`, `os_anon` = `Anonymous`, ...) and `/proc/self/status`
-  (`os_rss_anon`, `os_vm_hwm`, ...); on macOS `ps` RSS (`os_rss`) and the
+- the gateway OS process's memory: on Linux `/proc/self/status`
+  (`os_anon` = `os_rss_anon` = `RssAnon`, `os_vm_hwm`, ...) and
+  `/proc/self/smaps_rollup` (`os_rss`, `os_pss`, `os_smaps_anon` = its
+  `Anonymous`, ...); on macOS `ps` RSS (`os_rss`) and the
   physical footprint from `footprint` (`os_anon`, the nearest macOS has to
   anonymous RSS; best effort);
 - kernel memory of the gateway's agent-listener sockets, outside the process
@@ -404,8 +405,15 @@ Limits:
   +MBsbct 16 +Muacful de +Mumadtn true`); it now reads `vm.args.src` itself. On
   Rocky Linux 9 at 3,000 TLS agents with empty snapshots, the copied list gave
   about 218 KiB of `os_anon` per connection and the release's flags about
-  80 KiB, with BEAM memory unchanged (about 43 KiB), so `os_anon` figures taken
+  89 KiB, with BEAM memory unchanged (about 43 KiB), so `os_anon` figures taken
   with the harness before that date overstate the release's.
+- Until 2026-10-27 Linux `os_anon` was `smaps_rollup`'s `Anonymous`. With the
+  release's allocator flags, which map and unmap carriers every heartbeat, a
+  rollup read can miss mappings: on Rocky Linux 9 (kernel 5.14) at 3,000
+  agents single reads fell as far as 63% below `RssAnon` in the same sample,
+  so the window mean ran low and three identical runs spread over up to
+  20 KiB per connection (`RssAnon`: up to 11 KiB). `os_anon` is now
+  `RssAnon`; the rollup figure stays in the samples as `os_smaps_anon`.
 
 ### The ceiling (ratchet)
 
