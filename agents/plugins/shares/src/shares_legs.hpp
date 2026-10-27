@@ -31,6 +31,7 @@
 #include <yuzu/string_utils.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <functional>
@@ -469,7 +470,6 @@ inline Listing list_windows(const WinPageFn& page) {
     std::vector<Share> got;
     int level = 2;
     bool level2_denied = false;
-    bool stop_paging = false;
     bool failed = false;
 
     for (;;) {
@@ -498,24 +498,11 @@ inline Listing list_windows(const WinPageFn& page) {
         }
 
         for (const auto& rec : p.shares) {
+            static constexpr std::array<std::string_view, 4> kKinds{"disk", "print", "device",
+                                                                    "ipc"};
+            const auto kind = rec.type & kStypeMask;
             std::vector<std::string> flags;
-            switch (rec.type & kStypeMask) {
-            case 0:
-                flags.emplace_back("disk");
-                break;
-            case 1:
-                flags.emplace_back("print");
-                break;
-            case 2:
-                flags.emplace_back("device");
-                break;
-            case 3:
-                flags.emplace_back("ipc");
-                break;
-            default:
-                flags.emplace_back("other");
-                break;
-            }
+            flags.emplace_back(kind < kKinds.size() ? kKinds[kind] : "other");
             if ((rec.type & kStypeSpecial) != 0)
                 flags.emplace_back("special");
             if ((rec.type & kStypeTemporary) != 0)
@@ -524,7 +511,6 @@ inline Listing list_windows(const WinPageFn& page) {
                                       rec.path.empty() ? 1 : rec.path.size(),
                                       detail::flags_bytes(flags))) {
                 t.truncated = true;
-                stop_paging = true;
                 break;
             }
             Share s;
@@ -535,7 +521,7 @@ inline Listing list_windows(const WinPageFn& page) {
             s.source = std::string{kSrc};
             got.push_back(std::move(s));
         }
-        if (stop_paging || p.status == 0)
+        if (t.truncated || p.status == 0)
             break;
         if (p.shares.empty()) { // ERROR_MORE_DATA that read nothing: no forward progress
             t.acc.add_failure(tok("no_progress"));
