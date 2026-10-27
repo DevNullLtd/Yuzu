@@ -86,7 +86,7 @@
     {
       "grant": "**None.** `mas_receipt`/`vendor_plists` are unprivileged filesystem glob + plist reads (`/Applications/*.app/Contents/Info.plist` is world-readable).",
       "if_refused": "no coded refusal path: an absent glob match reports a structural zero-row success, never an error, and an `Info.plist` that cannot be read or decoded falls back to the bundle name with an empty version",
-      "measured": "2026-10-26, bare-metal, at euid 501 (unprivileged) — this plugin needs none of the daemon's root grant",
+      "measured": "2026-10-26, bare-metal, at euid 501 (unprivileged), and the binary-plist decoder again as root on 2026-10-27 (the production LaunchDaemon identity), identical to `plutil` both ways — this plugin needs none of the daemon's root grant",
       "os": "macOS",
       "runs_as": "agent LaunchDaemon, runs as **root** today (no `UserName` key; required for TAR's Endpoint Security client, unrelated to this plugin)"
     },

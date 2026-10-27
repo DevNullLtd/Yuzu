@@ -32,6 +32,6 @@ each key (the trailing newline is plutil's, not part of the value).
   sample capture does not carry that character; the fixture exists to pin the
   UTF-16 decode.
 - A full parity run over every binary `Info.plist` under `/Applications` (seven
-  bundles on this host) against `plutil` was byte-identical; that run is a
+  bundles on this host) against `plutil` was byte-identical, both as an unprivileged user and as root; that run is a
   verification step, not a committed test, because it depends on whatever apps
   the host has installed.

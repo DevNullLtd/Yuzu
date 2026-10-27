@@ -133,8 +133,9 @@ int do_surfaces(yuzu::CommandContext& ctx) {
 //     through plist_string_value and binary (bplist00) ones through the bounded
 //     decoder in licensing_bplist.hpp; a plist neither can decode falls back to
 //     the bundle name with an empty version. SUPPORTED: the binary decoder was
-//     measured 2026-10-26 on a real host (unprivileged user) byte-for-byte
-//     against plutil over every binary /Applications Info.plist. vendor_plists
+//     measured on a real host (2026-10-26 as an unprivileged user, 2026-10-27
+//     as root) byte-for-byte against plutil over every binary /Applications
+//     Info.plist. vendor_plists
 //     rows stay presence-only and the MAS receipt PKCS#7 is not validated
 //     (declared below).
 const YuzuActionDescriptor kActionDescriptors[] = {
