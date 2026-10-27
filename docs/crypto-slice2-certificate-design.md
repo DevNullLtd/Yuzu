@@ -1711,12 +1711,14 @@ posture, and the data-processor obligations an engine takes on.
   are valid and the references are gone. Subjects, issuers and SANs are never a count grouping
   key, never a metric label, and never in audit details (only counts and filter names are audited).
   The pre-existing `certificates.list` and `certificates.details` plugin results, stored as
-  ordinary responses, are outside this table and follow `Response:Read`, which is held by
-  Operator, PlatformEngineer, ITServiceOwner and Viewer as well as administrators; they are kept
+  ordinary responses, are outside this table and follow `Response:Read`: with RBAC on it is held
+  by Operator, PlatformEngineer, ITServiceOwner and Viewer as well as administrators, and under
+  RBAC off (the default) any authenticated session can read them; they are kept
   90 days and are not erased on decommission. A further exposure is the L7 generic-store residual
   (decision 8, ADR R17): a blob that a pre-2a-1 backend stored in the generic inventory store is
-  readable to `Inventory:Read` and `Infrastructure:Read` holders until the non-fatal boot purge
-  removes it.
+  readable to `Inventory:Read` and `Infrastructure:Read` holders (under RBAC off, the default, any
+  authenticated session) on that backend until the backend is upgraded to 2a-1 or later; from then
+  the typed-source read filter hides it and the non-fatal boot purge removes it.
 - **No redaction.** An e-mail SAN is the certificate's identity, so redacting it would falsify the
   fact. That differs from `browser_inventory`, where an e-mail is incidental. The narrow securable
   is the control instead.
@@ -2024,13 +2026,15 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
     worker blocks only itself, and no second worker starts while one is stuck; shutdown uses the
     existing `hard_exit` grace path, so a stuck worker cannot hold a reconnect or a stop. The
     residual below is therefore bounded to the certificate source on that device. The sync
-    thread's wait bounds the wait, not the syscall: item (5) stands. The fleet signal for a stuck
-    walk is a `walk_stalled` gauge and heartbeat key, which is 2a-2e's deliverable. Supported
+    thread's wait bounds the wait, not the syscall: item (5) stands. The signal for a stuck walk
+    is the agent heartbeat tag `yuzu.cert_walk_stalled` and an agent log line (2a-2e); the server
+    does not store the tag, so there is no fleet gauge or alert (limit (a)), and none is owed by a
+    slice-2 PR. Supported
     kernels: Linux 5.8 or later is supported; below 6.8 the mount-id-reuse residual (4) applies;
     on hosts with FUSE or autofs run 6.8 or later.
 
     **Disclosed limits (governance, 2026-10-27).** (a) `walk_stalled` has no fleet gauge or alert
-    as built: it is an agent log line only, so nothing durable detects agents that stay dark
+    as built: it is a heartbeat tag the server does not store plus an agent log line, so nothing durable detects agents that stay dark
     after it; fleet-drop alerts self-clear. (b) "A stuck worker cannot hold a stop" holds for the
     sync thread and the `hard_exit` grace path, but a worker left in uninterruptible kernel wait
     (for example by a silent FUSE daemon that has read the request) cannot be killed, so

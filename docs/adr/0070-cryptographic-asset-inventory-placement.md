@@ -1046,7 +1046,8 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     every backend must run the 2a-1 typed-source reservation release (PR #6563) or later before
     certificate-collecting agents are enabled, and no backend may be rolled back below it while
     those agents report (the no-rollback condition: a rolled-back backend stores the blob in the
-    generic store, readable under `Infrastructure:Read`); SOC 2 risk register, review-by
+    generic store, readable under `Inventory:Read` and `Infrastructure:Read`, which under RBAC off
+    (the default) any authenticated session holds, until that backend is upgraded); SOC 2 risk register, review-by
     2027-01-31. The SOC 2 risk entry ships in 2a-2a.
 - A capped or timed-out capture is reported `constrained`, and the report is never an
   empty success.
