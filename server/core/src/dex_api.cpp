@@ -71,8 +71,6 @@ public:
             // Constant text, never the caller's token; one line per interval.
             if (policy_warn_throttle_.should_warn("invalid_scope"))
                 spdlog::warn("DexApi::apps: platform scope refused (invalid_scope)");
-            else
-                spdlog::debug("DexApi::apps: platform scope refused (invalid_scope)");
             return m;
         }
         // The policy next: an unavailable policy answers without a fleet snapshot, and a

@@ -32,7 +32,6 @@
 #include <yuzu/metrics.hpp>
 
 #include <algorithm>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <expected>
@@ -836,70 +835,6 @@ TEST_CASE("DexApi: apps on an empty Linux fleet and an empty macOS fleet", "[pg]
         CHECK(std::string(m.apps[0].figures.score.withheld) == "no_population");
     }
     CHECK(api->apps("7d", "windows").population == 20);
-}
-
-// Manual latency probe (hidden): `yuzu_server_tests "[apps_bench]"`. A 30,000-agent
-// mixed-OS fleet (15k windows / 10k linux / 5k macos), 4 crash/hang rows per agent.
-// Prints the medians; the time budget is applied by the reader, not asserted here.
-TEST_CASE("DexApi: apps all vs windows on a 30k mixed-OS fleet (bench)", "[.][pg][dex][apps_bench]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GuaranteedStateStore store(pool);
-    REQUIRE(store.is_open());
-    {
-        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
-        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
-        const std::string sql =
-            "INSERT INTO guaranteed_state_store.guardian_observations "
-            "(event_id, agent_id, observed_at, obs_type, subject, platform, version) "
-            "SELECT 'b' || g || '-' || k, 'ag' || g, '" + kTs + "', "
-            "CASE WHEN k < 4 THEN 'process.crashed' ELSE 'process.hung' END, "
-            "'app' || ((g * k) % 200), "
-            "CASE g % 6 WHEN 0 THEN 'windows' WHEN 1 THEN 'windows' WHEN 2 THEN 'windows' "
-            "WHEN 3 THEN 'linux' WHEN 4 THEN 'linux' ELSE 'macos' END, "
-            "'1.0.0.' || (k % 3) FROM generate_series(1, 30000) g, generate_series(1, 4) k";
-        yuzu::server::pg::PgResult r{PQexec(conn.get(), sql.c_str())};
-        REQUIRE(r.ok());
-        // A bulk insert leaves the planner without statistics until autovacuum
-        // gets to it; analyse now so no timed read straddles that change.
-        yuzu::server::pg::PgResult an{
-            PQexec(conn.get(), "ANALYZE guaranteed_state_store.guardian_observations")};
-        REQUIRE(an.ok());
-    }
-    const auto fleet = [] {
-        yuzu::server::DexFleet f;
-        for (int g = 1; g <= 30000; ++g) {
-            const char* os = (g % 6 <= 2) ? "windows" : (g % 6 <= 4) ? "linux" : "macos";
-            f.connected_agents.emplace_back("ag" + std::to_string(g), os);
-        }
-        f.total_online = 30000;
-        return f;
-    };
-    auto api = make_local_dex_api(&store, fleet);
-    const auto median_ms = [&](const char* scope, int64_t population) {
-        const auto warm = api->apps("7d", scope);
-        REQUIRE_FALSE(warm.degraded);
-        REQUIRE(warm.population == population);
-        // Positive control: a fast read that returned nothing proves nothing.
-        REQUIRE(warm.apps_total == 200);
-        REQUIRE_FALSE(warm.apps.empty());
-        std::vector<double> ms;
-        for (int i = 0; i < 5; ++i) {
-            const auto t0 = std::chrono::steady_clock::now();
-            const auto m = api->apps("7d", scope);
-            const auto t1 = std::chrono::steady_clock::now();
-            REQUIRE_FALSE(m.degraded);
-            ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
-        }
-        std::sort(ms.begin(), ms.end());
-        return ms[2];
-    };
-    // all first, windows, all again: neither scope owns the cold-cache read.
-    const double a1 = median_ms("all", 30000);
-    const double w = median_ms("windows", 15000);
-    const double a2 = median_ms("all", 30000);
-    const double a = std::max(a1, a2);
-    WARN("apps_bench windows_ms=" << w << " all_ms=" << a1 << "," << a2 << " ratio=" << (a / w));
 }
 
 TEST_CASE("DexApi: apps with an invalid scope is degraded before policy or fleet",
