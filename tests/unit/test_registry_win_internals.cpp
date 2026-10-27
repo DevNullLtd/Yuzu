@@ -846,8 +846,8 @@ TEST_CASE("execute_guarded turns a throwing action into rc 1 and one error|excep
 TEST_CASE("Win32Registry::query_value returns a REG_SZ stored without its terminator exactly as stored",
           "[registry][windows][internals]") {
     // The capture of a pre-existing value feeds the audit row's old= field: it must be the stored bytes. A
-    // RegQueryValueExW into a roomy buffer may append a terminator the stored value never had; this pins that
-    // the plugin's read does not report one.
+    // RegQueryValueExW into a roomy buffer may append a terminator the stored value never had; this pins that the
+    // plugin's read reports exactly the stored bytes: no appended terminator, nothing truncated.
     //
     // The write needs care too. Measured on weecolin (build 26100.2605, 2026-10-27): RegSetValueExW given a 4-byte
     // REG_SZ, REG_EXPAND_SZ or REG_MULTI_SZ stores 6 bytes when the wchar_t just after those bytes in the caller's
@@ -866,6 +866,16 @@ TEST_CASE("Win32Registry::query_value returns a REG_SZ stored without its termin
     const wchar_t stored[3] = {L'a', L'b', L'X'}; // four bytes passed, no terminator; 'X' is only the neighbour
     REQUIRE(RegSetValueExW(raw.get(), L"V", 0, REG_SZ, reinterpret_cast<const BYTE*>(stored),
                            sizeof stored - sizeof(wchar_t)) == ERROR_SUCCESS);
+    // The write precondition, asked of the OS directly so that a failure names the layer: the key holds the one
+    // value "V", so the longest value data is its stored size. The 4 must stay 4. If a Windows build pads a string
+    // it is asked to store unterminated, create the value another way (NtSetValueKey) rather than relax this: the
+    // case is the only pin on the audit old= capture reporting no invented terminator.
+    DWORD stored_bytes = 0;
+    REQUIRE(RegQueryInfoKeyW(raw.get(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                             &stored_bytes, nullptr, nullptr) == ERROR_SUCCESS);
+    INFO("the OS stored " << stored_bytes << " bytes for the 4-byte REG_SZ write; not 4 means the OS padded the "
+         "write, which is not a fault in the plugin's read");
+    REQUIRE(stored_bytes == 4);
     Win32Registry reg;
     yuzu::registry::QueryResult q;
     REQUIRE(reg.query_value(as_handle(raw.get()), "V", 4096, q) == ERROR_SUCCESS);
