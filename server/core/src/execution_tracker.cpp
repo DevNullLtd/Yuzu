@@ -187,9 +187,9 @@ const char* kSelectErrorDetailEmpty = ", '' AS last_error_detail";
 // ingest treats an empty plugin as unverified), so it counts as Forensics-tier here: the fail
 // closed reading, the same one the ingest takes. A failed read returns nullopt; the caller then treats EVERY
 // candidate as Forensics (the safe reading: a bounded token or the placeholder is shown instead of
-// free text). `command_execution` has no `execution_id` index (a plain CREATE INDEX on an existing
-// table is barred by the store playbook), so this is a scan of at most 24h of mappings; it runs
-// only when a result actually carries a non-empty error text.
+// free text). The lookup is by `execution_id`, served by `idx_command_execution_execution_id`
+// (migration 7), so its cost follows the rows of the named executions, not the size of the table;
+// it runs only when a result actually carries a non-empty error text.
 // The decision is per EXECUTION: a mixed execution (one Forensics command and one ordinary command)
 // has every agent's text reduced on read, while the bus and the outbox decide per frame's plugin.
 std::optional<std::unordered_set<std::string>>
@@ -541,11 +541,19 @@ const std::vector<pg::PgMigration>& migrations() {
         // the ADD COLUMN metadata-only (no rewrite); the table was created in v2 and a fresh
         // database runs v2 and v6 back to back. `execution_id` stays NOT NULL: an untracked
         // dispatch (e.g. `/api/command`) now records the empty string, which readers treat as "no
-        // execution". No index is added (store playbook: a plain CREATE INDEX on an existing
-        // table is barred); the one reader by `plugin`, `forensics_executions_among`, already
-        // scans a bounded window.
+        // execution".
         {6,
          "ALTER TABLE command_execution ADD COLUMN plugin TEXT NOT NULL DEFAULT '';"},
+        // #4990: the read-side error-text reduction and the in-transaction one look up
+        // `command_execution` by `execution_id`; without an index each lookup is a scan of up to
+        // 24 hours of dispatch records (measured at 38 to 88 ms at 1M rows and 263 to 628 ms at
+        // 10M), which the sticky-terminal write path pays inside the agent-status transaction.
+        // A plain (transactional) index build is the store playbook's recorded exception for a
+        // deployment with no rolling upgrade: this release is a hard cutover into a fresh
+        // database, where the table is empty when the index is built; an already-large table
+        // would take a long lock, and that population is outside the deployment contract.
+        {7,
+         "CREATE INDEX idx_command_execution_execution_id ON command_execution(execution_id);"},
     };
     return kMigrations;
 }

@@ -484,6 +484,24 @@ TEST_CASE("tracker error_detail: a later RUNNING frame never republishes a store
     }
 }
 
+TEST_CASE("dispatch record: the execution-id lookups of the error-text reduction are indexed",
+          "[pg][server][forensics_tier]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, forensics_leaks_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    ExecutionTracker tracker{pool};
+    REQUIRE(tracker.is_open());
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT indexdef FROM pg_indexes WHERE schemaname = 'execution_tracker' AND "
+        "tablename = 'command_execution' AND indexname = 'idx_command_execution_execution_id'",
+        std::vector<std::string>{});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(res.get()) == 1);
+    CHECK(std::string(PQgetvalue(res.get(), 0, 0)).find("(execution_id)") != std::string::npos);
+}
+
 TEST_CASE("tracker error_detail: rows written before the sanitizer are reduced on every read",
           "[pg][server][forensics_tier][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, forensics_leaks_tpl);
