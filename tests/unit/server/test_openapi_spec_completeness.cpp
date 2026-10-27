@@ -1358,14 +1358,15 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
           "[openapi][structure]") {
     // The operationId is the method name an OpenAPI client generator derives (upgrading.md says
     // so), so renaming one is a breaking change for every generated client. The checksum below
-    // fails on ANY change to the set of ids: a rename, an addition or a removal.
+    // fails on ANY change to the id-to-operation pairs: a rename, an addition, a removal, or
+    // two operations exchanging their ids (which a hash of the ids alone cannot see).
     //
     // To update it after an intended change: run this test, copy the checksum the failure
     // prints into kOperationIdChecksum, and state the rename in the operationId note of
     // docs/user-manual/upgrading.md and in the change's changelog fragment. The count is
     // derived from the document (it is the number of operations); the one hand-kept number
     // for it lives in the typed-response test's exclusion list, not here.
-    static const std::string kOperationIdChecksum = "\"6c0502f0540bc8a1\"";
+    static const std::string kOperationIdChecksum = "\"32508ec3b723d370\"";
     static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
@@ -1385,13 +1386,15 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
                 FAIL_CHECK("operationId " << id << " is also used by " << it->second);
         }
         CHECK(seen.size() == ops.size());
-        // std::map iterates in key order, so the joined text is the sorted list of ids.
+        // std::map iterates in key order, so the joined text is the sorted "id method path" lines.
         std::string joined;
         for (const auto& [id, where] : seen) {
             joined += id;
+            joined += ' ';
+            joined += where;
             joined += '\n';
         }
-        INFO("sorted operationIds hash to " << yuzu::server::content_etag(joined)
+        INFO("sorted operationId pairs hash to " << yuzu::server::content_etag(joined)
              << " (update kOperationIdChecksum, and see the comment above it)");
         CHECK(yuzu::server::content_etag(joined) == kOperationIdChecksum);
     }

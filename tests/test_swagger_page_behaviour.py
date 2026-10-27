@@ -507,6 +507,17 @@ const out = {};
   out.r_console_errors = consoleErrors.length;
   out.r_guides = root.byClass('sw-gbtn').length;
   out.r_expect_guides = (real.tags || []).filter(t => t['x-yuzu-guide']).length;
+  // Every guide, operation and model of the real document opens: no error box, no console error.
+  await reload({ status: 200, body: real });
+  consoleErrors.length = 0;
+  root.byClass('sw-gbtn').forEach(b => b.click());
+  root.byClass('sw-op-h').forEach(b => b.click());
+  root.byClass('sw-model-h').forEach(b => b.click());
+  const isOpen = b => b.getAttribute('aria-expanded') === 'true';
+  out.x_ops = root.byClass('sw-op-h').length; out.x_ops_open = root.byClass('sw-op-h').filter(isOpen).length;
+  out.x_guides = root.byClass('sw-gbtn').length; out.x_guides_open = root.byClass('sw-gbtn').filter(isOpen).length;
+  out.x_models = root.byClass('sw-model-h').length; out.x_models_open = root.byClass('sw-model-h').filter(isOpen).length;
+  out.x_errors = root.byClass('sw-error').length; out.x_console = consoleErrors.length;
   console.log(JSON.stringify(out));
 })().catch(e => { console.log(JSON.stringify({ crash: String(e && e.stack || e) })); process.exit(1); });
 """
@@ -774,6 +785,12 @@ def main():
     check((out["r_typed"], out["r_untyped"], out["r_unavail"]) == (py["typed"], py["untyped"], py["unavail"]),
           "page pills %r/%r/%r differ from the counts derived from the document %r" % (
               out["r_typed"], out["r_untyped"], out["r_unavail"], py))
+    check(out["x_ops"] == out["r_expect"] and out["x_ops_open"] == out["x_ops"] and out["x_guides"] == out["r_expect_guides"]
+          and out["x_guides_open"] == out["x_guides"] and out["x_models"] > 100 and out["x_models_open"] == out["x_models"],
+          "every operation, guide and model of the real document must open: ops %r/%r guides %r/%r models %r/%r"
+          % (out["x_ops_open"], out["x_ops"], out["x_guides_open"], out["x_guides"], out["x_models_open"], out["x_models"]))
+    check(out["x_errors"] == 0 and out["x_console"] == 0,
+          "opening everything in the real document must draw no error box and log nothing: %r boxes, %r console" % (out["x_errors"], out["x_console"]))
     check(out["b_guide_msg"] and out["b_op_msg"], "a guide or operation that throws must still show its inline message")
     check(any("could not draw guide Boom" in e for e in out["b_logs"]) and any("could not draw operation GET /boom" in e for e in out["b_logs"]),
           "a guide and an operation that cannot be drawn must be logged by name: %r" % out["b_logs"])
