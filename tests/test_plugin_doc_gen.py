@@ -467,6 +467,18 @@ class ColumnDocKeys(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only meaningful on a string column"):
             g.parse_definition_docs(self._doc({"name": "n", "type": "int64", "values": [1, 2]}), "p.yaml")
 
+    def test_discriminator_is_a_boolean_on_the_first_string_column_only(self):
+        with self.assertRaisesRegex(ValueError, "`discriminator` must be a boolean"):
+            g.parse_definition_docs(self._doc({"name": "c", "type": "string", "discriminator": "true"}), "p.yaml")
+        with self.assertRaisesRegex(ValueError, "only meaningful on a string column"):
+            g.parse_definition_docs(self._doc({"name": "c", "type": "int64", "discriminator": True}), "p.yaml")
+        later = self._doc({"name": "a", "type": "string"})
+        later[0]["spec"]["result"]["columns"].append({"name": "b", "type": "string", "discriminator": True})
+        with self.assertRaisesRegex(ValueError, "x.a.b: `discriminator` is only meaningful on the first column"):
+            g.parse_definition_docs(later, "p.yaml")
+        ok = g.parse_definition_docs(self._doc({"name": "c", "type": "string", "discriminator": True}), "p.yaml")
+        self.assertNotIn("discriminator", ok[0].columns[0])  # behavioural, not documentation: not emitted
+
     def test_well_formed_keys_pass(self):
         defs = g.parse_definition_docs(self._doc({"name": "c", "type": "string", "values": ["a", "b"],
                                                   "example": "a", "platforms": ["windows", "darwin"],

@@ -1040,9 +1040,9 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         }
         // Allowlist of source names — never interpolate an arbitrary token into the
         // `<src>_enabled` configure key.
-        static const std::array<std::string_view, 10> kKnown = {
+        static const std::array<std::string_view, 11> kKnown = {
             "process", "tcp", "service", "user",   "perf",
-            "procperf", "netqual", "module", "arp", "dns"};
+            "procperf", "netqual", "module", "arp", "dns", "registry"};
         const std::string changes = get_param(req, "changes");
         // Review finding (#3133): this route gates only Infrastructure:Read above,
         // but `tar.configure` is classified Infrastructure:Write — the route relied

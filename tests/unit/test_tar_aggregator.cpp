@@ -588,7 +588,7 @@ TEST_CASE("TAR #538: every registered capture source is classified by diff_state
     // performed out here.
     const std::set<std::string_view> non_diff_sources = {"perf",     "procperf", "netqual",
                                                           "module",   "netconn",  "power",
-                                                          "removable", "usage"};
+                                                          "removable", "usage",  "registry"};
 
     for (const auto& src : capture_sources()) {
         const bool is_diff = diff_sources.contains(src.name);

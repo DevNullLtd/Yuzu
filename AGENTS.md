@@ -93,6 +93,10 @@ concerns, the second auth, access-control, and request-admission chokepoints, th
 read-only security-posture plugin rows, the gateway rows (upstream peer authorization, origin
 trust) and the same-site write-gate row, the fourth Forensics / per-user-software-data concerns
 (the third and fourth are the Wave 8 and Wave 10 splits). Same authority as this file.
+security-posture plugin rows (the read-only posture plugins and the mutating registry row), the
+gateway-upstream peer-authorization row and the same-site write-gate row, the fourth Forensics /
+per-user-software-data concerns (the third and fourth are the Wave 8 and Wave 10 splits). Same
+authority as this file.
 
 **OPEN AND READ ALL FOUR FILES — they are not auto-loaded on this leg:**
 

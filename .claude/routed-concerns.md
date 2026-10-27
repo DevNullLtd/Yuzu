@@ -9,6 +9,18 @@
      origin trust) are in security-posture; four files is the cap
      (docs/instruction-file-standard.md). Row discipline: catastrophic-if-violated
      invariants + doc pointers ONLY — detail goes in the routed doc. -->
+<!-- The "Routed concerns" table of CLAUDE.md, pulled in by its @-import — loaded
+     every session, same authority as CLAUDE.md. This file holds the
+     platform/product/data/observability concerns; auth, access-control and
+     request-admission live in the sibling `routed-concerns-access-control.md`,
+     the security-posture plugin rows (the read-only posture plugins and the
+     mutating registry row) in `routed-concerns-security-posture.md`, and
+     Forensics / per-user-software-data concerns in
+     `routed-concerns-software-estate.md`. The gateway-upstream
+     peer-authorization row is in the security-posture file; four files is the
+     cap (docs/instruction-file-standard.md). Row discipline:
+     catastrophic-if-violated invariants + doc pointers ONLY — detail goes in
+     the routed doc. -->
 
 | Concern | Doc | Loaded by |
 |---|---|---|

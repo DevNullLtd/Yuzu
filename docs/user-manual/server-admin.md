@@ -365,7 +365,8 @@ separately.
 **What changed.** Agent plugins that mount a logged-out Windows profile's `NTUSER.DAT` offline (to
 read its `HKEY_USERS` hive without a live session) have always run a file-level check against that
 hive — the path must not cross a UNC/non-fixed-drive or a reparse-point ancestor, and the file
-itself must be a regular file owned by the profile, LocalSystem or Administrators. Before this
+itself must be a regular file owned by the profile, LocalSystem or Administrators, with no more
+than one hard link (`hive_hardlinked`). Before this
 change only one plugin (`privacy_permissions`) opted into that check; the other five production
 callers (`autoruns`, `installed_apps`, `license_scan`, `registry`, and TAR's mapped-drive-history
 collector) mounted with no check at all. The check is now the default for all of them.
@@ -938,28 +939,29 @@ leader elected over a dedicated Postgres coordination connection (ADR-2002 §3).
 On a single server the sole replica is always the leader, so behaviour is
 unchanged.
 
-> **This is the *attempt-gate* half only — do NOT run a second server replica on
-> the strength of this change alone.** It ensures only the leader *attempts* the
-> dispatching loops; the correctness guarantee that a paused ex-leader cannot
-> still commit a dispatch (the epoch fence in the claim write) lands in a
-> follow-on slice, and a supported active-active deployment additionally needs
-> gateway-fronted routing, shared agent presence, and PKI HA. Running a second
-> replica against this slice alone can double-dispatch destructive singleton work
-> (quarantine, deployment, policy remediation). Single-server is the only
-> supported topology today.
+> **The elector alone is not a reason to run a second server replica.** It
+> ensures only the leader *attempts* the dispatching loops. The correctness
+> guarantee that a paused ex-leader cannot still commit a leader-driven dispatch
+> is the epoch fence in the claim write (the command outbox, since the follow-on
+> slice 3.3; operator-triggered remediation is arbitrated by its own durable
+> per-target claim instead). A supported active-active deployment additionally
+> needs gateway-fronted routing, shared agent presence, PKI HA and the rest of
+> the safe-to-scale gate (`docs/ha-delivery-matrix.md`); that gate is **not**
+> lifted. Single-server is the only supported topology today.
 
 What you will see, on **every** deployment including single-server, are new
 startup log lines — these are routine, not a fault:
 
 - `leader_elector: coordination connection established (host=… port=… dbname=…; dedicated, never-recycled)`
 - `leader_elector: election loop started (poll=5s)`
-- `leader_elector: acquired leadership 'server_background_leader' at epoch N`
+- `leader_elector: acquired leadership 'server_background_leader' at epoch N (holder_id=srv-…)`
 
 If instead you see `[HA] leader_elector could not open its coordination
 connection; FencedLeaderOnly background loops are PAUSED …`, the server could not
 reach its Postgres coordination connection: it keeps serving and re-tries every
 election cycle (so a transient blip self-heals within seconds), but while the
-message persists the four dispatching loops above do not run. This is fail-closed
+message persists the leader-only background loops (the four above, plus command-outbox
+delivery) do not run. This is fail-closed
 by design — a paused loop never double-dispatches — and a persistent occurrence
 is a Postgres-reachability problem to investigate, not a server bug. (The
 operator-triggered paths are unaffected: a manual policy remediation or evaluation,
@@ -968,6 +970,144 @@ remediation/evaluation is also *completed* on that same replica, so it still rea
 a terminal verdict even while that replica is not the leader. Only the leader-owned
 *scheduling* half — the automatic due-policy dispatch and the periodic CRL freshness
 re-publish — pauses.)
+
+### Leader election: metrics and alerts (HA WS-11)
+
+Running more than one server replica is **not supported today** (the safe-to-scale gate in
+`docs/ha-delivery-matrix.md` is not lifted); the multi-replica wording below is for pilots and
+pre-GA testing. On the supported single-server deployment `YuzuLeaderSplitBrain` cannot fire (one
+series); in practice only `YuzuLeaderNoLeader` and `YuzuLeaderCoordinationStale` fire, and
+`YuzuLeaderFlapping` only on a Postgres connection flap or a restart loop whose acquire is delayed.
+
+Each replica exposes the elector's state as `yuzu_server_leader_*` series on its
+own `/metrics` (reference: [metrics.md](metrics.md) "Leader election metrics"),
+and `docs/prometheus/yuzu-alerts.yml` ships the `yuzu-ha-leader` group. Reload
+your Prometheus rule file to pick it up. **Prometheus must scrape each replica
+individually** (not through the load balancer), and unrelated Yuzu deployments
+sharing one Prometheus need separate `job`s (the shipped scrape configs all use
+`job_name: 'yuzu-server'`, so a second stack must be renamed), because the alerts
+aggregate `sum by (job)`. **`/readyz` does not include leadership**: a replica that
+cannot lead is a ready follower, so these alerts are the only signal that the
+leader-only passes (scheduled dispatch, policy dispatch, quarantine
+reconciliation, the command-outbox delivery loop and the CRL re-publish) are
+paused. The thresholds below (2 m, 5 m, 6 acquisitions per 30 m, 120 s) are
+initial claims with no multi-replica fleet data behind them; tune them from your
+own history.
+
+**Every one of these alerts needs a successful scrape, and no server `up == 0`
+rule ships.** If the primary freezes while its kernel keeps acknowledging packets,
+the `/metrics` handler's own database queries hang too, the scrape fails, every
+`yuzu_server_leader_*` series goes stale at once and every rule below evaluates
+empty. Configure an `up{job="<your server job>"} == 0` alert (the shipped scrape configs
+name the job `yuzu-server`; use yours, with a `for:` of a few scrape intervals) and probe `/readyz`
+from a blackbox exporter or your load balancer as the backstop. A hung scrape becomes
+`up == 0` only after Prometheus's `scrape_timeout`. No server dead-man's-switch rule ships:
+#2956 tracked it and was closed without building it.
+
+Find the replica that is the leader with
+`yuzu_server_leader_is_leader == 1`; the cluster's authoritative record is
+`SELECT * FROM leader_elector.leader_state;` (its `holder_id` matches the
+`(holder_id=srv-…)` text in the `acquired leadership` log line of the process
+that holds it).
+
+- **`YuzuLeaderSplitBrain` (critical).** More than one replica believes it leads
+  for over 2 minutes. **First, compare each replica's coordination
+  host/dbname** in its startup log line (`coordination connection established
+  (host=… dbname=…)`). Against the real elector the usual cause is replicas
+  pointed at **different databases** (a split `--postgres-dsn`, or a Patroni
+  double-primary). In that case each replica holds a valid lock and a valid epoch
+  *in its own database*, so the epoch fence does **not** span them: both
+  replicas run every leader-only pass, and on a forked database the same
+  scheduled occurrence can be sent twice (only the agent's `command_id` dedup,
+  which is effectively-once, absorbs it). Then establish **which database is
+  authoritative**: `patronictl list`, and compare
+  `SELECT system_identifier FROM pg_control_system();` on each side (two different
+  identifiers are two different clusters; hostnames, aliases and a VIP can make
+  "different" hosts the same cluster, and a Patroni demotion followed by `pg_rewind`
+  discards the demoted side's divergent writes, so do not demote on a log-line
+  comparison alone). Then fix the DSN, or fence or demote the wrong primary in
+  Patroni, **before restarting any replica**: a restart just reconnects to
+  whichever primary the DSN resolves to. Only when every replica
+  shares **one** database is the stale replica the one whose
+  `yuzu_server_leader_epoch` differs from `leader_state.current_leader_epoch`;
+  restart it. Within one database fenced claims stay safe (assuming no committed
+  transaction was lost on a promotion, that is, synchronous replication, the
+  shipped quorum default; the fence is not claimed safe across a lossy
+  asynchronous promotion) and what runs twice is the unfenced background passes. **What it does not catch:** a *paused*
+  ex-leader (the case the epoch fence exists for) — its process is frozen, so its
+  series goes stale, not `1`, and a frozen process serves no `/metrics`, so no
+  alert on its own series can evaluate. That case is covered by the fence itself
+  (and `YuzuLeaderNoLeader` fires after 5 minutes if no other replica takes
+  over); `YuzuLeaderCoordinationStale` is the signal for a leader that is alive
+  and serving `/metrics` but whose coordination connection has stopped
+  answering. This alert is verified
+  by Prometheus rule unit cases only; a genuine two-leader state cannot be
+  produced against one database.
+- **`YuzuLeaderNoLeader` (critical).** No replica has believed it leads for over
+  5 minutes, so the leader-only passes are paused on every replica while
+  `/readyz` stays green. **Step 0:** scrape every replica's `/metrics` directly
+  and check `up` for each. If any replica reads `yuzu_server_leader_is_leader 1`
+  this is a scrape problem, not a leader problem (a leader whose own scrape target
+  is down leaves only the followers' zeros, which sums to 0). Otherwise check, in
+  order: the server log for
+  `[HA] leader_elector could not open its coordination connection` and the
+  `yuzu_server_leader_acquire_failures_total{cause}` series (`connect` rising
+  means the dedicated connection cannot be made, or its schema migration failed:
+  reach the primary directly, not through a transaction-mode pooler); then, in
+  Postgres,
+  `SELECT a.pid, a.client_addr, a.state, a.backend_start, a.state_change FROM pg_locks l JOIN pg_stat_activity a USING (pid) WHERE l.locktype = 'advisory' AND l.classid = 1735291205;`
+  Compare `client_addr` with the replicas: a lock held by a backend that **no live
+  replica owns** is a **zombie lock holder** (a half-open connection the server
+  side has not noticed; Postgres notices only via its own keepalives, which can
+  take hours by default). On a **single** replica the zombie is typically that
+  replica's *own previous connection* after a network blip of 15 seconds or more
+  (`backend_start` older than the server process, state idle), and the replica's
+  `acquire_failures_total` stays flat because losing the try-lock to a holder is
+  the normal follower outcome and is not counted. Only that backend should be
+  terminated: `SELECT pg_terminate_backend(<pid>);` (this needs superuser or
+  membership of `pg_signal_backend`), after which a replica acquires within one
+  election cycle. Terminating a *live* leader's backend forces a failover. Fenced claims stay
+  safe; for up to about 8 seconds (one heartbeat interval, plus any pass already in flight) before the old leader notices, its unfenced passes
+  (schedule tick, policy dispatch, quarantine reconcile, CRL re-publish) can
+  overlap the successor's, and any duplicate dispatch is absorbed only by the
+  agent's `command_id` dedup. During a restart of the only replica the series is
+  absent and the alert does not fire. **Silence this alert during planned
+  Postgres maintenance or a switchover that will take more than 5 minutes:**
+  scope the silence to the job, end it at the window plus about 10 minutes, and
+  afterwards confirm a replica reads `yuzu_server_leader_is_leader 1`.
+- **`YuzuLeaderFlapping` (warning).** Six or more acquisitions in 30 minutes across
+  a **multi-replica** deployment: a network or Postgres failover flap, or a
+  handover loop. Compare with `YuzuServerPostgresUnreachable` and
+  `yuzu_server_leader_lost_total{cause="liveness_failed"}`. A rolling upgrade of an
+  N-replica deployment legitimately adds up to N acquisitions; the threshold
+  leaves room for four replicas. **It usually does not detect a single
+  replica in a restart loop**: the counter is synced at scrape time, so a boot whose
+  leadership is acquired before its first scrape reads 1 with no rise, whereas a
+  boot whose acquire is delayed (slow or unreachable Postgres, a lock still held by
+  the previous process) is counted. Do not rely on this rule for that failure; use
+  `YuzuServerRestartLoop` (which has its own documented limits).
+- **`YuzuLeaderCoordinationStale` (critical).** A replica still reads leader but
+  its coordination connection has not answered for over 120 seconds. This is the
+  only series that moves when a network partition lets the peer's kernel keep
+  acknowledging packets and only the dedicated coordination connection wedges:
+  the heartbeat then blocks inside a database call that has **no client-side
+  time bound** against a frozen-but-acknowledging backend (about 100 seconds is
+  merely how long one measured pause lasted), the replica's leadership belief
+  stays `1`, so the count of leaders stays at one and **both `YuzuLeaderSplitBrain`
+  and `YuzuLeaderNoLeader` stay silent** while that replica's leader-only passes
+  keep attempting, and its fenced claims cannot commit (its unfenced passes may still succeed). Fenced claims still cannot double-dispatch
+  (the epoch predicate is evaluated in the claim's write on an ordinary pooled
+  connection). Detection takes about 4–5 minutes (age above 120 s, held for 2
+  minutes, plus a scrape interval); a shorter freeze never alerts. Check
+  connectivity from that replica to the primary. If the primary is reachable,
+  terminate the stuck backend as above (that ends the lock and unblocks the stale
+  replica, which then drops its belief; its unfenced passes can briefly overlap the
+  successor's, with the same `command_id`-dedup caveat); otherwise restart the replica. A restart
+  can take as long as the supervisor's stop timeout, or need a second signal,
+  while the coordination call is wedged; if the old backend still holds the
+  advisory lock afterwards, terminate it (see `YuzuLeaderNoLeader`). **Blind
+  spot:** when the whole primary is frozen the scrape itself fails (see the
+  note above), so this rule cannot evaluate: rely on the `up == 0` backstop.
 
 ### vNEXT — Guardian compliance % and the fleet honesty banner now reflect Linux Service Guards correctly (#4252; NOT breaking)
 
@@ -1066,9 +1206,9 @@ dispatch a fix. (This is the guarantee for when the safe-to-scale gate lifts, AD
 **Scope of the guarantee.** This holds between replicas running the **same
 schema version**. A rolling upgrade across the migration boundary can
 transiently run an old binary that predates the durable claim alongside a new
-one; that mixed-version window is gated today by issue #4014 (which blocks
-running a second production replica) pending a durable cluster-capability
-admission gate. The exposure is one-directional: a row written by an old
+one; that mixed-version window is covered today only by the safe-to-scale gate
+(`docs/ha-delivery-matrix.md`, which is procedural and not lifted), pending a
+durable cluster-capability admission gate (#6528). The exposure is one-directional: a row written by an old
 binary carries claim-generation `0`, a value a new binary never mints.
 Separately, this is effectively-once, not exactly-once (consistent with
 ADR-2002): a replica that pauses for longer than `fixing_stale_seconds`
@@ -5842,7 +5982,7 @@ On the main listener, a `/health` or `/api/health` request that carries a `Cooki
 - **A sustained overload also reds every replica together, and that is deliberate (#4944).** If the probe's one-row, no-table `SELECT` misses its 2 s deadline twice in a row, the database cannot answer real requests within their deadlines either (nearly every request validates a session and writes an audit row), so the replica is truthfully unable to serve — and, from the client side, a hopelessly slow backend and a frozen one look the same. There is **no server-side hysteresis** by decision: the rule stays two failures to go red, one success to recover, and your load balancer's thresholds are the damping — see "Load balancers and shutdown drain" below for the recommended values. A *brief* stall never evicts: one failed probe is a blip (`scripts/ha/ha-readyz-scenarios.sh`, scenario M holds a 3 s pause green; scenario L shows a CPU-starved database going red and recovering within one probe of the limit being lifted).
 - **Enablement is detail, not a gate.** The `enablement` object reports whether a regression is declared (`regression_pending`), whether this boot found no continuity anchor (`anchor_unwitnessed_at_boot`, which is `true` on every fresh install) and whether an endpoint reported above the store's highest (`report_ahead`). None of them changes the verdict. They are read from a cache refreshed at boot and when this replica declares a regression, so a declaration made by another replica shows here only after this one restarts; see [Enablement continuity anchor](#enablement-continuity-anchor). The `enablement_store` row is an ordinary startup check.
 - **The store rows are startup checks.** Every other row (`response_store`, `session_store`, ...) reports whether that store opened and migrated when the server started. They do not re-check a running store — a runtime problem with one store (a revoked grant, a dropped table) shows up as `503`s on that store's routes and in metrics, not on `/readyz`, because every replica shares the same database and moving traffic elsewhere would not help. For example, DEX Apps lists refuse with `score_policy_unavailable` once the `dex_score_policy` key has been unreadable for over 60 s, or at once when no policy is cached (a restart during the outage, or a concurrent first read) (see `yuzu_server_runtime_config_read_degrade_total{reason}`).
-- **Leadership is not readiness.** A replica that is not the background-work leader is fully ready.
+- **Leadership is not readiness.** A replica that is not the background-work leader is fully ready, and so is one whose leader elector could not open its coordination connection: it still serves every operator-synchronous request. The paused background passes are reported by the `yuzu_server_leader_*` metrics and the `YuzuLeaderNoLeader` alert instead (see [Leader election: metrics and alerts](#leader-election-metrics-and-alerts-ha-ws-11)).
 
 ### Probing a TLS-enabled server
 

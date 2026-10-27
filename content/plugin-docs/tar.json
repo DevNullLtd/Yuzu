@@ -898,7 +898,7 @@
     }
   ],
   "description": "Timeline Activity Record -- continuous system state change tracking",
-  "how_it_works": "TAR is the agent's local telemetry warehouse. Four scheduled collectors diff each cycle's OS\nsnapshot against the previous baseline and append change events to a local SQLite database\n(`tar.db`): `collect_fast` (process + network, default 60s), `collect_slow` (service + user\nsession, default 300s), `collect_perf` (device CPU/memory/disk/network counters, default 30s) and\n`collect_software` (installed-software inventory, default hourly) — all four triggers are\nregistered in `init()` (`tar_plugin.cpp:601-644`). `collect_slow` also drives a generic cursor-model\nloop (`tar_plugin.cpp:2122-2130`) over the sources `make_cursor_sources()` constructs\n(`tar_cursor_sources.cpp:30-35`): `power` (sleep/wake/AC-power transitions — Windows\n`PowerRegisterSuspendResumeNotification`/`WM_POWERBROADCAST`, Linux `systemd-logind`\nPrepareForSleep + power-supply sysfs/udev, macOS `pmset -g log` replay) and `removable`\n(removable-media attach/detach plus exec-from-removable correlation — Windows `EvtQuery` over the\nPartition/Diagnostic and Kernel-PnP channels, Linux a udev netlink monitor, macOS DiskArbitration\n`DADiskAppeared`/`Disappeared`; `tar_removable_diskarb.mm`). The plugin has 16 registered\ncapture sources and every one ships **on by default** on every OS (`default_enabled` in\n`tar_schema_registry.cpp`, enforced by a registry-wide test); an operator can disable any source\nper host with `configure`. `rollup` runs every 15 minutes: it always\naggregates live rows into hourly/daily/monthly tiers first, then unconditionally enforces\nretention on every tier, deleting aged rows (`tar_plugin.cpp:3619-3627`) — the ordering is\nload-bearing and the reason the capability declaration marks this action Destructive/Irreversible.\nReads go through `status` (health + the retention clock-guard counters), `query`/`export` (the\ncore process/network/service/user/software union, or one type behind an explicit filter — arp,\ndns and mapdrive are device-state sources reachable only that way, never the default feed) and `sql`\n(an arbitrary `SELECT` against `$`-prefixed warehouse tables, validated SELECT-only and translated\nto real table names — `tar_sql_executor.cpp:205-244`). `snapshot` forces an out-of-cycle full\ncollection across all four collectors and reports `complete` or `partial|<sources>` if any source\nretained a stale baseline instead. `fleet_snapshot` is a separate on-demand full re-enumeration\nthat bypasses the warehouse entirely, feeding the 3D fleet-topology view. `configure` rewrites\naround 25 collection knobs (retention, intervals, per-source enable flags, redaction patterns).\n`purge_source` deletes every warehouse row for one named source, but only once that source is\nalready disabled — closing the scan-then-purge race a still-collecting source would otherwise hit\n(`tar_plugin.cpp:2987-3031`).\n\nDeliberately not: TAR does not stream events to the server in real time — everything lands in the\nlocal warehouse first and is pulled on `query`/`export`/`sql`/`status`. It does not replay history\nfrom zero when a cursor-model source's log position is lost or wraps — it re-baselines forward and\nrecords a `capture_gap` (`tar_cursor.hpp:25-75`). It never fabricates OS support: a leg without a\nbound mechanism reports `planned`, not a guessed read.",
+  "how_it_works": "TAR is the agent's local telemetry warehouse. Four scheduled collectors diff each cycle's OS\nsnapshot against the previous baseline and append change events to a local SQLite database\n(`tar.db`): `collect_fast` (process + network, default 60s), `collect_slow` (service + user\nsession, default 300s), `collect_perf` (device CPU/memory/disk/network counters, default 30s) and\n`collect_software` (installed-software inventory, default hourly) — all four triggers are\nregistered in `init()` (`tar_plugin.cpp:601-644`). `collect_slow` also drives a generic cursor-model\nloop (`tar_plugin.cpp:2122-2130`) over the sources `make_cursor_sources()` constructs\n(`tar_cursor_sources.cpp:30-35`): `power` (sleep/wake/AC-power transitions — Windows\n`PowerRegisterSuspendResumeNotification`/`WM_POWERBROADCAST`, Linux `systemd-logind`\nPrepareForSleep + power-supply sysfs/udev, macOS `pmset -g log` replay) and `removable`\n(removable-media attach/detach plus exec-from-removable correlation — Windows `EvtQuery` over the\nPartition/Diagnostic and Kernel-PnP channels, Linux a udev netlink monitor, macOS DiskArbitration\n`DADiskAppeared`/`Disappeared`; `tar_removable_diskarb.mm`) — and, on Windows only, `registry`\n(registry value and key changes under a curated persistence/policy key list: a\n`RegNotifyChangeKeyValue` subtree watch finds what changed against a per-root baseline, giving\neach value's old and new data; the process that made a change is not recorded yet, so `actor_pid`\nis 0 on every row until attribution follows in a later release. **Stored values are unmasked**;\n`tar_registry_source.cpp`). The plugin has 17 registered\ncapture sources and every one ships **on by default** on every OS (`default_enabled` in\n`tar_schema_registry.cpp`, enforced by a registry-wide test); an operator can disable any source\nper host with `configure`. `rollup` runs every 15 minutes: it always\naggregates live rows into hourly/daily/monthly tiers first, then unconditionally enforces\nretention on every tier, deleting aged rows (`tar_plugin.cpp:3619-3627`) — the ordering is\nload-bearing and the reason the capability declaration marks this action Destructive/Irreversible.\nReads go through `status` (health + the retention clock-guard counters), `query`/`export` (the\ncore process/network/service/user/software union, or one type behind an explicit filter — arp,\ndns and mapdrive are device-state sources reachable only that way, never the default feed) and `sql`\n(an arbitrary `SELECT` against `$`-prefixed warehouse tables, validated SELECT-only and translated\nto real table names — `tar_sql_executor.cpp:205-244`). `snapshot` forces an out-of-cycle full\ncollection across all four collectors and reports `complete` or `partial|<sources>` if any source\nretained a stale baseline instead. `fleet_snapshot` is a separate on-demand full re-enumeration\nthat bypasses the warehouse entirely, feeding the 3D fleet-topology view. `configure` rewrites\naround 25 collection knobs (retention, intervals, per-source enable flags, redaction patterns).\n`purge_source` deletes every warehouse row for one named source, but only once that source is\nalready disabled — closing the scan-then-purge race a still-collecting source would otherwise hit\n(`tar_plugin.cpp:2987-3031`).\n\nDeliberately not: TAR does not stream events to the server in real time — everything lands in the\nlocal warehouse first and is pulled on `query`/`export`/`sql`/`status`. It does not replay history\nfrom zero when a cursor-model source's log position is lost or wraps — it re-baselines forward and\nrecords a `capture_gap` (`tar_cursor.hpp:25-75`). It never fabricates OS support: a leg without a\nbound mechanism reports `planned`, not a guessed read.",
   "inputs": [
     {
       "constraints": {
@@ -1148,6 +1148,17 @@
       "definition_id": "crossplatform.tar.configure",
       "description": "How far BEFORE enablement the removable source's first read may reach into OS-retained device-attach history (same shape as netconn_lookback_seconds / power_lookback_seconds above). Set to \"0\" to disable the pre-enablement read entirely (forward-only from the moment it is enabled). Clamped to 0-7776000 (0 - 90 days); default 604800 (7 days). Applies to the first read after enablement (and after a late enable); once caught up the source reads only forward. Requires agent v0.12.0+.\n",
       "name": "removable_lookback_seconds",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^(true|false)$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Enable or disable the Windows registry change source (registry → $Registry_Live, cursor-model seam). **ON by default (\"true\")**, like every other capture source. Windows only; on Linux and macOS the source is listed as unsupported and records nothing. A curated watch list (Run and RunOnce, Services, Image File Execution Options, AppInit_DLLs, Winlogon, LSA, Policies and Defender under HKLM, plus Run, RunOnce, Policies and Winlogon under every loaded user hive) is watched for changes; each added, changed or removed value is recorded with its old and new data. VALUES ARE STORED UNMASKED: any value under a watched key, changed or not, is readable through tar.sql - the per-key baseline in tar_state stores every current value (for example a Winlogon autologon DefaultPassword) and $Registry_Live holds the old and new data of every change. Treat both accordingly, or set \"false\" to opt out. Rows carry no acting process yet (actor_pid is 0); naming it follows in a later release. Rows land at the slow tick that observes the change (every slow_interval, 300 s by default); a full re-read of every watched key runs every 12 slow ticks (hourly at the default). A value written and reverted between two reads is not recorded. A key is baselined silently at its first read, so for a user hive that loads at logon (or a user who logs off and back on) anything written to its watched keys before that first read is not a row. Retention is a row count (500000 rows). Setting \"false\" pauses capture and a later \"true\" re-baselines every watched key (no row is invented for what changed while paused). Requires an agent newer than v0.14.1; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "name": "registry_enabled",
       "required": false,
       "type": "string"
     },
@@ -2808,6 +2819,8 @@
       "changelog.d/2026-10-21-tar-timeline-render.added.md",
       "changelog.d/2026-10-21-tar-windows-image-db-hardening.security.md",
       "changelog.d/2026-10-23-tar-timeline-page.added.md",
+      "changelog.d/2026-10-25-tar-regchange-source.added.md",
+      "changelog.d/2026-10-25-tar-retention-tiers-api.added.md",
       "changelog.d/20261014-tar-adhoc-sql-moved.changed.md",
       "changelog.d/20261021-tar-capture-sources-paused-core.fixed.md"
     ],
@@ -2859,6 +2872,9 @@
       "agents/plugins/tar/src/tar_proc_perf.hpp",
       "agents/plugins/tar/src/tar_proc_stream.cpp",
       "agents/plugins/tar/src/tar_proc_stream.hpp",
+      "agents/plugins/tar/src/tar_registry_parsers.hpp",
+      "agents/plugins/tar/src/tar_registry_source.cpp",
+      "agents/plugins/tar/src/tar_registry_source.hpp",
       "agents/plugins/tar/src/tar_removable_collector.cpp",
       "agents/plugins/tar/src/tar_removable_diskarb.mm",
       "agents/plugins/tar/src/tar_removable_parsers.hpp",
@@ -2884,6 +2900,7 @@
       "tests/test_tar_mapdrive_pin_lexical.py",
       "tests/test_tar_timeline_script_behaviour.py",
       "tests/unit/server/test_tar_process_tree.cpp",
+      "tests/unit/server/test_tar_retention_tiers.cpp",
       "tests/unit/server/test_tar_timeline_page.cpp",
       "tests/unit/server/test_tar_timeline_render.cpp",
       "tests/unit/server/test_tar_tree_routes.cpp",
@@ -2904,7 +2921,9 @@
       "tests/unit/test_tar_proc_es.cpp",
       "tests/unit/test_tar_proc_etw.cpp",
       "tests/unit/test_tar_proc_perf.cpp",
+      "tests/unit/test_tar_registry_source.cpp",
       "tests/unit/test_tar_removable.cpp",
+      "tests/unit/test_tar_retention_tiers_table.cpp",
       "tests/unit/test_tar_schema_registry.cpp",
       "tests/unit/test_tar_service.cpp",
       "tests/unit/test_tar_software.cpp",
