@@ -301,9 +301,10 @@ public:
     DexCrashSummary dex_crash_summary(const std::string& since = "",
                                       const std::string& platform = "") const;
     std::vector<DexAppCrashCount> dex_top_apps(const std::string& since = "", int limit = 20) const;
-    /// Windows-scoped (`platform`) application AND per-version stability rows in
-    /// ONE statement (one snapshot): for the `app_limit` applications affecting
-    /// the most devices (then events, then name; Windows rows only) -- the
+    /// Platform-scoped application AND per-version stability rows in ONE
+    /// statement (one snapshot); an empty `platform` means every platform. For
+    /// the `app_limit` applications affecting the most devices (then events,
+    /// then name; rows of `platform` only) -- the
     /// published activity order is the assembler's -- one total row (`version`
     /// nullopt, plus `version_count` and `apps_total`, the count of every
     /// qualifying application before the cut) and up to `version_limit`

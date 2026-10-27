@@ -151,6 +151,22 @@ inline std::string unescape_pipes(const std::string& s) {
     return out;
 }
 
+/// Split on EVERY unescaped '|' (the default shape for plugins without a fixed key/value schema).
+inline std::vector<std::string> split_all_pipes(const std::string& line) {
+    std::vector<std::string> parts;
+    size_t pos = 0;
+    while (pos <= line.size()) {
+        auto p = find_unescaped_pipe(line, pos);
+        if (p == std::string::npos) {
+            parts.push_back(unescape_pipes(line.substr(pos)));
+            break;
+        }
+        parts.push_back(unescape_pipes(line.substr(pos, p - pos)));
+        pos = p + 1;
+    }
+    return parts;
+}
+
 /// Split a pipe-delimited output line into fields according to the plugin schema.
 /// The first column ("Agent") is NOT included — the caller prepends the agent name.
 inline std::vector<std::string> split_fields(const std::string& plugin,
@@ -180,18 +196,7 @@ inline std::vector<std::string> split_fields(const std::string& plugin,
         return {unescape_pipes(line), ""};
     }
     // Default: split on all pipes
-    std::vector<std::string> parts;
-    size_t pos = 0;
-    while (pos <= line.size()) {
-        auto p = find_unescaped_pipe(line, pos);
-        if (p == std::string::npos) {
-            parts.push_back(unescape_pipes(line.substr(pos)));
-            break;
-        }
-        parts.push_back(unescape_pipes(line.substr(pos, p - pos)));
-        pos = p + 1;
-    }
-    return parts;
+    return split_all_pipes(line);
 }
 
 // -- Output line iteration ----------------------------------------------------

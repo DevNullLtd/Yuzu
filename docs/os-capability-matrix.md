@@ -379,8 +379,8 @@ implementation is.
 | filesystem | get_signature | linux | unsupported | - | - | - |
 | filesystem | get_signature | macos | supported | 2 | subprocess_runner:codesign | - |
 | filesystem | get_signature | windows | supported | 1 | wintrust | - |
-| filesystem | find_by_hash | linux | supported | 2 | std::filesystem+subprocess_runner:sha256sum | - |
-| filesystem | find_by_hash | macos | supported | 2 | std::filesystem+subprocess_runner:shasum | - |
+| filesystem | find_by_hash | linux | supported | 1 | std::filesystem+sha256_nofollow_fd | - |
+| filesystem | find_by_hash | macos | supported | 1 | std::filesystem+sha256_nofollow_fd | - |
 | filesystem | find_by_hash | windows | supported | 1 | std::filesystem+bcrypt | - |
 | filesystem | search_dir | linux | supported | 1 | std::filesystem+std::regex | - |
 | filesystem | search_dir | macos | supported | 1 | std::filesystem+std::regex | - |
