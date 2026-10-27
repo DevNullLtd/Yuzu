@@ -318,7 +318,7 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   `deploy/packaging/linux-floor-server.json` (glibc 2.34, `GLIBCXX_3.4.29`,
   `CXXABI_1.3.13`, `OPENSSL_3.0.0`, `LIBSYSTEMD_240`, `BLKID_1.0`, forbidden
   `EVP_sm4_*`; also the gateway's ERTS and OTP). They state the promise, not a
-  measurement. Changing one is a floor decision (ADR-2003 (Accepted, PR #5631),
+  measurement. Changing one is a floor decision (ADR-2003, accepted in PR #5631:
   "Floor review rule"), not a tuning edit. A typo in a family key would silently
   ungate that family (families absent from `max` are only reported), so the
   loader requires `GLIBC`, the script reports a measured family one edit away
