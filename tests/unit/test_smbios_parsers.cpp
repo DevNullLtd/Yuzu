@@ -696,7 +696,20 @@ TEST_CASE("smbios type 17: size units and layouts", "[smbios]") {
         CHECK(size(0x5C, 0x80004000) == (0x4000ull << 20)); // bit 31 reserved: masked off
         CHECK_FALSE(size(0x5C, 0).has_value());              // extended 0 = unknown
         CHECK_FALSE(size(0x5C, 0x80000000).has_value());
-        CHECK(size(0x1F, 0) == (0x7FFFull << 20));           // before 2.7 it is a plain MiB count
+    }
+    SECTION("0x7FFF with no Extended Size in the layout is unknown, still populated") {
+        // Not 32767 MiB: 0x7FFF is the "see Extended Size" sentinel, and the dword is absent.
+        const auto e = one_dimm(dimm(0x1F).u16(0x0C, 0x7FFF));
+        CHECK(e.data.populated);
+        CHECK_FALSE(e.data.size_bytes.has_value());
+        // The same structure inside an RSMB 3.5 frame decodes identically (the header never
+        // changes a field's layout; the structure's own Length does).
+        const auto r = sm::parse_rsmb(rsmb(cat({dimm(0x1F).u16(0x0C, 0x7FFF).bytes(), end_marker()})));
+        REQUIRE_FALSE(r.error);
+        REQUIRE(r.memory_devices.size() == 1);
+        CHECK(r.memory_devices[0].status == sm::Status::ok);
+        CHECK(r.memory_devices[0].data.populated);
+        CHECK_FALSE(r.memory_devices[0].data.size_bytes.has_value());
     }
     SECTION("layouts 0x15 0x1C 0x22 0x5C") {
         const auto a = one_dimm(dimm(0x15));

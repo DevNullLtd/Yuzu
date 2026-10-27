@@ -22,8 +22,9 @@
 //
 // Unknown and reserved values. Every DSP0134 `unknown` sentinel and every `reserved` value
 // decodes to nullopt, never a concrete number (core/thread count byte 0 and word 0 / 0xFFFF, memory
-// size 0xFFFF, speed 0 and a zero extended speed). Strings are RAW (right-trimmed only); string
-// index 0 is nullopt. OEM placeholder filtering is the consumer's call (is_placeholder below).
+// size 0xFFFF, memory size 0x7FFF in a layout with no Extended Size field, speed 0 and a zero
+// extended speed). Strings are RAW (right-trimmed only); string index 0 is nullopt. OEM
+// placeholder filtering is the consumer's call (is_placeholder below).
 // The walker returns the raw 16 UUID bytes and the RSMB header's major/minor; formatting the UUID
 // (byte order is version dependent, SMBIOS >= 2.6 is little-endian for the first three fields)
 // is the consumer's job.
@@ -289,9 +290,11 @@ inline Entry<Type17> decode_type17(const View& v) {
     d.populated = size != 0;
     if (size == 0) d.size_bytes = 0;
     else if (size == 0xFFFF) d.size_bytes = std::nullopt; // unknown
-    else if (size == 0x7FFF && v.len >= 0x20) {           // SMBIOS 2.7+: Extended Size, MiB
-        const std::uint64_t mib = v.u32(0x1C) & 0x7FFFFFFFu;
-        if (mib != 0) d.size_bytes = mib * 1024ull * 1024ull;
+    else if (size == 0x7FFF) {                            // "see Extended Size" (SMBIOS 2.7+, MiB)
+        if (v.len >= 0x20) {
+            const std::uint64_t mib = v.u32(0x1C) & 0x7FFFFFFFu;
+            if (mib != 0) d.size_bytes = mib * 1024ull * 1024ull;
+        } // else the layout has no Extended Size dword: the capacity is unknown, never 32767 MiB
     } else if (size & 0x8000u) d.size_bytes = static_cast<std::uint64_t>(size & 0x7FFFu) * 1024ull; // KiB
     else d.size_bytes = static_cast<std::uint64_t>(size) * 1024ull * 1024ull;                       // MiB
     d.form_factor = v.u8(0x0E);
