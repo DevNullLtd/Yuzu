@@ -1577,6 +1577,7 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     REQUIRE(real.contains("enforced"));
     REQUIRE(real["tar"].is_object());
     REQUIRE(real["tar"].contains("tick_seconds"));
+    REQUIRE(real["tar"].contains("tiers"));
     REQUIRE_FALSE(real["tar"]["tiers"].empty());
 
     const auto set_of = [](const json& arr) {
@@ -1601,6 +1602,7 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     // Every key the builder emits is declared; every key declared is emitted.
     const json& props = schema.at("properties");
     CHECK(schema.value("type", "") == type_of(real));
+    CHECK_FALSE(schema.value("nullable", false));
     CHECK(keys_of(props) == keys_of(real));
     for (const char* k : {"response_retention_days", "audit_retention_days",
                           "guardian_event_retention_days"}) {
@@ -1622,6 +1624,7 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
         cfg, yuzu::server::settings_model::RetentionEnforced{1, 2, 3});
     REQUIRE(real_set.contains("enforced"));
     CHECK(enforced.value("type", "") == type_of(real["enforced"]));
+    CHECK_FALSE(enforced.value("nullable", false));
     CHECK(keys_of(enforced.at("properties")) == keys_of(real["enforced"]));
     CHECK(set_of(enforced.at("required")) == keys_of(real["enforced"]));
     for (const auto& k : keys_of(real["enforced"])) {
@@ -1647,6 +1650,13 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     const json& item = tiers.at("items");
     CHECK(tiers.value("type", "") == type_of(real["tar"]["tiers"]));
     CHECK(item.value("type", "") == type_of(real["tar"]["tiers"][0]));
+    CHECK_FALSE(tiers.value("nullable", false));
+    CHECK_FALSE(item.value("nullable", false));
+    // `tier` and `limit_kind` are open vocabularies: a closed `enum` would make a generated
+    // client reject a new value the manual says it must tolerate.
+    const json& tier_prop = item.at("properties").at("tier");
+    CHECK_FALSE(tier_prop.contains("enum"));
+    CHECK_FALSE(item.at("properties").at("limit_kind").contains("enum"));
     CHECK(keys_of(item.at("properties")) == keys_of(real["tar"]["tiers"][0]));
     CHECK(set_of(item.at("required")) == keys_of(real["tar"]["tiers"][0]));
     bool saw_rows = false;
@@ -1654,6 +1664,9 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     for (const auto& tier : real["tar"]["tiers"]) {
         INFO("tier: " << tier.dump());
         CHECK(keys_of(tier) == keys_of(item.at("properties")));
+        // The `tier` description lists every tier name the table really uses.
+        CHECK(tier_prop.value("description", "").find(tier.at("tier").get<std::string>()) !=
+              std::string::npos);
         for (auto it = tier.begin(); it != tier.end(); ++it) {
             if (it.key() == "guaranteed_depth_seconds")
                 continue;
