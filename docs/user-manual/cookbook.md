@@ -541,6 +541,31 @@ int(result.value) >= 22621
 4. Scope: `ostype == "windows"` (the plugin also loads on macOS and Linux agents, where every action answers a `registry|unsupported|...` line instead of reading the registry)
 5. Click **Run**
 
+#### Recipe: Preview, Apply and Undo a Registry Plan
+
+`windows.registry.apply` is Destructive, so it takes explicit `agent_ids` (scope and broadcast are refused) and an
+administrator or an approval; it needs registry 2.1.0 on the agent (see [Upgrading](upgrading.md)).
+
+1. **Preview.** Run it with the default `dry_run=true` and this `plan`:
+
+   ```json
+   [{"op":"set_value","key":"SOFTWARE\\Acme","name":"Mode","type":"REG_SZ","value":"new"},
+    {"op":"delete_key","key":"SOFTWARE\\AcmeLegacy"}]
+   ```
+
+   The two items touch unrelated keys: an item on a key and one on its ancestor or descendant would be refused
+   `dependent_items`. Every `item` row should say `would_apply` and the `summary` row `undo_complete` 1. Save the reply.
+2. **Apply.** Run the same plan with `dry_run=false` and save the reply to the change record: its `item` rows
+   (`old_state`, `old_type`, `old_hex`) and `undo` rows are the only copy of the previous values.
+3. **Undo**, in reverse item order, only for items that say `applied` (or `failed` with a change): recreate
+   `SOFTWARE\AcmeLegacy` with `create_key`, then in a second plan one `set_value` per `undo` row of item 1
+   (`name`, `type`, hex as `data_hex`); for item 0, `set_value` with `type` = `old_type` and `data_hex` = `old_hex`
+   when `old_state` is `present`, or `delete_value` when it is `absent`. A row `name` of `-` is the default value:
+   omit `name` for it (a plan refuses `-`). When item 0's `created` is above 0, remove the keys it made with
+   `delete_key` in plans of their own, one call per level, deepest first (a value op and a key op on one key are
+   `dependent_items`). The undo restores values only, not the deleted key's security or volatility (the registry
+   README, "Undoing a plan").
+
 ---
 
 ### 1.8 Script Execution (`script_exec`)
@@ -967,7 +992,10 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `windows.registry.list_profiles` | list_profiles | Q | W | (none) | sid:string, profile_name:string, profile_path:string, hive_state:string |
 | `windows.registry.set_value` | set_value | A | W | hive:enum (req), key:string (req), name:string (req), value:string, data_hex:string (send one of the two), type:enum | status:string |
 | `windows.registry.delete_value` | delete_value | A | W | hive:enum (req), key:string (req), name:string (req) | status:string |
-| `windows.registry.delete_key` | delete_key | A | W | hive:enum (req), key:string (req) | status:string, counted_keys:int32, counted_values:int32, dry_run:bool, capped:bool |
+| `windows.registry.delete_key` | delete_key | A | W | hive:enum (req), key:string (req), recursive:enum, dry_run:enum | status:string, counted_keys:int32, counted_values:int32, dry_run:bool, capped:bool |
+| `windows.registry.set_user_value` | set_user_value | A | W | username:string, sid:string, key:string (req), name:string (req), value:string, data_hex:string (send one of the two), type:enum | status:string |
+| `windows.registry.delete_user_value` | delete_user_value | A | W | username:string, sid:string, key:string (req), name:string (req) | status:string |
+| `windows.registry.apply` | apply | A | W | plan:string (req, JSON array of up to 256 items), dry_run:enum (default true), continue_on_error:enum | row_kind:string, field_1..field_13:string |
 | `windows.registry.enumerate_keys` | enum_keys | Q | W | hive:enum (req), key:string (req) | subkey:string |
 | `windows.registry.enumerate_values` | enum_values | Q | W | hive:enum (req), key:string (req) | name:string, type:string |
 | `windows.registry.key_exists` | key_exists | Q | W | hive:enum (req), key:string (req) | exists:bool |
