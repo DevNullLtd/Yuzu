@@ -1288,6 +1288,7 @@ tar_test_exe = executable(
     'unit/test_tar_store.cpp',
     'unit/test_tar_schema_registry.cpp',
     'unit/test_tar_capability_table.cpp',
+    'unit/test_tar_retention_tiers_table.cpp',
     'unit/test_tar_warehouse.cpp',
     'unit/test_tar_aggregator.cpp',
     'unit/test_tar_usage.cpp',
@@ -1836,6 +1837,7 @@ if build_server
       'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_settings_model.cpp',        # #4028 — pure Settings read-twin builder unit tests
       'unit/server/test_settings_read_twins.cpp',   # #4028 — REST v1 read-twin route coverage
+      'unit/server/test_tar_retention_tiers.cpp',   # TAR retention tier TSV parser + depth arithmetic (pure)
       'unit/server/test_settings_page_ui.cpp',      # pure-string pins: 21 panels + static h1 on the /settings page
       'unit/server/test_settings_general.cpp',      # System General page: runtime/events renderers, routes, page pins
       'unit/server/test_plugin_signing_helpers.cpp',
@@ -3210,6 +3212,15 @@ test('ensure-erlang strict-mode callers',
   args: [files('test_ensure_erlang.py')],
   suite: 'docs',
   timeout: 180,
+)
+
+# docs/ build inputs of Meson targets are re-included in /.dockerignore (the image
+# builds `COPY . .` with docs/ otherwise excluded).
+test('docker context re-includes embedded docs inputs',
+  _python3_test,
+  args: [files('test_docker_context_embeds_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # Every script target uses yuzu_python (no ad-hoc find_program for python).
