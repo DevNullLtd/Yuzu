@@ -742,21 +742,32 @@ void RbacStore::seed_defaults() {
              {std::string(r.name), std::string(r.desc), std::to_string(now)});
 
     // #4990: the seed above is ON CONFLICT DO NOTHING, so an operator-authored role that already
-    // carries the name "ForensicsAnalyst" is kept as it is and the four seeded read grants are
-    // merged into it. Seed semantics are deliberately unchanged; this only makes the situation
-    // visible at boot. A non-system role is outside the structural bar that keeps engine
-    // principals off the seeded role, so an engine principal could be assigned it.
+    // carries the name "ForensicsAnalyst" is kept as it is. The four seeded read grants are then
+    // NOT added to it: merging them would hand Forensics:Read to every existing assignee of a role
+    // nobody reviewed for that, and a non-system role is outside the structural bar that keeps
+    // engine principals off the seeded role. The grants are minted only when the row is the
+    // built-in (is_system) role; when the check cannot be answered they are withheld too (they are
+    // idempotent, so the next boot adds them). Grants an earlier build already merged into such a
+    // role are not removed here (they cannot be told apart from the operator's own).
+    bool mint_forensics_analyst_grants = false;
     {
         pg::PgResult fa = pg::exec_params(
             c, "SELECT is_system FROM rbac_store.roles WHERE name = 'ForensicsAnalyst'",
             std::vector<std::string>{});
-        if (fa.status() == PGRES_TUPLES_OK && PQntuples(fa.get()) == 1 &&
-            !to_bool(PQgetvalue(fa.get(), 0, 0))) {
-            spdlog::warn(
-                "RbacStore: an existing non-system role named ForensicsAnalyst was found; the "
-                "built-in Forensics read grants were merged into it and its definition was left "
-                "unchanged. Engine principals could be assigned this role. Rename or remove it "
-                "and restart to adopt the built-in role.");
+        if (fa.status() == PGRES_TUPLES_OK && PQntuples(fa.get()) == 1) {
+            if (to_bool(PQgetvalue(fa.get(), 0, 0))) {
+                mint_forensics_analyst_grants = true;
+            } else {
+                spdlog::error(
+                    "RbacStore: an existing non-system role named ForensicsAnalyst was found; "
+                    "the built-in Forensics read grants were NOT added to it and its definition "
+                    "was left unchanged, so the built-in role is unavailable. Engine principals "
+                    "could be assigned this role. Rename or remove it and restart to adopt the "
+                    "built-in role.");
+            }
+        } else {
+            spdlog::error("RbacStore: the ForensicsAnalyst role check could not be completed; "
+                          "the built-in Forensics read grants were not added this boot");
         }
     }
 
@@ -1057,10 +1068,13 @@ void RbacStore::seed_defaults() {
     // principal, and it is deliberately NOT added to ITServiceOwner or any other role. It is
     // is_system, so the engine-principal dangerous-class gate refuses it structurally. With
     // RBAC off the role does nothing (the legacy branch of require_permission is unedited).
-    grant("ForensicsAnalyst", "Forensics", "Read");
-    grant("ForensicsAnalyst", "Response", "Read");
-    grant("ForensicsAnalyst", "Execution", "Read");
-    grant("ForensicsAnalyst", "Inventory", "Read");
+    // Withheld when an operator-authored role already holds the name (see the check above).
+    if (mint_forensics_analyst_grants) {
+        grant("ForensicsAnalyst", "Forensics", "Read");
+        grant("ForensicsAnalyst", "Response", "Read");
+        grant("ForensicsAnalyst", "Execution", "Read");
+        grant("ForensicsAnalyst", "Inventory", "Read");
+    }
 }
 
 bool RbacStore::load_enabled_flag() {

@@ -732,11 +732,11 @@ TEST_CASE("RbacStore: an existing database without the role gains it, with its f
     CHECK(reopened.get_principal_roles("user", "pre-existing").size() == 1);
 }
 
-TEST_CASE("RbacStore: a pre-existing custom role named ForensicsAnalyst is merged into, not replaced",
+TEST_CASE("RbacStore: a pre-existing custom role named ForensicsAnalyst is kept and gains no grants",
           "[rbac_store][pg][forensics_analyst]") {
     RBAC_STORE(store);
     // Reproduce the upgrade state: a database that already carries an operator-authored
-    // (SQL-created) role of this name and never had the seeded one.
+    // (SQL-created) role of this name and never had the seeded one, with a human assignee.
     {
         auto lease = rbac_pool_fx_.acquire();
         REQUIRE(lease);
@@ -748,31 +748,50 @@ TEST_CASE("RbacStore: a pre-existing custom role named ForensicsAnalyst is merge
     REQUIRE_FALSE(store.get_role("ForensicsAnalyst").has_value());
     REQUIRE(store.create_role({"ForensicsAnalyst", "site-authored", false, 0}).has_value());
     REQUIRE(store.set_permission({"ForensicsAnalyst", "Tag", "Read", "allow"}).has_value());
+    REQUIRE(store.assign_role({"user", "existing-holder", "ForensicsAnalyst"}).has_value());
 
-    // The next boot runs the real seed pass. It logs one WARN naming the role (the seed itself
-    // is unchanged); captured here so the boot visibility is pinned.
-    yuzu::test::LogCapture capture(spdlog::level::warn);
+    // The next boot runs the real seed pass. It logs one ERROR naming the role; captured here so
+    // the boot visibility is pinned.
+    yuzu::test::LogCapture capture(spdlog::level::err);
     RbacStore reopened{rbac_pool_fx_};
     REQUIRE(reopened.is_open());
     capture.stop();
     const std::string logs = capture.text();
     CHECK_THAT(logs, Catch::Matchers::ContainsSubstring("non-system role named ForensicsAnalyst"));
-    CHECK_THAT(logs, Catch::Matchers::ContainsSubstring("Engine principals could be assigned"));
+    CHECK_THAT(logs, Catch::Matchers::ContainsSubstring("were NOT added"));
 
     auto role = reopened.get_role("ForensicsAnalyst");
     REQUIRE(role.has_value());
-    // Observed behavior: the role row is untouched (ON CONFLICT DO NOTHING) so it stays a
-    // NON-system role with its own description, and the four seeded pairs are merged into
-    // whatever grants it already had. Nothing is removed.
+    // The role row is untouched (ON CONFLICT DO NOTHING) and the four seeded pairs are NOT merged
+    // into it: its own grants are exactly what the operator gave it, so an existing holder gains
+    // no Forensics:Read from the upgrade.
     CHECK_FALSE(role->is_system);
     CHECK(role->description == "site-authored");
-    CHECK(grant_pairs(reopened, "ForensicsAnalyst") ==
-          std::vector<std::string>{"Execution:Read/allow", "Forensics:Read/allow",
-                                   "Inventory:Read/allow", "Response:Read/allow", "Tag:Read/allow"});
+    CHECK(grant_pairs(reopened, "ForensicsAnalyst") == std::vector<std::string>{"Tag:Read/allow"});
+    CHECK_FALSE(reopened.check_permission("existing-holder", "Forensics", "Read"));
+    CHECK_FALSE(reopened.check_permission("existing-holder", "Response", "Read"));
     // Consequence worth knowing: because the row is not is_system, the engine-principal
     // built-in bar does not apply to this collided role (the structural refusal only holds
     // for the seeded row). Characterized here so a future change to it is deliberate.
     CHECK(reopened.assign_role({"engine", "engine:nvd", "ForensicsAnalyst"}).has_value());
+
+    // Removing the hand-made role and restarting adopts the built-in role with its four grants.
+    {
+        auto lease = rbac_pool_fx_.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "DELETE FROM rbac_store.roles WHERE name = 'ForensicsAnalyst'",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    RbacStore adopted{rbac_pool_fx_};
+    REQUIRE(adopted.is_open());
+    auto builtin = adopted.get_role("ForensicsAnalyst");
+    REQUIRE(builtin.has_value());
+    CHECK(builtin->is_system);
+    CHECK(grant_pairs(adopted, "ForensicsAnalyst") ==
+          std::vector<std::string>{"Execution:Read/allow", "Forensics:Read/allow",
+                                   "Inventory:Read/allow", "Response:Read/allow"});
 }
 
 // Item (6) of the #4990 role design: the dispatch gate is unchanged. Holding Operator +
