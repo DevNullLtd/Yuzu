@@ -849,11 +849,12 @@ TEST_CASE("Win32Registry::query_value returns a REG_SZ stored without its termin
     // RegQueryValueExW into a roomy buffer may append a terminator the stored value never had; this pins that
     // the plugin's read does not report one.
     //
-    // The write needs care too. RegSetValueExW stores a string type's terminator from the CALLER'S buffer when the
-    // wchar_t just past cbData is zero: a 4-byte REG_SZ, REG_EXPAND_SZ or REG_MULTI_SZ followed by a zero is stored
-    // as 6 bytes, one followed by 'X' as 4, REG_BINARY never (measured 2026-10-27, build 26100.2605). A bare
-    // `wchar_t[2]` made the stored size depend on the stack below it: 6 on a fresh stack (a release build run
-    // alone), 4 on a dirtied one (the full suite, a debug build). The non-zero neighbour below pins it at 4.
+    // The write needs care too. Measured on weecolin (build 26100.2605, 2026-10-27): RegSetValueExW given a 4-byte
+    // REG_SZ, REG_EXPAND_SZ or REG_MULTI_SZ stores 6 bytes when the wchar_t just after those bytes in the caller's
+    // buffer is zero and 4 when it is 'X'; REG_BINARY never pads. The bare `wchar_t[2]` this test used before
+    // failed 8 of 8 there when run alone. Likely cause, not inspected: the stack after the array was zero in a
+    // fresh process (a release build run alone) and not zero in a dirtied one (the full suite, a debug build).
+    // The non-zero neighbour after the string pins the stored size at 4.
     const std::string root = scratch_root("unterminated");
     ScratchTree cleanup{root};
     yuzu::win::RegKey raw; // closes on every exit, a failed REQUIRE included
@@ -864,7 +865,7 @@ TEST_CASE("Win32Registry::query_value returns a REG_SZ stored without its termin
     }
     const wchar_t stored[3] = {L'a', L'b', L'X'}; // four bytes passed, no terminator; 'X' is only the neighbour
     REQUIRE(RegSetValueExW(raw.get(), L"V", 0, REG_SZ, reinterpret_cast<const BYTE*>(stored),
-                           2 * sizeof(wchar_t)) == ERROR_SUCCESS);
+                           sizeof stored - sizeof(wchar_t)) == ERROR_SUCCESS);
     Win32Registry reg;
     yuzu::registry::QueryResult q;
     REQUIRE(reg.query_value(as_handle(raw.get()), "V", 4096, q) == ERROR_SUCCESS);
