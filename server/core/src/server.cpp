@@ -48,6 +48,7 @@
                                      // 3 review finding 2; see that field's own doc comment)
 #include "rotation_sweep_naming.hpp"
 #include "rotation_warn_dedup.hpp"
+#include "approval_denial_audit.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "credential_change_owner.hpp" // #5342 — one-transaction local credential change
@@ -255,6 +256,7 @@
 #include "background_jobs.hpp" // WS-10: pass-classification table + YUZU_ASSERT_BACKGROUND_JOB gate
 #include "coord_dsn.hpp"       // WS-3: build the elector's dedicated coordination DSN (testable)
 #include "leader_elector.hpp"  // WS-3: fenced leader-election primitive (ADR-2002 §3/§6/§10)
+#include "leader_metrics.hpp"  // WS-11 (#4014): yuzu_server_leader_* seed + scrape-time publisher
 #include "pg_reachability_probe.hpp" // WS-8: runtime Postgres reachability for /readyz (ADR-2002 §12)
 #include "shutdown_drain_rules.hpp" // WS-8: stop() drain-wait decision + bounds
 #include "leader_gate.hpp"     // WS-3 3.2: runtime FencedLeaderOnly loop gate over kBackgroundJobs
@@ -1060,13 +1062,30 @@ public:
         metrics_.describe("yuzu_mcp_approval_precondition_denied_total",
                           "MCP approval-ticket recalls refused by a pre-consume precondition "
                           "(#2443) - the ticket matched and was approved, but the underlying "
-                          "operation's live state had already moved on since mint. A subset "
+                          "operation's live state had already moved on since mint, or the "
+                          "ticket's own tool and arguments no longer matched the recall "
+                          "(the request match every approval-gated recall carries). A subset "
                           "of yuzu_mcp_approval_refused_total, broken out separately: unlike "
                           "the masked-denial split above, a precondition denial is already "
                           "distinguishable to the caller from the response body, so this "
                           "carries no anti-oracle restriction - it is not a `reason` label on "
                           "the shared counter because the shared counter's other kinds "
                           "(foreign-origin vs ordinary replay) still must not be",
+                          "counter");
+        metrics_.describe("yuzu_approval_precondition_denied_total",
+                          "Approval-ticket redemptions refused by a pre-consume precondition "
+                          "(#2443/#6062), by the ticket's origin: the ticket matched and was "
+                          "approved, but the state its effect depends on had moved on since "
+                          "mint. The ticket is left UNTOUCHED and still redeemable. Counted at "
+                          "the store for any redeemer that supplies a precondition, so it "
+                          "mirrors yuzu_mcp_approval_precondition_denied_total (which adds the "
+                          "MCP tool); each denial also writes an approval.precondition_denied "
+                          "audit row. TODAY only origin=mcp can move (every MCP "
+                          "approval-gated recall supplies a precondition: the request match, "
+                          "plus the rotation state check for confirm_engine_rotation); the "
+                          "instruction, schedule and guardian_deploy series are "
+                          "pre-seeded at zero and stay there until a redeemer for that surface "
+                          "exists",
                           "counter");
         metrics_.describe("yuzu_mcp_approval_burned_total",
                           "MCP approval-ticket recalls that SUCCESSFULLY consumed a one-time, "
@@ -1417,6 +1436,9 @@ public:
             metrics_.counter("yuzu_mcp_approval_refused_total", {{"tool", tool}});
             // Same closed set again for the #2786 masked-denial counter.
             metrics_.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", tool}});
+            // Every approval-gated recall carries a precondition now (the request match,
+            // g8r7-astra-D), so a precondition denial can reach any tool in the set.
+            metrics_.counter("yuzu_mcp_approval_precondition_denied_total", {{"tool", tool}});
             // #2444 item 3: a HANDLER can only burn a ticket for a tool that is
             // itself approval-gated in the first place, so this is the same
             // closed `tool` set as the three counters above. `reason` is a
@@ -1436,15 +1458,13 @@ public:
                 metrics_.counter(mcp::kMcpPollTotalMetric, {{"tool", tool}, {"result", result}});
             }
         }
-        // yuzu_mcp_approval_precondition_denied_total's reachable label set is
-        // NARROWER than the two above: kPrecondition can only fire for a tool
-        // that actually has a ConsumePrecondition wired, which today is just
-        // confirm_engine_rotation (#2443) — pre-seeding the full
-        // approval-gated set here would claim reachability for tools whose
-        // precondition is always `{}`. Extend this list alongside #2939's
-        // sweep as each tool gets its own precondition wired.
-        metrics_.counter("yuzu_mcp_approval_precondition_denied_total",
-                         {{"tool", "confirm_engine_rotation"}});
+        // #6062: the store-level counter's label is the ticket origin - a CLOSED set of
+        // the four writable surfaces (kUnspecified/kUnrecognised are never written and
+        // can never reach a precondition), so every combination is pre-seeded here.
+        for (const auto origin : {ApprovalOrigin::kInstruction, ApprovalOrigin::kSchedule,
+                                  ApprovalOrigin::kMcp, ApprovalOrigin::kGuardianDeploy})
+            metrics_.counter("yuzu_approval_precondition_denied_total",
+                             {{"origin", to_string(origin)}});
         // #2437 handler-side bound denials. The label set is closed on BOTH
         // axes: `tool` is execute_instruction alone (the only tool that EMITS
         // this counter today; the two kAgenticParamMaxLen read tools bound in
@@ -6637,6 +6657,16 @@ public:
             } else {
                 legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "instructions.db",
                                                          "ApprovalManager", {"approvals"});
+                // #6062: a precondition denial is counted and audited at the store, for
+                // every redeemer. audit_store_ is declared before approval_manager_, so it
+                // outlives every consume. The observer writes through AuditStore::log on
+                // its OWN lease - never the caller's transaction - so the evidence of a
+                // refused redemption survives the caller rolling back. No audit store
+                // (not open) means no row; the counter still counts.
+                approval_manager_->set_metrics(&metrics_);
+                approval_manager_->set_precondition_denial_observer(
+                    make_precondition_denial_audit_observer(
+                        [this]() -> AuditStore* { return audit_store_.get(); }));
             }
         }
 
@@ -8149,8 +8179,9 @@ public:
         // B-4 (#1238): the default CA + leaves are 10-year with NO auto-renewal,
         // so their eventual expiry is otherwise a silent outage. Publish the
         // absolute notAfter as a timestamp gauge so the yuzu-tls alert rules
-        // (warn @7d / crit @1d) fire ahead of it. The leaves are sized to the CA's
-        // notAfter, so cert="default-ca" is the binding expiry for the whole set.
+        // (warning from 30 d, critical from 7 d and again from 24 h) fire ahead of
+        // it. The leaves are sized to the CA's notAfter, so cert="default-ca" is
+        // the binding expiry for the whole set.
         if (default_cert_set_.ca_expires_at.time_since_epoch().count() != 0) {
             const auto exp_ts = std::chrono::duration_cast<std::chrono::seconds>(
                                     default_cert_set_.ca_expires_at.time_since_epoch())
@@ -8810,13 +8841,20 @@ public:
         if (pg_pool_ && !startup_failed_) {
             leader_elector_ = std::make_unique<LeaderElector>(LeaderElector::Config{
                 .dsn = build_coord_dsn(cfg_.postgres_dsn), .holder_id = random_holder_id()});
+            // WS-11 (#4014): birth the yuzu_server_leader_* series only where an
+            // elector exists (a server with none exports no leader series at all,
+            // never a fabricated "no leader"). Published at /metrics scrape time.
+            seed_leader_metrics(metrics_);
             if (!leader_elector_->is_open()) {
                 // Do NOT fail boot. On the single-replica deployment the loop below
                 // re-acquires within one cycle and the gated loops resume; the pause
                 // touches ONLY the FencedLeaderOnly loops, which is the fail-closed
                 // posture (never double-dispatch), not a data-loss one. A persistent
                 // failure is a coordination-substrate problem (§10) — loud, never
-                // silent. WS-11 (#4014) adds the metric/alert/readyz surface.
+                // silent. WS-11 (#4014) surfaces it as the yuzu_server_leader_* metrics
+                // (acquire_failures_total{cause="connect"} rising, is_leader 0) and the
+                // YuzuLeaderNoLeader alert. It is deliberately NOT a /readyz condition:
+                // a replica that cannot lead is a ready follower (health_routes.cpp).
                 spdlog::error("[HA] leader_elector could not open its coordination connection; "
                               "FencedLeaderOnly background loops are PAUSED until leadership is "
                               "acquired (single-replica: self-heals within one election cycle; "
@@ -8861,10 +8899,16 @@ public:
                             0, static_cast<int>(kLeaderJitterMax.count()));
                         wait += seconds{jitter(rng)};
                     } catch (const std::exception& e) {
+                        // WS-11: a plain atomic, NEVER a MetricsRegistry call -- the
+                        // registry takes a mutex and builds a std::string key that can
+                        // throw, which here would be a std::terminate defeating this
+                        // very guard. Published at /metrics scrape time.
+                        leader_loop_errors_.fetch_add(1, std::memory_order_relaxed);
                         spdlog::error("leader_elector: election iteration threw ({}) — continuing",
                                       e.what());
                         wait = kLeaderBackoffMin; // brief backoff so a persistent throw can't spin
                     } catch (...) {
+                        leader_loop_errors_.fetch_add(1, std::memory_order_relaxed);
                         spdlog::error("leader_elector: election iteration threw unknown — continuing");
                         wait = kLeaderBackoffMin;
                     }
@@ -11578,7 +11622,7 @@ private:
     // policy): verify_peer authenticates to the CA, NOT to a specific identity.
     //
     // #1422: the gateway side no longer stops at the CA check. Its mgmt
-    // listener's grpcbox auth_fun (yuzu_gw_authz:check_mgmt_peer/1) pins the
+    // listener's auth_fun (yuzu_gw_authz:check_mgmt_peer/1) pins the
     // peer to THIS server's key — SPKI SHA-256 of the presented leaf against
     // {yuzu_gw, mgmt_peer_pins} (default: the default-server.pem in the shared
     // cert volume), plus a serverAuth-EKU requirement agent leaves can never
@@ -13546,7 +13590,9 @@ private:
             registry_.to_json_obj(), rbac_store_.get(), mgmt_group_store_.get(), username);
     }
 
-    /// Auto-create a dynamic management group for a service tag value.
+    /// Auto-create a dynamic management group for a service tag value. Membership is a
+    /// SNAPSHOT taken once, when the group is created: if the group already exists this returns
+    /// early, so a later `service` tag write never adds or removes members.
     void ensure_service_management_group(const std::string& service_value) {
         if (!mgmt_group_store_ || service_value.empty())
             return;
@@ -13570,11 +13616,15 @@ private:
             // so a degraded tag read must never refresh the group to empty.
             // Prior membership is retained; there is NO automatic
             // repopulation pass (governance UP-5 — an earlier comment here
-            // claimed one) — membership refreshes only when this ensure
-            // helper next runs, i.e. on the next `service`-tag write. There
-            // is no dedicated recovery runbook for this; a degraded tag
-            // store is a `TagStore::agents_with_tag` failure, diagnosed the
-            // same way as any other store-degrade log line.
+            // claimed one), and this is the ONLY call to
+            // refresh_dynamic_membership: the helper returns early once the
+            // group exists, so a skipped refresh here leaves the group
+            // without those members until an operator adds them with
+            // POST /api/v1/management-groups/{id}/members, or the group is
+            // deleted and re-created. There is no dedicated recovery
+            // runbook for this; a degraded tag store is a
+            // `TagStore::agents_with_tag` failure, diagnosed the same way as
+            // any other store-degrade log line.
             if (tag_store_) {
                 if (auto agents = tag_store_->agents_with_tag("service", service_value)) {
                     mgmt_group_store_->refresh_dynamic_membership(*result, *agents);
@@ -13952,8 +14002,10 @@ private:
                         return; // success — done
                     }
                     // #1422: the gateway's mgmt-plane peer pin rejects with
-                    // UNAUTHENTICATED and an EMPTY message (grpcbox sends no
-                    // grpc-message when an auth_fun rejects) — the generic
+                    // UNAUTHENTICATED and, from a gateway built before the yuzu_grpc
+                    // listener, an EMPTY message (the old listener sent no
+                    // grpc-message when an auth_fun rejected; the current one
+                    // sends "unauthenticated") — the generic
                     // warn below would render as "failed:  (16)", which is
                     // invisible as the fleet-wide forwarding outage it
                     // actually is. Name the cause and the fix.
@@ -16483,6 +16535,8 @@ private:
                              .server_start_time = server_start_time_,
                              .pg_pool = pg_pool_.get(),
                              .pg_reachability_probe = pg_reachability_probe_.get(),
+                             .leader_elector = leader_elector_.get(), // WS-11 (#4014): /metrics only
+                             .leader_loop_errors = &leader_loop_errors_,
                              .response_store = response_store_.get(),
                              .audit_store = audit_store_.get(),
                              .instruction_store = instruction_store_.get(),
@@ -23483,7 +23537,22 @@ private:
     // in stop() before ~ServerImpl (a joinable std::thread destructor terminates).
     // FencedLeaderOnly background loops (schedule/policy/quarantine/CRL) gate on
     // leader_elector_->is_leader() via leader_gate.hpp — slice 3.2.
+    //
+    // BORROWED by the /metrics handler (WS-11, #4014): `health::Deps::leader_elector`
+    // and `::leader_loop_errors` are raw pointers to the next two members, copied
+    // into the route lambda. This is NOT guaranteed by declaration order (these
+    // are declared after web_server_/web_thread_, so they are destroyed BEFORE
+    // them); it is guaranteed by stop(), which joins web_thread_ (or _Exit()s on
+    // its timeout) before these two members are destroyed (stop() never resets
+    // either), and ~ServerImpl always calls stop() first. That join comes AFTER
+    // resign() and the leader_thread_ join, so a scrape may overlap resign(): safe
+    // because stats() is lock-free and the elector is still alive. Do not reorder
+    // stop().
     std::unique_ptr<LeaderElector> leader_elector_;
+    /// WS-11 (#4014): election-loop iterations that threw. A plain atomic the loop
+    /// increments (never the MetricsRegistry -- see the loop's catch blocks); the
+    /// /metrics handler pulls it via `health::Deps::leader_loop_errors`.
+    std::atomic<std::uint64_t> leader_loop_errors_{0};
     std::thread leader_thread_;
 
     // HA WS-8 (ADR-2002 §12): the runtime Postgres-reachability probe behind

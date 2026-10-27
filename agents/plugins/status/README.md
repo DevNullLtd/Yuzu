@@ -22,12 +22,12 @@ The plugin deliberately does not call `yuzu_ctx_get_secret()` (always returns `n
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Inventory.Read or<br/>PluginSecret.Read for switch]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[status.execute]
-  EX --> WIN[Windows leg<br/>native API / in-process config]
-  EX --> MAC[macOS leg<br/>native API / in-process config]
-  EX --> LIN[Linux leg<br/>native API / in-process config]
-  WIN & MAC & LIN --> ROWS[key|value rows,<br/>UNDECLARED status] --> RS[(ResponseStore)] --> API[REST /api/responses · MCP]
+  OP["Operator / workflow"] --> SRV["Server - authz: Inventory.Read, or PluginSecret.Read for switch"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"] --> EX["status.execute"]
+  EX --> WIN["Windows leg - native API / in-process config"]
+  EX --> MAC["macOS leg - native API / in-process config"]
+  EX --> LIN["Linux leg - native API / in-process config"]
+  WIN & MAC & LIN --> ROWS["key|value rows, UNDECLARED status"] --> RS[("ResponseStore")] --> API["REST /api/responses, MCP"]
 ```
 
 ## OS capability

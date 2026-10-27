@@ -36,6 +36,9 @@
 #include "grpc_audit_signal.hpp"
 #include "pg/pg_pool.hpp"
 #include "plugin_result_audit.hpp"
+#include "result_parsing.hpp"
+#include "../../../agents/plugins/registry/src/registry_parsers.hpp"
+#include "../../../agents/plugins/registry/src/registry_plan.hpp"
 #include "test_auth_db_pg_helper.hpp"
 #include "test_principal_lock_gate.hpp"
 #include "test_provenance_fake.hpp" // #4990: harness record source when no tracker is wired
@@ -320,20 +323,240 @@ TEST_CASE("registry audit: the AuditEvent shape", "[server][registry_audit]") {
     }
 }
 
+// ── the plugin's own renderer ────────────────────────────────────────────
+
+namespace {
+
+/// A line from the registry plugin's real renderer, never a hand-written one: the producer and this parser share
+/// only the text of the README grammar, so these cases are what keeps the two agreeing.
+std::string rendered(std::string_view result, std::string_view reason, std::string_view key) {
+    yuzu::registry::AuditRecord r;
+    r.op = "set_value";
+    r.hive = "HKLM";
+    r.key = std::string{key};
+    r.name = "Ver";
+    r.type_name = "REG_DWORD";
+    r.len = 4;
+    r.result = std::string{result};
+    r.reason = std::string{reason};
+    r.verify = result == "ok" ? "ok" : "";
+    r.old_state = "present";
+    r.old_type = "REG_DWORD";
+    r.old_bytes = {1, 0, 0, 0};
+    r.old_total = 4;
+    r.has_old = true;
+    r.new_bytes = {2, 0, 0, 0};
+    r.new_total = 4;
+    r.has_new = true;
+    return yuzu::registry::render_audit_line(r);
+}
+
+} // namespace
+
+TEST_CASE("registry audit: the plugin's own renderer puts result= where the extractor reads it",
+          "[server][registry_audit]") {
+    struct Case {
+        std::string_view result;
+        std::string_view reason;
+        const char* row_result;
+    };
+    for (const Case c : {Case{"ok", "", "success"}, Case{"refused", "access_denied", "failure"},
+                         Case{"failed", "verify_mismatch", "failure"}}) {
+        INFO(c.result);
+        const std::string line = rendered(c.result, c.reason, "SOFTWARE\\Acme");
+        REQUIRE(line.starts_with("audit|op=set_value|hive=HKLM|result=" + std::string{c.result} + "|"));
+        CHECK(registry_audit_result(line) == c.result);
+        const auto frame = registry_audit_events_for_frame("agent-1", rid(1), "registry", "set_value", line + "\n", 100);
+        REQUIRE(frame.events.size() == 1);
+        CHECK(frame.events[0].result == c.row_result);
+        CHECK(frame.events[0].action == "registry.write");
+        CHECK(frame.events[0].detail == "agent=agent-1 cut=0 " + line);
+    }
+}
+
+TEST_CASE("registry audit: a real rendered line with a 300-byte key is one row; cut by the renderer",
+          "[server][registry_audit]") {
+    const std::string line = rendered("ok", "", std::string(300, 'k'));
+    CHECK(line.find("|key=" + std::string(256, 'k') + "~300|") != std::string::npos);
+    const auto frame = registry_audit_events_for_frame("a1", rid(2), "registry", "set_value", line + "\n", 5);
+    REQUIRE(frame.events.size() == 1);
+    CHECK_FALSE(frame.truncated);
+    CHECK(frame.events[0].detail.starts_with("agent=a1 cut=0 audit|op=set_value|hive=HKLM|result=ok|"));
+    CHECK(frame.events[0].detail.ends_with("|old=01000000|new=02000000"));
+}
+
+TEST_CASE("registry audit: a real rendered line with one trailing CR yields the same row",
+          "[server][registry_audit]") {
+    const std::string line = rendered("ok", "", "SOFTWARE\\Acme");
+    const auto lf = registry_audit_events_for_frame("a1", rid(3), "registry", "set_value", line + "\n", 5);
+    const auto crlf = registry_audit_events_for_frame("a1", rid(3), "registry", "set_value", line + "\r\n", 5);
+    REQUIRE(lf.events.size() == 1);
+    REQUIRE(crlf.events.size() == 1);
+    CHECK(crlf.events[0].detail == lf.events[0].detail); // the CR is not neutralised into the last field's hex
+    CHECK(crlf.events[0].detail.ends_with("|new=02000000"));
+}
+
+TEST_CASE("registry audit: the plugin's exception literal mints one failed row per mutating action",
+          "[server][registry_audit]") {
+    // What a mutating action leaves when an exception ends it (execute_guarded's catch): a fixed 19-field line, so
+    // the server records a failed registry.write row for a write whose reply could not be built.
+    unsigned n = 40;
+    for (const std::string_view action :
+         {"set_value", "delete_value", "delete_key", "set_user_value", "delete_user_value", "apply"}) {
+        INFO(action);
+        const std::string line{yuzu::registry::exception_audit_line(action)};
+        REQUIRE_FALSE(line.empty());
+        CHECK(registry_audit_result(line) == "failed");
+        const auto frame =
+            registry_audit_events_for_frame("agent-1", rid(n++), "registry", action, line + "\n", 100);
+        REQUIRE(frame.events.size() == 1);
+        CHECK(frame.events[0].result == "failure");
+        CHECK(frame.events[0].action == "registry.write");
+        CHECK(frame.events[0].detail == "agent=agent-1 cut=0 " + line);
+        // all 19 fields, op= naming the action, and nothing but `-` after the exception verdict
+        CHECK(std::ranges::count(line, '|') == 19); // the tag and 19 fields: 20 parts
+        CHECK(line.starts_with("audit|op=" + std::string{action} + "|hive=-|result=failed|reason=exception|verify=-|"));
+    }
+}
+
+TEST_CASE("registry audit: the apply per-user and dry-run lines the plugin renders extract like any other row",
+          "[server][registry_audit]") {
+    // `result=` is read before key= and the caller-sized fields, whichever action rendered the line; a dry run's
+    // success row says dry_run=1 in its detail (a reader filtering result=success must also read dry_run).
+    yuzu::registry::AuditRecord r;
+    r.op = "apply.set_value";
+    r.hive = "HKLM";
+    r.key = "SOFTWARE\\Acme";
+    r.name = "Ver";
+    r.type_name = "REG_DWORD";
+    r.len = 4;
+    r.result = "ok";
+    r.dry_run = 1;
+    r.created = 0;
+    r.old_state = "present";
+    r.old_type = "REG_DWORD";
+    r.old_bytes = {1, 0, 0, 0};
+    r.old_total = 4;
+    r.has_old = true;
+    r.new_bytes = {2, 0, 0, 0};
+    r.new_total = 4;
+    r.has_new = true;
+    SECTION("an apply item under a dry run") {
+        const std::string line = yuzu::registry::render_audit_line(r);
+        REQUIRE(line.starts_with("audit|op=apply.set_value|hive=HKLM|result=ok|reason=-|verify=-|key="));
+        CHECK(registry_audit_result(line) == "ok");
+        const auto frame = registry_audit_events_for_frame("a1", rid(60), "registry", "apply", line + "\n", 5);
+        REQUIRE(frame.events.size() == 1);
+        CHECK(frame.events[0].result == "success");
+        CHECK(frame.events[0].detail.find("|dry_run=1|") != std::string::npos);
+        CHECK(frame.events[0].detail.ends_with("|old=01000000|new=02000000"));
+    }
+    SECTION("a per-user write names the hive HKU and the sid; a refused one is a failure row") {
+        r.op = "set_user_value";
+        r.hive = "HKU";
+        r.dry_run = -1;
+        r.sid = "S-1-5-21-1-2-3-1001";
+        std::string line = yuzu::registry::render_audit_line(r);
+        REQUIRE(line.starts_with("audit|op=set_user_value|hive=HKU|result=ok|"));
+        CHECK(line.find("|sid=S-1-5-21-1-2-3-1001|") != std::string::npos);
+        auto frame = registry_audit_events_for_frame("a1", rid(61), "registry", "set_user_value", line + "\n", 5);
+        REQUIRE(frame.events.size() == 1);
+        CHECK(frame.events[0].result == "success");
+        r.result = "refused";
+        r.reason = "hive_mount_failed";
+        line = yuzu::registry::render_audit_line(r);
+        frame = registry_audit_events_for_frame("a1", rid(62), "registry", "set_user_value", line + "\n", 5);
+        REQUIRE(frame.events.size() == 1);
+        CHECK(frame.events[0].result == "failure");
+        CHECK(frame.events[0].detail.find("|reason=hive_mount_failed|") != std::string::npos);
+    }
+    SECTION("a full plan (kMaxPlanItems items) is that many rows from one frame, none truncated") {
+        std::string text;
+        for (std::size_t i = 0; i < yuzu::registry::kMaxPlanItems; ++i)
+            text += yuzu::registry::render_audit_line(r) + "\nitem|0|x\n";
+        const auto frame = registry_audit_events_for_frame("a1", rid(63), "registry", "apply", text, 300);
+        CHECK(frame.events.size() == yuzu::registry::kMaxPlanItems);
+        CHECK_FALSE(frame.truncated);
+    }
+}
+
+// The plugin's plan bound and the server's bounds, tied by the compiler rather than by prose: a full plan's audit lines
+// fit one frame's line bound, and a dry run plus the real run of one full plan (2 x kMaxPlanItems rows) fit one agent's
+// row budget (the agent may still split a reply across frames at its 64 KiB flush; the budget is the binding bound).
+static_assert(yuzu::registry::kMaxPlanItems <= kMaxRegistryAuditLinesPerFrame);
+static_assert(yuzu::registry::kMaxPlanItems * 2 <= kRegistryAuditBudgetRows);
+
+TEST_CASE("registry audit: a refused apply item row with a trailing backslash still splits into 14 cells",
+          "[server][registry_audit]") {
+    // mutant: row_field keeps a trailing backslash (find_unescaped_pipe reads `\|` as escaped and merges two cells)
+    yuzu::registry::ItemRow row;
+    row.index = 3;
+    row.op = "delete_value";
+    row.hive = "HKLM";
+    row.key = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Installer\\Folders";
+    row.name = "C:\\Windows\\Installer\\";
+    row.verdict = "refused";
+    row.reason = "unrepresentable_name";
+    const auto cells = split_fields("registry", yuzu::registry::render_item_row(row));
+    REQUIRE(cells.size() == 14);
+    CHECK(cells[5] == "C:\\Windows\\Installer_");
+    CHECK(cells[6] == "refused");
+    CHECK(cells[7] == "unrepresentable_name");
+}
+
+TEST_CASE("registry audit: a string and a binary value reach the row as raw hex, capped with ~<total>",
+          "[server][registry_audit]") {
+    // Owner risk acceptance (2026-10-20): old= and new= are the raw bytes as hex for every type; masking is a later change.
+    yuzu::registry::AuditRecord r;
+    r.op = "set_value";
+    r.hive = "HKLM";
+    r.key = "SOFTWARE\\Acme";
+    r.name = "Secret";
+    r.type_name = "REG_SZ";
+    r.len = 16;
+    r.result = "ok";
+    r.verify = "ok";
+    r.old_state = "present";
+    r.old_type = "REG_SZ";
+    r.old_bytes = {0x61, 0, 0, 0};
+    r.old_total = 4;
+    r.has_old = true;
+    r.new_bytes = {0x68, 0, 0x75, 0, 0x6e, 0, 0x74, 0, 0x65, 0, 0x72, 0, 0x32, 0, 0, 0}; // "hunter2"
+    r.new_total = 16;
+    r.has_new = true;
+    std::string line = yuzu::registry::render_audit_line(r);
+    auto frame = registry_audit_events_for_frame("a1", rid(50), "registry", "set_value", line + "\n", 5);
+    REQUIRE(frame.events.size() == 1);
+    CHECK(frame.events[0].result == "success");
+    CHECK(frame.events[0].detail.ends_with("|old=61000000|new=680075006e0074006500720032000000"));
+
+    r.type_name = "REG_BINARY"; // past the 256-byte cap: 256 bytes as hex, then the total
+    r.old_type = "REG_BINARY";
+    r.old_bytes.assign(4096, 0x11);
+    r.old_total = 1048576;
+    r.new_bytes.assign(300, 0x22);
+    r.new_total = 300;
+    line = yuzu::registry::render_audit_line(r);
+    frame = registry_audit_events_for_frame("a1", rid(51), "registry", "set_value", line + "\n", 5);
+    REQUIRE(frame.events.size() == 1);
+    CHECK(frame.events[0].detail.ends_with("|old=" + std::string(512, '1') + "~1048576|new=" + std::string(512, '2') + "~300"));
+}
+
 // ── the binding ──────────────────────────────────────────────────────────
 
-TEST_CASE("registry audit: only the three mutating actions of the registry plugin mint rows",
+TEST_CASE("registry audit: only the six mutating actions of the registry plugin mint rows",
           "[server][registry_audit]") {
     const std::string output = "status|ok\n" + std::string{kOkLine} + "\n";
     const auto events = [&](std::string_view plugin, std::string_view action) {
         return registry_audit_events_for_frame("agent-1", rid(9), plugin, action, output, 5)
             .events;
     };
-    for (const char* a : {"set_value", "delete_value", "delete_key"}) {
+    for (const char* a : {"set_value", "delete_value", "delete_key", "set_user_value", "delete_user_value", "apply"}) {
         INFO(a);
         CHECK(events("registry", a).size() == 1);
         CHECK(is_registry_mutating_action(a));
     }
+    CHECK(kRegistryMutatingActions.size() == 6);
     SECTION("read actions, an empty action (an old agent) and unknown actions mint nothing") {
         for (const char* a :
              {"get_value", "key_exists", "enumerate_keys", "enumerate_values", "get_user_value",
@@ -503,7 +726,8 @@ TEST_CASE("registry audit: the mutating-action list matches the capability catal
             CHECK(is_registry_mutating_action(r.action) == mutating);
         }
     }
-    CHECK(registry_rows == 9);
+    CHECK(registry_rows == 12);
+    CHECK(mutating_rows == 6);
     CHECK(mutating_rows == kRegistryMutatingActions.size());
 }
 

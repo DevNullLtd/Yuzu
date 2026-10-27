@@ -770,9 +770,12 @@ TEST_CASE("OpenAPI spec declares ExecutionSseEvent and A4ErrorEnvelope schemas",
     // BLOCKING.
     REQUIRE(res->body.find(R"("ExecutionSseEvent":)") != std::string::npos);
     REQUIRE(res->body.find(R"("A4ErrorEnvelope":)") != std::string::npos);
-    REQUIRE(res->body.find(R"("$ref": "#/components/schemas/ExecutionSseEvent")") !=
+    // The served document is re-serialised compact, so compare the refs on the
+    // compact form and not on the spacing of the source literal.
+    const auto compact = nlohmann::json::parse(res->body).dump();
+    REQUIRE(compact.find(R"("$ref":"#/components/schemas/ExecutionSseEvent")") !=
             std::string::npos);
-    REQUIRE(res->body.find(R"("$ref": "#/components/schemas/A4ErrorEnvelope")") !=
+    REQUIRE(compact.find(R"("$ref":"#/components/schemas/A4ErrorEnvelope")") !=
             std::string::npos);
 }
 
@@ -1880,4 +1883,65 @@ TEST_CASE("GET /api/v1/events: a bad since is a 400 before the budget and before
     }
     for (std::size_t i = before; i < h.audit_log.size(); ++i)
         CHECK(h.audit_log[i].result != "success");
+}
+
+// ── Bound tickets (#6062): the frozen request on the A4 read shape ─────────────
+
+TEST_CASE("GET /api/v1/approvals/{id} and the list: a bound ticket carries request/digest/roots; "
+          "an unbound row is unchanged; same Approval:Read gate",
+          "[pg][events][approvals][a4][bound]") {
+    RestApprovalsHarness h;
+    auto plain = h->submit("def-plain", "alice", "tag:prod", "", ApprovalOrigin::kInstruction);
+    REQUIRE(plain.has_value());
+    const std::string request = R"({"definition":{"name":"Block RDP","hash":"abc"},"targets":["host-1"]})";
+    auto bound = h->submit_bound("guardian.deploy.r1", "alice", "", ApprovalOrigin::kGuardianDeploy,
+                                 BoundRequest{request, {"designer1"}});
+    REQUIRE(bound.has_value());
+
+    SECTION("single fetch") {
+        auto res = h.sink.Get("/api/v1/approvals/" + *bound);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto data = nlohmann::json::parse(res->body)["data"];
+        REQUIRE(data["request"].is_object());
+        CHECK(data["request"]["definition"]["name"] == "Block RDP");
+        CHECK(data["request_digest"].get<std::string>().size() == 64);
+        CHECK(data["excluded_roots"] == nlohmann::json::array({"designer1"}));
+
+        auto unbound = h.sink.Get("/api/v1/approvals/" + *plain);
+        REQUIRE(unbound);
+        const auto row = nlohmann::json::parse(unbound->body)["data"];
+        CHECK(row.size() == 9);
+        CHECK_FALSE(row.contains("request"));
+    }
+    SECTION("list") {
+        auto res = h.sink.Get("/api/v1/approvals");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j["data"].size() == 2);
+        int bound_rows = 0;
+        for (const auto& row : j["data"]) {
+            if (row["id"] == *bound) {
+                ++bound_rows;
+                CHECK(row["request"].is_object());
+                CHECK(row.contains("request_digest"));
+                CHECK(row.contains("excluded_roots"));
+            } else {
+                CHECK(row.size() == 9);
+            }
+        }
+        CHECK(bound_rows == 1);
+    }
+    SECTION("a caller without Approval:Read gets neither (the gate is unchanged)") {
+        h.perm_grant = false;
+        auto one = h.sink.Get("/api/v1/approvals/" + *bound);
+        REQUIRE(one);
+        CHECK(one->status == 403);
+        CHECK(one->body.find("request_digest") == std::string::npos);
+        auto list = h.sink.Get("/api/v1/approvals");
+        REQUIRE(list);
+        CHECK(list->status == 403);
+        CHECK(list->body.find("request_digest") == std::string::npos);
+    }
 }

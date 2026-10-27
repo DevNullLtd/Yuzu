@@ -292,7 +292,7 @@ where each lives.
 Every Linux native artifact carries the glibc / libstdc++ floor of the host
 that built it by accident (#5143). The gate makes the floor an explicit,
 committed promise and measures every build against it. It is specified by
-ADR-2003 (Proposed, PR #5631; the ADR is not on `dev` yet). **In S0 it is
+ADR-2003 (Accepted, PR #5631). **In S0 it is
 report-only: nothing it finds can fail a build or a release.** S2 turns it on.
 
 - **The script** runs `objdump -T` and `readelf -d` over every ELF under a
@@ -318,7 +318,7 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   `deploy/packaging/linux-floor-server.json` (glibc 2.34, `GLIBCXX_3.4.29`,
   `CXXABI_1.3.13`, `OPENSSL_3.0.0`, `LIBSYSTEMD_240`, `BLKID_1.0`, forbidden
   `EVP_sm4_*`; also the gateway's ERTS and OTP). They state the promise, not a
-  measurement. Changing one is a floor decision (ADR-2003 (Proposed, PR #5631),
+  measurement. Changing one is a floor decision (ADR-2003, accepted in PR #5631:
   "Floor review rule"), not a tuning edit. A typo in a family key would silently
   ungate that family (families absent from `max` are only reported), so the
   loader requires `GLIBC`, the script reports a measured family one edit away
@@ -362,7 +362,7 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   deterministic (sorted, no timestamps or paths): a refresh diffs cleanly. A
   set whose scan was incomplete (a PROBLEM, an unreadable or unscanned ELF)
   carries an `incomplete` list; the committed baseline has none. The
-  floor-review rule in ADR-2003 (Proposed, PR #5631) says when to refresh it.
+  floor-review rule in ADR-2003 (Accepted, PR #5631) says when to refresh it.
 - **Release wiring.** `release.yml`'s `build-linux` job runs the script
   report-only on the staged tarball contents right after "Package archive"
   (agent set, then server set) in a `continue-on-error` step, and uploads the
@@ -804,15 +804,75 @@ of reading as NOT TESTED.
 **Gateway-upstream peer authorization and the rigs.** The server refuses to start with
 `--gateway-upstream` unless gateway peer authorization is configured or acknowledged as disabled
 (`--insecure-gateway-peer`, or `YUZU_INSECURE_GATEWAY_PEER=1`). The rigs that run the server from
-the build under test pass the flag: `scripts/integration-test.sh` (in both its plaintext and
-`--tls` branches), `scripts/start-UAT.sh`, `scripts/win-start-UAT.sh`, `scripts/start-stack.sh`
-and the locally built full, sanitizer and viz UAT composes. None of them exercises a pinned
-gateway hop, and no workflow under `.github/` invokes `integration-test.sh` (it runs from
-`scripts/run-tests.sh`); running its `--tls` branch with a real pinned gateway leaf is a deferred
-follow-up. The pre-release `integration` job (`scripts/ci/qa-stack.sh`) starts no server itself:
-it runs this checkout's reference-gateway template on the release's published images, so any
-acknowledgement or pin that rig needs belongs in that template (an environment variable, which an
-image older than the flag ignores), not in the script.
+the build under test pass the flag: `scripts/integration-test.sh` in its plaintext mode,
+`scripts/start-UAT.sh`, `scripts/win-start-UAT.sh`, `scripts/start-stack.sh` and the locally built
+full, sanitizer and viz UAT composes. None of those exercises a pinned gateway hop. One rig does:
+`scripts/integration-test.sh --tls` runs the server on its generated default certificates with no
+acknowledgement, so it enforces the automatic pin of its own `default-gateway.pem`, and the gateway
+release dials it over `https` with `verify_peer` and that leaf as its client certificate; the
+reverse hop (server to the gateway's management listener) is pinned there too. The `linux`
+job runs it as the step "Gateway real-wire test (pinned TLS)" (below). The pre-release `integration`
+job (`scripts/ci/qa-stack.sh`) starts no server itself: it runs this checkout's reference-gateway
+template on the release's published images, so any acknowledgement or pin that rig needs belongs in
+that template (an environment variable, which an image older than the flag ignores), not in the
+script.
+
+**Gateway real-wire gate (#5652, #5653).** The gateway's unit tests mock the upstream client
+(`meck` on `yuzu_grpc_client`), so on their own they cannot show that a call site and the real client
+still agree. The `linux` job's gcc-15/debug leg therefore runs `scripts/integration-test.sh --tls
+--free-ports --gateway-ct`: the real `yuzu-server` under test, the gateway built as the prod
+release (`rebar3 as prod release`, started with `foreground` on a generated `sys.config` that has
+the production shape of `deploy/docker/reference-gateway-sys.config`) and one real `yuzu-agent`
+(agent to gateway over one-way TLS), then `yuzu_gw_real_upstream_SUITE` (Common Test) against that
+same server. The hop is pinned over TLS: the suite presents the gateway leaf the server auto-pins,
+and a valid leaf of the same CA that is not pinned must be refused with `UNAUTHENTICATED` (counted as
+`not_pinned`). The suite pairs every upstream call site (`ProxyRegister`, `BatchHeartbeat`,
+`ProxyInventory`, `NotifyStreamStatus`, `ForwardGuardianMessage`) with the real client and reads the
+effect back from the server (the decoded reply, or the server's `/metrics` for the two casts), checks
+the error shapes (a server status as `{error, {Status, Message}}`, a non-200 HTTP response as the
+`http_error` text, which needs an in-VM cowboy answering 502 because the real server never sends one),
+and forces a registration replay: the server must adopt the agent's existing session (read back
+through its answer to a heartbeat for that session), and a presented session it did not mint must
+tear the agent down. A swapped request marshal function, a lost `x-yuzu-session-id` header or
+`{error, _}` returned where `{http_error, _}` belongs each fails a named case (checked by mutating
+the gateway source and rerunning the suite).
+
+The same run covers the **management hop**, server to gateway (`:50063`, the privileged command
+plane; the symptom of #5175 was every `SendCommand` reaching the server as `Socket closed`). The
+gateway's management listener runs in the production posture: strict mutual TLS
+(`verify_peer` + `fail_if_no_peer_cert`), `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1`, and
+`mgmt_peer_pins = [{cert_file, <server default-server.pem>}]` (the shipped form: the gateway pins that
+leaf's SPKI and requires `serverAuth`); the server is pointed at it with `--gateway-command-addr` and
+presents its own default leaf. Three layers check it. (1) The script dispatches `os_info.os_name` to
+the real agent through the server's REST API (admin login, `POST /api/command`, poll
+`/api/responses/{id}`): one round trip, then 300 commands, 16 at a time, whose streams all share the
+server's single management connection; every one must return the agent's SUCCESS and the server's
+`yuzu_server_gateway_forward_total` must count all 301 as `ok` and none under any failure status (the
+REST per-IP limit is raised for this server with `--rate-limit 10000`; at the default 100 requests/s the
+limiter answers 429 for most of the burst and the commands never overlap). (2)
+`yuzu_gw_real_mgmt_SUITE` dials the listener itself: the pinned leaf is served; the gateway's own
+leaf and an enrolled agent's leaf, both valid certificates of the same CA, get `UNAUTHENTICATED` and
+move `yuzu_gw_mgmt_auth_rejected_total` by `pin_mismatch` and `missing_server_auth_eku`; a peer with
+no certificate gets no call; a command to the real agent returns its SUCCESS with output; 300
+`SendCommand` streams (50 in flight) over ONE connection all complete; a command to an agent that
+is not connected ends OK with a FAILURE frame; a fan-out whose 1 s deadline passes before the agent
+(held 4 s by `delay_seconds`) answers ends OK without that answer and the connection still serves;
+100 streams cancelled with `RST_STREAM` while the agent holds them leave the connection and gateway
+serving. (3) After all of it the script greps the gateway log for `function_clause`, `CRASH REPORT`,
+`=ERROR REPORT`, a supervisor termination or any `[error]` line, and the server log for `Socket
+closed` or a failed `Gateway SendCommand`. Checked by mutation: pinning the gateway's leaf instead
+of the server's fails the REST round trip and the burst, and listing the gateway's leaf as a second
+pin fails `unpinned_leaf_is_refused`. It cannot skip: the script has no skip path, a missing
+prerequisite exits non-zero, and `YUZU_REAL_UPSTREAM_STRICT=1` turns a check the suite cannot make
+(server unreachable, `/metrics` unreadable) into a failure. The four runner agents share one OS
+identity (#1871), so every named resource is per-run: all 8 ports come from the OS in one
+allocation (`--free-ports`), the Postgres database is `yuzu_test_<epoch>_gwint_<random>` created on
+the job's `YUZU_TEST_POSTGRES_DSN` and dropped on exit, the work directory is a `mktemp` name under
+`runner.temp`, and the gateway's Erlang node name and cookie carry a random salt (the release's own
+fixed `yuzu_gw` short name would contest the shared EPMD). A failed run keeps its work directory and
+the step "Upload gateway real-wire logs on failure" uploads its logs (`failure() &&` leads the
+condition) and the Common Test logs, never the run's throwaway CA or agent keys. The burst's own log
+(`mgmt_driver.log`) is among the uploaded `*.log` files.
 
 **Gateway peer authorization gates.** Four pieces enforce it in CI. (1) The `linux` job in
 `ci.yml` installs the `postgresql-client` apt package (it provides `psql`) and runs the step
@@ -994,6 +1054,28 @@ invocation selects `--suite platform` instead of `--suite docs` (the
 `docs` suite is Linux-only, "Test suites by leg" below) and its
 `assert-suite-cover.py` guard names `--exclude-suite docs`, so a missed
 label still fails loud.
+
+`Test (non-pg suites)` also carries the registry plugin's real-registry cases (#6488). It sets
+`YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1`, so a case that would skip (no `registry.dll`, or a process that
+cannot write `HKLM`; the job runs as LOCAL SYSTEM, which can) fails instead. The job-level
+`YUZU_TEST_REGISTRY_SCOPE` (`<run id>-<attempt>-<build type>`) puts every scratch key under
+`YuzuTest-<scope>-`, so two test phases sharing a box through the 2-slot gate judge only their own keys. The script
+scans only the direct children named `YuzuTest-*` of `HKLM\SOFTWARE`, its `Wow6432Node` and `HKCU\Software`; the
+local dispatcher's `Software\YuzuTest\RegistryPr17Ld_<salt>` keys (`test_registry_local_dispatcher.cpp:228,248`) are
+outside the scan.
+Before the suite, `Self-test the registry leftover check` plants a probe key under each root the script scans and proves both decisions of
+`scripts/ci/check-registry-test-leftovers.ps1` (the probe's own scope: exit 1 with an `::error` naming it; any
+other scope: exit 0 with a `::warning`); after it, `Assert this job left no YuzuTest-* registry keys behind` runs
+the same script with the job's scope; a root it cannot list fails the step (a missing root is skipped). The
+could-not-list arm has no self-test of its own (accepted residual): a persistent listing failure is caught pre-suite,
+because the self-test's probes go unnamed. It reports and never deletes (a leftover can be a registry link, and a
+tree delete follows links), so a key orphaned by a cancelled job stays as a warning in later jobs until a human
+removes it.
+
+Removing a leftover is the job of whoever owns the runner. For each `YuzuTest-*` key whose run is no longer in
+progress, open the key with `REG_OPTION_OPEN_LINK` and `DELETE` access, then call `NtDeleteKey` on that handle (a key
+with subkeys: delete them first, leaf first, the same way). Never use `Remove-Item -Recurse` or `RegDeleteTreeW`:
+both follow a registry link and can delete its target.
 
 `nightly.yml`'s `windows-asan` job now joins this same `with-test-slot.sh 2`
 gate and carries `--timeout-multiplier 2` (#4018) — previously it ran
@@ -1310,7 +1392,8 @@ clear the job timeout with a thin positive margin and now formally exceeds
 it is a materially different fact than "thin margin," not a rounding
 difference — #3443 (already the tracked home for this bump's temporary
 status) should treat the shard-K addition as a reason to revisit the 700s
-per-shard budget or the Linux `--num-processes 2` cap sooner rather than
+per-shard budget or the Linux `--num-processes 2` cap (the width then in
+force; the pg step is now np=4, Push 2c) sooner rather than
 later. Neither number is adjusted here without the same measurement
 discipline the rest of this PR applies to the Windows widths — this
 paragraph exists to make the new fact visible to the next reviewer, not to
@@ -1338,14 +1421,18 @@ cases and 9 more F cases than the dev base: C 914 against 886, F 541 against
 The theoretical degenerate ceiling grows with the count, as the paragraph
 above predicted for any addition. At the final 14 shards: 14 * 700 = 9800
 test-seconds, and at the Linux `--num-processes 2` that is 7 rounds of two
-shards, so 7 * 700 = 4900s = 81.7 minutes. That figure ALONE (it excludes checkout, build and the non-pg test step, so the real margin is smaller) is now under the
+shards, so 7 * 700 = 4900s = 81.7 minutes (np=2, as then in force; at the np=4 in
+force since Push 2c it is 4 rounds, 2800s = 46.7 minutes, and the figures
+below that quote 4900s are np=2 history). The np=2 figure ALONE (it excludes
+checkout, build and the non-pg test step, so the real margin is smaller) was under the
 Linux job's `timeout-minutes: 90` (`.github/workflows/ci.yml`, the `linux`
-job), by 8.3 minutes; with the up-to-30-minute slot wait
-(`YUZU_TEST_SLOT_TIMEOUT_MIN`) it is about 112 minutes, which still exceeds
-the 90-minute limit, before checkout and build time. For comparison, the 16-
-and 15-shard layouts (never on dev) were 8 rounds, 5600s = 93.3 minutes, over
-the limit on their own (about 123 minutes with the slot wait), and the actual
-dev base of 12 shards was 6 rounds, 4200s = 70 minutes (about 100 minutes with
+job), by 8.3 minutes (43.3 minutes at np=4); with the up-to-30-minute slot wait
+(`YUZU_TEST_SLOT_TIMEOUT_MIN`) it is about 112 minutes at np=2, which still exceeded
+the 90-minute limit, before checkout and build time (at np=4: 46.7 + 30 = 76.7
+minutes, under it; the ceiling holds while nothing is retried, and `known-flaky.json`
+is empty). For comparison, the 16- and 15-shard layouts (never on dev) were 8
+rounds, 5600s = 93.3 minutes, over the limit on their own (about 123 minutes with
+the slot wait), and the actual dev base of 12 shards was 6 rounds, 4200s = 70 minutes (about 100 minutes with
 the slot wait). The ceiling is a figure that requires every shard to hit its
 own cap, not an expected case: the degenerate figure applies only when every
 shard runs to 700s, and the makespan is lower whenever any shard finishes
@@ -1357,12 +1444,14 @@ job), so 14 shards are ceil(14/6) = 3 rounds, 3 * 700 = 2100s = 35 minutes,
 65 minutes with a 30-minute slot wait for the pg step alone. The job also
 acquires a slot for its non-pg step, so the worst case with both 30-minute
 waits is 95 minutes plus that step's own run time, still under that job's
-`timeout-minutes: 120`. The Linux slot-wait case is the one that still needs
-attention: the "revisit the 700s per-shard budget or the Linux
+`timeout-minutes: 120`. At np=2 the Linux slot-wait case was the one that
+needed attention: the "revisit the 700s per-shard budget or the Linux
 `--num-processes 2` cap" follow-up tracked on #3443 (see the shard-K paragraph
-above) remains open, with a less severe trigger than at 16 shards (the
-all-at-cap ceiling alone now fits the job limit; the ceiling plus a full slot
-wait does not). Neither number is adjusted here. The tag assignment is the
+above) had a less severe trigger than at 16 shards (the all-at-cap ceiling alone
+fit the job limit, the ceiling plus a full slot wait did not). At np=4 (Push 2c)
+both fit, about 77 minutes before checkout and build, so that trigger no longer
+holds for the pg step once Push 2c lands; the 700s budget is unchanged. Neither
+number is adjusted here. The tag assignment is the
 tuning knob (move a tag between M and N, or O and F), documented in
 `tests/meson.build` above shard M.
 
@@ -1661,11 +1750,12 @@ Separate Postgres containers also remove DB-lock/connection contention
 but not shared physical resources (page cache, DRAM bandwidth,
 kernel/container overhead) — the cap stays below 4 specifically to keep
 some protection against a full-box heavy-phase pileup. `--num-processes`
-stays at 2, deliberately NOT bundled with this change: 2 slots x 2
+stayed at 2 (as of 2026-08-25), deliberately NOT bundled with this change: 2 slots x 2
 shards/job = 4 concurrent pg shards today, 3 slots x 2 = 6, but 3 slots x
 3 would jump to 9 with no diagnostic support at that load and no way to
 attribute a regression to either knob — ship and measure one axis at a
-time.
+time. (Push 2c later widened it to 4 on its own axis; box-wide that is
+3 x 4 = 12.)
 
 Not starvation-proof: `with-test-slot.sh` has no FIFO or PR-aware
 admission — a freed slot goes to whichever waiter's 5s poll tick happens
@@ -1746,7 +1836,9 @@ once the actual mechanism is understood.
 
 ### Staged widening — Linux (2026-10-21)
 
-Until Push 2a (below), Linux ran `--num-processes 2` on every test invocation since #3443. The
+Until Push 2a (below), and for the pg-shards step until Push 2c, Linux ran
+`--num-processes 2` on every test invocation since #3443; the server-shard
+invocation stays at 2. The
 2026-10-20 baseline at that width: the 14 pg shards were 1,778 serial-s over
 907 s wall (sum/wall 1.96, so both workers were busy throughout); the non-pg
 step was 678 serial-s over 5.4 min; the worst shard, M, took 244 s, 35% of its
@@ -1765,7 +1857,8 @@ delta is attributable to one axis ("never bundled with a topology change"):
 | 1 | Preflight split, `platform` suite + Linux-only `docs`, `max-parallel` 4, duration summary, PGDATA/RAM probe (np stays 2) | topology | | | | | | |
 | 2a | Linux np 2 → 4 on the cheap-suites invocation only (see Push 2a below) | width | | | | | | |
 | 2b | `gateway eunit` meson `priority: 120`, so it starts first in the cheap-suites invocation (see Push 2b below) | ordering | | | | | | |
-| 2 | Linux np 2 → 4 on the remaining two invocations (server shards, pg); Windows pg 6 → 8, non-pg 4 → 6 | width | | | | | | |
+| 2c | Linux np 2 → 4 on the pg-shards step only (see Push 2c below) | width | | | | | | |
+| 2 | Linux np 2 → 4 on the server-shard invocation (not planned: that invocation is about 66 s of wall time, Push 2a, so there is little to gain); Windows pg 6 → 8, non-pg 4 → 6 (held) | width | | | | | | |
 | 3 | tmpfs PGDATA, cap from the push-1 probe (see "Postgres for server tests") | storage | | | | | | |
 | 4 | Linux np 4 → 6, then stop | width | | | | | | |
 
@@ -1777,8 +1870,8 @@ Probe (push 1, `Postgres container footprint (tmpfs sizing probe)` step):
 host RAM: pending (filled by the tmpfs commit from the probe step log); post-run PGDATA per container (residual on-disk size after the pg step, not peak): pending.
 
 **Push 2a (Linux cheap-suites invocation only, `--num-processes 2 → 4`).** The
-second `Test (non-pg suites)` invocation (server shards) and the pg step stay at
-2, so the delta is attributable to this one invocation.
+second `Test (non-pg suites)` invocation (server shards) and the pg step stayed at
+2 (at the time of 2a), so the delta is attributable to this one invocation.
 
 *Baseline at np=2.* Step median over the 12 most recent `dev` push runs in which
 the `gcc-15`/`debug` job succeeded (2026-10-22 to 2026-10-24): `Test (non-pg suites)` 6.7 min
@@ -1997,6 +2090,234 @@ priority (474 s to 521 s that morning): the pg step drifted upward through the
 evening on every run, with or without this change, so it says nothing about the
 priority. Eunit's duration on the first nightlies after merge is still to be
 read (see above).
+
+**Push 2c (Linux pg-shards step only, `--num-processes 2 → 4`).** The width of the
+`Test (pg shards, full)` step; the slot count (3), the 14 shards, their priorities
+and timeouts, and the other invocations are unchanged. The step runs only on the
+`gcc-15`/`debug` leg (`pg_mode=full`), on PR runs and dev pushes; the other three
+Linux legs do not run it. The 14 shards of one job share that job's single
+Postgres container, so this doubles that container's concurrent clients.
+
+*Baseline at np=2.* Fifteen runs whose `gcc-15`/`debug` job succeeded, from
+2026-10-24 16:46Z to 2026-10-25 01:22Z (runs 40112522948 to 40149184808, dev
+pushes and PR runs; run 40124557287 ended cancelled but its job succeeded, and it
+is counted): the pg step took 474 s to 743 s (median 586 s), the 14 shards
+summed 928 to 1,472 serial-s (sum/wall 1.96 to 1.99, so both workers were busy
+throughout) and the longest shard took 99 to 158 s. All 15 acquired their slot
+after 0 s, 11 at slot 1/3, 3 at 2/3 and 1 at 3/3 (run 40124557287, a PR run: 612 s,
+shard sum 1,202 s, longest shard 132 s). Step and shard times drifted upward
+through the window, not monotonically (474 s and 928 serial-s at the start, 743 s
+and 1,472 at the end). Push 2a merged mid-window, at 19:37Z: the seven runs that
+started before it have a pg-step median of 545 s and the eight from the merge push
+on 649 s, but three of the seven earlier runs are Push 2a's own PR runs (545, 522
+and 536 s), which excludes within-job spillover, so other jobs' now-wider non-pg
+steps and time of day are the candidates, and the cause is not established. This
+is the pg-step watch that Push 2a left open. The 2026-10-20 figure above (1,778
+serial-s) is higher still, so a comparison across time is not evidence; that is
+why the measurement below is interleaved, with both sides after Push 2a. The
+Windows precedent went from 602 s at `--num-processes 2` to 358 s at 4 (Push 2
+under "Windows test-phase concurrency gate" above: -40.5%, worst shard 1.16x); the
+602 s is a single cold-cache sample, as that section says, and Windows is a
+different OS.
+
+*Expectation (an estimate, not a measurement).* The shard sum divided by four is
+the floor, 232 s to 368 s for these runs. The Windows result suggests a cut of 30%
+to 40% of the step, so a saving of roughly 140 s to 300 s on a step of 474 s to
+743 s. The unknown is the shared Postgres container: four clients instead of two
+may slow every shard, which rule (b) bounds.
+
+*Capacity.* Box-wide, with the slot count held at 3, up to 3 jobs x 4 shards = 12
+concurrent pg shards (up from 6) across up to three of the four per-agent
+containers (`max_connections=400` each; a job owns its container, so connections
+do not add across jobs). The `ci.yml` comment on the slot count refused a jump to
+9 shards as having no diagnostic support at that load; this goes past 9, on the
+strength of the measurement below and the post-merge watch. The containers have no
+CPU or memory limit (`/dev/shm` is Docker's 64 MiB default), so their backends are
+not covered by the runner's `AllowedCPUs` (16 logical CPUs per runner agent),
+which pins only the test processes. Nightly and sanitizer jobs and every Linux
+leg's non-pg step (np=4 since Push 2a) are not slot-gated and add to the load.
+Connection use per shard has not been measured; the log checks below are the
+tripwire, and they read nothing on a green run. A poll of `pg_stat_activity`
+during one np=4 sample would turn that into a measurement; it is not done here
+because it is a probe-step change on a width PR.
+
+*Measurement.* Alternate np=4 and np=2 runs back to back so box drift cancels, one
+job at a time, in the order np=4, np=2, np=4, np=2, each finishing before the next
+starts. That samples a lightly loaded box, not the 12-shard regime; the post-merge
+watch is the only check on that, and only for the slot numbers it reaches. The
+np=4 side is this PR's `Linux gcc-15 debug` job (first run plus a re-run); a PR
+run checks out its merge commit, which a re-run reuses. The np=2 side is a re-run
+of the `Linux gcc-15 debug` job of a dev push (`gh run rerun <run> --job <id>`,
+for example run 40182640011, job 121136792637, the dev push at a5054012d, whose
+job succeeded while the run is red on another job). A push run does NOT reuse its
+commit: it checks out the floating `refs/heads/dev` (`ci.yml`, `checkout_ref` for
+non-PR events), so a re-run builds the current tip of dev, not the commit the run
+was first made for (the earlier candidate, run 40132838208 at 62c3c806f, is stale
+for this reason). Record the SHA each attempt actually checked out, from the
+checkout lines of its log, and check that the two sides run the same tests: `git
+diff --stat <np=2 sha> <np=4 merge sha> -- server/ agents/ common/ proto/ sdk/
+scripts/ci/ tests/ meson.build vcpkg.json vcpkg-configuration.json triplets/
+meson/ ':!tests/meson.build'` must show nothing, and `tests/meson.build`,
+`.github/workflows/ci.yml` and `scripts/ci/with-test-slot.sh` may differ only by
+this PR's own hunks (the comments in `tests/meson.build` and `with-test-slot.sh`,
+the width and comments in `ci.yml`). The root `meson.build`, `vcpkg.json`,
+`vcpkg-configuration.json`, `triplets/` and `meson/` are listed because their
+compiler flags and dependency pins do reach the pg test binary, and `sdk/` because
+the test targets link it; `gateway/` is not, because it cannot (#6458's `gateway
+eunit` priority only orders the non-pg step). If the diff is not empty, take a
+newer np=2 re-run. Attempt 1 of that same job is itself an np=2 sample at
+a5054012d (pg step 437 s, 10:00Z), the original push attempt and not a re-run.
+Meson's counts here are per shard (`Ok: 14`) and say nothing about the cases
+inside, so they cannot show equal populations. Before each rerun check that
+nothing is queued or running on `dev`, because a re-run joins its concurrency
+group and a newer pending run cancels an older pending one. For each sample
+record: run and job ids, the checked-out SHA, the runner name, the 14 per-shard
+times (`gh run view <run> --attempt <n> --job <id> --log`, the `N/14 ... server pg
+unit tests shard X` lines), the `with-test-slot: acquired '...' slot N/3 after Ns`
+line, and the other Linux jobs in progress at its start, captured then from the
+jobs API (`gh api repos/<repo>/actions/runs/<id>/jobs` for each in-progress run,
+ignoring runs that have been queued for days), since it cannot be reconstructed
+afterwards. The slot number is a weak proxy for load (the lowest free slot is
+taken, and the ungated builds and non-pg steps never show in it), so re-take a
+pair when the number of other Linux jobs running differs between its two sides.
+The step duration from the jobs API includes the slot wait, which is queue time
+and not width: take the step duration minus the wait, and re-take any sample with
+a non-zero wait. At most 2 extra pairs may be taken; record every pair, and if the
+box never settles record the result as inconclusive and ask the maintainer.
+Adjacent runs in the np=2 baseline differ by up to 15% in step time and by up to
+1.3x on a single shard, so a result between 10% and 15% on (a) is not a pass: take
+one more pair, which is a precondition and not a retry after a failed rule.
+Compare the np=4 median with the np=2 median taken in the same window, not with
+earlier days.
+
+*Decision rule.* The one under "Windows test-phase concurrency gate" above, with
+three differences: (b) is measured per shard, the median of the np=4 samples
+against the mean of the np=2 samples, (a) asks for 15% instead of 10%, and the
+error checks are new. (a) the np=4 median is at least 15% below the interleaved
+np=2 median (a result of 10% to 15% takes one more pair first, as above, and if
+the result is still between 10% and 15% record it as inconclusive and ask the
+maintainer); (b) no shard takes more than 1.5x its mean np=2 time; (c) no shard
+reaches 560 s (80% of its 700 s timeout); all 14 shards pass in every sample; and
+no shard output contains `sorry, too many clients already`, `remaining connection
+slots are reserved`, `deadlock detected`, `could not resize shared memory segment`
+or a connection or lease error. Meson prints only failing tests' output
+(`--print-errorlogs`) and the meson-logs artifact, which holds every shard's full
+output, uploads only on a red or cancelled job, so on an all-pass sample this
+check reads nothing; with the DSN set a connection failure fails the test instead
+of skipping it, so the all-14-pass requirement is the real test, and exhaustion
+may also show first as slowness, which (b) catches. Precondition for (b): the two
+np=2 samples must agree per shard within about 1.2x (adjacent baseline runs
+differed by up to 1.3x, and across the window shards moved by 1.1x to 2.1x, most
+by 1.6x or more); if they do not, take another np=4/np=2 pair within the cap above
+before adjudicating, which is a precondition and not the forbidden retry after a
+failed rule. If (b) or (c) fails, or (a) comes in under 10%, revert to 2 and stop;
+a failed safety check is not "try one more sample".
+
+*Merge condition and closure.* Merge only after the samples, run and job ids,
+checked-out SHAs, runner names, slot waits and a rule-by-rule verdict are recorded
+here (as Push 2a did) and (a) to (c) pass. After the merge 2c stays open until the
+next 10 or more dev-push `gcc-15`/`debug` runs show no pg-shard TIMEOUT, no
+repeated 560 s watchdog warning (two or more in the 10 runs, on one shard or
+scattered across several) and no red of the `Test (pg shards, full)` step itself
+(a red elsewhere in the run, such as the Windows legs, is not one). The np=2 red
+rate of that step is the control: 0 of the 20 dev-push runs from 2026-10-23 11:05Z
+to 2026-10-25 17:52Z (counted on 2026-10-25; the run before them had a cancelled
+step) had a red pg step. A red of the step that also occurs at np=2 at a
+comparable rate would be recorded and not a revert, but at 0 of 20 any red of the
+step has no np=2 precedent, and is a revert. Two things are checked on the 10
+runs. Occupancy: the ratio of the shard sum to the step duration minus the slot
+wait was 1.96 to 1.99 at np=2 and cannot exceed 4 at np=4; a median at or below
+2.5 (a judgement, not derived from data) means the extra workers are mostly idle.
+It detects idle workers and not a slowdown: shards stretched by CPU or Postgres
+contention keep the ratio high while the wall time gets no better. Gain: so the
+median step minus slot wait must also stay below 649 s, the post-Push-2a np=2
+median; at or above it no gain is demonstrated, and staying below it is necessary,
+not sufficient, since a quiet-box np=2 run took 437 s. Failing either check
+extends the watch by another 10 runs, recomputed over the 20; failing again is a
+revert. Record each run's slot number: slot 3/3 occurred once in the 15 baseline
+runs (a PR run, 0 s wait), and all 5 dev pushes among them held slot 1/3 (slots
+2/3 and 3/3 occurred only in PR runs), so dev pushes alone will rarely reach it.
+The watch therefore also counts np=4 `gcc-15`/`debug` PR runs toward the slot-3/3
+observation, and needs at least one run that acquired slot 3/3 or waited before it
+closes; if none does within 20 np=4 runs of either kind, the closure says plainly
+that the 12-shard regime was never observed (slot 3/3 needs two other holders).
+`tests/known-flaky.json` is `[]`, so nothing is retried and any np=4 flake turns
+the run red; the #2093 watchdog is reporting-only and gates nothing. Repeated
+warnings or a red with no np=2 precedent during the watch is a revert, not a
+re-run; the PR author watches the dev pushes. That watch is also the flake-rate
+check required before the Linux ladder's row 4 (np 4 → 6).
+
+*Revert.* Set `--num-processes` on the pg-shards `flake-retry.py` call back to 2,
+and in the same commit update the "Width history" comment and the "held at 2 ...
+until Push 2c" sentence in that step, ladder row 2c, the "Until Push 2a" sentence,
+this paragraph's status, and every sentence that says the pg step is np=4 or that
+Push 2c widened it (grep both `Push 2c` and `np=4`; the job-budget paragraphs
+above carry np=4 figures). Dated history paragraphs that still say np=2 were left
+as history and need no edit. The revert PR runs the full leg and, being a workflow
+edit, the canary job (about 6 minutes warm, much longer cold), so until it lands
+every dev push and new PR still runs np=4; an in-flight PR's re-run reuses its
+original merge commit and keeps np=4 until a new push or a sync.
+
+*Samples* (taken 2026-10-25, all on `gcc-15`/`debug`, every one acquired its slot
+after 0 s so the step minus the slot wait is the step; all 14 shards passed in
+each):
+
+| # | width | run / attempt / job | runner | checked-out SHA | pg step | shard sum, longest |
+|---|---|---|---|---|---|---|
+| 1 | np=4 | 40189715176 / 5 / 121215042603 | bigtam-linux-0, slot 1/3 | merge 889fba5f87 (PR 903d1cfdb into a5054012d) | 262 s | 941 s, 106 s (I) |
+| 2 | np=2 | 40182640011 / 2 / 121240829606 | bigtam-linux-0, slot 1/3 | dev tip at its start, a5054012d (`git log -1 --format=%H` in its checkout step) | 484 s | 947 s, 105 s (I) |
+| 3 | np=4 | 40189715176 / 7 / 121290474153 | bigtam-linux-3, slot 1/3 | merge 889fba5f87 | 260 s | 936 s, 106 s (I) |
+| 4 | np=2 | 40182640011 / 1 / 121136792637 | bigtam-linux-2, slot 1/3 | dev push at a5054012d | 437 s | 862 s, 96 s (I) |
+
+Per-shard seconds (shard J does not exist):
+
+| shard | #1 np=4 | #3 np=4 | #2 np=2 | #4 np=2 |
+|---|---|---|---|---|
+| A | 78 | 78 | 78 | 68 |
+| B | 92 | 92 | 92 | 90 |
+| C | 63 | 63 | 69 | 60 |
+| D | 57 | 57 | 56 | 50 |
+| E | 63 | 63 | 63 | 56 |
+| F | 74 | 74 | 73 | 65 |
+| G | 58 | 57 | 59 | 53 |
+| H | 90 | 89 | 90 | 82 |
+| I | 106 | 106 | 105 | 96 |
+| K | 31 | 30 | 33 | 30 |
+| L | 53 | 53 | 54 | 49 |
+| M | 93 | 94 | 93 | 87 |
+| N | 48 | 47 | 49 | 44 |
+| O | 35 | 35 | 35 | 31 |
+
+Deviations from the procedure above, stated plainly. By time the samples are #4
+(10:00Z), #1 (12:05Z), #2 (17:40Z) and #3 (21:08Z), so the widths alternate np=2,
+np=4, np=2, np=4, but the procedure's order np=4, np=2, np=4, np=2 was not
+followed: #4 is the original push attempt (not a re-run) and ran 2 hours before
+any np=4 sample. A fourth interleaved np=2 re-run was not taken because dev had
+moved off a5054012d, to 6954a193d (a `scripts/ci/` change, PR #6473) at 17:52Z and
+to 360f998d0 (new server tests, PR #6475) at 21:21Z, and a re-run of a push job
+builds the current tip, which would not have run the same tests as the np=4 merge
+commit (which is also why sample 2 had to be taken before 17:52Z). Sample 4's
+shard sum is 9% below the other np=2 sample's (862 s against 947 s). The other
+Linux jobs in progress were not captured at the start of samples 1 to 4 as the
+procedure asks; the only evidence is that all four took the lowest slot after 0 s,
+that no run was in progress when sample 2 was re-run, and that only a
+runner-inventory sentinel run was in progress when sample 3 was re-run. Attempt 6
+of the np=4 job failed in the non-pg step (`agent unit tests shard C`, exit status
+42) before the pg step ran and is not a sample; it was re-run as attempt 7.
+
+*Verdict.* (a) The np=4 median step is 261 s (262, 260) against an np=2 median of
+460.5 s (484, 437): 43.3% lower, and 46% against the interleaved np=2 sample
+alone; the 15% bar is met with a wide margin. (b) The precondition holds: the two
+np=2 samples agree per shard within 1.15x. The np=4 median over the np=2 mean is
+between 0.97x and 1.08x for every shard (largest on D, 57 s against 53 s), under
+the 1.5x limit. (c) The longest shard was 106 s, against the 560 s bar. All 14
+shards passed in all four samples. Occupancy (shard sum over step) was 3.6 at np=4
+and 1.96 to 1.97 at np=2. Shard times show no change from the width beyond the
+1.15x spread between the two np=2 samples (the np=4 median over the np=2 mean is
+0.97x to 1.08x per shard), so the shared Postgres container showed no slowdown at
+4 clients; this samples a lightly loaded box with the slot at 1/3 and says nothing
+about the 12-shard regime, which only the post-merge watch can reach. The
+max_connections and `pg_stat_activity` peak were not measured.
 
 ### Persistent runner-local test history
 

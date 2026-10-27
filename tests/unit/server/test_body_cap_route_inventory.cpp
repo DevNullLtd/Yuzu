@@ -121,6 +121,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <filesystem>
 #include <set>
@@ -619,7 +620,8 @@ TEST_CASE("route_registration_scan: rejects client receivers and a non-boundary 
         "sink.Post(\"/unterminated, h);\n";
     CHECK(route_scan::find_route_registrations(text, route_scan::kMutatingMethods).empty());
     // The same text with a Get request yields the one Get with a literal argument.
-    const auto gets = route_scan::find_route_registrations(text, {"Get"});
+    const auto gets =
+        route_scan::find_route_registrations(text, std::array<std::string_view, 1>{"Get"});
     REQUIRE(gets.size() == 1);
     CHECK(gets[0].raw_path == "/x");
 }

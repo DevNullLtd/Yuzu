@@ -620,13 +620,17 @@ strictly safer than falsely cancelling it, since there is no repair path today t
 
 Listed here because the routed trigger fires on any wall-clock cutoff in `approval_manager.cpp`, not
 because the store adopts the apparatus. Every stamp this store writes (`submitted_at`, `reviewed_at`,
-`consumed_at`) and every cutoff it compares against is Postgres `now()`, authored in-SQL; the file
-reads no process clock at all, and a source tripwire in `test_approval_manager.cpp` pins that. An
-approval ticket is "live" while it is `approved`,
+`consumed_at`) and every cutoff it compares against is the Postgres clock, authored in-SQL, and
+`now()` (transaction start) everywhere except the liveness test in the consume CAS and its
+diagnostic read, which use `clock_timestamp()` so a caller-held transaction cannot redeem past the
+lifetime (#6062 sg-6; the CAS still stamps `consumed_at` from `now()`); the file reads no process
+clock at all, and a source tripwire in `test_approval_manager.cpp` pins that and allows exactly
+one occurrence of `clock_timestamp`. An approval ticket is "live" while it is `approved`,
 unconsumed and `reviewed_at` lies within `[db_now - 7 days, db_now + 300 s]`. That test is ONE SQL
 predicate (`ticket_live_sql()` in `approval_manager.cpp`, constants `kApprovalTicketTtlSeconds` and
-`kApprovalReviewedAtSlackSeconds` in `approval_manager.hpp`), used by four sites that must never
-disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-ticket sweep, and
+`kApprovalReviewedAtSlackSeconds` in `approval_manager.hpp`) with one definition of the window,
+used by four sites that must not drift apart about its bounds: the `consume_ticket` CAS, its
+diagnostic read, `submit()`'s approved-ticket sweep, and
 `ticket_is_live()`, which `ScheduleRunner` calls before it fires an approved schedule ticket.
 
 - **Anti-fork rule.** `ticket_is_live()` answers liveness ONLY. It carries none of the #2442 origin and

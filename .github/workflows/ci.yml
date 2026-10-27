@@ -741,6 +741,10 @@ jobs:
       # silently skipping them. Linux (Big Tam) only: the Windows and macOS legs
       # are deliberately not covered (docs/erlang-gateway-build.md).
       YUZU_REQUIRE_TLS_TESTS: "1"
+      # yuzu_gw_config_files_tests reads the SHIPPED sys.config files. Without
+      # this a checkout layout it cannot find the repository root in reports
+      # SKIPPED on stderr and runs nothing; with it, that is a failure.
+      YUZU_REQUIRE_CONFIG_FILES_TEST: "1"
     strategy:
       fail-fast: false
       # max-parallel: 4 (raised from 3 on 2026-10-21, owner's call) — Big Tam has
@@ -896,7 +900,7 @@ jobs:
 
       # OTP + rebar3 for the gateway test legs. Without these, meson's
       # `find_program('rebar3', required: false)` returns not-found,
-      # `gateway eunit` and `gateway ct` are silently skipped, and the
+      # the `gateway eunit shard A/B` and `gateway ct` tests are silently skipped, and the
       # Linux matrix can't catch gateway regressions until they hit the
       # Windows leg (where rebar3 is pre-baked via choco). Pin matches
       # release.yml's "Build Gateway (Erlang)" job so any OTP bump moves
@@ -925,14 +929,6 @@ jobs:
         with:
           otp-version: '28'
           rebar3-version: '3.24'
-
-      # PKI PR5c: the gateway vendors a 2-line-patched grpcbox in
-      # gateway/_checkouts/grpcbox. This supply-chain gate fails the PR build if
-      # that copy is ever anything other than upstream grpcbox at the
-      # rebar.config-pinned tag + the documented grpcbox.yuzu.patch (tamper /
-      # drift / version skew). Runs on the merge-guarding path, not only release.
-      - name: Verify vendored grpcbox integrity
-        run: bash gateway/scripts/verify-vendored-grpcbox.sh
 
       # ADR-0016 / gov build-ci: the committed gateway _pb.erl are GENERATED from
       # the vendored proto (regen_pb.escript). Re-regenerate + byte-diff so an
@@ -1283,7 +1279,13 @@ jobs:
         # tuning history for THIS invocation (with-test-slot.sh, --num-
         # processes, shard timeouts) — unchanged by Phase 2, kept in full.
         #
-        # --num-processes 2: without a cap, meson fans every test() entry out at
+        # Width history: this invocation runs --num-processes 4 since Push 2c of
+        # the Linux staged-widening ladder (docs/ci-architecture.md); the long
+        # history below is the evidence the cap of 2 rested on, kept for the
+        # record. The decision rule, the interleaved measurement and the revert
+        # (this one number) are in the docs paragraph "Push 2c".
+        #
+        # Cap-of-2 history: without a cap, meson fans every test() entry out at
         # once — its default worker count is an uncapped, non-affinity-aware
         # cpu_count() (this runner's job is genuinely confined to execute on 16
         # logical CPUs via cgroup, "Self-hosted runner topology" in
@@ -1308,15 +1310,15 @@ jobs:
         # measured A=227.86s H=214.19s B=90.35s D=227.48s E=353.32s G=317.04s
         # F=262.81s C=359.42s — E and G both already well past HALF the then-
         # 600s ceiling on their own, with no contention at all. --num-processes
-        # 2 stays at 2 here, not a higher number: this mirrored Windows' own
+        # 2 was held at 2 here, not a higher number: this mirrored Windows' own
         # starting `--num-processes 2` on its "Test (pg shards, full)" step
         # (#3443) rather than deriving a Linux-specific value — the two
         # platforms have since DIVERGED: PR #3677's staged Windows
         # measurement protocol (docs/ci-architecture.md, current value
         # there, not restated here to avoid this comment going stale every
         # widening round) has moved Windows past 2 on real per-shard
-        # contention data; Linux stays at 2, unmeasured-and-unwidened,
-        # since nothing here has re-derived a Linux-specific value either.
+        # contention data; Linux was held at 2 until Push 2c widened it (the
+        # samples and the verdict are in docs/ci-architecture.md, "Push 2c").
         #
         # with-test-slot.sh (#3443 AC4): --num-processes 2 alone fixed
         # WITHIN-job fan-out but left cross-job contention unmeasured. Now
@@ -1374,9 +1376,10 @@ jobs:
         # is still a real, if smaller, improvement — it removes an incidental
         # ~51s gap this reconstruction also found between shards A and H
         # starting — but it does not by itself explain or fix E/G's own margin.
-        # --num-processes stays at 2 here, not 3: an earlier version of this
-        # commit raised it, reasoning the pool was now pg-only so 2 had "no
-        # competition to spend margin on" — but 3-wide FIFO over shards A,H,B,D,
+        # --num-processes was held at 2 here, not 3 (as of 2026-08-25): an
+        # earlier version of this commit raised it, reasoning the pool was now
+        # pg-only so 2 had "no competition to spend margin on" — but 3-wide FIFO
+        # over shards A,H,B,D,
         # E,G,F,C predicts D, E, and G (three of the heaviest) running
         # concurrently for a long stretch, worse than today's 2-wide pairing,
         # not better. Reverted without a real run confirming it helps; this
@@ -1386,7 +1389,7 @@ jobs:
         # this paragraph was written, for the same reason (box-wide job
         # saturation, #3443 AC4) — SUPERSEDED 2026-08-25, see the "Cross-job
         # slot count: 2 -> 3" paragraph below. --num-processes here is
-        # UNCHANGED (still 2) — only the box-wide slot count moved.
+        # UNCHANGED (2 at the time); only the box-wide slot count moved.
         #
         # 2026-08-25: the solo diagnostic above (E=353.32s, G=317.04s) is what
         # finally disproved the "isolate the pool and it'll fit" premise this
@@ -1417,8 +1420,9 @@ jobs:
         # two shards #3582 split. See tests/meson.build's shard-E/I/G/J
         # comment block and docs/ci-architecture.md's worst-case job-budget
         # arithmetic (re-derived for all-ten-at-700s: makespan is now a
-        # deterministic 3500s at --num-processes 2, no pairing variance,
-        # margin against the 90-min job ceiling under 2 minutes worst-case).
+        # deterministic 3500s at --num-processes 2 (the width then in force), no
+        # pairing variance, margin against the 90-min job ceiling under 2 minutes
+        # worst-case).
         #
         # Telemetry note: each invocation overwrites meson's single
         # testlog.junit.xml, so only the LAST one's per-suite ci_test_suites
@@ -1496,11 +1500,13 @@ jobs:
         # margin above further, on top of whatever the 3-slot regime itself
         # costs.
         #
-        # --num-processes stays at 2, deliberately NOT bundled with this
+        # --num-processes stayed at 2 (as of 2026-08-25), deliberately NOT bundled with this
         # change: 2 slots x 2 shards/job = 4 concurrent pg shards today; 3
         # slots x 2 = 6; 3 slots x 3 would jump to 9 with no diagnostic
         # support at that load and no way to attribute a regression to either
-        # knob. Ship and measure one axis at a time.
+        # knob. Ship and measure one axis at a time. Push 2c later widened it to 4
+        # on its own axis; box-wide that is 3 slots x 4 = 12 concurrent pg
+        # shards (docs/ci-architecture.md, "Push 2c", Capacity).
         #
         # Acceptance/rollback signal: the #2093 duration watchdog's 560s
         # (80% of the 700s per-shard ceiling) warning is an EXPECTED, accepted
@@ -1527,7 +1533,7 @@ jobs:
         run: |
           rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
           bash scripts/ci/with-test-slot.sh 3 -- \
-            python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite server-pg
+            python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 --suite server-pg
           # Outside the slot: pure parsing plus a --list-tests spawn per Catch2 entry.
           python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux pg shards"
 
@@ -1606,6 +1612,69 @@ jobs:
           YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
           YUZU_REQUIRE_PSQL: "1"
         run: bash tests/shell/test_gateway_peer_boot_refusal.sh
+
+      # Gateway real-wire gate (#5652, #5653): the REAL yuzu-server under test, the REAL gateway
+      # release (`rebar3 as prod release`) and one REAL yuzu-agent, brought up by
+      # scripts/integration-test.sh --tls, then gateway/apps/yuzu_gw/integration_test/
+      # yuzu_gw_real_upstream_SUITE against that server. Everything the gateway-side unit tests mock
+      # (meck on yuzu_grpc_client) is real here: every upstream RPC call site through the real gun
+      # client, the x-yuzu-session-id header of a registration replay and the server adopting that
+      # session, and the gateway->server hop PINNED OVER TLS (the server runs on its generated
+      # default certificates with no --insecure-gateway-peer, so it enforces the automatic pin of
+      # its own default-gateway.pem, which is the leaf the gateway and the suite present; a valid
+      # leaf of the same CA that is not pinned must be refused). Agents reach the gateway over
+      # one-way TLS and enrol for a per-agent leaf.
+      #
+      # The OTHER hop, server -> gateway management listener (the privileged command plane, #5175), is
+      # covered too, in the production posture: strict mutual TLS, auth_fun
+      # yuzu_gw_authz:check_mgmt_peer/1 and mgmt_peer_pins = the server's default leaf, the server
+      # pointed at it with --gateway-command-addr. The script dispatches commands to the real agent
+      # through the server's REST API (one round trip, then a 300-command burst over the server's one
+      # management connection, each required to return the agent's SUCCESS), and
+      # yuzu_gw_real_mgmt_SUITE dials the same listener as the server would and as the peers the pin
+      # must refuse (the gateway's own leaf and an enrolled agent's leaf: valid certificates of the
+      # same CA, UNAUTHENTICATED), plus SendCommand over one connection, the deadline-passes-first
+      # and the cancelled-stream paths. Both logs are then grepped for the #5175 signature
+      # (function_clause / crash reports in the gateway, 'Socket closed' in the server).
+      #
+      # Runs on the gcc-15/debug leg only (the one that already carries pg_mode=full and the PR
+      # fast path): the gateway release and the Common Test profile are built here, so the cost is
+      # a few minutes per leg, and the wire behaviour under test does not depend on the server's
+      # compiler or optimisation level. Never a silent skip: scripts/integration-test.sh has no
+      # skip path, a missing prerequisite (Postgres DSN, psql, openssl, erl/rebar3, a binary) exits
+      # non-zero, and the step fails the job on any failed check.
+      #
+      # Per-job salting (#1871: the four runner agents share ONE OS identity on ONE box). --free-ports
+      # takes all 8 ports from the OS in one allocation (no fixed 5005x/5006x/8080/8081/9568);
+      # the Postgres database is `yuzu_test_<epoch>_gwint_<random>` created on this job's
+      # YUZU_TEST_POSTGRES_DSN (the per-agent instance ensure-postgres.sh exported) and dropped on
+      # exit; the work directory is a mktemp name under runner.temp (per agent); the gateway's
+      # Erlang node name and cookie carry a per-run random salt (the release's own fixed
+      # `yuzu_gw` short name would contest the shared EPMD). Nothing is derived from a fixed value.
+      - name: Gateway real-wire test (pinned TLS)
+        id: gateway_real_wire
+        if: matrix.compiler == 'gcc-15' && matrix.build_type == 'debug'
+        timeout-minutes: 20
+        env:
+          YUZU_BUILDDIR: ${{ github.workspace }}/build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+          YUZU_IT_TMPDIR: ${{ runner.temp }}
+        run: bash scripts/integration-test.sh --tls --free-ports --gateway-ct
+
+      # A failed run keeps its work directory (scripts/integration-test.sh preserves it on any
+      # non-zero exit). Logs only: the directory also holds the run's throwaway CA and agent keys,
+      # its server config and Erlang cookie, which are not uploaded. `failure() &&` is mandatory:
+      # without a status function an `if:` that reads only a step outcome is unsatisfiable.
+      - name: Upload gateway real-wire logs on failure
+        if: failure() && steps.gateway_real_wire.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gateway-real-wire-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/yuzu-integration.*/*.log
+            ${{ runner.temp }}/yuzu-integration.*/gw_sys.config
+            ${{ runner.temp }}/yuzu-integration.*/ct-logs
+          if-no-files-found: warn
+          retention-days: 14
 
       # Graceful shutdown is not exercisable by the Catch2 suite (which never drives main(), so
       # never installs a signal handler). Nothing in unit, integration or CI failed if it broke
@@ -1710,6 +1779,8 @@ jobs:
       # Belt-and-suspenders with Start-PinnedRunner.ps1: every Wee Tam job
       # explicitly carries the 16-thread width of its assigned CCD.
       YUZU_BUILD_JOBS: "16"
+      # #6488: per-job registry key scope; see scripts/ci/check-registry-test-leftovers.ps1
+      YUZU_TEST_REGISTRY_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.build_type }}
     defaults:
       run:
         # The default `bash` keyword on a self-hosted Windows runner
@@ -2026,6 +2097,48 @@ jobs:
           echo "PGCONNECT_TIMEOUT=30" >> "$GITHUB_ENV"
           echo "PGCONNECT_TIMEOUT=30 appended to GITHUB_ENV for the later steps"
 
+      # #6488: proves both decisions of the leftover check; see scripts/ci/check-registry-test-leftovers.ps1
+      - name: Self-test the registry leftover check
+        shell: pwsh
+        run: |
+          $scope = $env:YUZU_TEST_REGISTRY_SCOPE
+          $script = './scripts/ci/check-registry-test-leftovers.ps1'
+          # one probe under EACH root the script scans, so dropping a root from it turns this step red
+          $probes = [ordered]@{
+            'HKCU:\Software' = "YuzuTest-selftest-$scope-probe-hkcu"
+            'HKLM:\SOFTWARE' = "YuzuTest-selftest-$scope-probe-hklm"
+            'HKLM:\SOFTWARE\Wow6432Node' = "YuzuTest-selftest-$scope-probe-wow"
+          }
+          function Arm($s, $want, $kind, $name) {
+            $out = & pwsh -NoProfile -NonInteractive -File $script -Scope $s 2>&1 | Out-String
+            $rc = $LASTEXITCODE
+            Write-Host ($out -replace '::(error|warning)::', 'child $1: ')
+            if ($rc -ne $want) {
+              throw "registry leftover check self-test, $name arm: expected exit $want, got exit $rc"
+            }
+            foreach ($p in $probes.Values) {
+              if ($out -notmatch ($kind + '.*' + [regex]::Escape($p))) {
+                throw "registry leftover check self-test, $name arm: expected exit $want naming $p, got exit $rc"
+              }
+            }
+          }
+          # no -Force: a probe that already exists fails the step and, not in $made, is never removed by it
+          $made = @()
+          try {
+            foreach ($root in $probes.Keys) { $p = Join-Path $root $probes[$root]; New-Item -Path $p | Out-Null; $made += $p }
+            Arm "selftest-$scope" 1 '::error::leftover registry key ' 'own-scope'
+            Arm $scope 0 '::warning::' 'other-scope'
+            foreach ($root in $probes.Keys) {
+              if (-not (Test-Path -LiteralPath (Join-Path $root $probes[$root]))) {
+                throw "registry leftover check self-test: the check removed its probe under $root"
+              }
+            }
+          } finally {
+            foreach ($p in $made) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p } }
+          }
+          Write-Host 'registry leftover check self-test: both decisions hold'
+          exit 0
+
       # Windows CI test-phase restructuring (#3443, 2026-08-28): mirrors the
       # Linux job's non-pg/pg-shards/pg-smoke split — see docs/ci-architecture.md
       # "PG coverage by platform" for the full rationale and the measured
@@ -2053,6 +2166,12 @@ jobs:
       - name: Test (non-pg suites)
         env:
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
+          # #6488: the registry plugin's real-registry cases (tests/unit/test_registry_write_local_dispatcher.cpp
+          # skip_or_fail, tests/unit/test_registry_win_internals.cpp skip_or_fail) WARN-and-skip when registry.dll is
+          # missing or the process cannot write HKLM, and a skip is green. This job runs as LOCAL SYSTEM (see the
+          # shell comment above), which is elevated, so a skip here is a regression: "1" turns it into a FAIL.
+          YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS: "1"
+          # The fixtures' key-name scope (YUZU_TEST_REGISTRY_SCOPE) is the job-level env above.
         run: |
           if [[ "${{ matrix.build_type }}" == "debug" ]]; then
             bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/debug/bin"
@@ -2092,6 +2211,20 @@ jobs:
           # (meson overwrites it), so a run that selects no tests leaves no stale log.
           # On a red run bash -e stops before it, use the meson-logs artifact (#4884).
           python scripts/ci/test-durations-summary.py --builddir build-windows-${{ matrix.build_type }} --label "Windows non-pg"
+
+      # #6488: the registry plugin's tests create scratch keys under HKLM\SOFTWARE (and Wow6432Node) and HKCU\Software
+      # (HKU\.DEFAULT for LOCAL SYSTEM) and each fixture removes its own; this step is the tripwire that notices one that
+      # did not. Only a key of THIS job's scope (YuzuTest-<scope>-..., see the job-level env) fails the job. Any other
+      # YuzuTest-* key is a ::warning only: an orphan of a cancelled or crashed job (a cancelled job skips this step), a
+      # concurrent job's live key on the shared box, or the nightly windows-asan leg's unscoped keys. It REPORTS and
+      # never deletes: a leftover can be a registry link, and every tree delete follows links (the plugin's own rule),
+      # so removal is left to a human. The scan is scripts/ci/check-registry-test-leftovers.ps1, whose two decisions the
+      # self-test step before the suite proves on every run.
+      - name: Assert this job left no YuzuTest-* registry keys behind
+        if: success() || failure()
+        shell: pwsh
+        run: |
+          ./scripts/ci/check-registry-test-leftovers.ps1 -Scope $env:YUZU_TEST_REGISTRY_SCOPE
 
       # if: matrix.pg_mode == 'full' — see the Resolve step above; PRs are
       # debug-only (exclude: above), so PR coverage is unaffected. k=2 was
@@ -2845,7 +2978,8 @@ jobs:
     # before a single TU of ours is built. The old 75-min ceiling left no
     # headroom, so a cold run timed out mid-build and only the `if: always()`
     # cache saves rescued the next run. 120 min covers a cold build with
-    # margin; warm runs still finish in ~6 min.
+    # margin. Warm runs (vcpkg cached) took 26-40 min in 2026-10, almost all
+    # of it the debug build with tests.
     timeout-minutes: 120
     env:
       # Override the workflow-level 30G (a self-hosted budget). This job is
@@ -3079,14 +3213,32 @@ jobs:
           # (~1.2 GB) needs ~8 GB of RAM, which the 7 GB hosted runner does not
           # have: the Build step was OOM-killed there (SIGTERM 143). yuzu_pg_canary,
           # which the provenance step inspects, does not depend on tests.
+          # -Dbackend_max_links=1 also serialises the remaining link steps, as
+          # release.yml does; compile parallelism is unchanged.
           meson setup build-linux \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
+            -Dbackend_max_links=1
+
+      # Headroom before the build (the baseline). Build also samples memory and
+      # disk every 15 s, so if the runner is shut down mid-Build the last
+      # sample in the log shows which ran out. A shut-down runner runs no later
+      # step, so neither can go after Build.
+      - name: Runner headroom (canary)
+        run: |
+          df -h / "$GITHUB_WORKSPACE"
+          free -m
 
       - name: Build
         id: build-canary
-        run: meson compile -C build-linux
+        run: |
+          ( while sleep 15; do date -u +%T; free -m | sed -n 2p; df -h --output=avail,pcent / | tail -1; done ) &
+          sampler=$!
+          rc=0
+          meson compile -C build-linux || rc=$?
+          kill "$sampler" 2>/dev/null || true
+          exit "$rc"
 
       # Link-provenance assertion (#1331 review HIGH-2) — same check as the
       # self-hosted Linux leg; the GHA-hosted image ships PostgreSQL client

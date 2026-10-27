@@ -601,12 +601,13 @@ InstructionStore::validate_and_prepare(InstructionDefinition& def) const {
                 return std::unexpected(
                     "definition id may only contain letters, digits, '.', '_', and '-'");
         }
-        // Reserved namespace (#2442): mcp.<tool> ids belong to the MCP approval-ticket gate.
+        // Reserved namespaces (#2442, #6062): mcp.<tool> ids belong to the MCP approval-ticket gate
+        // and guardian.<...> ids to the Guardian rule-deploy approvals.
         // Create-path only, deliberately: an update cannot originate an id, so an id that
         // predates the reservation stays editable and executable rather than becoming
         // uneditable on upgrade.
         if (is_reserved_definition_id(def.id))
-            return std::unexpected(std::string(kReservedDefinitionIdError));
+            return std::unexpected(std::string(reserved_definition_id_error(def.id)));
     } else {
         def.id = generate_id();
     }

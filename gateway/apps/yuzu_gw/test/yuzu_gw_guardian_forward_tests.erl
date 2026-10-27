@@ -32,10 +32,10 @@ guardian_forward_test_() ->
      ]}.
 
 setup() ->
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     catch meck:unload(telemetry),
-    meck:new(grpcbox_client, [non_strict, no_link]),
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) -> {ok, #{}, #{}} end),
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) -> {ok, #{}, #{}} end),
     %% passthrough + a recording stub so meck:history captures every execute/3.
     meck:new(telemetry, [passthrough, no_link]),
     meck:expect(telemetry, execute, fun(_, _, _) -> ok end),
@@ -52,7 +52,7 @@ setup() ->
 cleanup(Pid) ->
     catch unlink(Pid),
     catch gen_server:stop(Pid, shutdown, 5000),
-    meck:unload([grpcbox_client, telemetry]),
+    meck:unload([yuzu_grpc_client, telemetry]),
     ok.
 
 %%%===================================================================
@@ -74,7 +74,7 @@ count_forward(EventSuffix, Reason) ->
 barrier() -> _ = yuzu_gw_upstream:circuit_state().
 
 trip_circuit_open() ->
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) -> {error, connection_refused} end),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) -> {error, connection_refused} end),
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
@@ -109,7 +109,7 @@ drop_at_capacity() ->
     %% stays in guardian_pids — fills the in-flight budget without tripping the
     %% circuit. The sleep is short enough that all MAX+1 casts are issued while the
     %% earlier ones are still in flight.
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         timer:sleep(300),
         {ok, #{}, #{}}
     end),

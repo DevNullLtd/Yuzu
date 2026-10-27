@@ -300,9 +300,9 @@ use-after-free guard any shutdown refactor must preserve.
 > **Scope of the guarantee.** The claim prevents two replicas from independently *claiming* the
 > same `(policy, agent)` target only when both are running the **same schema version**. During a
 > rolling upgrade across the migration boundary, an old binary that predates the durable claim can
-> transiently run alongside a new one; that mixed-version window is gated today by issue #4014
-> (which blocks running a second production replica) pending a durable cluster-capability admission
-> gate. The exposure is one-directional — a row written by an old binary carries claim-generation
+> transiently run alongside a new one; that mixed-version window is covered today only by the safe-to-scale gate
+> (`docs/ha-delivery-matrix.md`, which is procedural and not lifted), pending a durable
+> cluster-capability admission gate (#6528). The exposure is one-directional — a row written by an old binary carries claim-generation
 > `0`, a value a new binary never mints for its own claims. Separately, the guarantee is
 > effectively-once, not exactly-once (consistent with ADR-2002): a replica that pauses for longer
 > than `fixing_stale_seconds` between winning the claim and actually sending a command over gRPC —

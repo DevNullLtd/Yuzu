@@ -584,7 +584,7 @@
     "capability_id": "get.fragments-approvals",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "composed-of:get.api-approvals"
+    "status": "composed-of:get.api-approvals,post.api-approvals-param-approve,post.api-approvals-param-reject"
   },
   {
     "method": "GET",
