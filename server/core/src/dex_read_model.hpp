@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server {
@@ -114,8 +115,8 @@ std::string dex_app_json(const DexAppModel& model, bool audit_persisted = true);
 // /fragments/dex/apps tab still reads dex_top_apps until it is rewired) ──
 
 /// Figures published for one application or one version of it. Counts are
-/// Windows-scoped and window-wide. The share, rate and score are over ONE
-/// population, the Windows devices online now: their numerators count only
+/// scoped to the requested platform and window-wide. The share, rate and score are over ONE
+/// population, the devices of that platform scope online now: their numerators count only
 /// devices in that set (`distinct_devices_online` is the share's numerator), so
 /// a device that crashed and went offline is in the counts but not in the share.
 /// The score is withheld as `offline_affected` when any affected device is not
@@ -152,7 +153,24 @@ struct DexAppStability {
 
 inline constexpr int kDexAppsLimit = 100;
 inline constexpr int kDexAppsVersionCap = 20;
-inline constexpr const char* kDexAppsPopulationBasis = "windows_online";
+
+/// The platform scopes an Apps read answers for: every platform, or one OS.
+/// Tokens match the OS-filter precedent (`dex_normalize_os_filter`).
+inline constexpr const char* kDexAppsScopeAll = "all";
+inline constexpr const char* kDexAppsScopeWindows = "windows";
+inline constexpr const char* kDexAppsScopeMacos = "macos";
+inline constexpr const char* kDexAppsScopeLinux = "linux";
+
+/// The scope token for all|windows|macos|linux (exact, lowercase); empty for
+/// anything else, so a caller fails closed rather than defaulting to a platform.
+std::string dex_normalize_apps_scope(std::string_view scope);
+
+/// Ids of the connected agents in `scope` (every connected agent for "all", else
+/// those whose normalized os equals the scope). `scope` must be a normalized token.
+std::vector<std::string> dex_apps_online_ids(const DexFleet& fleet, std::string_view scope);
+
+/// The published `population_basis`: `<scope>_online` ("windows_online" for windows).
+std::string dex_apps_population_basis(std::string_view scope);
 
 /// The score policy an Apps read scored under, and where it came from.
 /// `source` is "default" (nothing stored, or the stored document was refused and
@@ -174,11 +192,13 @@ struct DexPolicyInForce {
 /// or perfect list.
 struct DexAppsModel {
     std::string window;
-    /// Windows devices online now; nullopt = no fleet source wired (unknown),
-    /// 0 = no Windows device online.
+    /// The platform scope this model answers for: all|windows|macos|linux.
+    std::string platform_scope{kDexAppsScopeWindows};
+    /// Devices in `platform_scope` online now; nullopt = no fleet source wired
+    /// (unknown), 0 = no device in scope online.
     std::optional<int64_t> population;
     std::vector<DexAppStability> apps;
-    /// Every application with a Windows crash/hang signal in the window.
+    /// Every application with a crash/hang signal in the window on `platform_scope`.
     int64_t apps_total{0};
     bool apps_truncated{false}; ///< apps_total > apps.size(): the top-N cut dropped some
     DexPolicyInForce policy;    ///< the policy every figure in this model was scored under
