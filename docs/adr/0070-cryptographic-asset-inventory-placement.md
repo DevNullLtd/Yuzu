@@ -1037,6 +1037,12 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     because it adds a server-to-agent action and persistent agent state that a capability
     advertised on every registration makes unnecessary. Recorded as decision 8 in the Decisions
     section of `docs/crypto-slice2-certificate-design.md`.
+    As built, the gateway also enforces the capability per upstream connection (record from
+    `ProxyRegister`, strip for a connection without `certificate_inventory_v1`, fail closed for an
+    unknown one, rate-limited re-probe for admitted sessions only). Accepted residual (owner,
+    2026-10-27): behind an L7 balancer that spreads one connection's requests across backends,
+    every backend must run the 2a-1 typed-source reservation release (PR #6563) or later before
+    certificate-collecting agents are enabled; SOC 2 risk register, review-by 2027-01-31.
 - A capped or timed-out capture is reported `constrained`, and the report is never an
   empty success.
 - An empty blob is never sent for a failed or constrained capture (the ADR-0016

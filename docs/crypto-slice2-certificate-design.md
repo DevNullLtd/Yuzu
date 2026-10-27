@@ -88,7 +88,7 @@ counter or a store rather than a read, the PR says so, and the next PR in the ch
 | 2a-2b | Certificate read surface | The `CertificateInventory` securable, its seeding and floor entry; the per-certificate read and the raw-value summary (REST + MCP + `/crypto` fragment) with every filter in [Parameters](#parameters-strict-or-free-text-the-same-on-both-twins); admission, truncation, audit (OD-2), the D10 lint, the `cert_inventory.fleet_store_status` gauge job, and the `dn_dict` name table with its SOC 2 data-inventory row. | Operators read fleet certificates, including the [one-CA queries](#finding-one-cas-certificates). | 2a-2a |
 | 2a-2c | Decommission tombstones | The decommission tombstone itself (written by `delete_agent`, checked by ingest), the admin-only tombstone list and purge (REST + MCP, OD-4), `coverage.tombstoned_agents_registered`, and the cross-schema enrolment clear (`CertificateEnrolmentTombstoneOwner`) at every approval write. | An administrator lists and purges tombstones; approving a tombstoned agent clears it. | 2a-2b, and the DPIA screening |
 | 2a-2d | Certificate retention prune | The [prune](#retention-and-the-prune), at store and location grain, with its metrics and its clock-guarded-retention register entry. | Stores unread for 30 days are pruned and counted. | 2a-2a |
-| 2a-2e | Agent collector: action, daily-sync source and Linux | `certificates.list_inventory` (no catalogue row, OD-1), the `certificate_inventory` daily-sync source and blob writer, and the Linux store reads on a dedicated worker thread (the sync thread waits at most the 60 s deadline, then reports the source `constrained` with `walk_stalled`; a stuck worker blocks only itself and no second worker starts while one is stuck; shutdown uses the existing `hard_exit` grace path; the `walk_stalled` fleet signal is this PR's deliverable, see [decision 11](#decisions)), the agent gate that sends the source only when the server advertises `certificate_inventory_v1`; the daily sync never sends one report over the transport limit (the certificate blob is sent on its own when the combined report would exceed it). | A Linux agent reports its certificates daily. | 2a-2b, 2a-2c, 2a-2d |
+| 2a-2e | Agent collector: action, daily-sync source and Linux | `certificates.list_inventory` (no catalogue row, OD-1), the `certificate_inventory` daily-sync source and blob writer, and the Linux store reads on a dedicated worker thread (the sync thread waits at most 75 s, then skips the source with `walk_stalled` (`walk_unavailable` when the worker cannot start); a stuck worker blocks only itself and no second worker starts while one is stuck; shutdown uses the existing `hard_exit` grace path; the `walk_stalled` fleet signal is this PR's deliverable, see [decision 11](#decisions)), the agent gate that sends the source only when the server advertises `certificate_inventory_v1`; the daily sync never sends one report over the transport limit (the certificate blob is sent on its own when the combined report would exceed it). | A Linux agent reports its certificates daily. | 2a-2b, 2a-2c, 2a-2d |
 | 2a-2f | Agent collector: Windows | The Windows machine-store reads and the private-key metadata. | A Windows agent reports its certificates. | 2a-2e |
 | 2a-2g | Agent collector: macOS | The System keychain and SystemRoots reads. | A macOS agent reports its certificates. | 2a-2e |
 | 2a-3 | D13 certificate counts | The counts read (REST + MCP), the snapshot export, the D13 condition-1 lint entries and the recompute test; the data the certificate widgets read. | Operators see the counts on `/crypto` and through MCP. | 2a-2b |
@@ -1952,6 +1952,25 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
    from every registration, so a rollback or a mixed-replica upgrade is covered without relying
    on deploy order.
 
+    **As built, the gateway layer (2a-2a; owner acceptance 2026-10-27).** The gateway enforces
+    the capability itself, per upstream connection. It records each connection's
+    `server_capabilities` from the latest accepted `ProxyRegister` answer, live or replayed, and
+    drops the record when the connection closes. It strips the `certificate_inventory` source from
+    any relayed report sent on a connection that does not list `certificate_inventory_v1`, and
+    fails closed for a connection it has no record of or cannot identify. It re-probes an unknown
+    connection by a rate-limited registration replay (at most once per connection every 30
+    seconds), for admitted sessions only: a report from an unadmitted session is still forwarded
+    with the key stripped but never starts a probe. The agent clears its copy of the capability on
+    stream loss (2a-2e), so a reconnect to a different server starts closed.
+
+    **L7 residual, accepted by the owner on 2026-10-27.** Behind an L7 (gRPC-aware) balancer that
+    spreads the requests of one HTTP/2 connection across backends, the gateway cannot tell which
+    backend a report reaches. A backend older than the 2a-1 typed-source reservation release
+    (PR #6563) would store such a blob in the generic inventory store. Requirement: before
+    certificate-collecting agents are enabled behind such a balancer, every backend must run the
+    2a-1 reservation release or later, and none may be rolled back below it while those agents
+    report. Recorded as an accepted risk in the SOC 2 risk register, review-by 2027-01-31.
+
 9. **D13 counts at fleet scale** (raised by 2a-3, measured 2026-10-23). Computed from raw rows
    in one statement, the counts finish inside the 10 s statement cap only up to about 1.3M
    certificates in scope with a warm cache and two parallel workers (about 450k on a serial plan).
@@ -1969,7 +1988,7 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
    never stored"); the amendment is approved in principle for that PR and is not in force until
    it ships.
 
-10. **CBOM audit posture** (raised by 2a-4's governance, owner acknowledgement pending). The CBOM
+10. **CBOM audit posture** (raised by 2a-4's governance; decided, see the ruling below). The CBOM
     certificate half writes its own `crypto.certificates.view` row (`via=cbom`) and is omitted,
     named in `halves_omitted`, when that row cannot be stored, on REST and on MCP alike (stricter
     than OD-2's MCP set-and-proceed); the export's own row stays set-and-proceed for the library
@@ -1985,14 +2004,22 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
 
     **Restated 2026-10-26 (owner), superseding the consequence the ruling above was given on:**
     the walk no longer blocks the agent. 2a-2e runs it on a dedicated worker; the sync thread waits
-    at most the 60 s deadline, then reports the source `constrained` with `walk_stalled`; a stuck
+    at most 75 s, then the source is SKIPPED with reason `walk_stalled` (corrected 2026-10-27 to
+    the as-built behaviour, below); a stuck
     worker blocks only itself, and no second worker starts while one is stuck; shutdown uses the
     existing `hard_exit` grace path, so a stuck worker cannot hold a reconnect or a stop. The
-    residual below is therefore bounded to the certificate source on that device. The 60 s deadline
-    bounds the sync thread's wait, not the syscall: item (5) stands. The fleet signal for a stuck
+    residual below is therefore bounded to the certificate source on that device. The sync
+    thread's wait bounds the wait, not the syscall: item (5) stands. The fleet signal for a stuck
     walk is a `walk_stalled` gauge and heartbeat key, which is 2a-2e's deliverable. Supported
     kernels: Linux 5.8 or later is supported; below 6.8 the mount-id-reuse residual (4) applies;
     on hosts with FUSE or autofs run 6.8 or later.
+
+    **Corrected 2026-10-27 to the as-built 2a-2e behaviour (owner).** The sync thread waits at
+    most 75 s. On a stall the source is SKIPPED with reason `walk_stalled`: no status-only blob is
+    sent, so `observed_at` ages visibly and R16 never prunes on a stall. When the worker cannot
+    start, the source is skipped with `walk_unavailable`. The bounded-residual ruling applies on
+    every OS, not only Linux: on Windows a wedged CryptoAPI or provider call, on macOS a wedged
+    keychain read, blocks only the worker, never the agent.
 
     WHAT REMAINS (disclosed residual, as measured):
     (1) With the mount table read in full and statx available (Linux 5.8 or later, not blocked by seccomp), an unnamed dead autofs or FUSE mount as root, path hop or entry is refused without blocking, and a late overmount over a named local mount is refused.
@@ -2001,6 +2028,21 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
     (4) Mount-id reuse. On Linux 6.8 or later every candidate mount is matched to the snapshot by its never-reused mount id (STATX_MNT_ID_UNIQUE), so a mount swapped in after the snapshot is refused before any open, even when it reuses the old legacy id and device number; measured with a silent FUSE, a dead autofs, an answering FUSE and proc each reusing the id, at an entry and at a hop. On Linux 5.8 to 6.7 only the legacy id and the statx device can be compared, and anonymous device numbers (tmpfs, FUSE, overlay) are drawn from one pool, so a dead FUSE or autofs mount that reuses both the id and the device blocks in openat (measured at an entry and at a hop); the fstatfs check on the opened directory runs only after that open.
     (5) The 60 s action deadline and cooperative cancellation cannot interrupt a syscall already blocked in the kernel.
     (Restated outside the verbatim header: the deadline bounds the sync thread's wait, not the syscall; the worker absorbs the block.)
+
+12. **The decommission sweep, as built in 2a-2c** (r11-design; owner, 2026-10-27, "go with your
+    recommendations"). A background sweep, on the leader only, erases certificate rows for devices
+    decommissioned while the server ran a version older than the certificate store. It erases rows
+    and writes **no tombstone**, and only on positive evidence: the latest `sle.agent.decommission`
+    outcome audit row must be later than the agent's last certificate receipt by more than 10
+    minutes, with no later re-enrolment, and future-dated evidence is refused. The decision is
+    re-taken under the per-agent lock inside the delete's own transaction. A wrong erase
+    self-heals on the agent's next report, because nothing is discarded; a still-running agent
+    behind a rolled-back server repopulates until it is decommissioned again, and that normal
+    decommission tombstones. Offline devices are never touched (D12 and R16 hold: the sweep never
+    acts on absence or age). Never erased: decommissions before 2026-07-12 (before the audit verb
+    existed), those beyond the newest 20,000 decommission audit rows, and those whose audit rows
+    have aged out of audit retention; for those, re-issue the DELETE. Operator text:
+    `crypto.md` and `upgrading.md` on `feat/cert-inventory-tombstones`.
 
 ## How this could ship wrong
 
