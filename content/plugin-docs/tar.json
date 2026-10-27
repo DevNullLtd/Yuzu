@@ -2821,6 +2821,7 @@
       "changelog.d/2026-10-23-tar-timeline-page.added.md",
       "changelog.d/2026-10-25-tar-regchange-source.added.md",
       "changelog.d/2026-10-25-tar-retention-tiers-api.added.md",
+      "changelog.d/2026-10-26-tar-tiers-data-page.added.md",
       "changelog.d/20261014-tar-adhoc-sql-moved.changed.md",
       "changelog.d/20261021-tar-capture-sources-paused-core.fixed.md"
     ],
