@@ -100,15 +100,18 @@ GuardianBootEpochClaim claim_impl(IJournalStore* store, std::int64_t now_unix_s,
     if (d.candidate >= kGuardianBootEpochCeiling)
         return {0, Outcome::OutOfRange, persisted};
 
-    // The epoch write must survive power loss, or the next boot can re-issue an equal or lower
-    // epoch for events already emitted under this one. SQLite rolls back a committed but
-    // unsynced transaction below FULL (OFF, or NORMAL in WAL), so the claim is refused unless
-    // the store REPORTS FULL (2) or EXTRA (3). -1 (unreadable) is refused too: durability that
-    // cannot be shown is not assumed. A throwing read is a failed read (ReadFailed, nothing
-    // written), set below by on_throw before the call.
+    // The epoch write must be durable, or the next boot can re-issue an equal or lower epoch
+    // for events already emitted under this one. SQLite rolls back a committed but unsynced
+    // transaction below FULL (OFF, or NORMAL in WAL), so the claim is refused unless the store
+    // REPORTS FULL (2) or EXTRA (3). -1 means the store could not read the pragma at all: that is
+    // a failed read, not a durability fact, so it is ReadFailed, not DurabilityBelowFull. A
+    // throwing read is a failed read too (ReadFailed, nothing written); on_throw is already
+    // ReadFailed immediately above the call and stays so until the write below.
     on_throw = Outcome::ReadFailed;
     d.synchronous = -3;
     d.synchronous = store->pragma_synchronous();
+    if (d.synchronous == -1)
+        return {0, Outcome::ReadFailed, persisted};
     if (d.synchronous < 2)
         return {0, Outcome::DurabilityBelowFull, persisted};
 

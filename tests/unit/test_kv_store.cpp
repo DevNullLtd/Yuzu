@@ -632,6 +632,15 @@ TEST_CASE("KvStore::pragma_synchronous reports a valid level", "[kv_store][entri
     CHECK(level <= 3);
 }
 
+TEST_CASE("KvStore::open leaves synchronous at FULL or stronger", "[kv_store][entries]") {
+    // UP-14: the Guardian boot-epoch claim refuses a store that does not report FULL, so open()
+    // sets it explicitly rather than relying on SQLite's compile-time default. FULL is 2.
+    yuzu::test::TempDbFile db{"yuzu_test_kv_sync-"};
+    auto result = KvStore::open(db.path);
+    REQUIRE(result.has_value());
+    CHECK(result->pragma_synchronous() >= 2);
+}
+
 // ── namespace_size (#2303 C1): direct coverage of the aggregate size probe ──────
 
 TEST_CASE("KvStore::namespace_size counts rows and sums value bytes", "[kv_store][entries]") {

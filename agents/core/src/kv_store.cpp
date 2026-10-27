@@ -253,6 +253,34 @@ std::expected<KvStore, KvStoreError> KvStore::open(const std::filesystem::path& 
         sqlite3_free(err_msg);
     }
 
+    // Durability level (UP-14): set synchronous=FULL explicitly so the level does not depend on
+    // SQLite's compile-time default (FULL, 2, in the shipped build, so this changes nothing there
+    // for any consumer of this store). The Guardian boot-epoch claim refuses to issue an epoch
+    // unless pragma_synchronous() reports FULL or EXTRA. A refused pragma returns SQLITE_OK with
+    // the real level in the result row, so the level is read back. A failure here is logged and
+    // the store is still returned (config drift must not kill an agent); the epoch claim's own
+    // gate then refuses a store that is not FULL.
+    {
+        char* sync_err = nullptr;
+        rc = sqlite3_exec(raw_db, "PRAGMA synchronous=FULL", nullptr, nullptr, &sync_err);
+        if (rc != SQLITE_OK)
+            spdlog::warn("KvStore: setting synchronous=FULL failed: {}",
+                         sync_err ? sync_err : "unknown");
+        sqlite3_free(sync_err);
+
+        int level = -1;
+        sqlite3_stmt* raw_stmt = nullptr;
+        if (sqlite3_prepare_v2(raw_db, "PRAGMA synchronous", -1, &raw_stmt, nullptr) == SQLITE_OK) {
+            StmtPtr stmt(raw_stmt);
+            if (sqlite3_step(stmt.get()) == SQLITE_ROW)
+                level = sqlite3_column_int(stmt.get(), 0);
+        }
+        if (level < 2)
+            spdlog::warn("KvStore: synchronous=FULL not in effect (got {}); power-loss "
+                         "durability of the journal and the boot epoch is not guaranteed",
+                         level);
+    }
+
     // Busy handling for concurrent access (#5604): a handler reading an atomic budget instead of
     // sqlite3_busy_timeout(), so GuardianEngine::stop() can lower the budget lock-free and cut a
     // wait already in progress. Starts at kKvStoreBusyTimeout, the old behaviour. Installing a

@@ -241,8 +241,9 @@ public:
     /**
      * The effective `PRAGMA synchronous` level (0=OFF, 1=NORMAL, 2=FULL,
      * 3=EXTRA), or -1 on error. The journal's power-loss-durability claim wants
-     * FULL; the caller SOFT-warns on anything less (never a hard abort - config
-     * drift must not kill an agent).
+     * FULL; the journal SOFT-warns on anything less (never a hard abort - config
+     * drift must not kill an agent). The Guardian boot-epoch claim is stricter: it
+     * REFUSES a level below FULL and treats an unreadable (-1) pragma as a failed read.
      */
     [[nodiscard]] int pragma_synchronous() override;
 

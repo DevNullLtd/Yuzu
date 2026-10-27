@@ -253,7 +253,7 @@ TEST_CASE("boot-epoch: a throwing store is a failed claim, never an exception",
 
 TEST_CASE("boot-epoch: a store below FULL durability issues no epoch", "[guardian][boot_epoch]") {
     // UP-3: an epoch write that power loss can roll back could be re-issued by the next boot.
-    for (const int level : {0, 1, -1}) {
+    for (const int level : {0, 1}) {
         DYNAMIC_SECTION("synchronous " << level) {
             FaultingStore s;
             s.seed("77");
@@ -285,6 +285,19 @@ TEST_CASE("boot-epoch: a store below FULL durability issues no epoch", "[guardia
         CHECK(s.set_calls == 0);
         CHECK(s.stored() == "not-a-number");
     }
+}
+
+TEST_CASE("boot-epoch: an unreadable synchronous pragma is a failed read, nothing written",
+          "[guardian][boot_epoch]") {
+    // -1 is the store's "could not read the pragma" value, not a durability fact.
+    FaultingStore s;
+    s.seed("77");
+    s.sync_level = -1;
+    const auto c = claim_guardian_boot_epoch(&s, kNow);
+    CHECK(c.outcome == Outcome::ReadFailed);
+    CHECK(c.boot_epoch == 0);
+    CHECK(s.set_calls == 0);
+    CHECK(s.stored() == "77"); // untouched
 }
 
 TEST_CASE("boot-epoch: FULL and EXTRA durability claim normally", "[guardian][boot_epoch]") {
