@@ -392,8 +392,8 @@ Risk-register entry: an identity provider that removes a person who is the fleet
 administrator leaves that person active (loud: audit row, counter, critical event),
 until an operator promotes a second administrator and demotes the first.
 
-**Risk-register entry — PENDING owner decision, not accepted (2026-10-26, owner: liamsomerville
-(decision pending)): certificate inventory behind an L7 gRPC balancer (CC6.1, C1.1).** The gateway
+**Risk-register entry — ACCEPTED by the owner on 2026-10-27 (raised 2026-10-26, owner:
+liamsomerville): certificate inventory behind an L7 gRPC balancer (CC6.1, C1.1).** The gateway
 forwards the `certificate_inventory` daily-sync source only on an upstream HTTP/2 connection whose
 latest accepted `ProxyRegister` answer listed `certificate_inventory_v1`. A gRPC-aware (L7)
 balancer between the gateway and the servers can send the requests of one connection to different
@@ -410,8 +410,10 @@ it or cannot be identified; and the counter `yuzu_gw_inventory_source_stripped_t
 with the gauge `yuzu_gw_upstream_capability_gate_ready`. No alert rule ships yet. **Review by
 2027-01-31**, and in any case before the agent collector (2a-2e) ships. **Prerequisites for
 closing the entry:** an alert rule on the strip metric is shipped in `docs/prometheus/yuzu-alerts.yml`,
-and every backend behind an L7 balancer runs the 2a-1 release or later. Until the owner decides,
-the entry stays PENDING, not accepted.
+and every backend behind an L7 balancer runs the 2a-1 release or later. The owner accepted the
+residual on 2026-10-27 on the condition of the deployment requirement above (typed-source
+reservation release, 2a-1 / PR #6563, or later on every backend before certificate-collecting
+agents are enabled); the review-by date and closing prerequisites stand.
 
 **Addendum: approver assurance for approve and reject (CC6.1/CC6.3, #6061).** Approving or
 rejecting an approval request requires an interactive human session (local or OIDC), a human
