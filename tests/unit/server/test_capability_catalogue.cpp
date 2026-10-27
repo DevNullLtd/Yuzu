@@ -753,3 +753,21 @@ TEST_CASE("capability catalogue: every Forensics-securable plugin is in the resp
                                                    "remote_access_audit", "~unverified"});
     CHECK(set->contains(kUnverifiedProvenanceLabel));
 }
+
+// #4990: the unresolved-provenance sentinel "~unverified" is safe as a stored plugin label only
+// because no real plugin can carry that name. Nothing else enforces it (the boot soundness check
+// reads only the Forensics-securable rows), so every catalogue plugin name is pinned here to the
+// tilde-free alphabet, over all rows of all sources.
+TEST_CASE("capability catalogue: no plugin name can collide with the unverified provenance label",
+          "[server][dispatch][capability][responses][forensics]") {
+    std::size_t rows = 0;
+    for (const auto& source : all_labeled_sources()) {
+        for (const auto& row : source.rows) {
+            ++rows;
+            INFO("source=" << source.label << " plugin=" << row.plugin);
+            CHECK(std::string_view{row.plugin}.find('~') == std::string_view::npos);
+        }
+    }
+    CHECK(rows > 0);
+    CHECK(kUnverifiedProvenanceLabel.front() == '~');
+}
