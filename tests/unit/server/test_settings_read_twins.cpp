@@ -314,7 +314,7 @@ TEST_CASE("data-retention REST twin and fragment report the ENFORCED windows fro
     CHECK(frag->body.find("Unknown") != std::string::npos);
 }
 
-TEST_CASE("GET /api/v1/settings/data-retention carries the TAR tier defaults; fragment does not",
+TEST_CASE("GET /api/v1/settings/data-retention carries the TAR tier defaults and the fragment renders them",
           "[settings][rest][settings-read-twins][retention][tar]") {
     SettingsReadTwinsHarness h;
 
@@ -335,8 +335,11 @@ TEST_CASE("GET /api/v1/settings/data-retention carries the TAR tier defaults; fr
     auto frag = h.sink.Get("/fragments/settings/data-retention");
     REQUIRE(frag);
     CHECK(frag->status == 200);
-    CHECK(frag->body.find("netqual") == std::string::npos);
-    CHECK(frag->body.find("procperf") == std::string::npos);
+    CHECK(frag->body.find("TAR capture sources") != std::string::npos);
+    CHECK(frag->body.find("netqual") != std::string::npos);
+    CHECK(frag->body.find("procperf") != std::string::npos);
+    CHECK(frag->body.find("Look again after") != std::string::npos);
+    CHECK(frag->body.find("Guardian events") != std::string::npos);
 }
 
 TEST_CASE("data-retention fragment shows Unknown for every window when no reader is wired",
@@ -346,7 +349,8 @@ TEST_CASE("data-retention fragment shows Unknown for every window when no reader
     REQUIRE(frag);
     CHECK(frag->status == 200);
     CHECK(frag->body.find("Unknown") != std::string::npos);
-    CHECK(frag->body.find(" days") == std::string::npos); // no number nothing verified
+    // The three windows only: the TAR tier table below legitimately shows durations.
+    CHECK(frag->body.substr(0, frag->body.find("<caption")).find(" days") == std::string::npos);
 }
 
 TEST_CASE("GET /settings/data is admin-gated with a redirect, like /settings",
