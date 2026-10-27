@@ -45,13 +45,12 @@ ALSO NOT CAUGHT (found in the WS-A4 S0 review, each reproduced on a scratch tree
      aware), joins backslash-newline (trailing blanks / FF / VT allowed), drops a UTF-8 BOM,
      decodes UTF-16, treats NUL as whitespace and accepts `%:include`, `include_next` and
      `import` - cross-checked against `g++ -MM -MG` (a fuzz of ~100k files found hiding shapes in
-     earlier drafts and the S0 review found four more; each is fixed and pinned in the selftest,
-     and a fresh fuzz that includes them finds none). It still extracts NOTHING from a
+     earlier drafts and the S0 review found more; each is fixed and pinned in the selftest, and
+     the last fuzz runs found none). It still extracts NOTHING from a
      macro-built include (`#include SOME_MACRO`) or a `##`-spliced one, cannot see an include
      guarded away by `__has_include`. A backslash-newline INSIDE a raw string (the compiler
      reverts the splice there) and an include's `<header-name>` containing `//` or `/*` are lexed
-     as the compiler does; files with a raw-string opener are additionally lexed without the
-     splice join and the results unioned (see `strip_comments`). Conversely an `#include` line inside `#if 0`
+     as the compiler does (see `strip_comments`). Conversely an `#include` line inside `#if 0`
      or alone on a line inside a raw string IS extracted and can false-FAIL (conservative).
      THREAT MODEL: this is a regression lock against honest mistakes and refactors, not a proof
      against an author deliberately contorting source to hide a store include (a macro include
@@ -792,11 +791,41 @@ def _quoted_end(text: str, k: int, end_re) -> int:
         return sm.start() if ch == "\n" else sm.end()
 
 
+def _ends_in_pp_number(run: str) -> bool:
+    """`run` is a maximal run of [alnum _ . $] characters. True when its LAST token, lexed from the
+    left the way the compiler does, is a pp-number (starts with a digit or `.digit`, then takes
+    letters, digits, `_`, `.` and `$`); an identifier swallows its digits (`a$1`, `x1`), and a
+    `.` that is not followed by a digit is punctuation (`x.5` is the identifier `x` then `.5`)."""
+    i, n = 0, len(run)
+    is_num = False
+    while i < n:
+        c = run[i]
+        if c.isdigit() or (c == "." and i + 1 < n and run[i + 1].isdigit()):
+            i += 1
+            while i < n and (run[i].isalnum() or run[i] in "_.$"):
+                i += 1
+            is_num = True
+        elif c != "." and c != "":
+            i += 1
+            while i < n and (run[i].isalnum() or run[i] in "_$"):
+                i += 1
+            is_num = False
+        else:
+            i += 1
+            is_num = False
+    return is_num
+
+
 def _raw_prefix_ok(text: str, r: int) -> bool:
     """`text[r]` is an `R` directly before a `"`. True when `R`, `LR`, `uR`, `UR` or `u8R` starting
     at `r` (or just before it) is a whole raw-string encoding prefix: NOT the tail of a longer
     identifier or pp-number (`aLR"`, `1R"`, `0LR"`) and NOT a user-defined-literal suffix on a
     preceding literal (`"s"R"`, `'c'LR"`)."""
+    k = r
+    while k >= 0 and (text[k].isalnum() or text[k] in "_.$"):
+        k -= 1
+    if _ends_in_pp_number(text[k + 1:r + 1]):   # `1.R"`, `0x1R"`: the R belongs to a number
+        return False
     start = r
     if r >= 2 and text[r - 2:r] == "u8":
         start = r - 2
@@ -831,10 +860,9 @@ def strip_comments(text: str, blank_strings: bool, join_splices: bool = True) ->
     RAW-STRING SPLICES: phase-2 splices are removed before raw strings are lexed, but the compiler
     REVERTS a backslash-newline INSIDE a raw string. So the raw string's closing `)delim"` is
     searched in the ORIGINAL text (the offset is mapped back through the deleted splices), while
-    its opener is recognised on the joined text. `parse_includes` and `names_store_type` also lex a
-    file containing `R"` a second time WITHOUT the splice join and take the union (union = never
-    hides, only possibly over-extracts); that is defence in depth, not what makes the shapes above
-    work.
+    its opener is recognised on the joined text. (An earlier draft also lexed such files a second
+    time WITHOUT the join and unioned the results; with the mapping exact that was dead weight that
+    only added false FAILs, and no fixture needed it, so it was removed.)
 
     HEADER-NAMES: when a `//` or `/*` is met and the code on its line so far is an include
     directive with an open `<`, it is part of the header-name token, not a comment. A comment
@@ -931,14 +959,14 @@ def strip_comments(text: str, blank_strings: bool, join_splices: bool = True) ->
             i = end
         else:  # a single quote
             if j > 0 and _is_ident_char(text[j - 1]) and text[j + 1:j + 2].isalnum():
-                # C++14 digit separator (1'000'000) - but ONLY inside a pp-number: walk back over
-                # the token; it must START with a digit (an earlier separator in the same chain
-                # counts). `return'/*'`, `L'x'`, `u8'x'` and `1'/*'` are char literals.
+                # C++14 digit separator (1'000'000) - but ONLY inside a pp-number: tokenise the run of
+                # identifier/number characters that ends here; the token touching the quote must be
+                # a pp-number (an earlier separator in the same chain counts). `return'/*'`,
+                # `L'x'`, `u8'x'`, `1'/*'`, `a$1'x'` are char literals; `x.5'0` and `.5'0` are not.
                 k = j - 1
-                while k >= 0 and (text[k].isalnum() or text[k] in "_."):
+                while k >= 0 and (text[k].isalnum() or text[k] in "_.$"):
                     k -= 1
-                if (k >= 0 and k == last_sep) or text[k + 1].isdigit() or (
-                        text[k + 1] == "." and text[k + 2:k + 3].isdigit()):
+                if (k >= 0 and k == last_sep) or _ends_in_pp_number(text[k + 1:j]):
                     last_sep = j
                     i = j + 1
                     continue
@@ -964,16 +992,6 @@ def _read_source(path: Path) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n").replace("\0", " ")
 
 
-def _lex_variants(raw: str, blank_strings: bool) -> list[str]:
-    """The joined lex, plus - for a file with a raw-string opener - a lex WITHOUT the splice join.
-    Callers take the UNION of what each variant yields: a second variant can only ADD results
-    (never hide one), so the worst case is a possible false FAIL in a contrived file."""
-    variants = [strip_comments(raw, blank_strings=blank_strings)]
-    if 'R"' in raw:
-        variants.append(strip_comments(raw, blank_strings=blank_strings, join_splices=False))
-    return variants
-
-
 def parse_includes(path: Path):
     """Yields (is_angle, spelling) for every `#include` / `#include_next` directive in `path`,
     in file order. Comments are removed first by the linear `strip_comments`, backslash-newline
@@ -986,14 +1004,13 @@ def parse_includes(path: Path):
     Over-extracted (the conservative direction, a possible false FAIL): an `#include` line
     inside `#if 0` or inside a raw string literal."""
     out = []
-    for text in _lex_variants(_read_source(path), blank_strings=False):
-        for line in text.split("\n"):
-            m = _INCLUDE_RE.match(line)
-            if not m:
-                continue
-            item = (m.group(1).startswith("<"), m.group(1)[1:-1])
-            if item not in out:
-                out.append(item)
+    for line in strip_comments(_read_source(path), blank_strings=False).split("\n"):
+        m = _INCLUDE_RE.match(line)
+        if not m:
+            continue
+        item = (m.group(1).startswith("<"), m.group(1)[1:-1])
+        if item not in out:
+            out.append(item)
     return out
 
 
@@ -1239,13 +1256,13 @@ def names_store_type(path: Path):
     """Returns the first store-type token this file NAMES in code (comments
     stripped), or None. Catches both `*Store` class names (regex) and the
     non-`Store` store row/data types (EXTRA_STORE_TYPE_TOKENS)."""
-    for code in _lex_variants(_read_source(path), blank_strings=True):
-        m = STORE_TYPE_TOKEN_RE.search(code)
-        if m:
-            return m.group(0)
-        for tok in EXTRA_STORE_TYPE_TOKENS:
-            if re.search(r"\b" + re.escape(tok) + r"\b", code):
-                return tok
+    code = strip_comments(_read_source(path), blank_strings=True)
+    m = STORE_TYPE_TOKEN_RE.search(code)
+    if m:
+        return m.group(0)
+    for tok in EXTRA_STORE_TYPE_TOKENS:
+        if re.search(r"\b" + re.escape(tok) + r"\b", code):
+            return tok
     return None
 
 

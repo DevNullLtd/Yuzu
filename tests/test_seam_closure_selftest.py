@@ -312,13 +312,28 @@ def _gnu_gxx():
     return None
 
 
+# Fixtures the oracle judged / declined to judge. Declining is legitimate only for these: a file
+# the PREPROCESSOR itself rejects (an unterminated comment, a stray character). Anything else
+# declining means the oracle is broken (an old g++ without -std=gnu++23, say) and the selftest must
+# not print OK on the strength of an oracle that said nothing - see the end of main().
+ORACLE_JUDGED: list = []
+ORACLE_NO_VERDICT: list = []
+EXPECTED_NO_VERDICT = {
+    "hid_unterminated_comment_opens_before_include_routes.cpp",
+    "hid_unicode_line_separator_is_not_a_newline_routes.cpp",
+    "qe_unterminated_comment_include_on_next_line_routes.cpp",
+}
+
+
 def _oracle_lists(gxx, tu, include_dir):
     """True/False: does the compiler's preprocessor list hid_store.hpp for `tu`? None when it
     exits non-zero (an unterminated comment, say) - then its dependency output is not evidence."""
     dep = subprocess.run([gxx, "-std=gnu++23", "-MM", "-MG", "-I", str(include_dir), str(tu)],
                          capture_output=True, text=True, errors="replace")
     if dep.returncode != 0:
+        ORACLE_NO_VERDICT.append(Path(tu).name)
         return None
+    ORACLE_JUDGED.append(Path(tu).name)
     return "hid_store.hpp" in dep.stdout
 
 
@@ -863,6 +878,15 @@ def main() -> int:
             "string_udl_suffix_LR_is_not_a_raw_string": ('auto s = "a"LR"(";\n#include/**/"hid_store.hpp"\n', True),
             "identifier_ending_LR_then_string_hides_include": ('int aLR = 0; const char* p = aLR"()x"; /* hides\n#include "hid_store.hpp"\n*/ int z;\n', False),
             "dollar_identifier_ending_R_then_string_hides_include": ('int $R = 0; const char* p = $R"()x"; /* hides\n#include "hid_store.hpp"\n*/ int z;\n', False),
+            # QE round 7: the digit-separator rule tokenises the run before the quote
+            "dollar_identifier_digit_then_char_literal": ("int a$1=0; auto c=a$1'x'; int d='/*';\n#include \"hid_store.hpp\"\n", True),
+            "dollar_digit_then_unterminated_char": ("$1'0/*\n#include \"hid_store.hpp\"\n", True),
+            "identifier_dot_pp_number_separator": ("int a = x.5'0; int c = '/*';\n#include \"hid_store.hpp\"\n", True),
+            "dot_e_is_not_a_number_then_char_literal": ("int c = .e'x'; int d = '/*';\n#include \"hid_store.hpp\"\n", True),
+            "float_exponent_dot_separator": ("int n = 1.e5'0; int c = '/*';\n#include \"hid_store.hpp\"\n", True),
+            "u8_raw_prefix_at_file_start": ('u8R"(" /*)";\n#include "hid_store.hpp"\n', True),
+            "char_literal_udl_R_is_not_a_raw_string_hides_include": ("auto c = 'a'R\"(x\" /*)\";\n#include \"hid_store.hpp\"\n*/\n", False),
+            "dotted_pp_number_ending_R_then_string_hides_include": ('auto n = 1.R"()x"; /* hides\n#include "hid_store.hpp"\n*/ int z;\n', False),
             "pp_number_ending_LR_then_string_hides_include": ('auto n = 0LR"()x"; /* hides\n#include "hid_store.hpp"\n*/ int z;\n', False),
             # hide: NOT includes to the compiler
             "line_comment": ('// #include "hid_store.hpp"\nint x;\n', False),
@@ -909,6 +933,12 @@ def main() -> int:
             "angle_double_slash_trailing_comment": ("#include <sub//hid_store.hpp> // c\n", True),
             "angle_after_closed_comment": ("/* a\n*/ # include <sub//hid_store.hpp>\n", True),
             "angle_spliced_inside_name": ("#include <su\\\nb//hid_store.hpp>\n", True),
+            "angle_on_line_two": ("#pragma once\n#include <sub//hid_store.hpp>\n", True),
+            "angle_digraph_include": ("%:include <sub//hid_store.hpp>\n", True),
+            "angle_import": ("#import <sub//hid_store.hpp>\n", True),
+            "angle_include_next": ("#include_next <sub//hid_store.hpp>\n", True),
+            "angle_closed_then_comment_hides": ('#include <sub/ok.hpp> /* hides\n#include "hid_store.hpp"\n*/\n', False),
+            "less_than_before_comment_hides": ('int a = x < y; /* c\n#include "hid_store.hpp"\n*/\n', False),
             "angle_quote_inside_comment_hides": ("// #include <sub//hid_store.hpp>\nint x;\n", False),
         }
         for form, (body, fires) in angle_forms.items():
@@ -936,6 +966,7 @@ def main() -> int:
                 ("raw_splice_opener_type_token", 'R\\\n"()\\\n"/*)";\nclass HiddenStore;\n', "HiddenStore"),
                 ("raw_splice_content_type_token", 'const char* r = R"()\\\n"/*)";\nclass HiddenStore;\n', "HiddenStore"),
                 ("leading_dot_separator_type_token", "double d = .5'0; int c = '/*';\nclass HiddenStore;\n", "HiddenStore"),
+                ("string_literal_hides_type_token", 'const char* k = "FooStore";\n', None),
                 ("comment_hides_type_token", "/* class HiddenStore; */\nint x;\n", None)):
             tu = src / f"{form}.hpp"
             tu.write_text(body, encoding="utf-8")
@@ -955,6 +986,9 @@ def main() -> int:
                 ("opener", 'R\\\n"()\\\n"/*)";\n#include "hid_store.hpp"\n'),
                 ("content", 'const char* r = R"()\\\n"/*)";\n#include "hid_store.hpp"\n'),
                 ("splice_before_literal", '\\\n\\\nconst char* r = R"()\\\n"/*)";\n#include "hid_store.hpp"\n'),
+                ("splice_right_after_raw_close", 'auto s = R"(x)"\\\n; "/*";\n#include "hid_store.hpp"\n'),
+                ("long_blank_splice_then_raw", '\\' + ' ' * 300 + '\n/* )" */R"(/*)";\n#include "hid_store.hpp"\n'),
+                ("two_long_blank_splices_then_raw", ('\\' + ' ' * 300 + '\n') * 2 + '/*)"*/R"(/*)";\n#include "hid_store.hpp"\n'),
                 ("two_raw_strings", 'auto a = R"x(\\\n)x"; auto b = R"()\\\n"/*)";\n#include "hid_store.hpp"\n')):
             for blank in (False, True):
                 want_ = '#include ""' if blank else '#include "hid_store.hpp"'   # blanking empties the literal
@@ -962,6 +996,19 @@ def main() -> int:
                     _fail(f"strip_comments({form!r}, blank_strings={blank}) lost the include after a "
                           f"raw string holding a backslash-newline - the splice offset mapping is wrong",
                           failures)
+        # 20d. Every lane's "declared file not found" error tells the author WHAT to update.
+        for lane, call, want_ in (
+                ("impl-purity", lambda: mod.check_impl_purity(["server/core/src/no_such_impl.cpp"], roots=roots), "IMPL_TUS"),
+                ("abstract-header", lambda: mod.check_abstract_headers_store_type_free(
+                    ["server/core/src/no_such_api.hpp"], roots=roots), "ABSTRACT_API_HEADERS")):
+            err_ = io.StringIO()
+            with contextlib.redirect_stderr(err_):
+                ok_ = call()
+            if ok_ or want_ not in err_.getvalue() or "frozen pin" not in err_.getvalue() \
+                    or "renamed or deleted" not in err_.getvalue():
+                _fail(f"{lane} lane: a missing declared file must fail and say to update {want_} AND "
+                      f"the frozen pin; got ok={ok_} stderr={err_.getvalue()!r}", failures)
+
         # BOM / UTF-16 (bytes written explicitly: Windows editors and MSVC produce both).
         for form, raw in (("bom", b'\xef\xbb\xbf#include "hid_store.hpp"\nint x;\n'),
                           ("utf16_le", b'\xff\xfe' + '#include "hid_store.hpp"\nint x;\n'.encode("utf-16-le")),
@@ -1329,6 +1376,14 @@ def main() -> int:
     finally:
         (mod.check_family, mod.check_impl_purity,
          mod.check_abstract_headers_store_type_free) = real_fns
+
+    if _gnu_gxx() is not None:
+        stray = sorted(set(ORACLE_NO_VERDICT) - EXPECTED_NO_VERDICT)
+        if stray or len(ORACLE_JUDGED) < 80:
+            _fail(f"the g++ oracle is not producing verdicts: judged {len(ORACLE_JUDGED)} fixtures "
+                  f"(expected >= 80) and declined {stray!r} beyond the {len(EXPECTED_NO_VERDICT)} "
+                  f"expected - an old g++ or a broken toolchain would otherwise turn every "
+                  f"compiler cross-check into a silent skip", failures)
 
     if failures:
         print(f"\n{len(failures)} seam-closure self-test failure(s).", file=sys.stderr)
