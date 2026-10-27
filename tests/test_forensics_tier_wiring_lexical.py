@@ -267,6 +267,12 @@ COUNTED: list[tuple[str, str, int, str]] = [
     ("fixed-plugin-polls",
      r"(?P<k>ResponseTierFilter::for_fixed_plugin_poll\(" + _FP + r"\))", 3,
      "the DEX, TAR and device fixed-plugin polls must each build their tier with the plugin set"),
+    # The two call anchors of ORDER_ANCHORS: a second occurrence would let the "before" ordering be
+    # satisfied against the wrong site and weaken two rows silently.
+    ("anchor-listener-start", r"(?P<k>agent_server_=builder\.BuildAndStart\(\);)", 1,
+     "the agent gRPC listener starts at exactly one site (ORDER_ANCHORS measures against it)"),
+    ("anchor-web-thread", r"(?P<k>web_thread_=std::thread\()", 1,
+     "the web thread starts at exactly one site (ORDER_ANCHORS measures against it)"),
 ]
 
 # Spellings that open an unwired hatch. Each must NOT occur.
@@ -516,6 +522,16 @@ PROVENANCE_EXACT: dict[str, list[tuple[str, str, int, str]]] = {
         ("prov-no-old-record-api",
          r"\brecord_execution_id\b|\brecord_command_execution\b|\blookup_execution_id\b|\bresolve_execution_id\b",
          0, "the pre-provenance record/lookup API is gone"),
+        ("prov-finalize-one-caller", r"\bfinalize_classified_command\(", 1,
+         "the dispatch chokepoint finalizes a command at exactly one site; a second finalizer is a "
+         "second place a command can reach the wire without the record being written"),
+        ("prov-classified-command-mentions", r"\bClassifiedCommand\b", 5,
+         "ServerImpl names ClassifiedCommand only in the builder's return type and four by-reference "
+         "parameter types; a new use is a path around the chokepoint and needs this pin"),
+        ("prov-classified-command-no-construction",
+         r"\bClassifiedCommand(?:\s+\w+)?\s*[({]|make_(?:unique|shared)<[^>]*ClassifiedCommand", 0,
+         "ServerImpl never constructs a ClassifiedCommand itself: only finalize_classified_command does, "
+         "after the record-bearing builder"),
     ],
     "forensics_plugin_set.hpp": [
         ("prov-sentinel-in-set", r"names\.emplace_back\(kUnverifiedProvenanceLabel\);", 1,
