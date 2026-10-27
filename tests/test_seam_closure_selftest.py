@@ -887,6 +887,20 @@ def main() -> int:
             "u8_raw_prefix_at_file_start": ('u8R"(" /*)";\n#include "hid_store.hpp"\n', True),
             "char_literal_udl_R_is_not_a_raw_string_hides_include": ("auto c = 'a'R\"(x\" /*)\";\n#include \"hid_store.hpp\"\n*/\n", False),
             "dotted_pp_number_ending_R_then_string_hides_include": ('auto n = 1.R"()x"; /* hides\n#include "hid_store.hpp"\n*/ int z;\n', False),
+            # security round 7 (independent grammar): separators the compiler honours in skipped code
+            "separator_underscore_after_quote": ("#if 0\n1'_'/*\n#endif\n#include \"hid_store.hpp\"\n", True),
+            "separator_after_trailing_dot": ("#if 0\n1.'5'/*\n#endif\n#include \"hid_store.hpp\"\n", True),
+            "separator_after_exponent_sign": ("#if 0\n5e+'1'/*\n#endif\n#include \"hid_store.hpp\"\n", True),
+            "separator_next_char_non_ascii_is_a_char_literal": ("#if 0\n1'\u00e9 /*\n#endif\n#include \"hid_store.hpp\"\n", True),
+            "dollar_identifier_digit_quote_comment": ("#if 0\n$5'1/*\n#endif\n#include \"hid_store.hpp\"\n", True),
+            "dollar_identifier_inner_digit_quote_comment": ("#if 0\na$1'0/*\n#endif\n#include \"hid_store.hpp\"\n", True),
+            "define_comment_then_import_with_angle_comment": ('#define X 0/**/#import<//>/*\n#include "hid_store.hpp"\n', True),
+            "string_before_hash_is_not_a_directive_prefix": ('"x" #include <a /* hides\n#include "hid_store.hpp"\n*/\n', False),
+            "comment_inside_directive_keyword_is_not_the_keyword": ('#if 0\n#incl/**/ude <a /* hides\n#include "hid_store.hpp"\n*/\n#endif\n', False),
+            "multiline_comment_inside_directive_keyword": ('#if 0\n#incl/*\n*/ude <a /* hides\n#include "hid_store.hpp"\n*/\n#endif\n', False),
+            "longer_identifier_than_include_is_not_the_keyword": ('#if 0\n#includex <a /* hides\n#include "hid_store.hpp"\n*/\n#endif\n', False),
+            "plus_is_not_an_exponent_sign": ("int x = 1+'a'; /* hides\n#include \"hid_store.hpp\"\n*/ int z;\n", False),
+            "hex_float_exponent_sign_separator": ("#if 0\n0x1p+'1'/*\n#endif\n#include \"hid_store.hpp\"\n", True),
             "pp_number_ending_LR_then_string_hides_include": ('auto n = 0LR"()x"; /* hides\n#include "hid_store.hpp"\n*/ int z;\n', False),
             # hide: NOT includes to the compiler
             "line_comment": ('// #include "hid_store.hpp"\nint x;\n', False),
@@ -939,6 +953,13 @@ def main() -> int:
             "angle_include_next": ("#include_next <sub//hid_store.hpp>\n", True),
             "angle_closed_then_comment_hides": ('#include <sub/ok.hpp> /* hides\n#include "hid_store.hpp"\n*/\n', False),
             "less_than_before_comment_hides": ('int a = x < y; /* c\n#include "hid_store.hpp"\n*/\n', False),
+            "angle_comment_between_include_and_lt": ("#include/**/<sub//hid_store.hpp>\nint x;\n", True),
+            "angle_comment_between_hash_and_include": ("#/**/include<sub//hid_store.hpp>\n", True),
+            "angle_digraph_comment_then_lt": ("%:/**/include<sub//hid_store.hpp>\n", True),
+            "angle_multiline_comment_between_hash_and_include": ("# /* a\n */ include <sub//hid_store.hpp>\n", True),
+            "angle_second_header_name_with_comment_opener": ('#include<sub/ok.hpp></*>\n#include "hid_store.hpp"\n', True),
+            "angle_with_quote_inside_header_name": ('#include <sub//ok"x.hpp>\n#include "hid_store.hpp"\n', True),
+            "backslash_backslash_newline_ends_a_string": ('"\\\\\n\n#include "sub//hid_store.hpp"\n', True),
             "angle_quote_inside_comment_hides": ("// #include <sub//hid_store.hpp>\nint x;\n", False),
         }
         for form, (body, fires) in angle_forms.items():
@@ -967,6 +988,13 @@ def main() -> int:
                 ("raw_splice_content_type_token", 'const char* r = R"()\\\n"/*)";\nclass HiddenStore;\n', "HiddenStore"),
                 ("leading_dot_separator_type_token", "double d = .5'0; int c = '/*';\nclass HiddenStore;\n", "HiddenStore"),
                 ("string_literal_hides_type_token", 'const char* k = "FooStore";\n', None),
+                ("define_comment_import_angle_type_token", '#define X 0/**/#import<//>/*\nclass HiddenStore;\n', "HiddenStore"),
+                ("pp_number_dot_R_type_token", '#if 0\nx = 1.R"(\n#endif\nclass HiddenStore;\n', "HiddenStore"),
+                ("pp_number_exp_sign_R_type_token", '#if 0\nx = 1e+R"(\n#endif\nclass HiddenStore;\n', "HiddenStore"),
+                ("non_ascii_identifier_R_type_token", '#if 0\nx = \u00b7R"(\n#endif\nclass HiddenStore;\n', "HiddenStore"),
+                ("separator_underscore_type_token", "1'_ HiddenStore\n", "HiddenStore"),
+                ("separator_trailing_dot_type_token", "1.'5 HiddenStore\n", "HiddenStore"),
+                ("separator_exponent_sign_type_token", "5e+'1 HiddenStore\n", "HiddenStore"),
                 ("comment_hides_type_token", "/* class HiddenStore; */\nint x;\n", None)):
             tu = src / f"{form}.hpp"
             tu.write_text(body, encoding="utf-8")

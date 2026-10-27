@@ -45,8 +45,9 @@ ALSO NOT CAUGHT (found in the WS-A4 S0 review, each reproduced on a scratch tree
      aware), joins backslash-newline (trailing blanks / FF / VT allowed), drops a UTF-8 BOM,
      decodes UTF-16, treats NUL as whitespace and accepts `%:include`, `include_next` and
      `import` - cross-checked against `g++ -MM -MG` (a fuzz of ~100k files found hiding shapes in
-     earlier drafts and the S0 review found more; each is fixed and pinned in the selftest, and
-     the last fuzz runs found none). It still extracts NOTHING from a
+     earlier drafts, and two independent reviewers' own grammars found more in this one; each
+     reported shape is fixed and pinned in the selftest, but this is a hand-written lexer and
+     "no miss in the fuzz grammars tried" is the strongest claim available). It still extracts NOTHING from a
      macro-built include (`#include SOME_MACRO`) or a `##`-spliced one, cannot see an include
      guarded away by `__has_include`. A backslash-newline INSIDE a raw string (the compiler
      reverts the splice there) and an include's `<header-name>` containing `//` or `/*` are lexed
@@ -750,11 +751,12 @@ _INCLUDE_RE = re.compile(r'^[ \t\f\v]*(?:#|%:)[ \t\f\v]*(?:include(?:_next)?|imp
 # (GCC/Clang also accept trailing blanks between the backslash and the newline, with a
 # warning, and MSVC does too).
 _LINE_CONTINUATION_RE = re.compile(r'\\[ \t\f\v]*\r?\n')
-# The code on a line so far is an include directive with an OPEN header-name: `#include <a/b`. The
-# compiler lexes `<...>` as ONE token, so a `//` or `/*` that follows is not a comment:
-# `#include <yuzu/server//scim_store.hpp>` is an include. Applied to the stripped line prefix only
-# when a comment opener is met (see `strip_comments`).
-_OPEN_HEADER_NAME_RE = re.compile(r'[ \t\f\v]*(?:#|%:)[ \t\f\v]*(?:include(?:_next)?|import)[ \t\f\v]*<[^>]*$')
+# Per-logical-line directive tracking (see `_LineState`): the code on a line so far is
+# `#` / `%:` then `include` / `include_next` / `import` followed by a non-identifier character.
+_DIRECTIVE_PREFIX_RE = re.compile(r'[ \t\f\v]*(?:#|%:)[ \t\f\v]*(?:include_next|include|import)'
+                                  r'(?=[^A-Za-z0-9_$\x80-\U0010ffff])')
+_LT_OR_NL_RE = re.compile(r"[<\n]")
+_DIRECTIVE_PREFIX_CAP = 64   # `#   include_next` plus blanks fits; a longer prefix is not a directive
 _SPECIAL_RE = re.compile(r"[/\"']")
 _STR_END_RE = re.compile(r'["\\\n]')
 _CHR_END_RE = re.compile(r"['\\\n]")
@@ -772,8 +774,90 @@ def gh(kind, msg):
 
 
 def _is_ident_char(ch: str) -> bool:
-    # `$` is an identifier character to GCC, Clang and MSVC (`$R"x(` is an identifier then a string).
-    return ch.isalnum() or ch == "_" or ch == "$"
+    # `$` is an identifier character to GCC, Clang and MSVC (`$R"x(` is an identifier then a string),
+    # and so is any non-ASCII character (extended identifier characters).
+    return ch.isalnum() or ch == "_" or ch == "$" or ord(ch) > 127
+
+
+def _is_pp_run_char(ch: str) -> bool:
+    """A character that can be part of a run holding a pp-number or an identifier before a quote."""
+    return _is_ident_char(ch) or ch in ".+-"
+
+
+class _LineState:
+    """Tracks, for the CURRENT logical line (backslash-newline already joined; a multi-line block
+    comment is one blank and does not end it), whether the code so far is an include directive and
+    whether the lexer is inside a `<header-name>`.
+
+    The compiler lexes a header-name as ONE token, so `//` and `/*` inside it are not comments, and
+    in an include directive EVERY `<` after the keyword opens one (`#include<a.h></*>` has a second
+    header-name). The tracker is fed only plain code segments (comments contribute a blank, literals
+    are skipped via `literal()`), so a comment between `#`, `include` and `<` does not hide the
+    directive. Linear: each segment is scanned once, and the pre-keyword prefix is capped."""
+    __slots__ = ("prefix", "dead", "in_include", "in_name")
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.prefix = ""
+        self.dead = False
+        self.in_include = False
+        self.in_name = False
+
+    def literal(self):
+        # A string/char literal before the directive keyword makes this line not a directive; the
+        # `"` of `#include "x"` arrives before the keyword's follower, so look ahead with a blank.
+        if self.in_include or self.dead:
+            return
+        m = _DIRECTIVE_PREFIX_RE.match(self.prefix + " ")
+        if m:
+            self.in_include = True
+            self.prefix = ""
+        else:
+            self.dead = True
+
+    def feed(self, seg: str):
+        pos, n = 0, len(seg)
+        while pos < n:
+            if self.in_include:
+                if self.in_name:
+                    gt = seg.find(">", pos)
+                    nl = seg.find("\n", pos)
+                    if nl >= 0 and (gt < 0 or nl < gt):
+                        self.reset()
+                        pos = nl + 1
+                        continue
+                    if gt < 0:
+                        return
+                    self.in_name = False
+                    pos = gt + 1
+                else:
+                    m = _LT_OR_NL_RE.search(seg, pos)
+                    if m is None:
+                        return
+                    if m.group() == "\n":
+                        self.reset()
+                    else:
+                        self.in_name = True
+                    pos = m.end()
+            else:
+                nl = seg.find("\n", pos)
+                end = n if nl < 0 else nl
+                if not self.dead:
+                    self.prefix += seg[pos:end]
+                    m = _DIRECTIVE_PREFIX_RE.match(self.prefix)
+                    if m:
+                        rest = self.prefix[m.end():]
+                        self.in_include = True
+                        self.prefix = ""
+                        self.feed(rest)
+                    elif len(self.prefix) > _DIRECTIVE_PREFIX_CAP:
+                        self.dead = True
+                if nl < 0:
+                    return
+                self.reset()
+                pos = nl + 1
 
 
 def _quoted_end(text: str, k: int, end_re) -> int:
@@ -786,28 +870,37 @@ def _quoted_end(text: str, k: int, end_re) -> int:
             return len(text)
         ch = text[sm.start()]
         if ch == "\\":
+            if text[sm.start() + 1:sm.start() + 2] == "\n":
+                return sm.start() + 1   # a surviving backslash-newline is not a splice: the literal ends
             k = sm.start() + 2
             continue
         return sm.start() if ch == "\n" else sm.end()
 
 
 def _ends_in_pp_number(run: str) -> bool:
-    """`run` is a maximal run of [alnum _ . $] characters. True when its LAST token, lexed from the
-    left the way the compiler does, is a pp-number (starts with a digit or `.digit`, then takes
-    letters, digits, `_`, `.` and `$`); an identifier swallows its digits (`a$1`, `x1`), and a
-    `.` that is not followed by a digit is punctuation (`x.5` is the identifier `x` then `.5`)."""
+    """`run` is a maximal run of identifier characters, `.`, `+` and `-`. True when its LAST token,
+    lexed from the left the way the compiler does, is a pp-number: it starts with an ASCII digit or
+    `.digit`, then takes letters, digits, `_`, `.`, `$`, non-ASCII characters, and a sign directly
+    after `e`/`E`/`p`/`P`. An identifier swallows its digits (`a$1`, `x1`); a `.`, `+` or `-` that
+    does not continue a number is punctuation (`x.5` is the identifier `x` then `.5`)."""
     i, n = 0, len(run)
     is_num = False
     while i < n:
         c = run[i]
-        if c.isdigit() or (c == "." and i + 1 < n and run[i + 1].isdigit()):
+        if "0" <= c <= "9" or (c == "." and i + 1 < n and "0" <= run[i + 1] <= "9"):
             i += 1
-            while i < n and (run[i].isalnum() or run[i] in "_.$"):
-                i += 1
+            while i < n:
+                d = run[i]
+                if _is_ident_char(d) or d == ".":
+                    i += 1
+                elif d in "+-" and run[i - 1] in "eEpP":
+                    i += 1
+                else:
+                    break
             is_num = True
-        elif c != "." and c != "":
+        elif _is_ident_char(c):
             i += 1
-            while i < n and (run[i].isalnum() or run[i] in "_$"):
+            while i < n and _is_ident_char(run[i]):
                 i += 1
             is_num = False
         else:
@@ -822,7 +915,7 @@ def _raw_prefix_ok(text: str, r: int) -> bool:
     identifier or pp-number (`aLR"`, `1R"`, `0LR"`) and NOT a user-defined-literal suffix on a
     preceding literal (`"s"R"`, `'c'LR"`)."""
     k = r
-    while k >= 0 and (text[k].isalnum() or text[k] in "_.$"):
+    while k >= 0 and _is_pp_run_char(text[k]):
         k -= 1
     if _ends_in_pp_number(text[k + 1:r + 1]):   # `1.R"`, `0x1R"`: the R belongs to a number
         return False
@@ -864,10 +957,11 @@ def strip_comments(text: str, blank_strings: bool, join_splices: bool = True) ->
     time WITHOUT the join and unioned the results; with the mapping exact that was dead weight that
     only added false FAILs, and no fixture needed it, so it was removed.)
 
-    HEADER-NAMES: when a `//` or `/*` is met and the code on its line so far is an include
-    directive with an open `<`, it is part of the header-name token, not a comment. A comment
-    BETWEEN `include` and the `<` (`#include/*c*/<a//b>`) is not recognised as that prefix, which
-    is the conservative direction (over-protecting never hides an include).
+    HEADER-NAMES: `_LineState` follows each logical line (a multi-line block comment is one blank
+    and does not end it). Once the line is `#` / `%:` then `include` / `include_next` / `import`
+    - comments and blanks between the pieces are fine - EVERY `<` opens a header-name that runs to
+    `>` or the end of the line, and inside it no `//`, `/*`, `"` or `'` starts anything
+    (`#include<a.h></*>` has two header-names). Outside a directive a `<` means nothing.
 
     An include on its own line inside `#if 0` or a raw string is still extracted (the
     conservative direction: a possible false FAIL, never a hidden include). An unterminated
@@ -903,7 +997,8 @@ def strip_comments(text: str, blank_strings: bool, join_splices: bool = True) ->
     out: list[str] = []
     last = 0
     i = 0
-    cmt_end = 0     # end of the most recent comment: bounds the line-prefix look-back above
+    ls = _LineState()
+    fed = 0         # text[:fed] has been fed to `ls`
     last_sep = -1   # position of the previous digit-separator quote (a chain 1'0'0'0 is one token)
     while True:
         m = _SPECIAL_RE.search(text, i)
@@ -911,23 +1006,20 @@ def strip_comments(text: str, blank_strings: bool, join_splices: bool = True) ->
             break
         j = m.start()
         c = text[j]
+        ls.feed(text[fed:j])
+        fed = j
+        if ls.in_name:
+            i = j + 1   # inside a `<header-name>`: no comment, string or char literal can start
+            continue
         if c == "/":
             nxt = text[j + 1:j + 2]
-            if nxt in ("/", "*") and text.find("<", cmt_end, j) >= 0:
-                # Inside an include directive's `<header-name>`? The line prefix since the last
-                # comment (or line start) decides; over-protecting is the conservative direction.
-                nl = text.rfind("\n", cmt_end, j)
-                if _OPEN_HEADER_NAME_RE.match(text, nl + 1 if nl >= 0 else cmt_end, j):
-                    gt = text.find(">", j)
-                    eol = text.find("\n", j)
-                    i = gt + 1 if 0 <= gt and (eol < 0 or gt < eol) else (n if eol < 0 else eol)
-                    continue
             if nxt == "/":
                 end = text.find("\n", j + 2)
                 end = n if end < 0 else end
                 out.append(text[last:j])
                 out.append(" ")
-                last = i = cmt_end = end
+                last = i = fed = end
+                ls.feed(" ")
             elif nxt == "*":
                 end = text.find("*/", j + 2)
                 out.append(text[last:j])
@@ -935,7 +1027,8 @@ def strip_comments(text: str, blank_strings: bool, join_splices: bool = True) ->
                 if end < 0:
                     last = i = n
                     break
-                last = i = cmt_end = end + 2
+                last = i = fed = end + 2
+                ls.feed(" ")
             else:
                 i = j + 1
         elif c == '"':
@@ -952,25 +1045,31 @@ def strip_comments(text: str, blank_strings: bool, join_splices: bool = True) ->
                     end = n if oclose < 0 else max(to_joined(oclose + len(tail)), rm.end())
             if end is None:
                 end = _quoted_end(text, j + 1, _STR_END_RE)
+            ls.literal()
+            fed = end
             if blank_strings:
                 out.append(text[last:j])
                 out.append('""')
                 last = end
             i = end
         else:  # a single quote
-            if j > 0 and _is_ident_char(text[j - 1]) and text[j + 1:j + 2].isalnum():
+            nx = text[j + 1:j + 2]
+            if j > 0 and nx and nx.isascii() and (nx.isalnum() or nx == "_"):
                 # C++14 digit separator (1'000'000) - but ONLY inside a pp-number: tokenise the run of
                 # identifier/number characters that ends here; the token touching the quote must be
                 # a pp-number (an earlier separator in the same chain counts). `return'/*'`,
-                # `L'x'`, `u8'x'`, `1'/*'`, `a$1'x'` are char literals; `x.5'0` and `.5'0` are not.
+                # `L'x'`, `u8'x'`, `1'/*'`, `a$1'x'` are char literals; `x.5'0`, `.5'0`, `1.'5` and
+                # `5e+'1` are separators. The character after the quote must be ASCII [A-Za-z0-9_].
                 k = j - 1
-                while k >= 0 and (text[k].isalnum() or text[k] in "_.$"):
+                while k >= 0 and _is_pp_run_char(text[k]):
                     k -= 1
                 if (k >= 0 and k == last_sep) or _ends_in_pp_number(text[k + 1:j]):
                     last_sep = j
                     i = j + 1
                     continue
             end = _quoted_end(text, j + 1, _CHR_END_RE)
+            ls.literal()
+            fed = end
             if blank_strings:
                 out.append(text[last:j])
                 out.append("''")
