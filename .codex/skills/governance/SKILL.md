@@ -53,7 +53,7 @@ Use compact role prompts and include the Gate 1 summary plus prior gate findings
 - `quality-engineer`: test seams, integration coverage, fixture isolation, flaky patterns, temp DB/path hygiene, weak assertions. For C++ safety-sensitive changes, require coverage for cleanup paths, partial failure, short read/write, EINTR, failed `pclose`, failed `CloseHandle`, failed `sqlite3_prepare`, and concurrent teardown where relevant; for new RAII wrappers, require a test or compile-time assertion covering move-only/non-copyable behavior when feasible.
 - `build-ci`: Meson, vcpkg, workflows, release scripts, runner assumptions, cache behavior.
 - `plugin-developer`: plugin descriptors, SDK boundaries, YAML definitions, plugin execution behavior.
-- `gateway-erlang`: rebar3, OTP supervision, grpcbox/gpb, gateway proto mirrors, EUnit/CT/Dialyzer implications.
+- `gateway-erlang`: rebar3, OTP supervision, cowboy/gun/gpb, gateway proto mirrors, EUnit/CT/Dialyzer implications.
 - `dsl-engineer`: CEL, scope DSL, YAML DSL, trigger templates, validation and backward compatibility.
 - `cross-platform`: Darwin, Linux, Windows/MSVC, paths, sockets, filesystem, service behavior.
 - `performance`: SQLite hot paths, BFS/graph traversals, authz loops, gateway throughput, allocations.

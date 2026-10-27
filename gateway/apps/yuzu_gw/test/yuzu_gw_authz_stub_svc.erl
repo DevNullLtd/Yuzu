@@ -35,14 +35,12 @@ bump() ->
     _ = ets:update_counter(?TAB, invocations, 1),
     ok.
 
-%% Unary: grpcbox calls Module:Function(Ctx, Message) and expects
-%% {ok, Response, Ctx} (grpcbox_stream:handle_unary/3).
-list_agents(Ctx, _Request) ->
+%% Unary: yuzu_grpc_runner calls Module:Function(Ctx, Request).
+list_agents(_Ctx, _Request) ->
     bump(),
-    {ok, #{agents => [], next_cursor => <<>>}, Ctx}.
+    {ok, #{agents => [], next_cursor => <<>>}}.
 
-%% Output-streaming: grpcbox spawns handle_streams(Message, StreamState)
-%% and calls Module:Function(Message, StreamState) — send nothing, end OK.
+%% Server-streaming: Module:Function(Request, Stream) -- send nothing, end OK.
 send_command(_Request, _Stream) ->
     bump(),
     ok.

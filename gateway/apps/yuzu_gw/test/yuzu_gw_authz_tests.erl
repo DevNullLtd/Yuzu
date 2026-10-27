@@ -27,7 +27,7 @@
 
 authz_test_() ->
     {setup,
-     fun setup_certs/0,
+     fun setup_published/0,
      fun cleanup_certs/1,
      fun(Certs) ->
         case Certs of
@@ -159,15 +159,21 @@ rotation_overlap(#{srv_pem := SrvPem} = Certs) ->
 
 file_pin_rotation(#{dir := Dir, srv_pem := SrvPem, gw_pem := GwPem} = Certs) ->
     %% Pin path starts as a copy of srv; after the file is replaced (new
-    %% mtime), the pin must follow the NEW cert without a process restart.
+    %% mtime), the pin must follow the NEW cert without a process restart --
+    %% from the watcher's next refresh (yuzu_gw_mgmt_pins), which is what makes
+    %% it visible to the check: until then the OLD key is still the pin.
     Rotating = filename:join(Dir, "rotating.pem"),
     {ok, _} = file:copy(SrvPem, Rotating),
     ok = file:change_time(Rotating, {{2020, 1, 1}, {0, 0, 0}}),
     Pins = [{cert_file, Rotating}],
+    ok = yuzu_gw_mgmt_pins:refresh(Pins),
     ?assertEqual({true, <<"yuzu-server">>},
                  yuzu_gw_authz:check_peer(der(Certs, srv_pem), Pins)),
     {ok, _} = file:copy(GwPem, Rotating),
     ok = file:change_time(Rotating, {{2021, 1, 1}, {0, 0, 0}}),
+    %% not yet refreshed: the new leaf is refused (fail closed)
+    ?assertEqual(false, yuzu_gw_authz:check_peer(der(Certs, gw_pem), Pins)),
+    ok = yuzu_gw_mgmt_pins:refresh(Pins),
     ?assertEqual({true, <<"yuzu-server">>},
                  yuzu_gw_authz:check_peer(der(Certs, gw_pem), Pins)),
     ?assertEqual(false,
@@ -195,6 +201,18 @@ app_env_entry_point(#{srv_pem := SrvPem} = Certs) ->
 
 setup_certs() ->
     setup_certs("/tmp").
+
+%% setup_certs/0, then publish the srv leaf's file pin the way the running
+%% gateway's watcher (yuzu_gw_mgmt_pins) would, so the cases that pin
+%% `{cert_file, SrvPem}' find it: the check itself never reads the file.
+setup_published() ->
+    case setup_certs() of
+        #{srv_pem := SrvPem} = Certs ->
+            ok = yuzu_gw_mgmt_pins:refresh([{cert_file, SrvPem}]),
+            Certs;
+        Error ->
+            Error
+    end.
 
 %% BaseDir is where the per-run 0700 directory is created, so a caller can
 %% keep the files off a shared /tmp (for example under $TMPDIR).
@@ -332,7 +350,7 @@ openssl_available_canary_test() ->
 %% > 255 — a pasted Unicode lookalike) must be SKIPPED like any other
 %% malformed pin, never abort the pin walk and reject every peer.
 badarg_class_pin_is_skipped_test_() ->
-    {setup, fun setup_certs/0, fun cleanup_certs/1,
+    {setup, fun setup_published/0, fun cleanup_certs/1,
      fun(Certs) ->
         case Certs of
             #{srv_pem := SrvPem} ->
@@ -364,7 +382,7 @@ telemetry_counter_test_() ->
         {ok, Started2} = application:ensure_all_started(telemetry),
         catch telemetry:detach(yuzu_gw_prometheus),
         ok = yuzu_gw_telemetry:setup(),
-        Certs = setup_certs(),
+        Certs = setup_published(),
         {Certs, Started ++ Started2}
      end,
      fun({Certs, _}) ->
@@ -402,6 +420,8 @@ telemetry_counter_test_() ->
                                                    [Label]))
                       end, Cases)
                   end},
+                 {"N4: one log line per reason per interval, every rejection counted",
+                  fun() -> rejection_log_is_rate_limited(Certs, SrvPem) end},
                  {"unresolved configured pin bumps pin_unresolved",
                   fun() ->
                       Der = der(Certs, srv_pem),
@@ -417,6 +437,57 @@ telemetry_counter_test_() ->
             _ -> []
         end
      end}.
+
+%% N4: any holder of an install-CA certificate that reaches :50063 can make the
+%% gateway refuse a stream, as often as it likes. The refusal is counted every
+%% time, but logged at most once per reason per interval (the shared
+%% yuzu_gw_safe_call limiter), and the next line says how many were not logged.
+%% The stamp is held quiet around the burst so the interval cannot pass in the
+%% middle of it: the counts are exact.
+rejection_log_is_rate_limited(Certs, SrvPem) ->
+    Der = der(Certs, srv_pem),
+    GwDer = der(Certs, gw_pem),
+    Kind = {mgmt_peer_rejected, no_pins_configured},
+    %% Earlier cases in this module were limited too: one logged rejection of
+    %% each reason takes any count they left, so the burst below starts at 0.
+    _ = yuzu_gw_test_logs:capture(notice, fun() ->
+        ok = yuzu_gw_safe_call:expire_limit(Kind),
+        ok = yuzu_gw_safe_call:expire_limit({mgmt_peer_rejected, pin_mismatch}),
+        false = yuzu_gw_authz:check_peer(Der, []),
+        false = yuzu_gw_authz:check_peer(GwDer, [{cert_file, SrvPem}])
+    end),
+    ok = yuzu_gw_safe_call:expire_limit(Kind),
+    ok = yuzu_gw_safe_call:expire_limit({mgmt_peer_rejected, pin_mismatch}),
+    Before = counter_val(yuzu_gw_mgmt_auth_rejected_total, [<<"no_pins_configured">>]),
+    Lines = fun(Out) -> [L || L <- Out, binary:match(L, <<"peer rejected">>) =/= nomatch] end,
+    First = Lines(yuzu_gw_test_logs:capture(notice, fun() ->
+        ?assertEqual(false, yuzu_gw_authz:check_peer(Der, [])),
+        ok = yuzu_gw_safe_call:hold_limit(Kind),
+        [?assertEqual(false, yuzu_gw_authz:check_peer(Der, [])) || _ <- lists:seq(1, 50)],
+        %% another reason is limited on its own: its first line still logs
+        ?assertEqual(false, yuzu_gw_authz:check_peer(GwDer, [{cert_file, SrvPem}]))
+    end)),
+    ?assertMatch([_, _], First),
+    [NoPins, Mismatch] = First,
+    ?assertNotEqual(nomatch, binary:match(NoPins, <<"no_pins_configured">>)),
+    ?assertEqual(nomatch, binary:match(NoPins, <<"suppressed">>)),
+    ?assertNotEqual(nomatch, binary:match(Mismatch, <<"pin_mismatch">>)),
+    %% the counter saw all 51
+    ?assertEqual(Before + 51,
+                 counter_val(yuzu_gw_mgmt_auth_rejected_total, [<<"no_pins_configured">>])),
+    %% the interval passes: the next line carries the count, and takes it
+    ok = yuzu_gw_safe_call:expire_limit(Kind),
+    Next = Lines(yuzu_gw_test_logs:capture(notice, fun() ->
+        ?assertEqual(false, yuzu_gw_authz:check_peer(Der, []))
+    end)),
+    ?assertMatch([_], Next),
+    ?assertNotEqual(nomatch, binary:match(hd(Next), <<"(50 similar line(s) suppressed">>)),
+    ok = yuzu_gw_safe_call:expire_limit(Kind),
+    Last = Lines(yuzu_gw_test_logs:capture(notice, fun() ->
+        ?assertEqual(false, yuzu_gw_authz:check_peer(Der, []))
+    end)),
+    ?assertMatch([_], Last),
+    ?assertEqual(nomatch, binary:match(hd(Last), <<"suppressed">>)).
 
 counter_val(Name, Labels) ->
     case prometheus_counter:value(Name, Labels) of

@@ -6,6 +6,11 @@
 -module(yuzu_gw_mgmt_service_tests).
 -include_lib("eunit/include/eunit.hrl").
 
+%% gRPC statuses the handlers return (the integers of yuzu_grpc.hrl).
+-define(NOT_FOUND, 5).
+-define(INTERNAL, 13).
+-define(UNAVAILABLE, 14).
+
 %%%===================================================================
 %%% JSON escaping tests
 %%%===================================================================
@@ -155,7 +160,7 @@ ctx_cleanup(_) ->
 list_agents_ctx() ->
     Ctx = #{custom_header => <<"test">>},
     {ok, _Response, ReturnedCtx} = yuzu_gw_mgmt_service:list_agents(
-        #{limit => 10}, Ctx),
+        Ctx, #{limit => 10}),
     ?assertEqual(Ctx, ReturnedCtx).
 
 get_agent_ctx() ->
@@ -171,7 +176,7 @@ get_agent_ctx() ->
 
     Ctx = #{custom_header => <<"test2">>},
     {ok, _Response, ReturnedCtx} = yuzu_gw_mgmt_service:get_agent(
-        #{agent_id => AgentId}, Ctx),
+        Ctx, #{agent_id => AgentId}),
     ?assertEqual(Ctx, ReturnedCtx),
 
     yuzu_gw_agent:disconnect(AgentPid),
@@ -195,13 +200,44 @@ get_agent_maps_stale_pid_to_not_found_test() ->
     wait_dead(DeadPid, 100),
     ?assertEqual(false, is_process_alive(DeadPid)),
 
-    meck:new(yuzu_gw_registry, [passthrough]),
-    meck:expect(yuzu_gw_registry, lookup, fun(_) -> {ok, DeadPid} end),
+    catch meck:unload(yuzu_gw_registry),
+    meck:new(yuzu_gw_registry, [passthrough, no_link]),
+    try
+        meck:expect(yuzu_gw_registry, lookup, fun(_) -> {ok, DeadPid} end),
+        ?assertEqual({grpc_error, {?NOT_FOUND, <<"Agent not connected">>}},
+                     yuzu_gw_mgmt_service:get_agent(#{}, #{agent_id => <<"stale-agent">>}))
+    after
+        meck:unload(yuzu_gw_registry)
+    end.
 
-    Result = yuzu_gw_mgmt_service:get_agent(#{agent_id => <<"stale-agent">>}, #{}),
-    ?assertMatch({error, #{status := 5}}, Result),
+%% An agent the registry has never heard of is the same NOT_FOUND.
+get_agent_unknown_agent_is_not_found_test() ->
+    catch meck:unload(yuzu_gw_registry),
+    meck:new(yuzu_gw_registry, [passthrough, no_link]),
+    try
+        meck:expect(yuzu_gw_registry, lookup, fun(_) -> error end),
+        ?assertEqual({grpc_error, {?NOT_FOUND, <<"Agent not connected">>}},
+                     yuzu_gw_mgmt_service:get_agent(#{}, #{agent_id => <<"nobody">>}))
+    after
+        meck:unload(yuzu_gw_registry)
+    end.
 
-    meck:unload(yuzu_gw_registry).
+%% An agent process that answers with an error is INTERNAL, and the message
+%% names the reason (it is the agent's own, never the request).
+get_agent_query_failure_is_internal_test() ->
+    catch meck:unload(yuzu_gw_registry),
+    catch meck:unload(yuzu_gw_agent),
+    meck:new(yuzu_gw_registry, [passthrough, no_link]),
+    meck:new(yuzu_gw_agent, [passthrough, no_link]),
+    try
+        meck:expect(yuzu_gw_registry, lookup, fun(_) -> {ok, self()} end),
+        meck:expect(yuzu_gw_agent, get_info, fun(_) -> {error, draining} end),
+        ?assertEqual({grpc_error, {?INTERNAL, <<"Agent query failed: draining">>}},
+                     yuzu_gw_mgmt_service:get_agent(#{}, #{agent_id => <<"a">>}))
+    after
+        meck:unload(yuzu_gw_agent),
+        meck:unload(yuzu_gw_registry)
+    end.
 
 wait_dead(_Pid, 0) ->
     ok;
@@ -229,10 +265,12 @@ wait_dead(Pid, Attempts) ->
 %% fan-out to synchronously deliver a `command_error` then `fanout_complete`
 %% into this test process's own mailbox — `send_command/2` calls
 %% `stream_responses/3` as a plain tail call in the SAME process, so its
-%% `receive` loop picks both up in order — and `grpcbox_stream:send/2` to
-%% capture the outgoing map instead of touching a real HTTP/2 stream.
+%% `receive` loop picks both up in order — and `yuzu_grpc_stream:send/2` (the
+%% stream is its FIRST argument) to capture the outgoing map instead of
+%% touching a real HTTP/2 stream. The wire test of this handler over a real
+%% listener is yuzu_gw_mgmt_wire_tests.
 %% gateway-erlang Gate 8 re-review: the meck cleanup below MUST run even if
-%% an assertion inside throws, or yuzu_gw_router/grpcbox_stream stay mecked
+%% an assertion inside throws, or yuzu_gw_router/yuzu_grpc_stream stay mecked
 %% for the rest of this eunit run — a LATER module (yuzu_gw_registry_
 %% multinode_tests, which calls the real yuzu_gw_router:send_command/3)
 %% would then silently hit this test's stale mock instead of the real
@@ -240,9 +278,9 @@ wait_dead(Pid, Attempts) ->
 %% above, since this test's mocks are local to it, not shared suite state.
 send_command_stamps_real_command_id_on_not_connected_error_test() ->
     catch meck:unload(yuzu_gw_router),
-    catch meck:unload(grpcbox_stream),
+    catch meck:unload(yuzu_grpc_stream),
     meck:new(yuzu_gw_router, [non_strict, no_link]),
-    meck:new(grpcbox_stream, [non_strict, no_link]),
+    meck:new(yuzu_grpc_stream, [non_strict, no_link]),
     try
         FanoutRef = make_ref(),
         Self = self(),
@@ -252,8 +290,8 @@ send_command_stamps_real_command_id_on_not_connected_error_test() ->
                         Self ! {fanout_complete, FanoutRef, #{}},
                         {ok, FanoutRef}
                     end),
-        meck:expect(grpcbox_stream, send,
-                    fun(Msg, _Stream) ->
+        meck:expect(yuzu_grpc_stream, send,
+                    fun(test_stream, Msg) ->
                         Self ! {captured_send, Msg},
                         ok
                     end),
@@ -276,19 +314,67 @@ send_command_stamps_real_command_id_on_not_connected_error_test() ->
         end
     after
         meck:unload(yuzu_gw_router),
-        meck:unload(grpcbox_stream)
+        meck:unload(yuzu_grpc_stream)
+    end.
+
+%% A command_response is forwarded as it arrives, then the call ends with ok
+%% (the runner turns that into status 0).
+send_command_forwards_responses_in_order_test() ->
+    catch meck:unload(yuzu_gw_router),
+    catch meck:unload(yuzu_grpc_stream),
+    meck:new(yuzu_gw_router, [non_strict, no_link]),
+    meck:new(yuzu_grpc_stream, [non_strict, no_link]),
+    try
+        FanoutRef = make_ref(),
+        Self = self(),
+        meck:expect(yuzu_gw_router, send_command,
+                    fun(_AgentIds, _CommandReq, _Opts) ->
+                        Self ! {command_response, FanoutRef, <<"a1">>, #{output => <<"one">>}},
+                        Self ! {command_response, FanoutRef, <<"a2">>, #{output => <<"two">>}},
+                        Self ! {fanout_complete, FanoutRef, #{}},
+                        {ok, FanoutRef}
+                    end),
+        meck:expect(yuzu_grpc_stream, send, fun(test_stream, _Msg) -> ok end),
+
+        ?assertEqual(ok, yuzu_gw_mgmt_service:send_command(
+                           #{agent_ids => [<<"a1">>, <<"a2">>], command => #{}}, test_stream)),
+        Sent = [Msg || {_Pid, {yuzu_grpc_stream, send, [test_stream, Msg]}, _Result}
+                           <- meck:history(yuzu_grpc_stream)],
+        ?assertEqual([#{agent_id => <<"a1">>, response => #{output => <<"one">>}},
+                      #{agent_id => <<"a2">>, response => #{output => <<"two">>}}], Sent)
+    after
+        meck:unload(yuzu_gw_router),
+        meck:unload(yuzu_grpc_stream)
+    end.
+
+%% A router that is not running is UNAVAILABLE (a client may retry); any other
+%% failure of the fan-out is INTERNAL. Neither carries the request.
+send_command_router_failures_test() ->
+    catch meck:unload(yuzu_gw_router),
+    meck:new(yuzu_gw_router, [non_strict, no_link]),
+    try
+        Request = #{agent_ids => [<<"a">>], command => #{command_id => <<"secret-cmd">>}},
+        meck:expect(yuzu_gw_router, send_command,
+                    fun(_, _, _) -> {error, router_unavailable} end),
+        ?assertEqual({grpc_error, {?UNAVAILABLE, <<"Command router unavailable">>}},
+                     yuzu_gw_mgmt_service:send_command(Request, test_stream)),
+        meck:expect(yuzu_gw_router, send_command, fun(_, _, _) -> {error, overloaded} end),
+        ?assertEqual({grpc_error, {?INTERNAL, <<"Fanout failed: overloaded">>}},
+                     yuzu_gw_mgmt_service:send_command(Request, test_stream))
+    after
+        meck:unload(yuzu_gw_router)
     end.
 
 %% CommandResponse.action (field 8) must survive the management hop for an ORDINARY (non-Guardian)
 %% response: the server's registry.write audit hook for a gateway-connected agent depends on it.
 %% Drives send_command/2 exactly like the not_connected test above (the router delivers one
-%% command_response and fanout_complete; grpcbox_stream:send/2 is captured), then pushes the
+%% command_response and fanout_complete; yuzu_grpc_stream:send/2 is captured), then pushes the
 %% captured message through management_pb, the codec the wire uses, and checks the decoded frame.
 send_command_forwards_the_stamped_action_test() ->
     catch meck:unload(yuzu_gw_router),
-    catch meck:unload(grpcbox_stream),
+    catch meck:unload(yuzu_grpc_stream),
     meck:new(yuzu_gw_router, [non_strict, no_link]),
-    meck:new(grpcbox_stream, [non_strict, no_link]),
+    meck:new(yuzu_grpc_stream, [non_strict, no_link]),
     try
         FanoutRef = make_ref(),
         Self = self(),
@@ -301,8 +387,8 @@ send_command_forwards_the_stamped_action_test() ->
                         Self ! {fanout_complete, FanoutRef, #{}},
                         {ok, FanoutRef}
                     end),
-        meck:expect(grpcbox_stream, send,
-                    fun(Msg, _Stream) ->
+        meck:expect(yuzu_grpc_stream, send,
+                    fun(test_stream, Msg) ->
                         Self ! {captured_send, Msg},
                         ok
                     end),
@@ -327,5 +413,5 @@ send_command_forwards_the_stamped_action_test() ->
         end
     after
         meck:unload(yuzu_gw_router),
-        meck:unload(grpcbox_stream)
+        meck:unload(yuzu_grpc_stream)
     end.

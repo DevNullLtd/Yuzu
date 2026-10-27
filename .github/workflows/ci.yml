@@ -741,6 +741,10 @@ jobs:
       # silently skipping them. Linux (Big Tam) only: the Windows and macOS legs
       # are deliberately not covered (docs/erlang-gateway-build.md).
       YUZU_REQUIRE_TLS_TESTS: "1"
+      # yuzu_gw_config_files_tests reads the SHIPPED sys.config files. Without
+      # this a checkout layout it cannot find the repository root in reports
+      # SKIPPED on stderr and runs nothing; with it, that is a failure.
+      YUZU_REQUIRE_CONFIG_FILES_TEST: "1"
     strategy:
       fail-fast: false
       # max-parallel: 4 (raised from 3 on 2026-10-21, owner's call) — Big Tam has
@@ -896,7 +900,7 @@ jobs:
 
       # OTP + rebar3 for the gateway test legs. Without these, meson's
       # `find_program('rebar3', required: false)` returns not-found,
-      # `gateway eunit` and `gateway ct` are silently skipped, and the
+      # the `gateway eunit shard A/B` and `gateway ct` tests are silently skipped, and the
       # Linux matrix can't catch gateway regressions until they hit the
       # Windows leg (where rebar3 is pre-baked via choco). Pin matches
       # release.yml's "Build Gateway (Erlang)" job so any OTP bump moves
@@ -925,14 +929,6 @@ jobs:
         with:
           otp-version: '28'
           rebar3-version: '3.24'
-
-      # PKI PR5c: the gateway vendors a 2-line-patched grpcbox in
-      # gateway/_checkouts/grpcbox. This supply-chain gate fails the PR build if
-      # that copy is ever anything other than upstream grpcbox at the
-      # rebar.config-pinned tag + the documented grpcbox.yuzu.patch (tamper /
-      # drift / version skew). Runs on the merge-guarding path, not only release.
-      - name: Verify vendored grpcbox integrity
-        run: bash gateway/scripts/verify-vendored-grpcbox.sh
 
       # ADR-0016 / gov build-ci: the committed gateway _pb.erl are GENERATED from
       # the vendored proto (regen_pb.escript). Re-regenerate + byte-diff so an
@@ -1616,6 +1612,69 @@ jobs:
           YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
           YUZU_REQUIRE_PSQL: "1"
         run: bash tests/shell/test_gateway_peer_boot_refusal.sh
+
+      # Gateway real-wire gate (#5652, #5653): the REAL yuzu-server under test, the REAL gateway
+      # release (`rebar3 as prod release`) and one REAL yuzu-agent, brought up by
+      # scripts/integration-test.sh --tls, then gateway/apps/yuzu_gw/integration_test/
+      # yuzu_gw_real_upstream_SUITE against that server. Everything the gateway-side unit tests mock
+      # (meck on yuzu_grpc_client) is real here: every upstream RPC call site through the real gun
+      # client, the x-yuzu-session-id header of a registration replay and the server adopting that
+      # session, and the gateway->server hop PINNED OVER TLS (the server runs on its generated
+      # default certificates with no --insecure-gateway-peer, so it enforces the automatic pin of
+      # its own default-gateway.pem, which is the leaf the gateway and the suite present; a valid
+      # leaf of the same CA that is not pinned must be refused). Agents reach the gateway over
+      # one-way TLS and enrol for a per-agent leaf.
+      #
+      # The OTHER hop, server -> gateway management listener (the privileged command plane, #5175), is
+      # covered too, in the production posture: strict mutual TLS, auth_fun
+      # yuzu_gw_authz:check_mgmt_peer/1 and mgmt_peer_pins = the server's default leaf, the server
+      # pointed at it with --gateway-command-addr. The script dispatches commands to the real agent
+      # through the server's REST API (one round trip, then a 300-command burst over the server's one
+      # management connection, each required to return the agent's SUCCESS), and
+      # yuzu_gw_real_mgmt_SUITE dials the same listener as the server would and as the peers the pin
+      # must refuse (the gateway's own leaf and an enrolled agent's leaf: valid certificates of the
+      # same CA, UNAUTHENTICATED), plus SendCommand over one connection, the deadline-passes-first
+      # and the cancelled-stream paths. Both logs are then grepped for the #5175 signature
+      # (function_clause / crash reports in the gateway, 'Socket closed' in the server).
+      #
+      # Runs on the gcc-15/debug leg only (the one that already carries pg_mode=full and the PR
+      # fast path): the gateway release and the Common Test profile are built here, so the cost is
+      # a few minutes per leg, and the wire behaviour under test does not depend on the server's
+      # compiler or optimisation level. Never a silent skip: scripts/integration-test.sh has no
+      # skip path, a missing prerequisite (Postgres DSN, psql, openssl, erl/rebar3, a binary) exits
+      # non-zero, and the step fails the job on any failed check.
+      #
+      # Per-job salting (#1871: the four runner agents share ONE OS identity on ONE box). --free-ports
+      # takes all 8 ports from the OS in one allocation (no fixed 5005x/5006x/8080/8081/9568);
+      # the Postgres database is `yuzu_test_<epoch>_gwint_<random>` created on this job's
+      # YUZU_TEST_POSTGRES_DSN (the per-agent instance ensure-postgres.sh exported) and dropped on
+      # exit; the work directory is a mktemp name under runner.temp (per agent); the gateway's
+      # Erlang node name and cookie carry a per-run random salt (the release's own fixed
+      # `yuzu_gw` short name would contest the shared EPMD). Nothing is derived from a fixed value.
+      - name: Gateway real-wire test (pinned TLS)
+        id: gateway_real_wire
+        if: matrix.compiler == 'gcc-15' && matrix.build_type == 'debug'
+        timeout-minutes: 20
+        env:
+          YUZU_BUILDDIR: ${{ github.workspace }}/build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+          YUZU_IT_TMPDIR: ${{ runner.temp }}
+        run: bash scripts/integration-test.sh --tls --free-ports --gateway-ct
+
+      # A failed run keeps its work directory (scripts/integration-test.sh preserves it on any
+      # non-zero exit). Logs only: the directory also holds the run's throwaway CA and agent keys,
+      # its server config and Erlang cookie, which are not uploaded. `failure() &&` is mandatory:
+      # without a status function an `if:` that reads only a step outcome is unsatisfiable.
+      - name: Upload gateway real-wire logs on failure
+        if: failure() && steps.gateway_real_wire.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gateway-real-wire-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/yuzu-integration.*/*.log
+            ${{ runner.temp }}/yuzu-integration.*/gw_sys.config
+            ${{ runner.temp }}/yuzu-integration.*/ct-logs
+          if-no-files-found: warn
+          retention-days: 14
 
       # Graceful shutdown is not exercisable by the Catch2 suite (which never drives main(), so
       # never installs a signal handler). Nothing in unit, integration or CI failed if it broke
@@ -2919,7 +2978,8 @@ jobs:
     # before a single TU of ours is built. The old 75-min ceiling left no
     # headroom, so a cold run timed out mid-build and only the `if: always()`
     # cache saves rescued the next run. 120 min covers a cold build with
-    # margin; warm runs still finish in ~6 min.
+    # margin. Warm runs (vcpkg cached) took 26-40 min in 2026-10, almost all
+    # of it the debug build with tests.
     timeout-minutes: 120
     env:
       # Override the workflow-level 30G (a self-hosted budget). This job is
@@ -3153,14 +3213,32 @@ jobs:
           # (~1.2 GB) needs ~8 GB of RAM, which the 7 GB hosted runner does not
           # have: the Build step was OOM-killed there (SIGTERM 143). yuzu_pg_canary,
           # which the provenance step inspects, does not depend on tests.
+          # -Dbackend_max_links=1 also serialises the remaining link steps, as
+          # release.yml does; compile parallelism is unchanged.
           meson setup build-linux \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
+            -Dbackend_max_links=1
+
+      # Headroom before the build (the baseline). Build also samples memory and
+      # disk every 15 s, so if the runner is shut down mid-Build the last
+      # sample in the log shows which ran out. A shut-down runner runs no later
+      # step, so neither can go after Build.
+      - name: Runner headroom (canary)
+        run: |
+          df -h / "$GITHUB_WORKSPACE"
+          free -m
 
       - name: Build
         id: build-canary
-        run: meson compile -C build-linux
+        run: |
+          ( while sleep 15; do date -u +%T; free -m | sed -n 2p; df -h --output=avail,pcent / | tail -1; done ) &
+          sampler=$!
+          rc=0
+          meson compile -C build-linux || rc=$?
+          kill "$sampler" 2>/dev/null || true
+          exit "$rc"
 
       # Link-provenance assertion (#1331 review HIGH-2) — same check as the
       # self-hosted Linux leg; the GHA-hosted image ships PostgreSQL client
