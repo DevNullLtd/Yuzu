@@ -13,8 +13,9 @@
 // below is a linear find per method name.
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
-#include <initializer_list>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -38,10 +39,14 @@ struct ReceiverCall {
     std::size_t pos; // start of the receiver
 };
 
-inline constexpr std::initializer_list<std::string_view> kMutatingMethods = {"Post", "Put", "Patch",
-                                                                             "Delete"};
-inline constexpr std::initializer_list<std::string_view> kAllVerbs = {"Get",   "Post",   "Put",
-                                                                      "Patch", "Delete", "Options"};
+// std::array, not std::initializer_list. With these two as `inline constexpr` initializer_lists,
+// linking yuzu_server_tests.exe under /GL + /LTCG (MSVC 19.44, the Windows release job) failed with
+// C1001/LNK1000; as arrays it links (#6493). The compiler defect itself is not characterised, so
+// do not turn them back into initializer_lists without a Windows release build.
+inline constexpr std::array<std::string_view, 4> kMutatingMethods = {"Post", "Put", "Patch",
+                                                                      "Delete"};
+inline constexpr std::array<std::string_view, 6> kAllVerbs = {"Get",   "Post",   "Put",
+                                                              "Patch", "Delete", "Options"};
 
 namespace detail {
 
@@ -131,7 +136,7 @@ inline bool first_argument(std::string_view text, std::size_t j, std::string& ou
 // the text did not. A candidate inside a consumed literal advances nothing, so a real
 // registration after it is still found.
 inline std::vector<RouteRegistration>
-find_route_registrations(std::string_view text, std::initializer_list<std::string_view> methods) {
+find_route_registrations(std::string_view text, std::span<const std::string_view> methods) {
     struct Candidate {
         std::size_t at; // the method name's position
         std::string_view method;
@@ -169,7 +174,7 @@ find_route_registrations(std::string_view text, std::initializer_list<std::strin
 // as the text up to the next call in the list, so a per-verb list concatenated would
 // put an earlier call after a later one and make that span end before it starts.
 inline std::vector<ReceiverCall>
-find_receiver_calls(std::string_view text, std::initializer_list<std::string_view> verbs) {
+find_receiver_calls(std::string_view text, std::span<const std::string_view> verbs) {
     std::vector<ReceiverCall> out;
     for (const std::string_view verb : verbs) {
         const std::string needle = std::string(verb) + "(";
