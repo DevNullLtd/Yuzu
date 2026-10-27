@@ -1595,6 +1595,13 @@ Server supports multiple concurrent gateway registrations:
 
 **Files:** `server/core/src/agent_registry.cpp`, `server/core/src/gateway_service_impl.cpp`, `gateway/apps/yuzu_gw/src/yuzu_gw_cluster.erl`
 
+**Upstream side (gateway to several servers), added 2026-10-11.** Production runs dozens to hundreds of
+gateways against always at least two servers and a streaming-replication Postgres pair, so a gateway dialling
+several upstream servers is the standard case. Open work, in priority order: explicit server-to-gateway
+backpressure (#5647), a per-endpoint circuit breaker with failover (#5648), the registration-reconcile
+decision for several replicas (#5649), herd jitter for hundreds of gateways (#5650), and multi-server
+defaults and guidance (#5651). Design record: ADR-2002 §7g.
+
 ### Issue 14.3: Database Sharding (Response Partitioning)
 **Capability:** new | **Scope:** Server | **Status:** **Partial** (#292 closed NOT_PLANNED, 2026-07-14) — not implemented as designed below (no sharding/partitioning code exists); **obsoleted by the Postgres substrate migration**, which addresses the underlying scaling need differently
 
@@ -2202,10 +2209,13 @@ before acting on any "open" / "in progress" claim:
    event_id` — WS-2a shows "done" at the row-status level, but its own row text in
    `docs/ha-delivery-matrix.md`'s WS-2 row names this the outstanding 2nd-replica precondition,
    corroborated by `docs/executions-history-ladder.md`'s replica-local `Last-Event-ID` mechanism);
-   #4014 (WS-11 leader identity/epoch + CRL-freshness-staleness metrics + split-brain alert + the
-   `/readyz` decision), which the WS-3 3.2 exit-criteria note names a **hard prerequisite before a 2nd
-   replica or any WS-9 failover scenario** and which is distinct from WS-8-readyz's per-tier health
-   contract already listed above; and #4098 (verify webhook/offload emit sites are per-replica-origin
+   #4014 (WS-11 leader identity/epoch metrics + split-brain alert + the `/readyz` decision), which the
+   WS-3 3.2 exit-criteria note names a **hard prerequisite before a 2nd replica or any WS-9 failover
+   scenario**, is distinct from WS-8-readyz's per-tier health contract already listed above, and has
+   shipped (leader/epoch metrics and the `yuzu-ha-leader` alerts; the CRL-freshness gauge it once
+   also listed is split out as #6527 and the remediation-claim counters as #6526, neither shipped);
+   the durable cluster-capability admission gate that would replace the procedural mixed-version
+   hold is #6528, not built; and #4098 (verify webhook/offload emit sites are per-replica-origin
    before a 2nd replica — tracked against `store_worker_pool.worker_loop`'s `StoreWorkerPool::workers_`
    thread — or a fleet-triggered emit double-delivers). That gate is procedural: nothing in code
    refuses a 2nd replica today. See

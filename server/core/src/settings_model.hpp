@@ -164,8 +164,8 @@ struct RetentionEnforced {
 
 /// `GET /fragments/settings/data-retention` + `GET /api/v1/settings/data-retention`.
 /// ServerConfig:Read. {response_retention_days, audit_retention_days,
-/// guardian_event_retention_days, enforced:{<same three>: int|null}} — a handful
-/// of integers, lowest sensitivity of the eight (#4028 Evidence). The top-level
+/// guardian_event_retention_days, enforced:{<same three>: int|null}} — integers
+/// and fixed registry strings, lowest sensitivity of the eight (#4028 Evidence). The top-level
 /// three are the configured/stored values (unchanged keys); `enforced` is what
 /// the stores really apply. `tar` = {tick_seconds, tiers:[{source, tier,
 /// limit_kind: rows|seconds, limit, bucket_seconds, guaranteed_depth_seconds:

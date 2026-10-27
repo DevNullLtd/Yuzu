@@ -5472,8 +5472,9 @@ void SettingsRoutes::register_routes(
 
         // Owner-scoped revocation (fixes the sibling IDOR to #222 on
         // the HTMX dashboard path). A caller with ApiToken:Delete
-        // may only revoke their own tokens; the global admin role
-        // is the only bypass. We return a generic "not found"
+        // may only revoke their own tokens; the only bypass is an
+        // effective admin (the global admin role, or a session holding
+        // a JIT admin elevation). We return a generic "not found"
         // fragment in both the missing-id and the not-owner cases
         // so the dashboard does not become an enumeration oracle.
         auto existing = api_token_store_->get_token(token_id);

@@ -30,6 +30,8 @@ Here are the key concepts you will use in this tutorial:
 
 - **InstructionSet** -- A permission boundary that groups related definitions together and declares which roles can author, execute, and approve the definitions it contains.
 
+The `/api/v1` REST routes are described in the API reference at `http://localhost:8080/swagger`, which lists each operation with its parameters, bodies and responses and opens each group with a guide. It needs the `Infrastructure:Read` permission (with RBAC switched off, any signed-in account passes), has no menu entry, and is linked from Settings > Developer and API, which only administrators can open. The `/api/...` dashboard-session routes used in this tutorial (such as `/api/command` and `/api/instructions/yaml`) are not in that reference; see the [REST API reference](user-manual/rest-api.md) for them.
+
 Let's build all of this up, one step at a time.
 
 ---
