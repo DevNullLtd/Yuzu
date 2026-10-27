@@ -762,8 +762,9 @@ void RbacStore::seed_defaults() {
                     "RbacStore: an existing non-system role named ForensicsAnalyst was found; "
                     "the built-in Forensics read grants were NOT added to it and its definition "
                     "was left unchanged, so the built-in role is unavailable. Engine principals "
-                    "could be assigned this role. Rename or remove it and restart to adopt the "
-                    "built-in role.");
+                    "could be assigned this role. Remove it (a role cannot be renamed while it has "
+                    "grants or holders; create a replacement under another name first if its "
+                    "holders need one) and restart to adopt the built-in role.");
             }
         } else {
             spdlog::error("RbacStore: the ForensicsAnalyst role check could not be completed; "
