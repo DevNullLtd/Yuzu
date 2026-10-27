@@ -3,7 +3,10 @@
  * boundary is a canned fake (no disk, no uid dependence, no Windows API).
  *
  * Provenance: every specimen is a RECONSTRUCTION built from the documented layouts (the
- * Windows pages from the SHARE_INFO_1/2 and STYPE_* documentation; no live capture yet).
+ * Windows pages from the SHARE_INFO_1/2 and STYPE_* documentation). The native capture
+ * agents/plugins/shares/docs/samples/windows.txt (kingsley, LocalSystem, 2026-10-27) has the
+ * same row shapes: kind and special flags, '-' for the IPC$ path, backslash paths folded to '/'.
+ * The SDK side is pinned by shares_win.cpp's static_asserts and the tripwire case below.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -320,8 +323,6 @@ TEST_CASE("shares linux: rows are source rows first, then shares, each pipe-clea
 
 namespace {
 
-constexpr std::uint32_t kMore = 234;
-
 WinShareRec rec(std::string name, std::string path, std::uint32_t type = 0) {
     return WinShareRec{std::move(name), std::move(path), type};
 }
@@ -367,9 +368,10 @@ std::vector<WinShareRec> disks(const std::string& prefix, std::size_t n) {
 TEST_CASE("shares windows: one page of every kind is typed, special flagged not hidden",
           "[shares]") {
     FakeWinPages f;
-    f.pages[2] = {page_of(0, {rec("C$", "C:/", 0x80000000u), rec("ADMIN$", "C:/Windows", 0x80000000u),
-                              rec("IPC$", "", 0x80000003u), rec("Users", "C:/Users", 0),
-                              rec("HP", "", 1), rec("COM1", "", 2), rec("tmp", "C:/t", 0x40000000u)})};
+    // NetShareEnum returns backslash paths; the row grammar folds them to '/'. 3 is STYPE_IPC.
+    f.pages[2] = {page_of(0, {rec("C$", "C:\\", kStypeSpecial), rec("ADMIN$", "C:\\Windows", kStypeSpecial),
+                              rec("IPC$", "", kStypeSpecial | 3u), rec("Users", "C:\\Users", 0),
+                              rec("HP", "", 1), rec("COM1", "", 2), rec("tmp", "C:\\t", kStypeTemporary)})};
     const auto l = f.run();
     CHECK(l.status == StatusState::supported);
     CHECK(l.reason.empty());
@@ -388,7 +390,7 @@ TEST_CASE("shares windows: one page of every kind is typed, special flagged not 
 TEST_CASE("shares windows: an unknown kind is other; the temporary bit alone is disk,temporary",
           "[shares]") {
     FakeWinPages f;
-    f.pages[2] = {page_of(0, {rec("x", "C:/x", 7), rec("t", "C:/t", 0x40000000u)})};
+    f.pages[2] = {page_of(0, {rec("x", "C:/x", 7), rec("t", "C:/t", kStypeTemporary)})};
     const auto l = f.run();
     CHECK(has(l, "share|smb|x|C:/x|-|-|other|netshareenum"));
     CHECK(has(l, "share|smb|t|C:/t|-|-|disk,temporary|netshareenum"));
@@ -396,7 +398,7 @@ TEST_CASE("shares windows: an unknown kind is other; the temporary bit alone is 
 
 TEST_CASE("shares windows: an advancing pager is drained in page order", "[shares]") {
     FakeWinPages f;
-    f.pages[2] = {page_of(kMore, disks("a", 2)), page_of(kMore, disks("b", 2)),
+    f.pages[2] = {page_of(kWinMoreData, disks("a", 2)), page_of(kWinMoreData, disks("b", 2)),
                   page_of(0, disks("c", 2))};
     const auto l = f.run();
     CHECK(l.status == StatusState::supported);
@@ -409,7 +411,7 @@ TEST_CASE("shares windows: an advancing pager is drained in page order", "[share
 
 TEST_CASE("shares windows: a stalled pager is no_progress and reports no rows", "[shares]") {
     FakeWinPages f;
-    f.pages[2] = {page_of(kMore, disks("a", 2)), page_of(kMore)};
+    f.pages[2] = {page_of(kWinMoreData, disks("a", 2)), page_of(kWinMoreData)};
     const auto l = f.run();
     CHECK(l.status == StatusState::constrained);
     CHECK(reason_has(l, "windows:shares:netshareenum:no_progress"));
@@ -419,7 +421,7 @@ TEST_CASE("shares windows: a stalled pager is no_progress and reports no rows", 
 TEST_CASE("shares windows: a cyclic pager is cut at the row cap and stops asking for pages",
           "[shares]") {
     FakeWinPages f;
-    f.pages[2] = {page_of(kMore, disks("c", 100))}; // the same page, forever
+    f.pages[2] = {page_of(kWinMoreData, disks("c", 100))}; // the same page, forever
     const auto l = f.run();
     CHECK(count_prefix(l, "share|") == kMaxShareRows);
     CHECK(reason_has(l, "windows:shares:row_cap"));
@@ -431,7 +433,7 @@ TEST_CASE("shares windows: a cyclic pager is cut at the row cap and stops asking
 TEST_CASE("shares windows: one budget spans every page and refusal stops fetching", "[shares]") {
     FakeWinPages f;
     for (int i = 0; i < 6; ++i)
-        f.pages[2].push_back(page_of(kMore, disks("p" + std::to_string(i) + "_", 100)));
+        f.pages[2].push_back(page_of(kWinMoreData, disks("p" + std::to_string(i) + "_", 100)));
     const auto l = f.run();
     CHECK(count_prefix(l, "share|") == kMaxShareRows);
     CHECK(reason_has(l, "windows:shares:row_cap"));
@@ -448,7 +450,7 @@ TEST_CASE("shares windows: one budget spans every page and refusal stops fetchin
 
 TEST_CASE("shares windows: a failing later page discards every earlier row", "[shares]") {
     FakeWinPages f;
-    f.pages[2] = {page_of(kMore, disks("a", 3)), page_of(8)};
+    f.pages[2] = {page_of(kWinMoreData, disks("a", 3)), page_of(8)};
     const auto l = f.run();
     CHECK(l.status == StatusState::constrained);
     CHECK(reason_has(l, "windows:shares:netshareenum:status_8"));
@@ -457,8 +459,8 @@ TEST_CASE("shares windows: a failing later page discards every earlier row", "[s
 
 TEST_CASE("shares windows: level 2 refused falls back to level 1 names without paths", "[shares]") {
     FakeWinPages f;
-    f.pages[2] = {page_of(5)};
-    f.pages[1] = {page_of(0, {rec("Users", "", 0), rec("IPC$", "", 0x80000003u)})};
+    f.pages[2] = {page_of(kWinAccessDenied)};
+    f.pages[1] = {page_of(0, {rec("Users", "", 0), rec("IPC$", "", kStypeSpecial | 3u)})};
     const auto l = f.run();
     CHECK(f.calls == std::vector<int>{2, 1});
     CHECK(l.status == StatusState::constrained);
@@ -470,7 +472,7 @@ TEST_CASE("shares windows: level 2 refused falls back to level 1 names without p
 
 TEST_CASE("shares windows: the fallback restarts the budget and drops level-2 rows", "[shares]") {
     FakeWinPages f;
-    f.pages[2] = {page_of(kMore, disks("a", 400)), page_of(5)}; // denied after rows were gathered
+    f.pages[2] = {page_of(kWinMoreData, disks("a", 400)), page_of(kWinAccessDenied)}; // denied after rows were gathered
     f.pages[1] = {page_of(0, disks("b", 400))};
     const auto l = f.run();
     CHECK(count_prefix(l, "share|") == 400);
@@ -481,8 +483,8 @@ TEST_CASE("shares windows: the fallback restarts the budget and drops level-2 ro
 
 TEST_CASE("shares windows: refused at both levels is permission_denied", "[shares]") {
     FakeWinPages f;
-    f.pages[2] = {page_of(5)};
-    f.pages[1] = {page_of(5)};
+    f.pages[2] = {page_of(kWinAccessDenied)};
+    f.pages[1] = {page_of(kWinAccessDenied)};
     const auto l = f.run();
     CHECK(l.status == StatusState::permission_denied);
     CHECK(l.reason == "windows:shares:netshareenum:permission_denied");
@@ -491,13 +493,13 @@ TEST_CASE("shares windows: refused at both levels is permission_denied", "[share
 
 TEST_CASE("shares windows: a stopped Server service is typed unsupported, level 1 not tried",
           "[shares]") {
-    for (const std::uint32_t st : {2114u, 1722u, 1717u}) {
+    for (const std::uint32_t st : {kNerrServerNotStarted, kRpcServerUnavailable, kRpcUnknownIf}) {
         FakeWinPages f;
         f.pages[2] = {page_of(st)};
         const auto l = f.run();
         INFO("status " << st);
         CHECK(l.status == StatusState::unsupported);
-        CHECK(l.reason == (st == 2114u ? "windows:shares:netshareenum:server_not_started"
+        CHECK(l.reason == (st == kNerrServerNotStarted ? "windows:shares:netshareenum:server_not_started"
                                        : "windows:shares:netshareenum:server_unavailable"));
         CHECK(l.rows == std::vector<std::string>{"source|netshareenum|failed|-"});
         CHECK(f.calls == std::vector<int>{2});

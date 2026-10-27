@@ -5,8 +5,9 @@
  *
  * This file is the OS SHELL. Every decision (the level-2 -> level-1 fallback, the typed
  * service-stopped arm, the row/byte budget, paging termination) is the portable
- * `list_windows` in shares_legs.hpp, unit-tested over canned pages; the shell only turns one
- * NetShareEnum call into one WinPage.
+ * `list_windows` in shares_legs.hpp, unit-tested over canned pages; the shell owns only the
+ * NetShareEnum call, the resume handle (reset when the level changes, per WinPageFn's contract)
+ * and the one-page conversion.
  *
  * Bounded before materialised: the shell asks for 64 KiB pages (kWinPageBytes), never
  * MAX_PREFERRED_LENGTH, so the API itself never hands over the whole inventory in one buffer.
@@ -17,8 +18,6 @@
 
 #if defined(_WIN32)
 
-// Include order matters: winsock2.h before windows.h (tar_win_raii_guards.hpp shape).
-#include <winsock2.h>
 #include <windows.h>
 
 #include <lm.h> // NetShareEnum / NetApiBufferFree / SHARE_INFO_1 / SHARE_INFO_2

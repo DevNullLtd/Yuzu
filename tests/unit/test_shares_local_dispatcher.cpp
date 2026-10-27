@@ -20,6 +20,7 @@
 #include "shares_legs.hpp" // execute_list / report_list
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
@@ -138,15 +139,8 @@ int seam_execute(YuzuCommandContext* raw, const char* action, const YuzuParam* /
 }
 
 #if !defined(__APPLE__) // the macOS placeholder emits no share rows
-bool share_row_is_wellformed(const std::string& row) {
-    std::size_t pipes = 0;
-    for (std::size_t i = 0; i < row.size(); ++i)
-        if (row[i] == '|' && (i == 0 || row[i - 1] != '\\'))
-            ++pipes;
-    if (pipes != 7) // 8 fields
-        return false;
-    if (yuzu::shared::count_invalid_wire_bytes(row) != 0 || row.find('\0') != std::string::npos)
-        return false;
+/// Splits a wire row on its unescaped pipes.
+std::vector<std::string> wire_fields(const std::string& row) {
     std::vector<std::string> f;
     std::string cur;
     for (std::size_t i = 0; i < row.size(); ++i) {
@@ -158,6 +152,19 @@ bool share_row_is_wellformed(const std::string& row) {
         }
     }
     f.push_back(cur);
+    return f;
+}
+
+bool share_row_is_wellformed(const std::string& row) {
+    std::size_t pipes = 0;
+    for (std::size_t i = 0; i < row.size(); ++i)
+        if (row[i] == '|' && (i == 0 || row[i - 1] != '\\'))
+            ++pipes;
+    if (pipes != 7) // 8 fields
+        return false;
+    if (yuzu::shared::count_invalid_wire_bytes(row) != 0 || row.find('\0') != std::string::npos)
+        return false;
+    const auto f = wire_fields(row);
     const auto in = [](const std::string& v, std::initializer_list<const char*> set) {
         return std::ranges::any_of(set, [&](const char* s) { return v == s; });
     };
@@ -272,6 +279,33 @@ TEST_CASE("shares plugin: status row first, source rows next, then well-formed s
     // answer (status_<n>, no_progress, a budget cut) need not retain it.
     if (starts_with(rows[0], "status|list|supported|"))
         CHECK(saw_ipc);
+
+    // Field selection on the real NetShareEnum buffer, which the portable tests (they receive
+    // pre-converted pages) cannot see: a SHARE_INFO_2 path member swapped for another wide
+    // string, or a level-1 null path mis-marshalled, passes every shape check above.
+    const auto drive_rooted = [](const std::string& path) { // "C:/" after the wire fold
+        return path.size() >= 3 && std::isalpha(static_cast<unsigned char>(path[0])) != 0 &&
+               path[1] == ':' && path[2] == '/';
+    };
+    if (starts_with(rows[0], "status|list|supported|")) {
+        // A clean level-2 finish: C$ and ADMIN$ (when published) carry their drive-rooted path.
+        for (std::size_t i = 2; i < rows.size(); ++i) {
+            const auto f = wire_fields(rows[i]);
+            if (f[2] == "C$" || f[2] == "ADMIN$") {
+                INFO("row " << i << ": " << rows[i]);
+                CHECK(drive_rooted(f[3]));
+            }
+        }
+    } else if (rows[0].find("windows:shares:netshareenum:level2_permission_denied") !=
+               std::string::npos) {
+        // The level-1 fallback (a non-admin runner identity): IPC$ is always published, and
+        // SHARE_INFO_1 has no path, so every share row's path is the placeholder.
+        CHECK(rows.size() >= 3);
+        for (std::size_t i = 2; i < rows.size(); ++i) {
+            INFO("row " << i << ": " << rows[i]);
+            CHECK(wire_fields(rows[i])[3] == "-");
+        }
+    }
 #else
     REQUIRE(rows.size() >= 4);
     CHECK(starts_with(rows[1], "source|exports|"));
