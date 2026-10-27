@@ -712,7 +712,6 @@ struct WinEtw {
             // so the predecessor's carries this pid's name. Stop it and retry once, else this
             // run is attr:off and the leaked session runs until reboot.
             if (rc == ERROR_ALREADY_EXISTS) {
-                session.props()->LogFileNameOffset = 0;
                 ControlTraceW(0, session_name.c_str(), session.props(), EVENT_TRACE_CONTROL_STOP);
                 session.init();
                 rc = StartTraceW(&session.h, session_name.c_str(), session.props());

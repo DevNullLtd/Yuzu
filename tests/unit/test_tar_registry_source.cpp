@@ -28,6 +28,7 @@
 #include <chrono>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <limits>
 #include <map>
 #include <optional>
@@ -47,6 +48,7 @@
 #include <evntrace.h> // ControlTraceW QUERY: no session may outlive stop()
 #include <sddl.h>
 #include <win_str.hpp>
+#include "tar_win_process_name.hpp" // process_basename_for_pid
 #endif
 
 namespace fs = std::filesystem;
@@ -786,11 +788,19 @@ TEST_CASE("cursor and baseline codecs", "[tar][registry][pure]") {
     const auto json = encode_registry_cursor(cur);
     // A held candidate or a loss epoch makes this version 2: a build that predates them reads
     // only version 1, so it takes the cursor as lost (a gap row and a re-baseline) instead of
-    // re-encoding it without the changes it holds. Without either it stays version 1.
+    // re-encoding it without the changes it holds. Without either it stays version 1. Each of
+    // the two alone must select version 2: a held candidate with no loss epoch is the common
+    // case, and an encoder keyed on the loss list alone would write it as version 1. The
+    // old-reader half (a version-1-only decode taking version 2 as malformed) cannot run in
+    // this tree, which has the one codec; its analogues are the version-3 check below and the
+    // malformed-cursor case in the lost-cursor lifecycle test (one gap:cursorlost row).
     CHECK(nlohmann::json::parse(json).at("v").get<int>() == 2);
     auto bare = cur;
     bare.held.clear();
     CHECK(nlohmann::json::parse(encode_registry_cursor(bare)).at("v").get<int>() == 2); // loss alone
+    auto held_only = cur;
+    held_only.loss.clear();
+    CHECK(nlohmann::json::parse(encode_registry_cursor(held_only)).at("v").get<int>() == 2); // held alone
     bare.loss.clear();
     CHECK(nlohmann::json::parse(encode_registry_cursor(bare)).at("v").get<int>() == 1);
     CHECK_FALSE(decode_registry_cursor(encode_registry_cursor(bare)).malformed);
@@ -935,6 +945,7 @@ struct Fake {
     std::vector<std::int64_t> deadlines;
     std::int64_t clock{T0};
     SessionLoss loss;
+    std::function<void()> on_loss_query; // runs inside session_loss(): the callback thread never stops
     bool etw{true}; // the write-event session is delivering
     std::vector<std::string> sids;
     int ccs{1};
@@ -961,7 +972,11 @@ struct Fake {
         r.loaded_sids = [this] { return sids; };
         r.now_ts = [this] { return clock += 1000; }; // strictly increasing
         r.etw_running = [this] { return etw; };
-        r.session_loss = [this] { return loss; };
+        r.session_loss = [this] {
+            if (on_loss_query)
+                on_loss_query();
+            return loss;
+        };
         r.current_control_set = [this] { return ccs; };
         r.watch_roots = [this](const std::vector<std::string>& roots) { watch_calls.push_back(roots); };
         r.root_armed = [this](const std::string& root) { return !unarmed.contains(root); };
@@ -1557,10 +1572,10 @@ TEST_CASE("registry source: kernel loss and a failed loss query are loss, report
     CHECK(gap.rows[2][0] == "gap:loss:2");
 }
 
-TEST_CASE("registry source: loss over a held window degrades it (kernel counters, failed loss query)",
+TEST_CASE("registry source: loss over a held window degrades it (kernel counters, decode failures, failed loss query)",
           "[tar][registry][lifecycle]") {
-    enum class Loss { None, Kernel, FailedQuery };
-    for (const Loss mode : {Loss::None, Loss::Kernel, Loss::FailedQuery}) {
+    enum class Loss { None, Kernel, DecodeFailed, FailedQuery };
+    for (const Loss mode : {Loss::None, Loss::Kernel, Loss::DecodeFailed, Loss::FailedQuery}) {
         INFO("mode=" << static_cast<int>(mode));
         auto t = make_db();
         Fake f;
@@ -1582,6 +1597,8 @@ TEST_CASE("registry source: loss over a held window degrades it (kernel counters
         f.clock = T0 + 300 * SEC;
         if (mode == Loss::Kernel)
             f.loss.events_lost = 3;
+        if (mode == Loss::DecodeFailed)
+            f.loss.decode_failed = 1;
         if (mode == Loss::FailedQuery)
             f.loss.query_ok = false;
         tick(t.db, *src);
@@ -1595,6 +1612,42 @@ TEST_CASE("registry source: loss over a held window degrades it (kernel counters
             CHECK(rows.rows[0][1] == "attr:degraded");
         }
     }
+}
+
+TEST_CASE("registry source: an eviction during loss sampling cannot select the surviving writer",
+          "[tar][registry][lifecycle]") {
+    // collect() reads the buffer BEFORE the session's loss counters. The callback thread keeps
+    // pushing while the counters are sampled, so an eviction in that gap is in neither this
+    // tick's batch nor its drop count. With room for two events, one push removes one of two
+    // competing writers: sampling the counters first would leave the survivor alone in the
+    // batch and name it, with no loss recorded. Sampling the buffer first keeps both in the
+    // batch (ambiguous), and the eviction is counted by the next tick.
+    auto t = make_db();
+    Fake f;
+    f.buffer = std::make_shared<RegistryEtwBuffer>(2);
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    const auto held = baseline_then_change(t, f, *src, 1, 2);
+    const std::int64_t in_window = held.window_lo + SEC / 2;
+    src->push_event_for_test(ev(in_window, 11, RegistryEtwOp::Set, "Start", 4, 4, "first.exe"));
+    src->push_event_for_test(ev(in_window + 1, 22, RegistryEtwOp::Set, "Start", 4, 4, "second.exe"));
+    bool fired = false;
+    f.on_loss_query = [&] {
+        if (fired)
+            return;
+        fired = true;
+        // not this change's value: it only takes the place of the oldest event (pid 11's)
+        f.buffer->push(ev(in_window + 2, 77, RegistryEtwOp::Set, "Other", 4, 4, "x.exe"));
+    };
+    f.clock = T0 + 300 * SEC;
+    tick(t.db, *src);
+    REQUIRE(fired);
+    REQUIRE(f.buffer->drop_info().count == 1); // the positive control: the eviction happened mid-tick
+
+    const auto rows = q(t.db, "SELECT actor_pid, actor_image, detail FROM registry_live WHERE action = 'changed'");
+    REQUIRE(rows.rows.size() == 1);
+    CHECK(rows.rows[0][0] == "0"); // never the survivor
+    CHECK(rows.rows[0][1].empty());
+    CHECK(rows.rows[0][2] == "attr:ambiguous:2");
 }
 
 TEST_CASE("registry source: a root that stays Capped does not pin the event buffer",
@@ -2255,6 +2308,9 @@ TEST_CASE("registry live: stop leaves no ETW session behind", "[tar][registry][w
         SKIP("ETW session unavailable (not elevated)");
     }
     REQUIRE(session_exists()); // the positive control: the lookup does find a running session
+    // A collect samples the session's loss (ControlTraceW QUERY), which writes into the block the
+    // STOP below reuses: STOP must follow a production QUERY, not a fresh start.
+    tick(t.db, *src);
     src->stop();
     CHECK_FALSE(session_exists());
     CHECK_FALSE(etw_running());
@@ -2424,6 +2480,24 @@ TEST_CASE("registry live: stop is idempotent and destruction after stop is clean
         REQUIRE_NOTHROW(src->stop());
         REQUIRE_NOTHROW(src->stop()); // idempotent
     } // ~RegistryCursorSource() after stop() must neither throw nor hang
+}
+
+TEST_CASE("registry live: a pid is named only if its process already existed when the event was stamped",
+          "[tar][registry][windows]") {
+    // This process always opens (PROCESS_QUERY_LIMITED_INFORMATION on itself), so no elevation is
+    // needed. The FILETIME arithmetic and the GetProcessTimes call are what can be wrong, which
+    // is why the boundary is driven through the real function and not a copy of its comparison.
+    FILETIME created{}, exited{}, kernel{}, user{};
+    REQUIRE(GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user));
+    const auto created_at = static_cast<std::int64_t>(
+       (static_cast<std::uint64_t>(created.dwHighDateTime) << 32) | created.dwLowDateTime);
+    constexpr std::int64_t kSlack = 1'000'000; // 100 ms: process_basename_for_pid's clock allowance
+    const auto pid = ::GetCurrentProcessId();
+
+    CHECK_FALSE(process_basename_for_pid(pid, 0).empty());                  // 0: unchecked
+    CHECK_FALSE(process_basename_for_pid(pid, created_at).empty());         // stamped at creation
+    CHECK_FALSE(process_basename_for_pid(pid, created_at - kSlack).empty()); // exactly the slack: named
+    CHECK(process_basename_for_pid(pid, created_at - kSlack - 1).empty());   // past it: the pid was reused
 }
 
 #endif // _WIN32

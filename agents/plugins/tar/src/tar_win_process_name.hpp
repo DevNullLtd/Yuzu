@@ -31,8 +31,10 @@ inline std::string process_basename_for_pid(std::uint32_t pid, std::int64_t even
     if (!proc)
         return {};
     if (event_ts100ns != 0) {
-        // ETW stamps come from the coarse system clock (up to ~16 ms behind), so a process
-        // that wrote within its first moments must not read as created after its own event.
+        // The event's stamp comes from the coarse system clock, which ticks every ~15.6 ms,
+        // and the consumer sees the event some time after the kernel stamped it. A process
+        // that wrote within its first moments must not read as created after its own event:
+        // 100 ms is six clock ticks of margin for that gap.
         constexpr std::int64_t kClockSlack100ns = 1'000'000; // 100 ms
         FILETIME created{}, exited{}, kernel{}, user{};
         if (!GetProcessTimes(proc.get(), &created, &exited, &kernel, &user))
