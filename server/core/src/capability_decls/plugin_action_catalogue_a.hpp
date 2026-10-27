@@ -9,8 +9,8 @@
 /// @file plugin_action_catalogue_a.hpp
 /// PR1.10 group A + PR1.9 data A (#2204): the command-capability-catalogue
 /// fragment for five plugins — filesystem (16 actions), tar (13 of its 14
-/// actions — see the NOTE below), registry (9), license_scan (2), vuln_scan
-/// (5) — 45 rows total. Every `dispatch_class`/`mutability` pair and every
+/// actions — see the NOTE below), registry (12), license_scan (2), vuln_scan
+/// (5) — 48 rows total. Every `dispatch_class`/`mutability` pair and every
 /// `securable`/`operation` choice was made by reading the implementation,
 /// never the action name; ambiguous calls are resolved conservatively
 /// (Mutating over ReadOnly, Irreversible over Reversible) and say so inline.
@@ -18,7 +18,7 @@
 /// `seed_defaults()` `types[]`; `operation` reuses only `authz::Operation`'s
 /// seven values; every `risk_tier` is at or above `authz::min_risk_tier_for`
 /// its row's operation. `system_reserved` is false on every row — none of
-/// these forty-five dispatches is one the server issues to itself.
+/// these forty-eight dispatches is one the server issues to itself.
 ///
 /// NOTE — `tar.fleet_snapshot` is DELIBERATELY ABSENT from this fragment.
 /// `capability_decls/core_dispatch_capabilities.hpp` (a different package's
@@ -38,7 +38,7 @@ namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 45> kPluginActionCatalogueA{{
+inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
     // ── filesystem (agents/plugins/filesystem/src/filesystem_plugin.cpp) ──
     // All 16 actions classified under the `FileRetrieval` securable — the
     // plugin's own doc comment names it a file-operations surface requiring
@@ -419,14 +419,23 @@ inline constexpr std::array<CommandCapability, 45> kPluginActionCatalogueA{{
     // Low. set_value can overwrite an existing value with no restorable
     // backup — conservatively Irreversible. delete_value/delete_key are
     // named-explicit deletion — Destructive/Irreversible/Delete;
-    // delete_key is non-recursive (it refuses a key that has subkeys and
-    // removes only that key and its own values), but it drops every value
-    // on the key in one call, a larger blast radius than delete_value, so
-    // it is declared ABOVE the Delete floor at Critical. Prior values are
-    // only in the audit row (raw hex, capped at 256 bytes per value) and
-    // are not restorable beyond that.
+    // delete_key removes the key and its own values and, with
+    // `recursive=true`, every key beneath it (a dry run counts and deletes
+    // nothing; the default refuses a key that has subkeys). It drops every
+    // value on the key in one call, a larger blast radius than
+    // delete_value, so it is declared ABOVE the Delete floor at Critical.
+    // Prior values are only in the audit row (raw hex, capped at 256 bytes
+    // per value) and are not restorable beyond that; `apply` is the one
+    // action that returns an undo manifest (previous values, bounded).
     // get_user_value reads a per-user hive (PII, privilege-elevated via
     // SeBackup/SeRestore) — Medium, not the Read floor.
+    // set_user_value / delete_user_value write another user's hive (live
+    // HKU\<SID> or an offline NTUSER.DAT mounted under SeBackup/SeRestore):
+    // like set_value / delete_value, one tier up (High) for the cross-user
+    // reach. apply is the declarative bulk of set_value / delete_value /
+    // create_key / delete_key on HKLM (up to 256 items per call, dry-run by
+    // default): Destructive/Critical, the delete_key floor, because one call
+    // can drop whole keys.
     {
         .plugin = "registry",
         .action = "get_value",
@@ -462,7 +471,7 @@ inline constexpr std::array<CommandCapability, 45> kPluginActionCatalogueA{{
     },
     {
         // Above the Delete floor: removes the key and all of its own values
-        // in one call (non-recursive: refuses a key with subkeys) — larger
+        // in one call (and, with `recursive`, every key beneath it) — larger
         // blast radius than delete_value.
         .plugin = "registry",
         .action = "delete_key",
@@ -530,6 +539,39 @@ inline constexpr std::array<CommandCapability, 45> kPluginActionCatalogueA{{
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
         .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "registry",
+        .action = "set_user_value",
+        .dispatch_class = DispatchClass::Mutating,
+        .mutability = Mutability::Irreversible,
+        .securable = "Infrastructure",
+        .operation = authz::Operation::Write,
+        .risk_tier = authz::RiskTier::High,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
+    },
+    {
+        .plugin = "registry",
+        .action = "delete_user_value",
+        .dispatch_class = DispatchClass::Destructive,
+        .mutability = Mutability::Irreversible,
+        .securable = "Infrastructure",
+        .operation = authz::Operation::Delete,
+        .risk_tier = authz::RiskTier::High,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
+    },
+    {
+        .plugin = "registry",
+        .action = "apply",
+        .dispatch_class = DispatchClass::Destructive,
+        .mutability = Mutability::Irreversible,
+        .securable = "Infrastructure",
+        .operation = authz::Operation::Delete,
+        .risk_tier = authz::RiskTier::Critical,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
 
     // ── license_scan (agents/plugins/license_scan/src/license_scan_plugin.cpp) ──
