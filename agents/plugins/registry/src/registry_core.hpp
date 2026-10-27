@@ -893,15 +893,26 @@ struct ActionOutput {
 };
 
 /// Writes an action's lines one at a time (`Ctx` is yuzu::CommandContext; a template so the pure unit suites can drive
-/// it with a recording fake). Once a real `audit|` line is out, a sink failure on a later line must not reach
-/// `report_exception`'s fixed failed audit line: the server would mint a success row and then a failure row for one
-/// command_id. So that failure answers only `error|exception` (best effort) and put() answers false: the caller stops
-/// (apply mutates nothing more). A failure before any audit line has gone out propagates, and the seam's catch leaves
-/// its fixed line.
+/// it with a recording fake). Once the real `audit|` line of the current unit is out, a sink failure on a later line of
+/// that unit must not reach `report_exception`'s fixed failed audit line: the server would mint a success row and then a
+/// failure row for the same mutation. So that failure answers only `error|exception` (best effort) and put() answers
+/// false: the caller stops (apply mutates nothing more). A failure before the unit's audit line has gone out propagates,
+/// and the seam's catch leaves its fixed line.
+///
+/// A single action is one unit. `apply` is one per ITEM (the server mints one row per `audit|` line, so an apply
+/// command's rows may be ok and failed alike): put_audit() opens the item's unit, so a failure writing item N's audit
+/// line -- after item N mutated, with item N-1's line already out -- reaches the seam instead of being swallowed with
+/// no row at all for the mutation.
 template <class Ctx>
 struct LineSink {
     Ctx& ctx;
     bool audit_written = false;
+
+    /// The audit line of a new unit: nothing of THIS unit is out yet, so its failure propagates.
+    [[nodiscard]] bool put_audit(const std::string& line) {
+        audit_written = false;
+        return put(line);
+    }
 
     [[nodiscard]] bool put(const std::string& line) {
         try {
@@ -1304,7 +1315,15 @@ template <class Ctx>
         const bool facts_read = item.invalid.empty() && facts.open_error.empty();
         if (value_op && facts_read) {
             row.value_op = true;
-            row.old = budgeted_old(budget, item.name, facts.old);
+            if (reason.empty()) {
+                row.old = budgeted_old(budget, item.name, facts.old);
+            } else {
+                // A refused item changes nothing, so its previous value is not undo evidence: it must not spend the
+                // shared budget (which would flag a later item's manifest incomplete) nor flag it itself. Its bytes are
+                // not retained on the row either (state, type and ~total stay), which keeps the reply bound.
+                row.old = facts.old;
+                row.old.bytes.clear();
+            }
             fill_old(au, facts.old); // the audit line keeps its own bounded evidence (256 raw bytes)
         }
         if (item.op == PlanOp::delete_key && facts_read) {
@@ -1378,8 +1397,9 @@ template <class Ctx>
             }
         }
         row.verdict = verdict;
-        // The audit line first: it is the evidence a later sink failure must not lose.
-        if (!sink.put(render_audit_line(au)) || !sink.put(render_item_row(row))) return 1;
+        // The audit line first: it is the evidence a later sink failure must not lose. put_audit opens this item's unit,
+        // so if THIS line cannot be written the failure reaches the seam's fixed row (item N may already have mutated).
+        if (!sink.put_audit(render_audit_line(au)) || !sink.put(render_item_row(row))) return 1;
         if (undo)
             for (const auto& nv : facts.leaf_values)
                 if (!sink.put(render_undo_row(idx, nv.name, nv.v))) return 1;

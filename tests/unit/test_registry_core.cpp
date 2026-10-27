@@ -4040,6 +4040,29 @@ TEST_CASE("registry apply: each item's rows go out as it concludes and a sink fa
         CHECK(untouched(reg, "Software\\C"));
         CHECK(reg.calls("open_path:Software\\C") == 0);
     }
+    SECTION("a sink failure on item 1's AUDIT line, with item 0 complete, reaches the seam: the fixed failed row stands for it") {
+        // mutant: the audit-coverage flag is per plan, so item 1 (already mutated) loses its audit line AND the fixed row
+        FakeRegistry reg;
+        build(reg);
+        RecordingCtx ctx;
+        ctx.fails = [n = 0](std::string_view t) mutable { return t.rfind("audit|", 0) == 0 && n++ == 1; };
+        try {
+            (void)run_apply(ctx, reg, FakeRegistry::kRoot, plan_of(plan), ApplyOptions{false, false}, true);
+            FAIL("the sink failure did not propagate");
+        } catch (const std::bad_alloc&) {
+            report_exception(ctx, "apply"); // the seam (execute_guarded)
+        }
+        REQUIRE(ctx.lines.size() == 6);
+        CHECK(starts(ctx.lines[0], "audit|op=apply.delete_key|"));
+        CHECK(starts(ctx.lines[1], "item|0|"));
+        CHECK(starts(ctx.lines[2], "undo|0|a|"));
+        CHECK(starts(ctx.lines[3], "undo|0|b|"));
+        CHECK(ctx.lines[4] == exception_audit_line("apply")); // item 1 changed the registry: this row is its record
+        CHECK(ctx.lines[5] == "error|exception");
+        CHECK_FALSE(untouched(reg, "Software\\B"));              // item 1 mutated before its audit line failed
+        CHECK(untouched(reg, "Software\\C"));                    // nothing after it was opened
+        CHECK(reg.calls("open_path:Software\\C") == 0);
+    }
     SECTION("a sink failure on an undo row stops the plan: no later item is opened or changed and no summary goes out") {
         // mutant: an undo-row sink failure only sets the answer to 1 and the plan carries on
         FakeRegistry reg;
@@ -4245,6 +4268,30 @@ TEST_CASE("registry apply: set_value and delete_value over a value the manifest 
     CHECK(run.reason(1) == "unsupported_old_type");
     CHECK(reg.calls("set_value") == 0);
     CHECK(reg.calls("delete_value") == 0);
+}
+
+TEST_CASE("registry apply: refused items neither spend the undo budget nor flag a later manifest incomplete",
+          "[registry][core][apply]") {
+    // mutant: budgeted_old charges every value op that read a previous value, refused ones included. 140 refused rows of
+    // 4096 bytes exceed the 512 KiB budget, so the one item that does change loses its bytes and undo_complete drops to 0.
+    const bool dry = GENERATE(true, false);
+    FakeRegistry reg;
+    json plan = json::array();
+    for (int i = 0; i < 140; ++i) {
+        const std::string name = "n" + std::to_string(i);
+        reg.put("Software\\K", name, 0 /*REG_NONE*/, Bytes(kCaptureValueCap, 7)); // present, and not a type apply can write back
+        plan.push_back(set_item("Software\\K", name, "x"));
+    }
+    reg.put("Software\\K", "last", kRegDword, dword(1));
+    plan.push_back(set_item("Software\\K", "last", "2", "REG_DWORD"));
+    const auto run = run_plan(reg, plan, dry, true);
+    REQUIRE(run.items.size() == 141);
+    CHECK(run.reason(0) == "unsupported_old_type");
+    CHECK(run.reason(139) == "unsupported_old_type");
+    CHECK(run.verdict(140) == (dry ? "would_apply" : "applied"));
+    CHECK(run.items[0][12] == "~4096");       // a refused row keeps its metadata, not the bytes
+    CHECK(run.items[140][12] == "01000000");  // the changed item's previous value is retained whole
+    CHECK(run.undo_complete());
 }
 
 TEST_CASE("registry core: a child whose ACL denies DELETE refuses a recursive delete at the vet before anything goes",
