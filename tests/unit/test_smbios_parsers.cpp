@@ -26,6 +26,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -849,18 +850,22 @@ TEST_CASE("smbios walk: entry cap and the allocation bound", "[smbios]") {
 }
 
 TEST_CASE("smbios is_placeholder: exact case-insensitive table plus empty", "[smbios]") {
-    const char* table[] = {"Default string", "To Be Filled By O.E.M.", "None", "Not Specified",
-                           "Not Available", "N/A", "Unknown", "Undefined", "System Serial Number",
-                           "System Product Name", "System manufacturer", "System Version",
-                           "Base Board", "Chassis Serial Number", "Chassis Version",
-                           "Chassis Manufacture", "Asset Tag", "No Asset Tag",
-                           "No Asset Information", "Not Applicable", "OEM", "0123456789",
-                           "1234567890", "SKU", "x.x", "Type1ProductConfigId"};
-    for (const char* p : table) {
+    // The literal oracle: a table edit in the header must be mirrored here on purpose. The five
+    // false-positive entries "Standard", "Default", "Family", "Empty" and "NULL" were removed
+    // deliberately (each can be a real value), so re-adding one fails the equality below.
+    constexpr std::string_view table[] = {
+        "Default string", "To Be Filled By O.E.M.", "None", "Not Specified", "Not Available",
+        "N/A", "Unknown", "Undefined", "System Serial Number", "System Product Name",
+        "System manufacturer", "System Version", "Base Board", "Chassis Serial Number",
+        "Chassis Version", "Chassis Manufacture", "Asset Tag", "No Asset Tag",
+        "No Asset Information", "Not Applicable", "OEM", "0123456789", "1234567890", "SKU",
+        "x.x", "Type1ProductConfigId"};
+    CHECK(std::ranges::equal(sm::kPlaceholders, table));
+    for (const std::string_view p : table) {
         INFO(p);
         CHECK(sm::is_placeholder(p));
         CHECK(sm::is_placeholder(std::string{p} + "  "));
-        std::string up = p, lo = p;
+        std::string up{p}, lo{p};
         for (char& c : up) c = (c >= 'a' && c <= 'z') ? static_cast<char>(c - 32) : c;
         for (char& c : lo) c = (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
         CHECK(sm::is_placeholder(up));

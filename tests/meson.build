@@ -907,6 +907,29 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
   )
 endif
 
+# ── H.1 SMBIOS walker allocation budget (separate binary, deliberately) ──────
+# test_smbios_alloc_budget.cpp replaces the global operator new/delete to count the allocations of
+# one parse_table call (a structure past the entry cap must not be decoded), so it is not a source
+# of yuzu_agent_tests and must be ABSENT from sanitizer builds. The counted code is the pure header
+# agents/shared/smbios_parsers.hpp, so Linux and macOS pin it for every leg; not built on Windows
+# (the replacement is unmeasured under MSVC). Same --allow-running-no-tests rationale as the spark
+# probe above.
+if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
+  smbios_alloc_budget_exe = executable(
+    'yuzu_smbios_alloc_budget_tests',
+    files('unit/test_smbios_alloc_budget.cpp'),
+    include_directories: [include_directories('../agents/shared')],
+    dependencies: [catch2_dep],
+  )
+  test(
+    'smbios allocation budget',
+    smbios_alloc_budget_exe,
+    args: ['--allow-running-no-tests', '--durations=yes'],
+    suite: 'agent',
+    timeout: 30,
+  )
+endif
+
 # ── Plugin ABI containment under allocation failure (separate binary, deliberately) ──
 # test_plugin_abi_oom_containment.cpp replaces the global operator new/delete and defines the
 # yuzu_ctx_* host entry points itself (the real ones allocate), so it is not a source of

@@ -301,12 +301,16 @@ inline Entry<Type17> decode_type17(const View& v) {
     return {Status::ok, std::move(d)};
 }
 
-template <class T> void push_capped(std::vector<Entry<T>>& vec, bool& cap_hit, Entry<T>&& e) {
+// The cap test runs BEFORE the decoder, so a structure past kMaxEntriesPerType is never decoded
+// (its strings are never copied): the banner's allocation contract. Pinned by
+// tests/unit/test_smbios_alloc_budget.cpp.
+template <class T, class F>
+void push_capped(std::vector<Entry<T>>& vec, bool& cap_hit, const View& v, F decode) {
     if (vec.size() >= kMaxEntriesPerType) {
         cap_hit = true;
         return;
     }
-    vec.push_back(std::move(e));
+    vec.push_back(decode(v));
 }
 
 } // namespace detail
@@ -350,9 +354,9 @@ template <class T> void push_capped(std::vector<Entry<T>>& vec, bool& cap_hit, E
             if (out.baseboard.status == Status::absent) out.baseboard = detail::decode_type2(v);
             break;
         case 3: if (out.chassis.status == Status::absent) out.chassis = detail::decode_type3(v); break;
-        case 4: detail::push_capped(out.processors, out.entry_cap_hit, detail::decode_type4(v)); break;
+        case 4: detail::push_capped(out.processors, out.entry_cap_hit, v, detail::decode_type4); break;
         case 17:
-            detail::push_capped(out.memory_devices, out.entry_cap_hit, detail::decode_type17(v));
+            detail::push_capped(out.memory_devices, out.entry_cap_hit, v, detail::decode_type17);
             break;
         default: break; // every other type is stepped over
         }
@@ -380,16 +384,20 @@ template <class T> void push_capped(std::vector<Entry<T>>& vec, bool& cap_hit, E
     return out;
 }
 
-/// True when `s` (right-trimmed, ASCII case-insensitive) is empty or one of the OEM filler strings
-/// firmware ships instead of real data. The walker returns raw strings; legs call this.
+/// The OEM filler strings firmware ships instead of real data, matched whole (see is_placeholder).
+/// Deliberately excludes "Standard", "Default", "Family", "Empty" and "NULL": each is a plausible
+/// real value, and a false positive blanks it. Exposed so the test pins the exact table.
+inline constexpr std::array<std::string_view, 26> kPlaceholders{
+    "Default string", "To Be Filled By O.E.M.", "None", "Not Specified", "Not Available",
+    "N/A", "Unknown", "Undefined", "System Serial Number", "System Product Name",
+    "System manufacturer", "System Version", "Base Board", "Chassis Serial Number",
+    "Chassis Version", "Chassis Manufacture", "Asset Tag", "No Asset Tag",
+    "No Asset Information", "Not Applicable", "OEM", "0123456789", "1234567890", "SKU",
+    "x.x", "Type1ProductConfigId"};
+
+/// True when `s` (right-trimmed, ASCII case-insensitive) is empty or one of kPlaceholders.
+/// The walker returns raw strings; legs call this.
 [[nodiscard]] inline bool is_placeholder(std::string_view s) {
-    static constexpr std::array<std::string_view, 26> kPlaceholders{
-        "Default string", "To Be Filled By O.E.M.", "None", "Not Specified", "Not Available",
-        "N/A", "Unknown", "Undefined", "System Serial Number", "System Product Name",
-        "System manufacturer", "System Version", "Base Board", "Chassis Serial Number",
-        "Chassis Version", "Chassis Manufacture", "Asset Tag", "No Asset Tag",
-        "No Asset Information", "Not Applicable", "OEM", "0123456789", "1234567890", "SKU",
-        "x.x", "Type1ProductConfigId"};
     const std::string t = rtrim(s);
     if (t.empty()) return true;
     auto lower = [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; };
