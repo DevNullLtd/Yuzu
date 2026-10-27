@@ -610,7 +610,7 @@ Full design: `docs/auth-mfa-design.md`. Summary:
 - **RFC 6238 TOTP** (HMAC-SHA1, 30 s step, 6 digits, ±1 step skew with
   replay protection). 10 single-use base32 recovery codes per
   enrollment, PBKDF2-SHA256 hashed.
-- **Enrollment by an administrator for its own account** via Settings → Security and sign-in → Two-factor sign-in (the Settings enrolment routes are administrator-only; a non-admin enrols only at sign-in, when `--mfa-enforcement` protects it).
+- **Enrolment by an administrator for its own account** via Settings → Security and sign-in → Two-factor sign-in (the Settings enrolment routes are administrator-only; a non-admin enrols only at sign-in, when `--mfa-enforcement` protects it).
   One-time `otpauth://` reveal in the same `<div class="token-reveal">`
   pattern as API-token issuance.
 - **Login challenge** — `POST /login` returns HTTP 202 +
@@ -945,7 +945,7 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   database clock: the gate reads the row and `db_now_ms` in one SELECT and requires `0 <= db_now_ms - mfa_verified_ms <= window`,
   with no `kWallSanitySkew` allowance, in addition to the cached monotonic check. A suspended host or paused VM freezes the
   monotonic anchor, so the cached check alone is not a ceiling; the replica's own `system_clock` is never the authority.
-  A degraded read is `503`; a missing or future-dated proof is a step-up `401` for a local session. An OIDC session with no usable cached proof is refused earlier, `403` `mfa_proof_missing`, with one exception: when the cached anchor is empty because the stored proof is dated after the database clock (the identity provider or the replica that took the sign-in runs ahead of the database; `derive_session_deadlines` drops such a proof), the refusal is its own `503` while the database clock is still behind that instant, because signing in again cannot fix it (see below). With no SessionStore attached (a wiring fault: a serving process always has one) the
+  A degraded read is `503`; a missing or future-dated proof is a step-up `401` for a local session. An OIDC session with no usable cached proof is refused earlier, `403` `mfa_proof_missing`, with one exception: when the cached anchor is empty because the stored proof is dated after the database clock (the replica that took the sign-in ran ahead of the database; the sign-in clamps the ID-token `iat` to that replica's own clock, so an identity provider running ahead cannot future-date the proof by itself; `derive_session_deadlines` drops such a proof), the refusal is its own `503` while the database clock is still behind that instant, because signing in again cannot fix it (see below). With no SessionStore attached (a wiring fault: a serving process always has one) the
   gate answers `503` and nothing is decided; the replica's wall clock never stands in for the database clock.
   Once the central check has passed (or with the window at `0`), a refusal for an unenrolled or proof-less caller is a `403`
   (`approver_assurance_required:mfa_not_enrolled`, `mfa_proof_missing`, `saml_mfa_unsupported`,
@@ -956,11 +956,15 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   approver rule's own read fails (an unreadable stored proof, or an MFA-store fault at its own read) the answer is a
   `503` with `retry_after_ms` and `yuzu_auth_secret_unavailable_total{route="approval"}`. The clock-skew refusal is a separate outcome
   (`ApproverMfaOutcome::Kind::kProofClockSkew`): `503`, audit `result=error` with detail `approver_assurance:mfa_proof_clock_skew`, an A4
-  error naming the database clock and a remediation to correct clock synchronisation, no `retry_after_ms`, and no increment of the
+  error naming the database clock and a remediation to correct clock synchronisation, `retry_after_ms` null (the key is present), and no increment of the
   `route="approval"` counter, which stays a store-fault signal; the server logs an error line. A degraded durable-proof read is decided
-  first and answers the ordinary store-unavailable `503`. After the skew has passed, a session whose cached proof was dropped keeps an
-  empty anchor until its cache re-derives (a session write elsewhere, or a new sign-in) and answers `403` `mfa_proof_missing`, whose
-  remediation ends by asking the administrator to check clock synchronisation. With the window above `0`
+  first and answers the ordinary store-unavailable `503`. This `503` is typed only when the central check does not answer first (default
+  `--mfa-enforcement=optional`, or the window at `0`). Once the database clock has passed the stored instant (after at most as long as the skew is large, even while
+  the skew persists), a session whose cached proof was dropped keeps an empty anchor until its cache re-derives (a session write anywhere, or a
+  server restart) and answers `403` `mfa_proof_missing`, whose remediation always ends by asking the administrator to check clock
+  synchronisation; signing in again re-creates the same state while the skew persists. Under `required` (or `admin-only` for an administrator)
+  with the window above `0` the central check answers first: the OIDC approver sees a repeating `401` step-up challenge, no `approval.*` skew row
+  and no skew log line, and `yuzu_auth_mfa_step_up_gate_total{outcome="refused"}` rises. With the window above `0`
   the central check answers first for a SAML session (generic `403`), for a deleted or deactivated local account
   (`401` `MFA step-up required`), for a stale proof (`401`, normally: the central
   and approver windows are both 300 by default, so the ticket-specific `approver_assurance:mfa_proof_stale` row exists

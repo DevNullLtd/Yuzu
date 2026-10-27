@@ -494,7 +494,9 @@ and keeping the primary's time source correct is the customer's responsibility; 
 is the `YuzuSessionReapClockAnomaly` alert, which sees a backward step only when it exceeds the time
 since the last accepted session reap pass (nominally about 15 minutes while the session store is
 open, not a guarantee, plus the alert's 5 minute hold) and a forward step only when it exceeds about a
-year; (c) a non-admin
+year. The approver gate's comparison of the stored proof with the database clock also makes that clock an availability
+dependency as well as a security one: a database clock behind the sign-in replica refuses OIDC approvals closed with the
+clock-skew `503` (`docs/ops-runbooks/auth-db-recovery.md`, "OIDC approvers refused with a clock-skew 503"); (c) a non-admin
 cannot enrol itself under `--mfa-enforcement=optional` or `admin-only` (this refuses the approver
 `mfa_not_enrolled` only with RBAC enforcement on; with enforcement off, the shipped default, a non-admin
 is refused `403` "admin role required" before the MFA gate, so enrolment achieves nothing until
@@ -540,7 +542,7 @@ proof, a SAML session, an engine principal or a deleted or deactivated account i
 ticket id, so they show who was refused, when and on which route, but not which ticket; only the
 `approver_assurance:` rows and the decision rows name the ticket; the `user=` value of every
 `mfa.step_up.required` row is neutralised, a space, `=`, `,` or control byte written as `_`, so a name cannot add a
-`reason=` token), and `mcp.approve_request` / `mcp.reject_request` refusals (during a mixed-version window, also `result=success` rows for those actions from a replica not yet upgraded).
+`reason=` token), `result=error` rows with `detail=approver_assurance:mfa_store_unavailable` (the approver's MFA state or stored proof could not be read) or `approver_assurance:mfa_proof_clock_skew` (an OIDC proof dated after the database clock), each written before any `attempted` row, and `mcp.approve_request` / `mcp.reject_request` refusals (during a mixed-version window, also `result=success` rows for those actions from a replica not yet upgraded).
 The `attempted` and `success` rows of a decision made under the control carry
 `detail=approver_assurance:enrolled_fresh_mfa`, which marks a decision made by a replica that had the control (it
 dates the first upgraded replica, not the last old one, so keep per-replica upgrade timestamps in the change

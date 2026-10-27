@@ -641,11 +641,11 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
     MFA, or ask an administrator to have the provider assert `amr` for approvers. If the identity provider re-authenticates you silently without asserting an MFA `amr`, the retry returns `403` `mfa_proof_missing` again; complete provider-side MFA (for example by signing out of the provider first) and then retry. Real re-authentication at approval time is a planned follow-up. With step-up on and `--mfa-enforcement`
     protecting your role (`required`, or `admin-only` for an administrator), a sign-in with no MFA `amr` is
     answered first by the central step-up check with a `401` that sends you back to your identity provider, so a
-    provider that never asserts an MFA `amr` loops instead of showing `mfa_proof_missing`. If the clocks of the identity
-    provider and the Yuzu database disagree so that your stored proof is dated after the database clock, you are refused
+    provider that never asserts an MFA `amr` loops instead of showing `mfa_proof_missing`. If the replica that took your
+    sign-in ran ahead of the database clock, so that your stored proof is dated after the database clock, you are refused
     with `503` (`the approver's identity-provider MFA proof is dated after the database clock`, no retry hint) and signing
-    in again does not help: an administrator must correct clock synchronisation between the identity provider, the Yuzu
-    server and its database (see [OIDC approvers refused with a clock-skew 503](../ops-runbooks/auth-db-recovery.md#oidc-approvers-refused-with-a-clock-skew-503)).
+    in again does not help: an administrator must correct clock synchronisation between the Yuzu server hosts and the
+    database host (the dashboard shows you the remediation text; see [OIDC approvers refused with a clock-skew 503](../ops-runbooks/auth-db-recovery.md#oidc-approvers-refused-with-a-clock-skew-503)).
     An older proof is a
     `401` whose `challenge_url` is `/auth/oidc/start`; the Approvals dialog follows that challenge by
     sending the browser through your identity provider, which abandons the decision you were
