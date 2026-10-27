@@ -44,6 +44,7 @@
 #include "license_store.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
+#include "settings_model.hpp"
 #include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
 #include "software_deployment_store.hpp"
 #include "pg/pg_pool.hpp" // an unparseable-conninfo pool backs the unopened stand-in stores
@@ -1556,6 +1557,48 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
             }
         }
     }
+}
+
+TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the response builder",
+          "[openapi][retention][tar]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const json& schema = spec.at("components").at("schemas").at("SettingsDataRetention");
+    const auto keys_of = [](const json& obj) {
+        std::set<std::string> out;
+        for (auto it = obj.begin(); it != obj.end(); ++it)
+            out.insert(it.key());
+        return out;
+    };
+
+    Config cfg;
+    const json real = yuzu::server::settings_model::build_data_retention_settings(cfg);
+    REQUIRE(real.contains("tar"));
+    REQUIRE(real["tar"].is_object());
+    REQUIRE_FALSE(real["tar"]["tiers"].empty());
+
+    // Every key the builder emits is declared; every key declared is emitted.
+    CHECK(keys_of(schema.at("properties")) == keys_of(real));
+    const json& tar = schema.at("properties").at("tar");
+    CHECK(tar.value("nullable", false));
+    CHECK(keys_of(tar.at("properties")) == keys_of(real["tar"]));
+    CHECK(tar.at("required") == json::array({"tick_seconds", "tiers"}));
+
+    const json& item = tar.at("properties").at("tiers").at("items");
+    const json& tier0 = real["tar"]["tiers"][0];
+    CHECK(keys_of(item.at("properties")) == keys_of(tier0));
+    std::set<std::string> required_keys;
+    for (const auto& k : item.at("required"))
+        required_keys.insert(k.get<std::string>());
+    CHECK(required_keys == keys_of(tier0));
+
+    // A rows tier reports a null depth, so the schema must allow null there.
+    CHECK(item.at("properties").at("guaranteed_depth_seconds").value("nullable", false));
+
+    // `tar` stays out of `required`: a server older than this release omits it, and the manual
+    // tells clients to treat absent like null.
+    for (const auto& k : schema.at("required"))
+        CHECK(k.get<std::string>() != "tar");
 }
 
 TEST_CASE("openapi_spec_json(): the data-retention operation documents the TAR tiers",
