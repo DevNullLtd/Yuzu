@@ -2,21 +2,11 @@
  * test_smbios_alloc_budget.cpp -- agents/shared/smbios_parsers.hpp: a structure past the per-type
  * entry cap (kMaxEntriesPerType) is never DECODED, so it allocates nothing.
  *
- * WHY A SEPARATE EXECUTABLE. Counting allocations means replacing the global operator new/delete,
- * which is process-wide and cannot be scoped to one test (same precedent as
- * test_spark_alloc_budget.cpp and test_plugin_abi_oom_containment.cpp). It therefore does not
- * belong in yuzu_agent_tests, and it must be ABSENT from sanitizer builds, which own the
- * allocator. Not built on Windows: the replacement has not been measured under MSVC; the counted
- * code is one pure header, so the Linux and macOS runs pin the property for every leg.
- *
- * WHAT IT BUYS. The header banner promises "nothing is allocated beyond the result". A correct
- * output cannot show a violation: before the fix, structures past the cap were fully decoded
- * (their strings copied) and then discarded, and every result-level assertion still held. Only
- * the allocation count sees it (type 17, five 80-byte strings per structure: 256 structures ->
- * 1289 allocations, 257 -> 1294, 300 -> 1509; fixed: all three equal).
- *
- * POSITIVE CONTROL. The count at exactly the cap must cover one copy per string field per kept
- * entry; a counter that never ran would read zero and make the equality below vacuous.
+ * Separate executable: counting replaces the global operator new/delete, which is process-wide
+ * (as in test_spark_alloc_budget.cpp). Built on Linux and macOS; not under sanitizers (they own the
+ * allocator) and not on Windows (the replacement is unmeasured under MSVC).
+ * Pins what result-level asserts cannot see: over-decoding copies the strings, then discards them.
+ * Positive control: a counter that never ran reads zero and would make the equality vacuous.
  */
 #include <smbios_parsers.hpp>
 

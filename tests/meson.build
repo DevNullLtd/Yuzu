@@ -908,12 +908,8 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
 endif
 
 # ── H.1 SMBIOS walker allocation budget (separate binary, deliberately) ──────
-# test_smbios_alloc_budget.cpp replaces the global operator new/delete to count the allocations of
-# one parse_table call (a structure past the entry cap must not be decoded), so it is not a source
-# of yuzu_agent_tests and must be ABSENT from sanitizer builds. The counted code is the pure header
-# agents/shared/smbios_parsers.hpp, so Linux and macOS pin it for every leg; not built on Windows
-# (the replacement is unmeasured under MSVC). Same --allow-running-no-tests rationale as the spark
-# probe above.
+# test_smbios_alloc_budget.cpp replaces the global operator new/delete (see its header), so it is
+# a separate binary: absent under sanitizers and on Windows.
 if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
   smbios_alloc_budget_exe = executable(
     'yuzu_smbios_alloc_budget_tests',
