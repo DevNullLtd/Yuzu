@@ -292,7 +292,7 @@ where each lives.
 Every Linux native artifact carries the glibc / libstdc++ floor of the host
 that built it by accident (#5143). The gate makes the floor an explicit,
 committed promise and measures every build against it. It is specified by
-ADR-2003 (Proposed, PR #5631; the ADR is not on `dev` yet). **In S0 it is
+ADR-2003 (Accepted, PR #5631). **In S0 it is
 report-only: nothing it finds can fail a build or a release.** S2 turns it on.
 
 - **The script** runs `objdump -T` and `readelf -d` over every ELF under a
@@ -318,7 +318,7 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   `deploy/packaging/linux-floor-server.json` (glibc 2.34, `GLIBCXX_3.4.29`,
   `CXXABI_1.3.13`, `OPENSSL_3.0.0`, `LIBSYSTEMD_240`, `BLKID_1.0`, forbidden
   `EVP_sm4_*`; also the gateway's ERTS and OTP). They state the promise, not a
-  measurement. Changing one is a floor decision (ADR-2003 (Proposed, PR #5631),
+  measurement. Changing one is a floor decision (ADR-2003, accepted in PR #5631:
   "Floor review rule"), not a tuning edit. A typo in a family key would silently
   ungate that family (families absent from `max` are only reported), so the
   loader requires `GLIBC`, the script reports a measured family one edit away
@@ -362,7 +362,7 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   deterministic (sorted, no timestamps or paths): a refresh diffs cleanly. A
   set whose scan was incomplete (a PROBLEM, an unreadable or unscanned ELF)
   carries an `incomplete` list; the committed baseline has none. The
-  floor-review rule in ADR-2003 (Proposed, PR #5631) says when to refresh it.
+  floor-review rule in ADR-2003 (Accepted, PR #5631) says when to refresh it.
 - **Release wiring.** `release.yml`'s `build-linux` job runs the script
   report-only on the staged tarball contents right after "Package archive"
   (agent set, then server set) in a `continue-on-error` step, and uploads the
