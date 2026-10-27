@@ -20,13 +20,13 @@ The plugin deliberately never distinguishes "not domain-joined" from "the AD loo
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Inventory.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host]
-  HOST --> EX[device_identity.execute]
-  EX --> WIN[Windows leg<br/>GetComputerNameExA /<br/>NetGetJoinInformation /<br/>GetComputerObjectNameA]
-  EX --> MAC[macOS leg<br/>gethostname(3) /<br/>dsconfigad -show via bounded runner]
-  EX --> LIN[Linux leg<br/>gethostname(3) /<br/>resolv.conf + sd-bus InfoPipe /<br/>realm list]
-  WIN & MAC & LIN --> ROWS[key|value rows] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator / workflow"] --> SRV["Server - authz: Inventory.Read"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"]
+  HOST --> EX["device_identity.execute"]
+  EX --> WIN["Windows leg - GetComputerNameExA / NetGetJoinInformation / GetComputerObjectNameA"]
+  EX --> MAC["macOS leg - gethostname(3) / dsconfigad -show via bounded runner"]
+  EX --> LIN["Linux leg - gethostname(3) / resolv.conf + sd-bus InfoPipe / realm list"]
+  WIN & MAC & LIN --> ROWS["key|value rows"] --> RS[("ResponseStore")] --> API["REST /api/responses"]
 ```
 
 ## OS capability
