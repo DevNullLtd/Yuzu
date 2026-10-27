@@ -58,10 +58,10 @@
 #include <atomic>
 #include <cctype>
 #include <cstddef>
-#include <iterator>
-#include <optional>
 #include <functional>
+#include <iterator>
 #include <map>
+#include <optional>
 #include <regex>
 #include <set>
 #include <string>
@@ -1328,12 +1328,17 @@ TEST_CASE("openapi documents: no text cites an issue, an ADR, a build wave or th
           "[openapi][structure]") {
     // The document is read by operators and by agentic workers integrating with the API, on
     // /swagger and in generated clients. It states behaviour; it does not cite the issue, ADR
-    // decision, build wave, SOC 2 control or review gate that shaped it. Every string value in the
-    // document is checked, in both forms (keys are not text).
+    // decision, design section, build wave, SOC 2 control, review gate or C++ symbol that shaped
+    // it. Every string value in the document is checked, in both forms (keys are not text).
     static const std::regex kInternal(
-        R"(#[0-9]{3,5}\b|\bADR-?[0-9]{4}|\bSOC ?2 ?CC[0-9]|\bPhase [0-9]|\bWave [0-9]|\bPRs? ?[0-9]|)"
-        R"(\bWS-[A-Z][0-9]|\bA2-R[0-9]|\bINV-[0-9]|\bUP-[0-9]+|\bCDX-|[Gg]overnance|\bGate [0-9]|)"
-        R"(fix round|re-review|[Aa]pi-parity|API-parity|\bBatch [A-Z]\b)");
+        R"((^|[^A-Za-z0-9])#[0-9]{2,5}\b|\bADR-?[0-9]{4}|\bSOC ?2 ?CC[0-9]|\bCC-?[0-9]|\bPhase [0-9]|\bWave [0-9]|)"
+        R"(\bPRs? ?[0-9]|\bWS-[A-Z][0-9]|\bA2-R[0-9]|\bINV-[0-9]|\bUP-[0-9]+|\bCDX-|[Gg]overnance|)"
+        R"(\bGate [0-9]|fix round|re-review|[Aa]pi-parity|API-parity|\bBatch [A-Z]\b|\bsprint\b|§|)"
+        R"(decision log|docs/adr/|\badr/[0-9]{4}|[A-Za-z_]+::[A-Za-z_]|\.(hpp|cpp)\b|\b[a-z]+_fn\b|)"
+        R"(\bk[A-Z][a-z]+[A-Z]\w*|\(new\)|\([A-B][0-9]\)|\bA4 (error )?envelope|\bB[12]\b|)"
+        R"(\b[a-z][a-z_]+\(\)|routed-concerns|parity ledger|\bHermes\b|\bAstra\b|\b(SOLE|sole) (gate|authorization))");
+    // The line an operator reads first is held to more: no control number, gate word or label.
+    static const std::regex kSummary(R"(SOC ?2|\bCC-?[0-9]|\bGate\b|\bADR\b|\([A-B][0-9]\)|(^|[^A-Za-z0-9])#[0-9])");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
         const json spec = json::parse(document_text(with_guides));
@@ -1354,6 +1359,10 @@ TEST_CASE("openapi documents: no text cites an issue, an ADR, a build wave or th
             };
         walk(spec, "");
         CHECK(strings > 1000); // the walk really reached the text
+        for (const auto& o : all_operations(spec)) {
+            INFO(o.where());
+            CHECK_FALSE(std::regex_search(o.op.value("summary", std::string()), kSummary));
+        }
     }
 }
 
