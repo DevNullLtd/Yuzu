@@ -16,6 +16,17 @@
 
 `firmware` reports what the host's own firmware says about itself and changes nothing: the vendor, version and release date of the BIOS or system firmware and, on Linux only, whether the fwupd service knows of a firmware update waiting for a device. The action takes no parameters and returns rows of the form `firmware|<field>|<value>|<source>`. Every leg is an in-process read (no helper program is started); no `wmic`, `dmidecode`, `fwupdmgr` or `ioreg` is ever run.
 
+```mermaid
+flowchart LR
+  OP["Operator or workflow"] --> SRV["Server, authz Security Read"]
+  SRV -->|"gRPC over mTLS"| EX["firmware_posture execute: firmware"]
+  EX --> WIN["Windows leg: bounded Win32_BIOS WMI query plus GetSystemFirmwareTable RSMB"]
+  EX --> LIN["Linux leg: sysfs DMI bios files, then fwupd over sd-bus: GetDevices, GetUpgrades per updatable device"]
+  EX --> MAC["macOS leg: IORegistryEntryFromPath on IODeviceTree rom, chosen and root, sysctlbyname hw.model and hw.optional.arm64"]
+  WIN & LIN & MAC --> ROWS["firmware rows: value, absent, unavailable or unreadable, status OK, CONSTRAINED or PERMISSION_DENIED"]
+  ROWS --> RS[("ResponseStore")] --> API["REST /api/responses"]
+```
+
 - **Windows** asks two sources and reports both, so a disagreement between them is visible. `wmi` is a bounded `Win32_BIOS` query for exactly `Manufacturer`, `SMBIOSBIOSVersion` and `ReleaseDate`. `smbios` reads the raw SMBIOS table with `GetSystemFirmwareTable('RSMB')` and parses its type-0 record: vendor, version, release date, ROM size, and the BIOS and embedded-controller release numbers. The WMI array column `BIOSVersion` is not read, so no `bios_version_list` row exists.
 - **Linux** reads the four `/sys/class/dmi/id/bios_*` files (vendor, version, date, release), each once with a 4 KiB bound, then asks fwupd on the system D-Bus. It calls `GetDevices`, then `GetUpgrades` for each device flagged updatable, inside one 5 second budget for the whole fwupd read, and reports one `fwupd_device` row per device (at most 256) plus one aggregate `update_pending` row. sd-bus comes from the system package `libsystemd`, never from `vcpkg.json`; a build without it reports `update_pending` as `unreadable` with `fwupd:not_built`.
 - **macOS** reads the IODeviceTree plane through IOKit. An Intel Mac has `/rom` (version, release date, vendor). An Apple Silicon Mac has no `/rom`, so the version is `/chosen` `system-firmware-version` (else `firmware-version`) and the vendor is the tree root `manufacturer`. The plugin also reads `hw.model`, and uses `hw.optional.arm64` to decide whether a missing `/rom` is expected. No `update_pending` row is produced, and Apple Silicon has no release date.

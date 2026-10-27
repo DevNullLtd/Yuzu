@@ -16,6 +16,18 @@
 
 Four read-only actions report a host's local security configuration, one question each: `password_policy` (password rules), `lockout_policy` (account lockout), `audit_policy` (audit configuration) and `sudoers` (who may run commands as another user). None takes parameters, so no request text reaches a path or a command line, and no host policy is ever configured, imported or applied. Linux reads configuration files. macOS reads files for `audit_policy` and `sudoers` and runs `pwpolicy -getaccountpolicies` for password and lockout policy. Windows runs `secedit /export` once, stages the export in a private scratch directory under `agent.data_dir`, parses it and deletes it; `sudoers` does not exist on Windows. Every source reads as a **value**, as **`absent`** (the OS definitively says the file, key or directory is not there) or as **`unreadable`** (the read failed), and a failed read never looks like an absent one. The rows describe configuration as written, not the policy the OS evaluates.
 
+```mermaid
+flowchart LR
+  OP["Operator or workflow"] --> SRV["Server, authz Security Read"]
+  SRV -->|"gRPC over mTLS"| EX["local_security_policy execute: one of four actions"]
+  EX --> WIN["Windows leg: one secedit export of SECURITYPOLICY into a private scratch dir under agent.data_dir, 30 second deadline, parsed then deleted"]
+  EX -->|"sudoers on Windows"| WSU["unsupported row, status UNAVAILABLE"]
+  EX --> MAC["macOS leg: pwpolicy -getaccountpolicies for password and lockout, file reads for audit_control and sudoers"]
+  EX --> LIN["Linux leg: bounded reads of login.defs, pwquality, faillock, PAM files, audit.rules and sudoers"]
+  WIN & MAC & LIN --> ROWS["policy and source_state rows, status OK, CONSTRAINED or PERMISSION_DENIED"]
+  ROWS & WSU --> RS[("ResponseStore")] --> API["REST /api/responses"]
+```
+
 ### What is read, in what order
 
 | Action | Linux (files, in read order) | macOS | Windows |

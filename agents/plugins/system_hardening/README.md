@@ -16,6 +16,17 @@
 
 `posture` reads a fixed list of exploit-mitigation and kernel-hardening settings and writes one row per setting: `posture|<os>|<key>|<raw>|<state>`. It takes no parameters, so no request text reaches a path or a registry name, and it never starts a process. Linux reads 11 `/proc/sys` files, macOS reads 4 `sysctl` values with `sysctlbyname`, and Windows decodes two system-wide mitigation registry values and asks Windows about the agent's own process. Each key reads as a **value** with a state, as **`absent`** (the OS definitively says the key is not there) or as **`unreadable`** (the read failed). A failed read is never reported as absent, and a not-found counts as absence only where the surface being read is itself confirmed present. The state describes the hardening, not the raw number: `kernel.sysrq=0` is `enabled`, `kern.coredump=1` is `disabled`.
 
+```mermaid
+flowchart LR
+  OP["Operator or workflow"] --> SRV["Server, authz Security Read"]
+  SRV -->|"gRPC over mTLS"| EX["system_hardening execute: posture"]
+  EX --> WIN["Windows leg: RegQueryValueExW on MitigationOptions and MitigationAuditOptions under Session Manager kernel, GetProcessMitigationPolicy on the agent process"]
+  EX --> MAC["macOS leg: sysctlbyname on 4 allowlisted keys"]
+  EX --> LIN["Linux leg: reads of 11 allowlisted proc sys files, statfs procfs check before a not-found counts as absent"]
+  WIN & MAC & LIN --> ROWS["posture rows with raw value and state, status OK, CONSTRAINED or PERMISSION_DENIED"]
+  ROWS --> RS[("ResponseStore")] --> API["REST /api/responses"]
+```
+
 ### What is read and how absence is decided
 
 - **Linux.** `kernel.randomize_va_space`, `kernel.kptr_restrict`, `kernel.yama.ptrace_scope`, `kernel.dmesg_restrict`, `kernel.unprivileged_bpf_disabled`, `kernel.sysrq`, `fs.protected_hardlinks`, `fs.protected_symlinks`, `fs.protected_fifos`, `fs.protected_regular`, `fs.suid_dumpable`. One table maps each key to its path; there is no directory walk. A file that opens but is not a regular file (a FIFO, device or directory mounted at the path) is never read and reads `unreadable` with `<key>:not_regular`. An `ENOENT` is `absent` only when `statfs` confirms that the key's nearest existing directory, up to `/proc/sys`, is a mounted procfs; otherwise it becomes `ENODEV` and the key reads `unreadable` with `<key>:errno_19`. If that confirmation `statfs` is itself refused (`EACCES` or `EPERM`, as a seccomp profile or an LSM can do), the refusal is kept and the key reads `unreadable` with `<key>:eacces`.

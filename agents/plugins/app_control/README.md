@@ -16,6 +16,18 @@
 
 The two actions report how Windows application control is *configured* on the device. Both are read-only; neither says what is blocked, nor whether a configured policy is being applied at this moment.
 
+```mermaid
+flowchart LR
+  OP["Operator or workflow"] --> SRV["Server, authz Security Read"]
+  SRV -->|"gRPC over mTLS"| EX["app_control execute: wdac_policy or applocker_policy"]
+  EX --> WIN["Windows leg: RegEnumValueW on CI Policy, Active cip file listing, SiPolicy.p7b stat, MSFT_ApplockerPolicy CIM query with an SrpV2 registry walk as fallback"]
+  EX --> MAC["macOS leg: no OS call"]
+  EX --> LIN["Linux leg: no OS call"]
+  WIN --> ROWS["wdac, wdac_cip or applocker rows, status OK, CONSTRAINED or PERMISSION_DENIED"]
+  MAC & LIN --> UNS["unsupported row, status UNAVAILABLE"]
+  ROWS & UNS --> RS[("ResponseStore")] --> API["REST /api/responses"]
+```
+
 - `wdac_policy` enumerates every value under `HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy` (bounded: 256 values, 4 KiB each) and gives one of them, `VerifiedAndReputablePolicyState`, a named state. It then lists the `*.cip` files in `%SystemRoot%\System32\CodeIntegrity\CiPolicies\Active` (file stem only, never contents, at most 64 files, more reports `row_cap`) and checks, by stat only, whether the legacy single-policy file `System32\CodeIntegrity\SiPolicy.p7b` exists.
 - `applocker_policy` runs one bounded CIM query (15 second enumeration deadline) for `MSFT_ApplockerPolicy` in `root\StandardCimv2\Security\ApplicationControl`. When that gives no usable row, because the namespace or class is missing, the answer is empty, or the query fails, it walks `HKLM\SOFTWARE\Policies\Microsoft\Windows\SrpV2` and reports one row per rule collection (`Appx`, `Dll`, `Exe`, `Msi`, `Script`) with its `EnforcementMode` and rule-subkey count.
 

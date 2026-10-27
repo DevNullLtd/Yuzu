@@ -16,6 +16,20 @@
 
 The plugin reads which optional Windows features (Telnet client, TFTP, the IIS web server role, Virtual Machine Platform, .NET 3.5 and so on) are enabled, disabled or waiting on a restart, and changes nothing. `list` returns every feature with its state, optionally narrowed by a `state` filter; `info` returns one named feature with its display name, description and restart requirement. Both go through the Windows servicing API (DISM) in-process: no `dism.exe`, no WMI, no PowerShell.
 
+```mermaid
+flowchart LR
+  OP["Operator or workflow"] --> SRV["Server, authz Inventory Read"]
+  SRV -->|"gRPC over mTLS"| EX["windows_optional_features execute: list or info"]
+  EX --> SLOT["Windows leg: resolve the DismApi.dll exports, then acquire the agent-core DISM slot"]
+  SLOT -->|"acquired"| WIN["17 second bounded worker: DismInitialize, DismOpenSession, DismGetFeatures or DismGetFeatureInfo, DismCloseSession, DismShutdown"]
+  SLOT -->|"exports missing, busy or abandoned"| SENT["sentinel row, status UNAVAILABLE or CONSTRAINED"]
+  WIN --> ROWS["feature rows, status UNDECLARED on success, else a sentinel row with UNAVAILABLE, CONSTRAINED or PERMISSION_DENIED"]
+  EX --> MAC["macOS leg: no OS call"]
+  EX --> LIN["Linux leg: no OS call"]
+  MAC & LIN --> UNS["unsupported row, status UNAVAILABLE"]
+  ROWS & SENT & UNS --> RS[("ResponseStore")] --> API["REST /api/responses"]
+```
+
 Each call takes the agent's single DISM slot on the dispatching thread, then runs the same lifecycle on a worker thread: `DismInitialize`, `DismOpenSession` on the running OS, `DismGetFeatures` (`list`) or `DismGetFeatureInfo` (`info`), map each state number to a name, `DismCloseSession`, `DismShutdown`, release the slot. The whole call is bounded to 17 seconds. `DismApi.dll` is never linked; its eight exports are resolved from `System32` on first use. The slot, the session and the timeout all live in agent-core, which is never unloaded, so a worker that outlives a timeout never runs code belonging to a plugin that has been unloaded. Only one DISM call can be in flight in the agent at a time.
 
 What it is not: no enable, disable, add, remove or commit (the eight resolved exports are the plugin's whole DISM surface and none of them mutates), no `dism.exe` subprocess, and no use of `Win32_OptionalFeature`.

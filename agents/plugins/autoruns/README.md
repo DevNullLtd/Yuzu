@@ -16,6 +16,19 @@
 
 `catalog` and `list` answer two different questions, and neither changes the host. `catalog` makes no OS call: it prints the plugin's own versioned list of 34 persistence sources and whether this build supports each one on this OS. `list` reads those sources and returns one `autorun|` row per persistence entry it finds, plus exactly one `source|` status row per source, so a source that found nothing, a source that could not be read and a source that does not exist on this OS are never confused.
 
+```mermaid
+flowchart LR
+  OP["Operator or workflow"] --> SRV["Server, authz Security Read"]
+  SRV -->|"gRPC over mTLS"| EX["autoruns execute"]
+  EX -->|"catalog"| CAT["no OS call: catalog row plus one declared source row per id"]
+  EX -->|"list, optional sources filter"| WIN["Windows leg: RegOpenKeyExW on HKLM and user hives, Startup folders, ITaskService COM, bounded WMI query of root subscription"]
+  EX -->|"list"| LIN["Linux leg: bounded reads of cron, anacron, at, systemd timer, XDG and rc files, systemctl list-timers only as a fallback"]
+  EX -->|"list"| MAC["macOS leg: CFPropertyListCreateWithData over launchd plists, periodic names, emond rules"]
+  WIN & LIN & MAC --> ROWS["autorun rows plus one source status row per source, foreign-OS legs report unsupported"]
+  ROWS --> ST["status CONSTRAINED autoruns:degraded if any source is constrained, else UNDECLARED"]
+  CAT & ST --> RS[("ResponseStore")] --> API["REST /api/responses and MCP"]
+```
+
 `list` runs the Windows, Linux and macOS legs one after another on every build. Only the leg for the host's own OS reads anything. The other two print `source|<id>|unsupported|0|foreign_os` for each of their sources, so every capture names all 34 sources. The optional `sources=` filter (an exact, comma-separated list of source ids) skips the reads for the ids left out and reports them as `source|<id>|supported|-|filtered` (or `constrained` for the two permanently constrained Linux sources). It does not hide the foreign-OS rows, the macOS Login Items row ignores the filter and is always the same constrained row, and an id that matches nothing filters every source without an error.
 
 - **Windows.** Registry `Run`, `RunOnce`, `RunOnceEx`, `StartupApproved`, Winlogon `Shell` and `Userinit`, `AppInit_DLLs` and Image File Execution Options `Debugger` under `HKLM`; `Run`, `RunOnce` and `StartupApproved` again in every reachable user hive (a loaded hive first, otherwise an offline mount of the profile's hive file); the common and per-user Startup folders; Scheduled Tasks through the Task Scheduler COM interface; and permanent WMI event subscriptions from `root\subscription`. No `schtasks.exe`, `wmic.exe` or PowerShell is run.
