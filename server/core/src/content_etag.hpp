@@ -45,7 +45,9 @@ namespace yuzu::server {
 /// elements and optional whitespace around the commas are accepted, as the RFC asks of a recipient.
 /// The header is parsed as a whole: if any part of it is not a valid entity-tag list (`*` with
 /// anything else, a missing comma between tags, an unquoted or unterminated tag, text after a
-/// tag), nothing matches, so a bad header gets the full body, never a 304. `etag` is a quoted
+/// tag), nothing matches, so a bad header gets the full body, never a 304. The characters inside a quoted
+/// tag are not validated beyond the closing quote (a tag holding a space still parses): only the
+/// header's overall shape is checked. `etag` is a quoted
 /// strong tag as `content_etag` returns it. The `openapi.json` route uses this; the other
 /// catalogue routes still compare for exact equality and may adopt it. Linear in the header length.
 [[nodiscard]] inline bool if_none_match_matches(std::string_view header, const std::string& etag) {

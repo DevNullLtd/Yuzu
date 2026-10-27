@@ -1049,8 +1049,8 @@ TEST_CASE("GET /api/v1/openapi.json: gated on Infrastructure:Read for every form
     }
 }
 
-TEST_CASE("if_none_match_matches: RFC 9110 list, weak comparison and * alone; any malformed header "
-          "matches nothing",
+TEST_CASE("if_none_match_matches: RFC 9110 lists and weak comparison and * alone and any malformed "
+          "header matches nothing",
           "[openapi][etag]") {
     // Called directly so whitespace at the ends of the value, which the route test cannot send
     // (httplib drops a field value that starts or ends with a space), is covered.
@@ -1072,13 +1072,19 @@ TEST_CASE("if_none_match_matches: RFC 9110 list, weak comparison and * alone; an
         {"\"x\" \"abc\"", false},   {"\"abc\"x", false},        {"\"abc\"\"x\"", false},
         {"w/\"abc\"", false},       {"W/ \"abc\"", false},      {"W/W/\"abc\"", false},
         {"\"x\"W/\"abc\"", false},  {"\"x\" , ", false},
+        {"\"a,\"abc\"", false},      {"x\"abc\"", false},        {"*,", false},
+        {"*,\"abc\"", false},
     };
     for (const auto& c : cases) {
         INFO("If-None-Match: [" << c.header << "]");
         CHECK(if_none_match_matches(c.header, e) == c.matches);
     }
-    // A NUL byte inside a tag is a character like any other.
+    // A NUL byte inside a tag is a character like any other: it neither truncates the tag nor
+    // matches a different one.
     CHECK_FALSE(if_none_match_matches(std::string("\"a\0bc\"", 6), e));
+    const std::string nul_tag("\"a\0bc\"", 6);
+    CHECK(if_none_match_matches(nul_tag, nul_tag));
+    CHECK(if_none_match_matches("W/" + nul_tag, nul_tag));
     // A very long list is linear work and answers correctly at both ends.
     std::string big;
     for (int i = 0; i < 4000; ++i)

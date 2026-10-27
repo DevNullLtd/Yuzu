@@ -596,9 +596,9 @@ extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null ta
   }
   // Logged with what could not be drawn, since the page shows only a fixed line.
   function note(what, e) { try { console.error('API reference page: could not draw ' + what, e); } catch (x) { /* no console */ } }
-  // A response header is inline or a $ref into components.headers; own keys only.
   // A plain object, not null and not an array: the one test build() and load() share.
   function isObj(x) { return !!x && typeof x === 'object' && !Array.isArray(x); }
+  // A response header is inline or a $ref into components.headers; own keys only.
   function hdrOf(x) {
     if (!x || typeof x.$ref !== 'string') return x || {};
     var c = spec.components && spec.components.headers, n = refName(x.$ref);

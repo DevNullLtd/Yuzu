@@ -579,8 +579,8 @@ def main():
     # Every raw literal of the page is under the MSVC ceiling and named in the C++ size gate, so a
     # new piece cannot ship unmeasured (the list in test_swagger_page.cpp is otherwise by hand).
     gate = (ROOT / "tests/unit/server/test_swagger_page.cpp").read_text(encoding="utf-8")
-    declared = re.findall(r"extern const char\* const (kSwagger\w+) = R", page)
-    pieces = re.findall(r'extern const char\* const (kSwagger\w+) = R"SWG\((.*?)\)SWG";', page, re.S)
+    declared = re.findall(r"^extern const char\* const (kSwagger\w+) = R", page, re.M)
+    pieces = re.findall(r'^extern const char\* const (kSwagger\w+) = R"SWG\((.*?)\)SWG";', page, re.S | re.M)
     # kSwaggerPageHtml is the baked result, not a literal piece.
     if sorted(n for n in declared if n != "kSwaggerPageHtml") != sorted(n for n, _ in pieces):
         print("FAIL\n  - a kSwagger piece does not use the R\"SWG( delimiter, so the size gate would skip it: %r" % declared)
