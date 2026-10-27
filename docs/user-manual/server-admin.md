@@ -1296,9 +1296,13 @@ Until the fleet is fully upgraded, treat field 6 as free text: match on agent
 version rather than on the field's content, or defer any query that keys on it.
 `SELECT` on the plugin version, not on the value.
 
-A long-standing bug that made the macOS network scan return no results on
-macOS 14 and later is fixed in the same release; macOS hosts that reported an
-empty scan may begin reporting networks, subject to Location Services.
+On macOS 14 and later `list_networks` still normally returns no networks.
+`airport` was removed in that release, and the `system_profiler` fallback the
+plugin now tries needs a Location Services grant that a background daemon does
+not normally have. Without it the plugin reports a single `wifi|info` row
+(`wifi:macos_scan_requires_location_services`) instead of an empty scan, so the
+cause is visible; networks appear only on a host where Location Services has
+been granted.
 
 ### vNEXT — `event_logs` acquires natively; Windows message text and `count` semantics change (breaking)
 
