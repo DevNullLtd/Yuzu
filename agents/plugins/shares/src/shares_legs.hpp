@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -430,10 +431,12 @@ struct WinShareRec {
     std::uint32_t type = 0; ///< SHARE_INFO_*.shi*_type
 };
 
-/// One NetShareEnum call: its NET_API_STATUS and the entries of THAT page only.
+/// One NetShareEnum call: its NET_API_STATUS, the entries of THAT page only, and the API's
+/// `totalentries` for that call.
 struct WinPage {
     std::uint32_t status = 0;
     std::vector<WinShareRec> shares;
+    std::uint32_t total = 0;
 };
 
 /// Successive calls at one level return successive pages. The shell owns the resume handle
@@ -456,10 +459,19 @@ inline constexpr std::uint32_t kRpcUnknownIf = 1717;          ///< RPC_S_UNKNOWN
 /// `unsupported`, never an empty list. Any other status on any page discards every row (a
 /// partial drain is never reported as a complete list).
 ///
-/// Termination without a page counter: every entry of a non-empty page charges the row/byte
-/// budget BEFORE a Share is built, and the first refusal stops paging, so a pager that keeps
-/// answering ERROR_MORE_DATA with rows (a cyclic cursor) is cut at kMaxShareRows retained
-/// entries; an empty ERROR_MORE_DATA page is `no_progress` and stops at once.
+/// The enumeration is NOT a snapshot: NetShareEnum's resume handle is an index into the live
+/// share list, so a share deleted before the cursor makes the next page skip one and a share
+/// inserted before it repeats one. A name already kept (ASCII case-insensitively: Windows share
+/// names are unique that way) is dropped WITHOUT charging the budget, and a multi-page drain
+/// that finishes clean but holds a different number of shares than the first page's
+/// `totalentries` is `inconsistent_drain` (constrained, rows kept). A single-page drain cannot
+/// drift, and a truncated one is already `row_cap`, so neither is checked.
+///
+/// Termination without a page counter: every entry that is kept charges the row/byte budget
+/// BEFORE a Share is built and the first refusal stops paging, and an ERROR_MORE_DATA page that
+/// keeps nothing new (empty, or every name already seen: a cyclic cursor) is `no_progress` and
+/// stops at once. So every page asked for after the first keeps at least one entry, and the
+/// budget cuts the listing at kMaxShareRows retained entries.
 inline Listing list_windows(const WinPageFn& page) {
     constexpr std::string_view kOs = "windows";
     constexpr std::string_view kSrc = "netshareenum";
@@ -468,6 +480,9 @@ inline Listing list_windows(const WinPageFn& page) {
 
     Tally t;
     std::vector<Share> got;
+    std::set<std::string> seen;     // lower-cased names of `got`; at most one per kept row
+    std::size_t pages = 0;          // pages answered at the current level
+    std::uint32_t first_total = 0;  // totalentries of that level's first page
     int level = 2;
     bool level2_denied = false;
     bool failed = false;
@@ -477,6 +492,8 @@ inline Listing list_windows(const WinPageFn& page) {
 
         if (p.status == kWinAccessDenied) {
             got.clear();
+            seen.clear();
+            pages = 0;
             if (level == 2) {
                 level = 1;
                 level2_denied = true;
@@ -496,15 +513,23 @@ inline Listing list_windows(const WinPageFn& page) {
             failed = true;
             break;
         }
+        if (++pages == 1)
+            first_total = p.total;
 
+        std::size_t kept = 0;
         for (const auto& rec : p.shares) {
+            std::string key = detail::lower(rec.name);
+            if (seen.contains(key))
+                continue; // cursor drift repeated a share: dropped, not charged
             static constexpr std::array<std::string_view, 4> kKinds{"disk", "print", "device",
                                                                     "ipc"};
             const auto kind = rec.type & kStypeMask;
             std::vector<std::string> flags;
             flags.emplace_back(kind < kKinds.size() ? kKinds[kind] : "other");
             if ((rec.type & kStypeSpecial) != 0)
-                flags.emplace_back("special");
+                flags.emplace_back("special"); // ADMIN$, C$, IPC$: flagged, never hidden
+            else if (rec.name.ends_with('$'))
+                flags.emplace_back("hidden"); // the browse-hiding convention, as `browseable = no`
             if ((rec.type & kStypeTemporary) != 0)
                 flags.emplace_back("temporary");
             if (!detail::charge_share(t.budget, rec.name.size(),
@@ -520,10 +545,12 @@ inline Listing list_windows(const WinPageFn& page) {
             s.flags = std::move(flags);
             s.source = std::string{kSrc};
             got.push_back(std::move(s));
+            seen.insert(std::move(key));
+            ++kept;
         }
         if (t.truncated || p.status == 0)
             break;
-        if (p.shares.empty()) { // ERROR_MORE_DATA that read nothing: no forward progress
+        if (kept == 0) { // ERROR_MORE_DATA that kept nothing new: no forward progress
             t.acc.add_failure(tok("no_progress"));
             failed = true;
             break;
@@ -534,6 +561,8 @@ inline Listing list_windows(const WinPageFn& page) {
         t.acc.add_failure(tok("level2_permission_denied"));
     if (failed) // no rows survive a failed drain
         return t.finish({failed_src()});
+    if (!t.truncated && pages > 1 && got.size() != first_total)
+        t.acc.add_failure(tok("inconsistent_drain")); // rows kept: constrained, not failed
     ++t.read_sources;
     const std::size_t n = got.size();
     t.shares = std::move(got);

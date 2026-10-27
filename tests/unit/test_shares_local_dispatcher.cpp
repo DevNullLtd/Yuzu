@@ -262,6 +262,9 @@ TEST_CASE("shares plugin: status row first, source rows next, then well-formed s
         INFO("status row: " << rows[0]);
         CHECK(starts_with(rows[0], "status|list|unsupported|windows:shares:netshareenum:server_"));
         CHECK(rows.size() == 2);
+        // Visible in the log: a runner whose Server service is stopped checked none of the
+        // share-row assertions below.
+        WARN("Server service not answering: the share-row checks were skipped (" << rows[0] << ")");
         return;
     }
     bool saw_ipc = false;
@@ -303,7 +306,8 @@ TEST_CASE("shares plugin: status row first, source rows next, then well-formed s
         // failed source row and no shares. When the drain succeeded, a running Server service
         // publishes IPC$ (as on the supported arm above); SHARE_INFO_1 has no path, so every
         // share row's path is the placeholder.
-        if (starts_with(rows[1], "source|netshareenum|read|"))
+        // read|0 is an honest empty drain the leg permits; only a non-empty read must show rows.
+        if (starts_with(rows[1], "source|netshareenum|read|") && wire_fields(rows[1])[3] != "0")
             CHECK(rows.size() >= 3);
         for (std::size_t i = 2; i < rows.size(); ++i) {
             INFO("row " << i << ": " << rows[i]);

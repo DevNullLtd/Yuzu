@@ -327,6 +327,10 @@ WinShareRec rec(std::string name, std::string path, std::uint32_t type = 0) {
     return WinShareRec{std::move(name), std::move(path), type};
 }
 
+/// A drain that asks for more pages than this has not terminated: fail the test instead of
+/// letting a loop-exit regression spin the shard until its timeout.
+constexpr std::size_t kMaxPagerCalls = 64;
+
 /// Canned pager: per level, pages served in order; the last page repeats if asked again.
 /// Every call's level is recorded.
 struct FakeWinPages {
@@ -337,6 +341,9 @@ struct FakeWinPages {
     WinPageFn fn() {
         return [this](int level) {
             calls.push_back(level);
+            if (calls.size() > kMaxPagerCalls)
+                FAIL("the pager was asked for more than " << kMaxPagerCalls
+                                                           << " pages: the drain does not terminate");
             auto& v = pages[level];
             if (v.empty())
                 return WinPage{};
@@ -352,8 +359,11 @@ struct FakeWinPages {
     }
 };
 
-WinPage page_of(std::uint32_t status, std::vector<WinShareRec> shares = {}) {
-    return WinPage{status, std::move(shares)};
+/// `total` is NetShareEnum's totalentries for the call; list_windows reads it from the first page
+/// of a multi-page drain only.
+WinPage page_of(std::uint32_t status, std::vector<WinShareRec> shares = {},
+                std::uint32_t total = 0) {
+    return WinPage{status, std::move(shares), total};
 }
 
 std::vector<WinShareRec> disks(const std::string& prefix, std::size_t n) {
@@ -371,12 +381,13 @@ TEST_CASE("shares windows: one page of every kind is typed, special flagged not 
     // NetShareEnum returns backslash paths; the row grammar folds them to '/'. 3 is STYPE_IPC.
     f.pages[2] = {page_of(0, {rec("C$", "C:\\", kStypeSpecial), rec("ADMIN$", "C:\\Windows", kStypeSpecial),
                               rec("IPC$", "", kStypeSpecial | 3u), rec("Users", "C:\\Users", 0),
-                              rec("HP", "", 1), rec("COM1", "", 2), rec("tmp", "C:\\t", kStypeTemporary)})};
+                              rec("HP", "", 1), rec("COM1", "", 2), rec("tmp", "C:\\t", kStypeTemporary),
+                              rec("exfil$", "D:\\exfil", 0)})};
     const auto l = f.run();
     CHECK(l.status == StatusState::supported);
     CHECK(l.reason.empty());
-    REQUIRE(l.rows.size() == 8);
-    CHECK(l.rows[0] == "source|netshareenum|read|7");
+    REQUIRE(l.rows.size() == 9);
+    CHECK(l.rows[0] == "source|netshareenum|read|8");
     CHECK(l.rows[1] == "share|smb|C$|C:/|-|-|disk,special|netshareenum");
     CHECK(l.rows[2] == "share|smb|ADMIN$|C:/Windows|-|-|disk,special|netshareenum");
     CHECK(l.rows[3] == "share|smb|IPC$|-|-|-|ipc,special|netshareenum");
@@ -384,24 +395,30 @@ TEST_CASE("shares windows: one page of every kind is typed, special flagged not 
     CHECK(l.rows[5] == "share|smb|HP|-|-|-|print|netshareenum");
     CHECK(l.rows[6] == "share|smb|COM1|-|-|-|device|netshareenum");
     CHECK(l.rows[7] == "share|smb|tmp|C:/t|-|-|disk,temporary|netshareenum");
+    // A trailing '$' on a share that is not STYPE_SPECIAL is the browse-hiding convention.
+    CHECK(l.rows[8] == "share|smb|exfil$|D:/exfil|-|-|disk,hidden|netshareenum");
     CHECK(f.calls == std::vector<int>{2});
 }
 
 TEST_CASE("shares windows: an unknown kind is other; the temporary bit alone is disk,temporary",
           "[shares]") {
     FakeWinPages f;
-    f.pages[2] = {page_of(0, {rec("x", "C:/x", 7), rec("t", "C:/t", kStypeTemporary)})};
+    f.pages[2] = {page_of(0, {rec("x", "C:/x", 7), rec("t", "C:/t", kStypeTemporary),
+                              rec("h$", "C:/h", 2u | kStypeTemporary)})};
     const auto l = f.run();
     CHECK(has(l, "share|smb|x|C:/x|-|-|other|netshareenum"));
     CHECK(has(l, "share|smb|t|C:/t|-|-|disk,temporary|netshareenum"));
+    // kind, then hidden, then temporary; a special share is never hidden whatever its name ends in
+    CHECK(has(l, "share|smb|h$|C:/h|-|-|device,hidden,temporary|netshareenum"));
 }
 
 TEST_CASE("shares windows: an advancing pager is drained in page order", "[shares]") {
     FakeWinPages f;
-    f.pages[2] = {page_of(kWinMoreData, disks("a", 2)), page_of(kWinMoreData, disks("b", 2)),
-                  page_of(0, disks("c", 2))};
+    f.pages[2] = {page_of(kWinMoreData, disks("a", 2), 6), page_of(kWinMoreData, disks("b", 2), 6),
+                  page_of(0, disks("c", 2), 6)};
     const auto l = f.run();
     CHECK(l.status == StatusState::supported);
+    CHECK(l.reason.empty());
     CHECK(count_prefix(l, "share|") == 6);
     CHECK(has(l, "source|netshareenum|read|6"));
     CHECK(l.rows[1].starts_with("share|smb|a0|"));
@@ -418,16 +435,71 @@ TEST_CASE("shares windows: a stalled pager is no_progress and reports no rows", 
     CHECK(l.rows == std::vector<std::string>{"source|netshareenum|failed|-"});
 }
 
-TEST_CASE("shares windows: a cyclic pager is cut at the row cap and stops asking for pages",
+TEST_CASE("shares windows: a cyclic pager is no_progress on its second page and reports no rows",
           "[shares]") {
     FakeWinPages f;
     f.pages[2] = {page_of(kWinMoreData, disks("c", 100))}; // the same page, forever
     const auto l = f.run();
-    CHECK(count_prefix(l, "share|") == kMaxShareRows);
-    CHECK(reason_has(l, "windows:shares:row_cap"));
     CHECK(l.status == StatusState::constrained);
-    CHECK(has(l, "source|netshareenum|read|512"));
-    CHECK(f.calls_at(2) <= 7);
+    CHECK(reason_has(l, "windows:shares:netshareenum:no_progress"));
+    CHECK(l.rows == std::vector<std::string>{"source|netshareenum|failed|-"});
+    CHECK(f.calls_at(2) == 2); // the repeat kept nothing new, so no third page was asked for
+}
+
+TEST_CASE("shares windows: a share returned twice is kept once and costs no budget", "[shares]") {
+    FakeWinPages f;
+    // Cursor drift repeats a share (names compare without regard to ASCII case).
+    f.pages[2] = {page_of(kWinMoreData, {rec("a", "C:/a"), rec("b", "C:/b"), rec("c", "C:/c")}, 5),
+                  page_of(0, {rec("B", "C:/other"), rec("c", "C:/c"), rec("d", "C:/d"), rec("e", "C:/e")}, 5)};
+    const auto l = f.run();
+    CHECK(l.status == StatusState::supported);
+    CHECK(l.reason.empty());
+    CHECK(count_prefix(l, "share|") == 5);
+    CHECK(has(l, "source|netshareenum|read|5"));
+    CHECK(has(l, "share|smb|b|C:/b|-|-|disk|netshareenum")); // the first occurrence wins
+    CHECK_FALSE(has(l, "share|smb|B|C:/other|-|-|disk|netshareenum"));
+
+    // 400 distinct names, then a page that repeats all 400 and adds 112: 512 distinct fit the row
+    // cap exactly only if the 400 repeats were not charged.
+    FakeWinPages g;
+    g.pages[2] = {page_of(kWinMoreData, disks("d", 400), 512), page_of(0, [] {
+                      auto v = disks("d", 400);
+                      auto n = disks("n", 112);
+                      v.insert(v.end(), n.begin(), n.end());
+                      return v;
+                  }(), 512)};
+    const auto o = g.run();
+    CHECK(count_prefix(o, "share|") == kMaxShareRows);
+    CHECK(o.status == StatusState::supported);
+    CHECK_FALSE(reason_has(o, "windows:shares:row_cap"));
+}
+
+TEST_CASE("shares windows: a multi-page drain whose count differs from the first page's total is "
+          "inconsistent_drain, rows kept",
+          "[shares]") {
+    // A share created while paging: 4 read, 3 announced.
+    FakeWinPages f;
+    f.pages[2] = {page_of(kWinMoreData, disks("a", 2), 3), page_of(0, disks("b", 2), 4)};
+    const auto l = f.run();
+    CHECK(l.status == StatusState::constrained);
+    CHECK(reason_has(l, "windows:shares:netshareenum:inconsistent_drain"));
+    CHECK(count_prefix(l, "share|") == 4);
+    CHECK(has(l, "source|netshareenum|read|4"));
+
+    // A share deleted while paging: 4 read, 5 announced.
+    FakeWinPages g;
+    g.pages[2] = {page_of(kWinMoreData, disks("a", 2), 5), page_of(0, disks("b", 2), 4)};
+    const auto o = g.run();
+    CHECK(o.status == StatusState::constrained);
+    CHECK(reason_has(o, "windows:shares:netshareenum:inconsistent_drain"));
+    CHECK(count_prefix(o, "share|") == 4);
+
+    // A single page is read == total trivially and is never judged against it.
+    FakeWinPages h;
+    h.pages[2] = {page_of(0, disks("a", 2), 7)};
+    const auto s1 = h.run();
+    CHECK(s1.status == StatusState::supported);
+    CHECK_FALSE(reason_has(s1, "inconsistent_drain"));
 }
 
 TEST_CASE("shares windows: one budget spans every page and refusal stops fetching", "[shares]") {
@@ -438,6 +510,7 @@ TEST_CASE("shares windows: one budget spans every page and refusal stops fetchin
     CHECK(count_prefix(l, "share|") == kMaxShareRows);
     CHECK(reason_has(l, "windows:shares:row_cap"));
     CHECK(has(l, "source|netshareenum|read|512"));
+    CHECK_FALSE(reason_has(l, "inconsistent_drain")); // a truncated drain is row_cap, not drift
     CHECK(f.calls_at(2) == 6); // page 7 was never asked for
 
     FakeWinPages g;
@@ -446,6 +519,59 @@ TEST_CASE("shares windows: one budget spans every page and refusal stops fetchin
     CHECK(reason_has(o, "windows:shares:field_oversized"));
     REQUIRE(o.rows.size() == 2);
     CHECK(o.rows[1].size() < 4200);
+}
+
+TEST_CASE("shares windows: the byte budget cuts the listing before the row cap, at the first "
+          "refusal",
+          "[shares]") {
+    // Large entries exhaust 1 MiB long before 512 rows. Name, path, flags and the fixed per-row
+    // overhead are all charged ("disk" plus its separator is 5 flag bytes), and a small entry
+    // behind the refused one is never looked at.
+    const std::size_t per_row = 4000 + 4000 + 5 + kRowOverhead;
+    const std::size_t fit = kMaxShareBytes / per_row;
+    REQUIRE(fit < kMaxShareRows);
+    std::vector<WinShareRec> big;
+    for (std::size_t i = 0; i <= fit + 10; ++i) {
+        std::string name = "L" + std::to_string(i);
+        name.resize(4000, 'n');
+        big.push_back(rec(std::move(name), std::string(4000, 'p')));
+    }
+    big.push_back(rec("small", "C:/s"));
+    FakeWinPages f;
+    f.pages[2] = {page_of(0, std::move(big))};
+    const auto l = f.run();
+    CHECK(l.status == StatusState::constrained);
+    CHECK(reason_has(l, "windows:shares:row_cap"));
+    CHECK_FALSE(reason_has(l, "windows:shares:field_oversized")); // 4000 bytes is under the cut
+    CHECK(count_prefix(l, "share|") == fit);
+    CHECK(has(l, "source|netshareenum|read|" + std::to_string(fit)));
+    CHECK(count_prefix(l, "share|smb|small|") == 0);
+}
+
+TEST_CASE("shares windows: the level-1 fallback does not inherit level-2 state", "[shares]") {
+    // An oversized name read at level 2 is discarded with its page: the level-1 answer is judged
+    // on its own rows, so it carries no field_oversized, and the names the discarded level-2 rows
+    // used are free to appear again.
+    FakeWinPages f;
+    f.pages[2] = {page_of(kWinMoreData, {rec(std::string(5000, 'n'), "C:/x"), rec("Users", "C:/u")}, 800),
+                  page_of(kWinAccessDenied)};
+    f.pages[1] = {page_of(0, {rec("Users", ""), rec("Data", "")})};
+    const auto l = f.run();
+    CHECK(f.calls == std::vector<int>{2, 2, 1});
+    CHECK(l.status == StatusState::constrained);
+    CHECK(reason_has(l, "windows:shares:netshareenum:level2_permission_denied"));
+    CHECK_FALSE(reason_has(l, "windows:shares:field_oversized"));
+    CHECK(has(l, "source|netshareenum|read|2"));
+    CHECK(has(l, "share|smb|Users|-|-|-|disk|netshareenum"));
+
+    // A multi-page level-1 drain is judged against ITS first page's total, not level 2's (800).
+    FakeWinPages g;
+    g.pages[2] = {page_of(kWinMoreData, disks("a", 2), 800), page_of(kWinAccessDenied)};
+    g.pages[1] = {page_of(kWinMoreData, {rec("a0", ""), rec("a1", "")}, 3), page_of(0, {rec("a2", "")}, 3)};
+    const auto o = g.run();
+    CHECK(o.status == StatusState::constrained);
+    CHECK_FALSE(reason_has(o, "inconsistent_drain"));
+    CHECK(has(o, "source|netshareenum|read|3"));
 }
 
 TEST_CASE("shares windows: a failing later page discards every earlier row", "[shares]") {
@@ -504,12 +630,13 @@ TEST_CASE("shares windows: the level-1 fallback that answers empty is read|0, st
 TEST_CASE("shares windows: the fallback restarts the budget and drops level-2 rows", "[shares]") {
     FakeWinPages f;
     f.pages[2] = {page_of(kWinMoreData, disks("a", 400)), page_of(kWinAccessDenied)}; // denied after rows were gathered
-    f.pages[1] = {page_of(0, disks("b", 400))};
+    f.pages[1] = {page_of(0, disks("a", 400))}; // the same names: the discarded rows are forgotten
     const auto l = f.run();
     CHECK(count_prefix(l, "share|") == 400);
     CHECK_FALSE(reason_has(l, "windows:shares:row_cap"));
     CHECK(has(l, "source|netshareenum|read|400"));
-    CHECK(l.rows[1].starts_with("share|smb|b0|"));
+    REQUIRE(l.rows.size() > 1);
+    CHECK(l.rows[1].starts_with("share|smb|a0|"));
 }
 
 TEST_CASE("shares windows: refused at both levels is permission_denied", "[shares]") {

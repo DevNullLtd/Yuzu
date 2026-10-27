@@ -51,7 +51,8 @@ struct Share {
     Access access = Access::unknown;
     std::optional<bool> anonymous;
     /// closed vocabulary: hidden, unavailable, special, no_root_squash, clients_<n>, and the
-    /// Windows share kind (exactly one per row): disk, print, device, ipc, other; temporary
+    /// Windows share kind (exactly one per row): disk, print, device, ipc, other; temporary.
+    /// Windows `hidden` is a non-special share whose name ends in `$`
     std::vector<std::string> flags;
     std::string source;
 };
@@ -709,7 +710,9 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
 
 /// One free wire field: "-" when empty, else scrubbed of NUL and anything outside strictly
 /// well-formed UTF-8 (scrub_wire_bytes; NEVER sanitize_utf8, which passes overlong,
-/// surrogate and out-of-range sequences, #4864) then pipe/backslash/CRLF-escaped.
+/// surrogate and out-of-range sequences, #4864) then passed through safe_output_field: a
+/// backslash is folded to '/' (so a Windows path reads C:/Users), CR/LF fold to spaces and a
+/// pipe is escaped.
 [[nodiscard]] inline std::string wire_field(std::string_view v) {
     if (v.empty())
         return "-";
@@ -743,7 +746,7 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
     return r;
 }
 
-/// `source|<exports|exports_d|smb_conf>|<state>|<share count or ->`
+/// `source|<exports|exports_d|smb_conf|netshareenum>|<state>|<share count or ->`
 [[nodiscard]] inline std::string source_row(std::string_view kind, SourceState state,
                                             std::optional<std::size_t> count = std::nullopt) {
     std::string r = "source|";

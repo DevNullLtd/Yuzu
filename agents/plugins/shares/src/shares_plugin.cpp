@@ -46,8 +46,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_SUPPORTED, 1,
          "NetShareEnum level 2 (netapi32); level 1 (names, no paths) when level 2 is refused",
          "live Server-service state, not the LanmanServer registry: a stopped Server service is "
-         "unavailable (windows:shares:netshareenum:server_not_started); STYPE_SPECIAL shares "
-         "(ADMIN$, C$, IPC$) are flagged special, never hidden; access and anonymous are -, ACLs "
+         "unavailable (windows:shares:netshareenum:server_not_started, or "
+         "windows:shares:netshareenum:server_unavailable when its RPC endpoint does not answer); "
+         "STYPE_SPECIAL shares (ADMIN$, C$, IPC$) are flagged special, never hidden, and any "
+         "other share whose name ends in $ is flagged hidden; access and anonymous are -, ACLs "
          "and level 502 are never read"},
     },
 };

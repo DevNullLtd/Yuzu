@@ -9,10 +9,12 @@
  * NetShareEnum call, the resume handle (reset when the level changes, per WinPageFn's contract)
  * and the one-page conversion.
  *
- * Bounded before materialised: the shell asks for 64 KiB pages (kWinPageBytes), never
- * MAX_PREFERRED_LENGTH, so the API itself never hands over the whole inventory in one buffer.
- * One page is converted per call and freed by NetApiBuf on return (including on a throw), so
- * retained memory at any instant is one API page plus the budget-bounded rows.
+ * Bounded before materialised: the shell asks for at most 64 KiB per call (kWinPageBytes),
+ * never MAX_PREFERRED_LENGTH. That is a request, not a guarantee: the page the service actually
+ * returns bounds what is held. One page is converted per call and freed by NetApiBuf on return
+ * (including on a throw), so retained memory at any instant is the page the service returned
+ * plus the budget-bounded rows. Paging has not been exercised on a host with more than one
+ * page of shares (README caveat 3).
  */
 #include "shares_legs.hpp"
 
@@ -25,6 +27,7 @@
 #include <win_str.hpp>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace yuzu::shares {
 
@@ -54,15 +57,19 @@ struct NetApiBuf {
     }
 };
 
-/// One page is at most this many bytes of SHARE_INFO entries: two orders of magnitude above
-/// the largest SHARE_INFO_2 entry, so a page always holds at least one.
+/// The size asked for per call (prefmaxlen is a request). Well above the largest SHARE_INFO_2
+/// entry under the LAN Manager limits (NNLEN, MAXCOMMENTSZ, MAX_PATH), so a page normally holds
+/// many entries; a page that holds none is reported by list_windows as no_progress, never spun
+/// on.
 constexpr DWORD kWinPageBytes = 64 * 1024;
 
-/// One NetShareEnum call at `level`. `path` is null for level 1 (no path in SHARE_INFO_1).
-/// `resume` is the API's resume handle: NetShareEnum advances it on ERROR_MORE_DATA.
+/// One NetShareEnum call at the level `Info` names (SHARE_INFO_1 or SHARE_INFO_2). `path` is
+/// null for level 1 (no path in SHARE_INFO_1). `resume` is the API's resume handle: NetShareEnum
+/// advances it on ERROR_MORE_DATA.
 template <class Info>
-WinPage one_page(DWORD level, DWORD& resume, LPWSTR Info::*name, LPWSTR Info::*path,
-                 DWORD Info::*type) {
+WinPage one_page(DWORD& resume, LPWSTR Info::*name, LPWSTR Info::*path, DWORD Info::*type) {
+    static_assert(std::is_same_v<Info, SHARE_INFO_1> || std::is_same_v<Info, SHARE_INFO_2>);
+    constexpr DWORD level = std::is_same_v<Info, SHARE_INFO_2> ? 2 : 1;
     NetApiBuf buf;
     DWORD read = 0;
     DWORD total = 0;
@@ -70,7 +77,10 @@ WinPage one_page(DWORD level, DWORD& resume, LPWSTR Info::*name, LPWSTR Info::*p
         NetShareEnum(nullptr, level, &buf.p, kWinPageBytes, &read, &total, &resume);
     WinPage page;
     page.status = static_cast<std::uint32_t>(status);
+    page.total = static_cast<std::uint32_t>(total);
     if ((status == NERR_Success || status == ERROR_MORE_DATA) && buf.p != nullptr) {
+        // buf.p is an array of `read` Info entries (aligned by NetApiBufferAllocate) that stays
+        // valid until ~NetApiBuf; the strings the entries point at live in the same buffer.
         const auto* entries = reinterpret_cast<const Info*>(buf.p);
         page.shares.reserve(read);
         for (DWORD i = 0; i < read; ++i) {
@@ -97,9 +107,9 @@ int run_windows(yuzu::CommandContext& ctx) {
             last_level = level;
         }
         if (level == 2)
-            return one_page<SHARE_INFO_2>(2, resume, &SHARE_INFO_2::shi2_netname,
+            return one_page<SHARE_INFO_2>(resume, &SHARE_INFO_2::shi2_netname,
                                           &SHARE_INFO_2::shi2_path, &SHARE_INFO_2::shi2_type);
-        return one_page<SHARE_INFO_1>(1, resume, &SHARE_INFO_1::shi1_netname, nullptr,
+        return one_page<SHARE_INFO_1>(resume, &SHARE_INFO_1::shi1_netname, nullptr,
                                       &SHARE_INFO_1::shi1_type);
     };
     report_list(ctx, list_windows(pager));
