@@ -348,11 +348,17 @@ TEST_CASE("registry parse_plan: items whose verdicts would depend on each other 
         CHECK(err(json::array({set_item("Software\\\xC3\x84", "v", "1"), set_item("Software\\\xC3\xA4", "w", "2")})) == "dependent_items:0:1"); // names differ
         CHECK(err(json::array({item("create_key", "Software\\\xC3\x84"), set_item("Software\\\xC3\xA4\\B", "v", "1")})) == "dependent_items:0:1"); // descendant
         CHECK(err(json::array({set_item("Software\\\xC3\xA4\\B", "v", "1"), item("delete_key", "Software\\\xC3\x84")})) == "dependent_items:0:1"); // ancestor
+        // a SHARED PARENT spelled two ways, leaf keys different: the item that creates \xC3\x84 makes the later \xC3\xA4\\Y fail
+        // the canonical-name check. mutant: only whole-path (or ancestor) relations are compared.
+        CHECK(err(json::array({set_item("Software\\\xC3\x84\\X", "v", "1"), set_item("Software\\\xC3\xA4\\Y", "v", "2")})) == "dependent_items:0:1");
+        CHECK(err(json::array({set_item("Software\\\xC3\x84\\X", "v", "1"), item("create_key", "Software\\\xC3\xA4\\Y\\Z")})) == "dependent_items:0:1");
     }
     SECTION("non-ASCII keys the skeleton cannot relate stay independent, and one spelling twice is not a new clash") {
         CHECK(err(json::array({set_item("Software\\\xC3\x84", "v", "1"), set_item("Software\\B", "v", "2")})).empty()); // other component
         CHECK(err(json::array({set_item("Software\\\xC3\x84", "v", "1"), set_item("Other\\\xC3\xA4", "v", "2")})).empty()); // other parent
         CHECK(err(json::array({set_item("Software\\\xC3\x84", "v", "1"), set_item("Software\\\xC3\x84", "w", "2")})).empty()); // same spelling, ASCII names
+        CHECK(err(json::array({set_item("Software\\\xC3\x84\\X", "v", "1"), set_item("Software\\\xC3\x84\\Y", "v", "2")})).empty()); // same parent spelling, different leaves
+        CHECK(err(json::array({set_item("Software\\\xC3\x84\\X", "v", "1"), set_item("Other\\\xC3\xA4\\Y", "v", "2")})).empty()); // the parents part company higher up
     }
     SECTION("a key op over an equal, ancestor or descendant key of ANY other item") {
         CHECK(err(json::array({item("delete_key", "Software\\A"), set_item("Software\\A", "v", "1")})) == "dependent_items:0:1");

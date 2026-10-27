@@ -110,6 +110,20 @@ namespace detail {
     return out;
 }
 
+/// True when, at some depth the two keys share under the skeleton fold, the components are one key to the kernel but
+/// spelled differently under the ASCII fold (all arguments already folded; `ka`/`sa` and `kb`/`sb` are the same key
+/// under fold_ascii / fold_skeleton). A shared PARENT counts, not only the whole path: the item that creates `Ä` makes
+/// a later `ä\Y` fail the canonical-name check even though the leaf keys differ.
+[[nodiscard]] inline bool ambiguous_shared_prefix(std::string_view ka, std::string_view kb, std::string_view sa,
+                                                  std::string_view sb) {
+    const auto ca = split_key(ka), cb = split_key(kb), xa = split_key(sa), xb = split_key(sb);
+    for (std::size_t d = 0; d < std::min(ca.size(), cb.size()); ++d) {
+        if (xa[d] != xb[d]) return false; // the keys part company under every spelling: nothing deeper is shared
+        if (ca[d] != cb[d]) return true;
+    }
+    return false;
+}
+
 /// Nesting depth of '[' / '{' outside string literals; > 2 is not a flat array of flat objects. Checked BEFORE the
 /// parse so a deeply nested document never reaches the parser (or its destructor).
 [[nodiscard]] inline bool nested_deeper_than_two(std::string_view s) noexcept {
@@ -238,16 +252,14 @@ namespace detail {
         for (std::size_t i = 0; i < j; ++i) {
             if (!out.items[i].invalid.empty()) continue;
             const bool key_involved = detail::is_key_op(out.items[i].op) || detail::is_key_op(out.items[j].op);
-            // Related under a fold: a key op over an equal/ancestor/descendant key of any item, else the same key.
-            const auto related = [&](const std::vector<std::string>& k) {
-                return key_involved ? (detail::key_covers(k[i], k[j]) || detail::key_covers(k[j], k[i])) : k[i] == k[j];
-            };
-            const bool ascii_related = related(keys);
+            // Related under the ASCII fold: a key op over an equal/ancestor/descendant key of any item, else the same key.
+            const bool ascii_related = key_involved ? (detail::key_covers(keys[i], keys[j]) || detail::key_covers(keys[j], keys[i]))
+                                                    : keys[i] == keys[j];
             // Keys that differ only in the case of a non-ASCII character are one kernel key that apply's ASCII-only
             // handle map treats as two: the real run would refuse the second spelling (key_is_link) where the dry run
             // predicted it. The ASCII fold can neither prove them one nor apart, so such a plan is refused whole, as
-            // the value-name rule below does for non-ASCII names.
-            const bool spelling_clash = !ascii_related && related(skeletons);
+            // the value-name rule below does for non-ASCII names. Any shared path prefix counts, not only the whole key.
+            const bool spelling_clash = detail::ambiguous_shared_prefix(keys[i], keys[j], skeletons[i], skeletons[j]);
             const bool clash = spelling_clash || (ascii_related && (key_involved || names[i] == names[j] || non_ascii[i] || non_ascii[j]));
             if (clash)
                 return fail(std::string{kTokDependentItems} + ":" + std::to_string(i) + ":" + std::to_string(j));
