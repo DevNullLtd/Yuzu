@@ -208,6 +208,14 @@ jobs:
           node --version
           YUZU_REQUIRE_NODE=1 python3 tests/test_compose_wizard.py
 
+      # The /swagger page's renderer runs under node against a fake DOM. The meson entry
+      # skips without node, so run it here on the hosted image and fail rather than skip
+      # if node is missing.
+      - name: Swagger page behaviour
+        run: |
+          node --version
+          YUZU_REQUIRE_NODE=1 python3 tests/test_swagger_page_behaviour.py
+
       # Changelog promote --append (#5221): folds post-promotion hotfix
       # fragments into an already-promoted release section. Stdlib only.
       - name: Changelog promote --append
