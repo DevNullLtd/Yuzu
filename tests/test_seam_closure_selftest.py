@@ -1037,6 +1037,29 @@ def main() -> int:
                 _fail(f"{lane} lane: a missing declared file must fail and say to update {want_} AND "
                       f"the frozen pin; got ok={ok_} stderr={err_.getvalue()!r}", failures)
 
+        # 20e. A quote include that resolves OUTSIDE the repository root used to crash the walk with a
+        #      traceback (`relative_to`); it must be a clean unresolved-include `::error::` instead.
+        with tempfile.TemporaryDirectory() as outer_td:
+            outer = Path(outer_td).resolve()
+            (outer / "outside_hdr.hpp").write_text("#pragma once\n", encoding="utf-8")
+            inner = outer / "repo"
+            isrc, iinc, icommon = (inner / "server" / "core" / "src", inner / "server" / "core" / "include",
+                                   inner / "common" / "include")
+            for d_ in (isrc, iinc, icommon):
+                d_.mkdir(parents=True)
+            (isrc / "esc_routes.cpp").write_text('#include "../../../../outside_hdr.hpp"\n', encoding="utf-8")
+            err_ = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err_):
+                    ok_ = mod.check_family("outside-root", ["server/core/src/esc_routes.cpp"],
+                                           roots=mod.Roots(inner, isrc, iinc, icommon),
+                                           patterns=mod.FORBIDDEN_HEADER_PATTERNS)
+            except Exception as exc:   # noqa: BLE001 - the point is that nothing may escape
+                ok_, err_ = True, io.StringIO(f"raised {exc!r}")
+            if ok_ or "could not resolve quote-include" not in err_.getvalue():
+                _fail(f"an include resolving outside the repo root must fail with the unresolved-"
+                      f"include error, not pass or raise: ok={ok_} stderr={err_.getvalue()!r}", failures)
+
         # BOM / UTF-16 (bytes written explicitly: Windows editors and MSVC produce both).
         for form, raw in (("bom", b'\xef\xbb\xbf#include "hid_store.hpp"\nint x;\n'),
                           ("utf16_le", b'\xff\xfe' + '#include "hid_store.hpp"\nint x;\n'.encode("utf-16-le")),

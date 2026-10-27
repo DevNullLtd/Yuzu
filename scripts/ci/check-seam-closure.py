@@ -1119,11 +1119,17 @@ def resolve_include(includer: Path, is_angle: bool, name: str, roots: Roots = DE
     need not) see inside. See the module docstring's "INCLUDE RESOLUTION"
     section for why angle vs quote is not itself the external/internal
     signal in this codebase."""
+    def inside(candidate: Path):
+        # A header that resolves OUTSIDE the repository root (`"../../../x.h"`) is treated as not
+        # found: every error message and the chain printer assume root-relative paths.
+        resolved = candidate.resolve()
+        return resolved if roots.root.resolve() in resolved.parents else None
+
     if is_angle:
         for r in (roots.server_include, roots.common_include, *roots.extra_include):
             candidate = r / name
             if candidate.is_file():
-                return candidate.resolve()
+                return inside(candidate)
         return None
     # Quote form: directory of the includer first (ordinary compiler
     # behaviour), then the same internal roots plus server/core/src itself
@@ -1133,7 +1139,7 @@ def resolve_include(includer: Path, is_angle: bool, name: str, roots: Roots = DE
               *roots.extra_include, roots.server_src):
         candidate = d / name
         if candidate.is_file():
-            return candidate.resolve()
+            return inside(candidate)
     return None
 
 
