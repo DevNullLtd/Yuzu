@@ -45,6 +45,9 @@ power	macos	supported	pmset_log
 removable	windows	supported	wevtapi
 removable	linux	constrained	udev_netlink
 removable	macos	constrained	diskarbitration
+registry	windows	supported	regnotify
+registry	linux	unsupported	
+registry	macos	unsupported	
 usage	windows	supported	derived_process
 usage	linux	supported	derived_process
 usage	macos	constrained	derived_process

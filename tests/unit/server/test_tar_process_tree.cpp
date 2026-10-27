@@ -705,6 +705,38 @@ TEST_CASE("render_tar_capture_sources: rows, badges, staged toggles, device attr
     CHECK(html.find("capApplyBar") != std::string::npos);           // push bar present
 }
 
+TEST_CASE("render_tar_capture_sources: the registry source gets the System chip, a NEW badge and no PII badge",
+          "[tar][capture-sources]") {
+    const std::string compat =
+        "header|source|os|status|capture_method|notes\nrow|registry|windows|supported|etw|x\n";
+    const auto row = [](const std::string& h, const std::string& name) {
+        const auto b = h.find("<span class=\"src-name\">" + name + "</span>");
+        REQUIRE(b != std::string::npos);
+        return h.substr(b, h.find("</tr>", b) - b);
+    };
+    const auto npos = std::string::npos;
+
+    SECTION("reported by a Windows agent") {
+        const std::string html = render_tar_capture_sources(
+            "agent-123", "config|registry_enabled|true\nconfig|registry_live_rows|7\n", compat);
+        const auto r = row(html, "registry");
+        CHECK(r.find("badge-new") != npos);
+        CHECK(r.find("badge-pii") == npos); // values are unmasked, deliberately no PII badge
+        CHECK(r.find("<td class=\"cat\">System</td>") != npos);
+        CHECK(r.find("$Registry") != npos);
+        CHECK(r.find("data-source=\"registry\"") != npos); // a staged toggle, not locked
+        CHECK(html.find("data-cat=\"System\"") != npos);
+        // the sixth chip, filtering to the System category
+        CHECK(html.find("filterCap(this,'System')\">System</a>") != npos);
+    }
+    SECTION("an older agent that does not report registry_enabled: no row") {
+        const std::string html =
+            render_tar_capture_sources("agent-123", "config|process_enabled|true\n", compat);
+        CHECK(html.find("src-name\">registry<") == npos);
+        CHECK(html.find("$Registry") == npos);
+    }
+}
+
 TEST_CASE("render_tar_capture_sources: a paused core source reads paused with a locked unchecked box",
           "[tar][capture-sources]") {
     const std::string status =
