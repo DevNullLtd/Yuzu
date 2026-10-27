@@ -16,6 +16,8 @@
 
 Two read-only actions report whether boot-time and code-signing protections are configured on: `secure_boot` (is Secure Boot enforced) and `code_integrity` (is the OS restricting what code may run). Each writes rows of the form `<action>|<os>|<key>|<raw>|<state>`. Neither takes parameters, so no request text reaches a path, a registry name or a command line. Linux reads a few efivarfs and securityfs files; Windows reads registry values; macOS reports `secure_boot` as unsupported and runs `spctl --status` and `csrutil status` for `code_integrity`. Every read is a **value** with a state, **`absent`** (the OS definitively says it is not there) or **`unreadable`** (the read failed), and a failed read never reads as absent. `enabled`, `disabled` and `partial` describe the protection, not the raw number. The Windows rows report configured policy, not proof of what is running.
 
+This plugin's priority is asserted, not evidenced: it was built from a reading of a capability gap, and no capability-map requirement, parity gap, compliance control, roadmap item or named customer asks for it.
+
 ### What is read
 
 - **Linux** (`open` and `read`, errno classified, no process started). `secure_boot` reads the efivarfs `SecureBoot-*` and `SetupMode-*` variables (a 4-byte attribute word plus one data byte). `code_integrity` reads `/sys/kernel/security/lsm` (the active LSM list) and `/sys/kernel/security/lockdown` (the bracketed active mode).
