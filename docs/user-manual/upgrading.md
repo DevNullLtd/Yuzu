@@ -635,11 +635,14 @@ A refused request writes no quarantine record and releases none. The `403` bodie
 
 **Before you upgrade (checklist).**
 
-1. List your administrators and everyone who holds `Approval:Approve` (see "Find affected automation before you upgrade" below).
-2. Check who is enrolled: run the step-0 query in [Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#what-the-step-0-query-shows).
+1. List your administrators and everyone who holds `Approval:Approve` (see "Find affected automation before you upgrade" below). With RBAC enforcement off (the shipped default) the approvers are exactly the accounts with `role = 'admin'`; the step-0 query in step 2 returns the local ones that are not yet enrolled.
+2. Check who is enrolled: run the step-0 SQL, the first block of [Path A in the recovery runbook](../ops-runbooks/auth-db-recovery.md#path-a-an-enrolment-sign-in-window).
 3. Enrol each administrator in Settings → Security and sign-in → Two-factor sign-in; another administrator cannot do it for them.
 4. Plan each non-administrator approver (possible only once RBAC enforcement is on): it needs the runbook path, not Settings.
 5. A SAML deployment has no approver path (#6098); give those approvers a local or OIDC account first.
+6. Have at least two enrolled approvers: a submitter cannot review their own request, so a single enrolled approver cannot decide that approver's own requests.
+7. After the upgrade, run the approvals-refused query (step 6 of "After upgrading, verify approvals on a test request" below) to see whether approvals are being refused and why.
+8. Owners of scripts that run `yuzu-server --mfa-reset`, and of SIEM rules on `mfa.disabled` or `mfa.reset.breakglass`: `--mfa-reset` now exits `1` when ending the sessions fails (`result=partial`), when the audit store refuses its intent row, and when the clear itself fails; every clear writes two audit rows; a failed session delete is `result=partial`, not `success` (details in the `--mfa-reset` notice below).
 
 **What changed.** Approve and reject (`POST /api/approvals/{id}/approve`, `POST /api/approvals/{id}/reject`,
 the dashboard Approvals page, and the MCP tools `approve_request` / `reject_request`) now require all of:
@@ -710,7 +713,13 @@ principal and not an engine principal. The existing rule that the reviewer canno
     ends the account's sessions, and disabling MFA in Settings ends every session of the account, the one you
     are using included (neither ends API tokens). **`--mfa-reset` now exits non-zero when ending the sessions fails**
     (the factor is already cleared; it records `result=partial` in its audit row): scripts that run it and treat exit `0`
-    as success must handle that, and end the sessions by hand. **With RBAC enforcement off (the shipped default),** the legacy gate requires the `admin` role for
+    as success must handle that, and end the sessions by hand. It also exits `1` with
+    `error: audit store did not accept the intent row; nothing was changed` when the audit store refuses its `attempted`
+    intent row (nothing is cleared; a second line on stderr points at the runbook's "Fallback: direct SQL" section), and `1`
+    when the clear itself fails. Every reset, and every Settings disable, now
+    writes an extra `attempted` row before the outcome row, so a SIEM rule that counts one row per clear sees two; do
+    not match on `result <> 'success'` without excluding `attempted` and `detail LIKE 'blocked:%'` rows, and key
+    failure rules on `result IN ('partial','error')`. Order the pair by the audit `id`. **With RBAC enforcement off (the shipped default),** the legacy gate requires the `admin` role for
     approving, so a non-admin is refused `403` "admin role required" before the MFA check and enrolling a non-admin
     approver achieves nothing until RBAC enforcement is turned on.
   - **When the approver rule's own read fails** (an unreadable stored session proof for any approver, or, for a local
@@ -720,6 +729,12 @@ principal and not an engine principal. The existing rule that the reviewer canno
     whose MFA store is unreadable is refused first by the central check: `503` without `retry_after_ms`, counted as
     `yuzu_auth_secret_unavailable_total{route="mfa_stepup"}` and
     `yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}`.
+  - **An OIDC approver whose stored MFA proof is dated after the database clock** (the identity provider or the replica
+    that took the sign-in runs ahead of the database) is refused `503` with the message `the approver's identity-provider
+    MFA proof is dated after the database clock` and no `retry_after_ms`; audit `result=error`, `detail`
+    `approver_assurance:mfa_proof_clock_skew`. It is not counted in `route="approval"`. An administrator must correct clock
+    synchronisation between the identity provider, the Yuzu server and its database; see
+    [OIDC approvers refused with a clock-skew 503](../ops-runbooks/auth-db-recovery.md#oidc-approvers-refused-with-a-clock-skew-503).
 - **A same-site `Origin` (or `Referer`) is now required.** A browser or script `POST` to
   `/api/approvals/{id}/approve` or `/reject` that authenticates with a session cookie and carries no `Origin` or
   `Referer` naming this site now gets `403` (audited as `csrf.denied`; the server-wide same-site check answers it before the step-up check, so a cross-site request that also has a stale proof gets this `403`, not the step-up `401`, and spends no step-up). A script that
@@ -910,7 +925,9 @@ dispatches.
 
    A run of `approver_assurance:mfa_not_enrolled` means approvers still have to enrol; the runbook section
    [Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver) has the same query
-   and the enrolment paths.
+   and the enrolment paths. An `approver_assurance:mfa_proof_clock_skew` row with `result=error` means OIDC approvers are
+   being refused `503` because their proof is dated after the database clock; the fix is clock synchronisation (see
+   [OIDC approvers refused with a clock-skew 503](../ops-runbooks/auth-db-recovery.md#oidc-approvers-refused-with-a-clock-skew-503)).
 
 **Rolling back, or running mixed versions.** The approver-assurance change itself adds no schema; the separate
 scheduled-approval change (#6096, below) adds a data-only approvals step and a command-outbox index, both of which an
@@ -952,8 +969,8 @@ older binary ignores, so a rollback starts cleanly. What changes is which checks
   `DELETE /api/v1/sessions?username=<name>`. To find the accounts cleared during the mixed window, list the
   `mfa.disabled` and `mfa.reset.breakglass` rows in it. The bounds follow the same rules as the approval query below
   (UTC, an explicit `+00` on each, widened by a margin for clock skew). A row written by an old binary has no
-  `sessions_ended=` in its `detail`; an outcome row from this build always has one, except `no verified factor to clear`
-  (a cancelled, unfinished enrolment, which cleared nothing). This build also writes an `attempted` intent row before it
+  `sessions_ended=` in its `detail`; every `ok` or `success` outcome row from this build has one, except `no verified factor to clear`
+  (a cancelled, unfinished enrolment, which cleared nothing); an `error` row from the CLI has none. This build also writes an `attempted` intent row before it
   clears anything, and that row has no `sessions_ended=` either; the `result IN ('ok', 'success')` filter is what keeps
   those rows out of the list, so do not drop it.
 

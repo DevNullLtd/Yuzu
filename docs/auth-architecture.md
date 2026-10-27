@@ -945,7 +945,7 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   database clock: the gate reads the row and `db_now_ms` in one SELECT and requires `0 <= db_now_ms - mfa_verified_ms <= window`,
   with no `kWallSanitySkew` allowance, in addition to the cached monotonic check. A suspended host or paused VM freezes the
   monotonic anchor, so the cached check alone is not a ceiling; the replica's own `system_clock` is never the authority.
-  A degraded read is `503`; a missing or future-dated proof is a step-up `401` for a local session (an SSO session with no usable cached proof is refused earlier, `mfa_proof_missing`). With no SessionStore attached (a wiring fault: a serving process always has one) the
+  A degraded read is `503`; a missing or future-dated proof is a step-up `401` for a local session. An OIDC session with no usable cached proof is refused earlier, `403` `mfa_proof_missing`, with one exception: when the cached anchor is empty because the stored proof is dated after the database clock (the identity provider or the replica that took the sign-in runs ahead of the database; `derive_session_deadlines` drops such a proof), the refusal is its own `503` while the database clock is still behind that instant, because signing in again cannot fix it (see below). With no SessionStore attached (a wiring fault: a serving process always has one) the
   gate answers `503` and nothing is decided; the replica's wall clock never stands in for the database clock.
   Once the central check has passed (or with the window at `0`), a refusal for an unenrolled or proof-less caller is a `403`
   (`approver_assurance_required:mfa_not_enrolled`, `mfa_proof_missing`, `saml_mfa_unsupported`,
@@ -954,7 +954,13 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   is typed only when `--mfa-enforcement` does not protect the role, and `saml_mfa_unsupported` and
   `account_unavailable` are typed only with the window at `0` (`account_unavailable` also when the account disappears between two reads); a stale or pre-enrolment proof is the step-up `401`; and when the
   approver rule's own read fails (an unreadable stored proof, or an MFA-store fault at its own read) the answer is a
-  `503` with `retry_after_ms` and `yuzu_auth_secret_unavailable_total{route="approval"}`. With the window above `0`
+  `503` with `retry_after_ms` and `yuzu_auth_secret_unavailable_total{route="approval"}`. The clock-skew refusal is a separate outcome
+  (`ApproverMfaOutcome::Kind::kProofClockSkew`): `503`, audit `result=error` with detail `approver_assurance:mfa_proof_clock_skew`, an A4
+  error naming the database clock and a remediation to correct clock synchronisation, no `retry_after_ms`, and no increment of the
+  `route="approval"` counter, which stays a store-fault signal; the server logs an error line. A degraded durable-proof read is decided
+  first and answers the ordinary store-unavailable `503`. After the skew has passed, a session whose cached proof was dropped keeps an
+  empty anchor until its cache re-derives (a session write elsewhere, or a new sign-in) and answers `403` `mfa_proof_missing`, whose
+  remediation ends by asking the administrator to check clock synchronisation. With the window above `0`
   the central check answers first for a SAML session (generic `403`), for a deleted or deactivated local account
   (`401` `MFA step-up required`), for a stale proof (`401`, normally: the central
   and approver windows are both 300 by default, so the ticket-specific `approver_assurance:mfa_proof_stale` row exists
@@ -1021,9 +1027,12 @@ Consequences, each deliberate:
   `mfa.disabled`) is written BEFORE the clear and fails closed: the CLI prints `error: audit store did not accept the
   intent row; nothing was changed` and exits `1`, and Settings answers `503` with `Sec-Audit-Failed: true`, in
   either case with nothing changed. The outcome row follows the work, so no factor is cleared unless the intent row
-  is durable and a missing outcome row marks an incomplete clear. The residual, until the clear and the session delete
-  share one transaction, is the loss of the outcome row (the process dies after the clear, or the outcome write fails
-  after it): the factor is cleared, the sessions may be live, and the `attempted` row has nothing after it.
+  is durable (on the Settings route that relies on the audit store having opened and the audit writer being wired in, which
+  server boot requires; the CLI checks the write result directly) and an `attempted` row with no outcome row marks a clear that
+  was requested and whose outcome is unknown. The residual, until the clear and the session delete share one transaction, is the
+  loss of the outcome row (the process dies after the clear, or the outcome write fails after it): the factor is cleared, the
+  sessions may be live, and the `attempted` row has nothing after it; a process that dies before the clear leaves the same lone
+  row with the factor intact.
   `yuzu-server --mfa-reset` deletes the account's durable
   sessions in the same one-shot (`SessionStore::invalidate_user`, which bumps the generation so every
   replica drops its cached copy), and exits non-zero if that fails; the outcome row is `success` with
@@ -2069,9 +2078,10 @@ central check, but not the three JIT-elevation routes, which own their gate and 
 300 s window, so those still deny SAML). Approval approve/reject are among the 37 central
 routes, so with the window enabled the central check answers a SAML session first with this
 generic 403, and the handler never runs. They also carry their own, stricter approver gate
-(#6079), which refuses a SAML session in every configuration with
-`approver_assurance_required:saml_mfa_unsupported`, including with
-`--mfa-step-up-window-secs=0` (where the central check passes SAML through). The step-up decision
+(#6079), which refuses a SAML session in every configuration; the typed
+`approver_assurance_required:saml_mfa_unsupported` is what it answers with
+`--mfa-step-up-window-secs=0` (where the central check passes SAML through), and the
+generic `403` above answers first otherwise. The step-up decision
 (`decide_step_up` in `step_up_gate.cpp`, shared by the chokepoint and
 `require_mfa_step_up` in `mfa_step_up.cpp`) exits with an honest denial
 before reaching the local

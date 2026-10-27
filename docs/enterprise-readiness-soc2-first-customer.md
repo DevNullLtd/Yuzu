@@ -463,10 +463,15 @@ caller out too, except when it only cancels an enrolment that was never verified
 one commit and delete the account's sessions in another, so the pair is not atomic. Both audit the
 clear in two phases: an `attempted` intent row (`mfa.reset.breakglass` or `mfa.disabled`) is written
 first and fails closed, and an outcome row follows the work. No factor is cleared unless the intent
-row is durable; a missing outcome row marks an incomplete clear; the residual, until the clear and
-the session delete share one transaction, is the loss of the outcome row (a process that dies after
-the clear, or an outcome write that fails after it), which leaves the factor cleared, the sessions
-possibly live and an `attempted` row with nothing after it. If the session delete fails the factor
+row is durable (on the Settings route this relies on the audit store having opened and the audit
+writer being wired into the route, which server boot requires; the CLI checks the write result
+directly); an `attempted` row with no outcome row marks a clear that was requested and whose outcome
+is unknown; the residual, until the clear and the session delete share one transaction, is the loss
+of the outcome row (a process that dies after the clear, or an outcome write that fails after it),
+which leaves the factor cleared, the sessions possibly live and an `attempted` row with nothing after
+it. A process that dies between the intent write and the clear leaves the factor intact and the same
+lone `attempted` row, so that row alone does not prove the factor was cleared: check
+`auth.users.mfa_enrolled_at`. If the session delete fails the factor
 stays cleared and the sessions stay live until an operator ends them: Settings records `mfa.disabled`
 with `result=partial`, `--mfa-reset` records `mfa.reset.breakglass` with `result=partial` and exits
 non-zero (both with `sessions_ended=failed`), and the Settings page offers no retry control (an
@@ -548,9 +553,11 @@ acting session's principal, role and session id; `partial` or `sessions_ended=fa
 clear, and `error` marks a clear whose state is unknown. The `mfa.reset.breakglass` rows carry the OS
 identity that ran the command as principal; its outcome is `success`, `partial` (the session delete
 failed, detail `sessions_ended=failed`) or `error`. Both are inside the `auth-sample` export. An
-`attempted` row with no outcome row marks an incomplete clear: the process died, or the outcome write
-failed, after the factor was cleared. The reconciliation query that lists them is under "Finding a partial
-result" in `docs/ops-runbooks/auth-db-recovery.md`; the row definitions are in
+`attempted` row with no outcome row marks a clear that was requested and whose outcome is unknown: the
+process died, or the outcome write failed, after the factor was cleared, or the process died before the
+clear and the factor is intact. The reconciliation query that lists them is under "Finding a clear whose
+outcome is unknown" in `docs/ops-runbooks/auth-db-recovery.md`, which also has the query for outcome rows
+that ended `error` or `partial`; the row definitions are in
 `docs/user-manual/audit-log.md`.
 
 ---

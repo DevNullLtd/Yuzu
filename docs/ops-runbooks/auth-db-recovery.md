@@ -677,7 +677,8 @@ access* as equivalent to MFA-reset authority over every account:
 **Audit is mandatory and fail-closed.** The CLI first checks that the audit store opens, then writes the
 `attempted` intent row (`MFA clear requested via --mfa-reset CLI (os_identity=<account>)`) BEFORE it clears any MFA. If
 the audit store does not accept that row, the command prints `error: audit store did not accept the intent row; nothing
-was changed` and exits `1` without touching the account. The whole point is to replace the unaudited SQL path. A
+was changed` and exits `1` without touching the account; a second stderr line points at "Fallback: direct SQL" below, for the
+case where an operator is locked out and the audit store cannot be restored. The whole point is to replace the unaudited SQL path. A
 `{"status":"ok",…}` line with exit code 0 means both the intent row and the outcome row persisted.
 
 **It ends the account's sessions.** After clearing the factor the one-shot
@@ -698,7 +699,9 @@ sessions by hand" below. If the clear itself fails, the command ends no session 
 `error: failed to clear MFA; the state is unknown, check the account's status and re-run`, and the outcome row is
 `result=error` (`MFA clear failed; state unknown, re-run after checking status (os_identity=<account>)`). The commit
 acknowledgement may have been lost, so the clear MAY have landed: check the account's `mfa_enrolled_at` (null means
-no enrolled factor) before re-running. Disabling MFA from Settings ends **every** session of the
+no enrolled factor) before re-running. If it is null the clear landed, and because the CLI ends no session after a
+failed clear (the Settings route does), end the account's sessions by hand with
+`DELETE /api/v1/sessions?username=<name>` (see "Ending the sessions by hand" below). Disabling MFA from Settings ends **every** session of the
 account, the caller's included, and sends the browser to the landing page. If the
 durable delete fails there, the audit row is `mfa.disabled` with `result=partial` and
 `sessions_ended=failed`, the page says "MFA was disabled, but the account's sessions
@@ -714,8 +717,9 @@ administrator to check it and end the sessions." (check the account's enrolment 
 and end its sessions as below). Cancelling an enrolment that was never
 verified ends no session (`result=ok`, `no verified factor to clear`). Settings
 writes the same two rows. The `attempted` intent row (`MFA clear requested via Settings`) is written first and fails
-closed: if the audit store does not accept it, the page answers `503` ("Audit store unavailable; MFA was not
-changed.") and nothing is cleared. The outcome row is written after the changes and cannot undo them: if it cannot be
+closed: if the audit store does not accept it, the response is `503` with `Sec-Audit-Failed: true` and `Retry-After: 5`, the
+Two-factor sign-in panel of the Security settings page shows "Audit store unavailable; MFA was not changed." and nothing is
+cleared. Retry once the audit store has recovered, or tell the operator that the audit store needs attention. This guarantee on the Settings route relies on the audit store having opened and on the audit writer being wired into the route; server boot requires both (it refuses to start when the audit store cannot open, and binds the writer at boot). The CLI checks the intent write's result directly. The outcome row is written after the changes and cannot undo them: if it cannot be
 written the request still completes and the server logs an error. A failed audit write also increments
 `yuzu_server_audit_emit_failed_total`, which the `YuzuAuditPersistFailures` alert (critical) fires on, so a failed
 outcome write after a clear pages. The factor clear and the session delete are two separate database commits, so a
@@ -808,9 +812,32 @@ psql -q "$YUZU_POSTGRES_DSN" -c \
 A listed account is suspect, not proven: read its rows in `id` order (`timestamp` is whole seconds), check
 `auth.users.mfa_enrolled_at` (null means the factor is cleared), and if it is cleared end the account's sessions as
 above. The comparison is by count, so an old row from before the window can offset a lost one; it also lists a pair whose
-`attempted` row falls inside the window and whose outcome row falls just after it. A `result=error` outcome row means the
-clear reported a failure and its state is unknown (the commit acknowledgement may have been lost), so check those
-accounts the same way.
+`attempted` row falls inside the window and whose outcome row falls just after it. A requested clear can also leave
+the factor intact: if the process dies between the intent write and the clear, the account is unchanged, so read the
+`attempted` row as "requested, outcome unknown", not as proof that the factor was cleared. That query does **not** list
+a pair whose outcome row is `error`, because an `error` row counts as an outcome there; the next query does.
+
+**Finding a clear that ended `error` or `partial`.** A `result=error` outcome row means the clear reported a failure
+and its state is unknown (the commit acknowledgement may have been lost, so the clear may have landed); a
+`result=partial` row means the factor was cleared but its sessions were not ended. This query lists the last seven days
+of both, for either action, leaving out the `blocked:` self-target refusals (which are `error` rows for a request that
+changed nothing) and never matching the `attempted` intent rows:
+
+```bash
+psql -q "$YUZU_POSTGRES_DSN" -c \
+  "SELECT to_timestamp(timestamp) AT TIME ZONE 'UTC' AS at_utc, principal, action, result, target_id, detail
+     FROM audit_store.audit_events
+    WHERE action IN ('mfa.disabled', 'mfa.reset.breakglass')
+      AND result IN ('partial', 'error')
+      AND detail NOT LIKE 'blocked:%'
+      AND timestamp >= extract(epoch FROM now() - interval '7 days')
+    ORDER BY timestamp DESC;"
+```
+
+For each listed account check `auth.users.mfa_enrolled_at`. If it is NULL the clear landed: end the account's sessions
+by hand with `DELETE /api/v1/sessions?username=<name>` (the CLI ends no session after a failed clear, while the Settings
+route does), then run the "Check that no session remains" query. If it is not NULL the factor is intact; re-run the
+clear only if it is still wanted. A SIEM rule can use the same predicate.
 
 **Detective control.** Because the CLI exits without serving, it emits no
 Prometheus metric — the audit row is the only signal. Alert on
@@ -823,17 +850,35 @@ leaves an `attempted` row with no outcome row (the query above finds them); if `
 `yuzu_auth_session_store_degrade_total{op="invalidate_user"}` rose in the same minutes, treat a
 missing outcome row as unknown and end the sessions of any account that disabled MFA then.
 
+Every clear now writes two rows, the `attempted` intent row and then the outcome row, so a SIEM rule that counts these
+actions once per clear counts twice, and a rule written as `result <> 'success'` (or `result != 'ok'`) matches every
+intent row and every `blocked:` row. Exclude `result = 'attempted'` and `detail LIKE 'blocked:%'` from rules that look for
+failures, and key failure rules on `result IN ('partial','error')` as in the query above. Order the two rows by the audit
+`id` (`timestamp` is whole seconds).
+
 It is safe to run while the server is up: the one-shot opens its own pool and
 does not talk to the running process.
 
 ### Fallback: direct SQL
 
-Use it in two cases: no `yuzu-server` binary is available on the host, or
+Use it in three cases: no `yuzu-server` binary is available on the host;
 `--mfa-reset` fails with `kek_orphaned` because the stored secret's header names a
 key version that is not registered and that header is corrupt (see
 [Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version),
-where a restore of the paired backup comes first when the version once existed).
-**Last resort. It writes no audit row; record it manually in change management.**
+where a restore of the paired backup comes first when the version once existed); or
+`--mfa-reset` refuses with `error: audit store did not accept the intent row` while an
+operator is locked out and the audit store cannot be restored in the time available.
+**Last resort. It writes no audit row.** In the third case restore the audit store first
+and re-run `--mfa-reset`, which is the audited path; use this SQL only when that cannot be done,
+because it removes exactly the audit guarantee the CLI's refusal exists to keep.
+
+Because the database leaves no record of this path, the change-management record that
+follows it is the only evidence. It must state: who ran it (the OS account and the named
+person), when (date, time and time zone), why (the lockout and why neither `--mfa-reset` nor
+an audit-store restore was possible), the ticket reference, the account that was changed,
+the full SQL transcript (the `psql` session output, including the `COMMIT`), and who approved
+running it. Where the audit store later recovers, add a note to that ticket saying that no
+`mfa.reset.breakglass` or `mfa.disabled` row exists for this change.
 
 ```bash
 psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" <<'SQL'
@@ -1110,8 +1155,39 @@ SELECT detail, result, count(*) FROM audit_store.audit_events
 ```
 
 Run it with `psql "$YUZU_POSTGRES_DSN"`. A large count of `approver_assurance:mfa_not_enrolled` after an upgrade means
-the approvers still have to enrol (this section). The central step-up check's own refusals (a stale proof, SAML, an
+the approvers still have to enrol (this section); a row `approver_assurance:mfa_proof_clock_skew` with `result=error` is the
+next entry. The central step-up check's own refusals (a stale proof, SAML, an
 engine principal) are `mfa.step_up.required` rows, not `approval.*` rows, so they do not appear here.
+
+### OIDC approvers refused with a clock-skew 503
+
+**Symptom.** Every OIDC approver is refused with `503` and the message `the approver's identity-provider MFA proof is
+dated after the database clock`, and signing in again does not help. The body has no `retry_after_ms`, and the A4
+remediation says an administrator must correct clock synchronisation. Local-account approvers do not get this answer.
+
+**What to look for.** The audit trail has `approval.approve` / `approval.reject` rows with `result=error` and `detail`
+`approver_assurance:mfa_proof_clock_skew` (the "Seeing that approvals are being refused" query above lists them). The
+server log has error lines (one from the MFA check, one from the approval route) that contain `dated after the database clock`; grep for it:
+
+```bash
+grep 'dated after the database clock' /path/to/yuzu-server.log
+```
+
+`yuzu_auth_secret_unavailable_total{route="approval"}` does **not** move for this refusal, because that counter stays a
+store-fault signal. Do not conclude that the approval path is healthy from a flat counter.
+
+**Cause.** The proof timestamp stored with an OIDC session comes from the identity provider's ID token (clamped to the
+clock of the replica that took the sign-in), and the approver gate compares it with the database clock. A database
+clock that is behind the identity provider or that replica by more than the sign-in latency (a failover to a standby
+with a drifted clock, an NTP step, a resumed virtual machine) makes the stored proof read as dated in the future, so the
+gate refuses it.
+
+**Fix.** Correct time synchronisation (NTP or the platform's time service) on the database host, on the Yuzu server host
+and on the identity provider side, then have the approver sign in again. There is no retry hint because retrying cannot
+help until the clocks agree. Once the database clock has passed the stored instant the `503` stops; a session whose
+cached proof was dropped while the clocks disagreed then answers `403` `mfa_proof_missing` (whose remediation ends by
+asking the administrator to check clock synchronisation) until its cache re-derives, which happens on a session write
+elsewhere or on a new sign-in, so a fresh sign-in is the quickest way out.
 
 ### Path A: an enrolment sign-in window
 
@@ -1409,7 +1485,10 @@ approver whose MFA state cannot be read at that check (the window is `0` or less
 fault falls between the two reads), can still receive a `503` from that check (A4 envelope with `retry_after_ms`,
 counted `route="approval"` on `yuzu_auth_secret_unavailable_total`, audit
 `approval.approve` or `approval.reject` with `result=error` and `detail`
-`approver_assurance:mfa_store_unavailable`).
+`approver_assurance:mfa_store_unavailable`). A different `503` from the same route is the clock-skew refusal of an
+OIDC approver (`retry_after_ms` is null, audit `result=error` with `detail` `approver_assurance:mfa_proof_clock_skew`, not
+counted on `route="approval"`); it is not a store fault, and its entry is
+[OIDC approvers refused with a clock-skew 503](#oidc-approvers-refused-with-a-clock-skew-503).
 
 **The alert is slow by design.** `YuzuStepUpGateUnavailable` fires when the
 `unavailable` outcome counts at least **3** refusals in a 10-minute window for one
@@ -1489,7 +1568,10 @@ normal answer (for example a `401` challenge, counted `refused`) and `YuzuStepUp
 covers it is `YuzuAuditPersistFailures` (`docs/prometheus/yuzu-alerts.yml`), which
 fires on `increase(yuzu_server_audit_emit_failed_total[5m]) > 0` held for 2
 minutes, so allow for the 15 second refresh plus that hold. In that outage the
-refusal rows are lost and the counters are the only record.
+refusal rows are lost and the counters are the only record. The same alert covers the audit rows of an MFA clear
+done in Settings: an intent row the audit store refuses (the disable answers `503` and changes nothing) and an outcome
+row that is lost after a clear both increment `yuzu_server_audit_emit_failed_total`. `yuzu-server --mfa-reset` runs as
+its own process and exports no metric, so a refusal there is seen only in the command's output and exit status.
 
 **Probes during a stall.** `/livez` and `/login` stay fast (milliseconds,
 measured). `/readyz` does not flip at once. It answers from the latest result of
@@ -1574,7 +1656,7 @@ authentication store or reset the affected account. Know its limits:
   `/reject`), which keep their own gate whatever this value is (next bullet).
 - **Approval approve and reject keep a gate of their own.** The approver gate
   (#6079) ignores this flag: an approver still needs an enrolled factor and a
-  proof no older than 300 s on the database clock, a SAML session is still refused
+  proof no older than the approver window on the database clock, a SAML session is still refused
   `approver_assurance_required:saml_mfa_unsupported`, and an unreadable enrolment is
   still a `503`. The lever does not unblock approvals.
 - **Step-up evidence thins out.** While the window is `0` or less, no stale proof
