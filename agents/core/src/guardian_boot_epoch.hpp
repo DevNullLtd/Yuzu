@@ -24,7 +24,18 @@
 // invented in memory: an in-memory epoch would not be persisted, so the next boot would
 // repeat it. Epoch 0 makes the engine emit the pair as 0/0, which a pair-comparing
 // server treats as unordered and orders by the timestamp key instead. 0 is returned for:
-// a null store, a read error, a write failure, and a clock term at or above the ceiling.
+// a null store, a read error, a write failure, a clock term at or above the ceiling, and
+// a store that does not REPORT a durability level of FULL or stronger (see below).
+//
+// DURABILITY. The epoch write must survive power loss, or the next boot could re-issue an
+// equal or lower epoch for events already emitted under this one. Below FULL (PRAGMA
+// synchronous OFF or NORMAL; NORMAL in WAL can lose a committed transaction on power loss)
+// SQLite gives no such guarantee, so before writing the claim reads
+// IJournalStore::pragma_synchronous() and refuses (Outcome::DurabilityBelowFull, epoch 0,
+// nothing written) unless it reports 2 (FULL) or 3 (EXTRA). -1 (unreadable) is refused: a
+// level that cannot be shown is not assumed. A pragma read that throws is a failed read
+// (Outcome::ReadFailed). The shipped build defaults to FULL, so this is an enforcement
+// of that assumption, not a change for a correctly configured store.
 //
 // A stored value that is present but unusable (unparseable, trailing bytes, embedded
 // NUL, out of range, at or above the ceiling, or one whose successor would reach the
@@ -85,6 +96,7 @@ struct GuardianBootEpochClaim {
         ReadFailed,  ///< get_entry failed; epoch 0, nothing written
         WriteFailed, ///< set() failed; epoch 0
         OutOfRange,  ///< clock term at or above the ceiling; epoch 0, nothing written
+        DurabilityBelowFull, ///< synchronous below FULL or unreadable; epoch 0, nothing written
     };
 
     std::uint64_t boot_epoch = 0; ///< 0 means unordered (any outcome except Claimed/Recovered)

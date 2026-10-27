@@ -29,6 +29,8 @@ const char* outcome_name(Outcome o) noexcept {
         return "write_failed";
     case Outcome::OutOfRange:
         return "out_of_range";
+    case Outcome::DurabilityBelowFull:
+        return "durability_below_full";
     }
     return "unknown";
 }
@@ -41,7 +43,7 @@ struct Detail {
     std::size_t stored_len = 0;
     std::uint64_t clock = 0;
     std::uint64_t candidate = 0;
-    int synchronous = -2; // -2 = not read
+    int synchronous = -2; // -2 = not read; -3 = the read threw
 };
 
 // Full-consume decimal parse. from_chars stops at the first non-digit, so a suffix or an
@@ -98,6 +100,18 @@ GuardianBootEpochClaim claim_impl(IJournalStore* store, std::int64_t now_unix_s,
     if (d.candidate >= kGuardianBootEpochCeiling)
         return {0, Outcome::OutOfRange, persisted};
 
+    // The epoch write must survive power loss, or the next boot can re-issue an equal or lower
+    // epoch for events already emitted under this one. SQLite rolls back a committed but
+    // unsynced transaction below FULL (OFF, or NORMAL in WAL), so the claim is refused unless
+    // the store REPORTS FULL (2) or EXTRA (3). -1 (unreadable) is refused too: durability that
+    // cannot be shown is not assumed. A throwing read is a failed read (ReadFailed, nothing
+    // written), set below by on_throw before the call.
+    on_throw = Outcome::ReadFailed;
+    d.synchronous = -3;
+    d.synchronous = store->pragma_synchronous();
+    if (d.synchronous < 2)
+        return {0, Outcome::DurabilityBelowFull, persisted};
+
     on_throw = Outcome::WriteFailed;
     char buf[24];
     const auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), d.candidate);
@@ -112,7 +126,7 @@ GuardianBootEpochClaim claim_impl(IJournalStore* store, std::int64_t now_unix_s,
 void log_claim(IJournalStore* store, const GuardianBootEpochClaim& c, Detail& d,
                std::int64_t now_unix_s) noexcept {
     try {
-        if (store != nullptr)
+        if (store != nullptr && d.synchronous == -2)
             d.synchronous = store->pragma_synchronous();
         const char* stored = d.stored == Stored::Absent   ? "absent"
                              : d.stored == Stored::Parsed ? "parsed"

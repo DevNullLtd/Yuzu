@@ -42,6 +42,8 @@ public:
     bool fail_set = false;
     bool throw_get = false;
     bool throw_set = false;
+    bool throw_sync = false;
+    int sync_level = 2; // what pragma_synchronous() reports
     int set_calls = 0;
     int get_calls = 0;
 
@@ -55,7 +57,11 @@ public:
         return *r;
     }
 
-    int pragma_synchronous() override { return inner_.pragma_synchronous(); }
+    int pragma_synchronous() override {
+        if (throw_sync)
+            throw std::runtime_error("injected pragma_synchronous throw");
+        return sync_level;
+    }
     std::expected<KvNamespaceSize, KvStoreError> namespace_size(std::string_view p,
                                                                 std::string_view x) override {
         return inner_.namespace_size(p, x);
@@ -243,6 +249,69 @@ TEST_CASE("boot-epoch: a throwing store is a failed claim, never an exception",
         CHECK(c.outcome == Outcome::WriteFailed);
         CHECK(c.boot_epoch == 0);
     }
+}
+
+TEST_CASE("boot-epoch: a store below FULL durability issues no epoch", "[guardian][boot_epoch]") {
+    // UP-3: an epoch write that power loss can roll back could be re-issued by the next boot.
+    for (const int level : {0, 1, -1}) {
+        DYNAMIC_SECTION("synchronous " << level) {
+            FaultingStore s;
+            s.seed("77");
+            s.sync_level = level;
+            const auto c = claim_guardian_boot_epoch(&s, kNow);
+            CHECK(c.outcome == Outcome::DurabilityBelowFull);
+            CHECK(c.boot_epoch == 0);
+            CHECK(c.persisted == 77);
+            CHECK(s.set_calls == 0);
+            CHECK(s.stored() == "77"); // untouched
+        }
+    }
+    SECTION("an absent row stays absent") {
+        FaultingStore s;
+        s.sync_level = 1;
+        const auto c = claim_guardian_boot_epoch(&s, kNow);
+        CHECK(c.outcome == Outcome::DurabilityBelowFull);
+        CHECK(c.boot_epoch == 0);
+        CHECK(s.set_calls == 0);
+        CHECK(!s.stored().has_value());
+    }
+    SECTION("an unusable row is not overwritten either") {
+        FaultingStore s;
+        s.seed("not-a-number");
+        s.sync_level = 0;
+        const auto c = claim_guardian_boot_epoch(&s, kNow);
+        CHECK(c.outcome == Outcome::DurabilityBelowFull);
+        CHECK(c.boot_epoch == 0);
+        CHECK(s.set_calls == 0);
+        CHECK(s.stored() == "not-a-number");
+    }
+}
+
+TEST_CASE("boot-epoch: FULL and EXTRA durability claim normally", "[guardian][boot_epoch]") {
+    for (const int level : {2, 3}) {
+        DYNAMIC_SECTION("synchronous " << level) {
+            FaultingStore s;
+            s.seed("77");
+            s.sync_level = level;
+            const auto c = claim_guardian_boot_epoch(&s, kNow);
+            CHECK(c.outcome == Outcome::Claimed);
+            CHECK(c.boot_epoch == static_cast<std::uint64_t>(kNow));
+            CHECK(s.set_calls == 1);
+            CHECK(s.stored() == dec(static_cast<std::uint64_t>(kNow)));
+        }
+    }
+}
+
+TEST_CASE("boot-epoch: a throwing pragma_synchronous is a failed read, nothing written",
+          "[guardian][boot_epoch]") {
+    FaultingStore s;
+    s.seed("77");
+    s.throw_sync = true;
+    const auto c = claim_guardian_boot_epoch(&s, kNow);
+    CHECK(c.outcome == Outcome::ReadFailed);
+    CHECK(c.boot_epoch == 0);
+    CHECK(s.set_calls == 0);
+    CHECK(s.stored() == "77");
 }
 
 TEST_CASE("boot-epoch: a wiped row in the same second reuses the epoch (documented residual)",
