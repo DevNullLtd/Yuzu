@@ -860,6 +860,11 @@ TEST_CASE("DexApi: apps all vs windows on a 30k mixed-OS fleet (bench)", "[.][pg
             "'1.0.0.' || (k % 3) FROM generate_series(1, 30000) g, generate_series(1, 4) k";
         yuzu::server::pg::PgResult r{PQexec(conn.get(), sql.c_str())};
         REQUIRE(r.ok());
+        // A bulk insert leaves the planner without statistics until autovacuum
+        // gets to it; analyse now so no timed read straddles that change.
+        yuzu::server::pg::PgResult an{
+            PQexec(conn.get(), "ANALYZE guaranteed_state_store.guardian_observations")};
+        REQUIRE(an.ok());
     }
     const auto fleet = [] {
         yuzu::server::DexFleet f;
@@ -875,6 +880,9 @@ TEST_CASE("DexApi: apps all vs windows on a 30k mixed-OS fleet (bench)", "[.][pg
         const auto warm = api->apps("7d", scope);
         REQUIRE_FALSE(warm.degraded);
         REQUIRE(warm.population == population);
+        // Positive control: a fast read that returned nothing proves nothing.
+        REQUIRE(warm.apps_total == 200);
+        REQUIRE_FALSE(warm.apps.empty());
         std::vector<double> ms;
         for (int i = 0; i < 5; ++i) {
             const auto t0 = std::chrono::steady_clock::now();
@@ -886,9 +894,12 @@ TEST_CASE("DexApi: apps all vs windows on a 30k mixed-OS fleet (bench)", "[.][pg
         std::sort(ms.begin(), ms.end());
         return ms[2];
     };
+    // all first, windows, all again: neither scope owns the cold-cache read.
+    const double a1 = median_ms("all", 30000);
     const double w = median_ms("windows", 15000);
-    const double a = median_ms("all", 30000);
-    WARN("apps_bench windows_ms=" << w << " all_ms=" << a << " ratio=" << (a / w));
+    const double a2 = median_ms("all", 30000);
+    const double a = std::max(a1, a2);
+    WARN("apps_bench windows_ms=" << w << " all_ms=" << a1 << "," << a2 << " ratio=" << (a / w));
 }
 
 TEST_CASE("DexApi: apps with an invalid scope is degraded before policy or fleet",
