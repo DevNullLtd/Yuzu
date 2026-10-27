@@ -11,6 +11,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstring>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -121,7 +123,7 @@ TEST_CASE("registry encode REG_MULTI_SZ: LF-separated records; empty text is the
         CHECK(encode_value(kRegMultiSz, bad, {}, false).error == kTokInvalidData);
     CHECK(encode_value(kRegMultiSz, std::string_view{"a\0b", 3}, {}, false).error == kTokInvalidData);
     SECTION("the 1 MiB cap holds on the text and on the encoded bytes") {
-        // mutants: the text-size check removed; the encoded-size check removed
+        // mutants: drop the text-size check; drop the encoded-size check
         CHECK(encode_value(kRegMultiSz, std::string(kMaxWriteBytes + 1, 'x'), {}, false).error == kTokValueOverflow);
         // 600,000 ASCII characters are within the text bound but encode to 1,200,004 bytes (UTF-16, a record NUL
         // and the list NUL): over the cap.
@@ -261,6 +263,19 @@ TEST_CASE("registry audit_token: neutralises everything that could forge a field
     CHECK(audit_token("\\") == "_");
     CHECK(audit_token("a\\b\\") == "a\\b_");
     CHECK(audit_token("Caf\xC3\xA9") == "Caf\xC3\xA9");                   // valid UTF-8 survives
+    // ESC, the other C0 separators, DEL, C1 and the Unicode line breaks cannot split a line for a Unicode-aware reader
+    // or start a terminal escape either (#6492 Gate 4 UP-9).
+    CHECK(audit_token("a\x1b[31mb") == "a_[31mb");
+    CHECK(audit_token("a\x0b" "b\x0c" "c") == "a_b_c");                   // VT, FF
+    CHECK(audit_token("a\x1c" "b\x1d" "c\x1e" "d") == "a_b_c_d");         // FS, GS, RS
+    CHECK(audit_token("a\x7f" "b") == "a_b");                              // DEL
+    CHECK(audit_token("a\tb") == "a_b");                                   // log_token folds TAB here (sanitize_field keeps it)
+    CHECK(audit_token("a\xC2\x85" "b") == "a_b");          // U+0085
+    CHECK(audit_token("a\xC2\x9B" "31mb") == "a_31mb");    // C1 CSI U+009B
+    CHECK(audit_token("a\xC2\x9D" "0b") == "a_0b");        // C1 OSC U+009D
+    CHECK(audit_token("a\xE2\x80\xA8" "b") == "a_b");      // U+2028
+    CHECK(audit_token("a\xE2\x80\xA9" "b") == "a_b");      // U+2029
+    CHECK(audit_token("a\xE2\x80\xA7" "b") == "a\xE2\x80\xA7" "b"); // U+2027 is not a line break: kept
     SECTION("over the cap: cut on a character boundary, with ~<length>") {
         CHECK(audit_token(std::string(300, 'k')) == std::string(256, 'k') + "~300");
         CHECK(audit_token(std::string(256, 'k')) == std::string(256, 'k')); // exactly the cap: whole
@@ -271,6 +286,35 @@ TEST_CASE("registry audit_token: neutralises everything that could forge a field
         const auto t = audit_token(s);
         CHECK(t == std::string(255, 'k') + "~" + std::to_string(s.size()));
     }
+    SECTION("the cap is measured after folding: 257 raw bytes holding two U+2028 fold to 253 and stay whole") {
+        const std::string raw = std::string(125, 'k') + "\xE2\x80\xA8" + std::string(126, 'k') + "\xE2\x80\xA8";
+        REQUIRE(raw.size() == 257);
+        CHECK(audit_token(raw) == std::string(125, 'k') + "_" + std::string(126, 'k') + "_");
+    }
+}
+
+TEST_CASE("registry get_value_error_line: grew-through-the-re-reads, not found, and every other code",
+          "[registry][parsers]") {
+    CHECK(get_value_error_line(kErrorMoreData, "K") ==
+          yuzu::profiles::render_user_key_error(yuzu::profiles::UserKeyStatus::value_changed_during_read, "K"));
+    CHECK(get_value_error_line(kErrorFileNotFound, "K") == "error|value not found");
+    CHECK(get_value_error_line(kErrorPathNotFound, "K") == "error|value not found");
+    CHECK(get_value_error_line(kErrorAccessDenied, "K") == "error|win32:5");
+    CHECK(get_value_error_line(1018, "K") == "error|win32:1018");
+}
+
+TEST_CASE("registry output row: a NUL in registry text does not cut the row at the C-string ABI",
+          "[registry][parsers]") {
+    using namespace std::string_view_literals;
+    // registry_win.cpp renders `value|<sanitize_field(text)>`; write_output hands the row on as a C string.
+    const std::string row = "value|" + yuzu::profiles::sanitize_field("A\0B\0\0"sv);
+    CHECK(row == "value|A_B");
+    CHECK(std::strlen(row.c_str()) == row.size());
+    yuzu::profiles::ProfileInfo info{"S-1-5-21-1", std::string{"j\0smith"sv}, std::string{"C:\\Users\\j\0smith"sv}, // personal-data-ok: synthetic fixture account, not a real user
+                                     yuzu::profiles::HiveState::loaded};
+    const std::string prow = yuzu::profiles::render_profile_row(info);
+    CHECK(std::strlen(prow.c_str()) == prow.size());
+    CHECK(prow == "S-1-5-21-1|j_smith|C:\\Users\\j_smith|loaded"); // personal-data-ok: synthetic fixture account, not a real user
 }
 
 TEST_CASE("registry render_audit_line: byte-exact grammar", "[registry][parsers]") {
@@ -482,7 +526,7 @@ TEST_CASE("registry audit producer contract: no pipe LF or CR survives and the f
 
 TEST_CASE("registry exception_audit_line: one fixed 19-field literal per mutating action", "[registry][parsers]") {
     // The literal is what render_audit_line makes of a record that knows only the op, the failure and its reason.
-    for (const char* op : {"set_value", "delete_value", "delete_key"}) {
+    for (const char* op : {"set_value", "delete_value", "delete_key", "set_user_value", "delete_user_value", "apply"}) {
         INFO(op);
         AuditRecord x;
         x.op = op;
@@ -497,7 +541,283 @@ TEST_CASE("registry exception_audit_line: one fixed 19-field literal per mutatin
     }
     SECTION("a read action, an unknown one and the empty name have none") {
         for (const char* action : {"get_value", "key_exists", "enumerate_keys", "enumerate_values", "get_user_value",
-                                   "list_profiles", "", "Set_Value", "set_value "})
+                                   "list_profiles", "", "Set_Value", "set_value ", "apply.set_value", "Apply", "set_user_values"})
             CHECK(exception_audit_line(action).empty());
     }
 }
+
+// ── the registry 2.1.0 classifiers ────────────────────────────────────────
+
+TEST_CASE("registry parse_bool_param: empty is the default; true/1/false/0 only; anything else is nullopt",
+          "[registry][parsers]") {
+    CHECK(parse_bool_param("", false) == std::optional<bool>{false});
+    CHECK(parse_bool_param("", true) == std::optional<bool>{true}); // apply's dry_run defaults to true
+    for (const bool def : {false, true}) {
+        CHECK(parse_bool_param("true", def) == std::optional<bool>{true});
+        CHECK(parse_bool_param("1", def) == std::optional<bool>{true});
+        CHECK(parse_bool_param("false", def) == std::optional<bool>{false});
+        CHECK(parse_bool_param("0", def) == std::optional<bool>{false});
+        for (const char* bad : {"True", "FALSE", "yes", "no", "2", "-1", "t", " true", "true ", "maybe", "00", "on"})
+            CHECK_FALSE(parse_bool_param(bad, def).has_value());
+    }
+}
+
+TEST_CASE("registry classify_offline_write_race: only a hive found loaded after an offline write or a probe that "
+          "failed is worth saying",
+          "[registry][parsers]") {
+    CHECK(classify_offline_write_race(false, true, 0).empty());   // never mounted offline: the live arm, nothing to probe
+    CHECK(classify_offline_write_race(true, false, 0).empty());   // nothing was written
+    CHECK(classify_offline_write_race(true, true, kErrorFileNotFound).empty()); // the clean answer: no hive loaded now
+    CHECK(classify_offline_write_race(true, true, kErrorPathNotFound).empty());
+    CHECK(classify_offline_write_race(true, true, kErrorSuccess) == "hive_loaded_after_offline_write");
+    CHECK(classify_offline_write_race(true, true, kErrorAccessDenied) == "hive_post_unload_probe_failed:win32_5");
+    CHECK(classify_offline_write_race(true, true, 1450) == "hive_post_unload_probe_failed:win32_1450");
+}
+
+TEST_CASE("registry restorable: whether this plugin could write a captured previous value back as it was",
+          "[registry][parsers]") {
+    const auto present = [](std::uint32_t type, Bytes bytes, std::size_t total = 0) {
+        OldValue v;
+        v.state = OldState::present;
+        v.type = type;
+        v.total = total != 0 ? total : bytes.size();
+        v.bytes = std::move(bytes);
+        return v;
+    };
+    SECTION("nothing to write back is always restorable") {
+        CHECK(restorable(OldValue{}));                    // absent
+        OldValue unreadable;
+        unreadable.state = OldState::unreadable;
+        CHECK(restorable(unreadable));
+    }
+    SECTION("a writable type of a valid shape") {
+        CHECK(restorable(present(kRegDword, B({1, 0, 0, 0}))));
+        CHECK(restorable(present(kRegQword, Bytes(8, 1))));
+        CHECK(restorable(present(kRegSz, B({0x61, 0, 0, 0}))));
+        CHECK(restorable(present(kRegBinary, Bytes{})));         // a zero-byte binary
+        CHECK(restorable(present(kRegMultiSz, B({0, 0, 0, 0}))));
+    }
+    SECTION("a type this plugin cannot write: REG_NONE, REG_LINK, REG_DWORD_BIG_ENDIAN, anything unknown") {
+        for (const std::uint32_t t : {0u, 5u, 6u, 7u, 8u, 11u, 99u}) {
+            INFO("type " << t);
+            CHECK_FALSE(restorable(present(t, B({1, 2, 3, 4}))));
+        }
+    }
+    SECTION("a shape set_value would refuse") {
+        CHECK_FALSE(restorable(present(kRegDword, B({1, 2}))));
+        CHECK_FALSE(restorable(present(kRegQword, B({1, 2, 3, 4}))));
+        CHECK_FALSE(restorable(present(kRegSz, B({0x61, 0}))));        // no terminating NUL unit
+        CHECK_FALSE(restorable(present(kRegMultiSz, B({0x61, 0, 0, 0})))); // not a double NUL
+    }
+    SECTION("a capture cut at kCaptureValueCap is judged by its type and size, not by the part it kept") {
+        // 4,096 bytes of a 10,000-byte REG_DWORD would fail the shape check; the real value is not the capture
+        CHECK(restorable(present(kRegBinary, Bytes(4096, 7), 10000)));
+        CHECK(restorable(present(kRegSz, Bytes(4096, 7), 10000)));
+        CHECK_FALSE(restorable(present(0, Bytes(4096, 7), 10000)));    // still not a writable type
+    }
+    SECTION("a value over kMaxWriteBytes could not be written back either") {
+        CHECK(restorable(present(kRegBinary, Bytes(4096, 1), kMaxWriteBytes)));
+        CHECK_FALSE(restorable(present(kRegBinary, Bytes{}, kMaxWriteBytes + 1)));
+        CHECK_FALSE(restorable(present(kRegBinary, Bytes(4096, 1), kMaxWriteBytes + 1)));
+    }
+}
+
+TEST_CASE("registry recursion and plan limits", "[registry][parsers]") {
+    // The numbers the README and the definitions quote that no behavioural test pins by value.
+    CHECK(kMaxTreeNodes == 10000);
+    CHECK(kMaxTreeDepth == 600);
+    CHECK(kMaxPlanBytes == 65536);
+}
+
+// ── prepare_set (the front half of set_value) ────────────────────────────
+
+namespace {
+
+struct Prep {
+    AuditRecord au;
+    PreparedSet p;
+};
+
+Prep prep(std::string_view type, std::string_view value, std::string_view data_hex = {},
+          std::string_view key = "SOFTWARE\\Acme", std::string_view name = "V") {
+    Prep r;
+    r.p = prepare_set(r.au, key, name, type, value, data_hex);
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("registry prepare_set encodes each of the six types from text and records them on the audit record",
+          "[registry][parsers]") {
+    const auto check = [](std::string_view type, std::string_view value, const Bytes& want) {
+        INFO(type);
+        const auto r = prep(type, value);
+        CHECK(r.p.err.empty());
+        REQUIRE(r.p.type.has_value());
+        CHECK(r.p.enc.bytes == want);
+        CHECK(r.au.type_name == type);
+        CHECK(r.au.len == static_cast<long long>(want.size()));
+        CHECK(r.au.new_bytes == want);
+        CHECK(r.au.new_total == want.size());
+        CHECK(r.au.has_new);
+    };
+    check("REG_SZ", "hi", B({0x68, 0, 0x69, 0, 0, 0}));
+    check("REG_EXPAND_SZ", "%P%", B({0x25, 0, 0x50, 0, 0x25, 0, 0, 0}));
+    check("REG_DWORD", "7", B({7, 0, 0, 0}));
+    check("REG_QWORD", "7", B({7, 0, 0, 0, 0, 0, 0, 0}));
+    check("REG_MULTI_SZ", "a\nb", B({0x61, 0, 0, 0, 0x62, 0, 0, 0, 0, 0}));
+    check("REG_BINARY", "0aff", B({0x0a, 0xff}));
+    SECTION("data_hex carries the bytes instead of the text") {
+        const auto r = prep("REG_BINARY", {}, "0AFF");
+        CHECK(r.p.err.empty());
+        CHECK(r.p.enc.bytes == B({0x0a, 0xff}));
+        CHECK(r.au.has_new);
+    }
+}
+
+TEST_CASE("registry prepare_set: an empty type is REG_SZ", "[registry][parsers]") {
+    const auto r = prep({}, "x");
+    CHECK(r.p.err.empty());
+    REQUIRE(r.p.type.has_value());
+    CHECK(*r.p.type == kRegSz);
+    CHECK(r.au.type_name == "REG_SZ");
+}
+
+TEST_CASE("registry prepare_set: an empty value with no data_hex (a missing or misspelt parameter) is the empty "
+          "form, and refused for the numeric types",
+          "[registry][parsers]") {
+    CHECK(prep("REG_SZ", {}).p.enc.bytes == B({0, 0}));
+    CHECK(prep("REG_SZ", {}).p.err.empty());
+    CHECK(prep("REG_BINARY", {}).p.enc.bytes.empty());
+    CHECK(prep("REG_BINARY", {}).p.err.empty());
+    CHECK(prep("REG_DWORD", {}).p.err == kTokInvalidData);
+    CHECK_FALSE(prep("REG_DWORD", {}).au.has_new);
+}
+
+TEST_CASE("registry prepare_set: data_hex that is not hex, or of odd length, is invalid_data with nothing recorded",
+          "[registry][parsers]") {
+    for (const char* bad : {"zz", "abc"}) {
+        INFO(bad);
+        const auto r = prep("REG_BINARY", {}, bad);
+        CHECK(r.p.err == kTokInvalidData);
+        CHECK_FALSE(r.au.has_new);
+        CHECK(r.au.len == -1);
+        CHECK(r.au.type_name == "REG_BINARY");
+    }
+}
+
+TEST_CASE("registry prepare_set: data_hex over 2*kMaxWriteBytes characters and text over the cap are value_overflow",
+          "[registry][parsers]") {
+    const auto hex = prep("REG_BINARY", {}, std::string(kMaxWriteBytes * 2 + 2, 'a'));
+    CHECK(hex.p.err == kTokValueOverflow);
+    CHECK_FALSE(hex.au.has_new);
+    const auto text = prep("REG_SZ", std::string(kMaxWriteBytes + 1, 'x'));
+    CHECK(text.p.err == kTokValueOverflow);
+    CHECK_FALSE(text.au.has_new);
+}
+
+TEST_CASE("registry prepare_set: an unknown type, a bad key path or value name; precedence key path > value name > type",
+          "[registry][parsers]") {
+    const auto link = prep("REG_LINK", "x");
+    CHECK(link.p.err == kTokInvalidType);
+    CHECK_FALSE(link.p.type.has_value());
+    CHECK(link.au.type_name == "REG_LINK");
+    CHECK_FALSE(link.au.has_new);
+
+    const auto bad_key = prep("REG_SZ", "x", {}, std::string(300, 'k'));
+    CHECK(bad_key.p.err == kTokInvalidKeyPath);
+    CHECK(bad_key.au.type_name == "REG_SZ");
+    CHECK_FALSE(bad_key.au.has_new);
+    CHECK(prep("REG_SZ", "x", {}, "SOFTWARE\\Acme", "a\rb").p.err == kTokInvalidValueName);
+
+    CHECK(prep("REG_LINK", "x", {}, std::string(300, 'k'), "a\rb").p.err == kTokInvalidKeyPath);
+    CHECK(prep("REG_LINK", "x", {}, "SOFTWARE\\Acme", "a\rb").p.err == kTokInvalidValueName);
+}
+
+// ── resolve_target / is_sensitive_hklm_path ─────────────────────────────
+
+TEST_CASE("registry resolve_target: both parameters, then one of the four hive names", "[registry][parsers]") {
+    const auto missing = [](std::string_view hive, std::string_view key) {
+        const auto p = resolve_target(hive, key);
+        CHECK_FALSE(p.has_value());
+        CHECK(p.error() == kErrMissingHiveKey);
+    };
+    missing("", "k");
+    missing("HKLM", "");
+    missing("", "");
+    for (const char* hive : {"HKEY_LOCAL_MACHINE", "hklm", "HKLM "}) {
+        const auto p = resolve_target(hive, "k");
+        CHECK_FALSE(p.has_value());
+        CHECK(p.error() == kErrInvalidHive);
+    }
+    CHECK(kErrMissingHiveKey == "error|missing required parameters: hive, key");
+    CHECK(kErrInvalidHive == "error|invalid hive (use HKLM, HKCU, HKCR, or HKU)");
+    CHECK(*resolve_target("HKLM", "k") == Hive::hklm);
+    CHECK(*resolve_target("HKCU", "k") == Hive::hkcu);
+    CHECK(*resolve_target("HKCR", "k") == Hive::hkcr);
+    CHECK(*resolve_target("HKU", "k") == Hive::hku);
+    CHECK(resolve_target("HKU", "k").has_value());
+}
+
+TEST_CASE("registry is_sensitive_hklm_path: the Run keys and the service tree under HKLM, any ASCII case",
+          "[registry][parsers]") {
+    CHECK(is_sensitive_hklm_path("HKLM", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"));
+    CHECK(is_sensitive_hklm_path("HKLM", "software\\MICROSOFT\\windows\\currentversion\\runonce"));
+    CHECK(is_sensitive_hklm_path("HKLM", "System\\CurrentControlSet\\Services"));
+    CHECK(is_sensitive_hklm_path("HKLM", "SYSTEM\\CURRENTCONTROLSET\\SERVICES\\Foo\\Parameters"));
+    CHECK_FALSE(is_sensitive_hklm_path("HKCU", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"));
+    CHECK_FALSE(is_sensitive_hklm_path("HKLM", "SOFTWARE\\Other"));
+    CHECK_FALSE(is_sensitive_hklm_path("HKLM", "SYSTEM\\CurrentControlSet\\Servic")); // shorter than the prefix
+    CHECK_FALSE(is_sensitive_hklm_path("HKLM", ""));
+}
+
+// ── kernel_name_well_formed ─────────────────────────────────────────────
+
+namespace {
+// Both instantiations: char16_t on every host, and wchar_t (the shell's) where it is 16 bits.
+bool well_formed(std::u16string_view s) {
+    const bool got = kernel_name_well_formed(s);
+#if defined(_WIN32)
+    const std::wstring w(s.begin(), s.end());
+    CHECK(kernel_name_well_formed(std::wstring_view{w}) == got);
+#endif
+    return got;
+}
+} // namespace
+
+TEST_CASE("registry kernel_name_well_formed: no NUL unit, no lone surrogate; a pair and the empty name pass",
+          "[registry][parsers]") {
+    CHECK(well_formed(u""));
+    CHECK(well_formed(u"L"));
+    CHECK(well_formed(u"\\REGISTRY\\MACHINE\\L\\Caf\u00e9"));
+    CHECK(well_formed(u"L\xD800\xDC00")); // a pair
+    CHECK_FALSE(well_formed(u"L\xD800"));  // lone high, at the end
+    CHECK_FALSE(well_formed(u"L\xD800x"));  // lone high, followed by a plain unit
+    CHECK_FALSE(well_formed(u"L\xD800\xD800\xDC00")); // a high before a pair
+    CHECK_FALSE(well_formed(u"L\xDC00"));  // lone low
+    CHECK_FALSE(well_formed(u"\xDC00\xD800")); // reversed pair
+    CHECK_FALSE(well_formed(u"\xD800"));
+    CHECK_FALSE(well_formed(std::u16string_view{u"L\0", 2}));
+    CHECK_FALSE(well_formed(std::u16string_view{u"\0L", 2}));
+}
+
+TEST_CASE("registry kernel_name_well_formed: a high surrogate pairs only with a low one, at both ends of each range",
+          "[registry][parsers]") {
+    // the unit after a high surrogate must be DC00..DFFF: below it and above it are both lone highs
+    CHECK_FALSE(well_formed(u"\xD800\xDBFF")); // another high
+    CHECK_FALSE(well_formed(u"\xD800\xE000")); // the first unit above the low range
+    CHECK_FALSE(well_formed(u"\xD800\xFFFF"));
+    CHECK(well_formed(u"\xD800\xDC00"));       // the first pair
+    CHECK(well_formed(u"\xD800\xDFFF"));
+    // the last high surrogate is DBFF: alone it is lone, with a low after it it is a pair
+    CHECK_FALSE(well_formed(u"\xDBFF"));
+    CHECK(well_formed(u"\xDBFF\xDFFF"));
+    CHECK(well_formed(u"\xDBFF\xDC00"));
+    // and the unit just past each range is an ordinary character
+    CHECK(well_formed(u"\xD7FF"));
+    CHECK(well_formed(u"\xE000"));
+}
+
+// ERROR_INVALID_DATA: what an exact enumeration answers for a raw name that is not well-formed UTF-16
+// (Win32Registry::enumerated_name). registry_win.cpp pins the number on Windows only; this pins it on every host.
+static_assert(kErrorInvalidData == 13, "ERROR_INVALID_DATA");
