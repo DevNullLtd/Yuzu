@@ -65,12 +65,29 @@
 // process holds it. The loser keeps running with epoch 0, so its events are unordered (0/0)
 // rather than colliding with the holder's. The lock is held for the life of the process and
 // the kernel drops it at exit, so a crash leaves no stale lock; acquisition retries for a
-// short bounded time so a service restart that overlaps the old process's shutdown still
-// claims. Limits: it excludes only processes that run this code (an older agent binary
-// sharing the data directory does not take it, so a mixed-version pair is still unguarded);
-// a file system that does not support the lock reports the claim as unordered (epoch 0)
-// rather than guessing; and the lock guards the epoch claim only, not the rest of the data
-// directory (the identity and command-dedup stores have never been exclusive).
+// short bounded time (5 s in the agent) so a service restart that overlaps the old process's
+// shutdown still claims; the agent's worst-case teardown is longer than that (the two-watchdog
+// shutdown comment in agent.cpp), so a restart that overlaps a slow teardown claims 0/0 for that
+// whole process lifetime, with the instance_lock=contended error line. Limits:
+//   * it excludes only processes that run this code. An agent build that stamps the pair but
+//     predates the lock does not take it; none is on origin/dev, so only an unreleased build
+//     of this feature can be such a process.
+//   * it is a same-host guard. A data directory shared between hosts over a network file
+//     system is outside it (flock semantics there are the file system's, and a host-local
+//     fallback is not excluded across hosts).
+//   * the lock file is opened without following a symlink, must be a regular file, and after
+//     locking is re-resolved by path and compared with the locked file (device and inode); a
+//     file unlinked or replaced before the lock is therefore detected and re-locked. A file
+//     unlinked or replaced AFTER a successful claim is not detected: a second process would
+//     lock the new file and claim again. That needs write access to the data directory,
+//     which already allows rewriting kv_store.db itself.
+//   * a file system that does not support the lock reports the claim as unordered (epoch 0)
+//     rather than guessing, and a lock that cannot be taken for any reason other than a
+//     holder (Windows: a backup or antivirus handle open past the wait) is the same.
+//   * the lock guards the epoch claim only, not the rest of the data directory (the identity
+//     and command-dedup stores have never been exclusive).
+//   * there is no in-process recovery: a process that lost the lock stays at epoch 0 until it
+//     restarts, because a later claim could land between the holder's own claims.
 //
 // DOCUMENTED RESIDUAL. If the KV row is wiped AND the agent restarts within the same
 // wall-clock second as the previous boot, the new epoch equals the previous one (both
@@ -125,8 +142,7 @@ struct GuardianBootEpochClaim {
 /// Process-lifetime exclusive advisory lock on a file, the single-writer guard for the boot
 /// epoch claim (see SINGLE-WRITER GUARD above). Move-only RAII: the handle is closed, and the
 /// lock dropped, on destruction. POSIX uses flock(LOCK_EX | LOCK_NB) on an O_CLOEXEC
-/// descriptor, so a spawned plugin never inherits and outlives it; Windows opens the file with
-/// share mode 0. Never throws. The handle is stored as an integer so the header carries no
+/// descriptor, so an exec'd child never inherits it; Windows opens the file with share mode 0. Never throws. The handle is stored as an integer so the header carries no
 /// platform type.
 class YUZU_EXPORT GuardianInstanceLock {
 public:
@@ -152,13 +168,23 @@ public:
 
     [[nodiscard]] State state() const noexcept { return state_; }
     [[nodiscard]] bool held() const noexcept { return state_ == State::Held; }
+    /// errno (POSIX) or GetLastError() (Windows) of the last failed or contended attempt;
+    /// 0 when held or never attempted. ESTALE / ERROR_FILE_INVALID means the lock file kept
+    /// being replaced while it was locked.
+    [[nodiscard]] int native_error() const noexcept { return native_error_; }
 
 private:
     void release() noexcept;
 
     std::intptr_t handle_ = -1; ///< POSIX fd or Windows HANDLE; -1 = none
     State state_ = State::NotAcquired;
+    int native_error_ = 0;
 };
+
+/// The stable snake_case name of an outcome, as written in the claim log line
+/// (`outcome=<name>`) and quoted by the operator documentation. Never null.
+[[nodiscard]] YUZU_EXPORT const char*
+guardian_boot_epoch_outcome_name(GuardianBootEpochClaim::Outcome o) noexcept;
 
 /// Claim this boot's epoch. `now_unix_s` is the wall clock in whole seconds; a value
 /// <= 0 contributes 0 to the clock term. Never throws; logs one structured line.

@@ -884,14 +884,16 @@ public:
         // (epoch 0 = unordered: the wire pair is 0/0, which a pair-comparing server treats
         // as unordered and orders by the timestamp key). The literal `false` stays visible on
         // purpose: prefer_spark_ is never passed true in production.
-        const auto now_unix_s = std::chrono::duration_cast<std::chrono::seconds>(
-                                    std::chrono::system_clock::now().time_since_epoch())
-                                    .count();
         // UP-9: exclusive per-data-dir lock held for the life of the process (a member, so it
         // outlives guardian_). The wait covers a service restart overlapping the old process's
         // shutdown. A loser (or an unsupported file system) claims epoch 0 and emits 0/0.
         guardian_instance_lock_ = GuardianInstanceLock::acquire(
             cfg_.data_dir / "guardian_boot_epoch.lock", std::chrono::seconds{5});
+        // Read AFTER the wait: the clock term of the epoch is the time of the claim, and a wait of
+        // up to 5 s would otherwise make it stale.
+        const auto now_unix_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
         const auto boot_epoch_claim =
             claim_guardian_boot_epoch(kv_store_.get(), now_unix_s, guardian_instance_lock_);
         guardian_ =

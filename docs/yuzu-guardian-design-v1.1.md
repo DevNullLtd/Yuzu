@@ -1004,12 +1004,17 @@ Known limits of the boot epoch:
   the new epoch equals the previous one and `emit_seq` restarts at 1 (accepted by the UP-14
   residual-acceptance ruling; the equal epoch is pinned by a test).
 - A single writer is enforced for processes that run this code (UP-9): the agent holds an
-  exclusive advisory lock on `<data-dir>/guardian_boot_epoch.lock` for the life of the process,
-  and a second agent process on the same data directory claims no epoch (`instance_lock_not_held`)
-  and emits unordered 0/0 events instead of colliding with the first. The lock guards only the
-  epoch claim, not the rest of the data directory. It does not exclude an older agent binary
-  without the lock, so a mixed-version pair can still claim the same epoch and draw overlapping
-  `emit_seq` values; a file system that does not support the lock leaves the agent unordered.
+  exclusive advisory lock on `<data-dir>/guardian_boot_epoch.lock` for the life of the process
+  (waiting up to 5 s for a previous process to exit), and a process that cannot take it claims
+  no epoch (`instance_lock_not_held`, with `instance_lock=contended` or `failed`) and emits
+  unordered 0/0 events instead of colliding with the holder. The lock guards only the epoch
+  claim, not the rest of the data directory. Limits: an agent build that predates the lock does
+  not take it; it is a same-host guard; the 5 s wait is shorter than the agent's worst-case
+  shutdown, so a restart that overlaps a slow teardown runs unordered until its next restart;
+  a lock file that is removed or replaced after the claim is not detected (it needs write
+  access to the data directory); and a file system that does not support the lock, or a
+  Windows handle held open past the wait, leaves the agent unordered. The recovery is a restart
+  with the cause fixed; the process does not retry.
 - A clock wrongly ahead at boot pins the epoch ahead, and it does not self-heal because the
   claim tracks the persisted value rather than the clock. A burst of restarts or a crash loop
   within the same second also pushes the epoch ahead of a correct clock until the clock catches
@@ -1022,7 +1027,7 @@ Known limits of the boot epoch:
   boot, so no claim runs.
 - An agent whose epoch claim fails (no store, a read or write failure, a store that reports a
   `PRAGMA synchronous` level below FULL (outcome `durability_below_full`, not expected for the
-  agent's own store, which sets FULL at open; an unreadable pragma is `read_failed`), or a clock reading at or above the 2^62 ceiling) sends the pair as 0/0 for the whole process lifetime, ordered by
+  agent's own store, which sets FULL at open; an unreadable pragma is `read_failed`), a clock reading at or above the 2^62 ceiling, or the data-directory lock not held (`instance_lock_not_held`)) sends the pair as 0/0 for the whole process lifetime, ordered by
   the timestamp. Today this is visible only as an error-level `Guardian boot_epoch claim` log
   line.
 - Events replayed from the lifecycle journal carry 0/0, so a replayed event is not

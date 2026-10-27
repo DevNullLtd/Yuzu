@@ -20,6 +20,10 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **What to do.** Read the configuration with an administrator account or an administrator API token that is not MCP-tier if a script needs the administrator-only overrides.
 
+## New on-disk artifact: the Guardian boot-epoch lock file (#5690, #5674)
+
+The agent now creates an empty file `guardian_boot_epoch.lock` in its `--data-dir` at boot and holds an exclusive lock on it for the life of the process, so that two agent processes on one data directory cannot claim the same Guardian boot epoch. It is regenerable, holds no data and is not a backup target; do not delete it while an agent runs. A second agent process started on the same data directory logs `Guardian boot_epoch claim: outcome=instance_lock_not_held` and sends its Guardian events unordered until it is restarted. **What to do:** nothing for a normal upgrade. If you see that line, follow "Boot epoch and event ordering" in [guaranteed-state.md](guaranteed-state.md). Add the file to any data-directory allow-list or antivirus exclusion list you maintain for the agent, because a security product that keeps it open past the agent's 5 second wait leaves that process unordered on Windows.
+
 ## Behaviour change: a Guaranteed State delta push no longer drops the retry obligation of a rule it omits (#5547)
 
 **What changed.** This is an agent change. The agent holds an acknowledgment application per policy push and reports a policy generation only once that application has no unresolved arm. Before this release every push replaced the open application, so a delta push (`full_sync=false`) that named only some rules forgot the pending arm, retained wedge or drained failure of every rule it left out. The generation could then be acknowledged while an omitted rule was still unarmed, with nothing left to retry it. Now a delta carries the unresolved outcome of each rule it does not name into the new application, and the following differ:

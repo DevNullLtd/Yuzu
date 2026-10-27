@@ -44,6 +44,11 @@ Invariants (the numbered rules below; each failure message starts with its rule 
       serializer exists): `emit_guardian_event(` is called from exactly two places, the
       `set_event_sink` lambda and the DEX observer; a third caller is a new wire writer that
       must be reviewed for the stamp.
+  R3b agents/core/src/agent.cpp: `guardian_instance_lock_` is assigned from
+      `GuardianInstanceLock::acquire(<path>, <wait>)` exactly once, with a non-zero wait, BEFORE the
+      claim, and the member is declared after `kv_store_` and before `guardian_` (destroyed after
+      the engine, before the store). Without the assignment every boot loses the lock and the
+      whole fleet runs unordered (0/0) with every other test green.
   R4  agents/core/src/guardian_engine.cpp: every legacy executor is built through
       `make_legacy_sink_executor(` (no direct `make_unique<GuardianLegacySinkExecutor>` outside
       that helper, every `legacy_sink_executor_` init/assign goes through it), the helper copies
@@ -375,6 +380,25 @@ def _rule3(t, out):
         if len(cargs) != 3 or cargs[2] != "guardian_instance_lock_":
             out.append(f"R3: claim_guardian_boot_epoch( in {AGENT} must pass `guardian_instance_lock_` "
                        f"as its third argument (the UP-9 single-writer guard), got {cargs}")
+    # R3b: the lock must actually be taken, with a real wait, before the claim reads it.
+    acquires = list(re.finditer(r"guardian_instance_lock_ ?= ?GuardianInstanceLock::acquire\(", t))
+    if len(acquires) != 1:
+        out.append(f"R3b: expected exactly one `guardian_instance_lock_ = GuardianInstanceLock::acquire(` "
+                   f"in {AGENT}, found {len(acquires)} (without it every boot claims 0/0)")
+    else:
+        asites = call_sites(t[acquires[0].start():], r"GuardianInstanceLock::acquire")
+        aargs = split_args(t[acquires[0].start():][asites[0][1]:asites[0][2]]) if asites else []
+        if len(aargs) != 2 or re.fullmatch(r"(?:std::chrono::\w+\{0\}|0|\{\})", aargs[1]):
+            out.append(f"R3b: GuardianInstanceLock::acquire( in {AGENT} must pass a path and a non-zero "
+                       f"wait (a service restart overlaps the old process's shutdown), got {aargs}")
+        if len(claims) == 1 and acquires[0].start() > claims[0].start():
+            out.append(f"R3b: guardian_instance_lock_ is assigned after the claim in {AGENT}")
+    kv = re.search(r"std::unique_ptr<KvStore> kv_store_;", t)
+    lk = re.search(r"GuardianInstanceLock guardian_instance_lock_;", t)
+    gd = re.search(r"std::unique_ptr<GuardianEngine> guardian_;", t)
+    if not (kv and lk and gd) or not (kv.start() < lk.start() < gd.start()):
+        out.append(f"R3b: member order in {AGENT} must be kv_store_, guardian_instance_lock_, guardian_ "
+                   "(the lock outlives the engine and is released before the store closes)")
     sites = call_sites(t, r"make_(?:unique|shared)<GuardianEngine>")
     if not sites:
         out.append(f"R3: no make_unique<GuardianEngine>( call in {AGENT}")
@@ -607,6 +631,18 @@ MUTATIONS = [
     ("R3 claim without the instance lock", AGENT,
      r"now_unix_s, guardian_instance_lock_\)", "now_unix_s)", 1, 0,
      "must pass `guardian_instance_lock_` as its third argument"),
+    ("R3b lock never acquired", AGENT,
+     r"guardian_instance_lock_ = GuardianInstanceLock::acquire\(\s*cfg_\.data_dir / \"guardian_boot_epoch\.lock\", std::chrono::seconds\{5\}\);",
+     "", 1, 0, "R3b: expected exactly one `guardian_instance_lock_ = GuardianInstanceLock::acquire(`"),
+    ("R3b lock acquired with no wait", AGENT,
+     r"\"guardian_boot_epoch\.lock\", std::chrono::seconds\{5\}\)", "\"guardian_boot_epoch.lock\", std::chrono::seconds{0})",
+     1, 0, "must pass a path and a non-zero wait"),
+    ("R3b lock acquired after the claim", AGENT,
+     r"(guardian_instance_lock_ = GuardianInstanceLock::acquire\([^;]*\);)(.*?)(const auto boot_epoch_claim =\s*claim_guardian_boot_epoch\([^;]*\);)",
+     r"\2\3\n        \1", 1, 0, "assigned after the claim"),
+    ("R3b member declared before kv_store_", AGENT,
+     r"(std::unique_ptr<KvStore> kv_store_;)(.*?)(GuardianInstanceLock guardian_instance_lock_;)",
+     r"\3\n    \1\2", 1, 0, "member order"),
     ("R3 prefer_spark flipped", AGENT,
      r"/\*prefer_spark=\*/false, boot_epoch_claim", "/*prefer_spark=*/true, boot_epoch_claim", 1, 0,
      "the third GuardianEngine argument"),

@@ -3,7 +3,9 @@
 // successor would reach the ceiling), the 2^62 ceiling (checked on the persisted value
 // BEFORE the + 1), the documented single-writer and same-second residuals, and the
 // fail-to-zero rules (null store, read error, write failure, ceiling): a failed claim is 0
-// and nothing is invented in memory or written.
+// and nothing is invented in memory or written. The UP-9 single-writer guard
+// (GuardianInstanceLock) is covered at the end; the sole same-second equal-epoch residual
+// that remains after it is pinned by the wiped-row test.
 
 #include "guardian_boot_epoch.hpp"
 #include "guardian_emit_seq.hpp"
@@ -15,9 +17,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <fstream>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -753,3 +757,103 @@ TEST_CASE("boot-epoch: two agents on one data directory cannot both claim an epo
     CHECK(b.outcome == Outcome::InstanceLockNotHeld);
     CHECK(b.boot_epoch == 0);
 }
+
+TEST_CASE("boot-epoch: a directory or a missing parent is Failed and carries the OS error",
+          "[guardian][boot_epoch][instance_lock]") {
+    yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
+    std::filesystem::create_directories(dir.path);
+
+    // A directory in the lock file's place is never a lock.
+    auto as_dir = GuardianInstanceLock::acquire(dir.path);
+    CHECK(as_dir.state() == GuardianInstanceLock::State::Failed);
+    CHECK(as_dir.native_error() != 0);
+
+    auto missing = GuardianInstanceLock::acquire(dir.path / "missing" / "guardian_boot_epoch.lock");
+    CHECK(missing.state() == GuardianInstanceLock::State::Failed);
+    CHECK(missing.native_error() != 0);
+
+    // A held lock reports no error, and a contended one reports the contention.
+    const auto lock_path = dir.path / "guardian_boot_epoch.lock";
+    auto held = GuardianInstanceLock::acquire(lock_path);
+    REQUIRE(held.held());
+    CHECK(held.native_error() == 0);
+    auto contended = GuardianInstanceLock::acquire(lock_path);
+    CHECK(contended.state() == GuardianInstanceLock::State::Contended);
+    CHECK(contended.native_error() != 0);
+}
+
+TEST_CASE("boot-epoch: move-assignment releases the lock it replaces",
+          "[guardian][boot_epoch][instance_lock]") {
+    yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
+    std::filesystem::create_directories(dir.path);
+    const auto path_a = dir.path / "a.lock";
+    const auto path_b = dir.path / "b.lock";
+
+    auto target = GuardianInstanceLock::acquire(path_a);
+    auto source = GuardianInstanceLock::acquire(path_b);
+    REQUIRE(target.held());
+    REQUIRE(source.held());
+
+    target = std::move(source);
+    CHECK(target.held());
+    CHECK(source.state() == GuardianInstanceLock::State::NotAcquired); // NOLINT(bugprone-use-after-move)
+    // a.lock was released by the assignment; b.lock is still held, now by `target`.
+    CHECK(GuardianInstanceLock::acquire(path_a).held());
+    CHECK(GuardianInstanceLock::acquire(path_b).state() == GuardianInstanceLock::State::Contended);
+
+    // Self-move-assignment keeps the lock.
+    auto& alias = target;
+    target = std::move(alias);
+    CHECK(target.held());
+}
+
+TEST_CASE("boot-epoch: outcome names are the strings the operator documentation quotes",
+          "[guardian][boot_epoch]") {
+    CHECK(std::string_view{guardian_boot_epoch_outcome_name(Outcome::Claimed)} == "claimed");
+    CHECK(std::string_view{guardian_boot_epoch_outcome_name(Outcome::Recovered)} == "recovered");
+    CHECK(std::string_view{guardian_boot_epoch_outcome_name(Outcome::NoStore)} == "no_store");
+    CHECK(std::string_view{guardian_boot_epoch_outcome_name(Outcome::ReadFailed)} == "read_failed");
+    CHECK(std::string_view{guardian_boot_epoch_outcome_name(Outcome::WriteFailed)} == "write_failed");
+    CHECK(std::string_view{guardian_boot_epoch_outcome_name(Outcome::OutOfRange)} == "out_of_range");
+    CHECK(std::string_view{guardian_boot_epoch_outcome_name(Outcome::DurabilityBelowFull)} ==
+          "durability_below_full");
+    CHECK(std::string_view{guardian_boot_epoch_outcome_name(Outcome::InstanceLockNotHeld)} ==
+          "instance_lock_not_held");
+}
+
+#ifndef _WIN32
+TEST_CASE("boot-epoch: a symlink in the lock file's place is refused, not followed",
+          "[guardian][boot_epoch][instance_lock]") {
+    yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
+    std::filesystem::create_directories(dir.path);
+    const auto target = dir.path / "elsewhere";
+    {
+        std::ofstream out{target};
+        out << "x";
+    }
+    const auto lock_path = dir.path / "guardian_boot_epoch.lock";
+    std::filesystem::create_symlink(target, lock_path);
+
+    auto lock = GuardianInstanceLock::acquire(lock_path);
+    CHECK_FALSE(lock.held());
+    CHECK(lock.state() == GuardianInstanceLock::State::Failed);
+    CHECK(lock.native_error() == ELOOP);
+}
+
+TEST_CASE("boot-epoch: a lock file unlinked while held is re-created by the next acquire "
+          "(documented residual: needs data-directory write access)",
+          "[guardian][boot_epoch][instance_lock]") {
+    // Pins the limit stated in guardian_boot_epoch.hpp: an unlink AFTER a successful claim is not
+    // detected. The pre-lock window (unlinked or replaced between the open and the flock) is
+    // closed by the device/inode comparison and is not reachable from a single-threaded test.
+    yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
+    std::filesystem::create_directories(dir.path);
+    const auto lock_path = dir.path / "guardian_boot_epoch.lock";
+
+    auto first = GuardianInstanceLock::acquire(lock_path);
+    REQUIRE(first.held());
+    std::filesystem::remove(lock_path);
+    auto second = GuardianInstanceLock::acquire(lock_path);
+    CHECK(second.held()); // a new file, a new inode: this is the residual, not a guarantee
+}
+#endif

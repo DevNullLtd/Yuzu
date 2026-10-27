@@ -14,7 +14,10 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
+
+#include <yuzu/agent/scoped_fd.hpp>
 #endif
 
 #include <algorithm>
@@ -27,11 +30,8 @@
 
 namespace yuzu::agent {
 
-namespace {
-
-using Outcome = GuardianBootEpochClaim::Outcome;
-
-const char* outcome_name(Outcome o) noexcept {
+const char* guardian_boot_epoch_outcome_name(GuardianBootEpochClaim::Outcome o) noexcept {
+    using Outcome = GuardianBootEpochClaim::Outcome;
     switch (o) {
     case Outcome::Claimed:
         return "claimed";
@@ -52,6 +52,10 @@ const char* outcome_name(Outcome o) noexcept {
     }
     return "unknown";
 }
+
+namespace {
+
+using Outcome = GuardianBootEpochClaim::Outcome;
 
 // What the stored row looked like. Kept for the log line only; never the raw bytes.
 enum class Stored { Absent, Parsed, Unusable };
@@ -158,7 +162,7 @@ void log_claim(IJournalStore* store, const GuardianBootEpochClaim& c, Detail& d,
         spdlog::log(level,
                     "Guardian boot_epoch claim: outcome={} boot_epoch={} stored={} persisted={} "
                     "stored_len={} clock_unix_s={} candidate={} synchronous={}",
-                    outcome_name(c.outcome), c.boot_epoch, stored, c.persisted, d.stored_len,
+                    guardian_boot_epoch_outcome_name(c.outcome), c.boot_epoch, stored, c.persisted, d.stored_len,
                     now_unix_s, d.candidate, d.synchronous);
     } catch (...) {
         // Logging is best-effort and must never change the claim.
@@ -200,44 +204,77 @@ const char* lock_state_name(GuardianInstanceLock::State st) noexcept {
 
 constexpr std::intptr_t kNoHandle = -1;
 
-// One attempt. On success returns Held and stores the handle; otherwise Contended or Failed
-// and nothing is left open.
-GuardianInstanceLock::State try_lock_once(const std::filesystem::path& path,
-                                          std::intptr_t& handle) noexcept {
+// A held lock on a file that was unlinked or replaced after the open guards nothing: a second
+// process creates and locks the new file. After locking, the path is re-resolved and must name
+// the very file that was locked; a mismatch drops the lock and tries again, at most this often.
+constexpr int kMaxReplacedRetries = 5;
+#ifdef _WIN32
+constexpr int kReplacedError = ERROR_FILE_INVALID;
+#else
+constexpr int kReplacedError = ESTALE;
+#endif
+
+enum class Attempt { Held, Contended, Failed, Replaced };
+
+// One attempt. On Held the handle is stored; otherwise nothing is left open. `err` carries the
+// errno / GetLastError of a Failed or Contended attempt (0 when none).
+Attempt try_lock_once(const std::filesystem::path& path, std::intptr_t& handle,
+                      int& err) noexcept {
+    err = 0;
 #ifdef _WIN32
     // Share mode 0: a second open of the same file fails with ERROR_SHARING_VIOLATION while
-    // this handle lives, and the OS closes it at process exit.
+    // this handle lives (which also forbids deleting or renaming it), and the OS closes it at
+    // process exit. Nothing between CreateFileW and the store can fail, so no cleanup path.
     HANDLE h = ::CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
                              FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE)
-        return ::GetLastError() == ERROR_SHARING_VIOLATION
-                   ? GuardianInstanceLock::State::Contended
-                   : GuardianInstanceLock::State::Failed;
+    if (h == INVALID_HANDLE_VALUE) {
+        err = static_cast<int>(::GetLastError());
+        return err == ERROR_SHARING_VIOLATION ? Attempt::Contended : Attempt::Failed;
+    }
     handle = reinterpret_cast<std::intptr_t>(h);
-    return GuardianInstanceLock::State::Held;
+    return Attempt::Held;
 #else
-    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-    if (fd < 0)
-        return GuardianInstanceLock::State::Failed;
+    // O_NOFOLLOW: a planted symlink is refused rather than followed to a file elsewhere.
+    // O_NOCTTY: a lock path that names a terminal never becomes the controlling terminal.
+    ScopedFd fd;
+    do {
+        fd.reset(::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY, 0600));
+    } while (!fd.valid() && errno == EINTR);
+    if (!fd.valid()) {
+        err = errno;
+        return Attempt::Failed;
+    }
+    struct stat by_fd {};
+    if (::fstat(fd.get(), &by_fd) != 0) {
+        err = errno;
+        return Attempt::Failed;
+    }
+    if (!S_ISREG(by_fd.st_mode)) {
+        err = EINVAL; // a directory, device or FIFO is not a lock file
+        return Attempt::Failed;
+    }
     // flock locks belong to the open file description, so a second acquire in this same
     // process (a second object, or a test) contends exactly like a second process would.
-    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
-        const int err = errno;
-        ::close(fd);
-        return err == EWOULDBLOCK ? GuardianInstanceLock::State::Contended
-                                  : GuardianInstanceLock::State::Failed;
+    if (::flock(fd.get(), LOCK_EX | LOCK_NB) != 0) {
+        err = errno;
+        return err == EWOULDBLOCK ? Attempt::Contended : Attempt::Failed;
     }
-    handle = fd;
-    return GuardianInstanceLock::State::Held;
+    struct stat by_path {};
+    if (::stat(path.c_str(), &by_path) != 0 || by_path.st_dev != by_fd.st_dev ||
+        by_path.st_ino != by_fd.st_ino)
+        return Attempt::Replaced; // fd closes here, which drops the lock
+    handle = fd.release();
+    return Attempt::Held;
 #endif
 }
 
 } // namespace
 
 GuardianInstanceLock::GuardianInstanceLock(GuardianInstanceLock&& other) noexcept
-    : handle_(other.handle_), state_(other.state_) {
+    : handle_(other.handle_), state_(other.state_), native_error_(other.native_error_) {
     other.handle_ = kNoHandle;
     other.state_ = State::NotAcquired;
+    other.native_error_ = 0;
 }
 
 GuardianInstanceLock& GuardianInstanceLock::operator=(GuardianInstanceLock&& other) noexcept {
@@ -245,8 +282,10 @@ GuardianInstanceLock& GuardianInstanceLock::operator=(GuardianInstanceLock&& oth
         release();
         handle_ = other.handle_;
         state_ = other.state_;
+        native_error_ = other.native_error_;
         other.handle_ = kNoHandle;
         other.state_ = State::NotAcquired;
+        other.native_error_ = 0;
     }
     return *this;
 }
@@ -265,6 +304,7 @@ void GuardianInstanceLock::release() noexcept {
     }
     handle_ = kNoHandle;
     state_ = State::NotAcquired;
+    native_error_ = 0;
 }
 
 GuardianInstanceLock GuardianInstanceLock::acquire(const std::filesystem::path& path,
@@ -272,9 +312,23 @@ GuardianInstanceLock GuardianInstanceLock::acquire(const std::filesystem::path& 
     GuardianInstanceLock lock;
     try {
         const auto deadline = std::chrono::steady_clock::now() + wait;
+        int replaced = 0;
         for (;;) {
-            lock.state_ = try_lock_once(path, lock.handle_);
-            if (lock.state_ != State::Contended || std::chrono::steady_clock::now() >= deadline)
+            const Attempt a = try_lock_once(path, lock.handle_, lock.native_error_);
+            if (a == Attempt::Held) {
+                lock.state_ = State::Held;
+                break;
+            }
+            if (a == Attempt::Replaced) {
+                if (++replaced > kMaxReplacedRetries) {
+                    lock.state_ = State::Failed;
+                    lock.native_error_ = kReplacedError;
+                    break;
+                }
+                continue; // the path now names a different file: lock that one
+            }
+            lock.state_ = a == Attempt::Contended ? State::Contended : State::Failed;
+            if (a != Attempt::Contended || std::chrono::steady_clock::now() >= deadline)
                 break;
             std::this_thread::sleep_for(std::chrono::milliseconds{100});
         }
@@ -291,10 +345,17 @@ GuardianBootEpochClaim claim_guardian_boot_epoch(IJournalStore* store, std::int6
     if (store == nullptr || lock.held())
         return claim_guardian_boot_epoch(store, now_unix_s);
     try {
-        spdlog::error("Guardian boot_epoch claim: outcome={} boot_epoch=0 instance_lock={}; another "
-                      "agent process may be using this data directory, so this process emits "
-                      "unordered (0/0) events",
-                      outcome_name(Outcome::InstanceLockNotHeld), lock_state_name(lock.state()));
+        // The wording follows the state: only Contended means another holder was seen.
+        const char* why =
+            lock.state() == GuardianInstanceLock::State::Contended
+                ? "another agent process holds the data directory's boot-epoch lock"
+            : lock.state() == GuardianInstanceLock::State::Failed
+                ? "the boot-epoch lock file could not be opened or locked"
+                : "the boot-epoch lock was never acquired";
+        spdlog::error("Guardian boot_epoch claim: outcome={} boot_epoch=0 instance_lock={} "
+                      "native_error={}; {}, so this process emits unordered (0/0) events",
+                      guardian_boot_epoch_outcome_name(Outcome::InstanceLockNotHeld), lock_state_name(lock.state()),
+                      lock.native_error(), why);
     } catch (...) {
         // Logging is best-effort and must never change the claim.
     }
