@@ -983,9 +983,11 @@ lexicographically. They are ordinals, not timestamps: 0 means unset, and the age
 both or neither. `boot_epoch` is claimed once at agent boot as the larger of the persisted
 counter plus one and the boot time in unix seconds, stored in the agent KV store under
 namespace `__guardian__`, key `meta:boot_epoch`; a stored value that cannot be parsed, or is
-at or above 2^62 - 1, is re-claimed from the clock and overwritten, and a KV failure leaves
-the epoch 0, so the pair is sent as 0/0. The agent logs one `Guardian boot_epoch claim` line
-per boot, which also prints `synchronous=` (expected 2, FULL). `emit_seq` is drawn from one
+at or above 2^62 - 1, is re-claimed from the clock and overwritten (the agent emits nonzero
+pairs again, which does not by itself restore order relative to epochs issued before the loss),
+and a KV failure leaves the epoch 0, so the pair is sent as 0/0. The agent logs one
+`Guardian boot_epoch claim` line per boot, which also prints `synchronous=` (expected 2, FULL;
+a lower level fails the claim). `emit_seq` is drawn from one
 source owned by the engine and shared by both emit paths: the legacy sink executor draws it
 at admission, under the executor lock, and the Spark runtime draws it when it enqueues an
 outbox entry. Entries re-sent from the lifecycle journal carry 0/0, because their original
@@ -1015,7 +1017,8 @@ Known limits of the boot epoch:
   within a few seconds before the restore or the epoch had been pinned ahead of the clock. A VM
   memory-snapshot revert continues with the same epoch and a lower `emit_seq` and involves no
   boot, so no claim runs.
-- An agent whose epoch claim fails (no store, a read or write failure, or a clock reading at
+- An agent whose epoch claim fails (no store, a read or write failure, a store that reports a
+  `PRAGMA synchronous` level below FULL (outcome `durability_below_full`), or a clock reading at
   or above the 2^62 ceiling) sends the pair as 0/0 for the whole process lifetime, ordered by
   the timestamp. Today this is visible only as an error-level `Guardian boot_epoch claim` log
   line.

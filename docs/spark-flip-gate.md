@@ -2869,25 +2869,41 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   characterises UP-13 and deliberately asserts no order.
 - Merge gate for the agent change (UP-14; conditions the UP-14 SERVER change must meet before
   the agent change merges, in the fixed order census change, server change, agent change).
-  Status is tracked on #5690 and in the agent change's pull request description (one checkbox
-  per item):
-  1. The comparator orders by the pair only when both sides carry a nonzero pair, and
-     otherwise by the timestamp, with a test that rejects "an unset pair ranks lowest". The
-     pair is agent-asserted and unauthenticated, so the comparator must key per agent_id and
-     one agent's pair must never affect another agent's rows.
-  2. A tested recovery path for a pair regression (an agent KV row lost with the clock behind
-     the stored epoch; an epoch pinned ahead of the clock and then the row lost), and the
-     operator manual states the reset procedure.
-  3. The pair is kept out of `stored_event_matches`, so a journal replay (0/0) of an event
-     already delivered is not counted as a collision (otherwise `YuzuGuardianEventsDropped`
-     fires on benign replays).
-  4. The rule for gap repairs (they draw a fresh pair at admission today) and for an accepted
-     0/0 (overwrite or retain the stored pair) is stated and tested.
+  This agent change activates ordering against a server that may already use the pair; it stays
+  blocked until the receiving change satisfies items 1 to 4 and the integrated range is reviewed.
+  Status will be tracked on #5690 and in the agent change's pull request description (one
+  checkbox per item) once that pull request exists:
+  1. The comparator orders per (agent_id, rule_id), compares the pair only when both sides
+     carry a nonzero pair and otherwise uses the timestamp. Tests: isolation between agents and
+     rules (one agent's pair never affects another agent's rows), ordered to unordered to
+     ordered transitions, and a test that rejects "an unset pair ranks lowest". The pair is
+     agent-asserted and unauthenticated.
+  2. A tested recovery path for a pair regression. A lost, corrupt or restored-older agent row
+     that is below the server's retained epoch recovers without waiting for the clock to catch
+     up; both the ordinary backward-clock case and the previously-fast-clock case are covered.
+     While recovery is incomplete, stale census state is not silently shown as current (an
+     observable uncertain or degraded state, or another tested mechanism). Delayed events
+     carrying the former higher epoch cannot undo the recovery. The operator procedure names
+     the affected agent, leaves other agents' state untouched, and is written in the operator
+     manual.
+  3. The pair is kept out of `stored_event_matches` (pair-independent duplicate equality is
+     retained), so a journal replay (0/0) of an event already delivered is not counted as a
+     collision (otherwise `YuzuGuardianEventsDropped` fires on benign replays), and a test
+     shows a duplicate replay does not reapply an obsolete census transition.
+  4. The rule for gap repairs (they draw a fresh pair at admission today) and for accepted
+     unordered (0/0) events is stated with correctness outcomes and tests: a failed-claim 0/0
+     event against an existing ordered verdict; rollback to a non-stamping binary; the
+     transition from unordered back to ordered; whether an accepted 0/0 clears or retains the
+     stored ordering metadata, and how that metadata stays associated with the verdict it
+     actually describes; and the timeline of a previously undelivered older replay (an error at
+     timestamp 100 replayed as 0/0 after a backward clock step, after a newer live compliant
+     verdict at timestamp 90), in both arrival orders and with subsequent live events.
   5. The server change's hunk for fields 24 and 25 is the authority (the agreed split: the
      server change owns the fields); the agent change takes the server change's version of
      the hunk when it merges origin/dev. That comment must say boot_epoch is not guaranteed
      monotonic across restarts (lost row, clock-ahead pin, equal epoch, 2^62 ceiling) and
-     must define UP-14.
+     must define UP-14. This item is a compatibility and documentation criterion; it does not
+     close items 1 to 4.
 - Owner: not assigned in source material.
 - Milestone: PR #5776.
 - Revisit trigger: PR-5 (F14 flip) soak. During the first flip soak, inspect
