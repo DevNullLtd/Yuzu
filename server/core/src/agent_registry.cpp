@@ -926,6 +926,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"hardware.memory", "Installed memory modules (DIMMs) with size and type"},
         {"hardware.disks", "Physical disk drives with size and media type"},
         {"hardware.drivers", "Installed device drivers with version, date, provider, class"},
+        {"hardware.chassis", "Chassis type, serial and asset tag (planned on every OS this release; one unsupported status row)"},
+        {"hardware.baseboard", "Baseboard vendor, product and serial (planned on every OS this release; one unsupported status row)"},
+        {"hardware.swap", "Swap devices and page files with total and used size (planned on every OS this release; one unsupported status row)"},
+        {"hardware.machine_id", "Keyed hash of the OS machine identifier (planned on every OS this release; one unsupported status row)"},
         // os_info
         {"os_info.os_name", "Full OS product name"},
         {"os_info.os_version", "OS version string"},

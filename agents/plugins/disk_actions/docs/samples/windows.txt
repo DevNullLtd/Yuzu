@@ -1,4 +1,4 @@
-captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-07 · interactive user (elevated) · leg-hash f062fb9a3dfd
+captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-07 · interactive user (elevated) · leg-hash adfc0598de14
 == action=smart
 smart|PhysicalDrive0|Samsung SSD 970 EVO Plus 250GB|nvme|ssd|ok|5|100|-
 smart|PhysicalDrive1|Samsung SSD 970 EVO Plus 1TB|nvme|ssd|ok|1|100|-

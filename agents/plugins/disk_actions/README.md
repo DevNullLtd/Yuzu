@@ -6,17 +6,19 @@
 | **What it does** | Reports physical drive health and the mapping between drives and the logical volumes they back |
 | **Version** | 1.0.0 |
 | **Kind** | Collector · read-only · on-demand |
-| **Platforms** | Windows ✅ · macOS 🟡 constrained · Linux ⛔ unsupported |
-| **Actions** | `smart` (definition `crossplatform.storage.smart`) · `volumes` (definition `crossplatform.storage.volumes`) |
+| **Platforms** | Windows ✅ · macOS 🟡 constrained · Linux 🟡 planned |
+| **Actions** | `partitions` (definition `crossplatform.storage.partitions`) · `smart` (definition `crossplatform.storage.smart`) · `topology` (definition `crossplatform.storage.topology`) · `volumes` (definition `crossplatform.storage.volumes`) |
 | **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
 
-Both actions are reads. `smart` enumerates the physical drives the OS knows about and asks each for identity (model, transport, SSD or HDD). On Windows, NVMe drives additionally answer with SMART log page 0x02, which the plugin decodes into a wear percentage, available spare and a health verdict. `volumes` enumerates logical volumes and resolves two things for each: the physical drive that backs it and the mount points it serves.
+`smart` and `volumes` are reads. `smart` enumerates the physical drives the OS knows about and asks each for identity (model, transport, SSD or HDD). On Windows, NVMe drives additionally answer with SMART log page 0x02, which the plugin decodes into a wear percentage, available spare and a health verdict. `volumes` enumerates logical volumes and resolves two things for each: the physical drive that backs it and the mount points it serves.
 
 `volumes` is deliberately not a third volume inventory. `hardware.disks` already lists physical devices and `filesystem_posture.mounts` already lists mounts. This action carries only the join between them, which is what lets a failing-drive alert name the drive letters or mount points it affects.
+
+`partitions` and `topology` read nothing yet: on every OS each answers with exactly one `status|<action>|unsupported|<os>:planned` row from the shared planned-leg reporter (`agents/shared/planned_leg.hpp`), until their leg PRs land (partitions: H.5 Windows, H.12 Linux, H.13 macOS; topology: H.12 Linux LVM/md/multipath, H.13 macOS APFS containers; Windows has no topology source ruled yet).
 
 Every mechanism was bound by a spike against real hardware before the leg was written. Where a mechanism could not be bound (Linux) or is only reachable through a private OS interface (macOS health), the leg says so in its result rather than guessing.
 
@@ -38,14 +40,22 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
+| `partitions` | 🟡 planned · rung 1 · Win32_DiskPartition + Win32_LogicalDisk (H.5) | 🟡 planned · rung 1 · diskutil list + getmntinfo (H.13) | 🟡 planned · rung 1 · /proc/self/mountinfo + /sys/block/*/<part> (H.12) |
 | `smart` | ✅ supported · rung 1 · IOCTL_STORAGE_QUERY_PROPERTY (StorageDeviceProperty + StorageDeviceSeekPenaltyProperty + StorageDeviceProtocolSpecificProperty, NVMe log page 0x02) | 🟡 constrained · rung 1 · IOKit IOBlockStorageDevice device characteristics | ⛔ unsupported |
+| `topology` | 🟡 planned · rung 1 · no source ruled; stays planned | 🟡 planned · rung 1 · diskutil apfs list (H.13) | 🟡 planned · rung 1 · /sys/block/dm-*/dm/{name,uuid}, md*/md, slaves (H.12) |
 | `volumes` | 🟡 constrained · rung 1 · FindFirstVolumeW + IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS + GetVolumePathNamesForVolumeNameW | 🟡 constrained · rung 1 · IOKit IOMedia provider walk + getmntinfo_r_np(3) MNT_NOWAIT | ⛔ unsupported |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
+- **`partitions` / Windows** — not read yet: one unsupported status row, windows:planned
+- **`partitions` / macOS** — not read yet: one unsupported status row, macos:planned
+- **`partitions` / Linux** — not read yet: one unsupported status row, linux:planned
 - **`smart` / Windows** — the device handle is opened with zero access rights, which an unprivileged service account may do; wear and spare figures come from the NVMe SMART/Health log and are therefore reported only for NVMe devices, with SATA and USB drives reporting identity and media type but 'unknown' health
 - **`smart` / macOS** — reports device identity (model, medium type) and whether the device advertises NVMe SMART, but NOT the health attributes themselves: wear, available spare and the critical-warning flag are reachable only through Apple's private IONVMeSMARTUserClient selector interface, which is undocumented and version-fragile, so health reports 'unknown' on this platform rather than a guess
 - **`smart` / Linux** — not implemented in this change: no mechanism could be bound, because every Linux host available for the spike exposed virtualised disks only (WSL2 reports four 'Virtual Disk' SCSI nodes and no /dev/nvme* character devices), and shipping an NVME_IOCTL_ADMIN_CMD path written from documentation but never exercised is exactly how a dead leg reaches production. Binding it needs a Linux host with real storage, or a VM with disk passthrough; neither was reachable when this shipped
+- **`topology` / Windows** — not read yet: one unsupported status row, windows:planned
+- **`topology` / macOS** — not read yet: one unsupported status row, macos:planned
+- **`topology` / Linux** — not read yet: one unsupported status row, linux:planned
 - **`volumes` / Windows** — maps volumes to the physical drives backing them; a volume spanning several drives (a spanned or striped dynamic volume) reports every drive it touches, and a volume with no assigned drive letter or mount point reports '-' for mount points rather than being omitted
 - **`volumes` / macOS** — one row per IOMedia object, keyed on that object's BSD name, carrying the physical whole disk that backs it and any mount points it serves; the physical disk is resolved by walking the IOKit provider chain, so a volume inside a synthesized APFS container correctly reports the underlying drive rather than the container; a media object that maps nothing -- a whole disk serving no mount point -- is omitted, because this action carries only the physical-to-logical join and such a row has no join to carry
 - **`volumes` / Linux** — not implemented in this change: the physical-to-logical join is only meaningful alongside a bound smart leg, and the Linux smart leg is deferred with it
@@ -59,21 +69,33 @@ flowchart LR
 | macOS | LaunchDaemon (root today; `docs/agent-privilege-model.md`) | None. IOKit property reads only; no user client is opened, so the leg needs nothing root has. | 2026-09-03 and 2026-09-06 at euid 501 (an unprivileged user, a stricter test than the daemon's) | never `PERMISSION_DENIED`: the macOS legs report a refused or failed IOKit read — including a failed service match — as `CONSTRAINED` (partial, `macos:iokit` / `macos:iomedia` and their sub-tokens), and `UNAVAILABLE` only when the enumeration returned nothing at all |
 | Linux | n/a | n/a, leg not implemented | — | always `UNAVAILABLE` |
 
-No external binaries, no subprocesses, no network access. Do not "fix" the Windows open to `GENERIC_READ`; that is the change that breaks the leg under an unprivileged account.
+The two planned actions read nothing on any OS and need no grant. No external binaries, no subprocesses, no network access. Do not "fix" the Windows open to `GENERIC_READ`; that is the change that breaks the leg under an unprivileged account.
 
 ## Data contract
 
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-Neither action takes parameters.
+No action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
 
-Pipe-delimited rows, one per drive or volume. Field 0 is a literal discriminator (`smart` or `volume`) that precedes the columns below; every row of a kind has the same field count, with `-` where a value is inapplicable or was not read. `-` never means zero. Every field passes through `safe_output_field`, which rewrites `\` as `/`, so Windows volume GUID paths read `//?/Volume{…}/` and drive letters `C:/`. A leg that finds nothing still emits one placeholder row so zero rows can never be misread as "no disks": a `smart` placeholder carries `health=unsupported`, a `volume` placeholder carries `volume=-`, and both are accompanied by a typed status, which is the authoritative signal.
+Pipe-delimited rows, one per drive or volume. Field 0 is a literal discriminator (`smart` or `volume`; the planned actions answer one `status` row, `status|<action>|unsupported|<os>:planned`, and their final `partition` and `topology` row schemas are declared in `disk_actions_legs.hpp`) that precedes the columns below; every row of a kind has the same field count, with `-` where a value is inapplicable or was not read. `-` never means zero. Every field passes through `safe_output_field`, which rewrites `\` as `/`, so Windows volume GUID paths read `//?/Volume{…}/` and drive letters `C:/`. A leg that finds nothing still emits one placeholder row so zero rows can never be misread as "no disks": a `smart` placeholder carries `health=unsupported`, a `volume` placeholder carries `volume=-`, and both are accompanied by a typed status, which is the authoritative signal.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
+**`crossplatform.storage.partitions` — `row_kind|disk|partition|size_bytes|type|mount_points|detail`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | `status` `partition` | Windows, Linux, macOS | `status` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), partition (one per record read). |
+| `disk` | string | - | Windows, Linux, macOS | `disk0` | Physical disk the partition belongs to. Status rows: the action name. |
+| `partition` | string | - | Windows, Linux, macOS | `disk0s2` | Partition identifier. Status rows: the level (unsupported). |
+| `size_bytes` | string | - | Windows, Linux, macOS | `494384795648` | Partition size in bytes, or "-" when unread. Status rows: the reason token (<os>:planned). |
+| `type` | string | - | Windows, Linux, macOS | `apfs` | Partition type or filesystem hint, or "-". Absent on status rows. |
+| `mount_points` | string | - | Windows, Linux, macOS | `/` | Comma-separated mount points or drive letters, or "-". Absent on status rows. |
+| `detail` | string | - | Windows, Linux, macOS | `-` | Free text, or "-". Absent on status rows. |
+
 **`crossplatform.storage.smart` — `device|model|bus|media|health|pct_used|spare_pct|detail`**
 
 | Field | Type | Values | Available | Example | Description |
@@ -86,6 +108,17 @@ Pipe-delimited rows, one per drive or volume. Field 0 is a literal discriminator
 | `pct_used` | string | - | Windows | `5` | NVMe "Percentage Used" (0-255 by specification, never clamped), or "-" when not read. |
 | `spare_pct` | string | - | Windows | `100` | NVMe "Available Spare" (0-100), or "-" when not read. |
 | `detail` | string | - | all | `-` | Free text, or "-". |
+
+**`crossplatform.storage.topology` — `row_kind|kind|name|uuid|members|detail`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | `status` `topology` | Windows, Linux, macOS | `status` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), topology (one per record read). |
+| `kind` | string | - | Windows, Linux, macOS | `lvm_vg` | Layer kind. Values: lvm_vg, lvm_lv, md, multipath, apfs_container. Status rows: the action name. |
+| `name` | string | - | Windows, Linux, macOS | `vg0` | Layer name. Status rows: the level (unsupported). |
+| `uuid` | string | - | Windows, Linux, macOS | `-` | Layer UUID, or "-". Status rows: the reason token (<os>:planned). |
+| `members` | string | - | Windows, Linux, macOS | `sda2,sdb2` | Comma-separated member devices, or "-". Absent on status rows. |
+| `detail` | string | - | Windows, Linux, macOS | `-` | Free text, or "-". Absent on status rows. |
 
 **`crossplatform.storage.volumes` — `volume|mount_points|device|fstype|total_bytes|detail`**
 
@@ -108,6 +141,7 @@ Surfaced as `plugin_result_status` on the command response.
 | `OK` (derived from `UNDECLARED`) | — | — | clean read: `volumes` on Windows and macOS, `smart` on Windows |
 | `CONSTRAINED` | partial | Windows: `windows:physicaldrive` · `windows:physicaldrive_cap` · `windows:storage_device_property` · `windows:nvme_health` · `windows:volume_enum` · `windows:volume_extents:unread` · `windows:volume_extents:truncated` · `windows:volume_mount_paths` · `windows:volume_information`. macOS: `macos:iokit` · `macos:iokit:no_bsd_name` · `macos:iokit:health_unread` · `macos:iomedia` · `macos:iomedia:no_bsd_name` · `macos:provider_walk` · `macos:getmntinfo_r_np` | a per-device read degraded and the row carries `-` for what was not read; every macOS `smart` run reports `macos:iokit:health_unread` (identity read, health not); `windows:physicaldrive_cap` means more than `kMaxPhysicalDrives` drives exist |
 | `UNAVAILABLE` | partial | `linux:smart` · `linux:volumes` · `windows:physicaldrive` · `macos:iokit` · `macos:iomedia` | Linux, always (placeholder row); Windows or macOS when the drive or media enumeration itself fails, so no device was read at all |
+| `UNAVAILABLE` | unknown | `windows:planned` · `linux:planned` · `macos:planned` | `partitions` or `topology` on any OS: a planned action, one unsupported status row, nothing read |
 | `PERMISSION_DENIED` | partial | `windows:physicaldrive:denied` · `windows:volume_enum:denied` | Windows only: a device or volume handle open, or the volume enumeration, was refused; outranks every other degradation. The macOS legs never report it |
 
 ### Where the data goes
@@ -121,7 +155,7 @@ Surfaced as `plugin_result_status` on the command response.
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-07 · interactive user (elevated) · leg-hash f062fb9a3dfd
+**Windows** — captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-07 · interactive user (elevated) · leg-hash adfc0598de14
 
 ```
 == action=smart
@@ -138,7 +172,7 @@ volume|//?/Volume{b188886e-39bb-4915-a893-d61a3ca3c707}/|-|PhysicalDrive0|FAT32|
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 · leg-hash f062fb9a3dfd
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 · leg-hash adfc0598de14
 
 ```
 == action=smart
@@ -162,7 +196,7 @@ volume|disk2s2|-|disk0|-|5368664064|-
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash f062fb9a3dfd
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash adfc0598de14
 
 ```
 == action=smart
@@ -179,7 +213,7 @@ volume|-|-|-|-|-|physical-to-logical volume mapping is not implemented on Linux 
 
 1. **Health is NVMe-only on Windows.** SATA and USB drives report identity and media with `health=unknown`. `IOCTL_STORAGE_PREDICT_FAILURE` is deliberately not used as a fallback: it fails with `ERROR_INVALID_FUNCTION` on NVMe.
 2. **macOS health is always `unknown`.** The attributes sit behind Apple's private `IONVMeSMARTUserClient`; ruled out as the same class of dependency as the dead `FSCTL_SRV_ENUMERATE_SNAPSHOTS` in `filesystem_posture`.
-3. **Linux is declared, not implemented.** A future leg should bind `NVME_IOCTL_ADMIN_CMD` get-log-page (the Windows decoder is shareable), measure whether `SG_IO` ATA pass-through works without `CAP_SYS_RAWIO`, and take the cheap join from `/sys/block` plus `/proc/self/mountinfo`.
+3. **Linux is declared, not implemented.** A future leg should bind `NVME_IOCTL_ADMIN_CMD` get-log-page (the Windows decoder is shareable), measure whether `SG_IO` ATA pass-through works without `CAP_SYS_RAWIO`, and take the cheap join from `/sys/block` plus `/proc/self/mountinfo`. `partitions` and `topology` are advertised `planned` on all three OSes, though Windows has no LVM/md topology source and macOS has no multipath; the leg PRs move such legs to a typed `unsupported` with a reason, so until then `<os>:planned` means "not read", never "this host has no partitions".
 4. **No deadline on Windows device I/O.** `DeviceIoControl` is synchronous with no timeout; a wedged device parks the dispatch worker. Bounded only by `kMaxPhysicalDrives` and `ThreadErrorModeGuard`.
 5. **`total_bytes` is media capacity.** On macOS every APFS volume in a container reports the container's size, and unmounted members and containers appear with `-` mount points. Use `crossplatform.storage.mounts` for real capacity.
 
@@ -192,3 +226,4 @@ volume|-|-|-|-|-|physical-to-logical volume mapping is not implemented on Linux 
 - Tests: `tests/unit/test_disk_actions_local_dispatcher.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->
+

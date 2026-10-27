@@ -9,6 +9,9 @@
  *   "memory"       — Lists installed memory modules.
  *   "disks"        — Lists physical disk drives.
  *   "system"       — Serial number + system UUID (CMDB correlation key).
+ *   "chassis", "baseboard", "swap", "machine_id" — PLANNED on every OS: each answers one
+ *                    `status|<action>|unsupported|<os>:planned` row until its leg lands
+ *                    (hardware_estate_*.cpp).
  *
  * Output is pipe-delimited, one field per line via write_output():
  *   key|value   (for scalar actions)
@@ -16,6 +19,8 @@
  */
 
 #include <yuzu/plugin.hpp>
+
+#include "hardware_estate_legs.hpp" // chassis/baseboard/swap/machine_id seam
 
 #include <cstdint>
 #include <format>
@@ -409,7 +414,7 @@ int do_processors(yuzu::CommandContext& ctx) {
 #ifdef __linux__
     std::ifstream cpuinfo("/proc/cpuinfo");
     if (!cpuinfo) {
-        ctx.write_output("cpu|0|unknown|0|0|0");
+        ctx.write_output("cpu|0|unknown|0|0|0|-|-");
         return 0;
     }
     // Collect unique physical CPUs
@@ -448,11 +453,11 @@ int do_processors(yuzu::CommandContext& ctx) {
         }
     }
     if (cpus.empty()) {
-        ctx.write_output("cpu|0|unknown|0|0|0");
+        ctx.write_output("cpu|0|unknown|0|0|0|-|-");
     } else {
         for (auto& [id, c] : cpus) {
             ctx.write_output(
-                std::format("cpu|{}|{}|{}|{}|{:.0f}", id, c.model, c.cores, c.threads, c.mhz));
+                std::format("cpu|{}|{}|{}|{}|{:.0f}|-|-", id, c.model, c.cores, c.threads, c.mhz));
         }
     }
 
@@ -466,7 +471,7 @@ int do_processors(yuzu::CommandContext& ctx) {
     auto freq = sysctl_value<uint64_t>("hw.cpufrequency");
     double mhz = freq ? static_cast<double>(*freq) / 1e6 : 0.0;
     ctx.write_output(
-        std::format("cpu|0|{}|{}|{}|{:.0f}", brand.empty() ? "unknown" : brand, cores, threads, mhz));
+        std::format("cpu|0|{}|{}|{}|{:.0f}|-|-", brand.empty() ? "unknown" : brand, cores, threads, mhz));
 
 #elif defined(_WIN32)
     int idx = 0;
@@ -478,15 +483,15 @@ int do_processors(yuzu::CommandContext& ctx) {
                   auto threads = wmi_row_uint32(row, "NumberOfLogicalProcessors");
                   auto mhz = wmi_row_uint32(row, "MaxClockSpeed");
                   ctx.write_output(
-                      std::format("cpu|{}|{}|{}|{}|{}", idx++, name, cores, threads, mhz));
+                      std::format("cpu|{}|{}|{}|{}|{}|-|-", idx++, name, cores, threads, mhz));
               });
     // Deliberate #3404 divergence from silent-gap-on-empty -- see wmi_query()'s
     // doc comment above.
     if (idx == 0)
-        ctx.write_output("cpu|0|unknown|0|0|0");
+        ctx.write_output("cpu|0|unknown|0|0|0|-|-");
 
 #else
-    ctx.write_output("cpu|0|unknown|0|0|0");
+    ctx.write_output("cpu|0|unknown|0|0|0|-|-");
 #endif
     return 0;
 }
@@ -534,7 +539,7 @@ int do_memory(yuzu::CommandContext& ctx) {
                 auto pos = line.find_first_of("0123456789");
                 if (pos != std::string::npos) {
                     auto kb = std::stoull(line.substr(pos));
-                    ctx.write_output(std::format("dimm|total|{}|unknown|0", kb / 1024));
+                    ctx.write_output(std::format("dimm|total|{}|unknown|0|-|-|-", kb / 1024));
                 }
                 break;
             }
@@ -544,9 +549,9 @@ int do_memory(yuzu::CommandContext& ctx) {
 #elif defined(__APPLE__)
     auto mem = sysctl_value<uint64_t>("hw.memsize");
     if (mem) {
-        ctx.write_output(std::format("dimm|total|{}|unknown|0", *mem / (1024 * 1024)));
+        ctx.write_output(std::format("dimm|total|{}|unknown|0|-|-|-", *mem / (1024 * 1024)));
     } else {
-        ctx.write_output("dimm|total|unknown|unknown|0");
+        ctx.write_output("dimm|total|unknown|unknown|0|-|-|-");
     }
 
 #elif defined(_WIN32)
@@ -577,15 +582,15 @@ int do_memory(yuzu::CommandContext& ctx) {
                   }
                   auto size_mb = capacity / (1024 * 1024);
                   ctx.write_output(
-                      std::format("dimm|{}|{}|{}|{}", slot, size_mb, type_str, speed));
+                      std::format("dimm|{}|{}|{}|{}|-|-|-", slot, size_mb, type_str, speed));
               });
     // Deliberate #3404 divergence from silent-gap-on-empty -- see wmi_query()'s
     // doc comment above.
     if (!found)
-        ctx.write_output("dimm|unknown|0|unknown|0");
+        ctx.write_output("dimm|unknown|0|unknown|0|-|-|-");
 
 #else
-    ctx.write_output("dimm|unknown|0|unknown|0");
+    ctx.write_output("dimm|unknown|0|unknown|0|-|-|-");
 #endif
     return 0;
 }
@@ -781,7 +786,9 @@ int do_drivers(yuzu::CommandContext& ctx) {
 // unsupported on macOS (no public per-driver/kext enumeration API). "memory"
 // stays CONSTRAINED on Linux/macOS: both return a value, but only the
 // aggregate total, not full per-DIMM detail, without additional privilege /
-// API surface.
+// API surface. The four hardware-estate actions (chassis/baseboard/swap/
+// machine_id) are PLANNED on every leg (rung 1): a dispatch answers one
+// unsupported status row, `<os>:planned`, and reads nothing.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "manufacturer",
@@ -863,6 +870,62 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_SUPPORTED, 1,
          "WMI Win32_BIOS.SerialNumber + Win32_ComputerSystemProduct.UUID", nullptr},
     },
+    {
+        /* .action      = */ "chassis",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_PLANNED, 1,
+         "/sys/class/dmi/id/chassis_{type,serial,asset_tag} + SMBIOS type 3 (H.11)",
+         "not read yet: one unsupported status row, linux:planned"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_PLANNED, 1,
+         "no public source on Apple hardware (S-H1); H.13 declares it unsupported",
+         "not read yet: one unsupported status row, macos:planned"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_PLANNED, 1,
+         "GetSystemFirmwareTable('RSMB') SMBIOS type 3 via the shared walker (H.1/H.5)",
+         "not read yet: one unsupported status row, windows:planned"},
+    },
+    {
+        /* .action      = */ "baseboard",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_PLANNED, 1,
+         "/sys/class/dmi/id/board_{vendor,name,serial} + SMBIOS type 2 (H.11)",
+         "not read yet: one unsupported status row, linux:planned"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_PLANNED, 1,
+         "no public source on Apple hardware (S-H1); H.13 declares it unsupported",
+         "not read yet: one unsupported status row, macos:planned"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_PLANNED, 1,
+         "GetSystemFirmwareTable('RSMB') SMBIOS type 2 via the shared walker (H.1/H.5)",
+         "not read yet: one unsupported status row, windows:planned"},
+    },
+    {
+        /* .action      = */ "swap",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_PLANNED, 1, "/proc/swaps (H.11)",
+         "not read yet: one unsupported status row, linux:planned"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_PLANNED, 1, "sysctlbyname(vm.swapusage) (H.13)",
+         "not read yet: one unsupported status row, macos:planned"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_PLANNED, 1, "WMI Win32_PageFileUsage (H.5)",
+         "not read yet: one unsupported status row, windows:planned"},
+    },
+    {
+        /* .action      = */ "machine_id",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_PLANNED, 1, "keyed hash of /etc/machine-id (H.11)",
+         "not read yet: one unsupported status row, linux:planned"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_PLANNED, 1,
+         "no public source beyond the hardware UUID `system` already reports (S-H1); H.13 "
+         "declares it unsupported",
+         "not read yet: one unsupported status row, macos:planned"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_PLANNED, 1, "keyed hash of the registry MachineGuid (H.5)",
+         "not read yet: one unsupported status row, windows:planned"},
+    },
 };
 
 } // namespace
@@ -873,12 +936,13 @@ public:
     std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
         return "Reports hardware inventory: manufacturer, model, BIOS, CPU, memory, disks, "
-               "drivers";
+               "drivers, chassis, baseboard, swap, machine id";
     }
 
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"manufacturer", "model",   "bios",   "processors", "memory",
-                                     "disks",        "drivers", "system", nullptr};
+                                     "disks",        "drivers", "system", "chassis",
+                                     "baseboard",    "swap",    "machine_id", nullptr};
         return acts;
     }
 
@@ -912,6 +976,15 @@ public:
             return do_drivers(ctx);
         if (action == "system")
             return do_system(ctx);
+        if (auto k = yuzu::hardware::estate::parse_kind(action)) {
+#if defined(_WIN32)
+            return yuzu::hardware::estate::run_windows(ctx, *k);
+#elif defined(__linux__)
+            return yuzu::hardware::estate::run_linux(ctx, *k);
+#elif defined(__APPLE__)
+            return yuzu::hardware::estate::run_macos(ctx, *k);
+#endif
+        }
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;

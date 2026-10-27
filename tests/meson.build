@@ -599,6 +599,7 @@ agent_test_exe = executable(
     'unit/test_remote_access_audit_local_dispatcher.cpp',  # remote_access_audit: real plugin via LocalDispatcher + execute seam, unguarded on every OS
     'unit/test_firmware_posture_parsers.cpp',           # Wave 8 PR8.4: pure SMBIOS/DMI/fwupd/IODeviceTree decoders over REAL CAPTURE fixtures
     'unit/test_firmware_posture_local_dispatcher.cpp',  # Wave 8 PR8.4: real firmware_posture plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_hardware_local_dispatcher.cpp',  # H.2 scaffold: real hardware dylib/.so/.dll via LocalDispatcher, unguarded on every OS
     'unit/test_platform_security_parsers.cpp',            # Wave 8 PR8.1-a1: pure decoders/classifiers/status over REAL CAPTURE fixtures
     'unit/test_platform_security_win_parsers.cpp',        # Wave 8 PR8.1-a1: pure registry-state mappers + reg-export parser over the-rig REAL CAPTURE fixtures
     'unit/test_platform_security_local_dispatcher.cpp',   # Wave 8 PR8.1-a1: real platform_security dylib/.so/.dll via LocalDispatcher, unguarded on every OS

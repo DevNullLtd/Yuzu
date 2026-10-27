@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash fc050dca8530
+captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-27 · euid 0 · leg-hash 5f4b0195a1f5
 == action=manufacturer
 manufacturer|unknown
 [result_status] UNDECLARED / UNKNOWN / 
@@ -14,28 +14,59 @@ bios_date|unknown
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=processors
-cpu|0|unknown|0|0|0
+cpu|0|AMD Ryzen 9 PRO 8945HS w/ Radeon 780M Graphics|8|16|3993|-|-
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=memory
-dimm|total|7934|unknown|0
+dimm|total|15993|unknown|0|-|-|-
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=disks
-disk|0|vdb|0|HDD|virtio
-disk|1|vda|460|HDD|virtio
+disk|0|Virtual Disk|1024|HDD|unknown
+disk|1|Virtual Disk|0|HDD|unknown
+disk|2|Virtual Disk|8|HDD|unknown
+disk|3|Virtual Disk|0|HDD|unknown
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=drivers
-driver|0|selfowner|||kernel|module
-driver|1|shiftfs|||kernel|module
-driver|2|rosetta|||kernel|module
-driver|3|grpcfuse|||kernel|module
-driver|4|fakeowner|||kernel|module
+driver|0|xt_nat|||kernel|module
+driver|1|nf_conntrack_netlink|||kernel|module
+driver|2|xt_conntrack|||kernel|module
+driver|3|xt_MASQUERADE|||kernel|module
+driver|4|xfrm_user|||kernel|module
+driver|5|xfrm_algo|||kernel|module
+driver|6|xt_set|||kernel|module
+driver|7|ip_set|||kernel|module
+driver|8|xt_addrtype|||kernel|module
+driver|9|nft_compat|||kernel|module
+driver|10|sch_fq_codel|||kernel|module
+driver|11|autofs4|||kernel|module
+driver|12|br_netfilter|||kernel|module
+driver|13|bridge|||kernel|module
+driver|14|stp|||kernel|module
+driver|15|llc|||kernel|module
+driver|16|ip_tables|||kernel|module
+driver|17|tun|||kernel|module
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=system
 serial|unknown
 system_uuid|unknown
 [result_status] UNDECLARED / UNKNOWN / 
+
+== action=chassis
+status|chassis|unsupported|linux:planned
+[result_status] UNAVAILABLE / UNKNOWN / linux:planned
+
+== action=baseboard
+status|baseboard|unsupported|linux:planned
+[result_status] UNAVAILABLE / UNKNOWN / linux:planned
+
+== action=swap
+status|swap|unsupported|linux:planned
+[result_status] UNAVAILABLE / UNKNOWN / linux:planned
+
+== action=machine_id
+status|machine_id|unsupported|linux:planned
+[result_status] UNAVAILABLE / UNKNOWN / linux:planned
 

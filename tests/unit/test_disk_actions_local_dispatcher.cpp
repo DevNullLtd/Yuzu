@@ -408,6 +408,66 @@ TEST_CASE("disk_actions: macOS reports real mount points, not an empty join",
 }
 #endif // __APPLE__
 
+#if defined(_WIN32)
+constexpr const char* kPlannedToken = "windows:planned";
+#elif defined(__APPLE__)
+constexpr const char* kPlannedToken = "macos:planned";
+#else
+constexpr const char* kPlannedToken = "linux:planned";
+#endif
+
+TEST_CASE("disk_actions plugin: partitions and topology are declared PLANNED on every leg",
+          "[disk_actions][descriptors]") {
+    auto plugin = load_disk_actions_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    const auto* d = plugin->descriptor;
+    REQUIRE(d->action_descriptor_count == 4);
+    for (std::size_t i = 0; i < d->action_descriptor_count; ++i) {
+        const auto& a = d->action_descriptors[i];
+        const std::string_view name{a.action};
+        INFO("action: " << name);
+        if (name == "partitions" || name == "topology") {
+            for (const auto* leg : {&a.linux_leg, &a.macos_leg, &a.windows_leg}) {
+                CHECK(leg->support == YUZU_SUPPORT_PLANNED);
+                CHECK(leg->rung == 1);
+            }
+        } else if (name == "smart") {
+            CHECK(a.linux_leg.support == YUZU_SUPPORT_UNSUPPORTED);
+            CHECK(a.macos_leg.support == YUZU_SUPPORT_CONSTRAINED);
+            CHECK(a.windows_leg.support == YUZU_SUPPORT_SUPPORTED);
+        } else {
+            CHECK(name == "volumes");
+            CHECK(a.linux_leg.support == YUZU_SUPPORT_UNSUPPORTED);
+            CHECK(a.macos_leg.support == YUZU_SUPPORT_CONSTRAINED);
+            CHECK(a.windows_leg.support == YUZU_SUPPORT_CONSTRAINED);
+        }
+    }
+}
+
+TEST_CASE("disk_actions plugin: partitions and topology answer one typed planned status row",
+          "[disk_actions][actions]") {
+    auto plugin = load_disk_actions_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    for (const char* name : {"partitions", "topology"}) {
+        INFO("action: " << name);
+        auto result = dispatcher.run(plugin->descriptor, name);
+        CHECK(result.rc == 0);
+        const auto rows = captured_rows(result.captured);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == std::string{"status|"} + name + "|unsupported|" + kPlannedToken);
+        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+        CHECK(result.result_provenance == kPlannedToken);
+    }
+}
+
 TEST_CASE("disk_actions plugin: an unknown action is refused, not silently ignored",
           "[disk_actions][actions]") {
     auto plugin = load_disk_actions_plugin();
@@ -482,6 +542,33 @@ TEST_CASE("disk_actions: the volume row carries the physical-to-logical join",
     const auto r = format_volume_row("disk0s2", "/,/System/Volumes/Data", "disk0", "apfs",
                                      std::optional<std::uint64_t>{494384795648}, "-");
     CHECK(r == "volume|disk0s2|/,/System/Volumes/Data|disk0|apfs|494384795648|-");
+}
+
+TEST_CASE("disk_actions: partition and topology rows escape untrusted fields and render '-'",
+          "[disk_actions][format]") {
+    using namespace yuzu::disk_actions;
+    const auto p = format_partition_row("disk0", "disk0|s1", std::nullopt, "apfs", "/", "-");
+    const auto pf = split_fields_escape_aware(p);
+    REQUIRE(pf.size() == 7);
+    CHECK(pf[0] == "partition");
+    CHECK(pf[2] == "disk0|s1"); // round-trips through the escape, one field
+    CHECK(pf[3] == "-");        // an absent size is '-', never 0
+    CHECK(format_partition_row("sda", "sda1", std::optional<std::uint64_t>{1048576}, "ext4",
+                               "/boot", "-") == "partition|sda|sda1|1048576|ext4|/boot|-");
+
+    const auto t = format_topology_row(TopologyKind::lvm_lv, "vg|0/root", "u", "sda2", "-");
+    const auto tf = split_fields_escape_aware(t);
+    REQUIRE(tf.size() == 6);
+    CHECK(tf[0] == "topology");
+    CHECK(tf[1] == "lvm_lv");
+    CHECK(tf[2] == "vg|0/root"); // round-trips through the escape, one field
+
+    // Every kind renders its own closed token.
+    CHECK(topology_kind_token(TopologyKind::lvm_vg) == "lvm_vg");
+    CHECK(topology_kind_token(TopologyKind::lvm_lv) == "lvm_lv");
+    CHECK(topology_kind_token(TopologyKind::md) == "md");
+    CHECK(topology_kind_token(TopologyKind::multipath) == "multipath");
+    CHECK(topology_kind_token(TopologyKind::apfs_container) == "apfs_container");
 }
 
 // ── pure NVMe decision tests (K4 / FV-1) ────────────────────────────────

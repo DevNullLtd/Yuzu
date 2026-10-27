@@ -30,8 +30,9 @@
 
 namespace yuzu::hardware::linuxutil {
 
-// Parses `dmidecode -t memory` text into "dimm|slot|size_mb|type|speed_mhz"
-// rows. Returns {} both when dmi is unusable (empty, or no "Size:" field --
+// Parses `dmidecode -t memory` text into 8-field
+// "dimm|slot|size_mb|type|speed_mhz|manufacturer|part_number|serial" rows (the last three are
+// always "-" until a leg reads them). Returns {} both when dmi is unusable (empty, or no "Size:" field --
 // the same gate do_memory() used inline pre-Wave-3 to decide whether to fall
 // back to /proc/meminfo) and when it parses to zero installed-module rows;
 // callers distinguish those the same way the original code did (an empty
@@ -76,7 +77,7 @@ inline std::vector<std::string> parse_dmidecode_memory(const std::string& dmi) {
         sp = speed.find(' ');
         if (sp != std::string::npos)
             speed_mhz = speed.substr(0, sp);
-        rows.push_back("dimm|" + slot + "|" + size_mb + "|" + type + "|" + speed_mhz);
+        rows.push_back("dimm|" + slot + "|" + size_mb + "|" + type + "|" + speed_mhz + "|-|-|-");
     };
 
     while (std::getline(ss, line)) {

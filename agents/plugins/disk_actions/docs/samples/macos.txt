@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 · leg-hash f062fb9a3dfd
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 · leg-hash adfc0598de14
 == action=smart
 smart|disk0|APPLE SSD AP0512Z|nvme|ssd|unknown|-|-|device advertises SMART; health attributes are not read on macOS (they require Apple's private IONVMeSMARTUserClient interface)
 [result_status] CONSTRAINED / PARTIAL / macos:iokit:health_unread
