@@ -7088,6 +7088,11 @@ void SettingsRoutes::register_routes(
                       res.status = 503;
                       res.set_header("Retry-After", "5");
                       res.set_header("Sec-Audit-Failed", "true");
+                      // /settings swaps no 5xx body (only /settings/security swaps this
+                      // fragment), so the toast is what tells the operator on the main page.
+                      res.set_header("HX-Trigger",
+                                     R"({"showToast":{"message":"Audit store unavailable; MFA )"
+                                     R"(was not changed.","level":"error"}})");
                       res.set_content(render_mfa_fragment(
                                           *session, {}, {}, {}, {},
                                           "Audit store unavailable; MFA was not changed."),

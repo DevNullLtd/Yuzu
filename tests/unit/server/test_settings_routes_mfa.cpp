@@ -1152,6 +1152,11 @@ TEST_CASE("POST /api/settings/mfa/disable refuses to clear when the intent audit
     CHECK(res->get_header_value("HX-Redirect").empty());
     CHECK(res->get_header_value("Set-Cookie").find("Max-Age=0") == std::string::npos);
     CHECK(res->body.find("MFA was not changed") != std::string::npos);
+    CHECK(res->get_header_value("Retry-After") == "5");
+    // /settings drops a 5xx body, so the refusal also rides an HX-Trigger toast.
+    const auto toast = nlohmann::json::parse(res->get_header_value("HX-Trigger"));
+    CHECK(toast["showToast"]["message"] == "Audit store unavailable; MFA was not changed.");
+    CHECK(toast["showToast"]["level"] == "error");
     // Only the intent row was attempted: nothing after it ran.
     CHECK(results == std::vector<std::string>{"attempted"});
     CHECK(logs.text().find("MFA was NOT changed") != std::string::npos);

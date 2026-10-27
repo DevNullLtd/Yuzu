@@ -214,6 +214,18 @@ TEST_CASE("instruction extras ui: both 403 branches of the Approvals tab show an
     CHECK(has(js, "toast(approverRefusalText(env) || msg || 'You do not have permission to decide approvals.', 'error');"));
     CHECK(has(js, "toast(approverRefusalText(r.data) || r.message || 'You do not have permission to decide approvals.', 'error');"));
     CHECK(count_of(js, "approverRefusalText(") == 3); // definition + the two call sites
+    // A 503 (MFA state unreadable, clock fault, audit store down) shows error.remediation, on
+    // the initial response and on the response after the step-up retry; the generic text is the
+    // fallback. The 503 branch sits before the 403 one and never touches the 400/401/403 text.
+    CHECK(count_of(js, "function unavailableRemediationText(env)") == 1);
+    CHECK(has(js, "return e && typeof e.remediation === 'string' && e.remediation ? "
+                  "e.remediation : '';"));
+    CHECK(has(js, "x.status !== 401 && x.status !== 403 && x.status !== 503"));
+    CHECK(has(js, "if (x.status === 503) {\n      toast(unavailableRemediationText(env) ||\n"
+                  "            'Could not confirm the decision. Refresh to see the current state.', "
+                  "'error');"));
+    CHECK(has(js, "} else if (r.status === 503) {\n        toast(unavailableRemediationText(r.data) ||"));
+    CHECK(count_of(js, "unavailableRemediationText(") == 3); // definition + the two call sites
 }
 
 TEST_CASE("instruction extras ui: sets panel and set select stamp controls only when allowed",

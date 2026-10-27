@@ -244,6 +244,14 @@
       return '';
     }
 
+    // #6079: a 503 from the decision route (MFA state unreadable, clock fault, audit store down)
+    // carries error.remediation naming the next step. Show it; without one the caller keeps the
+    // generic text.
+    function unavailableRemediationText(env) {
+      var e = env && env.error;
+      return e && typeof e.remediation === 'string' && e.remediation ? e.remediation : '';
+    }
+
     // Approve / reject dialog for the selected pending request. The facts are the row's
     // own data-* attributes (no refetch); the decision is one POST through YuzuDialog.
     function decide(kind) {
@@ -298,6 +306,8 @@
               if (r.status === 401) return 'Your session has expired. Sign in again.';
               if (r.status === 403) return approverRefusalText(r.data) ||
                 'You do not have permission to decide approvals.';
+              if (r.status === 503) return unavailableRemediationText(r.data) ||
+                'Could not confirm the decision. Refresh to see the current state.';
               return 'Could not confirm the decision. Refresh to see the current state.';
             });
         }

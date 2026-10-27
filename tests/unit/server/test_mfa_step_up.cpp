@@ -1268,9 +1268,10 @@ auth::Session mint_oidc_session(yuzu::server::SessionStore& store, AuthManager& 
 }
 } // namespace
 
-TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: an SSO proof dated after the "
-                                 "database clock is its own 503 outcome, not a sign-in-again 403 "
-                                 "(UP-4)",
+TEST_CASE_METHOD(DurableFixture,
+                 "require_enrolled_fresh_mfa: an SSO proof dated after the "
+                 "database clock is its own 503 outcome, not a sign-in-again 403 "
+                 "(UP-4)",
                  "[pg][mfa][stepup][approver][approver_mfa][durable]") {
     const auto now_ms = std::chrono::duration_cast<milliseconds>(
                             system_clock::now().time_since_epoch())
@@ -1345,9 +1346,10 @@ TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: an SSO proof dated
 // UP-4 ordering: an SSO session whose cached anchor is empty AND whose durable read is degraded
 // is a store fault (503, counted), not the 403 "sign in again" that the empty anchor alone
 // would give. The degraded read decides first.
-TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: an SSO session with an empty "
-                                  "anchor and an unavailable durable read is a counted 503, not "
-                                  "a 403 (UP-4 ordering)",
+TEST_CASE_METHOD(ApproverFixture,
+                 "require_enrolled_fresh_mfa: an SSO session with an empty "
+                 "anchor and an unavailable durable read is a counted 503, not "
+                 "a 403 (UP-4 ordering)",
                  "[pg][mfa][stepup][approver][approver_mfa]") {
     const auto bare = make_session("oidc:x#y", "oidc"); // no proof: the anchor is empty
     REQUIRE(bare.steady_mfa_verified.time_since_epoch().count() == 0);
@@ -1365,9 +1367,10 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: an SSO session wi
     }
 }
 
-TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a real degraded durable read for an "
-                                 "SSO session with an empty anchor is a counted 503 (UP-4 "
-                                 "ordering)",
+TEST_CASE_METHOD(DurableFixture,
+                 "require_enrolled_fresh_mfa: a real degraded durable read for an "
+                 "SSO session with an empty anchor is a counted 503 (UP-4 "
+                 "ordering)",
                  "[pg][mfa][stepup][approver][approver_mfa][durable]") {
     const std::string tok = "yuzu-test-oidc-degraded-read-token-0001";
     const auto bare = mint_oidc_session(store, mgr, tok, 0);

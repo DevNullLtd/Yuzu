@@ -206,10 +206,11 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
     // replica's clock at login, so a replica running ahead of the database can store a proof
     // the database reads as future-dated. A future-dated durable instant is refused here; for
     // a freshly minted or loaded session the same condition has already left no cached proof
-    // (derive_session_deadlines), which probe_mfa_factor reports before this point (an SSO
-    // session: kProofClockSkew, or mfa_proof_missing once the skew has elapsed). kAbsent (no durable session, or another principal's) has no
-    // proof to age. kUnavailable (a degraded read, or no SessionStore attached) was refused
-    // above, so only kRow and kAbsent reach here.
+    // (derive_session_deadlines), which the kNoIdpProof arm above answers (an SSO session:
+    // kProofClockSkew, or mfa_proof_missing once the skew has elapsed). kAbsent (no
+    // durable session, or another principal's) has no proof to age. kUnavailable (a degraded
+    // read, or no SessionStore attached) was refused above, so only kRow and kAbsent reach
+    // here.
     bool within_window = false;
     std::int64_t proof_ms = 0;
     bool has_proof = false;

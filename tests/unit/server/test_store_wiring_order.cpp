@@ -976,8 +976,7 @@ TEST_CASE("strip_comments: block comments, an unterminated one, and line preserv
 
 TEST_CASE("strip_comments: server.cpp keeps its line count and is a fixed point",
           "[wiring_order][strip_comments]") {
-    const std::string raw =
-        read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    const std::string raw = read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
     REQUIRE(raw.size() > 100000); // not vacuous: the real file
     const std::string once = strip_comments(raw);
     CHECK(newlines_in(once) == newlines_in(raw));

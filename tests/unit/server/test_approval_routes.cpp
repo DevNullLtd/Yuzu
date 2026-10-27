@@ -1020,8 +1020,13 @@ TEST_CASE("approval_routes: the not-enrolled remediation names the role-appropri
     CHECK(user.find("Administrator guide") == std::string::npos);
     CHECK(user.find("Settings > Security and sign-in") == std::string::npos);
 
-    CHECK(remediation(auth::Role::user, MfaFactorState::kNoIdpProof).find("no MFA amr") !=
-          std::string::npos);
+    // The opening names BOTH causes: a proof dropped as future-dated leaves the same refusal
+    // after the skew has elapsed, so "no MFA amr" alone would be false there.
+    const auto no_proof = remediation(auth::Role::user, MfaFactorState::kNoIdpProof);
+    CHECK(no_proof.find("left no usable second-factor proof: the identity provider sent no MFA "
+                        "amr, or the clocks of the identity provider, the Yuzu server and its "
+                        "database disagree.") != std::string::npos);
+    CHECK(no_proof.find("did not attest") == std::string::npos);
     // The SSO "sign in again" advice also carries the clock clause, for the case where the
     // proof was dropped as future-dated and the skew has since elapsed (UP-4 residual).
     CHECK(remediation(auth::Role::user, MfaFactorState::kNoIdpProof)
@@ -1095,6 +1100,8 @@ TEST_CASE("approval_routes: an SSO proof dated after the database clock is a 503
         REQUIRE(j["error"].contains("retry_after_ms"));
         CHECK(j["error"]["retry_after_ms"].is_null());
         CHECK_FALSE(j["error"]["retry_after_ms"].is_number());
+        // No `Retry-After` header either (the Settings 503 sends one; this arm must not).
+        CHECK(res->get_header_value("Retry-After").empty());
         // The same ordering guarantee as the other 503 arm: one `error` row, no `attempted`.
         REQUIRE(h.audits.size() == 1);
         CHECK(h.audits[0].action == std::string("approval.") + verb);
@@ -1333,6 +1340,7 @@ TEST_CASE("approval_routes: when a refusal's audit row cannot be written the ref
     const Case kCases[] = {
         {"refuse", {Kind::kRefuse, MfaFactorState::kNotEnrolled}, 403},
         {"store unavailable", {Kind::kStoreUnavailable, MfaFactorState::kStoreUnavailable}, 503},
+        {"clock skew", {Kind::kProofClockSkew, MfaFactorState::kNoIdpProof}, 503},
         {"challenge written", {Kind::kChallengeWritten, MfaFactorState::kEnrolledLocal}, 401},
     };
     for (const auto& c : kCases) {
@@ -1993,8 +2001,7 @@ TEST_CASE("approval_routes: wiring -- server.cpp passes approver_mfa_fn and csrf
     CHECK(closure.find("session.username", read) != std::string::npos);
     CHECK(read < closure.find("require_enrolled_fresh_mfa("));
     CHECK(closure.find("action_label, durable,") != std::string::npos);
-    // The route="approval" 503 counter (and the alert on it) depends on the registry being
-    // handed to the gate: a nullptr here compiles and silently loses the series.
+    // The route="approval" 503 counter depends on the registry being handed to the gate: a nullptr here compiles and silently loses the series.
     CHECK(closure.find("action_label, durable, &metrics_)") != std::string::npos);
     // ...and the closure has no other way to build one: a synthetic proof literal here would
     // age the session on a clock the database does not own.

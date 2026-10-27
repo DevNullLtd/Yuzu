@@ -1956,8 +1956,8 @@ int main(int argc, char* argv[]) {
                           "Runbook (docs/ops-runbooks/auth-db-recovery.md)",
                           mfa_reset_user);
             std::cerr << "error: audit store did not accept the intent row; nothing was changed\n";
-            std::cerr << "if you are locked out and cannot restore the audit store, see \"Fallback: "
-                         "direct SQL\" in the Auth Store Recovery Runbook "
+            std::cerr << "if you are locked out and cannot restore the audit store, see "
+                         "\"Fallback: direct SQL\" in the Auth Store Recovery Runbook "
                          "(docs/ops-runbooks/auth-db-recovery.md)\n";
             return EXIT_FAILURE;
         }

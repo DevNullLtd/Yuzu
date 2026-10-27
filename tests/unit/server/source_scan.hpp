@@ -101,6 +101,11 @@ inline bool raw_string_opens_at(std::string_view text, std::size_t pos) noexcept
 // next line (the continuation newline is kept); a `'` inside a number is a digit separator, not
 // a character literal; `R"` opens a raw string only at the start of a token or after an
 // encoding prefix (u8, u, U, L). An unterminated `/*` swallows the rest of the text.
+//
+// Known limits, neither of which occurs in this tree: a backslash followed by trailing spaces
+// before the newline is not treated as a line continuation (GCC and Clang splice it, with a
+// warning), and a raw-string delimiter containing `"` is rejected although the standard allows
+// it.
 inline std::string strip_comments(std::string_view text) {
     std::string out;
     out.reserve(text.size());

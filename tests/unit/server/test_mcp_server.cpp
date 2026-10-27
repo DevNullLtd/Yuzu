@@ -2008,9 +2008,11 @@ TEST_CASE("MCP 2g: approve_request/reject_request descriptions state the REST en
         // One clause per reason (S-2): the lumped sentence put all three under one condition.
         CHECK(desc.find("conditional, because the generic step-up check can answer first") !=
               std::string::npos);
-        CHECK(desc.find("saml_mfa_unsupported (SAML, #4935) and account_unavailable "
-                        "(deactivated or deleted account) surface only with the step-up "
+        CHECK(desc.find("saml_mfa_unsupported (SAML, #4935) surfaces only with the step-up "
                         "window at 0") != std::string::npos);
+        CHECK(desc.find("account_unavailable (deactivated or deleted account) surfaces with "
+                        "the step-up window at 0, or when the account is removed between the "
+                        "approver rule's two reads") != std::string::npos);
         CHECK(desc.find("mfa_proof_missing (an OIDC login with no MFA amr) surfaces with the "
                         "step-up window at 0 or when MFA enforcement does not cover the "
                         "caller's role") != std::string::npos);

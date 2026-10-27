@@ -511,10 +511,16 @@
         typeof e.remediation === 'string' && e.remediation) return e.remediation;
     return '';
   }
+  /* #6079: a 503 (MFA state unreadable, clock fault, audit store down) names the next step in
+     error.remediation. Same textContent-only path as the 403 text above. */
+  function unavailableRemediationText(env) {
+    var e = env && env.error;
+    return e && typeof e.remediation === 'string' && e.remediation ? e.remediation : '';
+  }
   doc.body.addEventListener('htmx:responseError', function (evt) {
     var d = evt.detail;
     var x = d && d.xhr;
-    if (!x || (x.status !== 401 && x.status !== 403)) return;
+    if (!x || (x.status !== 401 && x.status !== 403 && x.status !== 503)) return;
     var path = (d.pathInfo && d.pathInfo.requestPath) ||
                (d.requestConfig && d.requestConfig.path) || '';
     var m = /^\/api\/approvals\/[^\/]+\/(approve|reject)$/.exec(path);
@@ -522,6 +528,11 @@
     var env = null;
     try { env = JSON.parse(x.responseText); } catch (e) { env = null; }
     var msg = env && env.error && typeof env.error.message === 'string' ? env.error.message : '';
+    if (x.status === 503) {
+      toast(unavailableRemediationText(env) ||
+            'Could not confirm the decision. Refresh to see the current state.', 'error');
+      return;
+    }
     if (x.status === 403) {
       toast(approverRefusalText(env) || msg || 'You do not have permission to decide approvals.', 'error');
       return;
@@ -540,6 +551,9 @@
         toast(approverRefusalText(r.data) || r.message || 'You do not have permission to decide approvals.', 'error');
       } else if (r.status === 400) {
         toast(r.message || 'The request was refused.', 'error');
+      } else if (r.status === 503) {
+        toast(unavailableRemediationText(r.data) ||
+              'Could not confirm the decision. Refresh to see the current state.', 'error');
       } else {
         toast('Could not confirm the decision. Refresh to see the current state.', 'error');
       }
