@@ -1,14 +1,3 @@
-<!-- The "Routed concerns" table of CLAUDE.md (repo root), pulled in by its
-     @-import — loaded every session, same authority as CLAUDE.md itself. This
-     file holds the platform/product/data/observability concerns; auth,
-     access-control and request-admission live in the sibling
-     `routed-concerns-access-control.md`, the read-only security-posture
-     plugin rows in `routed-concerns-security-posture.md`, and Forensics /
-     per-user-software-data concerns in `routed-concerns-software-estate.md`
-     (CLAUDE.md's own table names each). Gateway rows (upstream peer authz,
-     origin trust) are in security-posture; four files is the cap
-     (docs/instruction-file-standard.md). Row discipline: catastrophic-if-violated
-     invariants + doc pointers ONLY — detail goes in the routed doc. -->
 <!-- The "Routed concerns" table of CLAUDE.md, pulled in by its @-import — loaded
      every session, same authority as CLAUDE.md. This file holds the
      platform/product/data/observability concerns; auth, access-control and
