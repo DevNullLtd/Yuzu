@@ -734,7 +734,8 @@ spec:
         displayName: User SID
         description: >
           Windows security identifier of the target profile, as an alternative to username. Must match one of the
-          profiles list_profiles would report; a sid not found there is rejected.
+          profiles list_profiles would report, except that a `<SID>.bak` leftover is never a write target (its folder may
+          hold the user's real hive); a sid not found there is rejected.
         validation:
           maxLength: 256
       key:
@@ -828,7 +829,8 @@ spec:
         displayName: User SID
         description: >
           Windows security identifier of the target profile, as an alternative to username. Must match one of the
-          profiles list_profiles would report.
+          profiles list_profiles would report, except that a `<SID>.bak` leftover is never a write target (its folder may
+          hold the user's real hive).
         validation:
           maxLength: 256
       key:
@@ -891,9 +893,11 @@ metadata:
     backslash, or a value named `-`, which a row uses for the default value) is refused as unrepresentable_name
     before anything is changed, including the name of any value of a key an item would delete, whose raw UTF-16
     name must also be well-formed (a lone surrogate or a NUL has no exact UTF-8 spelling and is refused the same
-    way, in a dry run too; a value really named with U+FFFD is fine). Two value items on one key are also
-    dependent_items whenever either name holds a non-ASCII character (Windows folds value-name case with a
-    Unicode table the parser cannot reproduce). THE UNDO BUDGET: one 512 KiB budget charges every byte the
+    way, in a dry run too; a value really named with U+FFFD is fine). A plan is also refused dependent_items when
+    two items share a key prefix (a parent, or the whole key) spelled with a different non-ASCII case, or when
+    two value items on one key carry a non-ASCII name, because Windows folds that case with a Unicode table the
+    parser cannot reproduce; this also refuses distinct non-Latin sibling keys (for example two CJK vendor keys)
+    in one plan, so split them into separate plans. THE UNDO BUDGET: one 512 KiB budget charges every byte the
     manifest retains (previous values up to 4,096 bytes each, names and a fixed cost per row); a deleted key's
     values are all vetted but only as many as fit are returned, and when anything was cut the summary says
     undo_complete=0, in the dry run too, before anything is changed. THE UNDO CONTRACT: undo only `applied`
@@ -904,6 +908,8 @@ metadata:
     not captured, so a recreated key gets the parent's inherited security. It is a snapshot taken at capture:
     a value another writer changes between the capture and the change is lost or stale even with
     undo_complete=1. An item refused before its previous value was read shows "-" there, never "absent".
+    A refused item keeps no bytes: its old_hex is only ~<total> (the size), not data to replay, and it uses none
+    of the undo budget; undo only applied items.
     Rows are written as each item concludes, so a later exception inside the plugin or a failed output channel
     cannot take back rows already written; the agent sends output at command end or each 64 KiB, so an agent
     that dies mid-plan loses whatever it had not sent (for a plan whose output is under 64 KiB, all of it): read the keys back with a
@@ -1024,7 +1030,7 @@ spec:
         platforms: [windows]
       - name: field_12
         type: string
-        description: 'item: the previous value as hex (the kept bytes, then ~<total> when it was cut or the undo budget dropped it); restore it with data_hex. audit: counted_values=, or "-" when the item was refused before the contents of its key were read.'
+        description: 'item: the previous value as hex (the kept bytes, then ~<total> when it was cut or the undo budget dropped it; a refused item shows ~<total> only); restore it with data_hex. audit: counted_values=, or "-" when the item was refused before the contents of its key were read.'
         example: 6f006c006400
         platforms: [windows]
       - name: field_13

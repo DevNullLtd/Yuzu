@@ -341,6 +341,29 @@ TEST_CASE("registry parse_plan: items whose verdicts would depend on each other 
         CHECK(err(json::array({set_item("Software\\A", "caf\xC3\xA9", "1"), set_item("Software\\B", "caf\xC3\xA9", "2")})).empty()); // other key
         CHECK(err(json::array({set_item("Software\\A", "alpha", "1"), set_item("Software\\A", "beta", "2")})).empty()); // pure ASCII
     }
+    SECTION("keys that differ only in the case of a non-ASCII character are dependent, whatever the ops") {
+        // mutant: the ASCII fold alone. The kernel folds \xC3\x84 and \xC3\xA4 into one key; apply's handle map does not,
+        // so the real run refuses the second spelling (key_is_link) where the dry run said would_apply.
+        CHECK(err(json::array({set_item("Software\\\xC3\x84", "v", "1"), set_item("Software\\\xC3\xA4", "v", "2")})) == "dependent_items:0:1");
+        CHECK(err(json::array({set_item("Software\\\xC3\x84", "v", "1"), set_item("Software\\\xC3\xA4", "w", "2")})) == "dependent_items:0:1"); // names differ
+        CHECK(err(json::array({item("create_key", "Software\\\xC3\x84"), set_item("Software\\\xC3\xA4\\B", "v", "1")})) == "dependent_items:0:1"); // descendant
+        CHECK(err(json::array({set_item("Software\\\xC3\xA4\\B", "v", "1"), item("delete_key", "Software\\\xC3\x84")})) == "dependent_items:0:1"); // ancestor
+        // a SHARED PARENT spelled two ways, leaf keys different: the item that creates \xC3\x84 makes the later \xC3\xA4\\Y fail
+        // the canonical-name check. mutant: only whole-path (or ancestor) relations are compared.
+        CHECK(err(json::array({set_item("Software\\\xC3\x84\\X", "v", "1"), set_item("Software\\\xC3\xA4\\Y", "v", "2")})) == "dependent_items:0:1");
+        CHECK(err(json::array({set_item("Software\\\xC3\x84\\X", "v", "1"), item("create_key", "Software\\\xC3\xA4\\Y\\Z")})) == "dependent_items:0:1");
+    }
+    SECTION("non-ASCII keys the skeleton cannot relate stay independent, and one spelling twice is not a new clash") {
+        CHECK(err(json::array({set_item("Software\\\xC3\x84", "v", "1"), set_item("Software\\B", "v", "2")})).empty()); // other component
+        CHECK(err(json::array({set_item("Software\\\xC3\x84", "v", "1"), set_item("Other\\\xC3\xA4", "v", "2")})).empty()); // other parent
+        CHECK(err(json::array({set_item("Software\\\xC3\x84", "v", "1"), set_item("Software\\\xC3\x84", "w", "2")})).empty()); // same spelling, ASCII names
+        CHECK(err(json::array({set_item("Software\\\xC3\x84\\X", "v", "1"), set_item("Software\\\xC3\x84\\Y", "v", "2")})).empty()); // same parent spelling, different leaves
+        CHECK(err(json::array({set_item("Software\\\xC3\x84\\X", "v", "1"), set_item("Other\\\xC3\xA4\\Y", "v", "2")})).empty()); // the parents part company higher up
+        // an item that is already refused (bad type) changes nothing, so it clashes with nothing, non-ASCII spelling included
+        json bad_type = set_item("Software\\\xC3\x84\\X", "v", "1");
+        bad_type["type"] = "REG_NOPE";
+        CHECK(err(json::array({bad_type, set_item("Software\\\xC3\xA4\\Y", "v", "2")})).empty());
+    }
     SECTION("a key op over an equal, ancestor or descendant key of ANY other item") {
         CHECK(err(json::array({item("delete_key", "Software\\A"), set_item("Software\\A", "v", "1")})) == "dependent_items:0:1");
         CHECK(err(json::array({item("delete_key", "Software\\A"), set_item("Software\\A\\B", "v", "1")})) == "dependent_items:0:1"); // descendant

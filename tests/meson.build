@@ -258,6 +258,8 @@ agent_test_exe = executable(
     'unit/test_filesystem_read.cpp',
     'unit/test_filesystem_actions.cpp',
     'unit/test_filesystem_local_dispatcher.cpp', # #4728: real filesystem plugin via LocalDispatcher -- `replace` through the shared atomic write
+    'unit/test_filesystem_find_by_hash.cpp',  # #5624: pure find_by_hash walk core (limits, injected clock/cancel/hasher) + real no-follow fd hasher over TempDir
+    'unit/test_filesystem_find_by_hash_dispatcher.cpp',  # #5624: real filesystem plugin via LocalDispatcher -- byte-identical clean output, trailer + CONSTRAINED/PARTIAL
     'unit/test_confined_fs_rules.cpp',
     'unit/test_confined_fs_walk.cpp',
     'unit/test_confined_fs_posix.cpp',
@@ -1287,6 +1289,7 @@ tar_test_exe = executable(
     'unit/test_tar_store.cpp',
     'unit/test_tar_schema_registry.cpp',
     'unit/test_tar_capability_table.cpp',
+    'unit/test_tar_retention_tiers_table.cpp',
     'unit/test_tar_warehouse.cpp',
     'unit/test_tar_aggregator.cpp',
     'unit/test_tar_usage.cpp',
@@ -1835,6 +1838,7 @@ if build_server
       'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_settings_model.cpp',        # #4028 — pure Settings read-twin builder unit tests
       'unit/server/test_settings_read_twins.cpp',   # #4028 — REST v1 read-twin route coverage
+      'unit/server/test_tar_retention_tiers.cpp',   # TAR retention tier TSV parser + depth arithmetic (pure)
       'unit/server/test_settings_page_ui.cpp',      # pure-string pins: 21 panels + static h1 on the /settings page
       'unit/server/test_settings_general.cpp',      # System General page: runtime/events renderers, routes, page pins
       'unit/server/test_plugin_signing_helpers.cpp',
@@ -3211,6 +3215,15 @@ test('ensure-erlang strict-mode callers',
   timeout: 180,
 )
 
+# docs/ build inputs of Meson targets are re-included in /.dockerignore (the image
+# builds `COPY . .` with docs/ otherwise excluded).
+test('docker context re-includes embedded docs inputs',
+  _python3_test,
+  args: [files('test_docker_context_embeds_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Every script target uses yuzu_python (no ad-hoc find_program for python).
 test('meson python lookup is yuzu_python',
   _python3_test,
@@ -3485,6 +3498,16 @@ test('firmware_posture definition columns',
 test('runtimes definition columns',
   _python3_test,
   args: [files('test_runtimes_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# filesystem.find_by_hash's definition (content/definitions/filesystem.yaml): version 0.4.0, the
+# three declared columns and the row_kind values the declared-column result matcher binds to
+# (#5624); the C++ matcher test keeps a copy of the schema, this pins it to the shipped definition.
+test('filesystem definition columns',
+  _python3_test,
+  args: [files('test_filesystem_definition.py')],
   suite: 'docs',
   timeout: 30,
 )

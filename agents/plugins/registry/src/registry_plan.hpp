@@ -95,6 +95,35 @@ namespace detail {
     return b == a || (b.size() > a.size() && b.starts_with(a) && b[a.size()] == '\\');
 }
 
+/// The ASCII fold with every maximal run of non-ASCII bytes collapsed to one 0x80: the coarsest view under which two
+/// keys could still be one key to the kernel (it folds all of Unicode, this plugin only ASCII). Two keys that agree
+/// here but not under fold_ascii alone MAY be one key under different spellings.
+[[nodiscard]] inline std::string fold_skeleton(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    bool in_run = false;
+    for (const char c : fold_ascii(s)) {
+        const bool high = static_cast<unsigned char>(c) >= 0x80;
+        if (!high || !in_run) out += high ? '\x80' : c;
+        in_run = high;
+    }
+    return out;
+}
+
+/// True when, at some depth the two keys share under the skeleton fold, the components MAY be one key to the kernel but
+/// spelled differently under the ASCII fold (all arguments already folded; `ka`/`sa` and `kb`/`sb` are the same key
+/// under fold_ascii / fold_skeleton). A shared PARENT counts, not only the whole path: the item that creates `Ä` makes
+/// a later `ä\Y` fail the canonical-name check even though the leaf keys differ.
+[[nodiscard]] inline bool ambiguous_shared_prefix(std::string_view ka, std::string_view kb, std::string_view sa,
+                                                  std::string_view sb) {
+    const auto ca = split_key(ka), cb = split_key(kb), xa = split_key(sa), xb = split_key(sb);
+    for (std::size_t d = 0; d < std::min(ca.size(), cb.size()); ++d) {
+        if (xa[d] != xb[d]) return false; // the keys part company under every spelling: nothing deeper is shared
+        if (ca[d] != cb[d]) return true;
+    }
+    return false;
+}
+
 /// Nesting depth of '[' / '{' outside string literals; > 2 is not a flat array of flat objects. Checked BEFORE the
 /// parse so a deeply nested document never reaches the parser (or its destructor).
 [[nodiscard]] inline bool nested_deeper_than_two(std::string_view s) noexcept {
@@ -130,7 +159,8 @@ namespace detail {
 /// DEPENDENT ITEMS (two value ops on one key and name; a key op over another item's equal, ancestor or descendant key)
 /// are refused as a whole, so no verdict depends on an earlier item and dry run == real run; items that are already
 /// refused cannot change anything and are left out of the comparison. ponytail: O(n^2) over <= 256 items; keys compare
-/// ASCII-case-insensitively, so keys that differ only in non-ASCII case are not recognised as one (README caveat).
+/// ASCII-case-insensitively, and two items sharing a path prefix that differs only in non-ASCII case (ambiguous_shared_prefix)
+/// are dependent too, conservatively: the kernel folds all of Unicode and this parser cannot.
 /// Value names are CONSERVATIVE instead: Windows folds a value name's case with the full Unicode table, which this
 /// parser cannot reproduce, so two value items on one key are dependent whenever either name holds a non-ASCII byte.
 [[nodiscard]] inline PlanParse parse_plan(std::string_view text) {
@@ -207,12 +237,14 @@ namespace detail {
         out.items.push_back(std::move(item));
     }
 
-    std::vector<std::string> keys, names;
+    std::vector<std::string> keys, skeletons, names;
     std::vector<bool> non_ascii;
     keys.reserve(out.items.size());
+    skeletons.reserve(out.items.size());
     names.reserve(out.items.size());
     for (const auto& it : out.items) {
         keys.push_back(detail::fold_ascii(it.key));
+        skeletons.push_back(detail::fold_skeleton(it.key));
         names.push_back(detail::fold_ascii(it.name));
         non_ascii.push_back(std::ranges::any_of(it.name, [](char c) { return static_cast<unsigned char>(c) >= 0x80; }));
     }
@@ -221,9 +253,15 @@ namespace detail {
         for (std::size_t i = 0; i < j; ++i) {
             if (!out.items[i].invalid.empty()) continue;
             const bool key_involved = detail::is_key_op(out.items[i].op) || detail::is_key_op(out.items[j].op);
-            const bool clash = key_involved
-                                   ? (detail::key_covers(keys[i], keys[j]) || detail::key_covers(keys[j], keys[i]))
-                                   : (keys[i] == keys[j] && (names[i] == names[j] || non_ascii[i] || non_ascii[j]));
+            // Related under the ASCII fold: a key op over an equal/ancestor/descendant key of any item, else the same key.
+            const bool ascii_related = key_involved ? (detail::key_covers(keys[i], keys[j]) || detail::key_covers(keys[j], keys[i]))
+                                                    : keys[i] == keys[j];
+            // Keys that differ only in the case of a non-ASCII character are one kernel key that apply's ASCII-only
+            // handle map treats as two: the real run would refuse the second spelling (key_is_link) where the dry run
+            // predicted it. The ASCII fold can neither prove them one nor apart, so such a plan is refused whole, as
+            // the value-name rule below does for non-ASCII names. Any shared path prefix counts, not only the whole key.
+            const bool spelling_clash = detail::ambiguous_shared_prefix(keys[i], keys[j], skeletons[i], skeletons[j]);
+            const bool clash = spelling_clash || (ascii_related && (key_involved || names[i] == names[j] || non_ascii[i] || non_ascii[j]));
             if (clash)
                 return fail(std::string{kTokDependentItems} + ":" + std::to_string(i) + ":" + std::to_string(j));
         }
@@ -247,7 +285,7 @@ struct ItemRow {
 
 /// `item|<idx>|<op>|<hive>|<key>|<name>|<verdict>|<reason>|<verify>|<created>|<old_state>|<old_type>|<old_hex>|<new_len>`
 /// (14 cells). <old_hex> is the retained part of the previous value (<= kCaptureValueCap bytes), `~<total>` appended when
-/// the value was larger or the capture budget could not keep it. The key and name cells are row_field text: for an
+/// the value was larger, the capture budget could not keep it or the item was refused. The key and name cells are row_field text: for an
 /// item that proceeds they are exact (representable), for a refused one they may be the folded display form.
 [[nodiscard]] inline std::string render_item_row(const ItemRow& r) {
     using detail::dash;

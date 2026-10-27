@@ -336,11 +336,15 @@ def _check_definition_shapes(spec: dict, perms: dict, result: dict, definition_i
             raise ValueError(f"{where}: every spec.result.columns entry must be an object")
 
 
-def _check_column_docs(c: dict, definition_id: str, path: str) -> None:
+def _check_column_docs(c: dict, definition_id: str, path: str, index: int = 0) -> None:
     """The four optional documentation keys of ``spec.result.columns[]``
     (docs/yaml-dsl-spec.md): the server ignores them, so nothing else would
     ever notice a scalar where a list was meant — and the manifest would then
-    carry the wrong shape into ``yuzu://plugin-docs``."""
+    carry the wrong shape into ``yuzu://plugin-docs``. Also the one behavioural
+    key, ``discriminator``, which the server's result-set matcher DOES read (first
+    column only): a typo there would silently turn every column matcher on the
+    instruction into a never-match, so it is checked here too. It is not emitted
+    into the manifest."""
     where = f"{path}: {definition_id}.{c.get('name', '?')}"
     if c.get("description") is not None and not isinstance(c["description"], str):
         raise ValueError(f"{where}: `description` must be a string")
@@ -352,6 +356,13 @@ def _check_column_docs(c: dict, definition_id: str, path: str) -> None:
             raise ValueError(f"{where}: `values` (a closed vocabulary) is only meaningful on a string column")
     if c.get("example") is not None and not isinstance(c["example"], _SCALAR):
         raise ValueError(f"{where}: `example` must be a scalar")
+    if c.get("discriminator") is not None:
+        if not isinstance(c["discriminator"], bool):
+            raise ValueError(f"{where}: `discriminator` must be a boolean")
+        if index != 0:
+            raise ValueError(f"{where}: `discriminator` is only meaningful on the first column")
+        if str(c.get("type", "")) != "string":
+            raise ValueError(f"{where}: `discriminator` is only meaningful on a string column")
     platforms = c.get("platforms")
     if platforms is not None:
         if not isinstance(platforms, list) or not all(isinstance(pl, str) for pl in platforms):
@@ -379,9 +390,9 @@ def parse_definition_docs(docs: Iterable[dict], path: str) -> list[Definition]:
         result = spec.get("result") or {}
         _check_definition_shapes(spec, perms, result, defn_id, path)
         columns = []
-        for c in result.get("columns") or []:
+        for index, c in enumerate(result.get("columns") or []):
             if isinstance(c, dict):
-                _check_column_docs(c, defn_id, path)
+                _check_column_docs(c, defn_id, path, index)
                 columns.append({
                     "name": str(c.get("name", "")),
                     "type": str(c.get("type", "")),

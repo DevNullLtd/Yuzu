@@ -127,6 +127,10 @@ definition is never sent a target: it names no agent plugin, so if selected it i
 dispatch chokepoint denies it. A server.* row that the risk table classes destructive is skipped in
 a targeted run for the same reason, as is testing.chargen.start (it streams until stopped; start and
 stop it by hand through the dashboard or REST with agent_ids).
+
+Directory-shaped parameters (find_by_hash, search_dir) get a per-run directory the runner seeds on
+its own host, so they assume the agent shares the runner host's filesystem: a remote agent, or one
+under a private /tmp (systemd PrivateTmp), reports `directory is not accessible` for those rows.
 """
 
 from __future__ import annotations
@@ -135,17 +139,20 @@ import argparse
 import concurrent.futures
 import contextlib
 import datetime
+import hashlib
 import http.client
 import http.cookiejar
 import json
 import os
 import platform
 import re
+import shutil
 import signal
 import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -299,7 +306,9 @@ HOST = _detect_host()
 
 # Per-host string defaults for common parameter names. Keys are matched as
 # substrings against the lowercased parameter name, in declaration order —
-# more-specific keys first.
+# more-specific keys first. "dir" is the BASE under which main() provisions the
+# per-run seeded directory (seeded_directory below); it is only handed out as a
+# parameter value when that provisioning failed.
 _HOST_PATHS = {
     "linux":   {"file": "/bin/ls", "dir": "/tmp", "user_dir": "/tmp"},
     "darwin":  {"file": "/bin/ls", "dir": "/tmp", "user_dir": "/tmp"},
@@ -315,6 +324,72 @@ _HOST_GROUPS = {
 }
 
 
+# ── seeded directory for directory-shaped parameters ───────────────────────
+#
+# device.filesystem.find_by_hash walks the directory it is given and hashes what it finds, so a
+# shared, busy "/tmp" is a poor default: the walk is bounded now, but the gate row would still
+# answer "truncated" on a loaded host instead of the match it exists to prove (#5624). main()
+# provisions a small private directory per run -- three tiny files and the real SHA-256 of one --
+# and _synth_string hands that directory and digest to every directory- and sha256-shaped
+# parameter for the duration of the run.
+
+_SEED: dict[str, str] = {}
+
+_SEED_FILES: tuple[tuple[str, bytes], ...] = (
+    ("a.txt", b"yuzu instructions gate seed file a\n"),
+    ("b.txt", b"yuzu instructions gate seed file b\n"),
+    ("c.txt", b"yuzu instructions gate seed file c\n"),
+)
+
+
+def _provision_seed(base: str) -> tuple[str, str]:
+    """Create <base>/yuzu_test_instr_<salt> holding the seed files; return (dir, sha256 of a.txt).
+
+    Raises OSError (after removing any partial directory) so the caller can try another base.
+    """
+    path = tempfile.mkdtemp(prefix="yuzu_test_instr_", dir=base)
+    try:
+        os.chmod(path, 0o755)  # mkdtemp creates the directory 0700
+        for name, data in _SEED_FILES:
+            file_path = os.path.join(path, name)
+            with open(file_path, "wb") as fh:
+                fh.write(data)
+            os.chmod(file_path, 0o644)
+    except OSError:
+        shutil.rmtree(path, ignore_errors=True)
+        raise
+    return path, hashlib.sha256(_SEED_FILES[0][1]).hexdigest()
+
+
+@contextlib.contextmanager
+def seeded_directory(base: str | None = None):
+    """Provision the per-run seed directory for the duration of the block, then remove it.
+
+    Prefers `base` (default: the per-host "dir" root), falls back to the user's temp directory,
+    and, when neither is writable, prints one line to stderr and yields with nothing seeded so
+    every runner mode keeps its previous behaviour -- no mode depends on writable temp storage.
+    """
+    path = None
+    last_error: OSError | None = None
+    for candidate in (base or _HOST_PATHS[HOST]["dir"], tempfile.gettempdir()):
+        try:
+            path, digest = _provision_seed(candidate)
+        except OSError as exc:
+            last_error = exc
+            continue
+        _SEED.update(dir=path, sha256=digest)
+        break
+    if path is None:
+        say(f"instructions_runner: seed directory unavailable ({last_error}); "
+            "find_by_hash will use the host default", file=sys.stderr)
+    try:
+        yield path
+    finally:
+        _SEED.clear()
+        if path is not None:
+            shutil.rmtree(path, ignore_errors=True)
+
+
 def _synth_string(name: str, schema: dict) -> str:
     """Best-effort string default for a parameter, host-aware."""
     nl = name.lower()
@@ -324,7 +399,7 @@ def _synth_string(name: str, schema: dict) -> str:
     if nl == "sql" or nl.endswith("_sql") or "query" == nl:
         return "SELECT 1"
     if "sha256" in nl or nl == "hash" or nl.endswith("_hash"):
-        return "0" * 64
+        return _SEED.get("sha256") or "0" * 64
     if "sha1" in nl:
         return "0" * 40
     if "md5" in nl:
@@ -344,7 +419,7 @@ def _synth_string(name: str, schema: dict) -> str:
     if "extension" in nl:
         return "txt"
     if nl in ("root", "directory") or nl.endswith("_dir") or nl.endswith("_directory") or "folder" in nl:
-        return paths["dir"]
+        return _SEED.get("dir") or paths["dir"]
     if nl == "path" or nl.endswith("_path") or nl == "file" or nl.endswith("_file"):
         return paths["file"]
     if "group" in nl:
@@ -2085,7 +2160,8 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, OSError):  # not the main thread
             pass
     try:
-        return run(args)
+        with seeded_directory():
+            return run(args)
     except KeyboardInterrupt:
         say("instructions_runner: interrupted", file=sys.stderr)
         return 130

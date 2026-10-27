@@ -7,3 +7,35 @@ lint:
 breaking:
   use:
     - WIRE_JSON
+    # No-deletion policy (owner ruling, 2026-10-26, recorded in #6555): "proto subtractions are
+    # breaking, so we should just not use the field, not remove it from the
+    # protobufs." Nothing is ever deleted from a .proto -- not even with
+    # `reserved` (which WIRE_JSON alone accepts) -- and RPCs/services are
+    # never removed. Retire an item by ceasing to use it and marking it
+    # `[deprecated = true]` / `option deprecated = true;` where protobuf
+    # has that option (a oneof has none: deprecate its fields). These are
+    # FILE-category rules, so moving a message/enum/service to another
+    # file also counts as a deletion. Rule IDs checked against buf 1.50.0
+    # `buf config ls-breaking-rules`.
+    # `deprecated` is metadata only: retiring an RPC for a security reason
+    # also means removing EVERY handler that serves it -- the server's, the
+    # gateway's (un-export it from the yuzu_gw_*_service module) and any
+    # upstream RPC the gateway forwards it through; each removed handler
+    # then answers UNIMPLEMENTED. If a deletion reaches dev anyway, revert
+    # it. A deliberate removal needs a new owner ruling and an `ignore_only` entry
+    # scoped to one rule and one file, removed once the deletion is on main.
+    # A stale entry silently re-allows that rule's deletions in that file:
+    # for fields and enum values only with `reserved` (WIRE_JSON still
+    # applies), for oneofs nothing on its own (their fields stay guarded),
+    # for every other kind outright. Do not edit this block to get a PR
+    # green (#6552 tracks pinning this block).
+    - FILE_NO_DELETE
+    - MESSAGE_NO_DELETE
+    - ENUM_NO_DELETE
+    - SERVICE_NO_DELETE
+    - EXTENSION_NO_DELETE
+    - FIELD_NO_DELETE
+    - ONEOF_NO_DELETE
+    - ENUM_VALUE_NO_DELETE
+    - RPC_NO_DELETE
+    - EXTENSION_MESSAGE_NO_DELETE
