@@ -60,6 +60,7 @@
 #include <cstddef>
 #include <iterator>
 #include <optional>
+#include <functional>
 #include <map>
 #include <regex>
 #include <set>
@@ -1323,29 +1324,36 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
     }
 }
 
-TEST_CASE("openapi documents: operation summaries and descriptions carry no engineering-process "
-          "references",
+TEST_CASE("openapi documents: no text cites an issue, an ADR, a build wave or the review process",
           "[openapi][structure]") {
-    // The summary is the line an operator reads first on /swagger and in generated client docs. It
-    // names what the operation does, not the issue, ADR, review gate or build wave that shaped it.
-    // Descriptions may still cite an issue or an ADR where a reader needs it (a sweep of those is
-    // tracked separately), but never the review process itself.
-    static const std::regex kSummary(
-        R"(#[0-9]{3,5}|ADR-?[0-9]{4}|SOC ?2|[Gg]overnance|\bGate\b|\bWave [0-9]|\bPR-?[0-9]|\bWS-[A-Z][0-9]|)"
-        R"(\bPhase [0-9]|A2-R[0-9]|[Aa]pi-parity|API-parity|\bBatch [A-Z]\b|\bCC[0-9]\.[0-9])");
-    static const std::regex kProcess(
-        R"([Gg]overnance|\bGate [0-9]|fix round|re-review|\bUP-[0-9]+|\bCDX-)");
+    // The document is read by operators and by agentic workers integrating with the API, on
+    // /swagger and in generated clients. It states behaviour; it does not cite the issue, ADR
+    // decision, build wave, SOC 2 control or review gate that shaped it. Every string value in the
+    // document is checked, in both forms (keys are not text).
+    static const std::regex kInternal(
+        R"(#[0-9]{3,5}\b|\bADR-?[0-9]{4}|\bSOC ?2 ?CC[0-9]|\bPhase [0-9]|\bWave [0-9]|\bPRs? ?[0-9]|)"
+        R"(\bWS-[A-Z][0-9]|\bA2-R[0-9]|\bINV-[0-9]|\bUP-[0-9]+|\bCDX-|[Gg]overnance|\bGate [0-9]|)"
+        R"(fix round|re-review|[Aa]pi-parity|API-parity|\bBatch [A-Z]\b)");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
         const json spec = json::parse(document_text(with_guides));
-        for (const auto& o : all_operations(spec)) {
-            INFO(o.where());
-            const std::string summary = o.op.value("summary", "");
-            INFO("summary: " << summary);
-            CHECK_FALSE(std::regex_search(summary, kSummary));
-            const std::string description = o.op.value("description", "");
-            CHECK_FALSE(std::regex_search(description, kProcess));
-        }
+        std::size_t strings = 0;
+        const std::function<void(const json&, const std::string&)> walk =
+            [&](const json& node, const std::string& where) {
+                if (node.is_string()) {
+                    ++strings;
+                    INFO(where);
+                    CHECK_FALSE(std::regex_search(node.get<std::string>(), kInternal));
+                } else if (node.is_array()) {
+                    for (std::size_t i = 0; i < node.size(); ++i)
+                        walk(node[i], where + "/" + std::to_string(i));
+                } else if (node.is_object()) {
+                    for (const auto& [key, value] : node.items())
+                        walk(value, where + "/" + key);
+                }
+            };
+        walk(spec, "");
+        CHECK(strings > 1000); // the walk really reached the text
     }
 }
 
