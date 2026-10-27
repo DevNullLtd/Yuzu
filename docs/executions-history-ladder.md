@@ -291,7 +291,7 @@ materializes empty for every creator), and bundle collation applies the caller's
 `tests/test_forensics_tier_wiring_lexical.py` pins that `server.cpp`
 wires the plugin set and the resolver into each of these.
 
-**Provenance: the plugin label is server-authored (UP-7).** The plugin of a stored response decides its tier and the
+**Provenance: the plugin label is server-authored.** The plugin of a stored response decides its tier and the
 treatment of every derived sink, so it comes from the SERVER's dispatch record, never from the command id an agent
 echoes. `response_provenance.hpp` holds the one pure decision (`resolve_response_provenance`), called once per response
 frame on each ingest path (direct Subscribe and gateway proxy) through `AgentServiceImpl::resolve_response_provenance`;
