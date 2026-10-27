@@ -654,6 +654,19 @@ TEST_CASE("device live capture_sources: tar status -> read-only source table", "
     CHECK(r->body.find("/tar") != std::string::npos);                  // configure-on-TAR link
 }
 
+TEST_CASE("device live capture_sources: registry row renders with the System category",
+          "[device][routes]") {
+    LiveHarness h;
+    h.fake_rows = {{"a-1", 1, "config|registry_enabled|true\nconfig|registry_live_rows|7", ""}};
+    auto r = h.sink.Get("/fragments/device/live/result?command_id=tar-test"
+                        "&agent_id=a-1&kind=capture_sources&n=1");
+    REQUIRE(r);
+    CHECK(r->body.find("<span class=\"src-on\">registry</span>") != std::string::npos);
+    CHECK(r->body.find("<code>$Registry_Live</code></td><td class=\"ls-num\">7</td>"
+                       "<td><span class=\"ls-pill\">System</span>") != std::string::npos);
+    CHECK(r->body.find("1 of 1 on") != std::string::npos);
+}
+
 // Round-3 item 11: the ten new physical-hardware live kinds share ONE generic
 // pipe-row path (live_kinds.hpp LiveKind::columns/.row_prefix -> device_routes.cpp
 // render_live_result's `!lk.columns.empty()` branch -> device_ui.cpp

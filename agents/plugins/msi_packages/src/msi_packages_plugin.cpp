@@ -502,8 +502,8 @@ public:
             return 1;
         } catch (...) {
             try {
-                ctx.write_output(inv::format_status_row(
-                    action, inv::StatusLevel::constrained, "msi_packages:exception"));
+                ctx.write_output(yuzu::shared::format_status_row(
+                    action, yuzu::shared::StatusLevel::constrained, "msi_packages:exception"));
                 ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
                                       YUZU_RESULT_COMPLETENESS_PARTIAL, "msi_packages:exception");
             } catch (...) {
