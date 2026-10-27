@@ -11,7 +11,7 @@
  * plugin name keeps the operator's spelling, so it is compared ASCII-case-insensitively) AND the
  * frame's `CommandResponse.action` (stamped by the AGENT on every plugin-output RUNNING frame and on
  * the terminal frame: make_output_frame / make_final_frame in agents/core/src/command_frames.hpp,
- * called from agent.cpp) is one of the three
+ * called from agent.cpp) is one of the six
  * MUTATING actions. A read action's output can never mint a row, and an agent that stamps no action
  * (every agent that predates the stamp) produces none: fail-closed, documented. A read action's
  * output is never parsed for `audit|` lines, so the action gate is the control, not the content.
@@ -38,8 +38,12 @@
  * backslash-escaped `|` is still a `|` to this parser, so text after it could pick the row's
  * result or forge a second row). Put `result=` before any caller-sized field: it is read from the
  * whole line, but a line over the byte bound loses its tail. At most kMaxRegistryAuditLinesPerFrame
- * lines and kMaxRegistryAuditLineBytes bytes per line. One operation is ONE record (a delete_key
- * removes one key and the counts ride in fields): the frame and budget bounds assume it.
+ * lines and kMaxRegistryAuditLineBytes bytes per line. One operation is ONE record: a delete_key
+ * removes one key, or with `recursive` one tree, and the counts ride in fields; an `apply` writes
+ * one record per plan item it attempts, at most 256 (the plugin's kMaxPlanItems), which fits one
+ * frame's line bound even when the agent sends the whole reply in one frame (it may also split it
+ * at its 64 KiB flush). The frame and budget bounds assume it; static_asserts in the server test
+ * tie the two constants.
  *
  * PRODUCER: agents/plugins/registry/README.md ("Audit line grammar and producer contract"), pinned
  * against this parser by the render-pin cases in tests/unit/server/test_plugin_result_audit.cpp.
@@ -66,9 +70,9 @@
 
 namespace yuzu::server {
 
-/// The registry plugin's three state-changing actions -- the only ones whose output is audited.
-inline constexpr std::array<std::string_view, 3> kRegistryMutatingActions{
-    "set_value", "delete_value", "delete_key"};
+/// The registry plugin's six state-changing actions -- the only ones whose output is audited.
+inline constexpr std::array<std::string_view, 6> kRegistryMutatingActions{
+    "set_value", "delete_value", "delete_key", "set_user_value", "delete_user_value", "apply"};
 
 [[nodiscard]] constexpr bool is_registry_mutating_action(std::string_view action) noexcept {
     return std::ranges::find(kRegistryMutatingActions, action) != kRegistryMutatingActions.end();
@@ -78,10 +82,12 @@ inline constexpr std::size_t kMaxRegistryAuditLinesPerFrame = 300;
 inline constexpr std::size_t kMaxRegistryAuditLineBytes = 4096;
 
 /// Per-agent row budget (bounded_audit_budget.hpp), applied across frames and kept PER SERVER
-/// PROCESS (each replica has its own; a restart resets it). Far above the volume of a legitimate
-/// agent (about one row per command): its job is to stop an enrolled agent that loops 300-line
-/// frames from writing millions of 365-day evidence rows, not to ration normal use. A fixed
-/// window: a burst straddling a boundary can admit up to twice the rows. The first
+/// PROCESS (each replica has its own; a restart resets it). Above the volume of a legitimate agent:
+/// about one row per command, except `apply`, which writes one row per item (up to 256 per command, so
+/// 512 for a dry-run preview plus the real run of one full plan; a second plan inside the same window
+/// can exhaust it, and its rows are then refused and counted). Its job is to stop an enrolled agent
+/// that loops 300-line frames from writing millions of 365-day evidence rows, not to ration normal
+/// use. A fixed window: a burst straddling a boundary can admit up to twice the rows. The first
 /// kRegistryAuditBudgetAgents agents of a window each have an allowance; later agents are spread
 /// over kRegistryAuditOverflowBuckets shared allowances by a hash of the id, so a fleet-wide
 /// change answered by far more agents than the table holds, at about one row each, still loses

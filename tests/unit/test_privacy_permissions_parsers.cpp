@@ -853,6 +853,17 @@ TEST_CASE("win::classify_hive_file: a stock hive is accepted; each refusal fires
         auto rp = stock();
         rp.is_reparse = true;
         CHECK(token(rp) == "hive_reparse_point");
+        rp.leaf_hardlinked = true; // the reparse verdict comes first
+        CHECK(token(rp) == "hive_reparse_point");
+        auto hl = stock(); // the link count outranks kind, residency, owner, redirect and size
+        hl.leaf_hardlinked = true;
+        CHECK(token(hl) == "hive_hardlinked");
+        hl.is_directory = true;
+        hl.not_resident = true;
+        hl.owner_sid = "S-1-5-21-1-2-3-1002";
+        hl.final_path_matches = false;
+        hl.size = win::kMaxHiveBytes + 1;
+        CHECK(token(hl) == "hive_hardlinked");
         auto dir = stock();
         dir.is_directory = true;
         CHECK(token(dir) == "hive_not_regular");
