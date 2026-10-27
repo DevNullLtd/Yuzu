@@ -95,8 +95,8 @@ namespace detail {
     return b == a || (b.size() > a.size() && b.starts_with(a) && b[a.size()] == '\\');
 }
 
-/// The ASCII fold with every maximal run of non-ASCII bytes collapsed to one 0x80: the most two keys the ASCII fold
-/// cannot tell apart might still be (the kernel folds all of Unicode, this plugin only ASCII). Two keys that agree
+/// The ASCII fold with every maximal run of non-ASCII bytes collapsed to one 0x80: the coarsest view under which two
+/// keys could still be one key to the kernel (it folds all of Unicode, this plugin only ASCII). Two keys that agree
 /// here but not under fold_ascii alone MAY be one key under different spellings.
 [[nodiscard]] inline std::string fold_skeleton(std::string_view s) {
     std::string out;
@@ -110,7 +110,7 @@ namespace detail {
     return out;
 }
 
-/// True when, at some depth the two keys share under the skeleton fold, the components are one key to the kernel but
+/// True when, at some depth the two keys share under the skeleton fold, the components MAY be one key to the kernel but
 /// spelled differently under the ASCII fold (all arguments already folded; `ka`/`sa` and `kb`/`sb` are the same key
 /// under fold_ascii / fold_skeleton). A shared PARENT counts, not only the whole path: the item that creates `Ä` makes
 /// a later `ä\Y` fail the canonical-name check even though the leaf keys differ.
@@ -285,7 +285,7 @@ struct ItemRow {
 
 /// `item|<idx>|<op>|<hive>|<key>|<name>|<verdict>|<reason>|<verify>|<created>|<old_state>|<old_type>|<old_hex>|<new_len>`
 /// (14 cells). <old_hex> is the retained part of the previous value (<= kCaptureValueCap bytes), `~<total>` appended when
-/// the value was larger or the capture budget could not keep it. The key and name cells are row_field text: for an
+/// the value was larger, the capture budget could not keep it or the item was refused. The key and name cells are row_field text: for an
 /// item that proceeds they are exact (representable), for a refused one they may be the folded display form.
 [[nodiscard]] inline std::string render_item_row(const ItemRow& r) {
     using detail::dash;
