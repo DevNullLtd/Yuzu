@@ -295,6 +295,33 @@ S0_TOKEN_HOME_HEADER = {
 }
 
 
+def _gnu_gxx():
+    """A GNU g++ to use as the include oracle, or None. `g++` on macOS is Apple clang, whose
+    preprocessor differs on the shapes this selftest pins (`udl_suffix_R_is_not_a_raw_string`), so
+    the compiler must identify itself as GCC and not as clang."""
+    gxx = shutil.which("g++")
+    if not gxx:
+        return None
+    try:
+        r = subprocess.run([gxx, "-dM", "-E", "-x", "c++", os.devnull], capture_output=True,
+                           text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode == 0 and "#define __GNUC__" in r.stdout and "#define __clang__" not in r.stdout:
+        return gxx
+    return None
+
+
+def _oracle_lists(gxx, tu, include_dir):
+    """True/False: does the compiler's preprocessor list hid_store.hpp for `tu`? None when it
+    exits non-zero (an unterminated comment, say) - then its dependency output is not evidence."""
+    dep = subprocess.run([gxx, "-std=gnu++23", "-MM", "-MG", "-I", str(include_dir), str(tu)],
+                         capture_output=True, text=True, errors="replace")
+    if dep.returncode != 0:
+        return None
+    return "hid_store.hpp" in dep.stdout
+
+
 def _diff(got, want) -> str:
     """added/removed between a module list and its frozen pin (the full lists run to ~35 paths)."""
     got, want = list(got), list(want)
@@ -317,6 +344,10 @@ def _load_checker():
 
 
 def main() -> int:
+    if os.environ.get("YUZU_REQUIRE_TOOLCHAIN") == "1" and _gnu_gxx() is None:
+        print("::error::seam closure self-test: YUZU_REQUIRE_TOOLCHAIN=1 but no GNU g++ is on PATH "
+              "(Apple clang does not count) - the include-parser oracle cannot run", file=sys.stderr)
+        return 1
     mod = _load_checker()
     failures: list[str] = []
 
@@ -438,7 +469,7 @@ def main() -> int:
     # 3. Missing-family-member HARD ERROR: a declared TU that does not exist
     #    on disk must fail the family check, never be silently skipped.
     with tempfile.TemporaryDirectory() as td:
-        root = Path(td)
+        root = Path(td).resolve()   # macOS: /var -> /private/var, else relative_to() breaks
         src = root / "server" / "core" / "src"
         inc = root / "server" / "core" / "include"
         common = root / "common" / "include"
@@ -769,8 +800,8 @@ def main() -> int:
 
         # 20. PARSER (UP-1, UP-3): every form below hides a real store include from a
         #     line-anchored regex unless handled, and is a real include to GCC/Clang -
-        #     each `fire` form was cross-checked against `g++ -MM` while writing this (38
-        #     fixtures, no MISS). Every `fire` form must fire via check_family; every `hide` form
+        #     each form is re-checked against GNU `g++ -MM -MG` below when one is installed
+        #     (and the CI step REQUIRES one). Every `fire` form must fire via check_family; every `hide` form
         #     (a comment, a splice into a comment, an unterminated comment) must NOT.
         (src / "hid_store.hpp").write_text("#pragma once\nclass HidStore {};\n", encoding="utf-8")
         parser_forms = {
@@ -825,6 +856,14 @@ def main() -> int:
             "hex_separator_chain_then_comment_hides_include": ("int n = 0xAB'CD'EF; /* hides\n#include \"hid_store.hpp\"\n*/ int z;\n", False),
             # backslash-newline INSIDE a raw string is kept by the compiler (shape B of the fuzz)
             "raw_string_keeps_its_backslash_newline": ('const char* r = R"()\\\n"/*)";\n#include "hid_store.hpp"\n/* x */\n', True),
+            # S0 review (round 7): the splice inside the raw-string OPENER, the leading-dot
+            # pp-number separator, and `R` as the tail of an identifier / pp-number / UDL suffix.
+            "spliced_raw_string_opener": ('R\\\n"()\\\n"/*)";\n#include "hid_store.hpp"\n', True),
+            "leading_dot_digit_separator": ("double d = .5'0; int c = '/*';\n#include \"hid_store.hpp\"\n", True),
+            "string_udl_suffix_LR_is_not_a_raw_string": ('auto s = "a"LR"(";\n#include/**/"hid_store.hpp"\n', True),
+            "identifier_ending_LR_then_string_hides_include": ('int aLR = 0; const char* p = aLR"()x"; /* hides\n#include "hid_store.hpp"\n*/ int z;\n', False),
+            "dollar_identifier_ending_R_then_string_hides_include": ('int $R = 0; const char* p = $R"()x"; /* hides\n#include "hid_store.hpp"\n*/ int z;\n', False),
+            "pp_number_ending_LR_then_string_hides_include": ('auto n = 0LR"()x"; /* hides\n#include "hid_store.hpp"\n*/ int z;\n', False),
             # hide: NOT includes to the compiler
             "line_comment": ('// #include "hid_store.hpp"\nint x;\n', False),
             "line_comment_continued_over_include": ('// c \\\n#include "hid_store.hpp"\nint x;\n', False),
@@ -840,7 +879,7 @@ def main() -> int:
             "unicode_line_separator_is_not_a_newline": ('int x;\u2028#include "hid_store.hpp"\n', False),
             "vertical_tab_mid_line_is_not_a_newline": ('int x;\x0b#include "hid_store.hpp"\n', False),
         }
-        gxx = shutil.which("g++")   # optional oracle: present on the CI runner, skipped elsewhere
+        gxx = _gnu_gxx()   # oracle: GNU g++ only; the CI step sets YUZU_REQUIRE_TOOLCHAIN=1
         for form, (body, fires) in parser_forms.items():
             (src / f"hid_{form}_routes.cpp").write_text(body, encoding="utf-8", newline="")
             with contextlib.redirect_stderr(io.StringIO()):
@@ -848,17 +887,81 @@ def main() -> int:
                                       roots=roots, patterns=mod.FORBIDDEN_HEADER_PATTERNS)
             if gxx:
                 # The oracle: the real compiler's preprocessor must agree with the expectation.
-                dep = subprocess.run([gxx, "-std=gnu++23", "-MM", "-MG", "-I", str(src),
-                                      str(src / f"hid_{form}_routes.cpp")], capture_output=True, text=True)
-                if ("hid_store.hpp" in dep.stdout) != fires:
+                listed = _oracle_lists(gxx, src / f"hid_{form}_routes.cpp", src)
+                if listed is not None and listed != fires:
                     _fail(f"the compiler ({gxx}) disagrees with this selftest's expectation for {form!r}: "
-                          f"it {'lists' if 'hid_store.hpp' in dep.stdout else 'does not list'} hid_store.hpp "
+                          f"it {'lists' if listed else 'does not list'} hid_store.hpp "
                           f"but the probe expects fires={fires}", failures)
             if fires and ok:
                 _fail(f"the include parser missed a real store include written as {form!r} - the "
                       f"closure walk is blind to it (UP-1/UP-3)", failures)
             if not fires and not ok:
                 _fail(f"the include parser over-fired on {form!r}: a comment is not an include", failures)
+        # 20b. S0 review round 7: a `//` or `/*` INSIDE an include's `<header-name>` is not a comment
+        #      (the compiler lexes the header-name as one token), and the type-token lane must see
+        #      the same raw-string-with-splice shape the include lane does. The directory `sub`
+        #      lets `<sub//hid_store.hpp>` resolve on every platform; the `/*` spelling is judged
+        #      on the parser's output directly because `*` cannot be a file name on Windows.
+        (inc / "sub").mkdir()
+        (inc / "sub" / "hid_store.hpp").write_text("#pragma once\nclass HidStore {};\n", encoding="utf-8")
+        angle_forms = {
+            "angle_double_slash": ("#include <sub//hid_store.hpp>\nint x;\n", True),
+            "angle_double_slash_trailing_comment": ("#include <sub//hid_store.hpp> // c\n", True),
+            "angle_after_closed_comment": ("/* a\n*/ # include <sub//hid_store.hpp>\n", True),
+            "angle_spliced_inside_name": ("#include <su\\\nb//hid_store.hpp>\n", True),
+            "angle_quote_inside_comment_hides": ("// #include <sub//hid_store.hpp>\nint x;\n", False),
+        }
+        for form, (body, fires) in angle_forms.items():
+            tu = src / f"{form}_routes.cpp"
+            tu.write_text(body, encoding="utf-8", newline="")
+            with contextlib.redirect_stderr(io.StringIO()):
+                ok = mod.check_family(f"hid-{form}", [f"server/core/src/{form}_routes.cpp"],
+                                      roots=roots, patterns=mod.FORBIDDEN_HEADER_PATTERNS)
+            if fires and ok:
+                _fail(f"the include parser missed `{body.strip()!r}`: a `//` inside <header-name> is "
+                      f"not a comment", failures)
+            if not fires and not ok:
+                _fail(f"the include parser over-fired on {form!r}", failures)
+            if gxx:
+                listed = _oracle_lists(gxx, tu, inc)
+                if listed is not None and listed != fires:
+                    _fail(f"the compiler disagrees with the expectation for {form!r} "
+                          f"(lists={listed}, expected fires={fires})", failures)
+        tu = src / "angle_block_comment_routes.cpp"
+        tu.write_text("#include <a/*b*/c.hpp>\nint x;\n", encoding="utf-8")
+        if mod.parse_includes(tu) != [(True, "a/*b*/c.hpp")]:
+            _fail(f"parse_includes mangled `#include <a/*b*/c.hpp>`: {mod.parse_includes(tu)!r} - a "
+                  f"`/*` inside <header-name> is not a comment", failures)
+        for form, body, want in (
+                ("raw_splice_opener_type_token", 'R\\\n"()\\\n"/*)";\nclass HiddenStore;\n', "HiddenStore"),
+                ("raw_splice_content_type_token", 'const char* r = R"()\\\n"/*)";\nclass HiddenStore;\n', "HiddenStore"),
+                ("leading_dot_separator_type_token", "double d = .5'0; int c = '/*';\nclass HiddenStore;\n", "HiddenStore"),
+                ("comment_hides_type_token", "/* class HiddenStore; */\nint x;\n", None)):
+            tu = src / f"{form}.hpp"
+            tu.write_text(body, encoding="utf-8")
+            if mod.names_store_type(tu) != want:
+                _fail(f"names_store_type({form}) -> {mod.names_store_type(tu)!r}, want {want!r}: the "
+                      f"type-token lane must lex the shape the include lane does", failures)
+
+        # 20c. The SPLICE-JOINED lex alone must be right: `parse_includes` also unions an unjoined
+        #      lex for files with a raw-string opener, which would mask a broken offset mapping
+        #      between the original and the joined text, so assert on `strip_comments` directly.
+        # An earlier `)"` inside the window a WRONG offset mapping would search closes the raw string
+        # early; vary the padding so some pad puts it in range.
+        shifted = tuple((f"shifted_{nsplice}_{pad}",
+                         '\\\n' * nsplice + ' ' * pad + '")";R"()\\\n"/*)";\n#include "hid_store.hpp"\n')
+                        for nsplice in range(1, 7) for pad in range(0, 4))
+        for form, body in shifted + (
+                ("opener", 'R\\\n"()\\\n"/*)";\n#include "hid_store.hpp"\n'),
+                ("content", 'const char* r = R"()\\\n"/*)";\n#include "hid_store.hpp"\n'),
+                ("splice_before_literal", '\\\n\\\nconst char* r = R"()\\\n"/*)";\n#include "hid_store.hpp"\n'),
+                ("two_raw_strings", 'auto a = R"x(\\\n)x"; auto b = R"()\\\n"/*)";\n#include "hid_store.hpp"\n')):
+            for blank in (False, True):
+                want_ = '#include ""' if blank else '#include "hid_store.hpp"'   # blanking empties the literal
+                if want_ not in mod.strip_comments(body, blank_strings=blank):
+                    _fail(f"strip_comments({form!r}, blank_strings={blank}) lost the include after a "
+                          f"raw string holding a backslash-newline - the splice offset mapping is wrong",
+                          failures)
         # BOM / UTF-16 (bytes written explicitly: Windows editors and MSVC produce both).
         for form, raw in (("bom", b'\xef\xbb\xbf#include "hid_store.hpp"\nint x;\n'),
                           ("utf16_le", b'\xff\xfe' + '#include "hid_store.hpp"\nint x;\n'.encode("utf-16-le")),
@@ -995,12 +1098,10 @@ def main() -> int:
             # GCC does not decode UTF-16 source (MSVC does); the checker does, deliberately, so the
             # UTF-16 forms are the only ones the GCC oracle cannot judge.
             if gxx and "utf16" not in form:
-                dep_ = subprocess.run([gxx, "-std=gnu++23", "-MM", "-MG", "-I", str(src),
-                                       str(src / f"{form}_routes.cpp")], capture_output=True, text=True,
-                                      errors="replace")
-                if ("hid_store.hpp" in dep_.stdout) != fires_:
+                listed_ = _oracle_lists(gxx, src / f"{form}_routes.cpp", src)
+                if listed_ is not None and listed_ != fires_:
                     _fail(f"QE: the compiler disagrees with the expectation for {form!r} "
-                          f"(g++ {'lists' if 'hid_store.hpp' in dep_.stdout else 'does not list'} it, "
+                          f"(g++ {'lists' if listed_ else 'does not list'} it, "
                           f"expected fires={fires_})", failures)
             with contextlib.redirect_stderr(io.StringIO()):
                 ok_ = mod.check_family(f"qe-{form}", [f"server/core/src/{form}_routes.cpp"],
@@ -1149,6 +1250,29 @@ def main() -> int:
             mod.check_family("store_definition_free", ["server/core/src/nope_routes.cpp"], roots=roots)
         if "STORE_DEFINITION_FREE_TUS" not in cap_nf.getvalue():
             _fail("the missing-TU message does not name STORE_DEFINITION_FREE_TUS for that lane", failures)
+
+    # 18b. The LANE DEFAULTS are pinned. Check 19 forces run_check() onto them, so a mutated default
+    #      (`patterns=()`, `extra_include=()`, a repointed root) left both scripts green.
+    import inspect
+    for fn in (mod.check_family, mod.is_forbidden_header):
+        if inspect.signature(fn).parameters["patterns"].default is not mod.FORBIDDEN_HEADER_PATTERNS:
+            _fail(f"{fn.__name__}'s `patterns=` default is no longer FORBIDDEN_HEADER_PATTERNS - "
+                  f"run_check() would enforce a different policy than the one pinned above", failures)
+    for fn in (mod.check_family, mod.check_impl_purity, mod.check_abstract_headers_store_type_free,
+               mod.closure, mod.resolve_include):
+        if inspect.signature(fn).parameters["roots"].default is not mod.DEFAULT_ROOTS:
+            _fail(f"{fn.__name__}'s `roots=` default is not DEFAULT_ROOTS", failures)
+    dr = mod.DEFAULT_ROOTS
+    rel = lambda path: Path(path).relative_to(mod.ROOT).as_posix()
+    got_roots = (dr.root == mod.ROOT, rel(dr.server_src), rel(dr.server_include),
+                 rel(dr.common_include), [rel(x) for x in dr.extra_include])
+    want_roots = (True, "server/core/src", "server/core/include", "common/include",
+                  ["sdk/include", "server/core/vendor/qrcodegen", "server/core", "proto"])
+    if got_roots != want_roots:
+        _fail(f"DEFAULT_ROOTS drifted from the frozen pin:{_diff(got_roots, want_roots)}", failures)
+    for r in (dr.server_src, dr.server_include, dr.common_include, *dr.extra_include):
+        if not Path(r).is_dir():
+            _fail(f"DEFAULT_ROOTS names a directory that does not exist: {r}", failures)
 
     # 19. run_check() WIRING: every check above exercises a helper or a constant in
     #     isolation, so nothing observed how run_check() CONSUMES them - deleting a lane's

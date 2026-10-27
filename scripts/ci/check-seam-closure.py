@@ -44,11 +44,14 @@ ALSO NOT CAUGHT (found in the WS-A4 S0 review, each reproduced on a scratch tree
      linear lexer pass (`strip_comments`: `//`, `/* */` across lines, string/char/raw-string
      aware), joins backslash-newline (trailing blanks / FF / VT allowed), drops a UTF-8 BOM,
      decodes UTF-16, treats NUL as whitespace and accepts `%:include`, `include_next` and
-     `import` - cross-checked against `g++ -MM -MG` (a fuzz of ~100k files found six hiding
-     shapes in an earlier draft; five are fixed and pinned). It still extracts NOTHING from a
+     `import` - cross-checked against `g++ -MM -MG` (a fuzz of ~100k files found hiding shapes in
+     earlier drafts and the S0 review found four more; each is fixed and pinned in the selftest,
+     and a fresh fuzz that includes them finds none). It still extracts NOTHING from a
      macro-built include (`#include SOME_MACRO`) or a `##`-spliced one, cannot see an include
-     guarded away by `__has_include`. A backslash-newline INSIDE a raw string is handled by
-     lexing such files twice and taking the union (see `strip_comments`). Conversely an `#include` line inside `#if 0`
+     guarded away by `__has_include`. A backslash-newline INSIDE a raw string (the compiler
+     reverts the splice there) and an include's `<header-name>` containing `//` or `/*` are lexed
+     as the compiler does; files with a raw-string opener are additionally lexed without the
+     splice join and the results unioned (see `strip_comments`). Conversely an `#include` line inside `#if 0`
      or alone on a line inside a raw string IS extracted and can false-FAIL (conservative).
      THREAT MODEL: this is a regression lock against honest mistakes and refactors, not a proof
      against an author deliberately contorting source to hide a store include (a macro include
@@ -66,8 +69,10 @@ ALSO NOT CAUGHT (found in the WS-A4 S0 review, each reproduced on a scratch tree
      (`GENERATED_HEADER_SUFFIXES`, e.g. `agent.grpc.pb.h`) - because a header outside
      the resolution roots truncates the closure under it, and the closure under a
      generated header is not checked at all (they live only in the build directory). The
-     roots mirror the build's -I directories (`Roots.extra_include`: `sdk/include`,
-     `server/core/vendor/qrcodegen`); a NEW build include directory must be added there.
+     roots mirror the build's -I directories that can hold a checked-in header
+     (`Roots.extra_include`: `sdk/include`, `server/core/vendor/qrcodegen`, and meson's implicit
+     `-I server/core` and `-I proto`); a NEW build include directory must be added there, and
+     `DEFAULT_ROOTS` is frozen in the selftest so removing one is a loud change.
      Unresolved ANGLE includes stay silent (they are external by default; item 5).
   7. A FORWARD DECLARATION OF A STORE IS ALLOWED in a non-abstract closure (only the
      abstract `*_api.hpp` headers get the type-name probe); calling through it needs the
@@ -144,6 +149,7 @@ USAGE
 """
 from __future__ import annotations
 
+import bisect
 import fnmatch
 import re
 import sys
@@ -166,16 +172,19 @@ class Roots(NamedTuple):
     server_include: Path
     common_include: Path
     # Further directories the BUILD adds with -I (mirrored, not guessed): `sdk/include`
-    # (`"yuzu/metrics.hpp"`, reached through the yuzu_sdk dependency) and
+    # (`"yuzu/metrics.hpp"`, reached through the yuzu_sdk dependency),
     # `server/core/vendor/qrcodegen` (`"qrcodegen.hpp"`, the MFA-QR target,
-    # server/core/meson.build). Without them a legitimate quote include of a checked-in header
+    # server/core/meson.build), and meson's implicit per-subdir `-I` for the two directories whose
+    # meson.build declares targets and that can hold a checked-in header: `server/core`
+    # (`<src/x_store.hpp>` resolves) and `proto`. Without them a legitimate quote include of a checked-in header
     # would read as unresolved and - now that unresolved is a hard error - false-fail any
     # future enrolment of a TU that reaches on_behalf_guard.hpp / mfa_qr.cpp.
     extra_include: tuple = ()
 
 
 DEFAULT_ROOTS = Roots(ROOT, SERVER_SRC, SERVER_INCLUDE, COMMON_INCLUDE,
-                      (ROOT / "sdk" / "include", SERVER_CORE / "vendor" / "qrcodegen"))
+                      (ROOT / "sdk" / "include", SERVER_CORE / "vendor" / "qrcodegen",
+                       SERVER_CORE, ROOT / "proto"))
 
 # ── Forbidden header patterns (store layer + the core-only API half) ─────
 # Evidence (see the PR description / junior report for the exact commands):
@@ -742,6 +751,11 @@ _INCLUDE_RE = re.compile(r'^[ \t\f\v]*(?:#|%:)[ \t\f\v]*(?:include(?:_next)?|imp
 # (GCC/Clang also accept trailing blanks between the backslash and the newline, with a
 # warning, and MSVC does too).
 _LINE_CONTINUATION_RE = re.compile(r'\\[ \t\f\v]*\r?\n')
+# The code on a line so far is an include directive with an OPEN header-name: `#include <a/b`. The
+# compiler lexes `<...>` as ONE token, so a `//` or `/*` that follows is not a comment:
+# `#include <yuzu/server//scim_store.hpp>` is an include. Applied to the stripped line prefix only
+# when a comment opener is met (see `strip_comments`).
+_OPEN_HEADER_NAME_RE = re.compile(r'[ \t\f\v]*(?:#|%:)[ \t\f\v]*(?:include(?:_next)?|import)[ \t\f\v]*<[^>]*$')
 _SPECIAL_RE = re.compile(r"[/\"']")
 _STR_END_RE = re.compile(r'["\\\n]')
 _CHR_END_RE = re.compile(r"['\\\n]")
@@ -759,7 +773,36 @@ def gh(kind, msg):
 
 
 def _is_ident_char(ch: str) -> bool:
-    return ch.isalnum() or ch == "_"
+    # `$` is an identifier character to GCC, Clang and MSVC (`$R"x(` is an identifier then a string).
+    return ch.isalnum() or ch == "_" or ch == "$"
+
+
+def _quoted_end(text: str, k: int, end_re) -> int:
+    """Offset just past the string/char literal whose body starts at `k` (`end_re` finds the
+    closing quote, a backslash or a newline). Backslash skips the next character; an unterminated
+    literal ends AT the newline, which is not consumed; EOF ends it at len(text)."""
+    while True:
+        sm = end_re.search(text, k)
+        if sm is None:
+            return len(text)
+        ch = text[sm.start()]
+        if ch == "\\":
+            k = sm.start() + 2
+            continue
+        return sm.start() if ch == "\n" else sm.end()
+
+
+def _raw_prefix_ok(text: str, r: int) -> bool:
+    """`text[r]` is an `R` directly before a `"`. True when `R`, `LR`, `uR`, `UR` or `u8R` starting
+    at `r` (or just before it) is a whole raw-string encoding prefix: NOT the tail of a longer
+    identifier or pp-number (`aLR"`, `1R"`, `0LR"`) and NOT a user-defined-literal suffix on a
+    preceding literal (`"s"R"`, `'c'LR"`)."""
+    start = r
+    if r >= 2 and text[r - 2:r] == "u8":
+        start = r - 2
+    elif r >= 1 and text[r - 1] in "LuU":
+        start = r - 1
+    return start == 0 or not (_is_ident_char(text[start - 1]) or text[start - 1] in "\"'")
 
 
 def strip_comments(text: str, blank_strings: bool, join_splices: bool = True) -> str:
@@ -771,34 +814,68 @@ def strip_comments(text: str, blank_strings: bool, join_splices: bool = True) ->
 
     Linear by construction: `_SPECIAL_RE` jumps to the next `/`, `"` or `'`, and each
     terminator is found with `str.find` / a forward regex search from where the scan already
-    is. Do NOT replace this with `re.sub` over nested/lazy quantifiers: the previous versions
+    is (the header-name look-back is bounded by the previous comment's end). Do NOT replace this with `re.sub` over nested/lazy quantifiers: the previous versions
     of this function were quadratic (a header of `"\\"\\"...` or of repeated unterminated
     `/*` took 5-30 s per 64-240 KB) and this script gates CI.
 
-    Differentially tested against `g++ -MM -MG` as the oracle: ~46 hand-written fixtures (pinned
-    in the selftest, which re-checks them against g++ when one is installed) and, in review, ~100k
-    randomly generated files from a grammar of comments / literals / raw strings / splices /
-    digraphs / NULs / prefixes. That fuzz FOUND six hiding shapes in an earlier draft - a char
-    literal after `return`/`L`/`u8`/a digit, `R` used as a user-defined-literal suffix, a NUL byte,
-    a splice with FF/VT before the newline, `#import`, and a splice inside a raw string - five
-    are fixed and pinned; a fresh 9000-file re-run found none.
+    Differentially tested against `g++ -MM -MG` as the oracle: the hand-written fixtures pinned in
+    the selftest (which re-checks them against GNU g++ when one is installed) and, in review,
+    ~100k randomly generated files from a grammar of comments / literals / raw strings / splices /
+    digraphs / NULs / prefixes / `<header-name>`s. That fuzz FOUND hiding shapes in earlier
+    drafts - a char literal after `return`/`L`/`u8`/a digit, `R` used as a user-defined-literal
+    suffix or as the tail of an identifier / pp-number (`aLR"`, `0LR"`), a NUL byte, a splice with
+    FF/VT before the newline, `#import`, a splice inside a raw string or inside the raw-string
+    OPENER, a `//` or `/*` inside `#include <a//b.hpp>`, and a leading-dot pp-number separator
+    (`.5'0`) - all fixed and pinned.
 
-    RAW-STRING SPLICES: phase-2 splices are removed BEFORE raw strings are lexed, but the compiler
-    keeps a backslash-newline INSIDE a raw string, so `R"()` + backslash + newline + `"/*)"` would
-    make the joined lexing close the raw string early and open a comment that hides a following
-    include. `parse_includes` closes this by lexing a file that contains `R"` a second time WITHOUT
-    the splice join and taking the union of both results (union = never hides, only possibly
-    over-extracts). `strip_comments` itself (also used for the type-token probe) still joins.
+    RAW-STRING SPLICES: phase-2 splices are removed before raw strings are lexed, but the compiler
+    REVERTS a backslash-newline INSIDE a raw string. So the raw string's closing `)delim"` is
+    searched in the ORIGINAL text (the offset is mapped back through the deleted splices), while
+    its opener is recognised on the joined text. `parse_includes` and `names_store_type` also lex a
+    file containing `R"` a second time WITHOUT the splice join and take the union (union = never
+    hides, only possibly over-extracts); that is defence in depth, not what makes the shapes above
+    work.
+
+    HEADER-NAMES: when a `//` or `/*` is met and the code on its line so far is an include
+    directive with an open `<`, it is part of the header-name token, not a comment. A comment
+    BETWEEN `include` and the `<` (`#include/*c*/<a//b>`) is not recognised as that prefix, which
+    is the conservative direction (over-protecting never hides an include).
 
     An include on its own line inside `#if 0` or a raw string is still extracted (the
     conservative direction: a possible false FAIL, never a hidden include). An unterminated
     `/*` consumes the rest of the file (the compiler rejects such a file)."""
+    orig = text
+    cut_orig: list[int] = []   # original offset of each deleted splice
+    cut_join: list[int] = []   # joined offset at which each splice was deleted
+    cut_cum: list[int] = []    # cumulative deleted length up to and including that splice
     if join_splices:
-        text = _LINE_CONTINUATION_RE.sub("", text)
+        parts: list[str] = []
+        last_cut = 0
+        removed = 0
+        for sm in _LINE_CONTINUATION_RE.finditer(orig):
+            parts.append(orig[last_cut:sm.start()])
+            cut_orig.append(sm.start())
+            cut_join.append(sm.start() - removed)
+            removed += sm.end() - sm.start()
+            cut_cum.append(removed)
+            last_cut = sm.end()
+        parts.append(orig[last_cut:])
+        text = "".join(parts)
+    def to_orig(p: int) -> int:
+        # joined offset of a retained character -> its offset in the original text
+        k = bisect.bisect_right(cut_join, p)
+        return p + (cut_cum[k - 1] if k else 0)
+
+    def to_joined(e: int) -> int:
+        # original offset at a retained-character boundary -> joined offset
+        k = bisect.bisect_left(cut_orig, e)
+        return e - (cut_cum[k - 1] if k else 0)
+
     n = len(text)
     out: list[str] = []
     last = 0
     i = 0
+    cmt_end = 0     # end of the most recent comment: bounds the line-prefix look-back above
     last_sep = -1   # position of the previous digit-separator quote (a chain 1'0'0'0 is one token)
     while True:
         m = _SPECIAL_RE.search(text, i)
@@ -808,12 +885,21 @@ def strip_comments(text: str, blank_strings: bool, join_splices: bool = True) ->
         c = text[j]
         if c == "/":
             nxt = text[j + 1:j + 2]
+            if nxt in ("/", "*") and text.find("<", cmt_end, j) >= 0:
+                # Inside an include directive's `<header-name>`? The line prefix since the last
+                # comment (or line start) decides; over-protecting is the conservative direction.
+                nl = text.rfind("\n", cmt_end, j)
+                if _OPEN_HEADER_NAME_RE.match(text, nl + 1 if nl >= 0 else cmt_end, j):
+                    gt = text.find(">", j)
+                    eol = text.find("\n", j)
+                    i = gt + 1 if 0 <= gt and (eol < 0 or gt < eol) else (n if eol < 0 else eol)
+                    continue
             if nxt == "/":
                 end = text.find("\n", j + 2)
                 end = n if end < 0 else end
                 out.append(text[last:j])
                 out.append(" ")
-                last = i = end
+                last = i = cmt_end = end
             elif nxt == "*":
                 end = text.find("*/", j + 2)
                 out.append(text[last:j])
@@ -821,33 +907,23 @@ def strip_comments(text: str, blank_strings: bool, join_splices: bool = True) ->
                 if end < 0:
                     last = i = n
                     break
-                last = i = end + 2
+                last = i = cmt_end = end + 2
             else:
                 i = j + 1
         elif c == '"':
             end = None
             # Raw string: R"delim( ... )delim" (also LR / uR / UR / u8R prefixes).
-            if j > 0 and text[j - 1] == "R" and (
-                    j == 1 or (text[j - 2] not in "\"'" and (
-                        not _is_ident_char(text[j - 2]) or text[j - 2] in "Lu8U"))):
+            if j > 0 and text[j - 1] == "R" and _raw_prefix_ok(text, j - 1):
                 rm = _RAW_OPEN_RE.match(text, j)
                 if rm:
-                    close = text.find(")" + rm.group(1) + '"', rm.end())
-                    end = n if close < 0 else close + len(rm.group(1)) + 2
+                    # The compiler REVERTS phase-2 splices inside a raw string, so the closing
+                    # `)delim"` is searched in the ORIGINAL text, from just after the `(`.
+                    tail = ")" + rm.group(1) + '"'
+                    oclose = orig.find(tail, to_orig(rm.end() - 1) + 1)
+                    # max(): forward progress is guaranteed even if the offset mapping were wrong
+                    end = n if oclose < 0 else max(to_joined(oclose + len(tail)), rm.end())
             if end is None:
-                k = j + 1
-                while True:
-                    sm = _STR_END_RE.search(text, k)
-                    if sm is None:
-                        end = n
-                        break
-                    ch = text[sm.start()]
-                    if ch == "\\":
-                        k = sm.start() + 2
-                        continue
-                    # an unterminated string ends at the newline (which is NOT consumed)
-                    end = sm.start() if ch == "\n" else sm.end()
-                    break
+                end = _quoted_end(text, j + 1, _STR_END_RE)
             if blank_strings:
                 out.append(text[last:j])
                 out.append('""')
@@ -861,22 +937,12 @@ def strip_comments(text: str, blank_strings: bool, join_splices: bool = True) ->
                 k = j - 1
                 while k >= 0 and (text[k].isalnum() or text[k] in "_."):
                     k -= 1
-                if (k >= 0 and k == last_sep) or text[k + 1].isdigit():
+                if (k >= 0 and k == last_sep) or text[k + 1].isdigit() or (
+                        text[k + 1] == "." and text[k + 2:k + 3].isdigit()):
                     last_sep = j
                     i = j + 1
                     continue
-            k = j + 1
-            while True:
-                sm = _CHR_END_RE.search(text, k)
-                if sm is None:
-                    end = n
-                    break
-                ch = text[sm.start()]
-                if ch == "\\":
-                    k = sm.start() + 2
-                    continue
-                end = sm.start() if ch == "\n" else sm.end()
-                break
+            end = _quoted_end(text, j + 1, _CHR_END_RE)
             if blank_strings:
                 out.append(text[last:j])
                 out.append("''")
@@ -898,6 +964,16 @@ def _read_source(path: Path) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n").replace("\0", " ")
 
 
+def _lex_variants(raw: str, blank_strings: bool) -> list[str]:
+    """The joined lex, plus - for a file with a raw-string opener - a lex WITHOUT the splice join.
+    Callers take the UNION of what each variant yields: a second variant can only ADD results
+    (never hide one), so the worst case is a possible false FAIL in a contrived file."""
+    variants = [strip_comments(raw, blank_strings=blank_strings)]
+    if 'R"' in raw:
+        variants.append(strip_comments(raw, blank_strings=blank_strings, join_splices=False))
+    return variants
+
+
 def parse_includes(path: Path):
     """Yields (is_angle, spelling) for every `#include` / `#include_next` directive in `path`,
     in file order. Comments are removed first by the linear `strip_comments`, backslash-newline
@@ -910,15 +986,7 @@ def parse_includes(path: Path):
     Over-extracted (the conservative direction, a possible false FAIL): an `#include` line
     inside `#if 0` or inside a raw string literal."""
     out = []
-    raw = _read_source(path)
-    variants = [strip_comments(raw, blank_strings=False)]
-    if 'R"' in raw:
-        # The compiler keeps a backslash-newline INSIDE a raw string, but phase 2 (the splice join)
-        # runs before our lexer can know it is in one. For a file that has a raw-string opener, also
-        # lex WITHOUT the join and take the UNION: it can only ADD extractions (never hide one), so
-        # the worst case is a possible false FAIL in a contrived file, not a missed include.
-        variants.append(strip_comments(raw, blank_strings=False, join_splices=False))
-    for text in variants:
+    for text in _lex_variants(_read_source(path), blank_strings=False):
         for line in text.split("\n"):
             m = _INCLUDE_RE.match(line)
             if not m:
@@ -1028,7 +1096,7 @@ def report_unresolved(label: str, tu_rel, unresolved, roots: Roots = DEFAULT_ROO
                       seen: set | None = None) -> bool:
     """False (and a `::error::` per include) if the closure holds a QUOTE include that
     resolves nowhere and is not a generated header. Such an include TRUNCATES the closure
-    under it - a store header moved outside the three resolution roots would otherwise
+    under it - a store header moved outside the resolution roots would otherwise
     keep every TU that reaches it green on a warning nobody reads in a passing job."""
     ok = True
     for includer, spelling in unresolved:
@@ -1125,7 +1193,9 @@ def check_impl_purity(tus: list[str], roots: Roots = DEFAULT_ROOTS) -> bool:
     for rel in tus:
         tu = (roots.root / rel).resolve()
         if not tu.is_file():
-            gh("error", f"check-seam-closure: impl-purity: expected impl TU not found: {rel}")
+            gh("error", f"check-seam-closure: impl-purity: expected impl TU not found: {rel} - if it "
+                        f"was renamed or deleted, update IMPL_TUS AND the frozen pin in "
+                        f"tests/test_seam_closure_selftest.py")
             ok = False
             continue
         visited, parent, unresolved = closure(tu, roots)
@@ -1169,13 +1239,13 @@ def names_store_type(path: Path):
     """Returns the first store-type token this file NAMES in code (comments
     stripped), or None. Catches both `*Store` class names (regex) and the
     non-`Store` store row/data types (EXTRA_STORE_TYPE_TOKENS)."""
-    code = _strip_comments(_read_source(path))
-    m = STORE_TYPE_TOKEN_RE.search(code)
-    if m:
-        return m.group(0)
-    for tok in EXTRA_STORE_TYPE_TOKENS:
-        if re.search(r"\b" + re.escape(tok) + r"\b", code):
-            return tok
+    for code in _lex_variants(_read_source(path), blank_strings=True):
+        m = STORE_TYPE_TOKEN_RE.search(code)
+        if m:
+            return m.group(0)
+        for tok in EXTRA_STORE_TYPE_TOKENS:
+            if re.search(r"\b" + re.escape(tok) + r"\b", code):
+                return tok
     return None
 
 
@@ -1189,7 +1259,9 @@ def check_abstract_headers_store_type_free(headers: list[str],
     for rel in headers:
         tu = (roots.root / rel).resolve()
         if not tu.is_file():
-            gh("error", f"check-seam-closure: abstract-header probe: header not found: {rel}")
+            gh("error", f"check-seam-closure: abstract-header probe: header not found: {rel} - if it "
+                        f"was renamed or deleted, update ABSTRACT_API_HEADERS AND the frozen pin "
+                        f"in tests/test_seam_closure_selftest.py")
             ok = False
             continue
         visited, parent, unresolved = closure(tu, roots)
