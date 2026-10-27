@@ -32,6 +32,7 @@
 #include <yuzu/metrics.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <expected>
@@ -802,6 +803,92 @@ TEST_CASE("DexApi: apps windows scope is byte-identical to the one-argument read
           "windows_online");
     CHECK(nlohmann::json::parse(yuzu::server::dex_apps_json(api->apps("7d", "all")))["population_basis"] ==
           "all_online");
+    // The additive key: the windows read (both spellings) carries one key, all carries three.
+    const auto wj = nlohmann::json::parse(yuzu::server::dex_apps_json(windows));
+    CHECK(wj["crash_source_coverage"] == nlohmann::json{{"windows", "complete"}});
+    CHECK(nlohmann::json::parse(yuzu::server::dex_apps_json(implicit))["crash_source_coverage"] ==
+          wj["crash_source_coverage"]);
+    CHECK(nlohmann::json::parse(yuzu::server::dex_apps_json(api->apps("7d", "all")))["crash_source_coverage"] ==
+          nlohmann::json{{"windows", "complete"}, {"linux", "partial"}, {"macos", "partial"}});
+}
+
+// A Linux or macOS scope with signals but no connected device in it: the subject is
+// listed, nothing is shared or scored against a zero population.
+TEST_CASE("DexApi: apps on an empty Linux fleet and an empty macOS fleet", "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    seed_obs_v(store, "lxe1", "l9", "linux-only.bin", "process.crashed", "1.0", kTs, "linux");
+    seed_obs_v(store, "mce1", "m9", "macos-only.app", "process.crashed", "1.0", kTs, "macos");
+    auto api = make_local_dex_api(&store, fleet20); // Windows devices only
+    for (const auto& [scope, subject] :
+         {std::pair<const char*, const char*>{"linux", "linux-only.bin"}, {"macos", "macos-only.app"}}) {
+        const auto m = api->apps("7d", scope);
+        REQUIRE_FALSE(m.degraded);
+        CHECK(m.population == 0);
+        REQUIRE(m.apps.size() == 1);
+        CHECK(m.apps[0].subject == subject);
+        CHECK(m.apps[0].figures.distinct_devices_online == 0);
+        CHECK_FALSE(m.apps[0].figures.share_affected);
+        CHECK_FALSE(m.apps[0].figures.rate_per_1000);
+        CHECK(std::string(m.apps[0].figures.score.withheld) == "no_population");
+    }
+    CHECK(api->apps("7d", "windows").population == 20);
+}
+
+// Manual latency probe (hidden): `yuzu_server_tests "[apps_bench]"`. A 30,000-agent
+// mixed-OS fleet (15k windows / 10k linux / 5k macos), 4 crash/hang rows per agent.
+// Prints the medians; the time budget is applied by the reader, not asserted here.
+TEST_CASE("DexApi: apps all vs windows on a 30k mixed-OS fleet (bench)", "[.][pg][dex][apps_bench]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const std::string sql =
+            "INSERT INTO guaranteed_state_store.guardian_observations "
+            "(event_id, agent_id, observed_at, obs_type, subject, platform, version) "
+            "SELECT 'b' || g || '-' || k, 'ag' || g, '" + kTs + "', "
+            "CASE WHEN k < 4 THEN 'process.crashed' ELSE 'process.hung' END, "
+            "'app' || ((g * k) % 200), "
+            "CASE g % 6 WHEN 0 THEN 'windows' WHEN 1 THEN 'windows' WHEN 2 THEN 'windows' "
+            "WHEN 3 THEN 'linux' WHEN 4 THEN 'linux' ELSE 'macos' END, "
+            "'1.0.0.' || (k % 3) FROM generate_series(1, 30000) g, generate_series(1, 4) k";
+        yuzu::server::pg::PgResult r{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(r.ok());
+    }
+    const auto fleet = [] {
+        yuzu::server::DexFleet f;
+        for (int g = 1; g <= 30000; ++g) {
+            const char* os = (g % 6 <= 2) ? "windows" : (g % 6 <= 4) ? "linux" : "macos";
+            f.connected_agents.emplace_back("ag" + std::to_string(g), os);
+        }
+        f.total_online = 30000;
+        return f;
+    };
+    auto api = make_local_dex_api(&store, fleet);
+    const auto median_ms = [&](const char* scope, int64_t population) {
+        const auto warm = api->apps("7d", scope);
+        REQUIRE_FALSE(warm.degraded);
+        REQUIRE(warm.population == population);
+        std::vector<double> ms;
+        for (int i = 0; i < 5; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto m = api->apps("7d", scope);
+            const auto t1 = std::chrono::steady_clock::now();
+            REQUIRE_FALSE(m.degraded);
+            ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        }
+        std::sort(ms.begin(), ms.end());
+        return ms[2];
+    };
+    const double w = median_ms("windows", 15000);
+    const double a = median_ms("all", 30000);
+    WARN("apps_bench windows_ms=" << w << " all_ms=" << a << " ratio=" << (a / w));
 }
 
 TEST_CASE("DexApi: apps with an invalid scope is degraded before policy or fleet",
@@ -913,7 +1000,7 @@ TEST_CASE("DexApi: apps top-N membership is devices affected, not raw events",
     }
     CHECK(totals == 2);
     CHECK(widespread);
-    const auto m = yuzu::server::dex_apps_model_from_rows("7d", *rows, 20,
+    const auto m = yuzu::server::dex_apps_model_from_rows("7d", yuzu::server::kDexAppsScopeWindows, *rows, 20,
                                                           yuzu::server::DexPolicyInForce{});
     CHECK(m.apps_total == 4);
     CHECK(m.apps_truncated);
@@ -1032,7 +1119,7 @@ TEST_CASE("DexApi: apps store cuts rank by devices, then events, then byte-order
         for (int limit : {3, 2}) {
             const auto rows = store.dex_app_stability_checked(since, "windows", limit, 20, 5, {});
             REQUIRE(rows);
-            const auto m = yuzu::server::dex_apps_model_from_rows("7d", *rows, 20, policy);
+            const auto m = yuzu::server::dex_apps_model_from_rows("7d", yuzu::server::kDexAppsScopeWindows, *rows, 20, policy);
             CHECK(m.apps_total == 3);
             CHECK(m.apps_truncated == (limit == 2));
         }

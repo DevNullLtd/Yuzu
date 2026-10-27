@@ -2,6 +2,14 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## ⚠️ Breaking: `GET /api/v1/dex/apps` now covers every platform by default
+
+`GET /api/v1/dex/apps` gains a `platform` query parameter (`all`, `windows`, `macos`, `linux`) and its default is `all`. Until now the route counted Windows devices only.
+
+- **Affected:** any REST caller of `/api/v1/dex/apps` that sends no `platform`: its applications, counts, population (`population_basis` is now `all_online`) and scores now cover every platform.
+- **To keep today's figures:** add `platform=windows`. The Windows result is otherwise unchanged apart from one additive field, `crash_source_coverage`.
+- **Not changed:** the MCP tool `list_dex_apps` stays Windows-scoped; it also returns the additive `crash_source_coverage` field.
+
 ## New: leader-election metrics and alerts (HA WS-11, #4014)
 
 Additive; no behaviour change and no action is needed to keep a deployment working. Every server with a

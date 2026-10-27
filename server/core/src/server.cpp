@@ -18640,10 +18640,10 @@ private:
                         f.connected_os.push_back(os);
                     // Normalized (id, os) for the Overview score distribution +
                     // the segment breakdown.
-                    const std::string nos = os.starts_with("win")            ? "windows"
-                                            : os.starts_with("lin")          ? "linux"
-                                            : (os == "darwin" || os == "macos") ? "macos"
-                                                                                : os;
+                    // One normaliser (prefix-based, as the observation writer's
+                    // starts_with in guaranteed_state_store.cpp); an unknown token
+                    // passes through raw.
+                    const std::string nos = norm_os.empty() ? os : norm_os;
                     f.connected_agents.emplace_back(id, nos);
                 }
             }
