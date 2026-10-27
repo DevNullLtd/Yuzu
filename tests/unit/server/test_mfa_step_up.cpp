@@ -1089,13 +1089,13 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: a future-dated or
     {
         // The cached anchor is empty (nothing to age), and the durable row holds the same
         // future instant, i.e. one dated after the database clock. That is clock skew, not a
-        // login that attested no second factor, so it is a 503 and not the 403
-        // "sign in again" refusal whose remedy cannot work (UP-4). A genuinely proof-less SSO
-        // session is still the 403 (R13 below, and the dedicated UP-4 case).
+        // login that attested no second factor, so it is its own 503 outcome (kProofClockSkew)
+        // and not the 403 "sign in again" refusal whose remedy cannot work (UP-4). A genuinely
+        // proof-less SSO session is still the 403 (R13 below, and the dedicated UP-4 case).
         auto future_sso = with_wall_proof(*this, "oidc:x#y", "oidc", milliseconds(-600'000));
         auto r = run(future_sso);
-        CHECK(r.outcome.kind == Kind::kStoreUnavailable);
-        CHECK(r.outcome.factor == MfaFactorState::kStoreUnavailable);
+        CHECK(r.outcome.kind == Kind::kProofClockSkew);
+        CHECK(r.outcome.factor == MfaFactorState::kNoIdpProof);
         check_untouched(r);
     }
     audits.clear();
@@ -1247,31 +1247,38 @@ TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a future-dated, mi
 // whose clock runs ahead of the database stores an instant the database reads as future-dated;
 // derive_session_deadlines then leaves the cached anchor empty, which used to surface as the 403
 // "your login did not attest a second factor, sign in again" - a remedy that cannot work, because
-// the next login repeats it. The cause is clock skew, so the answer is the fail-closed 503.
+// the next login repeats it. The cause is clock skew, so the answer is its own fail-closed 503
+// outcome (kProofClockSkew): not the store-fault counter, and no retry hint at the route.
+namespace {
+/// Mint a durable OIDC session with the given proof instant and return the replica's cached view.
+auth::Session mint_oidc_session(yuzu::server::SessionStore& store, AuthManager& mgr,
+                                const std::string& tok, std::int64_t proof_ms) {
+    yuzu::server::SessionWriteParams p;
+    p.token_hash = AuthManager::sha256_hex(tok);
+    p.username = "oidc:x#y";
+    p.role = "user";
+    p.auth_source = "oidc";
+    p.session_lifetime_ms = 3600'000;
+    p.mfa_verified_ms_abs = proof_ms;
+    REQUIRE(store.create(p).has_value());
+    auto s = mgr.validate_session(tok);
+    REQUIRE(s.has_value());
+    REQUIRE(s->auth_source == "oidc");
+    return *s;
+}
+} // namespace
+
 TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: an SSO proof dated after the "
-                                 "database clock is a 503, not a sign-in-again 403 (UP-4)",
+                                 "database clock is its own 503 outcome, not a sign-in-again 403 "
+                                 "(UP-4)",
                  "[pg][mfa][stepup][approver][approver_mfa][durable]") {
     const auto now_ms = std::chrono::duration_cast<milliseconds>(
                             system_clock::now().time_since_epoch())
                             .count();
-    auto mint_oidc = [&](const std::string& tok, std::int64_t proof_ms) {
-        yuzu::server::SessionWriteParams p;
-        p.token_hash = AuthManager::sha256_hex(tok);
-        p.username = "oidc:x#y";
-        p.role = "user";
-        p.auth_source = "oidc";
-        p.session_lifetime_ms = 3600'000;
-        p.mfa_verified_ms_abs = proof_ms;
-        REQUIRE(store.create(p).has_value());
-        auto s = mgr.validate_session(tok);
-        REQUIRE(s.has_value());
-        REQUIRE(s->auth_source == "oidc");
-        return *s;
-    };
 
     // Proof 2 minutes ahead of the database clock.
     const std::string skewed_token = "yuzu-test-oidc-skewed-proof-token-0001";
-    const auto skewed = mint_oidc(skewed_token, now_ms + 120'000);
+    const auto skewed = mint_oidc_session(store, mgr, skewed_token, now_ms + 120'000);
     REQUIRE(skewed.steady_mfa_verified.time_since_epoch().count() == 0); // derive dropped it
     const auto skewed_durable = mgr.read_durable_mfa_proof(skewed_token, skewed.username);
     REQUIRE(skewed_durable.source == auth::DurableMfaProof::Source::kRow);
@@ -1281,20 +1288,44 @@ TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: an SSO proof dated
     yuzu::test::LogCapture logs;
     auto r = run(skewed, 300, &metrics, skewed_durable);
     logs.stop();
-    CHECK(r.outcome.kind == Kind::kStoreUnavailable);
-    CHECK(r.outcome.factor == MfaFactorState::kStoreUnavailable);
+    CHECK(r.outcome.kind == Kind::kProofClockSkew);
+    CHECK(r.outcome.factor == MfaFactorState::kNoIdpProof);
     CHECK_FALSE(r.outcome.kind == Kind::kRefuse);
+    CHECK_FALSE(r.outcome.kind == Kind::kStoreUnavailable);
     check_untouched(r); // no 403/401 body, no challenge
     CHECK(audits.empty());
+    // A clock fault is not a store fault: the store-fault counter does not move.
     CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}}).value() ==
-          1.0);
+          0.0);
     CHECK(logs.text().find("dated after the database clock") != std::string::npos);
     CHECK(logs.text().find("clock skew") != std::string::npos);
+
+    // Once the skew has elapsed (the database clock has caught up with the stored instant) the
+    // cached anchor is STILL empty, so the answer falls back to the 403 refusal: the gate does
+    // not re-derive the anchor. The comparison is strict, so equality is not skew either.
+    for (const long long catch_up : {0LL, 1LL, 120'000LL}) {
+        INFO("db clock - proof = " << catch_up << " ms");
+        auto elapsed = skewed_durable;
+        elapsed.db_now_ms = elapsed.mfa_verified_ms + catch_up;
+        yuzu::MetricsRegistry m;
+        auto e = run(skewed, 300, &m, elapsed);
+        CHECK(e.outcome.kind == Kind::kRefuse);
+        CHECK(e.outcome.factor == MfaFactorState::kNoIdpProof);
+        check_untouched(e);
+        CHECK(m.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}}).value() ==
+              0.0);
+    }
+    // One millisecond short of that is still skew.
+    {
+        auto just = skewed_durable;
+        just.db_now_ms = just.mfa_verified_ms - 1;
+        CHECK(run(skewed, 300, nullptr, just).outcome.kind == Kind::kProofClockSkew);
+    }
 
     // A genuinely missing proof (the IdP attested no second factor) is still the 403 refusal,
     // and is not counted as an outage.
     const std::string bare_token = "yuzu-test-oidc-no-amr-token-0001";
-    const auto bare = mint_oidc(bare_token, 0);
+    const auto bare = mint_oidc_session(store, mgr, bare_token, 0);
     const auto bare_durable = mgr.read_durable_mfa_proof(bare_token, bare.username);
     REQUIRE(bare_durable.source == auth::DurableMfaProof::Source::kRow);
     REQUIRE(bare_durable.mfa_verified_ms == 0);
@@ -1309,6 +1340,53 @@ TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: an SSO proof dated
     auto absent = run(bare, 300, nullptr, auth::DurableMfaProof{auth::DurableMfaProof::Source::kAbsent, 0, 0});
     CHECK(absent.outcome.kind == Kind::kRefuse);
     CHECK(absent.outcome.factor == MfaFactorState::kNoIdpProof);
+}
+
+// UP-4 ordering: an SSO session whose cached anchor is empty AND whose durable read is degraded
+// is a store fault (503, counted), not the 403 "sign in again" that the empty anchor alone
+// would give. The degraded read decides first.
+TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: an SSO session with an empty "
+                                  "anchor and an unavailable durable read is a counted 503, not "
+                                  "a 403 (UP-4 ordering)",
+                 "[pg][mfa][stepup][approver][approver_mfa]") {
+    const auto bare = make_session("oidc:x#y", "oidc"); // no proof: the anchor is empty
+    REQUIRE(bare.steady_mfa_verified.time_since_epoch().count() == 0);
+    for (const auto& unavailable :
+         {auth::DurableMfaProof{auth::DurableMfaProof::Source::kUnavailable, 0, 0},
+          auth::DurableMfaProof{}}) { // a value-initialised read is the same fail-closed answer
+        yuzu::MetricsRegistry metrics;
+        auto r = run(bare, 300, &metrics, unavailable);
+        CHECK(r.outcome.kind == Kind::kStoreUnavailable);
+        CHECK(r.outcome.factor == MfaFactorState::kStoreUnavailable);
+        check_untouched(r);
+        CHECK(audits.empty());
+        CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}})
+                  .value() == 1.0);
+    }
+}
+
+TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a real degraded durable read for an "
+                                 "SSO session with an empty anchor is a counted 503 (UP-4 "
+                                 "ordering)",
+                 "[pg][mfa][stepup][approver][approver_mfa][durable]") {
+    const std::string tok = "yuzu-test-oidc-degraded-read-token-0001";
+    const auto bare = mint_oidc_session(store, mgr, tok, 0);
+    REQUIRE(bare.steady_mfa_verified.time_since_epoch().count() == 0);
+    {
+        auto lease = db.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(lease.get(), "DROP SCHEMA session_store CASCADE",
+                                               std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    const auto durable = mgr.read_durable_mfa_proof(tok, bare.username);
+    REQUIRE(durable.source == auth::DurableMfaProof::Source::kUnavailable);
+    yuzu::MetricsRegistry metrics;
+    auto r = run(bare, 300, &metrics, durable);
+    CHECK(r.outcome.kind == Kind::kStoreUnavailable);
+    check_untouched(r);
+    CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}}).value() ==
+          1.0);
 }
 
 TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a fresh durable proof does not "

@@ -51,11 +51,14 @@ std::string mfa_refusal_remediation(approval::ApproverRefusal refusal,
                    : "sign out and sign in again: enrolment is offered at sign-in when this "
                      "deployment's --mfa-enforcement mode requires it for your role. If you are "
                      "not offered it, ask your Yuzu administrator to enrol you "
-                     "(Administrator guide: Enrolling a non-admin approver), then retry.";
+                     "(see \"Enrolling a non-admin approver\" in the Auth Store Recovery "
+                     "Runbook), then retry.";
     case approval::ApproverRefusal::kMfaProofMissing:
         return "your single sign-on login did not attest a second factor (no MFA amr). Sign in "
                "again through your identity provider with MFA, or ask an administrator to have "
-               "the provider assert amr for approvers.";
+               "the provider assert amr for approvers. If it repeats, ask your administrator to "
+               "check clock synchronisation between the identity provider, the Yuzu server and "
+               "its database.";
     case approval::ApproverRefusal::kSamlMfaUnsupported:
         return "MFA attestation is not available for SAML sessions (#4935); decide the request "
                "from a local or OIDC session.";
@@ -217,6 +220,23 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
                  "the approver's MFA state could not be read, so the decision was not recorded",
                  "retry the request; the approval ticket is unchanged and still pending",
                  /*retry_after_ms=*/5000);
+        return;
+    case MfaKind::kProofClockSkew:
+        // An SSO proof dated after the database clock: a server-side clock fault, not a store
+        // fault and not something signing in again fixes. Same ordering and audit shape as the
+        // store-unavailable arm (result=error, before any attempted row), with its own detail
+        // token, no retry hint (retrying cannot help until the clocks are corrected) and no
+        // increment of the store-fault counter (the gate did not touch it).
+        spdlog::error("approval {} refused: reviewer={} MFA proof dated after the database clock "
+                      "(fail closed)",
+                      verb, log_safe(session->username));
+        (void)detail::emit_behavioral_audit(deps.audit_fn, req, res, audit_action, "error",
+                                            "approval", audit_id,
+                                            "approver_assurance:mfa_proof_clock_skew");
+        write_a4(res, 503,
+                 "the approver's identity-provider MFA proof is dated after the database clock",
+                 "an administrator must correct clock synchronisation between the identity "
+                 "provider, the Yuzu server and its database; retrying will not help until then");
         return;
     case MfaKind::kRefuse:
     default: {

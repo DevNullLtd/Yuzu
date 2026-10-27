@@ -2005,8 +2005,16 @@ TEST_CASE("MCP 2g: approve_request/reject_request descriptions state the REST en
         // description must not call them unconditional.
         CHECK(desc.find("always refuses an un-enrolled session with "
                         "approver_assurance_required:mfa_not_enrolled") != std::string::npos);
-        CHECK(desc.find("only when the generic step-up check does not answer first") !=
+        // One clause per reason (S-2): the lumped sentence put all three under one condition.
+        CHECK(desc.find("conditional, because the generic step-up check can answer first") !=
               std::string::npos);
+        CHECK(desc.find("saml_mfa_unsupported (SAML, #4935) and account_unavailable "
+                        "(deactivated or deleted account) surface only with the step-up "
+                        "window at 0") != std::string::npos);
+        CHECK(desc.find("mfa_proof_missing (an OIDC login with no MFA amr) surfaces with the "
+                        "step-up window at 0 or when MFA enforcement does not cover the "
+                        "caller's role") != std::string::npos);
+        CHECK(desc.find("enforcement not protecting the route") == std::string::npos);
         CHECK(desc.find("--mfa-enforcement=required") == std::string::npos);
         CHECK(desc.find("is tracked in #6079") == std::string::npos);
     }

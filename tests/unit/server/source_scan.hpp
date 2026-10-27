@@ -60,10 +60,47 @@ inline std::string strip_line_comments(std::string_view text) {
     return out;
 }
 
+namespace scan_detail {
+
+inline bool is_ident_char(char c) noexcept {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+// True when the `'` at `pos` is a C++14 digit separator (`30'000`, `0xFF'FF`) and not the start
+// of a character literal. It is when the token it sits in begins with a digit: walk back over
+// the token's characters (identifier characters and earlier separators) and look at where it
+// starts. A literal prefix (`L'a'`, `u8'a'`) starts with a letter, so it stays a literal.
+inline bool is_digit_separator(std::string_view text, std::size_t pos) noexcept {
+    if (pos == 0 || !is_ident_char(text[pos - 1]))
+        return false;
+    std::size_t j = pos;
+    while (j > 0 && (is_ident_char(text[j - 1]) || text[j - 1] == '\''))
+        --j;
+    return text[j] >= '0' && text[j] <= '9';
+}
+
+// True when an `R"` at `pos` opens a raw string: the text before the R is not an identifier
+// character, or is exactly one of the encoding prefixes u8 / u / U / L. `BAR"x"` is the
+// identifier BAR followed by an ordinary string, not a raw string.
+inline bool raw_string_opens_at(std::string_view text, std::size_t pos) noexcept {
+    std::size_t k = pos;
+    while (k > 0 && is_ident_char(text[k - 1]))
+        --k;
+    const std::string_view prefix = text.substr(k, pos - k);
+    return prefix.empty() || prefix == "u8" || prefix == "u" || prefix == "U" || prefix == "L";
+}
+
+} // namespace scan_detail
+
 // Comment-evasion-proof variant for scans that must not be satisfied by commented-out code
 // (#6079 qe-S2): drops `//` and `/* */` comments, keeps every newline (line numbers are
 // unchanged), and leaves string, character and raw-string literals untouched, so a `//`
 // inside a literal is not a comment. A single linear pass; no pattern library.
+//
+// Lexical rules it follows: a `//` comment whose line ends in a backslash continues onto the
+// next line (the continuation newline is kept); a `'` inside a number is a digit separator, not
+// a character literal; `R"` opens a raw string only at the start of a token or after an
+// encoding prefix (u8, u, U, L). An unterminated `/*` swallows the rest of the text.
 inline std::string strip_comments(std::string_view text) {
     std::string out;
     out.reserve(text.size());
@@ -72,8 +109,20 @@ inline std::string strip_comments(std::string_view text) {
     while (i < n) {
         const char c = text[i];
         if (c == '/' && i + 1 < n && text[i + 1] == '/') {
-            while (i < n && text[i] != '\n')
-                ++i; // the newline is copied by the next pass
+            while (i < n && text[i] != '\n') {
+                if (text[i] == '\\') {
+                    // A backslash directly before the line end continues the comment.
+                    std::size_t k = i + 1;
+                    if (k < n && text[k] == '\r')
+                        ++k;
+                    if (k < n && text[k] == '\n') {
+                        out.push_back('\n'); // keep the line count
+                        i = k + 1;
+                        continue;
+                    }
+                }
+                ++i; // the terminating newline is copied by the next pass
+            }
         } else if (c == '/' && i + 1 < n && text[i + 1] == '*') {
             i += 2;
             while (i < n && !(text[i] == '*' && i + 1 < n && text[i + 1] == '/')) {
@@ -83,10 +132,20 @@ inline std::string strip_comments(std::string_view text) {
             }
             i = (i < n) ? i + 2 : n;
             out.push_back(' ');
-        } else if (c == 'R' && i + 1 < n && text[i + 1] == '"') {
-            // Raw string: R"delim( ... )delim"
+        } else if (c == 'R' && i + 1 < n && text[i + 1] == '"' &&
+                   scan_detail::raw_string_opens_at(text, i)) {
+            // Raw string: R"delim( ... )delim". The delimiter is at most 16 characters and
+            // holds no space, parenthesis, backslash or control character; anything else is
+            // not a raw-string opener and is lexed as an ordinary string below.
             const std::size_t open = text.find('(', i + 2);
-            if (open == std::string_view::npos) {
+            bool valid = open != std::string_view::npos && open - (i + 2) <= 16;
+            for (std::size_t k = i + 2; valid && k < open; ++k) {
+                const char d = text[k];
+                if (d == ' ' || d == ')' || d == '\\' || d == '\t' || d == '\v' || d == '\f' ||
+                    d == '\n' || d == '\r' || d == '"')
+                    valid = false;
+            }
+            if (!valid) {
                 out.push_back(c);
                 ++i;
                 continue;
@@ -98,6 +157,9 @@ inline std::string strip_comments(std::string_view text) {
                 (end == std::string_view::npos) ? n : end + close.size();
             out.append(text.substr(i, stop - i));
             i = stop;
+        } else if (c == '\'' && scan_detail::is_digit_separator(text, i)) {
+            out.push_back(c);
+            ++i;
         } else if (c == '"' || c == '\'') {
             out.push_back(c);
             ++i;

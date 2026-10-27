@@ -144,7 +144,10 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
 /// Only `kChallengeWritten` writes to `res` (the 401 step-up envelope plus one
 /// `mfa.step_up.required` row; the challenge reports the EFFECTIVE window).
 /// `kStoreUnavailable` also increments `yuzu_auth_secret_unavailable_total{route="approval"}`
-/// when `metrics` is set.
+/// when `metrics` is set. `kProofClockSkew` is an SSO session whose cached anchor is empty and
+/// whose stored proof is dated after the database clock: it writes nothing, is NOT counted (the
+/// counter is a store-fault signal) and the route answers it 503 with no retry hint. A degraded
+/// durable read for such a session is `kStoreUnavailable`, decided first.
 [[nodiscard]] ApproverMfaOutcome
 require_enrolled_fresh_mfa(const httplib::Request& req, httplib::Response& res,
                            const auth::Session& session, AuthDB& auth_db,

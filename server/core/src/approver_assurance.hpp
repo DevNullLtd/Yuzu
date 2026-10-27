@@ -24,9 +24,15 @@
 ///
 /// Positive allow-list, not a deny-list: a seventh `auth_source` added later is
 /// refused here until someone decides it is an interactive, human, cookie-backed
-/// session. SAML passes this class check and is then refused (#4935): by the generic
-/// step-up check when that check answers first, otherwise by the MFA gate with
-/// `saml_mfa_unsupported` (step-up window 0, or enforcement not protecting the route).
+/// session. SAML passes this class check and is then refused (#4935). Which refusal the
+/// caller sees depends on whether the generic step-up check answers first; each reason has its
+/// own condition under which the typed approver refusal is what surfaces:
+///   - `mfa_not_enrolled`: always typed (the generic check passes an un-enrolled account);
+///   - `saml_mfa_unsupported` and `account_unavailable`: typed only with the step-up window
+///     at 0, otherwise the generic check refuses a SAML session, or a deleted or deactivated
+///     account, first (whatever the enforcement mode);
+///   - `mfa_proof_missing` (an SSO login with no MFA amr): typed with the step-up window at 0
+///     or when `--mfa-enforcement` does not cover the caller's role.
 /// A SAML session carries no MFA attestation in this release -- documented behaviour,
 /// not a gap to patch here.
 ///

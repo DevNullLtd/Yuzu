@@ -54,6 +54,8 @@ struct ApproverMfaOutcome {
         kRefuse = 0,       ///< no usable second factor; nothing was written to the response
         kStoreUnavailable, ///< the enrolment read failed; nothing was written to the response
         kChallengeWritten, ///< the proof is stale or predates the enrolment; a 401 was written
+        kProofClockSkew,   ///< an SSO proof dated after the database clock; nothing was written
+                           ///< to the response (a server-side clock fault, not a store fault)
         kPass,             ///< enrolled and fresh
     };
     Kind kind{Kind::kRefuse};

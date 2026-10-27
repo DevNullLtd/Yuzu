@@ -1013,10 +1013,20 @@ TEST_CASE("approval_routes: the not-enrolled remediation names the role-appropri
     CHECK(user.find("--mfa-enforcement") != std::string::npos);
     CHECK(user.find("ask your Yuzu administrator to enrol you") != std::string::npos);
     CHECK(user.find("docs/ops-runbooks") == std::string::npos);
-    CHECK(user.find("Enrolling a non-admin approver") != std::string::npos);
+    // The pointer names a section that exists, by its title and its document, and carries no
+    // repo path.
+    CHECK(user.find("(see \"Enrolling a non-admin approver\" in the Auth Store Recovery "
+                    "Runbook), then retry.") != std::string::npos);
+    CHECK(user.find("Administrator guide") == std::string::npos);
     CHECK(user.find("Settings > Security and sign-in") == std::string::npos);
 
     CHECK(remediation(auth::Role::user, MfaFactorState::kNoIdpProof).find("no MFA amr") !=
+          std::string::npos);
+    // The SSO "sign in again" advice also carries the clock clause, for the case where the
+    // proof was dropped as future-dated and the skew has since elapsed (UP-4 residual).
+    CHECK(remediation(auth::Role::user, MfaFactorState::kNoIdpProof)
+              .find(" If it repeats, ask your administrator to check clock synchronisation "
+                    "between the identity provider, the Yuzu server and its database.") !=
           std::string::npos);
     CHECK(remediation(auth::Role::admin, MfaFactorState::kSamlUnsupported).find("#4935") !=
           std::string::npos);
@@ -1051,6 +1061,47 @@ TEST_CASE("approval_routes: an unreadable MFA enrolment is a retryable 503 with 
         CHECK(h.audits[0].result == "error");
         CHECK(h.audits[0].target_id == p.id);
         CHECK(h.audits[0].detail == "approver_assurance:mfa_store_unavailable");
+        CHECK(h.events.empty());
+        p.check_pending();
+    }
+}
+
+TEST_CASE("approval_routes: an SSO proof dated after the database clock is a 503 with its own "
+          "error row, its own texts and a null retry hint, and the ticket stays pending",
+          "[server][routes][approval_routes][approver_mfa][pg]") {
+    for (const char* verb : {"approve", "reject"}) {
+        INFO(verb);
+        Pending p;
+        Harness h;
+        h.approval_manager = p.mgr.get();
+        h.mfa_outcome = {Kind::kProofClockSkew, MfaFactorState::kNoIdpProof};
+        h.wire();
+
+        auto res = h.sink.Post("/api/approvals/" + p.id + "/" + verb, "{}");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+        auto j = body(res->body);
+        CHECK(j["error"]["code"] == 503);
+        CHECK(j["error"]["message"] ==
+              "the approver's identity-provider MFA proof is dated after the database clock");
+        CHECK(j["error"]["remediation"] ==
+              "an administrator must correct clock synchronisation between the identity "
+              "provider, the Yuzu server and its database; retrying will not help until then");
+        CHECK(j["error"].contains("correlation_id"));
+        // No retry hint: retrying cannot help until the clocks are fixed. The A4 envelope
+        // always carries the key and encodes "no hint" as null (rest_a4_envelope.hpp), so the
+        // pin is null, never a number.
+        REQUIRE(j["error"].contains("retry_after_ms"));
+        CHECK(j["error"]["retry_after_ms"].is_null());
+        CHECK_FALSE(j["error"]["retry_after_ms"].is_number());
+        // The same ordering guarantee as the other 503 arm: one `error` row, no `attempted`.
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == std::string("approval.") + verb);
+        CHECK(h.audits[0].result == "error");
+        CHECK(h.audits[0].target_type == "approval");
+        CHECK(h.audits[0].target_id == p.id);
+        CHECK(h.audits[0].detail == "approver_assurance:mfa_proof_clock_skew");
         CHECK(h.events.empty());
         p.check_pending();
     }

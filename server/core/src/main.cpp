@@ -1951,9 +1951,14 @@ int main(int argc, char* argv[]) {
                                                            "CLI (os_identity={})",
                                                            os_user)))) {
             spdlog::error("--mfa-reset: the audit store did not accept the intent row for '{}'; "
-                          "MFA was NOT cleared",
+                          "MFA was NOT cleared. If you are locked out and cannot restore the "
+                          "audit store, see \"Fallback: direct SQL\" in the Auth Store Recovery "
+                          "Runbook (docs/ops-runbooks/auth-db-recovery.md)",
                           mfa_reset_user);
             std::cerr << "error: audit store did not accept the intent row; nothing was changed\n";
+            std::cerr << "if you are locked out and cannot restore the audit store, see \"Fallback: "
+                         "direct SQL\" in the Auth Store Recovery Runbook "
+                         "(docs/ops-runbooks/auth-db-recovery.md)\n";
             return EXIT_FAILURE;
         }
         if (auto r = auth_db->mfa_disable(mfa_reset_user); !r) {

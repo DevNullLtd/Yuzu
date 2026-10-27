@@ -160,16 +160,24 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
         // The cached anchor of an SSO session is left empty both when the IdP attested no
         // second factor AND when the stored proof is dated after the database clock (a
         // replica or IdP clock ahead of the database; derive_session_deadlines drops it).
-        // Only the first is the approver's to fix by signing in again: the second would
-        // repeat on every login, so it answers 503 (a server-side condition) rather than
-        // a 403 with a remedy that cannot work. Still a refusal; no path passes.
+        // Order matters and every arm is a refusal; no path passes:
+        //  1. a degraded durable read cannot tell either case apart: store-unavailable (503),
+        //     counted like any other store fault;
+        //  2. a stored proof dated after the database clock is clock skew, which signing in
+        //     again cannot fix: its own 503 outcome, NOT counted (the counter is a store-fault
+        //     signal) and carrying no retry hint (retrying cannot help until an administrator
+        //     corrects the clocks);
+        //  3. anything else (no proof stored, no durable session, or a proof that is no longer
+        //     future-dated because the skew has since elapsed) is the 403 "sign in again".
+        if (durable.source == Source::kUnavailable)
+            return store_unavailable("durable mfa proof");
         if (durable.source == Source::kRow && durable.mfa_verified_ms > durable.db_now_ms) {
             spdlog::error("require_enrolled_fresh_mfa: approver MFA proof is dated after the "
                           "database clock (clock skew between the replica/IdP and the database); "
                           "refusing with 503 rather than telling the approver to sign in again "
                           "(user={})",
                           log_safe(session.username));
-            return unavailable();
+            return {Kind::kProofClockSkew, probe.state};
         }
         return {Kind::kRefuse, probe.state};
     default:
@@ -199,7 +207,7 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
     // the database reads as future-dated. A future-dated durable instant is refused here; for
     // a freshly minted or loaded session the same condition has already left no cached proof
     // (derive_session_deadlines), which probe_mfa_factor reports before this point (an SSO
-    // session: mfa_proof_missing). kAbsent (no durable session, or another principal's) has no
+    // session: kProofClockSkew, or mfa_proof_missing once the skew has elapsed). kAbsent (no durable session, or another principal's) has no
     // proof to age. kUnavailable (a degraded read, or no SessionStore attached) was refused
     // above, so only kRow and kAbsent reach here.
     bool within_window = false;
