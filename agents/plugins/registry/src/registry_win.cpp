@@ -468,8 +468,9 @@ struct ResolvedProfile {
 };
 
 /// PR1.7: resolves the target profile via ProfileList (username or an explicit sid), shared by the per-user read and
-/// write actions. Writes its own `error|...` line and returns false on a miss.
-bool resolve_profile(yuzu::CommandContext& ctx, yuzu::Params params, ResolvedProfile& out) {
+/// write actions. Writes its own `error|...` line and returns false on a miss. A write never resolves a `<SID>.bak`
+/// leftover (its folder may hold the user's real hive and its name can shadow the live profile's): for those it is a miss.
+bool resolve_profile(yuzu::CommandContext& ctx, yuzu::Params params, ResolvedProfile& out, bool for_write) {
     const auto username = params.get("username");
     const auto sid_param = params.get("sid");
     if (username.empty() && sid_param.empty()) {
@@ -488,7 +489,8 @@ bool resolve_profile(yuzu::CommandContext& ctx, yuzu::Params params, ResolvedPro
         return false;
     }
     const auto hku_subkeys = yuzu::win::enumerate_hku_subkeys();
-    const auto profile_list = yuzu::profiles::build_profile_list(records, hku_subkeys);
+    auto profile_list = yuzu::profiles::build_profile_list(records, hku_subkeys);
+    if (for_write) yuzu::profiles::remove_backup_entries(profile_list);
 
     if (!sid_param.empty()) {
         // Membership in the enumerated, non-system profile list is both necessary and sufficient:
@@ -530,7 +532,7 @@ bool resolve_profile(yuzu::CommandContext& ctx, yuzu::Params params, ResolvedPro
 // absent one.
 int do_get_user_value(yuzu::CommandContext& ctx, yuzu::Params params) {
     ResolvedProfile prof;
-    if (!resolve_profile(ctx, params, prof)) return 1;
+    if (!resolve_profile(ctx, params, prof, /*for_write=*/false)) return 1;
     const auto key = params.get("key");
     const auto val_name = params.get("name");
 
@@ -664,7 +666,7 @@ int do_delete_key(yuzu::CommandContext& ctx, yuzu::Params params) {
 /// post-unload probe is the pure classify_offline_write_race's input.
 int do_user_write(yuzu::CommandContext& ctx, yuzu::Params params, bool is_delete) {
     ResolvedProfile prof;
-    if (!resolve_profile(ctx, params, prof)) return 1;
+    if (!resolve_profile(ctx, params, prof, /*for_write=*/true)) return 1;
     const auto key = params.get("key");
     const auto name = params.get("name");
 
