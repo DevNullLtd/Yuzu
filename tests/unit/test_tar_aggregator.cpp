@@ -588,7 +588,7 @@ TEST_CASE("TAR #538: every registered capture source is classified by diff_state
     // performed out here.
     const std::set<std::string_view> non_diff_sources = {"perf",     "procperf", "netqual",
                                                           "module",   "netconn",  "power",
-                                                          "removable", "usage"};
+                                                          "removable", "usage",  "registry"};
 
     for (const auto& src : capture_sources()) {
         const bool is_diff = diff_sources.contains(src.name);
@@ -1888,15 +1888,30 @@ TEST_CASE("TAR #2361: a rolled-back retention pass does not discard another writ
     std::mutex ack_mu;
     std::condition_variable ack_cv;
     std::vector<int> acknowledged;
+    // #5170: back-to-back set_config calls re-take TarDatabase::mu_ (an unfair
+    // std::mutex) with no pause, and run_retention's execute_atomic_batch waits on
+    // the same mutex; on a loaded box the writer is thought to starve it (the cause
+    // is inferred from the #5170 hang, not measured) and the test hangs.
+    // yield() hands the CPU on without throttling the burst the ~1-in-5 detection
+    // above depends on (a per-write sleep would, at Windows' timer granularity; the
+    // effect of yield() on that detection is not measured on Windows);
+    // kMaxProbeWrites stops the writer re-taking mu_ past a ceiling retention never
+    // needs, so it can never be starved indefinitely.
+    constexpr int kMaxProbeWrites = 50000;
     std::thread writer([&] {
         int n = 0;
         while (!stop.load(std::memory_order_relaxed)) {
+            if (n >= kMaxProbeWrites) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
             const int mine = ++n;
             if (f.db->set_config(std::format("collector_probe_{}", mine), std::to_string(mine))) {
                 std::lock_guard lk(ack_mu);
                 acknowledged.push_back(mine);
                 ack_cv.notify_one();
             }
+            std::this_thread::yield();
         }
     });
     // Join on EVERY path: run_retention is not noexcept, and destroying a

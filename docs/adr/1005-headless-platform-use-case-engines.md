@@ -534,7 +534,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      unchanged).** The list/record/per-device routes are REST-only, no MCP twin, and absent from
      route discovery only in the sense that no `get_hardware_ci`/
      `list_hardware`/equivalent MCP tool exists yet — the REST routes
-     themselves ARE in `openapi_spec()` and `GET /api/v1/routes` (A2/A3
+     themselves ARE in `openapi_spec()` and `GET /api/v1/discover/routes` (A2/A3
      hold for the REST half). A "no" on Decision 1/4's both-surfaces
      requirement for the MCP half.
      - **No MCP twin — tracked follow-up, not a permanent exception.** An
@@ -892,7 +892,73 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        change because the REST and MCP twins differ in gate or content
        (`get.api-inventory-tables`, `post.api-inventory-query`,
        `get.api-inventory-param-param`, `get.api-agents`,
-       `get.fragments-network-overview`, `get.api-tags`).
+       `get.fragments-network-overview`, `get.api-tags`). `get.api-agents`
+       has since moved to a dated exception (the 2026-10-23 entry below).
+
+   - **2026-10-23 - MCP twin completeness gates, and `list_agents` as a dated
+     exception.** Two parts. First, `scripts/ci/check-api-parity.py` gains a
+     gate-parity check (for a ledger row with both a REST v1 twin and an MCP
+     tool, the securable, operation and gate kind must agree) and a
+     test-existence tripwire (each registry tool's test file must name the tool
+     and assert a schema and an audit row), and a Catch2 case checks that every
+     registry tool is both a ledger `mcp_twin` and a `kExpectedTwins` row. Each
+     check carries a size-pinned, shrink-only allowlist seeded from the tree as
+     it stood. The gate-parity table (`GATE_PARITY_KNOWN_MISMATCHES`) holds
+     the six rows whose REST and MCP gates still differ, or whose agreement
+     the check cannot prove, after it learned two shapes (a REST handler that
+     refuses a service-scoped token before its gate, and an MCP handler whose
+     own fleet read confines), with a
+     one-line reason each in the script; a second table
+     (`GATE_PARITY_NO_GATE_ALLOWED`) holds routes whose gate the script cannot
+     read. Both shrink only: a fix removes its entry and lowers the pin, and
+     adding an entry or raising a pin is a reviewed deferral that needs a
+     reason, a tracking issue and a ruling recorded in this ADR. These are
+     tripwires, not proofs: the check compares gate labels, not effect (REST
+     reads the management-group axis, MCP the service-scope axis), a row whose
+     `rest_v1_twin` or `mcp_twin` is null compares nothing, and the checks read
+     source text, so the first gate call in a handler is taken as its gate and
+     each further gate call must agree or be matched, one to one, by a gate call the MCP
+     handler makes, and, for a row with a REST object twin whose MCP handler body can be
+     derived, that handler's gate call for a pair other than the tool's declared
+     pair is a finding of its own (three pinned entries carry that extra handler
+     gate in their description; MCP-only tools and shared-branch handlers are not
+     held to it). `MIN_REGISTRY_FILES` rises from 1 to 3, the number of
+     `mcp_tools_*.cpp` registry files, and must equal that count; the
+     test-existence tripwire also requires the test file to be registered in
+     `tests/meson.build`, reads the `schema_violation(` call with string literals
+     blanked, and does not count a negative audit assertion. Second, `get.api-agents` becomes
+     `exception:#4041 revisit:2027-01-31`: MCP `list_agents` is unconfined (a
+     known gap, the World A gap tracked by #4041, not a design choice) while
+     `GET /api/v1/devices` is confined through `require_fleet_read`, so it is
+     not a twin until `list_agents` is confined. The legacy row
+     `get.fragments-devices-list` recorded the same pair as `twinned`; it moves
+     to the same exception so the ledger holds one answer for the pair
+     (untwinned 214 to 215). The pins are `(4041, "2027-01-31")` for both rows in
+     `STRICT_EXCEPTION_PINS`; like the 2026-10-22 entry this is a session
+     statement by the ADR owner, not a signed decision.
+
+   - **2026-10-23 - DEX customer score policy (`GET`, `PUT` and `DELETE
+     /api/v1/dex/score-policy`, #6086).** REST-only, no MCP twin: a "no" on
+     Decision 1's both-surfaces requirement, recorded rather than fixed in the
+     same change because the REST routes and the one write function behind
+     them ship first and the MCP twins follow over that function.
+     - **No MCP twin - tracked follow-up, not a permanent exception.** The
+       three twins are tracked as **#6087**; **revisit by 2027-01-31**. Until
+       they land, this row stands as the open exception for these routes, and
+       it retires when the twins merge (this entry is then amended to say so).
+       No ledger row is added: the parity ledger admits an `exception:` row
+       for a `/api/v1` route (check 1b, as for the password routes) but does
+       not require one; this one is recorded here and tracked by #6087.
+     - **The exception relaxes no control.** The routes are in
+       `openapi_spec()` and `GET /api/v1/discover/routes` (A2/A3 hold for the
+       REST half), errors from the route use the A4 envelope, `PUT` and
+       `DELETE` need `Infrastructure:Write` and an `If-Match` precondition,
+       are audit-first and fail closed on audit (`dex.score_policy.update`,
+       `.reset`, `.validate`), and a service-scoped token is refused at the
+       gate. The MCP-token posture of these routes is carried on #6087; this
+       entry does not fence MCP tokens.
+     - Wire reference: `docs/user-manual/rest-api.md`, "GET / PUT / DELETE
+       /api/v1/dex/score-policy"; audit rows: `docs/user-manual/audit-log.md`.
 
 ## Interim rules (until the named follow-ups ship)
 

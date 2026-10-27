@@ -644,7 +644,7 @@ TEST_CASE("#3685 defect 4: the two Destructive refusal strings are pinned byte-e
 // so a future catalogue change that adds or removes a Destructive row has
 // to touch this test, not silently drift past #3685's own coverage claim
 // the way the design doc's count already did.
-TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 19, not the design "
+TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 21, not the design "
           "doc's stale 14 (#3685) — a new/removed Destructive row must touch this test",
           "[server][dispatch][security]") {
     namespace capdecls = yuzu::server::capdecls;
@@ -698,12 +698,12 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 19,
             CHECK_FALSE(row.system_reserved);
         }
     }
-    // 19: re-verified fresh against the merged tree (see the TEST_CASE-level
+    // 21: re-verified fresh against the merged tree (see the TEST_CASE-level
     // comment above) rather than carried forward unchecked — a FUTURE
     // Destructive row in any fragment must land with the aggregate tripwire
     // still passing, which is exactly the drift this test's own title
-    // forbids.
-    CHECK(destructive_count == 19);
+    // forbids. (19 + registry.delete_user_value and registry.apply, registry 2.1.0.)
+    CHECK(destructive_count == 21);
     // D4's rationale (dispatch_destructive_gate.hpp doc comment): exactly
     // the four Execution:Execute rows rely on the chokepoint's
     // AdminOrApproval gate as their elevation ceiling. This sub-claim WAS

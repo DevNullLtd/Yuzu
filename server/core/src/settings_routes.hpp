@@ -312,9 +312,12 @@ private:
     /// than denormalised, to avoid drift between disk + DB.
     std::string render_plugin_signing_fragment();
     /// Render the Engine Principals admin-console fragment — a table of
-    /// every engine principal (`EnginePrincipalStore::list_all`, including
+    /// every engine principal (`EnginePrincipalStore::list_all_checked`, including
     /// revoked rows) with owner, classification, lifecycle state, and
-    /// active-credential count (`ApiTokenStore::list_active_for_principal`).
+    /// active-credential count (`ApiTokenStore::list_active_for_principal_checked`).
+    /// A roster that cannot be read renders an "unavailable" notice instead of a
+    /// table; a credential count that cannot be read renders "unavailable" and the
+    /// row offers neither Mint nor Rotate.
     /// Revoked rows surface the `superseded_by` linkage AND the revocation
     /// reason explicitly (design doc §3.1) — never a merged history that
     /// hides that a revocation occurred. Admin-only; a null

@@ -1,6 +1,7 @@
 #include "approval_routes.hpp"
 
 #include "approval_manager.hpp"
+#include "approval_model.hpp" // approval_row_json (the shared read-row builder)
 #include "approver_assurance.hpp"
 #include "audited_write.hpp" // WriteGate (same-site gate for the cookie-authorised write)
 #include "http_route_sink.hpp"
@@ -353,17 +354,10 @@ void register_approval_routes(HttpRouteSink& sink, Deps deps) {
 
         auto approvals = deps.approval_manager->query(q);
         nlohmann::json arr = nlohmann::json::array();
-        for (const auto& a : approvals) {
-            arr.push_back({{"id", a.id},
-                           {"definition_id", a.definition_id},
-                           {"status", a.status},
-                           {"submitted_by", a.submitted_by},
-                           {"submitted_at", a.submitted_at},
-                           {"reviewed_by", a.reviewed_by},
-                           {"reviewed_at", a.reviewed_at},
-                           {"review_comment", a.review_comment},
-                           {"scope_expression", a.scope_expression}});
-        }
+        // Shared builder (approval_model.hpp): the SAME rows as GET /api/v1/approvals and
+        // MCP list_pending_approvals, a bound ticket's frozen request included (#6062).
+        for (const auto& a : approvals)
+            arr.push_back(approval_row_json(a));
         res.set_content(nlohmann::json({{"approvals", arr}}).dump(), "application/json");
     });
 

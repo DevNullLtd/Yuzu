@@ -86,8 +86,8 @@
       "method": "GET",
       "path": "/api/v1/devices"
     },
-    "mcp_twin": "list_agents",
-    "status": "twinned"
+    "mcp_twin": null,
+    "status": "exception:#4041 revisit:2027-01-31 MCP list_agents is unconfined (known gap, #4041) while GET /api/v1/devices is confined through require_fleet_read; not a twin until list_agents is confined (ADR-1005 2026-10-23 entry)"
   },
   {
     "method": "GET",

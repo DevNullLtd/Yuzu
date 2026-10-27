@@ -3,7 +3,15 @@
 #include <string>
 #include <string_view>
 
-// The reserved `mcp.` definition-id namespace (#2442).
+// The reserved `mcp.` and `guardian.` definition-id namespaces (#2442, #6062).
+//
+// `guardian.` (#6062, four-eyes MVP PR2) is reserved by the SAME mechanism, for the
+// same reason: Guardian rule-deploy approvals (ApprovalOrigin::kGuardianDeploy) are
+// minted under `guardian.<...>`, and an authored instruction definition under that
+// prefix would be a ticket namespace an operator can populate from the instruction
+// editor. The recorded origin, not the prefix, is what redemption trusts; the prefix
+// is the authoring-side half, so the two namespaces stay separable on screen and in
+// audit as well as in the store.
 //
 // MCP approval tickets are minted under `mcp.<tool>`, and the MCP recall matched
 // a ticket on (definition_id, scope_expression) alone, without binding the
@@ -18,8 +26,8 @@
 // lives here, once, because it has to hold at two unrelated places that would
 // otherwise each carry a copy:
 //
-//   * InstructionStore::create_definition_impl — authoring (create + import)
-//   * validate_instruction_yaml        — the YAML validator, which MUST agree
+//   * InstructionStore::validate_and_prepare - authoring (create + import)
+//   * instruction_yaml::validate_definition_yaml - the YAML validator, which MUST agree
 //     with the store or the "YAML that validates always saves" contract breaks
 //     (#1993, re-broken by #2010 and again by the first cut of #2442 — three
 //     times, which is why the predicate is no longer copied)
@@ -30,7 +38,7 @@
 // redemption instead. The store RECORDS the minting surface; it does not police
 // the namespace.)
 //
-// A third site would be a third chance to diverge: call `is_reserved_definition_id`
+// A further site would be another chance to diverge: call `is_reserved_definition_id`
 // and report `kReservedDefinitionIdError` rather than re-implementing either.
 // mcp_server.cpp is the fourth call site of `kMcpDefinitionPrefix` (it builds
 // the definition id at the MCP mint) but not of the predicate above — it has
@@ -40,19 +48,45 @@ namespace yuzu::server {
 /// Definition-id prefix reserved for MCP-minted approval tickets.
 inline constexpr std::string_view kMcpDefinitionPrefix = "mcp.";
 
-/// True iff `id` lands in the reserved namespace. Case-sensitive on purpose:
-/// SQLite's default BINARY collation makes `MCP.` a different id everywhere
-/// else, so treating it as reserved here would refuse an id nothing else
-/// conflates.
-[[nodiscard]] inline bool is_reserved_definition_id(std::string_view id) {
+/// Definition-id prefix reserved for Guardian rule-deploy approval tickets (#6062).
+inline constexpr std::string_view kGuardianDefinitionPrefix = "guardian.";
+
+/// True iff `id` is under the MCP prefix specifically. The Approvals page keys its
+/// "MCP" tag, its tool-name display and its "re-call the tool" note off this, NOT off
+/// `is_reserved_definition_id`: a `guardian.` ticket is reserved but is not an MCP
+/// tool call.
+[[nodiscard]] inline bool is_mcp_definition_id(std::string_view id) {
     return id.starts_with(kMcpDefinitionPrefix);
 }
 
-/// THE denial message, shared by all three sites. One rule reads as one denial
+/// True iff `id` lands in ANY reserved namespace. Case-sensitive on purpose:
+/// ids are compared byte-for-byte everywhere else, so `MCP.` is a different id,
+/// and treating it as reserved here would refuse an id nothing else conflates.
+[[nodiscard]] inline bool is_reserved_definition_id(std::string_view id) {
+    return is_mcp_definition_id(id) || id.starts_with(kGuardianDefinitionPrefix);
+}
+
+/// THE denial messages, shared by both authoring sites. One rule reads as one denial
 /// to an operator and keys as one stable token in a SIEM rule
-/// (docs/user-manual/audit-log.md enumerates it) — two hand-written variants of
-/// the same refusal is how that contract silently drifts.
+/// (docs/user-manual/audit-log.md enumerates them) - two hand-written variants of
+/// the same refusal is how that contract silently drifts. The `mcp.` text is the
+/// #2442 token and is deliberately UNCHANGED; `guardian.` has its own so a rule keyed
+/// on the first keeps matching exactly what it matched before.
 inline constexpr std::string_view kReservedDefinitionIdError =
     "definition id may not use the reserved 'mcp.' prefix (reserved for MCP approvals)";
+inline constexpr std::string_view kReservedGuardianDefinitionIdError =
+    "definition id may not use the reserved 'guardian.' prefix (reserved for Guardian "
+    "deploy approvals)";
+
+/// The denial message for `id`, or an empty view when `id` is not reserved. Both
+/// authoring sites call THIS (not the constants), so which prefix fired can never
+/// disagree with which message is reported.
+[[nodiscard]] inline std::string_view reserved_definition_id_error(std::string_view id) {
+    if (is_mcp_definition_id(id))
+        return kReservedDefinitionIdError;
+    if (id.starts_with(kGuardianDefinitionPrefix))
+        return kReservedGuardianDefinitionIdError;
+    return {};
+}
 
 } // namespace yuzu::server

@@ -487,10 +487,10 @@ public:
     /// each axis's own infrastructure-unavailable case landing on
     /// `GateFailure::Degraded` (503, retryable): a null/not-open RBAC store
     /// on the management axis, and a null or query-failed tag store on the
-    /// service axis. Only a genuine `ListReadDecision::DenyAll` — real "no
-    /// grant," or an in-query store error surfacing through it, the one
-    /// residual weakening of `authorize_list_read`'s own promise this gate
-    /// does not add a discriminator for (implementation plan §2c) — lands on
+    /// service axis. A read that fails INSIDE `authorize_list_read` (the
+    /// global-grant, permission-group or subtree read: `read_failed`) is
+    /// `GateFailure::Degraded` (503) too. Only a genuine
+    /// `ListReadDecision::DenyAll` (real "no grant") lands on
     /// `GateFailure::Forbidden` (403).
     ///
     /// SELF-SUFFICIENT for the RBAC/management-group authority decision — do
@@ -544,10 +544,11 @@ public:
     /// here: `rbac_enforcement_in_effect()` (`rbac_store.cpp:1608`) returns
     /// `true` for a non-null-but-not-open store, routing both siblings INTO
     /// their RBAC-enforced branch, where `check_permission`/`authorize_list_
-    /// read` fail on the dead handle and 403 (fail CLOSED, matching this
-    /// gate's posture) — the only divergence here is STATUS-CODE
-    /// GRANULARITY: a permanent-looking 403 indistinguishable from "no
-    /// grant" in the siblings vs this gate's correct retryable 503. (c) a
+    /// read` fail on the dead handle (fail CLOSED, matching this gate's
+    /// posture) — the only divergence here is STATUS-CODE GRANULARITY: the
+    /// siblings that do not read `read_failed` answer a permanent-looking 403
+    /// indistinguishable from "no grant", this gate and `require_list_read`
+    /// the correct retryable 503. (c) a
     /// null OR not-open `mgmt_group_store_` — NEITHER sibling distinguishes
     /// null from not-open for this store the way (a)/(b) do for
     /// `rbac_store_`; both already fail CLOSED via `RbacStore::resolve_perm_
@@ -1016,6 +1017,15 @@ public:
     /// impractical to fill in a unit test). Test-only seam — governance
     /// qe-B: the load-shed branch must be exercised.
     void set_mfa_pending_cap_for_test(std::size_t cap) { mfa_pending_cap_ = cap; }
+
+    /// Test hook: push the pending MFA challenge `pending_token`'s steady
+    /// `expires_at` backward by `elapsed`, so the TTL reaper
+    /// (`reap_mfa_pending_locked`) sees it as lapsed after `elapsed` more time
+    /// without sleeping. The map is keyed by the raw pending token. A no-op for an
+    /// unknown token. Production code MUST NOT call this — no caller in
+    /// `server/core/src/**` references it.
+    void expire_mfa_pending_for_test(const std::string& pending_token,
+                                     std::chrono::milliseconds elapsed);
 
     /// Override the service-scope global-safe allow-list for a test
     /// (`kServiceScopeGlobalSafe` is seeded EMPTY in production, #2298 PR 3 —

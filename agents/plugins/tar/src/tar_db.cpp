@@ -18,6 +18,7 @@
 
 #include <sqlite3.h>
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp> // yuzu::log_key_token: a registry key/value name is attacker-chosen (CWE-117)
 
 #include <array>
 #include <cctype>
@@ -1315,6 +1316,40 @@ std::string TarDatabase::get_state(const std::string& collector) {
     return {};
 }
 
+std::expected<std::optional<std::string>, std::string>
+TarDatabase::try_get_state(const std::string& collector) {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return std::unexpected("TarDatabase::try_get_state: no open database");
+
+    const char* sql = "SELECT state_json FROM tar_state WHERE collector = ?";
+    sqlite3_stmt* raw_stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
+        std::string err =
+           std::string("TarDatabase::try_get_state prepare failed: ") + sqlite3_errmsg(db_);
+        spdlog::error("{}", err);
+        return std::unexpected(std::move(err));
+    }
+    StmtPtr stmt(raw_stmt);
+    sqlite3_bind_text(stmt.get(), 1, collector.c_str(), static_cast<int>(collector.size()),
+                      SQLITE_STATIC);
+
+    const int rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_ROW) {
+        const auto* t = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        return std::optional<std::string>(
+           t ? std::string(t, static_cast<std::size_t>(sqlite3_column_bytes(stmt.get(), 0)))
+             : std::string{});
+    }
+    if (rc != SQLITE_DONE) {
+        std::string err =
+           std::string("TarDatabase::try_get_state step failed: ") + sqlite3_errmsg(db_);
+        spdlog::error("{}", err);
+        return std::unexpected(std::move(err));
+    }
+    return std::optional<std::string>{}; // succeeded, no row
+}
+
 bool TarDatabase::set_state(const std::string& collector, const std::string& json) {
     std::lock_guard lock(mu_);
     if (!db_)
@@ -1750,6 +1785,146 @@ std::expected<void, TarDatabase::CursorInsertError> TarDatabase::insert_removabl
                                     : CursorInsertError::Transient);
 }
 
+std::expected<void, TarDatabase::CursorInsertError> TarDatabase::insert_registry_events_and_cursor(
+    const std::vector<RegistryEvent>& events, const std::string& cursor_json,
+    const std::vector<StateWrite>& baseline_writes) {
+    // Same refusal as the power/removable twins: a blank or NUL-bearing key would
+    // collapse distinct rows under INSERT OR IGNORE and still report success.
+    for (const auto& ev : events) {
+        if (ev.record_key.empty() || ev.record_key.find('\0') != std::string::npos) {
+            spdlog::error("TarDatabase::insert_registry_events_and_cursor: refusing a batch with an "
+                          "empty or NUL-bearing record_key -- the dedupe index would discard rows "
+                          "and report success");
+            return std::unexpected(CursorInsertError::KeyCollision);
+        }
+    }
+
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return std::unexpected(CursorInsertError::Transient);
+
+    bool collided = false;
+    const bool ok = insert_events_and_cursor_locked(
+        db_, "insert_registry_events_and_cursor", "registry", cursor_json,
+        [&events, &baseline_writes, &collided](sqlite3* db, const char* log_prefix) {
+            if (!events.empty()) {
+                const char* sql = R"(
+                    INSERT OR IGNORE INTO registry_live
+                        (ts, snapshot_id, hive, key_path, value_name, action, data_type, data,
+                         data_size, data_truncated, prev_data_type, prev_data, prev_data_size,
+                         prev_data_truncated, actor_pid, actor_image, source, observed_at,
+                         detail, record_key)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    RETURNING record_key
+                )";
+                sqlite3_stmt* raw_stmt = nullptr;
+                if (sqlite3_prepare_v2(db, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
+                    spdlog::error("{} events prepare: {}", log_prefix, sqlite3_errmsg(db));
+                    return false;
+                }
+                StmtPtr stmt(raw_stmt);
+                const char* dup_sql = R"(
+                    SELECT action, hive, key_path, value_name, data_type, data, data_size,
+                           prev_data_type, prev_data, prev_data_size, observed_at
+                      FROM registry_live WHERE record_key = ?
+                )";
+                sqlite3_stmt* raw_dup = nullptr;
+                if (sqlite3_prepare_v2(db, dup_sql, -1, &raw_dup, nullptr) != SQLITE_OK) {
+                    spdlog::error("{} dup-check prepare: {}", log_prefix, sqlite3_errmsg(db));
+                    return false;
+                }
+                StmtPtr dup(raw_dup);
+                const auto bind_text = [](sqlite3_stmt* s, int i, const std::string& v) {
+                    sqlite3_bind_text(s, i, v.c_str(), static_cast<int>(v.size()), SQLITE_STATIC);
+                };
+                for (const auto& ev : events) {
+                    sqlite3_reset(stmt.get());
+                    sqlite3_clear_bindings(stmt.get());
+                    sqlite3_bind_int64(stmt.get(), 1, ev.ts);
+                    sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
+                    bind_text(stmt.get(), 3, ev.hive);
+                    bind_text(stmt.get(), 4, ev.key_path);
+                    bind_text(stmt.get(), 5, ev.value_name);
+                    bind_text(stmt.get(), 6, ev.action);
+                    bind_text(stmt.get(), 7, ev.data_type);
+                    bind_text(stmt.get(), 8, ev.data);
+                    sqlite3_bind_int64(stmt.get(), 9, ev.data_size);
+                    sqlite3_bind_int(stmt.get(), 10, ev.data_truncated);
+                    bind_text(stmt.get(), 11, ev.prev_data_type);
+                    bind_text(stmt.get(), 12, ev.prev_data);
+                    sqlite3_bind_int64(stmt.get(), 13, ev.prev_data_size);
+                    sqlite3_bind_int(stmt.get(), 14, ev.prev_data_truncated);
+                    sqlite3_bind_int64(stmt.get(), 15, ev.actor_pid);
+                    bind_text(stmt.get(), 16, ev.actor_image);
+                    bind_text(stmt.get(), 17, ev.source);
+                    sqlite3_bind_int64(stmt.get(), 18, ev.observed_at);
+                    bind_text(stmt.get(), 19, ev.detail);
+                    bind_text(stmt.get(), 20, ev.record_key);
+                    // RETURNING, not sqlite3_changes(): see the power twin (#1033).
+                    const int step_rc = sqlite3_step(stmt.get());
+                    if (step_rc == SQLITE_ROW)
+                        continue; // inserted
+                    if (step_rc != SQLITE_DONE) {
+                        spdlog::error("{} events step: {}", log_prefix, sqlite3_errmsg(db));
+                        return false;
+                    }
+                    // Ignored: a legitimate replay, or a collision. Only the stored
+                    // IDENTITY (what changed) can tell them apart -- never the actor
+                    // or detail columns, which are not identity and must not wedge
+                    // the source on a permanent KeyCollision.
+                    sqlite3_reset(dup.get());
+                    sqlite3_clear_bindings(dup.get());
+                    bind_text(dup.get(), 1, ev.record_key);
+                    if (sqlite3_step(dup.get()) != SQLITE_ROW) {
+                        spdlog::error("{} dup-check: record_key '{}' was ignored but no stored "
+                                      "row could be read back", log_prefix,
+                                      yuzu::log_key_token(ev.record_key));
+                        return false;
+                    }
+                    auto col = [&](int i) {
+                        const auto* t =
+                           reinterpret_cast<const char*>(sqlite3_column_text(dup.get(), i));
+                        if (t == nullptr)
+                            return std::string_view{};
+                        return std::string_view{
+                           t, static_cast<std::size_t>(sqlite3_column_bytes(dup.get(), i))};
+                    };
+                    const bool is_gap = ev.action == "capture_gap";
+                    // A gap's identity lives entirely in its record_key (and the fact
+                    // it IS a gap); its time and text are "when we noticed".
+                    if (col(0) == ev.action &&
+                        (is_gap ||
+                         (col(1) == ev.hive && col(2) == ev.key_path && col(3) == ev.value_name &&
+                          col(4) == ev.data_type && col(5) == ev.data &&
+                          sqlite3_column_int64(dup.get(), 6) == ev.data_size &&
+                          col(7) == ev.prev_data_type && col(8) == ev.prev_data &&
+                          sqlite3_column_int64(dup.get(), 9) == ev.prev_data_size &&
+                          sqlite3_column_int64(dup.get(), 10) == ev.observed_at)))
+                        continue; // an exact replay -- the intended dedupe
+                    spdlog::error("{} record_key COLLISION on '{}': the stored row is a DIFFERENT "
+                                  "change, so accepting this batch would advance the cursor past "
+                                  "one that was never stored -- failing the transaction instead",
+                                  log_prefix, yuzu::log_key_token(ev.record_key));
+                    collided = true;
+                    return false;
+                }
+            }
+            // The per-root baselines commit with the rows they explain (same
+            // transaction, same lock).
+            for (const auto& w : baseline_writes) {
+                if (!upsert_state_locked(db, w.collector, w.json)) {
+                    spdlog::error("{} baseline write failed for '{}'", log_prefix, w.collector);
+                    return false;
+                }
+            }
+            return true;
+        });
+    if (ok)
+        return {};
+    return std::unexpected(collided ? CursorInsertError::KeyCollision
+                                    : CursorInsertError::Transient);
+}
+
 // ── Config management ────────────────────────────────────────────────────────
 
 std::expected<std::optional<std::string>, std::string>
@@ -1932,6 +2107,25 @@ std::expected<int, std::string> TarDatabase::purge_source(const std::string& sou
             return std::unexpected("purge failed on usage_daily_user: " + e);
         }
         total += sqlite3_changes(db_);
+    }
+
+    // registry (PR11.8): registry_live is not the only place the source keeps
+    // captured content. Each root's BASELINE (`registry:<root>` tar_state rows)
+    // holds rendered values. Erase them, and the cursor row, in THIS transaction,
+    // or a purge that the operator expects to be permanent leaves the very values
+    // it removed. The cursor erase also means the next collect is a fresh Baseline
+    // (zero rows), never a diff against a baseline that no longer exists.
+    // Bookkeeping rows are not counted in `total`.
+    if (source == "registry") {
+        for (const char* sql : {"DELETE FROM tar_cursor WHERE source = 'registry'",
+                                "DELETE FROM tar_state WHERE collector LIKE 'registry:%'"}) {
+            if (sqlite3_exec(db_, sql, nullptr, nullptr, &err_msg) != SQLITE_OK) {
+                std::string e = err_msg ? err_msg : "unknown";
+                sqlite3_free(err_msg);
+                sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+                return std::unexpected("purge failed on registry bookkeeping: " + e);
+            }
+        }
     }
 
     if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {

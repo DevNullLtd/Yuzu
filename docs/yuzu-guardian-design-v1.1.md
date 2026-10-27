@@ -1381,7 +1381,18 @@ POST /gs/fragment/approvals/:id/reject   Reject (returns updated list)
 
 ### 11.1 Two-person integrity (dual authorization)
 
-Rules with `action: enforce` or `action: quarantine` can modify endpoint state. A single compromised or malicious admin account deploying a harmful enforcement rule could affect the entire fleet. To prevent this, enforcement rules require approval from a second administrator before deployment.
+> **Authoritative design and build status.** ADR-0021 Decision 9, as amended by
+> `docs/adr/1009-four-eyes-mvp-bound-approval.md` (proposed; will supersede this section on
+> acceptance) is the intended design wherever they differ. Differences are marked **(amended)**
+> below. **None of the Guardian approval gate described here is built today, so there is nothing
+> to switch on.** The shared `ApprovalManager` exists and PR1 (#6061) made its reviewer decision
+> reliable; PR2 (#6062) added the bound-ticket and origin-declared-redemption primitives, which
+> no Guardian code calls yet. The Guardian-specific pieces are planned in epic #6060: approved
+> snapshots and the gated deploy (PR3, #6063), the system-caller chokepoint (PR5, #6065), the
+> `four_eyes.mandatory` setting (PR6, #6066), which does not exist yet and is planned to default
+> to off, and agent stale-generation rejection (PR7, #6067).
+
+Rules with `action: enforce` or `action: quarantine` can modify endpoint state. A single compromised or malicious admin account deploying a harmful enforcement rule could affect the entire fleet. To prevent this, enforcement rules require approval from a second administrator before deployment. **(amended)** The gate is symmetric and applies to every baseline that contains any enforce-mode guard: arming, disabling, deleting and an empty redeploy all need approval.
 
 **Approval flow:**
 1. Admin A creates or modifies a rule and submits for deployment
@@ -1391,21 +1402,21 @@ Rules with `action: enforce` or `action: quarantine` can modify endpoint state. 
    - Modifying remediation `params` (e.g., changing the `command` string) → requires approval
 3. If approval required: rule enters `pending_approval` state, visible to all admins on the dashboard
 4. Admin B reviews the full YAML source (with diff against previous version for modifications) and approves or rejects
-5. Admin B must be a **different principal** than Admin A (server enforces `approver != submitter`)
+5. Admin B must be a **different human** than Admin A (server enforces `approver != submitter`). **(amended)** Admin B must hold an interactive session with fresh MFA step-up, and must not be a human root recorded in the ticket's excluded roots (the submitter, and the creator, last editor and deployer of the content); the ticket binds the exact frozen request, not just the rule id.
 6. On approval: rule is pushed to agents. On rejection: rule is marked rejected with reason, audit logged
 7. Both the submission and the approval/rejection are audit events
 
 **Rules that bypass approval:**
 - New rules with `action: alert-only` — passive detection only, cannot modify endpoints. Deployed immediately.
-- Modifications that reduce enforcement scope (e.g., disabling a rule via `enabled: false` (MVP) or `enforce` → `disabled` (forward design), `enforce` → `audit`, narrowing scope expression). These make the system less aggressive, not more.
+- ~~Modifications that reduce enforcement scope (disabling a rule, `enforce` → `audit`, narrowing scope) bypass approval.~~ **(amended)** Reducing enforcement is no longer exempt. Disabling an enforce-mode rule, deleting it, and redeploying a baseline that omits it are gated like arming. The agent's full-sync reconcile deletes every rule a push omits, so an empty redeploy is a fleet-wide disarm and needs approval.
 
 **Configurable controls:**
-- Global setting: `require_approval_for_enforcement: true` (default true, can be disabled for dev/test environments)
-- Emergency override: A `break_glass` flag that allows single-admin deployment when `require_approval_for_enforcement` is true. Generates a `critical` severity audit event: `"gs.break_glass_deployment"` with the principal, rule ID, and justification text. The justification is mandatory — the server rejects break-glass without a reason. This is for genuine emergencies only (e.g., active security incident requiring immediate fleet-wide lockdown).
+- ~~Global setting: `require_approval_for_enforcement: true`~~ **(amended)** One server setting, `four_eyes.mandatory`, activates the gate. It is **off by default** until PR6 (#6066); there is no per-environment dev/test switch beyond it.
+- ~~Emergency override: a `break_glass` flag that allows single-admin deployment.~~ **(amended)** There is no arm-direction break-glass in the MVP. A single admin may perform an **emergency disarm** (disable, delete or empty redeploy of enforce content) with MFA step-up and a mandatory justification. It generates a `critical` severity audit event and an alert, mints no approval, and does not pre-approve any later arm. It is detected, not prevented. The audit event name is not fixed yet; the earlier `gs.break_glass_deployment` name described the arm-direction override, which is deferred.
 
-**Dashboard integration:** Pending approvals appear in the Guaranteed State dashboard with the full YAML source, the submitting admin's identity, and approve/reject buttons. The existing ApprovalManager (used by MCP tier-based approvals) is extended to handle guaranteed state rules.
+**Dashboard integration:** Pending approvals appear in the Guaranteed State dashboard with the full YAML source, the submitting admin's identity, and approve/reject buttons. The existing ApprovalManager (used by MCP tier-based approvals) is extended to handle guaranteed state rules. **(amended)** The approvals page renders the frozen request (`request_json`), not a bare digest; the Guardian-specific approvals tab and the `/gs/fragment/approvals` fragment routes listed in section 10 are design only until PR3 (#6063).
 
-**REST API:**
+**REST API** (design only; no such route exists today. The shared `/api/approvals` and `/api/v1/approvals` routes do exist):
 ```
 GET    /api/v1/guaranteed-state/approvals              List pending approvals
 POST   /api/v1/guaranteed-state/approvals/:id/approve  Approve (requires different principal)

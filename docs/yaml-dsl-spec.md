@@ -87,7 +87,7 @@ The core unit of the content model. Every ad-hoc command, scheduled task, policy
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `id` | string | Yes | -- | Globally unique identifier. Convention: `<scope>.<domain>.<action>` (e.g., `crossplatform.service.inspect`). The `mcp.` prefix is **reserved** and cannot be authored (#2442) — it names MCP approval tickets, whose recall matches on the definition id. |
+| `id` | string | Yes | -- | Globally unique identifier. Convention: `<scope>.<domain>.<action>` (e.g., `crossplatform.service.inspect`). The `mcp.` and `guardian.` prefixes are **reserved** and cannot be authored (#2442, #6062) — `mcp.` names MCP approval tickets, whose recall matches on the definition id, and `guardian.` is held for Guardian deploy approval tickets. The match is case-sensitive and on the exact prefix, so `Guardian.x` and `my.guardian.x` are not reserved. |
 | `displayName` | string | Yes | -- | Human-readable name shown in the dashboard. |
 | `version` | string | Yes | -- | Semantic version (e.g., `1.2.0`). Used for compatibility checks and pack versioning. |
 | `description` | string | No | `""` | Detailed description of what this definition does. |
@@ -185,10 +185,11 @@ Each column object:
 |---|---|---|---|---|
 | `name` | string | Yes | -- | Column identifier. |
 | `type` | string | Yes | -- | Column type. Values: `bool`, `int32`, `int64`, `string`, `datetime`, `guid`, `clob`. See [Section 11](#11-result-column-type-system). |
-| `description` | string | No | -- | Documentation only: what the column carries. Rendered into the plugin README's Outputs table and the `content/plugin-docs` manifest by `tools/plugin-doc-gen` (`docs/plugin-readme-standard.md` rule 8). Every server consumer of `result.columns` (`result_envelope.cpp`, `response_templates_engine.cpp`) reads only `name` and `type`; the extra keys pass through the embedded `result_schema` untouched. |
+| `description` | string | No | -- | Documentation only: what the column carries. Rendered into the plugin README's Outputs table and the `content/plugin-docs` manifest by `tools/plugin-doc-gen` (`docs/plugin-readme-standard.md` rule 8). Every server consumer of `result.columns` (`result_envelope.cpp`, `response_templates_engine.cpp`) reads only `name` and `type`, and the result-set matcher (`result_set_matcher.cpp`) additionally reads `discriminator`; the other extra keys pass through the embedded `result_schema` untouched. |
 | `values` | list of string | No | -- | Documentation only: the closed vocabulary the column may carry (e.g. `[ok, warning, failing, unknown, unsupported]`). Meaningful only on a `string` column. Not enforced at runtime; `tools/plugin-doc-gen` validates the shape of these four keys (a list where a list is meant, `platforms` drawn from the vocabulary below) and fails its `--check` otherwise. |
 | `example` | string | No | -- | Documentation only: one representative value. |
 | `platforms` | list of string | No | -- | Documentation only: the platforms on which the column carries a real value, from `windows`, `linux`, `darwin`. Omitted means every platform the definition lists. |
+| `discriminator` | boolean | No | `false` | Behavioural, first column only (a `string` column; plugin-doc-gen enforces the position and type, the server reads only a boolean on the first column): this column is the wire row's leading discriminator, and the declared columns are the wire fields in order. A result-set column matcher on the instruction then splits each row on every unescaped pipe and binds positionally, taking only a row of exactly the declared width. Without it a key/value plugin's rows are key + remainder and never match a wider declaration, which is also what a stored definition that predates the key keeps doing. Not rendered into the plugin docs; `tools/plugin-doc-gen` validates it. |
 
 #### `spec.result.aggregation`
 
@@ -238,7 +239,7 @@ neither controls anything at runtime.
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `minAgentVersion` | string | No | -- | Minimum agent version required to execute this definition. Agents below this version are skipped during dispatch (error `4003`). |
+| `minAgentVersion` | string | No | -- | Minimum agent version required to execute this definition. Declared and exported (nothing in the dashboard reads it); not compared at dispatch today, so an older agent is NOT skipped and error `4003` is not raised. |
 | `requiredPlugins` | list of string | No | `[]` | Plugins that must be loaded on the agent. If any required plugin is missing, the agent is skipped (error `4001`). |
 
 #### `spec.legacy_shim`
@@ -1766,6 +1767,9 @@ This section enumerates the stable builtin primitives that content authors targe
 | `registry.enumerate_values` | `registry` | Y | - | - | Verified |
 | `registry.get_user_value` | `registry` | Y | - | - | Verified |
 | `registry.list_profiles` | `registry` | Y | - | - | Verified |
+| `registry.set_user_value` | `registry` | Y | - | - | Verified |
+| `registry.delete_user_value` | `registry` | Y | - | - | Verified |
+| `registry.apply` | `registry` | Y | - | - | Verified |
 | `wmi.query` | `wmi` | Y | - | - | Verified |
 | `wmi.get_instance` | `wmi` | Y | - | - | Verified |
 | `rdp_control.set_state` | `rdp_control` | Y | - | - | Verified |

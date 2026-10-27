@@ -137,6 +137,10 @@ constexpr std::string_view kPluginConfig[] = {
     "get_plugin_config",    "list_plugin_config",      "set_plugin_config",
     "delete_plugin_config", "set_plugin_secret",       "delete_plugin_secret",
     "get_plugin_kill_switch", "set_plugin_kill_switch"};
+// Server runtime configuration: the effective values and stored overrides, and the one-key write.
+// Separate from plugin config, which is per-plugin keys and secrets; this is the server's own
+// settings (heartbeat timeout, retention windows, log level).
+constexpr std::string_view kRuntimeConfig[] = {"get_runtime_config", "set_runtime_config"};
 // Upload grants are separate from plugin config: they are a short-lived
 // CREDENTIAL surface, not configuration, and the agent-side session endpoints
 // they authorize deliberately have no MCP twin at all.
@@ -307,7 +311,7 @@ constexpr std::string_view kCryptoDashboard[] = {
     "list_crypto_widgets", "get_crypto_dashboard_layout", "set_crypto_dashboard_layout",
     "get_crypto_ca_stats"};
 
-constexpr std::array<ToolFamily, 41> kFamilies{{
+constexpr std::array<ToolFamily, 42> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions, their full export, and recurring "
@@ -355,6 +359,9 @@ constexpr std::array<ToolFamily, 41> kFamilies{{
     {"Plugin configuration", "per-plugin config keys, write-only secrets, and the per-action "
                              "kill switch",
      kPluginConfig},
+    {"Runtime configuration", "the server's own settings: effective values, stored overrides, "
+                              "and the one-key write",
+     kRuntimeConfig},
     {"Upload grants", "mint, list and revoke the one-time grants that authorize an agent to "
                       "upload a file northbound",
      kUploadGrants},

@@ -258,6 +258,8 @@ agent_test_exe = executable(
     'unit/test_filesystem_read.cpp',
     'unit/test_filesystem_actions.cpp',
     'unit/test_filesystem_local_dispatcher.cpp', # #4728: real filesystem plugin via LocalDispatcher -- `replace` through the shared atomic write
+    'unit/test_filesystem_find_by_hash.cpp',  # #5624: pure find_by_hash walk core (limits, injected clock/cancel/hasher) + real no-follow fd hasher over TempDir
+    'unit/test_filesystem_find_by_hash_dispatcher.cpp',  # #5624: real filesystem plugin via LocalDispatcher -- byte-identical clean output, trailer + CONSTRAINED/PARTIAL
     'unit/test_confined_fs_rules.cpp',
     'unit/test_confined_fs_walk.cpp',
     'unit/test_confined_fs_posix.cpp',
@@ -353,6 +355,7 @@ agent_test_exe = executable(
     'unit/test_launchd_state.cpp',      # A0 fix round: launchd_state_for (yuzu/agent/launchd_state.hpp)
     'unit/test_wmi_bounded.cpp',        # shared bounded WMI helper (roadmap C-8 extraction); header-only, no separate .cpp to list
     'unit/test_wmi_error_token.cpp',    # #4895: shared stage-aware WMI token classifier (agents/shared/wmi_error_token.hpp), portable
+    'unit/test_inventory_status_row.cpp', # shared inventory status-row grammar (agents/shared/inventory_status_row.hpp), portable
     'unit/test_installed_apps_registry_utf8.cpp',
     'unit/test_service_binpath.cpp',
     'unit/test_agent_log_options.cpp', # #4666 PR-2: make_log_handoff_options CLI-flags translator
@@ -408,6 +411,11 @@ agent_test_exe = executable(
     'unit/test_registry_local_dispatcher.cpp', # PR1.7 remediation fix #3: real registry.dll driven
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
+    'unit/test_registry_parsers.cpp',          # registry value encoders, validators and the audit line (pure, every host)
+    'unit/test_registry_plan.cpp',             # apply plan parser and the item/undo/summary row renderers (pure, every host)
+    'unit/test_registry_core.cpp',             # registry write logic over an in-memory fake registry (checked open, fast open, verify, delete_key; every host)
+    'unit/test_registry_write_local_dispatcher.cpp', # real registry.dll writes via LocalDispatcher (Windows branch, elevated); descriptor/version/sentinel pins on every host
+    'unit/test_registry_win_internals.cpp',    # TU-inclusion seam over registry_win.cpp -- Win32Registry on a dangling link and the final_name/root_name calls (Windows-only body, elevated; empty TU elsewhere)
     'unit/test_agent_command_frames.cpp',     # agents/core/src/command_frames.hpp -- the CommandResponse.action stamp on output + final frames (pure, every host)
     'unit/test_wmi_local_dispatcher.cpp',      # gate-1 remediation: real wmi.dll's query/get_instance
                                                 # actions driven end to end via LocalDispatcher, same
@@ -635,6 +643,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/update_source_trust/src'),  # update_source_trust_*.hpp (Wave 10 PR10.1-d)
     include_directories('../agents/plugins/mgmt_posture/src'),  # mgmt_posture_parsers.hpp / _legs.hpp
     include_directories('../agents/plugins/shares/src'),  # shares_parsers.hpp / _legs.hpp / _posix_fs.hpp
+    include_directories('../agents/plugins/registry/src'),  # registry_parsers.hpp / registry_core.hpp (pure layer)
     include_directories('../agents/plugins/remote_access_audit/src'),  # remote_access_audit_*_parsers.hpp / _legs.hpp / _posix_fs.hpp
     include_directories('../agents/plugins/firmware_posture/src'),  # firmware_posture_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/platform_security/src'),  # platform_security_*parsers.hpp / _legs.hpp (pure helpers), Wave 8 PR8.1-a1
@@ -823,6 +832,7 @@ agent_test_exe = executable(
                 update_source_trust_plugin_lib,  # Wave 10 PR10.1-d
                 mgmt_posture_plugin_lib,  # management-plane posture
                 shares_plugin_lib,  # shares
+                registry_plugin_lib,  # test_registry_write_local_dispatcher.cpp loads the real plugin by path
                 remote_access_audit_plugin_lib,  # remote_access_audit
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
                 browser_inventory_plugin_lib,  # Wave 10 P2a
@@ -1279,6 +1289,7 @@ tar_test_exe = executable(
     'unit/test_tar_store.cpp',
     'unit/test_tar_schema_registry.cpp',
     'unit/test_tar_capability_table.cpp',
+    'unit/test_tar_retention_tiers_table.cpp',
     'unit/test_tar_warehouse.cpp',
     'unit/test_tar_aggregator.cpp',
     'unit/test_tar_usage.cpp',
@@ -1299,6 +1310,7 @@ tar_test_exe = executable(
     'unit/test_tar_cursor.cpp',                  # Wave 6: cursor-source seam — lifecycle + persistence, atomic event+cursor commit, record_key dedupe, ack-by-sequence incl. the R-005 overflow regression (on-disk TarDb via unique_temp_path)
     'unit/test_tar_power.cpp',                   # Wave 6 PR6.2-b: pmset parser + exact-tail cursor/gap decisions, REAL-CAPTURE fixtures, RunFn-injected
     'unit/test_tar_removable.cpp',               # Wave 6 PR6.3: event-log channel parsers + identity + per-channel cursors, REAL-CAPTURE fixtures
+    'unit/test_tar_registry_source.cpp',         # PR11.8: registry source -- pure core (diff/dirty table/codecs) + injected-reader lifecycle + [windows] live cases
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
@@ -1331,6 +1343,8 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_power_collector.cpp',
     # Wave 6 PR6.3: the TU exercises the real CursorSource via the factory.
     '../agents/plugins/tar/src/tar_removable_collector.cpp',
+    # PR11.8: test_tar_registry_source.cpp drives the real source over an injected reader.
+    '../agents/plugins/tar/src/tar_registry_source.cpp',
   ) + tar_test_removable_darwin_sources,
   include_directories: [
     include_directories('../agents/plugins/tar/src'),
@@ -1462,6 +1476,7 @@ if build_server
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
+      'unit/server/test_config_write.cpp', # config_write.hpp: the transport-free core shared by the config routes and the MCP runtime-config tools
       'unit/server/test_config_routes.cpp', # #2542 PR-12: the 2-route Runtime Configuration API (7.3), extracted onto the HttpRouteSink seam
       'unit/server/test_legacy_diagnostic_routes.cpp', # #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API (diagnostics_routes.cpp), extracted onto the HttpRouteSink seam -- named away from test_diagnostics_*/test_chargen_*/test_procfetch_* to avoid a plugin_doc_gen.py filename collision with the agent plugins of those names
       'unit/server/test_legacy_events_routes.cpp', # #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
@@ -1496,6 +1511,8 @@ if build_server
 
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
+      'unit/server/test_approval_manager_bound.cpp', # #6062: origin-declared consume, bound request, excluded roots
+      'unit/server/test_approval_dormant_code_tripwire.cpp', # #6062: lexical tripwire, ADR-1009 accepted dormant code
       'unit/server/test_schedule_engine.cpp',
       'unit/server/test_schedule_routes.cpp',
       'unit/server/test_schedule_runner.cpp',
@@ -1552,6 +1569,7 @@ if build_server
       'unit/server/test_mcp_engine_principal_roles.cpp',
       'unit/server/test_engine_principal_lifecycle.cpp',
       'unit/server/test_engine_store_error_class.cpp',
+      'unit/server/test_engine_no_admin_audit.cpp',
       'unit/server/test_rotation_confirm_state.cpp',
       'unit/server/test_access_review_model.cpp',
       'unit/server/test_access_review_store.cpp',
@@ -1563,6 +1581,7 @@ if build_server
       'unit/server/test_capability_catalogue.cpp',
       'unit/server/test_operator_surface_twins.cpp',
       'unit/server/test_api_parity_ledger_catalogue.cpp', # every API-parity ledger mcp_twin claim vs the compiled kTools[]/kResources[]
+      'unit/server/test_twin_completeness.cpp', # every registry MCP tool is a ledger mcp_twin and has a kExpectedTwins row (shrink-only backfill sets)
       'unit/server/test_schedule_params.cpp',
       'unit/server/test_plugin_config_parsers.cpp',
       'unit/server/test_enablement_resolver.cpp',
@@ -1634,6 +1653,7 @@ if build_server
       'unit/server/test_software_catalog_rollup.cpp',
       'unit/server/test_tar_process_tree.cpp',
       'unit/server/test_tar_timeline_render.cpp', # TAR timeline: pure renderer, goldens, CSS pin
+      'unit/server/test_tar_timeline_page.cpp', # TAR timeline page: shell pins, flag default, escaping, script pins
       'unit/server/test_tar_tree_routes.cpp',
       'unit/server/test_dex_perf_model.cpp',
       # #1845 registry tripwire: pins detail::dex_perf_os_collects to the tar plugin's
@@ -1660,6 +1680,10 @@ if build_server
       'unit/server/test_dex_score_policy_json.cpp',
       # bounded-refresh score policy provider over injected read/clock fns - no store, no sleeps, no [pg]
       'unit/server/test_dex_score_policy_provider.cpp',
+      # apply_dex_score_policy over fake read/CAS/audit closures and a real provider - no store, no sleeps, no [pg]
+      'unit/server/test_dex_score_policy_writer.cpp',
+      # GET/PUT/DELETE /api/v1/dex/score-policy route shell through TestRouteSink - no store, no [pg]
+      'unit/server/test_dex_score_policy_routes.cpp',
       'unit/server/test_dex_catalogue.cpp', # ADR-0031 WS-A4 PR-1: the Catalogue View 1 read model + FnDexApi double
       'unit/server/test_dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
       'unit/server/test_schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam (schedule read)
@@ -1719,6 +1743,7 @@ if build_server
       'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
       'unit/server/test_rest_rbac_role_reads.cpp', # PR-0b: GET /rbac/roles + /rbac/roles/{role}/permissions fail closed (503) and 404 an unknown role
       'unit/server/test_rest_management_group_detail_degrade.cpp', # #1762 governance round-1: GET /management-groups/{id} fails closed on a degraded member read
+      'unit/server/test_engine_aware_visibility.cpp', # #6204: the engine rule in the username-keyed visibility/dispatch resolvers, against real stores
       'unit/server/test_authz_model.cpp', # PR1.4: registry-independent authz model + #1788 per-device visibility (all four arms)
       'unit/server/test_authz_gates.cpp', # service-scope-confinement PR2: require_fleet_read / confine_agent_target
       'unit/server/test_fleet_read_ceiling_routes_authz.cpp', # #3526: ITServiceOwner ceiling through real fleet-read routes (Execution x3, Enrollment, a four-securable table, and the Policy and Workflow sites)
@@ -1813,6 +1838,7 @@ if build_server
       'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_settings_model.cpp',        # #4028 — pure Settings read-twin builder unit tests
       'unit/server/test_settings_read_twins.cpp',   # #4028 — REST v1 read-twin route coverage
+      'unit/server/test_tar_retention_tiers.cpp',   # TAR retention tier TSV parser + depth arithmetic (pure)
       'unit/server/test_settings_page_ui.cpp',      # pure-string pins: 21 panels + static h1 on the /settings page
       'unit/server/test_settings_general.cpp',      # System General page: runtime/events renderers, routes, page pins
       'unit/server/test_plugin_signing_helpers.cpp',
@@ -1935,6 +1961,13 @@ if build_server
       # yuzu_proto_headers_dep - a DOWNWARD edge for both server and agent, no cycle, no
       # new build-graph node. NOT sdk/, which is the public plugin ABI surface.
       include_directories('../agents/core/src'),
+      # test_plugin_result_audit.cpp includes registry_parsers.hpp, whose OS-free includes (user_profile_model.hpp,
+      # wire_utf8.hpp) live in agents/shared. WHY it is on the whole executable: include_directories is per target,
+      # not per source, so every TU of this executable now sees agents/shared too. The risk is real and silent: a
+      # header of the same name in two include dirs is resolved by include-directory order, never a compile error. So a
+      # new agents/shared header needs a name no server test header or other include dir of this executable uses
+      # (none collide today).
+      include_directories('../agents/shared'),
     ],
     # httplib.h is header-only and its Client/Server class layout depends on
     # CPPHTTPLIB_OPENSSL_SUPPORT — yuzu_server_core compiles every TU with
@@ -1978,7 +2011,7 @@ if build_server
                (meson.project_source_root() / 'tests' / 'unit' / 'server' / 'golden').replace(
                    '\\', '/') +
                '"',
-               # test_api_parity_ledger_catalogue.cpp reads the committed API-parity
+               # test_api_parity_ledger_catalogue.cpp and test_twin_completeness.cpp read the committed API-parity
                # ledger (scripts/ci/api-parity/*.json) at run time; same
                # backslash-normalisation requirement as YUZU_SERVER_SRC_DIR above.
                '-DYUZU_API_PARITY_LEDGER_DIR="' +
@@ -2169,11 +2202,41 @@ if build_server
   # [mcp], and must not be double-claimed — verified empirically, not shard
   # C, which claims none) — verified 20 + 1949 = 1969, exact partition of
   # B's pre-carve population AT THE TIME OF THIS CARVE.
+  # 2026-10-22 (#4882, #2600; test hot spots): non-pg shards re-cut from MEASURED
+  # per-case time, braga (macOS debug, --durations yes, one shard at a time).
+  # Before: A 27.1 s, B 77.5 s, C 4.8 s, D 39.5 s. Shard D was 34 s of regular-
+  # expression passes over every server source file (the route inventory's two
+  # memoised passes, 24.2 s + 10.1 s); #4882 replaced them with linear finds
+  # (tests/unit/server/route_registration_scan.hpp, source_scan.hpp), so D is
+  # now 5.6 s and no longer a floor. B's four heaviest independent tags move to C
+  # as `~[pg]~[auth]~[mcp][tag]` clauses and B and D gain the matching `~[tag]`
+  # suffix: [oidc] 12.1 s, [retention] 8.0 s, [readyz] 5.6 s, [tls] 5.2 s.
+  # After: A 14.3 s (filter untouched: the 27 s above included about 12 s of the idle, elevation
+  # and posture sleeps that the seams removed), B 38.4 s,
+  # C 37.9 s, D 5.6 s. --list-tests counts on one binary, before -> after this
+  # filter edit: B 4783 -> 4493, C 1139 -> 1429 (+290 = the four tags), D 24, A
+  # 786; the non-pg total (6732) is unchanged, no case lost or duplicated.
+  # D's priority drops 48 -> 10 (now the lightest; A 20, C 45, B 50 stay distinct).
+  # 2026-10-23 (dev merge): dev's step-up route-inventory test brought one case that still ran
+  # two std::regex passes over the source tree ('kRequired labels equal the in-handler
+  # step_up_fn labels', test_step_up_route_inventory.cpp): 19.7 s of D's 25.2 s on braga (macOS
+  # debug, --durations=yes, one process). It now uses find_step_up_calls
+  # (route_registration_scan.hpp, a literal find): 0.08 s. All four non-pg shards run together
+  # (macOS debug, one run): A 17.1 s, D 7.9 s, C 38.2 s, B 46.7 s.
+  # Windows MSVC debug (kingsley, 2026-10-22, one process per shard run back to
+  # back, one sample): A 67.0 s, B 142.2 s, C 91.1 s, D 0.55 s; the four moved tags
+  # alone: [oidc] 61.5 s, [retention] 8.2 s, [readyz] 4.5 s, [tls] 5.9 s (so
+  # [oidc] is 5x its macOS cost and is most of C). D was 124-131 s on the Windows
+  # build host before the scan change (#4882; a different harness, so not a
+  # like-for-like delta). B is still the
+  # non-pg floor. A candidate that also moves [rest] from B to C measured B 121.2 s,
+  # C 110.5 s (max -15%); it is under the 25% bar (a re-cut must cut the longest shard by more than a
+  # quarter to be worth its churn), so the tag set stays.
   test('server unit tests shard A', server_test_exe,
        args: ['~[pg][auth],~[pg][mcp]', '--durations=yes'], suite: ['server', 'server-nonpg'], timeout: 600,
        priority: 20)
   test('server unit tests shard B', server_test_exe,
-       args: ['~[pg]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]~[body_cap]', '--durations=yes'],
+       args: ['~[pg]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]~[body_cap]~[oidc]~[retention]~[readyz]~[tls]', '--durations=yes'],
        suite: ['server', 'server-nonpg'], timeout: 600, priority: 50)
   # server unit tests shard C — carved from shard B 2026-08-28 (Windows CI
   # test-phase restructuring, #3443): six tags whose combined case count
@@ -2185,7 +2248,7 @@ if build_server
   # (docs/ci-architecture.md "PG coverage by platform") rebalances by
   # measured wall time, never by case count alone.
   test('server unit tests shard C', server_test_exe,
-       args: ['~[pg]~[auth]~[mcp][cel],~[pg]~[auth]~[mcp][viz],~[pg]~[auth]~[mcp][scope],~[pg]~[auth]~[mcp][dispatch],~[pg]~[auth]~[mcp][nvd],~[pg]~[auth]~[mcp][dex]', '--durations=yes'],
+       args: ['~[pg]~[auth]~[mcp][cel],~[pg]~[auth]~[mcp][viz],~[pg]~[auth]~[mcp][scope],~[pg]~[auth]~[mcp][dispatch],~[pg]~[auth]~[mcp][nvd],~[pg]~[auth]~[mcp][dex],~[pg]~[auth]~[mcp][oidc],~[pg]~[auth]~[mcp][retention],~[pg]~[auth]~[mcp][readyz],~[pg]~[auth]~[mcp][tls]', '--durations=yes'],
        suite: ['server', 'server-nonpg'], timeout: 600, priority: 45)
   # server unit tests shard D — carved from shard B (staged Windows
   # measurement follow-up, see the PR #3677 comment thread): [body_cap]
@@ -2209,6 +2272,7 @@ if build_server
   # CARVE.
   # A DSN-less run needs no --allow-running-no-tests: none of these are
   # [pg]-tagged (confirmed: '[pg][body_cap]' matches zero cases).
+  # (Superseded 2026-10-22: D's priority is now 10, see the re-cut note above shard A.)
   # Priority 48 (between C's 45 and B's 50): even after this carve, B's
   # REMAINING population still measures larger than D (23.02s vs 16.58s,
   # both drawn from the same 39.60s baseline) — D isn't the new floor, B
@@ -2217,13 +2281,14 @@ if build_server
   # 16.58s isn't on the same measured baseline as C's unmeasured population,
   # so this ordering is a reasonable placement, not a claimed comparison.
   # Shard D also holds six step-up route-inventory cases (test_step_up_route_inventory.cpp) that
-  # carry [body_cap] only as a PLACEMENT tag: each scans the whole route-source tree (~10 s on
-  # Linux, cached per process), which does not belong in the heavier shard B. Tagging them
+  # carry [body_cap] only as a PLACEMENT tag: each walks the whole route-source tree (cached per
+  # process; a pattern pass of ~10 s on Linux before #4882, a linear scan now, see the 2026-10-23 note
+  # above), which kept them out of the heavier shard B. Tagging them
   # [body_cap] moves them with no change to either filter, so flake-retry.py's verbatim non-pg
   # spec pin and this partition are untouched; the file's header comment names them.
   test('server unit tests shard D', server_test_exe,
-       args: ['[body_cap]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]', '--durations=yes'],
-       suite: ['server', 'server-nonpg'], timeout: 600, priority: 48)
+       args: ['[body_cap]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]~[oidc]~[retention]~[readyz]~[tls]', '--durations=yes'],
+       suite: ['server', 'server-nonpg'], timeout: 600, priority: 10)
   # [audit_store] is in shard A's OR-list because ADR-0040 moved that whole file
   # onto PG in one change: without it, every one of its cases lands in B, which
   # is the heavier half already. MEASURED on Linux at that change's head, same
@@ -2379,8 +2444,8 @@ if build_server
   # F 234s, G 200s, D 194s, O 194s, L 170s, N 168s, H 165s, M 148s, I 136s,
   # J 133s, K 115s, B 113s; P 100s in the final run). Merged priorities
   # (all distinct): A 260, F 250, I 245, E 240, D 230, G 220, O 210, H 200,
-  # L 190, M 185, N 180, C 170, K 160, B 120; the old values 150 (J), 140 (I),
-  # 130 (P) and 110 (M) are gone. Sparse scale, above the non-pg shards'
+  # L 190, B 186, M 185, N 180, C 170, K 160; the old values 150 (J), 140 (I),
+  # 130 (P) and 110 (M) are gone (B moved from 120 to 186 on 2026-10-22, see below). Sparse scale, above the non-pg shards'
   # 20-50. Re-rank from fresh measurements of the merged layout when a shard
   # is rebalanced; priority only orders starts, it moves no case.
   test('server pg unit tests shard A', server_test_exe,
@@ -2442,9 +2507,33 @@ if build_server
   # 31.5s on the same container — D is by far the lighter destination, so
   # [software_deployment] joins D, not B. Also added to shard C's exclusion
   # list per the same instruction (both or neither).
+  # 2026-10-22 (#2600; test hot spots): shard M's `[pg][readyz]` clause moved onto
+  # shard B VERBATIM, every exclusion kept. Measured on braga (macOS debug, one
+  # shard at a time): M 208 s and B 109 s. M's readyz clause alone is about 65 s
+  # (PgReachabilityProbe connect-deadline cases) and about 42 s of B was real sleeping
+  # in [rbac_store] cases, which RbacStore::age_refresh_state_for_test (and the
+  # other *_for_test deadline seams, see the test files) replaced. After: B 135.0 s,
+  # M 119.8 s (A 82.5 s, H 116.6 s, K 32.9 s, N 97.8 s, whose filters are untouched). --list-tests:
+  # B 131 -> 149, M 420 -> 402 (the 18 readyz cases); the [pg] total (5792) is
+  # unchanged, zero duplicates. No new entry (maintainer cap: 14 pg shards). B does
+  # not gain --allow-running-no-tests (it carries non-DSN cases, the reason A/B/C
+  # survive an all-skip); M keeps its own. This departs from the docs'
+  # pairing rule on purpose, see docs/ci-architecture.md (2026-10-22). Priority B
+  # 120 -> 186 (above M's 185; all 14 stay distinct).
+  # Windows MSVC (kingsley, 2026-10-22, one process per shard, one sample): B
+  # 120.7 s, M 386.1 s. The pre-move shards were not re-run in that harness, so
+  # the stated test (B and M within 25% of each other, both under the pre-move
+  # Windows maximum, M 239 s in CI) cannot be passed or failed from this data:
+  # B and M are 3.2x apart and 386 s is a serial wall on a different box than
+  # the CI figure. A candidate that moves the [pg][auth_db] clause from M to B
+  # measured B 205.4 s, M 319.0 s (max -17%, under the 25% bar), so the layout
+  # stays. Priority only orders starts: nine pg shards outrank both B and M, which
+  # start 10th and 11th at width 6, so whether M is the last finisher on Windows is
+  # unmeasured; the per-case durations that PR #6324 added to the job summary are
+  # what to re-cut from next.
   test('server pg unit tests shard B', server_test_exe,
-       args: ['[pg][rbac_store]~[routes]~[store]~[token]', '--durations=yes'],
-       suite: ['server', 'server-pg'], timeout: 700, priority: 120)
+       args: ['[pg][rbac_store]~[routes]~[store]~[token],[pg][readyz]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]', '--durations=yes'],
+       suite: ['server', 'server-pg'], timeout: 700, priority: 186)
   # --allow-running-no-tests: shard D's tags are ALL DSN-gated store
   # behaviour tests, so on a DSN-less platform (macOS, ADR-0035) every case
   # SKIPs and Catch2 exits 4 on an all-skipped run — reddening the leg (#2092,
@@ -2797,7 +2886,7 @@ if build_server
   # skipped" from exit 4 to exit 0. A shard that matches NO case at all still
   # fails check-pg-shard-partition.py loudly. Four more shards in this change
   # (M, N, O here and P below; P has since merged into M) added four more process startups per full
-  # run and, at Linux's --num-processes 2, a longer worst-case round count
+  # run and, at Linux's then-current --num-processes 2, a longer worst-case round count
   # (see the 2026-10-11 paragraph in docs/ci-architecture.md).
   #
   # MERGED 2026-10-11 (maintainer limit: at most 14 pg shards): shard P (see
@@ -2806,7 +2895,7 @@ if build_server
   # proof and the estimates are in the priorities comment above shard A. Shard
   # P no longer exists as an entry.
   test('server pg unit tests shard M', server_test_exe,
-       args: ['[pg][readyz]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password],[pg][auth_db]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password],[pg][analytics_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password],[pg][directory_sync]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password],[pg][rest]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][auth]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][dashboard]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][adversarial]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][authz_model]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][app_perf]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine]',
+       args: ['[pg][auth_db]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password],[pg][analytics_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password],[pg][directory_sync]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password],[pg][rest]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][auth]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][dashboard]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][adversarial]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][authz_model]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine],[pg][app_perf]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]~[readyz]~[auth_db]~[analytics_store]~[directory_sync]~[v1]~[policy]~[product_pack_store]~[rbac_admin_predicate]~[cold_cache]~[ha]~[gateway_route_wiring]~[workflow_engine]',
               '--allow-running-no-tests', '--durations=yes'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 185)
   test('server pg unit tests shard N', server_test_exe,
@@ -3126,6 +3215,15 @@ test('ensure-erlang strict-mode callers',
   timeout: 180,
 )
 
+# docs/ build inputs of Meson targets are re-included in /.dockerignore (the image
+# builds `COPY . .` with docs/ otherwise excluded).
+test('docker context re-includes embedded docs inputs',
+  _python3_test,
+  args: [files('test_docker_context_embeds_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Every script target uses yuzu_python (no ad-hoc find_program for python).
 test('meson python lookup is yuzu_python',
   _python3_test,
@@ -3228,6 +3326,16 @@ test('shell bell script behaviour',
 test('tokens page rotate behaviour',
   _python3_test,
   args: [files('test_access_tokens_rotate_behaviour.py')],
+  suite: ['server', 'docs'],
+  timeout: 60,
+)
+
+# TAR timeline page script: runs server/core/static/yuzu-tar-timeline.js under node (pure helpers as
+# tables; the DOM shell against a fake DOM, a recording fetch and a fake clock, never a sleep).
+# Skips (77) without node.
+test('tar timeline script behaviour',
+  _python3_test,
+  args: [files('test_tar_timeline_script_behaviour.py')],
   suite: ['server', 'docs'],
   timeout: 60,
 )
@@ -3394,6 +3502,16 @@ test('runtimes definition columns',
   timeout: 30,
 )
 
+# filesystem.find_by_hash's definition (content/definitions/filesystem.yaml): version 0.4.0, the
+# three declared columns and the row_kind values the declared-column result matcher binds to
+# (#5624); the C++ matcher test keeps a copy of the schema, this pins it to the shipped definition.
+test('filesystem definition columns',
+  _python3_test,
+  args: [files('test_filesystem_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # browser_policy's definition-column contract (content/definitions/browser_policy.yaml):
 # row_kind first and the column order match the wire row browser_policy_parsers.hpp emits;
 # parses the YAML directly -- catches a reordered or renamed column the C++ test's
@@ -3433,6 +3551,14 @@ test('mgmt_posture definition columns',
 test('shares definition columns',
   _python3_test,
   args: [files('test_shares_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# registry's definition contract (content/definitions/registry.yaml): ids, types, result columns, role gates.
+test('registry definition columns',
+  _python3_test,
+  args: [files('test_registry_definition.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -4136,6 +4262,16 @@ test('tier policy wiring lexical gate (#5047)',
 test('guardian/spark log-injection tripwire (#4665)',
   _python3_test,
   args: [files('test_guardian_spark_log_injection_tripwire.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #6086: the DEX score policy has ONE store writer. A write of the key anywhere but
+# dex_api.cpp would skip apply_dex_score_policy's If-Match precondition, audit-first rows and
+# the provider's commit-then-install order. Lexical; the script's docstring states its limits.
+test('dex score-policy single-writer tripwire (#6086)',
+  _python3_test,
+  args: [files('test_dex_score_policy_key_writer_tripwire.py')],
   suite: 'docs',
   timeout: 30,
 )

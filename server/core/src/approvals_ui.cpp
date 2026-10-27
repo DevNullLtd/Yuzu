@@ -59,6 +59,7 @@ constexpr std::string_view kBody = R"HTM(</style>
 <div><span>Requested by</span><b><span class="clip" data-f="by"></span></b></div>
 <div><span>Requested</span><b data-f="at"></b></div>
 <div class="stack"><span>Scope</span><code class="blk" data-f="scope"></code><span class="faint" data-f="no-scope">None recorded. The request named devices directly.</span></div>
+<div class="stack" data-f="request-row" hidden><span>Requested effect</span><code class="blk" data-f="request"></code></div>
 <div data-f="rev-by-row" hidden><span>Decided by</span><b><span class="clip" data-f="rev-by"></span></b></div>
 <div data-f="rev-at-row" hidden><span>Decided</span><b data-f="rev-at"></b></div>
 <div class="stack" data-f="comment-row" hidden><span>Reviewer comment</span><div class="cmt" data-f="comment"></div></div>
@@ -68,7 +69,7 @@ constexpr std::string_view kBody = R"HTM(</style>
 <button type="button" class="btn btn-primary" data-act="approve">Approve</button>
 <button type="button" class="btn btn-danger" data-act="reject">Reject</button>
 </div>
-<div class="btns"><span class="hint" data-f="self" hidden>You submitted this — another reviewer must approve</span></div>
+<div class="btns"><span class="hint" data-f="self" hidden>You submitted this — another reviewer must approve</span><span class="hint" data-f="excluded" hidden>You are excluded from approving this request. You can still reject it.</span></div>
 <div class="held" data-f="notes" hidden>
 <div>Pending requests are expired 7 days after submission, when the next request is submitted; until then they stay listed.</div>
 <div>Approving records a decision and audits it. It does not run the instruction itself.</div>

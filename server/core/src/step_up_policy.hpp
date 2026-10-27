@@ -143,6 +143,7 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     {"POST",   R"(/api/v1/rbac/roles/([A-Za-z0-9._-]+)/assignments)",           StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/rbac/roles/{name}/assignments"},
     {"DELETE", R"(/api/v1/rbac/roles/([A-Za-z0-9._-]+)/assignments/([A-Za-z0-9._-]+))", StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}"},
     {"PUT",    R"(/api/v1/rbac/enforcement)",                                   StepUpClass::kRequired, step_up_detail::kNoReason, "PUT /api/v1/rbac/enforcement"},
+    {"PUT",    R"(/api/v1/config/([a-z_]+))",                                   StepUpClass::kRequired, step_up_detail::kNoReason, "PUT /api/v1/config/{key}"},
     {"POST",   R"(/api/v1/software-packages)",                                  StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/software-packages"},
     {"POST",   R"(/api/v1/software-deployments/([a-f0-9]+)/start)",             StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/software-deployments/{id}/start"},
     {"POST",   R"(/api/v1/guaranteed-state/rules)",                             StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/guaranteed-state/rules"},
@@ -333,6 +334,8 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::pending("POST",  R"(/api/v1/license)"),
     step_up_detail::pending("DELETE",R"(/api/v1/license/([a-f0-9]+))"),
     step_up_detail::exempt("POST",  R"(/api/v1/dex/devices/([^/]+)/live)",                                        step_up_detail::kReadShaped),
+    step_up_detail::exempt("PUT",   R"(/api/v1/dex/score-policy)",                                                step_up_detail::kOperationalData),
+    step_up_detail::exempt("DELETE",R"(/api/v1/dex/score-policy)",                                                step_up_detail::kOperationalData),
     // result_set_routes.cpp
     step_up_detail::exempt("POST",  R"(/fragments/result-sets/(rs_[0-9a-f]+)/pin)",                               step_up_detail::kOperationalData),
     step_up_detail::exempt("POST",  R"(/fragments/result-sets/(rs_[0-9a-f]+)/unpin)",                             step_up_detail::kOperationalData),

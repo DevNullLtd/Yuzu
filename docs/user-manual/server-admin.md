@@ -100,7 +100,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--allow-unsigned-packs` | off | **Dangerous.** Accept product packs at install without an Ed25519 signature. Default is to reject unsigned packs with `pack '<name>' is unsigned and signature enforcement is enabled (set --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1 to bypass)` (security-by-default since #802 / W7.4). Setting this flag restores the pre-W7.4 behaviour where any operator with pack-upload permission, or a MITM on pack delivery, could install a pack containing arbitrary `InstructionDefinition` or plugin payloads that would execute fleet-wide. Two pieces of durable evidence that the flag is active: a startup log line `[SECURITY] product pack signature enforcement DISABLED by configuration`, and a `server.unsigned_packs_allowed` audit event (`target_type = ProductPack`) written to the audit store at boot. Use only as a temporary migration aid; sign your packs and remove the flag as soon as feasible. Env: `YUZU_ALLOW_UNSIGNED_PACKS`. |
 | `--allow-unsigned-definitions` | off | **Dangerous.** Accept `InstructionDefinition` imports via `POST /api/v1/instructions/import` without an Ed25519 signature. Default is to reject unsigned imports with `instruction-import is unsigned and signature enforcement is enabled (set --allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS=1 to bypass)` (security-by-default since #1073 / W7.4 sibling-gap closure). Closes the equivalent fleet-RCE surface that `--allow-unsigned-packs` covers on the ProductPack side: without enforcement, any operator with `InstructionDefinition:Write` (or a MITM on a content sync) can publish a definition that dispatches a malicious plugin invocation on every targeted agent. Durable evidence: startup log line `[SECURITY] instruction-definition signature enforcement DISABLED by configuration` AND a `server.unsigned_definitions_allowed` audit event (`target_type = InstructionDefinition`). Env: `YUZU_ALLOW_UNSIGNED_DEFINITIONS`. |
 | `--mfa-enforcement` | `optional` | MFA enforcement mode: `optional` (login never requires it; an administrator can enrol its own account in Settings, but Settings enrolment is administrator-only, so a non-admin cannot enrol itself, see [Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver)), `admin-only` (an admin without MFA must enroll before login completes), or `required` (every role must enroll). Under `admin-only`/`required` an un-enrolled login is redirected through TOTP enrollment (`POST /login/mfa/enroll`) before a session is minted; the server logs an `INFO` line naming the active mode at startup. **Breaking:** earlier releases accepted `admin-only`/`required` as no-ops — if you staged the flag, read `docs/user-manual/upgrading.md` before upgrading (live enforcement begins immediately, and SSO users require an IdP that asserts `amr`). See `docs/user-manual/authentication.md` § Multi-Factor Authentication and `docs/auth-mfa-design.md`. Env: `YUZU_MFA_ENFORCEMENT`. |
-| `--mfa-step-up-window-secs` | `300` | Seconds after a successful TOTP proof during which the 36 high-risk REST, Settings and Guardian dashboard routes enforced by the central step-up check (PR2 of the MFA ladder, since extended; see [Authentication](authentication.md)) accept the session as "stepped up" without re-prompting. Set to `0` (or less) to disable the stale-proof requirement on those routes (SAML sessions then pass too, and the authentication store is not read); the JIT-elevation routes keep a 300 s window, and engine denials and a server with no wired authentication store (`503`) still apply and are recorded (emits a startup `WARN`). Approval approve/reject are among those routes but are not switched off by `0`: they always require an enrolled MFA factor and a proof made within `min(this value, 300)` seconds (300 when this is `0` or less), and are never admitted for a SAML session (#6079; see `authentication.md`, "Approver MFA requirement"). Decisions recorded before that change under `0` carry only the interactive-session assurance; review every `approval.approve` audit row with `result=success` from that period, and check every `attempted` row that has no outcome row, comparing counts per `target_id` (each decision also writes a `result=attempted` row first, and a decision whose outcome row failed to write leaves only that row; see `audit-log.md`). Env: `YUZU_MFA_STEP_UP_WINDOW_SECS`. |
+| `--mfa-step-up-window-secs` | `300` | Seconds after a successful TOTP proof during which the 37 high-risk REST, Settings and Guardian dashboard routes enforced by the central step-up check (PR2 of the MFA ladder, since extended; see [Authentication](authentication.md)) accept the session as "stepped up" without re-prompting. Set to `0` (or less) to disable the stale-proof requirement on those routes (SAML sessions then pass too, and the authentication store is not read); the JIT-elevation routes keep a 300 s window, and engine denials and a server with no wired authentication store (`503`) still apply and are recorded (emits a startup `WARN`). Approval approve/reject are among those routes but are not switched off by `0`: they always require an enrolled MFA factor and a proof made within `min(this value, 300)` seconds (300 when this is `0` or less), and are never admitted for a SAML session (#6079; see `authentication.md`, "Approver MFA requirement"). Decisions recorded before that change under `0` carry only the interactive-session assurance; review every `approval.approve` audit row with `result=success` from that period, and check every `attempted` row that has no outcome row, comparing counts per `target_id` (each decision also writes a `result=attempted` row first, and a decision whose outcome row failed to write leaves only that row; see `audit-log.md`). Env: `YUZU_MFA_STEP_UP_WINDOW_SECS`. |
 | `--mfa-login-pending-secs` | `120` | Lifetime of the intermediate `mfa_pending_token` between password success and TOTP submission. The pending state is per-process (lost on restart, not shared across HA replicas without sticky sessions). Env: `YUZU_MFA_LOGIN_PENDING_SECS`. |
 | `--mfa-reset <username>` | *(none)* | **Break-glass.** Clears the named user's MFA enrollment and exits **without starting the server** - the recovery path from MFA-enforcement lockout. Also deletes the account's durable sessions, so every session of the account ends on every replica (API tokens are untouched); if that fails the command exits non-zero with "MFA cleared but the account's sessions were not ended" and the operator must run `DELETE /api/v1/sessions?username=<name>` by hand. Writes an `mfa.reset.breakglass` audit row (principal = the OS account that ran the CLI; the detail ends `sessions_ended=<n>` or `sessions_ended=failed`). Requires the Postgres auth store (`--postgres-dsn` / `YUZU_POSTGRES_DSN`), and the same `--config` the service uses if it is not at the platform default (`/etc/yuzu/yuzu-server.cfg` on Linux and root macOS; `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows) - the container images run with `--config /var/lib/yuzu/yuzu-server.cfg`, and without it the binary falls into interactive first-run setup and exits. No TLS flags needed. See `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | `--generate-tokens <N>` | *(none)* | Mint `N` enrollment tokens directly into the same PostgreSQL `auth.enrollment_tokens` store the running server reads (WS-6 6.2), and exit **without starting the server** — the recovery/scripting equivalent of the dashboard "Generate Token" button. Requires the Postgres auth store (`--postgres-dsn` / `YUZU_POSTGRES_DSN`); refuses with the same style of message as `--mfa-reset` when it is absent or unreachable. Tokens are attributed `created_by = "cli:<OS account that ran the CLI>"` (kernel-authoritative identity, `getpwuid(geteuid())`/`GetUserNameA`, not `getenv("USER")` — the same anti-forgery rule the break-glass audit rows use), so a dashboard operator reviewing the token list can tell a CLI-minted batch apart from one minted through `POST /api/settings/enrollment-tokens`. Companions: `--token-label` (label prefix, default `batch-<n>`), `--token-max-uses` (default `1`; `0` = unlimited), `--token-ttl-hours` (default `72`; `0` = never expires); a negative value of either is refused with a usage error and nothing is minted. The mint is audited as `enrollment.bulk_token_create` (`by`, `max_uses`, `ttl_s`, `label`, `count`, `ids`). Prints `{"count":N,"tokens":[...]}` to stdout (each raw token shown once — capture it now) and exits non-zero if any token fails to persist, naming how many of the batch minted before the failure (those remain valid; revoke via the dashboard). Does **not** run the one-time legacy `.cfg` import (that only ever runs from the server's own boot path, immediately after the auth store is wired — never from a CLI one-shot). |
@@ -365,7 +365,8 @@ separately.
 **What changed.** Agent plugins that mount a logged-out Windows profile's `NTUSER.DAT` offline (to
 read its `HKEY_USERS` hive without a live session) have always run a file-level check against that
 hive — the path must not cross a UNC/non-fixed-drive or a reparse-point ancestor, and the file
-itself must be a regular file owned by the profile, LocalSystem or Administrators. Before this
+itself must be a regular file owned by the profile, LocalSystem or Administrators, with no more
+than one hard link (`hive_hardlinked`). Before this
 change only one plugin (`privacy_permissions`) opted into that check; the other five production
 callers (`autoruns`, `installed_apps`, `license_scan`, `registry`, and TAR's mapped-drive-history
 collector) mounted with no check at all. The check is now the default for all of them.
@@ -392,7 +393,7 @@ named per-profile constraint from these plugins (`not_found`, `privilege_missing
 — none of these are new categories of outcome, only a more specific one for this particular cause.
 ### vNEXT - MFA step-up is checked once, before the route's own checks; the server refuses to start with an unclassified mutating route (breaking order of checks)
 
-**What changed.** A fresh MFA proof is required on 36 named high-risk routes for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`; un-enrolled accounts and API-token and MCP-token callers pass, and engine principals are denied. Other mutating routes and all MCP tools are not MFA-step-up gated in this release. The check now runs in the request pipeline before the route's own authorization and its own same-site copy (and after the server-wide same-site check, which answers a cross-site cookie write `403` first), so a session with a stale or missing proof receives the `401` step-up envelope instead of the route's `403`; engine principals receive `403` on every one of the 36 routes regardless of grants (once their credential resolves and the pre-routing gates and the unwired-store `503` below have been ruled out; during a database outage the credential cannot be resolved and the request is answered `401` `unauthorized` instead), audited as `mfa.step_up.required` instead of the per-route handler denial row; and `POST /api/settings/mfa/recovery-codes` and `POST /api/settings/mfa/disable` are newly gated. A server with no wired authentication store answers `503` on these routes, and an unreadable store answers `503` to local sessions. Full list of behaviour changes: [Upgrading](upgrading.md) ("Breaking: MFA step-up is checked once").
+**What changed.** A fresh MFA proof is required on 37 named high-risk routes for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`; un-enrolled accounts and API-token and MCP-token callers pass, and engine principals are denied. Other mutating routes and all MCP tools are not MFA-step-up gated in this release. The check now runs in the request pipeline before the route's own authorization and its own same-site copy (and after the server-wide same-site check, which answers a cross-site cookie write `403` first), so a session with a stale or missing proof receives the `401` step-up envelope instead of the route's `403`; engine principals receive `403` on every one of the 37 routes regardless of grants (once their credential resolves and the pre-routing gates and the unwired-store `503` below have been ruled out; during a database outage the credential cannot be resolved and the request is answered `401` `unauthorized` instead), audited as `mfa.step_up.required` instead of the per-route handler denial row; and `POST /api/settings/mfa/recovery-codes` and `POST /api/settings/mfa/disable` are newly gated. A server with no wired authentication store answers `503` on these routes, and an unreadable store answers `503` to local sessions. Full list of behaviour changes: [Upgrading](upgrading.md) ("Breaking: MFA step-up is checked once").
 
 **Boot refusal.** At boot the server checks that every `POST`/`PUT`/`PATCH`/`DELETE` route registered through the route sink is classified in the step-up table. If one is not, it logs `start_web_server(): mutating route has no MFA step-up policy row: <METHOD> <pattern>` for each, then `aborting: N mutating route(s) are not classified in step_up_policy.hpp`, stops the gRPC listeners and exits with status `1` before the web listener starts. The gRPC agent port is already listening when the check fails and keeps accepting connections for about five seconds while the server shuts down, before the process exits (about eleven to twelve seconds in total, measured), so while a restart policy keeps starting it, connected agents and gateways see the server accept connections for about five seconds out of every eleven to twelve and then drop, and the web UI never comes up. A restart policy (`restart: always` or `unless-stopped`, systemd `Restart=`, a Kubernetes pod) turns this into a restart loop, and a rolling deployment halts because the new replica never becomes ready. **It can only trigger on a fork or a custom build;** stock builds are checked by compiled and source-scan tests before release. **Recovery:** roll back to the previous binary or image (nothing is migrated), or add the missing row to `step_up_policy.hpp` and rebuild. No flag disables the check.
 
@@ -432,11 +433,27 @@ Check your own unit, env file, compose file or installer arguments before upgrad
 
 ### vNEXT - changing sign-in provider settings needs your own administrator role (breaking for elevation-only operators)
 
-**What changed.** `POST /api/settings/oidc` (Settings > OIDC) and `PUT /api/config/{key}` for the `oidc_*` keys refuse, with `403`, any session whose own role is not `admin`: a session that is administrator only through a temporary elevation, and (for the config route) a non-administrator account that holds `Infrastructure:Write` through a custom or service role, or whose authority is an RBAC Administrator grant only, and any MCP-tier token. The attempt is audited (`elevated_session_oidc_change_blocked`, `elevated_session_oidc_setting_blocked`). Other runtime-config keys are unaffected.
+**What changed.** `POST /api/settings/oidc` (Settings > OIDC) and `PUT /api/config/{key}` for the `oidc_*` keys refuse, with `403`, any session whose own role is not `admin`: a session that is administrator only through a temporary elevation, and (for the config route) a non-administrator account that holds `Infrastructure:Write` through a custom or service role, or whose authority is an RBAC Administrator grant only, and any MCP-tier token. The attempt is audited (`elevated_session_oidc_change_blocked` and `elevated_session_oidc_setting_blocked` for an elevation, `admin_role_required_oidc_setting_blocked` for a non-administrator, and `token_session_oidc_setting_blocked` for an MCP-tier or service-scoped token). Seven other keys, `plugin_signing_required`, the `dex_*` alerting keys and `audit_retention_days`, are administrator-only on the same route: see the next note. Every remaining runtime-config key is unaffected.
 
 **Who this affects.** Operators who rely on an elevated session to change the OIDC issuer, client, secret, redirect URI or administrator group, in particular deployments where every administrator is an elevation-eligible `user` account; and automation that writes `oidc_*` through `PUT /api/config/{key}` with a token whose creator is not an `admin` account.
 
 **What to do.** Make the change from an account whose own role is `admin` (a local administrator, or a member of the identity provider's administrator group). If no such account can sign in, use the break-glass account (`--break-glass-user`, `--break-glass-arm`) or the direct-SQL fallback in [`auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md). A stored `oidc_*` value overrides the matching `--oidc-*` flag after a restart, so correct the stored value rather than only the flag.
+
+### vNEXT - the runtime-configuration read shows a caller only the overrides it could write (breaking for MCP-tier and non-administrator readers)
+
+**What changed.** `GET /api/config`, the new `GET /api/v1/config` and the MCP tool `get_runtime_config` leave out the stored override of every key the caller could not write (the `oidc_*` keys, `plugin_signing_required`, the DEX alert keys and `audit_retention_days`), and the effective `audit_retention_days`. An administrator account's `GET /api/config` body is what it was, apart from `log_level` reading `warn` instead of `warning`. `heartbeat_timeout` is now limited to 30 to 86400 seconds on every write route, and a stored value outside that range is moved to the nearest bound at server start (logged).
+
+**Who this affects.** Scripts and backups that read `GET /api/config` with an MCP-tier token or a non-administrator role and expect the administrator-only keys; scripts that compare `config.log_level` to `"warning"`; scripts that write a `heartbeat_timeout` above 86400.
+
+**What to do.** Read with an administrator API token that is not MCP-tier. Use `GET /api/v1/config` to see which keys were withheld (`withheld_keys`). See [Upgrading](upgrading.md).
+
+### vNEXT - seven runtime-config keys are administrator-only on `PUT /api/config/{key}` (breaking for MCP-tier tokens and non-administrator roles)
+
+**What changed.** `PUT /api/config/{key}` for `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds` and `dex_cohort_export_key` now applies the same caller rule as the Settings routes that also write them, and `audit_retention_days` joins them by design (it is the stored audit-retention setting, reported by `GET /api/config`, evidence-bearing, and the lever that will govern enforcement once #483 lands; it is stored only today and a `PUT` does not change the retention actually applied; it has no Settings route, so this generic route is its only writer): an MCP-tier token, a service-scoped token, or a session whose effective role is not `admin` (a temporary elevation counts) is refused with `403`. The callers that newly reach this refusal are a supervised-tier MCP token (even one minted by an administrator) and, with RBAC on, a non-administrator role holding `Infrastructure:Write`; service-scoped tokens (and `readonly` or `operator` tier MCP tokens) were and remain refused earlier by the permission gate (`auth.permission_required`). A refusal at the new rule is audited as `config.update / denied` (`token_session_admin_setting_blocked` or `admin_role_required_setting_blocked`) and nothing is stored. The `oidc_*` keys, which already needed your own administrator role, are unchanged (the handler also refuses a service-scoped token, as defence in depth; the permission gate already does). The role checked is the account's legacy role or a live temporary elevation, never an RBAC grant: an RBAC Administrator grant alone does not count. Every other key (`response_retention_days`, `guardian_event_retention_days`, `log_level`, `heartbeat_timeout`) is unchanged and stays writable under `Infrastructure:Write`.
+
+**Who this affects.** Automation that writes these keys with a supervised-tier MCP token, even one minted by an administrator, and, with RBAC on, a non-administrator role that holds `Infrastructure:Write`.
+
+**What to do.** Change these settings with an administrator account: through the Settings pages (DEX alerts, Plugin Code Signing), or with an administrator API token that is not MCP-tier. `audit_retention_days` has no Settings page: use `PUT /api/config/audit_retention_days` with an administrator API token that is not MCP-tier, or an administrator session (a cookie session is a browser write and needs a same-site `Origin` or `Referer`; an administrator API token that is not MCP-tier is exempt). `PUT` only stores the `audit_retention_days` value: the window the server enforces comes from `--audit-retention-days` (or `YUZU_AUDIT_RETENTION_DAYS`) plus a restart, so check `enforced` in `GET /api/v1/settings/data-retention`. When #483 lands, every previously stored value becomes live at the next boot, so reviewing the stored values is a precondition of that upgrade. To find earlier writes and for the replay caveat, rolling-upgrade behaviour and the audit query, read the full note in [Upgrading](upgrading.md) ("Breaking: seven runtime-config keys are administrator-only on `PUT /api/config/{key}`").
 
 ### vNEXT — the shipped Docker Compose files keep `/etc/yuzu/certs` on a volume (#5370; action needed before you recreate a 0.14.0 container)
 
@@ -718,7 +735,7 @@ The agent writes `Guardian T_wire event_id=… domain=… sent=… wire_wall_ns=
 **If log volume matters.** There is no dedicated switch for these lines. The only lever is the log level, and it is blunt: `warn` also suppresses every other `info` line, including on the server the authentication and session lines (for example `User '…' authenticated`, `Local session created`) and the API-token created/revoked lines, which a SIEM ingesting the server log would then lose, and the Guardian arm/commit messages on an agent. It also silences the agent's own "Received signal, shutting down..." line (an ordinary `info`-level call since #4666 PR-2): at `--log-level warn` or above that line is absent entirely on a clean `SIGINT`/`SIGTERM`/Ctrl-C stop, so if you rely on it to confirm an intentional stop, keep agents at `info` or below, or check the process exit code (0 = clean) instead. The audit log is a separate store and is not affected by the log level. Prefer applying it to agents only, and weigh it before applying it fleet-wide.
 
 - **At startup:** `--log-level warn` (env `YUZU_LOG_LEVEL`) on the server and/or the agent; this needs a restart. Level names are lowercase and matching is case sensitive, so `WARN` is not `warn`: an unrecognised value given this way is treated as `off`, not rejected, so a typo silences everything. On an agent, `--verbose` forces `trace` whatever `--log-level` says.
-- **Without a restart:** on the server, the `log_level` runtime-configuration key (`PUT /api/config/log_level`, needs `Infrastructure:Write`, applied immediately and persisted, so it survives a restart; an invalid value is rejected; see [REST API: Runtime Configuration](rest-api.md#when-a-change-takes-effect)); on an agent, the `agent_actions` plugin's `set_log_level` action, which is in-process only and lasts until that agent restarts (see the agent `--log-level` flag in [device-management.md](device-management.md)).
+- **Without a restart:** on the server, the `log_level` runtime-configuration key (`PUT /api/config/log_level`, its twin `PUT /api/v1/config/log_level`, or the MCP tool `set_runtime_config`, which a supervised-tier agentic worker may call: needs `Infrastructure:Write`, applied immediately and persisted, so it survives a restart, and `GET /api/v1/config` shows who last set it and when; an invalid value is rejected; see [REST API: Runtime Configuration](rest-api.md#when-a-change-takes-effect)); on an agent, the `agent_actions` plugin's `set_log_level` action, which is in-process only and lasts until that agent restarts (see the agent `--log-level` flag in [device-management.md](device-management.md)).
 - **Precedence:** a `log_level` stored through runtime configuration is re-applied when the server boots, after the command line and environment, so it overrides `--log-level`. If `--log-level warn` appears to have no effect, check the stored value first; and if you stored `warn` to quieten these lines, remember to store `info` again afterwards.
 
 Retiring or gating these lines once the benchmark concludes is recorded in `docs/spark-flip-gate.md` §7.
@@ -887,8 +904,8 @@ What changes on **every** deployment, including single-server:
   that event has aged out of audit retention — 365 days by default — and you
   cannot establish the serial another way, you cannot tell whether it was lost:
   treat it as lost), then
-  page through `GET /api/v1/ca/issued` (follow `offset` until `has_more` is
-  false) or decode the CRL (`curl … /api/v1/ca/crl | openssl crl -inform DER
+  page through `GET /api/v1/ca/issued` with an unconfined account (follow `offset` until
+  `has_more` is false; a management-group-confined account, or one with no `Inventory:Read` grant, is refused that list) or decode the CRL (`curl … /api/v1/ca/crl | openssl crl -inform DER
   -noout -text`). If the serial is still listed as revoked, nothing was lost. If
   it is missing, re-root
   the internal CA with the clean re-root in `docs/pki-architecture.md`
@@ -1599,6 +1616,53 @@ Any id listed keeps executing after the upgrade and can still be edited through
 from the dashboard's YAML editor (that path validates the id on every save, not only on
 create). Rename those definitions before upgrading — create a replacement under a different id
 and delete the original.
+
+### vNEXT: the `guardian.` instruction-definition id prefix is reserved (#6062) (breaking)
+
+**Who this affects.** Anyone whose instruction definitions include an id beginning `guardian.`.
+No shipped or bundled content uses that prefix, so a deployment running only Yuzu-supplied
+content needs no action for this item. Operator-authored definitions are the population this
+cannot rule out: the prefix reads like a natural name for a Guardian-related definition, and
+nothing before this release refused it.
+
+**Why.** `guardian.<...>` is the namespace reserved for Guardian rule-deploy approval tickets
+(four-eyes epic #6060, [ADR-1009](../adr/1009-four-eyes-mvp-bound-approval.md)). Keeping authored
+definitions out of it keeps the two namespaces separable in the store, on the Approvals page and
+in the audit log, in the same way `mcp.` is kept apart for MCP tickets (previous entry). No
+Guardian deploy approval exists yet in this release; the reservation lands first so that no
+definition has to be renamed later, when a ticket that uses the prefix does exist.
+
+**What changes.** Creating a definition whose id starts `guardian.` is refused with a 400 on
+every authoring route that accepts an explicit id (`POST /api/instructions`, `POST
+/api/instructions/yaml`, `POST /api/instructions/import`) and such a definition is skipped
+(counted in `defs_errored`) at boot auto-import. The dashboard's YAML validator refuses it as
+well, so Validate and Save agree. The error text is `definition id may not use the reserved
+'guardian.' prefix (reserved for Guardian deploy approvals)`; the `mcp.` text is unchanged, so a
+SIEM or script rule keyed on it keeps matching exactly what it matched before. The rule is
+case-sensitive and exact-prefix: `Guardian.foo`, `my.guardian.foo` and `guardianx.foo` are not
+reserved.
+
+**What does NOT change.** As for `mcp.`, the store applies the rule at creation only. A
+definition that already carries a `guardian.` id keeps executing and can still be saved through
+`PUT /api/instructions/{id}`. The one exception is the dashboard's YAML editor, which runs the
+same validation on every save, create or update: an existing `guardian.`-prefixed definition
+cannot be edited there if its document declares `metadata.id` (a document that omits it still
+saves). Re-importing an export of such a definition also fails.
+
+**What to do.** Before upgrading, look for affected ids. Query the instruction database directly
+rather than the REST list route: `GET /api/v1/definitions` caps its result at 100 definitions
+and the shipped content alone exceeds that, so an API-based check can report a false all-clear.
+The query is read-only and case-sensitive, matching the reservation:
+
+```bash
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT id FROM instruction_store.instruction_definitions WHERE id ~ '^guardian\.';"
+```
+
+An empty result means nothing to do. For any id listed, create a replacement under a different id
+(for example `site.guardian-baseline-check`) and delete the original; update any schedule,
+workflow or script that refers to the old id first. Definitions you leave in place keep
+executing, but you lose the dashboard YAML editor and re-import for them.
 
 ### vNEXT — behind a reverse proxy, declare your external origin or CSRF-gated dashboard actions keep failing (#2537)
 
@@ -2851,7 +2915,7 @@ Plugin signature verification ships in two parts: an agent-side CMS verifier and
 
 **Cert-dir collision check.** The server now treats this filename as authoritative. If a prior deployment placed an unrelated PEM at this exact path for a different purpose, it will be interpreted as the plugin trust bundle on first read. This is unlikely (the filename was unused before this release) but worth confirming before upgrade. Run `ls <cert-dir>/plugin-trust-bundle.pem` and rename the file if it pre-exists for any other purpose.
 
-**New `runtime_config` key.** `plugin_signing_required` (string `"true"` or `"false"`). Set via the Settings card; reading and writing the key directly via the runtime-config REST surface is supported but not recommended — the Settings UI guarantees the disk-and-DB invariants (two-phase clear, file-presence-equals-enabled).
+**New `runtime_config` key.** `plugin_signing_required` (string `"true"` or `"false"`). Set via the Settings card; reading the key directly via the runtime-config REST surface is supported, and writing it there needs an administrator account (an MCP-tier or service-scoped token is refused) but is not recommended — the Settings UI guarantees the disk-and-DB invariants (two-phase clear, file-presence-equals-enabled).
 
 **New audit actions.** `plugin_signing.bundle.uploaded`, `plugin_signing.bundle.cleared`, `plugin_signing.require.changed` — see `audit-log.md` for the result and detail conventions. SIEM rules already filtering on `success`/`failure`/`denied` will pick these up unchanged; no new vocabulary tokens.
 
@@ -3156,7 +3220,18 @@ than *Current*.
 When the server runs its built-in CA, **Settings → Certificates and secrets**
 (or **Settings → Internal CA** on the Settings page) lists the newest 500
 issued certificates; for an older one, find its serial with
-`GET /api/v1/ca/issued?offset=` and revoke it with `POST /api/v1/ca/revoke`. To revoke one (e.g. a decommissioned or compromised agent):
+`GET /api/v1/ca/issued?offset=` and revoke it with `POST /api/v1/ca/revoke`. A caller whose
+view of the fleet is confined (management-group confinement), or who holds no `Inventory:Read` grant, is refused that route with a `403`,
+and the panel shows a note in place of the issued-certificate list while keeping the CA details,
+the root and CRL downloads and the import form. A confined `Security:Delete` holder can still
+revoke a serial it already knows through `POST /api/v1/ca/revoke`, but cannot list serials: use
+an unconfined account, or read revoked serials from the CRL (`/api/v1/ca/crl`). The panel's
+reply to a revoke or an import is never blank for such a caller: it shows the panel with a note
+where the list would be, plus a confirmation banner and a success toast after a success; the
+banner adds that the issued-certificate inventory is not shown (see the note below). A caller
+without `Security:Read` gets the plain note instead of the panel, and after a success the same
+confirmation banner and toast, without that sentence about the inventory. To
+revoke one (e.g. a decommissioned or compromised agent):
 
 1. Find the agent's row in the inventory (match on **Subject** = `agent_id` or
    the **Serial**).
@@ -4523,7 +4598,7 @@ the `openssl` keypair-generation and IdP-registration recipe.
 
 ### Known limitations in this release
 
-- **MFA step-up:** MFA step-up is not supported for SAML sessions: a SAML session hitting any step-up-gated endpoint receives a 403 regardless of `--mfa-enforcement` (unless `--mfa-step-up-window-secs` is `0` or less, which lets SAML sessions through on the 36 step-up-gated routes, but not on the JIT-elevation routes). This includes the Settings-page API-token Create and Revoke buttons. Use `optional` and rely on the IdP to enforce MFA. Avoid `required` for SAML deployments.
+- **MFA step-up:** MFA step-up is not supported for SAML sessions: a SAML session hitting any step-up-gated endpoint receives a 403 regardless of `--mfa-enforcement` (unless `--mfa-step-up-window-secs` is `0` or less, which lets SAML sessions through on the 37 step-up-gated routes, but not on the JIT-elevation routes). This includes the Settings-page API-token Create and Revoke buttons. Use `optional` and rely on the IdP to enforce MFA. Avoid `required` for SAML deployments.
 - **`--auth-mode=sso-only`:** Requires an SSO provider — OIDC, or (Linux/macOS, HTTPS enabled) a complete SAML SP config. A SAML-only deployment **can** disable local-password login. Note: SAML sessions cannot use JIT elevation (grant admin via `--saml-admin-group` instead), and the sign-in page (`/home`) offers a SAML button only when no OIDC provider is enabled — SAML operators otherwise go to `/auth/saml/start`.
 - **HA / multi-replica:** Pending AuthnRequest state is in-process. Configure load-balancer sticky sessions (session affinity) on `/auth/saml/start` + `/saml/acs`. Without affinity, approximately `(N−1)/N` of logins fail as unsolicited. OIDC shares this limitation.
 - **IdP cert rotation:** Update `--saml-idp-cert` and restart the server. There is no hot-reload.
@@ -5152,8 +5227,8 @@ session, which only the surface that received the request has (ADR-0010,
 design review "arch-7") — so an auditor correlating the audit log should
 expect the pair, not treat it as a double-count. `rewrap`/`rewrap_secrets`
 similarly audits `kek.rewrap` with `rows_rewrapped=<n>`; `GET
-/status`/`get_kek_status` is read-only and is not audited (matches the
-internal-CA read routes).
+/status`/`get_kek_status` is read-only and is not audited (as the CA metadata routes
+`/api/v1/ca/root` and `/api/v1/ca/crl` are not; `GET /api/v1/ca/issued` is audited).
 
 Decrypt failures are counted per store and failure class as
 `yuzu_server_secret_decrypt_failures_total{store, failure_class}` (classes:
@@ -5328,7 +5403,43 @@ note below.
 > single declined pass more likely right after the change. It is self-healing --
 > see [The retention clock guard](audit-log.md#the-retention-clock-guard).
 
-> **Note:** All three retention values can also be set via environment variables (`YUZU_RESPONSE_RETENTION_DAYS`, `YUZU_AUDIT_RETENTION_DAYS`, `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`). `PUT /api/config/<key>` (with `Infrastructure:Write`) persists a value via `RuntimeConfigStore` and `/api/config` then reports it — **but each running store copied its retention value at construction and does not re-read it, so a stored value is not the window being enforced.** Change a window with the startup option or environment variable and restart. This limitation is shared across all three retention keys and is tracked as issue #483. The **Data and retention** page (Settings, System group) shows the enforced value and flags a stored value that is not in force.
+> **Note:** All three retention values can also be set via environment variables (`YUZU_RESPONSE_RETENTION_DAYS`, `YUZU_AUDIT_RETENTION_DAYS`, `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`). `PUT /api/config/<key>` (with `Infrastructure:Write`; `audit_retention_days` also needs an administrator account, see [REST API](rest-api.md#put-apiconfigkey)) persists a value via `RuntimeConfigStore` and `/api/config` then reports it — **but each running store copied its retention value at construction and does not re-read it, so a stored value is not the window being enforced.** Change a window with the startup option or environment variable and restart. This limitation is shared across all three retention keys and is tracked as issue #483. The **Data and retention** page (Settings, System group) shows the enforced value and flags a stored value that is not in force.
+
+
+### Approval requests are not pruned, and a bound request is stored in clear text (#6062)
+
+None of the settings above applies to approval tickets. The `approvals` table has no retention
+pass today and nothing deletes a row, so every approval ever submitted is kept (growth is tracked
+in #3728). Each row records who submitted, reviewed and consumed a ticket, which is why it is
+kept rather than aged out.
+
+From #6062 an approval row can also carry a **bound request**: the exact effect the reviewer
+was shown, frozen at submission. It is stored in the `request_json` column as clear `TEXT`, up to
+16 KiB, with its SHA-256 in `request_digest` and the barred reviewers in `excluded_roots`. Treat
+`request_json` as follows:
+
+- **It is not a secret store.** It is not encrypted or hashed at rest, and it may contain the
+  operator-supplied parameters and the target devices of the request. Never put a secret
+  (password, token, key, connection string) in an instruction parameter that goes through a
+  four-eyes approval: the reviewer must be able to read it, so it is shown, and it stays in the
+  table.
+- **It is personal data if the parameters are.** A parameter that names a user, a path under a
+  user profile or an e-mail address is retained with the row. Include the `approvals` table in
+  your data inventory and in any subject-access or erasure process; there is no per-row delete
+  route.
+- **Who can read it.** Every principal holding `Approval:Read` (the seeded `Viewer`, `Operator`,
+  `PlatformEngineer`, `ITServiceOwner` and `Administrator` roles; with RBAC off, every
+  authenticated session) can
+  read it, on the Approvals page and in every approval read response: `GET /api/v1/approvals`,
+  `GET /api/v1/approvals/{id}`, the legacy `GET /api/approvals`, and MCP
+  (`list_pending_approvals`). A service-scoped API token is refused on all of them, even one whose
+  `ITServiceOwner` ceiling includes `Approval:Read`.
+- **Retention.** It is kept as long as its row, and rows are not pruned. Any future prune is a
+  bulk delete on a wall-clock cutoff and falls under the clock-guarded retention rules
+  ([`docs/clock-guarded-retention.md`](../clock-guarded-retention.md)).
+
+No feature creates a bound request in this release, so no `request_json` is stored yet; this is
+the contract for the change that does.
 
 ---
 
@@ -6337,6 +6448,6 @@ The following server administration features are on the roadmap but not yet impl
 
 | Feature | Phase | Description |
 |---|---|---|
-| Runtime Configuration API | Phase 7 (7.3) | Change retention TTLs, connection limits, and other server parameters via REST API. **Not all keys apply live** - retention TTLs are stored and reported immediately but enforced only after a restart, and OIDC keys apply only via Settings -> OIDC. See [REST API -> When a change takes effect](rest-api.md#when-a-change-takes-effect). |
+| Runtime Configuration API | Phase 7 (7.3) | Change retention TTLs, connection limits, and other server parameters via REST API. **Not all keys apply live** - retention TTLs are stored and reported immediately but not enforced (the enforced window comes from the `--*-retention-days` flag or its environment variable, #483), and OIDC keys apply only via Settings -> OIDC. See [REST API -> When a change takes effect](rest-api.md#when-a-change-takes-effect). |
 | AD/Entra Integration | Phase 7 (7.5) | Sync users and groups from Active Directory (LDAP) or Microsoft Entra ID. Auto-create Yuzu principals from directory membership. |
 | System Health Monitoring | Phase 7 (7.2) | Server-side health dashboard showing memory, CPU, disk, database size, connected agent count, and gRPC stream health. Prometheus metrics for server internals. |

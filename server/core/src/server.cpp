@@ -48,6 +48,7 @@
                                      // 3 review finding 2; see that field's own doc comment)
 #include "rotation_sweep_naming.hpp"
 #include "rotation_warn_dedup.hpp"
+#include "approval_denial_audit.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "credential_change_owner.hpp" // #5342 — one-transaction local credential change
@@ -159,6 +160,7 @@
 #include "response_store.hpp"
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_confined
 #include "dispatch_target_shape.hpp" // check_targeting_shape / targeting_supplied (#2500)
+#include "engine_aware_visibility.hpp" // #6204: engine-aware username-keyed resolvers (unit-tested)
 #include "authz_model.hpp" // #1788: per-arm visibility intersection (in_scope/filter_to_scope)
 #include "dispatch_confined_arms.hpp" // the ONE per-arm intersection, shared with /api/command
 #include "dispatch_destructive_gate.hpp" // #3685: the Destructive-class targeting verdict
@@ -1056,13 +1058,30 @@ public:
         metrics_.describe("yuzu_mcp_approval_precondition_denied_total",
                           "MCP approval-ticket recalls refused by a pre-consume precondition "
                           "(#2443) - the ticket matched and was approved, but the underlying "
-                          "operation's live state had already moved on since mint. A subset "
+                          "operation's live state had already moved on since mint, or the "
+                          "ticket's own tool and arguments no longer matched the recall "
+                          "(the request match every approval-gated recall carries). A subset "
                           "of yuzu_mcp_approval_refused_total, broken out separately: unlike "
                           "the masked-denial split above, a precondition denial is already "
                           "distinguishable to the caller from the response body, so this "
                           "carries no anti-oracle restriction - it is not a `reason` label on "
                           "the shared counter because the shared counter's other kinds "
                           "(foreign-origin vs ordinary replay) still must not be",
+                          "counter");
+        metrics_.describe("yuzu_approval_precondition_denied_total",
+                          "Approval-ticket redemptions refused by a pre-consume precondition "
+                          "(#2443/#6062), by the ticket's origin: the ticket matched and was "
+                          "approved, but the state its effect depends on had moved on since "
+                          "mint. The ticket is left UNTOUCHED and still redeemable. Counted at "
+                          "the store for any redeemer that supplies a precondition, so it "
+                          "mirrors yuzu_mcp_approval_precondition_denied_total (which adds the "
+                          "MCP tool); each denial also writes an approval.precondition_denied "
+                          "audit row. TODAY only origin=mcp can move (every MCP "
+                          "approval-gated recall supplies a precondition: the request match, "
+                          "plus the rotation state check for confirm_engine_rotation); the "
+                          "instruction, schedule and guardian_deploy series are "
+                          "pre-seeded at zero and stay there until a redeemer for that surface "
+                          "exists",
                           "counter");
         metrics_.describe("yuzu_mcp_approval_burned_total",
                           "MCP approval-ticket recalls that SUCCESSFULLY consumed a one-time, "
@@ -1413,6 +1432,9 @@ public:
             metrics_.counter("yuzu_mcp_approval_refused_total", {{"tool", tool}});
             // Same closed set again for the #2786 masked-denial counter.
             metrics_.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", tool}});
+            // Every approval-gated recall carries a precondition now (the request match,
+            // g8r7-astra-D), so a precondition denial can reach any tool in the set.
+            metrics_.counter("yuzu_mcp_approval_precondition_denied_total", {{"tool", tool}});
             // #2444 item 3: a HANDLER can only burn a ticket for a tool that is
             // itself approval-gated in the first place, so this is the same
             // closed `tool` set as the three counters above. `reason` is a
@@ -1432,15 +1454,13 @@ public:
                 metrics_.counter(mcp::kMcpPollTotalMetric, {{"tool", tool}, {"result", result}});
             }
         }
-        // yuzu_mcp_approval_precondition_denied_total's reachable label set is
-        // NARROWER than the two above: kPrecondition can only fire for a tool
-        // that actually has a ConsumePrecondition wired, which today is just
-        // confirm_engine_rotation (#2443) — pre-seeding the full
-        // approval-gated set here would claim reachability for tools whose
-        // precondition is always `{}`. Extend this list alongside #2939's
-        // sweep as each tool gets its own precondition wired.
-        metrics_.counter("yuzu_mcp_approval_precondition_denied_total",
-                         {{"tool", "confirm_engine_rotation"}});
+        // #6062: the store-level counter's label is the ticket origin - a CLOSED set of
+        // the four writable surfaces (kUnspecified/kUnrecognised are never written and
+        // can never reach a precondition), so every combination is pre-seeded here.
+        for (const auto origin : {ApprovalOrigin::kInstruction, ApprovalOrigin::kSchedule,
+                                  ApprovalOrigin::kMcp, ApprovalOrigin::kGuardianDeploy})
+            metrics_.counter("yuzu_approval_precondition_denied_total",
+                             {{"origin", to_string(origin)}});
         // #2437 handler-side bound denials. The label set is closed on BOTH
         // axes: `tool` is execute_instruction alone (the only tool that EMITS
         // this counter today; the two kAgenticParamMaxLen read tools bound in
@@ -6595,6 +6615,16 @@ public:
             } else {
                 legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "instructions.db",
                                                          "ApprovalManager", {"approvals"});
+                // #6062: a precondition denial is counted and audited at the store, for
+                // every redeemer. audit_store_ is declared before approval_manager_, so it
+                // outlives every consume. The observer writes through AuditStore::log on
+                // its OWN lease - never the caller's transaction - so the evidence of a
+                // refused redemption survives the caller rolling back. No audit store
+                // (not open) means no row; the counter still counts.
+                approval_manager_->set_metrics(&metrics_);
+                approval_manager_->set_precondition_denial_observer(
+                    make_precondition_denial_audit_observer(
+                        [this]() -> AuditStore* { return audit_store_.get(); }));
             }
         }
 
@@ -7107,7 +7137,7 @@ public:
                     [this] { invalidate_guardian_reconcile_caches(); });
                 spdlog::info("GuaranteedStateStore initialized (schema guaranteed_state_store; "
                              "retention={}d)",
-                             cfg_.guardian_event_retention_days);
+                             cfg_.guardian_event_retention_days.get());
                 // Step 5: ingest agent `__guard__` events arriving on the Subscribe
                 // stream → guaranteed_state_events. See docs/guardian-mvp-contract.md.
                 agent_service_.set_guaranteed_state_store(guaranteed_state_store_.get());
@@ -12499,8 +12529,9 @@ private:
             .increment();
     }
 
-    /// The ONE /crypto availability callback (ADR-0070 R2; fix-spec B1): CryptoRoutes, the
-    /// filtered GET /api/v1/ca/issued and the MCP server all receive THIS function, so the REST
+    /// The ONE /crypto availability callback (ADR-0070 R2; fix-spec B1): CryptoRoutes, both
+    /// forms of GET /api/v1/ca/issued (and the Settings CA panel's inventory) and the MCP server
+    /// all receive THIS function, so the REST
     /// widget list, the dashboard and list_crypto_widgets cannot draw different answers. Fleet
     /// gate classes ask the NON-auditing fleet-read probe (a confined caller has a present
     /// VisibleSet); the global class asks the non-auditing has_permission. Never a grant.
@@ -12562,6 +12593,7 @@ private:
         // so a broken store stays fail-closed (BR-002).
         facts.legacy_open = !rbac_enforcement_in_effect(rbac_store_.get());
         facts.elevated = auth::is_elevated(sess);
+        facts.principal_is_engine = sess.is_engine();
         facts.global_grant =
             rbac_store_ && rbac_store_->check_permission(sess.username, "Execution", "Execute");
         if (rbac_store_) {
@@ -12650,6 +12682,9 @@ private:
 
         yuzu::server::authz::ExecVisibleFacts facts;
         facts.legacy_open = !rbac_enforcement_in_effect(rbac_store_.get());
+        // Tripwire: an engine is not an AuthDB user, so the principal_resolves check above already
+        // denied an `engine:` creator; this keeps the composer correct if that ever changes.
+        facts.principal_is_engine = yuzu::server::authz::is_engine_principal_name(username);
         facts.global_grant =
             rbac_store_ && rbac_store_->check_permission(username, "Execution", "Execute");
         if (rbac_store_) {
@@ -12916,17 +12951,16 @@ private:
     /// Mirrors every other dispatch-adjacent RBAC read in this file (e.g.
     /// derive_exec_visible's own `legacy_open` composition): a
     /// loaded-and-explicitly-disabled store is legacy-open, and legacy-open
-    /// means "RBAC off, everyone may do everything" — the SAME bypass every
-    /// other securable already grants here, not a new one minted for this
-    /// chokepoint.
+    /// means "RBAC off, every HUMAN principal may do everything" — the SAME
+    /// bypass every other securable already grants here, not a new one minted
+    /// for this chokepoint. An ENGINE principal (`engine:<slug>`) is the one
+    /// exclusion: its only authority is an explicit RBAC grant, so under
+    /// legacy-open it is refused, never admitted (#6204).
     [[nodiscard]] bool dispatch_has_permission(std::string_view principal,
                                                std::string_view securable,
                                                yuzu::server::authz::Operation op) const {
-        if (!rbac_enforcement_in_effect(rbac_store_.get()))
-            return true;
-        return rbac_store_ != nullptr &&
-               rbac_store_->check_permission(std::string(principal), std::string(securable),
-                                             std::string(yuzu::server::authz::to_string(op)));
+        return yuzu::server::visibility::dispatch_permission(rbac_store_.get(), principal,
+                                                             securable, op);
     }
 
     std::expected<detail::ClassifiedCommand, detail::DispatchDenial> build_classified_command(
@@ -13458,44 +13492,14 @@ private:
     /// true (enforce), and `check_scoped_permission` then denies on the dead handle —
     /// so a corrupt rbac.db yields zero rows, never the whole fleet (#1498 ruling).
     bool response_agent_in_scope(const std::string& username, const std::string& agent_id) const {
-        if (!rbac_enforcement_in_effect(rbac_store_.get()))
-            return true; // loaded & explicitly disabled → legacy-open
-        return rbac_store_ && rbac_store_->check_scoped_permission(username, "Response", "Read",
-                                                                   agent_id, mgmt_group_store_.get());
+        return yuzu::server::visibility::response_agent_in_scope(
+            rbac_store_.get(), mgmt_group_store_.get(), username, agent_id);
     }
 
     /// Return the agent list as JSON, filtered by RBAC visibility for the given user.
     nlohmann::json get_visible_agents_json(const std::string& username) {
-        auto agents = registry_.to_json_obj();
-        // #1498 — restrict whenever RBAC enforcement is in effect, which includes
-        // a missing/load-failed store (fail closed); only a loaded-and-explicitly-
-        // disabled store skips filtering and returns the full fleet. Shares the
-        // rbac_enforcement_in_effect predicate with the get_visible_agents probe
-        // so /api/agents and the TAR fleet scan can never disagree.
-        if (mgmt_group_store_ && rbac_enforcement_in_effect(rbac_store_.get())) {
-            // A global Infrastructure:Read grant sees the whole fleet even under
-            // RBAC-on. On a load-failed store check_permission is unavailable
-            // (is_open()==false), so this is false and visibility falls to the
-            // role-scoped join, which itself fails closed.
-            bool global_read = rbac_store_ && rbac_store_->is_open() &&
-                               rbac_store_->check_permission(username, "Infrastructure", "Read");
-            if (!global_read) {
-                // ADR-0042: nullopt (store degraded) → empty visible set
-                // (fail-closed: return no agents rather than the full fleet).
-                auto visible = mgmt_group_store_->get_visible_agents(username);
-                std::set<std::string> visible_set;
-                if (visible)
-                    visible_set.insert(visible->begin(), visible->end());
-                nlohmann::json filtered = nlohmann::json::array();
-                for (const auto& a : agents) {
-                    if (a.contains("agent_id") &&
-                        visible_set.count(a["agent_id"].get<std::string>()))
-                        filtered.push_back(a);
-                }
-                return filtered;
-            }
-        }
-        return agents;
+        return yuzu::server::visibility::visible_agents_json(
+            registry_.to_json_obj(), rbac_store_.get(), mgmt_group_store_.get(), username);
     }
 
     /// Auto-create a dynamic management group for a service tag value.
@@ -14507,16 +14511,22 @@ private:
                 spdlog::set_level(spdlog::level::from_str(e.value));
             } else if (e.key == "heartbeat_timeout") {
                 try {
-                    // A value stored before the 30 s floor existed would make every directly
-                    // connected agent flap; raise it to the floor and say how to clear it.
+                    // A value stored before the 30 s floor (or the one-day ceiling) existed would
+                    // make every directly connected agent flap, or stop stale-agent reaping; move it
+                    // to the nearest bound and say how to clear it.
                     const int stored = std::stoi(e.value);
                     const int applied = clamp_heartbeat_timeout(stored);
                     if (applied != stored)
-                        spdlog::warn("Stored heartbeat_timeout {} is below the {} second minimum; "
-                                     "using {} seconds. PUT /api/config/heartbeat_timeout with a "
-                                     "value of {} or more to replace the stored one.",
-                                     stored, kMinHeartbeatTimeoutSeconds, applied,
-                                     kMinHeartbeatTimeoutSeconds);
+                        spdlog::warn("Stored heartbeat_timeout {} is {} the {} second {}; using "
+                                     "{} seconds. PUT /api/config/heartbeat_timeout with a value "
+                                     "from {} to {} to replace the stored one.",
+                                     stored, stored < kMinHeartbeatTimeoutSeconds ? "below" : "above",
+                                     stored < kMinHeartbeatTimeoutSeconds
+                                         ? kMinHeartbeatTimeoutSeconds
+                                         : kMaxHeartbeatTimeoutSeconds,
+                                     stored < kMinHeartbeatTimeoutSeconds ? "minimum" : "maximum",
+                                     applied, kMinHeartbeatTimeoutSeconds,
+                                     kMaxHeartbeatTimeoutSeconds);
                     cfg_.session_timeout = std::chrono::seconds(applied);
                 } catch (...) {}
             } else if (e.key == "response_retention_days") {
@@ -15962,20 +15972,8 @@ private:
         // fix immediately above.
         auto visible_set_fn =
             [this](const std::string& username) -> std::optional<std::set<std::string>> {
-            if (mgmt_group_store_ && rbac_enforcement_in_effect(rbac_store_.get())) {
-                bool global_read = rbac_store_ && rbac_store_->is_open() &&
-                                   rbac_store_->check_permission(username, "Infrastructure", "Read");
-                if (!global_read) {
-                    // ADR-0042: get_visible_agents nullopt means the mgmt-store
-                    // DEGRADED — return an EMPTY confined set (fail-closed: sees
-                    // nothing), NOT nullopt here (which means "sees all fleet").
-                    auto v = mgmt_group_store_->get_visible_agents(username);
-                    if (!v)
-                        return std::set<std::string>{};
-                    return std::set<std::string>(v->begin(), v->end());
-                }
-            }
-            return std::nullopt; // global read or RBAC disabled → sees all
+            return yuzu::server::visibility::infrastructure_visible_set(
+                rbac_store_.get(), mgmt_group_store_.get(), username);
         };
         // D3: the dashboard facet/scope surfaces' Response:Read-visible set
         // (dashboard_routes.hpp VisibleSetFn) — deliberately NOT built on
@@ -15995,17 +15993,8 @@ private:
         // perm_fn_ admission gates are untouched by this resolver.
         auto response_visible_set_fn =
             [this](const std::string& username) -> std::optional<std::set<std::string>> {
-            if (!rbac_enforcement_in_effect(rbac_store_.get())) return std::nullopt;
-            bool global_read = rbac_store_ && rbac_store_->is_open() &&
-                               rbac_store_->check_permission(username, "Response", "Read");
-            if (global_read) return std::nullopt; // global Response:Read sees all, #1715(b)
-            if (!rbac_store_ || !mgmt_group_store_) {
-                return std::set<std::string>{}; // fail-closed, no store to resolve against
-            }
-            auto v = rbac_store_->visible_agents_for_permission(username, "Response", "Read",
-                                                                 mgmt_group_store_.get());
-            if (!v) return std::set<std::string>{}; // degrade → fail-closed, never nullopt
-            return std::set<std::string>(v->begin(), v->end());
+            return yuzu::server::visibility::response_visible_set(
+                rbac_store_.get(), mgmt_group_store_.get(), username);
         };
         // #4035 review fix's bespoke `dex_visible_fn` resolver (a global-Read
         // bypass + `RbacStore::visible_agents_for_permission` join) is
@@ -16264,7 +16253,7 @@ private:
                         // The enforced figure (the store copies it at construction), not the
                         // live config value; without a store, the startup config.
                         return audit_store_ ? audit_store_->retention_days()
-                                            : cfg_.audit_retention_days;
+                                            : cfg_.audit_retention_days.get();
                     },
                 .now_fn = []() { return static_cast<std::int64_t>(std::time(nullptr)); },
             });
@@ -16696,6 +16685,7 @@ private:
                              .auth_fn = auth_fn,
                              .perm_fn = perm_fn,
                              .audit_fn = audit_fn,
+                             .step_up_fn = step_up_fn,
                              .cfg = &cfg_,
                              .auto_approve = &auto_approve_,
                              .runtime_config_store = runtime_config_store_.get(),
@@ -18809,6 +18799,19 @@ private:
         // (PreflightRoutes, DeploymentRoutes, TarTreeRoutes, and McpServer's/
         // TarTreeRoutes' `set_all_devices_fn`), unrelated to DeviceRoutes itself.
         auto device_api = make_local_device_api(registry_, tag_store_.get());
+        // The customer score policy is one stored document read through a
+        // bounded-refresh provider, so every instance converges within
+        // kDexPolicyRefreshMs. It depends only on the runtime config store, so it exists
+        // whenever that store is open: PUT/DELETE /api/v1/dex/score-policy install through
+        // it even where the signals store is absent. With no runtime config store the Apps
+        // read scores under the shipped defaults (the empty function).
+        if (runtime_config_store_ && runtime_config_store_->is_open())
+            dex_score_policy_provider_ = std::make_shared<DexScorePolicyProvider>(
+                dex_score_policy_store_reader(*runtime_config_store_), []() -> std::int64_t {
+                    return std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+                });
         // ADR-0031 WS-A4 (fifth family): the DEX signals API seam — ONE
         // instance backing the GuaranteedStateStore-backed GET /api/v1/dex/*
         // signal/experience reads, wired with the SAME `dex_fleet_fn` closure
@@ -18821,21 +18824,9 @@ private:
         // (byte-identical). Mirrors verify_api's "null → 503" contract.
         std::shared_ptr<yuzu::server::DexApi> dex_api;
         if (guaranteed_state_store_) {
-            // The customer score policy is one stored document read through a
-            // bounded-refresh provider, so every instance converges within
-            // kDexPolicyRefreshMs. With no runtime config store the Apps read scores
-            // under the shipped defaults (the empty function).
             yuzu::server::DexScorePolicyFn dex_policy_fn;
-            if (runtime_config_store_ && runtime_config_store_->is_open()) {
-                dex_score_policy_provider_ = std::make_shared<DexScorePolicyProvider>(
-                    dex_score_policy_store_reader(*runtime_config_store_),
-                    []() -> std::int64_t {
-                        return std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   std::chrono::steady_clock::now().time_since_epoch())
-                            .count();
-                    });
+            if (dex_score_policy_provider_)
                 dex_policy_fn = [p = dex_score_policy_provider_] { return p->current(); };
-            }
             dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn,
                                          std::move(dex_policy_fn));
         }
@@ -20250,7 +20241,9 @@ private:
         // copies the list into its handler captures, so it must be set first.
         ca_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
         // ADR-0070 R2-2: the filtered GET /api/v1/ca/issued reads through the SAME CryptoApi
-        // instance and is withheld from a confined caller via the SAME availability callback.
+        // instance; BOTH forms of it (and the Settings CA panel's inventory) are withheld from a
+        // confined caller via the SAME availability callback. This MUST run before
+        // register_routes: the handlers capture a copy, so a later call leaves them unwired.
         ca_routes_->set_filtered_issued(CaRoutes::FilteredIssuedDeps{
             .api = crypto_api_,
             .confinement_fn = [this](const httplib::Request& req) {
@@ -20944,6 +20937,9 @@ private:
                             out.visible_agents = std::move(authz.visible_agents);
                             break;
                         case ListReadDecision::DenyAll:
+                            // Deliberately ignores `authz.read_failed`: this seam's decision
+                            // type has no "degraded" arm, so a failed read maps to deny-all
+                            // (fail closed, nothing served), as before.
                             break; // out already kDenyAll (default)
                         }
                         return out;
@@ -21208,6 +21204,20 @@ private:
         // it stamps the principal, the effective role the route captured per binding, the
         // engine class and the session correlator. MUST run BEFORE register_routes().
         rest_api_v1_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
+        // #6086: GET/PUT/DELETE /api/v1/dex/score-policy. The reader and the two conditional
+        // writes borrow runtime_config_store_ by reference. stop() waits for and joins the
+        // listener thread(s) before it resets the store, so no handler is running when the
+        // reference dies (the same ordering the provider's reader relies on). Without an open
+        // store the three routes answer 503. MUST run BEFORE register_routes().
+        if (dex_score_policy_provider_) {
+            auto policy_writes = dex_score_policy_store_writer(*runtime_config_store_);
+            rest_api_v1_->set_dex_score_policy_writer(
+                {.read_stored = dex_score_policy_store_reader(*runtime_config_store_),
+                 .compare_and_set = std::move(policy_writes.compare_and_set),
+                 .compare_and_remove = std::move(policy_writes.compare_and_remove),
+                 .provider = dex_score_policy_provider_,
+                 .audit = {}});
+        }
         // #6065 PR-Q: the dispatch-chokepoint pre-check closure, defined ONCE and
         // handed to BOTH REST (POST and DELETE /api/v1/quarantine, the trailing register_routes
         // param) and MCP (set_authorize_dispatch_fn, wired further below), so the two
@@ -21987,6 +21997,10 @@ private:
             // with no MCP twin — an ADR-1005 gap for an ordinary
             // authenticated operator action).
             mcp_server_->set_plugin_config_store(plugin_config_store_.get());
+            // get_runtime_config / set_runtime_config: the same cfg_, auto_approve_ and
+            // runtime_config_store_ the config routes hold.
+            mcp_server_->set_runtime_config_backing(
+                {&cfg_, &auto_approve_, runtime_config_store_.get()});
             // #4036 (api-parity Batch A) — backs list_preflight_runs +
             // get_deployment_preview. Same store PreflightRoutes/
             // DeploymentRoutes already hold (constructed well before this
@@ -22044,6 +22058,7 @@ private:
                         out.visible_agents = std::move(authz.visible_agents);
                         break;
                     case ListReadDecision::DenyAll:
+                        // Deliberately ignores `authz.read_failed` (see the REST twin above).
                         break; // out already kDenyAll (default)
                     }
                     return out;

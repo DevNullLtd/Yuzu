@@ -981,3 +981,41 @@ TEST_CASE("RuntimeConfigStore: a create that loses a concurrent insert is stale 
     CHECK_FALSE(*cas);
     CHECK(w.store.get_value("log_level") == "warn"); // the committed insert, not the lost create
 }
+
+// A conditional write that cannot reach its table answers the store's own error, and the
+// failure's class (SQLSTATE) is logged: it is the only thing that tells an operator a missing
+// table from a dropped connection, since the caller is told "database write failed" either
+// way. 42P01 is undefined_table.
+TEST_CASE("RuntimeConfigStore: a failed conditional write logs its SQLSTATE and reports a "
+          "database error",
+          "[pg][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult d{PQexec(conn.get(), "DROP TABLE runtime_config_store.runtime_config")};
+        REQUIRE(d.ok());
+    }
+    const std::string failed = std::string(kRuntimeConfigDbErrorPrefix) + "database write failed";
+
+    SECTION("compare_and_set") {
+        yuzu::test::LogCapture cap;
+        const auto r =
+            w.store.compare_and_set("audit_retention_days", std::string("30"), "60", "bob");
+        cap.stop();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == failed);
+        CHECK(cap.text().find("compare_and_set") != std::string::npos);
+        CHECK(cap.text().find("SQLSTATE 42P01") != std::string::npos);
+    }
+    SECTION("compare_and_remove") {
+        yuzu::test::LogCapture cap;
+        const auto r = w.store.compare_and_remove("audit_retention_days", "30");
+        cap.stop();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == failed);
+        CHECK(cap.text().find("compare_and_remove") != std::string::npos);
+        CHECK(cap.text().find("SQLSTATE 42P01") != std::string::npos);
+    }
+}
