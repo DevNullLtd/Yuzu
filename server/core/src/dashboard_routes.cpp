@@ -860,9 +860,18 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // 7-bit, `replace` turns invalid UTF-8 into U+FFFD instead of throwing, and
                  // the ordered type keeps the key order of the hand-built header.
                  // The toast renders its message with textContent, so no HTML escaping.
+                 // The name has no length bound in this handler or in the store, and every
+                 // non-ASCII byte becomes a six-byte \uXXXX escape, so the echoed name is cut
+                 // at 80 bytes (a cut inside a UTF-8 sequence becomes U+FFFD) to keep the
+                 // header far under any proxy header limit; the group list shows the full name.
+                 constexpr std::size_t kToastNameBytes = 80;
+                 const std::string toast_name =
+                     group_name.size() > kToastNameBytes
+                         ? group_name.substr(0, kToastNameBytes) + "..."
+                         : group_name;
                  const nlohmann::ordered_json trigger = {
                      {"showToast",
-                      {{"message", "Group '" + group_name + "' created with " +
+                      {{"message", "Group '" + toast_name + "' created with " +
                                        std::to_string(agent_ids.size()) + " agents"},
                        {"level", "success"}}},
                      {"agentChanged", true}};

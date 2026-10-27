@@ -837,4 +837,20 @@ TEST_CASE("group-from-results: the success toast is valid single-line ASCII JSON
     SECTION("markup characters travel as text, not HTML entities") {
         run("R&D <team> 'north'");
     }
+    SECTION("a long name is cut in the toast so the header stays small, and the group keeps it whole") {
+        // 60 three-byte characters = 180 bytes of name, which would escape to 360 bytes.
+        std::string name;
+        for (int i = 0; i < 60; ++i)
+            name += "\xE6\x97\xA5";
+        auto res = h.post(GroupFromResultsHarness::form_body(percent_encode(name)));
+        REQUIRE(res->status == 200);
+        const std::string trigger = res->get_header_value("HX-Trigger");
+        REQUIRE_FALSE(trigger.empty());
+        CHECK(trigger.size() < 400);
+        const auto j = nlohmann::json::parse(trigger, nullptr, /*allow_exceptions=*/false);
+        REQUIRE_FALSE(j.is_discarded());
+        const std::string msg = j["showToast"].value("message", "");
+        CHECK(msg.find("...' created with 1 agents") != std::string::npos);
+        CHECK(h.mg.find_group_by_name(name).has_value()); // the store keeps the full name
+    }
 }
