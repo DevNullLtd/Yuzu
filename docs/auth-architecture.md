@@ -1198,12 +1198,14 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   by `AuthManager::reap_expired_elevation` at the `AuthRoutes::resolve_session`
   cookie chokepoint, on the FIRST authenticated request the operator makes
   *after* the window has lapsed. `elevated_until` is cleared to the sentinel on
-  that first observing call, so emission is exactly-once — a request that finds
+  that first observing call, so on a single server replica emission is exact (the
+  clear is rechecked under the exclusive session lock); with several replicas a rare
+  duplicate is possible (effectively-once, ADR-2002). A request that finds
   the sentinel already cleared (a prior reap, or a manual
   `revoke_elevation`/`revoke_user_elevations`, which clear to the same
   sentinel) emits nothing, so a manual step-down never ALSO produces a spurious
-  `expired` row. **The `role.elevation.expired` emission is itself best-effort
-  / at-most-once** (governance hardening round, UP-3): `elevated_until` is
+  `expired` row. **The `role.elevation.expired` emission is itself best-effort:
+  it is never retried, so it can be lost** (governance hardening round, UP-3). `elevated_until` is
   cleared to the sentinel BEFORE the audit call, so a store failure loses only
   the confirmatory `expired` row, never the reap itself (the session still
   correctly reverts to base role) — and the window's end remains
@@ -3628,7 +3630,7 @@ header, so these names stay rejected on client ingress permanently.
 ## API tokens and automation
 
 - **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens (see `docs/mcp-server.md`) use the same table with mandatory expiration (max 90 days).
-- **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; the global `admin` role is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
+- **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; an effective `admin` role (the global `admin` role, or a session holding a JIT admin elevation) is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
 
 ### Device tokens (`DeviceTokenStore`, ADR-0052, capability 18.8) — currently dormant, docs/user-manual/rest-api.md "Device Tokens"
 
@@ -3936,15 +3938,18 @@ walkthrough.
   behind a one-time secret-reveal panel, revoked rows showing `superseded_by` +
   revoke detail).
 - **REST gating:** every *mutating* route is human-admin + MFA-step-up gated;
-  the three read routes are human-admin + RBAC gated but not step-up gated —
-  list and get on `EnginePrincipal:Read` (moved off the over-broad
+  the read routes are human-admin + RBAC gated but not step-up gated: list,
+  get and the roles list on `EnginePrincipal:Read` (moved off the over-broad
   `Security:Read` by #2376, see "The authorization topology floor" above), and
   `audit/no-admin` on `AuditLog:Read` (floored under RBAC-off by #5771, so
-  the auditor route is admin-only on a default install). Every route —
-  reads included — structurally denies a caller whose own session is
+  the auditor route is admin-only on a default install). Every route, reads
+  included, structurally denies a caller whose own session is
   engine-classed (`principal_kind="engine"` / `auth_source="engine_token"`, the
-  §9 belt): an engine principal can never read or mutate its own or another
-  engine principal's lifecycle surface.
+  §9 belt), with one exception: `GET /engine-principals/{id}/roles` (list)
+  relies on `EnginePrincipal:Read` alone, and the role assign and unassign
+  routes are refused at the central step-up check. Apart from that list, an
+  engine principal can never read or mutate its own or another engine
+  principal's lifecycle surface.
 - **MCP gating:** the 6 mutating tools all gate on `Security:Write`
   (`mint_engine_credential`/`rotate_engine_credential` included — aligned with
   their REST twins, not `Security:Execute`), require the `supervised` tier,
@@ -4190,8 +4195,7 @@ this section does not restate them.
   token stays a 30-day token measured from its own original grant) — never
   recomputed as `now + 90d`, which would silently extend authorization
   lifetime through what should be a lateral credential swap. The store-level
-  API retains an internal `successor_expires_at` override parameter (reused
-  by the engine arm's own successor-TTL logic), but the REST route
+  API retains an internal `successor_expires_at` override parameter, but the REST route
   deliberately does not expose it — a senior-architecture ruling, recorded
   in the security review, that rotation must read as lifetime-neutral in
   CC6.3 evidence with no caller-controlled escape hatch. A caller that

@@ -525,6 +525,12 @@ Every SAML callback outcome, and every OIDC callback outcome except the two grou
 
 The self-service change route's lockout check shares `/login`'s instrumentation: a fail-closed auth-store refusal there — the lockout counter could not be recorded, or the account could not be read to verify the current password — increments `yuzu_auth_secret_unavailable_total{route="password_change"}` and `yuzu_auth_read_degrade_total{route="password_change",reason}` (both pre-seeded to 0); at `/login` the same read failure now answers `503` instead of a `401` with a lockout strike (see `docs/auth-architecture.md`, login/Postgres decoupling).
 
+## Session revocation metric
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_auth_sessions_revoked_total{caller, result, scope}` | counter | One increment per session-revoke call, not per session. `caller` is `admin` for `DELETE /api/v1/sessions` (cookie sessions of one named user) and `self` for `DELETE /api/v1/sessions/me` ("Sign out everywhere"). `scope` is `cookies` for the admin route and `all` for the self route, which also revokes the caller's API tokens. `result` is `success`, or `partial` when the durable session delete or the API-token revoke did not persist. Series are created on the first call, so they are absent until a revoke has happened. A sustained spike is the signal for an incident response in progress or an automation loop calling the revoke route. No alert rule ships. |
+
 ## SCIM deprovision-linkage metrics (ADR-2001, CC6.8)
 
 Two detective counters for the SCIM↔OIDC identity-link revoke seam — a SCIM

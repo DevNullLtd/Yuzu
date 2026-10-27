@@ -13002,6 +13002,10 @@ TEST_CASE("MCP 2g PR4: yuzu://openapi matches openapi_spec_json()",
     REQUIRE(contents.size() == 1);
     CHECK(contents[0]["uri"] == "yuzu://openapi");
     CHECK(contents[0]["mimeType"] == "application/json");
+    // The bytes themselves, not only the parsed value: the resource and REST's default
+    // `GET /api/v1/openapi.json` are documented as byte-identical, and a re-serialisation
+    // (key order, whitespace) would pass the parsed comparison below.
+    CHECK(contents[0]["text"].get<std::string>() == yuzu::server::openapi_spec_json());
     auto got = nlohmann::json::parse(contents[0]["text"].get<std::string>());
     CHECK(got == expected);
 }
