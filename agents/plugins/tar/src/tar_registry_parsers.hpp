@@ -921,18 +921,29 @@ struct RegistryRootState {
 
 /// Every future candidate's window starts at or after its root's window_base, so
 /// an event at or before the minimum of them can never be matched again. A root never
-/// completely read (window_base 0) does not take part: every candidate it yields has a
-/// wide window starting at 0, which is before events_since and so finalises as
-/// attr:lost-restart whatever the buffer holds, and its narrow notify candidates keep
-/// their events through release_event's held-window test. Counting it would let one root
-/// that stays Capped (a user-owned Software\Policies past the read budget) pin the
-/// watermark at 0 and keep the buffer full for the whole fleet's attribution.
+/// completely read (window_base 0) takes part only while it has an unread notify
+/// (`pending_first`: root -> the first notify stamp not yet read). Idle, such a root's
+/// only candidates have a wide window starting at 0, before events_since, so they
+/// finalise as attr:lost-restart whatever the buffer holds; counting it would let one
+/// root that stays Capped (a user-owned Software\Policies past the read budget) pin the
+/// watermark at 0 and keep the buffer full for the whole fleet's attribution. With an
+/// unread notify (a root the read budget deferred, or one marked again while it was
+/// being read) its next read builds a NARROW candidate from that stamp, and no held
+/// window protects the events of a candidate that does not exist yet: the floor stays at
+/// max(window_base, first - slack) -- exactly the `lo` candidate_window will compute --
+/// until that root is read. For a root with a window_base this never lowers the result
+/// (it is already counted). A notify the watcher delivers after the floor is taken is
+/// bounded by the watcher's delivery latency, like the banner's starved-consumer residual.
 [[nodiscard]] inline std::int64_t
-retention_watermark(const std::map<std::string, RegistryRootState>& roots) {
+retention_watermark(const std::map<std::string, RegistryRootState>& roots,
+                    const std::map<std::string, std::int64_t>& pending_first) {
     std::int64_t m = std::numeric_limits<std::int64_t>::max();
-    for (const auto& [_, st] : roots)
+    for (const auto& [root, st] : roots) {
         if (st.window_base != 0)
             m = std::min(m, st.window_base);
+        if (const auto p = pending_first.find(root); p != pending_first.end() && p->second != 0)
+            m = std::min(m, std::max(st.window_base, p->second - kEtwWindowSlack100ns));
+    }
     return m;
 }
 

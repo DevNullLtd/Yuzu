@@ -82,6 +82,14 @@ public:
         return it != m_.end() && it->second.dirty;
     }
 
+    /// The first notify of the burst not yet read for `root` (0 = clean): the stamp the
+    /// root's next read builds its window from.
+    [[nodiscard]] std::int64_t first(const std::string& root) const {
+        std::lock_guard lock(mu_);
+        const auto it = m_.find(root);
+        return it == m_.end() ? 0 : it->second.first;
+    }
+
     /// The most recent notify for `root` (0 = none yet).
     [[nodiscard]] std::int64_t last(const std::string& root) const {
         std::lock_guard lock(mu_);

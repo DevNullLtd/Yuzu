@@ -483,10 +483,17 @@ cursor.** What it adds to the pattern:
   sequence identity. It is not persisted: a restart, or a disable and
   re-enable, loses it, and the candidates it would have attributed are written
   `attr:lost-restart`. A root that is never completely read keeps its
-  `window_base` at 0 and is left out of the watermark: every wide-window candidate
-  of such a root has `window_lo` 0, before `events_since`, so it finalises
-  `attr:lost-restart` whatever the buffer holds, and its narrow notify candidates
-  keep their events through the held-window test. A root that was complete once
+  `window_base` at 0 and is left out of the watermark while it has no unread
+  notify: every wide-window candidate of such a root has `window_lo` 0, before
+  `events_since`, so it finalises `attr:lost-restart` whatever the buffer holds,
+  and an idle one that stays Capped does not pin the buffer for the fleet. An
+  unread notify changes that. A root the read budget deferred, or one marked
+  again while it was being read, has no candidate yet, so the held-window test
+  protects nothing of it: its next read builds a narrow window from the first
+  unread notify, and until that read the floor stays at
+  `max(window_base, first - slack)` (the pending stamps are passed to
+  `retention_watermark`; the same floor ages the loss epochs). The pin ends when
+  the root is read, which the fair rotation bounds. A root that was complete once
   and then stays Capped keeps its last `window_base` and so holds the watermark
   there: the buffer fills to the cap and the eviction shows as recurring
   `gap:loss` rows and `attr:degraded` (no volume guard is added).

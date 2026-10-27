@@ -368,7 +368,14 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
         cur.hku = sids;
         // No future window starts before the minimum window_base, nor does any held one
         // start before its own lo: an epoch ending before both can never intersect again.
-        const std::int64_t watermark = retention_watermark(cur.roots);
+        // A root whose notify is still unread (the read budget deferred it, or it was marked
+        // again during its own read) has no candidate yet, so its pending window is counted
+        // here too: the event floor and the loss-epoch floor are one value.
+        std::map<std::string, std::int64_t> pending_first;
+        for (const auto& root : roots)
+            if (const auto first = reader_.dirty->first(root); first != 0)
+                pending_first.emplace(root, first);
+        const std::int64_t watermark = retention_watermark(cur.roots, pending_first);
         std::int64_t floor = watermark;
         for (const auto& h : cur.held)
             floor = std::min(floor, h.window_lo);

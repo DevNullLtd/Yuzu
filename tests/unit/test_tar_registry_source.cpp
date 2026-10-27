@@ -711,16 +711,18 @@ TEST_CASE("RegistryEtwBuffer retires by sequence identity and counts what it evi
 
 TEST_CASE("retention rule (R5): the watermark and held windows decide what is released",
           "[tar][registry][pure]") {
+    constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
+    const std::map<std::string, std::int64_t> none; // no root has an unread notify
     std::map<std::string, RegistryRootState> roots;
-    CHECK(retention_watermark(roots) == std::numeric_limits<std::int64_t>::max()); // no roots
+    CHECK(retention_watermark(roots, none) == kMax); // no roots
     roots["a"].window_base = 100;
-    roots["b"].window_base = 0; // never completely read: it holds nothing back (see the rule)
-    CHECK(retention_watermark(roots) == 100);
+    roots["b"].window_base = 0; // never completely read, idle: it holds nothing back (see the rule)
+    CHECK(retention_watermark(roots, none) == 100);
     roots["a"].window_base = 0;
-    CHECK(retention_watermark(roots) == std::numeric_limits<std::int64_t>::max()); // none to protect
+    CHECK(retention_watermark(roots, none) == kMax); // none to protect
     roots["a"].window_base = 100;
     roots["b"].window_base = 200;
-    CHECK(retention_watermark(roots) == 100);
+    CHECK(retention_watermark(roots, none) == 100);
 
     RegistryEtwBuffer buf;
     for (std::int64_t ts : {50, 90, 100, 150})
@@ -728,7 +730,7 @@ TEST_CASE("retention rule (R5): the watermark and held windows decide what is re
     std::vector<RegistryCandidate> held{cand("changed", "v", 4, 4, 80, 95)};
     const auto batch = buf.snapshot();
     buf.retire(batch.last_seq, [&](const RegistryEtwEvent& e) {
-        return release_event(e, retention_watermark(roots), held);
+        return release_event(e, retention_watermark(roots, none), held);
     });
     std::set<std::int64_t> kept;
     for (const auto& e : buf.snapshot().items)
@@ -738,6 +740,35 @@ TEST_CASE("retention rule (R5): the watermark and held windows decide what is re
     // 100: at the watermark -> released. 150: newer than the watermark -> kept even with no
     // held window (root `a` may still produce a candidate whose window reaches it).
     CHECK(kept == std::set<std::int64_t>{90, 150});
+}
+
+TEST_CASE("retention floor: a never-complete root holds it only while it has an unread notify",
+          "[tar][registry][pure]") {
+    constexpr std::int64_t kSlack = kEtwWindowSlack100ns;
+    const std::map<std::string, std::int64_t> none;
+    std::map<std::string, RegistryRootState> roots;
+    roots["a"].window_base = 5 * kSlack;
+    roots["b"].window_base = 0;
+
+    // b's next read builds a narrow candidate from `first`, so its window starts at
+    // first - slack: the floor drops to exactly that, and no lower
+    CHECK(retention_watermark(roots, {{"b", 3 * kSlack}}) == 2 * kSlack);
+    // a burst starting within a slack of 0 floors at 0: nothing of it can be released
+    CHECK(retention_watermark(roots, {{"b", kSlack / 2}}) == 0);
+    // read (or never marked): the complete roots alone again
+    CHECK(retention_watermark(roots, none) == 5 * kSlack);
+    // a stamp for a root that left the scope does not take part
+    CHECK(retention_watermark(roots, {{"gone", 1}}) == 5 * kSlack);
+    // every root idle and never complete: nothing to protect
+    roots["a"].window_base = 0;
+    CHECK(retention_watermark(roots, none) == std::numeric_limits<std::int64_t>::max());
+
+    // An unread notify never lowers a root that has a window_base: its next window is
+    // max(window_base, first - slack) >= window_base, which is already counted.
+    roots["a"].window_base = 100 * kSlack;
+    roots["b"].window_base = 0;
+    CHECK(retention_watermark(roots, {{"a", 50 * kSlack}}) == 100 * kSlack);
+    CHECK(retention_watermark(roots, {{"a", 500 * kSlack}}) == 100 * kSlack);
 }
 
 TEST_CASE("record keys are length-framed and never carry a NUL", "[tar][registry][pure]") {
@@ -1650,7 +1681,7 @@ TEST_CASE("registry source: an eviction during loss sampling cannot select the s
     CHECK(rows.rows[0][2] == "attr:ambiguous:2");
 }
 
-TEST_CASE("registry source: a root that stays Capped does not pin the event buffer",
+TEST_CASE("registry source: an idle root that stays Capped does not pin the event buffer",
           "[tar][registry][lifecycle]") {
     auto t = make_db();
     Fake f;
@@ -1666,12 +1697,103 @@ TEST_CASE("registry source: a root that stays Capped does not pin the event buff
     REQUIRE(base2 != 0);
 
     // An event older than the one completely-read root's last read can never be matched again;
-    // the Capped root (read again every tick) must not keep it.
+    // the Capped root, which has no unread notify, must not keep it. (With an unread notify
+    // it does: see the budget-deferral case below.)
     src->push_event_for_test(ev(base2 - SEC, 1, RegistryEtwOp::Set, "old"));
     REQUIRE(src->buffer_for_test().size() == 1);
     f.clock = base2 + 10 * SEC;
     tick(t.db, *src);
     CHECK(src->buffer_for_test().size() == 0);
+}
+
+namespace {
+
+// kRoot (Capped, never complete) and kRoot2 (complete) are both notified. Tick 2's first read
+// (kRoot2, by the fair rotation) spends the read budget, so kRoot is deferred: still unread,
+// with a second writer's event and a fresh notify arriving during that read. Construction
+// runs both ticks; `kernel_loss` reports a kernel loss during tick 2.
+struct BudgetDeferral {
+    TestDb t = make_db();
+    Fake f;
+    bool exhaust{false};
+    std::unique_ptr<RegistryCursorSource> src;
+
+    explicit BudgetDeferral(bool kernel_loss) {
+        auto r = f.reader();
+        auto read = r.read_subtree;
+        r.read_subtree = [this, read](const std::string& root, std::int64_t deadline) {
+            auto result = read(root, deadline);
+            if (exhaust && root == kRoot2) {
+                f.buffer->push(ev(T0 + 102 * SEC, 22, RegistryEtwOp::Set, "Start"));
+                f.dirty->mark(kRoot, T0 + 102 * SEC);
+                f.clock += kSnapshotBudget100ns + SEC; // the budget is spent: kRoot is not reached
+            }
+            return result;
+        };
+        src = make_registry_cursor_source(scope2(), std::move(r));
+        src->start(t.db);
+        auto capped = svc(1);
+        capped.status = RegistryReadStatus::Capped;
+        f.reads[kRoot] = capped;
+        f.reads[kRoot2] = complete({{kRoot2 + "\\S", {{"Count", vread(4, dword(1))}}}});
+        tick(t.db, *src);
+        REQUIRE(read_cursor(t.db).roots.at(kRoot).window_base == 0);
+
+        f.clock = T0 + 101 * SEC;
+        capped = svc(2);
+        capped.status = RegistryReadStatus::Capped;
+        f.reads[kRoot] = capped;
+        burst(f, kRoot, T0 + 100 * SEC, T0 + 100 * SEC);
+        burst(f, kRoot2, T0 + 100 * SEC, T0 + 100 * SEC);
+        src->push_event_for_test(ev(T0 + 100 * SEC, 11, RegistryEtwOp::Set, "Start"));
+        f.loss.events_lost = kernel_loss ? 1 : 0;
+        exhaust = true;
+        f.read_calls.clear();
+        tick(t.db, *src);
+        exhaust = false;
+        REQUIRE(f.read_calls == std::vector<std::string>{kRoot2}); // kRoot was deferred
+        REQUIRE(f.dirty->peek_dirty(kRoot));                       // ... and is still unread
+        REQUIRE(f.buffer->pushed() == 2);
+        REQUIRE(f.buffer->drop_info().count == 0);
+    }
+};
+
+} // namespace
+
+// A never-complete root the read budget deferred has an unread notify but no candidate yet,
+// so no held window protects its events: the retention floor must.
+TEST_CASE("registry source: a budget-deferred never-complete root keeps its pending window's events",
+          "[tar][registry][lifecycle]") {
+    BudgetDeferral d(false);
+    // the positive control: kRoot2's read advanced the watermark past pid 11's event, and the
+    // pending window (burst start less the slack) still holds both writers' events
+    CHECK(d.src->buffer_for_test().size() == 2);
+
+    d.f.clock = T0 + 401 * SEC;
+    tick(d.t.db, *d.src);
+    const auto rows = q(d.t.db, "SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
+    REQUIRE(rows.rows.size() == 1);
+    CHECK(rows.rows[0][0] == "0"); // two writers: never the survivor
+    CHECK(rows.rows[0][1] == "attr:ambiguous:2");
+    CHECK(q(d.t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:loss:%'")
+             .rows.at(0).at(0) == "0");
+}
+
+TEST_CASE("registry source: a budget-deferred never-complete root keeps the loss epochs its window reaches",
+          "[tar][registry][lifecycle]") {
+    BudgetDeferral d(true);
+    // the positive control: tick 2 recorded the epoch (one gap:loss row), and the deferred
+    // root's pending window still reaches it, so it is not aged out
+    REQUIRE(read_cursor(d.t.db).loss.size() == 1);
+
+    d.f.clock = T0 + 401 * SEC;
+    tick(d.t.db, *d.src);
+    const auto rows = q(d.t.db, "SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
+    REQUIRE(rows.rows.size() == 1);
+    CHECK(rows.rows[0][0] == "0");
+    CHECK(rows.rows[0][1] == "attr:degraded");
+    CHECK(q(d.t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:loss:%'")
+             .rows.at(0).at(0) == "1");
 }
 
 TEST_CASE("registry source: read statuses; status keys; fair root scheduling",
