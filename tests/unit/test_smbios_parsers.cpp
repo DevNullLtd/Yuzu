@@ -345,7 +345,10 @@ void require_prefix_of(const sm::SmbiosTable& r, const sm::SmbiosTable& full) {
 Bytes read_file(const fs::path& p) {
     REQUIRE(fs::exists(p));
     std::ifstream f(p, std::ios::binary);
-    return Bytes{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+    REQUIRE(f.is_open());
+    Bytes out{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+    REQUIRE_FALSE(out.empty()); // an unreadable fixture must fail, not feed the sweeps empty input
+    return out;
 }
 Bytes kingsley() {
     return read_file(fs::path{YUZU_TEST_FIXTURE_DIR} / "hardware-estate" / "smbios" / "kingsley-rsmb.bin");

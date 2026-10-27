@@ -1,8 +1,9 @@
 // smbios_parsers.hpp -- one shared, bounds-checked SMBIOS structure-table walker and typed
 // decoders for structure types 0 (BIOS), 1 (System), 2 (Baseboard), 3 (Chassis), 4 (Processor)
-// and 17 (Memory Device). Pure C++: no OS header, no I/O, nothing throws on any input. Each OS leg
-// only fetches the bytes (Windows GetSystemFirmwareTable('RSMB'), Linux the DMI table) and hands
-// them here.
+// and 17 (Memory Device). Pure C++: no OS header, no I/O, and no parse path throws on any input
+// (std::bad_alloc from growing the result is the one exception the walker does not catch). Each OS
+// leg only fetches the bytes (Windows GetSystemFirmwareTable('RSMB'), Linux the DMI table) and
+// hands them here.
 //
 // Two framings, one walk:
 //   parse_rsmb(bytes)   the Windows RawSMBIOSData buffer: an 8-byte header (Used20CallingMethod,
@@ -10,6 +11,11 @@
 //   parse_table(bytes)  the headerless structure table (the Linux DMI table, or an RSMB body
 //                       with its header already stripped). parse_rsmb validates the header and
 //                       calls parse_table on exactly the Length bytes it claims.
+//
+// Walk rules. The first structure of types 0-3 wins (later ones are stepped over); types 4 and 17
+// collect every structure up to the cap. The string set of a structure is scanned BEFORE its type
+// is looked at, so a type 127 end marker whose string set is unterminated is `truncated`, not a
+// clean end. parse_rsmb walks exactly the Length the header claims; bytes past it are ignored.
 //
 // Failure model. A PER-TYPE fault (a structure shorter than its type's minimum layout, or a
 // string index that runs past its own string set) marks only that entry `Status::malformed`; the
@@ -23,8 +29,12 @@
 // Unknown and reserved values. Every DSP0134 `unknown` sentinel and every `reserved` value
 // decodes to nullopt, never a concrete number (core/thread count byte 0 and word 0 / 0xFFFF, memory
 // size 0xFFFF, memory size 0x7FFF in a layout with no Extended Size field, speed 0 and a zero
-// extended speed). Strings are RAW (right-trimmed only); string index 0 is nullopt. OEM
-// placeholder filtering is the consumer's call (is_placeholder below).
+// extended speed). Four fields are the exception and are RAW DSP0134 codes passed through
+// unnormalised: Type3::chassis_type (bit 7 masked), Type4::family, Type17::form_factor and
+// Type17::memory_type, so a DSP0134 "Unknown" (0x02) arrives as 2, not nullopt. An Extended BIOS
+// ROM Size of 0 (either unit) decodes to rom_size_bytes = 0, not nullopt, to stay byte-identical
+// with firmware_posture's original type-0 parser. Strings are RAW (right-trimmed only); string
+// index 0 is nullopt. OEM placeholder filtering is the consumer's call (is_placeholder below).
 // The walker returns the raw 16 UUID bytes and the RSMB header's major/minor; formatting the UUID
 // (byte order is version dependent, SMBIOS >= 2.6 is little-endian for the first three fields)
 // is the consumer's job.
