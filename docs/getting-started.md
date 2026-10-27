@@ -471,7 +471,7 @@ Expected response:
 ### Walk through the approval flow
 
 > **You need two accounts for this section.** A reviewer account cannot approve or
-> reject its own submission — the server rejects self-review with HTTP 400
+> reject its own submission: the server rejects self-review with HTTP 400
 > (`"reviewer cannot be the same as the submitter"`), and the dashboard shows
 > "You submitted this — another reviewer must approve" instead of buttons on
 > your own requests. If you have been following along as a single admin,

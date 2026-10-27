@@ -627,13 +627,15 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
     [Step-up on high-risk surfaces](authentication.md#step-up-on-high-risk-surfaces-pr-2)). A proof
     made before the account's current enrolment does not count: if MFA was disabled and enrolled again,
     enter a fresh code. If the account itself has been deleted or deactivated while you were signed in,
-    the decision is refused with `403` and `approver_assurance_required:account_unavailable`; sign in
-    again or contact an administrator.
+    the decision is refused: with step-up on (the default) the central check answers first with `401`
+    `MFA step-up required`, and `403` `approver_assurance_required:account_unavailable` appears only with
+    `--mfa-step-up-window-secs=0` (or when the account is removed in the middle of the request). Either way, sign in again or contact an administrator.
   - **OIDC single sign-on.** There is no local factor to check. The sign-in must have carried an MFA
     method claim (`amr`) from your identity provider, on an ID token issued within the approver window
     (at most 300 seconds, and shorter if `--mfa-step-up-window-secs` is lower). "Fresh" here means the
-    provider asserted MFA recently, **not** that you were asked for a
-    second factor again when you approved; real re-authentication at approval time is a planned
+    provider issued an ID token with an MFA `amr` within the window; the MFA itself may predate the token,
+    because the provider can reuse its own session. You are **not** asked for a
+    second factor again when you approve; real re-authentication at approval time is a planned
     follow-up. A sign-in with no MFA `amr` (or an ID token with no usable `iat`) is refused with `403` and
     `approver_assurance_required:mfa_proof_missing`; sign in again through your identity provider with
     MFA, or ask an administrator to have the provider assert `amr` for approvers. If the identity provider re-authenticates you silently without asserting an MFA `amr`, the retry returns `403` `mfa_proof_missing` again; complete provider-side MFA (for example by signing out of the provider first) and then retry. Real re-authentication at approval time is a planned follow-up. With step-up on and `--mfa-enforcement`
@@ -646,6 +648,10 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   - **SAML.** Refused with `403` (#4935). With step-up on (the default) the central check's generic `403`
     "MFA step-up is not available for SAML sessions in this release" answers first; the typed
     `approver_assurance_required:saml_mfa_unsupported` appears only with `--mfa-step-up-window-secs=0`.
+
+  On a default install (RBAC enforcement off, `--mfa-enforcement=optional`) the only approvers are
+  administrators, and an administrator who has not enrolled a factor in Settings is refused
+  `mfa_not_enrolled`, so enrol each administrator before the first approval is needed.
 
   A non-admin approver cannot enrol itself in the default modes. Local enrolment happens at sign-in only
   for accounts that `--mfa-enforcement` protects (`optional` protects nobody; `admin-only` protects
@@ -1602,7 +1608,7 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 | **Definitions** | Browse, search, create, edit, and delete instruction definitions. Supports both form mode and CodeMirror YAML editor. |
 | **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, the wall-clock dispatch time in the operator's local timezone (`HH:MM:SS.mmm <TZ>`, e.g. `12:22:33.251 BST`; full ISO-8601 UTC on hover), and — on failed rows — an 80-character preview of the most recent agent error. The "Fan-out" cell shows succeeded / failed / targeted counts that update in real time as agents respond. Click any row to expand an inline drawer that **live-updates via SSE as responses arrive** — no page reload required. The drawer shows a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a responses table with a **Time** column showing the server-side response arrival time at millisecond precision (same wall-clock format as above). The drawer is keyboard-reachable via Tab and Enter/Space. The Executions page (`/executions`) takes `?definition_id=<id>` and `?status=<s>` to pre-filter the list and `?id=<execution>` to open one. |
 | **Schedules** | Create, enable/disable, and delete recurring schedules. Shows next and last execution times. |
-| **Approvals** | Review pending approval requests. Approve or reject with comments. The sidebar's Approvals entry shows the pending count. A submitting account cannot review its own request (account names are compared; see [Who can approve](#who-can-approve)) — a pending row you submitted shows "You submitted this — another reviewer must approve" instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
+| **Approvals** | Review pending approval requests. Approve or reject with comments. The sidebar's Approvals entry shows the pending count. A submitting account cannot review its own request (account names are compared; see [Who can approve](#who-can-approve)). A pending row you submitted shows a "You submitted this" hint saying another reviewer must approve, instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
 
 **Executions and Approvals pages.** `/executions` and `/approvals` are read-only pages in the sidebar under Instructions: Executions lists the dispatch history with the same status counters as the tab, and Approvals lists the approval queue, pending first. Both honour your access scope and show a note, not an empty list, when a store cannot be read. Executing stays on the Instructions tab. On `/approvals`, pending rows carry Approve and Reject buttons (dialog with an optional comment). On `/executions`, selecting a row shows per-device results; a running execution updates live over SSE (a chip shows the stream state); and **Cancel execution** (dialog, shown when you may cancel and the execution is not finished) cancels it. Fleet-wide figures (today, all time, device success rate, average duration) appear for unconfined operators only and are hidden when the store cannot be read.
 

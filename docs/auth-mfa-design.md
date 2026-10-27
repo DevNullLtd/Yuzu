@@ -392,7 +392,7 @@ unreadable one (local sessions) are new. The full description is in
 `Config::mfa_enforcement` (CLI `--mfa-enforcement`, env
 `YUZU_MFA_ENFORCEMENT`):
 
-- `optional` (default) — login does not require MFA. An administrator may
+- `optional` (default): login does not require MFA. An administrator may
   enrol its own account in Settings; the Settings enrolment routes are
   administrator-only, so a non-admin cannot enrol itself in this mode.
 - `admin-only` — an admin without MFA must enrol before login completes.
@@ -580,7 +580,7 @@ Every transition writes to `AuditStore` via `AuthRoutes::audit_log`
 | `mfa.enroll.verified` | `POST /api/settings/mfa/verify` or `POST /login/mfa/enroll`: first code accepted. A Settings confirm also stamps a step-up proof on the confirming session; the detail is `step_up_proof=stamped`, or `step_up_proof=not_stamped` when the session could not be stamped (bearer principal, absent or mismatched cookie, or a store failure) |
 | `mfa.enroll.failed` | First code rejected (Settings or login bootstrap); or, detail `credential_changed` (#5342 F4), an enrolment write — Settings init/verify, the `POST /login` bootstrap init, or `POST /login/mfa/enroll` — found the account's password changed since its credential anchor was established (nothing revealed, written or enrolled) |
 | `mfa.enroll.race` | Result `ok` — a concurrent verify already resolved enrollment; the benign loser, kept out of the `mfa.enroll.failed` bad-code population (#3777, CC7.2) |
-| `mfa.disabled` | `POST /api/settings/mfa/disable` (`ok` + `sessions_ended=<n>`; `ok` + `no verified factor to clear` when an unfinished enrolment was cancelled and no session ended; `partial` + `sessions_ended=failed` when the factor was cleared but its sessions were not ended; `error` + `disable failed (sessions_ended=<n>\|failed)` when the clear itself failed (its sessions are still ended); `error` + `blocked: mfa_enforcement=<mode>` when the self-target guard fires) |
+| `mfa.disabled` | `POST /api/settings/mfa/disable` (an `attempted` + `MFA clear requested via Settings` intent row first, written before the factor is touched and fail-closed: the route answers `503` and changes nothing if it is not accepted; then the outcome row: `ok` + `sessions_ended=<n>`; `ok` + `no verified factor to clear` when an unfinished enrolment was cancelled and no session ended; `partial` + `sessions_ended=failed` when the factor was cleared but its sessions were not ended; `error` + `disable failed (sessions_ended=<n>\|failed)` when the clear itself failed (its sessions are still ended); `error` + `blocked: mfa_enforcement=<mode>` when the self-target guard fires) |
 | `mfa.login.required` | `POST /login` returned a pending token |
 | `mfa.login.verified` | `POST /login/mfa` TOTP code accepted |
 | `mfa.login.failed` | `POST /login/mfa` rejected (TOTP or recovery) |
