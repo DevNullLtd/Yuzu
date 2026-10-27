@@ -14,6 +14,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -274,9 +275,10 @@ TEST_CASE("NAT64 discovery is single-flight: N concurrent callers with a blocked
     DiscoveryRig rig;
     auto pool = std::make_shared<net::ResolverPool>(1); // the production discovery pool shape
     auto latch = std::make_shared<Latch>();
-    std::atomic<int> lookups{0};
-    rig.lookup = [latch, &lookups](const std::string&) -> net::ResolveResult {
-        ++lookups;
+    const auto lookups_p = std::make_shared<std::atomic<int>>(0);
+    auto& lookups = *lookups_p;
+    rig.lookup = [latch, lookups_p](const std::string&) -> net::ResolveResult {
+        ++*lookups_p;
         latch->wait();
         return {net::ResolveStatus::kOk, {kPref1}};
     };
@@ -316,9 +318,10 @@ TEST_CASE("NAT64 discovery: waiters share the leader's answer (no expiry stamped
     using namespace std::chrono_literals;
     DiscoveryRig rig;
     auto pool = std::make_shared<net::ResolverPool>(1);
-    std::atomic<int> lookups{0};
-    rig.lookup = [&lookups](const std::string&) -> net::ResolveResult {
-        ++lookups;
+    const auto lookups_p = std::make_shared<std::atomic<int>>(0);
+    auto& lookups = *lookups_p;
+    rig.lookup = [lookups_p](const std::string&) -> net::ResolveResult {
+        ++*lookups_p;
         std::this_thread::sleep_for(150ms);
         return {net::ResolveStatus::kOk, {kPref1}};
     };
@@ -367,11 +370,12 @@ TEST_CASE("NAT64 discovery: a waiter whose leader ended inconclusive does not st
     using namespace std::chrono_literals;
     DiscoveryRig rig;
     auto pool = std::make_shared<net::ResolverPool>(1);
-    std::atomic<int> lookups{0};
+    const auto lookups_p = std::make_shared<std::atomic<int>>(0);
+    auto& lookups = *lookups_p;
     // The leader's lookup is slow, then reports busy-equivalent (inconclusive via a clamped
     // timeout): 40 ms budget against a 300 ms lookup.
-    rig.lookup = [&lookups](const std::string&) -> net::ResolveResult {
-        ++lookups;
+    rig.lookup = [lookups_p](const std::string&) -> net::ResolveResult {
+        ++*lookups_p;
         std::this_thread::sleep_for(300ms);
         return {net::ResolveStatus::kOk, {kPref1}};
     };
@@ -418,9 +422,10 @@ TEST_CASE("NAT64 discovery: a CLAMPED leader's timeout leaves the cache untouche
     DiscoveryRig rig;
     auto pool = std::make_shared<net::ResolverPool>(1);
     auto latch = std::make_shared<Latch>();
-    std::atomic<int> lookups{0};
-    rig.lookup = [latch, &lookups](const std::string&) -> net::ResolveResult {
-        ++lookups;
+    const auto lookups_p = std::make_shared<std::atomic<int>>(0);
+    auto& lookups = *lookups_p;
+    rig.lookup = [latch, lookups_p](const std::string&) -> net::ResolveResult {
+        ++*lookups_p;
         latch->wait();
         return {net::ResolveStatus::kOk, {kPref1}};
     };
@@ -492,4 +497,73 @@ TEST_CASE("NAT64 cache: an overflow is reported once and counts each refusal",
     CHECK_FALSE(again.overflow_started);
     CHECK(rig.cache.stats.overflow_refusals.load() >= 1);
     CHECK(rig.cache.overflow_logged);
+}
+
+// Chaos CH-9/9b: a lookup path that throws AFTER the cache holds state must hand back that state,
+// never a default "not overflowed, nothing learned" (which would skip the overflow refusal and every
+// learned prefix).
+TEST_CASE("NAT64 discovery: a thrown flight still returns the learned prefixes and the overflow flag",
+          "[bounded_resolver][nat64_discovery]") {
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    SECTION("learned prefixes are returned") {
+        DiscoveryRig rig;
+        REQUIRE(discover(kFullBudget, answering({kPref1}), rig.cache, pool).prefixes.size() == 1);
+        rig.expire();
+        rig.cache.test_fault_after_lookup = [] { throw std::bad_alloc(); };
+        const auto d = discover(kFullBudget, answering({kPref1}), rig.cache, pool);
+        CHECK(d.inconclusive);
+        CHECK(d.ever_answered);
+        CHECK_FALSE(d.overflowed);
+        CHECK(d.prefixes.size() == 1);
+    }
+    SECTION("an overflowed cache stays overflowed") {
+        DiscoveryRig rig;
+        std::vector<std::string> many;
+        for (int i = 0; i < 65; ++i) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "2001:db8:%x:1::c000:aa", i + 1);
+            many.emplace_back(buf);
+        }
+        REQUIRE(discover(kFullBudget, answering(many), rig.cache, pool).overflowed);
+        rig.expire();
+        rig.cache.test_fault_after_lookup = [] { throw std::bad_alloc(); };
+        const auto d = discover(kFullBudget, answering(many), rig.cache, pool);
+        CHECK(d.inconclusive);
+        CHECK(d.overflowed); // the old code returned overflowed=false here (fail-open)
+    }
+}
+
+// Never-shrink and busy-pool mutation guards.
+TEST_CASE("NAT64 discovery: a failed or inconclusive refresh removes nothing; a busy pool is inconclusive",
+          "[bounded_resolver][nat64_discovery]") {
+    DiscoveryRig rig;
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    REQUIRE(discover(kFullBudget, answering({kPref1}), rig.cache, pool).prefixes.size() == 1);
+    rig.expire();
+    const auto failed = discover(kFullBudget, failing(), rig.cache, pool);
+    CHECK(failed.stale);
+    CHECK(failed.prefixes.size() == 1);
+    rig.expire();
+    const auto none = discover(kFullBudget, answering({"192.0.0.170"}), rig.cache, pool);
+    CHECK(none.prefixes.size() == 1); // an A-only answer adds and removes nothing
+    rig.expire();
+    // Pool already full: the lookup is refused kBusy -> inconclusive, nothing recorded.
+    auto latch = std::make_shared<Latch>();
+    const net::LookupFn blocked = [latch](const std::string&) -> net::ResolveResult {
+        latch->wait();
+        return {net::ResolveStatus::kOk, {kPref1}};
+    };
+    (void)net::bounded_resolve("blocker.example", 1ms, blocked, pool); // pins the one slot
+    const auto before = rig.cache.stats.inconclusive.load();
+    const auto busy = discover(kFullBudget, answering({kPref1}), rig.cache, pool);
+    CHECK(busy.inconclusive);
+    CHECK(busy.prefixes.size() == 1);
+    CHECK(rig.cache.stats.inconclusive.load() == before + 1);
+    {
+        std::lock_guard lk(rig.cache.mu);
+        CHECK_FALSE(rig.cache.last_failed);
+    }
+    latch->release();
+    for (int i = 0; i < 400 && pool->in_flight.load() > 0; ++i)
+        std::this_thread::sleep_for(10ms);
 }

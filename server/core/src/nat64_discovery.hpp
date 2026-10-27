@@ -3,7 +3,7 @@
 /// @file nat64_discovery.hpp
 /// ONE process-wide cache of the NAT64 prefixes the network advertises (RFC 7050: the AAAA answer
 /// for `ipv4only.arpa` carries the prefix wrapped around 192.0.0.170/171). Shared by every egress
-/// check - the OIDC client and the CRL-source registration check (and the later CRL fetcher) - so
+/// check - the OIDC client today, and any later egress check - so
 /// a prefix learned by one is known to all and there is no second, differently-behaved copy.
 ///
 /// NEVER SHRINKS. A prefix, once learned, is kept for the life of the process: an answered refresh
@@ -19,12 +19,12 @@
 ///
 /// An INCONCLUSIVE outcome is never remembered, so it cannot persist: the next call looks again (the
 /// resolver pool's cap bounds the cost). A resolver that is busy or too slow for every caller's
-/// budget therefore keeps registrations at 503 (`dns_busy` / `nat64_discovery_unavailable`) until
-/// it recovers, which is the intended fail-closed behaviour.
+/// budget therefore stays inconclusive (classified without the learned set, or refused by a
+/// consumer that fails closed) until it recovers, which is the intended behaviour.
 ///
 /// A caller must also treat "no lookup has EVER answered" (`ever_answered == false`) as unknown,
 /// not as "no translator": the OIDC path logs and proceeds (its historical behaviour), the
-/// revocation-source registration refuses with a retryable 503.
+/// a consumer that gates admission may refuse with a retryable error.
 
 #include "oidc_egress_policy.hpp"
 
@@ -199,9 +199,9 @@ inline Nat64Discovery run_flight(const Nat64LookupFn& lookup, Nat64DiscoveryCach
                 // any future one) gets the same single line and none can forget or repeat it.
                 spdlog::error("NAT64 discovery: the NAT64 prefix answer for ipv4only.arpa would "
                               "exceed {} learned prefixes; the learned set is frozen in overflow "
-                              "and IPv6 destinations are refused (OIDC IdP fetches and CRL source "
-                              "registrations) until a later answer fits or the server is "
-                              "restarted. Declare the real prefix with --oidc-nat64-prefix.",
+                              "and IPv6 destinations are refused (OIDC IdP fetches) until a later "
+                              "answer fits or the server is restarted. --oidc-nat64-prefix does NOT "
+                              "clear this; a restart does.",
                               kMaxDiscoveredNat64Prefixes);
             }
         } else {
@@ -294,11 +294,24 @@ inline Nat64Discovery run_flight(const Nat64LookupFn& lookup, Nat64DiscoveryCach
         return detail::run_flight(lookup, cache);
     } catch (...) {
         // An allocation failure (or anything else) while parsing/merging: this call is
-        // inconclusive; the guard clears the flight, so the next caller can look again.
+        // inconclusive; the guard clears the flight, so the next caller can look again. It must
+        // still carry the cache's CURRENT state: a fresh default would read as "not overflowed,
+        // nothing learned" and let the caller skip the overflow refusal and every learned prefix.
         Nat64Discovery d;
         d.looked_up = true;
         d.stale = true;
         d.inconclusive = true;
+        try {
+            std::lock_guard lock(cache.mu);
+            d.ever_answered = cache.ever_answered;
+            d.overflowed = cache.overflowed;
+            if (!cache.overflowed)
+                d.prefixes = cache.prefixes; // may itself throw: handled below
+        } catch (...) {
+            // Cannot even copy the set: fail CLOSED (refuse), never open.
+            d.prefixes.clear();
+            d.overflowed = true;
+        }
         return d;
     }
 }

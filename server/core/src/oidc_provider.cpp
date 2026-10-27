@@ -964,8 +964,9 @@ struct ResolvedAddress {
     std::array<unsigned char, 16> bytes{};
 };
 
-// This provider's OWN resolver pool for the host vet (cap 8, never shared with the NAT64 probe's
-// cap-1 pool or any other lookup). Never destroyed: detached workers may still hold it at exit.
+// The OIDC host vet's resolver pool: PROCESS-WIDE (cap 8), shared by every OIDC fetch, live
+// sign-ins and Settings "Test Connection" alike, but never with the NAT64 probe's cap-1 pool. A
+// hung resolver can pin all 8 slots; further vets then fail at once as "did not resolve". Never destroyed: detached workers may still hold it at exit.
 // On Windows the vet uses GetAddrInfoExW (below) and the pool stays idle.
 constexpr int kOidcResolverCap = 8;
 std::shared_ptr<::yuzu::server::net::ResolverPool> oidc_resolver_pool() {
@@ -1140,8 +1141,8 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
 // attacker wants unclassified.
 constexpr const char* kEgressNat64OverflowReason = OidcProvider::kEgressNat64Overflow;
 
-// The NAT64 discovery cache is the shared one (nat64_discovery.hpp): the revocation-source
-// registration check reads and fills the SAME process-wide set, never a second copy.
+// The NAT64 discovery cache is the shared one (nat64_discovery.hpp): any later egress
+// check reads and fills the SAME process-wide set, never a second copy.
 using ::yuzu::server::net::kMaxDiscoveredNat64Prefixes;
 using ::yuzu::server::net::Nat64DiscoveryCache;
 Nat64DiscoveryCache& nat64_discovery_cache() { return ::yuzu::server::net::process_nat64_cache(); }
@@ -1150,9 +1151,9 @@ Nat64DiscoveryCache& nat64_discovery_cache() { return ::yuzu::server::net::proce
 // (some AAAA), kAnsweredNone (the resolver answered "no such name/data", or only A records: no
 // DNS64 here, a NORMAL network), kFailed (timeout, SERVFAIL, resolver unavailable), kInconclusive
 // (the resolver pool was busy: nothing was asked, nothing is remembered). NXDOMAIN is an ANSWER,
-// exactly as the CRL-source registration check treats it (resolver_errors.hpp). The shared cache
+// as the shared classifier defines it (resolver_errors.hpp). The shared cache
 // SINGLE-FLIGHTS this lookup process-wide and it runs in a cap-1 resolver pool (nat64_probe.hpp),
-// so a sign-in burst, or a hung resolver, holds at most one thread and no registration slot.
+// so a sign-in burst, or a hung resolver, holds at most one thread and no host-vet slot.
 ::yuzu::server::net::Nat64LookupOutcome
 lookup_ipv4only_answers(int dns_timeout_ms, std::vector<::yuzu::server::oidc::egress::Ipv6>& out) {
     namespace egress = ::yuzu::server::oidc::egress;
@@ -1185,20 +1186,19 @@ lookup_ipv4only_answers(int dns_timeout_ms, std::vector<::yuzu::server::oidc::eg
                     static_cast<::yuzu::server::net::ResolveStatus>(r.status), r.addresses};
             };
     }
-    // The probe resolves through the SAME bounded resolver (and error classifier) as the CRL-source
-    // registration check, NOT through this file's host resolver: that one reports only success or
+    // The probe resolves through the SAME bounded resolver (and error classifier) as every other discovery consumer, NOT through this file's host resolver: that one reports only success or
     // failure, and httplib's wrapper reports EAI_NODATA for every CFHost error on macOS, which
     // would turn any failure into an "answer". The budget is this provider's own DNS timeout.
     const auto r = ::yuzu::server::net::bounded_resolve(
         ::yuzu::server::net::kNat64ProbeName,
         std::chrono::milliseconds{std::max(1, dns_timeout_ms)}, std::move(probe_lookup),
-        ::yuzu::server::net::nat64_probe_pool()); // cap 1: discovery never takes a registration slot
+        ::yuzu::server::net::nat64_probe_pool()); // cap 1: discovery never takes a host-vet slot
     return ::yuzu::server::net::nat64_outcome_from_resolve(r, /*budget_clamped=*/false, out);
 }
 
 // The prefixes learned from `ipv4only.arpa`, from the shared cache while it is fresh. nullopt = the
 // learned set overflowed: the caller must refuse. A failed lookup is logged and classifies without
-// it until retried (this path's historical behaviour; the registration check refuses instead).
+// it until retried (this path's historical behaviour).
 std::optional<std::vector<::yuzu::server::oidc::egress::Nat64Prefix>>
 discovered_nat64_prefixes(int dns_timeout_ms) {
     const auto d = ::yuzu::server::net::discover_nat64_prefixes_cached(

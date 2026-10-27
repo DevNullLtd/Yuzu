@@ -1096,8 +1096,6 @@ TEST_CASE("OIDC egress: the token POST's pre-check - pinned where the connect is
     }
 }
 
-#endif // !YUZU_OIDC_MOCK_IDP_TSAN
-
 // The OIDC probe's WIRING: which host it asks for, how each resolver status becomes a cache state,
 // and that it never claims a clamped budget (an OIDC lookup uses its own configured timeout).
 TEST_CASE("OIDC egress NAT64: the ipv4only.arpa probe wiring - host, status mapping, caching",
@@ -1109,15 +1107,23 @@ TEST_CASE("OIDC egress NAT64: the ipv4only.arpa probe wiring - host, status mapp
         }
         ~ProbeGuard() { OidcProvider::set_nat64_probe_lookup_for_test({}); }
     };
-    std::atomic<int> probes{0};
-    std::mutex mu;
-    std::vector<std::string> hosts;
-    int status = 1;
-    const auto stub = [&](const std::string& host) {
-        std::lock_guard lk(mu);
-        ++probes;
-        hosts.push_back(host);
-        return Stub{status, {}};
+    // The stub runs on a detached resolver worker that may outlive this test body: its state is
+    // shared-owned, never a reference into this stack frame.
+    struct ProbeState {
+        std::atomic<int> probes{0};
+        std::mutex mu;
+        std::vector<std::string> hosts;
+        std::atomic<int> status{1};
+    };
+    const auto st_p = std::make_shared<ProbeState>();
+    auto& probes = st_p->probes;
+    auto& hosts = st_p->hosts;
+    auto& status = st_p->status;
+    const auto stub = [st_p](const std::string& host) {
+        std::lock_guard lk(st_p->mu);
+        ++st_p->probes;
+        st_p->hosts.push_back(host);
+        return Stub{st_p->status.load(), {}};
     };
     // The target resolves through the system path for a LITERAL, so only the probe is stubbed.
     // The TARGET resolves through the test resolver to an IPv6 address (permitted with the
@@ -1210,3 +1216,5 @@ TEST_CASE("OIDC egress: the host vet resolves through the bounded resolver and d
     CHECK(OidcProvider::resolver_in_flight() == 0);
 }
 #endif
+
+#endif // !YUZU_OIDC_MOCK_IDP_TSAN

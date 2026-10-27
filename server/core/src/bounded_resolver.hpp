@@ -2,8 +2,7 @@
 
 /// @file bounded_resolver.hpp
 /// A name lookup with a hard time bound whose state is OWNED BY THE LOOKUP, never by the caller's
-/// stack. Shared by the revocation-source registration check (revocation_source_service.cpp) and,
-/// later, the CRL fetcher (2b-1b), so the two resolve the same way.
+/// stack. Shared by the OIDC egress path today (and any later egress check), so they resolve the same way.
 ///
 /// WHY NOT httplib's `getaddrinfo_with_timeout`: on glibc it hands a request that lives on the
 /// CALLER's stack to the async resolver, and on timeout it ignores `EAI_NOTCANCELED`, so the
@@ -24,20 +23,19 @@
 /// The lookup function is injectable (`LookupFn`) so a test can block it behind a latch and prove
 /// the timeout, the cap and the not-found paths deterministically, with no DNS.
 ///
-/// POOLS IN USE: the default process-wide pool (cap 16) serves CRL-source registration host lookups;
-/// NAT64 discovery uses its OWN capacity-one pool (`nat64_probe_pool()` in nat64_probe.hpp) so a hung
-/// discovery lookup can never take a registration slot.
+/// POOLS IN USE: the OIDC host-name check has its own cap-8 pool (oidc_provider.cpp); NAT64
+/// discovery uses its OWN capacity-one pool (`nat64_probe_pool()` in nat64_probe.hpp) so a hung
+/// discovery lookup can never take a host-check slot. The default process-wide pool (cap 16) is for
+/// a consumer that passes none.
 ///
-/// CONTRACT FOR CONSUMERS (the registration check today, the CRL fetcher in 2b-1b):
-///  - POOL OWNERSHIP. The default is ONE process-wide pool of `kMaxInFlightLookups`; every consumer
-///    that passes no pool shares it, so a stuck resolver starves all of them together. A consumer
-///    whose lookups must not be starved by another (the fetcher's refresh job vs an operator's
-///    registration) passes its OWN `ResolverPool`, sized for its own concurrency.
+/// CONTRACT FOR CONSUMERS:
+///  - POOL OWNERSHIP. Every consumer that passes no pool shares the process pool, so a stuck
+///    resolver starves all of them together. A consumer whose lookups must not be starved by
+///    another passes its OWN `ResolverPool`, sized for its own concurrency.
 ///  - `kNotFound` IS NOT PROOF OF ABSENCE. It is the resolver's current answer (it may be a
 ///    split-horizon or a poisoned NXDOMAIN, or a transient server failure the OS reported as "no
-///    name"). The registration check treats it as a caller error (400); the fetcher must treat it
-///    as a FAILED FETCH of this cycle and KEEP THE LAST GOOD CRL, never as "the CA has no CRL" or as
-///    a reason to drop revocation state.
+///    name"). A consumer that keeps last-good state must treat it as a failed cycle, never as a
+///    reason to drop that state.
 ///  - `kTemporary`, `kTimeout`, `kBusy` are retryable and mean "unknown".
 ///  - WINDOWS: the Winsock DLL must be initialised (WSAStartup) before the first call. httplib
 ///    initialises it once in a static initialiser, which every server TU links; a consumer in a
@@ -130,8 +128,10 @@ inline ResolveResult system_lookup(const std::string& host) {
     std::memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo* list = nullptr;
-    const int rc = ::getaddrinfo(host.c_str(), "0", &hints, &list);
+    struct addrinfo* raw = nullptr;
+    const int rc = ::getaddrinfo(host.c_str(), "0", &hints, &raw);
+    // Owned from here: a throwing emplace_back below must not leak the list.
+    std::unique_ptr<struct addrinfo, decltype(&::freeaddrinfo)> list(raw, &::freeaddrinfo);
     if (rc != 0 || list == nullptr) {
         // Only the resolver's definitive "no such name / no such data" is kNotFound (the rule lives
         // in resolver_errors.hpp, shared with every other consumer). EVERY other failure
@@ -142,7 +142,7 @@ inline ResolveResult system_lookup(const std::string& host) {
         out.status = not_found ? ResolveStatus::kNotFound : ResolveStatus::kTemporary;
         return out;
     }
-    for (const struct addrinfo* ai = list; ai != nullptr; ai = ai->ai_next) {
+    for (const struct addrinfo* ai = list.get(); ai != nullptr; ai = ai->ai_next) {
         // Copy the sockaddr into a local of the right type (length-checked) rather than casting
         // ai_addr, whose alignment is the resolver's business.
         char buf[INET6_ADDRSTRLEN] = {};
@@ -160,7 +160,6 @@ inline ResolveResult system_lookup(const std::string& host) {
                 out.addresses.emplace_back(buf);
         }
     }
-    ::freeaddrinfo(list);
     out.status = out.addresses.empty() ? ResolveStatus::kNotFound : ResolveStatus::kOk;
     return out;
 }
