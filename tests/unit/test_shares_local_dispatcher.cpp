@@ -298,9 +298,13 @@ TEST_CASE("shares plugin: status row first, source rows next, then well-formed s
         }
     } else if (rows[0].find("windows:shares:netshareenum:level2_permission_denied") !=
                std::string::npos) {
-        // The level-1 fallback (a non-admin runner identity): IPC$ is always published, and
-        // SHARE_INFO_1 has no path, so every share row's path is the placeholder.
-        CHECK(rows.size() >= 3);
+        // The level-1 fallback (a non-admin runner identity). The token only says the fallback
+        // was ATTEMPTED: a level-1 drain that then fails (status_<n>, no_progress) reports one
+        // failed source row and no shares. When the drain succeeded, a running Server service
+        // publishes IPC$ (as on the supported arm above); SHARE_INFO_1 has no path, so every
+        // share row's path is the placeholder.
+        if (starts_with(rows[1], "source|netshareenum|read|"))
+            CHECK(rows.size() >= 3);
         for (std::size_t i = 2; i < rows.size(); ++i) {
             INFO("row " << i << ": " << rows[i]);
             CHECK(wire_fields(rows[i])[3] == "-");

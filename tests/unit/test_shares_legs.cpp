@@ -470,6 +470,37 @@ TEST_CASE("shares windows: level 2 refused falls back to level 1 names without p
     CHECK(has(l, "share|smb|IPC$|-|-|-|ipc,special|netshareenum"));
 }
 
+TEST_CASE("shares windows: the level-1 fallback that then fails reports no shares, both tokens",
+          "[shares]") {
+    // The fallback token says the retry was attempted, not that it succeeded: a level-1 drain
+    // that fails leaves ONE failed source row (two wire rows with the status row) and no share.
+    for (const std::uint32_t st : {8u, kWinMoreData}) { // status_8 / no_progress (empty page)
+        FakeWinPages f;
+        f.pages[2] = {page_of(kWinAccessDenied)};
+        f.pages[1] = {page_of(st)};
+        const auto l = f.run();
+        INFO("level-1 status " << st);
+        CHECK(f.calls == std::vector<int>{2, 1});
+        CHECK(l.status == StatusState::constrained);
+        CHECK(reason_has(l, "windows:shares:netshareenum:level2_permission_denied"));
+        CHECK(reason_has(l, st == 8u ? "windows:shares:netshareenum:status_8"
+                                     : "windows:shares:netshareenum:no_progress"));
+        CHECK(l.rows == std::vector<std::string>{"source|netshareenum|failed|-"});
+    }
+}
+
+TEST_CASE("shares windows: the level-1 fallback that answers empty is read|0, still constrained",
+          "[shares]") {
+    FakeWinPages f;
+    f.pages[2] = {page_of(kWinAccessDenied)};
+    f.pages[1] = {page_of(0)};
+    const auto l = f.run();
+    CHECK(f.calls == std::vector<int>{2, 1});
+    CHECK(l.status == StatusState::constrained);
+    CHECK(reason_has(l, "windows:shares:netshareenum:level2_permission_denied"));
+    CHECK(l.rows == std::vector<std::string>{"source|netshareenum|read|0"});
+}
+
 TEST_CASE("shares windows: the fallback restarts the budget and drops level-2 rows", "[shares]") {
     FakeWinPages f;
     f.pages[2] = {page_of(kWinMoreData, disks("a", 400)), page_of(kWinAccessDenied)}; // denied after rows were gathered
