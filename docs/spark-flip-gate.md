@@ -2908,7 +2908,9 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
      monotonic across restarts (lost row, clock-ahead pin, equal epoch, 2^62 ceiling) and
      must define UP-14. This item is a compatibility and documentation criterion; it does not
      close items 1 to 4.
-- Owner: not assigned in source material.
+- Owner: Dave Rae (maintainer), for the UP-14 server change that must meet items 1 to 5.
+  Receiving tracking unit: #5690. No server pull request for the pair comparison exists yet;
+  when it does, its description carries one checkbox per item and links back here.
 - Milestone: PR #5776.
 - Revisit trigger: PR-5 (F14 flip) soak. During the first flip soak, inspect
   `send_order_hold_releases`, `send_stalls` and `send_exceptions` per endpoint on the pilot
