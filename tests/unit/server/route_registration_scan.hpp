@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <initializer_list>
 #include <span>
 #include <string>
 #include <string_view>
@@ -39,10 +40,12 @@ struct ReceiverCall {
     std::size_t pos; // start of the receiver
 };
 
-// std::array, not std::initializer_list. With these two as `inline constexpr` initializer_lists,
-// linking yuzu_server_tests.exe under /GL + /LTCG (MSVC 19.44, the Windows release job) failed with
-// C1001/LNK1000; as arrays it links (#6493). The compiler defect itself is not characterised, so
-// do not turn them back into initializer_lists without a Windows release build.
+// Arrays, not initializer_lists. The Windows release job (MSVC 19.44, LTO) failed to link
+// yuzu_server_tests.exe with C1001/LNK1000 while this header held `inline constexpr`
+// initializer_list globals and initializer_list parameters, and it links with arrays and spans
+// (#6493). Moving to arrays and spans changed the global type, the parameter type and one call
+// together, so which of them matters is not known. Rebuild the Windows release leg before
+// turning any of the three back.
 inline constexpr std::array<std::string_view, 4> kMutatingMethods = {"Post", "Put", "Patch",
                                                                       "Delete"};
 inline constexpr std::array<std::string_view, 6> kAllVerbs = {"Get",   "Post",   "Put",
