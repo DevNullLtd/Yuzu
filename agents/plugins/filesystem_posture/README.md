@@ -14,20 +14,59 @@
 
 ## How it works
 
-All three actions are reads; none can change host state (`Mutability::None`, `DispatchClass::ReadOnly` on every action). `mounts` enumerates mounted volumes and reports device, filesystem type, mount options, capacity, and a fixed flags vocabulary. `quotas` walks the same volume set and reports only *volume-level* quota-subsystem state — it is deliberately not a per-user or per-group quota inventory anywhere, because APFS has no such mechanism to report and the other legs read only the volume-scoped API. `snapshots` reports what each OS can actually enumerate: real VSS shadow copies on Windows and real APFS snapshots on macOS, but on Linux only snapshot-*capable* volume identity (mounted btrfs subvolume, or a device-mapper source that may or may not be a snapshot LV) — deliberately not a live snapshot inventory, since that needs privileged ioctls this read-only plugin does not issue. A single mountinfo read backs both the Linux `mounts` and `snapshots` legs. Every degraded or denied read is reported through a typed result status rather than folded into a clean row set.
+All three actions are reads; none can change host state. `mounts` lists the mounted volumes with device, filesystem type, mount options, capacity and a fixed flags vocabulary. `quotas` walks the same volumes and reports only whether the volume's quota subsystem is switched on and, where the OS exposes one, the volume's default limit; it is deliberately not a per-user or per-group quota inventory on any OS. `snapshots` reports what each OS can actually enumerate: real VSS shadow copies on Windows and real APFS snapshots on macOS, but on Linux only the identity of snapshot-capable volumes (a mounted btrfs subvolume, or a device-mapper source that may or may not be a snapshot volume). It is not a Linux snapshot inventory, because that needs privileged calls this read-only plugin never makes.
+
+On Linux all three actions read `/proc/self/mountinfo`, each action reading it afresh (up to 4 MiB and 4,096 entries); `mounts` adds `statvfs` for capacity and `quotas` adds a `quotactl` probe per block-device mount. On macOS the list comes from `getmntinfo`, quota state from `getattrlist` and snapshots from `fs_snapshot_list`. On Windows the volume list comes from `FindFirstVolumeW`, quota state from `IDiskQuotaControl` and snapshots from the VSS COM interface. A read that is refused or degraded is reported through a typed result status and, where a row exists, a row state, never folded into a clean-looking row set.
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow<br/>dispatches definition] --> SRV[Server<br/>authz: Inventory.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host]
-  HOST --> EX[filesystem_posture.execute]
-  EX --> WIN[Windows leg<br/>FindFirstVolumeW/GetDiskFreeSpaceExW<br/>IDiskQuotaControl<br/>IVssBackupComponents::Query]
-  EX --> MAC[macOS leg<br/>getmntinfo MNT_NOWAIT<br/>getattrlist ATTR_VOL_QUOTA_SIZE<br/>fs_snapshot_list]
-  EX --> LIN[Linux leg<br/>mountinfo + statvfs<br/>quotactl Q_GETFMT<br/>mountinfo btrfs/dm detection]
-  WIN & MAC & LIN --> ROWS[pipe rows +<br/>typed result status]
-  ROWS -- CommandResponse --> RS[(ResponseStore)]
-  RS --> API[REST /api/responses]
+  OP["Operator or workflow"] -->|"authz: Inventory Read"| SRV["Server"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"]
+  HOST --> EX["filesystem_posture execute"]
+  EX --> WIN["Windows: FindFirstVolumeW and GetDiskFreeSpaceExW, IDiskQuotaControl, VSS Query"]
+  EX --> MAC["macOS: getmntinfo, getattrlist volume quota, fs_snapshot_list"]
+  EX --> LIN["Linux: mountinfo and statvfs, quotactl Q_GETFMT, mountinfo btrfs and dm detection"]
+  WIN --> ROWS["pipe rows and typed result status"]
+  MAC --> ROWS
+  LIN --> ROWS
+  ROWS -->|"CommandResponse"| RS[("ResponseStore")] --> API["REST /api/responses"]
 ```
+
+### What you can decide with it
+
+| Question | Action | Windows | macOS | Linux |
+|---|---|---|---|---|
+| What is mounted and how full is it? | `mounts` | Local volumes, one row per mount path; a volume with no mount path is listed under its volume GUID path. Mapped network drives are not listed. No option string (reads `-`). | Every mount from the kernel's cached list, including system volumes. No option string (reads `-`). | Every line of the agent's own mount table. Capacity is `-` for network filesystems. |
+| Is a volume writable, or mounted with restrictive flags? | `mounts` `flags` | `ro`/`rw`, plus `removable`, `remote` or `cdrom` | `ro`/`rw`, `nosuid`, `nodev`, `noexec`, `noatime` | `ro`/`rw`, `nosuid`, `nodev`, `noexec`, `noatime`, `relatime` |
+| Is a disk quota switched on for a volume? | `quotas` | NTFS volumes with a drive letter: `not_enabled` or `configured` with the default limit and threshold. Tracking-only and enforcing are not told apart. The capture shows only `not_enabled`, `unavailable` and `unsupported_fs`; the `configured` path has not been run against a host with quotas set, so treat it as expected rather than observed. | APFS and HFS+ volumes: `none` (no volume quota set) or `configured` with quota and reserved size. | Mounts whose source starts with `/dev/`: `configured` only means a user-quota format is enabled; group and project quotas are not probed. |
+| Does a volume have point-in-time copies? | `snapshots` | Every VSS shadow copy on the machine: id and device path, no size or content. Needs Administrator rights. | Every APFS snapshot by name, per mount point. | Only that a btrfs subvolume or device-mapper volume exists. It does not say a snapshot exists. |
+
+What it cannot tell you: who is over quota (no per-user data anywhere), how large a snapshot is, whether a Linux host has any snapshot at all, or the state of a non-NTFS Windows volume or non-APFS/HFS+ macOS volume (reported `unsupported_fs`). A `none` row in `snapshots` is a sentinel, not a count: its detail says whether nothing was found or the read failed. A `CONSTRAINED` or `PERMISSION_DENIED` result means rows may be missing or marked unavailable; check the row `state` and `detail` before treating the host as quota-free or snapshot-free.
+
+### Diagrams
+
+```mermaid
+sequenceDiagram
+  participant D as Dispatch pool worker
+  participant C as COM and VSS
+  participant S as Volume Shadow Copy service
+  D->>C: initialise COM (MTA)
+  D->>C: CreateVssBackupComponents
+  C-->>D: E_ACCESSDENIED unless Administrator or SYSTEM
+  D->>C: InitializeForBackup
+  D->>C: SetContext VSS_CTX_ALL
+  D->>C: Query for snapshot objects
+  C->>S: cross-process call, no timeout
+  loop up to 1024 turns
+    D->>C: Next one object
+    C->>S: cross-process call, no timeout
+    S-->>D: snapshot id, volume, device path
+  end
+  Note over D,S: a wedged service or backup provider holds this worker indefinitely
+  D-->>D: rows, or one none row plus a degraded status
+```
+
+The Windows `snapshots` action makes a chain of synchronous cross-process COM calls on one shared agent worker. Each call has no deadline, so a hung Volume Shadow Copy service or third-party backup provider keeps that worker occupied, and a repeating schedule can occupy more of them. The walk itself is capped at 1,024 turns, and any failure is reported distinctly from a genuinely empty set.
 
 ## OS capability
 
@@ -54,11 +93,11 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | `mounts`, `quotas`: **none** (default `FindFirstVolumeW`/`GetVolumeInformationW`/`GetDiskFreeSpaceExW`; `IDiskQuotaControl` opened read-only, `bReadWrite=FALSE`). `snapshots`: **Administrative rights** — `CreateVssBackupComponents`/`IVssBackupComponents::Query`; the agent runs as LocalSystem today, so this succeeds with no extra grant | 2026-09-03 on the-rig: `NT AUTHORITY\SYSTEM` succeeds (3 shadow copies found); `NT AUTHORITY\LOCAL SERVICE` and `NT AUTHORITY\NETWORK SERVICE` both fail `E_ACCESSDENIED`; `NT SERVICE\YuzuAgent` not measured. Sample capture 2026-09-07, `SYSTEM`, bare-metal | `quotas`: per-volume result status `permission_denied` (HRESULT `E_ACCESSDENIED`); `snapshots`: whole-run `permission_denied` with a `none` row naming the HRESULT — never an empty snapshot set |
-| macOS | agent daemon, unprivileged | none — `getmntinfo`, `getattrlist`, `fs_snapshot_list` are all unprivileged reads | 2026-09-07 at euid 501 (jsmith), bare-metal | `quotas`: per-volume `permission_denied` (`getattrlist`/volume-root `open` returning `EPERM`/`EACCES`); `snapshots`: per-volume `permission_denied` when opening a volume root fails `EACCES`/`EPERM` |
-| Linux | agent daemon (sample captured as euid 0 in a container) | none for `mounts`/`snapshots` (mountinfo read + `statvfs`); `quotas` needs `CAP_SYS_ADMIN` for a non-`EPERM` `quotactl` reply | 2026-09-06, Debian 13 aarch64, container, euid 0 | `quotas`: `permission_denied` when every probed device returns `EPERM`/`EACCES`; `mounts`/`snapshots` have no privileged call, so a read failure there degrades to `CONSTRAINED` rather than a denial |
+| Windows | agent service account; LocalSystem today, not yet the intended `NT SERVICE\YuzuAgent` (see `docs/agent-privilege-model.md`) | `mounts`, `quotas`: **none** (`FindFirstVolumeW`, `GetVolumeInformationW`, `GetDiskFreeSpaceExW`; `IDiskQuotaControl` opened read-only; this is what the code requires, and a non-Administrator quota query may still be refused per volume, as the privilege model notes). `snapshots`: **Administrative rights** for `CreateVssBackupComponents` and `IVssBackupComponents::Query`; LocalSystem has them, so it succeeds with no extra grant today | 2026-09-03 on a bare-metal Windows host: `NT AUTHORITY\SYSTEM` succeeds (3 shadow copies found); `NT AUTHORITY\LOCAL SERVICE` and `NT AUTHORITY\NETWORK SERVICE` both fail `E_ACCESSDENIED`; `NT SERVICE\YuzuAgent` not measured. Sample capture 2026-09-07 as `SYSTEM`, bare metal | `quotas`: per-volume state `permission_denied` (`E_ACCESSDENIED`); `snapshots`: whole-run `PERMISSION_DENIED` with a `none` row naming the HRESULT, never an empty snapshot set |
+| macOS | agent daemon as root; the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md`) | None; `getmntinfo`, `getattrlist` and `fs_snapshot_list` are unprivileged reads | 2026-09-07 on bare metal as an interactive non-root user, not the production root daemon | `quotas`: per-volume `permission_denied` (`getattrlist` returning `EPERM`/`EACCES`); `snapshots`: `permission_denied` when opening a volume root fails with `EACCES`/`EPERM` |
+| Linux | dedicated unprivileged account (`yuzu-agent` on the packaged unit; `docs/agent-privilege-model.md`) | None for `mounts` and `snapshots` (mountinfo read and `statvfs`). `quotas` probes with `quotactl`; the plugin's own diagnostic says that query requires `CAP_SYS_ADMIN`, which was not measured on the unprivileged account | 2026-09-06 in a container as root, so the unprivileged-account answers are not evidenced | `quotas`: `PERMISSION_DENIED` when every probed device returns `EPERM`/`EACCES`; `mounts` and `snapshots` make no privileged call, so a failed read there degrades to `CONSTRAINED` |
 
-No external binaries, no subprocesses. No network access is initiated by this plugin; the Linux `mounts` leg deliberately skips `statvfs` on network filesystem types (`is_network_fstype`) specifically to avoid blocking on one.
+No external binaries and no subprocesses. No network access is initiated; the Linux `mounts` action deliberately skips `statvfs` on network filesystem types so that it cannot block on one. The Linux actions read the agent's own mount table, so inside a container or a private mount namespace they describe that view, not the host's.
 
 ## Data contract
 
@@ -70,7 +109,7 @@ No action takes parameters.
 
 ### Outputs
 
-Pipe-delimited rows. Field 0 is a literal discriminator (`mount`, `quota`, or `snapshot`); a `std::nullopt` byte count and any inapplicable/unread text field render as the literal `-`, which never means zero. Fields carrying arbitrary OS-supplied text go through the shared `safe_output_field` escaper; fields drawn from a fixed vocabulary (`flags`, the quota `state` token, `scope`, `kind`) are emitted verbatim. A leg that finds nothing for `snapshots` still emits one `kind=none` row rather than zero rows, so an empty result can never be misread as "action did not run".
+Pipe-delimited rows. Field 0 is a literal discriminator (`mount`, `quota` or `snapshot`). A byte count that was not read and any inapplicable or unread text field render as the literal `-`, which never means zero. Fields carrying arbitrary OS-supplied text go through the shared `safe_output_field` escaper; fields drawn from a fixed vocabulary (`flags`, the quota `state`, `scope`, `kind`) are emitted verbatim. A `snapshots` run that finds nothing still emits one `kind=none` row rather than zero rows, so an empty result can never be misread as the action not having run; its `detail` says whether nothing was found or the read failed. On Windows a volume with no mount path is keyed by its volume GUID path in `mount_point`, and a quota row for it reads `unavailable` with the detail `volume has no drive letter`.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`crossplatform.storage.mounts` — `mount_point|device|fstype|options|total_bytes|free_bytes|available_bytes|flags`**
@@ -120,14 +159,11 @@ Surfaced as `plugin_result_status` on the command response. `mark_result_partial
 
 ### Where the data goes
 
-- **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}` and aggregatable (`mounts` groups by `fstype`, `quotas` by `state`, `snapshots` by `kind`).
-- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — the plugin's only server-side reference is its `capability_decls` registration; nothing runs on a schedule beyond the per-execution `gather.ttlSeconds` response deadline.
-- **Sensitivity.** Rows carry filesystem and volume metadata only — mount points, device/volume
-  paths (`/dev/vda1`, a Windows volume GUID), capacity figures, quota state, and snapshot
-  GUIDs/names — nothing that names a specific person, a specific installed software product, or a
-  device beyond its id (no hostname, MAC, or username in any column).
-- **Siblings:** `crossplatform.storage.smart`, `crossplatform.storage.volumes` (`disk_actions` — physical drive health and the drive/volume join), `crossplatform.storage.free` (`disk_space`).
-- **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("crossplatform.storage.mounts")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
+- **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}` and aggregatable (`mounts` groups by `fstype`, `quotas` by `state`, `snapshots` by `kind`). The three definitions are gathered, with response TTLs of 60 s (`mounts`), 300 s (`quotas`) and 300 s (`snapshots`).
+- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX (Digital Employee Experience) or metrics; nothing runs on a schedule unless an operator or schedule dispatches the instruction.
+- **Sensitivity.** Rows carry filesystem and volume metadata only: mount points, device and volume paths (`/dev/vda1`, a Windows volume GUID), capacity figures, quota state and snapshot names or GUIDs. A mount point or volume path can embed text a person chose, such as an external drive's label under `/Volumes` or a user directory used as an automount target, but no hostname, MAC address or account name is emitted as its own column.
+- **Siblings:** `crossplatform.storage.smart` and `crossplatform.storage.volumes` (`disk_actions`: physical drive health and the drive-to-volume join) and `crossplatform.storage.free` (`disk_space`).
+- **MCP / REST.** Discover: `discover_plugins` (summary), `yuzu://plugin-docs` (this page as data), `discover_instructions` / `get_definition("crossplatform.storage.mounts")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
@@ -225,11 +261,11 @@ snapshot|-|-|none|no btrfs or device-mapper mount found
 
 ## Caveats and known gaps
 
-1. **Quota reporting is volume-level everywhere, never per-identity.** No platform enumerates per-user or per-group limits; on APFS the gap is structural, not a missing read — `quotactl` returns `ENOTSUP` on every APFS mount while succeeding on HFS+, so there is nothing per-identity to enumerate there at all.
-2. **Linux `snapshots` reports capability, not inventory.** It cannot enumerate unmounted btrfs snapshots (needs `CAP_SYS_ADMIN` via `BTRFS_IOC_TREE_SEARCH`) or distinguish an LVM snapshot LV from a plain dm-crypt/multipath/integrity target (needs a `DM_TABLE_STATUS` ioctl) — this read-only plugin performs neither.
-3. **Windows VSS enumeration has no deadline.** `CreateVssBackupComponents`/`Query`/`Next` are synchronous COM calls with no timeout, run on a bounded agent dispatch-pool worker shared with quarantine/containment dispatch. A wedged VSS service or a hung third-party backup provider parks that worker permanently; prefer on-demand invocation over a frequent schedule on hosts running third-party backup software.
-4. **Linux `mounts` omits capacity for network filesystems.** `nfs`, `nfs3`, `nfs4`, `cifs`, `smb3`, `smbfs`, `afs`, `ceph`, `glusterfs`, `9p`, `virtiofs`, `lustre`, `beegfs`, `gfs2`, `ocfs2`, `gpfs`, `panfs`, `vboxsf`, `vmhgfs`, `prl_fs`, `autofs`, and network-backed `fuse.*` mounts (`sshfs`, `s3fs`, `davfs`, `rclone`, `cephfs`, `ceph-fuse`, `glusterfs`, `nfs`, `smb`, `vmhgfs-fuse`, `prl_fsd`; the list is `agents/shared/network_fstype.hpp`) are still listed, but their capacity columns read `-` — a `statvfs` against an unreachable server blocks the dispatch worker indefinitely.
-5. **`FSCTL_SRV_ENUMERATE_SNAPSHOTS` was deliberately rejected as the Windows snapshots mechanism; do not reintroduce it.** No header in SDK 10.0.26100.0 declares it — a direct probe fails `C2065: undeclared identifier`, and an earlier shipped DLL carried a "built without FSCTL_SRV_ENUMERATE_SNAPSHOTS" sentinel, proving the guard had compiled the real path out. It is also the wrong question: an SMB *server*-side control listing previous versions a share exposes, not a volume's shadow copies.
+1. **Quotas and Linux snapshots report less than their names suggest.** Quota reporting is volume-level on every OS and never per-identity; on APFS that is structural: the macOS leg reads the volume quota with `getattrlist` and never calls `quotactl`, and the source comment says `quotactl` returns `ENOTSUP` on every APFS mount while succeeding on HFS+ (an OS behaviour the plugin does not itself exercise), and on Linux only the user-quota format is probed. Linux `snapshots` reports capability, not inventory: it cannot list unmounted btrfs snapshots (needs `CAP_SYS_ADMIN` through `BTRFS_IOC_TREE_SEARCH`) or tell an LVM snapshot volume from a dm-crypt, multipath or integrity target (needs a `DM_TABLE_STATUS` ioctl), and this plugin issues neither.
+2. **A typical Windows host returns `CONSTRAINED` for `quotas`, and the captured `mounts` run was too.** Every NTFS volume with no drive letter (recovery and similar partitions) gets an `unavailable` quota row, which marks the run `windows:dskquota`; in the captured `mounts` run every row carried a size and filesystem type yet the run was `windows:volume_enum`, because the code treats an empty mount-path list as a failed lookup. Read the per-row state rather than the run status alone.
+3. **Windows VSS enumeration has no deadline.** `CreateVssBackupComponents`, `Query` and `Next` are synchronous COM calls with no timeout, run on a bounded agent dispatch-pool worker shared with quarantine and containment dispatch. A wedged VSS service or a hung third-party backup provider parks that worker, so prefer on-demand `snapshots` over a frequent schedule on hosts running third-party backup software.
+4. **Linux `mounts` omits capacity for network filesystems.** `nfs`, `nfs3`, `nfs4`, `cifs`, `smb3`, `smbfs`, `afs`, `ceph`, `glusterfs`, `9p`, `virtiofs`, `lustre`, `beegfs`, `gfs2`, `ocfs2`, `gpfs`, `panfs`, `vboxsf`, `vmhgfs`, `prl_fs`, `autofs`, and network-backed `fuse.*` mounts (`sshfs`, `s3fs`, `davfs`, `rclone`, `cephfs`, `ceph-fuse`, `glusterfs`, `nfs`, `smb`, `vmhgfs-fuse`, `prl_fsd`; the list is `agents/shared/network_fstype.hpp`) are still listed, but their capacity columns read `-`, because a `statvfs` against an unreachable server blocks the dispatch worker indefinitely.
+5. **`FSCTL_SRV_ENUMERATE_SNAPSHOTS` was rejected as the Windows snapshots mechanism; do not reintroduce it.** No header in SDK 10.0.26100.0 declares it (a direct probe fails `C2065: undeclared identifier`), and an earlier build had silently compiled the real path out behind a guard. It is also the wrong question: an SMB server-side control that lists previous versions a share exposes, not the shadow copies a volume holds.
 
 ## Source and tests
 

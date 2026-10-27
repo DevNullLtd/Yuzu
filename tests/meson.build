@@ -1500,6 +1500,7 @@ if build_server
       'unit/server/test_home_panels_routes.cpp', # HM-2: Dashboard policies + events fragments
       'unit/server/test_leader_elector.cpp',
       'unit/server/test_leader_gate.cpp',
+      'unit/server/test_leader_metrics.cpp', # HA WS-11 (#4014): yuzu_server_leader_* seed + scrape-time publisher
       'unit/server/test_coord_dsn.cpp',
       'unit/server/test_pg_reachability_probe.cpp', # HA WS-8: /readyz pg_reachable rule + probe
       'unit/server/test_multi_host_dsn.cpp', # HA WS-8: multi-host DSN target_session_attrs guard
@@ -3301,6 +3302,16 @@ test('compose certs volume',
   timeout: 30,
 )
 
+# Gateway scrape (#5695): every Prometheus config under deploy/prometheus/ and
+# every compose stack that runs a Prometheus next to a gateway scrapes the
+# gateway's metrics port. Stdlib only, no Docker.
+test('gateway prometheus scrape',
+  _python3_test,
+  args: [files('test_gateway_prometheus_scrape.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Compose Wizard (#5420): every generated mode gives the server a writable,
 # persistent /etc/yuzu/certs (KEK + internal CA), and Operator mode mounts the
 # operator's PEMs read-only at /etc/yuzu/tls instead of over it. Runs the real
@@ -3659,6 +3670,19 @@ test('gateway wrapper guard selftest',
   timeout: 30,
 )
 
+# Pins the gateway eunit shard partition (scripts/gateway_eunit_shards.py):
+# the root meson.build `gateway eunit shard <X>` tests together run every
+# top-level apps/yuzu_gw/test module exactly once (what the old whole-suite
+# `--dir` run did), a new module lands in one shard, and the meson shard
+# table, scripts/ci/assert-gateway-tests.py and the wrapper's `--shard`
+# handling agree. Hermetic (a fake rebar3; no Erlang), so every leg runs it.
+test('gateway eunit partition selftest',
+  _python3_test,
+  args: [files('test_gateway_eunit_shards.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # #4853: pins the run-private epmd (scripts/gateway_epmd.py) the gateway test
 # wrapper gives every eunit/ct run, so another job's end-of-job orphan cleanup
 # on a shared self-hosted box cannot kill the epmd the multinode eunit modules'
@@ -3930,6 +3954,16 @@ test('same-site gate production wiring lexical selftest',
 test('alert runbook anchors resolve',
   _python3_test,
   args: [files('test_alert_runbook_anchors.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# HA WS-11 (#4014): the leader-election alerts, their promtool cases and the metrics reference may
+# name only series leader_metrics.hpp really exports (promtool cannot know the exporter), and the
+# reference must document every exported name and cause label. Source-text only, so Python.
+test('leader alert metric names match the exporter',
+  _python3_test,
+  args: [files('test_leader_alert_metric_names.py')],
   suite: 'docs',
   timeout: 30,
 )

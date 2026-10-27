@@ -125,8 +125,8 @@ jobs:
       # item 1): a family's presentation/handler TUs must not reach a store
       # directly. check-seam-closure.py walks each declared family TU's
       # transitive #include closure and fails on any store-layer header found
-      # in it (see the script's module docstring for the "sound proxy, two
-      # acknowledged escapes" scope statement). Pure lexical source-tree
+      # in it (see the script's module docstring for the "sound proxy" scope
+      # statement and its list of what is NOT caught). Pure lexical source-tree
       # analysis, no build deps — belongs beside the other preflight gates in
       # this job, same as the sibling check-api-parity.py gate (ci.yml).
       - name: Seam-closure gate (ADR-0031 WS-A4 item 1)
@@ -138,6 +138,11 @@ jobs:
       # above is evidence the gate actually discriminates, not that it always
       # passes. Mirrors the split interlock self-test's shape immediately above.
       - name: Seam-closure gate self-test
+        # The include-parser fixtures are cross-checked against GNU g++ -MM -MG; docs-lint's
+        # ubuntu-24.04 image has one, so require it rather than silently skipping the oracle
+        # (qa-4 precedent, the link-gate self-test below).
+        env:
+          YUZU_REQUIRE_TOOLCHAIN: "1"
         run: python3 tests/test_seam_closure_selftest.py
 
       # check-seam-closure.py's LINK-level twin, scripts/ci/check_core_
@@ -223,6 +228,12 @@ jobs:
       # escaping) and mutation-tests itself. Stdlib only.
       - name: Agent installer trust-anchor ACL lint
         run: python3 tests/test_agent_installer_acl_lint.py
+
+      # Gateway scrape (#5695): every shipped Prometheus config, and every
+      # compose stack that runs a Prometheus next to a gateway, scrapes the
+      # gateway's metrics port. Stdlib only.
+      - name: Gateway Prometheus scrape lint
+        run: python3 -I tests/test_gateway_prometheus_scrape.py
 
       # Release artifact gate (#5242): the expected SBOM set in
       # scripts/check-release-artifacts.sh includes the three chisel images,

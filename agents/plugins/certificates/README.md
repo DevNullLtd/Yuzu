@@ -14,21 +14,111 @@
 
 ## How it works
 
-`list` and `details` enumerate certificates in the OS's own stores and emit the same eight-field row per certificate; `list` returns every match (filtered by `store` and `expiring_within_days`), `details` returns the one row whose thumbprint matches (case-insensitive) or a `status|not_found`. `delete` is destructive: it hex-validates the thumbprint, then removes the certificate from the named store. On macOS `delete` additionally pre-checks presence before ever running the destructive command (so deleting an absent cert reports `status|not_found` instead of a command failure) and re-enumerates the keychain afterward to prove the certificate is actually gone before reporting `status|deleted` — a zero exit code alone is not trusted.
+`list` and `details` read the certificates held in the operating system's own trust stores and emit one eight-field row per certificate; `list` returns every match (filtered by `store` and `expiring_within_days`) and `details` returns the row whose SHA-1 thumbprint matches, or `status|not_found`. `delete` removes one certificate by thumbprint from one store. It validates the thumbprint as 40 hex characters first, acts on exactly one named store, and reports `status|deleted`, `status|not_found`, `status|delete_failed` (Windows and Linux, when the removal itself fails) or an `error|...` line with a non-zero exit. The plugin does not build or validate a trust chain, check revocation, import or renew certificates, or read stores other than those named below.
 
-Windows reads/writes CryptoAPI stores (MY, ROOT, CA, Trust) natively, in-process, no subprocess. `delete` opens the named store under the LocalMachine hive only and reports an error rather than falling back to CurrentUser; `list`/`details` do fall back to the CurrentUser hive when LocalMachine cannot be opened, and say so in the output and result status. Linux parses PEM files under `/etc/ssl/certs` via in-process libcrypto (`certificates_x509.hpp`) — the `openssl x509` subprocess this used to shell out to is gone. macOS is a genuine hybrid: System.keychain and SystemRootCertificates.keychain are read in-process via `SecItemCopyMatching`, bounded to 15 seconds per keychain through agent-core's `read_keychain_bounded` seam and abandoned (not cancelled) if `securityd` wedges past that bound, but the login keychain (the console user's own keychain, which the LaunchDaemon has none of itself) still reads through a `launchctl asuser`/`sudo -u`/`security find-certificate` subprocess hop — immediately preceded by an in-process re-check of `/dev/console`'s owner, so a fast-user-switch between console-user resolution and the spawn is refused rather than read against the wrong session — and `delete` always shells out to `/usr/bin/security delete-certificate`. Every macOS action runs under a shared 60-second wall-clock budget covering console-user resolution and every keychain read/parse it performs, so a wedged Directory Service or a pathological keychain degrades honestly (a `not_available|<reason>` row plus a `CONSTRAINED`/`PARTIAL` result status) instead of hanging or silently truncating.
+Windows reads the CryptoAPI stores `MY`, `ROOT`, `CA` and `Trust` in process under the LocalMachine hive; a read falls back to CurrentUser if LocalMachine cannot be opened and says so, but `delete` never falls back. Linux reads the `.pem` and `.crt` files directly under `/etc/ssl/certs` and parses them in process with libcrypto; only the first certificate in each file is read. macOS reads `System.keychain` and `SystemRootCertificates.keychain` in process through the Security framework (15 seconds per keychain) and the console user's login keychain through a subprocess: `launchctl asuser` and `sudo -u` run `security find-certificate`, and each returned block is parsed by `/usr/bin/openssl`. Before that spawn the agent re-checks the owner of `/dev/console` and refuses to read if it changed. Every macOS action runs inside a shared 60-second budget, so a wedged directory service shows as a `not_available` row with `CONSTRAINED` status rather than a hang.
 
-This plugin deliberately does not validate a certificate's trust chain, check revocation (CRL/OCSP), import or renew certificates, or read anything beyond the fixed set of stores/keychains named above.
+`delete` is destructive and cannot be undone by Yuzu; the certificate has to be re-imported by other means. On macOS it first proves the certificate is present (an absent one is `status|not_found`, not a command failure), runs `security delete-certificate` against `System.keychain`, then re-reads the keychain and reports `deleted` only if the certificate is gone. On Linux it removes the matching directory entry (a symlink is removed, never its target) after re-checking the entry's identity immediately before `unlinkat`. The plugin does not run `update-ca-certificates` or edit any combined bundle.
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Security.Read / Security.Delete]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[certificates.execute]
-  EX --> WIN[Windows leg<br/>CryptoAPI, in-process]
-  EX --> MAC[macOS leg<br/>SecItem (System/root, in-process)<br/>+ security find-certificate/delete-certificate (login, subprocess)]
-  EX --> LIN[Linux leg<br/>libcrypto PEM parse, in-process]
-  WIN & MAC & LIN --> ROWS[rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator or workflow"] --> SRV["Server authz; list, details: Security.Read; delete: Security.Delete, AdminOrApproval"]
+  SRV -- "gRPC mTLS" --> HOST["Agent plugin host"] --> EX["certificates.execute"]
+  EX --> WIN["Windows leg; CryptoAPI in process"]
+  EX --> MAC["macOS leg; SecItem for System and root; subprocess for login keychain and delete"]
+  EX --> LIN["Linux leg; libcrypto PEM parse in process"]
+  WIN --> ROWS["Rows and typed result status"]
+  MAC --> ROWS
+  LIN --> ROWS
+  ROWS --> RS[("ResponseStore")] --> API["REST api/responses"]
 ```
+
+The diagram shows where each OS leg gets its data. Reads need Security read; `delete` needs Security delete, is classed Destructive and is gated on an administrator or an approval.
+
+### What you can decide with it
+
+| Question | Action | Windows | macOS | Linux |
+|---|---|---|---|---|
+| Which certificates does this device trust? | `list` | Machine stores `ROOT`, `CA`, `Trust` and `MY`. Per-user stores are read only as a disclosed fallback. | System and system-root keychains, plus the login keychain when a user is at the console. | Files named `*.pem` or `*.crt` in `/etc/ssl/certs`, first certificate of each file. |
+| What expires soon? | `list` with `expiring_within_days` | Same filter on `not_after`. | Same. | Same. |
+| Is this specific certificate present, and where? | `details` with a thumbprint | Searches all four stores. | `store` narrows to `login`, `System`, `root` or `all`. | Searches the directory. |
+| Which certificates are not from the usual public authorities? | `list`, compare `issuer` and `subject` against a known list | Yes. | Yes. | Yes. |
+| Remove a rogue or expired certificate | `delete` | Named store, LocalMachine only. | `System.keychain` only. | The matching file or link in `/etc/ssl/certs`. |
+
+`expiring_within_days=N` keeps certificates whose `not_after` is within N days, including ones that have already expired, and any whose date could not be parsed. `0` returns everything.
+
+Safe workflow for `delete`: run `details` with the thumbprint to confirm the exact store and subject, dispatch `delete` to that one device with the same thumbprint and store, then run `details` again; it should report `status|not_found`. There is no preview and no undo. On macOS the root keychain is sealed by System Integrity Protection, so `delete` with `store=root`, `login` or `all` is rejected rather than redirected. On Linux, a file holding several certificates is removed whole when its first certificate matches.
+
+What a result does and does not prove:
+
+- Presence in a store is not the same as being trusted for every purpose. The plugin reads store contents only; it does not read macOS trust settings, Windows disallowed lists or application-specific bundles.
+- A `CONSTRAINED` status or a `not_available` row means part of the inventory is missing. Treat the list as incomplete, never as "nothing there".
+- An empty Linux list with no status means `/etc/ssl/certs` does not exist. Distributions that keep trust anchors elsewhere are not covered.
+- Thumbprints identify certificates, not devices or people, but `subject` for code-signing certificates is effectively a software-publisher list (see Sensitivity).
+
+### Diagrams
+
+Linux `delete` binds to one directory handle for the whole operation, so a swapped directory cannot redirect it:
+
+```mermaid
+sequenceDiagram
+  participant S as Server
+  participant A as Agent certificates plugin
+  participant D as Directory etc ssl certs
+  S->>A: delete thumbprint
+  A->>A: validate 40 hex characters
+  A->>D: open directory without following links, hold the handle
+  A->>D: list entries named pem or crt through the held handle
+  A->>D: read and parse each entry, first certificate only
+  A->>A: thumbprint matches?
+  A->>D: re-read entry identity: inode, link text, target inode
+  A->>D: unlinkat on the held handle
+  A-->>S: status deleted, or error and nothing removed
+```
+
+If the entry's identity changed since the match, or cannot be re-derived, nothing is removed and the result is `CONSTRAINED` with `posix:delete-recheck`. If any entry could not be read, the scan cannot prove the certificate is absent, so it reports an error rather than `not_found`. Identity is inode and link text, not content, so an in-place rewrite of the same file between match and unlink is not detected.
+
+macOS `delete` proves its own result:
+
+```mermaid
+sequenceDiagram
+  participant S as Server
+  participant A as Agent certificates plugin
+  participant K as System keychain
+  S->>A: delete thumbprint, store
+  A->>A: validate thumbprint, refuse root, login, all
+  A->>K: read keychain, is the certificate present?
+  alt "provably absent"
+    K-->>A: absent
+    A-->>S: status not_found
+  else "present, or the read was not definitive"
+    A->>K: security delete-certificate
+    A->>K: read keychain again
+    K-->>A: still present or unreadable
+    A-->>S: error, or status deleted when gone
+  end
+```
+
+The first absent answer short-circuits to `not_found` only when the read was definitive. Exit code zero from `security` is never trusted on its own: if the keychain cannot be re-read, or still holds the certificate, the result is an `error` and the exit code is non-zero.
+
+Windows store fallback differs between reads and `delete`:
+
+```mermaid
+stateDiagram-v2
+  [*] --> OpenLocalMachine
+  OpenLocalMachine --> Enumerate: opened
+  OpenLocalMachine --> OpenCurrentUser: read action and open failed
+  OpenLocalMachine --> DeleteRefused: delete and open failed
+  OpenCurrentUser --> Enumerate: opened, disclosed as store-fallback
+  OpenCurrentUser --> NotAvailable: open failed
+  Enumerate --> Done: end of store
+  Enumerate --> NotAvailable: ended abnormally
+  DeleteRefused --> [*]
+  NotAvailable --> [*]
+  Done --> [*]
+```
+
+A CurrentUser fallback row is announced by a `not_available` line before that store's rows and marks the result `CONSTRAINED` with `cryptoapi:store-fallback`. `delete` has no CurrentUser path: an unopenable store is `error|<store> store could not be opened; nothing removed`.
 
 ## OS capability
 
@@ -50,11 +140,11 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | `list`/`details`: none — `CertEnumCertificatesInStore` needs no elevation. `delete`: `SeBackupPrivilege` + `SeRestorePrivilege` to write the certificate store; already granted to the service account under LocalSystem today, no new grant. | 2026-09-07, bare-metal Windows 10.0.26200.0 x64, as SYSTEM | `enumerate_store()` returns a typed result that records whether the store actually opened under LocalMachine or fell back to CurrentUser, never a silent empty vector (`certificates_plugin.cpp:337-408`); `list` reports `not_available\|<store> store could not be opened` (provenance `cryptoapi:store-open`, `certificates_plugin.cpp:420-428`) or `not_available\|<store> store enumeration incomplete` when `CertEnumCertificatesInStore` ends abnormally part-way through a store (provenance `cryptoapi:store-enum`, `certificates_plugin.cpp:430-435`), then keeps scanning the remaining stores; when LocalMachine could not be opened but CurrentUser could, `list` emits a `not_available\|<store> store (LocalMachine) could not be opened; rows read from CurrentUser` row before that store's rows (provenance `cryptoapi:store-fallback`, `certificates_plugin.cpp:437-449`); `details` marks the result partial per store internally and, unlike `list`, does not emit a row for a plain open/enumeration failure at the point it happens — it keeps scanning, and only if a match is never found does it report one combined `not_available\|<store(s)> could not be opened/enumeration incomplete/read from CurrentUser; scan incomplete` row naming every affected store, instead of a false `status\|not_found`; a CurrentUser fallback, an unopened store, or an incompletely-enumerated store are the exceptions to "no row until the end" — `details_cert_win` discloses each such earlier store immediately alongside a later match, right before the matched certificate's own row, rather than waiting for the combined end-of-scan summary — see the Result-status table's `cryptoapi:store-fallback`/`cryptoapi:store-open`/`cryptoapi:store-enum` entries below for the exact shape (`details_cert_win`); `delete` opens the named store under LocalMachine only, with no CurrentUser retry (#4377) — a store that cannot be opened there reports `error\|<store> store could not be opened; nothing removed` (`certificates_plugin.cpp:615`), and a store whose enumeration ends abnormally reports `error\|<store> store enumeration ended abnormally; nothing removed` (`certificates_plugin.cpp:651`), both with a non-zero exit instead of `status\|not_found` |
-| macOS | agent daemon; the shipped LaunchDaemon has no `UserName` key, so it runs as root — but this sample was captured unprivileged (see Measured) | System/root keychain reads: none (in-process `SecItemCopyMatching`, no subprocess). Login keychain read: root, via `launchctl asuser` + `sudo -u` — live today only because the daemon runs as root; needs a dormant sudoers grant once #1455 narrows the agent off root. `delete` (System/MY only): a sudoers grant for `/usr/bin/security delete-certificate -t /Library/Keychains/System.keychain *` under the future non-root account; moot today. | 2026-09-07, bare-metal macOS 26.6.2 arm64, euid 501 (jsmith) — unprivileged, captured via the test harness (`PluginHandle::load` + `LocalDispatcher::run`, no `init()`), not the production root LaunchDaemon | System/root keychain read failure emits `not_available\|<keychain> not readable (no read permission)`, `not_available\|<keychain> read timed out` (15 s per-keychain bound exceeded), `not_available\|<keychain> read refused (bounded-call ceiling)`, `not_available\|<keychain> read failed`, or `not_available\|<keychain> scan incomplete` (the read was capped before it finished) — each + `CONSTRAINED`/`PARTIAL` (`certificates_macos_parsers.hpp:516-538`); an in-process `/dev/console` owner recheck immediately before the login-keychain spawn emits `not_available\|console user changed` (`certificates_plugin.cpp:1636`) or `not_available\|console user recheck failed` (`certificates_plugin.cpp:1640`); a failed login-keychain spawn emits `not_available\|login keychain read failed (<detail>)` naming the termination reason, on both `list` (`certificates_plugin.cpp:1697`) and `details` (`certificates_plugin.cpp:1945`) — the macOS sample shows a login-keychain degradation (`macos.txt:164-165`) |
-| Linux | dedicated unprivileged `yuzu` account in production; this sample was captured as euid 0 in a container, not representative of that account | `list`/`details`: none — native filesystem read + in-process libcrypto parse, no subprocess. `delete`: write access to `/etc/ssl/certs` to remove the matching file via `unlinkat` on the held `/etc/ssl/certs` dirfd (`certificates_linux_store.hpp:418`). | 2026-09-06, Debian GNU/Linux 13 (trixie) aarch64 container, euid 0 | An unreadable/unparseable PEM file reports `(unreadable)`/`(skipped)` and `CONSTRAINED`/`PARTIAL` rather than being silently dropped, provenance `libcrypto:unreadable-file` (`certificates_plugin.cpp:691-696`); `details` reports `not_available\|... scan incomplete` rather than a false `status\|not_found` when a candidate file couldn't be inspected (`certificates_plugin.cpp:805-811`); `/etc/ssl/certs` could not be opened (including a non-directory or symlink at that path) reports `not_available\|/etc/ssl/certs could not be opened` and CONSTRAINED/PARTIAL, provenance `posix:cert-dir` (`certificates_plugin.cpp:855-857`); a readdir(3)/fdopendir enumeration of `/etc/ssl/certs` that fails part-way through reports `not_available\|/etc/ssl/certs enumeration incomplete` (`list`) or folds into `delete`'s `error\|/etc/ssl/certs enumeration incomplete; nothing removed`, provenance `posix:cert-enum` (`certificates_plugin.cpp:727-729,894-897`); a `delete` whose target's identity (link inode, target text, and target inode) changed between match and unlink reports `error\|certificate file changed during delete; nothing removed`, provenance `posix:delete-recheck` (`certificates_linux_store.hpp:389-431`; `certificates_plugin.cpp:883,890`), instead of unlinking a different file than the one matched |
+| Windows | agent service account (LocalSystem today) | `list` and `details`: none, since reading the machine stores needs no elevation. `delete`: the plugin requests and enables no privilege of its own; the write to a LocalMachine store succeeds as `SYSTEM`. `docs/agent-privilege-model.md` lists `SeBackupPrivilege` and `SeRestorePrivilege` for this action, but nothing in the plugin code uses or requires either, and a narrower account has not been measured | `SYSTEM` on bare-metal Windows 10.0.26200, 2026-09-07, `list` and `details`; the captured `delete` exercises only its parameter check | A store that cannot be opened (even after the CurrentUser fallback) is a `not_available` row with `CONSTRAINED` and `cryptoapi:store-open`; one that ends abnormally is `cryptoapi:store-enum`. `details` never reports `not_found` for a store it could not fully read; it reports one combined scan-incomplete row. `delete` opens LocalMachine only and reports `error` with a non-zero exit, never `not_found` |
+| macOS | agent daemon, root (the LaunchDaemon has no `UserName` key; the sample was captured unprivileged, see Measured) | System and root keychains: none, read in process. Login keychain: root, through `launchctl asuser` and `sudo -n -u`; this works only because the daemon runs as root today, and a non-root agent would need the sudoers grant described in `docs/agent-privilege-model.md`. `delete` (System keychain only) runs `/usr/bin/security delete-certificate` as the daemon | bare-metal macOS 26.6.2, euid 501, 2026-09-07, through the test harness rather than the root LaunchDaemon, so the sample shows the login-keychain read degrading | A keychain that is unreadable, times out, hits the bounded-call ceiling or is capped emits a `not_available` row naming it, with `CONSTRAINED` and provenance `secitem:<keychain>`; an empty answer counts as "zero certificates" only if the keychain's read-permission bit is set. A login-keychain failure (no console user, user changed, spawn failed) is `not_available` with `login-keychain` |
+| Linux | agent daemon, dedicated unprivileged account, never root by design (`docs/agent-privilege-model.md`) | `list` and `details`: none, a filesystem read and in-process parse. `delete`: write permission on the `/etc/ssl/certs` directory itself, which is normally root-owned; without it the `unlinkat` fails and the result is `status\|delete_failed` with a non-zero exit | Debian GNU/Linux 13 container, euid 0, 2026-09-06; delete as the unprivileged account is not measured | An unreadable or unparseable file is a row marked `(unreadable)` with `CONSTRAINED` and `libcrypto:unreadable-file`. A directory that cannot be opened (including a symlink or non-directory at that path) is `not_available` with `posix:cert-dir`; a listing that fails part-way is `posix:cert-enum`. An identity change between match and unlink is `error` with `posix:delete-recheck`, and nothing is removed |
 
-Binaries/subprocesses/network: Windows — none, in-process CryptoAPI/`crypt32` only. macOS — `/usr/bin/openssl` (per-block PEM parse, `certificates_plugin.cpp:1164-1167`), `/usr/bin/security` (`find-certificate` for the login keychain, built by `build_login_keychain_read_argv` in `agents/shared/macos_console_user.hpp`; `delete-certificate`, `certificates_plugin.cpp:2063-2066`), `/usr/bin/stat` (console-user resolution, `certificates_plugin.cpp:1292`) — all via the bounded subprocess runner, pre-split argv, no shell. Linux — none, in-process libcrypto only (`certificates_plugin.cpp:82-87`). No network access on any OS.
+Binaries and network: Windows runs none, in-process CryptoAPI only. Linux runs none, in-process libcrypto only. macOS runs `/usr/bin/openssl` (parses each login-keychain PEM block), `/usr/bin/security` (`find-certificate` for the login keychain, `delete-certificate`), `/bin/launchctl` and `/usr/bin/sudo` (the login-keychain session hop) and `/usr/bin/stat` (console-user lookup), all through the bounded subprocess runner with a pre-split argv and no shell. No network access on any OS.
 
 ## Data contract
 
@@ -113,22 +203,22 @@ Binaries/subprocesses/network: Windows — none, in-process CryptoAPI/`crypt32` 
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
-| `CONSTRAINED` | `PARTIAL` | `libcrypto:unreadable-file` | Linux: a PEM file under `/etc/ssl/certs` could not be read or parsed (`certificates_plugin.cpp:747,923`) |
-| `CONSTRAINED` | `PARTIAL` | `cryptoapi:store-open` | Windows: a CryptoAPI store could not be opened for `list`/`details`/`delete` (`certificates_plugin.cpp:429,487,617`) |
-| `CONSTRAINED` | `PARTIAL` | `cryptoapi:store-enum` | Windows: `CertEnumCertificatesInStore` ended abnormally part-way through a store for `list`/`details`/`delete` (`certificates_plugin.cpp:436,493,653`) |
+| `CONSTRAINED` | `PARTIAL` | `libcrypto:unreadable-file` | Linux: a PEM file under `/etc/ssl/certs` could not be read or parsed |
+| `CONSTRAINED` | `PARTIAL` | `cryptoapi:store-open` | Windows: a CryptoAPI store could not be opened for `list`/`details`/`delete` |
+| `CONSTRAINED` | `PARTIAL` | `cryptoapi:store-enum` | Windows: `CertEnumCertificatesInStore` ended abnormally part-way through a store for `list`/`details`/`delete` |
 | `CONSTRAINED` | `PARTIAL` | `cryptoapi:store-fallback` | Windows: the LocalMachine store could not be opened and `list`/`details` read the CurrentUser store instead; `list_certs_win` discloses it with a `not_available` row before that store's rows; `details_cert_win` discloses every such store the same way — either as its own row immediately before a match served from it, or, if an earlier fallback store didn't match, as a combined row emitted alongside whichever later store's match ends the scan — and folds every fallback store into the combined scan-incomplete verdict only when no store ever matches |
-| `CONSTRAINED` | `PARTIAL` | `posix:cert-dir` | Linux: `/etc/ssl/certs` could not be opened (including a non-directory or symlink at that path) (`certificates_plugin.cpp:767,799,913`) |
-| `CONSTRAINED` | `PARTIAL` | `posix:cert-enum` | Linux: a readdir(3)/fdopendir enumeration of `/etc/ssl/certs` failed part-way through (`certificates_plugin.cpp:729,794,896`) |
-| `CONSTRAINED` | `PARTIAL` | `posix:delete-recheck` | Linux: `delete`'s pre-unlink identity recheck found the entry changed or could not be re-derived since the earlier match (`certificates_plugin.cpp:883,890`) |
-| `CONSTRAINED` | `PARTIAL` | `login-keychain` | macOS: console-user resolution failed, the console user changed or its owner recheck failed immediately before the login-keychain spawn, or the login-keychain read/scan failed, degraded, or was capped (`certificates_plugin.cpp:1573,1636,1640,1697,1945`) |
-| `CONSTRAINED` | `PARTIAL` | `secitem:System.keychain` | macOS: System.keychain was not readable (no read permission), timed out, was refused at the bounded-call ceiling, failed to open, or its scan was capped (`certificates_macos_parsers.hpp:516-538`) |
-| `CONSTRAINED` | `PARTIAL` | `secitem:SystemRootCertificates.keychain` | macOS: SystemRootCertificates.keychain was not readable (no read permission), timed out, was refused at the bounded-call ceiling, failed to open, or its scan was capped (`certificates_macos_parsers.hpp:516-538`) |
+| `CONSTRAINED` | `PARTIAL` | `posix:cert-dir` | Linux: `/etc/ssl/certs` could not be opened (including a non-directory or symlink at that path) |
+| `CONSTRAINED` | `PARTIAL` | `posix:cert-enum` | Linux: a readdir(3)/fdopendir enumeration of `/etc/ssl/certs` failed part-way through |
+| `CONSTRAINED` | `PARTIAL` | `posix:delete-recheck` | Linux: `delete`'s pre-unlink identity recheck found the entry changed or could not be re-derived since the earlier match |
+| `CONSTRAINED` | `PARTIAL` | `login-keychain` | macOS: console-user resolution failed, the console user changed or its owner recheck failed immediately before the login-keychain spawn, or the login-keychain read/scan failed, degraded, or was capped |
+| `CONSTRAINED` | `PARTIAL` | `secitem:System.keychain` | macOS: System.keychain was not readable (no read permission), timed out, was refused at the bounded-call ceiling, failed to open, or its scan was capped |
+| `CONSTRAINED` | `PARTIAL` | `secitem:SystemRootCertificates.keychain` | macOS: SystemRootCertificates.keychain was not readable (no read permission), timed out, was refused at the bounded-call ceiling, failed to open, or its scan was capped |
 
-A clean run on any OS — one that hits none of the degradations above — leaves the agent's default `UNDECLARED`/`UNKNOWN` status; the table rows above are the only places the plugin calls `set_result_status` — the sample captures show this (`windows.txt:84,89,93`; `linux.txt:155,160,164`; `macos.txt:170,174`).
+A clean run on any OS leaves the default `UNDECLARED` / `UNKNOWN` status. The plugin sets a status only to report a degraded read, so the table rows above are the only statuses it emits; the Sample output shows this. A failed `delete` is reported by its `error|...` line and a non-zero exit, and sets a status only on the paths named above.
 
 ### Where the data goes
 
-- **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention, `server/core/src/response_store.hpp:8,152`), queryable at `/api/responses/{id}` and aggregatable (`list` groups by `store`/`issuer` per its YAML `aggregation` block).
+- **Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention), queryable at `/api/responses/{id}`; `list` also aggregates by `store` and `issuer` through its definition's `aggregation` block.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — no reference to the `certificates` plugin or its definition ids exists outside `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`.
 - **Sensitivity.** `list`/`details` rows carry every certificate's `subject` and `issuer` — for code-signing certs (the Windows sample) this is effectively an installed-software-publisher inventory (e.g. `Logitech Inc`, `Microsoft Corporation`) by another route, and on macOS a successful login-keychain read can surface the signed-in user's own personal certificates; `thumbprint`/`serial` uniquely identify a specific certificate but not a device or person directly.
 - **Siblings:** none in this plugin group; the `diagnostics.certificates` action (a different plugin, TLS cert/key diagnostics) is unrelated despite the similar name.
@@ -230,11 +320,11 @@ error|thumbprint parameter required
 
 ## Caveats and known gaps
 
-1. **Windows store-open failures are no longer silent, `delete` on Windows never substitutes the CurrentUser store for an unopenable LocalMachine store (#4377), the Linux delete recheck still has a narrow residual window, and a macOS System/root keychain's empty answer is only trusted when the keychain is confirmed readable.** A CryptoAPI store that neither `CertOpenStore` attempt can open now reports `not_available|<store> store could not be opened` (`list`/`details`) or `error|<store> store could not be opened; nothing removed` with a non-zero exit (`delete`), and marks the result CONSTRAINED/PARTIAL via `cryptoapi:store-open` — the Windows leg does call `set_result_status` for this case (`certificates_plugin.cpp:422-430,487,613-619`); `delete` opens the named store under LocalMachine only and has no CurrentUser retry path at all (`certificates_plugin.cpp:602-611`), unlike `list`/`details`, which disclose a CurrentUser fallback rather than presenting it as a clean LocalMachine read. On Linux, the held-dirfd scan/delete core now lives in `certificates_linux_store.hpp`, with syscall-level tests in `tests/unit/test_certificates_linux_store.cpp` covering symlink retarget, inode swap, a failed recheck, and mid-enumeration failure; `delete` re-derives the matched entry's identity — its own device/inode and, for a symlink, the target's link text plus the target's device/inode — immediately before `unlinkat`, but POSIX has no unlink-by-fd, so a residual `fstatat`-then-`unlinkat` window remains (`certificates_linux_store.hpp:342-358,389-431`); because identity binds inode and target text/inode rather than content, an in-place rewrite of the SAME inode between match and unlink is not detected. A FIFO, device, socket or directory encountered during the scan is skipped silently via a nonblocking, post-open `S_ISREG` check rather than blocking the scan (`certificates_linux_store.hpp:232-252`), and deleting a symlinked entry always removes the link itself via `unlinkat`, never the file it points to. On macOS, a System/root keychain whose `SecItemCopyMatching` answer comes back empty is classified `zero certificates` only when the keychain's own read-permission status bit is set (`keychain_read.cpp:116`); otherwise it is reported as `not_available|<keychain> not readable (no read permission)` (`certificates_plugin.cpp:1586-1610`) and the result is CONSTRAINED/PARTIAL — an unreadable keychain is never a silent empty inventory (#2318).
-2. **The login keychain read is a registered exception, not a rung-1 promotion.** System.keychain/SystemRootCertificates.keychain are read in-process via `SecItemCopyMatching`, bounded to 15 seconds per keychain via agent-core's `read_keychain_bounded` and abandoned (not cancelled) on timeout (`certificates_plugin.cpp:1031,1170-1185`); the login keychain stays on the `launchctl asuser` + `sudo -u` + `security find-certificate` subprocess (rung 2, #3406) because the LaunchDaemon has no login keychain of its own (`certificates_plugin.cpp:16-23`) — do not "fix" this to a direct API call. Immediately before that subprocess spawn the plugin re-reads `/dev/console`'s owner in-process and refuses to spawn on a mismatch, shrinking (not eliminating) the fast-user-switch race window from tens of seconds to microseconds (`certificates_plugin.cpp:1497-1533`).
-3. **SystemRootCertificates.keychain delete is permanently rejected.** It is sealed under System Integrity Protection; `delete_cert_macos` rejects `store=root` outright before ever shelling out (`certificates_plugin.cpp:2089-2099`) — a hard OS limitation, not a bug to fix.
-4. **A macOS delete self-verifies before reporting success.** `delete_cert_macos` re-enumerates the target keychain after `security delete-certificate` exits 0 and only reports `status|deleted` on a positively-proven absence; a keychain that can't be re-read or still shows the certificate reports `error|...`, never a false `status|deleted` (`certificates_plugin.cpp:2191-2229`).
-5. **The macOS sample was captured unprivileged and shows the login-keychain leg degrading live, and test-only environment overrides exist on the macOS path that must never be set in production.** At euid 501 with no console session reachable via `launchctl asuser` without root, `list`'s login-keychain read failed and the result carries `CONSTRAINED`/`PARTIAL`/`login-keychain` (`macos.txt:164-165`) — expected under the capture harness, but it means this sample never exercises a successful login-keychain read. Separately, `YUZU_CERTIFICATES_SYSTEM_KEYCHAIN_PATH_OVERRIDE` / `YUZU_CERTIFICATES_ROOT_KEYCHAIN_PATH_OVERRIDE` (absolute paths; `agents/shared/macos_console_user.hpp`, `system_keychain_path`/`root_keychain_path`) redirect the System/root keychain reads of `list`/`details` to a fixture keychain — `delete` never consults them: `resolve_delete_keychain_path` returns the fixed literal paths regardless, so a destructive action can never be pointed at a substituted keychain. `YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE` replaces the `stat -f%Su /dev/console` console-user lookup with a fixed username (still validated and resolved through the bounded passwd lookup); `YUZU_CERTIFICATES_CONSOLE_OWNER_UID_OVERRIDE` replaces the in-process `/dev/console` owner recheck's uid (an unparsable value is a failed recheck); `YUZU_CERTIFICATES_LOGIN_KEYCHAIN_READ_FAIL_OVERRIDE` makes the login-keychain read report a failed read carrying that value instead of spawning `security`. They exist so `tests/unit/test_certificates_macos_actions.cpp` can drive the real plugin's SecItem-failure sentinels and the console-owner recheck end to end (#4374); each is read on every call, never cached, and is ignored when unset.
+1. **Coverage is a fixed set of stores, not everything the device trusts.** Windows reads the machine stores `MY`, `ROOT`, `CA` and `Trust`; Linux reads `.pem` and `.crt` files directly in `/etc/ssl/certs` and only the first certificate in each; macOS reads the System, system-root and (with a console user, and as root) login keychains. Trust settings, the Windows disallowed store, application-private bundles and any other trust-store location are not read, so presence in a listed store does not prove a certificate is trusted for every purpose.
+2. **Linux `delete` is coarse and keeps a narrow race.** It removes the first matching directory entry as a whole, so a file holding several certificates goes with its first one, and a symlink is removed without touching its target. POSIX has no unlink by descriptor, so a small window remains between the identity re-check and `unlinkat`, and because identity is inode and link text rather than content, an in-place rewrite of the same file in that window is not detected.
+3. **macOS `delete` covers the System keychain only, and the login keychain read is a subprocess.** `SystemRootCertificates.keychain` is sealed by System Integrity Protection and is rejected, and `login` and `all` are rejected for `delete` rather than redirected. The login-keychain read runs through `launchctl asuser` and `sudo -u`, works only because the daemon runs as root today, and the console-owner re-check narrows but does not close the fast-user-switch race.
+4. **Degraded reads are disclosed, with one quiet exception.** An unopenable or incomplete store, an unreadable file, a timed-out keychain or an unavailable login keychain each produces a `not_available` row and a `CONSTRAINED` / `PARTIAL` status. A Linux host with no `/etc/ssl/certs` directory returns the header row alone with no status, which looks the same as an empty store.
+5. **The macOS sample was captured unprivileged, and test-only overrides exist.** The sample shows the login-keychain read degrading and never a successful one. The `YUZU_CERTIFICATES_SYSTEM_KEYCHAIN_PATH_OVERRIDE`, `YUZU_CERTIFICATES_ROOT_KEYCHAIN_PATH_OVERRIDE`, `YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE`, `YUZU_CERTIFICATES_CONSOLE_OWNER_UID_OVERRIDE` and `YUZU_CERTIFICATES_LOGIN_KEYCHAIN_READ_FAIL_OVERRIDE` environment variables redirect or simulate those reads for unit tests and must never be set in production; `delete` ignores the keychain path overrides.
 
 ## Source and tests
 

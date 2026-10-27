@@ -47,10 +47,18 @@
 ## explicit pin, so the server pins its own default-gateway.pem automatically
 ## and no extra server flag is needed here.
 ##
-## Gateway TLS config: the gateway's grpcbox reads its OWN config, not the
-## YUZU_GW_* env vars, so we MOUNT reference-gateway-sys.config (upstream points
-## at the `server` service, listener is one-way TLS). Env-driven gateway TLS is
+## Gateway TLS config: the gateway's listeners are configured in its sys.config
+## ({yuzu_gw, grpc_listeners}), not by the YUZU_GW_* env vars, so we MOUNT
+## reference-gateway-sys.config (upstream points at the `server` service, agent
+## listener is one-way TLS). Env-driven gateway TLS is
 ## tracked in #1291.
+##
+## Gateway image: that config uses the grpc_listeners shape, so the gateway
+## image must be from the first release containing the yuzu_gw grpc_listeners
+## shape. An older image ignores grpc_listeners, binds no listener and still
+## answers /healthz and /readyz with 200 (the compose healthcheck stays green
+## while no agent can connect). Image and config are an atomic pair; see
+## "Upgrading the Gateway" in docs/user-manual/upgrading.md.
 ##
 ## --cert-san: the default leaves are minted with SANs for the in-compose
 ## service names so SNI verification succeeds (agent→`gateway`, gateway→`server`).
@@ -134,15 +142,30 @@ services:
 
   gateway:
     image: ghcr.io/devnullltd/yuzu-gateway:${YUZU_VERSION:-0.14.1}
+    # Planned stop: the gateway ends its agent sessions and sends their
+    # DISCONNECTED notices to the server before it exits, within
+    # shutdown_flush_budget_ms (default 20 s), then stops its processes. The
+    # Docker default (10 s before SIGKILL) would cut that short; 40 s covers the
+    # budget with margin. Raise both together (docs/user-manual/gateway.md,
+    # "Planned stop").
+    stop_grace_period: 40s
     container_name: yuzu-gateway
     restart: unless-stopped
+    # Bound the gateway's stdout: a persistent upstream TLS failure logs per
+    # redial attempt (docs/user-manual/gateway.md), and the default json-file
+    # driver has no size cap.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     environment:
       # Single-node, ephemeral — accept the default Erlang distribution cookie
       # (the gateway fail-closes on it otherwise). NEVER set this in a clustered
       # production gateway; set a strong YUZU_GW_COOKIE instead.
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
     volumes:
-      # grpcbox reads its own config — mount the TLS sys.config (#1291 follow-up).
+      # The listeners come from sys.config, not env — mount the TLS sys.config (#1291 follow-up).
       - ./reference-gateway-sys.config:/opt/yuzu_gw/releases/0.2.0/sys.config:ro
       - certs:/etc/yuzu/certs:ro      # reads default-ca/-gateway via the yuzu-pki group
     depends_on:
