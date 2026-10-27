@@ -7065,16 +7065,41 @@ void SettingsRoutes::register_routes(
                           "text/html; charset=utf-8");
                       return;
                   }
-                  // The row is written AFTER the actor's own session is deleted, so it is
-                  // attributed to the session already resolved, not re-resolved from the cookie.
-                  const auto audit = [&](const char* result, const std::string& detail) {
+                  // Two rows per disable: an INTENT row ("attempted") written BEFORE the factor is
+                  // touched, and an OUTCOME row after. The outcome row is written AFTER the actor's
+                  // own session is deleted, so both are attributed to the session already
+                  // resolved, not re-resolved from the cookie. Order them by the audit `id`.
+                  // Returns whether the row persisted; the unwired fallback (tests, other callers)
+                  // is a void writer and reports true, so only the production binding can refuse.
+                  const auto audit = [&](const char* result, const std::string& detail) -> bool {
                       if (audit_as_session_fn_)
-                          audit_as_session_fn_(req, *session,
-                                               auth::role_to_string(auth::effective_role(*session)),
-                                               "mfa.disabled", result, "User", session->username,
-                                               detail);
-                      else
-                          audit_fn_(req, "mfa.disabled", result, "User", session->username, detail);
+                          return audit_as_session_fn_(
+                              req, *session, auth::role_to_string(auth::effective_role(*session)),
+                              "mfa.disabled", result, "User", session->username, detail);
+                      audit_fn_(req, "mfa.disabled", result, "User", session->username, detail);
+                      return true;
+                  };
+                  // Fail closed on the intent row: an MFA clear that cannot be recorded does not
+                  // happen. Nothing has been cleared and no session has been ended.
+                  if (!audit("attempted", "MFA clear requested via Settings")) {
+                      spdlog::error("mfa.disabled: the audit store did not accept the intent row "
+                                    "for '{}'; MFA was NOT changed",
+                                    log_safe(session->username));
+                      res.status = 503;
+                      res.set_header("Retry-After", "5");
+                      res.set_header("Sec-Audit-Failed", "true");
+                      res.set_content(render_mfa_fragment(
+                                          *session, {}, {}, {}, {},
+                                          "Audit store unavailable; MFA was not changed."),
+                                      "text/html; charset=utf-8");
+                      return;
+                  }
+                  // The clear has no undo, so a lost OUTCOME row cannot stop it; it is logged.
+                  const auto audit_outcome = [&](const char* result, const std::string& detail) {
+                      if (!audit(result, detail))
+                          spdlog::error("mfa.disabled: MFA cleared for '{}' but the outcome audit "
+                                        "row failed to persist",
+                                        log_safe(session->username));
                   };
                   // Same exit as logout: drop the cookie and send the browser to the landing page.
                   const auto sign_out = [&] {
@@ -7091,7 +7116,7 @@ void SettingsRoutes::register_routes(
                       // The clear may have committed with its acknowledgement lost, so the
                       // sessions end anyway (#6079).
                       const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
-                      audit("error",
+                      audit_outcome("error",
                             "disable failed (sessions_ended=" +
                                 (ended.db_persisted ? std::to_string(ended.count)
                                                     : std::string("failed")) +
@@ -7114,7 +7139,7 @@ void SettingsRoutes::register_routes(
                   // Cancelling an enrolment that never completed clears no usable factor, so no
                   // proof can predate one: nothing to end.
                   if (!had_factor) {
-                      audit("ok", "no verified factor to clear");
+                      audit_outcome("ok", "no verified factor to clear");
                       res.set_content(render_mfa_fragment(*session), "text/html; charset=utf-8");
                       return;
                   }
@@ -7123,7 +7148,7 @@ void SettingsRoutes::register_routes(
                   // again; a kept session would be a surviving proof we could not tell apart.
                   const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
                   if (!ended.db_persisted) {
-                      audit("partial", "sessions_ended=failed");
+                      audit_outcome("partial", "sessions_ended=failed");
                       res.set_content(
                           render_mfa_fragment(
                               *session, {}, {}, {}, {},
@@ -7132,7 +7157,7 @@ void SettingsRoutes::register_routes(
                           "text/html; charset=utf-8");
                       return;
                   }
-                  audit("ok", std::format("sessions_ended={}", ended.count));
+                  audit_outcome("ok", std::format("sessions_ended={}", ended.count));
                   sign_out();
               });
 }

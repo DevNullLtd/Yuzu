@@ -60,6 +60,64 @@ inline std::string strip_line_comments(std::string_view text) {
     return out;
 }
 
+// Comment-evasion-proof variant for scans that must not be satisfied by commented-out code
+// (#6079 qe-S2): drops `//` and `/* */` comments, keeps every newline (line numbers are
+// unchanged), and leaves string, character and raw-string literals untouched, so a `//`
+// inside a literal is not a comment. A single linear pass; no pattern library.
+inline std::string strip_comments(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    const std::size_t n = text.size();
+    std::size_t i = 0;
+    while (i < n) {
+        const char c = text[i];
+        if (c == '/' && i + 1 < n && text[i + 1] == '/') {
+            while (i < n && text[i] != '\n')
+                ++i; // the newline is copied by the next pass
+        } else if (c == '/' && i + 1 < n && text[i + 1] == '*') {
+            i += 2;
+            while (i < n && !(text[i] == '*' && i + 1 < n && text[i + 1] == '/')) {
+                if (text[i] == '\n')
+                    out.push_back('\n');
+                ++i;
+            }
+            i = (i < n) ? i + 2 : n;
+            out.push_back(' ');
+        } else if (c == 'R' && i + 1 < n && text[i + 1] == '"') {
+            // Raw string: R"delim( ... )delim"
+            const std::size_t open = text.find('(', i + 2);
+            if (open == std::string_view::npos) {
+                out.push_back(c);
+                ++i;
+                continue;
+            }
+            const std::string close =
+                ")" + std::string(text.substr(i + 2, open - (i + 2))) + "\"";
+            const std::size_t end = text.find(close, open);
+            const std::size_t stop =
+                (end == std::string_view::npos) ? n : end + close.size();
+            out.append(text.substr(i, stop - i));
+            i = stop;
+        } else if (c == '"' || c == '\'') {
+            out.push_back(c);
+            ++i;
+            while (i < n && text[i] != c && text[i] != '\n') {
+                if (text[i] == '\\' && i + 1 < n)
+                    out.push_back(text[i++]);
+                out.push_back(text[i++]);
+            }
+            if (i < n && text[i] == c) {
+                out.push_back(c);
+                ++i;
+            }
+        } else {
+            out.push_back(c);
+            ++i;
+        }
+    }
+    return out;
+}
+
 inline std::string read_text_file(const std::filesystem::path& path) {
     INFO("reading " << path.string());
     REQUIRE(std::filesystem::is_regular_file(path));
@@ -119,6 +177,20 @@ inline const std::string& stripped_source(std::string_view basename) {
         std::string stripped = strip_line_comments(
             read_text_file(std::filesystem::path(YUZU_SERVER_SRC_DIR) / std::string(basename)));
         ++stripped_source_loads;
+        it = cache.emplace(std::string(basename), std::move(stripped)).first;
+    }
+    return it->second;
+}
+
+// `<YUZU_SERVER_SRC_DIR>/<basename>` with every C and C++ comment stripped
+// (strip_comments), read once per process. Use it for a scan whose pass must not be
+// satisfiable by commented-out code.
+inline const std::string& comment_free_source(std::string_view basename) {
+    static std::map<std::string, std::string, std::less<>> cache;
+    auto it = cache.find(basename);
+    if (it == cache.end()) {
+        std::string stripped = strip_comments(
+            read_text_file(std::filesystem::path(YUZU_SERVER_SRC_DIR) / std::string(basename)));
         it = cache.emplace(std::string(basename), std::move(stripped)).first;
     }
     return it->second;

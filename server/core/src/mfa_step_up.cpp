@@ -3,7 +3,7 @@
 #include "mfa_step_up.hpp"
 
 #include "step_up_gate.hpp"
-#include "web_utils.hpp" // audit_token / log_safe: session.username is IdP- or operator-controlled
+#include "web_utils.hpp" // log_safe: session.username is IdP- or operator-controlled
 
 #include <yuzu/metrics.hpp>
 
@@ -38,7 +38,7 @@ ProofAge mfa_proof_age(const auth::Session& session, std::chrono::seconds effect
     // cache-populate from the DB clock (ADR-2002 §4 DB-clock authority, WS-1/1a):
     // `steady_mfa_verified` is set to `steady_now - (db_now - mfa_verified_ms)` in
     // derive_session_deadlines, immune to local wall skew/steps. Its {} sentinel
-    // means "no usable MFA proof" — derive sets it {} for BOTH an absent proof AND
+    // means "no usable MFA proof": derive sets it {} for BOTH an absent proof AND
     // a FUTURE-DATED proof (`mfa_verified_ms > db_now`, a backward DB step below
     // the proof instant → fail CLOSED, never a spurious-fresh window). So the
     // future-dated rejection is already applied; this just reads the sentinel.
@@ -50,7 +50,7 @@ ProofAge mfa_proof_age(const auth::Session& session, std::chrono::seconds effect
                                         now - session.steady_mfa_verified);
     // Suspend backstop (parity with is_elevated / validate, ADR-2002 §4 / design-
     // review H5 + LOW-1): the freshness age above is on steady_clock, which pauses
-    // across host/VM suspend — so a stale proof could read fresh after a resume.
+    // across host/VM suspend, so a stale proof could read fresh after a resume.
     // Also require the ABSOLUTE (wall) proof age not be grossly past the window,
     // consulted only with the generous auth::kWallSanitySkew slack so a merely
     // clock-SKEWED (non-suspended) replica is never affected (only a long suspend,
@@ -138,14 +138,17 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
     using Kind = ApproverMfaOutcome::Kind;
     using Source = auth::DurableMfaProof::Source;
     const auto probe = probe_mfa_factor(session, auth_db);
-    const auto store_unavailable = [&](const char* what) -> ApproverMfaOutcome {
-        spdlog::error("require_enrolled_fresh_mfa: {}({}) unavailable - failing closed", what,
-                      log_safe(session.username));
+    const auto unavailable = [&]() -> ApproverMfaOutcome {
         if (metrics) {
             metrics->counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}})
                 .increment();
         }
         return {Kind::kStoreUnavailable, MfaFactorState::kStoreUnavailable};
+    };
+    const auto store_unavailable = [&](const char* what) -> ApproverMfaOutcome {
+        spdlog::error("require_enrolled_fresh_mfa: {}({}) unavailable - failing closed", what,
+                      log_safe(session.username));
+        return unavailable();
     };
     switch (probe.state) {
     case MfaFactorState::kEnrolledLocal:
@@ -153,6 +156,22 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
         break;
     case MfaFactorState::kStoreUnavailable:
         return store_unavailable("mfa_status");
+    case MfaFactorState::kNoIdpProof:
+        // The cached anchor of an SSO session is left empty both when the IdP attested no
+        // second factor AND when the stored proof is dated after the database clock (a
+        // replica or IdP clock ahead of the database; derive_session_deadlines drops it).
+        // Only the first is the approver's to fix by signing in again: the second would
+        // repeat on every login, so it answers 503 (a server-side condition) rather than
+        // a 403 with a remedy that cannot work. Still a refusal; no path passes.
+        if (durable.source == Source::kRow && durable.mfa_verified_ms > durable.db_now_ms) {
+            spdlog::error("require_enrolled_fresh_mfa: approver MFA proof is dated after the "
+                          "database clock (clock skew between the replica/IdP and the database); "
+                          "refusing with 503 rather than telling the approver to sign in again "
+                          "(user={})",
+                          log_safe(session.username));
+            return unavailable();
+        }
+        return {Kind::kRefuse, probe.state};
     default:
         return {Kind::kRefuse, probe.state};
     }
@@ -172,8 +191,10 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
     // 450 s old in elapsed time passes a 300 s window. A kRow closes that: age = db_now -
     // mfa_verified in ONE SELECT on the database clock, which a paused VM cannot stretch. The
     // cached monotonic check is kept as well (a stricter, never a looser, second condition),
-    // so both clocks must agree the proof is in the window. The replica's raw system_clock is
-    // never consulted. An SSO session's durable instant is the IdP `iat` clamped to this
+    // so both clocks must agree the proof is in the window. `mfa_proof_age` also computes a
+    // wall-clock figure (`wall_stale`, from the replica's system_clock) for the generic
+    // gate's suspend backstop; this gate never reads it, so no replica wall clock is
+    // decisional here. An SSO session's durable instant is the IdP `iat` clamped to this
     // replica's clock at login, so a replica running ahead of the database can store a proof
     // the database reads as future-dated. A future-dated durable instant is refused here; for
     // a freshly minted or loaded session the same condition has already left no cached proof
@@ -188,11 +209,16 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
     if (durable.source == Source::kRow) {
         proof_ms = durable.mfa_verified_ms;
         has_proof = proof_ms > 0;
-        const long long durable_age_ms = durable.db_now_ms - durable.mfa_verified_ms;
-        const bool durable_fresh = has_proof && durable_age_ms >= 0 && durable_age_ms <= window_ms;
-        within_window = durable_fresh && !proof.no_proof && proof.age_ms <= window_ms;
-        if (has_proof && durable_age_ms >= 0)
-            age_secs = std::max<long long>(proof.age_secs, durable_age_ms / 1000);
+        // Subtract only once the instant is known positive: a corrupt negative value would
+        // otherwise overflow the signed difference.
+        if (has_proof) {
+            const long long durable_age_ms = durable.db_now_ms - durable.mfa_verified_ms;
+            const bool durable_fresh = durable_age_ms >= 0 && durable_age_ms <= window_ms;
+            within_window = durable_fresh && !proof.no_proof && proof.age_ms >= 0 &&
+                            proof.age_ms <= window_ms;
+            if (durable_age_ms >= 0)
+                age_secs = std::max<long long>(proof.age_secs, durable_age_ms / 1000);
+        }
     }
 
     // A local proof stamped before the CURRENT enrolment was made under a factor that has

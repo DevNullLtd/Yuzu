@@ -112,7 +112,7 @@
 /// `detail::write_step_up_challenge`) is best effort: a failure to write it is
 /// logged and never surfaced in the response. Past those,
 /// approve/reject write an `"attempted"` row BEFORE the store call (fail closed, see
-/// above) and then audit BOTH outcomes — a denied review (e.g. the store's
+/// above) and then audit BOTH outcomes: a denied review (e.g. the store's
 /// self-approval segregation-of-duties block) is audited as `"denied"`
 /// with `result.error()` as the detail, and a successful one as
 /// `"success"` — and additionally emit an `approval.approved`/

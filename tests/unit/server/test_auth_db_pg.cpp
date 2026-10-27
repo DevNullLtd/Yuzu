@@ -2526,7 +2526,7 @@ void enroll(AuthDB& db, const std::string& user) {
 
 TEST_CASE("AuthDB::mfa_status enrolled_at_ms is 0 for a user who is not enrolled, including one "
           "with only a provisional secret",
-          "[pg][authdb][mfa]") {
+          "[pg][auth_db][mfa]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("d1", "h", "s", yuzu::server::auth::Role::user).has_value());
@@ -2544,7 +2544,7 @@ TEST_CASE("AuthDB::mfa_status enrolled_at_ms is 0 for a user who is not enrolled
 }
 
 TEST_CASE("AuthDB::mfa_status enrolled_at_ms is the database instant that completed enrolment",
-          "[pg][authdb][mfa]") {
+          "[pg][auth_db][mfa]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("d2", "h", "s", yuzu::server::auth::Role::user).has_value());
@@ -2563,7 +2563,7 @@ TEST_CASE("AuthDB::mfa_status enrolled_at_ms is the database instant that comple
 
 TEST_CASE("AuthDB::mfa_status enrolled_at_ms returns to 0 after mfa_disable and moves forward on "
           "re-enrolment",
-          "[pg][authdb][mfa]") {
+          "[pg][auth_db][mfa]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("d3", "h", "s", yuzu::server::auth::Role::user).has_value());
@@ -2585,6 +2585,72 @@ TEST_CASE("AuthDB::mfa_status enrolled_at_ms returns to 0 after mfa_disable and 
     REQUIRE(again.has_value());
     CHECK(again->enrolled_at_ms >= lo);
     CHECK(again->enrolled_at_ms > first->enrolled_at_ms);
+}
+
+// cs-S2 / au-F2 (#6079): mfa_disable_report's pre-image comes from the SAME row lock as the clear.
+// A concurrent writer holding the row decides what the report says: if a SELECT-then-UPDATE split
+// were ever introduced, the pre-image would be read before the wait and these two cases would
+// report the stale value (and a Settings caller would skip ending sessions made under a factor
+// that was enrolled while it waited).
+TEST_CASE("AuthDB::mfa_disable_report pre-image reflects an enrolment that commits while it "
+          "waits on the row lock",
+          "[pg][auth_db][mfa]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("dr1", "h", "s", yuzu::server::auth::Role::user).has_value());
+    REQUIRE(h.db.mfa_init_enrollment("dr1", "Yuzu", std::nullopt).has_value()); // provisional only
+    REQUIRE_FALSE(h.db.mfa_status("dr1")->enrolled);
+
+    // A second connection holds the row and completes the enrolment inside its transaction.
+    PgConn locker = connect(db.dsn());
+    { PgResult b{PQexec(locker.get(), "BEGIN")}; REQUIRE(b.ok()); }
+    {
+        PgResult u{PQexec(locker.get(), "UPDATE auth.users SET mfa_enrolled_at = now() "
+                                        "WHERE username = 'dr1'")};
+        REQUIRE(u.ok());
+    }
+    std::optional<std::expected<bool, AuthDBError>> report;
+    {
+        std::jthread disabler([&] { report = h.db.mfa_disable_report("dr1"); });
+        const bool waited = yuzu::test::wait_for_pg_lock_waiter(db.dsn(), "%WITH pre AS%");
+        PgResult c{PQexec(locker.get(), "COMMIT")};
+        CHECK(c.ok());
+        CHECK(waited);
+    } // jthread joins here
+    REQUIRE(report.has_value());
+    REQUIRE(report->has_value());
+    CHECK(**report); // the pre-image saw the enrolment that committed while it waited
+    auto after = h.db.mfa_status("dr1");
+    REQUIRE(after.has_value());
+    CHECK_FALSE(after->enrolled); // and the clear then removed it
+}
+
+TEST_CASE("AuthDB::mfa_disable_report pre-image is false when a concurrent disable commits first",
+          "[pg][auth_db][mfa]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("dr2", "h", "s", yuzu::server::auth::Role::user).has_value());
+    enroll(h.db, "dr2");
+    REQUIRE(h.db.mfa_status("dr2")->enrolled);
+
+    PgConn locker = connect(db.dsn());
+    { PgResult b{PQexec(locker.get(), "BEGIN")}; REQUIRE(b.ok()); }
+    {
+        PgResult u{PQexec(locker.get(), "UPDATE auth.users SET mfa_totp_secret = NULL, "
+                                        "mfa_enrolled_at = NULL WHERE username = 'dr2'")};
+        REQUIRE(u.ok());
+    }
+    std::optional<std::expected<bool, AuthDBError>> report;
+    {
+        std::jthread disabler([&] { report = h.db.mfa_disable_report("dr2"); });
+        const bool waited = yuzu::test::wait_for_pg_lock_waiter(db.dsn(), "%WITH pre AS%");
+        PgResult c{PQexec(locker.get(), "COMMIT")};
+        CHECK(c.ok());
+        CHECK(waited);
+    } // jthread joins here
+    REQUIRE(report.has_value());
+    REQUIRE(report->has_value());
+    CHECK_FALSE(**report); // nothing left to clear: the other disable already did
 }
 
 #endif // YUZU_TEST_ENABLE_PG

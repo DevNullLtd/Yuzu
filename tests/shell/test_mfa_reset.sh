@@ -127,7 +127,46 @@ else
   echo "FAIL - audit detail lacks sessions_ended=1 (detail=$detail)"; fail=$((fail+1))
 fi
 
-# A failed session delete is loud and non-zero, but the audit row is still written.
+# Two audit rows per reset (#6079 au-F1): an INTENT row ("attempted") written BEFORE the factor
+# is cleared and an OUTCOME row after, ordered by the `id` identity column (`timestamp` is whole
+# seconds). The last two rows are this run's pair.
+last_two="$(sess_sql "SELECT result FROM (SELECT id, result FROM audit_store.audit_events WHERE action='mfa.reset.breakglass' ORDER BY id DESC LIMIT 2) t ORDER BY id;" 2>&1 | tr '\n' ',' || true)"
+if [ "$last_two" = "attempted,success," ]; then
+  echo "ok   - intent row (attempted) precedes the outcome row (success)"; pass=$((pass+1))
+else
+  echo "FAIL - audit row order/results (got '$last_two', want 'attempted,success,')"; fail=$((fail+1))
+fi
+intent_detail="$(sess_sql "SELECT detail FROM audit_store.audit_events WHERE action='mfa.reset.breakglass' AND result='attempted' ORDER BY id DESC LIMIT 1;" 2>&1 || true)"
+if printf '%s' "$intent_detail" | grep -qF 'MFA clear requested via --mfa-reset CLI (os_identity='; then
+  echo "ok   - intent row detail names the CLI and the OS identity"; pass=$((pass+1))
+else
+  echo "FAIL - intent row detail (detail=$intent_detail)"; fail=$((fail+1))
+fi
+
+# Fail closed on the intent row: when the audit store refuses it, NOTHING is cleared. A BEFORE
+# INSERT trigger rejects only the intent row. The user is given a (marker-only) enrolment and a
+# session, and both must survive the refused run, which exits 1 and says nothing was changed.
+sess_sql "UPDATE auth.users SET mfa_enrolled_at = now() WHERE username='admin';"
+sess_sql "INSERT INTO session_store.sessions (token_hash, username, role, created_at_ms, expires_at_ms, last_activity_ms, mfa_verified_ms) VALUES ('yuzu_test_h_admin2', 'admin', 'admin', 1, 9999999999999, 1, 1);"
+sess_sql "CREATE FUNCTION public.yuzu_test_block_intent() RETURNS trigger LANGUAGE plpgsql AS \$\$ BEGIN IF NEW.action = 'mfa.reset.breakglass' AND NEW.result = 'attempted' THEN RAISE EXCEPTION 'yuzu_test: intent row refused'; END IF; RETURN NEW; END \$\$; CREATE TRIGGER yuzu_test_block_intent BEFORE INSERT ON audit_store.audit_events FOR EACH ROW EXECUTE FUNCTION public.yuzu_test_block_intent();"
+rows_before="$(sess_sql "SELECT count(*) FROM audit_store.audit_events WHERE action='mfa.reset.breakglass';")"
+set +e
+err="$("$BIN" --config "$TMP/yuzu-server.cfg" --data-dir "$TMP" --ca-dir "$TMP" --postgres-dsn "$CHILD_DSN" --mfa-reset admin 2>&1 >/dev/null)"
+got=$?
+set -e
+still_enrolled="$(sess_sql "SELECT count(*) FROM auth.users WHERE username='admin' AND mfa_enrolled_at IS NOT NULL;")"
+sess_left="$(sess_sql "SELECT count(*) FROM session_store.sessions WHERE username='admin';")"
+rows_after="$(sess_sql "SELECT count(*) FROM audit_store.audit_events WHERE action='mfa.reset.breakglass';")"
+sess_sql "DROP TRIGGER yuzu_test_block_intent ON audit_store.audit_events; DROP FUNCTION public.yuzu_test_block_intent();"
+if [ "$got" = "1" ] && printf '%s' "$err" | grep -qF 'nothing was changed' \
+   && [ "$still_enrolled" = "1" ] && [ "$sess_left" = "1" ] && [ "$rows_after" = "$rows_before" ]; then
+  echo "ok   - a refused intent row clears nothing (exit 1, factor and session intact, no row)"; pass=$((pass+1))
+else
+  echo "FAIL - refused intent row (exit=$got want=1; enrolled=$still_enrolled want 1; sessions=$sess_left want 1; rows $rows_before->$rows_after; err=$err)"; fail=$((fail+1))
+fi
+sess_sql "DELETE FROM session_store.sessions WHERE token_hash='yuzu_test_h_admin2';"
+
+# A failed session delete is loud and non-zero, but the outcome audit row is still written.
 sess_sql "ALTER TABLE session_store.sessions RENAME TO sessions_yuzu_test_hidden;"
 set +e
 "$BIN" --config "$TMP/yuzu-server.cfg" --data-dir "$TMP" --ca-dir "$TMP" --postgres-dsn "$CHILD_DSN" --mfa-reset admin >/dev/null 2>&1
@@ -138,6 +177,14 @@ if [ "$got" = "1" ] && printf '%s' "$detail" | grep -qF 'sessions_ended=failed';
   echo "ok   - failed session delete exits 1 and still audits sessions_ended=failed"; pass=$((pass+1))
 else
   echo "FAIL - failed session delete (exit=$got want=1; detail=$detail)"; fail=$((fail+1))
+fi
+# The outcome row's result is "partial" (the vocabulary the Settings route uses), not "success",
+# because the sessions were not ended; the intent row still precedes it (#6079 sec-F3, qe-N2).
+last_two="$(sess_sql "SELECT result FROM (SELECT id, result FROM audit_store.audit_events WHERE action='mfa.reset.breakglass' ORDER BY id DESC LIMIT 2) t ORDER BY id;" 2>&1 | tr '\n' ',' || true)"
+if [ "$last_two" = "attempted,partial," ]; then
+  echo "ok   - failed session delete records result=partial after the intent row"; pass=$((pass+1))
+else
+  echo "FAIL - failed session delete result column (got '$last_two', want 'attempted,partial,')"; fail=$((fail+1))
 fi
 
 echo "---- $pass passed, $fail failed ----"

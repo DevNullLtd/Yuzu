@@ -24,9 +24,10 @@
 ///
 /// Positive allow-list, not a deny-list: a seventh `auth_source` added later is
 /// refused here until someone decides it is an interactive, human, cookie-backed
-/// session. SAML passes this class check and is then refused by the MFA gate
-/// (`saml_mfa_unsupported`, whatever the step-up window) because a SAML session
-/// carries no MFA attestation in this release (#4935) -- documented behaviour,
+/// session. SAML passes this class check and is then refused (#4935): by the generic
+/// step-up check when that check answers first, otherwise by the MFA gate with
+/// `saml_mfa_unsupported` (step-up window 0, or enforcement not protecting the route).
+/// A SAML session carries no MFA attestation in this release -- documented behaviour,
 /// not a gap to patch here.
 ///
 /// Pure decision code: no I/O, no store access, no response mutation.

@@ -173,9 +173,12 @@ bool mfa_enforcement_protects(std::string_view mode, auth::Role role);
 
 namespace detail {
 
-/// Result of ageing a session's MFA proof on the cached monotonic anchor (the whole of
-/// `require_mfa_step_up`'s freshness test; the approver gate consumes it as the monotonic
-/// half only and adds its own durable, database-clock ceiling on top).
+/// Result of ageing a session's MFA proof on the cached monotonic anchor. The same age
+/// arithmetic exists in two copies that must stay in step: this one, whose only production
+/// consumer is the approver gate (`require_enrolled_fresh_mfa`, which uses the monotonic half
+/// and adds its own durable, database-clock ceiling on top), and the generic gate's own copy in
+/// `decide_step_up` (step_up_gate.cpp), which is what `require_mfa_step_up` and the central
+/// chokepoint decide on.
 struct ProofAge {
     bool no_proof{true};   ///< no usable proof: absent, or future-dated (derive left it {})
     bool fresh{false};     ///< a proof exists, is within the window, and is not wall-stale
@@ -190,8 +193,9 @@ struct ProofAge {
 };
 
 /// Age `session`'s proof against `effective_window` (monotonic anchor plus the wall
-/// suspend backstop; see the definition).
-ProofAge mfa_proof_age(const auth::Session& session, std::chrono::seconds effective_window);
+/// suspend backstop; see the definition). The wall figure (`wall_stale`) is computed from the
+/// replica's system_clock but is not decisional for the approver gate, which ignores it.
+[[nodiscard]] ProofAge mfa_proof_age(const auth::Session& session, std::chrono::seconds effective_window);
 
 /// Write the 401 step-up envelope (challenge_url differs for OIDC vs local) and emit
 /// one `mfa.step_up.required` row. `extra_detail`, when non-empty, is appended to the

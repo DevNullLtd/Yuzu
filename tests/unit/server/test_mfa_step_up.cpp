@@ -27,6 +27,7 @@
 #include <yuzu/server/auth_db.hpp>
 
 #include "test_auth_db_pg_helper.hpp"
+#include "../test_log_capture.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -607,7 +608,7 @@ TEST_CASE_METHOD(StepUpFixture,
 //
 // alice = enrolled admin, bob = not enrolled, carol = enrolled non-admin. alice's and
 // carol's enrolment is backdated an hour so a proof of any age under test is NOT
-// "older than the enrolment"; the binding cases move it explicitly.
+// "older than the enrolment"; the enrolment-instant cases move it explicitly.
 // ═══════════════════════════════════════════════════════════════════════════
 
 namespace {
@@ -1018,7 +1019,7 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: SAML and bearer s
 
 TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: a proof that predates the current "
                                   "enrolment is challenged; one made under it passes",
-                 "[pg][mfa][stepup][approver][binding]") {
+                 "[pg][mfa][stepup][approver][approver_enrolment_instant]") {
     // R17: alice proves, then her factor is cleared and re-enrolled.
     auto old_proof = with_wall_proof(*this, "alice", "local", seconds(10));
     REQUIRE(run(old_proof).outcome.kind == Kind::kPass);
@@ -1062,7 +1063,7 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: a hostile SSO sub
 
 TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: the enrolment boundary is "
                                   "inclusive to the millisecond",
-                 "[pg][mfa][stepup][approver][binding]") {
+                 "[pg][mfa][stepup][approver][approver_enrolment_instant]") {
     // bob enrols NOW (no backdating), so the boundary is a few ms ago and the proofs are fresh.
     enroll("bob");
     const auto at_ms = probe_mfa_factor(make_session("bob", "local"), *db).enrolled_at_ms;
@@ -1086,18 +1087,26 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: a future-dated or
         CHECK(r.res.status == 401);
     }
     {
+        // The cached anchor is empty (nothing to age), and the durable row holds the same
+        // future instant, i.e. one dated after the database clock. That is clock skew, not a
+        // login that attested no second factor, so it is a 503 and not the 403
+        // "sign in again" refusal whose remedy cannot work (UP-4). A genuinely proof-less SSO
+        // session is still the 403 (R13 below, and the dedicated UP-4 case).
         auto future_sso = with_wall_proof(*this, "oidc:x#y", "oidc", milliseconds(-600'000));
         auto r = run(future_sso);
-        CHECK(r.outcome.kind == Kind::kRefuse);
-        CHECK(r.outcome.factor == MfaFactorState::kNoIdpProof);
+        CHECK(r.outcome.kind == Kind::kStoreUnavailable);
+        CHECK(r.outcome.factor == MfaFactorState::kStoreUnavailable);
+        check_untouched(r);
     }
     audits.clear();
-    // R19: the monotonic anchor reads fresh (a host suspend freezes it) but the wall
-    // instant is an hour old, past window + the 5 minute skew allowance.
+    // R19: the monotonic anchor reads fresh (a host suspend freezes it) but the proof instant
+    // is an hour old. The approver gate does not consult the wall figure (`wall_stale`); what
+    // challenges here is the durable ceiling: `durable_row_for` builds the stored row from the
+    // same hour-old instant, so the database-clock age is an hour, past the 300 s window.
     {
-        // The enrolment is two hours old, so the one-hour-old wall proof is strictly NEWER
-        // than it: the only thing that can challenge here is the wall-stale rule, never the
-        // pre-enrolment rule (which would otherwise pass this test for the wrong reason).
+        // The enrolment is two hours old, so the one-hour-old proof is strictly NEWER than it:
+        // the pre-enrolment rule cannot be what challenges (it would otherwise pass this test
+        // for the wrong reason).
         backdate_enrolment("alice", seconds(7200));
         auto s = with_wall_proof(*this, "alice", "local", seconds(10));
         s.mfa_verified_at = system_clock::now() - std::chrono::hours(1);
@@ -1234,6 +1243,74 @@ TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a future-dated, mi
           auth::DurableMfaProof::Source::kAbsent);
 }
 
+// UP-4 (#6079): an SSO proof is `min(IdP iat, replica now)` stored as authored. A replica (or IdP)
+// whose clock runs ahead of the database stores an instant the database reads as future-dated;
+// derive_session_deadlines then leaves the cached anchor empty, which used to surface as the 403
+// "your login did not attest a second factor, sign in again" - a remedy that cannot work, because
+// the next login repeats it. The cause is clock skew, so the answer is the fail-closed 503.
+TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: an SSO proof dated after the "
+                                 "database clock is a 503, not a sign-in-again 403 (UP-4)",
+                 "[pg][mfa][stepup][approver][approver_mfa][durable]") {
+    const auto now_ms = std::chrono::duration_cast<milliseconds>(
+                            system_clock::now().time_since_epoch())
+                            .count();
+    auto mint_oidc = [&](const std::string& tok, std::int64_t proof_ms) {
+        yuzu::server::SessionWriteParams p;
+        p.token_hash = AuthManager::sha256_hex(tok);
+        p.username = "oidc:x#y";
+        p.role = "user";
+        p.auth_source = "oidc";
+        p.session_lifetime_ms = 3600'000;
+        p.mfa_verified_ms_abs = proof_ms;
+        REQUIRE(store.create(p).has_value());
+        auto s = mgr.validate_session(tok);
+        REQUIRE(s.has_value());
+        REQUIRE(s->auth_source == "oidc");
+        return *s;
+    };
+
+    // Proof 2 minutes ahead of the database clock.
+    const std::string skewed_token = "yuzu-test-oidc-skewed-proof-token-0001";
+    const auto skewed = mint_oidc(skewed_token, now_ms + 120'000);
+    REQUIRE(skewed.steady_mfa_verified.time_since_epoch().count() == 0); // derive dropped it
+    const auto skewed_durable = mgr.read_durable_mfa_proof(skewed_token, skewed.username);
+    REQUIRE(skewed_durable.source == auth::DurableMfaProof::Source::kRow);
+    REQUIRE(skewed_durable.mfa_verified_ms > skewed_durable.db_now_ms);
+
+    yuzu::MetricsRegistry metrics;
+    yuzu::test::LogCapture logs;
+    auto r = run(skewed, 300, &metrics, skewed_durable);
+    logs.stop();
+    CHECK(r.outcome.kind == Kind::kStoreUnavailable);
+    CHECK(r.outcome.factor == MfaFactorState::kStoreUnavailable);
+    CHECK_FALSE(r.outcome.kind == Kind::kRefuse);
+    check_untouched(r); // no 403/401 body, no challenge
+    CHECK(audits.empty());
+    CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}}).value() ==
+          1.0);
+    CHECK(logs.text().find("dated after the database clock") != std::string::npos);
+    CHECK(logs.text().find("clock skew") != std::string::npos);
+
+    // A genuinely missing proof (the IdP attested no second factor) is still the 403 refusal,
+    // and is not counted as an outage.
+    const std::string bare_token = "yuzu-test-oidc-no-amr-token-0001";
+    const auto bare = mint_oidc(bare_token, 0);
+    const auto bare_durable = mgr.read_durable_mfa_proof(bare_token, bare.username);
+    REQUIRE(bare_durable.source == auth::DurableMfaProof::Source::kRow);
+    REQUIRE(bare_durable.mfa_verified_ms == 0);
+    yuzu::MetricsRegistry bare_metrics;
+    auto b = run(bare, 300, &bare_metrics, bare_durable);
+    CHECK(b.outcome.kind == Kind::kRefuse);
+    CHECK(b.outcome.factor == MfaFactorState::kNoIdpProof);
+    check_untouched(b);
+    CHECK(bare_metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}})
+              .value() == 0.0);
+    // ...as is one whose durable session is absent (nothing dated after the clock).
+    auto absent = run(bare, 300, nullptr, auth::DurableMfaProof{auth::DurableMfaProof::Source::kAbsent, 0, 0});
+    CHECK(absent.outcome.kind == Kind::kRefuse);
+    CHECK(absent.outcome.factor == MfaFactorState::kNoIdpProof);
+}
+
 TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a fresh durable proof does not "
                                  "rescue a cached proof that is stale or missing",
                  "[pg][mfa][stepup][approver][durable]") {
@@ -1319,7 +1396,7 @@ TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a degraded durable
 
 TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: the durable proof, not the cached "
                                  "one, is compared with the enrolment instant",
-                 "[pg][mfa][stepup][approver][durable][binding]") {
+                 "[pg][mfa][stepup][approver][durable][approver_enrolment_instant]") {
     // Alice enrolled 10 s ago. The cached session was minted just now (after the enrolment),
     // so the cached comparison would pass; the durable proof is 100 s old, i.e. made before
     // the enrolment, and inside the 300 s window, so only the enrolment rule can refuse it.

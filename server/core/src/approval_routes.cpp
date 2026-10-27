@@ -45,14 +45,13 @@ std::string mfa_refusal_remediation(approval::ApproverRefusal refusal,
                                     const auth::Session& session) {
     switch (refusal) {
     case approval::ApproverRefusal::kMfaNotEnrolled:
-        return session.role == auth::Role::admin
-                   ? "Enrol under Settings > Security and sign-in > Two-factor sign-in, then "
+        return auth::effective_role(session) == auth::Role::admin
+                   ? "enrol under Settings > Security and sign-in > Two-factor sign-in, then "
                      "retry and enter a code when prompted."
                    : "sign out and sign in again: enrolment is offered at sign-in when this "
                      "deployment's --mfa-enforcement mode requires it for your role. If you are "
-                     "not offered it, ask an administrator to enrol you "
-                     "(docs/ops-runbooks/auth-db-recovery.md, 'Enrolling a non-admin approver'), "
-                     "then retry.";
+                     "not offered it, ask your Yuzu administrator to enrol you "
+                     "(Administrator guide: Enrolling a non-admin approver), then retry.";
     case approval::ApproverRefusal::kMfaProofMissing:
         return "your single sign-on login did not attest a second factor (no MFA amr). Sign in "
                "again through your identity provider with MFA, or ask an administrator to have "

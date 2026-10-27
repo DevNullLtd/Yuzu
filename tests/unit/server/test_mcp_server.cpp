@@ -2001,6 +2001,12 @@ TEST_CASE("MCP 2g: approve_request/reject_request descriptions state the REST en
         CHECK(desc.find("--mfa-step-up-window-secs") == std::string::npos);
         CHECK(desc.find("account_unavailable") != std::string::npos);
         CHECK(desc.find("MFA reasons belong to the REST route only") != std::string::npos);
+        // The typed MFA refusals other than mfa_not_enrolled are conditional (C-1): the
+        // description must not call them unconditional.
+        CHECK(desc.find("always refuses an un-enrolled session with "
+                        "approver_assurance_required:mfa_not_enrolled") != std::string::npos);
+        CHECK(desc.find("only when the generic step-up check does not answer first") !=
+              std::string::npos);
         CHECK(desc.find("--mfa-enforcement=required") == std::string::npos);
         CHECK(desc.find("is tracked in #6079") == std::string::npos);
     }

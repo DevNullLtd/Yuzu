@@ -45,6 +45,7 @@
 
 #include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
+#include "source_scan.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -916,7 +917,7 @@ using Kind = ApproverMfaOutcome::Kind;
 
 TEST_CASE("approval_routes: a refused MFA outcome is a 403 with a typed reason, a ticket-specific "
           "denied row, no attempted row, and the ticket stays pending",
-          "[server][routes][approval_routes][pg]") {
+          "[server][routes][approval_routes][approver_mfa][pg]") {
     struct Case {
         MfaFactorState factor;
         const char* reason;
@@ -964,7 +965,7 @@ TEST_CASE("approval_routes: a refused MFA outcome is a 403 with a typed reason, 
 }
 
 TEST_CASE("approval_routes: the default-constructed MFA outcome is a refusal, not a pass",
-          "[server][routes][approval_routes][pg]") {
+          "[server][routes][approval_routes][approver_mfa][pg]") {
     Pending p;
     Harness h;
     h.approval_manager = p.mgr.get();
@@ -978,7 +979,7 @@ TEST_CASE("approval_routes: the default-constructed MFA outcome is a refusal, no
 }
 
 TEST_CASE("approval_routes: the not-enrolled remediation names the role-appropriate next step",
-          "[server][routes][approval_routes][pg]") {
+          "[server][routes][approval_routes][approver_mfa][pg]") {
     Pending p;
     auto remediation = [&](auth::Role role, MfaFactorState factor) {
         Harness h;
@@ -1010,7 +1011,8 @@ TEST_CASE("approval_routes: the not-enrolled remediation names the role-appropri
     CHECK(user.find("cannot enrol itself") == std::string::npos);
     CHECK(user.find("sign out and sign in again") != std::string::npos);
     CHECK(user.find("--mfa-enforcement") != std::string::npos);
-    CHECK(user.find("ask an administrator to enrol you") != std::string::npos);
+    CHECK(user.find("ask your Yuzu administrator to enrol you") != std::string::npos);
+    CHECK(user.find("docs/ops-runbooks") == std::string::npos);
     CHECK(user.find("Enrolling a non-admin approver") != std::string::npos);
     CHECK(user.find("Settings > Security and sign-in") == std::string::npos);
 
@@ -1029,7 +1031,7 @@ TEST_CASE("approval_routes: the not-enrolled remediation names the role-appropri
 
 TEST_CASE("approval_routes: an unreadable MFA enrolment is a retryable 503 with an error row and "
           "the ticket stays pending",
-          "[server][routes][approval_routes][pg]") {
+          "[server][routes][approval_routes][approver_mfa][pg]") {
     for (const char* verb : {"approve", "reject"}) {
         INFO(verb);
         Pending p;
@@ -1056,7 +1058,7 @@ TEST_CASE("approval_routes: an unreadable MFA enrolment is a retryable 503 with 
 
 TEST_CASE("approval_routes: a stale MFA proof keeps the gate's 401 untouched and adds a "
           "mfa_proof_stale denied row, before any attempted row",
-          "[server][routes][approval_routes][pg]") {
+          "[server][routes][approval_routes][approver_mfa][pg]") {
     for (const char* verb : {"approve", "reject"}) {
         INFO(verb);
         Pending p;
@@ -1085,7 +1087,7 @@ TEST_CASE("approval_routes: a stale MFA proof keeps the gate's 401 untouched and
 // never reach an audit row or a log line as raw bytes. Each arm below writes a row naming the
 // ticket; the status of each is the one a well-formed id gets.
 TEST_CASE("approval_routes: a hostile ticket id is never audited or logged raw, on any refusing arm",
-          "[server][routes][approval_routes][pg]") {
+          "[server][routes][approval_routes][approver_mfa][pg]") {
     const std::vector<std::string> hostile = {
         std::string("abc\nforged=1 action=approval.approve"),
         std::string("x\r\ny\x01\x7f"),
@@ -1191,7 +1193,7 @@ TEST_CASE("approval_routes: a hostile ticket id is never audited or logged raw, 
 // exception or a body-less response: the 400 A4 envelope is written either way, and a failed
 // row is flagged the way every other refusal arm flags it (Sec-Audit-Failed).
 TEST_CASE("approval_routes: the invalid-id arm survives a failing or throwing audit sink",
-          "[server][routes][approval_routes][pg]") {
+          "[server][routes][approval_routes][approver_mfa][pg]") {
     Pending p;
     for (const bool throws : {false, true}) {
         INFO("audit_throws=" << throws);
@@ -1214,7 +1216,7 @@ TEST_CASE("approval_routes: the invalid-id arm survives a failing or throwing au
 }
 
 TEST_CASE("approval_routes: a well-formed ticket id of the maximum length is audited as sent",
-          "[server][routes][approval_routes][pg]") {
+          "[server][routes][approval_routes][approver_mfa][pg]") {
     Pending p;
     Harness h;
     h.approval_manager = p.mgr.get();
@@ -1230,7 +1232,7 @@ TEST_CASE("approval_routes: a well-formed ticket id of the maximum length is aud
 
 TEST_CASE("approval_routes: the attempted and success rows carry the assurance marker "
           "(comp-1, UP-13)",
-          "[server][routes][approval_routes][pg]") {
+          "[server][routes][approval_routes][approver_mfa][pg]") {
     for (const char* verb : {"approve", "reject"}) {
         INFO(verb);
         Pending p;
@@ -1250,7 +1252,7 @@ TEST_CASE("approval_routes: the attempted and success rows carry the assurance m
 
 TEST_CASE("approval_routes: a store denial after the gate keeps the store's reason as the detail "
           "and carries no assurance marker",
-          "[server][routes][approval_routes][pg]") {
+          "[server][routes][approval_routes][approver_mfa][pg]") {
     Pending p;
     Harness h;
     h.approval_manager = p.mgr.get();
@@ -1271,7 +1273,7 @@ TEST_CASE("approval_routes: a store denial after the gate keeps the store's reas
 
 TEST_CASE("approval_routes: when a refusal's audit row cannot be written the refusal stands and "
           "the response says so (Sec-Audit-Failed)",
-          "[server][routes][approval_routes][pg]") {
+          "[server][routes][approval_routes][approver_mfa][pg]") {
     struct Case {
         const char* label;
         ApproverMfaOutcome outcome;
@@ -1317,7 +1319,7 @@ TEST_CASE("approval_routes: when a refusal's audit row cannot be written the ref
 }
 
 TEST_CASE("approval_routes: with the store unavailable the MFA gate is never reached",
-          "[server][routes][approval_routes]") {
+          "[server][routes][approval_routes][approver_mfa]") {
     Harness h; // null approval_manager
     h.mfa_outcome = {Kind::kRefuse, MfaFactorState::kNotEnrolled};
     h.wire();
@@ -1330,7 +1332,7 @@ TEST_CASE("approval_routes: with the store unavailable the MFA gate is never rea
 
 TEST_CASE("approval_routes: an audit-write failure is a 503 with Sec-Audit-Failed and the ticket "
           "stays pending (audit before mutate, #5823)",
-          "[server][routes][approval_routes][pg]") {
+          "[server][routes][approval_routes][approver_mfa][pg]") {
     yuzu::test::ApprovalManagerPg mgr;
     auto a = mgr->submit("def-audit-a", "submitter1", "group:x", "", ApprovalOrigin::kInstruction);
     auto r = mgr->submit("def-audit-r", "submitter1", "group:x", "", ApprovalOrigin::kInstruction);
@@ -1882,9 +1884,7 @@ TEST_CASE("approval_routes: wiring -- server.cpp still calls register_approval_r
 #ifndef YUZU_SERVER_SRC_DIR
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
 #endif
-    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
-    REQUIRE(in.is_open());
-    std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    const std::string& src = yuzu::test::source_scan::comment_free_source("server.cpp");
     CHECK(src.find("register_approval_routes(") != std::string::npos);
 }
 
@@ -1901,9 +1901,8 @@ TEST_CASE("approval_routes: wiring -- server.cpp still calls register_approval_r
 TEST_CASE("approval_routes: wiring -- server.cpp passes approver_mfa_fn and csrf_trusted_origins "
           "into the approval Deps",
           "[server][routes][approval_routes]") {
-    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
-    REQUIRE(in.is_open());
-    std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    // Comments are stripped first: commented-out code must not satisfy a pin (#6079 qe-S2).
+    const std::string& src = yuzu::test::source_scan::comment_free_source("server.cpp");
     const auto call = src.find("approval::register_approval_routes(");
     REQUIRE(call != std::string::npos);
     // The call's Deps block ends at the ApprovalManager pointer, its last member.
@@ -1922,6 +1921,7 @@ TEST_CASE("approval_routes: wiring -- server.cpp passes approver_mfa_fn and csrf
     // The closure itself: it calls the approver gate, and a missing AuthDB must never pass.
     const auto def = src.find("approval::Deps::ApproverMfaFn approver_mfa_fn");
     REQUIRE(def != std::string::npos);
+    REQUIRE(def < call);
     const std::string closure = src.substr(def, call - def);
     CHECK(closure.find("require_enrolled_fresh_mfa(") != std::string::npos);
     CHECK(closure.find("require_mfa_step_up(") == std::string::npos);
@@ -1942,6 +1942,9 @@ TEST_CASE("approval_routes: wiring -- server.cpp passes approver_mfa_fn and csrf
     CHECK(closure.find("session.username", read) != std::string::npos);
     CHECK(read < closure.find("require_enrolled_fresh_mfa("));
     CHECK(closure.find("action_label, durable,") != std::string::npos);
+    // The route="approval" 503 counter (and the alert on it) depends on the registry being
+    // handed to the gate: a nullptr here compiles and silently loses the series.
+    CHECK(closure.find("action_label, durable, &metrics_)") != std::string::npos);
     // ...and the closure has no other way to build one: a synthetic proof literal here would
     // age the session on a clock the database does not own.
     CHECK(closure.find("DurableMfaProof{") == std::string::npos);
@@ -1954,9 +1957,7 @@ TEST_CASE("approval_routes: wiring -- server.cpp passes approver_mfa_fn and csrf
 TEST_CASE("approval_routes: wiring -- server.cpp pre-seeds route=\"approval\" on "
           "yuzu_auth_secret_unavailable_total",
           "[server][routes][approval_routes]") {
-    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
-    REQUIRE(in.is_open());
-    std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    const std::string& src = yuzu::test::source_scan::comment_free_source("server.cpp");
     const auto describe = src.find("metrics_.describe(\"yuzu_auth_secret_unavailable_total\"");
     REQUIRE(describe != std::string::npos);
     const auto loop = src.find("for (auto route :", describe);
