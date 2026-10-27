@@ -137,7 +137,7 @@ int seam_execute(YuzuCommandContext* raw, const char* action, const YuzuParam* /
     return yuzu::shares::execute_list(ctx, action, Leg, "linux:leg:exception");
 }
 
-#if !defined(_WIN32) && !defined(__APPLE__) // the planned legs emit no share rows
+#if !defined(__APPLE__) // the macOS placeholder emits no share rows
 bool share_row_is_wellformed(const std::string& row) {
     std::size_t pipes = 0;
     for (std::size_t i = 0; i < row.size(); ++i)
@@ -162,16 +162,16 @@ bool share_row_is_wellformed(const std::string& row) {
         return std::ranges::any_of(set, [&](const char* s) { return v == s; });
     };
     return f[0] == "share" && in(f[1], {"nfs", "smb"}) && in(f[4], {"ro", "rw", "mixed", "-"}) &&
-           in(f[5], {"true", "false", "-"}) && in(f[7], {"exports", "exports_d", "smb_conf"});
+           in(f[5], {"true", "false", "-"}) && in(f[7], {"exports", "exports_d", "smb_conf", "netshareenum"});
 }
 #endif
 
 } // namespace
 
-// MUTATION: flip a leg's declared support without changing the code behind it (macOS or Windows
-// to SUPPORTED while the leg is still the placeholder, Linux to PLANNED) -> the exact-level
+// MUTATION: flip a leg's declared support without changing the code behind it (macOS to
+// SUPPORTED while it is still the placeholder, Linux or Windows to PLANNED) -> the exact-level
 // checks fail. The mechanism/notes prose is not pinned: the capability-matrix check gates it.
-TEST_CASE("shares plugin: the descriptor declares Linux supported and macOS and Windows planned",
+TEST_CASE("shares plugin: the descriptor declares Linux and Windows supported and macOS planned",
           "[shares][descriptors]") {
     auto plugin = load_plugin();
     if (!plugin) {
@@ -188,7 +188,7 @@ TEST_CASE("shares plugin: the descriptor declares Linux supported and macOS and 
     CHECK(d.linux_leg.rung == 1);
     CHECK(d.macos_leg.support == YUZU_SUPPORT_PLANNED);
     CHECK(d.macos_leg.rung == 2);
-    CHECK(d.windows_leg.support == YUZU_SUPPORT_PLANNED);
+    CHECK(d.windows_leg.support == YUZU_SUPPORT_SUPPORTED);
     CHECK(d.windows_leg.rung == 1);
 }
 
@@ -240,17 +240,38 @@ TEST_CASE("shares plugin: status row first, source rows next, then well-formed s
         CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
     }
 
-#if defined(_WIN32) || defined(__APPLE__)
-    // PLANNED leg (Windows and macOS): exactly one row and UNAVAILABLE/UNKNOWN.
+#if defined(__APPLE__)
+    // PLANNED leg (macOS): exactly one row and UNAVAILABLE/UNKNOWN.
     // MUTATION: wiring any read here changes this row.
-#if defined(_WIN32)
-    constexpr const char* kPlanned = "windows:planned";
-#else
     constexpr const char* kPlanned = "macos:planned";
-#endif
     REQUIRE(rows.size() == 1);
     CHECK(rows[0] == std::string{"status|list|unsupported|"} + kPlanned);
     CHECK(result.result_provenance == kPlanned);
+#elif defined(_WIN32)
+    // NetShareEnum leg: status row, then one source row on every arm.
+    REQUIRE(rows.size() >= 2);
+    CHECK(starts_with(rows[1], "source|netshareenum|"));
+    if (starts_with(rows[0], "status|list|unsupported|")) { // stopped Server service: no shares
+        INFO("status row: " << rows[0]);
+        CHECK(starts_with(rows[0], "status|list|unsupported|windows:shares:netshareenum:server_"));
+        CHECK(rows.size() == 2);
+        return;
+    }
+    bool saw_ipc = false;
+    for (std::size_t i = 2; i < rows.size(); ++i) {
+        INFO("row " << i << ": " << rows[i]);
+        REQUIRE(share_row_is_wellformed(rows[i]));
+        CHECK(rows[i].starts_with("share|smb|"));
+        CHECK(rows[i].ends_with("|netshareenum"));
+        if (rows[i].find("|IPC$|") != std::string::npos) {
+            saw_ipc = true;
+            CHECK(rows[i].find("|ipc,special|") != std::string::npos);
+        }
+    }
+    // A running Server service always publishes IPC$; a constrained or permission_denied
+    // answer (status_<n>, no_progress, a budget cut) need not retain it.
+    if (starts_with(rows[0], "status|list|supported|"))
+        CHECK(saw_ipc);
 #else
     REQUIRE(rows.size() >= 4);
     CHECK(starts_with(rows[1], "source|exports|"));

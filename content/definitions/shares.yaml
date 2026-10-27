@@ -1,6 +1,7 @@
 ## Shares Definitions
-## Reports the shares this host is CONFIGURED to serve over SMB and NFS: names, paths, ro/rw,
-## whether anonymous access is configured, and a few flags. Nothing is changed or fetched.
+## Reports the shares this host serves over SMB and NFS: names, paths, ro/rw, whether
+## anonymous access is configured, and a few flags. Linux reads CONFIGURED shares; Windows
+## reads the LIVE shares of the Server service. Nothing is changed or fetched.
 ## Plugin: shares | Actions: list
 ##
 ## Sources by platform:
@@ -9,13 +10,18 @@
 ##            nfsd/smbd state. The Samba registry backend, include= files and usershares are
 ##            not read and are reported as constrained tokens.
 ##   macOS:   PLANNED, not read yet; one `unsupported` status row, macos:planned.
-##   Windows: PLANNED, not read yet; one `unsupported` status row, windows:planned.
+##   Windows: NetShareEnum level 2 (netapi32), the live shares of the Server service, read
+##            in bounded pages; level 1 (names, no paths) when level 2 is refused. The
+##            administrative ADMIN$, C$ and IPC$ shares are flagged `special`, never hidden.
+##            A stopped Server service is `unsupported` with a named token, never an empty
+##            list. Access and anonymous are `-`; ACLs (level 502) and the remark are never
+##            read.
 ##
 ## ACLs, `valid users` and NFS client host lists are never emitted. NFS clients are a count
 ## (`clients_<n>`) and an anonymous flag only. Share names and paths can embed account names
 ## (Samba [homes]): treat the result as sensitive.
-## Configured exports, not the mapped-drive and session observations the tar mapdrive source
-## records.
+## Linux rows are configured exports; Windows rows are the shares this host serves, not the
+## mapped-drive and session observations the tar mapdrive source records.
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -25,12 +31,14 @@ metadata:
   displayName: Shares
   version: 1.0.0
   description: >
-    Reports the shares this host is configured to serve over SMB and NFS: name, path,
+    Reports the shares this host serves over SMB and NFS: name, path,
     ro/rw/mixed, whether anonymous access is configured and a few flags, never ACLs or NFS client
     host lists (clients are a count). On Linux, read from /etc/exports, /etc/exports.d and
     /etc/samba/smb.conf as written, not live nfsd/smbd state; the Samba registry backend,
-    include files and usershares are not read. The macOS and Windows legs are planned and not
-    yet read. A refused or failed read is permission_denied or constrained with a reason token,
+    include files and usershares are not read. On Windows, read live from the Server service
+    through NetShareEnum: the administrative ADMIN$, C$ and IPC$ shares are flagged special,
+    and a stopped Server service is reported as unavailable, never as an empty list. The macOS
+    leg is planned and not yet read. A refused or failed read is permission_denied or constrained with a reason token,
     never an empty result; one source row per source says whether it was read. Share names and
     paths can embed account names, so the result is sensitive. A leading status row states
     whether the read was complete.
@@ -54,11 +62,12 @@ spec:
     # comes first, then one source row per source the leg knows about, then the share rows.
     #
     #   status|list|<supported|constrained|permission_denied|unsupported>|<reason tokens or ->
-    #   source|<exports|exports_d|smb_conf>|<read|absent|refused|failed>|<share count or ->
+    #   source|<exports|exports_d|smb_conf|netshareenum>|<read|absent|refused|failed>|<share count or ->
     #   share|<nfs|smb>|<name or ->|<path or ->|<ro|rw|mixed|->|<true|false|->|<flags or ->|<source>
     #
     # share flags (comma-separated, closed set): hidden, unavailable, special,
-    # no_root_squash, clients_<n>.
+    # no_root_squash, clients_<n>; Windows rows carry exactly one kind (disk, print, device,
+    # ipc, other), then special and temporary when set.
     columns:
       - name: row_kind
         type: string
@@ -68,17 +77,17 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_1
         type: string
-        description: 'status: the literal "list". source: exports, exports_d or smb_conf. share: nfs or smb.'
+        description: 'status: the literal "list". source: exports, exports_d, smb_conf or netshareenum. share: nfs or smb.'
         example: smb
         platforms: [windows, linux, darwin]
       - name: field_2
         type: string
-        description: 'status: supported, constrained, permission_denied or unsupported (the planned macOS and Windows legs, and a leg that threw). source: read, absent, refused or failed (absent is a state, not a failure). share: the SMB share name, or "-" for NFS (identified by path).'
+        description: 'status: supported, constrained, permission_denied or unsupported (the planned macOS leg, a stopped Windows Server service, and a leg that threw). source: read, absent, refused or failed (absent is a state, not a failure). share: the SMB share name, or "-" for NFS (identified by path).'
         example: supported
         platforms: [windows, linux, darwin]
       - name: field_3
         type: string
-        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:shares:exports:permission_denied, linux:shares:smb_conf:registry_backend, macos:planned, windows:planned. source: the number of shares read from it, "-" unless it was read. share: the exported path ("-" when none is set).'
+        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:shares:exports:permission_denied, linux:shares:smb_conf:registry_backend, windows:shares:netshareenum:server_not_started, macos:planned. source: the number of shares read from it, "-" unless it was read. share: the exported path ("-" when none is set).'
         example: '-'
         platforms: [windows, linux, darwin]
       - name: field_4
@@ -93,14 +102,14 @@ spec:
         platforms: [linux]
       - name: field_6
         type: string
-        description: 'share: comma-separated flags from hidden, unavailable, special, no_root_squash, clients_<n> (the NFS client count; hosts are never listed), or "-". Not used by the other kinds.'
+        description: 'share: comma-separated flags from hidden, unavailable, special, no_root_squash, clients_<n> (the NFS client count; hosts are never listed), or "-"; on Windows exactly one kind (disk, print, device, ipc or other), then special (STYPE_SPECIAL) and temporary when set. Not used by the other kinds.'
         example: clients_2
-        platforms: [linux]
+        platforms: [windows, linux]
       - name: field_7
         type: string
-        description: 'share: the source it came from (exports, exports_d or smb_conf). Not used by the other kinds.'
+        description: 'share: the source it came from (exports, exports_d, smb_conf or netshareenum). Not used by the other kinds.'
         example: exports
-        platforms: [linux]
+        platforms: [windows, linux]
     aggregation:
       groupBy:
         - row_kind

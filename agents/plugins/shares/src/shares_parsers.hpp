@@ -1,8 +1,9 @@
 #pragma once
 
 // shares_parsers.hpp -- pure parsers and row formatters for the shares plugin: what this
-// host CONFIGURES to serve over SMB/NFS. Header-only and portable so the unit tests run on
-// every host; no file I/O, no subprocess, no OS header.
+// host CONFIGURES to serve over SMB/NFS (the Windows leg reports LIVE shares through
+// shares_legs.hpp's list_windows and shares only the row formatters). Header-only and
+// portable so the unit tests run on every host; no file I/O, no subprocess, no OS header.
 //
 //   parse_exports       Linux exports(5) grammar (/etc/exports, /etc/exports.d/*.exports)
 //   parse_smb_conf      Samba smb.conf: share sections, synonyms, `copy =` and [global]
@@ -49,7 +50,9 @@ struct Share {
     std::string path;
     Access access = Access::unknown;
     std::optional<bool> anonymous;
-    std::vector<std::string> flags; ///< closed vocabulary: hidden, unavailable, special, no_root_squash, clients_<n>
+    /// closed vocabulary: hidden, unavailable, special, no_root_squash, clients_<n>, and the
+    /// Windows share kind (exactly one per row): disk, print, device, ipc, other; temporary
+    std::vector<std::string> flags;
     std::string source;
 };
 

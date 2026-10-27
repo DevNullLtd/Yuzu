@@ -1701,7 +1701,7 @@ Partial (library components only). `GET /api/v1/crypto/cbom` and MCP `export_cry
 | update_source_trust | - | Y | - | Security |
 | mgmt_posture | - | Y | Y | Security |
 | remote_access_audit | - | Y | Y | Security |
-| shares | - | Y | - | Network |
+| shares | Y | Y | - | Network |
 | agent_logging | Y | Y | Y | Agent Mgmt |
 | agent_actions | Y | Y | Y | Agent Mgmt |
 | diagnostics | Y | Y | Y | Agent Mgmt |

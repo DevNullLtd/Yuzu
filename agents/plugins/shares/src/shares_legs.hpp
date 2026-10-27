@@ -1,23 +1,24 @@
 /**
  * shares_legs.hpp -- shared seam between the shares plugin TU and its three per-OS leg
- * TUs (mgmt_posture_legs.hpp shape). Linux is the one leg that reads anything; the macOS
- * and Windows legs are PLANNED placeholders.
+ * TUs (mgmt_posture_legs.hpp shape). Linux reads CONFIGURED shares from files; Windows
+ * reads the LIVE shares through NetShareEnum; the macOS leg is a PLANNED placeholder.
  *
  * Holds (a) the per-OS entry-point declarations, (b) report_list, the SINGLE owner of the
  * `status|list|...` row (no leg and no parser writes one), pairing each status with its
  * result status/completeness, (c) execute_list, the plugin's whole execute() body
- * (dispatch + ABI containment), and (d) the OS-free Linux DECISION logic, `list_linux`, over
- * injected boundaries (file readers, an exports.d lister, a directory probe) so the
- * refused-vs-absent rules are unit-tested with canned results and no disk or uid
- * dependence. The leg TUs keep only the OS shell.
+ * (dispatch + ABI containment), and (d) the OS-free DECISION logic, `list_linux` and
+ * `list_windows`, over injected boundaries (file readers, an exports.d lister, a directory
+ * probe; a NetShareEnum page source) so the refused-vs-absent and paging rules are
+ * unit-tested with canned results and no disk, uid or Windows dependence. The leg TUs keep
+ * only the OS shell.
  *
  * Row contract (pipe rows, status row first):
  *   status|list|<supported|constrained|permission_denied|unsupported>|<tokens or ->
- *   source|<exports|exports_d|smb_conf>|<read|absent|refused|failed>|<n or ->
+ *   source|<exports|exports_d|smb_conf|netshareenum>|<read|absent|refused|failed>|<n or ->
  *   share|<nfs|smb>|<name>|<path>|<ro|rw|mixed|->|<true|false|->|<flags or ->|<source>
  * One `source` row per source the leg knows about is emitted on EVERY arm, so zero `share`
- * rows is never an ambiguous empty success. These are CONFIGURED shares, not live
- * nfsd/smbd state, and ACLs are never read.
+ * rows is never an ambiguous empty success. Linux rows are CONFIGURED shares, not live
+ * nfsd/smbd state; Windows rows are the live Server-service shares. ACLs are never read.
  *
  * Each entry point is a READ and returns 0: a degraded read is not a failed command.
  */
@@ -31,6 +32,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
@@ -102,9 +104,10 @@ struct Listing {
     std::vector<std::string> rows;
 };
 
-/// A leg that reads nothing reports `{StatusState::unsupported, <token>, {}}`: ONE
-/// `unsupported` status row and UNAVAILABLE/UNKNOWN carrying the same token. Callers: the
-/// Windows and macOS placeholders and execute_list's catch arm (`<os>:leg:exception`).
+/// A leg that reads nothing reports `{StatusState::unsupported, <token>, rows}`:
+/// ONE `unsupported` status row and UNAVAILABLE/UNKNOWN carrying the same token. Callers:
+/// the macOS placeholder, list_windows' service-stopped arm (with its failed `source` row)
+/// and execute_list's catch arm (`<os>:leg:exception`).
 inline void report_list(yuzu::CommandContext& ctx, const Listing& p) {
     report_list(ctx, p.rows, p.status, p.reason);
 }
@@ -412,6 +415,147 @@ inline Listing list_linux(const LinuxFs& fs) {
     if (t.field_oversized)
         t.acc.add_failure("linux:shares:field_oversized");
     return t.finish(std::move(source_rows));
+}
+
+// ---------------------------------------------------------------------------
+// Windows decision logic (OS-free; the shell in shares_win.cpp injects NetShareEnum)
+// ---------------------------------------------------------------------------
+
+/// One NetShareEnum entry, already converted to UTF-8 by the shell. No `remark` (free text
+/// that can name people) and no ACL: names, paths and the type word only.
+struct WinShareRec {
+    std::string name;
+    std::string path; ///< empty at level 1 (SHARE_INFO_1 carries none) and for IPC$
+    std::uint32_t type = 0; ///< SHARE_INFO_*.shi*_type
+};
+
+/// One NetShareEnum call: its NET_API_STATUS and the entries of THAT page only.
+struct WinPage {
+    std::uint32_t status = 0;
+    std::vector<WinShareRec> shares;
+};
+
+/// Successive calls at one level return successive pages. The shell owns the resume handle
+/// and resets it when the level changes.
+using WinPageFn = std::function<WinPage(int level)>;
+
+// lmshare.h STYPE_*, lmerr.h / winerror.h codes. shares_win.cpp static_asserts these against
+// the SDK; they live here so the portable tests can name them.
+inline constexpr std::uint32_t kStypeMask = 0xFF; ///< STYPE_MASK: the low byte is the kind
+inline constexpr std::uint32_t kStypeSpecial = 0x80000000u;   ///< STYPE_SPECIAL (ADMIN$, C$, IPC$)
+inline constexpr std::uint32_t kStypeTemporary = 0x40000000u; ///< STYPE_TEMPORARY
+inline constexpr std::uint32_t kWinAccessDenied = 5;          ///< ERROR_ACCESS_DENIED
+inline constexpr std::uint32_t kWinMoreData = 234;            ///< ERROR_MORE_DATA
+inline constexpr std::uint32_t kNerrServerNotStarted = 2114;  ///< NERR_ServerNotStarted
+inline constexpr std::uint32_t kRpcServerUnavailable = 1722;  ///< RPC_S_SERVER_UNAVAILABLE
+inline constexpr std::uint32_t kRpcUnknownIf = 1717;          ///< RPC_S_UNKNOWN_IF
+
+/// Level 2 first; ERROR_ACCESS_DENIED at level 2 discards what was gathered and retries
+/// level 1 (names, no paths) as `constrained`. A stopped Server service is typed
+/// `unsupported`, never an empty list. Any other status on any page discards every row (a
+/// partial drain is never reported as a complete list).
+///
+/// Termination without a page counter: every entry of a non-empty page charges the row/byte
+/// budget BEFORE a Share is built, and the first refusal stops paging, so a pager that keeps
+/// answering ERROR_MORE_DATA with rows (a cyclic cursor) is cut at kMaxShareRows retained
+/// entries; an empty ERROR_MORE_DATA page is `no_progress` and stops at once.
+inline Listing list_windows(const WinPageFn& page) {
+    constexpr std::string_view kOs = "windows";
+    constexpr std::string_view kSrc = "netshareenum";
+    const auto tok = [&](std::string_view cause) { return src_token(kOs, kSrc, cause); };
+    const auto failed_src = [&] { return source_row(kSrc, SourceState::failed); };
+
+    Tally t;
+    std::vector<Share> got;
+    int level = 2;
+    bool level2_denied = false;
+    bool stop_paging = false;
+    bool failed = false;
+
+    for (;;) {
+        const WinPage p = page(level);
+
+        if (p.status == kWinAccessDenied) {
+            got.clear();
+            if (level == 2) {
+                level = 1;
+                level2_denied = true;
+                t.budget.reset(); // the discarded level-2 rows no longer count
+                t.field_oversized = false;
+                continue;
+            }
+            t.note({SourceState::refused, tok("permission_denied")});
+            return t.finish({source_row(kSrc, SourceState::refused)});
+        }
+        if (p.status == kNerrServerNotStarted)
+            return Listing{StatusState::unsupported, tok("server_not_started"), {failed_src()}};
+        if (p.status == kRpcServerUnavailable || p.status == kRpcUnknownIf)
+            return Listing{StatusState::unsupported, tok("server_unavailable"), {failed_src()}};
+        if (p.status != 0 && p.status != kWinMoreData) {
+            t.acc.add_failure(tok("status_" + std::to_string(p.status)));
+            failed = true;
+            break;
+        }
+
+        for (const auto& rec : p.shares) {
+            std::vector<std::string> flags;
+            switch (rec.type & kStypeMask) {
+            case 0:
+                flags.emplace_back("disk");
+                break;
+            case 1:
+                flags.emplace_back("print");
+                break;
+            case 2:
+                flags.emplace_back("device");
+                break;
+            case 3:
+                flags.emplace_back("ipc");
+                break;
+            default:
+                flags.emplace_back("other");
+                break;
+            }
+            if ((rec.type & kStypeSpecial) != 0)
+                flags.emplace_back("special");
+            if ((rec.type & kStypeTemporary) != 0)
+                flags.emplace_back("temporary");
+            if (!detail::charge_share(t.budget, rec.name.size(),
+                                      rec.path.empty() ? 1 : rec.path.size(),
+                                      detail::flags_bytes(flags))) {
+                t.truncated = true;
+                stop_paging = true;
+                break;
+            }
+            Share s;
+            s.proto = Proto::smb;
+            s.name = detail::cut(rec.name, t.field_oversized);
+            s.path = detail::cut(rec.path, t.field_oversized);
+            s.flags = std::move(flags);
+            s.source = std::string{kSrc};
+            got.push_back(std::move(s));
+        }
+        if (stop_paging || p.status == 0)
+            break;
+        if (p.shares.empty()) { // ERROR_MORE_DATA that read nothing: no forward progress
+            t.acc.add_failure(tok("no_progress"));
+            failed = true;
+            break;
+        }
+    }
+
+    if (level2_denied)
+        t.acc.add_failure(tok("level2_permission_denied"));
+    if (failed) // no rows survive a failed drain
+        return t.finish({failed_src()});
+    ++t.read_sources;
+    const std::size_t n = got.size();
+    t.shares = std::move(got);
+    if (t.truncated)
+        t.acc.add_failure("windows:shares:row_cap");
+    if (t.field_oversized)
+        t.acc.add_failure("windows:shares:field_oversized");
+    return t.finish({source_row(kSrc, SourceState::read, n)});
 }
 
 } // namespace yuzu::shares

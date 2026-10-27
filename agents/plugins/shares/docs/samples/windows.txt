@@ -1,0 +1,13 @@
+captured: windows not-run · bare-metal · 2026-10-27 · reconstructed from the unit fixture, no live run; native kingsley capture pending · leg-hash pending
+== action=list
+status|list|supported|-
+source|netshareenum|read|7
+share|smb|C$|C:/|-|-|disk,special|netshareenum
+share|smb|ADMIN$|C:/Windows|-|-|disk,special|netshareenum
+share|smb|IPC$|-|-|-|ipc,special|netshareenum
+share|smb|Users|C:/Users|-|-|disk|netshareenum
+share|smb|HP|-|-|-|print|netshareenum
+share|smb|COM1|-|-|-|device|netshareenum
+share|smb|tmp|C:/t|-|-|disk,temporary|netshareenum
+[result_status] OK / FULL / 
+
