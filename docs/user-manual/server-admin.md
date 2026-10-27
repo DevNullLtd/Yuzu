@@ -365,7 +365,8 @@ separately.
 **What changed.** Agent plugins that mount a logged-out Windows profile's `NTUSER.DAT` offline (to
 read its `HKEY_USERS` hive without a live session) have always run a file-level check against that
 hive — the path must not cross a UNC/non-fixed-drive or a reparse-point ancestor, and the file
-itself must be a regular file owned by the profile, LocalSystem or Administrators. Before this
+itself must be a regular file owned by the profile, LocalSystem or Administrators, with no more
+than one hard link (`hive_hardlinked`). Before this
 change only one plugin (`privacy_permissions`) opted into that check; the other five production
 callers (`autoruns`, `installed_apps`, `license_scan`, `registry`, and TAR's mapped-drive-history
 collector) mounted with no check at all. The check is now the default for all of them.
