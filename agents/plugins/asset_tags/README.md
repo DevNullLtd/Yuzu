@@ -14,24 +14,76 @@
 
 ## How it works
 
-`asset_tags` gives an agent awareness of the four structured tag categories the server treats as authoritative — `role`, `environment`, `location`, `service` (`asset_tags_parsers.hpp:46-48`). `sync` is the only mutating action: the server calls it, pushing all four category values as parameters; the plugin diffs them against its cached copy, appends any differences to a change log (bounded at the newest 50 entries in memory and on disk, evicting the oldest on every append), and — inside one critical section with the diff — writes the new state to `<data_dir>/asset_tags.json` via a randomly-named, exclusively-created temp file renamed into place (`asset_tags_plugin.cpp:243-307`, `asset_tags_parsers.hpp:119-143`, `agents/shared/atomic_file_write.hpp`, `write_file_atomic`). Values are capped at 448 bytes on a UTF-8 codepoint boundary (the server's own tag-value limit) and stored raw (`asset_tags_parsers.hpp:91-103`). `status` reports the cached tags plus sync metadata — last-sync epoch, a staleness flag, the configured check interval, and the change-log length (`asset_tags_plugin.cpp:309-326`). `get` returns a single category's cached value, rejecting any key outside the fixed four (`asset_tags_plugin.cpp:328-343`). `changes` lists the change log, each field escaped (`asset_tags_plugin.cpp:345-357`). A background thread wakes every `check_interval` seconds (default 300, floored at 30) purely to flip `stale` to `true` if no sync has landed in that window — it never re-requests a sync itself, and it wakes at once when the plugin shuts down rather than waiting out the interval (`asset_tags_plugin.cpp:117-141`). `init()` returns the store path, the cache and the check interval to their defaults before it reads its configuration, so a second `init()` in the same process (a test harness, or a loader that keeps the image mapped across `dlclose`) never inherits the previous lifecycle's; `shutdown()` does not reset them, so a `sync` still queued when `run()` exits early and the agent shuts plugins down keeps persisting. The persist-failure counters that `status` reports are process-lifetime and are never reset (`asset_tags_plugin.cpp:63-82`).
+`asset_tags` keeps a local copy, on the endpoint, of the four tag categories the server treats as authoritative: `role`, `environment`, `location` and `service`. The server is the only writer. When an operator sets one of those tags through the REST API, the dashboard or MCP `set_tag`, the server reads all four of the device's current values from its TagStore and pushes them to the agent as one `sync` call (a system-reserved push, not an operator instruction). `sync` replaces the whole local copy: the four values are compared with the cache, each difference is appended to a change log (the newest 50 entries are kept), and the new state is written atomically to `<data_dir>/asset_tags.json`. A category that is empty or missing in a `sync` is erased, so a hand-dispatched `sync` that names one category clears the other three locally. `status`, `get` and `changes` only read the local copy. A background thread sets `stale` to true when `check_interval` seconds (default 300, minimum 30) pass without a sync; it never asks for one.
 
-It deliberately is not the general-purpose tag store: arbitrary free-form key/value tags are the sibling `tags` plugin (`content/definitions/tags.yaml`). `asset_tags` only ever holds the four server-authoritative categories, and the agent never initiates a sync — it only reacts to one the server pushes.
+Deliberately not: the tag store that scope targeting uses. `tag:` scope expressions resolve against the server's TagStore and never read this file, and no other agent component reads it. It is also not the free-form tag plugin (`tags`, `content/definitions/tags.yaml`), and it never pulls: the agent never initiates a sync.
 
 ```mermaid
 flowchart LR
-  REST[REST PUT /api/v1/tags<br/>or dashboard tag.set] --> TS[TagStore write]
-  MCP[MCP set_tag] --> TS
-  TS -- category changed --> PUSH[push_asset_tags_to_agent<br/>system caller, Tag.Write]
-  OP[Operator / workflow<br/>dispatches status/get/changes] -- authz: Tag.Read --> HOST
-  PUSH -- gRPC mTLS, system_reserved --> HOST[Agent plugin host]
-  HOST --> EX[asset_tags.execute]
-  EX --> WIN[Windows leg<br/>local_json_store]
-  EX --> MAC[macOS leg<br/>local_json_store]
-  EX --> LIN[Linux leg<br/>local_json_store]
-  WIN & MAC & LIN --> FILE[("<data_dir>/asset_tags.json")]
-  FILE --> ROWS[rows<br/>sync: typed status<br/>status/get/changes: UNDECLARED] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  SET["Tag set: REST PUT /api/v1/tags, dashboard tag.set, MCP set_tag"] --> TS[("Server TagStore")]
+  TS --> PUSH["push_asset_tags_to_agent: reads all four values, system push"]
+  PUSH -->|"gRPC mTLS"| HOST["Agent plugin host"]
+  OP["Operator or workflow: status, get, changes (Tag.Read)"] --> HOST
+  HOST --> EX["asset_tags.execute: same local JSON file read and write on Windows, macOS, Linux"]
+  EX --> FILE[("data_dir/asset_tags.json")]
+  EX --> ROWS["rows plus typed status (sync only)"]
+  ROWS --> RS[("ResponseStore")]
+  RS --> API["REST /api/responses"]
 ```
+
+### What you can decide with it
+
+The plugin answers questions about the endpoint's local copy of the four tags. It does not call the server, so it cannot say whether the server's value is different.
+
+| Question | Action | What you get |
+|---|---|---|
+| What does this device currently hold for role, environment, location and service? | `status` (all four) or `get` with `key` | The cached value; an empty value means never synced or cleared by a sync. |
+| When did the server last push? | `status`, `last_sync` | Epoch seconds of the last sync; `0` means no sync has landed. |
+| What changed, and when? | `changes` | The last 50 transitions, oldest first, each with old value, new value and epoch time; `changes\|none` when the log is empty. |
+| Is the plugin failing to save its state? | `status`, `persist_failures` and `last_persist_error` | Counters for this process lifetime; `-` means no failure or warning since start. |
+| Is the local copy current? | Compare `get` or `status` output with the server's tag read | The plugin gives the device side only; the comparison is yours. |
+
+On Windows, macOS and Linux the plugin reads and writes the same JSON file and returns the same rows, so there is no per-OS difference in what you learn. It returns nothing when the agent is offline or the plugin is disabled for the device.
+
+`stale` reports how long ago the last push landed, not whether the copy is correct. Pushes happen only when someone sets a structured tag, so a device whose tags have not changed in more than `check_interval` seconds reads `stale|true` while holding the right values, and `stale|false` is only re-checked once per interval. A clean `sync` result proves the push arrived and was saved (or that no data directory is configured and there was nothing to save); it does not prove the device holds what the server holds for the other categories you did not touch.
+
+### Diagrams
+
+#### Sync and what does not trigger one
+
+```mermaid
+sequenceDiagram
+  participant Op as Operator
+  participant Srv as Server
+  participant TS as TagStore
+  participant Ag as asset_tags plugin
+  participant F as asset_tags.json
+  Op->>Srv: set a structured tag
+  Srv->>TS: write the tag
+  Srv->>TS: read all four values for the device
+  Srv->>Ag: sync with role, environment, location, service
+  Note over Ag: one lock covers diff, change log and file write
+  Ag->>F: write temp file, then atomic rename
+  Ag-->>Srv: rows and typed result status
+  Note over Srv,Ag: tag deletes and reconnects send no sync
+```
+
+The server pushes only after a structured tag is set. The plugin compares, logs and saves under a single lock, so the file always holds one consistent state. Deleting a tag, or an agent that was offline when the push was sent, leaves the local copy as it was until the next structured set for that device.
+
+#### The `stale` flag
+
+```mermaid
+stateDiagram-v2
+  [*] --> Stale : first start, no saved state
+  [*] --> Restored : restart with a saved state file
+  Restored --> Fresh : saved flag was false
+  Restored --> Stale : saved flag was true
+  Stale --> Fresh : sync lands
+  Fresh --> Fresh : another sync lands
+  Fresh --> Stale : check_interval passes with no sync
+```
+
+`stale` starts true and becomes false only when a `sync` lands. After a restart the flag is read back from the saved file and is re-derived from `last_sync` on the next interval tick, so it can read false for up to one interval after a restart even when the last sync is old. The flag is held in memory and is not rewritten when the thread flips it.
 
 ## OS capability
 
@@ -48,11 +100,15 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account — LocalSystem today, not yet the intended `NT SERVICE\YuzuAgent` (#1442; `docs/agent-privilege-model.md:12`) | None — plain file I/O under `<data_dir>`; the shared writer calls `ReplaceFileW` (no extra privilege) | 2026-09-07 on bare metal as SYSTEM | No refusal path exists; a write failure is logged and reported as `CONSTRAINED` / `persist_failed` on `sync` (see below); an unreadable or corrupt state file is logged and ignored |
-| macOS | agent daemon, root — the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md:14`) | None | 2026-09-07 on bare metal at euid 501 (jsmith) — unprivileged, not the production root daemon | Same as Windows |
-| Linux | dedicated unprivileged account (`_yuzu`/`yuzu`; `docs/agent-privilege-model.md:12`) | None | 2026-09-07 in a container at euid 0 — more privileged than the production account | Same as Windows |
+| Windows | Agent service account: LocalSystem today, not yet the intended `NT SERVICE\YuzuAgent` (`docs/agent-privilege-model.md`) | None. Plain file I/O under `<data_dir>`; the shared writer calls `ReplaceFileW`, which needs no extra privilege | 2026-09-07 on bare metal as SYSTEM | No refusal path exists. A write failure is logged and reported as `CONSTRAINED` / `persist_failed` on `sync`; an unreadable or corrupt state file is logged and ignored |
+| macOS | Agent daemon as root: the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md`) | None | 2026-09-07 on bare metal at euid 501, unprivileged and not the production root daemon | Same as Windows |
+| Linux | Dedicated unprivileged account (`yuzu-agent` on the packaged unit; `docs/agent-privilege-model.md`) | None | 2026-09-07 in a container at euid 0, more privileged than the production account | Same as Windows |
 
-No external binaries, no subprocesses, no network access — every action is an in-process read/write of a local JSON file (`popen`/`CreateProcess`/socket grep over `asset_tags_plugin.cpp` returns nothing). Persistence is checked end to end (`agents/shared/atomic_file_write.hpp`, `write_file_atomic`): `fs::create_directories`, the temp-file write (flushed and closed before anything else touches it) and the rename are each error-checked, and the write happens under the same lock as the state change. On POSIX the temp is fsync'd (`F_FULLFSYNC`, then `fsync`, on macOS) before it is closed and its directory fsync'd after the rename; a `sync` whose directory fsync failed reports `asset_tags:persist_dir_unsynced` because until the next OS flush a power loss can still roll the rename back. On Windows the write goes through an ofstream and does not fsync, so a power loss immediately after a reported success can lose the write (documented residual in `agents/shared/atomic_file_write.hpp`). Leftover temps are not swept: one can be left by a write failure plus an unlink failure, or by the process dying between create and rename. A persistence failure (unwritable `data_dir`, disk full) is logged and surfaces on `sync` as `CONSTRAINED` / `PARTIAL` with provenance `persist_failed`; the in-memory state for that process stays authoritative and the rows are still truthful. The temp is a randomly-named sibling (`<dest>.tmp.<16 hex>`, unpredictable across processes) created EXCLUSIVELY, never a fixed name: on POSIX via `O_CREAT|O_EXCL|O_NOFOLLOW` at mode `0600` directly (no umask window — the mode is re-asserted once more before the rename purely for determinism under an unusual umask, and a re-assertion failure does not block persistence but is surfaced: that sync reports `CONSTRAINED` / `asset_tags:persist_mode_reassert_failed` and `status` retains it in `last_persist_error`; the file was created at `0600 & ~umask`, so it is never wider than 0600, but it may be narrower and unreadable at the next load); on Windows via `std::ios::noreplace` (C++23 exclusive-create semantics), though the DACL is still inherited, not tightened. Either way, a file already at the temp path — planted or left over — fails the create instead of being followed or silently overwritten. A state file that is unreadable, not valid JSON, has a wrong-typed known field, or names an unrecognised tag category or change-record key is rejected whole — defaults (`stale=true`, no tags) are kept, one warning names the offending field, and the next `sync`'s write replaces the file; an unrecognised *top-level* field is ignored, so a file written by a newer version still loads (`asset_tags_parsers.hpp:196-289`); nothing is partially loaded.
+No external binaries, no subprocesses, no network access: every action is an in-process read or write of one local JSON file under the agent data directory. `docs/agent-privilege-model.md` has no row for this plugin because it needs nothing beyond that.
+
+**Persistence.** The write happens under the same lock as the state change. Directory creation, the temp-file write (flushed and closed first) and the rename are each error-checked. The temp file is a randomly named sibling (`<dest>.tmp.<16 hex>`) created exclusively, so a file already at that path, planted or left over, fails the create instead of being followed or overwritten; leftovers from a crash between create and rename are not swept. On POSIX it is created with `O_CREAT|O_EXCL|O_NOFOLLOW` at mode `0600`, fsync'd (`F_FULLFSYNC` then `fsync` on macOS) before close, and the directory is fsync'd after the rename. A failed directory fsync reports `asset_tags:persist_dir_unsynced`, because a power loss can still roll the rename back. The mode is re-asserted once more before the rename; a failure there does not block persistence but reports `asset_tags:persist_mode_reassert_failed`, and the file may then be narrower than `0600` and unreadable at the next load. On Windows the temp file is created with exclusive-create semantics, the DACL is inherited rather than tightened, and the write does not fsync, so a power loss right after a reported success can lose it. A persistence failure (unwritable `data_dir`, full disk) is logged and reported on `sync` as `CONSTRAINED` / `PARTIAL`; the in-memory state for that process stays authoritative and the returned rows are truthful.
+
+**Loading.** A state file that is unreadable, not valid JSON, has a wrong-typed known field, or names an unrecognised tag category or change-record key is rejected whole: defaults (`stale=true`, no tags) are kept, one warning names the field, and the next `sync` replaces the file. An unrecognised top-level field is ignored, so a file written by a newer version still loads. `init()` resets the store path, the cache and the check interval before it reads configuration, so a second `init()` in the same process never inherits the previous one; `shutdown()` does not reset them, so a `sync` still queued when the agent shuts plugins down keeps persisting.
 
 ## Data contract
 
@@ -70,7 +126,7 @@ No external binaries, no subprocesses, no network access — every action is an 
 
 ### Outputs
 
-Every action writes one or more pipe-delimited lines via `ctx.write_output`. There is no single row shape shared across an action's own output: `get` emits exactly one `tag|<key>|<value>` line per call, and `changes` emits one `change|<key>|<old_value>|<new_value>|<timestamp>` line per recorded change (or the sentinel line `changes|none` when the log is empty, with no trailing count on that path). `status` and `sync` each emit several *different* line shapes in one response — see Caveats. There is no shared empty-result placeholder convention: an unset tag reports as an empty string, never `-`. Every string field on every row — values, keys, and the echoed text of the two error rows (`unknown action: …`, `error|unknown category: …`) — is escaped with the shared `safe_output_field` (`|` becomes `\|`, CR/LF become a space, a literal backslash is folded to `/`), so a value such as `Rack A|3` renders as `Rack A\|3` in a stable row shape. The stored value is never rejected or stripped; the backslash fold is a limitation of the shared server decoder and applies on the wire only. Values are capped at 448 bytes on `sync` and again on load from disk.
+Every action writes one or more pipe-delimited lines via `ctx.write_output`. There is no single row shape shared across an action's own output: `get` emits exactly one `tag|<key>|<value>` line per call, and `changes` emits one `change|<key>|<old_value>|<new_value>|<timestamp>` line per recorded change followed by `total_changes|<n>` (or the sentinel line `changes|none` when the log is empty, with no trailing count on that path). `status` and `sync` each emit several different line shapes in one response: `sync` writes `sync|no_changes` or one `sync|<event>|<key>|...` line per change, then four `tag|<key>|<value>` lines and `last_sync|<epoch>`. There is no shared empty-result placeholder convention: an unset tag reports as an empty string, never `-`. Every string field on every row — values, keys, and the echoed text of the two error rows (`unknown action: …`, `error|unknown category: …`) — is escaped with the shared `safe_output_field` (`|` becomes `\|`, CR/LF become a space, a literal backslash is folded to `/`), so a value such as `Rack A|3` renders as `Rack A\|3` in a stable row shape. The stored value is never rejected or stripped; the backslash fold is a limitation of the shared server decoder and applies on the wire only. Values are capped at 448 bytes on `sync` and again on load from disk.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`device.asset_tags.changes` — `key|old_value|new_value|timestamp`**
@@ -114,7 +170,7 @@ Every action writes one or more pipe-delimited lines via `ctx.write_output`. The
 
 ### Result status
 
-`sync` declares a typed result status on every call (`asset_tags_plugin.cpp:302-306`): `OK` / `FULL` when the state file was written with no warning, or `CONSTRAINED` / `PARTIAL` with provenance `asset_tags:persist_failed` when the atomic write failed — the in-memory state still advanced and the rows are truthful, so the return code stays `0`. `status`, `get` and `changes` set none, so the agent records `UNDECLARED` for them — as every captured sample below shows. `sync` was never captured (mutator capture policy), so no sample reflects its typed status.
+`sync` declares a typed result status on every call: `OK` / `FULL` when the state file was written with no warning (or no data directory is configured and there is nothing to write), or `CONSTRAINED` with one of the provenance tokens below when the write failed or carried a warning. The in-memory state advances in every case and the rows are truthful, so the return code stays `0`. `status`, `get` and `changes` set none, so the agent records `UNDECLARED` for them. `sync` is not captured in the samples (mutator capture policy), so no sample shows its typed status.
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
@@ -123,25 +179,18 @@ Every action writes one or more pipe-delimited lines via `ctx.write_output`. The
 | `CONSTRAINED` | full | `asset_tags:persist_mode_reassert_failed` | `sync`: the file was written but re-asserting owner-only mode (`fchmod` to 0600) failed; the file is never wider than 0600 (created at `0600 & ~umask`) but may be narrower, so the next load may fail; outranks `persist_dir_unsynced` when both occur (the status row's `last_persist_error` carries both causes) |
 | `CONSTRAINED` | full | `asset_tags:persist_dir_unsynced` | `sync`: the file was written and renamed but the parent-directory fsync failed, so the rename is durable only after the next OS flush |
 
-`persist_failures` and `last_persist_error` are process-lifetime values held in memory: they reset on restart and are never persisted. A write warning's `last_persist_error` begins with its typed cause label(s) (`mode_reassert_failed`, `dir_fsync_failed`, joined by `+` when both apply), so a long path in the detail text can never hide a cause. A restart in the middle of a persistence outage loses every unpersisted `change_log` transition; the counter makes the outage visible but cannot recover the lost entries. `persist_failures` is the plugin-local interim chosen for #4725: the SDK exposes no plugin metrics facility (`sdk/include/yuzu/plugin.hpp`), adding one is a cross-plugin ABI change deferred rather than taken here, and the counter is not a Prometheus metric. `last_persist_error` is retained until the next failure or warning overwrites it or the process restarts; a later clean `sync` does not clear it — read it alongside `persist_failures` and the latest `sync` status.
+`persist_failures` and `last_persist_error` are held in memory for the process lifetime: they reset on restart and are never persisted. A write warning's `last_persist_error` begins with its typed cause label(s) (`mode_reassert_failed`, `dir_fsync_failed`, joined by `+` when both apply), so a long path in the detail text never hides a cause. A restart in the middle of a persistence outage loses every unpersisted change-log entry; the counter makes the outage visible but cannot recover them. The counter is plugin-local, not a Prometheus metric, because the SDK has no plugin metrics facility. `last_persist_error` is kept until the next failure or warning overwrites it or the process restarts; a later clean `sync` does not clear it, so read it alongside `persist_failures` and the latest `sync` status.
 
-**Recovery.** Persistence and load are both self-healing — there is nothing to manually clean up.
-A repeated `CONSTRAINED`/`persist_failed` means the underlying OS-level condition (disk full, a
-permissions/ownership change on `data_dir`, an antivirus lock) needs fixing; once it is, the next
-`sync` writes cleanly with no restart or file deletion required. A corrupt or unreadable state file
-is similarly rejected and replaced automatically by the next successful `sync` (see "Where the data
-goes" below) — deleting it by hand is never necessary and only loses the in-memory `changes` history
-a moment sooner than the next write would anyway.
+**Recovery.** Persistence and load are self-healing. A repeated `CONSTRAINED` / `persist_failed` means the underlying OS condition (disk full, a permission or ownership change on `data_dir`, an antivirus lock) needs fixing; once it is fixed the next `sync` writes cleanly with no restart or file deletion. A corrupt state file is rejected and replaced by the next successful `sync`, so deleting it by hand is never necessary.
 
 ### Where the data goes
 
-- **Instruction result only** for row data — reaches the ResponseStore via the standard command-response path, queryable at `/api/responses/{id}`, same as any other plugin.
-- `sync`'s trigger additionally increments the Prometheus counter `yuzu_server_system_reserved_push_total{capability="asset_tags.sync"}` (`server.cpp:10771-10779`) — a delivery metric, not row data.
-- `sync` is invoked by the server, never directly by an operator: a structured tag-category write via the dashboard `tag.set` handler (`server.cpp:15550-15574`), the REST API v1 tags route (`server.cpp:21177-21193`), or MCP `set_tag` (`server.cpp:21777-21785`) all call the same `push_asset_tags_to_agent` closure (`server.cpp:11456-11494`).
-- **Not consumed by** daily-sync inventory, the TAR warehouse, or DEX.
-- **Sensitivity.** `role`/`environment`/`location`/`service` are free-form organizational tags an operator assigns — they can reveal a device's physical site or business role. The values are not content-validated (only byte-capped, `asset_tags_parsers.hpp:91-103`): an operator can type anything into them, including a hostname, a serial, or a person's name, so classify by what is actually assigned, not by the category name. The on-disk copy is owner-only (`0600`) on POSIX (see above).
-- **Siblings:** `tags` (`content/definitions/tags.yaml`) — the general-purpose, agent-authoritative free-form key/value tag store; `asset_tags` is deliberately narrower, holding only the 4 server-authoritative categories.
-- **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.asset_tags.status")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
+- **Instruction result only** for row data. Rows reach the ResponseStore through the standard command-response path, queryable at `/api/responses/{id}`.
+- **Trigger and delivery metric.** `sync` is sent by the server, never directly by an operator: a structured tag-category set through the dashboard `tag.set` handler, REST `PUT /api/v1/tags` or MCP `set_tag` calls the same `push_asset_tags_to_agent` closure. Each push increments `yuzu_server_system_reserved_push_total{capability="asset_tags.sync"}` with `result` `sent` or `undelivered` (the agent was not connected); this is a delivery metric, not row data.
+- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX or metrics. No other agent component reads `asset_tags.json`.
+- **Sensitivity.** `role`, `environment`, `location` and `service` are free-form organizational tags an operator assigns, and can reveal a device's physical site or business role. Values are byte-capped (448 bytes) but not content-validated: an operator can type anything into them, including a hostname, a serial or a person's name, so classify by what is actually assigned, not by the category name. The on-disk copy is owner-only (`0600`) on POSIX.
+- **Siblings:** `tags` (`content/definitions/tags.yaml`) is the general-purpose, agent-authoritative free-form key/value store; `asset_tags` holds only the four server-authoritative categories.
+- **MCP / REST.** Discover: `discover_plugins` (summary) then `yuzu://plugin-docs` (this page as data) then `discover_instructions` / `get_definition("device.asset_tags.status")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
@@ -227,11 +276,11 @@ changes|none
 
 ## Caveats and known gaps
 
-1. **Typed result status on `sync` only.** `status`, `get` and `changes` never call `set_result_status`, so every captured sample shows `UNDECLARED / UNKNOWN /` for them.
-2. **`sync`'s output is broader than its declared schema, and was never captured.** Beyond the 4-column `event`/`key`/`old_value`/`new_value` shape, every real `sync` call also emits 4 `tag|<key>|<value>` rows and a `last_sync|<epoch>` line that `content/definitions/asset_tags.yaml`'s `result.columns` (`asset_tags.yaml:51-74`) does not describe. All three samples show `[not captured]` for `sync` under the mutator capture policy.
-3. **The capture harness never calls `init()`.** Every sample reflects the plugin's cold-boot default state (empty tags, `last_sync=0`, `stale=true`, `check_interval=300`) because `load_state()` and the config read only run from `init()` (`asset_tags_plugin.cpp:186-210`), which the capture driver's `PluginHandle::load` + `LocalDispatcher::run` path does not call. `get key=role`'s captured `tag|role|` is therefore an empty value from a never-loaded store, not evidence the category is unset in practice — the samples do not reflect any real on-disk `asset_tags.json`.
-4. **The lock-ordering test is a translation-unit seam, not a dispatch through the plugin binary.** `tests/unit/test_asset_tags_actions.cpp` drives the real plugin through `LocalDispatcher` on every OS (cap, escaping, the bounded log, `init()` recovery, the typed `sync` status, prompt shutdown), while `tests/unit/test_asset_tags_sync_lock.cpp` includes `asset_tags_plugin.cpp` directly and stands in for `write_state_file_atomic` at its one call site in `do_sync` to prove the state file is written while the state mutex is held. It parks on a condition variable, with no clock, file descriptor or per-OS mechanism, so it runs on all three legs.
-5. **The captured samples predate the two `status` rows added for #4725.** All three captures carry `leg-hash pending` and show the eight-row `status` ending at `change_count`; the shipped plugin emits `persist_failures` and `last_persist_error` after it (see Outputs). Recapture is owed on every leg before release; until then the Outputs table, not the sample, is the `status` shape.
+1. **Pushes follow a tag set, nothing else.** Deleting a structured tag (REST, dashboard or MCP), an agent that is offline when a tag is set, and an agent reconnecting all send no `sync`, so the local copy can hold a deleted or outdated value until the next structured tag set for that device. Watch `yuzu_server_system_reserved_push_total{result="undelivered"}` for pushes that missed an offline agent.
+2. **`stale` is push recency, not correctness.** It is true when no `sync` landed within `check_interval`, which is the normal state of a device whose tags have not changed, and it is re-evaluated only once per interval. Compare the values themselves with the server when the question is whether the copy is right.
+3. **`sync` replaces the whole copy, and its output is wider than its declared schema.** A hand-dispatched `sync` that omits a category erases it locally and logs a `tag_removed` change. Every real `sync` also emits four `tag|<key>|<value>` rows and a `last_sync|<epoch>` line that the definition's `result.columns` does not describe.
+4. **A stalled data directory stalls every action.** `status`, `get`, `changes` and the staleness thread take the same lock as the file write, so a hung filesystem under `data_dir` blocks all of them, not only `sync`.
+5. **The samples show cold-boot defaults and predate two `status` rows.** The capture harness never calls `init()`, so every sample shows empty tags, `last_sync=0` and `stale=true` rather than any real state file, and `sync` is not captured. All three captures carry `leg-hash pending` and end `status` at `change_count`; the shipped plugin also emits `persist_failures` and `last_persist_error`, so treat the Outputs table, not the sample, as the `status` shape.
 
 ## Source and tests
 

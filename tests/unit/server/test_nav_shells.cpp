@@ -27,6 +27,7 @@
 // Full-page templates (defined at global scope in the *_ui.cpp translation units).
 extern const char* const kDashboardIndexHtml;
 extern const char* const kHelpHtml;
+extern const char* const kSwaggerPageHtml;
 extern const char* const kInstructionPageHtml;
 extern const char* const kApprovalsPageHtml;
 extern const char* const kExecutionsPageHtml;
@@ -607,6 +608,7 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         {"fleet map", kVizFleetPageHtml, {"/viz/fleet"}},
         {"host map", kVizHostPageHtml, {"/viz/fleet"}},
         {"help", kHelpHtml, {}},
+        {"swagger", kSwaggerPageHtml, {}},
         // Not listed on purpose: /home is the landing and sign-in page and carries no
         // shell at all (test_home_ui.cpp pins that). The logo reaches it (below).
     };

@@ -15,7 +15,32 @@
 
 namespace yuzu::server {
 
-/// Returns the exact JSON body `GET /api/v1/openapi.json` serves.
+/// Returns the exact JSON body `GET /api/v1/openapi.json` serves by default. It is the full
+/// document without the per-group guides (`tags[].x-yuzu-guide`), which are prose for the
+/// /swagger page. The MCP resource `yuzu://openapi` and the discover tools serve exactly this
+/// form; only `?guides=true` (see `openapi_spec_with_guides_json()`) differs from it.
 const std::string& openapi_spec_json();
+
+/// The result of `openapi_strip_guides()`: the document, and whether it had to be returned as
+/// written because it could not be used.
+struct OpenApiStripResult {
+    std::string json;
+    bool fell_back{false};
+};
+
+/// Removes `x-yuzu-guide` from every top-level tag of `full` and re-serialises it. When `full`
+/// cannot be parsed or has no `tags` array it comes back unchanged with `fell_back` set. The
+/// pure derivation behind `openapi_spec_json()`, exposed so the fallback can be tested.
+[[nodiscard]] OpenApiStripResult openapi_strip_guides(const std::string& full);
+
+/// The full document including the guides: what `GET /api/v1/openapi.json?guides=true`
+/// serves and what the /swagger page loads.
+const std::string& openapi_spec_with_guides_json();
+
+/// Strong content-derived ETags of the two forms above (`content_etag.hpp`), each computed once
+/// per process. `GET /api/v1/openapi.json` sends the one for the form it serves and answers
+/// `304` when `If-None-Match` matches it.
+const std::string& openapi_spec_etag();
+const std::string& openapi_spec_with_guides_etag();
 
 } // namespace yuzu::server

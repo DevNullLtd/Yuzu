@@ -10,7 +10,10 @@
 #include "developer_routes.hpp"
 
 #include "agent_registry.hpp"
+#include "developer_render.hpp"
+#include "discover_routes.hpp"
 #include "event_bus.hpp"
+#include "openapi_spec_access.hpp"
 #include "pg/pg_pool.hpp"
 #include "rbac_store.hpp"
 #include "test_route_sink.hpp"
@@ -20,6 +23,8 @@
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <nlohmann/json.hpp>
 
 #include <stdexcept>
 #include <string>
@@ -178,6 +183,26 @@ TEST_CASE("developer routes fragment: real OpenAPI catalogue, filter echoed esca
     REQUIRE(all);
     CHECK(has(all->body, "/api/v1/"));
     CHECK_FALSE(has(all->body, "could not be read"));
+
+    // End to end: every operation the catalogue marks `unavailable` shows exactly one
+    // marker on the page. The count is derived from the catalogue itself, so a rename of
+    // the key between build_routes_catalog and render_routes_table fails here (the
+    // catalogue test pins one side and the synthetic renderer test the other).
+    const auto catalogue = nlohmann::json::parse(build_routes_catalog(openapi_spec_json()).json);
+    REQUIRE(catalogue.at("routes").size() <= developer::kRoutesCap); // the page shows every row
+    std::size_t expected_markers = 0;
+    for (const auto& r : catalogue.at("routes"))
+        if (r.contains("unavailable") && r["unavailable"].is_string() &&
+            !r["unavailable"].get<std::string>().empty())
+            ++expected_markers;
+    REQUIRE(expected_markers > 0);
+    std::size_t shown_markers = 0;
+    for (std::size_t at = 0;
+         (at = all->body.find("<span class=\"pill warn\">unavailable</span>", at)) !=
+         std::string::npos;
+         ++at)
+        ++shown_markers;
+    CHECK(shown_markers == expected_markers);
 
     auto none = h.sink.Get("/fragments/settings/developer/routes?q=%3Cimg%20src%3Dx%3E");
     REQUIRE(none);

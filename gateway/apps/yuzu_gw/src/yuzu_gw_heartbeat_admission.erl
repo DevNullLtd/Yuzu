@@ -7,10 +7,16 @@
 %%%     stream that created it;
 %%%   - a session that has registered but not yet subscribed is bound to
 %%%     the connection that performed the Register.
+%%%   - a session whose owner process died and is being restarted to recover
+%%%     it (OWNER-RESTART, #5695) stays bound to its connection from the
+%%%     owner table (`yuzu_gw_agent_sup:held_session/1'), consulted only when
+%%%     both registry lookups miss: the registry drops a dead owner's row at
+%%%     once, and a refused heartbeat makes the agent drop the stream the
+%%%     restarted owner is about to re-attach.
 %%% Anything else is rejected. The decision reads node-local state only
 %%% (`yuzu_gw_registry:lookup_session/1' and `lookup_pending_session/1',
-%%% never `pg'); it does not depend on the upstream server's view of the
-%%% session. A missing registry table fails closed.
+%%% the owner table, never `pg'); it does not depend on the upstream server's
+%%% view of the session. A missing registry table fails closed.
 %%%
 %%% Every rejection is counted (`yuzu_gw_heartbeat_rejected_total{reason}',
 %%% or `yuzu_gw_heartbeat_session_mismatch_total{event="security"}' for a
@@ -20,11 +26,20 @@
 %%%
 %%% The caller answers every rejection with the same NOT_FOUND
 %%% "unknown session" regardless of reason.
+%%%
+%%% ReportInventory is admitted by the same decision (`admit_inventory/2',
+%%% #5695): an inventory report is forwarded upstream only for a session this
+%%% node holds, on the connection bound to it, and the check runs before the
+%%% call takes an upstream permit. Its rejections are counted apart, in
+%%% `yuzu_gw_inventory_rejected_total{reason}' (all four reasons, the
+%%% connection mismatch included), and logged by
+%%% `yuzu_gw_safe_call:warn_limited/3' (kind `inventory_refused', reason only,
+%%% never a session id), not folded into the heartbeat summary line.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_heartbeat_admission).
 
--export([admit/2, check/2]).
+-export([admit/2, admit_inventory/2, check/2]).
 -export([init_summary_state/0, reset_summary_state/0]).
 -export_type([reason/0]).
 
@@ -54,6 +69,25 @@ admit(Ctx, SessionId) ->
             rejected
     end.
 
+%% @doc The same decision for a ReportInventory call: `ok' means forward it,
+%% `rejected' means answer NOT_FOUND without taking an upstream permit. A
+%% rejection is counted on its own family, by reason, and logged at most once
+%% per second (the reason only).
+-spec admit_inventory(ctx:t(), term()) -> ok | rejected.
+admit_inventory(Ctx, SessionId) ->
+    case check(Ctx, SessionId) of
+        ok ->
+            ok;
+        {reject, Reason} ->
+            telemetry:execute([yuzu, gw, inventory, rejected], #{count => 1},
+                              #{reason => Reason}),
+            yuzu_gw_safe_call:warn_limited(
+              inventory_refused,
+              "ReportInventory refused before forwarding: no session held on this "
+              "connection (~s)", [Reason]),
+            rejected
+    end.
+
 %% @doc The pure decision: no counting, no logging.
 -spec check(ctx:t(), term()) -> ok | {reject, reason()}.
 check(_Ctx, SessionId) when not is_binary(SessionId); SessionId =:= <<>> ->
@@ -72,16 +106,21 @@ check(Ctx, SessionId) ->
                 {error, unavailable} ->
                     {reject, registry_unavailable};
                 error ->
-                    {reject, unknown_session}
+                    %% Its owner died and is being restarted to recover it
+                    %% (OWNER-RESTART): the registry has no row for the session
+                    %% until the restarted owner registers it again.
+                    case yuzu_gw_agent_sup:held_session(SessionId) of
+                        {ok, Bound} -> compare(Key, Bound);
+                        error       -> {reject, unknown_session}
+                    end
             end
     end.
 
 %% @doc Create the summary-log state. Called once at boot, before the
-%% supervision tree serves heartbeats (the agent listener belongs to the
-%% grpcbox dependency application, which can start first; the lazy path
-%% covers that window): creating it lazily on the first rejection is racy
-%% when the first rejections arrive together (each concurrent first caller
-%% would create its own state and log its own line).
+%% supervision tree, whose last children are the listeners, serves heartbeats:
+%% creating it lazily on the first rejection is racy when the first rejections
+%% arrive together (each concurrent first caller would create its own state and
+%% log its own line).
 -spec init_summary_state() -> ok.
 init_summary_state() ->
     _ = new_summary_state(),
@@ -147,11 +186,10 @@ slot(Reason) ->
 slot(Reason, [Reason | _], N) -> N;
 slot(Reason, [_ | Rest], N)   -> slot(Reason, Rest, N + 1).
 
-%% Normally created at boot by init_summary_state/0. The lazy path covers a
-%% caller that runs before that (unit tests, and the window in which the
-%% grpcbox dependency application serves heartbeats before yuzu_gw_app:start/2
-%% has run): a concurrent first call may create the state more than once,
-%% which only affects the log lines.
+%% Normally created at boot by init_summary_state/0, before any listener
+%% starts. The lazy path covers a caller that runs without it (unit tests): a
+%% concurrent first call may create the state more than once, which only
+%% affects the log lines.
 summary_state() ->
     case persistent_term:get(?STATE_KEY, undefined) of
         undefined -> new_summary_state();

@@ -720,6 +720,7 @@ yuzu_server_core_lib = static_library(
     'src/schedule_model.cpp', # ADR-0031 WS-A4: seventh per-family seam, pure JSON row builder
     'src/schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam
     'src/help_ui.cpp',
+    'src/swagger_page_ui.cpp',
     'src/home_ui.cpp',     # Home (/home): the sign-in landing page, rendered per request
     'src/home_render.cpp', # Dashboard panels: pure value structs + renderers
     'src/home_routes.cpp', # Dashboard: GET /fragments/dashboard/summary over injected seams
