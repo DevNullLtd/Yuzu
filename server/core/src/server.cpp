@@ -253,6 +253,7 @@
 #include "background_jobs.hpp" // WS-10: pass-classification table + YUZU_ASSERT_BACKGROUND_JOB gate
 #include "coord_dsn.hpp"       // WS-3: build the elector's dedicated coordination DSN (testable)
 #include "leader_elector.hpp"  // WS-3: fenced leader-election primitive (ADR-2002 §3/§6/§10)
+#include "leader_metrics.hpp"  // WS-11 (#4014): yuzu_server_leader_* seed + scrape-time publisher
 #include "pg_reachability_probe.hpp" // WS-8: runtime Postgres reachability for /readyz (ADR-2002 §12)
 #include "shutdown_drain_rules.hpp" // WS-8: stop() drain-wait decision + bounds
 #include "leader_gate.hpp"     // WS-3 3.2: runtime FencedLeaderOnly loop gate over kBackgroundJobs
@@ -8792,13 +8793,20 @@ public:
         if (pg_pool_ && !startup_failed_) {
             leader_elector_ = std::make_unique<LeaderElector>(LeaderElector::Config{
                 .dsn = build_coord_dsn(cfg_.postgres_dsn), .holder_id = random_holder_id()});
+            // WS-11 (#4014): birth the yuzu_server_leader_* series only where an
+            // elector exists (a server with none exports no leader series at all,
+            // never a fabricated "no leader"). Published at /metrics scrape time.
+            seed_leader_metrics(metrics_);
             if (!leader_elector_->is_open()) {
                 // Do NOT fail boot. On the single-replica deployment the loop below
                 // re-acquires within one cycle and the gated loops resume; the pause
                 // touches ONLY the FencedLeaderOnly loops, which is the fail-closed
                 // posture (never double-dispatch), not a data-loss one. A persistent
                 // failure is a coordination-substrate problem (§10) — loud, never
-                // silent. WS-11 (#4014) adds the metric/alert/readyz surface.
+                // silent. WS-11 (#4014) surfaces it as the yuzu_server_leader_* metrics
+                // (acquire_failures_total{cause="connect"} rising, is_leader 0) and the
+                // YuzuLeaderNoLeader alert. It is deliberately NOT a /readyz condition:
+                // a replica that cannot lead is a ready follower (health_routes.cpp).
                 spdlog::error("[HA] leader_elector could not open its coordination connection; "
                               "FencedLeaderOnly background loops are PAUSED until leadership is "
                               "acquired (single-replica: self-heals within one election cycle; "
@@ -8843,10 +8851,16 @@ public:
                             0, static_cast<int>(kLeaderJitterMax.count()));
                         wait += seconds{jitter(rng)};
                     } catch (const std::exception& e) {
+                        // WS-11: a plain atomic, NEVER a MetricsRegistry call -- the
+                        // registry takes a mutex and builds a std::string key that can
+                        // throw, which here would be a std::terminate defeating this
+                        // very guard. Published at /metrics scrape time.
+                        leader_loop_errors_.fetch_add(1, std::memory_order_relaxed);
                         spdlog::error("leader_elector: election iteration threw ({}) — continuing",
                                       e.what());
                         wait = kLeaderBackoffMin; // brief backoff so a persistent throw can't spin
                     } catch (...) {
+                        leader_loop_errors_.fetch_add(1, std::memory_order_relaxed);
                         spdlog::error("leader_elector: election iteration threw unknown — continuing");
                         wait = kLeaderBackoffMin;
                     }
@@ -16422,6 +16436,8 @@ private:
                              .server_start_time = server_start_time_,
                              .pg_pool = pg_pool_.get(),
                              .pg_reachability_probe = pg_reachability_probe_.get(),
+                             .leader_elector = leader_elector_.get(), // WS-11 (#4014): /metrics only
+                             .leader_loop_errors = &leader_loop_errors_,
                              .response_store = response_store_.get(),
                              .audit_store = audit_store_.get(),
                              .instruction_store = instruction_store_.get(),
@@ -23369,7 +23385,22 @@ private:
     // in stop() before ~ServerImpl (a joinable std::thread destructor terminates).
     // FencedLeaderOnly background loops (schedule/policy/quarantine/CRL) gate on
     // leader_elector_->is_leader() via leader_gate.hpp — slice 3.2.
+    //
+    // BORROWED by the /metrics handler (WS-11, #4014): `health::Deps::leader_elector`
+    // and `::leader_loop_errors` are raw pointers to the next two members, copied
+    // into the route lambda. This is NOT guaranteed by declaration order (these
+    // are declared after web_server_/web_thread_, so they are destroyed BEFORE
+    // them); it is guaranteed by stop(), which joins web_thread_ (or _Exit()s on
+    // its timeout) before these two members are destroyed (stop() never resets
+    // either), and ~ServerImpl always calls stop() first. That join comes AFTER
+    // resign() and the leader_thread_ join, so a scrape may overlap resign(): safe
+    // because stats() is lock-free and the elector is still alive. Do not reorder
+    // stop().
     std::unique_ptr<LeaderElector> leader_elector_;
+    /// WS-11 (#4014): election-loop iterations that threw. A plain atomic the loop
+    /// increments (never the MetricsRegistry -- see the loop's catch blocks); the
+    /// /metrics handler pulls it via `health::Deps::leader_loop_errors`.
+    std::atomic<std::uint64_t> leader_loop_errors_{0};
     std::thread leader_thread_;
 
     // HA WS-8 (ADR-2002 §12): the runtime Postgres-reachability probe behind

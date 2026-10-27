@@ -1,4 +1,5 @@
-registry_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
+# nlohmann_dep: registry_plan.hpp parses the apply plan (the asset_tags plugin's precedent).
+registry_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, nlohmann_dep, spdlog_dep]
 if host_machine.system() == 'windows'
   # win_profiles.hpp / win_reg_handle.hpp: Reg*W + RegLoadKeyW/RegUnLoadKeyW,
   # AdjustTokenPrivileges (PR1.7).
