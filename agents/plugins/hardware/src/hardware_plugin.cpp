@@ -11,7 +11,7 @@
  *   "system"       — Serial number + system UUID (CMDB correlation key).
  *   "chassis", "baseboard", "swap", "machine_id" — PLANNED on every OS: each answers one
  *                    `status|<action>|unsupported|<os>:planned` row until its leg lands
- *                    (hardware_estate_*.cpp).
+ *                    (the dispatch line in execute()).
  *
  * Output is pipe-delimited, one field per line via write_output():
  *   key|value   (for scalar actions)
@@ -20,7 +20,9 @@
 
 #include <yuzu/plugin.hpp>
 
-#include "hardware_estate_legs.hpp" // chassis/baseboard/swap/machine_id seam
+#include "hardware_estate_legs.hpp" // chassis/baseboard/swap/machine_id Kind
+
+#include <planned_leg.hpp> // shared planned-leg reporter (agents/shared)
 
 #include <cstdint>
 #include <format>
@@ -976,15 +978,8 @@ public:
             return do_drivers(ctx);
         if (action == "system")
             return do_system(ctx);
-        if (auto k = yuzu::hardware::estate::parse_kind(action)) {
-#if defined(_WIN32)
-            return yuzu::hardware::estate::run_windows(ctx, *k);
-#elif defined(__linux__)
-            return yuzu::hardware::estate::run_linux(ctx, *k);
-#elif defined(__APPLE__)
-            return yuzu::hardware::estate::run_macos(ctx, *k);
-#endif
-        }
+        if (auto k = yuzu::hardware::estate::parse_kind(action))
+            return yuzu::shared::report_planned(ctx, yuzu::hardware::estate::kind_name(*k));
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;

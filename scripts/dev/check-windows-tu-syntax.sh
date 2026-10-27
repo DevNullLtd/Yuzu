@@ -63,7 +63,6 @@ tus=(
     agents/plugins/update_source_trust/src/update_source_trust_win.cpp
     agents/plugins/mgmt_posture/src/mgmt_posture_win.cpp
     agents/plugins/shares/src/shares_win.cpp
-    agents/plugins/hardware/src/hardware_estate_win.cpp
     agents/plugins/remote_access_audit/src/remote_access_audit_win.cpp
     agents/plugins/runtimes/src/runtimes_win.cpp
     agents/plugins/runtimes/src/runtimes_linux.cpp # empty on Windows: checks the portable half of the Linux walk header

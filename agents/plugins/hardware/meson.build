@@ -26,14 +26,9 @@ endif
 # yuzu::agent::PluginHandle::load.
 hardware_plugin_lib = shared_library(
   'hardware',
-  files(
-    'src/hardware_plugin.cpp',
-    'src/hardware_estate_win.cpp',
-    'src/hardware_estate_linux.cpp',
-    'src/hardware_estate_macos.cpp',
-  ),
+  files('src/hardware_plugin.cpp'),
   name_prefix: '',
-  include_directories: include_directories('../../shared'),  # wmi_bounded.hpp (#3404, _WIN32-gated)
+  include_directories: include_directories('../../shared'),  # wmi_bounded.hpp (#3404, _WIN32-gated), planned_leg.hpp
   dependencies: hardware_deps,
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',

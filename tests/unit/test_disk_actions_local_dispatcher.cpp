@@ -544,33 +544,6 @@ TEST_CASE("disk_actions: the volume row carries the physical-to-logical join",
     CHECK(r == "volume|disk0s2|/,/System/Volumes/Data|disk0|apfs|494384795648|-");
 }
 
-TEST_CASE("disk_actions: partition and topology rows escape untrusted fields and render '-'",
-          "[disk_actions][format]") {
-    using namespace yuzu::disk_actions;
-    const auto p = format_partition_row("disk0", "disk0|s1", std::nullopt, "apfs", "/", "-");
-    const auto pf = split_fields_escape_aware(p);
-    REQUIRE(pf.size() == 7);
-    CHECK(pf[0] == "partition");
-    CHECK(pf[2] == "disk0|s1"); // round-trips through the escape, one field
-    CHECK(pf[3] == "-");        // an absent size is '-', never 0
-    CHECK(format_partition_row("sda", "sda1", std::optional<std::uint64_t>{1048576}, "ext4",
-                               "/boot", "-") == "partition|sda|sda1|1048576|ext4|/boot|-");
-
-    const auto t = format_topology_row(TopologyKind::lvm_lv, "vg|0/root", "u", "sda2", "-");
-    const auto tf = split_fields_escape_aware(t);
-    REQUIRE(tf.size() == 6);
-    CHECK(tf[0] == "topology");
-    CHECK(tf[1] == "lvm_lv");
-    CHECK(tf[2] == "vg|0/root"); // round-trips through the escape, one field
-
-    // Every kind renders its own closed token.
-    CHECK(topology_kind_token(TopologyKind::lvm_vg) == "lvm_vg");
-    CHECK(topology_kind_token(TopologyKind::lvm_lv) == "lvm_lv");
-    CHECK(topology_kind_token(TopologyKind::md) == "md");
-    CHECK(topology_kind_token(TopologyKind::multipath) == "multipath");
-    CHECK(topology_kind_token(TopologyKind::apfs_container) == "apfs_container");
-}
-
 // ── pure NVMe decision tests (K4 / FV-1) ────────────────────────────────
 //
 // These exist because the decision a failing-drive alert keys on used to live

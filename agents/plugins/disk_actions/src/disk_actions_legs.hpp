@@ -17,8 +17,9 @@
  *   topology|<kind>|<name>|<uuid>|<members>|<detail>
  *
  * `partitions` and `topology` are PLANNED on every OS: until their leg PRs land they answer
- * one `status|<action>|unsupported|<os>:planned` row (agents/shared/planned_leg.hpp) and
- * the two formatters below are not called by any leg yet.
+ * one `status|<action>|unsupported|<os>:planned` row (agents/shared/planned_leg.hpp). The
+ * leg PR that fills one adds its row formatter; the columns are declared in
+ * content/definitions/disk_actions.yaml.
  *
  * `health`, `bus` and `media` are FIXED vocabularies emitted verbatim (they are
  * derived from enums, never from parsed text); every other field is untrusted
@@ -100,20 +101,6 @@ constexpr std::string_view media_token(Media m) noexcept {
     case Media::Unknown: return "unknown";
     }
     return "unknown";
-}
-
-/// Storage-topology layer a `topology` row describes. Closed: emitted verbatim.
-enum class TopologyKind { lvm_vg, lvm_lv, md, multipath, apfs_container };
-
-constexpr std::string_view topology_kind_token(TopologyKind k) noexcept {
-    switch (k) {
-    case TopologyKind::lvm_vg:         return "lvm_vg";
-    case TopologyKind::lvm_lv:         return "lvm_lv";
-    case TopologyKind::md:             return "md";
-    case TopologyKind::multipath:      return "multipath";
-    case TopologyKind::apfs_container: return "apfs_container";
-    }
-    return "md";
 }
 
 namespace detail {
@@ -204,43 +191,6 @@ inline std::string format_volume_row(std::string_view volume, std::string_view m
     out += yuzu::util::safe_output_field(fstype);
     out += '|';
     out += detail::format_optional_bytes(total_bytes);
-    out += '|';
-    out += yuzu::util::safe_output_field(detail);
-    return out;
-}
-
-/// partition|<disk>|<partition>|<size_bytes>|<type>|<mount_points>|<detail>
-inline std::string format_partition_row(std::string_view disk, std::string_view partition,
-                                        std::optional<std::uint64_t> size_bytes,
-                                        std::string_view type, std::string_view mount_points,
-                                        std::string_view detail) {
-    std::string out = "partition|";
-    out += yuzu::util::safe_output_field(disk);
-    out += '|';
-    out += yuzu::util::safe_output_field(partition);
-    out += '|';
-    out += detail::format_optional_bytes(size_bytes);
-    out += '|';
-    out += yuzu::util::safe_output_field(type);
-    out += '|';
-    out += yuzu::util::safe_output_field(mount_points);
-    out += '|';
-    out += yuzu::util::safe_output_field(detail);
-    return out;
-}
-
-/// topology|<kind>|<name>|<uuid>|<members>|<detail>
-inline std::string format_topology_row(TopologyKind kind, std::string_view name,
-                                       std::string_view uuid, std::string_view members,
-                                       std::string_view detail) {
-    std::string out = "topology|";
-    out.append(topology_kind_token(kind)); // fixed vocabulary -- verbatim
-    out += '|';
-    out += yuzu::util::safe_output_field(name);
-    out += '|';
-    out += yuzu::util::safe_output_field(uuid);
-    out += '|';
-    out += yuzu::util::safe_output_field(members);
     out += '|';
     out += yuzu::util::safe_output_field(detail);
     return out;
