@@ -21,8 +21,8 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
-#include <fstream>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -32,6 +32,11 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 using namespace yuzu::agent;
 using Outcome = GuardianBootEpochClaim::Outcome;
@@ -660,7 +665,8 @@ TEST_CASE("boot-epoch: releasing the instance lock lets the next process take it
     // A moved-from lock owns nothing; the moved-to one keeps the lock.
     GuardianInstanceLock moved = std::move(next);
     CHECK(moved.held());
-    CHECK(next.state() == GuardianInstanceLock::State::NotAcquired); // NOLINT(bugprone-use-after-move)
+    // NOLINTNEXTLINE(bugprone-use-after-move)
+    CHECK(next.state() == GuardianInstanceLock::State::NotAcquired);
     CHECK(GuardianInstanceLock::acquire(lock_path).state() ==
           GuardianInstanceLock::State::Contended);
 }
@@ -796,7 +802,8 @@ TEST_CASE("boot-epoch: move-assignment releases the lock it replaces",
 
     target = std::move(source);
     CHECK(target.held());
-    CHECK(source.state() == GuardianInstanceLock::State::NotAcquired); // NOLINT(bugprone-use-after-move)
+    // NOLINTNEXTLINE(bugprone-use-after-move)
+    CHECK(source.state() == GuardianInstanceLock::State::NotAcquired);
     // a.lock was released by the assignment; b.lock is still held, now by `target`.
     CHECK(GuardianInstanceLock::acquire(path_a).held());
     CHECK(GuardianInstanceLock::acquire(path_b).state() == GuardianInstanceLock::State::Contended);
@@ -813,8 +820,10 @@ TEST_CASE("boot-epoch: outcome names are the strings the operator documentation 
     CHECK(std::string_view{guardian_boot_epoch_outcome_name(Outcome::Recovered)} == "recovered");
     CHECK(std::string_view{guardian_boot_epoch_outcome_name(Outcome::NoStore)} == "no_store");
     CHECK(std::string_view{guardian_boot_epoch_outcome_name(Outcome::ReadFailed)} == "read_failed");
-    CHECK(std::string_view{guardian_boot_epoch_outcome_name(Outcome::WriteFailed)} == "write_failed");
-    CHECK(std::string_view{guardian_boot_epoch_outcome_name(Outcome::OutOfRange)} == "out_of_range");
+    CHECK(std::string_view{guardian_boot_epoch_outcome_name(Outcome::WriteFailed)} ==
+          "write_failed");
+    CHECK(std::string_view{guardian_boot_epoch_outcome_name(Outcome::OutOfRange)} ==
+          "out_of_range");
     CHECK(std::string_view{guardian_boot_epoch_outcome_name(Outcome::DurabilityBelowFull)} ==
           "durability_below_full");
     CHECK(std::string_view{guardian_boot_epoch_outcome_name(Outcome::InstanceLockNotHeld)} ==
@@ -855,5 +864,105 @@ TEST_CASE("boot-epoch: a lock file unlinked while held is re-created by the next
     std::filesystem::remove(lock_path);
     auto second = GuardianInstanceLock::acquire(lock_path);
     CHECK(second.held()); // a new file, a new inode: this is the residual, not a guarantee
+}
+
+namespace {
+// Unlink the lock file and create a fresh one at the same path: what the post-flock re-check
+// exists to notice.
+void replace_file(const std::filesystem::path& p) {
+    std::filesystem::remove(p);
+    std::ofstream out{p};
+}
+} // namespace
+
+TEST_CASE("boot-epoch: a lock file replaced between the open and the lock is re-locked",
+          "[guardian][boot_epoch][instance_lock]") {
+    yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
+    std::filesystem::create_directories(dir.path);
+    const auto lock_path = dir.path / "guardian_boot_epoch.lock";
+
+    int calls = 0;
+    auto lock = GuardianInstanceLock::acquire_for_test(
+        lock_path, std::chrono::milliseconds{0}, [&] {
+            if (++calls == 1)
+                replace_file(lock_path); // only the first attempt loses its file
+        });
+    // The first attempt locked the unlinked inode, saw the path name another file, dropped it and
+    // locked the new one: two attempts, and the lock is on the file that is now at the path.
+    CHECK(calls == 2);
+    REQUIRE(lock.held());
+    CHECK(lock.native_error() == 0);
+    CHECK(GuardianInstanceLock::acquire(lock_path).state() ==
+          GuardianInstanceLock::State::Contended);
+}
+
+TEST_CASE("boot-epoch: a lock file replaced on every attempt ends Failed with ESTALE",
+          "[guardian][boot_epoch][instance_lock]") {
+    yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
+    std::filesystem::create_directories(dir.path);
+    const auto lock_path = dir.path / "guardian_boot_epoch.lock";
+
+    int calls = 0;
+    auto lock = GuardianInstanceLock::acquire_for_test(
+        lock_path, std::chrono::seconds{5}, [&] {
+            ++calls;
+            replace_file(lock_path);
+        });
+    // The first attempt plus kMaxReplacedRetries (5) retries, then it gives up. The wait is not
+    // consulted: replacement is not contention, so the loop never sleeps.
+    CHECK(calls == 6);
+    CHECK_FALSE(lock.held());
+    CHECK(lock.state() == GuardianInstanceLock::State::Failed);
+    CHECK(lock.native_error() == ESTALE);
+}
+
+TEST_CASE("boot-epoch: a path that cannot be re-resolved reports its own error, not ESTALE",
+          "[guardian][boot_epoch][instance_lock]") {
+    if (::geteuid() == 0)
+        SKIP("root ignores directory permissions");
+    yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
+    std::filesystem::create_directories(dir.path);
+    const auto sub = dir.path / "sub";
+    std::filesystem::create_directories(sub);
+    const auto lock_path = sub / "guardian_boot_epoch.lock";
+
+    auto lock = GuardianInstanceLock::acquire_for_test(
+        lock_path, std::chrono::milliseconds{0}, [&] {
+            // Search permission gone: stat(path) now fails with EACCES, which says nothing about
+            // the file having been replaced.
+            std::filesystem::permissions(sub, std::filesystem::perms::none);
+        });
+    std::filesystem::permissions(sub, std::filesystem::perms::owner_all); // let TempDir clean up
+    CHECK_FALSE(lock.held());
+    CHECK(lock.state() == GuardianInstanceLock::State::Failed);
+    CHECK(lock.native_error() == EACCES);
+}
+
+TEST_CASE("boot-epoch: a non-regular file at the lock path is refused",
+          "[guardian][boot_epoch][instance_lock]") {
+    yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
+    std::filesystem::create_directories(dir.path);
+    const auto lock_path = dir.path / "guardian_boot_epoch.lock";
+    REQUIRE(::mkfifo(lock_path.c_str(), 0600) == 0);
+
+    // open(O_RDWR) on a FIFO succeeds without blocking; the regular-file check then refuses it.
+    auto lock = GuardianInstanceLock::acquire(lock_path);
+    CHECK_FALSE(lock.held());
+    CHECK(lock.state() == GuardianInstanceLock::State::Failed);
+    CHECK(lock.native_error() == EINVAL);
+}
+
+TEST_CASE("boot-epoch: a throwing test hook fails the attempt instead of escaping",
+          "[guardian][boot_epoch][instance_lock]") {
+    yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
+    std::filesystem::create_directories(dir.path);
+    const auto lock_path = dir.path / "guardian_boot_epoch.lock";
+
+    auto lock = GuardianInstanceLock::acquire_for_test(
+        lock_path, std::chrono::milliseconds{0}, [] { throw std::runtime_error("hook"); });
+    CHECK_FALSE(lock.held());
+    CHECK(lock.state() == GuardianInstanceLock::State::Failed);
+    // The attempt's descriptor was closed on the way out: the next acquire is not contended.
+    CHECK(GuardianInstanceLock::acquire(lock_path).held());
 }
 #endif

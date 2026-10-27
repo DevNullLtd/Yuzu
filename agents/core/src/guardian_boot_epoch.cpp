@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -162,8 +163,8 @@ void log_claim(IJournalStore* store, const GuardianBootEpochClaim& c, Detail& d,
         spdlog::log(level,
                     "Guardian boot_epoch claim: outcome={} boot_epoch={} stored={} persisted={} "
                     "stored_len={} clock_unix_s={} candidate={} synchronous={}",
-                    guardian_boot_epoch_outcome_name(c.outcome), c.boot_epoch, stored, c.persisted, d.stored_len,
-                    now_unix_s, d.candidate, d.synchronous);
+                    guardian_boot_epoch_outcome_name(c.outcome), c.boot_epoch, stored, c.persisted,
+                    d.stored_len, now_unix_s, d.candidate, d.synchronous);
     } catch (...) {
         // Logging is best-effort and must never change the claim.
     }
@@ -207,9 +208,11 @@ constexpr std::intptr_t kNoHandle = -1;
 // A held lock on a file that was unlinked or replaced after the open guards nothing: a second
 // process creates and locks the new file. After locking, the path is re-resolved and must name
 // the very file that was locked; a mismatch drops the lock and tries again, at most this often.
+// POSIX only: on Windows share mode 0 forbids deleting or renaming the open file, so no attempt
+// is ever Replaced there (the branch compiles on both legs and is dead on Windows).
 constexpr int kMaxReplacedRetries = 5;
 #ifdef _WIN32
-constexpr int kReplacedError = ERROR_FILE_INVALID;
+constexpr int kReplacedError = ERROR_FILE_INVALID; // never reported: Replaced is POSIX only
 #else
 constexpr int kReplacedError = ESTALE;
 #endif
@@ -217,9 +220,11 @@ constexpr int kReplacedError = ESTALE;
 enum class Attempt { Held, Contended, Failed, Replaced };
 
 // One attempt. On Held the handle is stored; otherwise nothing is left open. `err` carries the
-// errno / GetLastError of a Failed or Contended attempt (0 when none).
-Attempt try_lock_once(const std::filesystem::path& path, std::intptr_t& handle,
-                      int& err) noexcept {
+// errno / GetLastError of a Failed or Contended attempt (0 when none). `after_flock` is the
+// test seam (POSIX): called once the lock is taken and before the path is re-resolved, so a
+// test can unlink or replace the file at exactly the point the re-check exists for.
+Attempt try_lock_once(const std::filesystem::path& path, std::intptr_t& handle, int& err,
+                      [[maybe_unused]] const std::function<void()>* after_flock) noexcept {
     err = 0;
 #ifdef _WIN32
     // Share mode 0: a second open of the same file fails with ERROR_SHARING_VIOLATION while
@@ -259,10 +264,27 @@ Attempt try_lock_once(const std::filesystem::path& path, std::intptr_t& handle,
         err = errno;
         return err == EWOULDBLOCK ? Attempt::Contended : Attempt::Failed;
     }
+    if (after_flock != nullptr && *after_flock) {
+        try {
+            (*after_flock)();
+        } catch (...) {
+            err = EINVAL;
+            return Attempt::Failed;
+        }
+    }
     struct stat by_path {};
-    if (::stat(path.c_str(), &by_path) != 0 || by_path.st_dev != by_fd.st_dev ||
-        by_path.st_ino != by_fd.st_ino)
+    if (::stat(path.c_str(), &by_path) != 0) {
+        // ENOENT: unlinked after the open, so the locked file is no longer the lock file.
+        // Any other failure (EACCES on a path component, EIO) says nothing about replacement
+        // and is reported as what it is.
+        if (errno != ENOENT) {
+            err = errno;
+            return Attempt::Failed;
+        }
         return Attempt::Replaced; // fd closes here, which drops the lock
+    }
+    if (by_path.st_dev != by_fd.st_dev || by_path.st_ino != by_fd.st_ino)
+        return Attempt::Replaced;
     handle = fd.release();
     return Attempt::Held;
 #endif
@@ -309,12 +331,26 @@ void GuardianInstanceLock::release() noexcept {
 
 GuardianInstanceLock GuardianInstanceLock::acquire(const std::filesystem::path& path,
                                                    std::chrono::milliseconds wait) noexcept {
+    return acquire_impl(path, wait, nullptr);
+}
+
+GuardianInstanceLock
+GuardianInstanceLock::acquire_for_test(const std::filesystem::path& path,
+                                       std::chrono::milliseconds wait,
+                                       const std::function<void()>& after_flock) noexcept {
+    return acquire_impl(path, wait, &after_flock);
+}
+
+GuardianInstanceLock
+GuardianInstanceLock::acquire_impl(const std::filesystem::path& path,
+                                   std::chrono::milliseconds wait,
+                                   const std::function<void()>* after_flock) noexcept {
     GuardianInstanceLock lock;
     try {
         const auto deadline = std::chrono::steady_clock::now() + wait;
         int replaced = 0;
         for (;;) {
-            const Attempt a = try_lock_once(path, lock.handle_, lock.native_error_);
+            const Attempt a = try_lock_once(path, lock.handle_, lock.native_error_, after_flock);
             if (a == Attempt::Held) {
                 lock.state_ = State::Held;
                 break;
@@ -345,17 +381,20 @@ GuardianBootEpochClaim claim_guardian_boot_epoch(IJournalStore* store, std::int6
     if (store == nullptr || lock.held())
         return claim_guardian_boot_epoch(store, now_unix_s);
     try {
-        // The wording follows the state: only Contended means another holder was seen.
+        // The wording follows the state. Contended means the lock is held by someone else: normally
+        // a second agent process, but on Windows any program holding the file open (a backup or
+        // security product) reports the same way, with native_error=32.
         const char* why =
             lock.state() == GuardianInstanceLock::State::Contended
-                ? "another agent process holds the data directory's boot-epoch lock"
+                ? "the data directory's boot-epoch lock is held by another process (normally a "
+                  "second agent; on Windows any program with the file open)"
             : lock.state() == GuardianInstanceLock::State::Failed
                 ? "the boot-epoch lock file could not be opened or locked"
                 : "the boot-epoch lock was never acquired";
         spdlog::error("Guardian boot_epoch claim: outcome={} boot_epoch=0 instance_lock={} "
                       "native_error={}; {}, so this process emits unordered (0/0) events",
-                      guardian_boot_epoch_outcome_name(Outcome::InstanceLockNotHeld), lock_state_name(lock.state()),
-                      lock.native_error(), why);
+                      guardian_boot_epoch_outcome_name(Outcome::InstanceLockNotHeld),
+                      lock_state_name(lock.state()), lock.native_error(), why);
     } catch (...) {
         // Logging is best-effort and must never change the claim.
     }

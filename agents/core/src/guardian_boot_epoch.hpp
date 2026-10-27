@@ -75,15 +75,22 @@
 //   * it is a same-host guard. A data directory shared between hosts over a network file
 //     system is outside it (flock semantics there are the file system's, and a host-local
 //     fallback is not excluded across hosts).
-//   * the lock file is opened without following a symlink, must be a regular file, and after
-//     locking is re-resolved by path and compared with the locked file (device and inode); a
-//     file unlinked or replaced before the lock is therefore detected and re-locked. A file
-//     unlinked or replaced AFTER a successful claim is not detected: a second process would
-//     lock the new file and claim again. That needs write access to the data directory,
-//     which already allows rewriting kv_store.db itself.
-//   * a file system that does not support the lock reports the claim as unordered (epoch 0)
-//     rather than guessing, and a lock that cannot be taken for any reason other than a
-//     holder (Windows: a backup or antivirus handle open past the wait) is the same.
+//   * POSIX: the lock file is opened without following a symlink in its last path component,
+//     must be a regular file, and after locking is re-resolved by path and compared with the
+//     locked file (device and inode); a file unlinked or replaced before the lock is therefore
+//     detected and re-locked. A file unlinked or replaced AFTER a successful claim is not
+//     detected: a second process would lock the new file and claim again. That needs write
+//     access to the data directory, which already allows rewriting kv_store.db itself.
+//     Windows: share mode 0 forbids deleting or renaming the file while it is held, so that
+//     case cannot arise; the open does follow a reparse point at the lock path, which still
+//     locks its target exclusively.
+//   * contention is reported by what the operating system says, not by who holds the lock: on
+//     Windows any other program with the file open (a backup or security product) fails the
+//     open with ERROR_SHARING_VIOLATION and is reported as Contended exactly like a second
+//     agent, with native_error=32. A file system that does not support the lock, or a lock
+//     file the service account cannot open (EACCES, for example one created earlier by
+//     another account), is Failed. Either way the claim is unordered (epoch 0) rather than a
+//     guess.
 //   * the lock guards the epoch claim only, not the rest of the data directory (the identity
 //     and command-dedup stores have never been exclusive).
 //   * there is no in-process recovery: a process that lost the lock stays at epoch 0 until it
@@ -109,6 +116,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string_view>
 
 namespace yuzu::agent {
@@ -142,14 +150,15 @@ struct GuardianBootEpochClaim {
 /// Process-lifetime exclusive advisory lock on a file, the single-writer guard for the boot
 /// epoch claim (see SINGLE-WRITER GUARD above). Move-only RAII: the handle is closed, and the
 /// lock dropped, on destruction. POSIX uses flock(LOCK_EX | LOCK_NB) on an O_CLOEXEC
-/// descriptor, so an exec'd child never inherits it; Windows opens the file with share mode 0. Never throws. The handle is stored as an integer so the header carries no
-/// platform type.
+/// descriptor, so an exec'd child never inherits it; Windows opens the file with share mode 0.
+/// Never throws. The handle is stored as an integer so the header carries no platform type.
 class YUZU_EXPORT GuardianInstanceLock {
 public:
     enum class State {
         NotAcquired, ///< default-constructed; no attempt made
         Held,        ///< this object holds the lock
-        Contended,   ///< another holder (a second agent process, or another object) has it
+        Contended,   ///< someone else has it: normally a second agent process (or another object);
+                     ///< on Windows any program holding the file open (native_error 32)
         Failed,      ///< the lock file could not be opened or locked for another reason
     };
 
@@ -166,14 +175,25 @@ public:
     acquire(const std::filesystem::path& path,
             std::chrono::milliseconds wait = std::chrono::milliseconds{0}) noexcept;
 
+    /// Test seam, POSIX behaviour only: as acquire(), but calls `after_flock` once the lock is
+    /// taken and before the path is re-resolved, so a test can unlink or replace the file at
+    /// the point the re-check guards. A throwing hook makes the attempt Failed (EINVAL).
+    [[nodiscard]] static GuardianInstanceLock
+    acquire_for_test(const std::filesystem::path& path, std::chrono::milliseconds wait,
+                     const std::function<void()>& after_flock) noexcept;
+
     [[nodiscard]] State state() const noexcept { return state_; }
     [[nodiscard]] bool held() const noexcept { return state_ == State::Held; }
     /// errno (POSIX) or GetLastError() (Windows) of the last failed or contended attempt;
-    /// 0 when held or never attempted. ESTALE / ERROR_FILE_INVALID means the lock file kept
-    /// being replaced while it was locked.
+    /// 0 when held or never attempted. A contended lock reports EWOULDBLOCK (EAGAIN) on POSIX
+    /// and ERROR_SHARING_VIOLATION (32) on Windows. POSIX only: ESTALE means the lock file kept
+    /// being unlinked or replaced while it was locked.
     [[nodiscard]] int native_error() const noexcept { return native_error_; }
 
 private:
+    [[nodiscard]] static GuardianInstanceLock
+    acquire_impl(const std::filesystem::path& path, std::chrono::milliseconds wait,
+                 const std::function<void()>* after_flock) noexcept;
     void release() noexcept;
 
     std::intptr_t handle_ = -1; ///< POSIX fd or Windows HANDLE; -1 = none

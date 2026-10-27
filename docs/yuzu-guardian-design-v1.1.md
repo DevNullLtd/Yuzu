@@ -1010,11 +1010,13 @@ Known limits of the boot epoch:
   unordered 0/0 events instead of colliding with the holder. The lock guards only the epoch
   claim, not the rest of the data directory. Limits: an agent build that predates the lock does
   not take it; it is a same-host guard; the 5 s wait is shorter than the agent's worst-case
-  shutdown, so a restart that overlaps a slow teardown runs unordered until its next restart;
-  a lock file that is removed or replaced after the claim is not detected (it needs write
-  access to the data directory); and a file system that does not support the lock, or a
-  Windows handle held open past the wait, leaves the agent unordered. The recovery is a restart
-  with the cause fixed; the process does not retry.
+  shutdown, so a restart that overlaps a slow teardown runs unordered until its next restart; on
+  Linux and macOS a lock file removed or replaced after the claim is not detected (it needs write
+  access to the data directory; a file replaced before the lock is detected and re-locked); on
+  Windows share mode 0 forbids removing the held file, and any other program holding it open (a
+  backup or security product) is reported as `contended` with `native_error=32`; and a file
+  system that does not support the lock, or a lock file the agent's account cannot open, is
+  `failed`. The recovery is a restart with the cause fixed; the process does not retry.
 - A clock wrongly ahead at boot pins the epoch ahead, and it does not self-heal because the
   claim tracks the persisted value rather than the clock. A burst of restarts or a crash loop
   within the same second also pushes the epoch ahead of a correct clock until the clock catches
