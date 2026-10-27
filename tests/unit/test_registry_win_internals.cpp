@@ -873,8 +873,8 @@ TEST_CASE("Win32Registry::query_value returns a REG_SZ stored without its termin
     DWORD stored_bytes = 0;
     REQUIRE(RegQueryInfoKeyW(raw.get(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                              &stored_bytes, nullptr, nullptr) == ERROR_SUCCESS);
-    INFO("the OS stored " << stored_bytes << " bytes for the 4-byte REG_SZ write; not 4 means the OS padded the "
-         "write, which is not a fault in the plugin's read");
+    INFO("the OS stored " << stored_bytes << " bytes for the 4-byte REG_SZ write; anything but 4 points to the OS "
+         "padding the write, not to a fault in the plugin's read");
     REQUIRE(stored_bytes == 4);
     Win32Registry reg;
     yuzu::registry::QueryResult q;
