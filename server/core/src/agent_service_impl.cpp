@@ -65,6 +65,18 @@ namespace yuzu::server::detail {
 // Bring html_escape into scope for the HTML rendering methods.
 using yuzu::server::html_escape;
 
+namespace {
+// The `__timing__|` intercept runs before the Forensics tier and the provenance label, and the
+// agent core emits the sentinel itself with a millisecond count. The stat bar is shared by every
+// dashboard session, so only a plain count (1 to 12 ASCII digits) is relayed; any other text a
+// frame puts after the sentinel is swallowed without being published (#4990).
+[[nodiscard]] bool is_timing_millis(std::string_view v) noexcept {
+    if (v.empty() || v.size() > 12)
+        return false;
+    return std::all_of(v.begin(), v.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+} // namespace
+
 // The registry audit budget keys on a whole agent id (the budget treats keys that share its key
 // bound as one agent, plugin_result_audit.hpp).
 static_assert(kRegistryAuditBudgetKeyBytes >= auth::kMaxAgentIdLength,
@@ -1542,8 +1554,9 @@ grpc::Status AgentServiceImpl::Subscribe(
                 auto payload = resp.output().substr(11);
                 auto eq = payload.find('=');
                 auto ms = (eq != std::string::npos) ? payload.substr(eq + 1) : payload;
-                bus_.publish("timing", "<strong id=\"stat-agent\" hx-swap-oob=\"true\">" +
-                                           html_escape(ms) + " ms</strong>");
+                if (is_timing_millis(ms)) // #4990: never relay arbitrary frame text to the shared bus
+                    bus_.publish("timing", "<strong id=\"stat-agent\" hx-swap-oob=\"true\">" +
+                                               html_escape(ms) + " ms</strong>");
                 continue;
             }
             // CHAOS-TTL-1 (PR #3784 fix round, ADR-1007): the agent's
@@ -1945,8 +1958,9 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             auto payload = resp.output().substr(11);
             auto eq = payload.find('=');
             auto ms = (eq != std::string::npos) ? payload.substr(eq + 1) : payload;
-            bus_.publish("timing", "<strong id=\"stat-agent\" hx-swap-oob=\"true\">" +
-                                       html_escape(ms) + " ms</strong>");
+            if (is_timing_millis(ms)) // #4990: never relay arbitrary frame text to the shared bus
+                bus_.publish("timing", "<strong id=\"stat-agent\" hx-swap-oob=\"true\">" +
+                                           html_escape(ms) + " ms</strong>");
             return;
         }
         // CHAOS-TTL-1 — see the direct-Subscribe twin of this intercept above

@@ -113,6 +113,34 @@ void record_for_prefix(AgentServiceImpl& svc, const std::string& command_id,
 
 } // namespace
 
+TEST_CASE("timing stat: only a plain millisecond count is relayed to the shared bus",
+          "[server][forensics_tier][security]") {
+    // The `__timing__|` intercept runs before the tier and the provenance label, so a frame that
+    // starts with the sentinel must never carry other text onto the bus every dashboard reads.
+    LiveBusHarness h;
+    const auto timing_events = [&] {
+        std::vector<SseEvent> out;
+        std::ranges::copy_if(h.seen, std::back_inserter(out),
+                             [](const SseEvent& e) { return e.event_type == "timing"; });
+        return out;
+    };
+    SECTION("a millisecond count is published") {
+        h.svc.process_gateway_response("agent-1", running_frame("echo-0t", "__timing__|exec_ms=42"));
+        const auto ev = timing_events();
+        REQUIRE(ev.size() == 1);
+        CHECK(ev[0].data.find("42 ms") != std::string::npos);
+    }
+    SECTION("any other text after the sentinel is swallowed, not published") {
+        for (const char* payload :
+             {"__timing__|exec_ms=", "__timing__|exec_ms=12 ms plus text", "__timing__|exec_ms=-1",
+              "__timing__|exec_ms=1234567890123", "__timing__|marker-4990-live-row",
+              "__timing__|exec_ms=<b>x</b>"})
+            h.svc.process_gateway_response("agent-1", running_frame("echo-0t", payload));
+        CHECK(timing_events().empty());
+        CHECK(h.marker_count() == 0);
+    }
+}
+
 TEST_CASE("live output bus: a Forensics-tier plugin's frames publish nothing to the live stream",
           "[server][forensics_tier][security]") {
     LiveBusHarness h;
