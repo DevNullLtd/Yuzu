@@ -6,7 +6,7 @@
 | **What it does** | Detects software licences across OS, vendor and per-user surfaces |
 | **Version** | 1.0.0 |
 | **Kind** | Collector · read-only · on-demand |
-| **Platforms** | Windows ✅ · macOS 🟡 constrained · Linux 🟡 constrained |
+| **Platforms** | Windows ✅ · macOS ✅ · Linux 🟡 constrained |
 | **Actions** | `list` · `surfaces` |
 | **Security** | securable `SoftwareLicensing` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute:  · author: - |
@@ -38,15 +38,15 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `list` | ✅ supported · rung 1 · wmi+win32_registry | 🟡 constrained · rung 1 · filesystem_probe(glob+plist) | 🟡 constrained · rung 2 · rpm/dpkg-query/openssl via bounded argv runner |
-| `surfaces` | ✅ supported · rung 1 · wmi+win32_registry | 🟡 constrained · rung 1 · filesystem_probe(glob+plist) | 🟡 constrained · rung 2 · rpm/dpkg-query/openssl via bounded argv runner |
+| `list` | ✅ supported · rung 1 · wmi+win32_registry | ✅ supported · rung 1 · filesystem_probe(glob+plist, XML and bplist00) | 🟡 constrained · rung 2 · rpm/dpkg-query via bounded argv runner; in-process libcrypto X.509 |
+| `surfaces` | ✅ supported · rung 1 · wmi+win32_registry | ✅ supported · rung 1 · filesystem_probe(glob+plist, XML and bplist00) | 🟡 constrained · rung 2 · rpm/dpkg-query via bounded argv runner; in-process libcrypto X.509 |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`list` / macOS** — binary (bplist00) Info.plist files are not parsed; falls back to the bundle name with an empty version
-- **`list` / Linux** — declared-licence classification only (no lapse detection) for pkg_metadata; entitlement_certs' authoritative expiry still depends on the openssl CLI being present
-- **`surfaces` / macOS** — binary (bplist00) Info.plist files are not parsed; falls back to the bundle name with an empty version
-- **`surfaces` / Linux** — declared-licence classification only (no lapse detection) for pkg_metadata; entitlement_certs' authoritative expiry still depends on the openssl CLI being present
+- **`list` / macOS** — vendor_plists rows are presence-only (status unknown); MAS receipt PKCS#7 is not validated
+- **`list` / Linux** — pkg_metadata is declared-licence classification only (no lapse detection); entitlement cert readability on RHEL is unmeasured -- a refused directory or cert reports cert_permission_denied
+- **`surfaces` / macOS** — vendor_plists rows are presence-only (status unknown); MAS receipt PKCS#7 is not validated
+- **`surfaces` / Linux** — pkg_metadata is declared-licence classification only (no lapse detection); entitlement cert readability on RHEL is unmeasured -- a refused directory or cert reports cert_permission_denied
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -97,28 +97,28 @@ No definition declares result columns.
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 93534d76a8aa
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-26 · LocalSystem (elevated) · leg-hash 0c437dc4008f
 
 ```
 == action=list
-lic|Office 16, Office16O365ProPlusR_Grace edition|Microsoft||retail|retail|unlicensed||os_licensing_api|authoritative|VMFTK||machine|
-lic|Windows(R), Professional edition|Microsoft||retail|retail|licensed||os_licensing_api|authoritative|3V66T||machine|
-lic|Microsoft Office (O365ProPlusRetail)|Microsoft|16.0.19822.20114|subscription||unknown||registry_probe|probable||winword.exe,excel.exe,outlook.exe,powerpnt.exe|machine|
+lic|Windows(R), Professional edition|Microsoft||oem|oem|licensed||os_licensing_api|authoritative|2R4J2||machine|
 lic|Microsoft Visual Studio|Microsoft||unknown||unknown||registry_probe|heuristic||devenv.exe|machine|
 lic|7-Zip|Igor Pavlov||open_source||unknown||registry_probe|heuristic||7zfm.exe|machine|
-lic|Notepad++|Notepad++ Team||open_source||unknown||registry_probe|heuristic||notepad++.exe|machine|
 lic|Git for Windows|The Git Development Community||open_source||unknown||registry_probe|heuristic||git.exe|machine|
-probe_status|slp_wmi|ok|2
-probe_status|office_c2r|ok|1
+probe_status|slp_wmi|ok|1
+probe_status|office_c2r|ok|0
 probe_status|sql_server|ok|0
 probe_status|exchange|ok|0
 probe_status|visual_studio|ok|1
-… 12 of 21 rows shown
+probe_status|autodesk_adsklicensing|ok|0
+probe_status|veeam|ok|0
+probe_status|acronis|ok|0
+… 12 of 18 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=surfaces
-probe_status|slp_wmi|ok|2
-probe_status|office_c2r|ok|1
+probe_status|slp_wmi|ok|1
+probe_status|office_c2r|ok|0
 probe_status|sql_server|ok|0
 probe_status|exchange|ok|0
 probe_status|visual_studio|ok|1
@@ -128,33 +128,37 @@ probe_status|acronis|ok|0
 probe_status|av_suites|ok|0
 probe_status|vmware_workstation|ok|0
 probe_status|winrar|ok|0
-probe_status|open_source_classification|ok|3
+probe_status|open_source_classification|ok|2
 … 12 of 14 rows shown
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 93534d76a8aa
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-26 · euid 501 · leg-hash 0c437dc4008f
 
 ```
 == action=list
-lic|Pages Creator Studio|||retail||licensed||app_receipt|probable|||machine|
-lic|iMovie|||retail||licensed||app_receipt|probable|||machine|
-lic|Numbers Creator Studio|||retail||licensed||app_receipt|probable|||machine|
-lic|Keynote Creator Studio|||retail||licensed||app_receipt|probable|||machine|
-lic|uBlock Origin Lite||2026.901.1442|retail||licensed||app_receipt|probable|||machine|
-lic|GarageBand|||retail||licensed||app_receipt|probable|||machine|
+lic|Pages Creator Studio||15.1.1|retail||licensed||app_receipt|probable|||machine|
+lic|OneDrive||26.168.0830|retail||licensed||app_receipt|probable|||machine|
+lic|iMovie||10.4.4|retail||licensed||app_receipt|probable|||machine|
+lic|Microsoft Word||16.114.1|retail||licensed||app_receipt|probable|||machine|
+lic|Numbers Creator Studio||15.1|retail||licensed||app_receipt|probable|||machine|
+lic|Microsoft Excel||16.114.1|retail||licensed||app_receipt|probable|||machine|
+lic|Microsoft Outlook||16.113.2|retail||licensed||app_receipt|probable|||machine|
+lic|Keynote Creator Studio||15.1.1|retail||licensed||app_receipt|probable|||machine|
+lic|uBlock Origin Lite||2026.1018.2229|retail||licensed||app_receipt|probable|||machine|
+lic|GarageBand||10.4.13|retail||licensed||app_receipt|probable|||machine|
+lic|Microsoft PowerPoint||16.114.1|retail||licensed||app_receipt|probable|||machine|
 lic|Hush||1.0.19|retail||licensed||app_receipt|probable|||machine|
-probe_status|mas_receipt|ok|7
-probe_status|vendor_plists|ok|0
+… 12 of 14 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=surfaces
-probe_status|mas_receipt|ok|7
+probe_status|mas_receipt|ok|12
 probe_status|vendor_plists|ok|0
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 93534d76a8aa
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 0c437dc4008f
 
 ```
 == action=list
@@ -192,8 +196,8 @@ probe_status|flexlm_lic|ok|0
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/license_scan/src/license_scan_plugin.cpp` · `agents/plugins/license_scan/src/licensing_linux.cpp` · `agents/plugins/license_scan/src/licensing_macos.cpp` · `agents/plugins/license_scan/src/licensing_parsers.hpp` · `agents/plugins/license_scan/src/licensing_probes.cpp` · `agents/plugins/license_scan/src/licensing_probes.hpp` · `agents/plugins/license_scan/src/licensing_record.hpp` · `agents/plugins/license_scan/src/licensing_win.cpp`
+- Plugin: `agents/plugins/license_scan/src/license_scan_plugin.cpp` · `agents/plugins/license_scan/src/licensing_bplist.hpp` · `agents/plugins/license_scan/src/licensing_linux.cpp` · `agents/plugins/license_scan/src/licensing_macos.cpp` · `agents/plugins/license_scan/src/licensing_parsers.hpp` · `agents/plugins/license_scan/src/licensing_probes.cpp` · `agents/plugins/license_scan/src/licensing_probes.hpp` · `agents/plugins/license_scan/src/licensing_record.hpp` · `agents/plugins/license_scan/src/licensing_win.cpp` · `agents/plugins/license_scan/src/licensing_x509.hpp`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
-- Tests: `tests/unit/test_license_scan_actions.cpp`
+- Tests: `tests/unit/test_license_scan_actions.cpp` · `tests/unit/test_license_scan_probe_host_posix.cpp` · `tests/unit/test_license_scan_surfaces.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->

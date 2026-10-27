@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-26 · euid 501 · leg-hash pending
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-26 · euid 501 · leg-hash 0c437dc4008f
 == action=list
 lic|Pages Creator Studio||15.1.1|retail||licensed||app_receipt|probable|||machine|
 lic|OneDrive||26.168.0830|retail||licensed||app_receipt|probable|||machine|
