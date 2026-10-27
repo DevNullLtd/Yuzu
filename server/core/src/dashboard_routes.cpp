@@ -709,7 +709,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      // (an HX-Trigger showToast event, rendered with textContent). The message is
                      // a constant: no caller or plugin data. Answered 200 (htmx drops a 4xx/5xx
                      // body); the body carries the same text for every caller, htmx simply
-                     // does not display it.
+                     // does not display it. The planned REST and MCP twins (#2146) must NOT copy
+                     // this 200: they answer the shared retryable A4 503
+                     // (`respond_forensics_tier_unknown`, with `retry_after_ms`), as the
+                     // read-side twin does.
                      res.set_header(
                          "HX-Trigger",
                          R"({"showToast":{"message":"The permission check for this action could )"

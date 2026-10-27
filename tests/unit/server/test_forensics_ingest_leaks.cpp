@@ -531,6 +531,34 @@ TEST_CASE("tracker error_detail: rows written before the sanitizer are reduced o
         // The mapped Forensics row beside it is still reduced.
         CHECK(tracker.get_agent_statuses(forensic)[0].error_detail == "forensics_error");
     }
+    SECTION("a mixed execution is reduced per EXECUTION on read (characterized over-reduction)") {
+        // One execution that ran a Forensics command and an ordinary command. The read scrub keys
+        // on the execution, so the ordinary command's agent text is reduced too; the write path
+        // and the bus decide per frame's plugin and publish it as written. Pinned so the
+        // difference stays a decision (documented in the upgrade guide and the executions ladder).
+        Execution e;
+        e.definition_id = "def-mixed";
+        e.dispatched_by = "tester";
+        e.status = "running";
+        e.agents_targeted = 1;
+        const auto id = tracker.create_execution(e);
+        REQUIRE(id.has_value());
+        REQUIRE(tracker.record_command_dispatch(std::string{test::kForensicsPlugin} + "-0m",
+                                                std::string{test::kForensicsPlugin}, *id));
+        REQUIRE(tracker.record_command_dispatch(std::string{test::kOrdinaryPlugin} + "-0n",
+                                                std::string{test::kOrdinaryPlugin}, *id));
+        AgentExecStatus s;
+        s.agent_id = "agent-1";
+        s.status = "failure";
+        s.completed_at = 100;
+        s.error_detail = kFreeText;
+        tracker.update_agent_status(*id, s);
+        tracker.refresh_counts(*id);
+        CHECK(tracker.get_agent_statuses(*id)[0].error_detail == "forensics_error");
+        const auto got = tracker.get_execution(*id);
+        REQUIRE(got.has_value());
+        CHECK(got->last_error_detail == "forensics_error");
+    }
     SECTION("get_execution (the unchecked accessor) reduces the execution-level text too") {
         const auto f = tracker.get_execution(forensic);
         REQUIRE(f.has_value());

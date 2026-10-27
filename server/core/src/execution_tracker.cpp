@@ -190,6 +190,8 @@ const char* kSelectErrorDetailEmpty = ", '' AS last_error_detail";
 // free text). `command_execution` has no `execution_id` index (a plain CREATE INDEX on an existing
 // table is barred by the store playbook), so this is a scan of at most 24h of mappings; it runs
 // only when a result actually carries a non-empty error text.
+// The decision is per EXECUTION: a mixed execution (one Forensics command and one ordinary command)
+// has every agent's text reduced on read, while the bus and the outbox decide per frame's plugin.
 std::optional<std::unordered_set<std::string>>
 forensics_executions_among(PGconn* conn, const ForensicsPluginSet& set,
                            const std::vector<std::string>& ids) {
@@ -1117,6 +1119,8 @@ ExecutionTracker::get_children_checked(const std::string& parent_id,
         result.children.reserve(static_cast<std::size_t>(take));
         for (int i = 0; i < take; ++i)
             result.children.push_back(row_to_exec(res.get(), i));
+        // #4990: a no-op today (this read selects an empty error text, and an empty slot is not
+        // looked up). Kept so a future switch to the error-detail subquery is reduced, not leaked.
         scrub_executions(c, forensics_plugins_, result.children); // #4990
         out = std::move(result);
         return true;
