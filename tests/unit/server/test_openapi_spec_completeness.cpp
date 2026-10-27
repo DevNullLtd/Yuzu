@@ -611,6 +611,29 @@ TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query
     }
 }
 
+TEST_CASE("openapi_spec_json(): /dex/apps documents the platform scope parameter and coverage",
+          "[openapi][dex]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["paths"].contains("/dex/apps"));
+    const auto& op = spec["paths"]["/dex/apps"]["get"];
+
+    const json* platform = nullptr;
+    for (const auto& p : op["parameters"])
+        if (p.value("name", "") == "platform")
+            platform = &p;
+    REQUIRE(platform != nullptr);
+    CHECK((*platform)["in"] == "query");
+    CHECK((*platform)["required"] == false);
+    CHECK((*platform)["schema"]["enum"] == json::array({"all", "windows", "macos", "linux"}));
+    CHECK((*platform)["schema"]["default"] == "all");
+
+    CHECK(op["responses"]["200"].value("description", "").find("crash_source_coverage") !=
+          std::string::npos);
+    CHECK(op["responses"]["400"].value("description", "").find("invalid platform") !=
+          std::string::npos);
+}
+
 TEST_CASE("openapi_spec_json(): the execution-statistics reads document their degraded-read 503 "
           "(A4 envelope, retry_after_ms 2000)",
           "[openapi][execution_statistics]") {

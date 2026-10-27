@@ -18640,10 +18640,8 @@ private:
                         f.connected_os.push_back(os);
                     // Normalized (id, os) for the Overview score distribution +
                     // the segment breakdown.
-                    // One normaliser (prefix-based, as the observation writer's
-                    // starts_with in guaranteed_state_store.cpp); an unknown token
-                    // passes through raw.
-                    const std::string nos = norm_os.empty() ? os : norm_os;
+                    // Fleet label: prefix-normalised, unknown passes through raw.
+                    const std::string nos = detail::dex_fleet_os_label(os);
                     f.connected_agents.emplace_back(id, nos);
                 }
             }

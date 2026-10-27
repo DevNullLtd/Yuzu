@@ -174,8 +174,9 @@ std::string dex_apps_population_basis(std::string_view scope);
 
 /// The published `crash_source_coverage`: how complete the crash/hang sources are per
 /// platform in `scope` (a normalized token). windows = "complete"; linux and macos =
-/// "partial" (an empty list there is not proof of stability). `all` carries all three,
-/// in the fixed order windows, linux, macos; a single scope carries its one pair.
+/// "partial" (an empty list there is not proof of stability). `all` carries all three
+/// keys, a single scope its one key; the vector order is this helper's, and the JSON
+/// object is keyed by platform with no ordering promise.
 std::vector<std::pair<std::string, std::string>> dex_apps_crash_source_coverage(std::string_view scope);
 
 /// The score policy an Apps read scored under, and where it came from.

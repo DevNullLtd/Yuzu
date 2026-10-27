@@ -69,7 +69,7 @@ public:
             m.degraded = true;
             m.degraded_reason = "invalid_scope";
             // Constant text, never the caller's token; one line per interval.
-            if (policy_warn_throttle_.should_warn("invalid_scope"))
+            if (refusal_warn_throttle_.should_warn("invalid_scope"))
                 spdlog::warn("DexApi::apps: platform scope refused (invalid_scope)");
             return m;
         }
@@ -81,7 +81,7 @@ public:
             if (!p) {
                 // One line per interval, not per request: an unreadable store would
                 // otherwise write one warning for every Apps read.
-                if (policy_warn_throttle_.should_warn("score_policy_unavailable"))
+                if (refusal_warn_throttle_.should_warn("score_policy_unavailable"))
                     spdlog::warn("DexApi::apps: score policy unavailable: {}", p.error());
                 else
                     spdlog::debug("DexApi::apps: score policy unavailable: {}", p.error());
@@ -174,7 +174,7 @@ private:
     GuaranteedStateStore* store_; ///< nullable — builders degrade; builder-less reads guard
     FleetFn fleet_fn_;
     DexScorePolicyFn policy_fn_;
-    mutable RefusalLogThrottle policy_warn_throttle_; ///< bounds the policy-unavailable warning
+    mutable RefusalLogThrottle refusal_warn_throttle_; ///< bounds the repeated-refusal warnings (score_policy_unavailable, invalid_scope)
 };
 
 std::shared_ptr<DexApi> make_local_dex_api(GuaranteedStateStore* store, FleetFn fleet_fn,

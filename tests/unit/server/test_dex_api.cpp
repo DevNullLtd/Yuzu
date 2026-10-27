@@ -27,6 +27,7 @@
 #include "runtime_config_store.hpp"    // the real policy store behind the production reader
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <libpq-fe.h>
 #include <yuzu/metrics.hpp>
@@ -132,6 +133,31 @@ TEST_CASE("DexApi: null store is the honest degrade, never a throw", "[pg][dex_a
     CHECK(api->device_score("a1", "7d").score == -1);
     CHECK(api->apps("7d").apps.empty());
     CHECK(api->apps("7d").degraded); // a null store is a degrade, never an empty healthy list
+}
+
+// An unknown platform scope is refused before any store, policy or fleet work, so no
+// Postgres is needed. The refusal warning is constant text (no token echo) and throttled:
+// the immediate repeat is demoted (RefusalLogThrottle's interval is 60 s).
+TEST_CASE("DexApi: apps with an unknown platform scope degrades invalid_scope and warns once",
+          "[dex][dex_api]") {
+    auto api = make_local_dex_api(/*store=*/nullptr, /*fleet_fn=*/{});
+    std::string log;
+    {
+        yuzu::test::LogCapture cap;
+        for (int i = 0; i < 2; ++i) {
+            const auto m = api->apps("7d", "darwin");
+            CHECK(m.degraded);
+            CHECK(m.degraded_reason == "invalid_scope");
+        }
+        cap.stop();
+        log = cap.text();
+    }
+    const std::string line = "DexApi::apps: platform scope refused (invalid_scope)";
+    std::size_t n = 0;
+    for (auto p = log.find(line); p != std::string::npos; p = log.find(line, p + 1))
+        ++n;
+    CHECK(n == 1);
+    CHECK(log.find("darwin") == std::string::npos);
 }
 
 // An unavailable policy answers before the fleet snapshot is taken (no wasted work). No

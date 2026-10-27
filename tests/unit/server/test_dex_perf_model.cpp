@@ -133,6 +133,15 @@ TEST_CASE("dex_perf_os_from_session: non-shipped macOS spellings fold to macos (
           "[dex][perf][rules][os]") {
     for (const char* os : {"darwin24.1", "macos14", "Darwin", "MacOS"})
         CHECK(rules::dex_perf_os_from_session(os) == "macos");
+}
+
+TEST_CASE("dex_fleet_os_label: normalised token, unknown passes through raw",
+          "[dex][perf][rules][os]") {
+    for (const char* os : {"darwin24.1", "Darwin 24.0", "macos14"})
+        CHECK(rules::dex_fleet_os_label(os) == "macos");
+    CHECK(rules::dex_fleet_os_label("Windows 11") == "windows");
+    CHECK(rules::dex_fleet_os_label("haiku") == "haiku");
+    CHECK(rules::dex_fleet_os_label("").empty());
     CHECK(rules::dex_perf_os_from_session("haiku").empty());
 }
 
