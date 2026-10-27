@@ -238,19 +238,17 @@ namespace detail {
         for (std::size_t i = 0; i < j; ++i) {
             if (!out.items[i].invalid.empty()) continue;
             const bool key_involved = detail::is_key_op(out.items[i].op) || detail::is_key_op(out.items[j].op);
-            const bool ascii_related = key_involved ? (detail::key_covers(keys[i], keys[j]) || detail::key_covers(keys[j], keys[i]))
-                                                    : keys[i] == keys[j];
+            // Related under a fold: a key op over an equal/ancestor/descendant key of any item, else the same key.
+            const auto related = [&](const std::vector<std::string>& k) {
+                return key_involved ? (detail::key_covers(k[i], k[j]) || detail::key_covers(k[j], k[i])) : k[i] == k[j];
+            };
+            const bool ascii_related = related(keys);
             // Keys that differ only in the case of a non-ASCII character are one kernel key that apply's ASCII-only
             // handle map treats as two: the real run would refuse the second spelling (key_is_link) where the dry run
             // predicted it. The ASCII fold can neither prove them one nor apart, so such a plan is refused whole, as
             // the value-name rule below does for non-ASCII names.
-            const bool spelling_clash =
-                !ascii_related && (key_involved ? (detail::key_covers(skeletons[i], skeletons[j]) ||
-                                                   detail::key_covers(skeletons[j], skeletons[i]))
-                                                : skeletons[i] == skeletons[j]);
-            const bool clash = spelling_clash ||
-                               (key_involved ? ascii_related
-                                             : (ascii_related && (names[i] == names[j] || non_ascii[i] || non_ascii[j])));
+            const bool spelling_clash = !ascii_related && related(skeletons);
+            const bool clash = spelling_clash || (ascii_related && (key_involved || names[i] == names[j] || non_ascii[i] || non_ascii[j]));
             if (clash)
                 return fail(std::string{kTokDependentItems} + ":" + std::to_string(i) + ":" + std::to_string(j));
         }
