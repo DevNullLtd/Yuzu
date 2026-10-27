@@ -59,16 +59,18 @@
 // that both read N would both claim N + 1 and draw emit_seq from 1: equal epochs and
 // overlapping sequences that the server cannot tell apart (UP-9). The KV file is in WAL mode,
 // which admits a second process, so the store alone does not exclude one. The agent therefore
-// takes an exclusive, non-blocking advisory lock on `<data_dir>/guardian_boot_epoch.lock`
-// (GuardianInstanceLock below) and passes it to the three-argument claim overload, which
-// refuses (Outcome::InstanceLockNotHeld, epoch 0, nothing read or written) unless this
-// process holds it. The loser keeps running with epoch 0, so its events are unordered (0/0)
-// rather than colliding with the holder's. The lock is held for the life of the process and
-// the kernel drops it at exit, so a crash leaves no stale lock; acquisition retries for a
-// short bounded time (5 s in the agent) so a service restart that overlaps the old process's
-// shutdown still claims; the agent's worst-case teardown is longer than that (the two-watchdog
-// shutdown comment in agent.cpp), so a restart that overlaps a slow teardown claims 0/0 for that
-// whole process lifetime, with the instance_lock=contended error line. Limits:
+// takes an exclusive, non-blocking lock on `<data_dir>/guardian_boot_epoch.lock`
+// (GuardianInstanceLock below; flock, which is advisory, on POSIX, and an open with share mode 0,
+// which is enforced by the operating system, on Windows) and passes it to the three-argument
+// claim overload, which refuses (Outcome::InstanceLockNotHeld, epoch 0, nothing read or written)
+// unless this process holds it. The loser keeps running with epoch 0, so its events are
+// unordered (0/0) rather than colliding with the holder's. The lock is held for the life of
+// the process and the kernel drops it at exit, so a crash leaves no stale lock; acquisition
+// retries for a short bounded time (5 s in the agent) so a service restart that overlaps the
+// old process's shutdown still claims; the agent's worst-case teardown is longer than that (the
+// two-watchdog shutdown comment in agent.cpp), so a restart that overlaps a slow teardown
+// claims 0/0 for that whole process lifetime, with the instance_lock=contended error line.
+// Limits:
 //   * it excludes only processes that run this code. An agent build that stamps the pair but
 //     predates the lock does not take it; none is on origin/dev, so only an unreleased build
 //     of this feature can be such a process.
@@ -91,6 +93,13 @@
 //     file the service account cannot open (EACCES, for example one created earlier by
 //     another account), is Failed. Either way the claim is unordered (epoch 0) rather than a
 //     guess.
+//   * a local principal that can open the lock file can hold it and force an agent to claim no
+//     epoch (0/0 for that process lifetime): on Windows with a sharing-allowed open across an
+//     agent start, if the file is readable by that principal (not measured here); on POSIX the
+//     file is requested at mode 0600 by the agent's account, which closes it for other users.
+//     Accepted:
+//     the result is the timestamp ordering the agent used before it stamped the pair, and the
+//     claim fails loudly (instance_lock=contended).
 //   * the lock guards the epoch claim only, not the rest of the data directory (the identity
 //     and command-dedup stores have never been exclusive).
 //   * there is no in-process recovery: a process that lost the lock stays at epoch 0 until it
@@ -147,11 +156,12 @@ struct GuardianBootEpochClaim {
     std::uint64_t persisted = 0; ///< the parsed stored value; 0 when absent or unusable
 };
 
-/// Process-lifetime exclusive advisory lock on a file, the single-writer guard for the boot
-/// epoch claim (see SINGLE-WRITER GUARD above). Move-only RAII: the handle is closed, and the
-/// lock dropped, on destruction. POSIX uses flock(LOCK_EX | LOCK_NB) on an O_CLOEXEC
-/// descriptor, so an exec'd child never inherits it; Windows opens the file with share mode 0.
-/// Never throws. The handle is stored as an integer so the header carries no platform type.
+/// Process-lifetime exclusive lock on a file (advisory flock on POSIX, share mode 0 on Windows),
+/// the single-writer guard for the boot epoch claim (see SINGLE-WRITER GUARD above). Move-only
+/// RAII: the handle is closed, and the lock dropped, on destruction. POSIX uses
+/// flock(LOCK_EX | LOCK_NB) on an O_CLOEXEC descriptor, so an exec'd child never inherits it;
+/// Windows opens the file with share mode 0. Never throws. The handle is stored as an integer so
+/// the header carries no platform type.
 class YUZU_EXPORT GuardianInstanceLock {
 public:
     enum class State {

@@ -255,7 +255,7 @@ Attempt try_lock_once(const std::filesystem::path& path, std::intptr_t& handle, 
         return Attempt::Failed;
     }
     if (!S_ISREG(by_fd.st_mode)) {
-        err = EINVAL; // a directory, device or FIFO is not a lock file
+        err = EINVAL; // a FIFO or device node (a directory already failed in open with EISDIR)
         return Attempt::Failed;
     }
     // flock locks belong to the open file description, so a second acquire in this same

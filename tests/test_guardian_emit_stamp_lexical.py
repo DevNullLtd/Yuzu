@@ -45,11 +45,15 @@ Invariants (the numbered rules below; each failure message starts with its rule 
       `set_event_sink` lambda and the DEX observer; a third caller is a new wire writer that
       must be reviewed for the stamp.
   R3b agents/core/src/agent.cpp: `guardian_instance_lock_` is assigned from
-      `GuardianInstanceLock::acquire(<path under cfg_.data_dir>, <wait>)` exactly once, with a wait
-      that is not a zero spelling (0, {}, T{0}, T(0), T::zero()), at the same block depth as the
-      claim and BEFORE it, never shadowed by a local of the same name, and the member is declared after `kv_store_` and before `guardian_` (destroyed after
-      the engine, before the store). Without the assignment every boot loses the lock and the
-      whole fleet runs unordered (0/0) with every other test green.
+      `GuardianInstanceLock::acquire(cfg_.data_dir / "<name>", <wait>)` exactly once, where the
+      path starts exactly at `cfg_.data_dir /` and the wait is a positive integer literal
+      duration (`std::chrono::seconds{5}`); the acquire precedes the claim in the SAME block
+      (the text between them never closes a block opened before the acquire); no local of the
+      same name shadows the member; and the member is declared after `kv_store_` and before
+      `guardian_` (destroyed after the engine, before the store). Without the assignment every
+      boot loses the lock and the whole fleet runs unordered (0/0) with every other test green.
+  R3c The test seam `acquire_for_test` is named only in guardian_boot_epoch.{hpp,cpp}: no other
+      production source under agents/core may call it (it can alter lock semantics).
   R4  agents/core/src/guardian_engine.cpp: every legacy executor is built through
       `make_legacy_sink_executor(` (no direct `make_unique<GuardianLegacySinkExecutor>` outside
       that helper, every `legacy_sink_executor_` init/assign goes through it), the helper copies
@@ -369,8 +373,12 @@ def _rule2(srcs, norm, out):
             out.append(f"R2: raw set_emit_seq(/set_boot_epoch( in {key} (allowed only in {EMIT_SEQ})")
 
 
-# Spellings of a zero wait: 0, {}, T{0}, T(0), T::zero(), T::zero.
-_ZERO_WAIT = re.compile(r"^(?:0|\{\})$|^[\w:]+\{0\}$|^[\w:]+\(0\)$|::zero(?:\(\))?$")
+# The only accepted wait: a positive integer literal in a chrono duration, e.g.
+# std::chrono::seconds{5}. A positive pin: every other spelling (zero in any form, a variable, an
+# expression) is rejected, so there is no list of zero spellings to keep complete.
+_POSITIVE_WAIT = re.compile(r"^std::chrono::(?:milliseconds|seconds|minutes)\{[1-9][0-9]*\}$")
+# The lock path: exactly `cfg_.data_dir / "<name>"` (the literal is blanked by the normaliser).
+_LOCK_PATH = 'cfg_.data_dir / ""'
 
 
 def _rule3(t, out):
@@ -393,19 +401,27 @@ def _rule3(t, out):
     else:
         asites = call_sites(t[acquires[0].start():], r"GuardianInstanceLock::acquire")
         aargs = split_args(t[acquires[0].start():][asites[0][1]:asites[0][2]]) if asites else []
-        if len(aargs) != 2 or _ZERO_WAIT.search(aargs[1]):
+        if len(aargs) != 2 or not _POSITIVE_WAIT.match(aargs[1]):
             out.append(f"R3b: GuardianInstanceLock::acquire( in {AGENT} must pass a path and a non-zero "
-                       f"wait (a service restart overlaps the old process's shutdown), got {aargs}")
-        if aargs and not aargs[0].startswith("cfg_.data_dir"):
-            out.append(f"R3b: the lock path in {AGENT} must be under cfg_.data_dir (the lock guards "
-                       f"that data directory's epoch), got {aargs[0]}")
+                       f"wait written as a positive integer literal duration, e.g. "
+                       f"std::chrono::seconds{{5}} (a service restart overlaps the old process's "
+                       f"shutdown), got {aargs}")
+        if aargs and aargs[0] != _LOCK_PATH:
+            out.append(f"R3b: the lock path in {AGENT} must be exactly `cfg_.data_dir / \"<name>\"` "
+                       f"(the lock guards that data directory's epoch), got {aargs[0]}")
         if len(claims) == 1 and acquires[0].start() > claims[0].start():
             out.append(f"R3b: guardian_instance_lock_ is assigned after the claim in {AGENT}")
-        if len(claims) == 1 and (t.count("{", 0, acquires[0].start()) - t.count("}", 0, acquires[0].start())
-                                 != t.count("{", 0, claims[0].start()) - t.count("}", 0, claims[0].start())):
-            out.append(f"R3b: the lock acquire and the claim are at different block depths in {AGENT} "
-                       "(a conditional or nested acquire can skip the lock)")
-    if re.search(r"(?:auto|GuardianInstanceLock) guardian_instance_lock_ ?=", t):
+        if len(claims) == 1 and acquires[0].start() < claims[0].start():
+            # Same block: between the two the brace depth never drops below the acquire's own
+            # level, so neither closes the block the acquire sits in, and it ends level.
+            depth = low = 0
+            for c in t[acquires[0].start():claims[0].start()]:
+                depth += (c == "{") - (c == "}")
+                low = min(low, depth)
+            if low < 0 or depth != 0:
+                out.append(f"R3b: the lock acquire and the claim are not in the same block in {AGENT} "
+                           "(a conditional or nested acquire can skip the lock)")
+    if re.search(r"(?:auto|GuardianInstanceLock)[&* ]+guardian_instance_lock_ ?[=({]", t):
         out.append(f"R3b: a local declaration shadows the guardian_instance_lock_ member in {AGENT}")
     kv = re.search(r"std::unique_ptr<KvStore> kv_store_;", t)
     lk = re.search(r"GuardianInstanceLock guardian_instance_lock_;", t)
@@ -451,6 +467,16 @@ def _rule3(t, out):
                    f"emit_guardian_event( callers in {AGENT} are expected to be exactly the "
                    f"set_event_sink lambda and the DEX observer; found sink={sink_n}, dex={dex_n}, "
                    f"unrecognised={other}. A new wire writer must be reviewed for the emit-pair stamp")
+
+
+def _rule3c(srcs, out):
+    for key, text in srcs.items():
+        if key in ("src/guardian_boot_epoch.cpp", "include/yuzu/agent/guardian_boot_epoch.hpp",
+                   "src/guardian_boot_epoch.hpp"):
+            continue
+        if re.search(r"(?<![A-Za-z0-9_])acquire_for_test(?![A-Za-z0-9_])", normalise(text)):
+            out.append(f"R3c: {key} names acquire_for_test (the GuardianInstanceLock test seam); "
+                       "production sources must call acquire()")
 
 
 def _rule4(t, out):
@@ -507,6 +533,7 @@ def problems(srcs):
     _rule1(norm(RUNTIME), out)
     _rule2(srcs, norm, out)
     _rule3(norm(AGENT), out)
+    _rule3c(srcs, out)
     _rule4(norm(ENGINE), out)
     return out
 
@@ -662,13 +689,30 @@ MUTATIONS = [
      "must pass a path and a non-zero wait"),
     ("R3b lock path outside the data dir", AGENT,
      r"cfg_\.data_dir / \"guardian_boot_epoch\.lock\"", "std::filesystem::temp_directory_path() / \"guardian_boot_epoch.lock\"",
-     1, 0, "must be under cfg_.data_dir"),
+     1, 0, "must be exactly `cfg_.data_dir /"),
     ("R3b local shadows the member", AGENT,
      r"guardian_instance_lock_ = GuardianInstanceLock::acquire\(", "auto guardian_instance_lock_ = GuardianInstanceLock::acquire(",
      1, 0, "shadows the guardian_instance_lock_ member"),
     ("R3b acquire wrapped in a conditional", AGENT,
      r"(guardian_instance_lock_ = GuardianInstanceLock::acquire\([^;]*;)", r"if (false) { \1 }", 1, 0,
-     "different block depths"),
+     "not in the same block"),
+    ("R3b wait spelled as an empty duration", AGENT,
+     r"std::chrono::seconds\{5\}\);", "std::chrono::seconds{});", 1, 0,
+     "positive integer literal duration"),
+    ("R3b wait spelled as a variable", AGENT,
+     r"std::chrono::seconds\{5\}\);", "kLockWait);", 1, 0, "positive integer literal duration"),
+    ("R3b lock path derived from the data dir", AGENT,
+     r"cfg_\.data_dir / \"guardian_boot_epoch\.lock\"", "cfg_.data_dir.parent_path() / \"guardian_boot_epoch.lock\"",
+     1, 0, "must be exactly `cfg_.data_dir /"),
+    ("R3b brace-initialised shadow", AGENT,
+     r"guardian_instance_lock_ = GuardianInstanceLock::acquire\(", "GuardianInstanceLock guardian_instance_lock_{}; guardian_instance_lock_ = GuardianInstanceLock::acquire(",
+     1, 0, "shadows the guardian_instance_lock_ member"),
+    ("R3b acquire and claim in sibling blocks", AGENT,
+     r"(guardian_instance_lock_ = GuardianInstanceLock::acquire\([^;]*;)(.*?)(const auto boot_epoch_claim =)",
+     r"if (true) { \1 } if (true) { \3", 1, 0, "not in the same block"),
+    ("R3c test seam named in production", AGENT,
+     r"guardian_instance_lock_ = GuardianInstanceLock::acquire\(", "guardian_instance_lock_ = GuardianInstanceLock::acquire_for_test(",
+     1, 0, "R3c: src/agent.cpp names acquire_for_test"),
     ("R3b member declared before kv_store_", AGENT,
      r"(std::unique_ptr<KvStore> kv_store_;)(.*?)(GuardianInstanceLock guardian_instance_lock_;)",
      r"\3\n    \1\2", 1, 0, "member order"),

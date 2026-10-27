@@ -854,7 +854,7 @@ TEST_CASE("boot-epoch: a lock file unlinked while held is re-created by the next
           "[guardian][boot_epoch][instance_lock]") {
     // Pins the limit stated in guardian_boot_epoch.hpp: an unlink AFTER a successful claim is not
     // detected. The pre-lock window (unlinked or replaced between the open and the flock) is
-    // closed by the device/inode comparison and is not reachable from a single-threaded test.
+    // closed by the device/inode comparison and is exercised through acquire_for_test below.
     yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
     std::filesystem::create_directories(dir.path);
     const auto lock_path = dir.path / "guardian_boot_epoch.lock";
@@ -936,6 +936,31 @@ TEST_CASE("boot-epoch: a path that cannot be re-resolved reports its own error, 
     CHECK_FALSE(lock.held());
     CHECK(lock.state() == GuardianInstanceLock::State::Failed);
     CHECK(lock.native_error() == EACCES);
+}
+
+TEST_CASE("boot-epoch: a parent that stops being a directory reports its own error, any user",
+          "[guardian][boot_epoch][instance_lock]") {
+    // Root-proof sibling of the EACCES case: no permission bits are involved, so it also runs
+    // as root. The hook swaps the lock file's parent directory for a regular file, and the
+    // re-resolve of "<parent>/guardian_boot_epoch.lock" then fails with ENOTDIR, which says
+    // nothing about the file having been replaced and must not be retried or relabelled ESTALE.
+    yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
+    std::filesystem::create_directories(dir.path);
+    const auto sub = dir.path / "sub";
+    std::filesystem::create_directories(sub);
+    const auto lock_path = sub / "guardian_boot_epoch.lock";
+
+    int calls = 0;
+    auto lock = GuardianInstanceLock::acquire_for_test(
+        lock_path, std::chrono::milliseconds{0}, [&] {
+            ++calls;
+            std::filesystem::remove_all(sub);
+            std::ofstream out{sub}; // "sub" is now a regular file
+        });
+    CHECK(calls == 1); // not retried
+    CHECK_FALSE(lock.held());
+    CHECK(lock.state() == GuardianInstanceLock::State::Failed);
+    CHECK(lock.native_error() == ENOTDIR);
 }
 
 TEST_CASE("boot-epoch: a non-regular file at the lock path is refused",
