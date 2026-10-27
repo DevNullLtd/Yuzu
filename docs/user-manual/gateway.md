@@ -568,16 +568,18 @@ connection, and fails closed:
   and logged as a rate-limited warning.
 - A report stripped because its connection has no record yet (for example after the
   upstream channel reconnected to a server no agent of this gateway has registered
-  through since) starts a capability probe, but only if the gateway admitted the
-  report's session: the session is held by this gateway and the report arrived on the
-  connection the session is bound to (the same check heartbeats pass). A report from
-  an unadmitted session is still forwarded, with the gated key removed, but never
-  starts a probe and never uses up the 30-second window. An admitted report's probe: the gateway replays the reporting agent's
-  registration through the usual replay drip (`yuzu_gw_registration_replay_triggered_total{trigger="capability"}`),
-  at most once per connection every 30 seconds, and the answer records the
-  connection. Reports on that connection are stripped until the answer arrives. With
-  several endpoints in `default_channel`, the replay goes to whichever endpoint the
-  channel picks, so it can take more than one probe to reach every connection.
+  through since) can start a capability probe. Only a report from an admitted session
+  can: the session is held by this gateway and the report arrived on the connection the
+  session is bound to (the same check heartbeats pass). A report from an unadmitted
+  session is still forwarded, with the gated key removed, but never starts a probe.
+- A probe replays the reporting agent's registration through the usual replay drip
+  (`yuzu_gw_registration_replay_triggered_total{trigger="capability"}`); the answer
+  records the connection. Each connection gets at most one probe every 30 seconds, and
+  the 30-second window is used up only when a replay is actually queued (no probe is
+  queued while the upstream circuit breaker is open). Reports on that connection stay
+  stripped until the answer arrives. With several endpoints in `default_channel`, the
+  replay goes to whichever endpoint the channel picks, so it can take more than one
+  probe to reach every connection.
 
 The connection of a call is identified by a unary interceptor that the upstream
 client installs on `default_channel` at start. If you configured your own
@@ -599,6 +601,10 @@ that gateway:
   probe records the connection within one replay (check
   `yuzu_gw_registration_replay_triggered_total{trigger="capability"}` and the
   `Registration replay` log lines).
+- `reason="upstream_unknown"` from sessions that are not admitted (for example a report
+  arriving on a connection other than the one its session is bound to): such reports
+  never start a probe, so the count does not fall on its own; check the agent's
+  registration on this gateway.
 - `reason="upstream_unknown"` rising steadily: the gateway cannot identify connections.
   Check `yuzu_gw_upstream_capability_gate_ready` (0 means an operator
   `unary_interceptor` on `default_channel`; the start-up WARN names it) and whether the
