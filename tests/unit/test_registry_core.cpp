@@ -4273,7 +4273,7 @@ TEST_CASE("registry apply: set_value and delete_value over a value the manifest 
 TEST_CASE("registry apply: refused items neither spend the undo budget nor flag a later manifest incomplete",
           "[registry][core][apply]") {
     // mutant: budgeted_old charges every value op that read a previous value, refused ones included. 140 refused rows of
-    // 4096 bytes exceed the 512 KiB budget, so the one item that does change loses its bytes and undo_complete drops to 0.
+    // 4096 bytes exceed the 512 KiB budget (~125 fit), so the manifest is flagged incomplete: undo_complete drops to 0.
     const bool dry = GENERATE(true, false);
     FakeRegistry reg;
     json plan = json::array();

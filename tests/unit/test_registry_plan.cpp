@@ -359,6 +359,10 @@ TEST_CASE("registry parse_plan: items whose verdicts would depend on each other 
         CHECK(err(json::array({set_item("Software\\\xC3\x84", "v", "1"), set_item("Software\\\xC3\x84", "w", "2")})).empty()); // same spelling, ASCII names
         CHECK(err(json::array({set_item("Software\\\xC3\x84\\X", "v", "1"), set_item("Software\\\xC3\x84\\Y", "v", "2")})).empty()); // same parent spelling, different leaves
         CHECK(err(json::array({set_item("Software\\\xC3\x84\\X", "v", "1"), set_item("Other\\\xC3\xA4\\Y", "v", "2")})).empty()); // the parents part company higher up
+        // an item that is already refused (bad type) changes nothing, so it clashes with nothing, non-ASCII spelling included
+        json bad_type = set_item("Software\\\xC3\x84\\X", "v", "1");
+        bad_type["type"] = "REG_NOPE";
+        CHECK(err(json::array({bad_type, set_item("Software\\\xC3\xA4\\Y", "v", "2")})).empty());
     }
     SECTION("a key op over an equal, ancestor or descendant key of ANY other item") {
         CHECK(err(json::array({item("delete_key", "Software\\A"), set_item("Software\\A", "v", "1")})) == "dependent_items:0:1");
