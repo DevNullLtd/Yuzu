@@ -2,7 +2,7 @@
 """Behavioural check of the /swagger page's renderer.
 
 test_swagger_page.cpp pins the page text (no innerHTML and so on); this runs the script. The
-two script pieces (kSwaggerJs1 and kSwaggerJs2) are cut out of server/core/src/swagger_page_ui.cpp
+script pieces (kSwaggerJs1, kSwaggerJs2, ...) are cut out of server/core/src/swagger_page_ui.cpp
 and executed under node against a minimal fake DOM and a queued fetch, then asserts what an
 operator would see: one panel per group and one row per operation, the typed / untyped /
 unavailable pills, a guide that opens on demand, oneOf alternatives rendered as tables, hostile
@@ -247,6 +247,7 @@ const out = {};
   out.model_c = models.C.textContent;
   out.model_a = models.A.textContent;
   out.model_d_text = models.D.textContent;
+  out.model_d_logged = consoleErrors.some(e => e.includes('could not draw model D'));
   const dBtn = models.D.byClass('sw-model-h')[0];
   out.model_d_state = dBtn.getAttribute('aria-expanded') + '/' + dBtn.lastChild.textContent + '/' + models.D.byClass('sw-error').length;
   dBtn.click();
@@ -341,12 +342,16 @@ const out = {};
   out.f_500_body_cid = root.textContent;
   await reload({ fail: true });                                                          // the network is down
   out.f_net = root.textContent; out.f_net_retry = root.byTag('button').length;
-  await reload({ status: 200, body: null });                                              // build() throws on a null document
+  await reload({ status: 200, body: { paths: {}, get tags() { throw new Error('boom-build'); } } });   // build() throws on a document that has paths
   out.f_null_doc = root.textContent; out.f_null_doc_retry = root.byTag('button').length;
   await reload({ status: 200, body: { tags: [], paths: {} } });                           // an empty but valid document renders
   out.f_empty_panels = root.byTag('section').length;
   out.f_empty_text = root.textContent;
   out.console_errors = consoleErrors.length;
+  await reload({ status: 200, body: null });                                              // JSON null is not a document either
+  out.f_null_msg = root.textContent;
+  await reload({ status: 200, body: {} });                                                // JSON, but not an API description
+  out.f_obj_doc = root.textContent; out.f_obj_doc_retry = root.byTag('button').length;
 
   // ---- the live regions: loading and failure are announced, the success view is not ----
   queue.push({ status: 503 }); location.hash = ''; (0, eval)(js);
@@ -418,6 +423,46 @@ const out = {};
   out.f_none_toc = tocHidden();
   setQ(''); out.f_back_toc = tocHidden(); out.f_back_empty = emptyEl().hidden; out.f_back_shown = shown().length;
 
+  // ---- a part that cannot be drawn is logged by name; a $ref'd header and a cut model list ----
+  let armed = false;
+  const boomOp = { summary: 'boom op', tags: ['Boom'], responses: R() };
+  Object.defineProperty(boomOp, 'requestBody', { get() { if (armed) throw new Error('boom-op'); return undefined; }, enumerable: true });
+  const boomGuide = { summary: '' };
+  Object.defineProperty(boomGuide, 'overview', { get() { if (armed) throw new Error('boom-guide'); return ['x']; }, enumerable: true });
+  const hdrs = { ETag: { $ref: '#/components/headers/ETag' }, Gone: { $ref: '#/components/headers/Nope' }, Own: { description: 'inline one' }, constructor: { $ref: '#/components/headers/constructor' } };
+  const specB = {
+    openapi: '3.0.3', info: { title: 't', version: '1' },
+    tags: [{ name: 'Boom', description: 'b', 'x-yuzu-guide': boomGuide }],
+    paths: { '/boom': { get: boomOp }, '/hdr': { get: { summary: 'hdr row', tags: ['Boom'], responses: { '200': { description: 'ok', headers: hdrs } } } } },
+    components: { headers: { ETag: { description: 'quoted revision' } } }
+  };
+  consoleErrors.length = 0;
+  await reload({ status: 200, body: specB });
+  armed = true;
+  const bsec = root.byTag('section')[0];
+  bsec.byClass('sw-gbtn')[0].click();
+  const boomRow = root.byClass('sw-op').filter(r => r.textContent.includes('boom op'))[0];
+  boomRow.byClass('sw-op-h')[0].click();
+  armed = false;
+  out.b_guide_msg = bsec.textContent.includes('This guide could not be shown.');
+  out.b_op_msg = boomRow.textContent.includes('This operation could not be shown.');
+  out.b_logs = consoleErrors.slice();
+  const hdrRow = root.byClass('sw-op').filter(r => r.textContent.includes('hdr row'))[0];
+  hdrRow.byClass('sw-op-h')[0].click();
+  out.b_hdrs = hdrRow.byClass('sw-hdrs')[0].textContent;
+  const manyModels = n => {
+    const sch = {}, props = {};
+    for (let i = 0; i < n; i++) { sch['Mod' + i] = { type: 'object', properties: { v: { type: 'string' } } }; props['m' + i] = { $ref: '#/components/schemas/Mod' + i }; }
+    return { openapi: '3.0.3', info: { title: 't', version: '1' }, tags: [{ name: 'Many', description: 'm', 'x-yuzu-guide': { overview: ['o'] } }],
+      paths: { '/many': { get: { summary: 'many', tags: ['Many'], responses: R({ content: { 'application/json': { schema: { type: 'object', properties: props } } } }) } } },
+      components: { schemas: sch } };
+  };
+  for (const n of [60, 61]) {
+    await reload({ status: 200, body: manyModels(n) });
+    root.byClass('sw-gbtn')[0].click();
+    out['cap_' + n] = root.byClass('sw-model').length + '/' + root.textContent.includes('Only the first 60 models are listed.');
+  }
+
   // ---- the real document: every operation drawn, every pill and filter agreeing with it ----
   const real = JSON.parse(require('fs').readFileSync(process.argv[2], 'utf8'));
   const M = ['get', 'post', 'put', 'patch', 'delete'];
@@ -469,13 +514,13 @@ const out = {};
 
 def extract_js():
     text = SRC.read_text(encoding="utf-8")
-    parts = []
-    for name in ("kSwaggerJs1", "kSwaggerJs2"):
-        m = re.search(r'extern const char\* const %s = R"SWG\((.*?)\)SWG";' % name, text, re.S)
-        if not m:
-            raise SystemExit("cannot find %s in %s" % (name, SRC))
-        parts.append(m.group(1))
-    return "".join(parts)
+    # Every kSwaggerJs<N> piece, in file order: a new piece is picked up without editing this list.
+    found = re.findall(r'extern const char\* const (kSwaggerJs\d+) = R"SWG\((.*?)\)SWG";', text, re.S)
+    if not found:
+        raise SystemExit("cannot find the kSwaggerJs pieces in %s" % SRC)
+    if [n for n, _ in found] != ["kSwaggerJs%d" % (i + 1) for i in range(len(found))]:
+        raise SystemExit("kSwaggerJs pieces are not numbered 1..N in order: %r" % [n for n, _ in found])
+    return "".join(body for _, body in found)
 
 
 def real_spec():
@@ -515,6 +560,16 @@ def main():
         return 77
     js = extract_js()
     page = SRC.read_text(encoding="utf-8")
+    # Every raw literal of the page is under the MSVC ceiling and named in the C++ size gate, so a
+    # new piece cannot ship unmeasured (the list in test_swagger_page.cpp is otherwise by hand).
+    gate = (ROOT / "tests/unit/server/test_swagger_page.cpp").read_text(encoding="utf-8")
+    for name, body in re.findall(r'extern const char\* const (kSwagger\w+) = R"SWG\((.*?)\)SWG";', page, re.S):
+        if len(body.encode("utf-8")) >= 15000:
+            print("FAIL\n  - %s is %d bytes, over the 15,000 byte gate" % (name, len(body.encode("utf-8"))))
+            return 1
+        if not re.search(r"\{\"\w+\", %s\}" % name, gate):
+            print("FAIL\n  - %s is not in the piece list of tests/unit/server/test_swagger_page.cpp" % name)
+            return 1
     body = re.search(r'kSwaggerBody = R"SWG\((.*?)\)SWG";', page, re.S).group(1)
     if not re.search(r'<div id="sw-root"[^>]*><noscript>[^<]*JavaScript[^<]*</noscript>', body):
         print("FAIL")
@@ -586,6 +641,7 @@ def main():
     # A schema that cannot be drawn must show a message and keep the button honest.
     check("These fields could not be shown." in out["model_d_text"] and out["model_d_state"] == "true/Hide fields/1",
           "a model that throws must open to an inline message: %r" % out["model_d_state"])
+    check(out["model_d_logged"], "a model that cannot be drawn must be logged by name")
     check(out["model_d_closed"] == "false/Show fields/true", "a failed model block must still close: %r" % out["model_d_closed"])
     # Breadth: wide and deep acyclic schemas stop at the budget and say so.
     check(out["wide_rows"] == 2000 and out["wide_note"], "a 3000-field schema must stop at 2000 rows and say 1000 more: %r" % out["wide_rows"])
@@ -623,6 +679,7 @@ def main():
     check("req-body-3" in out["f_500_body_cid"] and "req-hdr-3" not in out["f_500_body_cid"], "the A4 body id wins over the header: %r" % out["f_500_body_cid"])
     check("could not be reached" in out["f_net"] and "NETRAW" not in out["f_net"] and out["f_net_retry"] == 1,
           "a network failure must be explained, not echoed: %r" % out["f_net"])
+    check("not with an API description" in out["f_null_msg"], "a JSON null must read as not an API description: %r" % out["f_null_msg"])
     check("could not be shown" in out["f_null_doc"] and "Cannot read" not in out["f_null_doc"] and out["f_null_doc_retry"] == 1,
           "a build failure must be a fixed message with Retry: %r" % out["f_null_doc"])
     check(out["console_errors"] == 5, "each failure must be logged to the console for diagnosis, got %r" % out["console_errors"])
@@ -717,6 +774,17 @@ def main():
     check((out["r_typed"], out["r_untyped"], out["r_unavail"]) == (py["typed"], py["untyped"], py["unavail"]),
           "page pills %r/%r/%r differ from the counts derived from the document %r" % (
               out["r_typed"], out["r_untyped"], out["r_unavail"], py))
+    check(out["b_guide_msg"] and out["b_op_msg"], "a guide or operation that throws must still show its inline message")
+    check(any("could not draw guide Boom" in e for e in out["b_logs"]) and any("could not draw operation GET /boom" in e for e in out["b_logs"]),
+          "a guide and an operation that cannot be drawn must be logged by name: %r" % out["b_logs"])
+    check("quoted revision" in out["b_hdrs"] and "inline one" in out["b_hdrs"],
+          "a $ref'd response header must show the description of the header it names: %r" % out["b_hdrs"])
+    check("ETag" in out["b_hdrs"] and "Gone" in out["b_hdrs"] and "constructor" in out["b_hdrs"],
+          "an unresolvable or prototype-named header $ref must still list its name: %r" % out["b_hdrs"])
+    check(out["cap_60"] == "60/false" and out["cap_61"] == "60/true",
+          "the model list must say when it is cut, and not at exactly the cap: %r %r" % (out["cap_60"], out["cap_61"]))
+    check("not with an API description" in out["f_obj_doc"] and "Operations" not in out["f_obj_doc"] and out["f_obj_doc_retry"] == 1,
+          "a JSON body with no paths must read as not an API description, with Retry: %r" % out["f_obj_doc"])
     check(out["r_console_errors"] == 0, "the real document must draw without a console error: %r" % out["r_console_errors"])
     if errors:
         print("FAIL")

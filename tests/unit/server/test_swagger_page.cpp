@@ -21,6 +21,7 @@ extern const char* const kSwaggerCss;
 extern const char* const kSwaggerBody;
 extern const char* const kSwaggerJs1;
 extern const char* const kSwaggerJs2;
+extern const char* const kSwaggerJs3;
 extern const char* const kSwaggerTail;
 
 using namespace yuzu::server;
@@ -126,13 +127,23 @@ TEST_CASE("swagger page: renders from the live spec and builds the DOM safely",
     CHECK(region.find("aria-live=\"polite\"") != std::string::npos);
 }
 
+TEST_CASE("swagger page: the hidden attribute still hides what the page's own display rules show",
+          "[server][routes][swagger]") {
+    // Rows, panels, guides and models are shown and hidden through the hidden attribute. Any
+    // class that sets display would win over the browser's [hidden] rule, so the page restates it
+    // with !important. Dropping it makes every filter leave its rows visible.
+    CHECK(std::string(kSwaggerCss).find(".sw-page [hidden]{display:none!important}") !=
+          std::string::npos);
+}
+
 TEST_CASE("swagger page: every raw literal stays under the MSVC C2026 ceiling",
           "[server][routes][swagger]") {
     // The page is assembled from separate raw literals; the limit applies to each one, not to the
     // total. 15,000 leaves headroom under 16,380.
     const std::pair<const char*, const char*> pieces[] = {
         {"head", kSwaggerHead}, {"css", kSwaggerCss}, {"body", kSwaggerBody},
-        {"js1", kSwaggerJs1},   {"js2", kSwaggerJs2}, {"tail", kSwaggerTail}};
+        {"js1", kSwaggerJs1},   {"js2", kSwaggerJs2}, {"js3", kSwaggerJs3},
+        {"tail", kSwaggerTail}};
     for (const auto& [name, text] : pieces) {
         INFO(name);
         CHECK(std::strlen(text) < 15000);

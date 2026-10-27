@@ -126,7 +126,7 @@ extern const char* const kSwaggerBody = R"SWG(
 <script>
 )SWG";
 
-// Renderer, part 1 of 2 (split at a line boundary).
+// Renderer, part 1 of 3 (split at a line boundary).
 extern const char* const kSwaggerJs1 = R"SWG((function () {
   'use strict';
   var SPEC_URL = '/api/v1/openapi.json?guides=true';
@@ -285,7 +285,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
     var kids = [h('div', 'sw-resp-head', [pill(code, cls + ' mono'), h('span', 'sw-desc', [r.description || ''])])];
     if (r.headers) {
       kids.push(h('div', 'sw-hdrs', Object.keys(r.headers).map(function (k) {
-        return h('div', '', [mono(k), ' ', h('span', 'mut', [(r.headers[k].description || '')])]);
+        return h('div', '', [mono(k), ' ', h('span', 'mut', [hdrOf(r.headers[k]).description || ''])]);
       })));
     }
     if (r.content) {
@@ -333,6 +333,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
   var guides = dict();
   var SKIP_MODEL = dict();
   ['ApiMeta', 'ApiPagination', 'A4ErrorEnvelope', 'ApiEnvelope'].forEach(function (n) { SKIP_MODEL[n] = 1; });
+  var MODEL_CAP = 60;
   function collectRefs(node, acc) {
     if (!node || typeof node !== 'object') return;
     if (Array.isArray(node)) { node.forEach(function (n) { collectRefs(n, acc); }); return; }
@@ -343,13 +344,14 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
     var seen = dict(), queue = dict(), order = [];
     list.forEach(function (o) { collectRefs(o.op.responses, queue); collectRefs(o.op.requestBody, queue); });
     var names = Object.keys(queue);
-    while (names.length && order.length < 60) {
+    while (names.length && order.length < MODEL_CAP) {
       var n = names.shift();
       if (seen[n] || SKIP_MODEL[n]) continue;
       seen[n] = 1; order.push(n);
       var sub = dict(); collectRefs(schemaOf(n), sub);
       Object.keys(sub).forEach(function (m) { if (!seen[m]) names.push(m); });
     }
+    order.cut = names.some(function (m) { return !seen[m] && !SKIP_MODEL[m]; });
     return order;
   }
   function plainTable(cols, rows) {
@@ -364,6 +366,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
   function modelBlock(names) {
     if (!names.length) return null;
     var kids = [h('h3', '', ['Data model'])];
+    if (names.cut) kids.push(h('p', 'mut sw-cap', ['Only the first ' + MODEL_CAP + ' models are listed.']));
     names.forEach(function (n) {
       var body = null;
       var btn = h('button', 'sw-model-h', [pill(n, 'info mono'), h('span', 'mut', ['Show fields'])]);
@@ -375,7 +378,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
         // Hide button above an empty body.
         if (open && !body) {
           try { body = schemaBlock({ $ref: '#/components/schemas/' + n }); }
-          catch (e) { body = h('div', 'sw-error', ['These fields could not be shown.']); }
+          catch (e) { note('model ' + n, e); body = h('div', 'sw-error', ['These fields could not be shown.']); }
           wrap.appendChild(body);
         }
         btn.setAttribute('aria-expanded', open ? 'true' : 'false');
@@ -415,7 +418,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
     ops = []; tags = []; guides = dict(); st = { q: '', method: '', tag: '', typed: '' };
 )SWG";
 
-// Renderer, part 2 of 2.
+// Renderer, part 2 of 3.
 extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null tag, a guide that is not an object, a null path item) is
     // skipped, not allowed to take the whole page down.
     function isObj(x) { return !!x && typeof x === 'object' && !Array.isArray(x); }
@@ -479,7 +482,7 @@ extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null ta
           var open = force !== undefined ? force : gbtn.getAttribute('aria-expanded') !== 'true';
           if (open && !gbody) {
             try { gbody = guideBlock(g, ops.filter(function (o) { return o.tag === t; })); }
-            catch (e) { gbody = h('div', 'sw-guide', [h('div', 'sw-error', ['This guide could not be shown.'])]); }
+            catch (e) { note('guide ' + t, e); gbody = h('div', 'sw-guide', [h('div', 'sw-error', ['This guide could not be shown.'])]); }
             panel.insertBefore(gbody, list);
           }
           gbtn.setAttribute('aria-expanded', open ? 'true' : 'false');
@@ -506,7 +509,7 @@ extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null ta
       function toggle(force) {
         var open = force !== undefined ? force : head.getAttribute('aria-expanded') !== 'true';
         if (open && !body) {
-          try { body = detail(o); } catch (e) { body = h('div', 'sw-detail', [h('div', 'sw-error', ['This operation could not be shown.'])]); }
+          try { body = detail(o); } catch (e) { note('operation ' + o.key, e); body = h('div', 'sw-detail', [h('div', 'sw-error', ['This operation could not be shown.'])]); }
           row.appendChild(body);
         }
         head.setAttribute('aria-expanded', open ? 'true' : 'false');
@@ -592,6 +595,14 @@ extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null ta
   function headerCid(r) {
     try { return (r.headers && r.headers.get('X-Correlation-Id')) || ''; } catch (e) { return ''; }
   }
+  // Logged with what could not be drawn, since the page shows only a fixed line.
+  function note(what, e) { try { console.error('API reference page: could not draw ' + what, e); } catch (x) { /* no console */ } }
+  // A response header is inline or a $ref into components.headers; own keys only.
+  function hdrOf(x) {
+    if (!x || !x.$ref) return x || {};
+    var c = spec.components && spec.components.headers, n = refName(x.$ref);
+    return (c && Object.prototype.hasOwnProperty.call(c, n) && c[n]) || {};
+  }
   function load() {
     root.textContent = 'Loading the API description...';
     say('Loading the API description...');
@@ -618,7 +629,9 @@ extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null ta
         throw problem('The API description could not be reached. Check the network connection, then retry.', { raw: x });
       })
       .then(function (j) {
-        clearTimeout(timer); spec = j;
+        clearTimeout(timer);
+        if (!j || typeof j !== 'object' || !j.paths || typeof j.paths !== 'object') throw problem('The server answered, but not with an API description.');
+        spec = j;
         try { build(); } catch (x) { throw problem('The API description was loaded but could not be shown.', { raw: x }); }
       })
       .catch(function (e) {
@@ -629,7 +642,10 @@ extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null ta
       });
   }
   load();
-  // allOf -> one schema (in this piece to keep the first under the size gate; declarations
+)SWG";
+
+// Renderer, part 3 of 3: the schema flattening, kept apart so no piece nears the size gate.
+extern const char* const kSwaggerJs3 = R"SWG(  // allOf -> one schema (in this piece to keep the first under the size gate; declarations
   // hoist). Members are followed through $ref; properties and required merge in order, the
   // first definition wins and a later one only fills a missing description or format; type,
   // description, oneOf, anyOf, items and enum come from the first member having one. seen
@@ -676,7 +692,7 @@ extern const char* const kSwaggerTail = R"SWG(
 
 namespace {
 const std::string kSwaggerTemplate = std::string(kSwaggerHead) + kSwaggerCss + kSwaggerBody +
-                                     kSwaggerJs1 + kSwaggerJs2 + kSwaggerTail;
+                                     kSwaggerJs1 + kSwaggerJs2 + kSwaggerJs3 + kSwaggerTail;
 } // namespace
 
 // A page with no nav entry, like Help: the shell carries the title and no active key.
