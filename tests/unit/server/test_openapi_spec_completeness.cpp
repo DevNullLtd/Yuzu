@@ -926,6 +926,73 @@ TEST_CASE("openapi_spec_json(): x-yuzu-unavailable marks exactly the operations 
     }
 }
 
+TEST_CASE("openapi_spec_json(): the operations that override the top-level security are exactly "
+          "the ones that do not take an operator token (#6508)",
+          "[openapi][structure][security]") {
+    const json spec = json::parse(yuzu::server::openapi_spec_json());
+
+    // The default: any one of the three operator credentials.
+    REQUIRE(spec.contains("security"));
+    CHECK(spec["security"] ==
+          json::parse(R"([{"bearerAuth":[]},{"apiKeyHeader":[]},{"cookieAuth":[]}])"));
+
+    // Every scheme a requirement names is defined, and each scheme has the transport the handler
+    // reads: the upload credentials are headers, the session is a cookie.
+    const auto& schemes = spec.at("components").at("securitySchemes");
+    CHECK(schemes.at("cookieAuth").at("in") == "cookie");
+    CHECK(schemes.at("uploadGrantAuth").at("in") == "header");
+    CHECK(schemes.at("uploadGrantAuth").at("name") == "X-Yuzu-Upload-Grant");
+    CHECK(schemes.at("uploadSessionAuth").at("in") == "header");
+    CHECK(schemes.at("uploadSessionAuth").at("name") == "X-Yuzu-Upload-Session");
+
+    // The override set. An operation joining or leaving it is a decision to make here, on purpose:
+    // each of these answers 401 or 403 to the credential the default tells a client to send.
+    //  - the CA root and CRL are public;
+    //  - the elevation and password routes act on the caller's own browser session, so a token is
+    //    refused (auth_routes.cpp elevate and revoke read the cookie directly);
+    //  - the five upload routes authenticate by a grant or session credential in a header and never
+    //    consult an operator credential (file_retrieval_routes.cpp).
+    const std::map<std::string, json> kOverrides = {
+        {"get /ca/root", json::array()},
+        {"get /ca/crl", json::array()},
+        {"post /elevate", json::parse(R"([{"cookieAuth":[]}])")},
+        {"post /elevate/revoke", json::parse(R"([{"cookieAuth":[]}])")},
+        {"post /users/me/password", json::parse(R"([{"cookieAuth":[]}])")},
+        {"post /users/{username}/password", json::parse(R"([{"cookieAuth":[]}])")},
+        {"post /uploads", json::parse(R"([{"uploadGrantAuth":[]}])")},
+        {"put /uploads/{upload_id}/chunk", json::parse(R"([{"uploadSessionAuth":[]}])")},
+        {"get /uploads/{upload_id}", json::parse(R"([{"uploadSessionAuth":[]}])")},
+        {"delete /uploads/{upload_id}", json::parse(R"([{"uploadSessionAuth":[]}])")},
+        {"post /uploads/{upload_id}/commit", json::parse(R"([{"uploadSessionAuth":[]}])")},
+    };
+
+    std::map<std::string, json> found;
+    for (const auto& o : all_operations(spec)) {
+        if (!o.op.contains("security"))
+            continue;
+        found[o.where()] = o.op["security"];
+        // A requirement may name only a defined scheme.
+        for (const auto& alt : o.op["security"]) {
+            for (const auto& [name, scopes] : alt.items()) {
+                INFO(o.where() << " names " << name);
+                CHECK(schemes.contains(name));
+            }
+        }
+    }
+    CHECK(found == kOverrides);
+
+    // The info text names every exemption, so a reader of it is not told to send a token to a route
+    // that refuses one.
+    const std::string info = spec.at("info").at("description").get<std::string>();
+    for (const char* needle :
+         {"GET /ca/root", "GET /ca/crl", "POST /elevate", "POST /elevate/revoke",
+          "POST /users/me/password", "POST /users/{username}/password", "X-Yuzu-Upload-Grant",
+          "X-Yuzu-Upload-Session"}) {
+        INFO(needle);
+        CHECK(info.find(needle) != std::string::npos);
+    }
+}
+
 TEST_CASE("GET /api/v1/openapi.json: gated on Infrastructure:Read for every form of the document",
           "[openapi][security]") {
     RestApiV1 api;
