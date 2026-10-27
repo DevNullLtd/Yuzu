@@ -68,8 +68,9 @@ static_assert(kRegistryAuditBudgetKeyBytes >= auth::kMaxAgentIdLength,
 
 // Persists the `registry.write` audit rows one stored output frame owes (see
 // plugin_result_audit.hpp for the binding: a minted registry command id AND an agent-stamped
-// mutating action). Called at every site that stores an output-carrying frame, immediately before
-// `notify_exec_tracker` so the row exists before the execution advances (tests/
+// mutating action, any of the kRegistryMutatingActions: the hook is action-generic). Called at every
+// site that stores an output-carrying frame, immediately before `notify_exec_tracker` so the row
+// exists before the execution advances (tests/
 // test_audit_action_stamp_wiring_lexical.py pins the four sites and their order). The agent flushes
 // plugin output in RUNNING frames and its terminal frame carries none, so the terminal sites are
 // defence in depth for an agent that returns output there.

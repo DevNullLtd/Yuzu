@@ -36,9 +36,15 @@
 // A third path serves plain pipe rows: when the matcher carries the server-authored
 //   "declared_columns":[names in output order], "plugin":"<name>"
 // (written at admission by bind_declared_columns), C's index is its position in that list, each
-// output line is split with `split_fields(plugin, line)`, and a line is skipped unless its width
-// equals the list's and it is not the header row. Wrong-typed keys match nobody; a caller may not
-// supply either key.
+// output line is split with `split_fields(plugin, line)`, and a line is skipped unless its field
+// count equals the list's exactly and it is not the header row. When the definition's FIRST
+// declared column carries `discriminator: true` (the columns are then the wire fields in order,
+// leading row-kind tag included), bind_declared_columns also stores "row_discriminator":true and
+// the line is split on every unescaped pipe instead; without the flag a key/value plugin's rows
+// are key + remainder and never match a wider declaration. The index is the declared column
+// position, not the dashboard cell position (for a key/value plugin the dashboard still shows key
+// + remainder under the declared headers). Wrong-typed keys match nobody; a caller may not supply
+// any of the three server-authored keys.
 //
 // `op` ∈ {eq, in, contains, exists}. A non-SUCCESS response NEVER qualifies,
 // regardless of matcher — a plugin that errored is not evidence of a hit.
@@ -76,9 +82,11 @@ std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher
 /// Server-authored binding of a kind-less column matcher to the instruction definition's
 /// DECLARED output columns (field names in output order, from `result_schema` via
 /// `ResponseTemplatesEngine::synthesise_default` -- the dashboard's own source). When
-/// `matcher.column` is among them, stores `declared_columns` and `plugin` in `matcher` so
+/// `matcher.column` is among them, stores `declared_columns` and `plugin` in `matcher` (and
+/// `row_discriminator` when the definition's first column declares `discriminator: true`) so
 /// `response_matches` can resolve the column positionally in plain pipe rows. No-op otherwise.
-/// REST and MCP both call this ONE function. `validate_matcher` refuses both keys from a caller.
+/// REST and MCP both call this ONE function. `validate_matcher` refuses all three keys from a
+/// caller.
 void bind_declared_columns(nlohmann::json& matcher, const std::string& result_schema_json,
                            const std::string& plugin);
 
