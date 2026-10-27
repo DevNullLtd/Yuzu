@@ -59,9 +59,9 @@ TEST_CASE("is_profile_backup_entry: a `.bak` suffix, any case, on a non-empty ke
 TEST_CASE("remove_backup_entries: drops the `<SID>.bak` leftovers and keeps the rest in order", "[profiles]") {
     // mutant: the list is returned untouched (the per-user write path resolves a leftover, or lets it shadow the live profile)
     std::vector<RawProfileRecord> records{
-        {std::string{kAliceSid} + ".bak", "C:\\Users\\alice"},
-        {std::string{kAliceSid}, "C:\\Users\\alice.DOMAIN"},
-        {"S-1-5-21-9-9-9-1002", "C:\\Users\\bob"},
+        {std::string{kAliceSid} + ".bak", "C:\\Users\\jsmith"},
+        {std::string{kAliceSid}, "C:\\Users\\jsmith"},
+        {std::string{kBobSid}, "C:\\Users\\jsmith"},
     };
     std::vector<std::string> hku{};
     auto profiles = build_profile_list(records, hku);
@@ -69,7 +69,7 @@ TEST_CASE("remove_backup_entries: drops the `<SID>.bak` leftovers and keeps the 
     remove_backup_entries(profiles);
     REQUIRE(profiles.size() == 2);
     CHECK(profiles[0].sid == kAliceSid);
-    CHECK(profiles[1].sid == "S-1-5-21-9-9-9-1002");
+    CHECK(profiles[1].sid == kBobSid);
     remove_backup_entries(profiles); // idempotent on a list with none
     CHECK(profiles.size() == 2);
 }
