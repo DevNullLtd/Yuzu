@@ -14,22 +14,98 @@
 
 ## How it works
 
-Both actions are reads; the plugin has no rule-mutation surface despite its name. `state` reports whether the host firewall is on, per profile or per backend. `rules` lists the rule set the same backend exposes. On Windows both go through the `INetFwPolicy2` COM interface: `state` asks each of the Domain, Private and Public profiles for `FirewallEnabled`; `rules` enumerates `INetFwRules` and stops after 100 rules with a `truncated|true` marker row. On macOS `state` reads the Application Firewall global state through `socketfilterfw --getglobalstate` (the firewall a Mac administrator means), adds a `mode|block_all` row when block-all is set, then reads the pf packet-filter status through `pfctl -s info` as a secondary row, then `pfctl -s Anchors` and `pfctl -s rules` for the pf anchor list and rule count; `rules` reads the per-app allow/block list through `socketfilterfw --listapps`, lists pf rules through `pfctl -s rules`, then the same pf anchors and rule count. Each pf-backed read (anchors, rule count) is emitted only when it completed cleanly — a refused or partial read yields no anchor rows and `ruleset|unknown` rather than a partial answer presented as the whole. On Linux the plugin probes backends in a fixed order and stops at the first that answers: firewalld over sd-bus, then nftables over `NETLINK_NETFILTER` dumps, then `ufw status numbered`, then `iptables -S`, else `backend|none`. Each macOS subprocess call is bounded independently, so worst case is roughly additive across the sequential reads: ~15 s for `rules` (3 calls) and ~20 s for `state` (4 calls) if every one refuses or times out.
+Both actions are reads; the plugin has no rule-mutation surface despite its name. `state` answers "is the host firewall on, and which firewall answered"; `rules` lists what the same source exposes. Every parse is a pure function in `firewall_parsers.hpp`, and every subprocess runs through the bounded runner with a fixed 5 second deadline and no shell.
 
-Every subprocess runs through the bounded runner with a fixed deadline; every parse is a pure function in `firewall_parsers.hpp`. On Linux, firewalld, nftables, ufw and iptables are each bounded to their own ~5s acquisition deadline and probed in that fixed order, so a run that must walk every leg takes up to ~20s worst case (4 legs × 5s). The nftables leg further verifies each dump reply's sender (`nl_pid == 0`, genuinely from the kernel rather than a foreign process sharing the netlink family) before trusting it, and splits that ~5s deadline across three sequential per-dump budget slices (table, then chain, then rule) rather than one shared timeout for all three. The honest-status invariant holds on every leg: empty, truncated or unrecognised output parses to `unknown` (state) or no rows (rules), never to a false-safe "disabled" or a fabricated rule. Once nftables' table dump succeeds but a later chain or rule dump fails, the leg writes a `fallthrough|nftables:<dump>:<reason>` provenance row and falls through to `ufw` then `iptables` (clamped so a downstream "disabled" can't contradict tables already seen) rather than stopping there; only when neither backend answers either does the run report `backend|nftables` + `state|unknown` (or `rules|unknown`) plus an `error|nftables:<dump>:<reason>` row naming why.
+- **Windows.** The `INetFwPolicy2` COM interface is called in process. `state` asks each of the Domain, Private and Public profiles whether `FirewallEnabled` is set and adds the true total rule count (`INetFwRules` count). `rules` enumerates `INetFwRules` and stops after 100 rules with a `truncated|true` marker row.
+- **macOS.** Two separate firewalls are read. The Application Firewall is primary, because it is the firewall a Mac administrator means: `socketfilterfw --getglobalstate` gives `state|`, plus `mode|block_all` when block-all is set, and `socketfilterfw --listapps` gives the per-app allow or block list. The pf packet filter, off by default and unrelated to the Application Firewall, is secondary: `pfctl -s info` gives the `pf|` row, and `pfctl -s Anchors` and `pfctl -s rules` give the anchor names, the raw pf rule lines and the rule count. The anchor, rule and rule-count reads are published only when the command exited zero, did not time out and was not truncated, so a refused read yields no anchor rows and `ruleset|unknown` rather than a partial answer presented as the whole. The `pf|` row is always written; it reads `unknown` when `pfctl -s info` is refused.
+- **Linux.** A fixed ladder stops at the first source that answers: firewalld over sd-bus (only in builds with libsystemd; otherwise this rung is skipped), then nftables over `NETLINK_NETFILTER` dumps, then `ufw status numbered`, then `iptables -S`, else `backend|none`. The nftables leg checks that each dump reply came from the kernel (`nl_pid == 0`) and splits its 5 second deadline across three dumps (table, then chain, then rule, with cumulative cut-offs at 1, 2.5 and 5 seconds). A run that walks every rung takes about 20 seconds in the worst case.
+
+The honest-status rule holds on every leg: empty, truncated or unrecognised output parses to `unknown` (state) or no rows (rules), never to a false-safe "disabled" or an invented rule. If nftables' table dump succeeds but a later chain or rule dump fails, the leg writes a `fallthrough|nftables:<dump>:<reason>` row and continues to `ufw` then `iptables`, with their verdicts clamped so a downstream "disabled" cannot contradict tables already seen.
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow<br/>dispatches definition] --> SRV[Server<br/>authz: Security.Read<br/>concurrency: per-device]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host]
-  HOST --> EX[firewall.execute]
-  EX --> WIN[Windows leg<br/>INetFwPolicy2 COM<br/>profiles · INetFwRules]
-  EX --> MAC[macOS leg<br/>socketfilterfw · pfctl<br/>bounded subprocess]
-  EX --> LIN[Linux leg<br/>firewalld sd-bus → nftables netlink<br/>→ ufw → iptables → none]
-  WIN & MAC & LIN --> ROWS[pipe rows<br/>state · rule · backend]
-  ROWS -- CommandResponse --> RS[(ResponseStore<br/>90-day default retention)]
-  RS --> API[REST /api/responses<br/>fleet pie by state]
+  OP["Operator or workflow<br/>dispatches definition"] --> SRV["Server<br/>authz: Security.Read<br/>concurrency: per-device"]
+  SRV -- "gRPC mTLS" --> HOST["Agent plugin host"]
+  HOST --> EX["firewall.execute"]
+  EX --> WIN["Windows leg<br/>INetFwPolicy2 COM<br/>profiles and INetFwRules"]
+  EX --> MAC["macOS leg<br/>socketfilterfw and pfctl<br/>bounded subprocess"]
+  EX --> LIN["Linux leg<br/>firewalld, nftables, ufw, iptables, none"]
+  WIN & MAC & LIN --> ROWS["pipe rows<br/>state, rule, backend"]
+  ROWS -- "CommandResponse" --> RS[("ResponseStore<br/>90-day default retention")]
+  RS --> API["REST /api/responses<br/>fleet pie by state"]
 ```
+
+### What you can decide with it
+
+| Question | Action | Windows | macOS | Linux |
+|---|---|---|---|---|
+| Is the host firewall on? | `state` | Three `profile\|` rows, each `enabled`, `disabled` or `unknown`. Only Windows Firewall's own switches are read. | `state\|` is the Application Firewall only (`enabled`, `disabled`, `unknown`); pf is the separate `pf\|` row | `state\|` is `running` (firewalld), `active`/`inactive` (nftables, ufw, iptables) or `unknown` |
+| Which firewall answered? | `state` or `rules` | Always Windows Firewall | `backend\|appfirewall` | `backend\|` names the first source that answered, which is not necessarily the tool an administrator uses (rules managed by another tool but held in nftables report `nftables`) |
+| What is it enforcing? | `rules` | The first 100 rules: name, enabled, direction, allow or block, profile bitmask. No ports, programs or addresses. | `app\|` rows (per-app allow or block, no root needed); pf `rule\|` lines, anchors and a count (root only) | firewalld: services per active zone. nftables: base-chain hook and policy plus one handle row per rule. ufw: numbered rules. iptables: the `-S` entries. |
+| Is a particular port open? | neither | No: rows omit ports, and the list is capped | No: pf lines are raw text and the per-app list is not port-based | Not reliably: firewalld lists services only, and nftables handle rows carry no match detail |
+
+How to read the answers:
+
+- `unknown` and `ruleset|unknown` mean the read did not complete (refused, timed out, truncated or unrecognised). They never mean "off" or "empty"; a cleanly read empty ruleset reports `ruleset|0`.
+- `active` from nftables or iptables means there is at least one rule or a base-chain policy other than accept (for iptables, a user-defined chain also counts). A container runtime's own rules make a host `active`, so it is not evidence of a restrictive policy; `inactive` is reported only on a complete read.
+- On Windows `enabled` says a profile's firewall switch is on, not what its default inbound action is, and on macOS an Application Firewall `enabled` does not imply pf is filtering.
+- A fleet roll-up that counts `state` values should count `unknown` separately, since it hides both permission failures and absent tools.
+
+### Diagrams
+
+```mermaid
+flowchart TD
+  S["state or rules on Linux"] --> F{"firewalld answers getActiveZones?"}
+  F -- "yes" --> FD["backend firewalld<br/>state running, services as rules"]
+  F -- "no" --> N{"nftables table, chain and rule dumps all trusted?"}
+  N -- "yes" --> ND["backend nftables<br/>active or inactive"]
+  N -- "socket or table dump failed" --> E1["error row, nothing committed"]
+  N -- "chain or rule dump failed" --> FT["fallthrough row<br/>tables seen"]
+  E1 --> U
+  FT --> U{"ufw status exits 0?"}
+  U -- "yes" --> UD["backend ufw"]
+  U -- "no" --> I{"iptables -S ran?"}
+  I -- "yes" --> ID["backend iptables<br/>unknown if exit non-zero"]
+  I -- "no" --> X{"nftables tables seen?"}
+  X -- "yes" --> NU["backend nftables<br/>state or rules unknown, error row"]
+  X -- "no" --> NONE["backend none<br/>state or rules unknown"]
+```
+
+This is the whole Linux decision. A refused read does not stop the ladder early except at the last rung: `ufw` falls through on any failure, while a failed `iptables -S` is final and reports `backend|iptables` with `unknown`. `backend|none` appears when no nftables table was read and neither `/usr/sbin/ufw` (exit 0) nor `/usr/sbin/iptables` (ran) answered. A host with `iptables` therefore ends at `backend|iptables`, but a host with only `ufw` whose `ufw status` fails (for example when not run as root) ends at `none`.
+
+```mermaid
+flowchart LR
+  ALF["Application Firewall<br/>socketfilterfw, no root needed"]
+  PF["pf packet filter<br/>pfctl, root needed"]
+  ALF --> ST["state row and mode block_all<br/>from getglobalstate"]
+  ALF --> AP["app rows<br/>from listapps"]
+  PF --> PS["pf row<br/>from info"]
+  PF --> AN["anchor rows<br/>from Anchors"]
+  PF --> RL["rule rows and ruleset count<br/>from rules"]
+  AP --> OK{"read exited 0, within 5 s, not truncated?"}
+  AN --> OK
+  RL --> OK
+  OK -- "no" --> UNK["no rows, ruleset unknown"]
+```
+
+The macOS plugin keeps the two firewalls apart: the Application Firewall answers without privilege, while every pf read opens `/dev/pf` and needs root, so a non-root run still returns the Application Firewall answer plus `pf|unknown` and `ruleset|unknown`. Each rows-publishing read is gated on a clean exit, so a partial read yields no rows rather than a partial list.
+
+### Reading the Linux error and fallthrough rows
+
+| Row | Meaning |
+|---|---|
+| `error\|nftables:socket:eperm` | The netlink socket could not be opened or bound, typically a hardened host denying `AF_NETLINK` through systemd `RestrictAddressFamilies=`, seccomp or AppArmor |
+| `error\|nftables:<table or chain or rule>:eperm` | The socket opened but the kernel refused the dump; grant `CAP_NET_ADMIN` or use firewalld |
+| `error\|nftables:<dump>:timeout` | A dump did not finish in its budget, usually a long nft transaction holding the table lock |
+| `error\|nftables:<dump>:foreign_flood` | Another local process is writing to the same netlink family and drowning out the agent's replies |
+| `error\|nftables:<dump>:errno:undecoded` | The kernel's error reply could not be decoded; treat as an undiagnosed refusal, not errno 0 |
+| `error\|nftables:<dump>:truncated`, `oversized` or `io_error` | The dump exceeded the read buffer, exceeded the 4 MiB cap, or hit a socket failure; the ladder still falls through rather than report a clipped count |
+| `error\|fd_exhausted` | `EMFILE` or `ENFILE` on the nftables socket |
+| `fallthrough\|nftables:<dump>:torn` | The kernel flagged the dump as interrupted by a concurrent ruleset change; the ladder continues |
+
+Which row kind carries a reason depends on the dump. A failed table dump (including `torn`) writes `error|nftables:table:<reason>`. A failed chain or rule dump, after the table dump succeeded, writes `fallthrough|nftables:chain:<reason>` or `fallthrough|nftables:rule:<reason>` with any of the reasons above, and the `error|nftables:chain|rule:<reason>` form appears only on the terminal `unknown` result.
+
+An `error|nftables:table:<reason>` row can appear next to a later successful `backend|ufw` or `backend|iptables`, because it is written the moment the dump fails. Only a terminal `unknown` after it means no backend could answer.
 
 ## OS capability
 
@@ -44,9 +120,9 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | None. `INetFwPolicy2` profile and rule reads need no elevation. | 2026-09-06 on the-rig (Windows 11 Pro 10.0.26200), elevated SSH session: three profiles read `enabled`, 100 rule rows plus the `truncated\|true` marker | `error\|com_init` or `error\|policy2_create:<hresult>` row; profile rows read `error:<hresult>` |
-| macOS | LaunchDaemon (root today) | None for the Application Firewall reads (`socketfilterfw --getglobalstate` and `--listapps` are both unprivileged). The pf reads (`pfctl -s info`/`Anchors`/`rules`) open `/dev/pf` and need root; the plugin deliberately does not ride the quarantine plugin's `pfctl` sudoers grant. | 2026-09-14 at euid 501 on this host: `socketfilterfw --listapps` succeeds and emits `app\|` rows; `pfctl -s Anchors` and `pfctl -s rules` are both refused with `Permission denied`, so anchors are empty and `ruleset\|unknown` | `pf\|unknown` / `ruleset\|unknown` (state, rules), no anchor or pf rule rows, never a false-safe value; `app\|` rows are unaffected since `--listapps` needs no privilege |
-| Linux | agent service account | `firewall-cmd --state` is an unprivileged D-Bus query. The nftables netlink dump conventionally needs `CAP_NET_ADMIN` (verified 2026-08-23 with the capability present); `ufw status` and `iptables -S` need root. No sudoers entry is granted for any of them. | nftables verified 2026-08-23 in an Ubuntu 26.04 container with `CAP_NET_ADMIN`. The no-cap (unprivileged) signature is reasoned from the dispatch code itself — sender-verified (`nl_pid == 0`) reads, `classify_open_errno`/`nft_dump_reason` EPERM/EMFILE decoding, and the fixed C4 fall-through ladder — not measured on a live no-cap host, and it is **qualified by which rung-2 backend binaries are installed**: on a host where `ufw` or `iptables` exists, a refused nftables read falls through and the ladder terminates at `backend\|iptables` (or `backend\|ufw`) + `state\|unknown`, never `backend\|none`; `backend\|none` appears only when neither rung-2 binary is present at all | a refused nftables table dump (EPERM or other kernel error, or `EMFILE`/`ENFILE` reporting `error\|fd_exhausted`) falls through to `ufw` then `iptables`, each clamped so neither reports a false "disabled" contradicting tables already seen; a refused chain or rule dump after a successful table dump behaves the same way, first writing `fallthrough\|nftables:<dump>:<reason>`; if neither `ufw` nor `iptables` answers either, the run reports `backend\|nftables` + `state\|unknown` / `rules\|unknown` plus `error\|nftables:<dump>:<reason>`; a refused `iptables -S` alone (the last backend, nothing further to fall through to) reports `backend\|iptables` + `state\|unknown` / `rules\|unknown`; `backend\|none` appears only when no backend ran at all — neither `/usr/sbin/ufw` nor `/usr/sbin/iptables` exists, or `ufw` was refused and `iptables` is absent |
+| Windows | agent service account (LocalSystem today, #1442) | None. `INetFwPolicy2` profile and rule reads need no elevation. | 2026-09-15, bare-metal, elevated interactive user: three profiles `enabled`, `ruleset\|717`, 100 `rule\|` rows plus the `truncated\|true` marker | `error\|com_init`, `error\|policy2_create:<hresult>` or `error\|rules_count:<hresult>` rows; a profile that cannot be read shows `unknown` or `error:<hresult>` |
+| macOS | LaunchDaemon (root today) | None for the Application Firewall reads (`socketfilterfw --getglobalstate` and `--listapps` are unprivileged). The pf reads (`pfctl -s info`, `Anchors`, `rules`) open `/dev/pf` and need root; the plugin deliberately does not ride the quarantine plugin's `pfctl` sudoers grant. | 2026-09-15, bare-metal, unprivileged (`euid 501`): `--listapps` succeeds, while pf is refused, so `pf\|unknown`, no anchors and `ruleset\|unknown`. No capture has been taken as root. | `pf\|unknown` and `ruleset\|unknown`, no anchor or pf rule rows, never a false-safe value; `app\|` rows are unaffected |
+| Linux | agent service account (unprivileged by design) | The firewalld read is a D-Bus method call and the plugin requests no grant for it. The nftables netlink dump conventionally needs `CAP_NET_ADMIN`; `ufw status` and `iptables -S` need root. No sudoers entry is granted for any of them. | 2026-09-06, container, `euid 0` with `CAP_NET_ADMIN` in the host network namespace: nftables answered. The no-capability path is reasoned from the code (sender-verified reads, EPERM and EMFILE decoding, the fall-through ladder), not measured on a live host. | A refused nftables read falls through to `ufw`, then `iptables`; when the table dump had succeeded and only a later dump failed, each is clamped so neither reports a false "disabled" over tables already seen; if neither answers, the run ends at `backend\|nftables` with `unknown` and an `error\|nftables:<dump>:<reason>` row. A refused `iptables -S` alone reports `backend\|iptables` with `unknown`. `backend\|none` only when neither `/usr/sbin/ufw` nor `/usr/sbin/iptables` ran. |
 
 Subprocesses: `socketfilterfw`, `pfctl` (macOS), `ufw`, `iptables` (Linux), each as an argv vector through the bounded runner (rung 2), never a shell. Windows and the firewalld and nftables legs are native (rung 1). No network access.
 
@@ -83,12 +159,11 @@ Pipe-delimited key rows; the first field is the row kind. `state` emits `profile
 
 ### Result status
 
-The plugin does not call `set_result_status`; every run reports `UNDECLARED`, from which the agent derives `OK` when `execute` returns 0. Degradation is carried in the rows themselves (`unknown`, `error|…`, `backend|none`, `truncated|true`), not in the typed status.
+The plugin never sets a typed result status; every run reports `UNDECLARED / UNKNOWN`, as the samples show. Degradation is carried in the rows themselves (`unknown`, `error|...`, `fallthrough|...`, `backend|none`, `truncated|true`), so a consumer must read the rows, not the status, to tell a degraded read from a complete one.
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
-| `OK` (derived from `UNDECLARED`) | — | — | every run that returns 0, including degraded reads |
-
+| `UNDECLARED` | UNKNOWN | (empty) | Every run on every OS, including degraded reads |
 ### Where the data goes
 
 - **Instruction result only.** Rows land in the ResponseStore (90-day default retention), queryable at `/api/responses/{id}`; `security.firewall.state` aggregates by `state` and drives the fleet pie "Firewall profile state across the fleet" (profile rows, labelled by value).
@@ -178,11 +253,11 @@ rule|nftables|ip|filter|DOCKER-USER|handle|2
 
 ## Caveats and known gaps
 
-1. **Row shape is a key/value contract, not the YAML column list.** `result_parsing.hpp` clamps this plugin to two fields, so a `profile|Domain|enabled` row reaches the dashboard as key `profile`, value `Domain|enabled`. Splitting the value into its own axes is tracked under #626.
-2. **macOS rules are the raw pf lines** and the pf reads need root; under the least-privilege model both `pf|` state and the rules list degrade to unknown or empty on purpose.
-3. **The Linux unprivileged denial path is reasoned from the dispatch code, not measured on a live no-cap host.** The nftables leg was verified with `CAP_NET_ADMIN` present; on a non-firewalld host without that capability the probe falls through to `ufw`, then `iptables -S`, and a root-only iptables reports `backend|iptables` + `state|unknown`; `backend|none` only when no backend ran at all (neither binary exists, or `ufw` was refused and `iptables` is absent). Tracked for the Linux parity sweep. Linux troubleshooting tokens: `error|nftables:socket:eperm` means the netlink socket itself could not be opened or bound (EPERM/EACCES from `socket()`/`bind()`) — typically a hardened host's `systemd RestrictAddressFamilies=` omitting `AF_NETLINK`, or seccomp/AppArmor denying netlink; distinct from `error|nftables:table:eperm` (or `:chain:`/`:rule:`), which means the socket opened fine but the kernel refused a dump read — grant `CAP_NET_ADMIN` or run `firewalld` instead; `error|nftables:<dump>:timeout` means a dump did not finish inside its per-dump budget, typically a long-running nft transaction holding the table lock; `error|nftables:<dump>:foreign_flood` means another local process is writing to the same netlink family, drowning out the agent's own dump replies; `error|nftables:<dump>:errno:undecoded` means the kernel's `NLMSG_ERROR` reply itself couldn't be decoded (a short or anomalous payload) — treat it as an undiagnosed refusal, not errno 0; `truncated`/`oversized`/`io_error` mean the dump exceeded the read buffer, exceeded the 4 MiB size cap (a legitimately large enterprise ruleset can hit this; the ladder still falls through honestly to `ufw`/`iptables` rather than reporting a clipped count), or hit a raw socket/recv failure, respectively; `fallthrough|nftables:<dump>:torn` means a concurrent ruleset mutation interrupted the dump mid-read — routine on hosts running Docker or other frequent-reconfiguration workloads — and is not itself an error: the ladder continues to `ufw`/`iptables`. Note that an `error|nftables:table:<reason>` row can appear alongside a later successful `backend|ufw`/`backend|iptables` + `state|active` — the table-dump failure is reported the instant it happens, before the ladder has tried the next backend at all — so its presence alone does not mean every backend failed; only a terminal `state|unknown`/`rules|unknown` after it means no backend could answer.
-4. **Windows rules stop at 100.** The `truncated|true` row is emitted only when a genuine 101st rule exists, so a host with exactly 100 rules is not marked truncated.
-5. **A mixed fleet shows three macOS shapes.** Agents older than the Application Firewall change report pf as the sole state source (`backend|pf`); agents after that change but before the per-app list report `backend|appfirewall` plus a `pf|` row only; current agents add the unprivileged `app|` list, `anchor|` rows and the `ruleset|` count/`unknown` on top of that.
+1. **Row shape is a key/value contract, not the YAML column list.** The server clamps this plugin to two fields, so a `profile|Domain|enabled` row reaches the dashboard as key `profile`, value `Domain|enabled`. Splitting the value into its own axes is tracked under #626.
+2. **macOS pf reads need root, and no capture has used root.** Under the least-privilege model the `pf|` row and the pf rules degrade to unknown or empty on purpose, and the macOS sample shows exactly that at `euid 501`. The Application Firewall `state|` and `app|` rows are unaffected.
+3. **Two Linux paths are unmeasured.** The firewalld leg has never been run against a live firewalld, and it lists services only (zone ports and rich rules are not queried), so a firewalld host can hold open ports this plugin does not show. The unprivileged nftables denial path is likewise reasoned from the code, not measured, and it depends on which of `ufw` and `iptables` are installed.
+4. **Windows rules stop at 100 and omit what they match.** The `truncated|true` row is emitted only when a genuine 101st rule exists, so exactly 100 rules is not marked truncated; `state` reports the true total, so compare the two. Each rule row has no port, program or address, so the list cannot answer what a rule allows.
+5. **A mixed fleet shows three macOS shapes.** Agents older than the Application Firewall change report pf as the sole state source (`backend|pf`); agents after that change but before the per-app list report `backend|appfirewall` plus a `pf|` row only; current agents add the `app|` list, `anchor|` rows and the `ruleset|` count or `unknown`.
 
 ## Source and tests
 

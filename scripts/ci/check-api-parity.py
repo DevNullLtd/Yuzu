@@ -491,19 +491,22 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # so only the flips move this number; they left the generic placeholder (see BASELINE_GENERIC_PLANNED).
 # 214 -> 215 (MCP twin completeness tooling, ADR-1005 2026-10-23 entry): get.fragments-devices-list moved from twinned
 # to the #4041 exception, because its MCP tool list_agents is unconfined; see get.api-agents.
-# 215 -> 214 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me flipped from planned to twinned
+# 215 -> 213 (runtime configuration twins): get.api-config and put.api-config-param flipped to `twinned`
+# (GET/PUT /api/v1/config and the MCP tools get_runtime_config / set_runtime_config).
+# 213 -> 212 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me flipped from planned to twinned
 # (GET /api/v1/me + the get_me MCP tool).
-BASELINE_UNTWINNED = 214
+BASELINE_UNTWINNED = 212
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
 # issue. Bidirectional like BASELINE_UNTWINNED: lower it in the same change that removes rows.
 # 174 -> 87 (ledger reconcile, ADR-1005 2026-10-22 entry): 87 rows moved to twinned, exception, retire or composed-of.
 # 87 -> 86 (MCP twin completeness tooling, ADR-1005 2026-10-23 entry): get.api-agents became a dated exception.
+# 86 -> 84 (runtime configuration twins): get.api-config and put.api-config-param became twinned.
 GENERIC_PLANNED_STATUS = "planned:#2146"
 GENERIC_PLANNED_ISSUE = 2146
-# 86 -> 85 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me became twinned.
-BASELINE_GENERIC_PLANNED = 85
+# 84 -> 83 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me became twinned.
+BASELINE_GENERIC_PLANNED = 83
 
 # A revisit date outside this window is a typo (9999-12-31), a shape error. A date at or before
 # today + REVISIT_WARN_DAYS only produces ONE aggregated warning, never a failure.

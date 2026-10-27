@@ -305,7 +305,7 @@ The Hardware CI record's own **Live** lens (`/hardware` → device → **Live** 
 | **Drivers** — installed device drivers: name, version, date, provider, class | `hardware/drivers` | `device.live.hw_drivers` | Windows, Linux |
 | **Battery** — presence, charge state, percent, time-to-empty, cycle count, health | `power_health/battery` | `device.live.battery` | all |
 | **Thermal** — thermal zone status and temperature | `power_health/thermal` | `device.live.thermal` | all |
-| **Disk health (SMART)** — per-disk SMART health, percent used, spare percent | `disk_actions/smart` | `device.live.smart` | Windows, macOS |
+| **Disk health (SMART)** — per-disk model, bus and media type, plus SMART health, percent used and spare percent for NVMe drives on Windows only (health is `unknown` on macOS and for SATA, USB and virtual disks, whose percent used and spare percent are `-`) | `disk_actions/smart` | `device.live.smart` | Windows, macOS |
 | **Volumes** — mounted volumes: mount points, backing device, filesystem, size | `disk_actions/volumes` | `device.live.volumes` | Windows, macOS |
 | **Network adapters** — adapter name, MAC, link speed, status | `network_config/adapters` | `device.live.adapters` | all |
 | **Wi-Fi** — current association: SSID, signal, security, BSSID/channel | `wifi/connected` | `device.live.wifi` | all |
@@ -412,7 +412,7 @@ direct and gateway paths.
 corrupted, the agent transparently re-provisions on its next enrollment: it
 generates a fresh keypair + CSR and the server issues a **new** leaf with a
 **new serial**. The previous serial remains in the server's issued-cert inventory
-(`GET /api/v1/ca/issued`) as an orphaned row that no live agent holds — this is
+(`GET /api/v1/ca/issued`, which a management-group-confined account, or one with no `Inventory:Read` grant, is refused) as an orphaned row that no live agent holds — this is
 harmless, but if you reconcile the inventory you should expect one orphan per
 key-loss event and may revoke it for tidiness. No manual re-enrollment is needed.
 The same happens when the key is unreadable or unparseable at startup, or when

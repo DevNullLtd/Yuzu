@@ -347,8 +347,8 @@ TEST_CASE("msi inventory: unsupported status rows and the dash for empty tokens"
           "status|list_inventory|unsupported|macos:owned_by_installed_apps");
     CHECK(inv::unsupported_status_row("linux:no_msi") ==
           "status|list_inventory|unsupported|linux:no_msi");
-    CHECK(inv::format_status_row("list_inventory", inv::StatusLevel::supported, {}) ==
-          "status|list_inventory|supported|-");
+    CHECK(yuzu::shared::format_status_row("list_inventory", yuzu::shared::StatusLevel::supported,
+                                          {}) == "status|list_inventory|supported|-");
 }
 
 TEST_CASE("msi inventory: zero products is one status row and no sentinel",

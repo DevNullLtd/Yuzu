@@ -179,11 +179,19 @@ inline constexpr std::string_view kRuntimeConfigDbErrorPrefix = kDbErrorPrefix;
 /// script, so the floor lives here, not only in the General page.
 inline constexpr int kMinHeartbeatTimeoutSeconds = 30;
 
-/// A `heartbeat_timeout` stored before the floor existed, as the boot loader applies it: raised to
-/// the floor rather than dropped, so the operator's intent (a short window) is kept as nearly as
-/// the floor allows.
+/// Largest `heartbeat_timeout` (seconds) the store accepts: one day. A larger window leaves a dead
+/// agent reading online for as long, and a value near INT_MAX stops stale-stream reaping
+/// altogether. A script or an agentic worker can reach the generic write, so the ceiling lives
+/// here, beside the floor.
+inline constexpr int kMaxHeartbeatTimeoutSeconds = 86400;
+
+/// A `heartbeat_timeout` stored before the floor or the ceiling existed, as the boot loader applies
+/// it: moved to the nearest bound rather than dropped, so the operator's intent is kept as nearly
+/// as the bounds allow.
 [[nodiscard]] constexpr int clamp_heartbeat_timeout(int stored) noexcept {
-    return stored < kMinHeartbeatTimeoutSeconds ? kMinHeartbeatTimeoutSeconds : stored;
+    return stored < kMinHeartbeatTimeoutSeconds   ? kMinHeartbeatTimeoutSeconds
+           : stored > kMaxHeartbeatTimeoutSeconds ? kMaxHeartbeatTimeoutSeconds
+                                                  : stored;
 }
 
 class RuntimeConfigStore {
@@ -348,9 +356,10 @@ public:
     /// stall. Even that server-side timeout is in force only when the pool injects it: the pool
     /// skips its statement and lock timeouts when the DSN or PGOPTIONS carries its own
     /// `options=` (pg_pool.cpp), leaving the server's defaults. A transaction-scoped bound on
-    /// this statement (as `CaStore::publish_next_crl` sets) would need a transaction wrapper; it
-    /// is an obligation of the writer route that holds a lock across this call, not of this
-    /// primitive.
+    /// this statement (as `CaStore::publish_next_crl` sets) would need a transaction wrapper;
+    /// the score policy route (PUT/DELETE /api/v1/dex/score-policy) documents this limit instead
+    /// of bounding it: a stalled commit holds the provider's writer lock, and other writers
+    /// answer 503 with retry_after_ms.
     [[nodiscard]] std::expected<bool, std::string>
     compare_and_set(const std::string& key, const std::optional<std::string>& expected,
                     const std::string& value, const std::string& updated_by);

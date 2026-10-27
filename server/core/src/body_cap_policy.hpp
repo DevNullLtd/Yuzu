@@ -62,14 +62,14 @@
 /// cap. Chunked request bodies are legal HTTP, and this repo does not
 /// control every client that will ever talk to these routes, so the bit
 /// DEFAULTS OFF and is opted into per class, not per table. It is ON for
-/// three classes: `/mcp/` (that surface's own protocol/client contract already requires
+/// four classes: `/mcp/` (that surface's own protocol/client contract already requires
 /// `Content-Length` on every framed body - see `web_utils.hpp:577`'s
 /// `mcp_body_unmeasurable` rationale - so refusing an unmeasurable MCP body
-/// costs a conforming client nothing), `upload_session`, and `hardware` (the
+/// costs a conforming client nothing), `upload_session`, `hardware` (the
 /// Hardware CI routes carry only a tiny JSON body from the dashboard and API
-/// callers). Every other class below — public REST
-/// (bundles), SCIM, certificate import (REST + dashboard), the plugin trust
-/// bundle, product-pack/workflow authoring, and the OTA upload — keeps it
+/// callers) and `dex_score_policy` (one JSON document, capped by its handler). Every other
+/// class below — public REST (bundles), SCIM, certificate import (REST + dashboard), the
+/// plugin trust bundle, product-pack/workflow authoring, and the OTA upload — keeps it
 /// OFF and falls back to httplib's 100 MiB backstop for a body it cannot
 /// size, until a Content-Length contract is documented and a representative
 /// client population is tested against it. That is a scoping decision for
@@ -548,6 +548,15 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // requires_measurable stays OFF per the file-header default.
     {kBodyCapAnyMethod, "/api/v1/users", 16u * 1024, false, "users"},
 
+    // /api/v1/dex/score-policy: the customer DEX score policy (rest_api_v1.cpp). PUT's body IS
+    // the policy document, capped at kDexScorePolicyMaxBytes (256 KiB) by the handler; 320 KiB
+    // leaves framing headroom over that, so a legitimate document is never refused here and
+    // an unauthenticated flood is held 12x under the 4 MiB catch-all. ANY method: GET and
+    // DELETE are bodyless siblings sharing the class. requires_measurable = true: the
+    // permission gate runs in the handler, after httplib buffers the body (a cookie session's
+    // same-site gate runs earlier, pre-routing), so an unmeasurable (chunked) body must be
+    // refused here (the hardware row's reasoning).
+    {kBodyCapAnyMethod, "/api/v1/dex/score-policy", 320u * 1024, true, "dex_score_policy"},
     // /api/v1/crypto — the /crypto REST v1 subtree. The only body-bearing route is
     // PUT /api/v1/crypto/dashboard/layout {"widgets":[ids]}: at most 64 catalogue ids of at most
     // 64 bytes (crypto_widget_catalogue.hpp kMaxLayoutWidgets / kWidgetIdMaxBytes), about 4.4 KiB
@@ -555,6 +564,14 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // ca_revoke two-authority-split precedent. ANY method: every sibling is a bodyless GET and
     // shares the prefix (rule 4 in the routed-concern row).
     {kBodyCapAnyMethod, "/api/v1/crypto", 16u * 1024, false, "crypto"},
+
+    // /api/v1/config — the runtime-configuration REST v1 twin. The only body-bearing route is
+    // PUT /api/v1/config/{key} {"value": ...}: one scalar (an integer, a flag, a log level, a
+    // tag key, an OIDC client secret or a short JSON array of routed observation types), well
+    // under 16 KiB. The legacy PUT /api/config/{key} keeps the catch-all (kDefaultIsCorrectFor).
+    // ANY method: the sibling GET is bodyless and shares the prefix (rule 4 in the routed-concern
+    // row).
+    {kBodyCapAnyMethod, "/api/v1/config", 16u * 1024, false, "config"},
 
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.

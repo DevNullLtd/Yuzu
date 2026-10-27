@@ -702,7 +702,7 @@ teardown) the live re-read in `decide_retry()` no longer finds an outstanding we
 the next identical push is a Reapply, and the rule re-arms through the normal path.
 **Safety valve:** `decide_retry()` suppresses on a wedge at most
 `kWedgeSuppressMaxDecisions` (10) times per Application, then returns one forced
-Reapply; the counter is reset only by `begin_application()` and `retire()`. It is a
+Reapply; the counter is reset by `begin_full_application()`, `begin_delta_application()` and `retire()` (#5547: a delta replacement restarts it too, so alternating deltas and full pushes give no per-wedge elapsed-time bound). It is a
 decision-count bound, not a wall-clock one: `decide_retry()` has one production caller
 (`apply_rules()`), so it counts pushes. The push interval is
 `ceil(25 s / heartbeat) x heartbeat` (the server's 25 s minimum rounded up to a whole
@@ -748,7 +748,7 @@ service name, or registry hive and key) so it is no longer matched to the hung c
 the rule out of the push has an ordering rule: the push is built from the deployed snapshot
 and then filtered on the live rule row, so disabling the rule or narrowing its scope or OS
 target flows with the next automatic re-push, whereas removing a member from the Baseline is
-staged until a Re-deploy (a fleet-wide full push that also publishes every other staged member
+staged until a Re-deploy (a full push, to the agents connected to the server that handles it, that also publishes every other staged member
 edit on that Baseline). Neither the full-push exit nor the re-key exit is unconditional: the
 hung call keeps the call lock of its mechanism type while it is inside a mechanism call (the
 holder can be any hung same-type watch, unwatch or compensating teardown, including one the
@@ -762,8 +762,10 @@ success is torn down, whereas re-adding the same rule and spec re-observes the c
 at once and lets a late success be adopted; a different rule id on that key is refused
 (`kSparkKeyWedged`) and becomes an ordinary failure. The operator-facing statement is in the
 user manual's wedged-rule hold note and flip-gate AC-1. An omitting delta push is a
-different case: it ends the hold in the ledger without a full push but drops the retry
-obligation (known limit below; flip-gate AC-1 and AC-11). A genuine refusal
+different case: since #5547 it does not end the hold. The ledger carries the omitted
+rule's unresolved outcome into the new application, so the generation stays held until a
+full push, or a push naming the rule, replaces it (known limit below; flip-gate AC-1 and
+AC-11). A genuine refusal
 (a DISPATCHED call that returned a failure - backend refused or worker threw - or an
 admission rejection that is TERMINAL - `AlreadyRunning`, `LaunchFailed` or
 `Stopped` - where no call was attempted; a congestion rejection is parked and redriven
@@ -808,25 +810,53 @@ a Spark-first-captured `FileHashEquals` baseline that was lost, never written or
 remaining cases are enumerated in the flip gate's AC-10; `apply_rules` persists staged
 captures within its pass budget first (the remainder is handed to the new arm from memory)
 and persisted baselines are re-seeded on every arm); (3) an operator delta push (`full_sync=false`)
-during a hold flips the push identity twice and resets the suppression budget;
+during a hold flips the push identity twice and resets the suppression budget (#5547: the
+budget restarts on every replacement, delta or full, so alternating deltas and full pushes
+give no per-wedge elapsed-time bound);
 (4) recovery needs a live connection (the maintenance tick runs on the per-connection
 heartbeat thread). Known limits NOT fixed here: a delta push (`full_sync=false`) that
-OMITS a still-desired unresolved rule replaces the sole application wholesale
-(`GuardianArmAckLedger::begin_application`) and so
-drops that rule's retry obligation: the fresh application can then satisfy
-`can_advance()` and acknowledge, after which the omitted wedged claim has no owning
-application (pre-existing, since the old waiver code replaced the application the same
-way; the Spark path is dormant; no current production route emits an omitting delta,
-because the REST and MCP operator pushes default to `full_sync=false` but carry the
-full OS/scope-filtered deployed inventory, the REST `POST /api/v1/guaranteed-state/push`
-handler in `rest_api_v1.cpp`, the MCP `push_guardian_rules` tool in `mcp_server.cpp` and the
-`guardian_push_fn_` fan-out in `server.cpp`; so the default flag is not itself the hazard,
-a push that omits a still-desired rule is; follow-up FU-12 in the flip gate, #5547); an
+OMITS a still-desired unresolved rule no longer drops that rule's retry obligation
+(#5547; before it, `GuardianArmAckLedger::begin_application` replaced the sole
+application wholesale, so the fresh application could satisfy `can_advance()` and
+acknowledge while the omitted wedged claim had no owning application).
+`begin_delta_application()` now carries every unresolved per-rule outcome of a rule the
+delta does not name: pending receipts, retained wedges, drained failures
+(`failed_ids`) and synchronous failures (`sync_failed_ids`), each with its boot-origin tag.
+A rule the delta names is not carried, and a full push carries none of them. What the
+carry guarantees and what it does not: it holds the generation; a carried pending arm stays
+counted in `arm_pending`, and a carried wedge or drained failure in `arm_failed` (Spark path
+only), whereas a carried synchronous failure and the application-wide latch hold the
+generation without being counted in either (`arm_stats()` reads `pending.size()` and
+`resolved_failed` only), and `prefer_spark_=false` emits no arm
+pair; it does not re-attempt the omitted rule, because a repeat of the delta
+processes only the rules it names, and the server's heartbeat reconcile re-pushes a full
+push only while the agent reports a generation behind the server's. The REST and MCP
+pushes do not bump the generation (`server.cpp`, the comments in the push lambda that read,
+never bump, the generation), so a delta applied at the generation the agent already holds
+is not followed by an automatic full push: the hold lasts until a full push or a later
+generation (baseline deploy does bump it and sends a full push to the agents connected to the server that handles it, which retries the hold, except that a wedged rule stays held until its hung call returns, or another exit in flip gate AC-1 applies (a full push that drops it, an edit that changes its watch target, or an agent restart, each with AC-1's conditions); deleting a deployed Baseline does too, but withdraws every Guard that no other deployed
+Baseline delivers, so it is not a repair; `guardian_routes.cpp`). The suppress budget restarts on every replacement (flip gate AC-11 (4); as before #5547).
+The unattributed legacy debt (the application-wide latch from a full push's rule-key
+sweep, key delete or teardown failure, or a put_rule failure) is carried as
+`inherited_latch` and discharged only at the tail of a full push whose synchronous phases
+all succeeded (a clean synchronous tail shows that withdrawals were issued and queued, not
+that, for a Spark-attached rule, its backend disarm completed; the ledger does not track Disarm claims); this is live at
+`prefer_spark_=false`, where before the next operator delta forgot it. Known costs: the carried set is bounded by the distinct rule ids pushed since
+the last full push (a cardinality bound, not a work or memory cap; each replacement copies
+it under the engine lock); the carried AC-15 shape (a wedge adopted or settled before the
+agent retained it) is counted as an ordinary failure and persists until a full push or a
+push naming the rule, where before it cost one avoidable Reapply (flip-gate AC-15, FU-14).
+The omitting-delta exposure is not claimed to be impossible on any production route; the
+REST and MCP operator pushes and the `guardian_push_fn_` fan-out build each push from the
+deployed set, so the default flag alone is not proven to omit a rule (follow-up FU-12 in
+the flip gate, #5547); an
 agent restart gap (the boot
 Application opens at the loaded acknowledged generation with an empty `content_id`;
 a failed boot re-arm, formerly never retried, is resolved by #5513: the agent reports
 generation 0 (intermittently, with an agent-side back-off between failed catch-ups) with the
-`yuzu.guardian_boot_rearm_unresolved` tag until a push applies cleanly; a legacy guard that returns false at arm is the boot-path analogue of #2797's
+`yuzu.guardian_boot_rearm_unresolved` tag until a push applies cleanly (an unrelated delta
+does not clear it since #5547, except when the boot application could not be opened, the
+known residual in flip gate AC-13); a legacy guard that returns false at arm is the boot-path analogue of #2797's
 `apply_rules` defect and stays uncovered); a content-identity gap (before #4415 an
 identical re-observation matched `rule_id` and spec only, #5512; since then it also requires
 identical content, and changed content over a wedge queues a follower, flip gate AC-14); a wedge that is adopted or
@@ -857,8 +887,10 @@ heartbeat-thread stall.
 
 **R5.3 as implemented (rung 9c PR-2 Unit 5/6).** `GuardianArmAckLedger` is the
 concrete per-application tracker this section's "apply_rules() tracks, per accepted
-rule, whether its arm has resolved" describes. `begin_application(generation,
-content_id, full_sync, applied)` opens ONE current application, never a history -
+rule, whether its arm has resolved" describes. `begin_full_application(generation,
+content_id, applied)` and `begin_delta_application(generation, content_id, applied,
+named_rules)` (#5547; they replaced the single `begin_application(generation, content_id,
+full_sync, applied)`) open ONE current application, never a history -
 a receipt from a superseded application resolving later is simply no longer in any
 ledger's pending set, safe by construction since an `ArmReceipt` is an OBSERVATION
 handle, never an owning one. `add_pending()` registers each `Accepted` rule's
@@ -1036,7 +1068,7 @@ to the RETRY gate. The bullets below describe what is built now; where the earli
 design is mentioned it is named as the earlier design.
 
 - **What was removed.** `kReapplyWaiverThreshold`, `Application::reapply_count` and its
-  test accessor, the identical-content carry-forward in `begin_application()`, and the
+  test accessor, the identical-content carry-forward in the former `begin_application()`, and the
   waiver branch of `can_advance()`. With them went the cross-rule funding consequence
   the waiver had (a sibling's ordinary, now-cleared failure could prime the shared
   counter so that a different rule's wedge was waived on its first observation, and a
@@ -1065,7 +1097,7 @@ design is mentioned it is named as the earlier design.
   preserves the failed-generation-persist retry, sec-1/arch-1; non-empty all-pending is
   Suppress). Otherwise the safety valve applies: after
   `kWedgeSuppressMaxDecisions` (10) wedge suppressions one forced Reapply, and the
-  counter resets only in `begin_application()`/`retire()`; else Suppress. A popped,
+  counter resets in `begin_full_application()`, `begin_delta_application()` and `retire()`; else Suppress. A popped,
   late-failed claim therefore never suppresses, even before the next drain (its sticky
   `Wedged` status may remain, but it is no longer the Dispatched FIFO front).
 - **The "outstanding wedge" classification (formerly the "K-eligibility gap").**
@@ -1098,13 +1130,14 @@ design is mentioned it is named as the earlier design.
   have made every held push pay a full teardown). **Suppression may include
   compensation; acknowledgment never does.**
 - **Acknowledgment is the conservative branch only.** `can_advance()` is `current_ &&
-  pending.empty() && !latched_failure && resolved_failed == 0`. An outstanding wedge, a
+  pending.empty() && !latched_failure && !inherited_latch && resolved_failed == 0 &&
+  sync_failed_ids.empty()` (`guardian_arm_ack.cpp`). An outstanding wedge, a
   compensation-pending wedge and every ordinary failure keep `resolved_failed > 0`,
   so the generation stays held until a genuine recovery (the recovery drain
   decrements it for an adopted late success) or a fresh successful application
   replaces the Application.
 - **Suppression never touches the runtime.** A Suppress returns before
-  `begin_application()` and before any teardown: no failed receipt is erased, no
+  `begin_*_application()` and before any teardown: no failed receipt is erased, no
   failure telemetry decremented, no application retired, no rule withdrawn, no claim
   or compensation permit released, no failed rule represented as armed - matching
   "Completion ownership and recovery under the hold" and "Three separate transitions,
@@ -1112,7 +1145,9 @@ design is mentioned it is named as the earlier design.
   hold and clears on a genuine recovery (PR-5d's existing mechanism, unchanged). Note
   the claim-scoped #5403/#5404 age and deadline gauges do NOT dip on a forced
   Reapply (they are scoped to the claim/runtime); only `yuzu.guardian_arm_pending` and
-  `yuzu.guardian_arm_failed` are Application-scoped and reset on one.
+  `yuzu.guardian_arm_failed` are Application-scoped and reset on one. Since #5547 a forced
+  Reapply that is a delta no longer resets the entries of the rules it omits (they are carried);
+  a full push resets them.
 - **The drain-time linearization gap is removed, not relocated.** Under the waiver an
   eligibility read taken at the heartbeat drain authorized an acknowledgment, so a
   completion landing between that read and `persist_generation_locked()` (a late
@@ -1183,12 +1218,13 @@ design is mentioned it is named as the earlier design.
   generation forever (intended). A push whose unresolved set mixes a wedge with a
   congestion or ordinary failure forces a Reapply every time. A delta push
   (`full_sync=false`) during a hold flips identity twice and resets the suppression
-  budget. A delta push that OMITS a still-desired unresolved rule replaces the sole
-  application (`GuardianArmAckLedger::begin_application`) and drops that
-  rule's retry obligation, so the fresh application can acknowledge while the omitted
-  wedged claim has no owning application; pre-existing (the old waiver code did the
-  same), dormant, and no current production route emits an omitting delta (see the
-  known-limits list above); follow-up FU-12 in the flip gate (#5547). Recovery needs a
+  budget (and, since #5547, restarts it on every replacement, delta or full). A delta push that OMITS a
+  still-desired unresolved rule no longer drops that rule's retry obligation (#5547):
+  `GuardianArmAckLedger::begin_delta_application` carries the omitted rule's unresolved
+  outcome into the new application, so the generation stays held; this is live at
+  `prefer_spark_=false` for the application-wide latch (see the known-limits list above for
+  what the carry does and does not guarantee, including the same-generation case the
+  server's reconcile does not retry); follow-up FU-12 in the flip gate (#5547). Recovery needs a
   live connection (the maintenance tick runs on the per-connection heartbeat thread).
   Content identity (#5512, closed by the #4415 PR): an identical re-observation now requires
   identical content as well as `rule_id` and spec, so an edit that leaves the watch target the
@@ -1303,7 +1339,7 @@ settled via Astra (codex opine) + Fable (advisor) review, both checked against
    The corrected gate is `!prefer_spark_ || stopped_ || spark_availability_ !=
    Available`, layered on `GuardianArmAckLedger::arm_stats()`'s own `nullopt` when
    there is no current application at all - PR-2's `apply_rules()` calls
-   `begin_application()` unconditionally regardless of `prefer_spark_`, so a legacy
+   `begin_*_application()` unconditionally regardless of `prefer_spark_`, so a legacy
    (non-spark) agent has a live, empty Application on every push - gating on the
    Application's existence alone would make every non-spark agent in the fleet emit
    `arm_pending=0`/`arm_failed=0`, read by a fleet consumer as "spark arming, healthy"

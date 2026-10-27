@@ -18,6 +18,7 @@
                          // rather than re-declared, so the two error-prefix constants stay one copy.
 #include "ca_store.hpp"
 #include "command_capability.hpp" // #3685: CommandCapability / ClassificationError — ClassifyFn's return type
+#include "config_write.hpp" // config::Backing: get/set_runtime_config's backing pointers
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
 // ADR-0031 operator surface (PR1.6c) — MCP twins of the operator
 // mint/list/revoke upload-grant routes. Reuses UploadGrantListAuthorization/
@@ -506,6 +507,11 @@ public:
     /// "unavailable" rather than crashing or silently no-op'ing.
     void set_plugin_config_store(PluginConfigStore* store) { plugin_config_store_ = store; }
 
+    /// Backs get_runtime_config / set_runtime_config, the MCP twins of GET/PUT /api/v1/config
+    /// (api-parity rows get.api-config, put.api-config-param). Same objects the config routes
+    /// hold. Unset (all nullptr, the default) => both tools answer "unavailable".
+    void set_runtime_config_backing(config::Backing backing) { runtime_config_ = backing; }
+
     /// ADR-0031 operator surface (PR1.6c) — upload-grant store + the
     /// ADR-0017 list-admit resolver for list_upload_grants, backing
     /// mint/list/revoke_upload_grant. `list_read_fn` is the SAME shape as
@@ -829,8 +835,8 @@ public:
 
     /// The ONE non-auditing /crypto availability callback (server.cpp builds it once and wires
     /// the SAME function into CryptoRoutes): `list_crypto_widgets`' availability, the R2
-    /// confinement withhold of `get_crypto_ca_stats`' twin answers and of `list_issued_certs`'
-    /// filtered form. It decides what is DRAWN or withheld, never a grant (every data tool keeps
+    /// confinement withhold of `get_crypto_ca_stats`' twin answers and of `list_issued_certs`
+    /// (both the filtered and the unfiltered form). It decides what is DRAWN or withheld, never a grant (every data tool keeps
     /// its own gate). Unset => those paths answer an internal error, never a guessed answer.
     using CryptoAccessFn = std::function<crypto_widgets::Access(
         const httplib::Request&, crypto_widgets::WidgetGate, const std::string& securable_type,
@@ -1289,6 +1295,7 @@ private:
     // use and answers a clean "unavailable" error, matching
     // engine_principal_store_'s contract above.
     PluginConfigStore* plugin_config_store_{nullptr};
+    config::Backing runtime_config_{};
     UploadGrantStore* upload_grant_store_{nullptr};
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.

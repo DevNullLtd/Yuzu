@@ -187,7 +187,7 @@ def run_node(mode, payload):
         driver.write_text(DRIVER, encoding="utf-8")
         proc = subprocess.run([NODE, str(driver), str(GENERATE_JS), mode],
                               input=json.dumps(payload), capture_output=True,
-                              text=True, timeout=60)
+                              text=True, encoding="utf-8", timeout=60)
     if proc.returncode != 0:
         raise AssertionError(f"node driver failed ({proc.returncode}):\n{proc.stderr}")
     return json.loads(proc.stdout)
@@ -367,5 +367,74 @@ class ComposeWizardCerts(unittest.TestCase):
                 self.assertIn(TLS_DIR, out["alerts"][0])
 
 
+# The gateway's sys.config is embedded in the generated compose, where nothing
+# parses it until a container boots. The gateway's own boot decisions are Erlang,
+# and this test must run where there is no Erlang (docs-lint), so the check is
+# split on a golden file per TLS mode (tests/fixtures/compose-wizard/):
+#
+#   * here (node only): the block the wizard emits equals the golden, byte for byte;
+#   * gateway/apps/yuzu_gw/test/yuzu_gw_config_posture_tests.erl (Erlang only, the
+#     gateway CI leg): each golden passes yuzu_gw_app:evaluate_listeners/1 and
+#     evaluate_mgmt_posture/3, so a shape the gateway refuses fails there, not at
+#     `docker compose up`.
+#
+# A wizard change that alters the block fails here until the goldens are
+# regenerated, and the regenerated goldens then face the gateway's checks.
+GOLDEN_DIR = ROOT / "tests" / "fixtures" / "compose-wizard"
+GOLDEN_MODES = ("plaintext", "operator")
+REGENERATE = "python3 tests/test_compose_wizard.py --regenerate-gateway-goldens"
+
+
+def golden_path(tls_mode):
+    return GOLDEN_DIR / f"gateway-sys.config.{tls_mode}"
+
+
+def emitted_gateway_sys_config(tls_mode):
+    """The sys.config block the wizard puts in the compose for a gateway stack:
+    the lines under `gateway-sys-config:` / `content: |`, up to the first line
+    indented less than the block, with the block's indent removed."""
+    cfg = make_config(tls_mode, True, True)
+    cfg["gateway"] = True
+    text = run_node("compose", {"configs": [cfg]})["composes"][0]
+    lines = text.splitlines()
+    start = lines.index("  gateway-sys-config:") + 2
+    block = []
+    for line in lines[start:]:
+        if line.strip() and not line.startswith("      "):
+            break
+        block.append(line[6:])
+    return "\n".join(block).rstrip("\n") + "\n"
+
+
+def regenerate_gateway_goldens():
+    GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
+    for tls_mode in GOLDEN_MODES:
+        golden_path(tls_mode).write_text(emitted_gateway_sys_config(tls_mode),
+                                         encoding="utf-8", newline="\n")
+        print(f"wrote {golden_path(tls_mode).relative_to(ROOT)}")
+
+
+@unittest.skipIf(NODE is None, "node is not installed")
+class ComposeWizardGatewayGoldens(unittest.TestCase):
+    def test_emitted_sys_config_equals_the_golden_files(self):
+        for tls_mode in GOLDEN_MODES:
+            with self.subTest(tls_mode=tls_mode):
+                path = golden_path(tls_mode)
+                self.assertTrue(path.is_file(), f"missing golden {path}; run: {REGENERATE}")
+                golden = path.read_bytes().decode("utf-8")
+                self.assertEqual(
+                    emitted_gateway_sys_config(tls_mode), golden,
+                    f"the gateway sys.config the wizard emits for tlsMode={tls_mode} no "
+                    f"longer equals {path.relative_to(ROOT)}. If the change is intended, "
+                    f"regenerate the goldens with:\n  {REGENERATE}\n"
+                    f"and run the gateway posture tests (they check the goldens against "
+                    f"the gateway's boot decisions).")
+
+
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    if sys.argv[1:] == ["--regenerate-gateway-goldens"]:
+        if NODE is None:
+            raise SystemExit("node is required to regenerate the goldens")
+        regenerate_gateway_goldens()
+    else:
+        unittest.main(verbosity=2)

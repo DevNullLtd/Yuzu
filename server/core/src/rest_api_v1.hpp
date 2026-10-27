@@ -19,6 +19,7 @@
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4: the public in-process VERIFY API seam
 #include "dex_api.hpp"    // ADR-0031 WS-A4: the public in-process DEX signals API seam
+#include "dex_score_policy_writer.hpp" // DexScorePolicyWriteDeps: PUT/DELETE /dex/score-policy
 #include "dex_perf_api.hpp" // ADR-0031 WS-A4: the public in-process DEX app-perf-over-time API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
@@ -820,7 +821,17 @@ public:
         const std::string& target_type, const std::string& target_id, const std::string& detail)>;
     void set_audit_as_session_fn(AuditAsSessionFn fn) { audit_as_session_fn_ = std::move(fn); }
 
+    /// The score policy writer behind GET/PUT/DELETE /api/v1/dex/score-policy: the observed
+    /// store read, the store conditional writes and the provider (`audit` is bound per request
+    /// by the handler). Unset = the three routes answer 503 "runtime config store
+    /// unavailable". MUST be called BEFORE `register_routes()` (captured by value), like
+    /// `set_audit_as_session_fn`, whose session-bound audit writer the write routes require.
+    void set_dex_score_policy_writer(DexScorePolicyWriteDeps deps) {
+        dex_score_policy_writer_ = std::move(deps);
+    }
+
 private:
+    std::optional<DexScorePolicyWriteDeps> dex_score_policy_writer_;
     AuditAsSessionFn audit_as_session_fn_;
     EnginePrincipalStore* engine_principal_store_{nullptr};
     UserExistsFn user_exists_fn_;

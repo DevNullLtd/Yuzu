@@ -258,6 +258,8 @@ agent_test_exe = executable(
     'unit/test_filesystem_read.cpp',
     'unit/test_filesystem_actions.cpp',
     'unit/test_filesystem_local_dispatcher.cpp', # #4728: real filesystem plugin via LocalDispatcher -- `replace` through the shared atomic write
+    'unit/test_filesystem_find_by_hash.cpp',  # #5624: pure find_by_hash walk core (limits, injected clock/cancel/hasher) + real no-follow fd hasher over TempDir
+    'unit/test_filesystem_find_by_hash_dispatcher.cpp',  # #5624: real filesystem plugin via LocalDispatcher -- byte-identical clean output, trailer + CONSTRAINED/PARTIAL
     'unit/test_confined_fs_rules.cpp',
     'unit/test_confined_fs_walk.cpp',
     'unit/test_confined_fs_posix.cpp',
@@ -353,6 +355,7 @@ agent_test_exe = executable(
     'unit/test_launchd_state.cpp',      # A0 fix round: launchd_state_for (yuzu/agent/launchd_state.hpp)
     'unit/test_wmi_bounded.cpp',        # shared bounded WMI helper (roadmap C-8 extraction); header-only, no separate .cpp to list
     'unit/test_wmi_error_token.cpp',    # #4895: shared stage-aware WMI token classifier (agents/shared/wmi_error_token.hpp), portable
+    'unit/test_inventory_status_row.cpp', # shared inventory status-row grammar (agents/shared/inventory_status_row.hpp), portable
     'unit/test_installed_apps_registry_utf8.cpp',
     'unit/test_service_binpath.cpp',
     'unit/test_agent_log_options.cpp', # #4666 PR-2: make_log_handoff_options CLI-flags translator
@@ -408,6 +411,11 @@ agent_test_exe = executable(
     'unit/test_registry_local_dispatcher.cpp', # PR1.7 remediation fix #3: real registry.dll driven
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
+    'unit/test_registry_parsers.cpp',          # registry value encoders, validators and the audit line (pure, every host)
+    'unit/test_registry_plan.cpp',             # apply plan parser and the item/undo/summary row renderers (pure, every host)
+    'unit/test_registry_core.cpp',             # registry write logic over an in-memory fake registry (checked open, fast open, verify, delete_key; every host)
+    'unit/test_registry_write_local_dispatcher.cpp', # real registry.dll writes via LocalDispatcher (Windows branch, elevated); descriptor/version/sentinel pins on every host
+    'unit/test_registry_win_internals.cpp',    # TU-inclusion seam over registry_win.cpp -- Win32Registry on a dangling link and the final_name/root_name calls (Windows-only body, elevated; empty TU elsewhere)
     'unit/test_agent_command_frames.cpp',     # agents/core/src/command_frames.hpp -- the CommandResponse.action stamp on output + final frames (pure, every host)
     'unit/test_wmi_local_dispatcher.cpp',      # gate-1 remediation: real wmi.dll's query/get_instance
                                                 # actions driven end to end via LocalDispatcher, same
@@ -635,6 +643,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/update_source_trust/src'),  # update_source_trust_*.hpp (Wave 10 PR10.1-d)
     include_directories('../agents/plugins/mgmt_posture/src'),  # mgmt_posture_parsers.hpp / _legs.hpp
     include_directories('../agents/plugins/shares/src'),  # shares_parsers.hpp / _legs.hpp / _posix_fs.hpp
+    include_directories('../agents/plugins/registry/src'),  # registry_parsers.hpp / registry_core.hpp (pure layer)
     include_directories('../agents/plugins/remote_access_audit/src'),  # remote_access_audit_*_parsers.hpp / _legs.hpp / _posix_fs.hpp
     include_directories('../agents/plugins/firmware_posture/src'),  # firmware_posture_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/platform_security/src'),  # platform_security_*parsers.hpp / _legs.hpp (pure helpers), Wave 8 PR8.1-a1
@@ -823,6 +832,7 @@ agent_test_exe = executable(
                 update_source_trust_plugin_lib,  # Wave 10 PR10.1-d
                 mgmt_posture_plugin_lib,  # management-plane posture
                 shares_plugin_lib,  # shares
+                registry_plugin_lib,  # test_registry_write_local_dispatcher.cpp loads the real plugin by path
                 remote_access_audit_plugin_lib,  # remote_access_audit
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
                 browser_inventory_plugin_lib,  # Wave 10 P2a
@@ -1279,6 +1289,7 @@ tar_test_exe = executable(
     'unit/test_tar_store.cpp',
     'unit/test_tar_schema_registry.cpp',
     'unit/test_tar_capability_table.cpp',
+    'unit/test_tar_retention_tiers_table.cpp',
     'unit/test_tar_warehouse.cpp',
     'unit/test_tar_aggregator.cpp',
     'unit/test_tar_usage.cpp',
@@ -1299,6 +1310,7 @@ tar_test_exe = executable(
     'unit/test_tar_cursor.cpp',                  # Wave 6: cursor-source seam — lifecycle + persistence, atomic event+cursor commit, record_key dedupe, ack-by-sequence incl. the R-005 overflow regression (on-disk TarDb via unique_temp_path)
     'unit/test_tar_power.cpp',                   # Wave 6 PR6.2-b: pmset parser + exact-tail cursor/gap decisions, REAL-CAPTURE fixtures, RunFn-injected
     'unit/test_tar_removable.cpp',               # Wave 6 PR6.3: event-log channel parsers + identity + per-channel cursors, REAL-CAPTURE fixtures
+    'unit/test_tar_registry_source.cpp',         # PR11.8: registry source -- pure core (diff/dirty table/codecs) + injected-reader lifecycle + [windows] live cases
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
@@ -1331,6 +1343,8 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_power_collector.cpp',
     # Wave 6 PR6.3: the TU exercises the real CursorSource via the factory.
     '../agents/plugins/tar/src/tar_removable_collector.cpp',
+    # PR11.8: test_tar_registry_source.cpp drives the real source over an injected reader.
+    '../agents/plugins/tar/src/tar_registry_source.cpp',
   ) + tar_test_removable_darwin_sources,
   include_directories: [
     include_directories('../agents/plugins/tar/src'),
@@ -1435,6 +1449,7 @@ if build_server
       'unit/server/test_notification_routes.cpp',
       'unit/server/test_command_routes.cpp',
       'unit/server/test_page_routes.cpp',
+      'unit/server/test_swagger_page.cpp',
       'unit/server/test_dialog_module.cpp',
       'unit/server/test_dashboard_api_routes.cpp',
       'unit/server/test_developer_render.cpp', # System > Developer and API: pure renderers
@@ -1463,6 +1478,7 @@ if build_server
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
+      'unit/server/test_config_write.cpp', # config_write.hpp: the transport-free core shared by the config routes and the MCP runtime-config tools
       'unit/server/test_config_routes.cpp', # #2542 PR-12: the 2-route Runtime Configuration API (7.3), extracted onto the HttpRouteSink seam
       'unit/server/test_legacy_diagnostic_routes.cpp', # #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API (diagnostics_routes.cpp), extracted onto the HttpRouteSink seam -- named away from test_diagnostics_*/test_chargen_*/test_procfetch_* to avoid a plugin_doc_gen.py filename collision with the agent plugins of those names
       'unit/server/test_legacy_events_routes.cpp', # #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
@@ -1485,6 +1501,7 @@ if build_server
       'unit/server/test_home_panels_routes.cpp', # HM-2: Dashboard policies + events fragments
       'unit/server/test_leader_elector.cpp',
       'unit/server/test_leader_gate.cpp',
+      'unit/server/test_leader_metrics.cpp', # HA WS-11 (#4014): yuzu_server_leader_* seed + scrape-time publisher
       'unit/server/test_coord_dsn.cpp',
       'unit/server/test_pg_reachability_probe.cpp', # HA WS-8: /readyz pg_reachable rule + probe
       'unit/server/test_multi_host_dsn.cpp', # HA WS-8: multi-host DSN target_session_attrs guard
@@ -1497,6 +1514,8 @@ if build_server
 
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
+      'unit/server/test_approval_manager_bound.cpp', # #6062: origin-declared consume, bound request, excluded roots
+      'unit/server/test_approval_dormant_code_tripwire.cpp', # #6062: lexical tripwire, ADR-1009 accepted dormant code
       'unit/server/test_schedule_engine.cpp',
       'unit/server/test_schedule_routes.cpp',
       'unit/server/test_schedule_runner.cpp',
@@ -1553,6 +1572,7 @@ if build_server
       'unit/server/test_mcp_engine_principal_roles.cpp',
       'unit/server/test_engine_principal_lifecycle.cpp',
       'unit/server/test_engine_store_error_class.cpp',
+      'unit/server/test_engine_no_admin_audit.cpp',
       'unit/server/test_rotation_confirm_state.cpp',
       'unit/server/test_access_review_model.cpp',
       'unit/server/test_access_review_store.cpp',
@@ -1663,6 +1683,10 @@ if build_server
       'unit/server/test_dex_score_policy_json.cpp',
       # bounded-refresh score policy provider over injected read/clock fns - no store, no sleeps, no [pg]
       'unit/server/test_dex_score_policy_provider.cpp',
+      # apply_dex_score_policy over fake read/CAS/audit closures and a real provider - no store, no sleeps, no [pg]
+      'unit/server/test_dex_score_policy_writer.cpp',
+      # GET/PUT/DELETE /api/v1/dex/score-policy route shell through TestRouteSink - no store, no [pg]
+      'unit/server/test_dex_score_policy_routes.cpp',
       'unit/server/test_dex_catalogue.cpp', # ADR-0031 WS-A4 PR-1: the Catalogue View 1 read model + FnDexApi double
       'unit/server/test_dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
       'unit/server/test_schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam (schedule read)
@@ -1817,6 +1841,7 @@ if build_server
       'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_settings_model.cpp',        # #4028 — pure Settings read-twin builder unit tests
       'unit/server/test_settings_read_twins.cpp',   # #4028 — REST v1 read-twin route coverage
+      'unit/server/test_tar_retention_tiers.cpp',   # TAR retention tier TSV parser + depth arithmetic (pure)
       'unit/server/test_settings_page_ui.cpp',      # pure-string pins: 21 panels + static h1 on the /settings page
       'unit/server/test_settings_general.cpp',      # System General page: runtime/events renderers, routes, page pins
       'unit/server/test_plugin_signing_helpers.cpp',
@@ -1939,6 +1964,13 @@ if build_server
       # yuzu_proto_headers_dep - a DOWNWARD edge for both server and agent, no cycle, no
       # new build-graph node. NOT sdk/, which is the public plugin ABI surface.
       include_directories('../agents/core/src'),
+      # test_plugin_result_audit.cpp includes registry_parsers.hpp, whose OS-free includes (user_profile_model.hpp,
+      # wire_utf8.hpp) live in agents/shared. WHY it is on the whole executable: include_directories is per target,
+      # not per source, so every TU of this executable now sees agents/shared too. The risk is real and silent: a
+      # header of the same name in two include dirs is resolved by include-directory order, never a compile error. So a
+      # new agents/shared header needs a name no server test header or other include dir of this executable uses
+      # (none collide today).
+      include_directories('../agents/shared'),
     ],
     # httplib.h is header-only and its Client/Server class layout depends on
     # CPPHTTPLIB_OPENSSL_SUPPORT — yuzu_server_core compiles every TU with
@@ -2857,7 +2889,7 @@ if build_server
   # skipped" from exit 4 to exit 0. A shard that matches NO case at all still
   # fails check-pg-shard-partition.py loudly. Four more shards in this change
   # (M, N, O here and P below; P has since merged into M) added four more process startups per full
-  # run and, at Linux's --num-processes 2, a longer worst-case round count
+  # run and, at Linux's then-current --num-processes 2, a longer worst-case round count
   # (see the 2026-10-11 paragraph in docs/ci-architecture.md).
   #
   # MERGED 2026-10-11 (maintainer limit: at most 14 pg shards): shard P (see
@@ -3186,6 +3218,15 @@ test('ensure-erlang strict-mode callers',
   timeout: 180,
 )
 
+# docs/ build inputs of Meson targets are re-included in /.dockerignore (the image
+# builds `COPY . .` with docs/ otherwise excluded).
+test('docker context re-includes embedded docs inputs',
+  _python3_test,
+  args: [files('test_docker_context_embeds_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Every script target uses yuzu_python (no ad-hoc find_program for python).
 test('meson python lookup is yuzu_python',
   _python3_test,
@@ -3258,6 +3299,16 @@ test('agent installer enrollment-token lint',
 test('compose certs volume',
   _python3_test,
   args: [files('test_compose_certs_volume.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Gateway scrape (#5695): every Prometheus config under deploy/prometheus/ and
+# every compose stack that runs a Prometheus next to a gateway scrapes the
+# gateway's metrics port. Stdlib only, no Docker.
+test('gateway prometheus scrape',
+  _python3_test,
+  args: [files('test_gateway_prometheus_scrape.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -3464,6 +3515,16 @@ test('runtimes definition columns',
   timeout: 30,
 )
 
+# filesystem.find_by_hash's definition (content/definitions/filesystem.yaml): version 0.4.0, the
+# three declared columns and the row_kind values the declared-column result matcher binds to
+# (#5624); the C++ matcher test keeps a copy of the schema, this pins it to the shipped definition.
+test('filesystem definition columns',
+  _python3_test,
+  args: [files('test_filesystem_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # browser_policy's definition-column contract (content/definitions/browser_policy.yaml):
 # row_kind first and the column order match the wire row browser_policy_parsers.hpp emits;
 # parses the YAML directly -- catches a reordered or renamed column the C++ test's
@@ -3503,6 +3564,14 @@ test('mgmt_posture definition columns',
 test('shares definition columns',
   _python3_test,
   args: [files('test_shares_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# registry's definition contract (content/definitions/registry.yaml): ids, types, result columns, role gates.
+test('registry definition columns',
+  _python3_test,
+  args: [files('test_registry_definition.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -3600,6 +3669,19 @@ test('gateway wrapper guard selftest',
   args: [files('test_gateway_test_summary.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Pins the gateway eunit shard partition (scripts/gateway_eunit_shards.py):
+# the root meson.build `gateway eunit shard <X>` tests together run every
+# top-level apps/yuzu_gw/test module exactly once (what the old whole-suite
+# `--dir` run did), a new module lands in one shard, and the meson shard
+# table, scripts/ci/assert-gateway-tests.py and the wrapper's `--shard`
+# handling agree. Hermetic (a fake rebar3; no Erlang), so every leg runs it.
+test('gateway eunit partition selftest',
+  _python3_test,
+  args: [files('test_gateway_eunit_shards.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # #4853: pins the run-private epmd (scripts/gateway_epmd.py) the gateway test
@@ -3877,6 +3959,16 @@ test('alert runbook anchors resolve',
   timeout: 30,
 )
 
+# HA WS-11 (#4014): the leader-election alerts, their promtool cases and the metrics reference may
+# name only series leader_metrics.hpp really exports (promtool cannot know the exporter), and the
+# reference must document every exported name and cause label. Source-text only, so Python.
+test('leader alert metric names match the exporter',
+  _python3_test,
+  args: [files('test_leader_alert_metric_names.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Access reviews: pins the production wiring in server.cpp (the loud perm_fn gate, the scratch-response
 # Attest probe, the fail-closed store reads, the grant-table read). Source-text only, so Python.
 test('access reviews production wiring lexical gate',
@@ -3926,6 +4018,37 @@ test('gateway-upstream guard registration lexical gate',
   args: [files('test_gateway_peer_registration_lexical.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Static lexical gate: every raw-string segment of the OpenAPI document literal in
+# rest_api_v1.cpp stays under 15,000 bytes (MSVC C2026 rejects a string token over 16,380; the
+# Linux and macOS compilers do not, so only the Windows leg would notice). Carries its own
+# in-memory self-test. No build required. Suite 'docs' for the same reason as the gates above.
+test('OpenAPI literal segment size lexical gate',
+  _python3_test,
+  args: [files('test_openapi_literal_segments.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Lexical gate: the OpenAPI x-yuzu-unavailable markers agree with the stores server.cpp passes to
+# register_routes (a store passed as nullptr <=> its group is marked). Carries its own in-memory
+# mutation self-test. No build required.
+test('OpenAPI unavailable markers match store wiring lexical gate',
+  _python3_test,
+  args: [files('test_unavailable_store_wiring.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The /swagger page's renderer, run under node against a fake DOM and a queued fetch: panels and rows,
+# the typed / untyped / unavailable pills, guides built on demand, oneOf tables, hostile spec text kept as
+# text, a malformed URL fragment, the v2 curl path and the failure view with Retry. Skips (77) without node.
+test('swagger page behaviour',
+  _python3_test,
+  args: [files('test_swagger_page_behaviour.py')],
+  suite: ['server', 'docs'],
+  timeout: 60,
 )
 
 # #6016: static lexical gate pinning that only default_certs.cpp mints the server identity URI
@@ -4206,6 +4329,16 @@ test('tier policy wiring lexical gate (#5047)',
 test('guardian/spark log-injection tripwire (#4665)',
   _python3_test,
   args: [files('test_guardian_spark_log_injection_tripwire.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #6086: the DEX score policy has ONE store writer. A write of the key anywhere but
+# dex_api.cpp would skip apply_dex_score_policy's If-Match precondition, audit-first rows and
+# the provider's commit-then-install order. Lexical; the script's docstring states its limits.
+test('dex score-policy single-writer tripwire (#6086)',
+  _python3_test,
+  args: [files('test_dex_score_policy_key_writer_tripwire.py')],
   suite: 'docs',
   timeout: 30,
 )

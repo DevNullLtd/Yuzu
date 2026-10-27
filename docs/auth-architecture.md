@@ -647,7 +647,7 @@ Full design: `docs/auth-mfa-design.md`. Summary:
   unlock, Guardian rule write / push / policy-generation raise and guard update / delete,
   software-package write, software-deploy start, approval approve and reject
   (`POST /api/approvals/{id}/approve|reject`), MFA recovery-code
-  regeneration and MFA disable, JIT elevation). 36 are enforced by the
+  regeneration and MFA disable, JIT elevation). 37 are enforced by the
   central chokepoint described under "MFA step-up chokepoint" below; the
   three JIT-elevation routes apply their own stricter gate in the handler.
   Other mutating routes and all MCP tools are not MFA-step-up gated in
@@ -685,7 +685,7 @@ by each handler.
 - **One table.** `step_up_policy.hpp`'s `kStepUpPolicy` classifies every
   mutating (`POST`/`PUT`/`PATCH`/`DELETE`) route by its exact `(method,
   registered pattern)`; there are no prefixes or wildcards. The classes are
-  `kRequired` (a fresh proof is needed; today's 36 enforced routes, 34 of
+  `kRequired` (a fresh proof is needed; today's 37 enforced routes, 34 of
   them with the audit labels they always had), `kOwnGate` (the three JIT-elevation routes,
   whose handler applies a stricter gate that the chokepoint leaves alone),
   `kExempt` (a recorded reason: pre-session, self-service, read-shaped,
@@ -693,7 +693,7 @@ by each handler.
   class (`kPendingRuling`) for routes whose classification is still being
   decided, which the chokepoint treats as exempt: 73 REST rows today, a count
   pinned in a `static_assert` (`kPendingRulingMax`) that can only shrink. The
-  table has 232 REST rows: 36 `kRequired`, 3 `kOwnGate`, 120 `kExempt` and 73
+  table has 235 REST rows: 37 `kRequired`, 3 `kOwnGate`, 122 `kExempt` and 73
   `kPendingRuling`.
 - **Where it runs.** In `run_pre_request_stage` (`step_up_wiring.hpp`), the
   body of the pre-request handler `server.cpp` installs: after the route
@@ -740,7 +740,7 @@ by each handler.
   `--mfa-step-up-window-secs 0` (or less) disables the stale-proof requirement on
   `kRequired` rows, but neither the engine denial nor the null-store check
   below. The escape hatch precedes the SAML denial and the store read in
-  `decide_step_up`, so at a window of 0 or less SAML sessions pass all 36
+  `decide_step_up`, so at a window of 0 or less SAML sessions pass all 37
   routes and the authentication store is not read; no stale proof is refused
   (so none is recorded), while engine denials and unwired-store refusals are
   still recorded. The elevation routes use the global window when it is positive
@@ -818,7 +818,7 @@ by each handler.
   calls may be deleted once handlers consume the centrally resolved session or the
   repeated resolves are removed (#6200); the binding stays until then. Until then
   the in-handler calls remain
-  as defence in depth (38 distinct labels: one per `kRequired` row, 36, plus
+  as defence in depth (39 distinct labels: one per `kRequired` row, 37, plus
   the two the elevation path uses).
 - **Audit.** Refusals written by the chokepoint go through
   `AuthRoutes::audit_log`, so the actor is the resolved session. Every row is
@@ -868,19 +868,19 @@ by each handler.
   server's route table is sealed: a later mutating registration through the
   route sink that has no row is not registered, is logged as critical and
   makes the sink throw. Adding a mutating route therefore means adding a row.
-- **Scope.** A fresh MFA proof is required on 36 named high-risk routes (plus
+- **Scope.** A fresh MFA proof is required on 37 named high-risk routes (plus
   the three JIT-elevation routes, whose handlers apply their own gate) for
   MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`;
   un-enrolled accounts and API/MCP tokens pass; engine principals are denied.
-  "High-risk" names these 36 routes; it is not a completeness claim. Other
+  "High-risk" names these 37 routes; it is not a completeness claim. Other
   mutating routes and all MCP tools are not MFA-step-up gated in this release:
   73 REST rows are still `kPendingRuling` (among them CA revoke and
   issue-code-signing, and `PUT /api/config/*`), and MCP is governed by the MCP tier
   and approval ladder (`docs/mcp-server.md`). The MCP tools are classified in
-  a second table, `step_up_mcp_policy.hpp` (64 rows: 19 `kExempt`, 45
+  a second table, `step_up_mcp_policy.hpp` (65 rows: 19 `kExempt`, 46
   `kPendingRuling`, none `kRequired`), which is data only and changes no MCP
   behaviour. The pending rows are a frozen baseline of 44 whose count only goes down,
-  plus a separate list of tools added after it (today one), legal only for a tool
+  plus a separate list of tools added after it (today two), legal only for a tool
   whose REST twin is `kRequired`, which a compile-time check ties to the REST
   table. Every pending tool with a `kRequired` twin is pending because no MCP
   consumer enforces `kRequired` yet. PR 2 promotes pending rows; an MCP `kRequired` row will need a
@@ -1198,12 +1198,14 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   by `AuthManager::reap_expired_elevation` at the `AuthRoutes::resolve_session`
   cookie chokepoint, on the FIRST authenticated request the operator makes
   *after* the window has lapsed. `elevated_until` is cleared to the sentinel on
-  that first observing call, so emission is exactly-once — a request that finds
+  that first observing call, so on a single server replica emission is exact (the
+  clear is rechecked under the exclusive session lock); with several replicas a rare
+  duplicate is possible (effectively-once, ADR-2002). A request that finds
   the sentinel already cleared (a prior reap, or a manual
   `revoke_elevation`/`revoke_user_elevations`, which clear to the same
   sentinel) emits nothing, so a manual step-down never ALSO produces a spurious
-  `expired` row. **The `role.elevation.expired` emission is itself best-effort
-  / at-most-once** (governance hardening round, UP-3): `elevated_until` is
+  `expired` row. **The `role.elevation.expired` emission is itself best-effort:
+  it is never retried, so it can be lost** (governance hardening round, UP-3). `elevated_until` is
   cleared to the sentinel BEFORE the audit call, so a store failure loses only
   the confirmatory `expired` row, never the reap itself (the session still
   correctly reverts to base role) — and the window's end remains
@@ -1939,7 +1941,7 @@ deploy, approval approve/reject, user delete/role change, MFA recovery-code rege
 JIT elevation)
 receives a `403` with `"MFA step-up is not available for SAML sessions in this
 release"`, regardless of `--mfa-enforcement` mode (the one exception is a disabled window: with
-`--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 36 routes enforced by the
+`--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 37 routes enforced by the
 central check, but not the three JIT-elevation routes, which own their gate and substitute a
 300 s window, so those still deny SAML). The step-up decision
 (`decide_step_up` in `step_up_gate.cpp`, shared by the chokepoint and
@@ -3628,7 +3630,7 @@ header, so these names stay rejected on client ingress permanently.
 ## API tokens and automation
 
 - **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens (see `docs/mcp-server.md`) use the same table with mandatory expiration (max 90 days).
-- **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; the global `admin` role is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
+- **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; an effective `admin` role (the global `admin` role, or a session holding a JIT admin elevation) is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
 
 ### Device tokens (`DeviceTokenStore`, ADR-0052, capability 18.8) — currently dormant, docs/user-manual/rest-api.md "Device Tokens"
 
@@ -3695,7 +3697,7 @@ This migration also closed a **second, load-bearing gap it exposed**: `Enrollmen
 
 **`GET /api/v1/upload-grants` refuses a service-scoped token (found while working #3526).** That route's only gate was `list_read_fn(session->username)`, which evaluates the MINTER's username, so a service-scoped token inherited its minter's `UploadGrant:Read` view (every grant, for a minter holding a global grant); it is not a `require_fleet_read` route. `file_retrieval_routes.cpp`'s `register_list` now refuses a service-scoped session with `403` before the store or the list-admit resolver is touched, through the shared `deny_service_scoped_session` closure (audit `upload_grant.list.access_denied`; no `.permission`, because no grant would admit the caller; `register_file_retrieval_routes` throws `std::invalid_argument` at registration if the closure is unbound, and a bound closure that writes no response still gets the route's generic `403`). It matches the MCP twin `list_upload_grants`. Coverage: `tests/unit/server/test_upload_grants_service_scope.cpp`. This is an explicit service-scope deny on one `authorize_list_read` caller, shaped like the ADR-1006 §3e explicit denies (although this route did have a gate: it evaluated the minter's username, so the service token inherited the minter's view). It is not the §3d supersede-to-intersect migration, which stays deferred for the `authorize_list_read` callers, this one included (see `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`).
 
-**`GET /api/v1/upload-grants` applies the engine default-deny gate, and the username-keyed visibility resolvers are engine-aware.** An engine principal's only authority is an explicit RBAC grant, so the legacy-open fallback (RBAC off) must never apply to it. `register_list` clears `require_permission(UploadGrant, Read)` for an engine session before the list resolver runs (`403` RBAC off or no grant, `503` store unavailable, `403` when `perm_fn` is unwired), matching the MCP twin. The shared resolvers carry the same rule so a route that reaches one without a gate in front inherits it: `authz::compose_exec_visible` (`ExecVisibleFacts::principal_is_engine`) returns deny-all, and `RbacStore::authorize_list_read`, `ManagementGroupStore::get_visible_agents`, `schedule_arming_permitted`, and the resolvers in `engine_aware_visibility.hpp` (`dispatch_permission`, `response_agent_in_scope`, `visible_agents_json`, `infrastructure_visible_set`, `response_visible_set`, bound by `server.cpp`, plus the exec-visible derivations) refuse or return no agents. The engine test for a username is structural: `authz::is_engine_principal_name` (the reserved `engine:` prefix, which no human account can hold); a new username-keyed resolver must take the same fact. The sweep for remaining resolvers was by `rbac_enforcement_in_effect`, `authorize_list_read` and `get_visible_agents` call sites, not an exhaustive proof. Coverage: the resolver bodies for `dispatch_has_permission`, `response_agent_in_scope`, `get_visible_agents_json`, `visible_set_fn` and `response_visible_set_fn` live in `engine_aware_visibility.hpp` (free functions over the stores, bound into the route seams by `server.cpp`) and are tested behaviourally against real stores in `test_engine_aware_visibility.cpp`: with RBAC off each case compares an engine with a human under the same facts, and with RBAC on the cases pin the grant-versus-no-grant behaviour. The pure composer, `authorize_list_read`, `get_visible_agents` and `schedule_arming_permitted` have behavioural tests (`test_authz_model.cpp`, `test_management_group_store.cpp`, `test_operator_surface_twins.cpp`). Those cases also cover an absent RBAC store (no resolver returns the whole fleet: the permission resolvers deny, and a group member sees at most their group's agents) and pin the two store refusals that keep an engine from ever holding a confined view (scoped role assignment and group membership). Each resolver makes one enforcement read of its own, so its own admission branch uses one snapshot (`ManagementGroupStore::get_visible_agents` keeps its own RBAC probe, so for a human the two reads can still differ across a toggle, as before; an engine stays empty on both because that method refuses the `engine:` prefix when RBAC is off); `test_store_wiring_order.cpp` pins that read count per function in the header (counting `rbac_enforcement_in_effect`, `rbac_enforcement_label` and `is_rbac_enabled`, so a read through another helper would not be seen), because a timing test could not fail on the defect. `server.cpp` itself, which is not unit-constructible, is pinned by a source-presence test in the same file that matches each seam as a whole (the enclosing member or lambda, then its single delegation with the rbac and management-group stores in order); the same file counts the places each seam is handed on (the two route registrations that take `visible_set_fn`, the two dispatch lambdas that take `dispatch_has_permission`, and the response-visible-set seam through its own case); that catches a dropped or re-inlined binding, a wrong or swapped store, and a delegation in dead code, but not a delegation wrapped in a block comment or `#if 0`, and not a route rebound to a different resolver that keeps the same use-site count. With enforcement on and no management-group store, a caller without a global grant gets deny or empty (a global grant still sees the fleet). Not covered: a fresh run of the header under MSVC outside CI.
+**`GET /api/v1/upload-grants` applies the engine default-deny gate, and the username-keyed visibility resolvers are engine-aware.** An engine principal's only authority is an explicit RBAC grant, so the legacy-open fallback (RBAC off) must never apply to it. `register_list` clears `require_permission(UploadGrant, Read)` for an engine session before the list resolver runs (`403` RBAC off or no grant, including a stale cached-disabled view (this plain `require_permission` gate is deny-on-degrade, #6437), `503` store unavailable, `403` when `perm_fn` is unwired), matching the MCP twin. The shared resolvers carry the same rule so a route that reaches one without a gate in front inherits it: `authz::compose_exec_visible` (`ExecVisibleFacts::principal_is_engine`) returns deny-all, and `RbacStore::authorize_list_read`, `ManagementGroupStore::get_visible_agents`, `schedule_arming_permitted`, and the resolvers in `engine_aware_visibility.hpp` (`dispatch_permission`, `response_agent_in_scope`, `visible_agents_json`, `infrastructure_visible_set`, `response_visible_set`, bound by `server.cpp`, plus the exec-visible derivations) refuse or return no agents. The engine test for a username is structural: `authz::is_engine_principal_name` (the reserved `engine:` prefix, which no human account can hold); a new username-keyed resolver must take the same fact. The sweep for remaining resolvers was by `rbac_enforcement_in_effect`, `authorize_list_read` and `get_visible_agents` call sites, not an exhaustive proof. Coverage: the resolver bodies for `dispatch_has_permission`, `response_agent_in_scope`, `get_visible_agents_json`, `visible_set_fn` and `response_visible_set_fn` live in `engine_aware_visibility.hpp` (free functions over the stores, bound into the route seams by `server.cpp`) and are tested behaviourally against real stores in `test_engine_aware_visibility.cpp`: with RBAC off each case compares an engine with a human under the same facts, and with RBAC on the cases pin the grant-versus-no-grant behaviour. The pure composer, `authorize_list_read`, `get_visible_agents` and `schedule_arming_permitted` have behavioural tests (`test_authz_model.cpp`, `test_management_group_store.cpp`, `test_operator_surface_twins.cpp`). Those cases also cover an absent RBAC store (no resolver returns the whole fleet: the permission resolvers deny, and a group member sees at most their group's agents) and pin the two store refusals that keep an engine from ever holding a confined view (scoped role assignment and group membership). Each resolver makes one enforcement read of its own, so its own admission branch uses one snapshot (`ManagementGroupStore::get_visible_agents` keeps its own RBAC probe, so for a human the two reads can still differ across a toggle, as before; an engine stays empty on both because that method refuses the `engine:` prefix when RBAC is off); `test_store_wiring_order.cpp` pins that read count per function in the header (counting `rbac_enforcement_in_effect`, `rbac_enforcement_label` and `is_rbac_enabled`, so a read through another helper would not be seen), because a timing test could not fail on the defect. `server.cpp` itself, which is not unit-constructible, is pinned by a source-presence test in the same file that matches each seam as a whole (the enclosing member or lambda, then its single delegation with the rbac and management-group stores in order); the same file counts the places each seam is handed on (the two route registrations that take `visible_set_fn`, the two dispatch lambdas that take `dispatch_has_permission`, and the response-visible-set seam through its own case); that catches a dropped or re-inlined binding, a wrong or swapped store, and a delegation in dead code, but not a delegation wrapped in a block comment or `#if 0`, and not a route rebound to a different resolver that keeps the same use-site count. With enforcement on and no management-group store, a caller without a global grant gets deny or empty (a global grant still sees the fleet). Not covered: a fresh run of the header under MSVC outside CI.
 
 **Consequences accepted for v1 (recorded, not oversights):** fleet-wide aggregates with no per-agent identity (e.g. `get_dex_perf_fleet`, `get_network_fleet`) stay `denied` at C8 — a `confined` label with no real downstream mechanism would be an unenforced claim; re-admission is a Phase 2 `kServiceScopeGlobalSafe` entry with security-guardian sign-off, not an inferred-safe classification during a routine change. Service-tag writes (whoever sets an agent's `service` tag moves scope) are hardened as of #3289 — a service-scoped session is denied, value-blind, before writing/deleting the `service` key at every REST/legacy-dashboard/MCP tag-mutation site, and the agent's own gRPC `Register` sync path no longer accepts an agent-claimed `service` value at all; plain `Tag:Write`/`Tag:Delete` remains sufficient for non-service-scoped (already fleet-scoped) holders. A related but distinct gap — a live agent's in-memory self-reported tags shadowing the store during scope-DSL evaluation — was tracked separately as #3295 and is now closed: `evaluate_scope`'s `tag:<key>` resolver is store-first (a TagStore row of any source wins over a connected agent's live claim; the session value answers only when the store has no row at all), and `register_agent` drops an agent-claimed `service` key from the session at ingest. No cached derived confinement sets. Dispatch's supersede→intersect migration (§3d, four `authorize_list_read` callers) is deferred, not part of this PR. **Bootstrap note:** an empty-cohort service token cannot bootstrap its own scope via any route — and since #3289, neither can an agent via its own Register sync; onboarding a brand-new service still needs an interactive/unscoped path; see `docs/user-manual/authentication.md`.
 
@@ -3779,8 +3781,10 @@ resulting latency bounds.
   authoring surface that makes `RbacStore::assign_role(principal_type="engine")`
   reachable in production — see `docs/user-manual/rest-api.md` "Engine
   Principals" for the full contract. Mutations require admin + MFA step-up;
-  admin/built-in/wildcard role targets are rejected as `4xx`, never silently
-  narrowed or a `500` (design §4.2 "no admin, ever").
+  the `admin`/`Administrator` roles and every built-in role are rejected as `4xx`,
+  never silently narrowed or a `500` (design §4.2 "no admin, ever"). A custom role
+  whose grants cover everything is not rejected at assignment; the no-admin audit
+  route reports it afterwards.
 - Authorization model: scoped role assignments `(principal, role, scope)`
   for **all** principal classes, evaluated permissions ∩ scope through
   ADR-0017's `authorize_list_read` chokepoint for list/fan-out reads and
@@ -3934,15 +3938,18 @@ walkthrough.
   behind a one-time secret-reveal panel, revoked rows showing `superseded_by` +
   revoke detail).
 - **REST gating:** every *mutating* route is human-admin + MFA-step-up gated;
-  the three read routes are human-admin + RBAC gated but not step-up gated —
-  list and get on `EnginePrincipal:Read` (moved off the over-broad
+  the read routes are human-admin + RBAC gated but not step-up gated: list,
+  get and the roles list on `EnginePrincipal:Read` (moved off the over-broad
   `Security:Read` by #2376, see "The authorization topology floor" above), and
   `audit/no-admin` on `AuditLog:Read` (floored under RBAC-off by #5771, so
-  the auditor route is admin-only on a default install). Every route —
-  reads included — structurally denies a caller whose own session is
+  the auditor route is admin-only on a default install). Every route, reads
+  included, structurally denies a caller whose own session is
   engine-classed (`principal_kind="engine"` / `auth_source="engine_token"`, the
-  §9 belt): an engine principal can never read or mutate its own or another
-  engine principal's lifecycle surface.
+  §9 belt), with one exception: `GET /engine-principals/{id}/roles` (list)
+  relies on `EnginePrincipal:Read` alone, and the role assign and unassign
+  routes are refused at the central step-up check. Apart from that list, an
+  engine principal can never read or mutate its own or another engine
+  principal's lifecycle surface.
 - **MCP gating:** the 6 mutating tools all gate on `Security:Write`
   (`mint_engine_credential`/`rotate_engine_credential` included — aligned with
   their REST twins, not `Security:Execute`), require the `supervised` tier,
@@ -4016,12 +4023,17 @@ walkthrough.
   capability. Design record: `docs/security-reviews/human-token-rotation-2026-08-10.md`
   "Open risks" (#2961, marked resolved).
 - **No-admin auditor** — `GET /api/v1/engine-principals/audit/no-admin` /
-  MCP `audit_engine_no_admin` — independently resolves every engine
-  principal's actual roles + effective permissions against the live RBAC
-  reference tables and reports any violation (literal admin/system-role
-  grant, or a full securable × operation wildcard grant). Fails closed
-  (`503`, "cannot verify") rather than reporting a false `ok:true` if RBAC
-  reference data can't be resolved.
+  MCP `audit_engine_no_admin`: one shared implementation
+  (`engine_no_admin_audit.hpp`) over CHECKED reads of the grant table, the roles
+  and the role permissions. It is the DETECTIVE control for a wildcard custom
+  role, which assignment deliberately permits (maintainer ruling 2026-10-23,
+  #2485). It reports a detected `admin_role`, `system_role` or `wildcard_grant`
+  (a role, or the union of a principal's roles, allowing every securable ×
+  operation pair of the grid at run time; a role granting all but one pair is
+  not reported). Point-in-time and pull-only: no schedule, no alert. Fails
+  closed (`503` / retryable MCP error, a `failure` audit row, no `success` row,
+  no partial list) when any read cannot be answered, so a degraded read never
+  reads as `ok:true`.
 - **Audit-persist posture (#2466/#2406 + #3937, ADR-1005 "mutations fail closed
   on audit failure"):** every *mutating* engine-principal REST route fails closed
   — `503` + `Sec-Audit-Failed: true` — if its audit row cannot persist, so a
@@ -4183,8 +4195,7 @@ this section does not restate them.
   token stays a 30-day token measured from its own original grant) — never
   recomputed as `now + 90d`, which would silently extend authorization
   lifetime through what should be a lateral credential swap. The store-level
-  API retains an internal `successor_expires_at` override parameter (reused
-  by the engine arm's own successor-TTL logic), but the REST route
+  API retains an internal `successor_expires_at` override parameter, but the REST route
   deliberately does not expose it — a senior-architecture ruling, recorded
   in the security review, that rotation must read as lifetime-neutral in
   CC6.3 evidence with no caller-controlled escape hatch. A caller that
@@ -4406,7 +4417,7 @@ CIDR containment in `cidr_match.{hpp,cpp}`.
 
 **Gateway origin-IP attribution (#1064).** On the gateway `ProxyRegister` path
 the server's transport peer is the *gateway's* IP, so audit rows would
-mis-attribute the source (SOC 2 IR-2). `RegisterRequest.gateway_observed_peer`
+mis-attribute the source (SOC 2 CC7.2). `RegisterRequest.gateway_observed_peer`
 (an optional, gateway-authoritative, transport-agnostic field — carried in the
 message, not in transport metadata) carries the agent's origin IP; the server records
 `source_ip`=agent origin and `gateway_ip`=transport peer, falling back to the
@@ -4414,11 +4425,22 @@ gateway IP (`origin_observed=false`) when absent. The *direct* Register path
 ignores the field, so a *direct* agent cannot forge a source IP. It is **not** a
 defence against a compromised gateway (which is inside the trust boundary and
 can set any value) — both `source_ip` and the gateway's `gateway_ip` are
-recorded so an auditor can cross-check. **Server-side consumption ships now; the
-gateway-side population is a follow-up** — today's grpcbox transport can only
-source it from `x-forwarded-for` (proxied deployments); grpcbox does not yet
-expose the transport peer to the gateway's handlers, and the vendored accessor
-that will is #1172.
+recorded so an auditor can cross-check. **The gateway sets the field itself and
+discards whatever the agent sent** (`yuzu_gw_agent_service:register/2`): the value
+is the call's origin address as the gateway's own gRPC layer decides it — the
+transport peer by default, or the address a trusted proxy vouched for when the
+listener is configured with an `origin` mode (`proxy_protocol` or `forwarded_for`,
+judged by who connected, never by whether the claim matches; a claim from a peer
+that is not a configured proxy is ignored, and attributed to its TCP peer) — as a
+bare IP text. Empty means no observation: on a listener configured as proxied, a
+trusted proxy that gave no usable address (a PROXY `LOCAL`, a missing or unusable
+`x-forwarded-for`) is sent as empty rather than attributed to the proxy itself, and the
+server then records `source_ip`=the gateway node with `origin_observed=false`. A
+listener left in `transport` mode behind a proxy that was never configured records the
+proxy's address and nothing flags it. The server cannot tell a gateway that overwrites
+the field from an older one that forwards the agent's value, so all gateways must be
+upgraded before `source_ip` is relied on. See `docs/user-manual/gateway.md`,
+"Client addresses behind a proxy".
 
 ## HTTPS and bind defaults (hard invariants)
 
@@ -4471,8 +4493,9 @@ issued leaf's `CN` *is* the `agent_id` the server already checks.
 Issuance happens on **both** the direct `Register` and the gateway-proxied
 `ProxyRegister` paths (PKI PR5d — both share one `sign_agent_csr` chokepoint); see
 `docs/pki-architecture.md` "Per-agent enrollment through the gateway" for the
-gateway specifics (the agent↔gateway hop is one-way TLS in M1, so through-gateway
-identity stays the app-layer `gateway_observed_peer` until gateway mTLS lands).
+gateway specifics (the agent↔gateway hop is one-way TLS in M1, so through the gateway the
+agent's address is attributed by the app-layer `gateway_observed_peer` — attribution, not
+authentication — until gateway mTLS lands).
 
 **Bootstrap (chicken-and-egg) — resolved on one port.** The agent has no client
 cert on first boot, but the data plane requires one. Resolution:
@@ -4636,8 +4659,9 @@ direct-connect-authoritative caveat called out in `docs/pki-architecture.md`
 **Gateway CSR-swap forgery (R-5, accepted M1 residual).** Wiring `ProxyRegister`
 to sign forwarded CSRs makes the gateway a bounded **confused deputy**. The
 server signs the relayed CSR's public key under the **gateway-supplied**
-`agent_id` (the through-gateway identity is the app-layer `gateway_observed_peer`,
-not a transport-cryptographic binding in M1), so a compromised or on-path gateway
+`agent_id` (through the gateway the `agent_id` is a gateway-supplied message field and the
+agent's address is the app-layer `gateway_observed_peer`: attribution, not authentication,
+and not a transport-cryptographic binding in M1), so a compromised or on-path gateway
 can relay a *victim's* `agent_id` paired with its *own* CSR and obtain a real
 CA-signed leaf for that `agent_id`. Worse than a transient relay: that leaf is a
 durable credential the attacker can present for **persistent direct mTLS

@@ -222,6 +222,10 @@ inline constexpr TwinRow kExpectedTwins[] = {
     {"get_crypto_dashboard_layout", "Infrastructure", "Read", true},
     {"set_crypto_dashboard_layout", "Infrastructure", "Write", false},
     {"get_crypto_ca_stats", "Inventory", "Read", true},
+    // Runtime configuration: GET/PUT /api/v1/config gate on Infrastructure Read/Write, as the legacy
+    // /api/config routes do. The per-key administrator-only refusal is config::write_refusal's.
+    {"get_runtime_config", "Infrastructure", "Read", true},
+    {"set_runtime_config", "Infrastructure", "Write", false},
     // get_me, the twin of GET /api/v1/me (ledger row get.api-me). The REST route has no
     // permission gate (auth_fn only), so this row pins the MCP side alone:
     // Infrastructure:Read drives MCP tier classification only, with no RBAC check behind it

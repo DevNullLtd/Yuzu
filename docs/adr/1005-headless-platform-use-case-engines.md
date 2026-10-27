@@ -534,7 +534,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      unchanged).** The list/record/per-device routes are REST-only, no MCP twin, and absent from
      route discovery only in the sense that no `get_hardware_ci`/
      `list_hardware`/equivalent MCP tool exists yet — the REST routes
-     themselves ARE in `openapi_spec()` and `GET /api/v1/routes` (A2/A3
+     themselves ARE in `openapi_spec()` and `GET /api/v1/discover/routes` (A2/A3
      hold for the REST half). A "no" on Decision 1/4's both-surfaces
      requirement for the MCP half.
      - **No MCP twin — tracked follow-up, not a permanent exception.** An
@@ -891,9 +891,65 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `get.fragments-devices-list` recorded the same pair as `twinned`; it moves
      to the same exception so the ledger holds one answer for the pair
      (untwinned 214 to 215). The pins are `(4041, "2027-01-31")` for both rows in
-     `STRICT_EXCEPTION_PINS`; like the 2026-10-22 entry this is a session
+     `STRICT_EXCEPTION_PINS`; like the 2026-10-22 API-parity ledger reconcile entry this is a session
      statement by the ADR owner, not a signed decision.
 
+   - **2026-10-23 - DEX customer score policy (`GET`, `PUT` and `DELETE
+     /api/v1/dex/score-policy`, #6086).** REST-only, no MCP twin: a "no" on
+     Decision 1's both-surfaces requirement, recorded rather than fixed in the
+     same change because the REST routes and the one write function behind
+     them ship first and the MCP twins follow over that function.
+     - **No MCP twin - tracked follow-up, not a permanent exception.** The
+       three twins are tracked as **#6087**; **revisit by 2027-01-31**. Until
+       they land, this row stands as the open exception for these routes, and
+       it retires when the twins merge (this entry is then amended to say so).
+       No ledger row is added: the parity ledger admits an `exception:` row
+       for a `/api/v1` route (check 1b, as for the password routes) but does
+       not require one; this one is recorded here and tracked by #6087.
+     - **The exception relaxes no control.** The routes are in
+       `openapi_spec()` and `GET /api/v1/discover/routes` (A2/A3 hold for the
+       REST half), errors from the route use the A4 envelope, `PUT` and
+       `DELETE` need `Infrastructure:Write` and an `If-Match` precondition,
+       are audit-first and fail closed on audit (`dex.score_policy.update`,
+       `.reset`, `.validate`), and a service-scoped token is refused at the
+       gate. The MCP-token posture of these routes is carried on #6087; this
+       entry does not fence MCP tokens.
+     - Wire reference: `docs/user-manual/rest-api.md`, "GET / PUT / DELETE
+       /api/v1/dex/score-policy"; audit rows: `docs/user-manual/audit-log.md`.
+
+   - **2026-10-22 - the OpenAPI group guides (`?guides=true`) have no MCP path.**
+     A "no" on Decision 1's both-surfaces requirement for one query-parameter
+     form. `GET /api/v1/openapi.json?guides=true` returns the OpenAPI document
+     with the per-group guide text (`x-yuzu-guide` on the top-level `tags`),
+     and the dashboard `/swagger` page loads that form. The MCP resource
+     `yuzu://openapi` and the discover tools serve only the default form,
+     which leaves the guides out, and no MCP tool or resource takes a
+     `guides` argument.
+     - **Reason.** The guides are prose written for people reading the
+       reference page, and the guide text would make the document larger for
+       every reader of the MCP resource. The default document does not carry
+       everything the guides carry. Counted by parsing the document when this
+       entry was written (it then had 259 operations), 40 operations have no
+       description, and 73 operations in all have descriptions that name no
+       securable permission. The permission and
+       audit prose in each guide's access block is present only in the
+       `guides=true` form.
+     - **Scope.** The exception covers the guide text only. The operations,
+       parameters, schemas and `operationId` values are identical on both
+       surfaces, and the `/swagger` page adds no capability beyond what the
+       REST document describes. The page and the `guides` parameter take the
+       same `Infrastructure:Read` gate as the MCP resource.
+     - **Not visible to the parity check.** `scripts/ci/check-api-parity.py`
+       reads routes and tool names, so it cannot see a query-parameter variant
+       or the `/swagger` page. This entry is the record that the gap is
+       deliberate.
+     - **Acceptance.** Accepted by the ADR owner (Dave Rae) on 2026-10-23, as
+       a session statement like the entries above and not a signed decision.
+       Revisit by 2026-12-19, eight weeks after acceptance, as the ADR owner
+       directed on 2026-10-24 (a session statement). Issue #6359 carries the
+       conditions for revisiting it: an agentic worker shown to need guide
+       text the default document lacks, or the first release that ships the
+       `/swagger` page. The date is not machine-checked.
    - **2026-10-24 - `get_me` as the MCP twin of `GET /api/v1/me`, and one
      `GATE_PARITY_NO_GATE_ALLOWED` entry. Confirmed 2026-10-24 by the ADR owner,
      as written.** Three parts.

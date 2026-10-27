@@ -817,7 +817,9 @@ TEST_CASE("instruction_routes: instruction-set create/list/delete write an attem
     REQUIRE(list);
     CHECK(list->status == 200);
     bool found = false;
-    for (const auto& s : body(list->body)["sets"])
+    // Named local, not a range-for over a temporary's operator[]: it dangles before P2718R0 (#5924).
+    auto listed = body(list->body);
+    for (const auto& s : listed["sets"])
         found = found || (s["id"] == id);
     CHECK(found);
     CHECK(h.audits.size() == 2); // GET stays unaudited
@@ -1005,6 +1007,51 @@ TEST_CASE("instruction_routes: POST yaml save create+update round-trip audits su
     REQUIRE(mismatch);
     CHECK(mismatch->body.find("does not match") != std::string::npos);
     CHECK(h.audits.size() == 2); // unchanged -- the mismatch guard never audits
+}
+
+TEST_CASE("instruction_routes: a guardian. id is refused at every YAML authoring path "
+          "(validate, create, and a re-save of that same id)",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    const std::string yaml =
+        "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  "
+        "id: guardian.deploy.rules\n  displayName: Reserved\nspec:\n  plugin: "
+        "os_info\n  action: os_name\n  type: question\n";
+    // The reserved-namespace text names the Guardian deploy approvals; html_escape leaves
+    // that fragment untouched, so it identifies the guardian token without the quote marks.
+    const std::string marker = "reserved for Guardian deploy approvals";
+
+    auto validate = h.sink.Post("/api/instructions/validate-yaml",
+                                "yaml_source=" + url_encode_form(yaml),
+                                "application/x-www-form-urlencoded");
+    REQUIRE(validate);
+    CHECK(validate->body.find(marker) != std::string::npos);
+
+    auto create = h.sink.Post("/api/instructions/yaml", "yaml_source=" + url_encode_form(yaml),
+                              "application/x-www-form-urlencoded");
+    REQUIRE(create);
+    CHECK(create->body.find("Cannot save") != std::string::npos);
+    CHECK(create->body.find(marker) != std::string::npos);
+
+    // The re-save (update) branch: an id is supplied, so this is the path an EXISTING
+    // definition under the prefix would take. It is refused by the same validation.
+    auto resave = h.sink.Post("/api/instructions/yaml",
+                              "id=guardian.deploy.rules&yaml_source=" + url_encode_form(yaml),
+                              "application/x-www-form-urlencoded");
+    REQUIRE(resave);
+    CHECK(resave->body.find("Cannot save") != std::string::npos);
+    CHECK(resave->body.find(marker) != std::string::npos);
+
+    // Nothing was stored and nothing was audited.
+    CHECK(h.audits.empty());
+    auto stored = w.store.get_definition("guardian.deploy.rules");
+    REQUIRE(stored.has_value());       // the read succeeded...
+    CHECK_FALSE(stored->has_value());  // ...and found nothing
 }
 
 TEST_CASE("instruction_routes: a JSON PUT and a YAML editor save keep the stored "

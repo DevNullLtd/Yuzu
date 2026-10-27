@@ -18,6 +18,7 @@
 #include "instruction_schema_test_util.hpp"
 #include "instruction_store.hpp"
 #include "instruction_param_schema.hpp"
+#include "reserved_definition_id.hpp"
 #include "store_errors.hpp"
 
 #include "pg/pg_pool.hpp"
@@ -222,6 +223,49 @@ TEST_CASE("InstructionStore: the mcp. definition-id namespace is reserved",
     }
     SECTION("only the exact prefix is reserved") {
         def.id = "mcpx.thing"; // no dot boundary — not the MCP namespace
+        CHECK(store.create_definition(def).has_value());
+    }
+}
+
+TEST_CASE("InstructionStore: the guardian. definition-id namespace is reserved with its own message",
+          "[instruction_store][security][pg]") {
+    // #6062: Guardian rule-deploy tickets are minted under `guardian.<...>`; the prefix is
+    // refused at the authoring chokepoint exactly like `mcp.`, but with its own denial token.
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    InstructionDefinition def;
+    def.name = "Guardian Namespace Probe";
+    def.type = "question";
+    def.plugin = "test";
+    def.action = "test";
+    def.version = "1.0";
+
+    SECTION("a guardian.-prefixed id is rejected with the guardian token, not the mcp one") {
+        def.id = "guardian.deploy.rules";
+        auto result = store.create_definition(def);
+        REQUIRE(!result.has_value());
+        CHECK(result.error() == std::string(yuzu::server::kReservedGuardianDefinitionIdError));
+        CHECK(result.error() != std::string(yuzu::server::kReservedDefinitionIdError));
+    }
+    SECTION("the bare prefix with nothing after the dot is rejected too") {
+        def.id = "guardian.";
+        auto result = store.create_definition(def);
+        REQUIRE(!result.has_value());
+        CHECK(result.error() == std::string(yuzu::server::kReservedGuardianDefinitionIdError));
+    }
+    SECTION("no dot boundary: guardianx.thing is not reserved") {
+        def.id = "guardianx.thing";
+        CHECK(store.create_definition(def).has_value());
+    }
+    SECTION("case-sensitive: Guardian.x is not reserved") {
+        def.id = "Guardian.x";
+        CHECK(store.create_definition(def).has_value());
+    }
+    SECTION("only a leading prefix: my.guardian.x is not reserved") {
+        def.id = "my.guardian.x";
         CHECK(store.create_definition(def).has_value());
     }
 }

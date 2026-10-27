@@ -28,7 +28,7 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_log_text_sites_tests).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("grpcbox/include/grpcbox.hrl").
+-include("yuzu_grpc.hrl").
 
 
 -define(AWAIT_MS, 5000).
@@ -193,22 +193,16 @@ service_test_() ->
 %% registration is pending for it.
 subscribe_unknown_session_line() ->
     Session = control_id(<<"session-unknown">>),
-    catch meck:unload(grpcbox_stream),
-    ok = meck:new(grpcbox_stream, [non_strict, no_link]),
-    try
-        ok = meck:expect(grpcbox_stream, ctx,
-                         fun(_State) ->
-                             ctx:set(ctx:background(), md_incoming_key,
-                                     #{<<"x-yuzu-session-id">> => Session})
-                         end),
-        Line = capture_line(<<"Subscribe: no pending registration for session">>, fun() ->
-            ?assertThrow({grpc_error, {?GRPC_STATUS_NOT_FOUND, _}},
-                         yuzu_gw_agent_service:subscribe(make_ref(), not_a_stream_state))
-        end),
-        assert_clean(Line, <<"session-unknown">>)
-    after
-        meck:unload(grpcbox_stream)
-    end.
+    Stream = #yuzu_grpc_stream{conn = self(), stream_id = 1,
+                               ctx = yuzu_grpc:new_ctx(#{<<"x-yuzu-session-id">> => Session},
+                                                       self(), undefined, undefined, undefined),
+                               method = <<"/yuzu.agent.v1.AgentService/Subscribe">>,
+                               pb = agent_pb, output = 'yuzu.agent.v1.CommandRequest'},
+    Line = capture_line(<<"Subscribe: no pending registration for session">>, fun() ->
+        ?assertThrow({grpc_error, {?GRPC_STATUS_NOT_FOUND, _}},
+                     yuzu_gw_agent_service:subscribe(make_ref(), Stream))
+    end),
+    assert_clean(Line, <<"session-unknown">>).
 
 %%%===================================================================
 %%% yuzu_gw_upstream: the guardian forward lines
@@ -238,19 +232,19 @@ guardian_capacity_test_() ->
 
 setup_guardian() ->
     {ok, _} = application:ensure_all_started(telemetry),
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     yuzu_gw_test_upstream:stop_upstream(),
     Prev = yuzu_gw_test_upstream:save_env(?ENV_KEYS),
     yuzu_gw_test_upstream:set_breaker_env(3),
-    ok = meck:new(grpcbox_client, [non_strict, no_link]),
-    ok = meck:expect(grpcbox_client, unary,
+    ok = meck:new(yuzu_grpc_client, [non_strict, no_link]),
+    ok = meck:expect(yuzu_grpc_client, unary,
                      fun(_Ctx, _Path, _Req, _Def, _Opts) -> {error, econnrefused} end),
     yuzu_gw_test_upstream:start_upstream(),
     #{prev_env => Prev}.
 
 cleanup_guardian(#{prev_env := Prev}) ->
     yuzu_gw_test_upstream:stop_upstream(),
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     yuzu_gw_test_upstream:restore_env(Prev),
     ok.
 
@@ -260,14 +254,14 @@ cleanup_guardian(#{prev_env := Prev}) ->
 %% releases by exact pid whatever the test did.
 setup_guardian_blocked() ->
     {ok, _} = application:ensure_all_started(telemetry),
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     yuzu_gw_test_upstream:stop_upstream(),
     Prev = yuzu_gw_test_upstream:save_env(?ENV_KEYS),
     yuzu_gw_test_upstream:set_breaker_env(3),
     catch ets:delete(?BLOCKED),
     ?BLOCKED = ets:new(?BLOCKED, [named_table, public, set]),
-    ok = meck:new(grpcbox_client, [non_strict, no_link]),
-    ok = meck:expect(grpcbox_client, unary,
+    ok = meck:new(yuzu_grpc_client, [non_strict, no_link]),
+    ok = meck:expect(yuzu_grpc_client, unary,
                      fun(_Ctx, _Path, _Req, _Def, _Opts) ->
                          true = ets:insert(?BLOCKED, {self()}),
                          persistent_term:get(?BLOCKED_TEST) ! {guardian_call_entered, self()},
@@ -372,15 +366,15 @@ notify_cap_test_() ->
 setup_notify(Env) ->
     {ok, _} = application:ensure_all_started(telemetry),
     yuzu_gw_test_registry:ensure(),
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     yuzu_gw_test_upstream:stop_upstream(),
     Prev = yuzu_gw_test_upstream:save_env(?ENV_KEYS),
     yuzu_gw_test_upstream:set_breaker_env(3),
     [application:set_env(yuzu_gw, K, V) || {K, V} <- Env],
     catch ets:delete(?BLOCKED),
     ?BLOCKED = ets:new(?BLOCKED, [named_table, public, set]),
-    ok = meck:new(grpcbox_client, [non_strict, no_link]),
-    ok = meck:expect(grpcbox_client, unary,
+    ok = meck:new(yuzu_grpc_client, [non_strict, no_link]),
+    ok = meck:expect(yuzu_grpc_client, unary,
                      fun(_Ctx, _Path, _Req, _Def, _Opts) -> {error, econnrefused} end),
     yuzu_gw_test_upstream:start_upstream(),
     catch ets:delete(?NOTIFY_AGENTS),
@@ -453,7 +447,7 @@ notify_probe_worker_exited_line() ->
     Test = self(),
     trip_breaker(),
     notify(Id, <<"peer">>),
-    ok = meck:expect(grpcbox_client, unary,
+    ok = meck:expect(yuzu_grpc_client, unary,
                      fun(_Ctx, _Path, _Req, _Def, _Opts) ->
                          true = ets:insert(?BLOCKED, {self()}),
                          Test ! {probe_entered, self()},
@@ -477,7 +471,7 @@ notify_probe_killed_at_deadline_line() ->
     Test = self(),
     trip_breaker(),
     notify(Id, <<"peer">>),
-    ok = meck:expect(grpcbox_client, unary,
+    ok = meck:expect(yuzu_grpc_client, unary,
                      fun(_Ctx, _Path, _Req, _Def, _Opts) ->
                          true = ets:insert(?BLOCKED, {self()}),
                          Test ! {probe_entered, self()},
@@ -498,7 +492,7 @@ notify_evicted_line() ->
     Id = control_id(<<"notify-evicted">>),
     trip_breaker(),
     notify(Id, <<"peer">>),
-    ok = meck:expect(grpcbox_client, unary,
+    ok = meck:expect(yuzu_grpc_client, unary,
                      fun(_Ctx, _Path, _Req, _Def, _Opts) ->
                          erlang:error({?LOCAL_ENCODE_FAILED, error, boom})
                      end),
@@ -516,7 +510,7 @@ replay_not_encodable_line() ->
     ok = yuzu_gw_registry:register_agent(Id, Pid, <<"sess-replay-enc">>, [<<"svc">>],
                                          <<"host">>, #{info => #{agent_id => Id}},
                                          conn_log_text),
-    ok = meck:expect(grpcbox_client, unary,
+    ok = meck:expect(yuzu_grpc_client, unary,
                      fun(_Ctx, _Path, _Req, _Def, _Opts) ->
                          erlang:error({?LOCAL_ENCODE_FAILED, error, boom})
                      end),
@@ -529,7 +523,7 @@ replay_not_encodable_line() ->
 %% goes through the rate limited warning, which is told to log now.
 rpc_failed_request_fault_line() ->
     Msg = control_id(<<"rpc-fault">>),
-    ok = meck:expect(grpcbox_client, unary,
+    ok = meck:expect(yuzu_grpc_client, unary,
                      fun(_Ctx, _Path, _Req, _Def, _Opts) ->
                          {error, {<<"3">>, Msg}, #{}}
                      end),
@@ -543,7 +537,7 @@ rpc_failed_request_fault_line() ->
 %% INTERNAL is not a request fault: the plain warning.
 rpc_failed_other_line() ->
     Msg = control_id(<<"rpc-other">>),
-    ok = meck:expect(grpcbox_client, unary,
+    ok = meck:expect(yuzu_grpc_client, unary,
                      fun(_Ctx, _Path, _Req, _Def, _Opts) ->
                          {error, {<<"13">>, Msg}, #{}}
                      end),

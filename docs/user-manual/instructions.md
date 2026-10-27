@@ -286,7 +286,7 @@ spec:
 
 | Field | Description |
 |---|---|
-| `minAgentVersion` | Agents below this version are skipped during dispatch (error `4003`). |
+| `minAgentVersion` | Declared and exported; not compared at dispatch today, so an older agent is NOT skipped and error `4003` is not raised. |
 | `requiredPlugins` | Agents missing any listed plugin are skipped (error `4001`). |
 
 ---
@@ -1697,4 +1697,4 @@ These will be expressed as additional YAML DSL constructs within an InstructionD
 
 ### Product Packs (Phase 7.9)
 
-Signed distribution bundles containing instruction sets, definitions, policy fragments, and documentation. Product packs will use Ed25519 signatures with a trust chain anchored to an organization root key. Import will support staged review before activation.
+Signed distribution bundles containing instruction sets, definitions, policy fragments, and documentation. Product packs already carry Ed25519 signatures: a pack's signature is verified at install against the key inside the pack, a pack that fails verification is rejected, and an unsigned pack is refused unless the server runs with `--allow-unsigned-packs`. A trust chain anchored to an organization root key, and staged review before activation, are still planned.

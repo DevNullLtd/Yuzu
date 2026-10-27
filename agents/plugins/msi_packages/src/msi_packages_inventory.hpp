@@ -6,7 +6,9 @@
  * committed real capture.
  *
  * Wire grammar (consumed by parse_msi_packages_list_inventory_output in
- * agents/core/src/sync_source_installed_software.cpp):
+ * agents/core/src/sync_source_installed_software.cpp). The status row is
+ * formatted by yuzu::shared::format_status_row (agents/shared/inventory_status_row.hpp),
+ * the same helper pkg_inventory uses and the collector parses with:
  *
  *   status|list_inventory|<supported|constrained|unsupported>|<tokens or ->
  *   inv|<product_code>|<name>|<version>|<publisher>      (one per product)
@@ -18,7 +20,7 @@
  */
 #pragma once
 
-#include <yuzu/string_utils.hpp>
+#include <inventory_status_row.hpp>
 
 #include <cstddef>
 #include <expected>
@@ -71,8 +73,6 @@ inline constexpr unsigned kMaxPropertyChars = 4096;
         return std::unexpected(std::string{"windows:msi_prop:oversized"});
     return static_cast<std::size_t>(reported) + 1;
 }
-
-enum class StatusLevel { supported, constrained, unsupported };
 
 struct Product {
     std::string code;
@@ -146,31 +146,6 @@ inline std::string strip_row_breakers(std::string_view v) {
     return out;
 }
 
-[[nodiscard]] inline const char* level_token(StatusLevel level) noexcept {
-    switch (level) {
-    case StatusLevel::supported:
-        return "supported";
-    case StatusLevel::constrained:
-        return "constrained";
-    case StatusLevel::unsupported:
-        return "unsupported";
-    }
-    return "constrained";
-}
-
-/// status|<action>|<level>|<tokens or ->. Action and tokens are fixed
-/// vocabulary, so they go through safe_output_field as pkg_inventory does.
-[[nodiscard]] inline std::string format_status_row(std::string_view action, StatusLevel level,
-                                                   std::string_view tokens) {
-    std::string out = "status|";
-    out += yuzu::util::safe_output_field(action);
-    out += '|';
-    out += level_token(level);
-    out += '|';
-    out += tokens.empty() ? std::string{"-"} : yuzu::util::safe_output_field(tokens);
-    return out;
-}
-
 /// inv|<code>|<name>|<version>|<publisher>; empty stays empty.
 [[nodiscard]] inline std::string format_inventory_row(const Product& p) {
     std::string out = "inv|";
@@ -185,7 +160,7 @@ inline std::string strip_row_breakers(std::string_view v) {
 }
 
 [[nodiscard]] inline std::string unsupported_status_row(std::string_view token) {
-    return format_status_row(kAction, StatusLevel::unsupported, token);
+    return yuzu::shared::format_status_row(kAction, yuzu::shared::StatusLevel::unsupported, token);
 }
 
 /// Status row first (constrained iff a constraint is set), then one row per
@@ -195,9 +170,11 @@ inline std::string strip_row_breakers(std::string_view v) {
     std::vector<std::string> rows;
     rows.reserve(inv.products.size() + 1);
     if (inv.constraint)
-        rows.push_back(format_status_row(kAction, StatusLevel::constrained, *inv.constraint));
+        rows.push_back(yuzu::shared::format_status_row(
+            kAction, yuzu::shared::StatusLevel::constrained, *inv.constraint));
     else
-        rows.push_back(format_status_row(kAction, StatusLevel::supported, {}));
+        rows.push_back(
+            yuzu::shared::format_status_row(kAction, yuzu::shared::StatusLevel::supported, {}));
     for (const auto& p : inv.products)
         rows.push_back(format_inventory_row(p));
     return rows;

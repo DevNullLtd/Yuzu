@@ -2,9 +2,12 @@
 
 /// @file config_routes.hpp
 /// Extracted from server.cpp's inline registrations onto the HttpRouteSink
-/// seam (#2542 PR-12, the Infra/Misc bundle) — the 2-route Runtime
+/// seam (#2542 PR-12, the Infra/Misc bundle) — the Runtime
 /// Configuration API (7.3): the effective-config + `RuntimeConfigStore`
-/// overrides view, and the single-key override write. One of six small,
+/// overrides view, and the single-key override write, each on the legacy
+/// `/api/config` path and on its `/api/v1/config` twin (the MCP twins are
+/// `get_runtime_config`/`set_runtime_config`). The decisions every surface
+/// shares live in config_write.hpp; this file keeps the gate, audit and envelope. One of six small,
 /// heterogeneous modules bundled into PR-12 because none of them has a
 /// single owning store of its own large enough to justify its own PR (the
 /// `dashboard_api_routes.hpp`/`nvd_routes.hpp` bundling precedent). Every
@@ -23,15 +26,16 @@
 /// instant the store write succeeds, same as the original inline code. This
 /// is why `Deps::cfg` is `Config*`, not `const Config*`.
 ///
-/// Routes (2) — gate in parens:
-///   GET /api/config             (perm_fn Infrastructure:Read; lists
+/// Routes (4) — gate in parens (the v1 pair answers in the A4 envelope, the gates and audit rows
+/// are identical):
+///   GET /api/config, GET /api/v1/config   (perm_fn Infrastructure:Read; lists
 ///                                 `read_only_keys`, the allowed keys this route
 ///                                 does not write: the route-owned class, today
 ///                                 dex_score_policy)
-///   PUT /api/config/([a-z_]+)   (perm_fn Infrastructure:Write, THEN auth_fn for the
+///   PUT /api/config/([a-z_]+), PUT /api/v1/config/([a-z_]+)   (perm_fn Infrastructure:Write, THEN auth_fn for the
 ///                                 audit-attributed username and the same-site check,
 ///                                 THEN the route-owned 400 (dex_score_policy is written
-///                                 only through its own route, a later change), THEN the
+///                                 only through PUT /api/v1/dex/score-policy), THEN the
 ///                                 write-class 403 for an administrator-only key (a
 ///                                 `config.update`/`denied` row, no attempted row), THEN the
 ///                                 store-open 503, THEN body parsing and integer-key
@@ -46,6 +50,9 @@
 /// the original inline code's comment noting the opposite ("this route is
 /// not TestRouteSink-registered") is stale as of this extraction and is
 /// corrected at the call site in config_routes.cpp.
+
+#include "config_write.hpp" // Backing: what the shared core reads and writes
+#include "mfa_step_up.hpp"   // StepUpFn
 
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
@@ -78,6 +85,10 @@ struct Deps {
     AuthFn auth_fn;
     PermFn perm_fn;
     AuditFn audit_fn;
+    /// The shared MFA step-up closure. Called by `PUT /api/v1/config/{key}` only (its row in
+    /// `kStepUpPolicy` is kRequired); an empty closure skips the call, as in the other route
+    /// modules. The legacy `PUT /api/config/{key}` never calls it (its row is pending).
+    StepUpFn step_up_fn;
     /// `ServerImpl::cfg_`. Never null in production (bound to a live member
     /// at registration time) — WRITTEN by PUT on a successful integer-key
     /// override, matching the original inline code exactly.
@@ -85,9 +96,12 @@ struct Deps {
     /// `ServerImpl::auto_approve_`. Read-only here (`list_rules().empty()`
     /// feeds the GET response's `auto_approve_enabled` field).
     const auth::AutoApproveEngine* auto_approve{nullptr};
-    /// `ServerImpl::runtime_config_store_`. Null or closed -> both routes
-    /// answer 503 ("runtime config store unavailable") without touching it.
+    /// `ServerImpl::runtime_config_store_`. Null or closed -> every route
+    /// answers 503 ("runtime config store unavailable") without touching it.
     RuntimeConfigStore* runtime_config_store{nullptr};
+
+    /// The three backing pointers as the shared core takes them (config_write.hpp).
+    [[nodiscard]] Backing backing() const { return {cfg, auto_approve, runtime_config_store}; }
 };
 
 /// Register both Runtime Configuration API routes against `sink`.
