@@ -939,14 +939,24 @@ TEST_CASE("openapi_spec_json(): the operations that override the top-level secur
     // Every scheme a requirement names is defined, and each scheme has the transport the handler
     // reads: the upload credentials are headers, the session is a cookie.
     const auto& schemes = spec.at("components").at("securitySchemes");
+    CHECK(schemes.size() == 5);
+    CHECK(schemes.at("bearerAuth").at("type") == "http");
+    CHECK(schemes.at("bearerAuth").at("scheme") == "bearer");
+    CHECK(schemes.at("apiKeyHeader").at("type") == "apiKey");
+    CHECK(schemes.at("apiKeyHeader").at("in") == "header");
+    CHECK(schemes.at("apiKeyHeader").at("name") == "X-Yuzu-Token");
+    CHECK(schemes.at("cookieAuth").at("type") == "apiKey");
     CHECK(schemes.at("cookieAuth").at("in") == "cookie");
+    CHECK(schemes.at("cookieAuth").at("name") == "yuzu_session");
+    CHECK(schemes.at("uploadGrantAuth").at("type") == "apiKey");
     CHECK(schemes.at("uploadGrantAuth").at("in") == "header");
     CHECK(schemes.at("uploadGrantAuth").at("name") == "X-Yuzu-Upload-Grant");
+    CHECK(schemes.at("uploadSessionAuth").at("type") == "apiKey");
     CHECK(schemes.at("uploadSessionAuth").at("in") == "header");
     CHECK(schemes.at("uploadSessionAuth").at("name") == "X-Yuzu-Upload-Session");
 
     // The override set. An operation joining or leaving it is a decision to make here, on purpose:
-    // each of these answers 401 or 403 to the credential the default tells a client to send.
+    // each of these refuses or ignores the credential the default tells a client to send.
     //  - the CA root and CRL are public;
     //  - the elevation and password routes act on the caller's own browser session, so a token is
     //    refused (auth_routes.cpp elevate and revoke read the cookie directly);
@@ -985,9 +995,9 @@ TEST_CASE("openapi_spec_json(): the operations that override the top-level secur
     // that refuses one.
     const std::string info = spec.at("info").at("description").get<std::string>();
     for (const char* needle :
-         {"GET /ca/root", "GET /ca/crl", "POST /elevate", "POST /elevate/revoke",
+         {"GET /ca/root", "GET /ca/crl", "POST /elevate,", "POST /elevate/revoke",
           "POST /users/me/password", "POST /users/{username}/password", "X-Yuzu-Upload-Grant",
-          "X-Yuzu-Upload-Session"}) {
+          "X-Yuzu-Upload-Session", "with three exceptions"}) {
         INFO(needle);
         CHECK(info.find(needle) != std::string::npos);
     }
@@ -1037,6 +1047,44 @@ TEST_CASE("GET /api/v1/openapi.json: gated on Infrastructure:Read for every form
         CHECK(allowed->status == 200);
         CHECK_FALSE(allowed->body.empty());
     }
+}
+
+TEST_CASE("if_none_match_matches: RFC 9110 list, weak comparison and * alone; any malformed header "
+          "matches nothing",
+          "[openapi][etag]") {
+    // Called directly so whitespace at the ends of the value, which the route test cannot send
+    // (httplib drops a field value that starts or ends with a space), is covered.
+    using yuzu::server::if_none_match_matches;
+    const std::string e = "\"abc\"";
+    struct Case {
+        const char* header;
+        bool matches;
+    };
+    const Case cases[] = {
+        {"\"abc\"", true},          {"W/\"abc\"", true},        {"\"x\", \"abc\"", true},
+        {"\"abc\" ,\t\"x\"", true}, {"\"a,b\", \"abc\"", true}, {",,\"abc\",,", true},
+        {"\"abc\" ,", true},        {" \"abc\" ", true},        {"*", true},
+        {" * ", true},              {"\t*\t", true},            {"", false},
+        {" ", false},               {",", false},               {"\"abd\"", false},
+        {"W/", false},              {"W/\"", false},             {"\"abc", false},
+        {"abc\"", false},            {"garbage", false},         {"*x", false},
+        {"* ,\"x\"", false},         {"\"x\", *", false},        {"*, \"abc\"", false},
+        {"\"x\" \"abc\"", false},   {"\"abc\"x", false},        {"\"abc\"\"x\"", false},
+        {"w/\"abc\"", false},       {"W/ \"abc\"", false},      {"W/W/\"abc\"", false},
+        {"\"x\"W/\"abc\"", false},  {"\"x\" , ", false},
+    };
+    for (const auto& c : cases) {
+        INFO("If-None-Match: [" << c.header << "]");
+        CHECK(if_none_match_matches(c.header, e) == c.matches);
+    }
+    // A NUL byte inside a tag is a character like any other.
+    CHECK_FALSE(if_none_match_matches(std::string("\"a\0bc\"", 6), e));
+    // A very long list is linear work and answers correctly at both ends.
+    std::string big;
+    for (int i = 0; i < 4000; ++i)
+        big += "\"x\",";
+    CHECK_FALSE(if_none_match_matches(big, e));
+    CHECK(if_none_match_matches(big + e, e));
 }
 
 TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matching If-None-Match",
@@ -1101,26 +1149,37 @@ TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matchin
     }
 
     SECTION("a weak validator, a list and * revalidate too (RFC 9110 weak comparison)") {
+        const std::string stale = "\"0000000000000000\"";
         for (const std::string& header :
-             {"W/" + lean_etag, "\"0000000000000000\", " + lean_etag,
-              lean_etag + " ,\t\"0000000000000000\"", std::string("*")}) {
+             {"W/" + lean_etag, stale + ", " + lean_etag, lean_etag + " ,\t" + stale,
+              std::string("\"a,b\", ") + lean_etag, "," + lean_etag + ",", std::string("*")}) {
             INFO(header);
             auto hit = sink.Get(lean_path, {{"If-None-Match", header}});
             REQUIRE(hit);
             CHECK(hit->status == 304);
             CHECK(hit->body.empty());
+            CHECK(hit->get_header_value("ETag") == lean_etag);
+            CHECK(hit->get_header_value("Cache-Control") == "no-cache, private");
         }
     }
 
-    SECTION("a malformed or non-matching If-None-Match is a full 200, never a wrong 304") {
+    SECTION("a header that is not a valid If-None-Match is a full 200, never a wrong 304") {
+        // Each case holds a complete copy of the right tag, or a `*`, so a substring search or a
+        // lenient parser would answer 304. A valid header is `*` alone or a comma-separated list
+        // of quoted tags; anything else matches nothing.
+        const std::string stale = "\"0000000000000000\"";
         for (const std::string& header :
              {std::string("garbage"), lean_etag.substr(0, lean_etag.size() - 1),
-              std::string("W/"), std::string("\"unterminated"), full_etag + "x", std::string()}) {
+              std::string("W/"), std::string("\"unterminated"), full_etag + "x",
+              "\"x" + lean_etag, lean_etag + "x", lean_etag + lean_etag, stale + " " + lean_etag,
+              "w/" + lean_etag, "W/ " + lean_etag, std::string("*x"), std::string("* ,") + stale,
+              stale + ", *", "*, " + lean_etag, std::string()}) {
             INFO(header);
             auto miss = sink.Get(lean_path, {{"If-None-Match", header}});
             REQUIRE(miss);
             CHECK(miss->status == 200);
             CHECK(miss->body == lean->body);
+            CHECK(miss->get_header_value("ETag") == lean_etag);
         }
     }
 
@@ -1138,11 +1197,15 @@ TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matchin
 
     SECTION("the permission gate runs before the validator is looked at") {
         admit = false;
-        auto denied = sink.Get(lean_path, {{"If-None-Match", lean_etag}});
-        REQUIRE(denied);
-        CHECK(denied->status == 403);
-        CHECK(denied->get_header_value("ETag").empty());
-        CHECK(denied->body.find("\"openapi\"") == std::string::npos);
+        for (const std::string& header : {lean_etag, "W/" + lean_etag, "\"x\", " + lean_etag,
+                                          std::string("*")}) {
+            INFO(header);
+            auto denied = sink.Get(lean_path, {{"If-None-Match", header}});
+            REQUIRE(denied);
+            CHECK(denied->status == 403);
+            CHECK(denied->get_header_value("ETag").empty());
+            CHECK(denied->body.find("\"openapi\"") == std::string::npos);
+        }
     }
 
     SECTION("an unauthenticated caller is refused before the validator, even with the right one") {

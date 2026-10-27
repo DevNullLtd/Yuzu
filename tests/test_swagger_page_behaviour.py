@@ -352,6 +352,11 @@ const out = {};
   out.f_null_msg = root.textContent;
   await reload({ status: 200, body: {} });                                                // JSON, but not an API description
   out.f_obj_doc = root.textContent; out.f_obj_doc_retry = root.byTag('button').length;
+  out.f_paths_bad = [];
+  for (const bad of [[], 'text', 5, [{ '/a': {} }]]) {   // build() reads a non-object `paths` as empty; the page must not show that as a reference
+    await reload({ status: 200, body: { paths: bad } });
+    out.f_paths_bad.push(root.textContent.includes('not with an API description') && root.byTag('button').length === 1);
+  }
 
   // ---- the live regions: loading and failure are announced, the success view is not ----
   queue.push({ status: 503 }); location.hash = ''; (0, eval)(js);
@@ -429,7 +434,7 @@ const out = {};
   Object.defineProperty(boomOp, 'requestBody', { get() { if (armed) throw new Error('boom-op'); return undefined; }, enumerable: true });
   const boomGuide = { summary: '' };
   Object.defineProperty(boomGuide, 'overview', { get() { if (armed) throw new Error('boom-guide'); return ['x']; }, enumerable: true });
-  const hdrs = { ETag: { $ref: '#/components/headers/ETag' }, Gone: { $ref: '#/components/headers/Nope' }, Own: { description: 'inline one' }, constructor: { $ref: '#/components/headers/constructor' } };
+  const hdrs = { ETag: { $ref: '#/components/headers/ETag' }, Gone: { $ref: '#/components/headers/Nope' }, Own: { description: 'inline one' }, Num: { $ref: 7 }, constructor: { $ref: '#/components/headers/constructor' } };
   const specB = {
     openapi: '3.0.3', info: { title: 't', version: '1' },
     tags: [{ name: 'Boom', description: 'b', 'x-yuzu-guide': boomGuide }],
@@ -574,7 +579,13 @@ def main():
     # Every raw literal of the page is under the MSVC ceiling and named in the C++ size gate, so a
     # new piece cannot ship unmeasured (the list in test_swagger_page.cpp is otherwise by hand).
     gate = (ROOT / "tests/unit/server/test_swagger_page.cpp").read_text(encoding="utf-8")
-    for name, body in re.findall(r'extern const char\* const (kSwagger\w+) = R"SWG\((.*?)\)SWG";', page, re.S):
+    declared = re.findall(r"extern const char\* const (kSwagger\w+) = R", page)
+    pieces = re.findall(r'extern const char\* const (kSwagger\w+) = R"SWG\((.*?)\)SWG";', page, re.S)
+    # kSwaggerPageHtml is the baked result, not a literal piece.
+    if sorted(n for n in declared if n != "kSwaggerPageHtml") != sorted(n for n, _ in pieces):
+        print("FAIL\n  - a kSwagger piece does not use the R\"SWG( delimiter, so the size gate would skip it: %r" % declared)
+        return 1
+    for name, body in pieces:
         if len(body.encode("utf-8")) >= 15000:
             print("FAIL\n  - %s is %d bytes, over the 15,000 byte gate" % (name, len(body.encode("utf-8"))))
             return 1
@@ -796,7 +807,9 @@ def main():
           "a guide and an operation that cannot be drawn must be logged by name: %r" % out["b_logs"])
     check("quoted revision" in out["b_hdrs"] and "inline one" in out["b_hdrs"],
           "a $ref'd response header must show the description of the header it names: %r" % out["b_hdrs"])
-    check("ETag" in out["b_hdrs"] and "Gone" in out["b_hdrs"] and "constructor" in out["b_hdrs"],
+    check(out["f_paths_bad"] == [True, True, True, True],
+          "a `paths` that is not an object (array, string, number) must read as not an API description: %r" % out["f_paths_bad"])
+    check("ETag" in out["b_hdrs"] and "Gone" in out["b_hdrs"] and "constructor" in out["b_hdrs"] and "Num" in out["b_hdrs"],
           "an unresolvable or prototype-named header $ref must still list its name: %r" % out["b_hdrs"])
     check(out["cap_60"] == "60/false" and out["cap_61"] == "60/true",
           "the model list must say when it is cut, and not at exactly the cap: %r %r" % (out["cap_60"], out["cap_61"]))

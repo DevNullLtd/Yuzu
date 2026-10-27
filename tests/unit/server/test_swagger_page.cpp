@@ -148,8 +148,12 @@ TEST_CASE("swagger page: every raw literal stays under the MSVC C2026 ceiling",
         INFO(name);
         CHECK(std::strlen(text) < 15000);
     }
-    // ...and the pieces are what the page is made of.
+    // ...and the pieces are what the page is made of, in this order: the closing of the script's
+    // IIFE is in js3, so a dropped or reordered piece is a syntax error that no other test sees
+    // (the behaviour test joins the pieces itself).
     const std::string html(kSwaggerPageHtml);
+    CHECK(html.find(std::string(kSwaggerJs1) + kSwaggerJs2 + kSwaggerJs3 + kSwaggerTail) !=
+          std::string::npos);
     CHECK(html.find("function guideBlock") != std::string::npos);
     CHECK(html.find(".sw-guide") != std::string::npos);
 }

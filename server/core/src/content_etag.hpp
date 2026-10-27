@@ -16,6 +16,7 @@
 /// changing it would reshuffle the fleet's sync schedule, ADR-0016 section 3); do not "harmonise"
 /// any of them. tests/unit/server/test_openapi_spec_completeness.cpp pins known vectors.
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -38,34 +39,47 @@ namespace yuzu::server {
     return std::string(buf, static_cast<std::size_t>(n));
 }
 
-/// True when an `If-None-Match` header value matches `etag`, by RFC 9110 section 13.1.2: `*`
-/// matches, the value may be a comma-separated list, and a weak validator (`W/"..."`) compares by
-/// its opaque tag (the weak comparison `If-None-Match` uses). A malformed list matches nothing
-/// from the point it breaks, so a bad header gets the full body, never a wrong 304. `etag` is a
-/// quoted strong tag as `content_etag` returns it. The `openapi.json` route uses this; the other
-/// catalogue routes still compare for exact equality and may adopt it.
+/// True when an `If-None-Match` header value matches `etag`, by RFC 9110 section 13.1.2: the value
+/// is either `*` alone, or a comma-separated list of entity-tags, where a weak validator
+/// (`W/"..."`) compares by its opaque tag (the weak comparison `If-None-Match` uses). Empty list
+/// elements and optional whitespace around the commas are accepted, as the RFC asks of a recipient.
+/// The header is parsed as a whole: if any part of it is not a valid entity-tag list (`*` with
+/// anything else, a missing comma between tags, an unquoted or unterminated tag, text after a
+/// tag), nothing matches, so a bad header gets the full body, never a 304. `etag` is a quoted
+/// strong tag as `content_etag` returns it. The `openapi.json` route uses this; the other
+/// catalogue routes still compare for exact equality and may adopt it. Linear in the header length.
 [[nodiscard]] inline bool if_none_match_matches(std::string_view header, const std::string& etag) {
+    const std::size_t n = header.size();
     std::size_t i = 0;
-    const auto skip_ows_commas = [&] {
-        while (i < header.size() && (header[i] == ' ' || header[i] == '\t' || header[i] == ','))
+    const auto skip_ows = [&] {
+        while (i < n && (header[i] == ' ' || header[i] == '\t'))
             ++i;
     };
+    skip_ows();
+    if (i < n && header[i] == '*') {
+        ++i;
+        skip_ows();
+        return i == n;
+    }
+    bool matched = false;
     for (;;) {
-        skip_ows_commas();
-        if (i >= header.size())
-            return false;
-        if (header[i] == '*')
-            return true;
+        while (i < n && (header[i] == ' ' || header[i] == '\t' || header[i] == ','))
+            ++i;
+        if (i >= n)
+            return matched;
         if (header.substr(i, 2) == "W/")
             i += 2;
-        if (i >= header.size() || header[i] != '"')
+        if (i >= n || header[i] != '"')
             return false;
         const std::size_t close = header.find('"', i + 1);
         if (close == std::string_view::npos)
             return false;
         if (header.substr(i, close + 1 - i) == etag)
-            return true;
+            matched = true;
         i = close + 1;
+        skip_ows();
+        if (i < n && header[i] != ',')
+            return false;
     }
 }
 
