@@ -159,7 +159,8 @@ namespace detail {
 /// DEPENDENT ITEMS (two value ops on one key and name; a key op over another item's equal, ancestor or descendant key)
 /// are refused as a whole, so no verdict depends on an earlier item and dry run == real run; items that are already
 /// refused cannot change anything and are left out of the comparison. ponytail: O(n^2) over <= 256 items; keys compare
-/// ASCII-case-insensitively, so keys that differ only in non-ASCII case are not recognised as one (README caveat).
+/// ASCII-case-insensitively, and two items sharing a path prefix that differs only in non-ASCII case (ambiguous_shared_prefix)
+/// are dependent too, conservatively: the kernel folds all of Unicode and this parser cannot.
 /// Value names are CONSERVATIVE instead: Windows folds a value name's case with the full Unicode table, which this
 /// parser cannot reproduce, so two value items on one key are dependent whenever either name holds a non-ASCII byte.
 [[nodiscard]] inline PlanParse parse_plan(std::string_view text) {
