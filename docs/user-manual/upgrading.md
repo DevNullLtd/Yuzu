@@ -2,6 +2,18 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: OIDC egress resolves names through a bounded resolver with one shared NAT64 cache
+
+**What changed.** The OIDC client's outbound-fetch checks (discovery, JWKS, token, userinfo) changed how they resolve names and learn NAT64 prefixes. No flag, schema or agent change; a server restart picks it up, and rolling back restores the old behaviour.
+
+- **NXDOMAIN or NODATA for `ipv4only.arpa` is now an answer.** Before, any non-zero resolver code counted as a failed lookup and logged `the NAT64 prefix lookup (ipv4only.arpa) failed`. Now "no such name" means "no DNS64 on this network" (the normal case): it is cached for the 1-minute negative interval and logs nothing. A timeout or SERVFAIL is still a failure, still warned about, now at most once a minute.
+- **A busy resolver is inconclusive, not a failure.** If the discovery pool already has its one lookup outstanding, or a call cannot wait for the lookup in flight, that call classifies IPv6 destinations without the learned set; nothing is cached and nothing is logged, so the next IPv6 fetch looks again. A stuck resolver therefore shows on `yuzu_server_nat64_discovery_resolver_in_flight` and `..._lookups_total{outcome="inconclusive"}`, not as a log line per sign-in.
+- **One shared, never-shrinking prefix cache.** The learned NAT64 prefixes live in one process-wide cache (at most 64) that later features also read and fill. If an answer carries more than 64 prefixes the set freezes in overflow, and **IPv6 OIDC fetches are refused** (fixed text `the NAT64 prefix discovery answer exceeds the supported number of prefixes`, `yuzu_server_nat64_discovery_overflowed` = 1) until an answer fits or the server restarts. Declare the real prefix with `--oidc-nat64-prefix`.
+- **Timeouts are exact.** The provider's DNS timeout is now used to the millisecond; it was rounded up to whole seconds.
+- **The httplib resolver path is gone from OIDC.** The `ipv4only.arpa` probe and, on Linux and macOS, the host-name check of every OIDC fetch now run in the server's bounded resolver (its own 8-lookup pool; the probe has its own one-lookup pool), which also closes a use-after-free in httplib's timed `getaddrinfo` on glibc. On Windows the host check keeps `GetAddrInfoExW`; only the `ipv4only.arpa` probe moves to the bounded resolver (plain `getaddrinfo` on a worker thread, bounded the same way).
+
+**New metrics.** `yuzu_server_nat64_discovery_{lookups_total,overflowed,overflow_refusals_total,resolver_in_flight,prefixes}` and `yuzu_server_oidc_resolver_in_flight`; see [Metrics](metrics.md) and the runbook in [Server administration](server-admin.md#nat64-discovery-cache-runbook).
+
 ## New: leader-election metrics and alerts (HA WS-11, #4014)
 
 Additive; no behaviour change and no action is needed to keep a deployment working. Every server with a

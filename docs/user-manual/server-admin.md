@@ -5868,6 +5868,25 @@ server process's memory. Behind a load balancer with N replicas the effective
 ceiling is `configured_cap x N`, and a peer that reconnects to a different replica
 gets a fresh allowance.
 
+## NAT64 discovery cache runbook
+
+The server learns the network's NAT64 prefixes (RFC 7050: the AAAA answer for `ipv4only.arpa`) into **one process-wide cache that never shrinks**, used by the OIDC egress check (and by any later feature that classifies IPv6 destinations). Operators can see it:
+
+| Signal | Meaning |
+|---|---|
+| `yuzu_server_nat64_discovery_prefixes` | Prefixes held (at most 64). |
+| `yuzu_server_nat64_discovery_overflowed` | `1` while the set is in overflow. |
+| `yuzu_server_nat64_discovery_overflow_refusals_total` | IPv6 destinations refused because of it. |
+| `yuzu_server_nat64_discovery_lookups_total{outcome}` | `answered`, `answered_none` (NXDOMAIN or no AAAA: no DNS64 here, normal), `failed`, `inconclusive` (a busy resolver or a call that could not wait for the lookup in flight; not remembered). |
+| `yuzu_server_nat64_discovery_resolver_in_flight` | The discovery pool's one slot: `1` for more than a few seconds is a stuck lookup. |
+| `yuzu_server_oidc_resolver_in_flight` | The OIDC host vet's own 8-slot pool. |
+
+**Symptom of overflow:** OIDC fetches to IPv6 destinations fail; the log carries one `NAT64 discovery: ... would exceed 64 learned prefixes` error (logged once per transition, not per request). **Cause:** one answer for `ipv4only.arpa` carried more than 64 prefixes (a hostile or broken resolver). **Why it persists:** the set never shrinks, so after a hostile answer fills it to 64, a later answer is accepted only if it adds nothing new. **Remedy:** fix the resolver, declare the real prefix with `--oidc-nat64-prefix`, and **restart the server** (a restart clears the cache). IPv4 destinations are unaffected.
+
+**Isolation:** discovery is single-flight (at most one `ipv4only.arpa` lookup at a time, process-wide) and runs in its own capacity-one resolver pool, so a hung resolver cannot use up the 8 lookups the OIDC host vet resolves names in; at worst discovery stays inconclusive.
+
+**Stuck discovery lookup:** a blocking name-service module (NSS) can hold the single discovery slot until the process restarts. Symptoms: `yuzu_server_nat64_discovery_resolver_in_flight` stays `1` for longer than a few seconds and `yuzu_server_nat64_discovery_lookups_total{outcome="inconclusive"}` keeps rising. Effect: discovery cannot refresh; OIDC IPv6 fetches are classified with everything learned so far (and with no learned prefixes if none ever was, the historical behaviour). Remedy: fix the resolver/NSS module and restart the server (the stuck worker cannot be cancelled), or declare the prefix with `--oidc-nat64-prefix`.
+
 ## Response export bounds
 
 Runbook for the response routes' export limits (#4644, #4703). `GET /api/responses/{id}/export` and
