@@ -5563,6 +5563,36 @@ is absent or not open, which is "unknown", not zero. The two differ after a runt
 `PUT /api/config/<key>`, which is stored but not applied (see
 [When a change takes effect](#when-a-change-takes-effect)).
 
+`tar` publishes the TAR warehouse retention tiers: `tick_seconds` (the agent's prune
+tick, 900) and `tiers`, one row per source and tier (`live`, `hourly`, `daily`, `monthly`,
+`boot`). Each row has `limit_kind` (`rows` or `seconds`), `limit`, `bucket_seconds` (the
+roll-up bucket: 0 for `live`/`boot`, 3600, 86400, or 2678400 for a month, the 31-day worst
+case) and `guaranteed_depth_seconds`. Roll-up rows age from the start of their bucket, so
+a time-based tier is guaranteed for `limit - bucket_seconds` (a 365-day monthly tier is
+guaranteed for 334 days). It is `null` for `rows` tiers, whose time depth depends on how
+fast a device writes. `guaranteed_depth_seconds` is a floor on how long a record is kept, not
+where it sits: a record is still in its finer tier until the coarser roll-up closes. It is a
+floor on rows that exist, not on coverage: after an agent is offline longer than a tier's
+roll-up catch-up window (2 h hourly, 2 d daily, about 62 d monthly) the missed span is a gap in
+that tier, not a deeper tier. The
+`usage`/`live` row is a backstop, not an operative bound: the usage fold bounds its own open
+set (20,000 runs) before this limit can apply.
+
+These are the registry **defaults** an agent of this server's release applies (agents on other
+releases may differ), not per-device readings: TAR prunes on the agent, so the server has no
+live value. Every source's tiers are declared on every OS; where a source does not run on the
+agent's OS (see the OS compatibility matrix in the TAR manual) its tier applies to an empty
+table. A paused or errored source is never pruned (per-device paused sources: [`GET /api/v1/tar/retention-paused`](#get-apiv1tarretention-paused)); while the agent is running, rows may
+outlive their limit by up to `tick_seconds` (an offline agent or a disabled plugin prunes
+nothing), longer when the retention clock guard declines a prune, shorter by any plausible
+forward skew of the endpoint clock, which the guard does not decline (the depth is measured on
+the agent's own clock), and longer still while a backlog drains through the per-pass delete cap
+(5,000 rows per table per tick). `tar` is `null` only if the server's embedded table cannot be read. A server older than this release omits `tar`; treat absent like `null`.
+
+The order of `tiers` is unspecified; match rows by (`source`, `tier`). Clients must tolerate
+unknown `tier` and `limit_kind` values: a new tier is an additive change. A per-device or
+server-enforced reading, if one ever ships, lands under a new key, never by redefining `tiers`.
+
 ```json
 {
   "data": {
@@ -5573,6 +5603,15 @@ is absent or not open, which is "unknown", not zero. The two differ after a runt
       "response_retention_days": 90,
       "audit_retention_days": 365,
       "guardian_event_retention_days": 30
+    },
+    "tar": {
+      "tick_seconds": 900,
+      "tiers": [
+        { "source": "process", "tier": "live", "limit_kind": "rows", "limit": 100000,
+          "bucket_seconds": 0, "guaranteed_depth_seconds": null },
+        { "source": "process", "tier": "daily", "limit_kind": "seconds", "limit": 2678400,
+          "bucket_seconds": 86400, "guaranteed_depth_seconds": 2592000 }
+      ]
     }
   },
   "meta": { "api_version": "v1" }
@@ -7417,7 +7456,7 @@ re-eval, unchanged.
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `re-eval` only, the original's live parent set was deleted and its persisted `scope_input_id` shows it was narrowed at creation (#4306) — audited `result_set.create\|denied`, `reason=parent_gone` |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` with `"kind":"tar_rows_ge"` whose `n` is present but not a JSON integer from `1` to `2147483647` (a wrong type or a wrapped value used to throw in the maintenance tick, which re-threw every 2 seconds and starved the result-set GC; an `n` or `kind` already stored that is malformed, or an `n` below 1, now matches no device). A `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too, and so is a column matcher (no `kind`) whose `column`, `op` or `value` is present but not a string or whose `value_set` is present but not an array (`{"column":5,"op":"eq"}` used to qualify every responder; a stored one now matches no device, while a MISSING key keeps the accept-all default so a typo cannot silently empty the set); it used to be dropped, which meant every responder qualified (omit `matcher` for that default). Nothing is dispatched (#4644) |
-| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` that carries `declared_columns` or `plugin`. These two keys are server-authored: when the matcher's `column` is a column the instruction definition declares in its `result_schema`, the server stores them (`declared_columns` = field names in output order, `plugin` = the definition's plugin) so a column matcher works on any plugin's pipe-row output, not only TAR or JSON. The header row and short status rows (`status\|not_found`, `not_available\|<reason>`) are skipped. A column the definition does not declare stores nothing extra |
+| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` that carries `declared_columns`, `plugin` or `row_discriminator`. These three keys are server-authored: when the matcher's `column` is a column the instruction definition declares in its `result_schema`, the server stores them (`declared_columns` = field names in output order, `plugin` = the definition's plugin) so a column matcher works on any plugin's pipe-row output, not only TAR or JSON. The header row and short status rows (`status\|not_found`, `not_available\|<reason>`) are skipped. A column the definition does not declare stores nothing extra |
 | 400 | `sql`/`instruction_id`/`name` present but not a JSON string (a clean 400 rather than an uncaught exception, #4406); `name` over 256 bytes on `from-tar-query` or `from-instruction-result` |
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
 | 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
@@ -11212,7 +11251,7 @@ write a `command.dispatch` audit row with `result=denied` and `detail=reason=<re
 must be a JSON object; anything else is `400`.
 
 **Destructive-class capabilities require explicit, non-empty `agent_ids` — broadcast and `scope`
-fan-out are refused (#3685).** The command catalogue currently classifies 19 `plugin.action` pairs
+fan-out are refused (#3685).** The command catalogue currently classifies 21 `plugin.action` pairs
 `Destructive` (e.g. `tar.purge_source`, `filesystem.delete_lines`, `registry.delete_key`); dispatching
 any of them with `agent_ids` omitted or empty, or with `scope` present at all — including
 `"__all__"` — is refused **before** the command reaches an agent. This is a narrower carve-out

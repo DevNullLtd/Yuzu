@@ -1481,7 +1481,7 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
                                        "  'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
                                      : "") +
                 " WHERE g.obs_type IN ('process.crashed', 'process.hung')"
-                "  AND g.observed_at >= $1 AND g.platform = $2"
+                "  AND g.observed_at >= $1 AND ($2::text = '' OR g.platform = $2::text)"
                 " GROUP BY g.subject, g.version, g.agent_id),"
                 "tc AS ("
                 " SELECT subject, COUNT(DISTINCT agent_id) AS dev, SUM(c) + SUM(h) AS ev"

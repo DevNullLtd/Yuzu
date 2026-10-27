@@ -270,7 +270,7 @@ TEST_CASE("apps json: a custom policy's source and revision and fault appear ver
 TEST_CASE("apps builder: a hand-built invalid in-force policy still degrades", "[dex][apps_model]") {
     DexPolicyInForce f;
     f.policy.tiers.edges.good = 95.0; // not below excellent
-    const auto m = build_dex_apps_model(nullptr, "7d", "2026-10-07T00:00:00Z",
+    const auto m = build_dex_apps_model(nullptr, "7d", "2026-10-07T00:00:00Z", "windows",
                                         std::vector<std::string>(50, "id"), f);
     CHECK(m.degraded);
     CHECK(m.degraded_reason == "score_policy_invalid");
@@ -280,7 +280,7 @@ TEST_CASE("apps builder: a hand-built invalid in-force policy still degrades", "
 // The invalid-policy arm needs an open store to discriminate, so it lives in
 // test_dex_api.cpp; a null store degrades regardless of the policy.
 TEST_CASE("apps builder: a null store degrades, never scores", "[dex][apps_model]") {
-    const auto m = build_dex_apps_model(nullptr, "7d", "2026-10-07T00:00:00Z",
+    const auto m = build_dex_apps_model(nullptr, "7d", "2026-10-07T00:00:00Z", "windows",
                                        std::vector<std::string>(50, "id"), def());
     CHECK(m.degraded);
     CHECK(m.apps.empty());
@@ -417,6 +417,31 @@ TEST_CASE("apps model: share and rate and score use the online figures only", "[
     // 2 only, so it is withheld.
     CHECK_FALSE(f.score.score);
     CHECK(std::string(f.score.withheld) == "offline_affected");
+}
+
+TEST_CASE("apps scope: dex_normalize_apps_scope accepts the four tokens and nothing else",
+          "[dex][apps_model]") {
+    for (const char* s : {"all", "windows", "macos", "linux"})
+        CHECK(dex_normalize_apps_scope(s) == s);
+    for (const char* s : {"", "darwin", "Windows", "win"})
+        CHECK(dex_normalize_apps_scope(s).empty());
+}
+
+TEST_CASE("apps scope: dex_apps_online_ids selects the connected agents of the scope",
+          "[dex][apps_model]") {
+    DexFleet f;
+    f.connected_agents = {{"w1", "windows"}, {"l1", "linux"}, {"m1", "macos"}};
+    CHECK(dex_apps_online_ids(f, "windows") == std::vector<std::string>{"w1"});
+    CHECK(dex_apps_online_ids(f, "linux") == std::vector<std::string>{"l1"});
+    CHECK(dex_apps_online_ids(f, "macos") == std::vector<std::string>{"m1"});
+    CHECK(dex_apps_online_ids(f, "all") == std::vector<std::string>{"w1", "l1", "m1"});
+    CHECK(dex_apps_online_ids(DexFleet{}, "all").empty());
+}
+
+TEST_CASE("apps scope: the population basis is the scope plus _online", "[dex][apps_model]") {
+    CHECK(dex_apps_population_basis("windows") == "windows_online");
+    CHECK(dex_apps_population_basis("all") == "all_online");
+    CHECK(dex_apps_population_basis("linux") == "linux_online");
 }
 
 TEST_CASE("apps model: the score is published when every affected device is online",

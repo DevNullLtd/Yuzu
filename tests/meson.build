@@ -258,6 +258,8 @@ agent_test_exe = executable(
     'unit/test_filesystem_read.cpp',
     'unit/test_filesystem_actions.cpp',
     'unit/test_filesystem_local_dispatcher.cpp', # #4728: real filesystem plugin via LocalDispatcher -- `replace` through the shared atomic write
+    'unit/test_filesystem_find_by_hash.cpp',  # #5624: pure find_by_hash walk core (limits, injected clock/cancel/hasher) + real no-follow fd hasher over TempDir
+    'unit/test_filesystem_find_by_hash_dispatcher.cpp',  # #5624: real filesystem plugin via LocalDispatcher -- byte-identical clean output, trailer + CONSTRAINED/PARTIAL
     'unit/test_confined_fs_rules.cpp',
     'unit/test_confined_fs_walk.cpp',
     'unit/test_confined_fs_posix.cpp',
@@ -353,6 +355,7 @@ agent_test_exe = executable(
     'unit/test_launchd_state.cpp',      # A0 fix round: launchd_state_for (yuzu/agent/launchd_state.hpp)
     'unit/test_wmi_bounded.cpp',        # shared bounded WMI helper (roadmap C-8 extraction); header-only, no separate .cpp to list
     'unit/test_wmi_error_token.cpp',    # #4895: shared stage-aware WMI token classifier (agents/shared/wmi_error_token.hpp), portable
+    'unit/test_inventory_status_row.cpp', # shared inventory status-row grammar (agents/shared/inventory_status_row.hpp), portable
     'unit/test_installed_apps_registry_utf8.cpp',
     'unit/test_service_binpath.cpp',
     'unit/test_agent_log_options.cpp', # #4666 PR-2: make_log_handoff_options CLI-flags translator
@@ -409,6 +412,7 @@ agent_test_exe = executable(
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
     'unit/test_registry_parsers.cpp',          # registry value encoders, validators and the audit line (pure, every host)
+    'unit/test_registry_plan.cpp',             # apply plan parser and the item/undo/summary row renderers (pure, every host)
     'unit/test_registry_core.cpp',             # registry write logic over an in-memory fake registry (checked open, fast open, verify, delete_key; every host)
     'unit/test_registry_write_local_dispatcher.cpp', # real registry.dll writes via LocalDispatcher (Windows branch, elevated); descriptor/version/sentinel pins on every host
     'unit/test_registry_win_internals.cpp',    # TU-inclusion seam over registry_win.cpp -- Win32Registry on a dangling link and the final_name/root_name calls (Windows-only body, elevated; empty TU elsewhere)
@@ -1285,6 +1289,7 @@ tar_test_exe = executable(
     'unit/test_tar_store.cpp',
     'unit/test_tar_schema_registry.cpp',
     'unit/test_tar_capability_table.cpp',
+    'unit/test_tar_retention_tiers_table.cpp',
     'unit/test_tar_warehouse.cpp',
     'unit/test_tar_aggregator.cpp',
     'unit/test_tar_usage.cpp',
@@ -1305,6 +1310,7 @@ tar_test_exe = executable(
     'unit/test_tar_cursor.cpp',                  # Wave 6: cursor-source seam — lifecycle + persistence, atomic event+cursor commit, record_key dedupe, ack-by-sequence incl. the R-005 overflow regression (on-disk TarDb via unique_temp_path)
     'unit/test_tar_power.cpp',                   # Wave 6 PR6.2-b: pmset parser + exact-tail cursor/gap decisions, REAL-CAPTURE fixtures, RunFn-injected
     'unit/test_tar_removable.cpp',               # Wave 6 PR6.3: event-log channel parsers + identity + per-channel cursors, REAL-CAPTURE fixtures
+    'unit/test_tar_registry_source.cpp',         # PR11.8: registry source -- pure core (diff/dirty table/codecs) + injected-reader lifecycle + [windows] live cases
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
@@ -1337,6 +1343,8 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_power_collector.cpp',
     # Wave 6 PR6.3: the TU exercises the real CursorSource via the factory.
     '../agents/plugins/tar/src/tar_removable_collector.cpp',
+    # PR11.8: test_tar_registry_source.cpp drives the real source over an injected reader.
+    '../agents/plugins/tar/src/tar_registry_source.cpp',
   ) + tar_test_removable_darwin_sources,
   include_directories: [
     include_directories('../agents/plugins/tar/src'),
@@ -1830,6 +1838,7 @@ if build_server
       'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_settings_model.cpp',        # #4028 — pure Settings read-twin builder unit tests
       'unit/server/test_settings_read_twins.cpp',   # #4028 — REST v1 read-twin route coverage
+      'unit/server/test_tar_retention_tiers.cpp',   # TAR retention tier TSV parser + depth arithmetic (pure)
       'unit/server/test_settings_page_ui.cpp',      # pure-string pins: 21 panels + static h1 on the /settings page
       'unit/server/test_settings_general.cpp',      # System General page: runtime/events renderers, routes, page pins
       'unit/server/test_plugin_signing_helpers.cpp',
@@ -1952,7 +1961,13 @@ if build_server
       # yuzu_proto_headers_dep - a DOWNWARD edge for both server and agent, no cycle, no
       # new build-graph node. NOT sdk/, which is the public plugin ABI surface.
       include_directories('../agents/core/src'),
-      include_directories('../agents/shared'), # test_plugin_result_audit.cpp: registry_parsers.hpp's OS-free shared includes
+      # test_plugin_result_audit.cpp includes registry_parsers.hpp, whose OS-free includes (user_profile_model.hpp,
+      # wire_utf8.hpp) live in agents/shared. WHY it is on the whole executable: include_directories is per target,
+      # not per source, so every TU of this executable now sees agents/shared too. The risk is real and silent: a
+      # header of the same name in two include dirs is resolved by include-directory order, never a compile error. So a
+      # new agents/shared header needs a name no server test header or other include dir of this executable uses
+      # (none collide today).
+      include_directories('../agents/shared'),
     ],
     # httplib.h is header-only and its Client/Server class layout depends on
     # CPPHTTPLIB_OPENSSL_SUPPORT — yuzu_server_core compiles every TU with
@@ -3200,6 +3215,15 @@ test('ensure-erlang strict-mode callers',
   timeout: 180,
 )
 
+# docs/ build inputs of Meson targets are re-included in /.dockerignore (the image
+# builds `COPY . .` with docs/ otherwise excluded).
+test('docker context re-includes embedded docs inputs',
+  _python3_test,
+  args: [files('test_docker_context_embeds_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Every script target uses yuzu_python (no ad-hoc find_program for python).
 test('meson python lookup is yuzu_python',
   _python3_test,
@@ -3474,6 +3498,16 @@ test('firmware_posture definition columns',
 test('runtimes definition columns',
   _python3_test,
   args: [files('test_runtimes_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# filesystem.find_by_hash's definition (content/definitions/filesystem.yaml): version 0.4.0, the
+# three declared columns and the row_kind values the declared-column result matcher binds to
+# (#5624); the C++ matcher test keeps a copy of the schema, this pins it to the shipped definition.
+test('filesystem definition columns',
+  _python3_test,
+  args: [files('test_filesystem_definition.py')],
   suite: 'docs',
   timeout: 30,
 )

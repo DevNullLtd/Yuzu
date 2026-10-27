@@ -40,6 +40,8 @@ tar_sources = files(
 tar_sources += files('src/tar_power_collector.cpp')
 # Wave 6 PR6.3: the removable cursor source
 tar_sources += files('src/tar_removable_collector.cpp')
+# PR11.8: the registry cursor source (Windows key watch + baseline diff)
+tar_sources += files('src/tar_registry_source.cpp')
 
 if host_machine.system() == 'windows'
   tar_deps += cxx.find_library('advapi32')

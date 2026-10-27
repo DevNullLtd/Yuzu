@@ -370,6 +370,18 @@ yuzu::server::DexFleet fleet20() {
     return f;
 }
 
+// fleet20's Windows devices plus two Linux (l1, l2) and one macOS (m1) device.
+yuzu::server::DexFleet fleet23() {
+    auto f = fleet20();
+    f.connected_agents.emplace_back("l1", "linux");
+    f.connected_agents.emplace_back("l2", "linux");
+    f.connected_agents.emplace_back("m1", "macos");
+    f.linux_online = 2;
+    f.macos_online = 1;
+    f.total_online = 23;
+    return f;
+}
+
 void seed_apps_fixture(GuaranteedStateStore& store) {
     int n = 0;
     auto id = [&] { return "ap" + std::to_string(++n); };
@@ -726,6 +738,109 @@ TEST_CASE("DexApi: apps counts Windows rows only", "[pg][dex][apps_model]") {
     CHECK(m.apps[0].figures.hangs == 1);
     CHECK(m.apps[0].figures.distinct_devices == 4);
     CHECK(m.apps[0].version_count == 2);
+}
+
+// A platform scope answers over that scope's online devices only; the population
+// and every figure move together.
+TEST_CASE("DexApi: apps platform scope", "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    for (int i = 1; i <= 3; ++i)
+        seed_obs_v(store, "lxo" + std::to_string(i), "l1", "linux-only.bin", "process.crashed", "1.0",
+                   kTs, "linux");
+    for (int i = 1; i <= 2; ++i)
+        seed_obs_v(store, "mco" + std::to_string(i), "m1", "macos-only.app", "process.crashed", "1.0",
+                   kTs, "macos");
+    auto api = make_local_dex_api(&store, fleet23);
+
+    const auto win = api->apps("7d");
+    REQUIRE_FALSE(win.degraded);
+    CHECK(win.population == 20);
+    REQUIRE(win.apps.size() == 2);
+    CHECK(win.apps[0].subject == "app.exe");
+    CHECK(win.apps[1].subject == "aardvark.exe");
+
+    const auto all = api->apps("7d", "all");
+    REQUIRE_FALSE(all.degraded);
+    CHECK(all.population == 23);
+    CHECK(all.apps_total == 4);
+    REQUIRE(all.apps.size() == 4);
+    for (const auto& a : all.apps)
+        if (a.subject == "linux-only.bin") {
+            REQUIRE(a.figures.share_affected);
+            CHECK(a.figures.share_affected->estimate == yuzu::server::dex_proportion(1, 23)->estimate);
+        }
+
+    const auto lin = api->apps("7d", "linux");
+    REQUIRE_FALSE(lin.degraded);
+    CHECK(lin.population == 2);
+    REQUIRE(lin.apps.size() == 1);
+    CHECK(lin.apps[0].subject == "linux-only.bin");
+
+    const auto mac = api->apps("7d", "macos");
+    REQUIRE_FALSE(mac.degraded);
+    CHECK(mac.population == 1);
+    REQUIRE(mac.apps.size() == 1);
+    CHECK(mac.apps[0].subject == "macos-only.app");
+}
+
+TEST_CASE("DexApi: apps windows scope is byte-identical to the one-argument read",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    seed_obs_v(store, "lxo1", "l1", "linux-only.bin", "process.crashed", "1.0", kTs, "linux");
+    auto api = make_local_dex_api(&store, fleet23);
+    const auto implicit = api->apps("7d");
+    const auto windows = api->apps("7d", "windows");
+    REQUIRE_FALSE(windows.degraded);
+    CHECK(yuzu::server::dex_apps_json(implicit) == yuzu::server::dex_apps_json(windows));
+    CHECK(nlohmann::json::parse(yuzu::server::dex_apps_json(windows))["population_basis"] ==
+          "windows_online");
+    CHECK(nlohmann::json::parse(yuzu::server::dex_apps_json(api->apps("7d", "all")))["population_basis"] ==
+          "all_online");
+}
+
+TEST_CASE("DexApi: apps with an invalid scope is degraded before policy or fleet",
+          "[dex][dex_api]") {
+    int fleet_calls = 0;
+    int policy_calls = 0;
+    auto api = make_local_dex_api(
+        /*store=*/nullptr,
+        [&fleet_calls] {
+            ++fleet_calls;
+            return yuzu::server::DexFleet{};
+        },
+        [&policy_calls]() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+            ++policy_calls;
+            return yuzu::server::DexPolicyInForce{};
+        });
+    for (const char* bad : {"", "darwin", "Windows"}) {
+        const auto m = api->apps("7d", bad);
+        CHECK(m.degraded);
+        CHECK(m.degraded_reason == "invalid_scope");
+    }
+    CHECK(fleet_calls == 0);
+    CHECK(policy_calls == 0);
+}
+
+TEST_CASE("DexApi: apps all scope without a FleetFn has an unknown population",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    const auto m = make_local_dex_api(&store, {})->apps("7d", "all");
+    REQUIRE_FALSE(m.degraded);
+    CHECK_FALSE(m.population);
+    REQUIRE_FALSE(m.apps.empty());
+    CHECK(std::string(m.apps[0].figures.score.withheld) == "no_population");
 }
 
 // 102 subjects: the top 100 by devices affected then activity are kept, ties fall

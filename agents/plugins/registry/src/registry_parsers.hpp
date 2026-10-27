@@ -4,7 +4,8 @@
  * registry_parsers.hpp -- the registry plugin's PURE layer (no windows.h, no I/O, no clock; unit-tested
  * on every host; the shell is registry_win.cpp, the logic over an injected registry registry_core.hpp):
  * value encoders, the key-path / value-name validators (the trust boundary of every mutating action),
- * the error tokens, and the audit-line renderer.
+ * the error tokens, the audit-line renderer, the small pure classifiers the per-user writes and `apply`
+ * share, and the limits of both (the apply plan itself lives in registry_plan.hpp, which needs nlohmann).
  *
  * Limits: Microsoft's "Registry Element Size Limits" allow a key name 255 characters and a value name
  * 16,383; this plugin also caps a whole key path at 255 bytes and 32 components (kMaxKeyPathBytes,
@@ -17,6 +18,7 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <span>
 #include <string>
@@ -39,9 +41,20 @@ inline constexpr std::size_t kMaxValueNameBytes = 16383;
 inline constexpr std::size_t kMaxWriteBytes = 1024 * 1024;
 /// A previous value is captured up to this many bytes; `OldValue::total` keeps the full size.
 inline constexpr std::size_t kCaptureValueCap = 4096;
-/// delete_key: nodes (the key itself plus its values) counted by the bounded enumeration before `capped`;
-/// past it `counted_values` is a lower bound.
+/// delete_key: nodes (keys plus values) counted by the bounded vetting walk before `capped`; past it the counts are
+/// a lower bound and a REAL recursive delete is refused tree_too_large.
 inline constexpr std::size_t kMaxTreeNodes = 10000;
+/// delete_key recursive: levels below the target the vetting and the delete walk descend (one open handle per level
+/// is held, so this bounds the handles a walk holds); a deeper tree is `capped`.
+inline constexpr unsigned kMaxTreeDepth = 600;
+/// apply: the ONE budget of every byte a plan retains for its undo manifest, names and captured values alike (see
+/// registry_core.hpp CaptureBudget). Hex doubles it, which keeps the whole reply under the dispatcher's 2 MiB cap.
+inline constexpr std::size_t kCaptureTotalCap = 512 * 1024;
+/// apply: the fixed cost charged to the capture budget for every retained row, for the row text around the hex.
+inline constexpr std::size_t kUndoRowOverhead = 64;
+/// apply: the plan's bounds (parse_plan).
+inline constexpr std::size_t kMaxPlanItems = 256;
+inline constexpr std::size_t kMaxPlanBytes = 65536;
 /// Audit line budgets: raw bytes of old/new data and characters of a name token.
 inline constexpr std::size_t kAuditHexCapBytes = 256;
 inline constexpr std::size_t kAuditTokenCap = 256;
@@ -61,12 +74,18 @@ inline constexpr std::string_view kTokInvalidKeyPath = "invalid_key_path";
 inline constexpr std::string_view kTokInvalidValueName = "invalid_value_name";
 inline constexpr std::string_view kTokVerifyMismatch = "verify_mismatch";
 inline constexpr std::string_view kTokKeyHasSubkeys = "key_has_subkeys";
+inline constexpr std::string_view kTokTreeTooLarge = "tree_too_large";
+inline constexpr std::string_view kTokUnsupportedOldType = "unsupported_old_type";
+inline constexpr std::string_view kTokUnrepresentableName = "unrepresentable_name";
+inline constexpr std::string_view kTokDependentItems = "dependent_items";
+inline constexpr std::string_view kTokInvalidHive = "invalid_hive";
 
 // Win32 codes this layer branches on (registry_win.cpp static_asserts each against the SDK).
 inline constexpr long kErrorSuccess = 0;
 inline constexpr long kErrorFileNotFound = 2;
 inline constexpr long kErrorPathNotFound = 3;
 inline constexpr long kErrorAccessDenied = 5;
+inline constexpr long kErrorInvalidData = 13;
 inline constexpr long kErrorNotSupported = 50;
 inline constexpr long kErrorMoreData = 234;
 inline constexpr long kErrorNoMoreItems = 259;
@@ -97,6 +116,64 @@ enum class Hive { hklm, hkcu, hkcr, hku };
     case Hive::hku: return "HKU";
     }
     return "HKLM";
+}
+
+/// Whether a kernel key name (NtQueryKey's UTF-16, before any conversion) round-trips to UTF-8 exactly: no NUL
+/// unit, no lone surrogate. The canonical-name compare of the fast open runs on the UTF-8 form, and a lossy
+/// conversion would map a lone surrogate to U+FFFD, so a key one code unit away from the requested name could compare
+/// equal; a name that fails this is never compared (the fast open declines and the walk decides).
+/// A template over the 16-bit code unit so the Windows shell passes its wchar_t buffer as it is (no cast between the
+/// two character types) and the tests pass char16_t on every host.
+template <class C> [[nodiscard]] bool kernel_name_well_formed(std::basic_string_view<C> name) noexcept {
+    static_assert(sizeof(C) == 2, "a UTF-16 code unit");
+    const auto unit = [&](std::size_t i) { return static_cast<std::uint16_t>(name[i]); };
+    for (std::size_t i = 0; i < name.size(); ++i) {
+        const std::uint16_t u = unit(i);
+        if (u == 0) return false;
+        if (u >= 0xD800 && u <= 0xDBFF) {
+            if (i + 1 >= name.size() || unit(i + 1) < 0xDC00 || unit(i + 1) > 0xDFFF) return false;
+            ++i; // the pair
+        } else if (u >= 0xDC00 && u <= 0xDFFF) {
+            return false; // a low surrogate with no high before it
+        }
+    }
+    return true;
+}
+
+/// The two refusals every action's hive/key parameters can earn (the shell writes the line verbatim).
+inline constexpr std::string_view kErrMissingHiveKey = "error|missing required parameters: hive, key";
+inline constexpr std::string_view kErrInvalidHive = "error|invalid hive (use HKLM, HKCU, HKCR, or HKU)";
+
+/// Pure front half of every action's parse_target: both parameters present, the hive one of the four names.
+/// The error is the line to write, a view of a constant.
+[[nodiscard]] inline std::expected<Hive, std::string_view> resolve_target(std::string_view hive,
+                                                                          std::string_view key) noexcept {
+    if (hive.empty() || key.empty()) return std::unexpected{kErrMissingHiveKey};
+    if (const auto h = parse_hive(hive)) return *h;
+    return std::unexpected{kErrInvalidHive};
+}
+
+namespace detail {
+
+/// The one ASCII fold the plugin uses: A-Z to a-z, every other byte (including a non-ASCII one) unchanged. A strict
+/// subset of the kernel's case folding, so a compare built on it never equates two names the kernel keeps distinct.
+[[nodiscard]] constexpr char lower_ascii(char c) noexcept {
+    return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c;
+}
+
+} // namespace detail
+
+/// L7: whether an access names a path the agent log should note (the Run keys and the service tree under HKLM).
+/// ASCII-case-insensitive prefix match on the raw, not yet validated, key; no copy of it.
+[[nodiscard]] inline bool is_sensitive_hklm_path(std::string_view hive, std::string_view key_path) noexcept {
+    if (hive != "HKLM") return false;
+    const auto starts_ci = [&](std::string_view upper_prefix) {
+        return key_path.size() >= upper_prefix.size() &&
+               std::equal(upper_prefix.begin(), upper_prefix.end(), key_path.begin(),
+                          [](char p, char c) { return detail::lower_ascii(p) == detail::lower_ascii(c); });
+    };
+    return starts_ci("SOFTWARE\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\RUN") ||
+           starts_ci("SYSTEM\\CURRENTCONTROLSET\\SERVICES");
 }
 
 // ── value types and encoders ─────────────────────────────────────────────
@@ -160,8 +237,7 @@ inline void put_le(std::vector<std::uint8_t>& out, std::uint64_t v, int bytes) {
 /// ASCII-only lower-casing (registry key and value names compare case-insensitively).
 [[nodiscard]] inline std::string fold_ascii(std::string_view s) {
     std::string o{s};
-    for (char& c : o)
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+    for (char& c : o) c = lower_ascii(c);
     return o;
 }
 
@@ -227,6 +303,9 @@ inline void put_le(std::vector<std::uint8_t>& out, std::uint64_t v, int bytes) {
 /// data_hex is the zero-byte form, valid only for REG_BINARY). Otherwise `value` is the text form:
 /// decimal digits for DWORD / QWORD (overflow -> value_overflow), UTF-8 for SZ / EXPAND_SZ,
 /// LF-separated non-empty records for MULTI_SZ (empty text = the lone double NUL), hex for BINARY.
+/// A missing or misspelt `value` parameter reaches this as an empty text (the caller cannot tell the two apart), so
+/// an empty text is the empty string / empty binary for SZ / EXPAND_SZ / BINARY, the lone double NUL for MULTI_SZ and
+/// invalid_data for DWORD / QWORD; the MULTI_SZ record separator is LF only.
 /// Everything is capped at kMaxWriteBytes.
 [[nodiscard]] inline Encoded encode_value(std::uint32_t type, std::string_view value,
                                           std::string_view data_hex, bool data_hex_present) {
@@ -386,6 +465,15 @@ inline void put_le(std::vector<std::uint8_t>& out, std::uint64_t v, int bytes) {
     return {};
 }
 
+/// A boolean action parameter (the server stringifies JSON booleans to "true"/"false"): empty means `def`; "true" / "1"
+/// and "false" / "0" are the only other spellings; anything else is nullopt (the caller refuses invalid_data).
+[[nodiscard]] inline std::optional<bool> parse_bool_param(std::string_view text, bool def) noexcept {
+    if (text.empty()) return def;
+    if (text == "true" || text == "1") return true;
+    if (text == "false" || text == "0") return false;
+    return std::nullopt;
+}
+
 // ── Win32 return codes -> tokens ─────────────────────────────────────────
 
 enum class Missing { key, value };
@@ -402,6 +490,19 @@ enum class Missing { key, value };
         return std::string{what == Missing::key ? kTokKeyNotFound : kTokValueNotFound};
     case kErrorKeyDeleted: return std::string{kTokConcurrentChange};
     default: return "win32:" + std::to_string(rc);
+    }
+}
+
+/// get_value's line for a failed bounded read (`rc` from query_value_bounded): a value that kept growing through the
+/// re-reads is value_changed_during_read, FILE / PATH not found the 1.0.0 `error|value not found`, anything else
+/// `error|win32:<rc>`.
+[[nodiscard]] inline std::string get_value_error_line(long rc, std::string_view key) {
+    switch (rc) {
+    case kErrorMoreData:
+        return yuzu::profiles::render_user_key_error(yuzu::profiles::UserKeyStatus::value_changed_during_read, key);
+    case kErrorFileNotFound:
+    case kErrorPathNotFound: return "error|value not found";
+    default: return "error|win32:" + std::to_string(rc);
     }
 }
 
@@ -425,12 +526,34 @@ struct OldValue {
     std::string error;
 };
 
+/// Whether this plugin could write a captured previous value back as it was: an absent or unreadable one has nothing to
+/// write, a present one needs a writable type and a shape check_value_shape accepts (a capture cut at kCaptureValueCap
+/// can only be judged by its type and size: the part it kept is not the whole value) and a size set_value will carry.
+[[nodiscard]] inline bool restorable(const OldValue& v) {
+    if (v.state != OldState::present) return true;
+    if (!is_writable_type(v.type) || v.total > kMaxWriteBytes) return false;
+    return v.bytes.size() < v.total || check_value_shape(v.type, v.bytes).empty();
+}
+
+/// After an OFFLINE per-user write is unloaded the shell probes `RegOpenKeyExW(HKEY_USERS, sid)`: a hive now LOADED
+/// means a session loaded NTUSER.DAT after the write returned (README caveat: a logon that failed while the hive was
+/// mounted leaves no trace). The warning token, or "" when there is nothing to say: not mounted offline, nothing
+/// written, or the probe found no hive (not-found is the clean answer); any other probe failure is reported.
+[[nodiscard]] inline std::string classify_offline_write_race(bool mounted_offline, bool wrote,
+                                                             long post_unload_open_rc) {
+    if (!mounted_offline || !wrote) return {};
+    if (post_unload_open_rc == kErrorFileNotFound || post_unload_open_rc == kErrorPathNotFound) return {};
+    if (post_unload_open_rc == kErrorSuccess) return "hive_loaded_after_offline_write";
+    return "hive_post_unload_probe_failed:win32_" + std::to_string(post_unload_open_rc);
+}
+
 // ── audit line ───────────────────────────────────────────────────────────
 
-/// Neutralises untrusted text for an `audit|k=v|...` line: invalid UTF-8 -> '?', control bytes,
-/// space, '=' and ',' (yuzu::log_token) -> '_', and '|' -> '_' (log_token does not map the field
-/// separator). A trailing backslash becomes '_' too. Over `cap` bytes it is cut on a character boundary and gets
-/// `~<total length>`.
+/// Neutralises untrusted text for an `audit|k=v|...` line: invalid UTF-8 -> '?', control bytes, DEL, space, '=' and
+/// ',' (yuzu::log_token) -> '_', and '|' -> '_' (log_token does not map the field separator).
+/// The C1 controls U+0080-U+009F (NEL U+0085 among them), U+2028 and U+2029 -> '_' too (fold_line_breaks; log_token
+/// passes every byte >= 0x80). A trailing backslash becomes '_'. Over `cap` bytes it is cut on a character boundary
+/// and gets `~<total length>`; the cap and `~<total>` are measured after folding.
 [[nodiscard]] inline std::string audit_token(std::string_view s, std::size_t cap = kAuditTokenCap) {
     std::string t;
     if (yuzu::shared::count_invalid_wire_bytes(s) == 0) { // well-formed (the usual case): no scrubbed copy
@@ -441,6 +564,7 @@ struct OldValue {
         t = yuzu::log_token(scrubbed);
     }
     std::replace(t.begin(), t.end(), '|', '_');
+    yuzu::profiles::fold_line_breaks(t); // log_token folds C0 and DEL but passes C1, U+2028 and U+2029
     // A field that ends in a backslash would make the following separator read as an escaped `|` to the server's
     // splitter (result_parsing.hpp find_unescaped_pipe) and merge two cells.
     if (!t.empty() && t.back() == '\\') t.back() = '_';
@@ -470,6 +594,41 @@ struct AuditRecord {
     std::size_t new_total = 0;
     bool has_new = false;
 };
+
+/// The front half of set_value: validate, encode, and record the type and new bytes on the audit record.
+/// `err` is empty on success. A missing or misspelt `value` / `data_hex` parameter arrives here as an empty string,
+/// so an empty text is a valid empty REG_SZ / REG_BINARY (and an invalid REG_DWORD); a REG_MULTI_SZ record
+/// separator is LF only (a CR stays inside its record). `err` always views a static constant, never a member string,
+/// so a copy or move cannot dangle.
+struct PreparedSet {
+    std::string_view err;
+    std::optional<std::uint32_t> type;
+    Encoded enc;
+};
+
+[[nodiscard]] inline PreparedSet prepare_set(AuditRecord& au, std::string_view key, std::string_view name,
+                                             std::string_view type_str, std::string_view value,
+                                             std::string_view data_hex) {
+    if (type_str.empty()) type_str = "REG_SZ";
+    au.type_name = std::string{type_str};
+    PreparedSet p;
+    p.err = validate_key_path(key);
+    if (p.err.empty()) p.err = validate_value_name(name);
+    p.type = parse_reg_type(type_str);
+    if (p.err.empty() && !p.type) p.err = kTokInvalidType;
+    if (p.err.empty()) {
+        // On the string-map actions an empty data_hex is the same as an absent one.
+        p.enc = encode_value(*p.type, value, data_hex, !data_hex.empty());
+        p.err = p.enc.error;
+    }
+    if (p.err.empty()) {
+        au.len = static_cast<long long>(p.enc.bytes.size());
+        au.new_bytes = p.enc.bytes;
+        au.new_total = p.enc.bytes.size();
+        au.has_new = true;
+    }
+    return p;
+}
 
 namespace detail {
 
@@ -531,6 +690,15 @@ namespace detail {
                "counted_keys=-|counted_values=-|capped=-|created=-|sid=-|old_state=-|old_type=-|old=-|new=-";
     if (action == "delete_key")
         return "audit|op=delete_key|hive=-|result=failed|reason=exception|verify=-|key=-|name=-|type=-|len=-|dry_run=-|"
+               "counted_keys=-|counted_values=-|capped=-|created=-|sid=-|old_state=-|old_type=-|old=-|new=-";
+    if (action == "set_user_value")
+        return "audit|op=set_user_value|hive=-|result=failed|reason=exception|verify=-|key=-|name=-|type=-|len=-|dry_run=-|"
+               "counted_keys=-|counted_values=-|capped=-|created=-|sid=-|old_state=-|old_type=-|old=-|new=-";
+    if (action == "delete_user_value")
+        return "audit|op=delete_user_value|hive=-|result=failed|reason=exception|verify=-|key=-|name=-|type=-|len=-|"
+               "dry_run=-|counted_keys=-|counted_values=-|capped=-|created=-|sid=-|old_state=-|old_type=-|old=-|new=-";
+    if (action == "apply")
+        return "audit|op=apply|hive=-|result=failed|reason=exception|verify=-|key=-|name=-|type=-|len=-|dry_run=-|"
                "counted_keys=-|counted_values=-|capped=-|created=-|sid=-|old_state=-|old_type=-|old=-|new=-";
     return {};
 }
