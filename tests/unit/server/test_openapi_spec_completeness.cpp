@@ -1100,6 +1100,30 @@ TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matchin
         CHECK(full_hit->body.empty());
     }
 
+    SECTION("a weak validator, a list and * revalidate too (RFC 9110 weak comparison)") {
+        for (const std::string& header :
+             {"W/" + lean_etag, "\"0000000000000000\", " + lean_etag,
+              lean_etag + " ,\t\"0000000000000000\"", std::string("*")}) {
+            INFO(header);
+            auto hit = sink.Get(lean_path, {{"If-None-Match", header}});
+            REQUIRE(hit);
+            CHECK(hit->status == 304);
+            CHECK(hit->body.empty());
+        }
+    }
+
+    SECTION("a malformed or non-matching If-None-Match is a full 200, never a wrong 304") {
+        for (const std::string& header :
+             {std::string("garbage"), lean_etag.substr(0, lean_etag.size() - 1),
+              std::string("W/"), std::string("\"unterminated"), full_etag + "x", std::string()}) {
+            INFO(header);
+            auto miss = sink.Get(lean_path, {{"If-None-Match", header}});
+            REQUIRE(miss);
+            CHECK(miss->status == 200);
+            CHECK(miss->body == lean->body);
+        }
+    }
+
     SECTION("another form's validator, or a stale one, is a full 200") {
         auto crossed = sink.Get(lean_path, {{"If-None-Match", full_etag}});
         REQUIRE(crossed);
@@ -1119,23 +1143,6 @@ TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matchin
         CHECK(denied->status == 403);
         CHECK(denied->get_header_value("ETag").empty());
         CHECK(denied->body.find("\"openapi\"") == std::string::npos);
-    }
-
-    SECTION("the comparison is exact: a weak validator, a list or * is a full 200") {
-        // The server compares the header to its one ETag as a string. It does not parse the
-        // If-None-Match grammar, so each of these revalidates by refetching. That is documented
-        // (rest-api.md, the spec text); a proxy that weakens or merges validators costs the
-        // 304 saving, never correctness.
-        for (const std::string& inm :
-             {"W/" + lean_etag, lean_etag + ", \"0000000000000000\"",
-              "\"0000000000000000\", " + lean_etag, std::string("*")}) {
-            INFO("If-None-Match: " << inm);
-            auto r = sink.Get(lean_path, {{"If-None-Match", inm}});
-            REQUIRE(r);
-            CHECK(r->status == 200);
-            CHECK(r->body == lean->body);
-            CHECK(r->get_header_value("ETag") == lean_etag);
-        }
     }
 
     SECTION("an unauthenticated caller is refused before the validator, even with the right one") {

@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <string_view>
 
 namespace yuzu::server {
 
@@ -35,6 +36,37 @@ namespace yuzu::server {
     char buf[19];
     const int n = std::snprintf(buf, sizeof(buf), "\"%016llx\"", static_cast<unsigned long long>(h));
     return std::string(buf, static_cast<std::size_t>(n));
+}
+
+/// True when an `If-None-Match` header value matches `etag`, by RFC 9110 section 13.1.2: `*`
+/// matches, the value may be a comma-separated list, and a weak validator (`W/"..."`) compares by
+/// its opaque tag (the weak comparison `If-None-Match` uses). A malformed list matches nothing
+/// from the point it breaks, so a bad header gets the full body, never a wrong 304. `etag` is a
+/// quoted strong tag as `content_etag` returns it. The `openapi.json` route uses this; the other
+/// catalogue routes still compare for exact equality and may adopt it.
+[[nodiscard]] inline bool if_none_match_matches(std::string_view header, const std::string& etag) {
+    std::size_t i = 0;
+    const auto skip_ows_commas = [&] {
+        while (i < header.size() && (header[i] == ' ' || header[i] == '\t' || header[i] == ','))
+            ++i;
+    };
+    for (;;) {
+        skip_ows_commas();
+        if (i >= header.size())
+            return false;
+        if (header[i] == '*')
+            return true;
+        if (header.substr(i, 2) == "W/")
+            i += 2;
+        if (i >= header.size() || header[i] != '"')
+            return false;
+        const std::size_t close = header.find('"', i + 1);
+        if (close == std::string_view::npos)
+            return false;
+        if (header.substr(i, close + 1 - i) == etag)
+            return true;
+        i = close + 1;
+    }
 }
 
 } // namespace yuzu::server
