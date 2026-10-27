@@ -1574,7 +1574,9 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     Config cfg;
     const json real = yuzu::server::settings_model::build_data_retention_settings(cfg);
     REQUIRE(real.contains("tar"));
+    REQUIRE(real.contains("enforced"));
     REQUIRE(real["tar"].is_object());
+    REQUIRE(real["tar"].contains("tick_seconds"));
     REQUIRE_FALSE(real["tar"]["tiers"].empty());
 
     const auto set_of = [](const json& arr) {
@@ -1598,10 +1600,13 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
 
     // Every key the builder emits is declared; every key declared is emitted.
     const json& props = schema.at("properties");
+    CHECK(schema.value("type", "") == type_of(real));
     CHECK(keys_of(props) == keys_of(real));
     for (const char* k : {"response_retention_days", "audit_retention_days",
-                          "guardian_event_retention_days"})
+                          "guardian_event_retention_days"}) {
         CHECK(props.at(k).value("type", "") == type_of(real.at(k)));
+        CHECK_FALSE(props.at(k).value("nullable", false));
+    }
 
     // `required` is the builder's keys minus `tar`: a server older than this release omits `tar`,
     // and the manual tells clients to treat absent like null.
@@ -1610,34 +1615,51 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     CHECK(set_of(schema.at("required")) == expected_required);
 
     // `enforced`: the same three keys, each a nullable integer, all required.
+    // With the default (all null) `enforced` the builder emits no integer, so the type is read
+    // from a second build whose three windows are set.
     const json& enforced = props.at("enforced");
+    const json real_set = yuzu::server::settings_model::build_data_retention_settings(
+        cfg, yuzu::server::settings_model::RetentionEnforced{1, 2, 3});
+    REQUIRE(real_set.contains("enforced"));
+    CHECK(enforced.value("type", "") == type_of(real["enforced"]));
     CHECK(keys_of(enforced.at("properties")) == keys_of(real["enforced"]));
     CHECK(set_of(enforced.at("required")) == keys_of(real["enforced"]));
     for (const auto& k : keys_of(real["enforced"])) {
-        CHECK(enforced.at("properties").at(k).value("type", "") == "integer");
+        INFO("enforced key: " << k);
+        CHECK(real["enforced"].at(k).is_null());
+        CHECK(enforced.at("properties").at(k).value("type", "") ==
+              type_of(real_set["enforced"].at(k)));
         CHECK(enforced.at("properties").at(k).value("nullable", false));
     }
 
     const json& tar = props.at("tar");
+    CHECK(tar.value("type", "") == type_of(real["tar"]));
     CHECK(tar.value("nullable", false));
     CHECK(keys_of(tar.at("properties")) == keys_of(real["tar"]));
     CHECK(set_of(tar.at("required")) == keys_of(real["tar"]));
     CHECK(tar.at("properties").at("tick_seconds").value("type", "") ==
           type_of(real["tar"]["tick_seconds"]));
+    CHECK_FALSE(tar.at("properties").at("tick_seconds").value("nullable", false));
 
     // Every real tier: the declared keys, the declared types, and a null depth exactly on rows
     // tiers (so `nullable` is needed and is not decoration).
-    const json& item = tar.at("properties").at("tiers").at("items");
+    const json& tiers = tar.at("properties").at("tiers");
+    const json& item = tiers.at("items");
+    CHECK(tiers.value("type", "") == type_of(real["tar"]["tiers"]));
+    CHECK(item.value("type", "") == type_of(real["tar"]["tiers"][0]));
     CHECK(keys_of(item.at("properties")) == keys_of(real["tar"]["tiers"][0]));
     CHECK(set_of(item.at("required")) == keys_of(real["tar"]["tiers"][0]));
     bool saw_rows = false;
     bool saw_seconds = false;
     for (const auto& tier : real["tar"]["tiers"]) {
+        INFO("tier: " << tier.dump());
         CHECK(keys_of(tier) == keys_of(item.at("properties")));
         for (auto it = tier.begin(); it != tier.end(); ++it) {
             if (it.key() == "guaranteed_depth_seconds")
                 continue;
+            INFO("key: " << it.key());
             CHECK(item.at("properties").at(it.key()).value("type", "") == type_of(it.value()));
+            CHECK_FALSE(item.at("properties").at(it.key()).value("nullable", false));
         }
         const std::string kind = tier.at("limit_kind").get<std::string>();
         if (kind == "rows") {
