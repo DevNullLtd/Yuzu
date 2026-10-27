@@ -1323,6 +1323,32 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
     }
 }
 
+TEST_CASE("openapi documents: operation summaries and descriptions carry no engineering-process "
+          "references",
+          "[openapi][structure]") {
+    // The summary is the line an operator reads first on /swagger and in generated client docs. It
+    // names what the operation does, not the issue, ADR, review gate or build wave that shaped it.
+    // Descriptions may still cite an issue or an ADR where a reader needs it (a sweep of those is
+    // tracked separately), but never the review process itself.
+    static const std::regex kSummary(
+        R"(#[0-9]{3,5}|ADR-?[0-9]{4}|SOC ?2|[Gg]overnance|\bGate\b|\bWave [0-9]|\bPR-?[0-9]|\bWS-[A-Z][0-9]|)"
+        R"(\bPhase [0-9]|A2-R[0-9]|[Aa]pi-parity|API-parity|\bBatch [A-Z]\b|\bCC[0-9]\.[0-9])");
+    static const std::regex kProcess(
+        R"([Gg]overnance|\bGate [0-9]|fix round|re-review|\bUP-[0-9]+|\bCDX-)");
+    for (const bool with_guides : {false, true}) {
+        INFO("form: " << form_name(with_guides));
+        const json spec = json::parse(document_text(with_guides));
+        for (const auto& o : all_operations(spec)) {
+            INFO(o.where());
+            const std::string summary = o.op.value("summary", "");
+            INFO("summary: " << summary);
+            CHECK_FALSE(std::regex_search(summary, kSummary));
+            const std::string description = o.op.value("description", "");
+            CHECK_FALSE(std::regex_search(description, kProcess));
+        }
+    }
+}
+
 TEST_CASE("openapi documents: x-yuzu-unavailable marks exactly the pinned operations",
           "[openapi][structure][unavailable]") {
     // method and path as they appear in the document, without the /api/v1 base.
