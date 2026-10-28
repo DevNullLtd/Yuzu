@@ -20,7 +20,7 @@
 #include "network_perf_rules.hpp"
 #include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
 #include "offline_endpoint_store.hpp" // HA WS-5 presence merge (ADR-2002 §7a)
-#include "tar_corruption_audit.hpp" // #1567 tag keys + parse helpers
+#include "echo_corruption_audit.hpp" // #1567 tag keys + parse helpers
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
 #include "result_set_store.hpp"
 #include "device_token_store.hpp"
@@ -899,7 +899,7 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"shares.list",
          "Shares this host serves over SMB/NFS as configured: name, path, ro/rw, anonymous access "
          "and a few flags, never ACLs or NFS client host lists; configured exports, not the "
-         "mapping/session observations tar mapdrive records; Linux reads /etc/exports, "
+         "mapping/session observations echo mapdrive records; Linux reads /etc/exports, "
          "/etc/exports.d and /etc/samba/smb.conf, macOS and Windows are planned; read-only"},
         {"remote_access_audit.list",
          "SSH inbound-access audit as configured: sshd_config values (Include followed, Match not "
@@ -1153,16 +1153,16 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"diagnostics.certificates", "List TLS certificate paths and whether they exist"},
         {"diagnostics.connection_info",
          "Server address, TLS, session, channel state, latency, uptime"},
-        // tar (Timeline Activity Record)
-        {"tar.status", "Current TAR collection status, event counts, and DB size"},
-        {"tar.query", "Query recorded timeline events by type and time range"},
-        {"tar.snapshot", "Trigger an immediate full-state snapshot"},
-        {"tar.export", "Export timeline events as structured data"},
-        {"tar.configure", "Update TAR collection intervals and retention settings"},
-        {"tar.collect_fast", "Run fast collectors (processes + network connections)"},
-        {"tar.collect_slow", "Run slow collectors (services + users)"},
-        {"tar.collect_perf", "Record one device performance sample (CPU/memory/disk/network)"},
-        {"tar.collect_software",
+        // echo
+        {"echo.status", "Current Echo collection status, event counts, and DB size"},
+        {"echo.query", "Query recorded timeline events by type and time range"},
+        {"echo.snapshot", "Trigger an immediate full-state snapshot"},
+        {"echo.export", "Export timeline events as structured data"},
+        {"echo.configure", "Update Echo collection intervals and retention settings"},
+        {"echo.collect_fast", "Run fast collectors (processes + network connections)"},
+        {"echo.collect_slow", "Run slow collectors (services + users)"},
+        {"echo.collect_perf", "Record one device performance sample (CPU/memory/disk/network)"},
+        {"echo.collect_software",
          "Scan installed software and record install/uninstall/upgrade events"},
     };
     return m;
@@ -2272,15 +2272,15 @@ void AgentHealthStore::upsert(const std::string& agent_id,
         snap.last_seen = std::chrono::steady_clock::now();
 
         // #1567 candidate: surfaced on EVERY heartbeat whose tag pair parses (not
-        // deduped here); TarCorruptionAuditGate dedups; a candidate skipped
+        // deduped here); EchoCorruptionAuditGate dedups; a candidate skipped
         // because the gate's slot was busy retries on the next heartbeat, a
         // failed write after the 60 s degraded window.
         if (corruption_sink_) {
-            const auto tot = snap.status_tags.find(kTarTagCorruptionTotal);
-            const auto ql = snap.status_tags.find(kTarTagQuarantineLast);
+            const auto tot = snap.status_tags.find(kEchoTagCorruptionTotal);
+            const auto ql = snap.status_tags.find(kEchoTagQuarantineLast);
             if (tot != snap.status_tags.end() && ql != snap.status_tags.end()) {
-                const auto parsed = parse_tar_corruption_total(tot->second);
-                if (parsed && valid_tar_quarantine_last(ql->second)) {
+                const auto parsed = parse_echo_corruption_total(tot->second);
+                if (parsed && valid_echo_quarantine_last(ql->second)) {
                     sink = corruption_sink_;
                     corruption_total = *parsed;
                     quarantine_last = ql->second;
@@ -2647,7 +2647,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     };
 
     int ota_signature_refusing = 0;
-    int tar_db_corruption_agents = 0;               // #1567
+    int echo_db_corruption_agents = 0;               // #1567
     std::map<std::string, int64_t> plugin_init_failed; // #1567: plugin -> agents
     int sync_skipping = 0; // #5332: agents whose installed_software daily sync is skipping
 
@@ -2669,9 +2669,9 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         // #1567: agents whose plugin-published corruption total parses > 0, and the
         // per-plugin count of agents reporting a failed init. Both tags are
         // agent-controlled: bounded token count, in-place reads (no copies).
-        if (auto it = snap.status_tags.find(kTarTagCorruptionTotal);
-            it != snap.status_tags.end() && parse_tar_corruption_total(it->second))
-            ++tar_db_corruption_agents;
+        if (auto it = snap.status_tags.find(kEchoTagCorruptionTotal);
+            it != snap.status_tags.end() && parse_echo_corruption_total(it->second))
+            ++echo_db_corruption_agents;
         if (auto it = snap.status_tags.find("yuzu.plugins_failed");
             it != snap.status_tags.end() && !it->second.empty()) {
             std::string_view rest{it->second};
@@ -2679,7 +2679,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             // #1567 round-2: dedupe within THIS agent's tag value before counting.
             // An honest agent never repeats a plugin name (plugins_failed_ is a
             // set, one entry per failed plugin), so this only matters for a
-            // malformed or compromised agent sending e.g. "tar,tar" — without the
+            // malformed or compromised agent sending e.g. "echo,echo" — without the
             // dedupe that one agent would inflate yuzu_fleet_plugin_init_failed by
             // its repeat count instead of by 1. `seen_this_agent` holds views into
             // `it->second`, which outlives this block.
@@ -2737,13 +2737,13 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         static const std::string kKeySparkDisabled{kSparkTagDisabled};
 
         // #5332: agents whose daily-sync source is skipping (skip_streak > 0). Same
-        // digits-only/>0 rule as the tar total above; its 18-char cap vs the emitter's 6 is
+        // digits-only/>0 rule as the echo total above; its 18-char cap vs the emitter's 6 is
         // harmless - the value is only counted, never summed or labelled.
         // One source today (the agent emitter, #5327, is generic over every registered sync
         // source, but only installed_software sets skip_reason); make this a table when a
         // second source emits skip_streak.
         static const std::string kKeySyncSkip{"yuzu.sync.installed_software.skip_streak"};
-        if (parse_tar_corruption_total(get_view(kKeySyncSkip)))
+        if (parse_echo_corruption_total(get_view(kKeySyncSkip)))
             ++sync_skipping;
 
         auto os_val = get("yuzu.os");
@@ -3073,14 +3073,14 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // without this the refusal is invisible outside a per-endpoint log.
     metrics.gauge("yuzu_fleet_ota_signature_refusing_agents")
         .set(static_cast<double>(ota_signature_refusing));
-    // #1567: agents reporting a quarantined tar.db (cumulative per agent since
+    // #1567: agents reporting a quarantined echo.db (cumulative per agent since
     // install; a RISING value is the signal), and per-plugin init failures
     // (absent-not-zero). Fleet-wide label cap: the first 64 plugin names in
     // lexicographic order, the remainder summed under plugin="other".
-    metrics.gauge("yuzu_fleet_tar_db_corruption_agents")
-        .set(static_cast<double>(tar_db_corruption_agents));
+    metrics.gauge("yuzu_fleet_echo_db_corruption_agents")
+        .set(static_cast<double>(echo_db_corruption_agents));
     // #5332: published every sweep, 0 included (a server-owned count over the reporting
-    // population, like yuzu_fleet_tar_db_corruption_agents above), so the fixed label set
+    // population, like yuzu_fleet_echo_db_corruption_agents above), so the fixed label set
     // needs no clear_gauge_family.
     metrics.gauge("yuzu_fleet_inventory_sync_skipping", {{"source", "installed_software"}})
         .set(static_cast<double>(sync_skipping));

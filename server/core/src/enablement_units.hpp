@@ -20,7 +20,7 @@
  * `CommandCapability::system_reserved` is deliberately NOT read here. It
  * records who the RBAC caller of a dispatch is, not whether work is
  * switchable: under D3 work the agent starts by itself obeys the same state,
- * so tar.fleet_snapshot and asset_tags.sync are ordinary units.
+ * so echo.fleet_snapshot and asset_tags.sync are ordinary units.
  *
  * PROTECTIVE SEAM (one line): the caller injects the predicate, and it is the
  * canonical protective set, `kProtectivePredicate`, which is
@@ -131,12 +131,12 @@ using ProtectivePredicate = bool (*)(std::string_view plugin, std::string_view a
 inline constexpr ProtectivePredicate kProtectivePredicate = &yuzu::protective::is_protective_action;
 
 // Requirement edges, per action. app_usage.summary and app_usage.last_used
-// open tar.db read-only (app_usage_plugin.cpp:112-160). app_usage.foreground
+// open echo.db read-only (app_usage_plugin.cpp:112-160). app_usage.foreground
 // has NO edge: do_foreground (app_usage_plugin.cpp:572) emits a constant
-// constrained line and never touches tar.db.
+// constrained line and never touches echo.db.
 inline constexpr std::array<RequirementEdge, 2> kRequirements{{
-    {"app_usage.summary", "tar"},
-    {"app_usage.last_used", "tar"},
+    {"app_usage.summary", "echo"},
+    {"app_usage.last_used", "echo"},
 }};
 
 // matrix: docs/os-capability-matrix.md generated block (2026-10-06; shares.list,
@@ -343,20 +343,20 @@ inline constexpr std::array<UnitOsRow, 236> kUnitOs{{
     {"tags", "check", kWin | kLin | kMac},
     {"tags", "clear", kWin | kLin | kMac},
     {"tags", "count", kWin | kLin | kMac},
-    {"tar", "status", kWin | kLin | kMac},
-    {"tar", "query", kWin | kLin | kMac},
-    {"tar", "snapshot", kWin | kLin | kMac},
-    {"tar", "export", kWin | kLin | kMac},
-    {"tar", "configure", kWin | kLin | kMac},
-    {"tar", "collect_fast", kWin | kLin | kMac},
-    {"tar", "collect_slow", kWin | kLin | kMac},
-    {"tar", "collect_perf", kWin | kLin | kMac},
-    {"tar", "collect_software", kWin | kLin | kMac},
-    {"tar", "rollup", kWin | kLin | kMac},
-    {"tar", "sql", kWin | kLin | kMac},
-    {"tar", "compatibility", kWin | kLin | kMac},
-    {"tar", "fleet_snapshot", kWin | kLin | kMac},
-    {"tar", "purge_source", kWin | kLin | kMac},
+    {"echo", "status", kWin | kLin | kMac},
+    {"echo", "query", kWin | kLin | kMac},
+    {"echo", "snapshot", kWin | kLin | kMac},
+    {"echo", "export", kWin | kLin | kMac},
+    {"echo", "configure", kWin | kLin | kMac},
+    {"echo", "collect_fast", kWin | kLin | kMac},
+    {"echo", "collect_slow", kWin | kLin | kMac},
+    {"echo", "collect_perf", kWin | kLin | kMac},
+    {"echo", "collect_software", kWin | kLin | kMac},
+    {"echo", "rollup", kWin | kLin | kMac},
+    {"echo", "sql", kWin | kLin | kMac},
+    {"echo", "compatibility", kWin | kLin | kMac},
+    {"echo", "fleet_snapshot", kWin | kLin | kMac},
+    {"echo", "purge_source", kWin | kLin | kMac},
     {"update_source_trust", "sources", kWin | kLin | kMac},
     {"users", "logged_on", kWin | kLin | kMac},
     {"users", "sessions", kWin | kLin | kMac},

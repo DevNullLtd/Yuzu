@@ -445,7 +445,7 @@ kill_switch_denial(const CommandCapability& cap, const KillSwitchFn& action_allo
 /// 2. **BR-009 canonical wire names.** The wire command is built from `cap`'s
 ///    catalogue-resolved spelling (`cap.plugin`/`cap.action`), never the
 ///    caller's raw strings — `classify()` is case-insensitive but the agent
-///    matches case-SENSITIVELY, so a caller passing `plugin="TAR"` would
+///    matches case-SENSITIVELY, so a caller passing `plugin="Echo"` would
 ///    otherwise be authorized here and rejected on the endpoint. `raw_plugin`/
 ///    `raw_action` are threaded through ONLY into the dispatch-tag hash
 ///    (`compute_dispatch_tag`), unchanged from what `build_classified_command`
@@ -1462,15 +1462,15 @@ public:
     void upsert(const std::string& agent_id,
                 const google::protobuf::Map<std::string, std::string>& tags);
 
-    /// #1567: receives a tar.db corruption CANDIDATE `(agent_id, corruption_total,
+    /// #1567: receives an echo.db corruption CANDIDATE `(agent_id, corruption_total,
     /// quarantine_last)` when a heartbeat carries a valid
-    /// `yuzu.plugin.tar.db_corruption_total` (> 0) and `db_quarantine_last`, and
+    /// `yuzu.plugin.echo.db_corruption_total` (> 0) and `db_quarantine_last`, and
     /// on EVERY such heartbeat. The store deliberately does NOT dedup (its
     /// memory is per-process and pruned every ~90 s): the sink
-    /// (TarCorruptionAuditGate) owns durable dedup and its own rate limit; a
+    /// (EchoCorruptionAuditGate) owns durable dedup and its own rate limit; a
     /// failed write is retried after the gate's degraded window, and a
     /// candidate skipped only because the gate's slot was busy is retried on
-    /// the next heartbeat -- see tar_corruption_audit.hpp for the distinction.
+    /// the next heartbeat -- see echo_corruption_audit.hpp for the distinction.
     /// This is the store's first plugin-specific side-effecting hook -- a
     /// second consumer of the same "surface a candidate, let an injected sink
     /// durably dedup it" shape should generalize this to a small named-sink

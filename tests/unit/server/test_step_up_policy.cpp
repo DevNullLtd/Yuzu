@@ -238,7 +238,7 @@ constexpr PendingKey kGrandfatheredPending[] = {
     {"DELETE", R"(/api/v1/sle/agents/([^/]+))"},
     {"POST", R"(/api/v1/software-deployments)"},
     {"POST", R"(/api/v1/software-deployments/([a-f0-9]+)/rollback)"},
-    {"POST", R"(/api/v1/tar/retention-paused/purge)"},
+    {"POST", R"(/api/v1/echo/retention-paused/purge)"},
     {"POST", R"(/api/v1/upload-grants)"},
     {"DELETE", R"(/api/v1/upload-grants/([a-f0-9]+))"},
     {"POST", R"(/api/webhooks)"},
@@ -249,9 +249,9 @@ constexpr PendingKey kGrandfatheredPending[] = {
     {"POST", R"(/fragments/guardian/baselines)"},
     {"POST", R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/enabled)"},
     {"POST", R"(/fragments/guardian/guards)"},
-    {"POST", R"(/fragments/tar/capture-sources/push)"},
-    {"POST", R"(/fragments/tar/retention-paused/purge)"},
-    {"POST", R"(/fragments/tar/retention-paused/reenable)"},
+    {"POST", R"(/fragments/echo/capture-sources/push)"},
+    {"POST", R"(/fragments/echo/retention-paused/purge)"},
+    {"POST", R"(/fragments/echo/retention-paused/reenable)"},
 };
 
 } // namespace

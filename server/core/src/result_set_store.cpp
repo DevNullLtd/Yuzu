@@ -1196,8 +1196,8 @@ bool ResultSetStore::heal_poisoned_payload(const std::string& id) {
 // Part-6 anchor decision (recorded, per the invariant): a MISSING stored
 // reading is ordinary — the fresh-store / first-pass-after-migration case —
 // and says nothing by itself; it is reported only when the pass would ALSO
-// expire every datable row (the AuditStore choice, not the TAR choice,
-// because unlike TAR this table is legitimately empty/short-lived in normal
+// expire every datable row (the AuditStore choice, not the Echo choice,
+// because unlike Echo this table is legitimately empty/short-lived in normal
 // operation and a first pass against it deletes at most 1-hour-old scratch).
 namespace {
 constexpr int64_t kGcSweepCapPerPass = 5000;      // part 5: unconditional

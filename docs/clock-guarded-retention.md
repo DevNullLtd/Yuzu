@@ -52,17 +52,17 @@ The cap is the half that always applies; the detectors are best-effort.
 
 The retention guards that face this question **each answer it differently, ON PURPOSE.**
 
-- **TAR** treats no-stored-reading as a decline trigger in its own right (the first pass against an
+- **Echo** treats no-stored-reading as a decline trigger in its own right (the first pass against an
   existing store would otherwise delete under an already-wrong clock with every detector silent).
-- **`audit_store`** does too since #2579, gated the SAME way — TAR short-circuits on `!has_expired`
+- **`audit_store`** does too since #2579, gated the SAME way — Echo short-circuits on `!has_expired`
   before it computes `no_anchor`, and `classify` returns `None` on `!has_expired` before testing it,
   so neither fires on a fresh install with nothing to lose. *(Do not describe either as narrower than
   the other: that claim was made and was false.)*
 
-  The two differ in **SCOPE and ACCOUNTING, not in trigger**. TAR decides per warehouse table and
-  deliberately never RECORDS a bootstrap NoAnchor fact set into its dedup map (#2573 TAR half) —
+  The two differ in **SCOPE and ACCOUNTING, not in trigger**. Echo decides per warehouse table and
+  deliberately never RECORDS a bootstrap NoAnchor fact set into its dedup map (#2573 Echo half) —
   unlike `audit_store`, whose durable bootstrap-settled marker commits in the SAME transaction as its
-  verdict, TAR's anchor persist is a plain `set_config` independent of that map, so recording
+  verdict, Echo's anchor persist is a plain `set_config` independent of that map, so recording
   NoAnchor would let a persistent persist-failure turn every later identical pass into a silently
   suppressed drain. `audit_store` decides per database and gets the same non-latching property free
   from fact-set dedup; the pass declines ONCE, anchors, and counts to its own
@@ -786,7 +786,7 @@ not copy it for part (2)**.
 include root #2549 so agent stores can adopt it without a fork) + `audit_store.cpp::cleanup_once`
 (fact-set).
 
-`tar_aggregator.cpp::run_retention` adopted the shared `classify` + fact-set dedup (#2573 TAR half).
+`echo_aggregator.cpp::run_retention` adopted the shared `classify` + fact-set dedup (#2573 Echo half).
 `guardian_lifecycle_journal.cpp::prune_locked_` adopted it too (#2573 GJ half, closed) —
 `Facts::no_anchor` and `Facts::prev_unusable` are always false there (GJ persists no anchor across
 restarts by design, and its comparison reading is never read back from an untrusted store); see the
@@ -800,5 +800,5 @@ the numbers.**
 
 - Rule and tests: #2360 / #2361 / #2549, `common/include/yuzu/audit_retention_rules.hpp` (`classify`),
   `AuditStore::cleanup_once`, `tests/unit/server/test_audit_store.cpp`
-- `docs/user-manual/audit-log.md` and `docs/user-manual/tar.md` "The retention clock guard" are
+- `docs/user-manual/audit-log.md` and `docs/user-manual/echo.md` "The retention clock guard" are
   operator **RUNBOOKS** and deliberately do not state this rule.

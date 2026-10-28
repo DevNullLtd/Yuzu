@@ -146,7 +146,7 @@ std::string canonicalize(const std::string& path) {
 /// ALLOWLIST_OPENAPI_MISSING - see file header comment. Cross-check against
 /// the Python script's list before adding here. The ten F2-backlog entries
 /// this set used to carry (statistics, topology, inventory/evaluate,
-/// elevation-eligibility, execution-statistics, sessions, tar purge) were
+/// elevation-eligibility, execution-statistics, sessions, echo purge) were
 /// backfilled into openapi_spec() by #3992 (merged 2026-09-06) and pruned
 /// here in lockstep with the Python side's own reconciliation
 /// (commit 3871688f6) - do not let the two allowlists drift again.
@@ -1592,7 +1592,7 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
 }
 
 TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the response builder",
-          "[openapi][retention][tar]") {
+          "[openapi][retention][echo]") {
     json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
     REQUIRE_FALSE(spec.is_discarded());
     const json& schema = spec.at("components").at("schemas").at("SettingsDataRetention");
@@ -1605,12 +1605,12 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
 
     Config cfg;
     const json real = yuzu::server::settings_model::build_data_retention_settings(cfg);
-    REQUIRE(real.contains("tar"));
+    REQUIRE(real.contains("echo"));
     REQUIRE(real.contains("enforced"));
-    REQUIRE(real["tar"].is_object());
-    REQUIRE(real["tar"].contains("tick_seconds"));
-    REQUIRE(real["tar"].contains("tiers"));
-    REQUIRE_FALSE(real["tar"]["tiers"].empty());
+    REQUIRE(real["echo"].is_object());
+    REQUIRE(real["echo"].contains("tick_seconds"));
+    REQUIRE(real["echo"].contains("tiers"));
+    REQUIRE_FALSE(real["echo"]["tiers"].empty());
 
     const auto set_of = [](const json& arr) {
         std::set<std::string> out;
@@ -1642,10 +1642,10 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
         CHECK_FALSE(props.at(k).value("nullable", false));
     }
 
-    // `required` is the builder's keys minus `tar`: a server older than this release omits `tar`,
+    // `required` is the builder's keys minus `echo`: a server older than this release omits `echo`,
     // and the manual tells clients to treat absent like null.
     auto expected_required = keys_of(real);
-    expected_required.erase("tar");
+    expected_required.erase("echo");
     CHECK(set_of(schema.at("required")) == expected_required);
 
     // `enforced`: the same three keys, each a nullable integer, all required.
@@ -1667,21 +1667,21 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
         CHECK(enforced.at("properties").at(k).value("nullable", false));
     }
 
-    const json& tar = props.at("tar");
-    CHECK(tar.value("type", "") == type_of(real["tar"]));
-    CHECK(tar.value("nullable", false));
-    CHECK(keys_of(tar.at("properties")) == keys_of(real["tar"]));
-    CHECK(set_of(tar.at("required")) == keys_of(real["tar"]));
-    CHECK(tar.at("properties").at("tick_seconds").value("type", "") ==
-          type_of(real["tar"]["tick_seconds"]));
-    CHECK_FALSE(tar.at("properties").at("tick_seconds").value("nullable", false));
+    const json& echo = props.at("echo");
+    CHECK(echo.value("type", "") == type_of(real["echo"]));
+    CHECK(echo.value("nullable", false));
+    CHECK(keys_of(echo.at("properties")) == keys_of(real["echo"]));
+    CHECK(set_of(echo.at("required")) == keys_of(real["echo"]));
+    CHECK(echo.at("properties").at("tick_seconds").value("type", "") ==
+          type_of(real["echo"]["tick_seconds"]));
+    CHECK_FALSE(echo.at("properties").at("tick_seconds").value("nullable", false));
 
     // Every real tier: the declared keys, the declared types, and a null depth exactly on rows
     // tiers (so `nullable` is needed and is not decoration).
-    const json& tiers = tar.at("properties").at("tiers");
+    const json& tiers = echo.at("properties").at("tiers");
     const json& item = tiers.at("items");
-    CHECK(tiers.value("type", "") == type_of(real["tar"]["tiers"]));
-    CHECK(item.value("type", "") == type_of(real["tar"]["tiers"][0]));
+    CHECK(tiers.value("type", "") == type_of(real["echo"]["tiers"]));
+    CHECK(item.value("type", "") == type_of(real["echo"]["tiers"][0]));
     CHECK_FALSE(tiers.value("nullable", false));
     CHECK_FALSE(item.value("nullable", false));
     // `tier` and `limit_kind` are open vocabularies: a closed `enum` would make a generated
@@ -1689,11 +1689,11 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     const json& tier_prop = item.at("properties").at("tier");
     CHECK_FALSE(tier_prop.contains("enum"));
     CHECK_FALSE(item.at("properties").at("limit_kind").contains("enum"));
-    CHECK(keys_of(item.at("properties")) == keys_of(real["tar"]["tiers"][0]));
-    CHECK(set_of(item.at("required")) == keys_of(real["tar"]["tiers"][0]));
+    CHECK(keys_of(item.at("properties")) == keys_of(real["echo"]["tiers"][0]));
+    CHECK(set_of(item.at("required")) == keys_of(real["echo"]["tiers"][0]));
     bool saw_rows = false;
     bool saw_seconds = false;
-    for (const auto& tier : real["tar"]["tiers"]) {
+    for (const auto& tier : real["echo"]["tiers"]) {
         INFO("tier: " << tier.dump());
         CHECK(keys_of(tier) == keys_of(item.at("properties")));
         // The `tier` description lists every tier name the table really uses.
@@ -1721,15 +1721,15 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     CHECK(depth.value("type", "") == "integer");
     CHECK(depth.value("nullable", false));
 
-    // The builder's `tar: null` branch (no table available) is the case `nullable` exists for.
+    // The builder's `echo: null` branch (no table available) is the case `nullable` exists for.
     const json no_table =
         yuzu::server::settings_model::build_data_retention_settings(cfg, {}, nullptr);
-    REQUIRE(no_table.contains("tar"));
-    CHECK(no_table["tar"].is_null());
+    REQUIRE(no_table.contains("echo"));
+    CHECK(no_table["echo"].is_null());
 }
 
-TEST_CASE("openapi_spec_json(): the data-retention operation documents the TAR tiers",
-          "[openapi][retention][tar]") {
+TEST_CASE("openapi_spec_json(): the data-retention operation documents the Echo tiers",
+          "[openapi][retention][echo]") {
     json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
     REQUIRE_FALSE(spec.is_discarded());
     REQUIRE(spec.contains("paths"));
@@ -1745,5 +1745,5 @@ TEST_CASE("openapi_spec_json(): the data-retention operation documents the TAR t
         CHECK(description.find(needle) != std::string::npos);
 
     const std::string ok = get_op["responses"]["200"].value("description", "");
-    CHECK(ok.find("tar: {tick_seconds, tiers") != std::string::npos);
+    CHECK(ok.find("echo: {tick_seconds, tiers") != std::string::npos);
 }

@@ -1035,10 +1035,10 @@ class TestFailureModesOnSyntheticData(unittest.TestCase):
         self.assertFalse(unexempt_missing)
 
     def test_strictest_wins_across_multiple_definitions(self) -> None:
-        pair_modes = {("tar", "sql"): ["auto", "auto", "role-gated", "auto"]}
-        fragment_rows = [("tar", "sql", "None")]
+        pair_modes = {("echo", "sql"): ["auto", "auto", "role-gated", "auto"]}
+        fragment_rows = [("echo", "sql", "None")]
         mismatches, unexempt_missing = diff_gates(pair_modes, fragment_rows)
-        self.assertEqual(mismatches, {("tar", "sql"): ("None", "AdminOrApproval")})
+        self.assertEqual(mismatches, {("echo", "sql"): ("None", "AdminOrApproval")})
 
     def test_gate_problems_reports_an_unparseable_document_alongside_gate_gaps(self) -> None:
         skipped = [("content/definitions/tab.yaml", 2, "while scanning for the next token")]

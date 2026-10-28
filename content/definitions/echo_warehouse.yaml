@@ -1,0 +1,995 @@
+## Echo Warehouse SQL Query Definitions
+## Pre-built SQL queries against the Echo data warehouse tables.
+## Plugin: echo | Action: sql | Uses $-prefixed table names.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.echo.sql
+  displayName: "Echo: SQL Query"
+  version: 1.0.0
+  description: >
+    Execute an arbitrary SELECT query against the Echo warehouse tables on each
+    targeted agent. Use $-prefixed table names ($Process_Live, $TCP_Hourly, etc.)
+    which are translated to real table names on the agent. Only SELECT queries
+    are permitted.
+  tags: [echo, warehouse, sql, query]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: echo
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        displayName: SQL Query
+        description: >
+          A SELECT query using $-prefixed table names. Available tables include
+          $Process_Live, $Process_Hourly, $Process_Daily, $Process_Monthly,
+          $TCP_Live, $TCP_Hourly, $TCP_Daily, $TCP_Monthly,
+          $Service_Live, $Service_Hourly, $User_Live, $User_Daily, and
+          $ARP_Live/$ARP_Hourly and $DNS_Live/$DNS_Hourly (ADR-0015; need
+          arp_enabled / dns_enabled left on; $ARP_* is collected on Windows, Linux and
+          macOS (constrained), $DNS_* on Windows only today — empty elsewhere).
+    required: [sql]
+
+  result:
+    columns:
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.10.0"
+    requiredPlugins: [echo]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.echo.recent_processes
+  displayName: "Echo: Recent Processes"
+  version: 1.0.0
+  description: >
+    Show all processes that started or stopped in the last 24 hours.
+  tags: [echo, warehouse, processes, forensics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: echo
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT name, pid, cmdline, user, ts FROM $Process_Live WHERE ts > strftime('%s','now','-24 hours') ORDER BY ts DESC LIMIT 500"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.10.0"
+    requiredPlugins: [echo]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.echo.tcp_by_process
+  displayName: "Echo: TCP Connections by Process"
+  version: 1.0.0
+  description: >
+    Aggregate TCP connections grouped by process name and remote endpoint.
+  tags: [echo, warehouse, network, tcp]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: echo
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT process_name, remote_addr, remote_port, proto, COUNT(*) as conn_count FROM $TCP_Live GROUP BY process_name, remote_addr, remote_port, proto ORDER BY conn_count DESC LIMIT 200"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.10.0"
+    requiredPlugins: [echo]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.echo.listening_ports
+  displayName: "Echo: Listening Ports"
+  version: 1.0.0
+  description: >
+    Show all listening TCP ports with the process that owns them.
+  tags: [echo, warehouse, network, listeners]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: echo
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT local_port, proto, pid, process_name FROM $TCP_Live WHERE state = 'LISTEN' ORDER BY local_port"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.10.0"
+    requiredPlugins: [echo]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.echo.hourly_process_summary
+  displayName: "Echo: Hourly Process Summary"
+  version: 1.0.0
+  description: >
+    Show hourly aggregated process start counts for the last 7 days.
+  tags: [echo, warehouse, processes, aggregation]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: echo
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT hour_ts, name, start_count FROM $Process_Hourly ORDER BY hour_ts DESC LIMIT 168"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.10.0"
+    requiredPlugins: [echo]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.echo.service_state_changes
+  displayName: "Echo: Service State Changes"
+  version: 1.0.0
+  description: >
+    Show recent service start/stop/state_changed events.
+  tags: [echo, warehouse, services]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: echo
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT ts, name, action, status, prev_status FROM $Service_Live WHERE action = 'state_changed' ORDER BY ts DESC LIMIT 200"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.10.0"
+    requiredPlugins: [echo]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.echo.connections_to_ip
+  displayName: "Echo: Network Connections to IP"
+  version: 1.0.0
+  description: >
+    Show all TCP connections to a specific remote IP address. Replace the
+    target_ip parameter with the IP to investigate.
+  tags: [echo, warehouse, network, investigation]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: echo
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        displayName: SQL Query
+        description: "Query with target IP. Edit the IP address in the WHERE clause."
+        default: "SELECT ts, process_name, pid, remote_port, proto FROM $TCP_Live WHERE remote_addr = '10.0.0.1' ORDER BY ts DESC LIMIT 500"
+    required: [sql]
+
+  result:
+    columns:
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.10.0"
+    requiredPlugins: [echo]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.echo.daily_connection_summary
+  displayName: "Echo: Daily Connection Summary"
+  version: 1.0.0
+  description: >
+    Show daily aggregated TCP connection counts by remote address and process.
+  tags: [echo, warehouse, network, aggregation]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: echo
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT day_ts, remote_addr, process_name, connect_count FROM $TCP_Daily ORDER BY day_ts DESC, connect_count DESC LIMIT 500"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.10.0"
+    requiredPlugins: [echo]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.echo.user_sessions
+  displayName: "Echo: User Sessions"
+  version: 1.0.0
+  description: >
+    Show recent user login and logout events.
+  tags: [echo, warehouse, users, sessions]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: echo
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT ts, user, domain, logon_type, action FROM $User_Live ORDER BY ts DESC LIMIT 200"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.10.0"
+    requiredPlugins: [echo]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.echo.process_tree
+  displayName: "Echo: Process Tree"
+  version: 1.0.0
+  description: >
+    Show recently started processes with parent-child relationships
+    for the last hour.
+  tags: [echo, warehouse, processes, tree, forensics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: echo
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT pid, ppid, name, user, ts FROM $Process_Live WHERE action = 'started' AND ts > strftime('%s','now','-1 hours') ORDER BY ts"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.10.0"
+    requiredPlugins: [echo]
+
+status:
+  phase: active
+
+---
+## Issue #60 — daily aggregation example reading from $Process_Daily.
+## Demonstrates the live-to-aggregate rollup tier shape (start_count /
+## stop_count are SUM-aggregated by day_ts + name + user). The
+## `datetime(day_ts, 'unixepoch')` conversion is the SQLite-native
+## equivalent of competing platforms' `EPOCHTOJSON(TS)` helper.
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.echo.daily_process_summary
+  displayName: "Echo: Daily process summary"
+  version: 1.0.0
+  description: >
+    Per-day process activity for the last 30 days, aggregated from
+    $Process_Daily. Each row is (date, process_name, user, start_count,
+    stop_count). Useful for trend questions ("did $process_name run more
+    often last week than the week before?") that would be O(N) over
+    $Process_Live.
+  tags: [echo, warehouse, processes, daily, examples]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: echo
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT datetime(day_ts, 'unixepoch') AS day, name, user, start_count, stop_count FROM $Process_Daily WHERE day_ts > strftime('%s', 'now', '-30 days') ORDER BY day_ts DESC, start_count DESC LIMIT 1000"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.10.0"
+    requiredPlugins: [echo]
+
+status:
+  phase: active
+
+---
+## Issue #60 — ISO timestamp conversion example.
+## Operators reading raw ts INTEGER columns get epoch seconds, which are
+## hard to skim. SQLite's `datetime(ts, 'unixepoch')` returns a sortable
+## ISO-8601 string ("2026-04-25 19:31:42"). This query is shipped as a
+## copy-paste reference and as a standing example query.
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.echo.recent_processes_iso
+  displayName: "Echo: Recent processes (ISO timestamps)"
+  version: 1.0.0
+  description: >
+    Same as `echo.recent_processes` but emits human-readable ISO-8601
+    timestamps via `datetime(ts, 'unixepoch')` instead of epoch seconds.
+    Use this when piping query output to a human reader; use
+    `echo.recent_processes` when piping to another tool that expects
+    epoch seconds.
+  tags: [echo, warehouse, processes, examples, iso]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: echo
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT datetime(ts, 'unixepoch') AS event_time, action, name, pid, user FROM $Process_Live WHERE ts > strftime('%s', 'now', '-24 hours') ORDER BY ts DESC LIMIT 500"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.10.0"
+    requiredPlugins: [echo]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.echo.rollup
+  displayName: "Echo: Run Aggregation"
+  version: 1.0.0
+  description: >
+    Force an immediate rollup aggregation cycle (normally runs every 15 minutes).
+    Aggregates live data into hourly, daily, and monthly summary tables and
+    then permanently deletes rows older than each tier's retention limit.
+    Classified Destructive/Irreversible with no approval gate: an operator
+    who can dispatch it deletes history immediately and cannot undo it.
+  tags: [echo, warehouse, rollup, aggregation]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: echo
+    action: rollup
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: status
+        type: string
+        description: >-
+          Declared as a literal status token; the plugin's actual response line is `echo|rollup|<n>|rows_aggregated` (a single positional line, not a status/rows_aggregated pair), so this column is not populated by the current wire format — see Caveats and known gaps. Values: not emitted by the current wire format.
+        example: "-"
+        platforms: []
+      - name: rows_aggregated
+        type: int32
+        description: >-
+          Number of rows the aggregation pass moved into the hourly/daily/monthly tiers this cycle (run_aggregation's return value); carried as the third field of the `echo|rollup|<n>|rows_aggregated` line rather than a named column. Values: non-negative integer.
+        example: "-"
+        platforms: [windows, linux, darwin]
+
+  readablePayload: "Force Echo warehouse rollup aggregation"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.10.0"
+    requiredPlugins: [echo]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.echo.recent_arp
+  displayName: "Echo: ARP table (recent)"
+  version: 1.0.0
+  description: >
+    Recent ARP / neighbour-table activity (ADR-0015) — IP<->MAC bindings per
+    interface with their appeared/removed action. Requires the `arp`
+    capture source to be enabled on the device (the default).
+  tags: [echo, warehouse, arp, network, forensics]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: echo
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT interface, ip_address, mac_address, entry_type, action, ts FROM $ARP_Live ORDER BY ts DESC LIMIT 500"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows]
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.12.0"
+    requiredPlugins: [echo]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.echo.recent_dns
+  displayName: "Echo: DNS cache (recent)"
+  version: 1.0.0
+  description: >
+    Recent DNS resolver-cache state (ADR-0015) — name/record_type/data/TTL with
+    their appeared/removed action. Device-level (no per-process attribution).
+    Requires the `dns` capture source to be enabled on the device (the default).
+  tags: [echo, warehouse, dns, network, forensics]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: echo
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT name, record_type, data, ttl_remaining_s, source, action, ts FROM $DNS_Live ORDER BY ts DESC LIMIT 500"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows]
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.12.0"
+    requiredPlugins: [echo]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.echo.recent_mapdrive
+  displayName: "Echo: Mapped drives (recent + historical)"
+  version: 1.0.0
+  description: >
+    Mapped network-share activity (capability-map §3.8) in both directions —
+    outbound (drives this host maps to remote shares) and inbound (remote hosts
+    mapping this host's shares). Live rows carry appeared/removed; historical
+    rows (origin='historical', from registry / fstab / event-log backfill) carry
+    action='historical'. Requires the `mapdrive` capture source to be
+    enabled on the device (the default); rows expose usernames + share paths.
+  tags: [echo, warehouse, mapdrive, network, lateral-movement, forensics]
+
+spec:
+  type: question
+  platforms: [windows, linux]
+
+  execution:
+    plugin: echo
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT direction, local_mount, remote_path, remote_host, username, provider, origin, action, ts FROM $MapDrive_Live ORDER BY ts DESC LIMIT 500"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux]
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.12.0"
+    requiredPlugins: [echo]
+
+status:
+  phase: active

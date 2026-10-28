@@ -40,7 +40,7 @@ std::vector<std::string_view> split_lines(std::string_view text) {
     return out;
 }
 
-// Split a `|`-joined tar row into cell views.
+// Split a `|`-joined echo row into cell views.
 std::vector<std::string_view> split_cells(std::string_view line) {
     std::vector<std::string_view> out;
     size_t start = 0;
@@ -80,9 +80,9 @@ bool cell_satisfies(std::string_view cell, const std::string& op, const nlohmann
     return false;
 }
 
-// Column matcher over the tar `__schema__` / row / `__total__` shape. Returns
+// Column matcher over the echo `__schema__` / row / `__total__` shape. Returns
 // true iff any data row's named column satisfies the op.
-bool tar_column_match(std::string_view output, const std::string& column, const std::string& op,
+bool echo_column_match(std::string_view output, const std::string& column, const std::string& op,
                       const nlohmann::json& matcher) {
     auto lines = split_lines(output);
     int col_idx = -1;
@@ -114,7 +114,7 @@ bool tar_column_match(std::string_view output, const std::string& column, const 
 
 // Column matcher over a JSON array-of-objects output (`[{"sha256":"..."}]`).
 // Best-effort fallback for instructions that emit structured JSON rather than
-// the tar pipe format. Returns true iff any object's column satisfies the op.
+// the echo pipe format. Returns true iff any object's column satisfies the op.
 bool json_column_match(std::string_view output, const std::string& column, const std::string& op,
                        const nlohmann::json& matcher) {
     auto doc = nlohmann::json::parse(output, nullptr, false);
@@ -189,7 +189,7 @@ bool declared_column_match(std::string_view output, const std::string& column, c
     return false;
 }
 
-// The `n` of a `tar_rows_ge` matcher (#4644). ABSENT is the documented default 1. A PRESENT `n`
+// The `n` of an `echo_rows_ge` matcher (#4644). ABSENT is the documented default 1. A PRESENT `n`
 // must be one JSON integer that fits an int; anything else (string, null, float, array, bool,
 // 4294967297) is nullopt. `m.value("n", 1)` THREW on a wrong type -- out of the maintenance tick,
 // where it re-threw every 2 s and starved the GC and retention reaps behind it -- and wrapped an
@@ -274,7 +274,7 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json) {
             return std::string("matcher.") + key + " is server-authored and cannot be supplied";
     if (!m.contains("kind"))
         return column_shape_defect(m);
-    if (m["kind"].get<std::string>() != "tar_rows_ge")
+    if (m["kind"].get<std::string>() != "echo_rows_ge")
         return std::nullopt;
     const auto n = read_row_threshold(m);
     if (!n || *n < 1)
@@ -310,7 +310,7 @@ void bind_declared_columns(nlohmann::json& matcher, const std::string& result_sc
         matcher[kRowDiscriminatorKey] = true;
 }
 
-int tar_row_count(std::string_view output) {
+int echo_row_count(std::string_view output) {
     if (output.starts_with("error|"))
         return 0;
     // Prefer the authoritative trailer the plugin emits.
@@ -354,13 +354,13 @@ bool response_matches(std::string_view matcher_json, int status, std::string_vie
         const auto kind = m["kind"].get<std::string>();
         if (kind == "any_response")
             return true;
-        if (kind == "tar_rows_ge") {
+        if (kind == "echo_rows_ge") {
             // A malformed threshold fails CLOSED, like an unknown kind: nobody qualifies, and the
             // tick carries on to the next set instead of throwing. n < 1 is malformed too
             // (admission refuses it; `count >= 0` would admit every responder, a row stored
             // before that refusal included).
             const auto need = read_row_threshold(m);
-            return need && *need >= 1 && tar_row_count(output) >= *need;
+            return need && *need >= 1 && echo_row_count(output) >= *need;
         }
         return false; // unknown kind → conservatively exclude
     }
@@ -373,9 +373,9 @@ bool response_matches(std::string_view matcher_json, int status, std::string_vie
     if (m.contains("column") && m["column"].is_string() && m.contains("op") && m["op"].is_string()) {
         const auto column = m["column"].get<std::string>();
         const auto op = m["op"].get<std::string>();
-        // Try the tar pipe shape first (its schema line is unambiguous),
+        // Try the echo pipe shape first (its schema line is unambiguous),
         // then the JSON array-of-objects fallback.
-        if (tar_column_match(output, column, op, m) || json_column_match(output, column, op, m))
+        if (echo_column_match(output, column, op, m) || json_column_match(output, column, op, m))
             return true;
         return m.contains(kDeclaredColumnsKey) && declared_column_match(output, column, op, m);
     }

@@ -100,7 +100,7 @@ TEST_CASE("parse_window_params: by run_count/run_time recognised; anything else 
 
 // ────────────────────────────────────────────────── normalise_exe_key() ───
 
-TEST_CASE("normalise_exe_key: 10-input parity with tar_usage.hpp's rule "
+TEST_CASE("normalise_exe_key: 10-input parity with echo_usage.hpp's rule "
           "(lowercase, basename, trim, empty -> (unknown))",
           "[app_usage][exe_key]") {
     CHECK(normalise_exe_key("Chrome.EXE") == "chrome.exe");
@@ -129,15 +129,15 @@ TEST_CASE("source_state_from_config: RECONSTRUCTION — the #560 tri-state, seve
 }
 
 TEST_CASE("source_state_from_config: RECONSTRUCTION — seeded :memory: db with "
-         "usage_enabled=maybe reports Errored via the same tar_config read read_meta uses",
+         "usage_enabled=maybe reports Errored via the same echo_config read read_meta uses",
           "[app_usage][source_state][sql]") {
     sqlite3* db = nullptr;
     REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
     seed::create_schema(db);
-    seed::insert_tar_config(db, "usage_enabled", "maybe");
+    seed::insert_echo_config(db, "usage_enabled", "maybe");
 
     sqlite3_stmt* stmt = nullptr;
-    REQUIRE(sqlite3_prepare_v2(db, "SELECT value FROM tar_config WHERE key = ?", -1, &stmt,
+    REQUIRE(sqlite3_prepare_v2(db, "SELECT value FROM echo_config WHERE key = ?", -1, &stmt,
                                nullptr) == SQLITE_OK);
     sqlite3_bind_text(stmt, 1, "usage_enabled", -1, SQLITE_STATIC);
     REQUIRE(sqlite3_step(stmt) == SQLITE_ROW);
@@ -166,14 +166,14 @@ TEST_CASE("summary SQL text is pinned", "[app_usage][sql]") {
 // ──────────────────────────────────────────── read_meta (REAL CAPTURE) ────
 
 // Expectations below are the actual values this REAL CAPTURE fixture holds
-// at capture time — see tar_config_macos.txt.provenance.txt for the
+// at capture time — see echo_config_macos.txt.provenance.txt for the
 // derivation. Five of the eleven candidate keys are ABSENT on this real,
 // fresh-host capture (unmatched_stops/clock_anomalies/gap_count/
 // gap_lost_events/gap_last_ts are only ever written when non-zero,
-// tar_usage.cpp:648-671) — asserting their honest absent-key defaults here
+// echo_usage.cpp:648-671) — asserting their honest absent-key defaults here
 // is itself the point: a prior RECONSTRUCTION fixture invented non-zero
 // values for all of these, which no real host actually produces.
-TEST_CASE("read_meta: REAL CAPTURE fixture — tar_config counters match the captured "
+TEST_CASE("read_meta: REAL CAPTURE fixture — echo_config counters match the captured "
          "snapshot, including the honest absent-key defaults",
           "[app_usage][meta][fixture]") {
     RealFixture fx;
@@ -192,22 +192,22 @@ TEST_CASE("read_meta: REAL CAPTURE fixture — tar_config counters match the cap
     CHECK(meta->last_fold_ts == "1789411607");
 }
 
-TEST_CASE("read_meta: RECONSTRUCTION — every tar_config counter reads back non-default "
+TEST_CASE("read_meta: RECONSTRUCTION — every echo_config counter reads back non-default "
          "when actually seeded (contrast with the REAL CAPTURE case's honest absent-key "
          "defaults)",
           "[app_usage][meta]") {
     sqlite3* db = nullptr;
     REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
     seed::create_schema(db);
-    seed::insert_tar_config(db, "usage_coverage_since", "1000");
-    seed::insert_tar_config(db, "usage_unmatched_stops", "2");
-    seed::insert_tar_config(db, "usage_clock_anomalies", "1");
-    seed::insert_tar_config(db, "usage_gap_count", "1");
-    seed::insert_tar_config(db, "usage_gap_lost_events", "9");
-    seed::insert_tar_config(db, "usage_gap_last_ts", "5000");
-    seed::insert_tar_config(db, "usage_lag_events", "3");
-    seed::insert_tar_config(db, "usage_feeder_enabled", "false");
-    seed::insert_tar_config(db, "usage_last_fold_ts", "6000");
+    seed::insert_echo_config(db, "usage_coverage_since", "1000");
+    seed::insert_echo_config(db, "usage_unmatched_stops", "2");
+    seed::insert_echo_config(db, "usage_clock_anomalies", "1");
+    seed::insert_echo_config(db, "usage_gap_count", "1");
+    seed::insert_echo_config(db, "usage_gap_lost_events", "9");
+    seed::insert_echo_config(db, "usage_gap_last_ts", "5000");
+    seed::insert_echo_config(db, "usage_lag_events", "3");
+    seed::insert_echo_config(db, "usage_feeder_enabled", "false");
+    seed::insert_echo_config(db, "usage_last_fold_ts", "6000");
 
     const auto meta = read_meta(db);
     REQUIRE(meta.has_value());
@@ -223,7 +223,7 @@ TEST_CASE("read_meta: RECONSTRUCTION — every tar_config counter reads back non
     sqlite3_close(db);
 }
 
-TEST_CASE("read_meta: RECONSTRUCTION — missing tar_config keys fall back to honest defaults",
+TEST_CASE("read_meta: RECONSTRUCTION — missing echo_config keys fall back to honest defaults",
           "[app_usage][meta]") {
     sqlite3* db = nullptr;
     REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
@@ -262,8 +262,8 @@ TEST_CASE("read_meta: usage_feeder_enabled key specifically omitted reads as dis
         REQUIRE(rc == SQLITE_OK);
     }
     seed::create_schema(db.get());
-    seed::insert_tar_config(db.get(), "usage_enabled", "true");
-    seed::insert_tar_config(db.get(), "usage_coverage_since", "1000");
+    seed::insert_echo_config(db.get(), "usage_enabled", "true");
+    seed::insert_echo_config(db.get(), "usage_coverage_since", "1000");
     // Deliberately no usage_feeder_enabled row at all.
 
     const auto meta = read_meta(db.get());
@@ -573,8 +573,8 @@ TEST_CASE("usage_daily_table_exists: true with the table, false without", "[app_
 // (here, a corrupt/not-a-database file) must be distinguished from the
 // legitimate "no such table" case above -- the old bool-returning version
 // conflated both into `false`, which app_usage_plugin.cpp's caller read as
-// "older TAR schema". Same bug class as check_usage_source_state's
-// tar_config tri-state (b88c3b690), now closed for the schema check too.
+// "older Echo schema". Same bug class as check_usage_source_state's
+// echo_config tri-state (b88c3b690), now closed for the schema check too.
 TEST_CASE("usage_daily_table_exists: a genuine read failure (corrupt db) is distinguished "
          "from a legitimately-absent table, never silently mapped to false",
           "[app_usage][schema]") {
@@ -771,7 +771,7 @@ std::string read_whole_file(const fs::path& p) {
 
 } // namespace
 
-TEST_CASE("negative: no app_usage plugin source mentions TAR's raw process-event table "
+TEST_CASE("negative: no app_usage plugin source mentions Echo's raw process-event table "
          "or a cmdline column",
           "[app_usage][negative][security]") {
     // YUZU_TEST_FIXTURE_DIR is "<source_root>/tests/unit/fixtures" (tests/meson.build) —

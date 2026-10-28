@@ -1602,7 +1602,7 @@ void ResponseStore::reap_expired() {
             // "Clock-guarded retention" part 6): decline — AuditStore's/
             // GuaranteedStateStore's answer, not ResultSetStore's. A
             // mis-timed pass here would destroy agent command/instruction
-            // results powering the executions drawer + `/tar` dashboard,
+            // results powering the executions drawer + `/echo` dashboard,
             // some of which carry usage-class behavioral PII (device.live.*,
             // per-app panels) — not ResultSetStore's reproducible
             // one-TTL-window scratch result sets.

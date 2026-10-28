@@ -14,7 +14,7 @@
 ## ACLs, `valid users` and NFS client host lists are never emitted. NFS clients are a count
 ## (`clients_<n>`) and an anonymous flag only. Share names and paths can embed account names
 ## (Samba [homes]): treat the result as sensitive.
-## Configured exports, not the mapped-drive and session observations the tar mapdrive source
+## Configured exports, not the mapped-drive and session observations the echo mapdrive source
 ## records.
 
 ---

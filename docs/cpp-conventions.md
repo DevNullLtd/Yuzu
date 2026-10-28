@@ -103,7 +103,7 @@ Two patterns coexist for embedding static front-end assets in the server binary;
 
 Use for assets we author in this repo (page HTML shells, small bespoke JS modules, hand-curated bundle code).
 
-- Single namespace-scope `extern const std::string` (or `extern const char* const` for HTML strings) declared in the consuming TU and defined in its own `.cpp` (e.g. `viz_page_ui.cpp`, `tar_page_ui.cpp`, `charts_js_bundle.cpp`).
+- Single namespace-scope `extern const std::string` (or `extern const char* const` for HTML strings) declared in the consuming TU and defined in its own `.cpp` (e.g. `viz_page_ui.cpp`, `echo_page_ui.cpp`, `charts_js_bundle.cpp`).
 - Source code is the authoritative form; raw-string literal embeds the body verbatim.
 - Stay under MSVC's 16,380-byte raw-string-literal limit (C2026); chunk by hand or migrate to Pattern B once growth approaches the limit.
 - Test tags in `tests/unit/server/test_static_js_bundle.cpp` follow the surface they describe, not the TU pattern: `[viz][page]` / `[viz][routes]` for the HTML pages and routes, `[static-js][viz]` / `[static-js][three]` / `[static-js][htmx]` for JS bundles.
@@ -126,7 +126,7 @@ Use for vendored assets (Three.js r168, ECharts, IBM Plex typeface) and for firs
 
 - Raw error codes or output parameters (use `std::expected`).
 - printf-family calls (use `std::format` or spdlog).
-- scanf-family calls (`sscanf`/`fscanf`/`scanf`): glibc 2.38 redirects them to versioned `__isoc23_*` symbols under C23/C++23, so binaries built on new-glibc toolchains refuse to load on RHEL-era glibc. Parse with `std::strtol`-family + end-pointer checks (width-capped fields: see `tar_mapdrive_collector.cpp::scan_int`).
+- scanf-family calls (`sscanf`/`fscanf`/`scanf`): glibc 2.38 redirects them to versioned `__isoc23_*` symbols under C23/C++23, so binaries built on new-glibc toolchains refuse to load on RHEL-era glibc. Parse with `std::strtol`-family + end-pointer checks (width-capped fields: see `echo_mapdrive_collector.cpp::scan_int`).
 - Raw `new`/`delete` (use RAII).
 - Manual resource cleanup (use RAII / smart pointers).
 - C++ types crossing the C ABI boundary in `plugin.h`.

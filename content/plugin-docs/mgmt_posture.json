@@ -321,7 +321,7 @@
   "version": "1.0.0",
   "where_the_data_goes": [
     "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. `posture` is also a gathered definition (`crossplatform.security.mgmt_posture`, 3600s TTL).",
-    "**Not consumed by** daily-sync, TAR, DEX, or metrics.",
+    "**Not consumed by** daily-sync, Echo, DEX, or metrics.",
     "**Sensitivity.** The MDM server host and the management plane are organisation-level facts; no person is named. The SSSD domain name that decides the plane is used internally and is never emitted. Only the host of the MDM server URL is kept (no path or query, which can carry a token). Key material is never read: the keytab is a presence check only.",
     "**Siblings:** `device_identity` (owns the domain, OU and joined rows) and `local_security_policy` (local policy, not management plane)."
   ]

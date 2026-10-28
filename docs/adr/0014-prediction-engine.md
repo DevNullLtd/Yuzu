@@ -14,7 +14,7 @@ builds-on: docs/adr/0003-telemetry-capture-model.md (federated edge warehouse),
 # 0014 — Prediction Engine: probabilistic reliability forecasting from the edge warehouse
 
 > **Implementation status:** greenfield proposal. The *inputs* ship today (the DEX signal
-> catalogue, the cross-platform state polls, the `dex_perf_breach` latches, the TAR `$Perf_Hourly`
+> catalogue, the cross-platform state polls, the `dex_perf_breach` latches, the Echo `$Perf_Hourly`
 > warehouse, the battery/SMART counters); the forecasting layer described here is **not built**.
 
 ## Context

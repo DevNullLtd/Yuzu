@@ -205,7 +205,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | inventory | 4 | 4 | 0 |
 | dex | 27 | 18 | 9 |
 | guardian | 18 | 10 | 8 |
-| tar | 12 | 3 | 9 |
+| echo | 12 | 3 | 9 |
 | auto-preflight | 4 | 1 | 3 |
 | auto-deploy | 6 | 3 | 3 |
 | auto-verify | 3 | 1 | 2 |

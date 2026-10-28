@@ -11,10 +11,10 @@ The supplied draft was written from memory and contains several factually wrong 
 |---|---|
 | capability-map says 225 / 166 / **74%** | capability-map.md:35 says **208 / 165 / 79%** |
 | README says 184 / 150 / **82%** | README.md:239 says **184 / 150 / 82%** ← stale, but draft's number is right |
-| "Phase 15 TAR + Scope Walking" | TAR is roadmap **Issue 7.19 — Done**; no Phase 15 exists |
+| "Phase 15 Echo + Scope Walking" | Echo is roadmap **Issue 7.19 — Done**; no Phase 15 exists |
 | "Phase 16 Guardian (2 of 15 PRs)" | No numbered phase; Guardian is tracked separately in CLAUDE.md PR ladder |
 | "Phase 17" hole | Roadmap stops at **Phase 14**; Phase 17 would be net-new |
-| `docs/scope-walking-design.md`, `docs/tar-dashboard.md`, `docs/tar-implementer.md` | None of these files exist |
+| `docs/scope-walking-design.md`, `docs/echo-dashboard.md`, `docs/echo-implementer.md` | None of these files exist |
 | "MCP Phase 2 not on roadmap" | **Issue 13.5** already plans `set_tag`, `delete_tag`, `approve_request`, `reject_request`, `quarantine_device` + SSE for execution progress |
 | "capability-map §2.2: scope/filter targeting NOT implemented" vs "asset-tagging-guide says it works" | **Code wins** — `agent_registry.cpp:838-847` resolves `tag:X`, `props.X`, `ostype`, `hostname`, `arch`, `agent_version`. capability-map §2.2 is wrong; asset-tagging-guide is right |
 | "set_tag, delete_tag implemented as MCP write tools" | `mcp_server.cpp` has them in `kToolSecurity`/`kWriteTools` and a misleading "Implemented:" comment, but **no dispatch handler** — only `execute_instruction` is wired (line 1313). They fall through to "Unknown tool" |

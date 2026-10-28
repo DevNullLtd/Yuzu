@@ -131,7 +131,7 @@ public:
     /// the JSON parser, BEFORE std::vector::reserve(), so a malicious
     /// `[{}, {}, ...]` cannot trigger a ~200 MB allocation per heartbeat
     /// (sec-H1 / UP-8). The cap matches `kFleetSnapshotMaxRows` in the
-    /// agent-side `tar_fleet_snapshot.hpp`; agents already truncate at
+    /// agent-side `echo_fleet_snapshot.hpp`; agents already truncate at
     /// 4096 per list, so a legitimate snapshot will never trip this.
     /// A snapshot exceeding the cap is rejected wholesale rather than
     /// truncated server-side — the truncation signal belongs to the
@@ -192,7 +192,7 @@ public:
     /// AgentServiceImpl::Heartbeat parses the JSON into a RawAgentSnapshot
     /// and calls this method. The store keeps the latest snapshot per
     /// agent in `pushed_` and invalidates the cache so the next get()
-    /// reads from the pushed map instead of dispatching tar.fleet_snapshot.
+    /// reads from the pushed map instead of dispatching echo.fleet_snapshot.
     /// Thread-safe: takes `pushed_mu_` plus `slots_mu_` for the
     /// invalidation half. Safe to call from any heartbeat-dispatcher
     /// thread.
@@ -242,8 +242,8 @@ public:
     /// Round-3 Hardware-merge accessor (item 10, IP column): a copy of the
     /// full agent_id -> claimed-local-ips index, taken under pushed_mu_. Only
     /// currently-connected agents that have pushed at least one
-    /// fleet_snapshot (TAR fleet source, 60 s cache) ever appear here — this
-    /// is NOT a durable device-CI field, so an offline or TAR-disabled agent
+    /// fleet_snapshot (Echo fleet source, 60 s cache) ever appear here — this
+    /// is NOT a durable device-CI field, so an offline or Echo-disabled agent
     /// is simply absent (caller renders "—"). O(fleet) copy; call once per
     /// list render, never per row.
     std::unordered_map<std::string, std::vector<std::string>> claimed_ips() const {

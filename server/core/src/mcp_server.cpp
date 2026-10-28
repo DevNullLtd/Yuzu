@@ -34,7 +34,7 @@
 #include "app_perf_compare.hpp" // app_perf_param_valid — shared cap + control-char/NUL re-floor
 #include "app_perf_daily_store.hpp" // AppPerfDailyStore::kRetentionDays -- the VERIFY compare window clamp
 #include "compliance_model.hpp"         // shared REST/MCP/fragment builders (#4034)
-#include "dashboard_routes.hpp"         // DashboardRoutes::gather_tar_retention_paused (#4027)
+#include "dashboard_routes.hpp"         // DashboardRoutes::gather_echo_retention_paused (#4027)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
 #include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
 #include "product_pack_model.hpp" // #4029: ProductPackStore (fwd-declared only in mcp_server.hpp) + shared builders
@@ -645,49 +645,49 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}}},"required":["agents"]})j"},
 
-    // ── #4027 API-parity read twins: TAR process-tree / capture-sources device
+    // ── #4027 API-parity read twins: Echo process-tree / capture-sources device
     // pickers + retention-paused source list. Requires Infrastructure:Read,
     // enforced via fleet_read_fn_ (#4027 fix round, CDX-P1-01/K4 — the ADR-0017
     // admit-then-filter chokepoint; SAME gate their REST twins use, NOT the two
     // pre-existing HTML fragment siblings, which stay on the legacy bare
-    // require_permission gate this round — see tar_tree_routes.cpp's
+    // require_permission gate this round — see echo_tree_routes.cpp's
     // recorded-exception comments at their registration). #4143 review fix:
     // all three now read from an UNFILTERED source (all_devices_fn_ /
-    // DashboardRoutes::gather_tar_retention_paused with
+    // DashboardRoutes::gather_echo_retention_paused with
     // extra_scope_is_authoritative=true) exactly like list_agents' own
     // agents_fn, with fleet_read_fn_'s gate.scope as the SOLE filter — no
     // longer intersected with a separate per-operator-scoped provider. See
     // set_all_devices_fn's doc comment (mcp_server.hpp) for the full
     // rationale.
-    // GET /fragments/tar/process-tree/result and .../detail are DELIBERATELY NOT
-    // twinned by #4027 (see tar_tree_routes.hpp's file comment) — no REST/MCP-only
+    // GET /fragments/echo/process-tree/result and .../detail are DELIBERATELY NOT
+    // twinned by #4027 (see echo_tree_routes.hpp's file comment) — no REST/MCP-only
     // path exists to mint their required pcmd/tcmd/token inputs today.
-    {"list_tar_process_tree_devices",
-     "List the operator-scoped device picker for the TAR process-tree viewer. "
+    {"list_echo_process_tree_devices",
+     "List the operator-scoped device picker for the Echo process-tree viewer. "
      "Each row carries `online`, which is always true today — the sole wired "
      "provider sources this list from the live-session registry, so a "
      "disconnected enrolled device is not included (#4027 fix round, "
      "CDX-P1-02/K1). Requires Infrastructure:Read. Read-only twin of GET "
-     "/fragments/tar/process-tree's device picker / GET /api/v1/tar/process-tree.",
+     "/fragments/echo/process-tree's device picker / GET /api/v1/echo/process-tree.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"online":{"type":"boolean"}},"required":["agent_id","hostname","os","arch","agent_version","online"]}}},"required":["devices"]})j"},
 
-    {"list_tar_capture_sources_devices",
-     "List the operator-scoped device picker for the TAR capture-sources (ADR-0015 "
-     "enable/disable) frame. Same row shape as list_tar_process_tree_devices — "
+    {"list_echo_capture_sources_devices",
+     "List the operator-scoped device picker for the Echo capture-sources (ADR-0015 "
+     "enable/disable) frame. Same row shape as list_echo_process_tree_devices — "
      "`online` is always true today, same reason. Requires Infrastructure:Read. "
-     "Read-only twin of GET /fragments/tar/capture-sources's device picker / "
-     "GET /api/v1/tar/capture-sources.",
+     "Read-only twin of GET /fragments/echo/capture-sources's device picker / "
+     "GET /api/v1/echo/capture-sources.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"online":{"type":"boolean"}},"required":["agent_id","hostname","os","arch","agent_version","online"]}}},"required":["devices"]})j"},
 
-    {"list_tar_retention_paused",
-     "List the calling operator's most recent TAR retention-paused source scan "
+    {"list_echo_retention_paused",
+     "List the calling operator's most recent Echo retention-paused source scan "
      "(per-username state; filtered to the operator's visible agents), one row per "
      "(agent, paused source). Requires Infrastructure:Read. Read-only twin of GET "
-     "/fragments/tar/retention-paused / GET /api/v1/tar/retention-paused. Returns "
+     "/fragments/echo/retention-paused / GET /api/v1/echo/retention-paused. Returns "
      "scan_id=\"\" when the operator has not dispatched a scan yet (call "
-     "POST /fragments/tar/retention-paused/scan first, dashboard-only today). "
+     "POST /fragments/echo/retention-paused/scan first, dashboard-only today). "
      "result_truncated_by_cap=true means the scan's response read reached its "
      "10,000-row / 50 MiB cap, so rows and the counters are PARTIAL (a dropped "
      "response reads as an agent that never answered); store_degraded is then "
@@ -1294,8 +1294,8 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
-    {"create_result_set_from_tar_query",
-     "Create a result set by DISPATCHING a read-only TAR SQL query to the fleet. ASYNC: "
+    {"create_result_set_from_echo_query",
+     "Create a result set by DISPATCHING a read-only Echo SQL query to the fleet. ASYNC: "
      "returns immediately with status=\"pending\" — poll get_result_set by the returned id, "
      "or subscribe to /api/v1/events on source_execution_id, until status flips to "
      "\"materialized\" (or \"failed\"). Requires Execution:Execute, confined to the caller's "
@@ -1306,7 +1306,7 @@ static const ToolDef kTools[] = {
      "parent_id's CURRENT members when supplied, else broadcasts to every connected agent — "
      "omitting parent_id is the only way to broadcast; a supplied parent_id that resolves to "
      "nothing is refused (400), never silently widened. REST v1 twin: POST "
-     "/api/v1/result-sets/from-tar-query. NEVER re-send this call on a timeout or an "
+     "/api/v1/result-sets/from-echo-query. NEVER re-send this call on a timeout or an "
      "ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
      "instead. Two distinct fault tokens distinguish when retry is safe: a pre-dispatch "
      "RESULT_SET_STORE_UNAVAILABLE (the quota check degraded before anything was sent) "
@@ -1320,14 +1320,14 @@ static const ToolDef kTools[] = {
 
     {"create_result_set_from_instruction_result",
      "Create a result set by DISPATCHING an existing InstructionDefinition to the fleet. "
-     "ASYNC — same pending->materialize contract as create_result_set_from_tar_query: poll "
+     "ASYNC — same pending->materialize contract as create_result_set_from_echo_query: poll "
      "get_result_set by id, or subscribe to /api/v1/events on source_execution_id. Requires "
      "Execution:Execute, confined to the caller's derived visible device set — the ONLY "
      "per-device authorization on this dispatch surface. Membership is the responders whose "
      "output row satisfies the operator-supplied matcher (column/op/value); omitting matcher "
      "accepts every responder. Dispatches to parent_id's CURRENT members when supplied, else "
      "broadcasts — same omit-to-broadcast / refuse-if-resolves-to-nothing contract as "
-     "create_result_set_from_tar_query. Find valid instruction_id values via list_definitions "
+     "create_result_set_from_echo_query. Find valid instruction_id values via list_definitions "
      "or discover_instructions — do not guess. If the definition runs a Forensics-tier "
      "plugin (an action on the Forensics securable) the set materializes with no members "
      "for every creator, because the materializer never reads Forensics-tier output; an "
@@ -1340,13 +1340,13 @@ static const ToolDef kTools[] = {
      "RESULT_SET_STORE_FAULT_AFTER_DISPATCH (the store faulted after a real command "
      "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
      "poll executions for the outcome instead.",
-     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder. {kind:tar_rows_ge,n} needs n to be an integer from 1 to 2147483647"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
+     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder. {kind:echo_rows_ge,n} needs n to be an integer from 1 to 2147483647"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
     {"reevaluate_result_set",
      "Re-run an existing result set's OWN source query, creating a NEW SIBLING set (same "
-     "parent_id as the original, NOT a child of it) — a fresh snapshot of a tar_query or "
+     "parent_id as the original, NOT a child of it) — a fresh snapshot of an echo_query or "
      "instruction_result set's original question against today's fleet. Requires "
      "Execution:Execute (re-dispatches to the fleet, ASYNC, same pending->materialize "
      "contract as the create_result_set_from_* producers) — confined to the caller's derived "
@@ -3342,7 +3342,7 @@ static const ToolDef kTools[] = {
     {"get_agent_app_usage",
      "Query a single agent's per-executable app-usage projection (wave 7 PR7.2) — the "
      "MCP twin of GET /api/v1/forensics/agents/{id}/app-usage. One row per executable: "
-     "first_seen/last_seen (agent-observed, within TAR's retained usage window — 31 days "
+     "first_seen/last_seen (agent-observed, within Echo's retained usage window — 31 days "
      "default, operator-tunable) and a trailing-30-day run_count/total_seconds window. "
      "collected_at is the agent's batch collection time. No user names or pids — the "
      "store carries none. Requires Forensics:Read.",
@@ -4499,7 +4499,7 @@ static const char* const kWriteToolsRaw[] = {
     // operation is "Read"; operation is the ONLY thing that decides
     // membership here, not whether a handler mutates state.
     "create_result_set", "create_result_set_from_inventory_query",
-    "create_result_set_from_tar_query",
+    "create_result_set_from_echo_query",
     "create_result_set_from_instruction_result", "reevaluate_result_set",
     "pin_result_set", "unpin_result_set", "delete_result_set",
     // #2146 Batch B1 — Guardian rule CRUD + push. create/update: Write;
@@ -4577,9 +4577,9 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // (dashboard_routes.cpp) — none of the six #4027 surfaces admits a
     // service-scoped caller; this fix round closes the management-group gap
     // only, never widens the service-scope one.
-    {"list_tar_process_tree_devices", {"Infrastructure", "Read"}},
-    {"list_tar_capture_sources_devices", {"Infrastructure", "Read"}},
-    {"list_tar_retention_paused", {"Infrastructure", "Read"}},
+    {"list_echo_process_tree_devices", {"Infrastructure", "Read"}},
+    {"list_echo_capture_sources_devices", {"Infrastructure", "Read"}},
+    {"list_echo_retention_paused", {"Infrastructure", "Read"}},
     // #1700 / #3290 Phase 2: migrated onto require_fleet_read, which gives
     // this tool a REAL confinement mechanism (meet(management-group,
     // service-scope)) — reclassified from the default `denied` to
@@ -4739,7 +4739,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // is the #1788/ADR-0017 confinement class -- get it right: the derived
     // VisibleSet is the ONLY per-device authorization on this surface, not
     // defense-in-depth.
-    {"create_result_set_from_tar_query", {"Execution", "Execute", ServiceScopeClass::confined}},
+    {"create_result_set_from_echo_query", {"Execution", "Execute", ServiceScopeClass::confined}},
     {"create_result_set_from_instruction_result",
      {"Execution", "Execute", ServiceScopeClass::confined}},
     {"reevaluate_result_set", {"Execution", "Execute", ServiceScopeClass::confined}},
@@ -5435,12 +5435,12 @@ struct ToolAnnotation {
 static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // ── Read-only tools (effect ReadOnly, idempotent) ─────────────────────────
     {"list_agents", {ToolEffect::ReadOnly, true, "List agents"}},
-    {"list_tar_process_tree_devices",
-     {ToolEffect::ReadOnly, true, "List TAR process-tree device picker"}},
-    {"list_tar_capture_sources_devices",
-     {ToolEffect::ReadOnly, true, "List TAR capture-sources device picker"}},
-    {"list_tar_retention_paused",
-     {ToolEffect::ReadOnly, true, "List TAR retention-paused sources"}},
+    {"list_echo_process_tree_devices",
+     {ToolEffect::ReadOnly, true, "List Echo process-tree device picker"}},
+    {"list_echo_capture_sources_devices",
+     {ToolEffect::ReadOnly, true, "List Echo capture-sources device picker"}},
+    {"list_echo_retention_paused",
+     {ToolEffect::ReadOnly, true, "List Echo retention-paused sources"}},
     {"get_agent_details", {ToolEffect::ReadOnly, true, "Get agent details"}},
     {"query_audit_log", {ToolEffect::ReadOnly, true, "Query audit log"}},
     {"list_definitions", {ToolEffect::ReadOnly, true, "List instruction definitions"}},
@@ -5524,8 +5524,8 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"create_result_set", {ToolEffect::Additive, false, "Create result set"}},
     {"create_result_set_from_inventory_query",
      {ToolEffect::Additive, false, "Create result set from inventory query"}},
-    {"create_result_set_from_tar_query",
-     {ToolEffect::Destructive, false, "Create result set from TAR query"}},
+    {"create_result_set_from_echo_query",
+     {ToolEffect::Destructive, false, "Create result set from Echo query"}},
     {"create_result_set_from_instruction_result",
      {ToolEffect::Destructive, false, "Create result set from instruction result"}},
     {"reevaluate_result_set", {ToolEffect::Destructive, false, "Re-evaluate result set"}},
@@ -9347,7 +9347,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
-            // ── #4027 read twins: TAR process-tree / capture-sources device
+            // ── #4027 read twins: Echo process-tree / capture-sources device
             // pickers + retention-paused source list. #4027 fix round
             // (CDX-P1-01/K4): all three now gate SOLELY on fleet_read_fn_
             // (require_fleet_read, the ADR-0017 admit-then-filter chokepoint),
@@ -9376,20 +9376,20 @@ McpServer::HandlerFn McpServer::build_handler(
             // (api-twin-recipe.md Rule 1) from an UNFILTERED registry snapshot
             // (all_devices_fn_ — same source list_agents' agents_fn and
             // GET /api/v1/devices (#4033) use), with gate.scope as the SOLE
-            // filter — not an intersection with tar_devices_fn_'s direct-
+            // filter — not an intersection with echo_devices_fn_'s direct-
             // membership-only pre-filter (see set_all_devices_fn's doc comment
             // above for why the old intersection design was an ADR-0017
             // INV-4/INV-7 violation). And both now fail LOUD (503-equivalent
             // kInternalError) when their provider is unwired, matching
-            // list_tar_retention_paused's existing posture below — the previous
+            // list_echo_retention_paused's existing posture below — the previous
             // code silently answered "0 devices in your scope" on a misconfigured
             // call site for these two tools only, indistinguishable from a
             // genuinely-empty-scope caller (a false "closed" that reads as data,
             // not an outage; the same class of bug the loud unwired-fleet_read_fn_
             // branch just above already guards against). ──
-            if (tool_name == "list_tar_process_tree_devices") {
+            if (tool_name == "list_echo_process_tree_devices") {
                 if (!fleet_read_fn_ || !all_devices_fn_) {
-                    spdlog::error("list_tar_process_tree_devices: fleet_read_fn_/"
+                    spdlog::error("list_echo_process_tree_devices: fleet_read_fn_/"
                                   "all_devices_fn_ unwired — misconfigured call site; "
                                   "failing closed");
                     res.set_content(error_response(id, kInternalError, "service unavailable"),
@@ -9408,7 +9408,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             visible.push_back(std::move(d));
                     devices.swap(visible);
                 }
-                const std::string devices_json = tar_process_tree_frame_json(devices);
+                const std::string devices_json = echo_process_tree_frame_json(devices);
                 mcp_audit("success");
                 res.set_content(
                     success_response(id,
@@ -9419,9 +9419,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
-            if (tool_name == "list_tar_capture_sources_devices") {
+            if (tool_name == "list_echo_capture_sources_devices") {
                 if (!fleet_read_fn_ || !all_devices_fn_) {
-                    spdlog::error("list_tar_capture_sources_devices: fleet_read_fn_/"
+                    spdlog::error("list_echo_capture_sources_devices: fleet_read_fn_/"
                                   "all_devices_fn_ unwired — misconfigured call site; "
                                   "failing closed");
                     res.set_content(error_response(id, kInternalError, "service unavailable"),
@@ -9440,7 +9440,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             visible.push_back(std::move(d));
                     devices.swap(visible);
                 }
-                const std::string devices_json = tar_capture_sources_devices_json(devices);
+                const std::string devices_json = echo_capture_sources_devices_json(devices);
                 mcp_audit("success");
                 res.set_content(
                     success_response(id,
@@ -9451,9 +9451,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
-            if (tool_name == "list_tar_retention_paused") {
+            if (tool_name == "list_echo_retention_paused") {
                 if (!fleet_read_fn_) {
-                    spdlog::error("list_tar_retention_paused: fleet_read_fn_ unwired — "
+                    spdlog::error("list_echo_retention_paused: fleet_read_fn_ unwired — "
                                   "misconfigured call site; failing closed");
                     res.set_content(error_response(id, kInternalError, "service unavailable"),
                                     "application/json");
@@ -9464,16 +9464,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     return; // gate already wrote the A4 error body + status
                 if (!dashboard_routes_) {
                     res.set_content(
-                        a4_error(kInternalError, "TAR retention-paused surface unavailable",
+                        a4_error(kInternalError, "Echo retention-paused surface unavailable",
                                  "this is a server configuration/wiring fault, not a caller "
                                  "error; contact an administrator"),
                         "application/json");
                     return;
                 }
                 // #4143 review fix: gate.scope is authoritative here — see
-                // gather_tar_retention_paused's doc comment.
+                // gather_echo_retention_paused's doc comment.
                 const std::string payload =
-                    tar_retention_paused_json(dashboard_routes_->gather_tar_retention_paused(
+                    echo_retention_paused_json(dashboard_routes_->gather_echo_retention_paused(
                         session->username, gate.scope, /*extra_scope_is_authoritative=*/true));
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
@@ -13677,7 +13677,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // see every connected agent, not just their own visible set.
                 // `fleet_read_fn_` REPLACES the permission check (it already
                 // performs the RBAC check internally) rather than being
-                // paired with it — same pattern as list_tar_process_tree_devices.
+                // paired with it — same pattern as list_echo_process_tree_devices.
                 if (!fleet_read_fn_) {
                     spdlog::error("preview_scope_targets: fleet_read_fn_ unwired — "
                                   "misconfigured call site; failing closed");
@@ -13837,7 +13837,7 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // `rs_run_async`: MCP twin of rest_api_v1.cpp's `run_async` — the
             // shared dispatch engine for the 3 async result-set producers
-            // (create_result_set_from_tar_query, create_result_set_from_
+            // (create_result_set_from_echo_query, create_result_set_from_
             // instruction_result, reevaluate_result_set). `args_for_parent` is
             // read ONLY for `parent_id` (everything else is passed explicitly
             // so reevaluate_result_set can synthesise it) — mirrors REST's
@@ -14270,7 +14270,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // from a genuinely parentless original once its parent is
                 // deleted (ON DELETE SET NULL) -- the same #4306/#2500
                 // target-erasure shape the dedicated
-                // create_result_set_from_tar_query/_instruction_result tools
+                // create_result_set_from_echo_query/_instruction_result tools
                 // are already protected against. Parse into a mutable object
                 // so scope_input_id can be merged in below, once pid's
                 // ownership check (rs_load_owned) succeeds -- mirrors those
@@ -14891,7 +14891,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
-            if (tool_name == "create_result_set_from_tar_query") {
+            if (tool_name == "create_result_set_from_echo_query") {
                 if (!perm_fn(req, res, "Execution", "Execute"))
                     return;
                 std::string sql = param_str(args, "sql");
@@ -14943,15 +14943,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 const bool include_empty = args.value("include_empty", false);
                 nlohmann::json matcher = include_empty
                                              ? nlohmann::json{{"kind", "any_response"}}
-                                             : nlohmann::json{{"kind", "tar_rows_ge"}, {"n", 1}};
-                // source_payload — design §3.2 tar_query shape (re-eval reads it).
+                                             : nlohmann::json{{"kind", "echo_rows_ge"}, {"n", 1}};
+                // source_payload — design §3.2 echo_query shape (re-eval reads it).
                 nlohmann::json payload;
                 payload["sql"] = sql;
                 payload["include_empty"] = include_empty;
                 if (args.contains("parent_id") && args["parent_id"].is_string())
                     payload["scope_input_id"] = args["parent_id"];
                 std::unordered_map<std::string, std::string> params{{"sql", sql}};
-                rs_run_async("tar", "sql", params, source_kind::kTarQuery, payload.dump(),
+                rs_run_async("echo", "sql", params, source_kind::kEchoQuery, payload.dump(),
                             matcher.dump(), args, param_str(args, "name"));
                 return;
             }
@@ -15010,7 +15010,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             return;
                         }
                     }
-                    // #4644: a malformed tar_rows_ge threshold (`n`) is refused here, before
+                    // #4644: a malformed echo_rows_ge threshold (`n`) is refused here, before
                     // anything is dispatched or stored, like the REST twin.
                     // A PRESENT matcher that is not a JSON object used to be dropped silently
                     // ("accept every responder"); it is refused now. Absent stays the default.
@@ -15192,7 +15192,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // no reeval_name), so hoist it to an early return right after
                 // sp is parsed. Mirrors REST's identical reorder on this
                 // route (rest_api_v1.cpp).
-                if (orig->source_kind != source_kind::kTarQuery &&
+                if (orig->source_kind != source_kind::kEchoQuery &&
                     orig->source_kind != source_kind::kInstructionResult) {
                     res.set_content(
                         error_response(id, kInvalidParams,
@@ -15212,7 +15212,7 @@ McpServer::HandlerFn McpServer::build_handler(
                            !sp["scope_input_id"].get_ref<const std::string&>().empty()) {
                     // #4306 / #2500-class target erasure: the original was
                     // NARROWED at creation (scope_input_id persisted into
-                    // source_payload by create_result_set_from_tar_query /
+                    // source_payload by create_result_set_from_echo_query /
                     // create_result_set_from_instruction_result, OR by the
                     // generic create_result_set -- #4306 follow-up, all three
                     // mirror the same payload["scope_input_id"] = ... pattern),
@@ -15263,10 +15263,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     orig->name.empty()                  ? std::string()
                     : orig->name.ends_with(" (re-eval)") ? orig->name
                                                          : (orig->name + " (re-eval)");
-                if (orig->source_kind == source_kind::kTarQuery) {
+                if (orig->source_kind == source_kind::kEchoQuery) {
                     // Adversarial review (PR #4330): sp.value("sql", "") throws
                     // nlohmann::json::type_error on a type mismatch rather than
-                    // coercing - unlike create_result_set_from_tar_query's own
+                    // coercing - unlike create_result_set_from_echo_query's own
                     // caller-facing "sql" arg, which gets an explicit type check.
                     // orig->source_payload isn't caller-supplied on THIS call,
                     // but a row minted via the generic (uncapped) create_result_set
@@ -15287,9 +15287,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     // Gate 4 unhappy-path BLOCKING fix: re-apply the SAME cap
-                    // create_result_set_from_tar_query enforces before dispatch.
+                    // create_result_set_from_echo_query enforces before dispatch.
                     // `orig` may have been minted via the uncapped create_result_set
-                    // (source_kind labeled tar_query with no create-time SQL-length
+                    // (source_kind labeled echo_query with no create-time SQL-length
                     // check of its own) - without this, re-eval would smuggle an
                     // oversized SQL payload past the 200 KiB pre-routing body cap
                     // that exists specifically for this SQL size, then dispatch it
@@ -15302,7 +15302,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     std::unordered_map<std::string, std::string> params{{"sql", sql}};
-                    rs_run_async("tar", "sql", params, source_kind::kTarQuery, orig->source_payload,
+                    rs_run_async("echo", "sql", params, source_kind::kEchoQuery, orig->source_payload,
                                 orig->matcher, synth, reeval_name);
                 } else if (orig->source_kind == source_kind::kInstructionResult) {
                     // Same type-confusion guard as the sql field above.
@@ -15325,7 +15325,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // oversized instruction_id would reach instruction_store's
                     // lookup unbounded, and an over-keyed or oversized params
                     // object would dispatch fleet-wide. Mirrors the sql-size
-                    // recheck in the kTarQuery branch above. chaos-injector's
+                    // recheck in the kEchoQuery branch above. chaos-injector's
                     // Finding 1 caught the instruction_id gap: the fix's own
                     // "re-apply the SAME caps" note originally covered only
                     // params, not this sibling field.
@@ -15400,7 +15400,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                 orig->source_payload, orig->matcher, synth, reeval_name);
                 }
                 // else: unreachable -- the early return above already refused
-                // every source_kind other than kTarQuery/kInstructionResult
+                // every source_kind other than kEchoQuery/kInstructionResult
                 // before we got here.
                 return;
             }
@@ -19064,7 +19064,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // `version` is REQUIRED-PRESENT (distinct from get_dex_app_perf's ""
                 // = all-versions convention above): this drill is always scoped to
                 // ONE exact version, and Linux procperf emits "" for every app
-                // (tar_proc_perf.cpp) — an omitted `version` would otherwise
+                // (echo_proc_perf.cpp) — an omitted `version` would otherwise
                 // silently collapse to that single bucket instead of surfacing a
                 // genuine parameter error.
                 if (!args.contains("version") || !args["version"].is_string()) {

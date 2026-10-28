@@ -33,7 +33,7 @@ flow-summary schema:
 Aggregate **at the edge** (the in-kernel-map / Cilium-Hubble / Datadog-NPM pattern) into
 flow summaries `(src, dst, port, proto, first_seen, last_seen, count)` — lossless on flow
 *existence* while keeping volume near today's poll volume. Summaries persist in the
-**agent's local SQLite warehouse** (TAR `tcp_live` precedent), retained and **not flushed**;
+**agent's local SQLite warehouse** (Echo `tcp_live` precedent), retained and **not flushed**;
 each box is a leaf of a distributed SQL warehouse the server queries on demand. The raw
 event firehose **never reaches the server**.
 

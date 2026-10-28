@@ -63,7 +63,7 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/storage/README', slug: 'plugins/storage', title: 'storage' },
   { file: 'agents/plugins/system_hardening/README', slug: 'plugins/system_hardening', title: 'system_hardening' },
   { file: 'agents/plugins/tags/README', slug: 'plugins/tags', title: 'tags' },
-  { file: 'agents/plugins/tar/README', slug: 'plugins/tar', title: 'tar' },
+  { file: 'agents/plugins/echo/README', slug: 'plugins/echo', title: 'echo' },
   { file: 'agents/plugins/update_source_trust/README', slug: 'plugins/update_source_trust', title: 'update_source_trust' },
   { file: 'agents/plugins/users/README', slug: 'plugins/users', title: 'users' },
   { file: 'agents/plugins/vuln_scan/README', slug: 'plugins/vuln_scan', title: 'vuln_scan' },

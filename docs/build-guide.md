@@ -67,10 +67,10 @@ Per-OS build dirs prevent clobbering when one tree is built from multiple hosts 
 
 ## Test
 
-Every test target carries a `suite:` label (`agent`, `tar`, `server`, `proto`, `gateway`, `platform` for OS-contract tests that run on every CI leg, `docs` for OS-independent gates that run on the Linux leg only) so `--suite <name>` filters directly:
+Every test target carries a `suite:` label (`agent`, `echo`, `server`, `proto`, `gateway`, `platform` for OS-contract tests that run on every CI leg, `docs` for OS-independent gates that run on the Linux leg only) so `--suite <name>` filters directly:
 
 ```bash
-meson test -C build-linux --suite <server|agent|tar> --print-errorlogs   # omit --suite for everything
+meson test -C build-linux --suite <server|agent|echo> --print-errorlogs   # omit --suite for everything
 ```
 
 Tests require `-Dbuild_tests=true`. vcpkg installs Catch2 only on `x64 | arm64`; the ARM64 cross-compile CI job intentionally skips tests.

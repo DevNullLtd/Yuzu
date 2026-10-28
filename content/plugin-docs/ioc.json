@@ -331,7 +331,7 @@
   "version": "1.0.0",
   "where_the_data_goes": [
     "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention, `response_store.hpp:8`), queryable at `/api/responses/{id}` and aggregatable by `(type, matched)` count per the definition's own `aggregation` block (`content/definitions/ioc.yaml:112-114`).",
-    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches `security.ioc.check`.",
+    "**Not consumed by** daily-sync inventory, the Echo warehouse, DEX, or metrics. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches `security.ioc.check`.",
     "**Sensitivity.** `value` is the operator-supplied IOC being checked (an IP, domain, hash, path, or port — not host state), and `detail` can name an owning process id (`pid`) on Windows/macOS matches — no row carries a device serial/hostname, a username, or an installed-software name/version.",
     "**Siblings:** grouped with `security.quarantine.{isolate,release,status,whitelist}`, `security.certificates.{list,details,delete}`, and `security.sccm.{client_version,site}` under the `core.security.security-response` instruction set (`content/definitions/security_response_set.yaml:20-32`).",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"security.ioc.check\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."

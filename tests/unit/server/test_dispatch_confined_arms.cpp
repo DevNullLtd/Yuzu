@@ -1043,12 +1043,12 @@ TEST_CASE("the shared confined-dispatch seam does not refuse a Destructive fan-o
             {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
     }
 
-    // A REAL Destructive row (tar.purge_source, DispatchClass::Destructive in
+    // A REAL Destructive row (echo.purge_source, DispatchClass::Destructive in
     // capability_decls/plugin_action_catalogue_a.hpp) — named explicitly so
     // this case cannot quietly become a test about a harmless pair.
     yuzu::agent::v1::CommandRequest cmd;
     cmd.set_command_id("d3-pin-cmd");
-    cmd.set_plugin("tar");
+    cmd.set_plugin("echo");
     cmd.set_action("purge_source");
     cmd.set_dispatch_tag("v1|ro|none|0123456789abcdef0123456789abcdef");
     auto classified = ClassifiedCommandTestAccess::make(cmd);

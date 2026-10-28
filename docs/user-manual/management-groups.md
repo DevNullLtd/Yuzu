@@ -52,7 +52,7 @@ For example, if `jane.ops` holds the Operator role on the "London Office" group,
 > **When RBAC is disabled (the default posture):** management-group role
 > assignments are **not** consulted. Every authenticated user sees the full
 > enrolled agent set, matching the legacy-admin "full access" behaviour. The
-> dashboard agent list, the `/api/agents` endpoint, and the TAR fleet scan all
+> dashboard agent list, the `/api/agents` endpoint, and the Echo fleet scan all
 > draw from this path. If you later **enable** RBAC, visibility immediately
 > becomes role-scoped — ensure users have appropriate management-group role
 > assignments *before* enabling RBAC in production (see "Enabling RBAC" in

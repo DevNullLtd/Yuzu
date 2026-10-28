@@ -545,7 +545,7 @@ private:
     // mappings), closing the unbounded-growth risk the map's doc comment
     // used to flag here (sec-M1 / perf-S1).
     std::atomic<size_t> output_row_count_{0};
-    std::vector<std::string> tar_dynamic_columns_; // TAR SQL dynamic schema cache
+    std::vector<std::string> echo_dynamic_columns_; // Echo SQL dynamic schema cache
     bool require_client_identity_{false};
     bool gateway_mode_{false};
     // #1128: operator-declared multi-egress NAT/proxy ranges (see Config). Empty

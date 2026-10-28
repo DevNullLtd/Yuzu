@@ -145,7 +145,7 @@ The reason tokens that appear in a `probe_status|<surface>|error|<reason>` line 
 - **Server store.** The blob is parsed and ingested into `SoftwareLicensingStore`.
 - **REST.** `GET /api/v1/sle/agents/{agent_id}` returns the device's detected licences (product, type, channel, state, expiry, confidence, `exe_hints` and the per-user `user_scope` and `user_ref`), gated `SoftwareLicensing:Read` scoped to the device and audited per open. `DELETE /api/v1/sle/agents/{agent_id}` is decommission erasure and needs the single `Decommission:Delete` permission, scoped to that device. A role holding only the per-store `SoftwareLicensing:Delete`, `Inventory:Delete` and `GuaranteedState:Delete` grants is refused with 403.
 - **MCP.** The `query_software_licenses` tool, gated `SoftwareLicensing:Read` with confined scope, reads the same store, not a live dispatch.
-- **Not consumed by** the TAR warehouse, DEX or metrics.
+- **Not consumed by** the Echo warehouse, DEX or metrics.
 - **Sensitivity.** `lic` rows are an installed-software and licence inventory: `product`, `vendor` and `version` name specific installed software, `exe_hints` names executables, and `key_hint` carries a partial OS-provided key or a key-derived hash (never raw key material). `user_scope` and `user_ref` can carry a local profile name for a user-scoped licence; the daily sync can pseudonymise or drop `user_ref`. `probe_status` rows carry only a surface name and a count or reason.
 - **Siblings:** none shipped. `ent|` entitlement records (FlexLM seat counts, KMS activation counts) are not emitted by this plugin.
 

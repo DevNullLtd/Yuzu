@@ -209,14 +209,14 @@
       ]
     },
     {
-      "id": "tar",
-      "why": "TAR dashboard (server side; the tar plugin is under the plugin README rule)",
+      "id": "echo",
+      "why": "Echo dashboard (server side; the echo plugin is under the plugin README rule)",
       "code": [
-        "server/core/src/tar_*.{hpp,cpp}"
+        "server/core/src/echo_*.{hpp,cpp}"
       ],
       "docs": [
-        "docs/user-manual/tar.md",
-        "docs/tar-dashboard.md",
+        "docs/user-manual/echo.md",
+        "docs/echo-dashboard.md",
         "docs/user-manual/rest-api.md"
       ]
     },
