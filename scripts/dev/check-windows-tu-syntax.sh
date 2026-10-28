@@ -66,6 +66,8 @@ tus=(
     agents/plugins/remote_access_audit/src/remote_access_audit_win.cpp
     agents/plugins/runtimes/src/runtimes_win.cpp
     agents/plugins/runtimes/src/runtimes_linux.cpp # empty on Windows: checks the portable half of the Linux walk header
+    agents/plugins/middleware/src/middleware_win.cpp
+    agents/plugins/middleware/src/middleware_linux.cpp # empty on Windows: checks the portable half
     agents/core/src/dism_bounded_call.cpp
     agents/plugins/windows_optional_features/src/windows_optional_features_plugin.cpp
     agents/plugins/firmware_posture/src/firmware_posture_win.cpp

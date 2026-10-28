@@ -1,0 +1,112 @@
+## Middleware Definitions
+## Reports installed middleware products from their installers' own metadata. Read-only, zero
+## subprocess. Table-driven: one action per product of agents/shared/middleware_products.hpp.
+## Plugin: middleware | Actions: ibm_mq
+##
+## SHIPPED LEG: Linux only, rung 1 (installer-metadata file reads; no `dspmqver` or `dspmqinst`
+## process is ever started).
+##   Linux ibm_mq: /etc/opt/mqm/mqinst.ini `Installation:` stanzas (Name, FilePath); the version
+##                 comes from the PRODUCT tag file name under each installation's FilePath/swidtag
+##                 (`ibm.com_IBM_MQ*-<v>.swidtag`, else exactly `IBM_MQ-<v>.mqtag`). Bundled
+##                 component tags (GSKit, JRE, Runtime, Messages_*) never name the product.
+##
+## WINDOWS AND macOS: planned; the action answers a single unsupported status row on this OS.
+## Until then every action on those hosts answers a single
+## `status|<action>|unsupported|<windows|macos>:planned` row. The planned Windows mechanism is
+## declared in the product table (HKLM\SOFTWARE\IBM\WebSphere MQ\Installation\<name> in both
+## registry views).
+##
+## Every action's output is: one `status|<action>|<level>|<reason>` row FIRST, then zero or
+## more `<action>|<title>|<name>|<version>|<install_path>|<edition>` rows. A `supported` status
+## with zero data rows means no registered installation was found at the places listed above;
+## a `constrained` status means a read failed or was skipped and the rows may be incomplete --
+## failure never reads as absent. A `constrained` answer withholds every IBM MQ row for that
+## cycle (the daily installed-software sync drops the source), so previously stored rows
+## disappear until the source recovers.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.middleware.ibm_mq
+  displayName: IBM MQ Inventory
+  version: 1.0.0
+  description: >
+    Reports installed IBM MQ installations on Linux: one row per installation
+    (title, name, version, install path). Reads the /etc/opt/mqm/mqinst.ini
+    `Installation:` stanzas and takes the version from the product tag file name
+    under each installation's FilePath/swidtag. No `dspmqver` process is started.
+    A `supported` status with no rows means no registered installation was found;
+    a `constrained` status means a read failed or was skipped and the list may be
+    incomplete. Windows and macOS: planned; the action answers a single
+    unsupported status row on this OS
+    (`status|ibm_mq|unsupported|<windows|macos>:planned`).
+  tags: [middleware, ibm_mq, inventory]
+
+spec:
+  type: question
+  platforms: [linux]
+
+  execution:
+    plugin: middleware
+    action: ibm_mq
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|ibm_mq|<level>|<reason>   (always first)
+    # ibm_mq|<title>|<name>|<version or ->|<install_path>|<edition or ->
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), ibm_mq (one per installation found).'
+        values: [status, ibm_mq]
+        example: ibm_mq
+        platforms: [linux]
+      - name: title
+        type: string
+        description: 'Product display name, fixed per action (IBM MQ). Status rows: the action name.'
+        example: IBM MQ
+        platforms: [linux]
+      - name: name
+        type: string
+        description: 'Installation name: the mqinst.ini Name value, for example Installation1. Status rows: the level (supported, constrained or unsupported).'
+        example: Installation1
+        platforms: [linux]
+      - name: version
+        type: string
+        description: 'Installation version taken from the product tag file name (ibm.com_IBM_MQ*-<v>.swidtag, else IBM_MQ-<v>.mqtag; component tags such as GSKit or Runtime never name the product), or "-" when it cannot be read. Status rows: the comma-joined failure tokens, or -.'
+        example: 9.4.5
+        platforms: [linux]
+      - name: install_path
+        type: string
+        description: 'Absolute path of the installation (the mqinst.ini FilePath value).'
+        example: /opt/mqm
+        platforms: [linux]
+      - name: edition
+        type: string
+        description: 'Always "-" for ibm_mq: the installer metadata the agent reads carries no edition field.'
+        example: "-"
+        platforms: [linux]
+
+  readablePayload: "List installed IBM MQ installations"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [middleware]
+
+status:
+  phase: active
