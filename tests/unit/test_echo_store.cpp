@@ -34,7 +34,7 @@
 #include <vector>
 
 #ifndef _WIN32
-#include <unistd.h> // geteuid — the unmovable-quarantine test is POSIX-only
+#include <unistd.h> // geteuid — root-skip in the POSIX-only permission-based tests
 #else
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -3517,12 +3517,17 @@ TEST_CASE("EchoDatabase: a v8 file already holding echo_* tables only gets the v
     CHECK(db->get_config("kept", "") == "yes");
 }
 
-TEST_CASE("adopt_legacy_echo_db: a read-only directory fails closed and open() refuses too",
+TEST_CASE("adopt_legacy_echo_db: a rename that cannot complete fails closed and open() refuses too",
           "[echo][store][adopt]") {
+    // Only the "make tar.db -> echo.db fail" set-up differs per OS; every assertion is shared.
+#ifndef _WIN32
     if (::geteuid() == 0)
         SKIP("root bypasses directory permissions; cannot make the rename fail");
+#endif
     ScratchDir d;
     make_legacy_tar_db(d.path());
+#ifndef _WIN32
+    // POSIX: rename needs write permission on the directory.
     struct DirGuard {
         fs::path dir;
         ~DirGuard() {
@@ -3535,6 +3540,16 @@ TEST_CASE("adopt_legacy_echo_db: a read-only directory fails closed and open() r
                     fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write,
                     fs::perm_options::remove, perm_ec);
     REQUIRE_FALSE(perm_ec);
+#else
+    // Windows: a directory's read-only attribute does not stop rename/create inside it, so hold
+    // tar.db open WITHOUT FILE_SHARE_DELETE instead -- the move then fails with
+    // ERROR_SHARING_VIOLATION (elevation does not bypass it). Declared after ScratchDir so the
+    // handle closes before the directory is removed.
+    HANDLE raw = ::CreateFileW((d.path() / "tar.db").c_str(), GENERIC_READ, FILE_SHARE_READ,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(raw != INVALID_HANDLE_VALUE);
+    const std::unique_ptr<void, decltype(&::CloseHandle)> held{raw, ::CloseHandle};
+#endif
 
     const auto echo_db = d.path() / "echo.db";
     auto adopted = yuzu::shared::adopt_legacy_echo_db(echo_db);
