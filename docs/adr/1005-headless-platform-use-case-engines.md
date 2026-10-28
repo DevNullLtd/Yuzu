@@ -1027,6 +1027,46 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      records it; like the entries above it is not a separately signed
      decision.
 
+  - **2026-10-24 - MFA factor binding ships as a hard cutover (scope exception
+    recorded by the maintainer, #6079 PR 2).** The factor-generation binding
+    (`auth` schema v3, `session_store` schema v2) is introduced with no upgrade
+    path: an account that was already enrolled reads factor generation `0`, and
+    every gate that compares a proof with the factor refuses it. This entry
+    supersedes the operator wording of the 2026-10-28 mixed-version entry below,
+    which described a rolling-upgrade window; this build has no such window, and
+    mixed-version operation is unsupported. Operator wording:
+    `docs/user-manual/upgrading.md`, the MFA cutover section.
+    - **Conditions of this exception.** There is no upgrade path and no
+      rollback of the migrations; the only way back is restoring the backup
+      taken before the cutover (a restore of the previous build's data, not an
+      undo of the migrations). Enrolled operators are refused `503`
+      `mfa_proof_unavailable` on the 37 step-up routes (approve and reject
+      included) and on the 3 JIT-elevation routes until `yuzu-server --mfa-reset
+      <user>` has been run for them from a host shell, which needs the Postgres
+      DSN and the keys directory, so an affected operator cannot recover alone.
+      After the cutover the operator reconciles the `mfa.reset.breakglass` rows
+      against the `mfa.enroll.verified` rows per operator (the query is in
+      `upgrading.md`). These controls are customer-operated: Yuzu neither
+      enforces nor evidences them.
+    - **Acceptance.** Acceptor: Dave Rae (maintainer). Ruling date: 2026-10-24.
+      Ruling source: the maintainer's ruling in the #6079 working session that
+      the change ships as a hard cutover. As with the entries above, this is a
+      working-session statement, not a signed decision. The acceptor is also the
+      committer of the change that introduces this entry, so independent review
+      of this acceptance rests on the pull request review (expected, not
+      enforced by tooling), not on a second approver.
+    - **Residual exposure.** Until each enrolled operator is reset, approvals
+      and JIT elevation are unavailable to that operator (an availability cost,
+      not a bypass). A reset account is password-only until it enrols again
+      under `--mfa-enforcement=optional`, so MFA coverage drops for the window.
+      Under `--auth-mode=sso-only` the break-glass account cannot be reset
+      without a time-boxed restart under `--auth-mode=standard`. No
+      minimum-version check exists, so nothing stops an earlier binary being
+      pointed at a migrated database; such a binary does not run the new gate.
+    - **Revisit** when an in-product re-enrolment path for a reset operator
+      exists, or when a minimum-version admission check exists, whichever comes
+      first. No calendar date is set.
+
     - **2026-10-28 - mixed-version admission during a rolling upgrade (scope
       exception recorded by the maintainer, #6079).** The approver gate
       (`require_enrolled_fresh_mfa`) runs on each server replica and no
@@ -1040,7 +1080,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
       `docs/ha-delivery-matrix.md`), so the entry covers the rolling-upgrade
       case and is not a statement that multi-replica operation is supported.
       Operator wording: `docs/user-manual/upgrading.md` "Mixed-version
-      admission".
+      admission" (that section no longer exists: the cutover ruling of the
+      2026-10-24 entry above supersedes this wording, and the marker query it
+      cites was removed with it).
      - **Conditions of this exception.** The upgrade is controlled: the
        operator records each replica's upgrade timestamp (UTC) in the change
        ticket (SOC 2 CC8.1) as the roll happens, because the audit row does not

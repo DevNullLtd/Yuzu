@@ -626,8 +626,9 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
     inline, and a script posts the code to `/login/mfa/stepup` and retries (see
     [Step-up on high-risk surfaces](authentication.md#step-up-on-high-risk-surfaces-pr-2)). A proof
     must belong to the factor enrolled now: if MFA was disabled and enrolled again, the request returns the same `401` and you enter a fresh code. If the account itself has been deleted or deactivated while you were signed in,
-    the decision is refused with `403` and `approver_assurance_required:account_unavailable`; sign in
-    again or contact an administrator.
+    the decision is refused: with step-up on (the default) the central check answers first with `401`
+    `MFA step-up required`, and `403` `approver_assurance_required:account_unavailable` appears only with
+    `--mfa-step-up-window-secs=0` (or when the account is removed in the middle of the request). Either way, sign in again or contact an administrator.
   - **OIDC single sign-on.** There is no local factor to check. The sign-in must have carried an MFA
     method claim (`amr`) from your identity provider, on an ID token issued within the approver window
     (at most 300 seconds, and shorter if `--mfa-step-up-window-secs` is lower). "Fresh" here means the
@@ -677,7 +678,7 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   account and a single sign-on identity, or two single sign-on identities, is two different names to the
   server, so that person can submit a request under one identity and approve it under the other (each
   identity still needs its own enrolled MFA factor and fresh proof). This behaviour predates #6079 and was
-  left out of its scope by the Yuzu project maintainer; resolving every identity to one person is a planned
+  left out of its scope by the owner; resolving every identity to one person is a planned
   follow-up. Until then, do not rely on the reviewer check as proof that two different humans were involved
   where users can hold more than one identity.
 - **Not a SAML session.** MFA step-up is not available for SAML sessions (#4935), so a user who

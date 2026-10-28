@@ -726,14 +726,14 @@ Full design: `docs/auth-mfa-design.md`. Summary:
 - **Step-up on high-risk surfaces** — `cfg.mfa_step_up_window_secs` (300 s
   default) controls how long after a TOTP proof high-risk endpoints
   accept the session as "stepped up." PR 2 introduced the gate on 11
-  sites and the `/login/mfa/stepup` proof route; it now covers 39 mutating
+  sites and the `/login/mfa/stepup` proof route; it now covers 40 mutating
   routes (user delete and role change, token, session, engine-principal,
   RBAC-assignment and enforcement-toggle lifecycle, password reset and
   unlock, Guardian rule write / push / policy-generation raise and guard update / delete,
   software-package write, software-deploy start, approval approve and reject
   (`POST /api/approvals/{id}/approve|reject`), MFA recovery-code
-  regeneration and MFA disable, JIT elevation). 36 are enforced by the
-  central chokepoint described under "MFA step-up chokepoint" below (34
+  regeneration and MFA disable, JIT elevation). 37 are enforced by the
+  central chokepoint described under "MFA step-up chokepoint" below (35
   `kRequired` rows and the 2 `kFactorCredential` rows, MFA recovery-code
   regeneration and MFA disable); the three JIT-elevation routes apply their
   own stricter gate in the handler.
@@ -772,11 +772,11 @@ by each handler.
 - **One table.** `step_up_policy.hpp`'s `kStepUpPolicy` classifies every
   mutating (`POST`/`PUT`/`PATCH`/`DELETE`) route by its exact `(method,
   registered pattern)`; there are no prefixes or wildcards. The classes are
-  `kRequired` (a fresh proof is needed; 34 rows), `kFactorCredential` (the two
+  `kRequired` (a fresh proof is needed; 35 rows), `kFactorCredential` (the two
   rows that issue or retire a second factor, recovery-code regeneration and MFA
   disable: a fresh proof bound to the current factor, a local interactive
   session only, and never the window-0 hatch; a `static_assert` closes the class
-  to those two rows, which together with the 34 are the 36 enforced routes),
+  to those two rows, which together with the 35 are the 37 enforced routes),
   `kOwnGate` (the three JIT-elevation routes,
   whose handler applies a stricter gate that the chokepoint leaves alone),
   `kExempt` (a recorded reason: pre-session, self-service, read-shaped,
@@ -784,8 +784,8 @@ by each handler.
   class (`kPendingRuling`) for routes whose classification is still being
   decided, which the chokepoint treats as exempt: 73 REST rows today, a count
   pinned in a `static_assert` (`kPendingRulingMax`) that can only shrink. The
-  table has 232 REST rows: 34 `kRequired`, 2 `kFactorCredential`, 3 `kOwnGate`,
-  120 `kExempt` and 73 `kPendingRuling`.
+  table has 235 mutating REST rows: 35 `kRequired`, 2 `kFactorCredential`, 3 `kOwnGate`,
+  122 `kExempt` and 73 `kPendingRuling`.
 - **Where it runs.** In `run_pre_request_stage` (`step_up_wiring.hpp`), the
   body of the pre-request handler `server.cpp` installs: after the route
   is matched and the body is read (and after the post-read body cap, which
@@ -839,10 +839,10 @@ by each handler.
   (`result=denied`, detail `engine_session_denied`) and its older body text
   are no longer produced there, so SIEM rules keyed on them need updating.
   `--mfa-step-up-window-secs 0` (or less) disables the stale-proof requirement and
-  the binding check on the 34 `kRequired` rows, but neither the engine denial nor
+  the binding check on the 35 `kRequired` rows, but neither the engine denial nor
   the null-store check below. The escape hatch precedes the SAML denial and the
   store read in `decide_step_up`, so at a window of 0 or less SAML sessions pass
-  all 34 `kRequired` routes and the authentication store is not read; no stale
+  all 35 `kRequired` routes and the authentication store is not read; no stale
   proof is refused (so none is recorded), while engine denials and unwired-store
   refusals are still recorded. The two `kFactorCredential` rows ignore the hatch:
   they always use the approver window (`min(window, 300)`, and 300 when the
@@ -1004,7 +1004,7 @@ by each handler.
   un-enrolled accounts and API/MCP tokens pass (except on the two
   `kFactorCredential` rows, which refuse every non-local session); engine
   principals are denied.
-  "High-risk" names these 36 routes; it is not a completeness claim. Other
+  "High-risk" names these 37 routes; it is not a completeness claim. Other
   mutating routes and all MCP tools are not MFA-step-up gated in this release:
   73 REST rows are still `kPendingRuling` (among them CA revoke and
   issue-code-signing, and `PUT /api/config/*`), and MCP is governed by the MCP tier
@@ -1070,7 +1070,7 @@ gate applied.
   code never writes it. It is not advanced by a provisional secret, a TOTP counter advance, recovery-code
   regeneration or a `SecretCodec` re-encryption. The migration seeds nothing (a hard cutover, see "Rollout and cutover" below): every existing row
   starts at `0` and the trigger advances it from the next enrolment change, so an account that was already
-  enrolled on a carried-over database reads generation `0`, is refused `503` `mfa_proof_unavailable`, and
+  enrolled on a carried-over database reads generation `0`, is refused `503` (audit `reason=mfa_proof_unavailable`), and
   must have its factor cleared with `yuzu-server --mfa-reset <user>` (under `--mfa-enforcement=required`, or `admin-only` for an administrator, the user enrols again at next sign-in).
 - **The session side is guarded too.** `session_store.sessions.mfa_factor_gen` and `mfa_bind_seq`
   (session_store migration v2) hold the bound proof. The trigger `sessions_mfa_rebind_guard`
@@ -1164,7 +1164,7 @@ gate applied.
   factor generation is not positive; every transient cause (an unreadable enrolment or stored-proof read,
   or, on the `auth` side only, a single catalog check that could not run) keeps `retry_after_ms` 5000;
   the session store serves the row on such a check and retries on the next read. At the central gate the
-  not-positive generation is a `503` `mfa_proof_unavailable`, decided after the unenforced arm. Sign-in
+  not-positive generation is a `503` (audit `reason=mfa_proof_unavailable`), decided after the unenforced arm. Sign-in
   and step-up proving keep working. `yuzu_auth_mfa_binding_enforcement_ok{store="auth"|"session"}` drops
   to `0` and `YuzuMfaBindingNotEnforced` fires; the operator procedure is
   `docs/ops-runbooks/auth-db-recovery.md` "MFA binding enforcement failed". What this does not cover: a
@@ -1178,15 +1178,16 @@ gate applied.
 
 This build is a hard cutover. It has no upgrade path, no rolling or mixed-version window and no
 rollback. The supported procedure for an existing deployment (stop every replica, back up the `auth` and
-`session_store` schemas, start the new build, list the accounts still at generation `0`, run
-`yuzu-server --mfa-reset <user>` for each enrolled operator) is in `docs/user-manual/upgrading.md`. Starting
+`session_store` schemas, run `yuzu-server --mfa-reset <user>` for each enrolled operator, which can be done before
+the new build starts or afterwards for each account still at generation `0`) is in `docs/user-manual/upgrading.md`,
+with the restore sequence that is the only way back (a restore of the previous build's data, not a rollback). Starting
 with empty `auth` and `session_store` schemas is an operator choice for a deployment with no enrolled
 operators; it discards local accounts, passwords, MFA enrolments and sessions.
 
 | State | Behaviour |
 |---|---|
 | Fresh database | Full closure on every gate. Every row starts at generation `0` and the trigger advances it from the first enrolment. |
-| Carried-over database with an already-enrolled account | The `auth` v3 migration seeds nothing, so the account reads generation `0` and is refused `503` `mfa_proof_unavailable` until `yuzu-server --mfa-reset <user>` clears its factor (under `--mfa-enforcement=required`, or `admin-only` for an administrator, the user enrols again at next sign-in). |
+| Carried-over database with an already-enrolled account | The `auth` v3 migration seeds nothing, so the account reads generation `0` and is refused `503` (audit `reason=mfa_proof_unavailable`) until `yuzu-server --mfa-reset <user>` clears its factor (under `--mfa-enforcement=required`, or `admin-only` for an administrator, the user enrols again at next sign-in). |
 | Trigger dropped, disabled, replica-only or body replaced | Boot refuses (only `--mfa-reset` and `--break-glass-arm` open their bootstrap `AuthDB` past it, and report the binding not enforced). While running, a validation that observes it fails every local binding decision closed (sticky). Changes made while it was not firing are not reconstructable: end the affected accounts' sessions (runbook). |
 | Coherent offline restore | The accepted ADR-2002 checkpoint class. After ANY restore of the auth schema end every session (a restart does not). |
 
@@ -1305,7 +1306,7 @@ Consequences, each deliberate:
   in #6098).
 - **`--mfa-step-up-window-secs=0` no longer lowers approval assurance.** The approver window is 300
   seconds when the setting is `0`, so approvals keep their enrolled-factor and fresh-proof requirement
-  while the 34 `kRequired` step-up endpoints are switched off (the two `kFactorCredential` rows keep the same 300-second
+  while the 35 `kRequired` step-up endpoints are switched off (the two `kFactorCredential` rows keep the same 300-second
   window and their binding check). Decisions recorded before this control existed (including
   any made with the setting at `0`) gain no retroactive assurance; see
   `docs/user-manual/upgrading.md`.
@@ -2420,18 +2421,18 @@ applies to these two flags).
 ### MFA enforcement with SAML
 
 **MFA step-up is not supported for SAML sessions in this release.** A SAML
-session hitting any step-up-gated route (the 39 listed in the REST API
+session hitting any step-up-gated route (the 37 listed in the REST API
 reference under "Step-up envelope on high-risk endpoints": token, session,
 engine-principal and RBAC lifecycle, Guardian rule and guard writes, software
 deploy, approval approve/reject, user delete/role change, MFA recovery-code regeneration and disable,
 JIT elevation)
 receives a `403` with `"MFA step-up is not available for SAML sessions in this
 release"`, regardless of `--mfa-enforcement` mode (the one exception is a disabled window: with
-`--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 34 `kRequired` routes enforced by the
+`--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 35 `kRequired` routes enforced by the
 central check, but not the three JIT-elevation routes, which own their gate and substitute a
 300 s window, so those still deny SAML, and not the two `kFactorCredential` rows, which refuse every
 non-local session whatever the window, with their own `403` `managing an account's second factor
-requires a local interactive session`). Approval approve/reject are among the 34 `kRequired` central
+requires a local interactive session`). Approval approve/reject are among the 35 `kRequired` central
 routes, so with the window enabled the central check answers a SAML session first with this
 generic 403, and the handler never runs. They also carry their own, stricter approver gate
 (#6079), which refuses a SAML session in every configuration; the typed

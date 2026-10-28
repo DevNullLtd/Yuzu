@@ -774,7 +774,7 @@ An enroll-verify whose loaded provisional secret is no
    reads the MFA store). The order is: after the pre-routing
    gates, a null auth store answers `503` for every caller class first, then an engine is `403` with no
    store read, ahead of the window-disabled hatch, which in turn precedes the
-   SAML denial and the store read (so a window of 0 or less lets SAML through the 34 `kRequired` rows). A `kFactorCredential` row takes a different order: after the engine denial its window becomes the approver window, so the hatch is unreachable for it, and any non-local session is refused `403` before the store read;
+   SAML denial and the store read (so a window of 0 or less lets SAML through the 35 `kRequired` rows). A `kFactorCredential` row takes a different order: after the engine denial its window becomes the approver window, so the hatch is unreachable for it, and any non-local session is refused `403` before the store read;
    (g) a gated request authorised by a principal other than the one the check passed:
    the binding removed while handlers still resolve more than once. One principal per request: once the central check passes a gated request,
    every `AuthRoutes::resolve_session` call for that request yields the same principal or

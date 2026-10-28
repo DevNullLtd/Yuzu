@@ -6233,14 +6233,21 @@ groups:
             the check). The gated routes stay closed until the cause is fixed; re-entering a
             TOTP code does not help. Each refusal has a best-effort
             `mfa.step_up.required` audit row (lost when the audit store is also
-            down) whose `reason=` token in `detail` names the cause. Usually
+            down) whose `reason=` token in `detail` names the cause. Often
             PostgreSQL or KEK trouble: correlate with
             yuzu_auth_session_store_degrade_total and
             yuzu_server_secret_decrypt_failures_total, and see
-            docs/ops-runbooks/auth-db-recovery.md "Step-up returns 503".
+            docs/ops-runbooks/auth-db-recovery.md "Step-up returns 503". A
+            reason=mfa_proof_unavailable or mfa_binding_unenforced refusal can
+            instead be persistent and is not cured by waiting: an enrolled
+            account still at factor generation 0 after the MFA cutover (an
+            administrator must run yuzu-server --mfa-reset for it), or a
+            binding trigger that is not in force (see "Enrolled accounts at
+            generation 0" under "Post-restore verification" and "MFA binding
+            enforcement failed" in the same runbook).
       # The window gauge is the configured --mfa-step-up-window-secs. 0 or less
       # is the documented recovery lever (it disables the stale-proof requirement
-      # on the 34 ordinary step-up routes, and also lets SAML sessions through
+      # on the 35 ordinary step-up routes, and also lets SAML sessions through
       # them and skips the store read there; engine denials and the unwired-store
       # 503 still apply; the two factor-credential rows, approval approve/reject
       # and the JIT-elevation routes keep their own windows); it must not be left on.
@@ -6254,7 +6261,7 @@ groups:
           summary: "MFA step-up stale-proof requirement is disabled (--mfa-step-up-window-secs <= 0)"
           description: >-
             The server was started with --mfa-step-up-window-secs 0 (or less),
-            so the stale-proof requirement is disabled on the 34 ordinary
+            so the stale-proof requirement is disabled on the 35 ordinary
             step-up routes: no stale proof is refused (so none is recorded),
             and SAML sessions and the authentication-store read are skipped
             too, while engine denials and unwired-store refusals still apply
