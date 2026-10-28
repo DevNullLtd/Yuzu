@@ -42,10 +42,12 @@ metadata:
     through NetShareEnum: the administrative ADMIN$, C$ and IPC$ shares are flagged special,
     any other share whose name ends in $ is flagged hidden, and a stopped Server service is
     reported as unavailable, never as an empty list. Under a service identity that is not an
-    administrator (the intended NT SERVICE\YuzuAgent) the Windows leg answers names and kind
-    only, constrained with windows:shares:netshareenum:level2_permission_denied; per the
-    NetShareEnum contract, membership of Server Operators for that identity would restore
-    paths. The macOS leg is planned and not yet
+    administrator (the intended NT SERVICE\YuzuAgent) the Windows leg is predicted (per the
+    NetShareEnum contract; not yet measured) to answer names and kind only, constrained with
+    windows:shares:netshareenum:level2_permission_denied; per that contract, membership of
+    Administrators or Power Users for that identity would restore paths (Server Operators
+    exists only on a domain controller; Windows Server 2022 lists Administrators or Access
+    Control Assistance Operators). The macOS leg is planned and not yet
     read. A refused or failed read is permission_denied or constrained with a reason token,
     never an empty result; one source row per source says whether it was read. Share names and
     paths can embed account names, so the result is sensitive. A leading status row states

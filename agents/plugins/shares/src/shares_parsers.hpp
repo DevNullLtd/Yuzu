@@ -489,7 +489,8 @@ inline void smb_canon(std::string& key, std::string& value) {
     std::string k;
     for (const char c : key)
         if (!is_ws(c))
-            k += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            k += c;
+    k = lower(k);
     if (k == "writable" || k == "writeable" || k == "writeok") {
         k = "readonly";
         if (const auto b = parse_bool(value))

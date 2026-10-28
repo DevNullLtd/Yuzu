@@ -427,6 +427,27 @@ TEST_CASE("shares windows: an advancing pager is drained in page order", "[share
     CHECK(f.calls_at(2) == 3);
 }
 
+TEST_CASE("shares windows: a terminal page that keeps nothing ends the drain cleanly, not as "
+          "no_progress",
+          "[shares]") {
+    // The status==0 check must precede the kept==0 check: an empty last page, or one that only
+    // repeats a name already seen, is the end of a clean drain and every earlier row survives.
+    FakeWinPages f;
+    f.pages[2] = {page_of(kWinMoreData, disks("a", 2), 2), page_of(0, {}, 2)};
+    FakeWinPages g;
+    g.pages[2] = {page_of(kWinMoreData, disks("a", 2), 2), page_of(0, disks("a", 1), 2)};
+    for (auto* p : {&f, &g}) {
+        const auto l = p->run();
+        CHECK(l.status == StatusState::supported);
+        CHECK(l.reason.empty());
+        CHECK_FALSE(reason_has(l, "no_progress"));
+        CHECK_FALSE(reason_has(l, "inconsistent_drain"));
+        CHECK(count_prefix(l, "share|") == 2);
+        CHECK(has(l, "source|netshareenum|read|2"));
+        CHECK(p->calls_at(2) == 2);
+    }
+}
+
 TEST_CASE("shares windows: a stalled pager is no_progress and reports no rows", "[shares]") {
     FakeWinPages f;
     f.pages[2] = {page_of(kWinMoreData, disks("a", 2)), page_of(kWinMoreData)};
