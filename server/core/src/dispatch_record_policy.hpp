@@ -16,8 +16,12 @@
 /// database or pool outage that turns a 5,000-agent push into hours. (The heartbeat reconcile push
 /// and the asset-tag push also mint one id per agent, but they are one write per call, not a
 /// loop, and keep the ordinary budget; the pool already clamps an acquire on a saturated pool to
-/// 500 ms. Every other `build_classified_command` caller builds ONE command and fans that same
-/// object out, so it is one write per dispatch however many agents it reaches.)
+/// 500 ms. The quarantine containment reconciler's tick is another per-device loop (up to
+/// `kMaxDispatchesPerTick` serial single dispatches) that is NOT latched today: each pays the
+/// ordinary budget, so a contended pool delays re-containment, never refuses it (tracked in the
+/// follow-up for the remaining push sites). Every other `build_classified_command` caller builds
+/// ONE command and fans that same object out, so it is one write per dispatch however many
+/// agents it reaches.)
 ///
 /// The fix is CALLER-KEYED, not tracker-wide. A loop declares a `DispatchRecordLatch` and passes
 /// its address down to the record write:

@@ -416,7 +416,7 @@ long-term target it covers up to two fleet-wide per-agent events a day (1.0M row
 rows of other dispatches; a third event (1.5M rows) is above the reclaim rate. A burst is drained over
 the following passes (a 500,000-row burst past the window takes ten), but a SUSTAINED inflow above
 1.2M rows/day saturates the cap on every pass and the table then grows by the difference (about
-210 bytes a row, indexes included). The same ceiling applies to API-driven dispatch: a sustained rate
+210 bytes a row measured before the `execution_id` index of migration 7, roughly 250 for a tracked row with it: reasoned, not measured). The same ceiling applies to API-driven dispatch: a sustained rate
 above about 14 a second saturates it, and a per-principal or per-address inflow quota is NOT part of
 this bound (it is tracked as a separate follow-up).
 

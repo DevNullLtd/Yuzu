@@ -6514,7 +6514,7 @@ groups:
             at or near its 50,000 rows per pass cap on {{ $labels.instance }} (at least
             200,000 rows over the last 6 hours) continuously for 24 hours, so records are
             being created faster than the sweep can reclaim them and the table is growing
-            (about 210 bytes a row, indexes included). This is a capacity signal, not a
+            (about 210 bytes a row before the execution_id index, a little more with it). This is a capacity signal, not a
             response failure: nothing is unverified by it. A burst of per-agent dispatches
             is drained at the cap and resolves on its own after the backlog clears. If it
             persists, the sustained dispatch rate is about 11 records a second or more (the

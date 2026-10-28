@@ -548,10 +548,13 @@ const std::vector<pg::PgMigration>& migrations() {
         // `command_execution` by `execution_id`; without an index each lookup is a scan of up to
         // 24 hours of dispatch records (measured at 38 to 88 ms at 1M rows and 263 to 628 ms at
         // 10M), which the sticky-terminal write path pays inside the agent-status transaction.
-        // A plain (transactional) index build is the store playbook's recorded exception for a
-        // deployment with no rolling upgrade: this release is a hard cutover into a fresh
-        // database, where the table is empty when the index is built; an already-large table
-        // would take a long lock, and that population is outside the deployment contract.
+        // A plain (transactional) index build: the fourth entry of the store playbook's recorded
+        // exception (docs/postgres-store-playbook.md), on the owner's hard-cutover ruling. This
+        // release is a fresh-database deployment, where the table is empty when the index is
+        // built (the playbook's empty-table rule). On an already-populated table the build holds
+        // a SHARE lock and can hit the pool's lock or statement timeout, which rolls the
+        // migration back and leaves the tracker closed; that population is outside the
+        // deployment contract. The `executions(parent_id)` index (#4624) is a separate item above.
         {7,
          "CREATE INDEX idx_command_execution_execution_id ON command_execution(execution_id);"},
     };
@@ -2509,7 +2512,8 @@ constexpr std::int64_t kCmdExecutionReapWindowSecs = 24 * 3600;
 //     third event (1.5M rows) is above the reclaim rate. A burst is drained over the following
 //     passes (a 500,000-row burst past the window takes ten), but a SUSTAINED inflow above
 //     1.2M rows/day saturates the cap on every pass and the table then grows by the difference
-//     (about 210 bytes a row, indexes included).
+//     (about 210 bytes a row measured before the execution_id index of migration 7; roughly 250
+//     for a tracked row with it, reasoned and not measured).
 //   - The same ceiling applies to API-driven dispatch: a sustained rate above about 14 a second
 //     saturates it. A per-principal or per-address inflow quota is NOT part of this bound; it is
 //     tracked as a separate follow-up.
