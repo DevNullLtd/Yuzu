@@ -216,37 +216,48 @@ def _signature(yaml, node):
                                  for k, v in node.value))
 
 
-def plan_shards(text: str, max_shards: int) -> list[str] | None:
-    """Split the test file `text` into up to `max_shards` complete test files,
-    or return None when it cannot be split SAFELY (the caller then lets
-    promtool read the original).
+class _Refuse(Exception):
+    """`plan_shards` cannot split the file safely; the message says why."""
 
-    THE SPLIT HAPPENS ON YAML NODES, NOT ON PYTHON OBJECTS. Three rounds of
-    governance found three ways a `safe_load` + `safe_dump` round trip is a
-    weaker parser than promtool, each measured against the pinned image as a
-    shard run that passes where the unsplit file fails (rc 0 vs rc 1):
-      - a repeated mapping key (promtool: `field interval already set`;
-        PyYAML keeps the last value and drops the earlier assertion);
-      - YAML 1.1 coercion (`on`, `0755`, `1.10`, `2026-01-01T00:00:00Z` load as
-        bool, int, float, datetime and are dumped as `true`, `493`, `1.1`, ...);
-      - a quoted string dumped PLAIN (`'0.1e1'` -> `0.1e1`), which promtool's
-        resolver then reads as a float.
-    Each fix closed one instance and the next round found another, because the
-    round trip itself is lossy. So nothing here is re-dumped: the original
-    nodes keep their tag, quoting style and text, only the `tests` sequence is
-    sliced, and `yaml.serialize` writes them back out.
 
-    That is not trusted either. The text of EVERY shard is parsed again and its
-    scalar signature (tag, style, text) must equal the node tree it came from,
-    else None. A repeated key (`Strict`, because PyYAML would silently keep the
-    last), an anchor or alias, a merge key, a duplicate or non-sequence
-    `tests`, an unparseable file, a missing PyYAML and fewer than two cases all
-    give None, so promtool gives the verdict on the file as written.
+def plan_shards(text: str, max_shards: int) -> tuple[list[str] | None, str]:
+    """Split the test file `text` into up to `max_shards` complete test files.
+
+    Returns `(shard_texts, "")`, or `(None, reason)` when the file cannot be
+    split SAFELY; the caller then lets promtool read the original.
+
+    A SHARD IS THE ORIGINAL TEXT WITH THE OTHER CASES CUT OUT. Nothing is
+    parsed into Python values and written back, and nothing is re-emitted.
+    Reviews found, each measured against the pinned promtool as a shard run
+    that passes where the unsplit file fails (rc 0 vs rc 1), that every form of
+    re-emission launders something promtool's reader (Go yaml v2) would have
+    rejected or typed differently from PyYAML's:
+      - a repeated mapping key (PyYAML keeps the last value);
+      - YAML 1.1 coercion (`on`, `0755`, `1.10`, `2026-01-01T00:00:00Z`);
+      - a quoted string written back plain (`'0.1e1'` becomes a float);
+      - an explicit tag dropped as redundant (`!!str 1e0` becomes a float);
+      - an escape PyYAML accepts and Go rejects (a backslash-slash inside double
+        quotes is rewritten without the backslash).
+    Each fix closed one instance and the next review found another, so the fix
+    is to keep every case's bytes exactly as written: whatever promtool does
+    with a case, it does the same with it in a shard.
+
+    The seam is the `tests:` block sequence. Each item runs from the start of
+    the line holding its `- ` to the start of the next item's line, the head
+    (everything before the first item) and the tail (everything after the last)
+    are repeated in every shard, and an item that does not begin on its dash's
+    line, or a flow-style `tests:`, is refused. The result is not trusted: each
+    shard's text is parsed and its (kind, tag, style, text) signature must equal
+    the original node tree with only that shard's cases, else None. Also
+    refused, so promtool gives the verdict on the file as written: a repeated
+    key (`Strict`; PyYAML would silently keep the last), an anchor or alias, a
+    merge key, a duplicate or non-sequence `tests`, unparseable text, no
+    PyYAML, fewer than two cases, and any unexpected error in this function.
     """
     try:
         import yaml
     except ImportError:
-        return None
+        return None, "PyYAML is not installed"
 
     class Strict(yaml.SafeLoader):
         def construct_mapping(self, node, deep=False):
@@ -259,39 +270,68 @@ def plan_shards(text: str, max_shards: int) -> list[str] | None:
             return super().construct_mapping(node, deep)
 
     try:
-        doc = yaml.load(text, Loader=Strict)  # noqa: S506 - SafeLoader subclass
+        try:
+            doc = yaml.load(text, Loader=Strict)  # noqa: S506 - SafeLoader subclass
+        except (yaml.YAMLError, ValueError, TypeError, RecursionError) as ex:
+            raise _Refuse(f"it does not load strictly ({type(ex).__name__}: a repeated "
+                          f"key, unparseable text or an unsupported value)") from ex
         if any(isinstance(e, yaml.NodeEvent) and e.anchor is not None
                for e in yaml.parse(text)):
-            return None
+            raise _Refuse("it uses an anchor or alias")
         root = yaml.compose(text)
         if not isinstance(doc, dict) or not isinstance(root, yaml.MappingNode):
-            return None
+            raise _Refuse("it is not a single mapping")
         cases = doc.get("tests")
         at = [i for i, (k, _) in enumerate(root.value)
               if isinstance(k, yaml.ScalarNode) and k.value == "tests"]
         if len(at) != 1 or not isinstance(cases, list):
-            return None
+            raise _Refuse("`tests` is missing, repeated or not a list")
         index = at[0]
         key_node, seq = root.value[index]
         n = min(max_shards, len(cases))
-        if (n <= 1 or not isinstance(seq, yaml.SequenceNode)
-                or len(seq.value) != len(cases)):
-            return None
+        if n <= 1:
+            raise _Refuse("it has fewer than two cases, or only one shard is allowed")
+        if (not isinstance(seq, yaml.SequenceNode) or len(seq.value) != len(cases)
+                or seq.flow_style):
+            raise _Refuse("`tests` is not a block sequence")
+
+        # Where each case begins: the start of the line holding its "- ".
+        starts, dash_cols = [], set()
+        for item in seq.value:
+            at_idx = item.start_mark.index
+            line_start = text.rfind("\n", 0, at_idx) + 1
+            prefix = text[line_start:at_idx]
+            if not re.fullmatch(r" *- +", prefix):
+                raise _Refuse("a case does not begin on the line holding its '- '")
+            starts.append(line_start)
+            dash_cols.add(prefix.index("-"))
+        if len(dash_cols) != 1 or starts != sorted(set(starts)):
+            raise _Refuse("the cases are not aligned one per line")
+        end = seq.end_mark.index
+        if end > 0 and text[end - 1] != "\n":
+            nl = text.find("\n", end)
+            end = len(text) if nl == -1 else nl + 1
+        bounds = starts + [end]
+        pieces = [text[bounds[i]:bounds[i + 1]] for i in range(len(starts))]
+        head, tail = text[:starts[0]], text[end:]
+
         shards = []
         for k in range(n):
+            shard_text = head + "".join(pieces[k::n]) + tail
             part = yaml.SequenceNode(seq.tag, seq.value[k::n], seq.start_mark,
                                      seq.end_mark, flow_style=seq.flow_style)
             entries = list(root.value)
             entries[index] = (key_node, part)
-            shard = yaml.MappingNode(root.tag, entries, root.start_mark,
-                                     root.end_mark, flow_style=root.flow_style)
-            shard_text = yaml.serialize(shard, Dumper=yaml.SafeDumper)
-            if _signature(yaml, yaml.compose(shard_text)) != _signature(yaml, shard):
-                return None
+            want = yaml.MappingNode(root.tag, entries, root.start_mark,
+                                    root.end_mark, flow_style=root.flow_style)
+            if _signature(yaml, yaml.compose(shard_text)) != _signature(yaml, want):
+                raise _Refuse("a shard did not parse back to the cases it was cut for")
             shards.append(shard_text)
-    except (yaml.YAMLError, ValueError, TypeError, RecursionError):
-        return None
-    return shards
+    except _Refuse as why:
+        return None, str(why)
+    except Exception as ex:  # noqa: BLE001 - any planner failure means: let promtool read the original
+        return None, f"the planner failed ({type(ex).__name__}: {ex})"
+    return shards, ""
 
 
 def run_test_rules(promtool_argv: list[str], tests_argv: str, tests_host: Path, *,
@@ -306,21 +346,21 @@ def run_test_rules(promtool_argv: list[str], tests_argv: str, tests_host: Path, 
 
     Returns `(rc, combined output)` like `run()`: rc is the first non-zero shard
     rc, and the output is every shard's, so `check_gate_output`'s "no file match
-    pattern" scan covers all of them. When `plan_shards` returns None it runs
-    the ORIGINAL file unsplit, so promtool gives the verdict, and says so. A
-    refused file costs speed only. Without PyYAML `gate()`'s strict
+    pattern" scan covers all of them. When `plan_shards` refuses it runs the
+    ORIGINAL file unsplit, so promtool gives the verdict, and prints the reason.
+    A refused file costs speed only. Without PyYAML `gate()`'s strict
     `inspect_test_file` then fails the run.
     """
-    shard_texts = None
+    shard_texts, why = None, "the file could not be read"
     try:
-        shard_texts = plan_shards(tests_host.read_text(encoding="utf-8"), TEST_SHARDS)
+        # newline="" keeps the file's own line endings, so a shard is a byte-exact
+        # cut of the original and no platform translates it on the way out.
+        with open(tests_host, encoding="utf-8", newline="") as fh:
+            shard_texts, why = plan_shards(fh.read(), TEST_SHARDS)
     except (OSError, ValueError):
         pass
     if shard_texts is None:
-        print(f"running {Path(tests_argv).name} unsplit (sharding is off, or the file "
-              f"has fewer than two cases, or it cannot be re-emitted unchanged: a "
-              f"repeated key, an anchor, a merge key, unparseable text, no PyYAML)",
-              flush=True)
+        print(f"running {Path(tests_argv).name} unsplit: {why}", flush=True)
         return run(promtool_argv + ["test", "rules", tests_argv],
                    timeout=timeout, quiet=quiet)
 
@@ -334,7 +374,7 @@ def run_test_rules(promtool_argv: list[str], tests_argv: str, tests_host: Path, 
                                         suffix=".test.yml")
             path = Path(name)
             paths.append(path)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
                 fh.write(shard_text)
             # Same umask hazard as build_canary_tree: uid 65534 must be able to
             # read it through the read-only mount.
@@ -966,10 +1006,11 @@ def docker_argv(root: Path = REPO_ROOT) -> list[str]:
 # Fake promtool for `sharding_selftest`: argv[-1] is the file it was handed. It
 # first leaves a "<LOG>.<name>.call" marker (before it parses anything, so a run
 # that crashes is still seen to have been invoked), then a "<LOG>.<name>.rec"
-# record of what it was handed: each case's `name` scalar as (style, TEXT) read
-# from the YAML nodes, never from loaded Python values, so a quoted string that
-# came back plain or an `on` that came back `true` is visible; the top-level
-# entries; and the file's mode. One file per invocation, never a shared append,
+# record of what it was handed: each case's `name` scalar as (style, value, RAW
+# SOURCE TEXT) read from the YAML nodes and their marks, never from loaded
+# Python values, so a quoted string that came back plain, an `on` that came back
+# `true` or a tag or escape that was rewritten is visible; the top-level entries;
+# and the file's mode. One file per invocation, never a shared append,
 # so concurrent shards cannot overwrite one another on Windows. It exits 1 if a
 # case is named FAIL* and prints the no-match warning if one is named NOMATCH*.
 _FAKE_PROMTOOL = r"""
@@ -977,7 +1018,8 @@ import json, pathlib, sys
 p = pathlib.Path(sys.argv[-1])
 open(LOG + "." + p.name + ".call", "w").close()
 import yaml
-root = yaml.compose(p.read_text())
+data = open(p, encoding="utf-8", newline="").read()
+root = yaml.compose(data)
 def flat(n):
     if isinstance(n, yaml.ScalarNode): return n.value
     if isinstance(n, yaml.SequenceNode): return [flat(c) for c in n.value]
@@ -987,7 +1029,8 @@ names = []
 for case in tops["tests"].value:
     fields = {k.value: v for k, v in case.value}
     node = fields.get("name")
-    names.append([node.style, node.value] if node is not None else [None, None])
+    names.append([node.style, node.value, data[node.start_mark.index:node.end_mark.index]]
+                 if node is not None else [None, None, None])
 with open(LOG + "." + p.name + ".rec", "w") as fh:
     json.dump({"file": p.name, "names": names, "mode": p.stat().st_mode & 0o044,
                "top": {k: flat(v) for k, v in tops.items() if k != "tests"}}, fh)
@@ -1051,8 +1094,18 @@ def sharding_selftest(failures: list[str]) -> None:
     def seen(recs) -> list:
         return sorted((tuple(n) for r in recs for n in r["names"]), key=repr)
 
-    def sharded(res, recs, calls, f, want) -> bool:
-        return (ok(res) and seen(recs) == sorted(want, key=repr) and len(recs) > 1
+    def names_of(text: str) -> list:
+        """The (style, value, raw source text) of every case's `name` in `text`."""
+        out = []
+        for case in dict((k.value, v) for k, v in yaml.compose(text).value)["tests"].value:
+            node = dict((k.value, v) for k, v in case.value)["name"]
+            out.append((node.style, node.value, text[node.start_mark.index:node.end_mark.index]))
+        return out
+
+    def sharded(res, recs, calls, f) -> bool:
+        with open(f, encoding="utf-8", newline="") as fh:
+            want = sorted(names_of(fh.read()), key=repr)
+        return (ok(res) and seen(recs) == want and len(recs) > 1
                 and f.name not in calls and all(r["names"] for r in recs)
                 and all(r["mode"] == 0o044 for r in recs))
 
@@ -1065,7 +1118,7 @@ def sharding_selftest(failures: list[str]) -> None:
             # run, readable by the container user, top-level keys verbatim,
             # nothing left behind.
             res, recs, calls, left, f = go(tmp, doc(names))
-            if not (sharded(res, recs, calls, f, plain) and len(recs) == 3 and res[0] == 0):
+            if not (sharded(res, recs, calls, f) and len(recs) == 3 and res[0] == 0):
                 fail(f"partition wrong: {res!r} recs={recs!r} calls={calls!r}")
             if any(r["top"] != top for r in recs):
                 fail("top-level keys not preserved in every shard")
@@ -1098,19 +1151,37 @@ def sharding_selftest(failures: list[str]) -> None:
                 fail(f"an exception was not propagated: {res!r}")
             if left:
                 fail(f"shard files left after an exception: {left}")
-            # Scalars a PyYAML round trip would re-type are written back EXACTLY
-            # as the file spells them, quoting included: `on` stays plain,
-            # '0.1e1' stays quoted (promtool reads a plain 0.1e1 as a float).
-            spelled = [(None, "on"), (None, "yes"), (None, "0755"), (None, "1.10"),
-                       (None, "2026-01-01T00:00:00Z"), (None, "~"), ("'", "0.1e1"),
-                       ('"', "1e3"), ("'", "y"), ("'", "on"), ("|", "lit\n"), (None, "x")]
+            # Every case is cut out of the original BYTE FOR BYTE: nothing is
+            # re-typed (`on`, 0755, 1.10, a timestamp, ~), re-quoted ('0.1e1' must
+            # stay quoted: promtool reads a plain 0.1e1 as a float), de-tagged
+            # (!!str 1e0), or unescaped ("a\/b": Go rejects the escape, PyYAML
+            # accepts it, so a rewrite would launder it), and a literal block, a
+            # non-ASCII value and a folded scalar keep their text.
             text = ("rule_files: [r.yml]\ntests:\n- name: on\n- name: yes\n- name: 0755\n"
                     "- name: 1.10\n- name: 2026-01-01T00:00:00Z\n- name: ~\n"
                     "- name: '0.1e1'\n- name: \"1e3\"\n- name: 'y'\n- name: 'on'\n"
-                    "- name: |\n    lit\n- name: x\n")
+                    "- name: !!str 1e0\n- name: \"a\\/b\"\n- name: caf\u00e9\n"
+                    "- name: |\n    lit\n- name: >\n    fold\n    ed\n- name: x\n")
             res, recs, calls, left, f = go(tmp, text, shards=4)
-            if not sharded(res, recs, calls, f, spelled):
-                fail(f"scalar spelling or style changed in a shard: {seen(recs)!r} / {res!r}")
+            if not sharded(res, recs, calls, f):
+                fail(f"a case was not cut out byte for byte: {seen(recs)!r} / {res!r}")
+            # CRLF files keep their line endings in every shard (the literal
+            # block's raw text contains them).
+            res, recs, calls, left, f = go(tmp, "rule_files: [r.yml]\r\ntests:\r\n"
+                                           "- name: a\r\n- name: |\r\n    lit\r\n"
+                                           "- name: c\r\n", shards=3)
+            if not sharded(res, recs, calls, f) or not any("\r\n" in n[2] for r in recs
+                                                              for n in r["names"]):
+                fail(f"CRLF test file not cut byte for byte: {seen(recs)!r} / {res!r}")
+            # The head and the tail are repeated in EVERY shard: here a top-level
+            # key and a comment come after `tests:`, and none before it.
+            res, recs, calls, left, f = go(tmp, "tests:\n- name: a\n- name: b\n- name: c\n"
+                                           "# trailing comment\nevaluation_interval: 1m\n"
+                                           "rule_files: [r.yml]\n", shards=3)
+            if (not sharded(res, recs, calls, f)
+                    or any(r["top"] != {"evaluation_interval": "1m", "rule_files": ["r.yml"]}
+                           for r in recs)):
+                fail(f"head/tail not repeated in every shard: {recs!r} / {res!r}")
             # Runs the ORIGINAL file, once, unsplit.
             unsplit = (
                 ("one case", doc(["only"]), 3),
@@ -1126,6 +1197,10 @@ def sharding_selftest(failures: list[str]) -> None:
                 ("an inline merge key", "tests:\n- <<: {name: a}\n- name: y\n- name: z\n", 3),
                 ("a bad date", "tests:\n- name: 2026-13-45\n- name: y\n- name: z\n", 3),
                 ("deep nesting", "tests: " + "[" * 3000 + "]" * 3000 + "\n", 3),
+                ("a flow-style tests", "tests: [{name: a}, {name: b}, {name: c}]\n", 3),
+                ("a dash on its own line", "tests:\n-\n  name: a\n-\n  name: b\n"
+                 "- name: c\n", 3),
+                ("a bad bool tag", "tests:\n- name: !!bool '\\\\'\n- name: y\n- name: z\n", 3),
             )
             for label, text, shards in unsplit:
                 res, recs, calls, left, f = go(tmp, text, shards=shards)
