@@ -1594,6 +1594,7 @@ if build_server
       'unit/server/test_enablement_resolver.cpp',
       'unit/server/test_enablement_units.cpp',
       'unit/server/test_plugin_config_store_pg.cpp',
+      'unit/server/test_echo_rename_migration_pg.cpp',   # Echo rename: ten stores' tar -> echo data migrations (seeded legacy rows)
       'unit/server/test_enablement_state_core.cpp',
       'unit/server/test_enablement_store_pg.cpp',
       'unit/server/test_plugin_config_routes.cpp',

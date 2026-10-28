@@ -662,6 +662,59 @@ TEST_CASE("AuditStore: wildcard-bearing / all-empty prefixes fail closed (M-2)",
     CHECK(r3->empty());
 }
 
+// Echo rename, upgrade window: audit rows written before the rename keep their `tar.` action
+// spelling and are never rewritten; an `echo.` filter must reach both. The legacy spellings are the
+// point of these cases.
+TEST_CASE("AuditStore: an echo.* action filter also matches the pre-rename tar.* spelling",
+          "[pg][audit_store][echo_rename]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    CHECK(store.log(mk("admin", "tar.status.scan")));
+    CHECK(store.log(mk("admin", "echo.status.scan")));
+    CHECK(store.log(mk("admin", "tar.source.purge")));
+    CHECK(store.log(mk("admin", "auth.login")));
+
+    AuditQuery q;
+    q.action = "echo.status.scan";
+    auto r = store.query(q);
+    REQUIRE(r.has_value());
+    CHECK(r->size() == 2);
+    for (const auto& e : *r)
+        CHECK((e.action == "tar.status.scan" || e.action == "echo.status.scan"));
+
+    // The legacy spelling still means exactly the legacy rows.
+    AuditQuery legacy;
+    legacy.action = "tar.status.scan";
+    auto lr = store.query(legacy);
+    REQUIRE(lr.has_value());
+    REQUIRE(lr->size() == 1);
+    CHECK((*lr)[0].action == "tar.status.scan");
+}
+
+TEST_CASE("AuditStore: an echo. action_prefix matches both spellings; other prefixes are unchanged",
+          "[pg][audit_store][echo_rename]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    for (const auto& a : {"tar.status.scan", "echo.status.scan", "tar.source.purge",
+                          "echo.source.purge", "auth.login", "target.thing"})
+        CHECK(store.log(mk("admin", a)));
+
+    AuditQuery q;
+    q.action_prefixes = {"echo."};
+    auto r = store.query(q);
+    REQUIRE(r.has_value());
+    CHECK(r->size() == 4); // both spellings of both actions; not target.thing, not auth.login
+
+    AuditQuery auth;
+    auth.action_prefixes = {"auth."};
+    auto ar = store.query(auth);
+    REQUIRE(ar.has_value());
+    REQUIRE(ar->size() == 1);
+    CHECK((*ar)[0].action == "auth.login");
+}
+
 TEST_CASE("AuditStore: random_sample over the scan cap is recency-capped + bounded by limit",
           "[pg][audit_store][auth-sample][slow]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);

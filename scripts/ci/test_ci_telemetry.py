@@ -124,8 +124,8 @@ def main() -> int:
         check(job == (1, "linux", "yuzu-bigtam-linux-2", "failure"),
               f"wrong job row: {job}", failures)
         check(suites == [
-            ("server unit tests", "timeout", 602.1, 600.0),
             ("echo unit tests", "success", 14.5, 90.0),
+            ("server unit tests", "timeout", 602.1, 600.0),
         ], f"wrong suite rows: {suites}", failures)
         check(flakes == [("Known Flake", 1)], f"wrong flake rows: {flakes}", failures)
 

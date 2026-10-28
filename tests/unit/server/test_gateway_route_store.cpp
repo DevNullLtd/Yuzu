@@ -397,6 +397,47 @@ TEST_CASE("GatewayRouteStore[pg]: announce_connected fills cluster/node when ses
     CHECK_FALSE((*row)->is_stale);
 }
 
+// Echo rename, upgrade window: the directory row remembers whether the agent registered the
+// pre-rename plugin name, so the HA dispatch path (no AgentSession) can still write it on the
+// wire. Removed with the other legacy-name shims; the column stays.
+TEST_CASE("GatewayRouteStore[pg]: legacy_echo_wire_name is written by register_fresh and read by "
+          "lookup_route(s); announce_connected and renew_leases leave it alone",
+          "[gateway_route][pg][store][echo_rename]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-legacy", "session-l", true).value().won);
+    REQUIRE(fx.store().register_fresh("agent-current", "session-c").value().won);
+    REQUIRE(fx.store().announce_connected("agent-legacy", "session-l", "c1", "n1", 30).value().matched);
+    REQUIRE(fx.store().announce_connected("agent-current", "session-c", "c1", "n1", 30).value().matched);
+
+    std::vector<std::string> agents{"agent-legacy", "agent-current"};
+    std::vector<std::string> ids{"session-l", "session-c"};
+    REQUIRE(fx.store().renew_leases(agents, ids, 3600).value() == 2);
+
+    auto legacy = fx.store().lookup_route("agent-legacy");
+    auto current = fx.store().lookup_route("agent-current");
+    REQUIRE(legacy.has_value());
+    REQUIRE(legacy->has_value());
+    REQUIRE(current.has_value());
+    REQUIRE(current->has_value());
+    CHECK((*legacy)->legacy_echo_wire_name);
+    CHECK_FALSE((*current)->legacy_echo_wire_name);
+
+    auto batch = fx.store().lookup_routes(agents);
+    REQUIRE(batch.has_value());
+    REQUIRE(batch->size() == 2);
+    for (const auto& rr : *batch) {
+        INFO(rr.route.agent_id);
+        CHECK(rr.route.legacy_echo_wire_name == (rr.route.agent_id == "agent-legacy"));
+    }
+
+    // A later connection re-states the flag: the agent upgraded, so the next register clears it.
+    REQUIRE(fx.store().register_fresh("agent-legacy", "session-l2", false).value().won);
+    auto upgraded = fx.store().lookup_route("agent-legacy");
+    REQUIRE(upgraded.has_value());
+    REQUIRE(upgraded->has_value());
+    CHECK_FALSE((*upgraded)->legacy_echo_wire_name);
+}
+
 TEST_CASE("GatewayRouteStore[pg]: announce_connected is a no-op against a different session",
           "[gateway_route][pg][store]") {
     GatewayRoutePg fx;
@@ -3033,7 +3074,7 @@ TEST_CASE("GatewayRouteStore[pg]: migration v5 tombstones every row of a duplica
                                  "'gateway_route_store' AND indexname = "
                                  "'agent_routes_session_id_idx'") == "0");
     CHECK(raw_scalar(conn.get(), "SELECT version::text FROM public.schema_meta WHERE store = "
-                                 "'gateway_route_store'") == "5");
+                                 "'gateway_route_store'") == "6");
 
     GatewayRouteStore reopened{pool};
     REQUIRE(reopened.is_open());
@@ -3143,7 +3184,7 @@ TEST_CASE("GatewayRouteStore[pg]: migration v5 tolerates a hand-dropped old sess
 
     auto conn = raw_connect(db.dsn());
     CHECK(raw_scalar(conn.get(), "SELECT version::text FROM public.schema_meta WHERE store = "
-                                 "'gateway_route_store'") == "5");
+                                 "'gateway_route_store'") == "6");
     CHECK(raw_scalar(conn.get(), "SELECT count(*) FROM pg_indexes WHERE schemaname = "
                                  "'gateway_route_store' AND indexname = "
                                  "'ux_agent_routes_session_id'") == "1");

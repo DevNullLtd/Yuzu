@@ -207,8 +207,8 @@ TEST_CASE("app_usage plugin: summary — real echo.db if present, else an explic
         REQUIRE(fields.size() >= 3);
         const std::string& resolved_path = fields[2];
         CHECK_FALSE(resolved_path.empty());
-        CHECK(resolved_path.size() >= 6);
-        CHECK(resolved_path.compare(resolved_path.size() - 6, 6, "echo.db") == 0);
+        CHECK(resolved_path.size() >= 7);
+        CHECK(resolved_path.compare(resolved_path.size() - 7, 7, "echo.db") == 0);
         CHECK(resolved_path.find(kPlatformDefaultDbDir) == 0);
         return;
     }
@@ -524,6 +524,62 @@ TEST_CASE("app_usage plugin: an echo_config PREPARE failure (table missing) maps
     const auto last_used_rows = captured_rows(last_used.captured);
     REQUIRE(last_used_rows.size() == 1);
     CHECK(last_used_rows.front().rfind("constrained|usage_source_errored|", 0) == 0);
+
+    plugin->descriptor->shutdown(ctx.get());
+}
+
+// ── Echo rename: a file the echo plugin has not migrated reads as Errored ───
+// app_usage never adopts or migrates. A database still holding the pre-rename `tar_config`
+// table (the echo plugin absent, kill-switched or failed at init) has no `echo_config`, so the
+// config read FAILS: the existing fail-closed contract (routed-concerns clause 3) maps that to
+// Errored. There is deliberately no fallback read of the legacy table, which would be a second
+// shim; this pins that the legacy table cannot make the source read as Enabled.
+
+TEST_CASE("app_usage plugin: a not-yet-migrated legacy schema (tar_config only) reads as "
+          "usage_source_errored, never Enabled",
+          "[app_usage][actions][regression]") {
+    auto plugin = load_app_usage_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    REQUIRE(plugin->descriptor->init != nullptr);
+    REQUIRE(plugin->descriptor->shutdown != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_app_usage_legacy_schema_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    REQUIRE_FALSE(ec);
+    const fs::path& data_dir = dir_guard.path;
+
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    sqlite3* writer = nullptr;
+    REQUIRE(sqlite3_open((data_dir / "echo.db").string().c_str(), &writer) == SQLITE_OK);
+    seed::exec_or_fail(writer, "PRAGMA journal_mode=WAL");
+    seed::exec_or_fail(writer,
+                       "CREATE TABLE tar_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    seed::exec_or_fail(writer, "INSERT INTO tar_config VALUES ('usage_enabled', 'true')");
+    seed::exec_or_fail(writer, "INSERT INTO tar_config VALUES ('usage_feeder_enabled', 'true')");
+    seed::exec_or_fail(writer,
+                       "CREATE TABLE usage_daily (day_ts INTEGER, exe_key TEXT, "
+                       "run_count INTEGER, total_seconds INTEGER, first_seen INTEGER, "
+                       "last_seen INTEGER, superseded_runs INTEGER, expired_runs INTEGER)");
+    seed::insert_usage_daily(writer, now - (now % 86400), "legacy.exe", /*run_count=*/1,
+                             /*total_seconds=*/60, /*first_seen=*/now, /*last_seen=*/now,
+                             /*superseded_runs=*/0, /*expired_runs=*/0);
+    sqlite3_close(writer);
+
+    yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
+    REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto summary = dispatcher.run(plugin->descriptor, "summary");
+    CHECK(summary.rc == 0);
+    const auto rows = captured_rows(summary.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows.front().rfind("constrained|usage_source_errored|", 0) == 0);
+    // Never a real usage row built off the legacy table's "true".
+    CHECK(rows.front().find("legacy.exe") == std::string::npos);
 
     plugin->descriptor->shutdown(ctx.get());
 }

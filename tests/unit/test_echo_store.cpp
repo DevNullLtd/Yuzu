@@ -8,6 +8,7 @@
 #include "echo_db.hpp"
 #include "echo_netqual.hpp"
 #include "echo_netqual_boot.hpp"
+#include "echo_db_legacy_rename.hpp" // agents/shared: tar.db -> echo.db adoption
 #include "echo_sql_executor.hpp"
 #include "test_helpers.hpp"
 
@@ -1544,7 +1545,7 @@ TEST_CASE("EchoDatabase: a fresh open creates no tar_events table (#760 UP-8)",
     { EchoDatabase discard = std::move(t.db); }
     auto reopened = EchoDatabase::open(t.path);
     REQUIRE(reopened.has_value());
-    CHECK(reopened->schema_version() == 8);
+    CHECK(reopened->schema_version() == 9);
     auto q2 = reopened->execute_query(count_sql);
     REQUIRE(q2.has_value());
     CHECK(q2->rows[0][0] == "0");
@@ -1578,7 +1579,7 @@ TEST_CASE("EchoDatabase: a pre-v3 database still has tar_events dropped on open"
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 8); // the 2→3→4→5→6→7→8 walk ran
+        CHECK(db->schema_version() == 9); // the 2→3→4→5→6→7→8→9 walk ran
         auto q =
             db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' OR "
                               "name LIKE 'idx_tar_events%'");
@@ -1619,7 +1620,7 @@ TEST_CASE("EchoDatabase: schema v5 drops tar_events from an ALREADY-MIGRATED dat
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 8);
+        CHECK(db->schema_version() == 9);
         auto q = db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' "
                                    "OR name LIKE 'idx_tar_events%'");
         REQUIRE(q.has_value());
@@ -1697,7 +1698,7 @@ TEST_CASE("EchoDatabase: schema v4 ALTERs version onto a pre-existing procperf t
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 8); // the v3→v4→v5→v6→v7→v8 walk ran
+        CHECK(db->schema_version() == 9); // the v3→v4→v5→v6→v7→v8→v9 walk ran
 
         // Both tiers now carry `version` (added by the ALTER, not the DDL).
         for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
@@ -1760,7 +1761,7 @@ TEST_CASE("EchoDatabase: schema v7 ALTERs is_kthread onto a pre-existing procper
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 8); // the v6→v7→v8 walk ran
+        CHECK(db->schema_version() == 9); // the v6→v7→v8→v9 walk ran
 
         // Both tiers now carry `is_kthread` (added by the ALTER, not the DDL).
         for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
@@ -3046,9 +3047,9 @@ void remove_db_files(const fs::path& tmp) {
 
 } // namespace
 
-TEST_CASE("EchoDatabase: a fresh open lands at schema_version 8", "[echo][store][migration][v8]") {
+TEST_CASE("EchoDatabase: a fresh open lands at schema_version 9", "[echo][store][migration][v8]") {
     auto t = make_test_db();
-    CHECK(t.db.schema_version() == 8);
+    CHECK(t.db.schema_version() == 9);
 }
 
 TEST_CASE("EchoDatabase v7->v8: stored opt-outs of every formerly-off source flip once",
@@ -3073,7 +3074,7 @@ TEST_CASE("EchoDatabase v7->v8: stored opt-outs of every formerly-off source fli
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 8);
+        CHECK(db->schema_version() == 9);
         int64_t expect = 1'700'000'000;
         for (const auto src : kFormerlyOff) {
             INFO("formerly-off source=" << src);
@@ -3101,7 +3102,7 @@ TEST_CASE("EchoDatabase v7->v8: errored / already-on / absent rows are left alon
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 8);
+        CHECK(db->schema_version() == 9);
         CHECK(db->get_config("netqual_enabled", "") == "errored");
         // An already-on source's deliberate pause survives.
         CHECK(db->get_config("process_enabled", "") == "false");
@@ -3126,7 +3127,7 @@ TEST_CASE("EchoDatabase v7->v8: an opt-out written after the migration sticks",
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 8);
+        CHECK(db->schema_version() == 9);
         CHECK(db->get_config("procperf_enabled", "") == "false");
     }
     remove_db_files(tmp);
@@ -3163,7 +3164,7 @@ TEST_CASE("EchoDatabase v7->v8: a failed flip rolls the whole migration back and
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 8);
+        CHECK(db->schema_version() == 9);
         CHECK(db->get_config("procperf_enabled", "") == "true");
         CHECK(db->get_config("procperf_paused_at", "") == "0");
         CHECK(db->get_config("netqual_enabled", "") == "true");
@@ -3200,7 +3201,7 @@ TEST_CASE("EchoDatabase v7->v8: a disable written while a failed migration is pe
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 8);
+        CHECK(db->schema_version() == 9);
         CHECK(db->get_config("arp_enabled", "") == "true");
         CHECK(db->get_config("arp_paused_at", "") == "0");
     }
@@ -3260,7 +3261,7 @@ TEST_CASE("EchoDatabase: one failed schema_version read at open does not replay 
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        REQUIRE(db->schema_version() == 8);
+        REQUIRE(db->schema_version() == 9);
         REQUIRE(db->set_config("module_enabled", "false"));
         REQUIRE(db->set_config("module_paused_at", "1761000000"));
     }
@@ -3274,9 +3275,275 @@ TEST_CASE("EchoDatabase: one failed schema_version read at open does not replay 
         g_deny_value_read = -1;
         REQUIRE(db.has_value());
         REQUIRE(g_denied.load()); // the fault reached the schema_version read
-        CHECK(db->schema_version() == 8);
+        CHECK(db->schema_version() == 9);
         CHECK(db->get_config("module_enabled", "") == "false");
         CHECK(db->get_config("module_paused_at", "") == "1761000000");
     }
     remove_db_files(tmp);
+}
+
+// ── Echo rename: adopting a pre-rename tar.db (upgrade window) ───────────────
+//
+// The legacy names below (tar.db, tar_state, tar_config, tar_cursor) are the on-disk spelling of
+// databases written before the rename, so they stay verbatim here.
+namespace {
+
+using SqliteOwner = yuzu::test::SqliteHandleOwner<sqlite3>;
+
+void exec_sql(sqlite3* db, const char* sql) {
+    REQUIRE(sqlite3_exec(db, sql, nullptr, nullptr, nullptr) == SQLITE_OK);
+}
+
+std::string slurp_file(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
+void spit_file(const fs::path& p, std::string_view bytes) {
+    std::ofstream f(p, std::ios::binary | std::ios::trunc);
+    REQUIRE(f.is_open());
+    f << bytes;
+}
+
+std::vector<std::string> table_names(const fs::path& db_file) {
+    SqliteOwner o;
+    REQUIRE(sqlite3_open_v2(db_file.string().c_str(), &o.db, SQLITE_OPEN_READONLY, nullptr) ==
+            SQLITE_OK);
+    std::vector<std::string> out;
+    sqlite3_stmt* raw = nullptr;
+    REQUIRE(sqlite3_prepare_v2(o.db, "SELECT name FROM sqlite_master WHERE type = 'table'", -1,
+                               &raw, nullptr) == SQLITE_OK);
+    while (sqlite3_step(raw) == SQLITE_ROW)
+        out.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(raw, 0)));
+    sqlite3_finalize(raw);
+    return out;
+}
+
+bool has_table(const std::vector<std::string>& names, std::string_view n) {
+    return std::ranges::find(names, n) != names.end();
+}
+
+// A closed, healthy, pre-rename database at <dir>/tar.db: tar_* tables, schema_version 8, rollback
+// journal (so no WAL is left behind). Built from the real schema, then renamed by raw SQL.
+void make_legacy_tar_db(const fs::path& dir) {
+    const auto scratch = dir / "echo.db";
+    {
+        auto db = EchoDatabase::open(scratch);
+        REQUIRE(db.has_value());
+    }
+    {
+        SqliteOwner o;
+        REQUIRE(sqlite3_open(scratch.string().c_str(), &o.db) == SQLITE_OK);
+        exec_sql(o.db, "PRAGMA journal_mode=DELETE");
+        exec_sql(o.db, "ALTER TABLE echo_state RENAME TO tar_state");
+        exec_sql(o.db, "ALTER TABLE echo_config RENAME TO tar_config");
+        exec_sql(o.db, "ALTER TABLE echo_cursor RENAME TO tar_cursor");
+        exec_sql(o.db, "UPDATE tar_config SET value = '8' WHERE key = 'schema_version'");
+    }
+    for (const char* suffix : {"-wal", "-shm", "-journal"}) {
+        std::error_code ec;
+        fs::remove(fs::path{scratch.string() + suffix}, ec);
+    }
+    fs::rename(scratch, dir / "tar.db");
+}
+
+// A crash-shaped legacy file set in `dst`: tar.db plus a tar.db-wal holding one committed but
+// never-checkpointed row (wal_marker=x). The copy is taken while the writer is still open, so the
+// row exists ONLY in the WAL.
+void make_legacy_tar_db_with_wal(const fs::path& dst) {
+    yuzu::test::TempDir src("yuzu_test_echo_walsrc_");
+    REQUIRE(fs::create_directories(src.path));
+    make_legacy_tar_db(src.path);
+    SqliteOwner o;
+    REQUIRE(sqlite3_open((src.path / "tar.db").string().c_str(), &o.db) == SQLITE_OK);
+    exec_sql(o.db, "PRAGMA journal_mode=WAL");
+    exec_sql(o.db, "PRAGMA wal_autocheckpoint=0");
+    exec_sql(o.db, "INSERT INTO tar_config(key, value) VALUES ('wal_marker', 'x')");
+    REQUIRE(fs::exists(src.path / "tar.db-wal"));
+    fs::copy_file(src.path / "tar.db", dst / "tar.db");
+    fs::copy_file(src.path / "tar.db-wal", dst / "tar.db-wal");
+}
+
+struct ScratchDir {
+    yuzu::test::TempDir dir{"yuzu_test_echo_adopt_"};
+    ScratchDir() { REQUIRE(fs::create_directories(dir.path)); }
+    [[nodiscard]] const fs::path& path() const { return dir.path; }
+};
+
+} // namespace
+
+TEST_CASE("adopt_legacy_echo_db: a crash-shaped tar.db + un-checkpointed WAL opens as echo.db",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    const auto echo_db = d.path() / "echo.db";
+
+    REQUIRE(yuzu::shared::adopt_legacy_echo_db(echo_db).has_value());
+    CHECK_FALSE(fs::exists(d.path() / "tar.db"));
+    CHECK_FALSE(fs::exists(d.path() / "tar.db-wal"));
+    CHECK(fs::exists(echo_db));
+    CHECK(fs::exists(d.path() / "echo.db-wal"));
+
+    {
+        auto db = EchoDatabase::open(echo_db);
+        REQUIRE(db.has_value());
+        CHECK(db->get_config("wal_marker", "") == "x"); // the WAL-only row survived the move
+        CHECK(db->schema_version() == 9);
+    }
+    const auto names = table_names(echo_db);
+    CHECK(has_table(names, "echo_state"));
+    CHECK(has_table(names, "echo_config"));
+    CHECK(has_table(names, "echo_cursor"));
+    CHECK_FALSE(has_table(names, "tar_state"));
+    CHECK_FALSE(has_table(names, "tar_config"));
+    CHECK_FALSE(has_table(names, "tar_cursor"));
+}
+
+TEST_CASE("adopt_legacy_echo_db: an interrupted adoption resumes", "[echo][store][adopt]") {
+    SECTION("sidecar already moved, main file not") {
+        ScratchDir d;
+        make_legacy_tar_db_with_wal(d.path());
+        fs::rename(d.path() / "tar.db-wal", d.path() / "echo.db-wal");
+        REQUIRE(yuzu::shared::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+        CHECK_FALSE(fs::exists(d.path() / "tar.db"));
+        auto db = EchoDatabase::open(d.path() / "echo.db");
+        REQUIRE(db.has_value());
+        CHECK(db->get_config("wal_marker", "") == "x");
+    }
+    SECTION("everything already at the echo names: a no-op") {
+        ScratchDir d;
+        make_legacy_tar_db_with_wal(d.path());
+        REQUIRE(yuzu::shared::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+        const auto before = slurp_file(d.path() / "echo.db");
+        const auto wal_before = slurp_file(d.path() / "echo.db-wal");
+        REQUIRE(yuzu::shared::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+        CHECK(slurp_file(d.path() / "echo.db") == before);
+        CHECK(slurp_file(d.path() / "echo.db-wal") == wal_before);
+    }
+    SECTION("a lone stale tar.db-shm beside an adopted echo.db is moved") {
+        ScratchDir d;
+        {
+            auto db = EchoDatabase::open(d.path() / "echo.db");
+            REQUIRE(db.has_value());
+        }
+        std::error_code ec;
+        fs::remove(d.path() / "echo.db-shm", ec);
+        spit_file(d.path() / "tar.db-shm", "stale");
+        REQUIRE(yuzu::shared::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+        CHECK_FALSE(fs::exists(d.path() / "tar.db-shm"));
+        auto db = EchoDatabase::open(d.path() / "echo.db");
+        CHECK(db.has_value());
+    }
+}
+
+TEST_CASE("adopt_legacy_echo_db: both main files present is two databases and nothing moves",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    {
+        auto db = EchoDatabase::open(d.path() / "echo.db");
+        REQUIRE(db.has_value());
+        REQUIRE(db->set_config("which", "echo"));
+    }
+    make_legacy_tar_db_with_wal(d.path());
+    spit_file(d.path() / "echo.db-wal", ""); // an empty live WAL beside the live echo.db
+
+    const std::array<const char*, 4> files = {"tar.db", "tar.db-wal", "echo.db", "echo.db-wal"};
+    std::vector<std::string> before;
+    for (const char* f : files)
+        before.push_back(slurp_file(d.path() / f));
+
+    REQUIRE(yuzu::shared::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+    for (std::size_t i = 0; i < files.size(); ++i) {
+        INFO(files[i]);
+        REQUIRE(fs::exists(d.path() / files[i]));
+        CHECK(slurp_file(d.path() / files[i]) == before[i]);
+    }
+    auto db = EchoDatabase::open(d.path() / "echo.db");
+    REQUIRE(db.has_value());
+    CHECK(db->get_config("which", "") == "echo");
+}
+
+TEST_CASE("EchoDatabase::open refuses to create a fresh echo.db beside an unadopted tar.db",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db(d.path());
+    const auto echo_db = d.path() / "echo.db";
+
+    auto refused = EchoDatabase::open(echo_db);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("tar.db") != std::string::npos);
+    CHECK_FALSE(fs::exists(echo_db));
+
+    REQUIRE(yuzu::shared::adopt_legacy_echo_db(echo_db).has_value());
+    auto db = EchoDatabase::open(echo_db);
+    REQUIRE(db.has_value());
+    CHECK(db->schema_version() == 9);
+}
+
+TEST_CASE("adopt_legacy_echo_db: a fresh directory is a no-op and opens at schema 9",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    const auto echo_db = d.path() / "echo.db";
+    REQUIRE(yuzu::shared::adopt_legacy_echo_db(echo_db).has_value());
+    CHECK_FALSE(fs::exists(echo_db));
+    {
+        auto db = EchoDatabase::open(echo_db);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 9);
+    }
+    CHECK_FALSE(fs::exists(d.path() / "tar.db"));
+    auto again = EchoDatabase::open(echo_db);
+    REQUIRE(again.has_value());
+    CHECK(again->schema_version() == 9);
+}
+
+TEST_CASE("EchoDatabase: a v8 file already holding echo_* tables only gets the version marker",
+          "[echo][store][migration][v9]") {
+    ScratchDir d;
+    const auto echo_db = d.path() / "echo.db";
+    {
+        auto db = EchoDatabase::open(echo_db);
+        REQUIRE(db.has_value());
+        REQUIRE(db->set_config("kept", "yes"));
+    }
+    {
+        SqliteOwner o;
+        REQUIRE(sqlite3_open(echo_db.string().c_str(), &o.db) == SQLITE_OK);
+        exec_sql(o.db, "UPDATE echo_config SET value = '8' WHERE key = 'schema_version'");
+    }
+    auto db = EchoDatabase::open(echo_db);
+    REQUIRE(db.has_value());
+    CHECK(db->schema_version() == 9);
+    CHECK(db->get_config("kept", "") == "yes");
+}
+
+TEST_CASE("adopt_legacy_echo_db: a read-only directory fails closed and open() refuses too",
+          "[echo][store][adopt]") {
+    if (::geteuid() == 0)
+        SKIP("root bypasses directory permissions; cannot make the rename fail");
+    ScratchDir d;
+    make_legacy_tar_db(d.path());
+    struct DirGuard {
+        fs::path dir;
+        ~DirGuard() {
+            std::error_code ec;
+            fs::permissions(dir, fs::perms::owner_all, fs::perm_options::add, ec);
+        }
+    } guard{d.path()};
+    std::error_code perm_ec;
+    fs::permissions(d.path(),
+                    fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write,
+                    fs::perm_options::remove, perm_ec);
+    REQUIRE_FALSE(perm_ec);
+
+    const auto echo_db = d.path() / "echo.db";
+    auto adopted = yuzu::shared::adopt_legacy_echo_db(echo_db);
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(adopted.error().find("tar.db") != std::string::npos);
+    CHECK_FALSE(fs::exists(echo_db));
+
+    auto opened = EchoDatabase::open(echo_db);
+    REQUIRE_FALSE(opened.has_value());
+    CHECK(opened.error().find("tar.db") != std::string::npos);
+    CHECK_FALSE(fs::exists(echo_db));
 }

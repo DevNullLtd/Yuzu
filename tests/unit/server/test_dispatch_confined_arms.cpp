@@ -32,6 +32,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
@@ -1207,6 +1208,58 @@ TEST_CASE("wire_and_dispatch_confined: a local-miss agent with a ROUTABLE direct
     CHECK(pending[0].agent_id == "dev-remote");
     REQUIRE(pending[0].cluster_id.has_value());
     CHECK(*pending[0].cluster_id == "cluster-b");
+}
+
+// Echo rename, upgrade window: a command for the echo plugin to an agent that only has a
+// directory row (no local session) carries the legacy plugin name iff the row says the agent
+// registered it. The legacy spelling `tar` is the point of this case.
+TEST_CASE("wire_and_dispatch_confined: a directory-routed echo command is written as `tar` only "
+          "for a row flagged legacy_echo_wire_name",
+          "[pg][server][dispatch][scope][gateway_route_dispatch][echo_rename]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dispatch_route_fallback_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+
+    for (const auto& [id, session, legacy] :
+         {std::tuple{"dev-remote-legacy", "sess-legacy", true},
+          std::tuple{"dev-remote-current", "sess-current", false}}) {
+        auto fresh = store.register_fresh(id, session, legacy);
+        REQUIRE(fresh.has_value());
+        REQUIRE(fresh->won);
+        auto announced = store.announce_connected(id, session, "cluster-b", "node-b", 90);
+        REQUIRE(announced.has_value());
+        REQUIRE(announced->matched);
+    }
+
+    auto cmd = make_route_fallback_cmd("route-fb-echo");
+    cmd.set_plugin("echo");
+    cmd.set_action("sql");
+    auto classified = ClassifiedCommandTestAccess::make(cmd);
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    const auto outcome = yuzu::server::wire_and_dispatch_confined(
+        registry, /*mgmt_group_store=*/nullptr, /*result_set_store=*/nullptr,
+        /*tag_store=*/nullptr, /*custom_properties_store=*/nullptr,
+        /*execution_tracker=*/nullptr, noop_audit, noop_audit,
+        /*command_id=*/"route-fb-echo", /*execution_id=*/"", /*principal_role=*/"",
+        /*agent_ids=*/{"dev-remote-legacy", "dev-remote-current"}, /*scope_expr=*/"",
+        /*exec_visible=*/unfiltered(), /*broadcast_on_none=*/false, kNoContainment, classified,
+        /*definition_id=*/{}, /*concurrency_mode=*/{}, &store);
+
+    CHECK(outcome.sent == 2);
+    auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 2);
+    for (const auto& p : pending) {
+        INFO(p.agent_id);
+        CHECK(p.cmd.plugin() == (p.agent_id == "dev-remote-legacy" ? "tar" : "echo"));
+        REQUIRE(p.cluster_id.has_value());
+        CHECK(*p.cluster_id == "cluster-b");
+    }
 }
 
 TEST_CASE("wire_and_dispatch_confined: a local-miss agent ABSENT from the directory is a "
