@@ -3958,6 +3958,16 @@ test('same-site gate production wiring lexical selftest',
   timeout: 60,
 )
 
+# A unit-test file marked "Whole file compiled out under TSan" must have nothing after its
+# `#ifndef YUZU_TSAN_BUILD` guard's closing `#endif`: no PR job builds with TSan, so a case added
+# there compiles everywhere except the nightly's TSan leg (#6419). Source-text only, so Python.
+test('TSan whole-file guard lexical gate',
+  _python3_test,
+  args: [files('test_tsan_whole_file_guard.py'), meson.current_source_dir()],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Every repository-markdown runbook_url in the shipped alert rules that carries a #fragment names a
 # heading that exists in that file (source-text only, stdlib Python).
 test('alert runbook anchors resolve',
