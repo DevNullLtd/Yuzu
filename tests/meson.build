@@ -3659,11 +3659,15 @@ test('prometheus alert rules',
 # Pure-logic selftest for the harness above (version-banner parsing, docker argv
 # construction, the pin's own shape). No promtool, no docker, no network, so it
 # runs everywhere -- mirroring the flake-retry and plugin-spawn selftests below.
+# 60 s: the sharding rows launch 42 short Python children as a fake
+# promtool, about 2 s in total on an idle Linux box and about 6 s on a 2-CPU box
+# kept busy. CI runs this entry on the Linux leg only (the Windows and macOS
+# legs exclude the docs suite); the margin covers a local run on a slow box.
 test('prometheus harness selftest',
   _python3_test,
   args: [files('prometheus/run_promtool_tests.py'), '--selftest'],
   suite: 'docs',
-  timeout: 30,
+  timeout: 60,
 )
 
 # #4800: pins scripts/test_gateway.py's zero-executed guard, the ct --dir that

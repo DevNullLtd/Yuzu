@@ -14,6 +14,14 @@
 %%% must refuse.
 %%%
 %%% What the cases pin:
+%%%   - the server identity (#6016): the gateway derives it from the install CA
+%%%     (a single-certificate cacertfile) and the C++ server mints it on its own
+%%%     leaf, so the real server leaf is admitted by IDENTITY, not by the pin
+%%%     (`yuzu_gw_mgmt_auth_admitted_total{method="identity"}` moves, `pin` does
+%%%     not): the two sides compute the same bytes. A leaf with a NEW key and the
+%%%     same identity (a server key renewal) and a same-key re-issue are served
+%%%     with no change on the gateway; a leaf carrying another install's
+%%%     identity is refused.
 %%%   - the pin is enforced on THIS hop: a valid leaf of the same CA that is not
 %%%     the pinned one (the gateway's own) is refused UNAUTHENTICATED and counted
 %%%     as `pin_mismatch'; an enrolled agent's leaf (clientAuth only) is refused
@@ -36,6 +44,7 @@
 %%%   YUZU_MGMT_HOST / YUZU_MGMT_PORT          the gateway management listener
 %%%   YUZU_MGMT_CACERT                         the install CA
 %%%   YUZU_MGMT_CERT / YUZU_MGMT_KEY           the PINNED leaf (the server's)
+%%%   YUZU_MGMT_CA_KEY                         the install CA's key (to mint leaves)
 %%%   YUZU_MGMT_UNPINNED_CERT / _KEY           a valid leaf of that CA, not pinned
 %%%   YUZU_MGMT_AGENT_CERT / _KEY              an enrolled agent's leaf
 %%%   YUZU_MGMT_AGENT_ID                       the connected agent to command
@@ -61,6 +70,10 @@
 
 all() ->
     [pinned_server_leaf_is_served,
+     server_leaf_is_admitted_by_identity,
+     renewed_server_key_with_the_same_identity_is_served,
+     reissued_server_leaf_over_the_same_key_is_served,
+     leaf_with_another_installs_identity_is_refused,
      unpinned_leaf_is_refused,
      agent_leaf_is_refused,
      no_client_certificate_gets_no_call,
@@ -88,6 +101,7 @@ init_per_suite(Config) ->
             ok = ensure_started(ssl),
             %% Every variable the cases need, checked once, loudly.
             [_ = req_env(V) || V <- ["YUZU_MGMT_CACERT", "YUZU_MGMT_CERT", "YUZU_MGMT_KEY",
+                                     "YUZU_MGMT_CA_KEY",
                                      "YUZU_MGMT_UNPINNED_CERT", "YUZU_MGMT_UNPINNED_KEY",
                                      "YUZU_MGMT_AGENT_CERT", "YUZU_MGMT_AGENT_KEY",
                                      "YUZU_MGMT_AGENT_ID", "YUZU_GW_METRICS_URL"]],
@@ -109,6 +123,55 @@ end_per_suite(_Config) ->
 pinned_server_leaf_is_served(_Config) ->
     {ok, #{agents := Agents}} = list_agents(pinned()),
     ?assert(lists:any(fun(#{agent_id := A}) -> A =:= agent_id() end, Agents)).
+
+%% The identity check runs before the pin in `identity_or_pin', so a real server
+%% leaf that is admitted by IDENTITY proves the gateway's derivation (SHA-256 of
+%% the CA certificate, upper-case hex) is byte-for-byte the URI the C++ server
+%% minted. Were they to differ the call would still succeed, by the pin, and only
+%% the `pin' counter would move.
+server_leaf_is_admitted_by_identity(_Config) ->
+    IdBefore = admitted("identity"),
+    PinBefore = admitted("pin"),
+    ?assertMatch({ok, #{agents := _}}, list_agents(pinned())),
+    ok = wait_until(fun() -> admitted("identity") >= IdBefore + 1 end, 10000),
+    ?assertEqual(PinBefore, admitted("pin")).
+
+%% A server key renewal that keeps the identity: a NEW key, so the pin does not
+%% know it, yet the gateway needs no change and no pin refresh (#6016).
+renewed_server_key_with_the_same_identity_is_served(Config) ->
+    Leaf = mint_leaf(Config, "renewed", server_identity(), new_key),
+    {ok, Spki} = yuzu_gw_authz:spki_sha256(der_of(Leaf)),
+    {ok, PinnedSpki} = yuzu_gw_authz:spki_sha256(der_of(pinned())),
+    ?assertNotEqual(PinnedSpki, Spki),
+    IdBefore = admitted("identity"),
+    Rejected = rejected("pin_mismatch"),
+    ?assertMatch({ok, #{agents := _}}, list_agents(Leaf)),
+    ok = wait_until(fun() -> admitted("identity") >= IdBefore + 1 end, 10000),
+    ?assertEqual(Rejected, rejected("pin_mismatch")).
+
+%% What the server's in-place upgrade does (#6072): a new certificate, a new
+%% serial, over the SAME key. Served, and the existing pin still matches it.
+reissued_server_leaf_over_the_same_key_is_served(Config) ->
+    Leaf = mint_leaf(Config, "reissued", server_identity(), same_key),
+    ?assertNotEqual(yuzu_gw_authz:serial_number(der_of(pinned())),
+                    yuzu_gw_authz:serial_number(der_of(Leaf))),
+    ?assertEqual(yuzu_gw_authz:spki_sha256(der_of(pinned())),
+                 yuzu_gw_authz:spki_sha256(der_of(Leaf))),
+    ?assertMatch({ok, #{agents := _}}, list_agents(Leaf)).
+
+%% A serverAuth leaf of this CA whose URI names another install (or the agent
+%% family): not the identity, and not a pinned key, so refused.
+leaf_with_another_installs_identity_is_refused(Config) ->
+    Before = rejected("pin_mismatch"),
+    Other = mint_leaf(Config, "foreign", "yuzu://" ++ lists:duplicate(64, $0) ++ "/server",
+                      new_key),
+    {error, {<<"16">>, _}} = list_agents(Other),
+    Agent = mint_leaf(Config, "agenturi",
+                      string:replace(server_identity(), "/server", "/agent/integration-agent-1"),
+                      new_key),
+    {error, {<<"16">>, _}} = list_agents(Agent),
+    ok = wait_until(fun() -> rejected("pin_mismatch") >= Before + 2 end, 10000),
+    ?assertMatch({ok, #{agents := _}}, list_agents(pinned())).
 
 %% A valid leaf of the same CA that the gateway does not pin: the TLS handshake
 %% passes (CA membership), the auth_fun refuses the stream.
@@ -430,14 +493,61 @@ agent_listed(Agent) ->
 
 %% yuzu_gw_mgmt_auth_rejected_total{reason="Reason"} from the gateway's /metrics.
 rejected(Reason) ->
+    counter("yuzu_gw_mgmt_auth_rejected_total{reason=\"" ++ Reason ++ "\"}").
+
+%% yuzu_gw_mgmt_auth_admitted_total{method="Method"} (identity | pin).
+admitted(Method) ->
+    counter("yuzu_gw_mgmt_auth_admitted_total{method=\"" ++ Method ++ "\"}").
+
+counter(Prefix) ->
     {ok, {{_, 200, _}, _, Body}} =
         httpc:request(get, {req_env("YUZU_GW_METRICS_URL"), []}, [{timeout, 5000}], []),
-    Prefix = "yuzu_gw_mgmt_auth_rejected_total{reason=\"" ++ Reason ++ "\"}",
     Lines = string:split(Body, "\n", all),
     case [string:trim(string:slice(L, length(Prefix))) || L <- Lines, lists:prefix(Prefix, L)] of
         [V | _] -> metric_number(V);
         []      -> 0
     end.
+
+%% The server identity the REAL server leaf carries, read from its URI SANs (not
+%% derived here), so the leaves minted below are compared with what the C++
+%% server really emits.
+server_identity() ->
+    Uris = yuzu_gw_authz:server_uri_sans(der_of(pinned())),
+    [Id] = [binary_to_list(U) || U <- Uris, binary:longest_common_suffix([U, <<"/server">>]) =:= 7],
+    Id.
+
+der_of({Cert, _Key}) ->
+    {ok, Pem} = file:read_file(Cert),
+    [{'Certificate', Der, not_encrypted} | _] = public_key:pem_decode(Pem),
+    Der.
+
+%% A serverAuth+clientAuth leaf signed by the install CA with the given URI SAN,
+%% the way default_certs.cpp shapes the server's: over a new key, or over the
+%% server's own key (a re-issue). Returns the {Cert, Key} files.
+mint_leaf(Config, Name, Uri, KeyMode) ->
+    Dir = proplists:get_value(priv_dir, Config),
+    Key = case KeyMode of
+              same_key -> req_env("YUZU_MGMT_KEY");
+              new_key  -> filename:join(Dir, Name ++ ".key")
+          end,
+    Csr = filename:join(Dir, Name ++ ".csr"),
+    Ext = filename:join(Dir, Name ++ ".ext"),
+    Pem = filename:join(Dir, Name ++ ".pem"),
+    ok = file:write_file(Ext, ["subjectAltName=DNS:localhost,IP:127.0.0.1,URI:", Uri, "\n",
+                               "extendedKeyUsage=serverAuth,clientAuth\n",
+                               "basicConstraints=CA:FALSE\n"]),
+    Serial = integer_to_list(erlang:unique_integer([positive]) + 1000000),
+    Cmds = [[case KeyMode of
+                 new_key -> ["openssl ecparam -name prime256v1 -genkey -noout -out '", Key, "'"];
+                 same_key -> "true"
+             end],
+            ["openssl req -new -key '", Key, "' -subj '/O=Yuzu/CN=Yuzu Default server' -out '", Csr, "'"],
+            ["openssl x509 -req -in '", Csr, "' -CA '", req_env("YUZU_MGMT_CACERT"),
+             "' -CAkey '", req_env("YUZU_MGMT_CA_KEY"), "' -set_serial ", Serial,
+             " -days 1 -sha256 -extfile '", Ext, "' -out '", Pem, "'"]],
+    [_ = os:cmd(lists:flatten(C) ++ " 2>&1") || C <- Cmds],
+    true = filelib:is_regular(Pem),
+    {Pem, Key}.
 
 metric_number(V) ->
     try list_to_integer(V)

@@ -209,6 +209,9 @@ spike/
 # tests/prometheus/run_promtool_tests.py; a fresh mkdtemp per gate() call
 # since #2340 PR-4, so only a killed run leaves one of these behind)
 .promtool-canary-*/
+# promtool test shards written beside the test file by run_test_rules(); same
+# story - only a killed run (SIGKILL, cancelled job) skips the cleanup
+tests/prometheus/.promtool-shard-*.test.yml
 
 # marker-extracted yuzu-guardian-journal rules (#2340 PR-4), materialized
 # fresh on every run by tests/prometheus/run_promtool_tests.py from the
