@@ -56,8 +56,11 @@ journal. Clear it with `systemctl reset-failed yuzu-server` once fixed.
 ## Recovery procedures
 
 The `psql "$YUZU_POSTGRES_DSN"` blocks in this runbook assume the DSN is set in your shell. On a Linux package
-install it lives only in the root-only env file, so an interactive shell does not have it; run a block as
-`sudo sh -c '. /etc/yuzu/yuzu-server.env; psql "$YUZU_POSTGRES_DSN" -c "..."'`.
+install it lives only in the env file (`/etc/yuzu/yuzu-server.env`, mode `0600`, readable only by root and the
+`yuzu` account), so an interactive shell does not have it. Read the value into a shell variable instead of sourcing
+the file, because a DSN containing `&` or spaces breaks as shell:
+`YUZU_POSTGRES_DSN=$(sudo sed -n 's/^YUZU_POSTGRES_DSN=//p' /etc/yuzu/yuzu-server.env)`, then run the blocks as
+written. The installer writes the line unquoted; if you edited it to add quotes, strip them from the value first.
 
 ### No DSN configured
 
@@ -728,8 +731,8 @@ and end its sessions as below). Cancelling an enrolment that was never
 verified ends no session (`result=ok`, `no verified factor to clear`). Settings
 writes the same two rows. The `attempted` intent row (`MFA clear requested via Settings`) is written first and fails
 closed: if the audit store does not accept it, the response is `503` with `Sec-Audit-Failed: true` and `Retry-After: 5`, the
-message "Audit store unavailable; MFA was not changed." is shown as a toast on both Settings pages (and, on Security and
-sign-in, also in the Two-factor sign-in panel) and nothing is cleared. Retry once the audit store has recovered, or tell the operator that the audit store needs attention. This guarantee on the Settings route relies on the audit store having opened and on the audit writer being wired into the route; server boot requires both (it refuses to start when the audit store cannot open, and binds the writer at boot). The CLI checks the intent write's result directly. The outcome row is written after the changes and cannot undo them: if it cannot be
+message "Audit store unavailable; MFA was not changed." is shown as a toast on both Settings pages (an error toast has a close button; on Security and
+sign-in the message also appears in the Two-factor sign-in panel) and nothing is cleared. Retry once the audit store has recovered, or tell the operator that the audit store needs attention. This guarantee on the Settings route relies on the audit store having opened and on the audit writer being wired into the route; server boot requires both (it refuses to start when the audit store cannot open, and binds the writer at boot). The CLI checks the intent write's result directly. The outcome row is written after the changes and cannot undo them: if it cannot be
 written the request still completes and the server logs an error. A failed audit write also increments
 `yuzu_server_audit_emit_failed_total`, which the `YuzuAuditPersistFailures` alert (critical) fires on, so a failed
 outcome write after a clear pages. The factor clear and the session delete are two separate database commits, so a
@@ -1182,16 +1185,15 @@ engine principal) are `mfa.step_up.required` rows, not `approval.*` rows, so the
 **Symptom.** An OIDC approver is refused with `503` and the message `the approver's identity-provider MFA proof is
 dated after the database clock`, and signing in again does not help. The body carries `retry_after_ms: null` (the key
 is present with a null value, so there is no retry hint) and the A4 remediation says an administrator must correct clock
-synchronisation. Local-account approvers do not get this answer. The dashboard shows the remediation text to the
+synchronisation. Local-account approvers do not get this answer. The dashboard shows the message and the remediation together to the
 approver for a `503`, in the approve dialog and on the Approvals tab. What the approver sees depends on the
-configuration, so do not rely on the `503` alone:
+configuration (derived from the code path; not reproduced against a deliberately skewed rig), so do not rely on the `503` alone:
 
-- **Default `--mfa-enforcement=optional`, or the step-up window at `0`.** The approver gets the `503` until the
+- **Default `--mfa-enforcement=optional`, `admin-only` with a non-administrator approver, or the step-up window at `0`.** The approver gets the `503` until the
   database clock reaches the stored proof instant, which is after at most as long as the skew is large. After that the
   cached proof stays dropped and the approver gets `403` `mfa_proof_missing` (its remediation names both causes, the
   identity provider sending no MFA `amr` and the Yuzu server and its database disagreeing about the time, and always ends
-  by asking the administrator to check clock synchronisation) until the session cache re-derives: a session write
-  anywhere, or a server restart. Signing in again re-creates the same state while the skew persists.
+  by asking the administrator to check clock synchronisation) until the session cache re-derives (a session create, MFA mark, elevation or delete by any user clears it; an activity touch does not; so does a server restart). Signing in again re-creates the same state while the skew persists.
 - **`--mfa-enforcement=required`, or `admin-only` for an administrator approver, with the window above `0`.** The central
   step-up check answers first (unchanged by this release). The OIDC approver sees a repeating `401` step-up challenge,
   there is no `approval.*` skew row and no skew log line, and `yuzu_auth_mfa_step_up_gate_total{outcome="refused"}`
@@ -1220,7 +1222,9 @@ different time sources) makes the stored proof read as dated in the future, so t
 **Fix.** Synchronise the clocks of the Yuzu server hosts and of the database host to the same time source (NTP or the
 platform's time service), then have the approver sign in again. The remediation text also names the identity provider, which
 is only the origin of the timestamp: because of the clamp it cannot cause this refusal alone. There is no retry hint because
-retrying cannot help until the clocks agree.
+retrying cannot help until the clocks agree. If the approver still gets `403`
+`mfa_proof_missing` once the clocks agree, configure the provider to require MFA for approvers and to report it in `amr`
+only when MFA was performed; Yuzu trusts the `amr` claim, so one asserted unconditionally defeats the control.
 
 ### Path A: an enrolment sign-in window
 

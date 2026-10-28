@@ -636,7 +636,7 @@ A refused request writes no quarantine record and releases none. The `403` bodie
 **Before you upgrade (checklist).**
 
 1. List your administrators and everyone who holds `Approval:Approve` (see "Find affected automation before you upgrade" below). With RBAC enforcement off (the shipped default) the approvers are exactly the accounts with `role = 'admin'`; the step-0 query in step 2 returns the local ones that are not yet enrolled.
-2. Check who is enrolled: run the step-0 SQL, the first block of [Path A in the recovery runbook](../ops-runbooks/auth-db-recovery.md#path-a-an-enrolment-sign-in-window). On a Linux package install the `psql "$YUZU_POSTGRES_DSN"` blocks in this section fail in an interactive shell, because the DSN lives only in the root-only env file; run each as `sudo sh -c '. /etc/yuzu/yuzu-server.env; psql "$YUZU_POSTGRES_DSN" -c "..."'`.
+2. Check who is enrolled: run the step-0 SQL, the first block of [Path A in the recovery runbook](../ops-runbooks/auth-db-recovery.md#path-a-an-enrolment-sign-in-window). On a Linux package install the `psql "$YUZU_POSTGRES_DSN"` blocks in this section fail in an interactive shell, because the DSN lives only in the env file, which is readable only by root and the `yuzu` account; read the value into a shell variable (do not source the file, because a DSN containing `&` or spaces breaks as shell) with `YUZU_POSTGRES_DSN=$(sudo sed -n 's/^YUZU_POSTGRES_DSN=//p' /etc/yuzu/yuzu-server.env)` and then run each block as written.
 3. Enrol each administrator in Settings → Security and sign-in → Two-factor sign-in; another administrator cannot do it for them.
 4. Plan each non-administrator approver (possible only once RBAC enforcement is on): it needs the runbook path, not Settings.
 5. A SAML deployment has no approver path (#6098); give those approvers a local or OIDC account first.
@@ -735,10 +735,8 @@ principal and not an engine principal. The existing rule that the reviewer canno
     MFA proof is dated after the database clock` and `retry_after_ms` null; audit `result=error`, `detail`
     `approver_assurance:mfa_proof_clock_skew`. It is not counted in `route="approval"`. An administrator must correct clock
     synchronisation between the Yuzu server hosts and the database host (the remediation also names the identity
-    provider). This `503` is typed only when the central check does not answer first (default
-    `--mfa-enforcement=optional`, or the step-up window at `0`), and only until the database clock reaches the stored instant (after at most as long as the skew is large): afterwards
-    the approver gets `403` `mfa_proof_missing` until the session cache re-derives (a session write anywhere, or a server
-    restart), and signing in again re-creates that state while the skew persists. Under `required` (or `admin-only` for an
+    provider). This `503` is typed only when the central check does not answer first (default `--mfa-enforcement=optional`, `admin-only` for a non-administrator approver, or the step-up window at `0`), and only until the database clock reaches the stored instant (after at most as long as the skew is large): afterwards
+    the approver gets `403` `mfa_proof_missing` until the session cache re-derives (a session create, MFA mark, elevation or delete by any user clears it; an activity touch does not; so does a server restart), and signing in again re-creates that state while the skew persists. Under `required` (or `admin-only` for an
     administrator) with the window above `0`, the central check answers first: the approver sees a repeating `401` step-up
     challenge, no `approval.*` skew row, and a rising `yuzu_auth_mfa_step_up_gate_total{outcome="refused"}`; check clock
     synchronisation first. See

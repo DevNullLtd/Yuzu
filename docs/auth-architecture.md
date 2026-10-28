@@ -958,10 +958,8 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   (`ApproverMfaOutcome::Kind::kProofClockSkew`): `503`, audit `result=error` with detail `approver_assurance:mfa_proof_clock_skew`, an A4
   error naming the database clock and a remediation to correct clock synchronisation, `retry_after_ms` null (the key is present), and no increment of the
   `route="approval"` counter, which stays a store-fault signal; the server logs an error line. A degraded durable-proof read is decided
-  first and answers the ordinary store-unavailable `503`. This `503` is typed only when the central check does not answer first (default
-  `--mfa-enforcement=optional`, or the window at `0`). Once the database clock has passed the stored instant (after at most as long as the skew is large, even while
-  the skew persists), a session whose cached proof was dropped keeps an empty anchor until its cache re-derives (a session write anywhere, or a
-  server restart) and answers `403` `mfa_proof_missing`, whose remediation always ends by asking the administrator to check clock
+  first and answers the ordinary store-unavailable `503`. This `503` is typed only when the central check does not answer first (default `--mfa-enforcement=optional`, `admin-only` for a non-administrator approver, or the window at `0`). Once the database clock has passed the stored instant (after at most as long as the skew is large, even while
+  the skew persists), a session whose cached proof was dropped keeps an empty anchor until its cache re-derives (a session create, MFA mark, elevation or delete by any user clears it; an activity touch does not; so does a server restart) and answers `403` `mfa_proof_missing`, whose remediation always ends by asking the administrator to check clock
   synchronisation; signing in again re-creates the same state while the skew persists. Under `required` (or `admin-only` for an administrator)
   with the window above `0` the central check answers first: the OIDC approver sees a repeating `401` step-up challenge, no `approval.*` skew row
   and no skew log line, and `yuzu_auth_mfa_step_up_gate_total{outcome="refused"}` rises. With the window above `0`
