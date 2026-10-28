@@ -7,11 +7,10 @@ three-model adversarial review (Fable + gpt-5.6-sol + Kimi-K2.7) surfaced as mis
 failback/rebalance, roadmap 7.1.1, #5759) was added 2026-10-13 as the pair to WS-13. If a row here
 disagrees with ADR-2002, the ADR wins.
 
-**Verified 2026-10-26 (status re-stamp against `origin/dev` at `931842654`, with `gh`):** ONLY the WS-3 and
-WS-11 rows were re-audited in this pass, against `origin/dev` `931842654` PLUS the unmerged #4014 branch
-(`leader_metrics.hpp` and the `yuzu-ha-leader` group in `docs/prometheus/yuzu-alerts.yml` exist only on that
-branch until it merges; `leader_elector.*` is on both) and `gh` issue state (#4014 open until this change
-merges; #6526, #6527, #6528 and #6535 open). Re-stamp at merge. Every other row was NOT re-audited
+**Verified 2026-10-28 (status re-stamp against `origin/dev` at `377cc7700`, with `gh`):** ONLY the WS-3 and
+WS-11 rows were re-audited in this pass. `leader_metrics.hpp` and the `yuzu-ha-leader` group in
+`docs/prometheus/yuzu-alerts.yml` are on `origin/dev` (PR #6542, merge commit `40e1f8956`), #4014 is closed, and
+#6526, #6527, #6528 and #6535 are open. Every other row was NOT re-audited
 here; their last audit is the **2026-10-13** stamp at `d81109688` (the WS-5 and WS-9 rows, the WS-2 Status
 caveat). Every PR that changes a workstream's status updates its row and re-stamps this line in the same PR.
 
