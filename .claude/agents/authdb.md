@@ -209,8 +209,9 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   enforced for the process life; it exists ONLY on the `AuthDB` constructor,
   `SessionStore` has no bypass, the serving binary never passes it, any other
   use is CRITICAL); `mfa_status` re-validates behind a
-  request-driven 60 s memo and a failure is STICKY
-  (`MfaStatus::binding_enforced == false`), which every gate must answer `503`
+  request-driven 60 s memo and a trigger observed not in force is STICKY
+  (`MfaStatus::binding_enforced == false`; a check that could not run instead latches
+  `binding_inconclusive`, so every read reports not-enforced until a later check returns Valid), which every gate must answer `503`
   through the one `judge_local_mfa_binding` (a second copy of that decision is
   a defect). `mfa_regenerate_recovery_codes` takes a REQUIRED
   `expected_factor_gen` and compares it under the `auth.users` row lock

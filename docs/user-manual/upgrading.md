@@ -509,12 +509,12 @@ unwired-store refusals still apply and are still recorded. The JIT-elevation rou
 window when it is positive, else 300 s). The new alert `YuzuStepUpWindowDisabled` fires while the
 window is 0 or less. This release has no supported return to v0.14.1 (see "Deployment contract (hard cutover)"). v0.14.1 does not gate the two Settings routes or the four existing routes listed under "What is newly gated" above in their handlers, and it does not have the six routes that are new in this release. A server whose `/metrics` lacks `yuzu_auth_mfa_step_up_gate_total` and `yuzu_auth_mfa_step_up_window_seconds` has no step-up gate on these routes at all, and `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled` cannot fire there: their silence is not evidence that the gate is on.
 
-## ⚠️ Breaking: MFA proofs are bound to the factor they were earned with; hard cutover with no upgrade path or rollback (#6079)
+## Breaking: MFA proofs are bound to the factor they were earned with; hard cutover with no upgrade path or rollback (#6079)
 
 **This build is a hard cutover.** It has no upgrade path, no rolling or mixed-version window (mixed-version
 operation is unsupported) and no rollback of the new binary's migrations: the only way back is restoring the backup
 taken in step 2 below, which puts the previous build's data back (it does not undo the migrations in place). The
-procedure below only carries an existing deployment's data across the cutover; it is not an upgrade path and does not
+carry-over procedure below only carries an existing deployment's data across the cutover; it is not an upgrade path and does not
 change the fresh-deployment contract stated for the Forensics tier elsewhere in this guide.
 The `auth` v3 migration seeds nothing and starts every existing row at factor generation `0`; the trigger
 advances it only from the next enrolment change. So an account that was already enrolled reads generation
@@ -530,11 +530,31 @@ the window is above 0, because creating a token is itself an ordinary step-up ro
 
 **Before you cut over.** While the previous build is still running:
 
+- Keep the previous build's binary or image (its package file or tag) to hand. Restoring the backup is the only
+  way back, and it works only with the build that matches the restored data.
 - List the accounts that are enrolled (that build has no `mfa_factor_gen` column, so the query cannot test it;
   after the migration every one of these rows reads generation `0`):
 
   ```sql
   SELECT username FROM auth.users WHERE mfa_enrolled_at IS NOT NULL;
+  ```
+
+- List the enrolled accounts that are NOT administrators. A reset (step 3) clears their factor too, and a
+  non-admin cannot enrol again by itself under `--mfa-enforcement=optional` or `admin-only` (the Settings enrolment
+  routes need the administrator role), so until an administrator enrols it
+  ([Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver)) or you run
+  a `--mfa-enforcement=required` window, that account stays refused on approvals and JIT elevation. The legacy
+  `role` column is authoritative only while RBAC enforcement is off; with it on, an account is an administrator
+  when it holds the `Administrator` grant, so this query excludes both:
+
+  ```sql
+  SELECT u.username, u.role
+    FROM auth.users u
+   WHERE u.is_active AND u.mfa_enrolled_at IS NOT NULL AND u.role <> 'admin'
+     AND NOT EXISTS (SELECT 1 FROM rbac_store.principal_roles pr
+                      WHERE pr.principal_type = 'user' AND pr.principal_id = u.username
+                        AND pr.role_name = 'Administrator')
+   ORDER BY u.username;
   ```
 
 - Record the schema versions the previous build holds. You need them only if you restore (step 2):
@@ -544,19 +564,28 @@ the window is above 0, because creating a token is itself an ordinary step-up ro
   ```
 
   A build without this change records `auth` 2 and `session_store` 1.
-- Mint an administrator API token now and keep it (for ending sessions by hand and other administrator work while
-  the enrolled administrators are refused; it cannot reach the 2 factor-credential routes or approve, and
-  `yuzu-server --mfa-reset` needs a host shell, not a token).
+- Mint an administrator API token now and keep it, with a SHORT expiry (a day or two), and revoke it after step 5
+  (it is also a pre-cutover credential: do not leave it standing). It is for ending sessions by hand and other
+  administrator work while the enrolled administrators are refused; it cannot reach the 2 factor-credential routes or
+  approve, and `yuzu-server --mfa-reset` needs a host shell, not a token.
 - Decide the enforcement mode for the window. Under `--mfa-enforcement=optional` an account you reset is
-  password-only until someone enrols it again; `--mfa-enforcement=admin-only` makes each administrator enrol at
-  next sign-in, which closes that dip for the accounts that matter most (the flag is read at startup, so set it
-  in the unit file before step 3).
+  password-only until someone enrols it again (a CC6.6 dip you should record); `--mfa-enforcement=admin-only` makes
+  each administrator enrol at next sign-in, which closes that dip for the accounts that matter most. Recommended
+  for the window. The flag is read when the server starts (step 4); the reset command in step 3 does not read it.
+- Freeze user, role, SCIM, API-token and group changes from the moment you take the backup until you have decided
+  the cutover stands: a restore rolls back only the `auth` and `session_store` schemas, not `rbac_store` (role
+  grants), `scim_store`, `api_token_store` or `management_group_store`.
 - Under `--auth-mode=sso-only` with `--break-glass-user`, read "Break-glass account under `sso-only`" below
   before you reset anything.
 
-**Supported procedure for an existing deployment.**
+**Carry-over procedure for an existing deployment.** This guide's fresh-deployment contract (see "Deployment
+contract (hard cutover)" under the Forensics-tier note) says existing databases and backups from earlier builds are
+unsupported; this procedure is the one narrow exception, for the `auth` and `session_store` schemas of this change
+alone. It is not an upgrade path and widens nothing else.
 
-1. Stop every server replica.
+1. Stop every server replica, and keep them stopped until step 4. If a package install or upgrade restarts the
+   service on its own (the shipped unit has `Restart=on-failure`), stop and mask it for the duration
+   (`systemctl stop yuzu-server && systemctl mask yuzu-server`) and unmask it at step 4.
 2. Back up the `auth` and `session_store` schemas, and the keys directory with them, as a pair. The dump holds
    password hashes, session rows and envelope-encrypted TOTP secrets, so take it the way the runbook's
    [Backup - the KEK pairing rule](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule) block does:
@@ -571,43 +600,82 @@ the window is above 0, because creating a token is itself an ordinary step-up ro
      sudo -u _yuzu pg_dump "$YUZU_POSTGRES_DSN" --format=custom --schema=auth --schema=session_store \
        | sudo sh -c "umask 077; cat > /var/backups/yuzu/yuzu-$STAMP.dump" &&
      sudo sh -c "umask 077; tar -czf /var/backups/yuzu/yuzu-keys-$STAMP.tar.gz -C /etc/yuzu certs" ) &&
-     echo "OK: pair written to /var/backups/yuzu"
+     echo "OK: pair written to /var/backups/yuzu (STAMP=$STAMP)"
    ```
 
-   The Docker Compose and Windows forms are in the same runbook section; use them for those deployments and add the
-   same two `--schema` options to the `pg_dump` call. Go on only after `OK:` (or the form's own success line). This
-   cutover rotates no KEK, so the keys archive is the directory as it stands now.
+   Write the `STAMP` down: the restore below is usually run from a different shell. The shipped unit runs as the
+   `yuzu` account; use `sudo -u yuzu` where your service account is `yuzu` rather than `_yuzu`. The Docker Compose
+   and Windows backup forms are in the same runbook section; use them for those deployments and add the same two
+   `--schema` options to the `pg_dump` call. Go on only after `OK:` (or the form's own success line). This cutover
+   rotates no KEK, so the keys archive is the directory as it stands now.
 
    **Restoring this backup is the only way back, and it is a restore of the previous build's data, not a rollback.**
    A restore rolls credentials and sessions back to the dump (passwords, session rows, lockout state and MFA
-   enrolments return to that moment). Do **not** use `pg_restore --clean --if-exists` over the migrated schemas: the
-   two trigger functions the migrations create are not in the dump, so `DROP SCHEMA auth` and `DROP SCHEMA
-   session_store` fail (`pg_restore` exits non-zero), the old tables are not recreated cleanly, and
-   `public.schema_meta` keeps `auth` at 3 and `session_store` at 2, so a later start of the new build skips
+   enrolments return to that moment), and only the `auth` and `session_store` schemas: the role grants, SCIM,
+   API-token and group rows written after the cutover stay as they are. A grant for a user created after the dump
+   is orphaned, and a user later recreated with the same name inherits it; the audit rows for resets made after
+   the dump also stay (see the reconciliation note below). The sequence is written for bare-metal Linux; for Docker
+   Compose and Windows run the same SQL and `pg_restore` calls through the client form of the runbook's backup
+   section, and rehearse it on a scratch database first. Do **not** use `pg_restore --clean --if-exists` over the
+   migrated schemas: the two trigger functions the migrations create are not in the dump, so `DROP SCHEMA auth`
+   and `DROP SCHEMA session_store` fail (`pg_restore` exits non-zero), the old tables are not recreated cleanly,
+   and `public.schema_meta` keeps `auth` at 3 and `session_store` at 2, so a later start of the new build skips
    both migrations against tables that lack `mfa_factor_gen` and its trigger and refuses to boot. Use this
-   sequence instead, with every replica stopped (rehearse it on a scratch database first, and add the `--role` and
-   connection options your own backup recipe uses):
+   sequence instead, as root, with every replica stopped (add the `--role` and connection options your own
+   backup recipe uses). Set `STAMP`, `DUMP` and `KEYS` explicitly, check the target database by name, and
+   dry-run the drops before you run them:
 
    ```bash
+   : "${YUZU_POSTGRES_DSN:?set YUZU_POSTGRES_DSN}"
+   STAMP=<the STAMP you wrote down>
+   DUMP=/var/backups/yuzu/yuzu-$STAMP.dump
+   KEYS=/var/backups/yuzu/yuzu-keys-$STAMP.tar.gz
+   MIGRATED=/var/backups/yuzu/yuzu-migrated-$(date -u +%Y%m%dT%H%M%SZ).dump
+
+   # 1. The dump must exist and be readable BEFORE anything is dropped, and you must be on the right database.
+   test -r "$DUMP" && test -r "$KEYS" && pg_restore --list "$DUMP" >/dev/null &&
+     psql -At "$YUZU_POSTGRES_DSN" -c 'SELECT current_database()'
+   # Go on only if that printed the Yuzu database, and the pg_restore --list above printed nothing to stderr.
+
+   # 2. Dry run: ONE transaction, rolled back. Read the "drop cascades to ..." NOTICE lines; stop if they
+   #    name anything outside the auth and session_store schemas.
+   psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" <<'SQL'
+   BEGIN;
+   DROP SCHEMA auth CASCADE;
+   DROP SCHEMA session_store CASCADE;
+   ROLLBACK;
+   SQL
+
+   # 3. The real run, chained so that a failure stops it. First a dump of the migrated state, in case you
+   #    decide to go back to the new build.
+   ( umask 077; pg_dump "$YUZU_POSTGRES_DSN" --format=custom --schema=auth --schema=session_store \
+       -f "$MIGRATED" ) &&
    psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" \
      -c "DROP SCHEMA IF EXISTS auth CASCADE;" \
-     -c "DROP SCHEMA IF EXISTS session_store CASCADE;"
-   pg_restore --no-owner --exit-on-error --dbname="$YUZU_POSTGRES_DSN" /var/backups/yuzu/yuzu-$STAMP.dump
+     -c "DROP SCHEMA IF EXISTS session_store CASCADE;" &&
+   pg_restore --single-transaction --no-owner --exit-on-error --dbname="$YUZU_POSTGRES_DSN" "$DUMP" &&
    psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" \
      -c "UPDATE public.schema_meta SET version = 2 WHERE store = 'auth';" \
-     -c "UPDATE public.schema_meta SET version = 1 WHERE store = 'session_store';"
+     -c "UPDATE public.schema_meta SET version = 1 WHERE store = 'session_store';" \
+     -c "DELETE FROM session_store.sessions;" &&
+   tar -xzpf "$KEYS" -C /etc/yuzu &&
+   echo "OK: restored; the previous build can be started"
    ```
 
    `CASCADE` removes only the objects inside those two schemas (the tables and the two functions
-   `auth.users_mfa_factor_gen()` and `session_store.sessions_mfa_rebind_guard()`, with their triggers); read the
-   `NOTICE` lines it prints, and stop if it names anything outside them. Use the two version numbers you recorded
-   before the cutover if they differ from 2 and 1. Without the `UPDATE` statements the restored tables would sit
-   under `schema_meta` rows that still say 3 and 2. Then restore the keys archive from the same pair, start the
-   previous build, and follow the runbook's [restore steps](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule)
-   ("A restore rolls credentials and sessions back to the dump": end every session, re-apply password changes, check
-   both MFA binding triggers) and its
-   [Post-restore verification](../ops-runbooks/auth-db-recovery.md#post-restore-verification). Starting this
-   build again afterwards re-runs the two migrations from the restored versions.
+   `auth.users_mfa_factor_gen()` and `session_store.sessions_mfa_rebind_guard()`, with their triggers). Use the
+   two version numbers you recorded before the cutover if they differ from 2 and 1; without the `UPDATE`
+   statements the restored tables would sit under `schema_meta` rows that still say 3 and 2. The `DELETE` ends
+   every session: the restored rows (including ones that were revoked after the dump was taken) would otherwise
+   be valid until you end them by hand; run it now, with the replicas stopped, before the previous build starts.
+   The `tar` command restores the keys directory from the same pair (`certs` under `/etc/yuzu`, ownership and
+   modes kept). Then start the previous build (the binary or image you kept), and follow the runbook's
+   [restore steps](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule) ("A restore rolls credentials
+   and sessions back to the dump": re-apply password changes, notify users whose MFA enrolment came back) and run
+   only the checks of its [Post-restore verification](../ops-runbooks/auth-db-recovery.md#post-restore-verification)
+   that apply to the previous build: expect `auth` 2 and `session_store` 1, no binding trigger and no binding
+   gauge there. The dump has no binding triggers, so there is nothing to check for them on the previous-build path.
+   Starting the new build again afterwards re-runs the two migrations from the restored versions.
 3. Install the new build but do not start any replica yet, then run `yuzu-server --mfa-reset <user>` on the host
    for each enrolled operator, administrators first. This works before any replica has served: the command opens
    the auth store itself (which applies the `auth` v3 migration) and applies the `session_store` v2 migration before
@@ -615,39 +683,57 @@ the window is above 0, because creating a token is itself an ordinary step-up ro
    reset migrates the database, so from that point the previous build can no longer be started without the
    restore in step 2, and a reset ends that account's sessions. The command takes one user per run, needs a host
    shell, the Postgres DSN and the keys directory (`docs/ops-runbooks/auth-db-recovery.md`, "The `--mfa-reset` CLI
-   (audited)"), and an affected user cannot recover on their own. For many accounts:
+   (audited)"), and an affected user cannot recover on their own. `yuzu-server --mfa-reset ""` does not reset
+   anything: it starts a full server, so guard every single-user call with `[ -n "$u" ]` as the loop does. For
+   many accounts, run this in a root shell (the loop writes its failures to a file under the backup directory):
 
    ```bash
-   psql -At "$YUZU_POSTGRES_DSN" -c \
-     "SELECT username FROM auth.users WHERE mfa_enrolled_at IS NOT NULL AND is_active ORDER BY username;" |
+   STAMP=<the STAMP from step 2>   # unset in a new shell
+   FAILED_LOG=/var/backups/yuzu/mfa-reset-failed-$STAMP.txt
+   BG="${BREAKGLASS_USER:-}"   # set to the --break-glass-user name under --auth-mode=sso-only, else leave empty
+   users=$(psql -At -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" -c \
+     "SELECT username FROM auth.users WHERE mfa_enrolled_at IS NOT NULL AND is_active ORDER BY username;") ||
+     echo "QUERY FAILED: no account was reset" | tee -a "$FAILED_LOG"
    while read -r u; do
-     [ -n "$u" ] || continue    # an empty --mfa-reset value does not reset anything: it starts the server
+     [ -n "$u" ] || continue                        # an empty --mfa-reset value starts the server
+     [ -n "$BG" ] && [ "$u" = "$BG" ] && continue   # the break-glass account is handled below
      sudo -u _yuzu yuzu-server --config /etc/yuzu/yuzu-server.cfg --postgres-dsn "$YUZU_POSTGRES_DSN" \
-       --ca-dir /etc/yuzu/certs --mfa-reset "$u" < /dev/null || echo "FAILED: $u"
-   done
+       --ca-dir /etc/yuzu/certs --mfa-reset "$u" < /dev/null || echo "FAILED: $u" | tee -a "$FAILED_LOG"
+   done <<< "$users"
    ```
 
-   Exclude the break-glass account from this loop if it is covered below. A deactivated enrolled account is skipped
-   by the query on purpose: the command refuses it (`user '<name>' not found`), so reset it after it is
-   reactivated. Leave the list of `FAILED:` lines for step 5.
-4. Start the new build. The migrations run at the first start if step 3 did not already apply them, and seed
+   Set `BREAKGLASS_USER` before you run it under `sso-only`. A deactivated enrolled account is skipped by the
+   query on purpose: the command refuses it (`user '<name>' not found`), so reset it after it is reactivated. The
+   `FAILED:` lines (and a `QUERY FAILED` line) are kept in `$FAILED_LOG` for step 5; a clean run prints none.
+4. Start the new build (unmask the service first if you masked it). Set `--mfa-enforcement` now (the server reads
+   it at this start). The migrations run at the first start if step 3 did not already apply them, and seed
    nothing. The user enrols again at next sign-in only under `--mfa-enforcement=required`, or `admin-only` for an
-   administrator; under `optional` nobody is made to, and under `admin-only` a non-admin is not.
-5. Run the post-start check, which lists the enrolled accounts that still read generation `0` (it must be empty;
-   anything listed is refused `503` until you run `--mfa-reset` for it), and list the active accounts that have no
-   enrolled factor, so you can see which administrators are password-only until they enrol:
+   administrator; under `optional` nobody is made to, and under `admin-only` a non-admin is not (see the
+   non-admin list above).
+5. Run the post-start check, which lists the active enrolled accounts that still read generation `0` (it must be
+   empty; anything listed is refused `503` until you run `--mfa-reset` for it; deactivated accounts are excluded
+   because the reset command refuses them), and list the active accounts that have no enrolled factor, so you can
+   see which are password-only until they enrol (the `role` column is the legacy value, authoritative only while
+   RBAC enforcement is off; `holds_admin_grant` is the RBAC grant):
 
    ```sql
-   SELECT username FROM auth.users WHERE mfa_enrolled_at IS NOT NULL AND mfa_factor_gen <= 0;
-   SELECT username, role FROM auth.users WHERE is_active AND mfa_enrolled_at IS NULL ORDER BY username;
+   SELECT username FROM auth.users WHERE is_active AND mfa_enrolled_at IS NOT NULL AND mfa_factor_gen <= 0;
+   SELECT u.username, u.role,
+          EXISTS (SELECT 1 FROM rbac_store.principal_roles pr
+                   WHERE pr.principal_type = 'user' AND pr.principal_id = u.username
+                     AND pr.role_name = 'Administrator') AS holds_admin_grant
+     FROM auth.users u WHERE u.is_active AND u.mfa_enrolled_at IS NULL ORDER BY u.username;
    ```
+
+   Then revoke the administrator API token you minted before the cutover.
 
 Until a reset has been done for an account, the 37 step-up routes (approve and reject included) and the 3 JIT-elevation
 routes answer `503` (audit `reason=mfa_proof_unavailable`) for it, the 35 ordinary rows only while `--mfa-step-up-window-secs` is
 above 0 (at 0 they pass without reading the store). After the cutover, reconcile the `mfa.reset.breakglass` rows
 against the `mfa.enroll.verified` rows per operator. This lists every operator with a reset and no enrolment since
 (expected under `optional`; under `required`, or `admin-only` for an administrator, it should empty as people sign
-in):
+in; after a restore it also lists operators whose reset rows remain in the audit store although their enrolments
+came back with the restored `auth` schema):
 
 ```sql
 SELECT r.target_id AS operator, to_timestamp(max(r.timestamp)) AT TIME ZONE 'UTC' AS last_reset_utc
@@ -661,16 +747,26 @@ SELECT r.target_id AS operator, to_timestamp(max(r.timestamp)) AT TIME ZONE 'UTC
 
 **Break-glass account under `sso-only`.** With `--auth-mode=sso-only` and an enrolled `--break-glass-user`, the
 server checks at every start that the break-glass account exists, is active and carries a second factor, and
-refuses to boot otherwise (`--break-glass-user='<name>' is invalid under --auth-mode=sso-only: ...`). Resetting
+refuses to boot otherwise. It logs `--break-glass-user='<name>' is invalid under --auth-mode=sso-only: <why>. Fix the
+account (create it / enroll MFA) or correct the flag - refusing to start with an unusable break-glass account.` and
+exits non-zero; the log does not mention the way back, which is the standard-mode re-enrolment in
+`docs/ops-runbooks/auth-db-recovery.md`, "Break-glass arm (IdP outage under `--auth-mode=sso-only`)". Resetting
 that account therefore makes the next start under `sso-only` refuse to boot, and the only way to enrol it again is
-a restart under `--auth-mode=standard` (`docs/ops-runbooks/auth-db-recovery.md`, "Break-glass arm (IdP outage
-under `--auth-mode=sso-only`)"), which turns local-password sign-in back on for every local account. Choose one:
+a restart under `--auth-mode=standard`. Choose one:
 
-- **Reset it, in this order, and time-box the window.** Reset the account (step 3), start the new build under
-  `--auth-mode=standard` with the listener restricted (see the runbook), sign in as the break-glass account and
-  enrol it (sign-in enrols it under `--mfa-enforcement=required`; otherwise use Settings, which needs the
-  administrator role), then restart under `--auth-mode=sso-only`. Do not start under `sso-only` between the reset
-  and the enrolment.
+- **Reset it, in this order, and time-box the window.** Do this while the identity provider is healthy (the
+  break-glass account exists for an IdP outage; do not take it out during one). Reset the account by hand once the step 3 loop has finished
+  (`yuzu-server --mfa-reset '<name>'`), then start the new build
+  under `--auth-mode=standard`, sign in as the break-glass account and enrol it, then restart under
+  `--auth-mode=sso-only`. Do not start under `sso-only` between the reset and the enrolment. Keep the standard-mode
+  window to hours, not days, a single maintenance window. While it lasts: local-password sign-in is back on for
+  every local account; bind the listener to loopback (`--web-address 127.0.0.1`, or restrict the published port in a
+  container) and expect lockouts, because the break-glass lockout exemption does not apply in standard mode; the
+  mode switch writes no audit row, so record the window in the change ticket (CC6.6 evidence); and a break-glass
+  account that is not an administrator needs `--mfa-enforcement=required` for that restart, which applies to every
+  user (un-enrolled local users are enrolled at login, and SSO users whose IdP sends no MFA `amr` cannot pass
+  step-up). Under `required` the sign-in itself enrols; otherwise enrol under Settings, which needs the
+  administrator role. The full procedure is in the runbook section named above.
 - **Leave it out of the reset step.** The new build boots under `sso-only` (the account still carries a factor),
   and the account can still sign in during an IdP outage, but at generation `0` it is refused `503` on the 37
   step-up routes and the 3 elevation routes, so it can do little that is privileged until it is reset later in a
@@ -695,15 +791,26 @@ such bypass.
 
 **What you will see.**
 
-- **An enrolled operator gets `503` where they used to be asked for a code.** On the step-up routes, approve and
-  reject, and JIT elevation, the dashboard shows a toast and a REST caller gets `503` with the message "this
-  account's second-factor state cannot be verified" (and no `retry_after_ms`); the `mfa.step_up.required` audit row
-  carries `reason=mfa_proof_unavailable` and `yuzu_auth_secret_unavailable_total{route="mfa_binding"}` rises. The
-  cause is the cutover: the account still reads factor generation `0` (the post-start query in step 5 lists it).
-  Retrying does not help; run `yuzu-server --mfa-reset <user>` on the host. The same toast and token also appear
-  when a binding trigger is not in force (`reason=mfa_binding_unenforced` for the account store) or the session
-  store is faulty; the `yuzu_auth_mfa_binding_enforcement_ok` gauge tells those apart (below). A `503`
-  whose message is "authentication store is temporarily unavailable" is the transient one.
+- **An enrolled operator gets `503` where they used to be asked for a code.** On the step-up routes and JIT
+  elevation, the dashboard shows a toast and a REST caller gets `503` with the message "this account's
+  second-factor state cannot be verified" (`mfa_step_up_required: false`, no `retry_after_ms`, and a remediation
+  that names the MFA binding enforcement runbook); the `mfa.step_up.required` audit row carries
+  `reason=mfa_proof_unavailable` and `yuzu_auth_secret_unavailable_total{route="mfa_binding"}` rises. Approve and
+  reject answer that central message only while `--mfa-step-up-window-secs` is above 0; at 0 the approver rule
+  answers with its own message, "the approver's MFA binding cannot be verified, so the decision was not recorded"
+  (or "the approver's MFA state could not be read, so the decision was not recorded", with a retry hint, when the
+  cause is transient), and an `approver_assurance:mfa_store_unavailable` audit row. The message does not say
+  whether the cause is permanent. It is persistent for a pre-cutover (generation 0) account, which is the expected
+  cause right after the cutover (the post-start query in step 5 lists it; then run `yuzu-server --mfa-reset <user>`
+  on the host) and for a binding trigger that is not in force (`reason=mfa_binding_unenforced` for the account
+  store). It is transient for a failed read, an inconclusive trigger validation (the `binding_inconclusive` latch,
+  which clears on the next valid check) or an unusable database clock reading. The audit `reason=` token and the
+  server log (a warning is logged once per inconclusive episode) tell the causes apart; the
+  `yuzu_auth_mfa_binding_enforcement_ok` gauge shows only the sticky trigger case (it still reads 1 while the
+  latch is set, and only `YuzuStepUpGateUnavailable` fires), and the step 5 query shows only generation-0
+  accounts. Retry once; if it persists, follow the runbook, and do not run `--mfa-reset` for an account on the
+  strength of this message alone. A `503` whose message is "authentication store is temporarily unavailable" is
+  the plain transient one.
 - **Clearing a factor is one transaction.** `yuzu-server --mfa-reset` and Disable in Settings clear the
   factor, delete the recovery codes, end every session of the account and write the audit row together
   (`MfaDisableOwner`); a failed audit write rolls the whole clear back, so the Settings Disable is
@@ -958,7 +1065,7 @@ The same tier is applied wherever the server reads those rows for a reason other
 
 The filter works per plugin because only the `plugin` name is stored with a row; no plugin with both Forensics and ordinary actions exists today. The tier is per plugin, not per kind of data: other plugins can return comparable information under their own securables (for example file, registry, WMI or event-log reads), and their stored rows remain governed by `Response:Read` as before.
 
-**Deployment contract (hard cutover).** This release supports initial deployment into a fresh database with no data imported from earlier builds. Existing databases and backups from earlier builds are unsupported. Every server writer and serving replica must run the new build. Earlier binaries must have no access to the new deployment's database. Restarts, additional replicas and recovery may reuse data created entirely within this deployment contract. Recovery means rolling forward on the new build, or restoring this build's own backups into a fresh deployment; a database or backup written by an earlier build is unsupported. The executable does not enforce this: it does not verify the provenance of the database it opens and it cannot keep an earlier binary away from it. Provisioning a fresh database and excluding earlier binaries from it are deployment responsibilities. Data written by earlier builds is outside the supported population: this section describes no upgrade path, no operation alongside earlier builds and no return to an earlier build, and makes no statement about what an earlier build stored. An earlier binary has no Forensics tier, so pointing one at this deployment's database would let every holder of `Response:Read` read these rows again, and the executable cannot prevent it. Notification history is served as stored (there is no read-time scrub and no retention bound), so a database carried forward from an earlier build would expose earlier failure text through the notification list to a holder of `Infrastructure:Read`, and nothing in the executable detects such a database. Test environments follow the same rule: because this release is a fresh-deployment cutover, any pre-release upgrade test (the `/test` skill's Phase 2, which upgrades the previous release's database to HEAD) must run against a freshly provisioned database, and standing rigs (the 3-env stack, a home server, a shared test PostgreSQL, long-lived agent hosts) must be reprovisioned fresh before they are pointed at this build. The contract is a scope decision of the project owner, 2026-10-24 (no upgrade path is provided); it is not an acceptance of any residual risk, and it is procedural, not enforced by the executable.
+**Deployment contract (hard cutover).** This release supports initial deployment into a fresh database with no data imported from earlier builds. Existing databases and backups from earlier builds are unsupported (the only exception is the carry-over procedure for the MFA factor-binding cutover near the top of this guide, which covers the `auth` and `session_store` schemas of that one change and nothing else). Every server writer and serving replica must run the new build. Earlier binaries must have no access to the new deployment's database. Restarts, additional replicas and recovery may reuse data created entirely within this deployment contract. Recovery means rolling forward on the new build, or restoring this build's own backups into a fresh deployment; a database or backup written by an earlier build is unsupported. The executable does not enforce this: it does not verify the provenance of the database it opens and it cannot keep an earlier binary away from it. Provisioning a fresh database and excluding earlier binaries from it are deployment responsibilities. Data written by earlier builds is outside the supported population: this section describes no upgrade path, no operation alongside earlier builds and no return to an earlier build, and makes no statement about what an earlier build stored. An earlier binary has no Forensics tier, so pointing one at this deployment's database would let every holder of `Response:Read` read these rows again, and the executable cannot prevent it. Notification history is served as stored (there is no read-time scrub and no retention bound), so a database carried forward from an earlier build would expose earlier failure text through the notification list to a holder of `Infrastructure:Read`, and nothing in the executable detects such a database. Test environments follow the same rule: because this release is a fresh-deployment cutover, any pre-release upgrade test (the `/test` skill's Phase 2, which upgrades the previous release's database to HEAD) must run against a freshly provisioned database, and standing rigs (the 3-env stack, a home server, a shared test PostgreSQL, long-lived agent hosts) must be reprovisioned fresh before they are pointed at this build. The contract is a scope decision of the project owner, 2026-10-24 (no upgrade path is provided); it is not an acceptance of any residual risk, and it is procedural, not enforced by the executable.
 
 **Leftover enrollment files (added 2026-10-30 as a hazard disclosure; not part of the owner's decision above).** The statement above that no data is imported from earlier builds has an exception for two files. The server keeps one import record per file kind (tokens, pending agents), holding a SHA-256 of the file. At a boot where there is no record for that kind (a fresh database, or one restored from a dump taken before the first import), it imports `enrollment-tokens.cfg` and `pending-agents.cfg` from `--data-dir`, or from the directory holding `yuzu-server.cfg` when `--data-dir` has no copy, without checking where they came from; a copy in the other directory is never imported but stays in place, so remove it too. Where a record exists, an identical file is skipped and a different file (for example one restored with an older data directory) is refused, not merged: the server logs `[enrollment-import] ... DIFFERS from the file that was already imported` at CRITICAL, writes an `enrollment.import` audit row with `result=warning`, counts `yuzu_server_enrollment_import_total{outcome="fingerprint_mismatch"}` and leaves the file in place; remove or archive it. A file that exists but cannot be read stops the server from starting. Imported tokens (with their `max_uses`, `use_count`, `expires` and `revoked` state) and approved pending agents are live credentials. Before the first boot of a fresh deployment, confirm both files are absent from both directories; a fresh database is not enough if the data directory is reused. Also look for their `.imported` renames: the server never reads those again, but they show that an import happened. The directories are: for the Docker image and the reference compose files, `/var/lib/yuzu` (the `<project>_server-data` volume); for the packaged Linux service, `/var/lib/yuzu` and `/etc/yuzu`; for the Windows installer, `%ProgramData%\Yuzu Server` and `%ProgramData%\Yuzu Server\data`. To find out whether an import already happened, look for the log line `[enrollment-import] ONE-TIME import of legacy ...`, an `enrollment.import` audit row (`source=<path>` in the detail), the counter `yuzu_server_enrollment_import_total{outcome="imported"}` (per process, so it resets on restart), and rows whose `created_by` or `status_changed_by` is `legacy-import`. The audit row, the `legacy-import` rows and the import record are stored in the database, so a database restored from a dump taken before the import contains none of them; the `.imported` renames and the server log are on the host and are not rolled back by a restore. With several server replicas on one database, check the directories on every replica. To undo an import, revoke the imported tokens with `DELETE /api/settings/enrollment-tokens/{id}` and deny any imported agent that is still `pending` (`POST /api/settings/pending-agents/{id}/deny`). An imported agent that was already `approved` cannot be denied or removed through the dashboard or the REST API (both answer `409`), is listed nowhere, and registers without an enrollment token; there is no supported way to remove one. Treat a deployment that imported approved agents as one whose enrollment state you cannot trust, and redeploy from a fresh database and empty directories. Removing the rows in SQL (`auth.pending_agents`, `status_changed_by = 'legacy-import'`) is outside the supported surface and unaudited.
 

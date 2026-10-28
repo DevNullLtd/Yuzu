@@ -1027,48 +1027,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      records it; like the entries above it is not a separately signed
      decision.
 
-  - **2026-10-24 - MFA factor binding ships as a hard cutover (scope exception
-    recorded by the maintainer, #6079 PR 2).** The factor-generation binding
-    (`auth` schema v3, `session_store` schema v2) is introduced with no upgrade
-    path: an account that was already enrolled reads factor generation `0`, and
-    every gate that compares a proof with the factor refuses it. This entry
-    supersedes the operator wording of the 2026-10-28 mixed-version entry below,
-    which described a rolling-upgrade window; this build has no such window, and
-    mixed-version operation is unsupported. Operator wording:
-    `docs/user-manual/upgrading.md`, the MFA cutover section.
-    - **Conditions of this exception.** There is no upgrade path and no
-      rollback of the migrations; the only way back is restoring the backup
-      taken before the cutover (a restore of the previous build's data, not an
-      undo of the migrations). Enrolled operators are refused `503`
-      `mfa_proof_unavailable` on the 37 step-up routes (approve and reject
-      included) and on the 3 JIT-elevation routes until `yuzu-server --mfa-reset
-      <user>` has been run for them from a host shell, which needs the Postgres
-      DSN and the keys directory, so an affected operator cannot recover alone.
-      After the cutover the operator reconciles the `mfa.reset.breakglass` rows
-      against the `mfa.enroll.verified` rows per operator (the query is in
-      `upgrading.md`). These controls are customer-operated: Yuzu neither
-      enforces nor evidences them.
-    - **Acceptance.** Acceptor: Dave Rae (maintainer). Ruling date: 2026-10-24.
-      Ruling source: the maintainer's ruling in the #6079 working session that
-      the change ships as a hard cutover. As with the entries above, this is a
-      working-session statement, not a signed decision. The acceptor is also the
-      committer of the change that introduces this entry, so independent review
-      of this acceptance rests on the pull request review (expected, not
-      enforced by tooling), not on a second approver.
-    - **Residual exposure.** Until each enrolled operator is reset, approvals
-      and JIT elevation are unavailable to that operator (an availability cost,
-      not a bypass). A reset account is password-only until it enrols again
-      under `--mfa-enforcement=optional`, so MFA coverage drops for the window.
-      Under `--auth-mode=sso-only` the break-glass account cannot be reset
-      without a time-boxed restart under `--auth-mode=standard`. No
-      minimum-version check exists, so nothing stops an earlier binary being
-      pointed at a migrated database; such a binary does not run the new gate.
-    - **Revisit** when an in-product re-enrolment path for a reset operator
-      exists, or when a minimum-version admission check exists, whichever comes
-      first. No calendar date is set.
-
     - **2026-10-28 - mixed-version admission during a rolling upgrade (scope
-      exception recorded by the maintainer, #6079).** The approver gate
+      exception recorded by the maintainer, #6079; superseded by the
+      2026-10-29 entry below, which ships the change as a hard cutover with no
+      rolling window).** The approver gate
       (`require_enrolled_fresh_mfa`) runs on each server replica and no
       minimum-version check exists. While a rolling upgrade is in progress, or
       after a replica is rolled back, a replica that predates the gate can admit
@@ -1088,8 +1050,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        ticket (SOC 2 CC8.1) as the roll happens, because the audit row does not
        name the replica, and keeps the load balancer log for the window. The
        marker query in `upgrading.md` lists the decisions in the window that
-       carry no marker. Those controls are customer-operated: Yuzu neither
-       enforces nor evidences them.
+       carry no marker (this Condition is superseded: the marker query was
+       removed from `upgrading.md` with the cutover entry below, and no
+       rolling window exists to query). Those controls are customer-operated:
+       Yuzu neither enforces nor evidences them.
      - **Acceptance.** Acceptor: Dave Rae (maintainer). Date: 2026-10-28. Ruling
        source: the maintainer's answer during the #6079 PR 1 governance working
        session, given after the governance ledger raised this as finding UP-9.
@@ -1124,6 +1088,70 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      surface; the migration guide (`docs/user-manual/upgrading.md`) lists the
      old and new names. The ledger records the retirement because the policy
      requires it.
+
+  - **2026-10-29 (ruling of 2026-10-24) - MFA factor binding ships as a hard
+    cutover (#6079 PR 2).**
+    **STATUS: DRAFT, not accepted until the maintainer approves it.**
+    The factor-generation binding (`auth` schema v3, `session_store` schema v2)
+    is introduced with no upgrade path: an account that was already enrolled
+    reads factor generation `0`, and every gate that compares a proof with the
+    factor refuses it. This entry supersedes the operator wording of the
+    2026-10-28 mixed-version entry above, which described a rolling-upgrade
+    window; this build has no such window, and mixed-version operation is
+    unsupported. Operator wording: `docs/user-manual/upgrading.md`, the MFA
+    cutover section. The maintainer's recorded ruling of 2026-10-24 covers one
+    thing only: shipping #6079 as a hard cutover with no upgrade path. It does
+    NOT cover the residual exposures listed below (enrolled operators refused
+    until a host-shell reset, the password-only dip, the sso-only break-glass
+    trap, no minimum-version check), and it does not cover the carry-over
+    procedure or the restore sequence in `upgrading.md`; those are PROPOSED
+    extensions, put forward with this draft for the maintainer to accept,
+    amend or strike.
+    - **Conditions of this exception (proposed).** There is no upgrade path and
+      no rollback of the migrations; the only way back is restoring the backup
+      taken before the cutover (a restore of the previous build's data, not an
+      undo of the migrations). Enrolled operators are refused `503`
+      (`mfa_proof_unavailable`) until `yuzu-server --mfa-reset <user>` has been
+      run for them from a host shell, which needs the Postgres DSN and the keys
+      directory, so an affected operator cannot recover alone. The refusal
+      applies to the step-up routes as follows: the 35 ordinary rows (approve
+      and reject among them) refuse only while `--mfa-step-up-window-secs` is
+      above 0, whereas approve and reject, the 2 factor-credential routes and
+      the 3 JIT-elevation routes refuse regardless of the window. After the
+      cutover the operator reconciles the `mfa.reset.breakglass` rows against
+      the `mfa.enroll.verified` rows per operator (the query is in
+      `upgrading.md`). These controls are customer-operated: Yuzu neither
+      enforces nor evidences them. No MCP tool may twin
+      `/api/settings/mfa/recovery-codes` or `/api/settings/mfa/disable` until
+      the MCP step-up table gains a local-session-only class; the build refuses
+      such a twin (`step_up_mcp_policy.hpp`: a twin of those rows cannot be
+      declared `kExempt`, cannot join the second list because that list
+      requires a `kRequired` REST twin, and a new baseline `kPendingRuling` row
+      exceeds `kMcpPendingBaselineMax`, which equals the frozen baseline and
+      only goes down).
+    - **Acceptance.** Acceptor: Dave Rae (maintainer). Ruling date:
+      2026-10-24; entry authored 2026-10-29. Ruling source: the maintainer's
+      ruling in the #6079 working session that the change ships as a hard
+      cutover. The ruling is accepted for that scope only. Acceptance of the
+      Conditions and the Residual exposure is NOT YET GIVEN: they are put
+      forward by this draft. As with the entries above, the ruling is a
+      working-session statement, not a signed decision. The acceptor is also
+      the committer of the change that introduces this entry, so independent
+      review of this acceptance rests on the pull request review (expected, not
+      enforced by tooling), not on a second approver.
+    - **Residual exposure (proposed for acceptance).** Until each enrolled
+      operator is reset, approvals and JIT elevation are unavailable to that
+      operator (an availability cost, not a bypass). A reset account is
+      password-only until it enrols again under `--mfa-enforcement=optional`,
+      so MFA coverage drops for the window. Under `--auth-mode=sso-only` the
+      break-glass account cannot be reset without a time-boxed restart under
+      `--auth-mode=standard`. No minimum-version check exists, so nothing stops
+      an earlier binary being pointed at a migrated database; such a binary
+      does not run the new gate.
+    - **Revisit** when an in-product re-enrolment path for a reset operator
+      exists, or when a minimum-version admission check exists, whichever comes
+      first, and in any case at the monthly review at the end of November 2026
+      (by 2026-11-30).
 
 ## Interim rules (until the named follow-ups ship)
 
