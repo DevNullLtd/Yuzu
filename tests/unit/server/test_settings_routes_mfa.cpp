@@ -895,17 +895,17 @@ TEST_CASE("POST /api/settings/mfa/disable ends EVERY session of the account, the
     // session-bound writer: record what that writer is handed.
     std::string bound_user, bound_role, bound_action, bound_result;
     std::vector<std::string> bound_results;
-    h.routes.set_audit_as_session_fn(
-        [&](const httplib::Request&, const auth::Session& s, const std::string& role,
-            const std::string& action, const std::string& result, const std::string&,
-            const std::string&, const std::string&) {
-            bound_user = s.username;
-            bound_role = role;
-            bound_action = action;
-            bound_result = result;
-            bound_results.push_back(result);
-            return true;
-        });
+    h.routes.set_audit_as_session_fn([&](const httplib::Request&, const auth::Session& s,
+                                         const std::string& role, const std::string& action,
+                                         const std::string& result, const std::string&,
+                                         const std::string&, const std::string&) {
+        bound_user = s.username;
+        bound_role = role;
+        bound_action = action;
+        bound_result = result;
+        bound_results.push_back(result);
+        return true;
+    });
 
     auto res = h.sink.dispatch("POST", "/api/settings/mfa/disable", {},
                                "application/x-www-form-urlencoded",
@@ -956,9 +956,9 @@ TEST_CASE("POST /api/settings/mfa/disable reports a failed session delete and au
 
     // The factor clear commits first, so a session store that cannot delete leaves the factor
     // cleared and the sessions alive: the response must say so and must not redirect.
-    yuzu::test::SqlFault fault(
-        h.auth_db.pool(), "ALTER TABLE session_store.sessions RENAME TO sessions_gone",
-        "ALTER TABLE session_store.sessions_gone RENAME TO sessions");
+    yuzu::test::SqlFault fault(h.auth_db.pool(),
+                               "ALTER TABLE session_store.sessions RENAME TO sessions_gone",
+                               "ALTER TABLE session_store.sessions_gone RENAME TO sessions");
     fault.arm();
     auto res = h.sink.dispatch("POST", "/api/settings/mfa/disable", {},
                                "application/x-www-form-urlencoded",
@@ -1133,9 +1133,8 @@ TEST_CASE("POST /api/settings/mfa/disable refuses to clear when the intent audit
 
     std::vector<std::string> results;
     h.routes.set_audit_as_session_fn(
-        [&](const httplib::Request&, const auth::Session&, const std::string&,
-            const std::string&, const std::string& result, const std::string&,
-            const std::string&, const std::string&) {
+        [&](const httplib::Request&, const auth::Session&, const std::string&, const std::string&,
+            const std::string& result, const std::string&, const std::string&, const std::string&) {
             results.push_back(result);
             return false; // the audit store rejects every row
         });
@@ -1184,9 +1183,8 @@ TEST_CASE("POST /api/settings/mfa/disable logs a lost outcome audit row and stil
 
     std::vector<std::string> results;
     h.routes.set_audit_as_session_fn(
-        [&](const httplib::Request&, const auth::Session&, const std::string&,
-            const std::string&, const std::string& result, const std::string&,
-            const std::string&, const std::string&) {
+        [&](const httplib::Request&, const auth::Session&, const std::string&, const std::string&,
+            const std::string& result, const std::string&, const std::string&, const std::string&) {
             results.push_back(result);
             return result == "attempted"; // the intent row lands, the outcome row does not
         });
@@ -1221,7 +1219,8 @@ TEST_CASE("settings: server.cpp binds the session-bound audit writer to AuthRout
           "[mfa][settings]") {
     // Comments are stripped first: a commented-out binding must not satisfy the pin (#6079).
     const std::string& src = yuzu::test::source_scan::comment_free_source("server.cpp");
-    CHECK(src.find("settings_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn())") !=
+    CHECK(src.find(
+              "settings_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn())") !=
           std::string::npos);
 }
 

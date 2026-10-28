@@ -1515,14 +1515,14 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
     auto lease = acquire_with_retry(impl_->pool, kReadTimeout); // #2396 transient-blip ride-out
     if (!lease)
         return std::unexpected(AuthDBError::StoreBusy);
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT id, encode(mfa_totp_secret, 'hex'), (mfa_enrolled_at IS NOT NULL), "
-        "COALESCE((mfa_enrolled_at AT TIME ZONE 'UTC')::text, ''), "
-        "COALESCE((mfa_disabled_at AT TIME ZONE 'UTC')::text, ''), "
-        "COALESCE((extract(epoch from mfa_enrolled_at)*1000)::bigint, 0) "
-        "FROM auth.users WHERE username = $1 AND is_active = TRUE",
-        std::vector<std::string>{username});
+    pg::PgResult res =
+        pg::exec_params(lease.get(),
+                        "SELECT id, encode(mfa_totp_secret, 'hex'), (mfa_enrolled_at IS NOT NULL), "
+                        "COALESCE((mfa_enrolled_at AT TIME ZONE 'UTC')::text, ''), "
+                        "COALESCE((mfa_disabled_at AT TIME ZONE 'UTC')::text, ''), "
+                        "COALESCE((extract(epoch from mfa_enrolled_at)*1000)::bigint, 0) "
+                        "FROM auth.users WHERE username = $1 AND is_active = TRUE",
+                        std::vector<std::string>{username});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(AuthDBError::QueryFailed);
     if (PQntuples(res.get()) == 0)

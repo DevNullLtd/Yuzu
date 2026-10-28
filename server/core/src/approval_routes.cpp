@@ -197,8 +197,8 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
     // The approver gate (#6079) is stricter than the generic step-up above and does not
     // replace it: the pass the central check armed is consumed by the call above, and this
     // check then requires an ENROLLED factor with a proof no older than the approver window.
-    const auto mfa = deps.approver_mfa_fn(req, res, *session,
-                                          std::string("POST /api/approvals/{id}/") + verb);
+    const auto mfa =
+        deps.approver_mfa_fn(req, res, *session, std::string("POST /api/approvals/{id}/") + verb);
     using MfaKind = ApproverMfaOutcome::Kind;
     switch (mfa.kind) {
     case MfaKind::kPass:
@@ -207,13 +207,12 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
         // The gate wrote the 401 step-up envelope; add the ticket-specific evidence row.
         (void)detail::emit_behavioral_audit(
             deps.audit_fn, req, res, audit_action, "denied", "approval", audit_id,
-            "approver_assurance:" +
-                std::string(approval::approver_refusal_reason(
-                    approval::ApproverRefusal::kMfaProofStale)));
+            "approver_assurance:" + std::string(approval::approver_refusal_reason(
+                                        approval::ApproverRefusal::kMfaProofStale)));
         return;
     case MfaKind::kStoreUnavailable:
-        spdlog::error("approval {} refused: reviewer={} MFA state unreadable (fail closed)",
-                      verb, log_safe(session->username));
+        spdlog::error("approval {} refused: reviewer={} MFA state unreadable (fail closed)", verb,
+                      log_safe(session->username));
         (void)detail::emit_behavioral_audit(deps.audit_fn, req, res, audit_action, "error",
                                             "approval", audit_id,
                                             "approver_assurance:mfa_store_unavailable");

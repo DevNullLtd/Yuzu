@@ -7093,10 +7093,10 @@ void SettingsRoutes::register_routes(
                       res.set_header("HX-Trigger",
                                      R"({"showToast":{"message":"Audit store unavailable; MFA )"
                                      R"(was not changed.","level":"error"}})");
-                      res.set_content(render_mfa_fragment(
-                                          *session, {}, {}, {}, {},
-                                          "Audit store unavailable; MFA was not changed."),
-                                      "text/html; charset=utf-8");
+                      res.set_content(
+                          render_mfa_fragment(*session, {}, {}, {}, {},
+                                              "Audit store unavailable; MFA was not changed."),
+                          "text/html; charset=utf-8");
                       return;
                   }
                   // The clear has no undo, so a lost OUTCOME row cannot stop it; it is logged.
@@ -7121,11 +7121,10 @@ void SettingsRoutes::register_routes(
                       // The clear may have committed with its acknowledgement lost, so the
                       // sessions end anyway (#6079).
                       const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
-                      audit_outcome("error",
-                            "disable failed (sessions_ended=" +
-                                (ended.db_persisted ? std::to_string(ended.count)
-                                                    : std::string("failed")) +
-                                ")");
+                      audit_outcome("error", "disable failed (sessions_ended=" +
+                                                 (ended.db_persisted ? std::to_string(ended.count)
+                                                                     : std::string("failed")) +
+                                                 ")");
                       if (ended.db_persisted) {
                           sign_out();
                           return;

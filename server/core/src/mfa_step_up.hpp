@@ -152,8 +152,7 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
 require_enrolled_fresh_mfa(const httplib::Request& req, httplib::Response& res,
                            const auth::Session& session, AuthDB& auth_db,
                            int configured_window_secs, const StepUpAuditFn& audit_fn,
-                           const std::string& action_label,
-                           const auth::DurableMfaProof& durable,
+                           const std::string& action_label, const auth::DurableMfaProof& durable,
                            yuzu::MetricsRegistry* metrics = nullptr);
 
 /// True if the IdP `amr` claim attests a multi-factor (or otherwise
@@ -183,8 +182,8 @@ namespace detail {
 /// `decide_step_up` (step_up_gate.cpp), which is what `require_mfa_step_up` and the central
 /// chokepoint decide on.
 struct ProofAge {
-    bool no_proof{true};   ///< no usable proof: absent, or future-dated (derive left it {})
-    bool fresh{false};     ///< a proof exists, is within the window, and is not wall-stale
+    bool no_proof{true};    ///< no usable proof: absent, or future-dated (derive left it {})
+    bool fresh{false};      ///< a proof exists, is within the window, and is not wall-stale
     long long age_secs{-1}; ///< whole seconds on the monotonic anchor; -1 when `no_proof`
     /// Milliseconds on the monotonic anchor; -1 when `no_proof`. `fresh` compares the
     /// whole-second age (a proof 300.5 s old is still fresh in a 300 s window); a caller
@@ -198,7 +197,8 @@ struct ProofAge {
 /// Age `session`'s proof against `effective_window` (monotonic anchor plus the wall
 /// suspend backstop; see the definition). The wall figure (`wall_stale`) is computed from the
 /// replica's system_clock but is not decisional for the approver gate, which ignores it.
-[[nodiscard]] ProofAge mfa_proof_age(const auth::Session& session, std::chrono::seconds effective_window);
+[[nodiscard]] ProofAge mfa_proof_age(const auth::Session& session,
+                                     std::chrono::seconds effective_window);
 
 /// Write the 401 step-up envelope (challenge_url differs for OIDC vs local) and emit
 /// one `mfa.step_up.required` row. `extra_detail`, when non-empty, is appended to the

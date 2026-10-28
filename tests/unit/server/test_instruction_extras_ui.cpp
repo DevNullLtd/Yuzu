@@ -190,7 +190,8 @@ TEST_CASE("instruction extras ui: the Approvals tab buttons surface a 401/403 in
     CHECK_FALSE(has(js, "hx-on"));
 }
 
-TEST_CASE("instruction extras ui: both 403 branches of the Approvals tab show an approver refusal's remediation (#6079)",
+TEST_CASE("instruction extras ui: both 403 branches of the Approvals tab show an approver "
+          "refusal's remediation (#6079)",
           "[ui][instruction_extras][approvals_fragment_routes]") {
     const auto& whole = yuzu::server::kYuzuOperateExtrasJs;
     // Same scope trap as the #6061 case above: the edit must sit in the FIRST IIFE, which is
@@ -208,11 +209,14 @@ TEST_CASE("instruction extras ui: both 403 branches of the Approvals tab show an
     CHECK(has(js, "e.message.indexOf('approver_assurance_required:') === 0"));
     // The returned value is pinned with the guard it belongs to: a body that returned
     // `e.message` (or anything else) while keeping the condition text would otherwise pass.
-    CHECK(has(js, "typeof e.remediation === 'string' && e.remediation) return e.remediation;\n    return '';"));
+    CHECK(has(js, "typeof e.remediation === 'string' && e.remediation) return e.remediation;\n    "
+                  "return '';"));
     // Initial 403 and the 403 returned after the step-up retry: both use it, each reading its
     // own envelope (the parsed response text, then the dialog helper's r.data).
-    CHECK(has(js, "toast(approverRefusalText(env) || msg || 'You do not have permission to decide approvals.', 'error');"));
-    CHECK(has(js, "toast(approverRefusalText(r.data) || r.message || 'You do not have permission to decide approvals.', 'error');"));
+    CHECK(has(js, "toast(approverRefusalText(env) || msg || 'You do not have permission to decide "
+                  "approvals.', 'error');"));
+    CHECK(has(js, "toast(approverRefusalText(r.data) || r.message || 'You do not have permission "
+                  "to decide approvals.', 'error');"));
     CHECK(count_of(js, "approverRefusalText(") == 3); // definition + the two call sites
     // A 503 (MFA state unreadable, clock fault, audit store down) shows error.message and
     // error.remediation together as one text, on the initial response and on the response after

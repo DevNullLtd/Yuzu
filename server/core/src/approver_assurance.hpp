@@ -52,8 +52,8 @@ namespace yuzu::server::approval {
 /// Why a session may not decide an approval. `kNone` == allowed (class only).
 enum class ApproverRefusal {
     kNone,
-    kEnginePrincipal,      ///< ADR-0031 engine principal (machine identity)
-    kNonHumanPrincipal,    ///< principal_kind != "human"
+    kEnginePrincipal,       ///< ADR-0031 engine principal (machine identity)
+    kNonHumanPrincipal,     ///< principal_kind != "human"
     kNonInteractiveSession, ///< bearer (api_token / mcp_token) or any unrecognised auth_source
     kMfaNotEnrolled,        ///< local account with no enrolled MFA factor (#6079)
     kMfaProofMissing,       ///< SSO login whose IdP asserted no MFA method (#6079)

@@ -45,9 +45,10 @@ ProofAge mfa_proof_age(const auth::Session& session, std::chrono::seconds effect
     ProofAge out;
     const auto now = std::chrono::steady_clock::now();
     out.no_proof = session.steady_mfa_verified.time_since_epoch().count() == 0;
-    const auto age = out.no_proof ? std::chrono::seconds::max()
-                                  : std::chrono::duration_cast<std::chrono::seconds>(
-                                        now - session.steady_mfa_verified);
+    const auto age =
+        out.no_proof
+            ? std::chrono::seconds::max()
+            : std::chrono::duration_cast<std::chrono::seconds>(now - session.steady_mfa_verified);
     // Suspend backstop (parity with is_elevated / validate, ADR-2002 §4 / design-
     // review H5 + LOW-1): the freshness age above is on steady_clock, which pauses
     // across host/VM suspend, so a stale proof could read fresh after a resume.
@@ -225,8 +226,8 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
         if (has_proof) {
             const long long durable_age_ms = durable.db_now_ms - durable.mfa_verified_ms;
             const bool durable_fresh = durable_age_ms >= 0 && durable_age_ms <= window_ms;
-            within_window = durable_fresh && !proof.no_proof && proof.age_ms >= 0 &&
-                            proof.age_ms <= window_ms;
+            within_window =
+                durable_fresh && !proof.no_proof && proof.age_ms >= 0 && proof.age_ms <= window_ms;
             if (durable_age_ms >= 0)
                 age_secs = std::max<long long>(proof.age_secs, durable_age_ms / 1000);
         }
@@ -235,16 +236,15 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
     // A local proof stamped before the CURRENT enrolment was made under a factor that has
     // since been cleared (disable / reset) or replaced; it says nothing about this one.
     // Equal passes: both instants are authored by the same database clock at ms resolution.
-    const bool predates =
-        probe.state == MfaFactorState::kEnrolledLocal && has_proof && proof_ms < probe.enrolled_at_ms;
+    const bool predates = probe.state == MfaFactorState::kEnrolledLocal && has_proof &&
+                          proof_ms < probe.enrolled_at_ms;
 
     if (within_window && !predates)
         return {Kind::kPass, probe.state};
 
-    detail::write_step_up_challenge(req, res, session, session.auth_source == "oidc",
-                                    audit_fn, action_label, age_secs, window_secs,
-                                    predates ? "reason=proof_predates_enrolment"
-                                             : std::string_view{});
+    detail::write_step_up_challenge(
+        req, res, session, session.auth_source == "oidc", audit_fn, action_label, age_secs,
+        window_secs, predates ? "reason=proof_predates_enrolment" : std::string_view{});
     return {Kind::kChallengeWritten, probe.state};
 }
 

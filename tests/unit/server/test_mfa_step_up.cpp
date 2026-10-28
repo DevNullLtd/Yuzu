@@ -632,8 +632,8 @@ struct ApproverFixture : StepUpFixture {
     void add_user(const std::string& name) {
         auto salt = AuthManager::random_bytes(16);
         auto hash = AuthManager::pbkdf2_sha256("pw", salt, 1000);
-        REQUIRE(db->upsert_user(name, hash, AuthManager::bytes_to_hex(salt), Role::user)
-                    .has_value());
+        REQUIRE(
+            db->upsert_user(name, hash, AuthManager::bytes_to_hex(salt), Role::user).has_value());
     }
 
     void enroll(const std::string& user) {
@@ -747,8 +747,9 @@ TEST_CASE("approver_step_up_window: configured value is capped at 300 s and a di
 
 // ── probe_mfa_factor ─────────────────────────────────────────────────────────
 
-TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: local accounts are classified by their own "
-                                  "enrolment row",
+TEST_CASE_METHOD(ApproverFixture,
+                 "probe_mfa_factor: local accounts are classified by their own "
+                 "enrolment row",
                  "[pg][mfa][stepup][approver][probe]") {
     auto alice = probe_mfa_factor(make_session("alice", "local", system_clock::now()), *db);
     CHECK(alice.state == MfaFactorState::kEnrolledLocal); // P1
@@ -783,8 +784,9 @@ TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: local accounts are classifi
           MfaFactorState::kAccountUnavailable);
 }
 
-TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an enrolled row with no usable enrolment "
-                                  "instant fails closed as kStoreUnavailable (sec-4)",
+TEST_CASE_METHOD(ApproverFixture,
+                 "probe_mfa_factor: an enrolled row with no usable enrolment "
+                 "instant fails closed as kStoreUnavailable (sec-4)",
                  "[pg][mfa][stepup][approver][probe]") {
     // `enrolled` is `mfa_enrolled_at IS NOT NULL`, so an epoch-or-earlier instant reads back
     // as enrolled with enrolled_at_ms <= 0. Left as kEnrolledLocal it would make the
@@ -795,7 +797,8 @@ TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an enrolled row with no usa
              " WHERE username = $1")
                 .c_str(),
             "alice");
-        const auto probe = probe_mfa_factor(make_session("alice", "local", system_clock::now()), *db);
+        const auto probe =
+            probe_mfa_factor(make_session("alice", "local", system_clock::now()), *db);
         CHECK(probe.state == MfaFactorState::kStoreUnavailable);
         CHECK(probe.enrolled_at_ms == 0);
 
@@ -808,8 +811,9 @@ TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an enrolled row with no usa
     }
 }
 
-TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an SSO or bearer session never borrows a "
-                                  "local namesake's factor",
+TEST_CASE_METHOD(ApproverFixture,
+                 "probe_mfa_factor: an SSO or bearer session never borrows a "
+                 "local namesake's factor",
                  "[pg][mfa][stepup][approver][probe]") {
     // Both an SSO-shaped name and an ENROLLED local namesake (alice) must give the same answer.
     for (const char* user : {"oidc:x#y", "alice"}) {
@@ -831,8 +835,9 @@ TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an SSO or bearer session ne
           MfaFactorState::kIdpAttested);
 }
 
-TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an unreadable secret is kStoreUnavailable, "
-                                  "never kNotEnrolled",
+TEST_CASE_METHOD(ApproverFixture,
+                 "probe_mfa_factor: an unreadable secret is kStoreUnavailable, "
+                 "never kNotEnrolled",
                  "[pg][mfa][stepup][approver][probe]") {
     null_secret_keep_enrolled("alice"); // P10
     CHECK(probe_mfa_factor(make_session("alice", "local"), *db).state ==
@@ -844,8 +849,9 @@ TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an unreadable secret is kSt
 
 // ── require_enrolled_fresh_mfa ───────────────────────────────────────────────
 
-TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: an enrolled local account with a "
-                                  "fresh proof passes and the response is untouched",
+TEST_CASE_METHOD(ApproverFixture,
+                 "require_enrolled_fresh_mfa: an enrolled local account with a "
+                 "fresh proof passes and the response is untouched",
                  "[pg][mfa][stepup][approver]") {
     for (const char* user : {"alice", "carol"}) { // admin and non-admin alike
         INFO(user);
@@ -857,8 +863,9 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: an enrolled local
     CHECK(audits.empty());
 }
 
-TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: the 300 s ceiling is hard to the "
-                                  "sub-second",
+TEST_CASE_METHOD(ApproverFixture,
+                 "require_enrolled_fresh_mfa: the 300 s ceiling is hard to the "
+                 "sub-second",
                  "[pg][mfa][stepup][approver]") {
     auto in = run(with_wall_proof(*this, "alice", "local", milliseconds(299'500)));
     CHECK(in.outcome.kind == Kind::kPass); // R2
@@ -889,8 +896,9 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: no proof at all i
     CHECK(audits[0].detail.find("age_secs=-1") != std::string::npos);
 }
 
-TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: the configured window can only "
-                                  "tighten the ceiling, and 0 does not disable it",
+TEST_CASE_METHOD(ApproverFixture,
+                 "require_enrolled_fresh_mfa: the configured window can only "
+                 "tighten the ceiling, and 0 does not disable it",
                  "[pg][mfa][stepup][approver]") {
     CHECK(run(with_wall_proof(*this, "alice", "local", seconds(200)), 0).outcome.kind ==
           Kind::kPass); // R5
@@ -919,8 +927,9 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: the configured wi
           Kind::kPass);
 }
 
-TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: an un-enrolled local account is "
-                                  "refused, writing nothing and counting nothing",
+TEST_CASE_METHOD(ApproverFixture,
+                 "require_enrolled_fresh_mfa: an un-enrolled local account is "
+                 "refused, writing nothing and counting nothing",
                  "[pg][mfa][stepup][approver]") {
     yuzu::MetricsRegistry metrics;
     auto r = run(make_session("bob", "local", system_clock::now()), 300, &metrics); // R9
@@ -932,9 +941,10 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: an un-enrolled lo
           0.0);
 }
 
-TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: a deactivated or missing account "
-                                  "is refused as account_unavailable, writing nothing and "
-                                  "counting nothing (sec-2)",
+TEST_CASE_METHOD(ApproverFixture,
+                 "require_enrolled_fresh_mfa: a deactivated or missing account "
+                 "is refused as account_unavailable, writing nothing and "
+                 "counting nothing (sec-2)",
                  "[pg][mfa][stepup][approver]") {
     add_user("erin");
     enroll("erin");
@@ -952,8 +962,9 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: a deactivated or 
           0.0);
 }
 
-TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: an unreadable secret is "
-                                  "kStoreUnavailable, counted once, and writes nothing",
+TEST_CASE_METHOD(ApproverFixture,
+                 "require_enrolled_fresh_mfa: an unreadable secret is "
+                 "kStoreUnavailable, counted once, and writes nothing",
                  "[pg][mfa][stepup][approver]") {
     null_secret_keep_enrolled("alice");
     yuzu::MetricsRegistry metrics;
@@ -964,12 +975,14 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: an unreadable sec
     CHECK(audits.empty());
     CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}}).value() ==
           1.0);
-    CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_stepup"}})
-              .value() == 0.0);
+    CHECK(
+        metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_stepup"}}).value() ==
+        0.0);
 }
 
-TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: SSO sessions stand on the IdP "
-                                  "proof alone, never a namesake row",
+TEST_CASE_METHOD(ApproverFixture,
+                 "require_enrolled_fresh_mfa: SSO sessions stand on the IdP "
+                 "proof alone, never a namesake row",
                  "[pg][mfa][stepup][approver]") {
     // R11: fresh proof passes even though the namesake `bob` is un-enrolled.
     {
@@ -1000,8 +1013,9 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: SSO sessions stan
     CHECK(audits.empty());
 }
 
-TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: SAML and bearer sessions are "
-                                  "refused whatever proof they carry",
+TEST_CASE_METHOD(ApproverFixture,
+                 "require_enrolled_fresh_mfa: SAML and bearer sessions are "
+                 "refused whatever proof they carry",
                  "[pg][mfa][stepup][approver]") {
     auto saml = run(make_session("alice", "saml", system_clock::now())); // R14
     CHECK(saml.outcome.kind == Kind::kRefuse);
@@ -1017,8 +1031,9 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: SAML and bearer s
     CHECK(audits.empty());
 }
 
-TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: a proof that predates the current "
-                                  "enrolment is challenged; one made under it passes",
+TEST_CASE_METHOD(ApproverFixture,
+                 "require_enrolled_fresh_mfa: a proof that predates the current "
+                 "enrolment is challenged; one made under it passes",
                  "[pg][mfa][stepup][approver][approver_enrolment_instant]") {
     // R17: alice proves, then her factor is cleared and re-enrolled.
     auto old_proof = with_wall_proof(*this, "alice", "local", seconds(10));
@@ -1045,8 +1060,9 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: a proof that pred
     }
 }
 
-TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: a hostile SSO subject cannot forge "
-                                  "audit detail fields through the step-up challenge (sec-3)",
+TEST_CASE_METHOD(ApproverFixture,
+                 "require_enrolled_fresh_mfa: a hostile SSO subject cannot forge "
+                 "audit detail fields through the step-up challenge (sec-3)",
                  "[pg][mfa][stepup][approver]") {
     // An OIDC session's username is IdP-controlled. Its proof is 10 minutes old, so the gate
     // writes the challenge and the `mfa.step_up.required` detail embeds `user=<username>`.
@@ -1061,8 +1077,9 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: a hostile SSO sub
     CHECK(detail.find("window_secs=") == detail.rfind("window_secs="));
 }
 
-TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: the enrolment boundary is "
-                                  "inclusive to the millisecond",
+TEST_CASE_METHOD(ApproverFixture,
+                 "require_enrolled_fresh_mfa: the enrolment boundary is "
+                 "inclusive to the millisecond",
                  "[pg][mfa][stepup][approver][approver_enrolment_instant]") {
     // bob enrols NOW (no backdating), so the boundary is a few ms ago and the proofs are fresh.
     enroll("bob");
@@ -1071,13 +1088,14 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: the enrolment bou
     auto at = [&](std::int64_t ms) {
         return make_session("bob", "local", system_clock::time_point{milliseconds(ms)});
     };
-    CHECK(run(at(at_ms)).outcome.kind == Kind::kPass);                 // equal passes
+    CHECK(run(at(at_ms)).outcome.kind == Kind::kPass); // equal passes
     CHECK(run(at(at_ms + 1)).outcome.kind == Kind::kPass);
     CHECK(run(at(at_ms - 1)).outcome.kind == Kind::kChallengeWritten); // one ms earlier does not
 }
 
-TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: a future-dated or wall-stale proof "
-                                  "is not fresh",
+TEST_CASE_METHOD(ApproverFixture,
+                 "require_enrolled_fresh_mfa: a future-dated or wall-stale proof "
+                 "is not fresh",
                  "[pg][mfa][stepup][approver]") {
     // R18: a proof stamped in the future derives to "no proof".
     {
@@ -1160,11 +1178,11 @@ struct DurableFixture : ApproverFixture {
     void set_durable_proof_age(long long age_ms) {
         auto lease = db.pool().acquire();
         REQUIRE(lease);
-        auto r = yuzu::server::pg::exec_params(
-            lease.get(),
-            "UPDATE session_store.sessions SET mfa_verified_ms = "
-            "(extract(epoch from now())*1000)::bigint - $1::bigint",
-            std::vector<std::string>{std::to_string(age_ms)});
+        auto r =
+            yuzu::server::pg::exec_params(lease.get(),
+                                          "UPDATE session_store.sessions SET mfa_verified_ms = "
+                                          "(extract(epoch from now())*1000)::bigint - $1::bigint",
+                                          std::vector<std::string>{std::to_string(age_ms)});
         INFO(PQresultErrorMessage(r.get()));
         REQUIRE(r.status() == PGRES_COMMAND_OK);
     }
@@ -1177,8 +1195,9 @@ struct DurableFixture : ApproverFixture {
 
 } // namespace
 
-TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a proof young on the steady clock but "
-                                 "450 s old on the database clock is challenged (UP-8)",
+TEST_CASE_METHOD(DurableFixture,
+                 "require_enrolled_fresh_mfa: a proof young on the steady clock but "
+                 "450 s old on the database clock is challenged (UP-8)",
                  "[pg][mfa][stepup][approver][durable]") {
     // Sanity: the cached monotonic view is fresh, so the OLD logic would have passed.
     REQUIRE(detail::mfa_proof_age(cached, std::chrono::seconds(300)).fresh);
@@ -1192,8 +1211,9 @@ TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a proof young on t
     CHECK(audits[0].detail.find("age_secs=450") != std::string::npos);
 }
 
-TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: the durable ceiling is 300 s with no "
-                                 "skew allowance",
+TEST_CASE_METHOD(DurableFixture,
+                 "require_enrolled_fresh_mfa: the durable ceiling is 300 s with no "
+                 "skew allowance",
                  "[pg][mfa][stepup][approver][durable]") {
     set_durable_proof_age(299'000);
     auto in = run_durable();
@@ -1212,8 +1232,9 @@ TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: the durable ceilin
     CHECK(run_durable(120).outcome.kind == Kind::kPass);
 }
 
-TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a future-dated, missing or foreign "
-                                 "durable proof is challenged, never passed",
+TEST_CASE_METHOD(DurableFixture,
+                 "require_enrolled_fresh_mfa: a future-dated, missing or foreign "
+                 "durable proof is challenged, never passed",
                  "[pg][mfa][stepup][approver][durable]") {
     set_durable_proof_age(-600'000); // stamped 10 minutes in the DATABASE's future
     CHECK(run_durable().outcome.kind == Kind::kChallengeWritten);
@@ -1237,8 +1258,7 @@ TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a future-dated, mi
     auto foreign = mgr.read_durable_mfa_proof(token, "carol");
     CHECK(foreign.source == auth::DurableMfaProof::Source::kAbsent);
     CHECK(run(cached, 300, nullptr, foreign).outcome.kind == Kind::kChallengeWritten);
-    CHECK(mgr.read_durable_mfa_proof("", "alice").source ==
-          auth::DurableMfaProof::Source::kAbsent);
+    CHECK(mgr.read_durable_mfa_proof("", "alice").source == auth::DurableMfaProof::Source::kAbsent);
     CHECK(mgr.read_durable_mfa_proof(std::string(200, 'x'), "alice").source ==
           auth::DurableMfaProof::Source::kAbsent);
 }
@@ -1273,9 +1293,8 @@ TEST_CASE_METHOD(DurableFixture,
                  "database clock is its own 503 outcome, not a sign-in-again 403 "
                  "(UP-4)",
                  "[pg][mfa][stepup][approver][approver_mfa][durable]") {
-    const auto now_ms = std::chrono::duration_cast<milliseconds>(
-                            system_clock::now().time_since_epoch())
-                            .count();
+    const auto now_ms =
+        std::chrono::duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 
     // Proof 2 minutes ahead of the database clock.
     const std::string skewed_token = "yuzu-test-oidc-skewed-proof-token-0001";
@@ -1338,7 +1357,8 @@ TEST_CASE_METHOD(DurableFixture,
     CHECK(bare_metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}})
               .value() == 0.0);
     // ...as is one whose durable session is absent (nothing dated after the clock).
-    auto absent = run(bare, 300, nullptr, auth::DurableMfaProof{auth::DurableMfaProof::Source::kAbsent, 0, 0});
+    auto absent = run(bare, 300, nullptr,
+                      auth::DurableMfaProof{auth::DurableMfaProof::Source::kAbsent, 0, 0});
     CHECK(absent.outcome.kind == Kind::kRefuse);
     CHECK(absent.outcome.factor == MfaFactorState::kNoIdpProof);
 }
@@ -1392,8 +1412,9 @@ TEST_CASE_METHOD(DurableFixture,
           1.0);
 }
 
-TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a fresh durable proof does not "
-                                 "rescue a cached proof that is stale or missing",
+TEST_CASE_METHOD(DurableFixture,
+                 "require_enrolled_fresh_mfa: a fresh durable proof does not "
+                 "rescue a cached proof that is stale or missing",
                  "[pg][mfa][stepup][approver][durable]") {
     // The cached monotonic check is a second, stricter condition (it also covers a backward
     // database step the durable arithmetic cannot see). Durable 10 s old, cached anchor varied.
@@ -1402,8 +1423,9 @@ TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a fresh durable pr
 
     auto stale = cached;
     stale.steady_mfa_verified = std::chrono::steady_clock::now() - seconds(200);
-    CHECK(run(stale, 300, nullptr, mgr.read_durable_mfa_proof(token, stale.username))
-              .outcome.kind == Kind::kPass); // 200 s on the anchor is inside the window
+    CHECK(
+        run(stale, 300, nullptr, mgr.read_durable_mfa_proof(token, stale.username)).outcome.kind ==
+        Kind::kPass); // 200 s on the anchor is inside the window
 
     stale.steady_mfa_verified = std::chrono::steady_clock::now() - seconds(400);
     {
@@ -1422,8 +1444,9 @@ TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a fresh durable pr
     }
 }
 
-TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: the durable ceiling admits an age "
-                                 "equal to the window and refuses one millisecond more",
+TEST_CASE_METHOD(DurableFixture,
+                 "require_enrolled_fresh_mfa: the durable ceiling admits an age "
+                 "equal to the window and refuses one millisecond more",
                  "[pg][mfa][stepup][approver][durable]") {
     // The database clock is read in the same SELECT as the proof, so the exact age cannot be
     // produced by backdating (the read lands a few ms after the UPDATE). Take the real read
@@ -1451,8 +1474,9 @@ TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: the durable ceilin
     }
 }
 
-TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a degraded durable read is a 503, "
-                                 "not a challenge, and is counted",
+TEST_CASE_METHOD(DurableFixture,
+                 "require_enrolled_fresh_mfa: a degraded durable read is a 503, "
+                 "not a challenge, and is counted",
                  "[pg][mfa][stepup][approver][durable]") {
     yuzu::MetricsRegistry metrics;
     {
@@ -1475,8 +1499,9 @@ TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a degraded durable
           Kind::kStoreUnavailable);
 }
 
-TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: the durable proof, not the cached "
-                                 "one, is compared with the enrolment instant",
+TEST_CASE_METHOD(DurableFixture,
+                 "require_enrolled_fresh_mfa: the durable proof, not the cached "
+                 "one, is compared with the enrolment instant",
                  "[pg][mfa][stepup][approver][durable][approver_enrolment_instant]") {
     // Alice enrolled 10 s ago. The cached session was minted just now (after the enrolment),
     // so the cached comparison would pass; the durable proof is 100 s old, i.e. made before
@@ -1489,8 +1514,9 @@ TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: the durable proof,
     CHECK(audits[0].detail.find("reason=proof_predates_enrolment") != std::string::npos);
 }
 
-TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: with no SessionStore attached the "
-                                  "gate fails closed as store-unavailable (503), never a pass",
+TEST_CASE_METHOD(ApproverFixture,
+                 "require_enrolled_fresh_mfa: with no SessionStore attached the "
+                 "gate fails closed as store-unavailable (503), never a pass",
                  "[pg][mfa][stepup][approver][durable]") {
     // No store means no database clock to age a proof on, and no replica clock stands in for
     // it: the read is "unavailable", so the gate answers 503 (counted like any outage) rather
@@ -1510,10 +1536,12 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: with no SessionSt
 }
 
 // (f) The generic gate is deliberately unchanged: same inputs, same pass.
-TEST_CASE_METHOD(StepUpFixture, "require_mfa_step_up: the same steady-10s / wall-450s proof still "
-                                "passes the generic 300 s window (legacy behaviour pinned)",
+TEST_CASE_METHOD(StepUpFixture,
+                 "require_mfa_step_up: the same steady-10s / wall-450s proof still "
+                 "passes the generic 300 s window (legacy behaviour pinned)",
                  "[pg][mfa][stepup][durable]") {
-    auto s = make_session("alice", "local", std::chrono::system_clock::now() - std::chrono::seconds(10));
+    auto s =
+        make_session("alice", "local", std::chrono::system_clock::now() - std::chrono::seconds(10));
     s.mfa_verified_at = std::chrono::system_clock::now() - std::chrono::seconds(450);
     httplib::Request req;
     httplib::Response res;

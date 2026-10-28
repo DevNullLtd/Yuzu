@@ -2578,7 +2578,8 @@ TEST_CASE("AuthDB::mfa_status enrolled_at_ms returns to 0 after mfa_disable and 
     CHECK_FALSE(off->enrolled);
     CHECK(off->enrolled_at_ms == 0);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(20)); // ms resolution: force a later instant
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(20)); // ms resolution: force a later instant
     const std::int64_t lo = db_now_ms(h.conn.get());
     enroll(h.db, "d3");
     auto again = h.db.mfa_status("d3");
@@ -2603,7 +2604,10 @@ TEST_CASE("AuthDB::mfa_disable_report pre-image reflects an enrolment that commi
 
     // A second connection holds the row and completes the enrolment inside its transaction.
     PgConn locker = connect(db.dsn());
-    { PgResult b{PQexec(locker.get(), "BEGIN")}; REQUIRE(b.ok()); }
+    {
+        PgResult b{PQexec(locker.get(), "BEGIN")};
+        REQUIRE(b.ok());
+    }
     {
         PgResult u{PQexec(locker.get(), "UPDATE auth.users SET mfa_enrolled_at = now() "
                                         "WHERE username = 'dr1'")};
@@ -2634,7 +2638,10 @@ TEST_CASE("AuthDB::mfa_disable_report pre-image is false when a concurrent disab
     REQUIRE(h.db.mfa_status("dr2")->enrolled);
 
     PgConn locker = connect(db.dsn());
-    { PgResult b{PQexec(locker.get(), "BEGIN")}; REQUIRE(b.ok()); }
+    {
+        PgResult b{PQexec(locker.get(), "BEGIN")};
+        REQUIRE(b.ok());
+    }
     {
         PgResult u{PQexec(locker.get(), "UPDATE auth.users SET mfa_totp_secret = NULL, "
                                         "mfa_enrolled_at = NULL WHERE username = 'dr2'")};

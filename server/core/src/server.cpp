@@ -3324,15 +3324,16 @@ public:
         // handling (stale-cache-or-401) without grepping logs. `op` labels the
         // degrading operation. Wired from AuthManager (validate/create/touch/
         // generation) + the maintenance-thread reap above.
-        metrics_.describe("yuzu_auth_session_store_degrade_total",
-                          "Durable session-store operations that hit a degraded PostgreSQL read/"
-                          "write on the auth hot path (labelled by op: validate / create / touch / "
-                          "generation_refresh / reap / invalidate_user / invalidate / mark_mfa / "
-                          "elevate); a validate degrade fails the request closed, and elevate / "
-                          "revoke (via invalidate_user) degrades fail the privileged op closed, except "
-                          "that an invalidate_user after an already-committed MFA clear leaves the "
-                          "clear in place and ends partial",
-                          "counter");
+        metrics_.describe(
+            "yuzu_auth_session_store_degrade_total",
+            "Durable session-store operations that hit a degraded PostgreSQL read/"
+            "write on the auth hot path (labelled by op: validate / create / touch / "
+            "generation_refresh / reap / invalidate_user / invalidate / mark_mfa / "
+            "elevate); a validate degrade fails the request closed, and elevate / "
+            "revoke (via invalidate_user) degrades fail the privileged op closed, except "
+            "that an invalidate_user after an already-committed MFA clear leaves the "
+            "clear in place and ends partial",
+            "counter");
         for (auto op : {"validate", "create", "touch", "generation_refresh", "reap",
                         "invalidate_user", "invalidate", "mark_mfa", "elevate"})
             metrics_.counter("yuzu_auth_session_store_degrade_total", {{"op", op}});
@@ -16676,9 +16677,8 @@ private:
             return require_enrolled_fresh_mfa(
                 req, res, session, *auth_db, cfg_.mfa_step_up_window_secs,
                 [this](const httplib::Request& r, const std::string& a, const std::string& rs,
-                       const std::string& tt, const std::string& ti, const std::string& d) {
-                    return audit_log(r, a, rs, tt, ti, d);
-                },
+                       const std::string& tt, const std::string& ti,
+                       const std::string& d) { return audit_log(r, a, rs, tt, ti, d); },
                 action_label, durable, &metrics_);
         };
 

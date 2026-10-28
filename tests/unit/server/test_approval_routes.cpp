@@ -112,8 +112,7 @@ struct Harness {
     /// Approver MFA gate stub (`require_enrolled_fresh_mfa` has its own tests; the [pg] cases
     /// below drive the real one): the outcome the closure returns. kChallengeWritten also
     /// writes a 401 envelope, as the real gate does. Default is an enrolled caller passing.
-    ApproverMfaOutcome mfa_outcome{ApproverMfaOutcome::Kind::kPass,
-                                   MfaFactorState::kEnrolledLocal};
+    ApproverMfaOutcome mfa_outcome{ApproverMfaOutcome::Kind::kPass, MfaFactorState::kEnrolledLocal};
     bool wire_mfa{true};
     /// When set, replaces the stub entirely: the [pg] integration cases bind the REAL gate here.
     approval::Deps::ApproverMfaFn mfa_fn_override;
@@ -589,15 +588,14 @@ TEST_CASE("approver_assurance: check_approver_class is a positive allow-list",
 TEST_CASE("approver_assurance: the MFA refusal tokens are stable and refusal_for_factor maps every "
           "factor state (#6079)",
           "[server][routes][approval_routes]") {
-    using approval::ApproverRefusal;
     using approval::approver_refusal_message;
     using approval::approver_refusal_reason;
+    using approval::ApproverRefusal;
     using approval::refusal_for_factor;
     // Agentic workers key off these literals: pinned verbatim, not derived from the enum.
     CHECK(approver_refusal_reason(ApproverRefusal::kMfaNotEnrolled) == "mfa_not_enrolled");
     CHECK(approver_refusal_reason(ApproverRefusal::kMfaProofMissing) == "mfa_proof_missing");
-    CHECK(approver_refusal_reason(ApproverRefusal::kSamlMfaUnsupported) ==
-          "saml_mfa_unsupported");
+    CHECK(approver_refusal_reason(ApproverRefusal::kSamlMfaUnsupported) == "saml_mfa_unsupported");
     CHECK(approver_refusal_reason(ApproverRefusal::kMfaProofStale) == "mfa_proof_stale");
     CHECK(approver_refusal_reason(ApproverRefusal::kAccountUnavailable) == "account_unavailable");
     CHECK(approver_refusal_message(ApproverRefusal::kAccountUnavailable) ==
@@ -1150,16 +1148,17 @@ TEST_CASE("approval_routes: a stale MFA proof keeps the gate's 401 untouched and
 // every refusal row is written BEFORE any ticket-existence check, so a hostile segment must
 // never reach an audit row or a log line as raw bytes. Each arm below writes a row naming the
 // ticket; the status of each is the one a well-formed id gets.
-TEST_CASE("approval_routes: a hostile ticket id is never audited or logged raw, on any refusing arm",
-          "[server][routes][approval_routes][approver_mfa][pg]") {
+TEST_CASE(
+    "approval_routes: a hostile ticket id is never audited or logged raw, on any refusing arm",
+    "[server][routes][approval_routes][approver_mfa][pg]") {
     const std::vector<std::string> hostile = {
         std::string("abc\nforged=1 action=approval.approve"),
         std::string("x\r\ny\x01\x7f"),
         std::string("has space"),
         std::string("a=b,c"),
         std::string("caf\xC3\xA9"),
-        std::string(129, 'a'),         // one past the shape bound
-        std::string(10 * 1024, 'a'),   // 10 KB
+        std::string(129, 'a'),       // one past the shape bound
+        std::string(10 * 1024, 'a'), // 10 KB
     };
     enum class Arm { kClassCheck, kRefuse, kStoreUnavailable, kChallenge, kPass };
     struct Case {
@@ -1218,8 +1217,8 @@ TEST_CASE("approval_routes: a hostile ticket id is never audited or logged raw, 
                 CHECK(row.target_type == "approval");
                 CHECK(row.target_id == "invalid-id");
                 CHECK(row.detail == c.detail);
-                for (const auto* field : {&row.action, &row.result, &row.target_type,
-                                          &row.target_id, &row.detail}) {
+                for (const auto* field :
+                     {&row.action, &row.result, &row.target_type, &row.target_id, &row.detail}) {
                     CHECK(field->find_first_of(std::string_view("\r\n\x01\x7f", 4)) ==
                           std::string::npos);
                     CHECK(field->size() < 128);
@@ -1608,8 +1607,8 @@ struct RealGate {
     void sql(const char* statement, const std::string& user) {
         auto lease = authdb.pool().acquire();
         REQUIRE(lease);
-        auto r = yuzu::server::pg::exec_params(lease.get(), statement,
-                                               std::vector<std::string>{user});
+        auto r =
+            yuzu::server::pg::exec_params(lease.get(), statement, std::vector<std::string>{user});
         INFO(PQresultErrorMessage(r.get()));
         REQUIRE(r.status() == PGRES_COMMAND_OK);
     }
@@ -1627,12 +1626,12 @@ struct RealGate {
         s.username = user;
         s.role = role;
         s.auth_source = source;
-        const std::int64_t now = std::chrono::duration_cast<milliseconds>(
-                                     system_clock::now().time_since_epoch())
-                                     .count();
+        const std::int64_t now =
+            std::chrono::duration_cast<milliseconds>(system_clock::now().time_since_epoch())
+                .count();
         const std::int64_t verified = age ? now - age->count() : 0;
-        REQUIRE(auth::AuthManager::derive_session_deadlines(s, now, now + 3'600'000, now,
-                                                            verified, 0, 0, now));
+        REQUIRE(auth::AuthManager::derive_session_deadlines(s, now, now + 3'600'000, now, verified,
+                                                            0, 0, now));
         return s;
     }
 
@@ -1721,9 +1720,8 @@ TEST_CASE("approval integration: a durable proof past 300 s on the database cloc
           "[server][routes][approval_routes][pg][approver_mfa]") {
     RealGate g;
     g.h.session = g.session("alice", "local", auth::Role::admin, milliseconds(10'000));
-    const auto now_ms = std::chrono::duration_cast<milliseconds>(
-                            system_clock::now().time_since_epoch())
-                            .count();
+    const auto now_ms =
+        std::chrono::duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
     g.durable = {auth::DurableMfaProof::Source::kRow, now_ms - 450'000, now_ms};
     auto res = g.decide("approve", g.id);
     REQUIRE(res);
@@ -1802,8 +1800,9 @@ TEST_CASE("approval integration: an unreadable MFA secret is a 503 and is counte
     CHECK(res->status == 503);
     CHECK(body(res->body)["error"]["retry_after_ms"] == 5000);
     CHECK(g.status_of(g.id) == "pending");
-    CHECK(g.metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}}).value() ==
-          1.0);
+    CHECK(
+        g.metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}}).value() ==
+        1.0);
 }
 
 TEST_CASE("approval integration: an enrolled non-admin approver is admitted (I7)",
@@ -1995,7 +1994,8 @@ TEST_CASE("approval_routes: wiring -- server.cpp passes approver_mfa_fn and csrf
     const auto null_check = closure.find("if (!auth_db)");
     REQUIRE(null_check != std::string::npos);
     CHECK(closure.find("*auth_db,") != std::string::npos);
-    CHECK(closure.find("Kind::kStoreUnavailable", null_check) < closure.find("require_enrolled_fresh_mfa("));
+    CHECK(closure.find("Kind::kStoreUnavailable", null_check) <
+          closure.find("require_enrolled_fresh_mfa("));
     CHECK(closure.find("Kind::kPass") == std::string::npos);
     // UP-8: the production closure takes the authoritative durable proof read (cookie token,
     // principal-checked) and hands it to the gate. Dropping it, or passing "no store

@@ -1244,7 +1244,8 @@ int main(int argc, char* argv[]) {
         spdlog::warn(
             "--mfa-step-up-window-secs={} disables the stale-proof requirement on the 37 central "
             "step-up routes (REST, dashboard and Settings routes; the three JIT-elevation routes "
-            "keep their own 300 s window). On the 37 routes a stale or absent proof is neither refused nor "
+            "keep their own 300 s window). On the 37 routes a stale or absent proof is neither "
+            "refused nor "
             "recorded (no SOC 2 CC6.6 `mfa.step_up.required` evidence row), they will NOT "
             "re-prompt for MFA proof, SAML sessions pass, and the auth store is not read. "
             "Engine-principal denials and unwired-auth-store refusals still apply on those "
@@ -1948,8 +1949,8 @@ int main(int argc, char* argv[]) {
             return ev;
         };
         if (!audit->log(make_event("attempted", std::format("MFA clear requested via --mfa-reset "
-                                                           "CLI (os_identity={})",
-                                                           os_user)))) {
+                                                            "CLI (os_identity={})",
+                                                            os_user)))) {
             spdlog::error("--mfa-reset: the audit store did not accept the intent row for '{}'; "
                           "MFA was NOT cleared. If you are locked out and cannot restore the "
                           "audit store, see \"Fallback: direct SQL\" in the Auth Store Recovery "
@@ -2012,7 +2013,8 @@ int main(int argc, char* argv[]) {
                 sessions_end_failed ? "partial" : "success",
                 std::format("MFA enrollment cleared via --mfa-reset CLI (os_identity={}, "
                             "sessions_ended={})",
-                            os_user, sessions_end_failed ? "failed" : std::to_string(sessions_ended))))) {
+                            os_user,
+                            sessions_end_failed ? "failed" : std::to_string(sessions_ended))))) {
             // The intent row exists, but the outcome write failed (e.g. disk filled
             // mid-op). MFA is already cleared; fail loudly and non-zero so automation
             // and the operator know the outcome row is missing and must be recorded.

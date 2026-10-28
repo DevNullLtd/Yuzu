@@ -2240,10 +2240,10 @@ TEST_CASE("refusal audit: a hostile subject is neutralised in every decision's d
           "[stepup][gate]") {
     const std::string hostile = "evil reason=engine_principal_denied,x";
     const std::string safe = "evil_reason_engine_principal_denied_x";
-    for (const auto decision :
-         {StepUpDecision::kChallenge, StepUpDecision::kSamlDenied, StepUpDecision::kStoreUnavailable,
-          StepUpDecision::kStatusFailed, StepUpDecision::kUnwired, StepUpDecision::kUnsupportedClass,
-          StepUpDecision::kEvaluationFailed, StepUpDecision::kEngineDenied}) {
+    for (const auto decision : {StepUpDecision::kChallenge, StepUpDecision::kSamlDenied,
+                                StepUpDecision::kStoreUnavailable, StepUpDecision::kStatusFailed,
+                                StepUpDecision::kUnwired, StepUpDecision::kUnsupportedClass,
+                                StepUpDecision::kEvaluationFailed, StepUpDecision::kEngineDenied}) {
         Rig rig;
         StepUpVerdict v;
         v.decision = decision;

@@ -155,11 +155,9 @@ inline std::string strip_comments(std::string_view text) {
                 ++i;
                 continue;
             }
-            const std::string close =
-                ")" + std::string(text.substr(i + 2, open - (i + 2))) + "\"";
+            const std::string close = ")" + std::string(text.substr(i + 2, open - (i + 2))) + "\"";
             const std::size_t end = text.find(close, open);
-            const std::size_t stop =
-                (end == std::string_view::npos) ? n : end + close.size();
+            const std::size_t stop = (end == std::string_view::npos) ? n : end + close.size();
             out.append(text.substr(i, stop - i));
             i = stop;
         } else if (c == '\'' && scan_detail::is_digit_separator(text, i)) {

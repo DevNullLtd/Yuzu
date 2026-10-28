@@ -145,15 +145,15 @@
 #include "confined_sink_scan.hpp"
 #include "source_scan.hpp"
 
-using yuzu::test::wiring_scan::find_confined_dispatch_sink_sites;
-using yuzu::test::wiring_scan::kFieldWindow;
-using yuzu::test::wiring_scan::kTypeName;
 using yuzu::test::source_scan::line_of;
 using yuzu::test::source_scan::read_text_file;
 using yuzu::test::source_scan::strip_comments;
 using yuzu::test::source_scan::strip_line_comments;
 using yuzu::test::source_scan::stripped_source;
 using yuzu::test::source_scan::stripped_source_loads;
+using yuzu::test::wiring_scan::find_confined_dispatch_sink_sites;
+using yuzu::test::wiring_scan::kFieldWindow;
+using yuzu::test::wiring_scan::kTypeName;
 
 namespace {
 
