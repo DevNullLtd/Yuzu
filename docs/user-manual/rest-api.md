@@ -1035,6 +1035,12 @@ none is. Such a value is not indexed in newly stored responses, so when the arra
 `agent_count` can be 0 or an undercount. The array names keys only, never the values. `agent_count`
 and every status code are unchanged, including the `503` when the response store is degraded.
 
+**Forensics-tier rows (#4990).** Rows written by a Forensics-tier plugin are counted only for a caller who also
+holds `Forensics:Read` (see "Forensics-tier rows" under Command/Instruction Responses). For any other caller they are
+absent from the count with no marker, so a low or zero `agent_count` does not prove that no matching data exists. If
+the caller's Forensics authority cannot be determined the route answers a retryable `503` with `retry_after_ms`
+instead of a partial count. The route writes no audit row of its own.
+
 ---
 
 ### API Tokens
@@ -3151,9 +3157,9 @@ Self-audited as `rbac.assignments.list`.
 
 #### `POST /api/v1/rbac/roles/{name}/assignments`
 
-Grant one of the 6 fleet-wide-assignable built-in RBAC roles (`Administrator`,
-`PlatformEngineer`, `Operator`, `ApiTokenManager`, `Viewer`, `Reviewer`) to a
-human user, fleet-wide. See "Fleet-Wide Role Assignment (Built-in Roles)" in
+Grant one of the 7 fleet-wide-assignable built-in RBAC roles (`Administrator`,
+`PlatformEngineer`, `Operator`, `ApiTokenManager`, `Viewer`, `Reviewer`,
+`ForensicsAnalyst`) to a human user, fleet-wide. See "Fleet-Wide Role Assignment (Built-in Roles)" in
 `docs/user-manual/rbac.md` for the full narrative (key constraints, examples,
 and why this is a separate surface from `POST /api/v1/rbac/check`'s
 `perm_fn`-gated siblings above).
@@ -3210,7 +3216,7 @@ is never misreported as "no active account."
 array or scalar), missing `principal_id`, a `principal_type`/`principal_id`
 field present with the wrong JSON type (degrades to "missing"/"invalid",
 never an uncaught exception), `principal_type` other than `"user"`, a
-malformed `principal_id`, `{name}` is not one of the 6 assignable roles
+malformed `principal_id`, `{name}` is not one of the 7 assignable roles
 (`ITServiceOwner` and a genuinely unknown/custom role name return the
 identical client-facing message — no role-catalog oracle; the specific
 reason is audited server-side only; use `POST
@@ -3226,7 +3232,9 @@ Administrator role, does not hold authority under the regime that is durably
 true right now, is a service-scoped/engine session, presented an
 MCP-tier bearer token of any tier (use the `assign_rbac_role` MCP tool
 instead), or made a cross-site cookie-session call (`cross-site request
-refused`); `503` — the RBAC or `AuthDB` store is unavailable (including when
+refused`); `409` — a role that is not a built-in role holds the name of the
+built-in role (a name collision; nothing is assigned, and the upgrade guide,
+"Role name collision", has the remedy); `503` — the RBAC or `AuthDB` store is unavailable (including when
 the admin gate itself cannot confirm durable authority — now logged and
 audited as a `denied` row, not silently invisible), a genuine store/query
 fault while writing the grant (as opposed to a client-validation rejection,
@@ -4052,7 +4060,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `scope.evaluation_aborted` | Emitted when a scoped dispatch is aborted fail-closed before any device is targeted. `result=failure`. Reasons: `db_degraded` (a `from_result_set:<id>` alias/owner/membership read against the result-set store could not answer — ADR-0036 — **or** a `props.<key>`/`tag:<key>` bulk preload against the custom-properties/tag store could not answer — ADR-0045; all abort the same way and share this reason value), `owner_check_failed` (a referenced set is absent, expired, or not owned — paired with per-ref `instruction.scope_resolution_failed` rows; as of #4981 PR-1 this ALSO fires, with its own paired per-ref row, when the set was deleted in the window between the pre-dispatch owner-check gate and the registry's own later membership read — a TOCTOU case the pre-#4981 code could not detect at all, see ADR-0036's 2026-09-26 Update), `principal_unresolved` (a tracked/MCP dispatch could not recover the dispatching operator), `presence_degraded` (#4981 PR-1 — the cross-replica presence read backing fleet-wide scope evaluation could not answer), `unresolvable` (a `from_result_set:`/`props.<key>` atom referenced a store that was never wired at this call site — unreachable on the real production dispatch ladder, both stores are always wired there, but a defensively-labelled case rather than a misleading `db_degraded`). `target_type` on the audit row is `result_set` for `owner_check_failed` (the only reason actually about a specific result set) and `scope` for every other reason. Fires on all three scoped dispatch paths, plus the no-principal tracked-closure guard (principal_unresolved only). |
 | `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`. `result=success` (`target_id=<bundle-… correlation id>`, detail `agent=<id> steps=<n>`) or `result=failure` (dispatch threw — `target_id` empty, detail `agent=<id> error=<…>`). |
 | `bundle.<plugin>.<action>` | One step of a live-query bundle, emitted per step at dispatch — the device-access lens. `target_type=Agent`, `target_id=<agent_id>`. `result=dispatched` (reached the agent) or `result=no_agents` (reached zero agents → `dispatch_failed` on collate). A bundle of N steps emits N of these, so it is exactly as auditable as N separate executions (works-council parity). Emitted on **both** the REST and MCP surfaces (the per-step verb is transport-agnostic; the MCP tool-call envelope additionally audits as `mcp.execute_bundle`). |
-| `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). |
+| `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). A collation that serves a Forensics-tier step's output also writes `response.forensics.read` with `surface=bundle` (see `response.forensics.read` in the [Audit log](audit-log.md) guide). |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
 | `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result` ∈ {`success`, `error`}. Success detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` degraded-evaluation case (`policy_evaluator_->evaluate_now` returning an error, e.g. an InstructionStore DB/lease failure per ADR-0058, or #4981 PR-1's scope-evaluation abort) DOES audit, `result=error`, detail = the specific underlying-cause string (not a fixed literal — see the route's own 503 documentation) — matches `policy.remediate`'s own `error`-vs-`denied` convention: an infra degrade is not an operator denial. |
 | `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>` (`agents` = delivered count, see the route doc); denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents, a target is already claimed for remediation, or a target has reached its fix-retry cap for this policy); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
@@ -5042,7 +5050,7 @@ the store's unfiltered fleet-wide aggregate. MCP twin: `get_policy_agent_statuse
 this API's general behavioural-PII posture (see [`Sec-Audit-Failed` and the
 behavioural-PII audit posture](#sec-audit-failed-and-the-behavioural-pii-audit-posture)
 above). Unlike the five sibling routes above it, this route's `check_result`
-field carries the raw, unrestricted output of whatever instruction the
+field carries the output of whatever instruction the
 bound fragment's `check_instruction` names — free-form and
 operator-authored at fragment-creation time, not a fixed machine-scope
 shape — so it cannot make the same "not behavioural PII" claim
@@ -5050,6 +5058,14 @@ shape — so it cannot make the same "not behavioural PII" claim
 (`get_policy_agent_statuses`) is unaffected: it follows MCP's own
 convention of surfacing the same gap via an `audit_persisted:false` body
 field rather than a header/status code.
+
+**Forensics-tier checks.** The one case where `check_result` is not the check's output: when
+the check instruction runs a Forensics-tier plugin (`app_usage`, `browser_inventory`,
+`execution_artifacts`, `privacy_permissions`, `remote_access_audit`), the agent's `status` is
+`unknown` and `check_result` is empty, because the evaluator does not read or store that plugin's
+output. `unknown` there says nothing about the device. Check output of such a policy is never
+stored. See "Forensics-tier rows" in the
+Command/Instruction Responses section.
 
 ---
 
@@ -6836,6 +6852,59 @@ row cap and the export byte cap. `GET
 (`response_query_row_json`, `docs/api-twin-recipe.md` Rule 1); `GET /api/v1/responses/{id}/aggregate`
 and MCP `aggregate_responses` share another (`response_aggregate_row_json`).
 
+**Forensics-tier rows (#4990).** Rows written by Forensics-tier plugins (`app_usage`,
+`browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`; the set is
+derived from the capability catalogue) are served only to callers who hold `Forensics:Read` in
+addition to `Response:Read`. This applies to every route that reads stored responses: the legacy
+`GET /api/responses/{id}[/aggregate|/export]`, the v1 twins above, `GET
+/api/v1/executions/{id}/responses`, `GET /api/v1/executions/{id}/visualization`, `GET
+/api/v1/bundles/{id}` (a Forensics step stays `pending` with an empty output for a caller without a
+global grant, so that bundle never reports `complete=true` to that caller), and the `GET
+/api/v1/management-groups/agent-count-preview` count. To any other caller those rows are absent,
+not marked: there is no extra field or flag, and the row cap, the truncation flags, the aggregate
+counts and the agent counts are all computed over the rows the caller may read, so **an empty or
+short result does not imply that no data exists**. The one error is the unresolved case: if the
+server cannot determine whether the caller may read Forensics rows (the authorization store is
+unavailable; this applies to sessions, API tokens, MCP tokens and engine principals (an engine principal once its cached RBAC view is older than 5 seconds: an explicit grant is then admitted and a missing one is `403`; the authorization model reference has the condition), while a service-scoped token is
+default-denied with a definitive `403`), the route answers a retryable A4 `503` (`retry_after_ms` 5000, no
+`permission` field) instead of a result with those rows silently missing; that shape is the Forensics check's own, and
+when a whole-store outage fails the route's earlier `Response:Read` gate first, that gate's own answer is returned
+in its own shape (it can name a `permission`). `yuzu_server_rbac_read_degrade_total`
+(alert `YuzuRbacReadDegraded`) is the correlated signal. `Forensics:Read` is a global grant only: there is
+no management-group scoped read tier on these stored-response routes, and a hand-authored scoped grant reads
+nothing from them (the per-device application-usage read is a separate data set and keeps its own scoped gate). Service-scoped tokens,
+MCP-tier tokens and engine principals need the global grant like everyone else. With RBAC enforcement off, `Forensics:Read` is
+administrator-only, so a non-administrator session does not receive these rows. The built-in
+`ForensicsAnalyst` role is the delegable read-only holder (see `rbac.md`). A served read that
+includes at least one such row also writes a `response.forensics.read` audit row
+(`detail=forensics_rows=<n> plugins=<names> surface=<s>`, `surface` being `rest` for the v1 routes
+and `legacy` for the unversioned ones), fail-closed like the neighboring `response.read` row
+(`503` + `Sec-Audit-Failed: true`, no data); aggregate, facet-option and count reads write none. For an export the
+`forensics_rows` count is taken before the byte cap trims the file, so it can exceed the rows the file holds. When the
+`response.forensics.read` row cannot persist and the route answers `503`, the attempt has already left its
+neighboring success row (`response.read` or `execution.detail.fetch`, written first), and a retry leaves a second one. A caller using
+an API token, an MCP token or an engine principal that does not hold a global `Forensics:Read`
+also leaves one `auth.permission_required` denied audit row per read attempt (an interactive
+browser sign-in does not), so expect denial rows from automation that polls stored responses.
+The filter is per plugin, because only the `plugin` name is stored with a row, and it is a rule
+about these plugins' rows, not about a kind of data: other plugins can return comparable
+information under their own securables, and their stored rows stay under `Response:Read`. The same filter is applied to the
+server's own consumers of these rows: policy check output (such a policy scores `unknown`), result
+set membership (a set sourced from such a command materializes empty) and the live output stream,
+which publishes no row of a Forensics-tier plugin on `GET /events`, `GET /sse/executions/{id}` or
+`GET /api/v1/events`. (Such a frame publishes nothing to the live output stream, not a row and not a notice, and
+nothing is published there when the plugin set is unwired or the frame carries no output. The timing and
+command-status events, which carry no plugin output, still go out, and a dashboard dispatch still resets the Console to
+"Waiting for results..."; the Console's results table therefore stays on that placeholder for such an action,
+so open the execution results instead.) The per-agent `error_detail` of a Forensics-tier command (execution routes,
+`include=agents`) is a short machine token (`scope:cause[:detail]`) or the fixed value
+`forensics_error`; status and exit code are unchanged. The failure notification, the analytics
+event and the webhook and offload payload carry the same reduced text. A response is labelled with the
+plugin the server recorded when it dispatched the command, not with the command id the agent echoes; a
+response with no server record is labelled `~unverified`, which is part of the Forensics set, so it is
+withheld from a caller without `Forensics:Read` like any other Forensics row (see "Provenance" in
+`docs/authz-model.md`).
+
 **Numeric query parameters are parsed strictly (#4644), on these routes AND the legacy
 `GET /api/responses/{id}[/aggregate|/export]` routes.** `status`, `since`, `until`, `limit` (and the
 legacy catch-all route's `offset`) must each be one complete base-10 integer, or the route answers
@@ -6998,7 +7067,12 @@ the query route above. The v1 twin of `GET /api/responses/{id}/aggregate` above,
 `min`/`max` (default `count`); `op_column` (only meaningful for `sum`/`avg`/`min`/`max`) is one of
 `timestamp`/`status`/`id`, defaulting to `id` when omitted. An invalid `group_by`/`op_column` is a
 `400`, validated against `ResponseStore`'s own allow-list before the aggregate query runs — never
-mapped to a `503` (a client typo must not read as store degradation).
+mapped to a `503` (a client typo must not read as store degradation). A `503` (with `retry_after_ms`)
+means the response store is degraded or not initialized, the `response.read` audit row could not persist,
+or the caller's Forensics authority could not be determined (retryable). Rows of Forensics-tier plugins
+are absent from every group and total for a caller without `Forensics:Read`, with no marker, so a small or
+zero total does not prove that no data exists; an aggregate writes no `response.forensics.read` row (see
+"Forensics-tier rows" above).
 
 **Response:**
 
@@ -8302,7 +8376,7 @@ Pin (exempt from TTL expiry) or unpin a result set.
 
 ### Forensics
 
-The **per-agent app-usage** discovery surface (Wave 7 PR7.2, ADR-0016 §5). Data is derived on the agent from TAR's `usage_daily` fold via the read-only `app_usage` plugin and synced daily into `AppUsageStore`, projecting each executable's retained-window first/last-seen plus a trailing-30-day run-count/total-seconds window. `Forensics` is **Administrator-only by design** — deliberately absent from the seeded Viewer read-list.
+The **per-agent app-usage** discovery surface (Wave 7 PR7.2, ADR-0016 §5). Data is derived on the agent from TAR's `usage_daily` fold via the read-only `app_usage` plugin and synced daily into `AppUsageStore`, projecting each executable's retained-window first/last-seen plus a trailing-30-day run-count/total-seconds window. `Forensics` is **held by default only by Administrator and the read-only `ForensicsAnalyst` role** — deliberately absent from the seeded Viewer read-list.
 
 #### `GET /api/v1/forensics/agents/{agent_id}/app-usage`
 
@@ -8686,7 +8760,7 @@ Steps are returned in **request order** (not arrival order), so duplicate or sam
 | `404` | Bundle not found, **or** the caller did not dispatch it and is not an admin. The two are deliberately indistinguishable (no enumeration oracle); the real reason is recorded in the audit log. |
 | `503` | The bundle manifest WAS found and owned, but the response store could not be read (transient Postgres degrade) — distinct from a 404, and retryable: `retry_after_ms:5000` in the A4 body. Poll again after the hint rather than treating this as terminal. |
 
-**Audit:** `bundle.collate` (`target_type=Execution`, `target_id=<id>`), `result=success` (carrying `complete=0|1`), `result=denied` (not found / not owned), or `result=failure` (response store degraded, the 503 case above).
+**Audit:** `bundle.collate` (`target_type=Execution`, `target_id=<id>`), `result=success` (carrying `complete=0|1`), `result=denied` (not found / not owned), or `result=failure` (response store degraded, the 503 case above). When the collation serves the output of a Forensics-tier step (a step of a plugin on the `Forensics` securable that has responded), it also writes `response.forensics.read` (`target_type=Execution`, `target_id=<id>`, detail `forensics_rows=<n> plugins=<names> surface=bundle`); it fails closed like the other REST reads: if that row cannot persist the response is `503` with `Sec-Audit-Failed: true` and no result is returned, and a later poll writes the row again. A bundle with no served Forensics-tier step writes no such row.
 
 **Notes:**
 
@@ -8696,6 +8770,7 @@ Steps are returned in **request order** (not arrival order), so duplicate or sam
 **Error handling and retry (for integrators):**
 
 - **Poll cadence:** poll `GET /api/v1/bundles/{id}` with a short backoff (e.g. 1s, 2s, 4s) until `complete` is `true`, then read `succeeded`/`steps`.
+- **A bundle with a Forensics-tier step may never complete for a caller who cannot read it.** For a caller without a global `Forensics:Read` that step stays `pending` with an empty output and carries no marker, so the bundle stays `complete=false` for that caller (an approval ticket to dispatch the step does not imply the right to read its output). The REST result carries no `retry_after_ms`; the MCP `get_bundle_result` twin does keep advertising one while the bundle is incomplete. Because each collate refreshes the manifest window (next bullet), a poller that never stops keeps the manifest alive, so bound the polling with a deadline of your own.
 - **Manifest TTL ≈ 10 minutes, sliding.** Each successful collate refreshes the window, so a bundle you are actively polling never expires; only an abandoned bundle (no poll for the full window) is swept.
 - **A 404 on a poll that previously returned 200** means the manifest expired (you stopped polling past the TTL) **or** the server restarted (in-memory state lost). The correct recovery is to **re-dispatch the bundle** — the already-executed step responses are harmless (idempotent reads). Do not treat the 404 as a hard failure.
 
@@ -11125,7 +11200,7 @@ Render the Users panel: one row per active account (name, source, account role).
 Render the Roles panel: one row per role in the catalogue (name, description, whether it is built in).
 
 - **Permission:** `UserManagement:Read`, the same securable and the same checked store read as `GET /api/v1/rbac/roles`.
-- **Response (200):** HTML fragment. A role store that does not answer is a red "could not be read" box with a Retry button and no table, still with status 200. An empty catalogue (which the store never produces: it seeds seven roles) is drawn as the same red box, never as "no roles".
+- **Response (200):** HTML fragment. A role store that does not answer is a red "could not be read" box with a Retry button and no table, still with status 200. An empty catalogue (which the store never produces: it seeds eight roles) is drawn as the same red box, never as "no roles".
 - **Response (403):** The caller lacks the permission; the panel shows a "not available to your account" note.
 - **Headers:** `Cache-Control: no-store`. No success audit row (the REST twin writes none).
 
@@ -12423,7 +12498,7 @@ backport-aware matching (M1b/OVAL) lands.
 
 #### `GET /events`
 
-Server-Sent Events stream for real-time dashboard updates. Events include agent connections/disconnections, command responses, and system notifications.
+Server-Sent Events stream for real-time dashboard updates. Events include agent connections/disconnections, command responses, and system notifications. Live output events never carry a row written by a Forensics-tier plugin (see "Forensics-tier rows" under Command/Instruction Responses); a Forensics-tier frame publishes nothing to the live output stream (no row, no notice; the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder; open the execution results instead.
 
 **Example (curl):**
 
@@ -12450,6 +12525,8 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 - **`{id}`:** the execution id returned by `POST /api/instructions/:id/execute` or visible in the executions list (regex: `[A-Za-z0-9_-]{1,128}`).
 - **Content-Type:** `text/event-stream`
 - **Headers:** `Cache-Control: no-cache`, `X-Accel-Buffering: no` (so reverse proxies don't buffer the stream into chunks).
+
+**Forensics-tier output is not published (#4990).** The live output events never carry a row written by a Forensics-tier plugin (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`), whoever is subscribed, and the failure text in the execution events of such a command is a short machine token or the fixed value `forensics_error`. Read the rows through the response routes, which require `Forensics:Read`. Such a frame publishes nothing to the live output stream, not even a notice (the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder for such an action; open the execution results instead.
 
 **Management-group confinement (#1634).** Gated by `require_fleet_read`/`fleet_read_fn` (ADR-0017 admit-then-filter), not a flat global `Execution:Read` check — a management-group-confined operator is admitted and then sees only their in-scope agents' events. The caller who **dispatched** the execution is always admitted to the stream (visibility only — avoids a false 404 on a just-dispatched execution with zero responses yet), but that ownership never bypasses the per-event redaction below. RBAC-off → unrestricted (legacy-open). **This gate is evaluated once, at subscribe time** — it is not re-checked for the life of the connection. If your scope is narrowed, or your session is revoked, mid-stream, an already-open subscription is not automatically disconnected (tracked: #3788); a full server restart is the only thing that currently drops every live stream.
 
@@ -12540,6 +12617,8 @@ The browser-oriented `/sse/executions/{id}` route is preserved for the dashboard
 
 **Permission:** `Execution:Read`.
 **Auth:** Bearer token, `X-Yuzu-Token` header, or session cookie. Same auth surface as every other `/api/v1/*` endpoint.
+
+**Forensics-tier output is not published (#4990).** The live output events never carry a row written by a Forensics-tier plugin (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`), whoever is subscribed, and the failure text in the execution events of such a command is a short machine token or the fixed value `forensics_error`. Read the rows through the response routes, which require `Forensics:Read`. Such a frame publishes nothing to the live output stream, not even a notice (the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder for such an action; open the execution results instead.
 
 **Management-group confinement (#1634).** Gated by `require_fleet_read`/`fleet_read_fn` (ADR-0017 admit-then-filter), not a flat global `Execution:Read` check — a management-group-confined operator is admitted and then sees only their in-scope agents' events. The execution's dispatcher is always admitted to the stream (visibility only — avoids a false 404 on a just-dispatched execution with zero responses yet), never a bypass of the per-event redaction below. RBAC-off → unrestricted (legacy-open). This route shares one event projector (`execution_event_scope.hpp`) with the dashboard's `/sse/executions/{id}` sibling — see that section for the drop/sanitize table (`agent-transition` filtered by `agent_id`, `execution-progress` dropped, `execution-completed` sanitized to `status` only), and for the same subscribe-time-only gate staleness caveat (tracked: #3788) — this route shares that gap.
 

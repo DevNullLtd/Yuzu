@@ -403,7 +403,7 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
                         "permission, and describe the calling session (identity, role, tier, "
                         "direct RBAC role names)",
      kRbacCheck},
-    {"RBAC administration", "grant or revoke one of the 6 fleet-wide-assignable built-in RBAC "
+    {"RBAC administration", "grant or revoke one of the 7 fleet-wide-assignable built-in RBAC "
                             "roles to a human user, and switch RBAC enforcement on/off "
                             "(Administrator-gated, not a plain permission check)",
      kRbacAdministration},

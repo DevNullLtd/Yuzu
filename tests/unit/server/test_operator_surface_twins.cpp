@@ -245,7 +245,7 @@ TEST_CASE("arming_check composition: RBAC enabled + ungranted principal denies",
     CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
     TWINS_RBAC(rbac);
     rbac.set_rbac_enabled(true);
-    // "bob" holds no role at all -> check_permission's collect_roles_locked
+    // "bob" holds no role at all -> check_permission's collect_roles
     // returns empty -> false.
     CHECK_FALSE(compose_arming_check(registry, &rbac, "bob", "filesystem", "exists"));
 }

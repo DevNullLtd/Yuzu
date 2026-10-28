@@ -24,6 +24,7 @@
 #include "command_capability.hpp"    // CommandCapability, ClassificationError
 #include "device_containment_render.hpp" // kContainmentUi
 #include "dex_routes.hpp"            // DexAgentResponse (ResponsesFn return type)
+#include "forensics_visibility.hpp"  // ForensicsVisibilityFn (#4990)
 #include "hardware_action_form.hpp"  // ActionFormSpec
 #include "hardware_list_model.hpp"
 #include "inventory_routes.hpp"      // InventoryDeviceRow / InventoryDevicesResult reuse
@@ -184,7 +185,20 @@ std::string render_hardware_actions_lens(const std::string& agent_id, const std:
 /// `device_routes.cpp`'s live-info result idiom: Pending polls again via
 /// `hx-trigger="load delay:700ms"`; a terminal state renders once and stops.
 struct HwActionResultView {
-    enum class Phase { Pending, Rendered, RenderedEmpty, Failed, TimedOut } phase{Phase::Pending};
+    /// `NeedsForensicsRead` / `PermissionUnconfirmed` (#4990) end the poll with a notice: the caller
+    /// cannot read this Forensics-tier plugin's reply for this device (a permission, not a timeout),
+    /// or the permission check itself could not be completed (the notice points to the execution
+    /// results; running the action again starts a new collection). Appended last: the phase
+    /// number is part of the `hardware.action.result` audit detail.
+    enum class Phase {
+        Pending,
+        Rendered,
+        RenderedEmpty,
+        Failed,
+        TimedOut,
+        NeedsForensicsRead,
+        PermissionUnconfirmed
+    } phase{Phase::Pending};
     std::string output;
     std::string error_detail;
     int attempt{1};
@@ -252,8 +266,16 @@ public:
     using SchemaFn =
         std::function<std::unordered_map<std::string, std::string>(const std::string& plugin)>;
 
-    using ResponsesFn = std::function<std::vector<DexAgentResponse>(const std::string& command_id,
-                                                                    const std::string& agent_id)>;
+    /// Reads the replies to `command_id` from `agent_id`. The `ResponseTierFilter` is REQUIRED
+    /// (#4990): the caller names what it may read with respect to the Forensics tier, the store
+    /// applies it in SQL.
+    using ResponsesFn = std::function<std::vector<DexAgentResponse>(
+        const std::string& command_id, const ResponseTierFilter& tier, const std::string& agent_id)>;
+
+    /// True when `plugin` is a plugin of the composed capability catalogue (case-insensitive).
+    /// Wired from `CommandCapabilityRegistry::knows_plugin`, never a hand-kept list. Unwired
+    /// answers "not known": the Actions-lens result poll then refuses every command id.
+    using KnownPluginFn = std::function<bool(const std::string& plugin)>;
 
     /// Per-device permission PROBE — a stricter check than the Read gate the
     /// record/list already passed, run against a throwaway `Response` so it never
@@ -304,6 +326,9 @@ public:
         ClassifyFn classify_fn;
         SchemaFn schema_fn;
         ResponsesFn responses_fn;
+        /// #4990: the catalogue plugin lookup the result poll validates the command id's plugin
+        /// prefix against (see `KnownPluginFn`).
+        KnownPluginFn known_plugin_fn;
         ScopedProbeFn scoped_probe_fn;
         const std::unordered_map<std::string, std::string>* action_descriptions{nullptr};
         ManifestFn manifest_fn;           // parameter hints (R2.5)
@@ -330,6 +355,12 @@ public:
         /// Same-site gate for the cookie-authorised sync POSTs (both the fleet and the
         /// per-device route). Unwired fails closed: a header-less request is refused.
         WriteGate write_gate;
+        /// #4990: who may read Forensics-plugin rows out of the response store (see
+        /// `forensics_visibility.hpp`). Unwired (empty) resolves to present-empty at the use site.
+        ForensicsVisibilityFn forensics_visibility_fn;
+        /// #4990: `ServerImpl::forensics_plugin_set_` (borrowed). Unwired (nullptr) refuses every
+        /// row on the result poll, see `tier_filter_for`.
+        const ForensicsPluginSet* forensics_plugins{nullptr};
     };
 
     void register_routes(httplib::Server& svr, Deps deps);
