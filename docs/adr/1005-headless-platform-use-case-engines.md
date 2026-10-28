@@ -994,6 +994,43 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        text the default document lacks, or the first release that ships the
        `/swagger` page. The date is not machine-checked.
 
+    - **2026-10-28 - mixed-version admission during a rolling upgrade (scope
+      exception recorded by the maintainer, #6079).** The approver gate
+      (`require_enrolled_fresh_mfa`) runs on each server replica and no
+      minimum-version check exists. While a rolling upgrade is in progress, or
+      after a replica is rolled back, a replica that predates the gate can admit
+      an approve or reject decision the upgraded gate would refuse. Those rows
+      lack the `approver_assurance:enrolled_fresh_mfa` marker. The upgraded
+      build does not relax its own gate; the exception covers only the window in
+      which the control is not yet in force on every replica. Running more than
+      one server replica is unsupported today (the safe-to-scale gate in
+      `docs/ha-delivery-matrix.md`), so the entry covers the rolling-upgrade
+      case and is not a statement that multi-replica operation is supported.
+      Operator wording: `docs/user-manual/upgrading.md` "Mixed-version
+      admission".
+     - **Conditions of this exception.** The upgrade is controlled: the
+       operator records each replica's upgrade timestamp (UTC) in the change
+       ticket (SOC 2 CC8.1) as the roll happens, because the audit row does not
+       name the replica, and keeps the load balancer log for the window. The
+       marker query in `upgrading.md` lists the decisions in the window that
+       carry no marker. Those controls are customer-operated: Yuzu neither
+       enforces nor evidences them.
+     - **Acceptance.** Acceptor: Dave Rae (maintainer). Date: 2026-10-28. Ruling
+       source: the maintainer's answer during the #6079 PR 1 governance working
+       session, given after the governance ledger raised this as finding UP-9.
+       As with the entries above, this is a working-session statement, not a
+       signed decision. The acceptor is also the author of the commits that
+       introduce this entry, so independent review of this acceptance rests on
+       the pull request review (expected, not enforced by tooling), not on a
+       second approver. This entry replaces the earlier statements in
+       `upgrading.md` and `docs/enterprise-readiness-soc2-first-customer.md`
+       that cited an acceptance dated 2026-10-19: no repository record of an
+       acceptance of this exposure existed on that date. The 2026-10-19 addendum
+       above concerns distinct humans only.
+     - **Revisit** when a minimum-version admission check exists, or when
+       multi-replica operation leaves the unsupported state in the safe-to-scale
+       gate, whichever comes first. No calendar date is set.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

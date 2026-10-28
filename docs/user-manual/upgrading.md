@@ -999,9 +999,10 @@ older binary ignores, so a rollback starts cleanly. What changes is which checks
   window, an audit store restored or purged, a lost audit write), so run the same count control over the same bounds.
 - **Mixed-version admission is a documented known limitation of a rolling upgrade.** The approver
   gate is stateless and no minimum-version check exists, so while a rolling upgrade is in progress an old replica
-  can admit a decision the new gate would refuse. The Yuzu project maintainer accepted this on 2026-10-19 as inherent to
-  the upgrade method, on the condition that the upgrade is controlled; that acceptance is the maintainer's own decision,
-  not an artifact you can verify from this page. The condition is: record each
+  can admit a decision the new gate would refuse. The Yuzu project maintainer accepted this on 2026-10-28 as inherent to
+  the upgrade method, on the condition that the upgrade is controlled; the acceptance is recorded in the ADR-1005
+  exception ledger (`docs/adr/1005-headless-platform-use-case-engines.md`, entry of 2026-10-28) as a working-session
+  statement, not a signed decision. The condition is: record each
   replica's upgrade timestamp (in UTC) in the change ticket (SOC 2 CC8.1) **as you roll**, because the audit row does
   not name the replica. A decision row **without**
   `approver_assurance:enrolled_fresh_mfa` was written before the control existed, by a replica that did not have
