@@ -1468,6 +1468,7 @@ if build_server
       'unit/server/test_access_tokens_js.cpp', # Tokens and principals page: string pins on template and glue
       'unit/server/test_access_tokens_authz.cpp', # Tokens and principals page: [pg] persona matrix through the real gates
       'unit/server/test_rest_me.cpp',               # /api/v1/me session self-description + admin_gate_verdict
+      'unit/server/test_me_response.cpp',           # shared /api/v1/me + /api/me + MCP get_me builder (pure, injected RBAC read)
       'unit/server/test_access_tokens_writes_render.cpp', # Tokens and principals page: write controls per caller and row, hostile ids
       'unit/server/test_access_tokens_actions_js.cpp', # Tokens and principals page: string pins on the write glue and reveal strip
       'unit/server/test_access_audit_render.cpp', # Audit and reviews page: pure renderers (log, sample, retention)
@@ -3656,11 +3657,15 @@ test('prometheus alert rules',
 # Pure-logic selftest for the harness above (version-banner parsing, docker argv
 # construction, the pin's own shape). No promtool, no docker, no network, so it
 # runs everywhere -- mirroring the flake-retry and plugin-spawn selftests below.
+# 60 s: the sharding rows launch 42 short Python children as a fake
+# promtool, about 2 s in total on an idle Linux box and about 6 s on a 2-CPU box
+# kept busy. CI runs this entry on the Linux leg only (the Windows and macOS
+# legs exclude the docs suite); the margin covers a local run on a slow box.
 test('prometheus harness selftest',
   _python3_test,
   args: [files('prometheus/run_promtool_tests.py'), '--selftest'],
   suite: 'docs',
-  timeout: 30,
+  timeout: 60,
 )
 
 # #4800: pins scripts/test_gateway.py's zero-executed guard, the ct --dir that
@@ -3951,6 +3956,16 @@ test('same-site gate production wiring lexical selftest',
   args: [files('test_same_site_wiring_lexical_selftest.py')],
   suite: 'docs',
   timeout: 60,
+)
+
+# A unit-test file marked "Whole file compiled out under TSan" must have nothing after its
+# `#ifndef YUZU_TSAN_BUILD` guard's closing `#endif`: no PR job builds with TSan, so a case added
+# there compiles everywhere except the nightly's TSan leg (#6419). Source-text only, so Python.
+test('TSan whole-file guard lexical gate',
+  _python3_test,
+  args: [files('test_tsan_whole_file_guard.py'), meson.current_source_dir()],
+  suite: 'docs',
+  timeout: 30,
 )
 
 # Every repository-markdown runbook_url in the shipped alert rules that carries a #fragment names a

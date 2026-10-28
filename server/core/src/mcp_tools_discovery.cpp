@@ -6,10 +6,10 @@
 
 #include "mcp_tool_registry.hpp"
 
-#include "discover_routes.hpp"     // build_routes_catalog (shared with REST /discover/routes)
-#include "mcp_jsonrpc.hpp"         // kTierDenied, success_response
-#include "mcp_policy.hpp"          // tier_allows
-#include "openapi_spec_access.hpp" // openapi_spec_json()
+#include "discover_catalog_types.hpp" // build_routes_catalog (shared with REST /discover/routes)
+#include "mcp_jsonrpc.hpp"             // kTierDenied, success_response
+#include "mcp_policy.hpp"              // tier_allows
+#include "openapi_spec_access.hpp"     // openapi_spec_json()
 
 #include <span>
 

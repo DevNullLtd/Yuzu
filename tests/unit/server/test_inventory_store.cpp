@@ -19,6 +19,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "typed_inventory_sources.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -90,6 +91,19 @@ void inventory_reset() {
     InventoryStore store{pool};                                                                    \
     REQUIRE(store.is_open())
 
+// Rows for one plugin, counted in SQL rather than through the store's reads,
+// which exclude typed sources (ADR-0070 D12).
+std::int64_t raw_row_count(PgPool& pool, const std::string& plugin) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = pg::exec_params(lease.get(),
+                               "SELECT COUNT(*) FROM inventory_store.inventory_data "
+                               "WHERE plugin = $1",
+                               std::vector<std::string>{plugin});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    return std::stoll(PQgetvalue(res.get(), 0, 0));
+}
+
 // Wall-clock now, mirroring the store's internal `now_secs()` — used only to
 // bound assertions on the store's own clamping, never to construct fixture
 // data that would itself need clamping.
@@ -123,6 +137,11 @@ TEST_CASE("InventoryStore degrades (not empty) on a broken pool", "[inventory]")
     auto g = store.get("a", "p");
     CHECK(!g.has_value());
     CHECK(g.error() == yuzu::server::InventoryReadError::kDegraded);
+    // A typed source name on a broken store is a degrade too, never "absent": the
+    // read filter must not turn a failure into a quiet 404 (chaos CH-3).
+    auto typed = store.get("a", "device_ci");
+    CHECK(!typed.has_value());
+    CHECK(typed.error() == yuzu::server::InventoryReadError::kDegraded);
     CHECK_FALSE(store.delete_agent("a"));       // ingest/delete: fail-soft, false, no crash
     CHECK_FALSE(store.delete_source("app_usage")); // same, keyed on plugin instead of agent
     store.upsert("a", "p", "{}", 1);            // fail-soft: does not throw
@@ -131,12 +150,12 @@ TEST_CASE("InventoryStore degrades (not empty) on a broken pool", "[inventory]")
 TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][inventory]") {
     INVENTORY_SHARED(store, pool);
 
-    store.upsert("agent-1", "installed_software", R"({"n":1})", 1000);
-    store.upsert("agent-1", "device_ci", R"({"n":2})", 1000);
-    store.upsert("agent-2", "installed_software", R"({"n":3})", 2000);
+    store.upsert("agent-1", "hardware_info", R"({"n":1})", 1000);
+    store.upsert("agent-1", "os_info", R"({"n":2})", 1000);
+    store.upsert("agent-2", "hardware_info", R"({"n":3})", 2000);
 
     SECTION("get: found, absent, degrade-free") {
-        auto found = store.get("agent-1", "installed_software");
+        auto found = store.get("agent-1", "hardware_info");
         REQUIRE(found.has_value());
         REQUIRE(found->has_value());
         CHECK((*found)->data_json == R"({"n":1})");
@@ -148,8 +167,8 @@ TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][
     }
 
     SECTION("upsert replaces an existing (agent_id, plugin) row") {
-        store.upsert("agent-1", "installed_software", R"({"n":99})", 5000);
-        auto found = store.get("agent-1", "installed_software");
+        store.upsert("agent-1", "hardware_info", R"({"n":99})", 5000);
+        auto found = store.get("agent-1", "hardware_info");
         REQUIRE(found.has_value());
         REQUIRE(found->has_value());
         CHECK((*found)->data_json == R"({"n":99})");
@@ -164,7 +183,7 @@ TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][
         CHECK(by_agent->size() == 2);
 
         InventoryQuery q2;
-        q2.plugin = "installed_software";
+        q2.plugin = "hardware_info";
         auto by_plugin = store.query(q2);
         REQUIRE(by_plugin.has_value());
         CHECK(by_plugin->size() == 2);
@@ -208,7 +227,7 @@ TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][
         REQUIRE(tables.has_value());
         bool found_installed = false;
         for (const auto& t : *tables) {
-            if (t.plugin == "installed_software") {
+            if (t.plugin == "hardware_info") {
                 found_installed = true;
                 CHECK(t.agent_count == 2); // agent-1 + agent-2
             }
@@ -223,9 +242,9 @@ TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][
     }
 
     SECTION("upsert rejects a blank agent_id/plugin (GDPR orphan guard, IS5/UP-7)") {
-        store.upsert("", "installed_software", R"({"x":1})", 1000);
+        store.upsert("", "hardware_info", R"({"x":1})", 1000);
         store.upsert("agent-blank-plugin", "  ", R"({"x":1})", 1000);
-        auto blank_id = store.get("", "installed_software");
+        auto blank_id = store.get("", "hardware_info");
         REQUIRE(blank_id.has_value());
         CHECK_FALSE(blank_id->has_value()); // never written
         auto blank_plugin = store.get_agent_inventory("agent-blank-plugin");
@@ -235,22 +254,22 @@ TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][
 
     SECTION("upsert never lets an older report overwrite a newer row (stale guard, IS6/UP-8)") {
         // agent-1/installed_software is already seeded at collected_at=1000.
-        store.upsert("agent-1", "installed_software", R"({"n":"older"})", 500); // older: rejected
-        auto after_older = store.get("agent-1", "installed_software");
+        store.upsert("agent-1", "hardware_info", R"({"n":"older"})", 500); // older: rejected
+        auto after_older = store.get("agent-1", "hardware_info");
         REQUIRE(after_older.has_value());
         REQUIRE(after_older->has_value());
         CHECK((*after_older)->data_json == R"({"n":1})");
         CHECK((*after_older)->collected_at == 1000);
 
-        store.upsert("agent-1", "installed_software", R"({"n":"same-instant"})",
+        store.upsert("agent-1", "hardware_info", R"({"n":"same-instant"})",
                      1000); // equal: still updates
-        auto after_equal = store.get("agent-1", "installed_software");
+        auto after_equal = store.get("agent-1", "hardware_info");
         REQUIRE(after_equal.has_value());
         REQUIRE(after_equal->has_value());
         CHECK((*after_equal)->data_json == R"({"n":"same-instant"})");
 
-        store.upsert("agent-1", "installed_software", R"({"n":"newer"})", 2000); // newer: updates
-        auto after_newer = store.get("agent-1", "installed_software");
+        store.upsert("agent-1", "hardware_info", R"({"n":"newer"})", 2000); // newer: updates
+        auto after_newer = store.get("agent-1", "hardware_info");
         REQUIRE(after_newer.has_value());
         REQUIRE(after_newer->has_value());
         CHECK((*after_newer)->data_json == R"({"n":"newer"})");
@@ -284,23 +303,91 @@ TEST_CASE("InventoryStore delete_source erases one plugin across all agents, lea
 
     store.upsert("agent-1", "app_usage", R"({"n":1})", 1000);
     store.upsert("agent-2", "app_usage", R"({"n":2})", 1000);
-    store.upsert("agent-1", "installed_software", R"({"n":3})", 1000);
+    store.upsert("agent-1", "hardware_info", R"({"n":3})", 1000);
+    REQUIRE(raw_row_count(pool, "app_usage") == 2);
 
     CHECK(store.delete_source("app_usage"));
 
-    auto agent1 = store.get_agent_inventory("agent-1");
-    REQUIRE(agent1.has_value());
-    CHECK(agent1->size() == 1);
-    CHECK((*agent1)[0].plugin == "installed_software");
-
-    auto agent2 = store.get_agent_inventory("agent-2");
-    REQUIRE(agent2.has_value());
-    CHECK(agent2->empty());
+    // Counted in SQL: the reads exclude app_usage (a typed source) whether or not
+    // the purge ran, so only a raw count proves the rows are gone.
+    CHECK(raw_row_count(pool, "app_usage") == 0);
+    CHECK(raw_row_count(pool, "hardware_info") == 1);
 
     CHECK_FALSE(store.delete_source("")); // empty-name guard
 
     // Idempotent: a 0-row delete of an already-purged source still commits.
     CHECK(store.delete_source("app_usage"));
+}
+
+TEST_CASE("InventoryStore reads never return a typed source's stray row (ADR-0070 D12)",
+          "[pg][inventory]") {
+    INVENTORY_SHARED(store, pool);
+
+    // A stray typed row, as an older server (or one rolled back below the change
+    // that made the source typed) would have written it, beside a generic row.
+    for (const auto typed : yuzu::server::kTypedInventorySources)
+        store.upsert("agent-1", std::string(typed), R"({"stray":true})", 1000);
+    store.upsert("agent-1", "hardware_info", R"({"n":1})", 1000);
+    REQUIRE(raw_row_count(pool, "certificate_inventory") == 1);
+
+    SECTION("get reads a typed source as absent, not degraded") {
+        for (const auto typed : yuzu::server::kTypedInventorySources) {
+            auto row = store.get("agent-1", std::string(typed));
+            REQUIRE(row.has_value());
+            CHECK_FALSE(row->has_value());
+        }
+        auto generic = store.get("agent-1", "hardware_info");
+        REQUIRE(generic.has_value());
+        CHECK(generic->has_value());
+    }
+    SECTION("query and get_agent_inventory return only the generic row") {
+        auto rows = store.get_agent_inventory("agent-1");
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        CHECK(rows->front().plugin == "hardware_info");
+
+        InventoryQuery q;
+        q.plugin = "certificate_inventory"; // asking for it by name does not reach it
+        auto named = store.query(q);
+        REQUIRE(named.has_value());
+        CHECK(named->empty());
+    }
+    SECTION("stray typed rows never consume the query limit or flag truncation") {
+        InventoryQuery q;
+        q.agent_id = "agent-1";
+        // One above the generic row count: with the filter, one candidate (not at the
+        // limit, so not truncated); without it, the six stray rows would fill the
+        // limit and flag truncation (#2633's exact-at-cap rule).
+        q.limit = 2;
+        bool truncated = true;
+        auto rows = store.query(q, &truncated);
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        CHECK(rows->front().plugin == "hardware_info");
+        CHECK_FALSE(truncated);
+    }
+    SECTION("delete_source removes every typed source's rows and leaves the generic row") {
+        for (const auto typed : yuzu::server::kTypedInventorySources) {
+            CHECK(store.delete_source(typed));
+            CHECK(raw_row_count(pool, std::string(typed)) == 0);
+        }
+        CHECK(raw_row_count(pool, "hardware_info") == 1);
+    }
+    SECTION("delete_agent erases typed stray rows too, not just the visible ones") {
+        CHECK(store.delete_agent("agent-1"));
+        for (const auto typed : yuzu::server::kTypedInventorySources)
+            CHECK(raw_row_count(pool, std::string(typed)) == 0);
+        CHECK(raw_row_count(pool, "hardware_info") == 0);
+    }
+    SECTION("list_tables and count leave typed sources out") {
+        auto tables = store.list_tables();
+        REQUIRE(tables.has_value());
+        REQUIRE(tables->size() == 1);
+        CHECK(tables->front().plugin == "hardware_info");
+        auto total = store.count();
+        REQUIRE(total.has_value());
+        CHECK(*total == 1);
+    }
 }
 
 TEST_CASE("InventoryStore upsert clamps a far-future collected_at to server receipt "
@@ -311,12 +398,12 @@ TEST_CASE("InventoryStore upsert clamps a far-future collected_at to server rece
     const std::int64_t now_before = test_now_secs();
     const std::int64_t far_future = now_before + 10'000'000;
 
-    store.upsert("agent-clamp", "installed_software", R"({"n":1})", far_future);
+    store.upsert("agent-clamp", "hardware_info", R"({"n":1})", far_future);
     const std::int64_t now_after = test_now_secs();
 
     // Read via both single-record `get` and the list-shaped
     // `get_agent_inventory` — the clamp must hold on both read paths.
-    auto found = store.get("agent-clamp", "installed_software");
+    auto found = store.get("agent-clamp", "hardware_info");
     REQUIRE(found.has_value());
     REQUIRE(found->has_value());
     CHECK((*found)->data_json == R"({"n":1})");
@@ -333,8 +420,8 @@ TEST_CASE("InventoryStore upsert clamps a far-future collected_at to server rece
     // predicate (its real collected_at could never reach the far-future
     // stored value). With the clamp, an honest report at ~now for the same
     // (agent, plugin) must still land.
-    store.upsert("agent-clamp", "installed_software", R"({"n":2})", 0 /* now */);
-    auto landed = store.get("agent-clamp", "installed_software");
+    store.upsert("agent-clamp", "hardware_info", R"({"n":2})", 0 /* now */);
+    auto landed = store.get("agent-clamp", "hardware_info");
     REQUIRE(landed.has_value());
     REQUIRE(landed->has_value());
     CHECK((*landed)->data_json == R"({"n":2})"); // lands — the regression net for the freeze bug
@@ -347,10 +434,10 @@ TEST_CASE("InventoryStore upsert: an older report after a fresh one is suppresse
     yuzu::MetricsRegistry metrics;
     store.set_metrics(&metrics);
 
-    store.upsert("agent-stale", "installed_software", R"({"n":"fresh"})", 10'000); // T
-    store.upsert("agent-stale", "installed_software", R"({"n":"older"})", 9'900); // T-100: rejected
+    store.upsert("agent-stale", "hardware_info", R"({"n":"fresh"})", 10'000); // T
+    store.upsert("agent-stale", "hardware_info", R"({"n":"older"})", 9'900); // T-100: rejected
 
-    auto row = store.get("agent-stale", "installed_software");
+    auto row = store.get("agent-stale", "hardware_info");
     REQUIRE(row.has_value());
     REQUIRE(row->has_value());
     CHECK((*row)->data_json == R"({"n":"fresh"})"); // unchanged
@@ -364,9 +451,9 @@ TEST_CASE("InventoryStore query: the truncated out-param signals a capped read (
           "[pg][inventory]") {
     INVENTORY_SHARED(store, pool);
 
-    store.upsert("agent-t1", "installed_software", R"({"n":1})", 1000);
-    store.upsert("agent-t2", "installed_software", R"({"n":2})", 2000);
-    store.upsert("agent-t3", "installed_software", R"({"n":3})", 3000);
+    store.upsert("agent-t1", "hardware_info", R"({"n":1})", 1000);
+    store.upsert("agent-t2", "hardware_info", R"({"n":2})", 2000);
+    store.upsert("agent-t3", "hardware_info", R"({"n":3})", 3000);
 
     SECTION("limit below the row count returns the cap and sets truncated=true") {
         InventoryQuery q;
