@@ -3862,12 +3862,15 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
 # (executor offer(), outbox set_common), agent.cpp passes the claimed boot epoch as the 4th
 # GuardianEngine argument, and both executor construction paths share the engine's emit source.
 # Carries its own in-memory mutation self-test (one or more per rule, plus comment/string
-# stripping proofs). No build required. Python, one process, ~2 s.
+# stripping proofs). No build required. Python, one process, ~5 s on Linux and ~7 s on an M1
+# (the mutation self-test re-scans the large agent.cpp once per mutation; the helpers are memoised
+# so a rule scan of an unchanged source is not repeated). The 60 s timeout leaves headroom on a
+# loaded self-hosted runner; the gate took 24-35 s, past the old 30 s limit, before it was memoised.
 test('guardian emit-pair stamp wiring lexical gate (UP-14)',
   _python3_test,
   args: [files('test_guardian_emit_stamp_lexical.py')],
   suite: 'agent',
-  timeout: 30,
+  timeout: 60,
 )
 
 # Access Users page: pins the production wiring in server.cpp (the real require_admin gate and the

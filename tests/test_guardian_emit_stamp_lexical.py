@@ -98,6 +98,7 @@ Python, not bash: a source-text gate is one process (docs/testing/unit-test-conv
 
 Usage: python3 tests/test_guardian_emit_stamp_lexical.py
 """
+import functools
 import re
 import sys
 import unittest
@@ -146,6 +147,7 @@ def _blank(m):
     return '""'
 
 
+@functools.lru_cache(maxsize=None)
 def normalise(src):
     """Strip comments and string/char literals, collapse whitespace, trim spaces at punctuation."""
     t = _STRIP.sub(_blank, src)
@@ -158,6 +160,7 @@ def _keep_non_comments(m):
     return " " if s.startswith("/") else s
 
 
+@functools.lru_cache(maxsize=None)
 def strip_comments(src):
     """Blank comments only. String and char literals are kept verbatim (a `//` inside a string is
     consumed by the string alternative first), for rules that must read a literal's text."""
@@ -200,13 +203,18 @@ def split_args(s):
 
 def call_sites(t, pattern):
     """(start, args_start, args_end) for every `pattern(` occurrence; args exclude the parens."""
+    return list(_call_sites(t, pattern))
+
+
+@functools.lru_cache(maxsize=None)
+def _call_sites(t, pattern):
     out = []
     for m in re.finditer(pattern + r"\(", t):
         op = m.end() - 1
         cp = match_close(t, op)
         if cp >= 0:
             out.append((m.start(), op + 1, cp))
-    return out
+    return tuple(out)
 
 
 _DEF_TAIL = re.compile(r"(?: ?(?:const|noexcept|override|final|&&|&))*(?: ?->[^{;]*)? ?\{")
