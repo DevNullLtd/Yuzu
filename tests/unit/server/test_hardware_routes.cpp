@@ -11,7 +11,12 @@
 /// null-vs-value contract for the new fields, and the POST .../sync route matrix.
 
 #include "hardware_routes.hpp"
+#include "pg/pg_pool.hpp"
+#include "response_store.hpp"
+#include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -102,6 +107,12 @@ struct HwHarness {
     // so each row renders a form and a Run button.
     std::vector<HwPluginActions> actions_plugins;
 
+    // #4990: the caller's Forensics visibility for the Actions-lens result poll (admin by default).
+    yuzu::server::test::ForensicsCaller forensics;
+
+    // When non-empty, `audit_should_fail` fails ONLY this audit action (the row is still recorded).
+    std::string audit_fail_only;
+
     std::vector<std::string> audits;        // "action|result"
     std::vector<std::string> audit_full;    // "action|result|target_type|target_id"
     std::vector<std::string> audit_details; // detail strings, parallel to `audits`
@@ -115,9 +126,12 @@ struct HwHarness {
     // the real lambda. Pass either flag to the constructor, never assign it after.
     // `containment_ui_ctor` is Deps::containment_ui: the default is the shipped state (hidden);
     // the tests that exercise the pill/panel/banner/tab pass true.
+    // `response_store` (#4990), when given, backs the result poll's `responses_fn` exactly as
+    // server.cpp's closure does: the route-derived tier filter is applied by the real store.
     explicit HwHarness(bool unwire_sync_dispatch_ctor = false, bool unwire_agent_version_fn_ctor = false,
                        bool quarantine_list_wired_ctor = false,
-                       bool containment_ui_ctor = kContainmentUi) {
+                       bool containment_ui_ctor = kContainmentUi,
+                       ResponseStore* response_store = nullptr) {
         quarantine_list_wired = quarantine_list_wired_ctor;
         unwire_sync_dispatch = unwire_sync_dispatch_ctor;
         unwire_agent_version_fn = unwire_agent_version_fn_ctor;
@@ -185,7 +199,7 @@ struct HwHarness {
             audits.push_back(a + "|" + r);
             audit_full.push_back(a + "|" + r + "|" + tt + "|" + tid);
             audit_details.push_back(detail);
-            return !audit_should_fail;
+            return !(audit_should_fail && (audit_fail_only.empty() || audit_fail_only == a));
         };
         HardwareRoutes::DexScoreFn dex_fn = [this](const std::string& id) {
             ++dex_calls;
@@ -227,6 +241,25 @@ struct HwHarness {
             };
         }
         deps.containment_ui = containment_ui_ctor;
+        deps.forensics_plugins = &yuzu::server::test::forensics_plugin_set();
+        deps.forensics_visibility_fn = forensics.fn();
+        deps.known_plugin_fn = [](const std::string& plugin) {
+            static const CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
+            return registry.knows_plugin(plugin);
+        };
+        deps.responses_fn = [response_store](const std::string& command_id,
+                                             const ResponseTierFilter& tier,
+                                             const std::string& agent_id) {
+            std::vector<DexAgentResponse> out;
+            if (!response_store)
+                return out;
+            ResponseQuery q;
+            q.agent_id = agent_id;
+            for (const auto& r : response_store->query(command_id, tier, q)
+                                     .value_or(std::vector<StoredResponse>{}))
+                out.push_back({r.agent_id, r.status, r.output, r.error_detail, r.plugin});
+            return out;
+        };
         deps.actions_fn = [this](const std::string&) -> std::optional<std::vector<HwPluginActions>> {
             return actions_plugins;
         };
@@ -1253,6 +1286,439 @@ TEST_CASE("route: sync and actions-lens ids are floored: over-length or control 
 
         REQUIRE(h.audits.empty());
     }
+}
+
+// ───────────────────── Actions-lens result poll (#4990) ─────────────────────────────────────────────
+//
+// The poll's plugin is DERIVED from the command id and validated against the composed catalogue;
+// the client `plugin` parameter is a caption only. Rendered HTML against a real Postgres-backed
+// store, with an ordinary-plugin control: the Forensics output must be absent for a caller without
+// Forensics:Read and present for one with it.
+
+namespace {
+yuzu::test::PgTestTemplate hw_responsestore_tpl{"responsestore", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("hardware responsestore template: store failed to migrate");
+}};
+
+void put_hw_response(ResponseStore& rs, const std::string& command_id, const std::string& agent,
+                     const std::string& plugin, const std::string& output) {
+    StoredResponse r;
+    r.instruction_id = command_id;
+    r.agent_id = agent;
+    r.status = 1; // SUCCESS
+    r.plugin = plugin;
+    r.output = output;
+    rs.store(r);
+}
+
+std::string poll_url(const std::string& agent, const std::string& command_id,
+                     const std::string& plugin) {
+    return "/fragments/hardware/ci/result?id=" + agent + "&command_id=" + command_id +
+           "&plugin=" + plugin;
+}
+} // namespace
+
+TEST_CASE("result poll: the catalogue lookup is case-insensitive and the Forensics plugin names are "
+          "dash-free, so the prefix split is exact",
+          "[hardware][route][security][forensics]") {
+    const CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    // The derivation is "everything before the last dash of <plugin>-<hex>". It is only sound
+    // while no plugin name carries a dash; this is the check that keeps that true.
+    for (const char* p : {"browser_inventory", "tar", "hardware", "app_usage"})
+        CHECK(registry.knows_plugin(p));
+    CHECK_FALSE(registry.knows_plugin("no_such_plugin"));
+    CHECK_FALSE(registry.knows_plugin(""));
+    // The derivation is only sound while plugin names carry no dash. A source-wide grep of the
+    // capability declarations shows none does; this pins the Forensics tier, the one that matters.
+    CHECK(registry.knows_plugin("HARDWARE"));
+    for (const auto& name : yuzu::server::test::forensics_plugin_set().names())
+        CHECK(name.find('-') == std::string::npos);
+}
+
+TEST_CASE("result poll: the plugin comes from the command id; a mismatching caption or an unknown "
+          "prefix is a 400",
+          "[hardware][route][security][forensics]") {
+    HwHarness h;
+    auto status = [&](const std::string& url) {
+        auto r = h.sink.Get(url);
+        REQUIRE(r);
+        return r->status;
+    };
+    // A real catalogue plugin with a matching caption passes the validation (no reply yet: pending).
+    CHECK(status(poll_url("agent-1", "hardware-abc123", "hardware")) == 200);
+    // The caption names a different plugin than the command id carries.
+    CHECK(status(poll_url("agent-1", "hardware-abc123", "tar")) == 400);
+    CHECK(status(poll_url("agent-1", "tar-abc123", "hardware")) == 400);
+    // A prefix that is not a catalogue plugin, even with a matching caption.
+    CHECK(status(poll_url("agent-1", "no_such_plugin-abc123", "no_such_plugin")) == 400);
+    // No dash, an empty prefix, or an extra dash (the prefix would then not be a plugin).
+    CHECK(status(poll_url("agent-1", "hardware", "hardware")) == 400);
+    CHECK(status(poll_url("agent-1", "-abc123", "")) == 400);
+    CHECK(status(poll_url("agent-1", "hardware-x-abc123", "hardware")) == 400);
+}
+
+TEST_CASE("result poll: a Forensics-plugin reply is rendered only for a caller with Forensics:Read",
+          "[pg][hardware][route][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, hw_responsestore_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    put_hw_response(rs, "browser_inventory-aaaa1111", "agent-1", "browser_inventory",
+                    "TOKEN-HW-FORENSICS");
+    put_hw_response(rs, "hardware-bbbb2222", "agent-1", "hardware", "TOKEN-HW-ORDINARY");
+
+    HwHarness h(false, false, false, kContainmentUi, &rs);
+
+    SECTION("a caller without Forensics:Read gets a permission notice, never the output") {
+        h.forensics.viewer();
+        auto res = h.sink.Get(poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory"));
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_FALSE(contains(res->body, "TOKEN-HW-FORENSICS"));
+        CHECK(contains(res->body, "data-forensics-read-required"));
+        CHECK(contains(res->body, "Forensics:Read"));
+        CHECK_FALSE(contains(res->body, "Waiting for the device to respond"));
+    }
+    SECTION("a global Forensics:Read gets the output") {
+        h.forensics.admin();
+        auto res = h.sink.Get(poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory"));
+        REQUIRE(res);
+        CHECK(contains(res->body, "TOKEN-HW-FORENSICS"));
+    }
+    SECTION("a subset naming the device's own agent still fails closed (no scoped read tier)") {
+        for (const char* agent : {"agent-other", "agent-1"}) {
+            h.forensics.unsupported_subset({agent});
+            auto denied =
+                h.sink.Get(poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory"));
+            REQUIRE(denied);
+            CHECK_FALSE(contains(denied->body, "TOKEN-HW-FORENSICS"));
+            CHECK(contains(denied->body, "data-forensics-read-required"));
+        }
+    }
+    SECTION("an ordinary plugin's reply is unaffected for every caller") {
+        for (int i = 0; i < 2; ++i) {
+            i == 0 ? h.forensics.viewer() : h.forensics.admin();
+            auto res = h.sink.Get(poll_url("agent-1", "hardware-bbbb2222", "hardware"));
+            REQUIRE(res);
+            CHECK(contains(res->body, "TOKEN-HW-ORDINARY"));
+        }
+    }
+}
+
+TEST_CASE("result poll: a caller who lacks the Forensics read proof gets a permission notice on the first "
+          "poll and on every later one, never a false timeout",
+          "[hardware][route][security][forensics]") {
+    // No response store is needed: the notice is decided before any read.
+    HwHarness h;
+    const auto url = poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory");
+    h.forensics.viewer();
+
+    for (const char* attempt : {"", "&n=1", "&n=2", "&n=39", "&n=40", "&n=50"}) {
+        INFO(attempt);
+        auto res = h.sink.Get(url + attempt);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "data-forensics-read-required"));
+        CHECK(contains(res->body, "Forensics:Read"));
+        // The poll ends here: not pending (no further hx-get), and never the timeout text.
+        CHECK_FALSE(contains(res->body, "Timed out"));
+        CHECK_FALSE(contains(res->body, "Waiting"));
+        CHECK_FALSE(contains(res->body, "hx-get"));
+    }
+    // Control: an ordinary plugin's poll is untouched for the same caller (pending, then a timeout
+    // only at the 40th attempt, as before).
+    auto ordinary = h.sink.Get(poll_url("agent-1", "hardware-abc123", "hardware"));
+    REQUIRE(ordinary);
+    CHECK(contains(ordinary->body, "Waiting"));
+    CHECK_FALSE(contains(ordinary->body, "data-forensics-read-required"));
+    auto timeout = h.sink.Get(poll_url("agent-1", "hardware-abc123", "hardware") + "&n=40");
+    REQUIRE(timeout);
+    CHECK(contains(timeout->body, "Timed out"));
+
+    // A holder is polled normally (pending until a reply lands); a subset (unsupported, fails
+    // closed) is refused for every device, its own included.
+    h.forensics.admin();
+    auto holder = h.sink.Get(url);
+    REQUIRE(holder);
+    CHECK(contains(holder->body, "Waiting"));
+    CHECK_FALSE(contains(holder->body, "data-forensics-read-required"));
+    h.forensics.unsupported_subset({"agent-other"});
+    auto other_device = h.sink.Get(url);
+    REQUIRE(other_device);
+    CHECK(contains(other_device->body, "data-forensics-read-required"));
+    h.forensics.unsupported_subset({"agent-1"});
+    auto own_device = h.sink.Get(url);
+    REQUIRE(own_device);
+    CHECK(contains(own_device->body, "data-forensics-read-required"));
+    CHECK_FALSE(contains(own_device->body, "Waiting"));
+}
+
+TEST_CASE("result poll: a grant withdrawn between two polls of the same command ends the poll with the "
+          "permission notice, never a timeout",
+          "[hardware][route][security][forensics]") {
+    // The route re-resolves the caller's Forensics visibility on EVERY poll, so a holder who is
+    // still waiting (pending, polling on) and then loses the grant gets the notice on the very next
+    // poll, including at the attempt count where an ordinary poll would turn into "Timed out".
+    HwHarness h;
+    const auto url = poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory");
+
+    h.forensics.admin();
+    auto before = h.sink.Get(url + "&n=1");
+    REQUIRE(before);
+    CHECK(contains(before->body, "Waiting"));
+    CHECK(contains(before->body, "hx-get")); // still polling
+
+    h.forensics.viewer(); // the grant is withdrawn mid-poll
+    for (const char* attempt : {"&n=2", "&n=39", "&n=40"}) {
+        INFO(attempt);
+        auto after = h.sink.Get(url + attempt);
+        REQUIRE(after);
+        CHECK(contains(after->body, "data-forensics-read-required"));
+        CHECK_FALSE(contains(after->body, "Timed out"));
+        CHECK_FALSE(contains(after->body, "hx-get")); // the poll ends: nothing re-arms it
+    }
+}
+
+TEST_CASE("result poll: an Unknown Forensics decision ends a Forensics poll with a notice pointing "
+          "to the execution results, never a timeout or rows; an ordinary plugin's poll does not "
+          "depend on it",
+          "[pg][hardware][route][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, hw_responsestore_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    put_hw_response(rs, "browser_inventory-aaaa1111", "agent-1", "browser_inventory",
+                    "TOKEN-HW-FORENSICS");
+    put_hw_response(rs, "hardware-bbbb2222", "agent-1", "hardware", "TOKEN-HW-ORDINARY");
+    HwHarness h(false, false, false, kContainmentUi, &rs);
+    h.forensics.unknown();
+
+    for (const char* attempt : {"", "&n=40"}) {
+        INFO(attempt);
+        auto res = h.sink.Get(poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory") +
+                              attempt);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "data-permission-unconfirmed"));
+        CHECK(contains(res->body, "could not be completed"));
+        // The notice points to the execution results; it must not invite a second collection.
+        CHECK(contains(res->body, "execution results"));
+        CHECK_FALSE(contains(res->body, "Try again"));
+        CHECK_FALSE(contains(res->body, "try again"));
+        CHECK_FALSE(contains(res->body, "Timed out"));
+        CHECK_FALSE(contains(res->body, "Waiting"));
+        CHECK_FALSE(contains(res->body, "hx-get"));
+        CHECK_FALSE(contains(res->body, "TOKEN-HW-"));
+    }
+    for (const auto& full : h.audit_full)
+        CHECK(full.rfind("response.forensics.read|", 0) != 0);
+
+    // The ordinary plugin's reply does not depend on the Forensics decision: it renders, and the
+    // resolver is not even asked.
+    h.forensics.calls = 0;
+    auto ordinary = h.sink.Get(poll_url("agent-1", "hardware-bbbb2222", "hardware"));
+    REQUIRE(ordinary);
+    CHECK(contains(ordinary->body, "TOKEN-HW-ORDINARY"));
+    CHECK_FALSE(contains(ordinary->body, "data-permission-unconfirmed"));
+    CHECK(h.forensics.calls == 0);
+}
+
+TEST_CASE("result poll: the Forensics resolver runs once per poll of a Forensics plugin and never for any "
+          "other plugin",
+          "[pg][hardware][route][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, hw_responsestore_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    put_hw_response(rs, "hardware-bbbb2222", "agent-1", "hardware", "TOKEN-HW-ORDINARY");
+    // A Forensics-plugin row planted under an ordinary command id would be a stored row whose plugin
+    // is not its command id's plugin; the filter still excludes it for a caller without the tier.
+    put_hw_response(rs, "hardware-cccc3333", "agent-1", "browser_inventory", "TOKEN-HW-MISFILED");
+    HwHarness h(false, false, false, kContainmentUi, &rs);
+    h.forensics.viewer();
+
+    for (int i = 0; i < 5; ++i) {
+        auto res = h.sink.Get(poll_url("agent-1", "hardware-bbbb2222", "hardware"));
+        REQUIRE(res);
+        CHECK(contains(res->body, "TOKEN-HW-ORDINARY"));
+    }
+    CHECK(h.forensics.calls == 0);
+
+    // The exclusion is exact without a per-caller answer: even an admin's ordinary-plugin poll does
+    // not surface a Forensics-plugin row filed under that command id.
+    h.forensics.admin();
+    auto misfiled = h.sink.Get(poll_url("agent-1", "hardware-cccc3333", "hardware"));
+    REQUIRE(misfiled);
+    CHECK_FALSE(contains(misfiled->body, "TOKEN-HW-MISFILED"));
+    CHECK(h.forensics.calls == 0);
+
+    // A Forensics plugin asks the resolver exactly once per poll.
+    h.forensics.admin();
+    for (int i = 1; i <= 3; ++i) {
+        (void)h.sink.Get(poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory"));
+        CHECK(h.forensics.calls == i);
+    }
+}
+
+namespace {
+// The recorded `response.forensics.read` rows: "action|result|type|id" + the parallel detail.
+struct ForensicsAuditRows {
+    int count{0};
+    std::string full;
+    std::string detail;
+};
+ForensicsAuditRows forensics_audit_rows(const HwHarness& h) {
+    ForensicsAuditRows out;
+    for (std::size_t i = 0; i < h.audit_full.size(); ++i) {
+        if (h.audit_full[i].rfind("response.forensics.read|", 0) != 0)
+            continue;
+        ++out.count;
+        out.full = h.audit_full[i];
+        out.detail = h.audit_details[i];
+    }
+    return out;
+}
+} // namespace
+
+TEST_CASE("result poll: response.forensics.read is recorded only when a Forensics-tier reply is "
+          "rendered",
+          "[pg][hardware][route][security][forensics][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, hw_responsestore_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    put_hw_response(rs, "browser_inventory-aaaa1111", "agent-1", "browser_inventory",
+                    "TOKEN-HW-FORENSICS");
+    // The ordinary control row: a plugin outside the tier, same device.
+    put_hw_response(rs, "hardware-bbbb2222", "agent-1", "hardware", "TOKEN-HW-ORDINARY");
+    // A Forensics-tier plugin's FAILED reply: the error text is rendered too.
+    StoredResponse failed;
+    failed.instruction_id = "browser_inventory-ffff6666";
+    failed.agent_id = "agent-1";
+    failed.status = 2;
+    failed.plugin = "browser_inventory";
+    failed.error_detail = "TOKEN-HW-FORENSICS-ERR";
+    rs.store(failed);
+
+    HwHarness h(false, false, false, kContainmentUi, &rs);
+    const auto forensics_url = poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory");
+
+    SECTION("a caller served nothing (no Forensics:Read) leaves no verb row") {
+        h.forensics.viewer();
+        auto res = h.sink.Get(forensics_url);
+        REQUIRE(res);
+        CHECK_FALSE(contains(res->body, "TOKEN-HW-FORENSICS"));
+        CHECK(forensics_audit_rows(h).count == 0);
+        // Control: the ordinary reply is served to the same caller and also leaves none.
+        auto ord = h.sink.Get(poll_url("agent-1", "hardware-bbbb2222", "hardware"));
+        REQUIRE(ord);
+        CHECK(contains(ord->body, "TOKEN-HW-ORDINARY"));
+        CHECK(forensics_audit_rows(h).count == 0);
+        CHECK(h.audit_full.back() == "hardware.action.result|success|Agent|agent-1");
+    }
+    SECTION("a global Forensics:Read serving a Forensics reply leaves exactly one row") {
+        h.forensics.admin();
+        auto res = h.sink.Get(forensics_url);
+        REQUIRE(res);
+        CHECK(contains(res->body, "TOKEN-HW-FORENSICS"));
+        CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+        const auto rows = forensics_audit_rows(h);
+        CHECK(rows.count == 1);
+        CHECK(rows.full == "response.forensics.read|success|Execution|browser_inventory-aaaa1111");
+        CHECK(rows.detail == "forensics_rows=1 plugins=browser_inventory surface=hardware");
+        // The page's own row is still written.
+        CHECK(std::ranges::count(h.audits, "hardware.action.result|success") == 1);
+    }
+    SECTION("a subset (unsupported) leaves no row, even for the device it names") {
+        for (const char* agent : {"agent-other", "agent-1"}) {
+            h.forensics.unsupported_subset({agent});
+            auto denied = h.sink.Get(forensics_url);
+            REQUIRE(denied);
+            CHECK_FALSE(contains(denied->body, "TOKEN-HW-FORENSICS"));
+            CHECK(forensics_audit_rows(h).count == 0);
+        }
+    }
+    SECTION("a rendered Forensics failure text is also a served row") {
+        h.forensics.admin();
+        auto res = h.sink.Get(poll_url("agent-1", "browser_inventory-ffff6666", "browser_inventory"));
+        REQUIRE(res);
+        CHECK(contains(res->body, "TOKEN-HW-FORENSICS-ERR"));
+        const auto rows = forensics_audit_rows(h);
+        CHECK(rows.count == 1);
+        CHECK(rows.detail == "forensics_rows=1 plugins=browser_inventory surface=hardware");
+    }
+    SECTION("an ordinary plugin's reply leaves no verb row, even for a Forensics:Read caller") {
+        h.forensics.admin();
+        auto res = h.sink.Get(poll_url("agent-1", "hardware-bbbb2222", "hardware"));
+        REQUIRE(res);
+        CHECK(contains(res->body, "TOKEN-HW-ORDINARY"));
+        CHECK(forensics_audit_rows(h).count == 0);
+        CHECK(h.audit_full.back() == "hardware.action.result|success|Agent|agent-1");
+    }
+    SECTION("a pending poll renders no reply and leaves no verb row") {
+        h.forensics.admin();
+        auto res = h.sink.Get(poll_url("agent-1", "browser_inventory-9999aaaa", "browser_inventory"));
+        REQUIRE(res);
+        CHECK(contains(res->body, "Waiting for the device to respond"));
+        CHECK(forensics_audit_rows(h).count == 0);
+    }
+    SECTION("a failed persist of the verb row still renders the page and sets Sec-Audit-Failed") {
+        h.forensics.admin();
+        h.audit_should_fail = true;
+        h.audit_fail_only = "response.forensics.read"; // the page's own row persists normally
+        auto res = h.sink.Get(forensics_url);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "TOKEN-HW-FORENSICS"));
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(forensics_audit_rows(h).count == 1); // attempted once, not retried
+        // Control: an ordinary reply under the same failing sink sets no header.
+        auto ord = h.sink.Get(poll_url("agent-1", "hardware-bbbb2222", "hardware"));
+        REQUIRE(ord);
+        CHECK(contains(ord->body, "TOKEN-HW-ORDINARY"));
+        CHECK(ord->get_header_value("Sec-Audit-Failed").empty());
+    }
+}
+
+TEST_CASE("sync await poll: a Forensics-plugin reply stored under a sync command id is never "
+          "rendered, whoever asks",
+          "[pg][hardware][route][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, hw_responsestore_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    // The poll is constrained to `__sync__-` ids and renders a FAILURE-status reply's text; a
+    // Forensics-plugin row cannot be stored under such an id by the server, but the read must not
+    // depend on that: it excludes the Forensics plugins outright.
+    StoredResponse r;
+    r.instruction_id = "__sync__-cccc3333";
+    r.agent_id = "agent-1";
+    r.status = 2;
+    r.plugin = yuzu::server::test::kForensicsPlugin;
+    r.output = "TOKEN-SYNC-FORENSICS";
+    rs.store(r);
+    StoredResponse ok = r;
+    ok.instruction_id = "__sync__-dddd4444";
+    ok.plugin = "hardware";
+    ok.output = "TOKEN-SYNC-REFUSAL";
+    rs.store(ok);
+
+    HwHarness h(false, false, false, kContainmentUi, &rs);
+    h.forensics.admin();
+    auto poll = [&](const char* command_id) {
+        auto res = h.sink.Get(std::string("/fragments/hardware/ci?id=agent-1&lens=overview&"
+                                          "await_since=1&lens_only=1&command_id=") +
+                              command_id);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        return res->body;
+    };
+    CHECK_FALSE(contains(poll("__sync__-cccc3333"), "TOKEN-SYNC-FORENSICS"));
+    // Control: an ordinary plugin's refusal under a sync id still ends the poll with its text.
+    CHECK(contains(poll("__sync__-dddd4444"), "TOKEN-SYNC-REFUSAL"));
 }
 
 // Pins the documented dual-degraded shape: a degraded CI store alongside a degraded roster

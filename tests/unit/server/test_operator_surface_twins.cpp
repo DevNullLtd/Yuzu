@@ -245,7 +245,7 @@ TEST_CASE("arming_check composition: RBAC enabled + ungranted principal denies",
     CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
     TWINS_RBAC(rbac);
     rbac.set_rbac_enabled(true);
-    // "bob" holds no role at all -> check_permission's collect_roles_locked
+    // "bob" holds no role at all -> check_permission's collect_roles
     // returns empty -> false.
     CHECK_FALSE(compose_arming_check(registry, &rbac, "bob", "filesystem", "exists"));
 }
@@ -523,6 +523,7 @@ TEST_CASE("operator surface MCP twins: every tool satisfies the A5 contract",
             "list_crypto_widgets",
             "get_crypto_dashboard_layout",
             "get_crypto_ca_stats",
+            "get_me",
         };
         if (!kNoArgTools.contains(expected.tool))
             CHECK(schema_it->schema_json != R"({"type":"object","properties":{}})");

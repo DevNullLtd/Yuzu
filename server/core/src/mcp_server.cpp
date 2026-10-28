@@ -13,6 +13,7 @@
 #include "mcp_jsonrpc.hpp"
 #include "discovered_devices_model.hpp" // list_discovered_devices shared builders
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
+#include "me_response.hpp" // shared get_me body builder (REST /api/v1/me + legacy /api/me twin)
 #include "mcp_policy.hpp"
 #include "hardware_routes.hpp"   // HardwareRoutes::*Fn: the static_asserts pinning ToolDeps
 #include "mcp_tool_registry.hpp" // ToolRecord/ToolCallContext: the registry seam (merged by catalogue())
@@ -65,7 +66,7 @@
 #include "upload_grant_parsers.hpp"
 #include "engine_principal_store.hpp"     // PR 4.2: engine role-assignment MCP twins
 #include "rbac_admin_predicate.hpp"       // A2: is_rbac_administrator/is_self_target — global human role assignment gate
-#include "rbac_assignable_roles.hpp"      // A2: kRbacAssignableRoles/is_rbac_assignable_role — closed 6-role set
+#include "rbac_assignable_roles.hpp"      // A2: kRbacAssignableRoles/is_rbac_assignable_role — closed 7-role set
 #include "dex_window.hpp"               // dex_window_to_days / dex_iso_since / dex_normalize_os_filter (pure, store-free/httplib-free window resolver — narrower than dex_routes.hpp, which this file no longer needs)
 #include "deployment_routes.hpp"        // deploy_preview_json (shared REST/MCP builder, #4036)
 #include "preflight_routes.hpp"         // preflight_run_row_json (shared REST/MCP builder, #4036)
@@ -74,6 +75,7 @@
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "auth_routes.hpp"      // detail::sanitize_detail_value — audit-string sanitiser
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
+#include "forensics_read_audit.hpp"     // #4990: response.forensics.read
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
 #include "web_utils.hpp"                // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "bundle_orchestrator.hpp"      // live-query bundle (ADR-0011): dispatch + collate
@@ -777,6 +779,15 @@ static const ToolDef kTools[] = {
      "grant sees only their in-scope agents' rows, pushed into the underlying query "
      "before the row-limit cap so a confined caller's page is never truncated by "
      "hidden rows; a global Response:Read holder sees every agent's rows unchanged. "
+     "Rows written by Forensics-tier plugins (those with an action on the Forensics securable) "
+     "are served only to a caller who also holds a GLOBAL Forensics:Read: there is no "
+     "management-group-scoped read tier for these rows, so a grant scoped to a management group "
+     "does not admit them, and with RBAC off "
+     "Forensics:Read is administrator-only. For any other caller those rows are absent from "
+     "the rows and from the row cap, with no marker, so an empty or short result does NOT prove "
+     "that no data exists. If the caller's Forensics authority cannot be determined the call "
+     "fails with a retryable internal error (retry_after_ms) instead of returning a partial "
+     "result. "
      "Fails closed (zero rows) when the RBAC store is corrupt. Each row also carries "
      "the response's own row id, its instruction_id, error_detail (populated on a "
      "failed/errored response), the originating plugin name, and received_at_ms "
@@ -795,8 +806,15 @@ static const ToolDef kTools[] = {
      "regardless of what a caller asked for). Confined by management group: "
      "the caller's visible-agent set is resolved and applied to the aggregation source rows BEFORE "
      "grouping (filter-before-aggregate), so a confined caller's totals cover only their in-scope "
-     "agents; a global Response:Read holder's totals are unchanged. Fails closed (a JSON-RPC error, "
-     "never empty totals) when the RBAC store is corrupt or the response read errors. A denied-scope "
+     "agents; a global Response:Read holder's totals are unchanged. Rows written by Forensics-tier "
+     "plugins (those with an action on the Forensics securable) are counted only for a caller "
+     "who also holds Forensics:Read; an MCP-tier token needs a GLOBAL Forensics:Read (a "
+     "management-group-scoped grant does not apply to MCP-tier or service-scoped tokens), and "
+     "with RBAC off Forensics:Read is administrator-only. For any other caller those rows add "
+     "to no group or total, with no marker, so a small or zero total does NOT prove no such "
+     "data exists. Fails closed (a JSON-RPC error, never empty totals) when the RBAC store is "
+     "corrupt or the response read errors, and with a retryable error (retry_after_ms) when "
+     "the caller's Forensics authority cannot be determined. A denied-scope "
      "audit row is emitted on a drop.",
      R"({"type":"object","properties":{"instruction_id":{"type":"string"},"group_by":{"type":"string"},"aggregate":{"type":"string","enum":["count","sum","avg","min","max"]},"op_column":{"type":"string","enum":["timestamp","status","id"],"description":"Column for sum/avg/min/max; ignored for count. Defaults to \"id\" when omitted."}},"required":["instruction_id","group_by"]})",
      R"j({"type":"object","properties":{"results":{"type":"array","items":{"type":"object","properties":{"group_value":{"type":"string"},"count":{"type":"integer"},"aggregate_value":{"type":"number"}},"required":["group_value","count","aggregate_value"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["results"]})j"},
@@ -805,15 +823,21 @@ static const ToolDef kTools[] = {
      "Query GENERIC per-source inventory blobs across agents (filter by agent or plugin). For the "
      "typed installed-software inventory (name/version/publisher per device, fleet-queryable), use "
      "query_installed_software instead. `limit` is 1..1000 (default 100): a value above 1000 is "
-     "clamped to 1000 and a value below 1 falls back to the default.",
+     "clamped to 1000 and a value below 1 falls back to the default. The typed daily-sync sources "
+     "(installed_software, app_perf, device_ci, software_licensing, app_usage, "
+     "certificate_inventory) are never returned here; use their typed tools.",
      R"({"type":"object","properties":{"agent_id":{"type":"string"},"plugin":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Page size, 1..1000. Out of range does not error: above 1000 is clamped to 1000, below 1 uses the default"}}})",
      R"j({"type":"object","properties":{"records":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"plugin":{"type":"string"},"data":{"type":"string"},"collected_at":{"type":"integer"}},"required":["agent_id","plugin","data","collected_at"]}},"result_truncated_by_cap":{"type":"boolean"}},"required":["records","result_truncated_by_cap"]})j"},
 
-    {"list_inventory_tables", "List available inventory data types with agent counts.",
+    {"list_inventory_tables",
+     "List available generic inventory data types with agent counts. The typed daily-sync sources "
+     "are not listed; use their typed tools.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"tables":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"agent_count":{"type":"integer"},"last_collected":{"type":"integer"}},"required":["plugin","agent_count","last_collected"]}}},"required":["tables"]})j"},
 
-    {"get_agent_inventory", "Get all inventory data for a specific agent.",
+    {"get_agent_inventory",
+     "Get all generic inventory data for a specific agent. The typed daily-sync sources are not "
+     "returned; use their typed tools.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"description":"Agent ID"}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"records":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"data":{"type":"string"},"collected_at":{"type":"integer"}},"required":["plugin","data","collected_at"]}},"result_truncated_by_cap":{"type":"boolean"}},"required":["records","result_truncated_by_cap"]})j"},
 
@@ -908,7 +932,10 @@ static const ToolDef kTools[] = {
      "Get one policy's per-agent compliance statuses (fan-out list) plus a summary tallied "
      "from exactly the agents returned. Confined by management group / service scope: a "
      "confined caller's summary counts only its own visible agents, never the fleet-wide "
-     "total. REST v1 twin: GET /api/v1/compliance/{id} (same shape).",
+     "total. A policy whose check instruction runs a Forensics-tier plugin (an action on the "
+     "Forensics securable) is scored unknown for every agent with an empty check_result: the "
+     "evaluator never reads Forensics-tier output, so unknown there is by design and says "
+     "nothing about the device. REST v1 twin: GET /api/v1/compliance/{id} (same shape).",
      R"({"type":"object","properties":{"policy_id":{"type":"string","minLength":1,"description":"Policy ID"}},"required":["policy_id"]})",
      R"j({"type":"object","properties":{"policy_id":{"type":"string"},"summary":{"type":"object","properties":{"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"total":{"type":"integer"}}},"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"last_check_at":{"type":"integer"},"last_fix_at":{"type":"integer"},"check_result":{"type":"string"}},"required":["agent_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["policy_id","summary","agents"]})j"},
 
@@ -943,7 +970,13 @@ static const ToolDef kTools[] = {
      "an empty filters map returns a genuine 0 (no scoped count to report), never a "
      "store read. Requires ManagementGroup:Write — approval-gated (supervised MCP "
      "tier maker-checker), matching every other ManagementGroup:Write surface, even "
-     "though this tool itself performs no mutation. When unindexed_filter_keys is "
+     "though this tool itself performs no mutation. An agent is counted only through response "
+     "rows the caller may read: rows written by Forensics-tier plugins (those with an action "
+     "on the Forensics securable) count only for a caller who also holds Forensics:Read (an "
+     "MCP-tier token needs a GLOBAL one; with RBAC off Forensics:Read is administrator-only), "
+     "so a count that omits such agents does NOT prove they did not answer. A retryable error "
+     "(retry_after_ms) is returned when the caller's Forensics authority cannot be "
+     "determined. When unindexed_filter_keys is "
      "non-empty, agent_count can be 0 or an undercount because filter values over "
      "2048 bytes (measured as ingest stores it: a NUL or invalid UTF-8 byte counts as 3) "
      "are not indexed in newly stored responses; its keys are in a stable "
@@ -1069,7 +1102,12 @@ static const ToolDef kTools[] = {
      "\"(redacted - confined view)\" for a confined caller, exactly like "
      "scope_expression), plus completed_at/parent_id/rerun_of, which stay "
      "truthful for every caller - the REST v1 twin GET /api/v1/executions/{id} "
-     "already returned all four; this closes the MCP field-parity gap.",
+     "already returned all four; this closes the MCP field-parity gap. "
+     "error_detail (per agent, and the error preview): for a command of a Forensics-tier "
+     "plugin (an action on the Forensics securable) a failure message is kept only when it "
+     "is a short machine token (scope:cause[:detail], e.g. windows:amcache:hive_locked); "
+     "any other text is replaced by the fixed value forensics_error. Status and exit code are "
+     "unchanged.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"},"include":{"type":"array","items":{"type":"string","enum":["agents"]},"description":"Optional; \"agents\" adds a confined per-agent array + kpi summary"}},"required":["execution_id"]})",
      R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"parameter_values":{"type":"string","description":"Redacted to \"(redacted - confined view)\" for a confined caller"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"completed_at":{"type":"integer"},"parent_id":{"type":"string"},"rerun_of":{"type":"string"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"},"agents":{"type":"array","description":"Present only when include contains \"agents\"","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"},"first_response_at":{"type":"integer"},"completed_at":{"type":"integer"},"exit_code":{"type":"integer"},"error_detail":{"type":"string"}}}},"kpi":{"type":"object","description":"Present only when include contains \"agents\"","properties":{"total":{"type":"integer"},"succeeded":{"type":"integer"},"failed":{"type":"integer"},"p50_ms":{"type":["number","null"]},"p95_ms":{"type":["number","null"]}}},"audit_persisted":{"type":"boolean","description":"Present and false only when the per-agent expansion's audit row failed to persist"}},"required":["id","definition_id","status","scope_expression","parameter_values","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct","completed_at","parent_id","rerun_of"]})j"},
 
@@ -1290,7 +1328,10 @@ static const ToolDef kTools[] = {
      "accepts every responder. Dispatches to parent_id's CURRENT members when supplied, else "
      "broadcasts — same omit-to-broadcast / refuse-if-resolves-to-nothing contract as "
      "create_result_set_from_tar_query. Find valid instruction_id values via list_definitions "
-     "or discover_instructions — do not guess. REST v1 twin: POST "
+     "or discover_instructions — do not guess. If the definition runs a Forensics-tier "
+     "plugin (an action on the Forensics securable) the set materializes with no members "
+     "for every creator, because the materializer never reads Forensics-tier output; an "
+     "empty set from such a definition says nothing about the fleet. REST v1 twin: POST "
      "/api/v1/result-sets/from-instruction-result. NEVER re-send this call on a timeout or "
      "an ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
      "instead. Two distinct fault tokens distinguish when retry is safe: a pre-dispatch "
@@ -2322,6 +2363,12 @@ static const ToolDef kTools[] = {
      "EXCEPTION (Wave 7 PR7.2b): a Forensics-classified plugin.action pair requires EXACTLY ONE "
      "explicit, in-scope agent_id - not merely non-empty agent_ids, and scope is refused outright "
      "even when it would resolve to one device - a forensic read is per-device by nature. "
+     "READING THE RESULT: the collected rows of a Forensics-classified pair are returned by "
+     "query_responses, get_bundle_result and the REST response reads only to a caller who holds "
+     "Forensics:Read as well as Response:Read. Dispatch authority (administrator, or an approved "
+     "ticket) and read authority are separate: a caller without Forensics:Read gets an EMPTY "
+     "result that looks like a run still in flight, so confirm that grant before polling for such "
+     "a pair. "
      "DENIAL DISCRIMINATION (#3687): a dispatch-authorization denial is a JSON-RPC error whose "
      "error.data.reason is one of the six machine-readable values \"unclassified\", "
      "\"ambiguous\", \"anonymous_operator\", \"forbidden\", \"approval_required\", "
@@ -2434,7 +2481,15 @@ static const ToolDef kTools[] = {
      "retry_after_ms, the minimum wait in milliseconds before polling again — bundles emit no "
      "progress notifications, so polling at that cadence is the contract (see execute_bundle). "
      "Mirrors GET /api/v1/bundles/{id}, plus this MCP-only retry_after_ms hint. "
-     "Requires Response:Read.",
+     "Requires Response:Read. Approval to dispatch a Forensics-tier step (a plugin with an "
+     "action on the Forensics securable) does not include reading its output: for a caller "
+     "without a GLOBAL Forensics:Read (an MCP-tier token needs the global grant) that step "
+     "stays state=pending with an empty output, so such a bundle never reports complete=true "
+     "to that caller and polling it will not end. An authorization read that cannot be "
+     "completed returns a retryable error (retry_after_ms) instead of a partial result. "
+     "A collation that serves a Forensics-tier step's output writes a response.forensics.read "
+     "access-audit row (surface=bundle); if that row fails to persist the output is still "
+     "returned and the result carries audit_persisted:false.",
      R"j({"type":"object","properties":{)j"
      R"j("bundle_id":{"type":"string","minLength":1,"description":"The bundle id (bundle-…) returned by execute_bundle"})j"
      R"j(},"required":["bundle_id"]})j",
@@ -2445,7 +2500,8 @@ static const ToolDef kTools[] = {
      R"j("plugin":{"type":"string"},"action":{"type":"string"},"state":{"type":"string","enum":["pending","responded","dispatch_failed"]},)j"
      R"j("status":{"type":"integer","description":"CommandResponse::Status enum value, meaningful when state is responded"},"output":{"type":"string"})j"
      R"j(},"required":["plugin","action","state","status","output"]}},)j"
-     R"j("retry_after_ms":{"type":"integer","description":"Present only while complete=false — minimum ms before polling again"})j"
+     R"j("retry_after_ms":{"type":"integer","description":"Present only while complete=false — minimum ms before polling again"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the access-audit row for serving a Forensics-tier step's output failed to persist"})j"
      R"j(},"required":["complete","received","succeeded","expected","steps"]})j"},
 
     // ── Internal-CA tools (MCP/REST parity for /api/v1/ca/*, PR4 B-2) ──────────
@@ -2897,11 +2953,20 @@ static const ToolDef kTools[] = {
      "approver_assurance_required:<reason> (reason: non_interactive_session, "
      "engine_principal or non_human_principal) after the Approval:Approve RBAC check. "
      "A human reviewer decides via the dashboard Approvals page or POST "
-     "/api/approvals/{id}/approve from an interactive session that passes the existing "
-     "MFA step-up gate (an un-enrolled local user and, unless --mfa-enforcement=required "
-     "(or admin-only, for an admin role), an OIDC session without an amr proof pass it; "
-     "--mfa-step-up-window-secs=0 disables it; "
-     "SAML sessions are refused, #4935; an enrolled-factor requirement is tracked in #6079).",
+     "/api/approvals/{id}/approve from an interactive session. The REST route (not this "
+     "tool) requires an enrolled MFA factor with a proof no older than the approver "
+     "window (at most 300 s) (#6079); it answers a stale proof with a step-up "
+     "challenge and always refuses an un-enrolled session with "
+     "approver_assurance_required:mfa_not_enrolled. Three further typed reasons are "
+     "conditional, because the generic step-up check can answer first: "
+     "saml_mfa_unsupported (SAML, #4935) surfaces only with the step-up window at 0; "
+     "account_unavailable (deactivated or deleted account) surfaces with the step-up window "
+     "at 0, or when the account is removed between the central step-up check's read and "
+     "the approver rule's read; "
+     "mfa_proof_missing (an OIDC "
+     "login with no MFA amr) surfaces with the step-up window at 0 or when MFA "
+     "enforcement does not cover the caller's role. Otherwise the generic check answers "
+     "first. Those MFA reasons belong to the REST route only.",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to approve"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
@@ -2921,11 +2986,20 @@ static const ToolDef kTools[] = {
      "approver_assurance_required:<reason> (reason: non_interactive_session, "
      "engine_principal or non_human_principal) after the Approval:Approve RBAC check. "
      "A human reviewer decides via the dashboard Approvals page or POST "
-     "/api/approvals/{id}/reject from an interactive session that passes the existing "
-     "MFA step-up gate (an un-enrolled local user and, unless --mfa-enforcement=required "
-     "(or admin-only, for an admin role), an OIDC session without an amr proof pass it; "
-     "--mfa-step-up-window-secs=0 disables it; "
-     "SAML sessions are refused, #4935; an enrolled-factor requirement is tracked in #6079).",
+     "/api/approvals/{id}/reject from an interactive session. The REST route (not this "
+     "tool) requires an enrolled MFA factor with a proof no older than the approver "
+     "window (at most 300 s) (#6079); it answers a stale proof with a step-up "
+     "challenge and always refuses an un-enrolled session with "
+     "approver_assurance_required:mfa_not_enrolled. Three further typed reasons are "
+     "conditional, because the generic step-up check can answer first: "
+     "saml_mfa_unsupported (SAML, #4935) surfaces only with the step-up window at 0; "
+     "account_unavailable (deactivated or deleted account) surfaces with the step-up window "
+     "at 0, or when the account is removed between the central step-up check's read and "
+     "the approver rule's read; "
+     "mfa_proof_missing (an OIDC "
+     "login with no MFA amr) surfaces with the step-up window at 0 or when MFA "
+     "enforcement does not cover the caller's role. Otherwise the generic check answers "
+     "first. Those MFA reasons belong to the REST route only.",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to reject"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
@@ -2975,7 +3049,7 @@ static const ToolDef kTools[] = {
     // ── Engine principal role assignments (PR 4.2, design §4.1) — MCP twins of
     // POST/DELETE/GET /api/v1/engine-principals/{id}/roles. Closes the "no
     // production caller" gap for RbacStore::assign_role(principal_type="engine"):
-    // without an authoring surface the resolution side (collect_roles_locked's
+    // without an authoring surface the resolution side (collect_roles's
     // engine UNION arm) is unreachable — a real grant that never takes effect.
     {"assign_engine_role",
      "Grant a FLEET-WIDE RBAC role to an engine principal — the durable identity behind an "
@@ -3033,21 +3107,24 @@ static const ToolDef kTools[] = {
     // this PR, no REST route, MCP tool, or dashboard fragment could grant a
     // human anything beyond Operator/Viewer at management-group scope.
     {"assign_rbac_role",
-     "Grant one of the 6 fleet-wide-assignable built-in RBAC roles to a human user, "
+     "Grant one of the 7 fleet-wide-assignable built-in RBAC roles to a human user, "
      "FLEET-WIDE: Administrator, PlatformEngineer, Operator, ApiTokenManager, Viewer, "
-     "Reviewer. Requires the CALLER to hold a durable Administrator role themselves — this "
+     "Reviewer, ForensicsAnalyst (read-only: Forensics, Response, Execution and Inventory "
+     "reads, no dispatch). Requires the CALLER to hold a durable Administrator role themselves — this "
      "is a stronger gate than an ordinary Security:Write permission check, since it mints "
      "standing authority (including, potentially, Administrator itself). principal_type "
      "must be \"user\" (group-scoped assignment is not supported yet). 'ITServiceOwner' is "
      "REJECTED for this fleet-wide surface — its confinement model requires a "
      "management-group scope this tool does not carry; use the management-group role route "
-     "instead. Assigning to a username with no existing account is allowed "
+     "instead. A role that is not a built-in role but holds a built-in role's name is "
+     "refused with invalid params and nothing is assigned. Assigning to a username with "
+     "no existing account is allowed "
      "(pre-provisioning) and reported via target_provisioned. Requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
      R"j("principal_type":{"type":"string","enum":["user"],"description":"Must be \"user\" — group-scoped assignment is not supported yet"},)j"
      R"j("principal_id":{"type":"string","pattern":"^[A-Za-z0-9._-]{1,64}$","description":"Target username"},)j"
-     R"j("role":{"type":"string","enum":["Administrator","PlatformEngineer","Operator","ApiTokenManager","Viewer","Reviewer"],"description":"One of the 6 fleet-wide-assignable built-in roles — see discover_permissions for the full role/securable catalog, including non-assignable roles like ITServiceOwner"})j"
+     R"j("role":{"type":"string","enum":["Administrator","PlatformEngineer","Operator","ApiTokenManager","Viewer","Reviewer","ForensicsAnalyst"],"description":"One of the 7 fleet-wide-assignable built-in roles — see discover_permissions for the full role/securable catalog, including non-assignable roles like ITServiceOwner"})j"
      R"j(},"required":["principal_type","principal_id","role"]})j",
      R"j({"type":"object","properties":{"assigned":{"type":"boolean"},"principal_type":{"const":"user"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
      R"j("target_provisioned":{"type":"string","enum":["true","false","unknown"],"description":"\"true\" iff principal_id has a currently-active auth.users row at assignment time; \"false\" means it does not — either no account ever existed at this username, or the account is currently deactivated (not distinguished); \"unknown\" means the AuthDB read degraded and this could not be determined (never conflated with \"false\")"})j"
@@ -3077,7 +3154,7 @@ static const ToolDef kTools[] = {
      "Security:Write (supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","pattern":"^[A-Za-z0-9._-]{1,64}$","description":"Target username"},)j"
-     R"j("role":{"type":"string","minLength":1,"maxLength":64,"description":"The role name to revoke — deliberately NOT restricted to the 6 assignable names (unlike assign_rbac_role): unassign is a pure idempotent DELETE with no privilege granted, so it must stay able to clean up an out-of-band grant (e.g. ITServiceOwner or a custom role assigned by direct SQL) that assign_rbac_role itself could never have created"})j"
+     R"j("role":{"type":"string","minLength":1,"maxLength":64,"description":"The role name to revoke — deliberately NOT restricted to the 7 assignable names (unlike assign_rbac_role): unassign is a pure idempotent DELETE with no privilege granted, so it must stay able to clean up an out-of-band grant (e.g. ITServiceOwner or a custom role assigned by direct SQL) that assign_rbac_role itself could never have created"})j"
      R"j(},"required":["principal_id","role"]})j",
      R"j({"type":"object","properties":{"unassigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"})j"
      // audit_persisted deliberately NOT documented here — see
@@ -4306,6 +4383,56 @@ static const ToolDef kTools[] = {
      R"j("week_basis":{"type":"string"},"weeks":{"type":"array","items":{"type":"object","properties":{"week":{"type":"string","description":"ISO 8601 week, e.g. 2026-W40"},"week_start":{"type":"integer"},"partial":{"type":"boolean"},"issued":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]},"revoked":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]}}},"required":["week","week_start","partial","issued","revoked"]}},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
      R"j(},"required":["scope","scope_note","rule_set_version","as_of","as_of_iso","active","expiring_within_days","expired_within_days","revoked_within_days","issued_within_days","week_basis","weeks"]})j"},
+    // Twin of REST GET /api/v1/me (and legacy GET /api/me): the caller's own session
+    // self-description, built by the ONE shared me_response::build_me_json. Legacy
+    // (non-registry) tool, mirroring check_permission: the generic tier gate only,
+    // no perm_fn (REST /api/v1/me has none: it describes only the caller). The security row
+    // below is {"Infrastructure","Read"} with the default `denied` service-scope class,
+    // so a service-scoped token is refused at C8. Not in kWriteToolsRaw, no step-up row.
+    {"get_me",
+     "Describe the CALLING session: its stable principal id (username), display name, persisted "
+     "legacy role and effective role, whether it is a human or an engine principal "
+     "(principal_kind), how it authenticated (auth_source), its MCP tier, whether JIT admin "
+     "elevation is active, and its RBAC role names. Takes no arguments and cannot name another "
+     "principal: the answer is always about the caller. role and effective_role are the legacy "
+     "session view only and are NOT an authority summary: with RBAC on, authority is decided per "
+     "permission, so call check_permission for a specific permission; for an engine principal "
+     "read rbac_roles. rbac_enabled is the server's cached view of the RBAC switch, can lag, and "
+     "does not report the degraded state in which enforcement fails closed (tracked in #6033); "
+     "rbac_roles_resolved reports only whether the role-store read succeeded (true also when no "
+     "read was needed because RBAC reads as off), and false means "
+     "rbac_role and rbac_roles are omitted, never guessed, so retry later. rbac_roles lists the "
+     "caller's DIRECT role assignments only: roles granted through group membership are NOT "
+     "included, an empty list is not proof of no access, and it is not access-review evidence "
+     "(the AccessReview export is). rbac_role is deprecated: the first direct role by role_name "
+     "order, or for a human with no direct role a legacy Administrator/Viewer label that is not "
+     "a grant. An engine principal never receives a fabricated role: with RBAC off, or with no "
+     "engine grant, rbac_role is omitted. For an MCP bearer token (non-empty mcp_tier) "
+     "can_access_settings is always false, because the admin gate denies any MCP tier before it "
+     "tests the role, and effective_role equals role because token sessions are never elevated. "
+     "Read-only, available at every MCP tier, no RBAC permission required. A service-scoped "
+     "token is refused; use REST GET /api/v1/me instead, which a service-scoped token may call. "
+     "Audited as mcp.get_me; audit_persisted:false is returned when that row is dropped. "
+     "Mirrors REST GET /api/v1/me.",
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("username":{"type":"string","description":"Stable principal id: the login name, an opaque oidc:<iss>#<sub> id for SSO sessions, or engine:<slug> for an engine principal"},)j"
+     R"j("display_name":{"type":"string","description":"Human-readable label; falls back to username"},)j"
+     R"j("role":{"type":"string","description":"Persisted legacy role (admin or user)"},)j"
+     R"j("principal_kind":{"type":"string","description":"human (the default for every non-engine session) or engine"},)j"
+     R"j("auth_source":{"type":"string","description":"How the caller authenticated: local, oidc, saml, api_token, mcp_token or engine_token"},)j"
+     R"j("mcp_tier":{"type":"string","description":"readonly, operator or supervised; empty for a non-MCP session"},)j"
+     R"j("scope_service":{"type":"string","description":"Service the token is scoped to; empty when unscoped. Always empty over MCP because a service-scoped token is refused"},)j"
+     R"j("rbac_enabled":{"type":"boolean","description":"The server's cached view of the RBAC switch; can lag and does not report the degraded fail-closed state (#6033)"},)j"
+     R"j("rbac_role":{"type":"string","description":"Deprecated display field: the first DIRECT role by role_name order, or for a human with none a legacy Administrator/Viewer label that is not a grant. Omitted for an engine principal with RBAC off or no engine grant, and when rbac_roles_resolved is false. Not an authority summary: call check_permission"},)j"
+     R"j("rbac_roles":{"type":"array","items":{"type":"string"},"description":"DIRECT role assignments for this principal only; roles granted through group membership are NOT included and this is not access-review evidence. Empty when RBAC is off. Omitted when rbac_roles_resolved is false"},)j"
+     R"j("rbac_roles_resolved":{"type":"boolean","description":"Whether the role-store read succeeded; false means rbac_role and rbac_roles are omitted. Also true when no read was needed because RBAC reads as off (the cached view), so true is not proof that enforcement is off"},)j"
+     R"j("effective_role":{"type":"string","description":"Effective legacy session role (admin while JIT elevation is active); not an authority summary, call check_permission for a specific permission"},)j"
+     R"j("elevated":{"type":"boolean","description":"Whether JIT admin elevation is active"},)j"
+     R"j("elevated_until":{"type":"string","description":"ISO 8601 UTC end of the elevation window; present only while elevated"},)j"
+     R"j("can_access_settings":{"type":"boolean","description":"Whether the admin-only settings pages admit this session; always false for an MCP tier or service-scoped token"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
+     R"j(},"required":["username","display_name","role","principal_kind","auth_source","mcp_tier","scope_service","rbac_enabled","rbac_roles_resolved","effective_role","elevated","can_access_settings"],"additionalProperties":false})j"},
 };
 
 // The audit-detail tag of a /crypto layout failure (never the username), shared by the two
@@ -4834,6 +4961,11 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // every tier, so it does not narrow REST's zero-RBAC-gate posture, and the
     // tool's own handler makes no perm_fn call, matching REST exactly.
     {"check_permission", {"Infrastructure", "Read"}},
+    // get_me: twin of GET /api/v1/me, which calls auth_fn only (no perm_fn). Same posture as
+    // check_permission above: this row drives ONLY the generic tier gate (Read is allowed at
+    // every tier). Default `denied` service-scope class on purpose: do NOT widen it, and it is
+    // not in kServiceScopeGlobalSafe.
+    {"get_me", {"Infrastructure", "Read"}},
     // B4 (#2146 API-parity) — matches the REST route's own perm_fn op exactly.
     {"unlock_account", {"UserManagement", "Write"}},
     // A2 discovery tools (mirrors of GET /api/v1/discover/*).
@@ -5379,6 +5511,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
      {ToolEffect::ReadOnly, true, "List management group role grants"}},
     {"list_api_tokens", {ToolEffect::ReadOnly, true, "List own API tokens"}},
     {"check_permission", {ToolEffect::ReadOnly, true, "Check own RBAC permission"}},
+    {"get_me", {ToolEffect::ReadOnly, true, "Get my identity and roles"}},
     {"get_execution_status", {ToolEffect::ReadOnly, true, "Get execution status"}},
     {"get_execution_children", {ToolEffect::ReadOnly, true, "List execution children"}},
     {"list_executions", {ToolEffect::ReadOnly, true, "List executions"}},
@@ -10038,13 +10171,26 @@ McpServer::HandlerFn McpServer::build_handler(
                 // hidden ones the LIMIT already truncated. Mirrors aggregate_responses'
                 // resolve-then-scope pattern; `distinct_agent_ids`/`_by_execution` picks
                 // the twin matching whichever id this call used.
+                // #4990: derived after the Response:Read gate (fleet_read_fn_) and the scope derivation
+                // above, before the store read (the resolver never writes a response).
+                const auto tier_resolved = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                if (!tier_resolved) { // Unknown: a retryable error, never a partial result (#4990)
+                    mcp_audit("failure", "forensics tier unresolved");
+                    res.set_content(a4_error(kInternalError,
+                                             "Authorization for this read could not be resolved; "
+                                             "no partial result is returned",
+                                             {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const ResponseTierFilter& resp_tier = *tier_resolved;
                 AggregateScope scope_arg; // nullopt = unrestricted
                 bool scope_filtered = false;
                 std::size_t dropped_agents = 0;
                 if (gate.scope) {
                     auto distinct = !exec_id.empty()
-                                        ? response_store->distinct_agent_ids_by_execution(exec_id)
-                                        : response_store->distinct_agent_ids(instr_id);
+                                        ? response_store->distinct_agent_ids_by_execution(exec_id, resp_tier)
+                                        : response_store->distinct_agent_ids(instr_id, resp_tier);
                     if (!distinct) {
                         mcp_audit("failure", "store degraded; " + key);
                         res.set_content(
@@ -10077,8 +10223,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     poll_hint.reset();
 
                 auto responses_opt = !exec_id.empty()
-                                         ? response_store->query_by_execution(exec_id, rq, scope_arg)
-                                         : response_store->query(instr_id, rq, scope_arg);
+                                         ? response_store->query_by_execution(exec_id, resp_tier, rq, scope_arg)
+                                         : response_store->query(instr_id, resp_tier, rq, scope_arg);
                 if (!responses_opt) {
                     mcp_audit("failure", "store degraded; " + key);
                     res.set_content(
@@ -10120,7 +10266,16 @@ McpServer::HandlerFn McpServer::build_handler(
                                                         key);
                 // #1550 HIGH-2: observe the audit bool — a dropped evidence row on this
                 // SOC 2 read surface is surfaced to the caller via audit_persisted:false.
-                const bool audit_ok = mcp_audit("success", key) && denied_ok;
+                bool audit_ok = mcp_audit("success", key) && denied_ok;
+                // #4990: a read that served Forensics-tier rows leaves its own separately
+                // countable row (set-and-proceed here: a drop shows as audit_persisted:false).
+                if (const auto served = summarize_forensics_served(responses, forensics_plugins_);
+                    served.any()) {
+                    const bool forensics_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, kForensicsReadVerb, "success", "Execution", key,
+                        served.detail(ForensicsSurface::kMcp));
+                    audit_ok = audit_ok && forensics_ok;
+                }
                 // poll_hint was computed above, before the response-store
                 // query (UP-1). Emit the count only when in-flight-ness was
                 // actually checked — an instruction_id-only call (nullopt)
@@ -10994,10 +11149,22 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 // #1634: resolve the gate's VisibleSet before aggregation. An engaged,
                 // empty AggregateScope is deliberate and produces zero rows.
+                // #4990: derived after the Response:Read gate (never writes a response), before the store read.
+                const auto tier_resolved = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                if (!tier_resolved) { // Unknown: a retryable error, never a partial result (#4990)
+                    mcp_audit("failure", "forensics tier unresolved");
+                    res.set_content(a4_error(kInternalError,
+                                             "Authorization for this read could not be resolved; "
+                                             "no partial result is returned",
+                                             {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const ResponseTierFilter& resp_tier = *tier_resolved;
                 AggregateScope agg_scope; // nullopt = unrestricted
                 std::size_t dropped_agents = 0;
                 if (gate.scope) {
-                    auto distinct = response_store->distinct_agent_ids(instr_id);
+                    auto distinct = response_store->distinct_agent_ids(instr_id, resp_tier);
                     if (!distinct) {
                         // Store-read error resolving the in-scope set. Surface it as an
                         // internal error — NOT success+empty: an empty aggregate reads as
@@ -11023,7 +11190,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     agg_scope = std::move(in_scope);
                 }
 
-                auto results_opt = response_store->aggregate(instr_id, aq, {}, agg_scope);
+                auto results_opt = response_store->aggregate(instr_id, resp_tier, aq, {}, agg_scope);
                 if (!results_opt) {
                     mcp_audit("failure", "store degraded; " + instr_id);
                     res.set_content(
@@ -11912,8 +12079,21 @@ McpServer::HandlerFn McpServer::build_handler(
                         agent_scope = std::vector<std::string>(scope->begin(), scope->end());
                 }
 
-                auto count =
-                    group_agent_count_preview(response_store, command_id, filters, agent_scope);
+                // #4990: derived after the ManagementGroup:Write gate and the scope derivation above (never
+                // writes a response), before the store read.
+                const auto tier_resolved = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                if (!tier_resolved) { // Unknown: a retryable error, never a partial result (#4990)
+                    mcp_audit("failure", "forensics tier unresolved");
+                    res.set_content(a4_error(kInternalError,
+                                             "Authorization for this read could not be resolved; "
+                                             "no partial result is returned",
+                                             {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const ResponseTierFilter& resp_tier = *tier_resolved;
+                auto count = group_agent_count_preview(response_store, resp_tier, command_id, filters,
+                                                       agent_scope);
                 if (!count) {
                     mcp_audit("failure", "store degraded; preview_management_group_agent_count");
                     res.set_content(
@@ -21057,9 +21237,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 res.set_content(
                     a4_error(kPermissionDenied, approval::approver_refusal_message(refusal),
                              "approving or rejecting requires an interactive human session "
-                             "(passing the MFA step-up gate); MCP, API-token and engine "
-                             "credentials cannot decide an approval. Ask a human reviewer to "
-                             "use the dashboard Approvals page.",
+                             "(local or OIDC login) with an enrolled MFA factor and a fresh proof; "
+                             "MCP, API-token and engine credentials cannot decide an approval. "
+                             "Ask a human reviewer to use the dashboard Approvals page.",
                              /*retry_after_ms=*/-1, /*cid_override=*/{}, audit_ok),
                     "application/json");
                 return;
@@ -21769,7 +21949,19 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const bool is_admin = session->role == auth::Role::admin;
-                auto agg = bundle_orch->collate(bundle_id, session->username, is_admin);
+                // #4990: the caller's own Forensics visibility, resolved on this request.
+                const auto tier_resolved = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                if (!tier_resolved) { // Unknown: a retryable error, never a partial result (#4990)
+                    mcp_audit("failure", "forensics tier unresolved");
+                    res.set_content(a4_error(kInternalError,
+                                             "Authorization for this read could not be resolved; "
+                                             "no partial result is returned",
+                                             {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const ResponseTierFilter& resp_tier = *tier_resolved;
+                auto agg = bundle_orch->collate(bundle_id, session->username, is_admin, resp_tier);
                 if (!agg) {
                     // #2691 (Doomgoose finding #3): kDegraded is a real store
                     // read failure on a bundle that WAS found and owned — a
@@ -21810,6 +22002,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 count_poll("get_bundle_result", !agg->complete);
                 mcp_audit("success", std::string("bundle_id=") + bundle_id +
                                          " complete=" + (agg->complete ? "1" : "0"));
+                // #4990: a collation that serves a Forensics-tier step's output leaves its own
+                // separately countable row (set-and-proceed: a drop shows as audit_persisted:false).
+                // Only this row is surfaced: the ordinary collate row keeps its existing behavior.
+                if (const auto served = summarize_forensics_served(*agg, forensics_plugins_);
+                    served.any() &&
+                    !yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, kForensicsReadVerb, "success", "Execution", bundle_id,
+                        served.detail(ForensicsSurface::kBundle))) {
+                    // Same string-splice as retry_after_ms above: never reserialize the payload.
+                    if (const auto pos = payload.rfind('}'); pos != std::string::npos)
+                        payload.insert(pos, ",\"audit_persisted\":false");
+                }
                 res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
                                 "application/json");
                 return;
@@ -26061,7 +26265,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // both return the SAME client-facing message.
                 const std::string kUniformReject =
                     "role '" + role_name + "' cannot be assigned to a human principal fleet-wide";
-                // Closed six-name allow-list (rbac_assignable_roles.hpp) —
+                // Closed allow-list (rbac_assignable_roles.hpp):
                 // see the REST route's own comment for the full reasoning
                 // (adversarial-review PR1/A2 finding). Covers BOTH the
                 // ITServiceOwner named exclusion (delivery plan §2) AND a
@@ -26076,11 +26280,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 // Defense-in-depth — see the REST route's own comment.
-                if (!rbac_store->get_role(role_name)) {
+                // ONE read serves both checks below (see the REST route's own comment).
+                const auto role_row = rbac_store->get_role(role_name);
+                if (!role_row) {
                     // Doomgoose external review, PR #4985 IMPORTANT finding
                     // #3: reclassified from kInvalidParams to kInternalError
                     // (503-analog, retryable) — role_name has ALREADY passed
-                    // the closed six-name allow-list above, so the caller's
+                    // the closed allow-list above, so the caller's
                     // input was never wrong; a missing row here is a
                     // store-integrity fault, matching the REST route's own
                     // fix.
@@ -26093,6 +26299,21 @@ McpServer::HandlerFn McpServer::build_handler(
                                  "missing from the store; escalate to an operator",
                                  "escalate to an operator",
                                  /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+
+                // #4990: see the REST route's own comment: the closed list is enforced by
+                // name, so a non-built-in role holding a built-in name is refused.
+                if (!role_row->is_system) {
+                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
+                                   role_name + ": a non-built-in role holds this name (name "
+                                               "collision)");
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "a non-built-in role holds the name of this built-in role; "
+                                       "remove or replace it before assigning (see the upgrade "
+                                       "guide, role name collision)"),
                         "application/json");
                     return;
                 }
@@ -29085,6 +29306,43 @@ McpServer::HandlerFn McpServer::build_handler(
                     success_response(id, tool_result(JObj().add("allowed", allowed).str(),
                                                      kObjectOutputSchema)),
                     "application/json");
+                return;
+            }
+
+            // ── get_me ─────────────────────────────────────────────────────
+            // Twin of GET /api/v1/me and legacy GET /api/me: the SAME builder
+            // (me_response.hpp), so the three bodies cannot drift. Mirrors
+            // check_permission's posture exactly: the generic tier gate only, NO
+            // perm_fn (REST /api/v1/me calls auth_fn only), and it describes the
+            // CALLING session alone: there is no argument that can name another
+            // principal. A store fault is a 200 body with rbac_roles_resolved:false
+            // (never an error and never an invented role), so there is no error
+            // branch needing a retry hint. Audit is set-and-proceed through the
+            // generic mcp_audit; the generic helper does not itself report a dropped
+            // row, so audit_persisted:false is added here.
+            if (tool_name == "get_me") {
+                // The generic C8 gate has already run (and audited a denial) before this
+                // branch; this in-handler check mirrors check_permission's and is kept as
+                // defence in depth, so removing it would only be correct if C8 were
+                // proven to subsume it.
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                auto me_json = me_response::build_me_json(*session, me_response::rbac_view(rbac_store));
+                // Serialise BEFORE the audit row: the replace handler degrades invalid
+                // UTF-8 in username/display_name to U+FFFD instead of throwing; serialising
+                // first is defence in depth so a serialisation failure cannot leave a
+                // success audit row behind.
+                std::string me_body = me_response::dump_me_json(me_json);
+                if (!mcp_audit("success")) {
+                    me_json["audit_persisted"] = false;
+                    me_body = me_response::dump_me_json(me_json);
+                }
+                res.set_content(success_response(id, tool_result(me_body, kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 

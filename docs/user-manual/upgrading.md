@@ -555,6 +555,53 @@ Windows agent registered by an earlier installer.
   `--enrollment-token-file`, write it only after that agent has registered, or stop the service
   first.
 
+## Behaviour change: stored responses of Forensics-tier plugins need `Forensics:Read` (#4990, fresh deployment only)
+
+This section describes how the new build behaves in a fresh deployment. It is not a procedure for upgrading an existing database: see "Deployment contract (hard cutover)" below.
+
+**What changed.** Rows written by Forensics-tier plugins (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`) are now served only to a caller who holds `Forensics:Read` in addition to `Response:Read`. The set of plugins is derived from the capability catalogue (every plugin with an action on the `Forensics` securable). This applies on every path that reads stored responses: the legacy `/api/responses/{id}` routes, the `/api/v1` response, execution-response and visualization routes, `query_responses` and `aggregate_responses` on MCP, the dashboard results view and its filter options, the executions drawer and page detail, the Hardware Actions-lens result poll, and the agent counts in the management-group previews. To any other caller those rows are absent: counts, truncation flags and filter options are computed over the rows the caller may read, and no error is returned. **An empty or short result therefore no longer implies that no data exists.** A read that serves such rows also writes a `response.forensics.read` audit row.
+
+The same tier is applied wherever the server reads those rows for a reason other than a direct response read:
+
+- **Bundles.** `GET /api/v1/bundles/{id}` and the MCP `get_bundle_result` collate a Forensics-tier step's output only for a caller with a global `Forensics:Read`. Approval to dispatch the step does not imply the right to read its output. For any other caller that step stays `pending` with an empty output, so the bundle never reports `complete=true` to that caller.
+- **Result sets.** A result set whose source is a command of a Forensics-tier plugin (for example `from-instruction-result` on such a definition) materializes with no members for every creator.
+- **Compliance.** A policy whose check instruction runs a Forensics-tier plugin is scored `unknown` for every agent, with no stored check output. The check instruction is still dispatched to the endpoints and the plugin's response row is still stored (readable only through the tier, kept for the response retention window); only the verdict and `check_result` are withheld. Deleting the policy (`DELETE /api/policies/{id}`) removes its status rows.
+- **Live output.** The live output event stream publishes no row of a Forensics-tier plugin. Such a frame publishes nothing to that stream, not even a notice (the timing and command-status events, which carry no plugin output, still go out, and a dashboard dispatch still resets the Console to "Waiting for results..."), so the dashboard Console, which fills its results table from the output stream, stays on that placeholder for such an action; the rows are read through the execution results, which apply the tier. Nothing is published when the plugin set is unwired or the frame carries no output.
+- **Execution error text.** For a command of a Forensics-tier plugin, the failure text kept in the execution record, the event outbox and the event stream is reduced to a short machine token of the shape `scope:cause[:detail]` (for example `windows:amcache:hive_locked`; at most 96 bytes), or to the fixed value `forensics_error` when the message is not of that shape. Status and exit code are unchanged. The same reduction is applied when the execution record is read, and to the copies of the failure text that the server writes into the failure notification message, the analytics event `error_message` and the `error` field of webhook and offload payloads. On a read, the reduction applies to every agent's failure text in an execution that ran at least one such command, so an ordinary plugin's failure text in that same mixed execution is also reduced when read (it is stored and published as written, except that the transition event of a mixed execution is built from the persisted text and can carry the reduced form). The stored response row itself keeps the plugin's own message, and is served through the tier like any other row.
+- **Provenance.** A response is labelled with the plugin the server recorded when it dispatched the command (a `plugin` column on the correlation record `command_execution`, one row per dispatch, written at the one dispatch chokepoint before any frame is sent), not with the command id the agent echoes back. A response whose command id has no server record (an id the server never issued, a record whose write failed, or a record older than the 24 hour retention window) is stored with the label `~unverified`. That label is part of the Forensics set, so such a response is withheld from every caller without `Forensics:Read`, publishes nothing to the live output stream, and its failure text is reduced in every sink, with no separate rule per consumer. `yuzu_server_response_provenance_total{outcome}` counts every response by `verified`, `unrecorded` (no record) or `lookup_degraded` (the record read failed twice); a sustained `unrecorded` or `lookup_degraded` rate means failed record writes, records reaped under a long-running command, or an endpoint echoing ids the server never issued.
+
+**What the caller sees.** A caller without `Forensics:Read` sees fewer rows, or none, where those plugins ran. If the server cannot complete the permission check (the authorization store is unavailable, or a dependency of the check was never wired), the REST and MCP routes answer a retryable error (`503` with `retry_after_ms` 5000 and no `permission` field on REST, since granting a permission does not fix an outage; an internal error carrying a retry hint on MCP) instead of a partial result, and the dashboard shows a notice instead of an empty list. This holds for sessions, API tokens, MCP tokens and engine principals (an engine principal is included once its cached RBAC view says RBAC is off and is older than the 5 second stale-serve bound: whether RBAC is on can no longer be confirmed, so no grant is read and the engine is refused with the retryable error, whatever grant it holds; a cached view that says RBAC is on still reads the grant, and a failed read is the retryable error; inside the bound a stale view that says RBAC is off still answers a definitive `403`; the authorization model reference, `docs/authz-model.md`, has the detail), and a failed role query counts as unavailable as well (`yuzu_server_rbac_read_degrade_total{reason="query_error"}`). A service-scoped token is the exception: while the authorization store is degraded it is default-denied with a definitive `403` (no retry hint; such a token never holds the grant). The `503` shape above (`retry_after_ms` 5000, no `permission` field) is the Forensics check's own answer. Every surface first runs its own admission gate (`Response:Read`; `Inventory:Read` and `Execution:Execute` on the Hardware poll), and when a whole-store outage fails that gate first, the gate's own answer is returned instead, in its own shape (it can name a `permission`), and `yuzu_server_forensics_tier_withheld_total` does not move. Retry, and see the alerts below if it persists. "Create group from results" creates nothing and shows an error toast ("The permission check for this action could not be completed. Nothing was created. Retry shortly.") when the permission check cannot be completed (HTTP `200`; the toast arrives in an `HX-Trigger` `showToast` header because the form swaps no body into the page); its store-degraded case answers `503` with its own error toast and also creates nothing. The Hardware Actions-lens result poll tells a caller who may not read a Forensics-tier reply that the reply needs `Forensics:Read`, instead of reporting a timeout; that notice, and the notice shown when the permission could not be confirmed, leave no audit row of their own. The poll is not re-armed after the "could not be completed" notice: do not press Run again for that reason, because Run starts a new collection although the first reply may already be stored; open the execution's results (the Executions page) instead. A call made with an API token, an MCP token or an engine principal that does not hold a global `Forensics:Read` also leaves one `auth.permission_required` denied audit row per read of these responses, so expect new denial rows from automation that polls stored responses; an interactive browser sign-in (local, OIDC or SAML) does not leave one. The volume is one row per read attempt per such caller: a token that polls once per second leaves about 86,400 denial rows a day (arithmetic from the one-row-per-attempt rule, not a measurement), so size audit retention and SIEM ingest before pointing such automation at a tier it does not hold.
+
+**What an operator or an agentic worker will notice.** A succeeded execution of one of these plugins shows zero rows to a caller without `Forensics:Read` (the fan-out counts come from the execution record, not from the rows); that is the tier, not a lost result. A retryable `503` / `-32603` with `retry_after_ms` means the authority could not be determined, not that access was refused. A bundle containing a Forensics step never completes for a caller who cannot read it (the step stays `pending`; the MCP result keeps advertising `retry_after_ms`, and each poll refreshes the manifest window, so a worker must bound its polling with its own deadline). The dashboard Console stays on "Waiting for results..." for a Forensics action, because nothing is published to it; open the execution results. A policy whose check runs one of these plugins shows `unknown` for every agent although the check is still dispatched.
+
+**Who is affected.** Callers who held only `Response:Read`: the Viewer, Operator, PlatformEngineer and ITServiceOwner roles, and, while RBAC enforcement is off, every non-administrator session (`Forensics:Read` is administrator-only until enforcement is on). They no longer see the stored rows of these plugins, including in the executions drawer. A caller with the `Execution:Read` permission but not `Response:Read` no longer sees the responses section of the executions drawer at all; it names the missing permission instead. Administrators, and holders of the new `ForensicsAnalyst` role (below) or of a role delegated `Forensics:Read`, see no change. Automation that polls these plugins' results with an API token is affected the same way as its owner: every one of them needs a global `Forensics:Read`; a service-scoped token never proves it. A plain API token carries its owner's authority, and so does an MCP-tier token created by a user holding a global `Forensics:Read`.
+
+**How to fix.** Decide who needs these rows, then:
+
+- **RBAC enforcement on.** Assign the new built-in `ForensicsAnalyst` role (read-only: `Forensics:Read`, `Response:Read`, `Execution:Read` and `Inventory:Read`) fleet-wide, through the Users and roles page, `POST /api/v1/rbac/roles/ForensicsAnalyst/assignments` or the MCP `assign_rbac_role` tool. It does not allow dispatching anything: collecting forensic data stays approval-gated, and a user holding `Operator` plus `ForensicsAnalyst` can read what was collected but still needs an approval ticket to collect it. A user holding only `ForensicsAnalyst` cannot dispatch at all: `POST /api/command` answers `403` for want of `Execution:Execute`. On the MCP `execute_instruction` tool at the supervised tier, the approval step runs before the tool's own permission check, so an approval ticket can be spent by a call that is then refused for the same reason; that ordering already applied to any caller who lacked `Execution:Execute`. `Administrator` also holds `Forensics:Read`. See "The ForensicsAnalyst role" in the RBAC guide.
+- **RBAC enforcement off (the shipped default).** Only administrators can read these rows, and no role grant changes that while enforcement is off (an assigned `ForensicsAnalyst` grant is stored but inert until enforcement is switched on). To delegate the read, turn enforcement on and assign the role. Enforcement is fleet-wide and changes more than this read: follow "Enabling RBAC" in the [RBAC guide](rbac.md#enabling-rbac) first, because with enforcement on a user who has no management-group role assignment sees no agents, so every operator needs a management-group role before the switch.
+- **Only a fleet-wide grant reads these rows.** There is no management-group-scoped read tier: a `Forensics:Read` grant scoped to a management group (which can only be written directly in PostgreSQL, which is unsupported and is not recorded in the in-product audit log) reads nothing from the stored-response surfaces (the per-device application-usage read, `GET /api/v1/forensics/agents/{id}/app-usage` and MCP `get_agent_app_usage`, is a different data set with its own per-device scoped gate and still honors such a grant for devices in the group). The scoped assignment routes accept only `Operator` and `Viewer`, so even `Administrator` is refused at management-group scope, and engine principals cannot hold a scoped assignment or the seeded built-in roles (a hand-made non-system role that reuses a built-in name is not barred; see "Role name collision" below).
+
+The filter works per plugin because only the `plugin` name is stored with a row; no plugin with both Forensics and ordinary actions exists today. The tier is per plugin, not per kind of data: other plugins can return comparable information under their own securables (for example file, registry, WMI or event-log reads), and their stored rows remain governed by `Response:Read` as before.
+
+**Deployment contract (hard cutover).** This release supports initial deployment into a fresh database with no data imported from earlier builds. Existing databases and backups from earlier builds are unsupported. Every server writer and serving replica must run the new build. Earlier binaries must have no access to the new deployment's database. Restarts, additional replicas and recovery may reuse data created entirely within this deployment contract. Recovery means rolling forward on the new build, or restoring this build's own backups into a fresh deployment; a database or backup written by an earlier build is unsupported. The executable does not enforce this: it does not verify the provenance of the database it opens and it cannot keep an earlier binary away from it. Provisioning a fresh database and excluding earlier binaries from it are deployment responsibilities. Data written by earlier builds is outside the supported population: this section describes no upgrade path, no operation alongside earlier builds and no return to an earlier build, and makes no statement about what an earlier build stored. An earlier binary has no Forensics tier, so pointing one at this deployment's database would let every holder of `Response:Read` read these rows again, and the executable cannot prevent it. Notification history is served as stored (there is no read-time scrub and no retention bound), so a database carried forward from an earlier build would expose earlier failure text through the notification list to a holder of `Infrastructure:Read`, and nothing in the executable detects such a database. Test environments follow the same rule: because this release is a fresh-deployment cutover, any pre-release upgrade test (the `/test` skill's Phase 2, which upgrades the previous release's database to HEAD) must run against a freshly provisioned database, and standing rigs (the 3-env stack, a home server, a shared test PostgreSQL, long-lived agent hosts) must be reprovisioned fresh before they are pointed at this build. The contract is a scope decision of the project owner, 2026-10-24 (no upgrade path is provided); it is not an acceptance of any residual risk, and it is procedural, not enforced by the executable.
+
+**After deployment.**
+
+1. Assign the `ForensicsAnalyst` role (or `Administrator`) fleet-wide to the people and automation that need to read these rows (see "How to fix").
+2. Watch `yuzu_server_forensics_tier_withheld_total` (it should stay flat), `yuzu_server_response_provenance_total{outcome}` (the `unrecorded` and `lookup_degraded` outcomes should stay flat) and the counters that name the cause: `yuzu_exec_correlation_write_degrade_total` (dispatch-record writes that failed or, in the operator Guardian rule push after its first failure, were skipped; one outage push adds one count per target), `yuzu_exec_correlation_read_degrade_total{reason}` (record reads that failed) and the `yuzu_pg_*` pool and lock metrics. The alerts `YuzuDispatchRecordWriteFailing` (write failures), `YuzuResponseProvenanceLookupDegraded` (record reads that fail twice) and `YuzuExecCorrelationReapSaturated` (the retention sweep running at its cap) watch the record (see "Alert" below). If one fires, check PostgreSQL health and locks first, then the matching counter. Also watch the server log warning "Forensics execution lookup failed" (a second signal, log only with no counter: the execution lookup that decides whether stored failure text is shown failed, and the text was withheld; throttled to about one line a minute), and the `response.forensics.read` audit verb (it is the evidence of who read these rows, with limits: it is written only by reads that return at least one such row; aggregate, facet-option and count reads, the dashboard filter bar and the create-group-from-results action write no such row; an interactive cookie session that lacks the grant leaves no denial row; and on the dashboard and MCP surfaces a failure to persist it does not stop the data being served, unlike REST; the audit log guide lists the reads it does not count). Expect `auth.permission_required` denial rows from token automation that polls these responses without the grant (about 86,400 a day for a once-per-second poller; see "What the caller sees").
+3. **Verify.** Run a Forensics-tier action against one device, then read its responses with `query_responses` as an Administrator (the rows are returned and a `response.forensics.read` row is written) and as an Operator (no rows and no error). If the Administrator gets none, first check that the action completed on the device and that the Administrator holds `Forensics:Read`. Then run an ordinary plugin (one that is not Forensics-tier) against the same device and confirm that the Operator sees its rows and that `yuzu_server_response_provenance_total{outcome="verified"}` moved. This second check matters: if every dispatch-record write is failing, every response is stored `~unverified`, which is Forensics-tier, so the first check gives the same observations as a healthy tier while every ordinary plugin's results are hidden from every caller without `Forensics:Read`.
+
+**Known limits.** The filter covers reads of stored responses and the server-side consumers listed above. It does not change who may dispatch a Forensics-tier plugin; a separate follow-up (#6065) tracks the dispatch-side authorization of policy checks. The provenance label proves that the server issued the command id for that plugin; it does not prove who sent the frame. An endpoint that was legitimately sent a command (or was inside a broadcast of it) can replay that id on a frame of its own and so label that frame with the command's plugin, and the content of a frame is not validated. A single execution that runs longer than the 24 hour record window finds no record when it answers and is stored as `~unverified`; a delayed or staggered command does not reach that window, because `delay` and `stagger` are each limited to 300 seconds (600 seconds in total) and only `POST /api/command` accepts them. A dispatch whose record write failed has its responses stored as `~unverified`, so a reader that excludes the Forensics set (for example the Hardware Actions-lens result poll) never finds them, and a registry write command with no record mints no `registry.write` audit rows, because those rows are minted only for a response labelled `registry`.
+
+**Role name collision.** The `ForensicsAnalyst` role is created by the idempotent seed pass at server start and is assigned to nobody. If a role with that name that is not a built-in role already exists (it can only have been created by hand in PostgreSQL), it is left as it is, the four read grants are NOT added to it (so its existing holders gain no `Forensics:Read`), and the server logs one error naming the role at start-up; the built-in role is then unavailable until the hand-made role is removed and the server restarted. To find it, list the roles (`GET /api/v1/rbac/roles`) and look for `ForensicsAnalyst` with `is_system` false, and its holders with `GET /api/v1/rbac/roles/assignments`. While the collision exists, assigning `ForensicsAnalyst` through `POST /api/v1/rbac/roles/ForensicsAnalyst/assignments` or `assign_rbac_role` is refused as a name collision (409 on REST, an invalid-params error on MCP, audited). There is no product route to remove a role, so the remedy is direct SQL on the `rbac_store` schema, which is unsupported and not audited: create a replacement role under another name first if its holders need one, then `DELETE FROM rbac_store.roles WHERE name = 'ForensicsAnalyst' AND NOT is_system`, which also removes the role's grants and assignments (they reference the role by name with `ON DELETE CASCADE`, and a role with grants cannot be renamed); a hand `DELETE` does not bump the RBAC generation, so restart every serving replica afterwards. If the seed's role check cannot be completed at start-up, the four grants are withheld for that boot and added at the next one (an error is logged). Grants an earlier build already merged into such a role are not removed. Because it is not a built-in role, the engine-principal bar does not apply to it: review who holds it and what it grants.
+
+**Alert.** `YuzuForensicsTierUnresolved` fires when reads are being refused because the caller's authority could not be determined, repeatedly over about 10 minutes (it is `rate(yuzu_server_forensics_tier_withheld_total[5m]) > 0` for 10 minutes, so a single refusal or a burst shorter than about 5 minutes does not fire it, and neither does a refusal that recurs only every 5 minutes or longer, by design, because the 5 minute rate window is then false between events). It points at the authorization store (`rbac_unavailable`), as the metric's `reason` label names; `unwired` is not a store problem but a wiring defect in the build, which a running server should not show. For `rbac_unavailable`, check the authorization store's health and correlate with `yuzu_server_rbac_read_degrade_total`, the pool metrics and the server log line "Forensics-tier visibility could not be resolved"; the reads recover on their own once the store answers.
+
+Three more alerts (four in all, with `YuzuForensicsTierUnresolved` above) watch the dispatch record, which decides the label (and so the tier) of every stored response. `YuzuDispatchRecordWriteFailing` (warning) fires when `rate(yuzu_exec_correlation_write_degrade_total[5m]) > 0` for 10 minutes: dispatch is unaffected, but each response to a command whose record was not written is stored `~unverified`. `YuzuResponseProvenanceLookupDegraded` (warning) fires when `yuzu_server_response_provenance_total{outcome="lookup_degraded"}` has a non-zero rate for 10 minutes: the record read failed twice for incoming responses, with the same consequence. For both, check PostgreSQL health and locks and the `yuzu_pg_*` pool and lock metrics first, then the counter; responses already stored `~unverified` are not repaired when the store recovers, so re-run the affected commands. A dispatch rate below about one every 5 minutes is not detected by the rate window (the counter is the complete evidence). `YuzuExecCorrelationReapSaturated` (warning) fires when the hourly sweep of the dispatch-record table has run at or near its 50,000 rows per pass cap for 24 hours (`increase(yuzu_exec_correlation_reap_total[6h]) >= 200000`): records are created faster than the sweep reclaims them, which is a capacity signal and leaves nothing unverified. There is deliberately no alert on the `unrecorded` outcome: it also counts an id the server never issued, a record reaped after 24 hours and an empty id, so it is non-zero on a healthy fleet.
+
+**Start-up refusal.** If the log shows `[Forensics] Refusing to start: <reason> (#4990) - fail-closed` at ERROR level and the server exits, the capability catalogue compiled into this binary yields no usable Forensics plugin set, and the server will not start rather than serve a tier that excludes nothing. It is a defect in the build, not in the configuration or the database: install a correct build of the same release.
+
 ## Behaviour change: new enrollment tokens default to 72 hours and 100 uses
 
 **What changed.** A limit left blank when minting an enrollment token now defaults to 72 hours
@@ -574,6 +621,26 @@ spent or expired.
 
 **How to fix.** Pass an explicit `0` for `max_uses` and/or `ttl_hours` to keep the old
 unlimited/no-expiry behaviour, or size them to the rollout window and the number of machines.
+
+## Behaviour change: generic inventory reads never return a typed source's rows
+
+**What changed.** The generic inventory store's reads (`query_inventory`, `get_agent_inventory`, `list_inventory_tables` and their REST twins, `POST /api/v1/inventory/evaluate`, and the inventory-query result-set source) no longer return rows for the typed daily-sync sources: `installed_software`, `app_perf`, `device_ci`, `software_licensing`, `app_usage`, and the reserved `certificate_inventory`. Those sources have their own stores and gates. Before this change, a typed source's blob that reached the generic store through an older server's gateway path could be read there under `Infrastructure:Read` or `Inventory:Read` until the next boot purge removed it. That window is now closed on every server at this release or later (see the per-server note below). The gateway also drops a `certificate_inventory` blob, a source no agent sends yet, instead of storing it generically.
+
+**Who notices.** Only a caller that read one of those six source names from the generic store. Their data was never meant to be there. Use the typed surface instead, which is unchanged:
+
+| Source | REST | MCP |
+|---|---|---|
+| `installed_software` | `GET /api/v1/inventory/software` | `query_installed_software` |
+| `device_ci` | `GET /api/v1/hardware/{id}` | `get_hardware_ci`, `list_hardware_ci` |
+| `app_perf` | `GET /api/v1/dex/perf/apps` and the other `/api/v1/dex/perf/app*` routes | `list_dex_perf_apps`, `get_dex_app_perf` |
+| `software_licensing` | `GET /api/v1/sle/agents/{agent_id}` | `query_software_licenses` |
+| `app_usage` | `GET /api/v1/forensics/agents/{agent_id}/app-usage` | `get_agent_app_usage` |
+| `certificate_inventory` | reserved; its routes arrive with its store | — |
+
+**Deploy order, and what is per server.** The filter protects reads served by a server at this release or later, and nothing else. Every server older than this release, or rolled back below it, keeps storing typed-source blobs that arrive through a gateway attached to it, and keeps serving them under `Infrastructure:Read` or `Inventory:Read`. In a multi-replica deployment that means the exposure is not closed until every replica runs this release: during a rolling upgrade, reads routed to an older replica still return those rows, and rows an older replica writes after an upgraded replica's boot purge stay in the table (unreadable through upgraded replicas) until a purge runs again. Upgrade servers before agents, finish the rolling upgrade promptly, and never roll a server back below this release once agents send `certificate_inventory` (none does yet).
+
+**No action on upgrade.** There is no schema change, and the boot purge still removes any stray typed rows.
+
 ## Behaviour change: the DEX score policy document carries a version (#6085, #6086)
 
 **What changed.** The canonical text of the `dex_score_policy` document now includes `"version": 1`, and `version` is a recognised key. A document without the field reads as version 1. A server that meets a version above the one it supports scores under the shipped defaults, reports `fault: unsupported_version at version: N above the supported 1` on every Apps response, and logs it once. It never applies part of a document, and the revision stays the hash of the stored text. `PUT /api/v1/dex/score-policy` writes the document from this release. A build that predates the score policy reader ignores it. A development build that has the reader but predates this change refuses a `version` key as an unknown key and serves the shipped defaults with a fault for any document that carries it.
@@ -641,11 +708,22 @@ A refused request writes no quarantine record and releases none. The `403` bodie
 
 **How to fix.** Call the route with an API token, or send an `Origin` header matching the dashboard origin (for example `-H "Origin: https://yuzu.example.com"`). Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin`. No configuration or data migration is required.
 
-## ⚠️ Breaking: approving or rejecting a request now needs an interactive session and MFA step-up; MCP cannot approve (#6061)
+## ⚠️ Breaking: approving or rejecting a request now needs an interactive session and an enrolled MFA factor with a fresh proof; MCP cannot approve (#6061, #6079)
+
+**Before you upgrade (checklist).**
+
+1. List your administrators and everyone who holds `Approval:Approve` (see "Find affected automation before you upgrade" below). With RBAC enforcement off (the shipped default) the approvers are exactly the accounts with `role = 'admin'`; the step-0 query in step 2 returns the local ones that are not yet enrolled.
+2. Check who is enrolled: run the step-0 SQL, the first block of [Path A in the recovery runbook](../ops-runbooks/auth-db-recovery.md#path-a-an-enrolment-sign-in-window). On a Linux package install the `psql "$YUZU_POSTGRES_DSN"` blocks in this section fail in an interactive shell, because the DSN lives only in the env file, which is readable only by root and the `yuzu` account; read the value into a shell variable (do not source the file, because a DSN containing `&` or spaces breaks as shell) with `YUZU_POSTGRES_DSN=$(sudo sed -n 's/^YUZU_POSTGRES_DSN=//p' /etc/yuzu/yuzu-server.env)` and then run each block as written.
+3. Enrol each administrator in Settings → Security and sign-in → Two-factor sign-in; another administrator cannot do it for them.
+4. Plan each non-administrator approver (possible only once RBAC enforcement is on): it needs the runbook path, not Settings.
+5. A SAML deployment has no approver path (#6098); give those approvers a local or OIDC account first.
+6. Have at least two enrolled approvers: a submitter cannot review their own request, so a single enrolled approver cannot decide that approver's own requests.
+7. After the upgrade, run the approvals-refused query (step 6 of "After upgrading, verify approvals on a test request" below) to see whether approvals are being refused and why.
+8. Owners of scripts that run `yuzu-server --mfa-reset`, and of SIEM rules on `mfa.disabled` or `mfa.reset.breakglass`: `--mfa-reset` now exits `1` when ending the sessions fails (`result=partial`), when the audit store refuses its intent row, and when the clear itself fails; every clear writes two audit rows; a failed session delete is `result=partial`, not `success` (details in the `--mfa-reset` notice below).
 
 **What changed.** Approve and reject (`POST /api/approvals/{id}/approve`, `POST /api/approvals/{id}/reject`,
 the dashboard Approvals page, and the MCP tools `approve_request` / `reject_request`) now require all of:
-an interactive cookie session (local or OIDC), a fresh MFA step-up (with the pass-through described below), a human
+an interactive cookie session (local or OIDC), an enrolled MFA factor with a fresh proof (#6079, described below), a human
 principal and not an engine principal. The existing rule that the reviewer cannot be the submitter is unchanged.
 
 - **API-token and MCP-token sessions are refused** with a typed `403` (A4 error envelope).
@@ -655,24 +733,91 @@ principal and not an engine principal. The existing rule that the reviewer canno
   ADR-1005's exception ledger (entry 2026-10-18: "human review is a human-session act"). The tools stay registered, and listing pending
   approvals through MCP is unchanged. Their tier/permission mapping is `Approval:Approve` (it was
   mapped as `Approval:Write`, #3151).
-- **SAML users cannot approve while MFA step-up is on.** SAML sessions can never pass step-up (#4935). A
-  deployment whose approvers all sign in through SAML therefore has no working approver path until they are given
-  an OIDC provider or a local account, or step-up is turned off fleet-wide with `--mfa-step-up-window-secs=0`
-  (under `--auth-mode=sso-only` the only local sign-in left is the break-glass account, which is not a substitute).
-  This is a known limitation, tracked in #6098.
-- **"Fresh MFA step-up" is not a guarantee of a second factor.** The step-up gate can only ask for a factor the
-  account has, so it passes without a second factor for a local account with no enrolled factor (in every
-  `--mfa-enforcement` mode; `required`, and `admin-only` for admins, force enrolment at login, so in practice any
-  account under `optional` and a non-admin under `admin-only`), for an OIDC session whose identity provider
-  asserted no `amr` proof **unless `--mfa-enforcement=required`** (under `admin-only` it still passes for a
-  non-admin role), and for any session when `--mfa-step-up-window-secs=0`. `--mfa-enforcement=required` closes the
-  OIDC case only if your identity provider asserts an MFA-method `amr` for approvers: an OIDC session without one
-  gets `401` and loops through re-sign-in at every step-up endpoint, not only approval, which locks those operators
-  out of all of them. Check `amr` before enabling `required`; the way back is restarting the server in
-  `optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards), not just any non-`required` mode, because an `amr`-less OIDC admin is still gated under `admin-only` (see
-  [MFA on SSO sessions](authentication.md#mfa-on-sso-sessions-pr-3) and the
-  [recovery runbook](../ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)). (SAML sessions are refused at step-up gates in every mode, independent of `required`.) Requiring that the approver holds an enrolled factor
-  in every mode is tracked in #6079.
+- **SAML users cannot approve.** SAML sessions can never pass step-up (#4935), so a SAML user is refused with
+  `403`. With step-up on (the default `--mfa-step-up-window-secs`), the central step-up check answers first with its
+  generic `403` "MFA step-up is not available for SAML sessions in this release" and an `mfa.step_up.required` row
+  `reason=saml_session_no_mfa_this_release`; the typed `approver_assurance_required:saml_mfa_unsupported` appears only
+  with `--mfa-step-up-window-secs=0`. A deployment whose approvers all sign in through
+  SAML therefore has no working approver path until they are given an OIDC provider or a local account (under
+  `--auth-mode=sso-only` the only local sign-in left is the break-glass account, which is not a substitute).
+  This is a known limitation, tracked in #6098. Before #6079, `--mfa-step-up-window-secs=0` admitted a SAML
+  approver; it no longer does.
+- **The approver needs an enrolled MFA factor and a fresh proof, at most 300 seconds old (#6079).** The
+  generic step-up gate can only ask for a factor the account has, so it passed an account with none; approve and
+  reject now use their own rule, in every `--mfa-enforcement` mode:
+  - **Local account:** it must have an enrolled TOTP factor, or the decision is refused `403`
+    `approver_assurance_required:mfa_not_enrolled`. The proof must also be no older than the window and must not
+    predate the account's current enrolment (disabling MFA and enrolling again invalidates older proofs; the
+    response is the usual step-up `401`).
+  - **OIDC session:** the identity provider must have asserted an MFA-method `amr` (with an `iat`) on the ID
+    token at sign-in. If it did not (no MFA `amr`, or `iat` missing or not positive), the decision is refused
+    `403` `approver_assurance_required:mfa_proof_missing` (with step-up on, typed only when `--mfa-enforcement` does not
+    protect the role; otherwise the central check answers first with the `401` step-up). If it did, but the token was issued longer ago than the
+    approver window, the response is instead the step-up `401` with `challenge_url=/auth/oidc/start`. Read "fresh"
+    narrowly: it means the provider issued an ID token with an MFA `amr` within the window; the MFA itself may
+    predate the token, because the provider can reuse its own session. No second factor is presented again at
+    approval time, and any single MFA-method `amr` value counts. Real re-authentication (`auth_time` with
+    `max_age`) is a named follow-up.
+  - **The window** is `min(--mfa-step-up-window-secs, 300)` seconds, and 300 when the setting is `0` or negative:
+    300 seconds is a ceiling, not a fixed window, so a setting of 60 gives a 60-second window.
+    The ceiling is measured on the database clock against the session's stored proof timestamp, so a paused virtual
+    machine or a resumed host cannot extend it.
+    It does not depend on `--mfa-enforcement`, so `--mfa-step-up-window-secs=0` no longer lowers approval
+    assurance and no setting lengthens it past 300 seconds.
+  - **A deleted, deactivated or invalid account** cannot decide an approval: a live session whose account row no
+    longer exists, is deactivated, or has an invalid username is refused. With step-up on (the default) the central
+    check answers first with `401` `MFA step-up required` (remediation `auth_db unavailable: retry shortly or contact
+    an administrator`); the typed `403` `approver_assurance_required:account_unavailable` (audit detail
+    `approver_assurance:account_unavailable`) appears only with `--mfa-step-up-window-secs=0`, or when the account
+    disappears between the two reads. Sign in again or contact an administrator.
+  - **Break-glass accounts** are enrolled by validation and get no exemption. The reviewer must still differ from
+    the submitter.
+  - **Known limitation, unchanged by this release:** "differ from the submitter" means a different account name.
+    One person holding a local and an SSO identity (or two SSO identities) counts as two reviewers. Resolving
+    identities to one person is a planned follow-up; see "Who can approve" in
+    [Instructions](instructions.md#who-can-approve).
+  - **A non-admin cannot enrol itself** under `--mfa-enforcement=optional` or `admin-only` (login enrols only the
+    accounts the mode protects, and the Settings enrolment routes are administrator-only). The seeded `Operator`
+    role holds `Approval:Approve`, so with RBAC enforcement on, every such approver is refused `mfa_not_enrolled`
+    after the upgrade until an administrator enrols them, either with a temporary enrolment sign-in window or by promoting each account to
+    administrator just long enough to enrol and then demoting it; see
+    [Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver),
+    including the identity-proofing step (under the window, whoever signs in first with the password enrols the
+    factor) and each path's consequences. Plan this **before** upgrading, and make sure at least one
+    enrolled, authorised approver exists who is not the submitter of each request you expect to be decided: until
+    then nothing can be approved. A seeded administrator that has never enrolled is in the same position. Self-service
+    enrolment for non-admins is a planned follow-up and is not part of this change. `yuzu-server --mfa-reset`
+    ends the account's sessions, and disabling MFA in Settings ends every session of the account, the one you
+    are using included (neither ends API tokens). **`--mfa-reset` now exits non-zero when ending the sessions fails**
+    (the factor is already cleared; it records `result=partial` in its audit row): scripts that run it and treat exit `0`
+    as success must handle that, and end the sessions by hand. It also exits `1` with
+    `error: audit store did not accept the intent row; nothing was changed` when the audit store refuses its `attempted`
+    intent row (nothing is cleared; a second line on stderr points at the runbook's "Fallback: direct SQL" section), and `1`
+    when the clear itself fails. Every reset, and every Settings disable, now
+    writes an extra `attempted` row before the outcome row, so a SIEM rule that counts one row per clear sees two; do
+    not match on `result <> 'success'` without excluding `attempted` and `detail LIKE 'blocked:%'` rows, and key
+    failure rules on `result IN ('partial','error')`. Order the pair by the audit `id`. **With RBAC enforcement off (the shipped default),** the legacy gate requires the `admin` role for
+    approving, so a non-admin is refused `403` "admin role required" before the MFA check and enrolling a non-admin
+    approver achieves nothing until RBAC enforcement is turned on.
+  - **When the approver rule's own read fails** (an unreadable stored session proof for any approver, or, for a local
+    approver, an MFA-store fault at the approver's own read: with the step-up window at `0` or negative, or a fault
+    between the central check's read and that one), the answer is `503` with `retry_after_ms`, counted as
+    `yuzu_auth_secret_unavailable_total{route="approval"}`; nothing is decided. While step-up is on, a local approver
+    whose MFA store is unreadable is refused first by the central check: `503` without `retry_after_ms`, counted as
+    `yuzu_auth_secret_unavailable_total{route="mfa_stepup"}` and
+    `yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}`.
+  - **An OIDC approver whose stored MFA proof is dated after the database clock** (the replica that took the sign-in ran
+    ahead of the database clock; the sign-in clamps the ID token's `iat` to that replica's own clock, so an identity
+    provider running ahead cannot cause this alone) is refused `503` with the message `the approver's identity-provider
+    MFA proof is dated after the database clock` and `retry_after_ms` null; audit `result=error`, `detail`
+    `approver_assurance:mfa_proof_clock_skew`. It is not counted in `route="approval"`. An administrator must correct clock
+    synchronisation between the Yuzu server hosts and the database host (the remediation also names the identity
+    provider). This `503` is typed only when the central check does not answer first (default `--mfa-enforcement=optional`, `admin-only` for a non-administrator approver, or the step-up window at `0`), and only until the database clock reaches the stored instant (after at most as long as the skew is large): afterwards
+    the approver gets `403` `mfa_proof_missing` until the session cache re-derives (a session create, MFA mark, elevation or delete by any user clears it; an activity touch does not; so does a server restart), and signing in again re-creates that state while the skew persists. Under `required` (or `admin-only` for an
+    administrator) with the window above `0`, the central check answers first: the approver sees a repeating `401` step-up
+    challenge, no `approval.*` skew row, and a rising `yuzu_auth_mfa_step_up_gate_total{outcome="refused"}`; check clock
+    synchronisation first. See
+    [OIDC approvers refused with a clock-skew 503](../ops-runbooks/auth-db-recovery.md#oidc-approvers-refused-with-a-clock-skew-503).
 - **A same-site `Origin` (or `Referer`) is now required.** A browser or script `POST` to
   `/api/approvals/{id}/approve` or `/reject` that authenticates with a session cookie and carries no `Origin` or
   `Referer` naming this site now gets `403` (audited as `csrf.denied`; the server-wide same-site check answers it before the step-up check, so a cross-site request that also has a stale proof gets this `403`, not the step-up `401`, and spends no step-up). A script that
@@ -680,9 +825,10 @@ principal and not an engine principal. The existing rule that the reviewer canno
   TLS-terminating or Host-rewriting reverse proxy must declare the public address with `--csrf-trusted-origin`, as
   for the sibling cookie-write routes described further down this page (for example the hardware-sync and
   `PUT /api/config/{key}` notes) and in [Server Administration](server-admin.md), or the dashboard's Approve and Reject buttons are refused. Token callers
-  are not subject to this check (they are refused as non-interactive sessions instead). The dashboard dialog shows
-  every `403` as "You do not have permission to decide approvals", so a missing `Origin` looks like a permission
-  problem there; see "Who can approve" in `instructions.md` for the causes.
+  are not subject to this check (they are refused as non-interactive sessions instead). The dashboard dialog shows an
+  `approver_assurance_required` refusal as its own remediation text, but shows any other `403` (a missing `Origin`,
+  or a missing `Approval:Approve`) as "You do not have permission to decide approvals", so a missing `Origin` looks
+  like a permission problem there; see "Who can approve" in `instructions.md` for the causes.
 - **A degraded session read fails closed.** The route answers `503` and the request stays pending; it no
   longer records the reviewer `unknown` (#4128).
 - **The attempt is audited first.** If the audit row cannot be written, approve and reject return `503`
@@ -696,14 +842,21 @@ principal and not an engine principal. The existing rule that the reviewer canno
 **Who this affects.** Any automation that approved or rejected over MCP or with an API token. It will now
 fail. A supervised-tier agentic worker still requests approval and recalls with the `approval_id`, but a
 person must approve in the dashboard or over REST on a signed-in session. SAML-only approvers must sign
-in with a local account or OIDC. Scripts that approve with a session cookie must complete the step-up
+in with a local account or OIDC. Also affected: **every approver whose account has no enrolled MFA factor**, which on a default install means every approver. With RBAC enforcement off
+and `--mfa-enforcement=optional` (the shipped defaults) the only approvers are administrators, and none is enrolled until it
+enrols itself in Settings, so each is refused until it does (another administrator cannot enrol it). Once RBAC enforcement is on, every
+non-admin approver under `optional` or `admin-only` is in the same position and needs the runbook path. Also affected is every OIDC approver whose provider does not assert an MFA
+`amr`; both are refused until fixed. Scripts that approve with a session cookie must complete the step-up
 (`POST /login/mfa/stepup`) when they receive `401` with `meta.mfa_step_up_required`.
 
-**If you set `--mfa-step-up-window-secs=0`,** approval loses its MFA requirement and is protected by the
-interactive-session rule only. Review every `approval.approve` audit row with `result=success` if you run
-that way, and check every `attempted` row that has no outcome row (compare counts per `target_id`). Each
-decision also writes a `result=attempted` row first, so do not count both, and a decision whose outcome row
-failed to write leaves only the `attempted` row (see [Audit Log](audit-log.md)).
+**If you set `--mfa-step-up-window-secs=0`,** approval no longer loses its MFA requirement: approve and reject use a
+300-second window instead, and still require an enrolled factor. The setting still switches the step-up gate off for
+the other step-up endpoints. Decisions made **before** the upgrade, and in particular any made with the setting at
+`0`, gain no retroactive assurance: review every `approval.approve` audit row with `result=success` from that period,
+and check every `attempted` row that has no outcome row (compare counts per `target_id`). A build that has #6061
+also writes a `result=attempted` row first, so do not count both, and a decision whose outcome row failed to write
+leaves only the `attempted` row (see [Audit Log](audit-log.md)). A build that predates #6061 writes no
+`attempted` row, only the outcome row.
 
 **Find affected automation before you upgrade.** Nothing is listed for you, so search the audit log for
 callers that approved or rejected without a signed-in browser session.
@@ -738,9 +891,9 @@ need `AccessReview:Read`) and match each principal's roles against the roles tha
 
 **What that search cannot see.** The audit query finds token and MCP approvers only. The approvers most likely
 to hit the new behaviour are human accounts, which carry `principal_class = 'human'` and so look the same before
-and after the upgrade: SAML users (refused at step-up), OIDC users whose identity provider asserts no MFA-method
-`amr` (refused with a `401` re-sign-in loop under `--mfa-enforcement=required`, and also under `admin-only` for an
-admin, and passed through otherwise), and local accounts with no enrolled factor (passed through without a second factor). To
+and after the upgrade: SAML users (refused), OIDC users whose identity provider asserts no MFA-method
+`amr` (now refused `mfa_proof_missing`; before this change they passed unless `--mfa-enforcement=required`), and local
+accounts with no enrolled factor (now refused `mfa_not_enrolled`; before this change they passed without a second factor). To
 list the SAML and `amr`-less OIDC operators who have signed in, query the login rows in the audit store (the
 retention window applies):
 
@@ -769,7 +922,9 @@ ORDER BY username;
 ```
 
 `role` is the account's legacy role column, not its RBAC grants, so compare the result with who holds
-`Approval:Approve`. An account listed here passes the step-up without a second factor.
+`Approval:Approve`. An account listed here is refused as an approver (`mfa_not_enrolled`) after the upgrade, so enrol it first if it is meant to approve; a non-admin needs the enrolment sign-in window described above.
+With RBAC enforcement off (the shipped default), a non-admin account is refused `403` "admin role required" before
+the MFA check, so `mfa_not_enrolled` is what an administrator sees, and a non-admin sees it only once enforcement is on.
 
 **After upgrading, verify approvals on a test request.** Use a test device and a harmless, read-only
 instruction, and do not skip the safety notes in step 1: an execute call that is not held for approval really
@@ -804,9 +959,11 @@ dispatches.
    redemption path yet, so the approval is recorded and nothing is dispatched (tracked in #6064). The test proves
    the approval gate, not execution.
 2. As that human approver on a signed-in browser session, approve the pending test request on the Approvals page.
-   Expect the step-up prompt if the proof is older than `--mfa-step-up-window-secs`, then success. The audit store
-   should show an `approval.approve` row with `result=attempted` followed by one with `result=success`, and the
-   `success` row should carry `principal_class = 'human'`. If you script this step with a session cookie, send an
+   The approver must be an enrolled local account (or an OIDC login your provider sent an MFA `amr` for). Expect the
+   step-up prompt if the proof is older than the approver window (`min(--mfa-step-up-window-secs, 300)`, or 300 if
+   that is `0`), then success. The audit store
+   should show an `approval.approve` row with `result=attempted` followed by one with `result=success`, both with
+   `detail=approver_assurance:enrolled_fresh_mfa`, and the `success` row should carry `principal_class = 'human'`. If you script this step with a session cookie, send an
    `Origin` header naming the server (for example `-H "Origin: https://yuzu.example.com"`), or the `POST` is
    refused with `403` before anything is recorded other than a `csrf.denied` row.
 3. With an API token that holds `Approval:Approve`, send `POST /api/approvals/{id}/approve` for a pending request (create a second test request if step 2 already decided the first).
@@ -815,30 +972,182 @@ dispatches.
    `approve_request` returns `-32003` with the same message. (A token without `Approval:Approve` gets the plain
    permission `403` first, so it does not prove the new check. Over MCP, an operator-tier or readonly-tier token is
    refused earlier by the tier check with `-32004`; use a supervised-tier or untiered token for this step.)
-4. Repeat step 2 with one account of each kind you run: a SAML user (expect `403` "MFA step-up is not available
-   for SAML sessions in this release"), an OIDC user your identity provider does not send an MFA `amr` for (what
-   you see depends on `--mfa-enforcement`, as above), and a local account with no enrolled factor (it succeeds
-   without a prompt for a second factor, which is the documented limit tracked in #6079). Each repeat needs its
-   own pending test request, submitted by someone other than the account being tried, and a decided request
-   cannot be decided again.
+4. Repeat step 2 with one account of each kind you run and check the outcome: a SAML user (expect `403`
+   `MFA step-up is not available for SAML sessions in this release` from the central step-up check, with an
+   `mfa.step_up.required` row `reason=saml_session_no_mfa_this_release` and no `approval.*` row; the typed
+   `approver_assurance_required:saml_mfa_unsupported` appears only with `--mfa-step-up-window-secs` at `0`), an OIDC user
+   your identity provider does not send an MFA `amr` for (expect `403`
+   `approver_assurance_required:mfa_proof_missing`; under `--mfa-enforcement=required`, or `admin-only` for an
+   administrator, the central check answers first with a `401` that sends the user back to the identity provider, so a
+   provider that never asserts `amr` loops instead of showing `mfa_proof_missing`), a local account with no enrolled factor
+   (expect `403` `approver_assurance_required:mfa_not_enrolled`, with a `denied` row whose detail is
+   `approver_assurance:mfa_not_enrolled`), and an enrolled local account whose last MFA proof is older than the
+   window (expect the step-up `401`, then success after the code). Then enrol a non-admin approver through the
+   runbook and confirm it succeeds. Each repeat needs its own pending test request, submitted by someone other than
+   the account being tried, and a decided request cannot be decided again. **With RBAC enforcement off (the shipped
+   default),** only administrator accounts reach the MFA check (any other account is refused `403` "admin role
+   required" first), so this step can only be run with administrator accounts, and the non-admin enrolment
+   outcome cannot be observed until enforcement is on.
 5. Clean up. Reject every test request that is still pending, from the dashboard Approvals page or with
    `POST /api/approvals/{id}/reject` (same gates as approve: a human session with a fresh step-up, a same-site
    `Origin`, and not the submitter). A ticket that is already `approved` cannot be rejected; it stays listed as
    `approved`, is refused at use 7 days after its review, flips to `expired` on the first accepted approval submission
    after that (#6098), is never deleted, and, for an instruction-origin ticket, dispatches nothing. Record the
    ids of the approved test tickets in your change record so nobody mistakes them for a real decision later.
+6. To see that approvals are currently being refused, and why, query the audit store (read-only; the approver gate's
+   refusals carry `approver_assurance:<reason>` in `detail`; a refusal by the central step-up check is an
+   `mfa.step_up.required` row instead):
+
+   ```sql
+   SELECT detail, result, count(*) FROM audit_store.audit_events
+    WHERE action IN ('approval.approve','approval.reject')
+      AND detail LIKE 'approver_assurance:%' AND result IN ('denied','error')
+      AND timestamp >= extract(epoch FROM now() - interval '1 hour')
+    GROUP BY detail, result ORDER BY 3 DESC;
+   ```
+
+   A run of `approver_assurance:mfa_not_enrolled` means approvers still have to enrol; the runbook section
+   [Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver) has the same query
+   and the enrolment paths. An `approver_assurance:mfa_proof_clock_skew` row with `result=error` means OIDC approvers are
+   being refused `503` because their proof is dated after the database clock; the fix is clock synchronisation (see
+   [OIDC approvers refused with a clock-skew 503](../ops-runbooks/auth-db-recovery.md#oidc-approvers-refused-with-a-clock-skew-503)).
 
 **Rolling back, or running mixed versions.** The approver-assurance change itself adds no schema; the separate
 scheduled-approval change (#6096, below) adds a data-only approvals step and a command-outbox index, both of which an
 older binary ignores, so a rollback starts cleanly. What changes is which checks run.
 
+> **Warning: mixed versions silently weaken the approver control.** The enrolled-factor and fresh-proof
+> requirement (#6079) is in force **only while every replica that serves `/api/approvals/*` runs a build that
+> has it.** Behind one load balancer, an old replica keeps the weaker gate: it passes an approver who has no
+> enrolled factor, and a build that predates #6061 also accepts bearer and MCP approvals. The same person can
+> therefore get `403` `mfa_not_enrolled` from one replica and succeed on the next request, and nothing in the
+> response says which replica answered. Rolling those replicas first shortens the exposure window; the gap closes
+> only when approval traffic reaches upgraded replicas only (pin or drain approvals), and stop-all, upgrade, start-all is
+> the default recommendation. Running more than one server replica is unsupported today (the safe-to-scale gate,
+> `docs/ha-delivery-matrix.md`), so this describes a rolling upgrade and is not a statement that a multi-replica
+> deployment is supported. **Rolling back to an
+> older build is a security-policy downgrade**, not only a convenience: it re-opens the weaker gate, and tickets
+> decided before the upgrade gain no retroactive assurance.
+>
+> If you are about to roll, write down each replica's upgrade time (in UTC) in the change ticket as you go; see
+> "Mixed-version admission" below for why it matters and for the queries that use it.
+
 - A replica or a rolled-back binary that predates this change still accepts bearer and MCP approvals, and does
   not check an approved ticket's age when it is consumed or when `ScheduleRunner` fires it. While any such
   replica serves traffic, the assurance is only as strong as that replica; drain it, or send approval traffic
   to upgraded replicas only.
+- Endpoint agents need no change.
 - An older binary does not write the `result=attempted` row, and does not read it. Rows written by the new
   binary stay in the audit store and are ignored by the old one; a `denied` row with
   `detail=approver_assurance:<reason>` simply stops appearing.
+- **Telling old and new rows apart.** The `attempted` and `success` rows of an approve or reject written by a
+  build with #6079 carry `detail=approver_assurance:enrolled_fresh_mfa`. A row without it was written before
+  the control, or by a replica that does not have it. Use that token as the cutover marker when sampling
+  decisions, and to spot an old replica still serving approvals during a roll. The audit row does not name the
+  replica; your load balancer's access log is the place to find which one answered.
+- **Mixed versions and clearing a factor.** Until every replica and the CLI image run this build, an old binary's
+  `--mfa-reset` or Settings disable clears the factor without ending the account's sessions, so its existing
+  sessions stay live. Afterwards run the new
+  binary's `--mfa-reset` (before the user enrols again, because it clears the factor) or
+  `DELETE /api/v1/sessions?username=<name>`. To find the accounts cleared during the mixed window, list the
+  `mfa.disabled` and `mfa.reset.breakglass` rows in it. The bounds follow the same rules as the approval query below
+  (UTC, an explicit `+00` on each, widened by a margin for clock skew). A row written by an old binary has no
+  `sessions_ended=` in its `detail`; every `ok` or `success` outcome row from this build has one, except `no verified factor to clear`
+  (a cancelled, unfinished enrolment, which cleared nothing); an `error` row from the CLI has none. This build also writes an `attempted` intent row before it
+  clears anything, and that row has no `sessions_ended=` either; the `result IN ('ok', 'success')` filter is what keeps
+  those rows out of the list, so do not drop it.
+
+  ```bash
+  psql -q "$YUZU_POSTGRES_DSN" -c \
+    "SET TIME ZONE 'UTC';
+     SELECT to_timestamp(timestamp) AS at, principal, action, result, target_id, detail
+       FROM audit_store.audit_events
+      WHERE action IN ('mfa.disabled', 'mfa.reset.breakglass')
+        AND result IN ('ok', 'success')
+        AND COALESCE(detail, '') NOT LIKE '%sessions_ended=%'
+        AND COALESCE(detail, '') <> 'no verified factor to clear'
+        AND timestamp >= extract(epoch FROM timestamptz '<first replica upgraded, minus margin, UTC with +00>')
+        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded, plus margin, UTC with +00>')
+      ORDER BY timestamp;"
+  ```
+
+  Each row's `target_id` is an account whose sessions were left live. End them as above. An empty list is not
+  evidence that none were cleared: it has the same blind spots as the approval query below (bounds that miss the
+  window, an audit store restored or purged, a lost audit write), so run the same count control over the same bounds.
+- **Mixed-version admission is a documented known limitation of a rolling upgrade.** The approver
+  gate is stateless and no minimum-version check exists, so while a rolling upgrade is in progress an old replica
+  can admit a decision the new gate would refuse. The Yuzu project maintainer accepted this on 2026-10-28 as inherent to
+  the upgrade method, on the condition that the upgrade is controlled; the acceptance is recorded in the ADR-1005
+  exception ledger (`docs/adr/1005-headless-platform-use-case-engines.md`, entry of 2026-10-28) as a working-session
+  statement, not a signed decision. The condition is: record each
+  replica's upgrade timestamp (in UTC) in the change ticket (SOC 2 CC8.1) **as you roll**, because the audit row does
+  not name the replica. A decision row **without**
+  `approver_assurance:enrolled_fresh_mfa` was written before the control existed, by a replica that did not have
+  it, or after a rollback. To list the decisions in a window that carry no marker, set the start to the first
+  replica's upgrade time minus a margin and the end to the last replica's upgrade time plus a margin, or to the
+  present time if a rollback happened or a replica may still be old. **Both bounds are UTC.** The command's first
+  statement pins the session to UTC, because `psql` otherwise reads a bare `timestamptz` literal in the session's
+  own time zone (the server default, the role's setting, `PGTZ` or a DSN option), which shifts the window by whole
+  hours and returns no rows without any error; write each bound with an explicit `+00`, for example
+  `2026-10-20 09:55+00`. If the times in your change ticket are local times, convert them to UTC first.
+
+  ```bash
+  psql -q "$YUZU_POSTGRES_DSN" -c \
+    "SET TIME ZONE 'UTC';
+     SELECT to_timestamp(timestamp) AS at, principal, action, target_type, target_id, result, source_ip, detail
+       FROM audit_store.audit_events
+      WHERE (   (action IN ('approval.approve', 'approval.reject')
+                 AND result IN ('attempted', 'success')
+                 AND detail <> 'approver_assurance:enrolled_fresh_mfa')
+             OR (action IN ('mcp.approve_request', 'mcp.reject_request')
+                 AND result = 'success'))
+        AND timestamp >= extract(epoch FROM timestamptz '<first replica upgraded, minus margin, UTC with +00>')
+        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded, plus margin, UTC with +00>')
+      ORDER BY timestamp;"
+  ```
+
+  The `at` column is shown in UTC. Match each row against the ticket's per-replica timestamps and the load balancer
+  log, and review the decision it records. Only `attempted` and `success` rows are listed for the REST actions,
+  because a refusal (`denied`) never carries the marker. Rows before the window are pre-upgrade decisions and gain no
+  retroactive assurance. Rows inside the leading margin, before the first replica was upgraded, are also
+  pre-upgrade decisions: expect them in the list, they are not old-replica admissions.
+
+  **A list with no rows is not evidence of a clean upgrade.** The same output appears when the bounds miss the
+  window, when the audit store is empty or was restored from an earlier copy, and when an audit write was lost (the
+  `success` row of a REST decision is best effort). Run this control over the SAME bounds. It counts every audit row
+  in the window, whatever the action:
+
+  ```bash
+  psql -q "$YUZU_POSTGRES_DSN" -c \
+    "SET TIME ZONE 'UTC';
+     SELECT count(*), to_timestamp(min(timestamp)) AS earliest, to_timestamp(max(timestamp)) AS latest
+       FROM audit_store.audit_events
+      WHERE timestamp >= extract(epoch FROM timestamptz '<first replica upgraded, minus margin, UTC with +00>')
+        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded, plus margin, UTC with +00>');"
+  ```
+
+  For a window in which the deployment was running, `count` must be above zero and `earliest` and `latest` must
+  fall inside the bounds. A `count` of zero means the bounds or the audit store are wrong (check that both bounds
+  are UTC, that the start is earlier than the end, and that the audit store was not restored or purged), not that
+  the upgrade was clean; do not use an empty list as evidence until the control is above zero. A non-zero count shows
+  the bounds select audit rows, not that every decision left a row. Attach both command texts, with the bounds
+  filled in, and their output to the change ticket.
+
+  The `mcp.approve_request` and `mcp.reject_request` rows are listed for a different reason. A decision made
+  over MCP never carries the marker, because the upgraded binaries refuse MCP approvals and rejections, so any
+  `success` row for these actions inside the window came from a replica that had not been upgraded yet, or from
+  a rollback. For those rows `target_type` is `mcp_tool` and `target_id` is the tool name; the approval ticket id
+  is in `detail`. The MCP query in "Find affected automation before you upgrade", above, finds the same actions
+  across the whole retention period; this one limits them to the window.
+
+  The `timestamp` column is written from the clock of the replica that wrote the row, while the bounds you
+  recorded in the change ticket come from wherever you read the time, so widen both bounds by a margin that
+  covers the NTP skew between your replicas (the observed skew, or a few minutes if you have not measured it).
+  The margin covers clock skew only. It does not cover a time-zone offset, which is why the bounds must be UTC
+  and the session is pinned to UTC. A replica that wrote no row is invisible to these queries, so also attach
+  the load balancer log excerpt for the window, together with the per-replica upgrade timestamps.
+  Re-run both commands, with the end bound set to the present time, until every replica is confirmed upgraded and
+  no rollback or re-creation from an old image is possible, and attach the final run.
 - A ticket approved by an older replica carries a `reviewed_at` stamped from that replica's own clock. The new
   binaries judge it against database time, so a replica whose clock runs more than 5 minutes ahead of the
   database produces a ticket the new binaries treat as not yet live (a recall over MCP answers
@@ -1027,10 +1336,11 @@ customer-distribution lane. Before switching lanes, read the
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Gateway heartbeat admission is now bound to the connection that opened the session (gateway restart required; breaking for L7-fronted gateways).** The gateway admits an agent `Heartbeat` only on the HTTP/2 connection that opened the session's `Subscribe` stream; any other heartbeat is answered `NOT_FOUND` and not forwarded. Deploy with a gateway restart, and check for an HTTP/2-terminating hop in front of `:50051` first. A rejected agent recovers by re-registering. That logic exists from v0.13.0, but the released v0.13.0 and v0.14.0-rc6 agents wedge in their reconnect path with default settings (bug #2182, fixed by PR #5183, in no release yet) and recover only with `--no-auto-update`; v0.12.0 never recovers by itself (observed; older versions were not tested). Upgrade the agents first, then the gateway, with a build that includes the #2182 fix once released; until then restart an agent that stays rejected. Agents that do not connect through the gateway are not affected by this requirement (see Older agents). No wire or server change. See the section "Breaking: gateways fronted by an HTTP/2-terminating proxy or mesh sidecar" below and [Heartbeat admission](gateway.md#heartbeat-admission). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **`--gateway-upstream` now refuses to start without gateway peer authorization (breaking for own-certificate and plaintext installs).** The gateway-upstream service admits only a gateway whose certificate key (SPKI SHA-256) is pinned, which carries `serverAuth` and is inside its validity window; the server exits at boot, before binding a port, when `--gateway-upstream` is set and that cannot be arranged. Generated default certificates are pinned automatically; your own certificates need `--gateway-peer-pin` / `--gateway-peer-pin-file` first; a plaintext (`--no-tls`) rig needs `--insecure-gateway-peer`; the Linux package unit passes `--gateway-upstream` unconditionally. Agents and gateways are unaffected on the wire. See the section "Breaking: `--gateway-upstream` now refuses to start without gateway peer authorization" below. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The gateway now holds stream-status notifications instead of dropping them (#4632; gateway restart required).** Deploy it with a gateway restart, which disconnects every agent the node holds, so read "Upgrade day" and "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts) first (released v0.13.0 and v0.14.0-rc6 agents do not recover by themselves after a gateway restart). **Read the [Gateway upgrade note for #4632](#gateway-upgrade-note-stream-status-notifications-and-startup-checks-4632) before you restart: a gateway whose configured `cluster_id` cannot be represented as UTF-8 now refuses to start.** There is no hot code load for this change: the upstream client's `code_change` is the identity function while its state gained fields, so deploy it by restart, not by a hot upgrade (INFERRED from the code, not run). No wire change and no change to the minimum agent or server version: `NotifyStreamStatus` is unchanged, so any pairing interoperates. What changes: a `CONNECTED` or `DISCONNECTED` notification that arrives while 10 are in flight or the circuit breaker is open is held in a bounded, memory-only store and sent first in first out, where the old gateway dropped it; when the breaker goes half open the new gateway sends one held notification as the probe, where the old one let up to 10 notifications through; and an agent-supplied peer address is sanitised and capped before it is held (a value that is not valid UTF-8 becomes `invalid`, and one over 255 bytes is cut at a character boundary). New settings `notify_pending_max` (default derived from the agent listeners: three per connection they admit, the sum of their `limits.max_connections`, at least 15000, so 15000 on a listener without a ceiling and 180000 with the 60000 ceiling the packaged, production and reference configs set; `sys.config.prod` and the reference compose config also set 180000 explicitly; valid range 1 to 1000000; a value outside the range or not an integer falls back to the default with a WARN that names the key; see "Upstream client tuning" in [gateway.md](gateway.md)); size it at least as large as the largest `Subscribe` burst you expect; and `notify_probe_timeout_ms` (default 15000, valid range 100 to 300000, not present in any shipped `sys.config`, same fallback rule), the gateway's own deadline for the half-open notification probe: a probe worker that has not reported by then is killed and the probe fails like any failed probe. The other behaviour changes of the same restart are listed in the upgrade note below the table. Metrics: new gauges `yuzu_gw_upstream_notify_pending` and `yuzu_gw_upstream_notify_inflight` and counter `yuzu_gw_upstream_notify_coalesced_total`. The `reason` label of `yuzu_gw_upstream_notify_dropped_total` is now the closed set `at_capacity` and `unknown`: the value `circuit_open` is retired, so during a rolling upgrade old nodes still export `circuit_open` and new nodes export `at_capacity`, and a rule or dashboard that sums the family sees both. A rule or panel of your own that selects `reason="circuit_open"` stops matching once every node is upgraded: use `yuzu_gw_upstream_notify_pending` for held notifications and `reason="at_capacity"` for lost ones. The rollback is the previous gateway release. A rollback is itself a gateway restart: it disconnects every agent the node holds and carries the same agent-reconnect cost as the upgrade (see "Upgrade day" and "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts), and the released-agent caveat above), so weigh it against the problem you are fixing. It also brings back the earlier behaviours: notifications dropped at 10 in flight or with the breaker open, a request that the gateway's own validation or encoder rejected (or a server status that means the request itself was wrong) counted as an upstream failure that can open the breaker, and no `cluster_id` boot refusal. The pending store is memory only, so nothing persists and nothing needs to be cleaned up; the notifications held at that moment are lost, as they were dropped before. Runbook rows and the measured evidence: [Stream Status Notification](gateway.md#stream-status-notification) and the [evidence record](../security-reviews/gateway-notify-pending-store-2026-10-05.md). |
-| 0.15.x (next) | 0.12.0 | 0.12.0 | **Gateway: a planned stop needs up to 40 s, deleting a pin file no longer withdraws the pin, and the management listener, circuit breaker, connection ceilings and certificate-expiry alerts change (#5695; deployed by the same gateway restart as the listener move above, so read "Upgrade day" and "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts) first: agents without the #5183 fix do not recover by themselves after a gateway restart).** (1) **Stop timeout.** On SIGTERM the gateway now ends its agent sessions and sends their `DISCONNECTED` notices to the server before its processes stop, within `shutdown_flush_budget_ms` (default 20000 ms, valid 0 to 600000). Every shipped compose file sets `stop_grace_period: 40s` on the gateway service and `deploy/systemd/yuzu-gateway.service` sets `TimeoutStopSec=40`. A supervisor of your own must allow a stop timeout above `shutdown_flush_budget_ms`, with room for the processes to stop after it (40 s for the default budget): Docker's default is 10 s (a `docker run`, or a compose file you maintain without `stop_grace_period`), a Kubernetes pod's default `terminationGracePeriodSeconds` is 30 s. Raise the timeout and the budget together. A stop cut short by SIGKILL sends no notices, and the server keeps those sessions listed as online until the agents register again. See [Planned stop](gateway.md#planned-stop). (2) **Pin files.** A key read from a `{cert_file, Path}` entry of `mgmt_peer_pins` now stays pinned when the file later cannot be read or parsed (reported by `yuzu_gw_cert_file_readable{role="mgmt_peer_pin"}` reading 0 and by `YuzuGatewayMgmtPinUnresolved`), so deleting, emptying or corrupting the file no longer withdraws the pin: **it does not revoke the pinned key**, which the gateway keeps admitting. To change or revoke the pinned key, replace the file with the new certificate (picked up within `mgmt_pin_refresh_ms`, 5 s by default). Removing the entry from `mgmt_peer_pins` also revokes it, but applies only at the next gateway restart, which disconnects every agent on the node, and agents without the #5183 fix stay wedged after it. The kept key is only ever one that was pinned; a file that has never been readable since the gateway started still pins nothing (fail closed). Revocation by identity instead of a pin is #6016. See [Certificate rotation and expiry](gateway.md#certificate-rotation-and-expiry). (3) **Management listener.** A listener that routes the `ManagementService` defaults to 4096 concurrent HTTP/2 streams (an agent listener keeps 1024) and 100000 received frames per 10 s (Cowboy's own limit, kept on the agent listener, is 10000), because the server sends a whole command fan-out over one connection; it has no per-connection memory ceiling unless `limits.max_connection_memory_bytes` sets one. A value in the entry's `http2` or `limits` map still wins, so a management entry you wrote with a lower `max_concurrent_streams` keeps it. See [gRPC listeners](gateway.md#grpc-listeners). (4) **Connection ceilings and held notifications.** The packaged release config (`gateway/config/sys.config`, which the release packages and the systemd unit run) sets `limits.max_connections` to 60000 on the agent listener and 256 on the management listener, the values `sys.config.prod` sets; a listener without the key has no connection ceiling. Change the agent value together with the unit's `LimitNOFILE`. `notify_pending_max` defaults to three per agent-listener connection (at least 15000), so 180000 with that ceiling, and `sys.config.prod` and the reference compose config set 180000 explicitly. (5) **Circuit breaker.** The longest wait before the breaker probes the server again, `circuit_breaker_max_reset_timeout_ms`, defaults to 30000 ms (was 300000), and every shipped config now sets 30000. A config copied from an earlier release sets 300000 explicitly and keeps it: change it, because `YuzuGatewayUpstreamCircuitOpened` assumes the breaker reopens at least every 4 minutes or so. See [The upstream client](gateway.md#the-upstream-client). (6) **Alerts (check your Alertmanager routes and silences).** `YuzuCertificateExpiringSoon` (server, warning) now fires from 30 days before expiry instead of 7; the 7-day band is the new critical `YuzuCertificateExpiryImminent`, and `YuzuCertificateExpiryCritical` stays at 24 hours. The gateway gains the same three steps for its own certificate files (`YuzuGatewayCertificateExpiringSoon`, `YuzuGatewayCertificateExpiryImminent`, `YuzuGatewayCertificateExpiryCritical`). `YuzuGatewayMgmtAuthRejected` no longer counts `reason="pin_mismatch"`: that reason has its own `YuzuGatewayMgmtPinMismatch`, which stays quiet for 4 minutes after the gateway publishes a rotated pin; the old name keeps its silences and routes for the other reasons. The server's `YuzuGatewayForwardUnauthenticated` is unchanged and can still fire for up to an hour after a rotation that had a command in flight (#5988 removes that cause). New gateway rules: `YuzuGatewayUpstreamCircuitOpened` (the breaker stays open for 3 minutes, or keeps flapping), `YuzuGatewayUpstreamSlow`, `YuzuGatewayCertificateFileUnreadable`, `YuzuGatewayMemorySheddingActive`, `YuzuGatewayMemorySheddingTransitionFailing`, `YuzuGatewayMemorySheddingInactive` (shedding enabled but not running), `YuzuGatewayListenerNearConnectionCeiling`, `YuzuGatewayFileDescriptorsNearLimit` and `YuzuGatewayProcessBacklogged`. (7) **Memory-shedding marks are checked at boot.** With `memory_shedding` enabled, a low mark not below the high mark, a mark at or above the gateway's memory limit, or a mark that is not positive now refuses to start (`Refusing to start: {yuzu_gw, memory_shedding}: ...`); before, such a config booted with shedding silently off. Setting only `high_water_bytes` (or only `low_water_bytes`) is now valid: the other mark is derived from it. Check a `memory_shedding` block you wrote against the gateway's memory limit before the upgrade. See "Node-wide memory load shedding" under [gRPC listeners](gateway.md#grpc-listeners). **Rollback:** the previous gateway release with its own config (see the listener move above); a rollback is itself a gateway restart, with the same agent-reconnect cost. |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **Gateway: a planned stop needs up to 40 s, deleting a pin file no longer withdraws the pin, and the management listener, circuit breaker, connection ceilings and certificate-expiry alerts change (#5695; deployed by the same gateway restart as the listener move above, so read "Upgrade day" and "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts) first: agents without the #5183 fix do not recover by themselves after a gateway restart).** (1) **Stop timeout.** On SIGTERM the gateway now ends its agent sessions and sends their `DISCONNECTED` notices to the server before its processes stop, within `shutdown_flush_budget_ms` (default 20000 ms, valid 0 to 600000). Every shipped compose file sets `stop_grace_period: 40s` on the gateway service and `deploy/systemd/yuzu-gateway.service` sets `TimeoutStopSec=40`. A supervisor of your own must allow a stop timeout above `shutdown_flush_budget_ms`, with room for the processes to stop after it (40 s for the default budget): Docker's default is 10 s (a `docker run`, or a compose file you maintain without `stop_grace_period`), a Kubernetes pod's default `terminationGracePeriodSeconds` is 30 s. Raise the timeout and the budget together. A stop cut short by SIGKILL sends no notices, and the server keeps those sessions listed as online until the agents register again. See [Planned stop](gateway.md#planned-stop). (2) **Pin files.** A key read from a `{cert_file, Path}` entry of `mgmt_peer_pins` now stays pinned when the file later cannot be read or parsed (reported by `yuzu_gw_cert_file_readable{role="mgmt_peer_pin"}` reading 0 and by `YuzuGatewayMgmtPinUnresolved`), so deleting, emptying or corrupting the file no longer withdraws the pin: **it does not revoke the pinned key**, which the gateway keeps admitting. To change or revoke the pinned key, replace the file with the new certificate (picked up within `mgmt_pin_refresh_ms`, 5 s by default). Removing the entry from `mgmt_peer_pins` also revokes it, but applies only at the next gateway restart, which disconnects every agent on the node, and agents without the #5183 fix stay wedged after it. The kept key is only ever one that was pinned; a file that has never been readable since the gateway started still pins nothing (fail closed). Withdrawing a certificate without a file is the serial deny-list `mgmt_peer_denied` (#6016, read at boot, so a change applies at the next gateway restart, which disconnects the node's agents). See [Certificate rotation and expiry](gateway.md#certificate-rotation-and-expiry) and [Authorizing the server by its identity](gateway.md#authorizing-the-server-by-its-identity). (3) **Management listener.** A listener that routes the `ManagementService` defaults to 4096 concurrent HTTP/2 streams (an agent listener keeps 1024) and 100000 received frames per 10 s (Cowboy's own limit, kept on the agent listener, is 10000), because the server sends a whole command fan-out over one connection; it has no per-connection memory ceiling unless `limits.max_connection_memory_bytes` sets one. A value in the entry's `http2` or `limits` map still wins, so a management entry you wrote with a lower `max_concurrent_streams` keeps it. See [gRPC listeners](gateway.md#grpc-listeners). (4) **Connection ceilings and held notifications.** The packaged release config (`gateway/config/sys.config`, which the release packages and the systemd unit run) sets `limits.max_connections` to 60000 on the agent listener and 256 on the management listener, the values `sys.config.prod` sets; a listener without the key has no connection ceiling. Change the agent value together with the unit's `LimitNOFILE`. `notify_pending_max` defaults to three per agent-listener connection (at least 15000), so 180000 with that ceiling, and `sys.config.prod` and the reference compose config set 180000 explicitly. (5) **Circuit breaker.** The longest wait before the breaker probes the server again, `circuit_breaker_max_reset_timeout_ms`, defaults to 30000 ms (was 300000), and every shipped config now sets 30000. A config copied from an earlier release sets 300000 explicitly and keeps it: change it, because `YuzuGatewayUpstreamCircuitOpened` assumes the breaker reopens at least every 4 minutes or so. See [The upstream client](gateway.md#the-upstream-client). (6) **Alerts (check your Alertmanager routes and silences).** `YuzuCertificateExpiringSoon` (server, warning) now fires from 30 days before expiry instead of 7; the 7-day band is the new critical `YuzuCertificateExpiryImminent`, and `YuzuCertificateExpiryCritical` stays at 24 hours. The gateway gains the same three steps for its own certificate files (`YuzuGatewayCertificateExpiringSoon`, `YuzuGatewayCertificateExpiryImminent`, `YuzuGatewayCertificateExpiryCritical`). `YuzuGatewayMgmtAuthRejected` no longer counts `reason="pin_mismatch"`: that reason has its own `YuzuGatewayMgmtPinMismatch`, which stays quiet for 4 minutes after the gateway publishes a rotated pin; the old name keeps its silences and routes for the other reasons. The server's `YuzuGatewayForwardUnauthenticated` is unchanged and can still fire for up to an hour after a rotation that had a command in flight (#5988 removes that cause). New gateway rules: `YuzuGatewayUpstreamCircuitOpened` (the breaker stays open for 3 minutes, or keeps flapping), `YuzuGatewayUpstreamSlow`, `YuzuGatewayCertificateFileUnreadable`, `YuzuGatewayMemorySheddingActive`, `YuzuGatewayMemorySheddingTransitionFailing`, `YuzuGatewayMemorySheddingInactive` (shedding enabled but not running), `YuzuGatewayListenerNearConnectionCeiling`, `YuzuGatewayFileDescriptorsNearLimit` and `YuzuGatewayProcessBacklogged`. (7) **Memory-shedding marks are checked at boot.** With `memory_shedding` enabled, a low mark not below the high mark, a mark at or above the gateway's memory limit, or a mark that is not positive now refuses to start (`Refusing to start: {yuzu_gw, memory_shedding}: ...`); before, such a config booted with shedding silently off. Setting only `high_water_bytes` (or only `low_water_bytes`) is now valid: the other mark is derived from it. Check a `memory_shedding` block you wrote against the gateway's memory limit before the upgrade. See "Node-wide memory load shedding" under [gRPC listeners](gateway.md#grpc-listeners). **Rollback:** the previous gateway release with its own config (see the listener move above); a rollback is itself a gateway restart, with the same agent-reconnect cost. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **`registry` plugin 2.0.0: typed, verified writes; registry links refused (breaking; agent plugin).** Once the 1.1.0 `set_value`, `delete_value` and `delete_key` definitions are in the store (an existing install keeps the 1.0.0 ones until they are re-imported; see the same page's "Breaking" section), they also reach an agent whose `registry` plugin is still 1.x, and nothing compares a plugin or agent version at dispatch: such an agent writes an EMPTY `REG_SZ` for a `data_hex`-only `set_value` (with `type=REG_DWORD` and `data_hex` only it throws and writes nothing), stores the new value types as `REG_SZ` text, answers `status|ok` with no leading `audit|` row, and mints no `registry.write` row unless it stamps the action (the first release containing #6294). Upgrade the agents before using `data_hex` or the new types, in schedules, workflows, policies and bundles as well as scripts; see "Breaking: the `registry` plugin 2.0.0" at the top of this page. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The plain-HTTP port answers the four health probes when HTTPS is on (#5906).** `GET`/`HEAD` on `/livez`, `/readyz`, `/health` and `/api/health` on the redirect port now return `200` (or `503` while the HTTPS listener is not serving, the server is draining, or Postgres is down) instead of `301`, in cleartext; every other request still redirects. Server restart only; see the section below. |
-| 0.15.x (next) | 0.12.0 | 0.12.0 | **The built-in server certificate is re-issued once with a server identity URI (#6016).** Same root, same key, so existing `mgmt_peer_pins` stay valid and the gateway needs no action. The old certificate shows as revoked with reason `superseded` in the CA inventory and the next CRL (bookkeeping, not a compromise). New audit action `server.default_certs_server_identity_upgraded`, new gauge `yuzu_server_identity_uri_present`. See "Behaviour change: the built-in server certificate is re-issued once with a server identity URI". |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **The built-in server certificate is re-issued once with a server identity URI (#6016).** Same root, same key, so existing `mgmt_peer_pins` stay valid and the gateway needs no action for the re-issue. The gateway in this release can also admit the server by that identity (`mgmt_peer_auth_mode`, `mgmt_peer_identity`, `mgmt_peer_denied`; new reasons on `yuzu_gw_mgmt_auth_rejected_total`, new counter `yuzu_gw_mgmt_auth_admitted_total`, new alert `YuzuServerIdentityUriAbsent`): the identity is an explicit opt-in: the shipped reference configs and an unset mode are all `pin`, so nothing changes until you set `identity_or_pin` or `identity`. The old certificate shows as revoked with reason `superseded` in the CA inventory and the next CRL (bookkeeping, not a compromise). New audit action `server.default_certs_server_identity_upgraded`, new gauge `yuzu_server_identity_uri_present`. See [Authorizing the server by its identity](gateway.md#authorizing-the-server-by-its-identity) and "Behaviour change: the built-in server certificate is re-issued once with a server identity URI". |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **Breaking, fresh deployment only: stored responses of Forensics-tier plugins are served only to callers holding `Forensics:Read` (#4990).** Applies to every stored-response read path (REST, MCP, dashboard) and to the server-side consumers of those rows (bundle collation, result-set membership, policy checks, the live output stream, execution error text), with the limits listed under "Known limits" in that section; other readers see the rows as absent, with counts and caps computed over what they may read, so an empty result no longer implies no data. Viewer, Operator, PlatformEngineer and ITServiceOwner, and with RBAC off every non-administrator session, no longer see these rows. New built-in `ForensicsAnalyst` role (read-only, assign it fleet-wide with RBAC on) and new audit action `response.forensics.read`. A read whose authority cannot be determined is refused with a retryable error rather than a partial result. This release is a hard cutover: it supports initial deployment into a fresh database only and provides no upgrade path from an earlier server's database (see "Deployment contract" in the section; the agent and gateway columns above are the minimum agent and gateway versions, not a supported upgrade starting point for the database). See "Behaviour change: stored responses of Forensics-tier plugins need `Forensics:Read` (#4990, fresh deployment only)". |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **MFA step-up is enforced by one central check on 37 named routes, before the route's own checks (breaking order of checks; server restart only, no agent or gateway change, no migration).** A stale or missing MFA proof is now answered with the `401` step-up envelope before the route's own `403` (permission, `token_session`, `not_local`; a cross-site cookie write is answered `403` by the server-wide same-site check before the step-up check); engine principals receive `403` on every step-up-gated route regardless of grants (audited as `mfa.step_up.required`, no longer as the per-route handler denial row); a server with no wired authentication store answers `503` on these routes, and an unreadable store answers `503` to local sessions; `POST /api/settings/mfa/recovery-codes` and `POST /api/settings/mfa/disable` are newly gated; SAML sessions still cannot satisfy step-up (`403`, unless the window is disabled with `--mfa-step-up-window-secs 0`). The server now exits with status `1` at boot when a mutating route has no step-up classification, which can only happen on a fork or custom build (a restart policy turns it into a restart loop; roll back to recover). Other mutating routes and all MCP tools are not MFA-step-up gated in this release. New metric `yuzu_auth_mfa_step_up_gate_total` and alerts `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled`. See [Breaking: MFA step-up is checked once](#breaking-mfa-step-up-is-checked-once-before-the-routes-own-checks-and-two-more-routes-need-a-fresh-proof). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Seven runtime-config keys are administrator-only on `PUT /api/config/{key}` (breaking for non-administrator and MCP-tier callers; server restart only, no agent or gateway change, no migration).** `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`, `dex_cohort_export_key` and `audit_retention_days` now answer `403` to a supervised-tier MCP token and, with RBAC on, to a non-administrator role that holds `Infrastructure:Write`; every other config key is unchanged. Server restart only; see the first section on this page. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The runtime-configuration read shows a caller only the overrides it could write (breaking for MCP-tier and non-administrator readers; server restart only, no agent or gateway change, no migration).** `GET /api/config`, `GET /api/v1/config` and the MCP tool `get_runtime_config` leave out the `oidc_*`, `plugin_signing_required`, DEX alert and `audit_retention_days` overrides unless the caller could write them; an administrator account's `GET /api/config` body is unchanged apart from `log_level` reading `warn`. `heartbeat_timeout` is limited to 30 to 86400 seconds on every write route. Mixed-version fleets are not a concern (server-side only). |
@@ -1325,7 +1635,13 @@ visible to them. Rolling back removes the widgets and routes. The two sections a
 
 On first boot after the upgrade, an install that uses the built-in default certificates has `default-server.pem` re-issued once, under the **same root and the same key**, with one added Subject Alternative Name: the server identity `yuzu://<ca-fingerprint>/server`. The previous certificate then appears **revoked with reason `superseded`** in the CA inventory (`GET /api/v1/ca/issued`, the CA page) and in the next CRL. That is bookkeeping, not a key compromise: the new certificate certifies the same key. Existing `mgmt_peer_pins` entries stay valid because the key is unchanged, so the gateway needs no action. The one-time event is audited as `server.default_certs_server_identity_upgraded` and logged as a WARN line. The CRL carries no revocation reason code, so the `superseded` reason is visible in the CA inventory only; a CRL consumer sees an ordinary revoked serial.
 
-This release only mints the identity; the gateway management plane still admits the server by key pin. Check `yuzu_server_identity_uri_present` (`1` once `default-server.pem` carries the URI; it describes the file, so it is a readiness signal only when the agent and management listeners use the built-in certificates). Operator-supplied certificates, `--no-default-certs` and `--mgmt-tls-server-*` are not touched, and rolling back is safe (an older build ignores the extra name).
+The gateway in this release can admit the server by that identity instead of by its key pin. Nothing changes until you opt in. The shipped reference configs (`gateway/config/sys.config.prod`, `deploy/docker/reference-gateway-sys.config`) set `{mgmt_peer_auth_mode, pin}` explicitly, and an installation with its own `sys.config` that does not set the key is `pin` too (an unset mode is always `pin`, never the identity, so a configuration with no pins and no mode still refuses to boot on an exposed listener). If you set `mgmt_peer_identity` while the mode is `pin`, the identity is ignored and the gateway logs a warning saying so. Once you opt in, a server key renewal that keeps the identity needs no change on the gateway when no pin is configured (a pin kept in `identity` mode must follow the renewal); in `identity_or_pin` the identity admits the renewed key whatever the pin says, and there is no `pin_mismatch` window. In `identity_or_pin` with pins configured, a peer that fails both paths because it has no identity (`no_uri_san`, `identity_mismatch`) is reported with the pin's reason (`pin_mismatch`, `no_pins_resolved`); `identity_unresolved` (the gateway could not resolve the identity) and `revoked` are always reported as themselves, and a pin that never resolved is reported (`yuzu_gw_mgmt_auth_pin_unresolved_total`) even while the identity admits the traffic. The gateway's rejection log line now ends `see mgmt_peer_auth_mode, mgmt_peer_pins)` (it ended `see mgmt_peer_pins`), so a SIEM or log rule that matches the old text needs updating. **The identity trusts the issuing CA's issuance policy:** do not enable it where the management listener's `cacertfile` is a bring-your-own corporate CA that lets a requester choose a URI SAN with serverAuth (stay in `pin`); an identity over a `cacertfile` that is not demonstrably exactly one readable certificate (a bundle, or an empty, unreadable or half-written file) refuses to boot unless the mode is `identity` with a pin (`identity_over_ca_bundle`). See [Authorizing the server by its identity](gateway.md#authorizing-the-server-by-its-identity) for the modes, how the identity is resolved, the serial deny-list `mgmt_peer_denied` and the trust trade-off (the identity needs a certificate the install CA signed, not the server's private key).
+
+To move a gateway to the identity: (1) upgrade the server to this release and confirm `yuzu_server_identity_uri_present` is `1` on every replica (`YuzuServerIdentityUriAbsent` warns when it stays `0`); (2) set the gateway to `identity_or_pin` and keep the pin (the reference configs ship `pin`, so this is a change you make); (3) set `identity` only when **both** the gauge reads `1` on every replica **and**, after real command traffic through the gateway, `yuzu_gw_mgmt_auth_admitted_total{method="identity"}` moved while `{method="pin"}` did not; neither is sufficient alone (the gauge is set once at server boot and describes the file `default-server.pem`, not the certificate the server presents to the gateway, and a replica on the previous binary does not export it; `{method="pin"}` standing still on an idle gateway proves nothing). After that the pins may be dropped or kept as an extra constraint that must also match. `mgmt_peer_auth_mode` is read at boot, so a change applies when the gateway next restarts; do that only if its agents can take the disconnect, because agents without the #5183 fix stay wedged after a gateway restart.
+
+Bring-your-own certificates, `--no-default-certs` and a server given its own `--cert`/`--key` carry no identity and stay on pins. `yuzu_server_identity_uri_present` is `1` once `default-server.pem` carries the URI; it describes the file, so it is a readiness signal only when the agent and management listeners use the built-in certificates. Operator-supplied certificates, `--no-default-certs` and a server given its own `--cert`/`--key` are not touched by the server's re-issue, and rolling back the **server** is safe (an older server build ignores the extra name in its certificate).
+
+**Rolling back the gateway is not the same.** A gateway binary from before #6016 ignores `mgmt_peer_auth_mode`, `mgmt_peer_identity` and `mgmt_peer_denied` (nothing else reads them). After such a rollback (i) the deny-list is not honoured, so a withdrawn serial whose key is still in a pin is admitted again, with no signal; (ii) if the node has no pins (dropped for `identity`, or `identity_or_pin` running on the identity alone), the older binary refuses to boot (`no_mgmt_peer_pins`) and the command plane for that node is down; and (iii) the rollback is itself a gateway restart, which disconnects the node's agents: do it only if they can take the disconnect, because agents without the #5183 fix stay wedged after a gateway restart. Before you roll back, restore the pins (and the contents of any pin file), make sure they match the key the server presents now (a literal `spki_sha256` pin can be stale after a key renewal made on the identity), check each withdrawn serial against the CA inventory, and re-key the server (or accept the re-admission) for any withdrawn serial whose key is still pinned. See [Authorizing the server by its identity](gateway.md#authorizing-the-server-by-its-identity), "Rolling back".
 
 If you had **already revoked** the built-in server certificate for another reason (for example a suspected key leak) and not replaced it, the upgrade is skipped on purpose, with a warning on every boot and `yuzu_server_identity_uri_present` at `0`: re-certifying a key you withdrew would undo your revocation. Replace the key first by re-keying the set (see `--cert-san` in [Server administration](server-admin.md): renaming `default-marker.json` aside re-mints every default leaf with a new key, which also changes the server key every gateway `mgmt_peer_pins` entry refers to, so update those pins at the same time). The same warning and `0` appear while the certificate directory is read-only or the certificate authority key is not in it; if that is intentional the warning is harmless, and the identity appears the first boot the directory is writable. The same applies if the revocation lands while the upgrade is running: the new certificate is then revoked too (audit detail `replacement_withdrawn=true`) and the set must be re-keyed.
 
@@ -1433,6 +1749,19 @@ the Settings link is hidden for every user, administrators included, whenever
 `/api/me` is answered by an older replica; open `/settings` directly by URL (it is
 unaffected) or wait for the upgrade to finish. Tabs opened before the upgrade keep
 the old shell until reloaded. No configuration change is needed.
+
+## Behaviour change: `GET /api/v1/me` and `GET /api/me` no longer invent a role (#2146)
+
+This is listed as a behaviour change rather than a break because the value that goes away was fabricated, was never documented for an engine principal, and `rbac_role` is now documented as an optional key.
+
+- An engine principal's `rbac_role` is now absent where it used to read `Viewer` (or `Administrator`, taken from its legacy session role). The endpoints now look an engine principal up under its own RBAC principal type.
+- With RBAC on, an engine principal's grants now appear in `rbac_roles`. An engine principal with no grant has no `rbac_role`.
+- If the role store cannot be read, the call answers `200` with `rbac_roles_resolved: false` and neither `rbac_role` nor `rbac_roles`, instead of a made-up role. Treat an absent list as unknown, not as "no roles".
+- `rbac_role` is deprecated. Read `rbac_roles` (direct assignments only; group grants are not listed) instead.
+- Browser users: no action is needed. If the role store cannot be read during a page load, the navigation badge shows the lowercase legacy `role` (`admin` or `user`) instead of `Administrator` or `Viewer`; the Settings link is unaffected.
+- New keys are additive: `principal_kind` (`human` or `engine`), `auth_source`, `mcp_tier`, `scope_service`, `rbac_roles` and `rbac_roles_resolved`. `GET /api/me` now emits its keys in insertion order rather than alphabetically; a JSON consumer must not depend on key order.
+- A new MCP tool, `get_me`, is the twin of `GET /api/v1/me`.
+- During a rolling upgrade an older replica omits the new keys, still reports `Viewer` for an engine principal, and has no `get_me` tool (it answers unknown-tool).
 
 ## ⚠️ Breaking: the audit log is admin-only while RBAC is off, and audit reads are bounded (#5771)
 
@@ -7092,7 +7421,7 @@ pairing, which refuses to start.
 | Exit 1, `Refusing to start: {yuzu_gw, grpc_listeners} is unset or empty` | The `servers` block was deleted and nothing added, or `grpc_listeners` sits in the `grpcbox` block | Add the listeners to the `yuzu_gw` block. |
 | Listeners up, every TLS handshake fails with `no_suitable_ciphers` | `tls.ciphers` is set to a list with no suite for the certificate's key type (ECDSA suites with an RSA certificate, say) | Remove `ciphers` (the default follows the key type) or list suites that fit the key (below). |
 | Works, but the audit log shows many agents with one `source_ip` | A load balancer or router in front of the gateway and no `origin` configured | Configure `origin` (below). |
-| Exit 1, a critical line naming the management listener and a defect | The management listener lacks the required posture (`plaintext`, `missing_cert_material`, `verify_not_peer`, `peer_cert_not_required`, `missing_or_wrong_auth_fun`, `no_mgmt_peer_pins`, `proxied_origin`) | Fix the entry as in `sys.config.prod`; the lab-only override is `allow_insecure_mgmt`. |
+| Exit 1, a critical line naming the management listener and a defect | The management listener lacks the required posture (`plaintext`, `missing_cert_material`, `verify_not_peer`, `peer_cert_not_required`, `missing_or_wrong_auth_fun`, `no_mgmt_peer_pins` (mode `pin`), `no_mgmt_peer_identity` (mode `identity`), `no_mgmt_peer_pins_or_identity` (mode `identity_or_pin`), `proxied_origin`) | Fix the entry as in `sys.config.prod`; the lab-only override is `allow_insecure_mgmt`. |
 
 **Bring-your-own certificates.** The TLS cipher list is chosen by the certificate's key
 type unless `tls.ciphers` is set: the ECDHE-ECDSA AEAD suites for an EC key (the

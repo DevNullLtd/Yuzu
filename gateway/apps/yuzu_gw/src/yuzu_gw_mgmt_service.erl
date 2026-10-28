@@ -55,8 +55,9 @@ send_command(Request, Stream) ->
     %% target) and threaded through to stream_responses/3, which stamps it
     %% on a command_error-derived response below. Previously that response
     %% carried a hardcoded command_id => <<>>, which the core-side server
-    %% could not correlate to any tracked execution (resolve_execution_id("")
-    %% -> nullopt) — an agent-not-connected-on-this-cluster error was
+    %% could not correlate to any tracked execution (an empty command id
+    %% resolved to no execution; the server now labels it ~unverified) — an
+    %% agent-not-connected-on-this-cluster error was
     %% therefore invisible end-to-end: no tracker terminal, an orphan
     %% response-store row, and forward_gateway_pending's own metric recorded
     %% it as "ok" (Finish() still returns OK for a streamed error response).

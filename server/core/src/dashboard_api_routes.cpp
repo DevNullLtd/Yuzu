@@ -8,6 +8,7 @@
 #include "data_export.hpp"
 #include "http_route_sink.hpp"
 #include "json_extract.hpp" // extract_json_string — shared JSON body-extraction helper
+#include "me_response.hpp"   // shared /api/me builder (also REST /api/v1/me and MCP get_me)
 #include "mcp_jsonrpc.hpp"   // json_exceeds_depth / kMcpMaxJsonDepth
 #include "rbac_store.hpp"
 #include "scope_engine.hpp"
@@ -38,48 +39,14 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
         auto session = deps.auth_fn(req, res);
         if (!session)
             return;
-        // #1837: `username` is the STABLE authorization principal (an
-        // opaque `oidc:<iss>#<sub>` id for SSO sessions) — never render
-        // it alone as the nav-bar identity. `display_name` is the
-        // human-readable label consumed by every page's nav/context
-        // bar JS below; falls back to `username` for a legacy session
-        // created before this field existed.
-        auto j = nlohmann::json(
-            {{"username", session->username},
-            {"display_name",
-             session->display_name.empty() ? session->username : session->display_name},
-            {"role", auth::role_to_string(session->role)}});
-        // Add RBAC role if enabled
-        if (deps.rbac_store && deps.rbac_store->is_rbac_enabled()) {
-            j["rbac_enabled"] = true;
-            auto roles = deps.rbac_store->get_principal_roles("user", session->username);
-            if (!roles.empty()) {
-                j["rbac_role"] = roles[0].role_name;
-            } else {
-                // Fallback: map legacy role to RBAC role name
-                j["rbac_role"] =
-                    session->role == auth::Role::admin ? "Administrator" : "Viewer";
-            }
-        } else {
-            j["rbac_enabled"] = false;
-            j["rbac_role"] = session->role == auth::Role::admin ? "Administrator" : "Viewer";
-        }
-        // Session self-description (#5779, #4208). `role` stays the persisted
-        // role; these report what the server will actually honour. No store
-        // read and no gate call, so no audit row per page load.
-        const bool elevated = auth::is_elevated(*session);
-        j["effective_role"] = auth::role_to_string(auth::effective_role(*session));
-        j["elevated"] = elevated;
-        if (elevated) {
-            j["elevated_until"] = format_iso_utc(
-                std::chrono::duration_cast<std::chrono::seconds>(
-                    session->elevated_until.time_since_epoch())
-                    .count());
-        }
-        j["can_access_settings"] =
-            authz::admin_gate_verdict(*session) == authz::AdminGate::Admit;
+        // One builder shared with GET /api/v1/me and MCP get_me (me_response.hpp).
+        // This route returns the object raw (no envelope): the dashboard shell JS
+        // reads display_name / username / rbac_role / role / can_access_settings
+        // straight off it. `rbac_role` is absent when the caller is an engine
+        // principal or the RBAC read was unresolved, so consumers fall back to `role`.
+        // No gate call and no audit row, so none per page load.
         res.set_header("Cache-Control", "no-store, private");
-        res.set_content(j.dump(), "application/json");
+        res.set_content(me_response::build_me_body(*session, deps.rbac_store), "application/json");
     });
 
     // -- Agent listing API ------------------------------------------------
