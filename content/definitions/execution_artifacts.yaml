@@ -6,9 +6,10 @@
 ## exists).
 ## Plugin: execution_artifacts | Actions: shimcache, amcache, prefetch
 ##
-## Gated behind the Forensics securable, Administrator-only. execution_artifacts
-## and app_usage share the same enforced boundary (both Forensics:Read +
-## AdminOrApproval, Forensics seeded to Administrator only); the higher
+## Gated behind the Forensics securable: dispatch is Administrator or approval-gated.
+## execution_artifacts and app_usage share the same enforced boundary (both
+## Forensics:Read + AdminOrApproval; Forensics:Read is seeded to Administrator and
+## to the read-only ForensicsAnalyst role, which cannot dispatch); the higher
 ## RiskTier here is operator-triage metadata, not a wider authorization gap —
 ## see this plugin's README (agents/plugins/execution_artifacts/README.md);
 ## the docs/user-manual page is a separate follow-up. Every read
