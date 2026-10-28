@@ -118,7 +118,7 @@ patterns to `kDefaultRedactionPatterns` in `tar_collectors.hpp` rather
 than scrubbing per-callsite.
 
 **Schema versioning.** `tar_db.cpp` runs an idempotent migration at open
-time. Current schema version is **5** (legacy `tar_events` was retired at v3 in
+time. Current schema version is **8** (legacy `tar_events` was retired at v3 in
 PR M14, but `kCreateSchema` kept recreating it on every open — v5 stops that and
 drops it from already-migrated databases, #2093). Bumps go in the same
 function, never in `applies_*` collectors.
@@ -129,11 +129,12 @@ function, never in `applies_*` collectors.
 
 | Operation | tar.db behavior |
 |-----------|-----------------|
-| **In-place agent upgrade** | tar.db is preserved (lives in the agent data dir, not the install dir). Schema migration runs at first open of the new binary. Live-tier rows captured by the old binary remain queryable; rollups continue. |
+| **In-place agent upgrade** | tar.db is preserved (lives in the agent data dir, not the install dir). Schema migration runs at first open of the new binary. Live-tier rows captured by the old binary remain queryable; rollups continue. On Windows, the first open also re-secures `tar.db` and its sidecars, and refuses the open when the files are owned by an account other than SYSTEM, Administrators or the agent's (for example after the agent's service account changed; the new account also needs access to the files): see `docs/user-manual/tar.md` "Data storage". |
 | **Uninstall** (`yuzu-agent --remove-service`, MSI uninstall) | tar.db is **left in place** by design. The data dir is operator-managed; uninstall removes the binary and service registration only. To wipe TAR data, delete `<data_dir>/tar.db` explicitly. |
-| **Reinstall over an existing data dir** | The new binary opens the existing tar.db, runs migration if the schema version differs, and resumes collection. State in `tar_state` may be stale (see §5). |
+| **Reinstall over an existing data dir** | The new binary opens the existing tar.db, runs migration if the schema version differs, and resumes collection. State in `tar_state` may be stale (see §5). On Windows, files left by a different agent account are refused rather than adopted (`docs/user-manual/tar.md` "Data storage"). |
 | **`data_dir` change** (config update) | The new directory has no tar.db — the next collect_fast creates it from scratch. The old tar.db at the previous path is orphaned but not deleted. Operator concern, not TAR's. |
-| **Corruption detected at open** (#559) | `TarDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm` sidecars are renamed to `tar.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `tar_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `tar.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — TAR refuses to load rather than trust the corrupt DB. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.tar.*` heartbeat tags; the server exposes `yuzu_fleet_tar_db_corruption_agents` and writes a `tar.db.corruption_quarantined` audit row — see docs/user-manual/tar.md "Fleet visibility". |
+| **Roll back to an older agent** | The older binary opens the same `tar.db` (the registry source adds no schema version) but does not know the `registry` source, so the `registry_live` table, the `registry` row of `tar_cursor` and every `registry:%` baseline in `tar_state` stay on disk, with the per-key baselines holding every watched value unmasked, and the older binary has no way to erase them. Run `tar.purge_source` on the paused `registry` source BEFORE the rollback. |
+| **Corruption detected at open** (#559) | `TarDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm`/`-journal` sidecars are renamed to `tar.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `tar_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `tar.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — TAR refuses to load rather than trust the corrupt DB. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.tar.*` heartbeat tags; the server exposes `yuzu_fleet_tar_db_corruption_agents` and writes a `tar.db.corruption_quarantined` audit row — see docs/user-manual/tar.md "Fleet visibility". |
 
 The "leave data on uninstall" rule is identical to other Yuzu agent
 state stores. If a customer asks for "delete tar data on uninstall",
@@ -141,30 +142,26 @@ that is a deployment-tooling change (MSI custom action), not a TAR
 plugin change.
 
 > **Collect gate and retention share `canonical_source_enabled`.** Both
-> `source_enabled()` (`tar_plugin.cpp`) and `run_retention()`
-> (`tar_aggregator.cpp`) decide a source's state via
+> `source_enabled()` (`tar_aggregator.cpp`) and `run_retention()` decide a
+> source's state through it: `run_retention()` calls `source_enabled()` itself,
+> and `source_enabled()` maps the stored value through
 > `canonical_source_enabled(stored_value)`, which maps anything other than the
 > literal `"true"` to non-enabled (`"false"` → disabled, anything else →
 > `"errored"`). This is load-bearing: a value the plugin never writes fails
 > **closed** — collection stops *and* retention preserves the rows — instead of
 > a bare `!= "false"` that would treat a tampered/corrupt value as enabled and
-> let retention delete the paused window (#560). When adding a new always-on
-> capture source, gate collection on `source_enabled(*db_, "<name>")` and do
-> **not** add a parallel `== "false"` retention check — `run_retention` walks
-> `capture_sources()` and gates *every* registered source (including the opt-in
-> ones) through the same canonical helper, so retention is uniform.
->
-> **Caveat for the opt-in collect gates.** The *retention* gate is canonical for
-> all sources, but the *collect* legs of the opt-in privacy sources (`procperf`,
-> `netqual`) deliberately read a raw `db_->get_config("<src>_enabled","false") ==
-> "true"` rather than `source_enabled()` — they default OFF and must not inherit
-> a source's `default_enabled`. That raw `== "true"` is *coincidentally*
-> fail-closed-equivalent to the canonical gate (only the literal `"true"`
-> enables), so an `errored` value still stops collection — but it is a separate
-> code path, not the shared helper. Unifying the opt-in collect gates onto
-> `canonical_source_enabled` is tracked as a follow-up; until then, the perf and
-> always-on collect legs are canonical and the two opt-in legs are raw-but-
-> equivalent.
+> let retention delete the paused window (#560). `source_enabled()` also fails
+> closed on a failed config read (closed database, SQL error): the registry
+> default applies only to a confirmed-absent row. When adding a new capture
+> source, gate collection on `source_enabled(*db_, "<name>")` and do **not** add
+> a parallel `== "true"`/`== "false"` check or a raw `get_config("<src>_enabled",
+> ...)` read — every collect, retention and purge gate for every registered
+> source goes through the one helper, so the registry's `default_enabled` is
+> the only place a default lives. Collect and retention gates use
+> `source_enabled()` (an unreadable flag skips); discard, drain and purge
+> decisions use `source_enabled_state()`, which distinguishes a confirmed
+> `true`/`false` from an unreadable flag so a destructive path never acts on a
+> failed read.
 >
 > **`paused_at` is cleared on any non-`true` → `true` re-enable.**
 > `apply_source_enabled_transition` (`tar_aggregator.cpp`) canonicalises the
@@ -325,26 +322,17 @@ header):
    operator input to it.
    Declare a row for **every** OS (`kSupported`/`kSupportedConstrained`/`kPlanned`/
    `kUnsupported`) — the schema-invariant test requires it. Add a `rollup_sql`
-   branch per non-live tier. **Privacy-sensitive / usage-class sources are opt-in**
-   (`default_enabled = false`, like `module`/`procperf`/`netqual`/`dns`) under the
-   works-council posture. A source MAY also ship `default_enabled = false` as a
-   cautious roll-out default even when it carries no PII (e.g. `software` —
-   machine-scope asset inventory), letting an operator opt in per host.
-
-   **Amended (Wave 6, operator ruling 2026-09-04).** `power` and `removable`
-   ship `default_enabled = true` — the first *works-council-class* sources to do
-   so (the five machine-scope sources `process`/`tcp`/`service`/`user`/`perf`
-   have always been on; of the eight added since 1.5 under the opt-in
-   posture, every one defaults off) — and, as the
-   roadmap brings each existing source in for change, that source moves to
-   default-on too. The works-council reasoning above is NOT withdrawn: it now
-   attaches to the `<name>_lookback_seconds` control (`0` = forward-only)
-   rather than to the enable flag, and it applies **at upgrade** rather than at
-   an operator's opt-in, which is a stronger obligation, not a weaker one. A
-   default-on source MUST therefore state the divergence plainly in its
-   user-manual page, its changelog fragment, and the SOC 2 data inventory —
-   never only in a code comment. Do not read the paragraph above as licence to
-   ship a new source opt-in without asking; the ruling is the current posture.
+   branch per non-live tier. **Every capture source ships `default_enabled =
+   true`** (Alex ruling 2026-10-21: all sources, every OS, no exceptions). The
+   registry-wide test in `test_tar_schema_registry.cpp` fails any source that
+   declares `false`, so a new source must ship enabled. The retrospective-reach
+   control is the source's `<name>_lookback_seconds` key where one exists
+   (`0` = forward-only), not the enable flag. A default-on source MUST state
+   its default in its user-manual page, its changelog fragment, and the SOC 2
+   data inventory — never only in a code comment. An agent that stored
+   `<name>_enabled = "false"` before a source's default flipped is brought to
+   the new default by a one-time, version-gated `tar.db` migration (see the v8
+   block in `TarDatabase::open`), not by changing the registry alone.
 6. **`tar_plugin.cpp`** — add a leg in `collect_fast_impl` (or `collect_slow_impl`)
    gated on `source_enabled(*db_, "<source>")`: enumerate → diff →
    `typed.empty() ? db_->set_state(key, json) : db_->insert_<src>_events(typed,
@@ -353,8 +341,8 @@ header):
    `error|<src> state_save_failed` (baseline-only) and call
    `note_health(<registry name>, "insert_failed"|"state_save_failed")`; on success
    `note_health(<registry name>, "events_recorded")`. A leg that never calls
-   `note_health` reads `never_ran` in status. For an opt-in source a failure is
-   non-fatal (no `error|` line — don't fail the always-on legs' tick). Add `do_query`/`do_export` `type` branches if the source
+   `note_health` reads `never_ran` in status. For a non-core source (netqual, module, arp, dns, …) a failure is
+   non-fatal (no `error|` line — don't fail the core legs' tick). Add `do_query`/`do_export` `type` branches if the source
    should appear in those actions.
 7. **`agents/plugins/tar/meson.build`** — add the new `.cpp` to the
    `shared_library` sources; add any new Windows import lib (`dnsapi` for DNS).
@@ -362,12 +350,15 @@ header):
    `crossplatform.tar.configure` (the MCP/REST + GUI toggle path) and any canned
    `tar.sql` drill-downs.
 9. **Server GUI** (optional) — the Capture-sources frame
-   (`render_tar_capture_sources`) auto-lists any source the agent reports in
-   `tar status`; presentation metadata (category, always-on, `$`-name, badges)
+   (`render_tar_capture_sources`) lists the eleven core sources (the original ten plus
+   `registry`, which also adds the sixth `System` category chip) in a static array
+   (`kSources` in `tar_process_tree.cpp`, plus the Push allowlist in
+   `tar_tree_routes.cpp` and `kSrc` in `device_routes.cpp`); a new source is toggled through `tar.configure`
+   until it is added to both; presentation metadata (category, always-on, `$`-name, badges)
    lives in that render function. Device-level panels (no pid) go in the
    process-tree pane (`render_tar_*_panel` + a `tar_tree_routes` fragment).
 10. **Tests** — extend `test_tar_schema_registry.cpp` (every source has all three
-    OS rows; opt-in sources in the `default_enabled=false` cross-check),
+    OS rows; every source in the `default_enabled=true` registry-wide invariant),
     `test_tar_diff.cpp` (appeared/removed + cap), `test_tar_warehouse.cpp` (DDL +
     `$`-name translation + authorizer), and add a `test_tar_<source>.cpp`.
 
@@ -409,6 +400,66 @@ between snapshot and ack cannot destroy an entry that was never committed.
 `EventRing<T>` for a stream whose loss is acceptable and counted; use
 `BoundedPendingQueue` when the events are forensic and the sink is
 transactional. Do not add a fourth.
+
+**The `registry` source (`tar_registry_source.{hpp,cpp}`, pure core in
+`tar_registry_parsers.hpp`) is the third `CursorSource` and the precedent for a
+cursor source whose durable state is a snapshot baseline plus a position
+cursor.** What it adds to the pattern:
+
+- **Two stores, one transaction.** What changed comes from a
+  `RegNotifyChangeKeyValue` subtree watch and a per-root baseline diff; each
+  root's baseline lives in a `tar_state` row (`registry:<root>`) and is written
+  by `insert_registry_events_and_cursor` in the SAME transaction as the rows and
+  the cursor, so a baseline can never advance without the rows that explain it.
+  A baseline read goes through the tri-state `try_get_state`; `get_state`'s
+  empty-on-failure would read a transient SQLite error as "no baseline" and
+  silently re-baseline. The baselines hold rendered (unmasked) values and are
+  readable through `tar.sql` like `registry_live` itself;
+  `purge_source("registry")` erases the table, the cursor row and every
+  `registry:%` baseline in one transaction.
+- **Four read statuses.** Complete, Absent, Unreadable, Capped. Removals are
+  derived only from Complete and Absent reads; an Unreadable read changes
+  nothing and a Capped one only adds and updates, so a partial read can never
+  fabricate a deletion. Unreadable means the root, or any key beneath it other
+  than an access-denied child, could not be read (an open, a query or an
+  enumeration failure there makes the whole root Unreadable). Only an
+  access-denied child is isolated: it is listed in the read's `skipped` set, the
+  rest of the root is read as usual, and the diff keeps what the baseline holds
+  beneath the denied key. That holds for up to `kSkippedCap` (32) children per
+  read; the 33rd makes the read Capped, which derives no deletion in that root.
+  A root going Unreadable, or the denied set gaining a member, writes one
+  `gap:unreadable:<root>` row; the set is kept in the cursor so a steady state,
+  a shrink or a clear writes nothing. A Capped read's list is partial, so it can
+  add to the stored set but never shrinks it, and the stored set is clamped to
+  `kSkippedCap` names so a root that stays Capped cannot grow the cursor row.
+  Keys are opened with `REG_OPTION_OPEN_LINK`, so a watched key that is itself a
+  symbolic link is recorded as the link (its `SymbolicLinkValue`) and its target
+  is never followed: following it would let a user point this agent's SYSTEM
+  token at a key they cannot read, and the price is that writes under a link a
+  user planted over their own `Run` key are invisible. The reader's enumeration
+  is index-driven, so `read_key` compares each key's value count, subkey count
+  and last-write time before and after walking it; a difference means the key
+  was written to mid-walk, and the read is Capped (no removals, root re-read at
+  the next tick), never Complete, because a deletion at an index already passed
+  would otherwise hide a surviving entry and report it removed.
+- **Reconcile.** Every `kReconcileEveryTicks` (12) slow ticks every root is
+  re-read whether or not the watch fired (hourly at the default 300 s
+  `slow_interval`). It finds what the watch missed (a notify lost to a watcher
+  that is not running, an unarmed root) and a child that became denied after the
+  last read: the watch mask is `NAME | LAST_SET`, so a permission change raises
+  nothing.
+- **A root's first read is silent.** A root not yet baselined (first run, a user
+  hive loaded at logon, a user who logged off and back on, a re-enable) has its
+  first read taken as the baseline, with no rows. Writes made to it between the
+  hive loading and that read, up to one slow interval, are folded into the
+  baseline and are not recorded; no per-root gap row is written, since a logon
+  would add one per root per user.
+- **Rows land in the tick that observes the change.** A diff row is stamped with
+  the end of the read that saw it and written in that tick's transaction.
+  `actor_pid`/`actor_image` are in the schema but hold `0`/`''` until a later
+  change attributes writers; the row's `record_key` never depends on them.
+- **Windows warehouse columns are NOT NULL.** "Not applicable" is `''`/`0`, and an
+  empty `data_type` distinguishes an absent value from an empty one.
 
 **`NstatClient` (`tar_netqual_nstat.*`) is the second such case and a
 deliberate, documented exception to a literal `ProcStreamCollector` subclass:**

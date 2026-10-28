@@ -586,6 +586,29 @@ inline std::string plist_string_value(std::string_view xml, std::string_view key
     return ProbeOutcome{"entitlement_certs", true, emitted, {}};
 }
 
+// ── per_user_hives outcome decision (pure seam) ────────────────────────────
+
+/// Classifies the Windows `per_user_hives` surface from four plain facts, same seam shape as
+/// entitlement_certs_outcome above so run_per_user_surfaces' precedence is unit-testable without
+/// a real ProfileList walk. Fixed precedence: privilege_missing > hive_file_refused >
+/// hive_unload_failed > profile_list_truncated > ok. `rows` is carried on every branch -- the
+/// loaded/live-hive records already gathered are never discarded because one profile degraded.
+/// The aggregate reason names only the generic `hive_file_refused`; the per-profile sid + its
+/// specific guard token go to the agent log only (ADR-0024 D3/R15: one ProbeOutcome per surface).
+[[nodiscard]] inline ProbeOutcome per_user_hives_outcome(bool privilege_missing,
+                                                          bool file_refused, bool unload_failed,
+                                                          bool truncated, std::size_t rows) {
+    if (privilege_missing)
+        return ProbeOutcome{"per_user_hives", false, rows, "privilege_missing"};
+    if (file_refused)
+        return ProbeOutcome{"per_user_hives", false, rows, "hive_file_refused"};
+    if (unload_failed)
+        return ProbeOutcome{"per_user_hives", false, rows, "hive_unload_failed"};
+    if (truncated)
+        return ProbeOutcome{"per_user_hives", false, rows, "profile_list_truncated"};
+    return ProbeOutcome{"per_user_hives", true, rows, {}};
+}
+
 } // namespace yuzu::license_scan
 
 #endif // YUZU_LICENSE_SCAN_LICENSING_PARSERS_HPP

@@ -2,7 +2,8 @@
 # e2e-security-test.sh — End-to-end security validation for Yuzu server
 #
 # Tests authentication enforcement, CORS policy, session management,
-# error envelope consistency, and rate limiting against a running server.
+# error envelope consistency, cookie-session write admission (same-site Origin
+# or Referer), and rate limiting against a running server.
 #
 # Usage:
 #   ./scripts/e2e-security-test.sh                              # default http://127.0.0.1:8080
@@ -34,6 +35,9 @@ done
 
 # Strip trailing slash from SERVER_URL
 SERVER_URL="${SERVER_URL%/}"
+
+# Cookie-session writes send a same-site Origin (the server's own scheme://host:port).
+SITE_ORIGIN=$(sed -E 's,^([A-Za-z][A-Za-z0-9+.-]*://)([^/?#@]*@)?([^/?#]*).*,\1\3,' <<< "$SERVER_URL")
 
 # ── Helpers (same pattern as integration-test.sh) ───────────────────────
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
@@ -413,6 +417,7 @@ if [[ -n "$ADMIN_PASS" ]]; then
 
     # Logout
     curl -s -o /dev/null -b "$COOKIE_JAR" \
+        -H "Origin: ${SITE_ORIGIN}" \
         -X POST "${SERVER_URL}/logout" 2>/dev/null
 
     # Reuse old cookie — should be invalid
@@ -486,11 +491,13 @@ if [[ -n "$ADMIN_PASS" ]]; then
     # Test: POST /api/command with invalid JSON → 400, check envelope
     INVALID_CMD_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
         -b "$COOKIE_JAR" \
+        -H "Origin: ${SITE_ORIGIN}" \
         -X POST "${SERVER_URL}/api/command" \
         -H "Content-Type: application/json" \
         -d '{"this is invalid' 2>/dev/null || echo "000")
     INVALID_CMD_BODY=$(curl -s \
         -b "$COOKIE_JAR" \
+        -H "Origin: ${SITE_ORIGIN}" \
         -X POST "${SERVER_URL}/api/command" \
         -H "Content-Type: application/json" \
         -d '{"this is invalid' 2>/dev/null || echo "")
@@ -544,6 +551,338 @@ assert_not_contains "/livez does NOT use error envelope" '"error"' "$LIVEZ_BODY"
 READYZ_BODY=$(curl -s "${SERVER_URL}/readyz" 2>/dev/null || echo "")
 assert_contains "/readyz uses status field" '"status"' "$READYZ_BODY"
 assert_not_contains "/readyz does NOT use error envelope" '"error"' "$READYZ_BODY"
+
+# ══════════════════════════════════════════════════════════════════════════
+# Category 6b: Cookie-session requests that dispatch work require same-site proof
+# ══════════════════════════════════════════════════════════════════════════
+# This is the closure evidence for the production wiring of the central write
+# gate: it drives a REAL server over a REAL socket, so it sees the pre-routing
+# pipeline that the in-process unit fixture only models and that the lexical
+# source check (tests/test_same_site_wiring_lexical.py) can only approximate.
+# Every case asserts the HTTP status, and the message text wherever a body exists
+# (a HEAD refusal has none, so its audit row carries the rest); a transport
+# failure (000) is a failure, so none of them can pass vacuously. After the
+# refusals the audit REST API is read back: every refusal must have left one
+# `csrf.denied` row (denied, `<METHOD> <path>` target, closed-set reason, the
+# logged-in admin as principal).
+# Placed before Category 7, which exhausts the per-IP login rate limit.
+log ""
+log "Category 6b: Cookie-session requests that dispatch work require same-site proof"
+
+SS_WRITE_PATH="/api/command"          # the handler answers 400 to this body
+SS_WRITE_BODY='{"this is invalid'     # deterministic non-403 for a same-site call
+# A read the central gate also holds to the rule. The query names an unknown kind, so the
+# handler answers 400 before it dispatches anything (admitted calls never start work).
+SS_GUARDED_GET_PATH="/fragments/device/live/run"
+SS_GUARDED_GET_QUERY="?id=e2e-same-site-probe&kind=e2e-no-such-kind"
+# The same rule on the token-reachable (v1) twin of a guarded read. A non-positive machines_max
+# is answered 400 by the handler before it does any work, so an admitted call changes nothing.
+SS_GUARDED_REST_PATH="/api/v1/viz/fleet/topology"
+SS_GUARDED_REST_QUERY="?machines_max=0"
+SS_QUERY=""                           # appended to the URL only (the audit target has no query)
+SS_MESSAGE="cross-site request refused"
+# The gate's own remediation text. The refusal message alone is also emitted by other per-route
+# checks, so a refusal by the central gate is recognised by this text as well.
+SS_REMEDIATION="--csrf-trusted-origin"
+SS_METHOD="POST"                      # the verb ss_write sends
+SS_ADMIT_RE='^(400|422)$'             # what an admitted request is answered with
+SS_STATUS=""
+SS_BODY=""
+SS_EXPECTED=()                        # "<METHOD> <path> <reason>" for each refusal asserted below
+SS_AUDIT_ROWS=""
+SS_AUDIT_BASE_ID=0
+SS_AUDIT_BASE_COUNT=0
+
+# ss_write <curl args...>: send SS_METHOD to SS_WRITE_PATH (a write carries SS_WRITE_BODY; GET and
+# HEAD carry none, HEAD has no response body), set SS_STATUS / SS_BODY.
+ss_write() {
+    local out
+    case "$SS_METHOD" in
+        GET)
+            out=$(curl -s -m 10 -w $'\n%{http_code}' \
+                "$@" "${SERVER_URL}${SS_WRITE_PATH}${SS_QUERY}" 2>/dev/null) || out=$'\n000' ;;
+        HEAD)
+            out=$(curl -s -I -m 10 -o /dev/null -w $'\n%{http_code}' \
+                "$@" "${SERVER_URL}${SS_WRITE_PATH}${SS_QUERY}" 2>/dev/null) || out=$'\n000' ;;
+        *)
+            out=$(curl -s -m 10 -w $'\n%{http_code}' -X "$SS_METHOD" \
+                -H "Content-Type: application/json" -d "$SS_WRITE_BODY" \
+                "$@" "${SERVER_URL}${SS_WRITE_PATH}${SS_QUERY}" 2>/dev/null) || out=$'\n000' ;;
+    esac
+    SS_STATUS="${out##*$'\n'}"
+    SS_BODY="${out%$'\n'*}"
+    [[ "$SS_STATUS" =~ ^[0-9]{3}$ ]] || SS_STATUS="000"
+}
+
+# ss_audit_fetch: read the `csrf.denied` rows (newest first) through the audit REST API into
+# SS_AUDIT_ROWS, one flat JSON object per line.
+ss_audit_fetch() {
+    local body
+    body=$(curl -s -m 10 -b "$COOKIE_JAR" \
+        "${SERVER_URL}/api/v1/audit?action=csrf.denied&limit=1000" 2>/dev/null || true)
+    SS_AUDIT_ROWS=$(grep -o '{[^{}]*"action":"csrf.denied"[^{}]*}' <<< "$body" || true)
+}
+
+# ss_row_str <row> <key>: the string value of a flat JSON key ("" when absent).
+ss_row_str() {
+    grep -o "\"$2\":\"[^\"]*\"" <<< "$1" | head -1 | cut -d'"' -f4 || true
+}
+
+# ss_row_id <row>: the numeric id of a row ("" when absent).
+ss_row_id() {
+    grep -o '"id":[0-9]*' <<< "$1" | head -1 | cut -d: -f2 || true
+}
+
+# ss_expect_refused <label> <reason> <curl args...>: 403 AND the refusal message (a HEAD response
+# has no body, so for HEAD the status alone is asserted here and the audit row below carries the
+# rest). <reason> is the closed-set token the audit row must end with; the case is recorded for
+# the audit read-back.
+ss_expect_refused() {
+    local label="$1" reason="$2"; shift 2
+    ss_write "$@"
+    TESTS=$((TESTS + 1))
+    if [[ "$SS_STATUS" == "403" && ( "$SS_METHOD" == "HEAD" || \
+            ( "$SS_BODY" == *"$SS_MESSAGE"* && "$SS_BODY" == *"$SS_REMEDIATION"* ) ) ]]; then
+        SS_EXPECTED+=("${SS_METHOD} ${SS_WRITE_PATH} ${reason}")
+        if [[ "$SS_METHOD" == "HEAD" ]]; then
+            pass "$label → 403"
+        else
+            pass "$label → 403 with refusal message and remediation"
+        fi
+    else
+        fail "$label (expected 403 containing '$SS_MESSAGE' and '$SS_REMEDIATION', got status '$SS_STATUS')"
+    fi
+}
+
+# ss_expect_answered <label> <curl args...>: the request was answered after the gate
+# (SS_ADMIT_RE), and not by the gate.
+ss_expect_answered() {
+    local label="$1"; shift
+    ss_write "$@"
+    TESTS=$((TESTS + 1))
+    if [[ "$SS_STATUS" =~ $SS_ADMIT_RE && "$SS_BODY" != *"$SS_MESSAGE"* \
+            && "$SS_BODY" != *"$SS_REMEDIATION"* ]]; then
+        pass "$label → $SS_STATUS after the gate"
+    else
+        fail "$label (expected status matching $SS_ADMIT_RE without '$SS_MESSAGE', got status '$SS_STATUS')"
+    fi
+}
+
+if [[ -n "$ADMIN_PASS" ]]; then
+    curl -s -o /dev/null -c "$COOKIE_JAR" \
+        -X POST "${SERVER_URL}/login" \
+        -d "username=${ADMIN_USER}&password=${ADMIN_PASS}" 2>/dev/null
+
+    # Precondition: the cookie session is valid, so a refusal below cannot be a 401 in disguise.
+    SS_PRE=$(curl -s -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+        "${SERVER_URL}/api/v1/me" 2>/dev/null || echo "000")
+    assert_eq "same-site gate: cookie session valid before the probes" "200" "$SS_PRE"
+
+    # Baseline of the audit read-back below: the highest existing csrf.denied row id.
+    ss_audit_fetch
+    while IFS= read -r ss_row; do
+        [[ -n "$ss_row" ]] || continue
+        SS_AUDIT_BASE_COUNT=$((SS_AUDIT_BASE_COUNT + 1))
+        ss_rid=$(ss_row_id "$ss_row")
+        if [[ -n "$ss_rid" && "$ss_rid" -gt "$SS_AUDIT_BASE_ID" ]]; then SS_AUDIT_BASE_ID="$ss_rid"; fi
+    done <<< "$SS_AUDIT_ROWS"
+    log "  audit baseline: ${SS_AUDIT_BASE_COUNT} csrf.denied row(s), highest id ${SS_AUDIT_BASE_ID}"
+
+    ss_expect_refused "cookie-session write without Origin/Referer is refused" no_origin_no_referer \
+        -b "$COOKIE_JAR"
+    ss_expect_refused "cookie-session write with a foreign Origin is refused" origin_mismatch \
+        -b "$COOKIE_JAR" -H "Origin: https://foreign.example"
+    ss_expect_refused "cookie-session write with Origin 'null' is refused" origin_mismatch \
+        -b "$COOKIE_JAR" -H "Origin: null"
+    ss_expect_answered "cookie-session write with a same-site Origin reaches the handler" \
+        -b "$COOKIE_JAR" -H "Origin: ${SITE_ORIGIN}"
+    ss_expect_answered "cookie-session write with a same-site Referer reaches the handler" \
+        -b "$COOKIE_JAR" -H "Referer: ${SITE_ORIGIN}/"
+
+    # Other write verbs are gated before routing: a path no handler serves for the verb is
+    # refused when headers are missing and answered (404/405) when the Origin is same-site.
+    SS_WRITE_PATH="/api/v1/e2e-same-site-probe"
+    SS_ADMIT_RE='^(404|405)$'
+    for SS_METHOD in PUT DELETE; do
+        ss_expect_refused "cookie-session ${SS_METHOD} without Origin/Referer is refused" no_origin_no_referer \
+            -b "$COOKIE_JAR"
+        ss_expect_answered "cookie-session ${SS_METHOD} with a same-site Origin is not refused" \
+            -b "$COOKIE_JAR" -H "Origin: ${SITE_ORIGIN}"
+    done
+    SS_METHOD="POST"
+    SS_WRITE_PATH="/api/command"
+    SS_ADMIT_RE='^(400|422)$'
+
+    # Reads that dispatch work are held to the same rule centrally. A browser states how a request
+    # was initiated in Sec-Fetch-Site (page script cannot set it): same-origin and none are
+    # accepted, anything else is refused; a client that sends no fetch metadata falls back to the
+    # Origin / Referer rule. The handler answers an admitted call 400 (unknown kind) without
+    # dispatching.
+    SS_METHOD="GET"
+    SS_WRITE_PATH="$SS_GUARDED_GET_PATH"
+    SS_QUERY="$SS_GUARDED_GET_QUERY"
+    SS_ADMIT_RE='^400$'
+    ss_expect_refused "cookie-session guarded read with cross-site fetch metadata is refused" origin_mismatch \
+        -b "$COOKIE_JAR" -H "Sec-Fetch-Site: cross-site"
+    ss_expect_refused "cookie-session guarded read with same-site fetch metadata is refused" origin_mismatch \
+        -b "$COOKIE_JAR" -H "Sec-Fetch-Site: same-site"
+    ss_expect_refused "cookie-session guarded read with cross-site fetch metadata and a same-site Referer is refused" origin_mismatch \
+        -b "$COOKIE_JAR" -H "Sec-Fetch-Site: cross-site" -H "Referer: ${SITE_ORIGIN}/"
+    ss_expect_answered "cookie-session guarded read with same-origin fetch metadata reaches the handler" \
+        -b "$COOKIE_JAR" -H "Sec-Fetch-Site: same-origin"
+    ss_expect_answered "cookie-session guarded read with fetch metadata none reaches the handler" \
+        -b "$COOKIE_JAR" -H "Sec-Fetch-Site: none"
+    ss_expect_refused "cookie-session guarded read without fetch metadata, Origin or Referer is refused" no_origin_no_referer \
+        -b "$COOKIE_JAR"
+    ss_expect_answered "cookie-session guarded read without fetch metadata but with a same-site Referer reaches the handler" \
+        -b "$COOKIE_JAR" -H "Referer: ${SITE_ORIGIN}/"
+    SS_METHOD="HEAD"
+    ss_expect_refused "cookie-session guarded HEAD with cross-site fetch metadata is refused" origin_mismatch \
+        -b "$COOKIE_JAR" -H "Sec-Fetch-Site: cross-site"
+    ss_expect_refused "cookie-session guarded HEAD without fetch metadata, Origin or Referer is refused" no_origin_no_referer \
+        -b "$COOKIE_JAR"
+    ss_expect_answered "cookie-session guarded HEAD with same-origin fetch metadata reaches the handler" \
+        -b "$COOKIE_JAR" -H "Sec-Fetch-Site: same-origin"
+
+    # The v1 twin of a guarded read follows the same rule for cookie sessions.
+    SS_METHOD="GET"
+    SS_WRITE_PATH="$SS_GUARDED_REST_PATH"
+    SS_QUERY="$SS_GUARDED_REST_QUERY"
+    ss_expect_refused "cookie-session guarded v1 read with cross-site fetch metadata is refused" origin_mismatch \
+        -b "$COOKIE_JAR" -H "Sec-Fetch-Site: cross-site"
+    ss_expect_refused "cookie-session guarded v1 read without fetch metadata, Origin or Referer is refused" no_origin_no_referer \
+        -b "$COOKIE_JAR"
+    ss_expect_answered "cookie-session guarded v1 read with same-origin fetch metadata reaches the handler" \
+        -b "$COOKIE_JAR" -H "Sec-Fetch-Site: same-origin"
+    SS_METHOD="POST"
+    SS_WRITE_PATH="/api/command"
+    SS_QUERY=""
+    SS_ADMIT_RE='^(400|422)$'
+
+    # Audit read-back: each refusal above left a `csrf.denied` row, read through the audit REST
+    # API (GET /api/v1/audit exposes principal, result, target_type, target_id and detail to the
+    # admin session). Rows are new when their id is above the baseline taken before the probes;
+    # the read is retried briefly in case the audit write lands a moment after the 403.
+    SS_NEW_ROWS=()
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        ss_audit_fetch
+        SS_NEW_ROWS=()
+        while IFS= read -r ss_row; do
+            [[ -n "$ss_row" ]] || continue
+            ss_rid=$(ss_row_id "$ss_row")
+            if [[ -n "$ss_rid" && "$ss_rid" -gt "$SS_AUDIT_BASE_ID" ]]; then SS_NEW_ROWS+=("$ss_row"); fi
+        done <<< "$SS_AUDIT_ROWS"
+        [[ ${#SS_NEW_ROWS[@]} -ge ${#SS_EXPECTED[@]} ]] && break
+        sleep 1
+    done
+    log "  audit read-back: ${#SS_EXPECTED[@]} refusal(s) asserted, ${#SS_NEW_ROWS[@]} new csrf.denied row(s)"
+
+    TESTS=$((TESTS + 1))
+    if [[ ${#SS_EXPECTED[@]} -gt 0 && ${#SS_NEW_ROWS[@]} -ge ${#SS_EXPECTED[@]} ]]; then
+        pass "audit: at least one new csrf.denied row per refusal (${#SS_NEW_ROWS[@]} rows for ${#SS_EXPECTED[@]} refusals)"
+    else
+        fail "audit: expected at least ${#SS_EXPECTED[@]} new csrf.denied rows, found ${#SS_NEW_ROWS[@]}"
+    fi
+
+    SS_ROW_BAD=0
+    SS_ROW_BAD_WHY=""
+    for ss_row in "${SS_NEW_ROWS[@]+"${SS_NEW_ROWS[@]}"}"; do
+        ss_result=$(ss_row_str "$ss_row" result)
+        ss_ttype=$(ss_row_str "$ss_row" target_type)
+        ss_tid=$(ss_row_str "$ss_row" target_id)
+        ss_detail=$(ss_row_str "$ss_row" detail)
+        ss_princ=$(ss_row_str "$ss_row" principal)
+        if [[ "$ss_result" != "denied" || "$ss_ttype" != "Endpoint" \
+                || ! "$ss_tid" =~ ^(POST|PUT|DELETE|PATCH|GET|HEAD)\ /[^\ ]*$ \
+                || ! "$ss_detail" =~ reason=(no_origin_no_referer|origin_mismatch|referer_mismatch)$ \
+                || "$ss_princ" != "$ADMIN_USER" ]]; then
+            SS_ROW_BAD=$((SS_ROW_BAD + 1))
+            SS_ROW_BAD_WHY="result='${ss_result}' target_type='${ss_ttype}' target_id='${ss_tid}' principal='${ss_princ}'"
+        fi
+    done
+    TESTS=$((TESTS + 1))
+    if [[ "$SS_ROW_BAD" -eq 0 && ${#SS_NEW_ROWS[@]} -gt 0 ]]; then
+        pass "audit: every new row is denied, targets '<METHOD> <path>', ends in a closed-set reason, principal '${ADMIN_USER}'"
+    else
+        fail "audit: ${SS_ROW_BAD} new row(s) malformed (last: ${SS_ROW_BAD_WHY:-none seen})"
+    fi
+
+    # Each refusal asserted above is matched by its own row (method, path and reason).
+    SS_REMAINING=("${SS_NEW_ROWS[@]+"${SS_NEW_ROWS[@]}"}")
+    SS_UNMATCHED=""
+    for ss_want in "${SS_EXPECTED[@]+"${SS_EXPECTED[@]}"}"; do
+        ss_want_tid="${ss_want% *}"
+        ss_want_reason="${ss_want##* }"
+        ss_found=-1
+        for ss_i in "${!SS_REMAINING[@]}"; do
+            ss_cand="${SS_REMAINING[$ss_i]}"
+            if [[ "$(ss_row_str "$ss_cand" target_id)" == "$ss_want_tid" \
+                    && "$(ss_row_str "$ss_cand" detail)" == *"reason=${ss_want_reason}" ]]; then
+                ss_found="$ss_i"; break
+            fi
+        done
+        if [[ "$ss_found" -ge 0 ]]; then
+            unset 'SS_REMAINING[ss_found]'
+        else
+            SS_UNMATCHED+=" [${ss_want}]"
+        fi
+    done
+    TESTS=$((TESTS + 1))
+    if [[ -z "$SS_UNMATCHED" ]]; then
+        pass "audit: each refusal is matched by a row with its method, path and reason"
+    else
+        fail "audit: no matching csrf.denied row for:${SS_UNMATCHED}"
+    fi
+
+    # Bearer API-token write with no Origin: not an ambient credential, so not refused here.
+    # The probe token expires by itself after five minutes, so an interrupted run leaves nothing
+    # lasting; the cleanup below still revokes it.
+    SS_TOKEN_EXPIRY=$(( $(date +%s) + 300 ))
+    SS_TOKEN_RESP=$(curl -s -m 10 -b "$COOKIE_JAR" -H "Origin: ${SITE_ORIGIN}" \
+        -H "Content-Type: application/json" -X POST \
+        -d "{\"name\":\"e2e-sec-same-site-probe\",\"expires_at\":${SS_TOKEN_EXPIRY}}" \
+        "${SERVER_URL}/api/v1/tokens" 2>/dev/null || echo "")
+    SS_TOKEN=$(grep -o '"token":"[^"]*"' <<< "$SS_TOKEN_RESP" | head -1 | cut -d'"' -f4 || true)
+    if [[ -n "$SS_TOKEN" ]]; then
+        ss_expect_answered "bearer-token write without Origin/Referer is not refused by the central check" \
+            -H "Authorization: Bearer ${SS_TOKEN}"
+        SS_METHOD="GET"
+        SS_WRITE_PATH="$SS_GUARDED_GET_PATH"
+        SS_QUERY="$SS_GUARDED_GET_QUERY"
+        SS_ADMIT_RE='^400$'
+        ss_expect_answered "bearer-token guarded read without fetch metadata, Origin or Referer is not refused by the central check" \
+            -H "Authorization: Bearer ${SS_TOKEN}"
+        SS_WRITE_PATH="$SS_GUARDED_REST_PATH"
+        SS_QUERY="$SS_GUARDED_REST_QUERY"
+        ss_expect_answered "bearer-token guarded v1 read without fetch metadata, Origin or Referer is not refused by the central check" \
+            -H "Authorization: Bearer ${SS_TOKEN}"
+        SS_METHOD="POST"
+        SS_WRITE_PATH="/api/command"
+        SS_QUERY=""
+        SS_ADMIT_RE='^(400|422)$'
+        # Best-effort cleanup: the create reply carries no id, so find the probe token(s) by
+        # name in the list and revoke each (with a same-site Origin, as a browser would).
+        SS_LIST=$(curl -s -m 10 -b "$COOKIE_JAR" "${SERVER_URL}/api/v1/tokens" 2>/dev/null || true)
+        while IFS= read -r ss_obj; do
+            ss_id=$(grep -o '"token_id":"[^"]*"' <<< "$ss_obj" | head -1 | cut -d'"' -f4 || true)
+            [[ -n "$ss_id" ]] || continue
+            curl -s -m 10 -o /dev/null -b "$COOKIE_JAR" -H "Origin: ${SITE_ORIGIN}" \
+                -X DELETE "${SERVER_URL}/api/v1/tokens/${ss_id}" 2>/dev/null || true
+        done < <(grep -o '{[^{}]*"name":"e2e-sec-same-site-probe"[^{}]*}' <<< "$SS_LIST" || true)
+    else
+        TESTS=$((TESTS + 1))
+        fail "bearer-token write case: could not mint an API token to probe with"
+    fi
+
+    # The refusals above must not have damaged the session.
+    SS_POST=$(curl -s -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+        "${SERVER_URL}/api/v1/me" 2>/dev/null || echo "000")
+    assert_eq "same-site gate: cookie session still valid after the refusals" "200" "$SS_POST"
+    ss_expect_answered "cookie-session same-site write still works after the refusals" \
+        -b "$COOKIE_JAR" -H "Origin: ${SITE_ORIGIN}"
+else
+    log "  SKIPPED (no admin credentials available)"
+fi
 
 # ══════════════════════════════════════════════════════════════════════════
 # Category 7: Rate Limiting

@@ -3,7 +3,7 @@
 **Change:** #2376 — an authorization-topology floor that holds regardless of the RBAC toggle, plus a
 new `EnginePrincipal` RBAC securable cut away from the over-broad `Security:Read`.
 
-**Repo:** /home/fraser/Yuzu/.claude/worktrees/authz-topology-floor (a git worktree; branch
+**Repo:** /home/<user>/Yuzu/.claude/worktrees/authz-topology-floor (a git worktree; branch
 `feat/authz-topology-floor`). **Range:** `origin/dev..HEAD` = c686f31a..33b4153a, 7 commits.
 
 **The defect being closed.** `RbacStore::rbac_enabled_` defaults false, so a fresh install runs RBAC

@@ -24,6 +24,11 @@
 
 using namespace yuzu::privacy_permissions;
 
+// The guard lives in yuzu::win; this file spells its names win::X.
+namespace yuzu::privacy_permissions::win {
+using namespace ::yuzu::win;
+}
+
 namespace {
 
 std::size_t field_count(const std::string& row) {
@@ -837,6 +842,7 @@ TEST_CASE("win::classify_hive_file: a stock hive is accepted; each refusal fires
         deep.depth = win::kMaxHivePathDepth + 1;
         CHECK(token(deep) == "hive_path_too_deep");
         deep.depth = win::kMaxHivePathDepth;
+        CHECK(win::kMaxHivePathDepth == 32);
         CHECK(token(deep) == "<accepted>");
         auto anc = stock();
         anc.ancestor_reparse = true;
@@ -847,6 +853,17 @@ TEST_CASE("win::classify_hive_file: a stock hive is accepted; each refusal fires
         auto rp = stock();
         rp.is_reparse = true;
         CHECK(token(rp) == "hive_reparse_point");
+        rp.leaf_hardlinked = true; // the reparse verdict comes first
+        CHECK(token(rp) == "hive_reparse_point");
+        auto hl = stock(); // the link count outranks kind, residency, owner, redirect and size
+        hl.leaf_hardlinked = true;
+        CHECK(token(hl) == "hive_hardlinked");
+        hl.is_directory = true;
+        hl.not_resident = true;
+        hl.owner_sid = "S-1-5-21-1-2-3-1002";
+        hl.final_path_matches = false;
+        hl.size = win::kMaxHiveBytes + 1;
+        CHECK(token(hl) == "hive_hardlinked");
         auto dir = stock();
         dir.is_directory = true;
         CHECK(token(dir) == "hive_not_regular");
@@ -871,6 +888,7 @@ TEST_CASE("win::classify_hive_file: a stock hive is accepted; each refusal fires
         big.size = win::kMaxHiveBytes + 1;
         CHECK(token(big) == "hive_oversized");
         big.size = win::kMaxHiveBytes;
+        CHECK(win::kMaxHiveBytes == 536870912ull); // 512 MiB
         CHECK(token(big) == "<accepted>");
     }
     SECTION("sidecar facts") {
@@ -1121,6 +1139,13 @@ TEST_CASE("win::assemble_windows_rows: each hive-access outcome is its own row, 
         p.profile_path_unreadable = true;
         only(unreachable(HiveAccessStatus::not_found), p);
         CHECK(row_raw("alice:profile_path_unreadable") == 1);
+    }
+    SECTION("a hive-file refusal whose unload also failed reports both") {
+        auto rd = unreachable(HiveAccessStatus::file_refused, "hive_identity_changed");
+        rd.unload_failed = true;
+        only(rd);
+        CHECK(row_raw("alice:hive_identity_changed") == 1);
+        CHECK(run.acc.reason().find("alice:hive_unload_failed") != std::string::npos);
     }
     SECTION("a failed unload after a good read adds a token, never a row") {
         auto rd = reachable_allow();
@@ -1614,8 +1639,8 @@ TEST_CASE("macos::immutable_uri: only % ? # are encoded, so every hostile spelli
           "[privacy_permissions][macos_parsers]") {
     CHECK(macos::immutable_uri("/Users/Jane Doe/TCC.db") ==
           "file:/Users/Jane Doe/TCC.db?immutable=1");
-    CHECK(macos::immutable_uri("/Users/a%20b/q?x#h/TCC.db") ==
-          "file:/Users/a%2520b/q%3Fx%23h/TCC.db?immutable=1");
+    CHECK(macos::immutable_uri("/Users/a%20b/q?x#h/TCC.db") ==  // personal-data-ok: synthetic test path
+          "file:/Users/a%2520b/q%3Fx%23h/TCC.db?immutable=1");  // personal-data-ok: synthetic test path
 }
 
 TEST_CASE("macos::classify_tcc_open_errno: a refused open is denied, a symlink and every other "
@@ -1710,8 +1735,8 @@ TEST_CASE("macos::path_under_network_mount: a network mount at or above the path
     CHECK(refused("/Users/alice/Library/Application Support/com.apple.TCC/TCC.db"));
     CHECK(refused("/Users/carol/Library"));
     CHECK(refused("/Volumes/web/x"));
-    CHECK_FALSE(refused("/Users/alicia"));   // prefix of the name, not of a segment
-    CHECK_FALSE(refused("/Users/al"));
+    CHECK_FALSE(refused("/Users/alicia"));   // prefix of the name, not of a segment  // personal-data-ok: synthetic test path
+    CHECK_FALSE(refused("/Users/al"));  // personal-data-ok: synthetic test path
     CHECK_FALSE(refused("/Users/dave/Library")); // a local mount is never a reason
     CHECK_FALSE(refused("/Library/Application Support/com.apple.TCC/TCC.db"));
     CHECK_FALSE(macos::path_under_network_mount("/Users/alice", {}));
@@ -1724,7 +1749,7 @@ TEST_CASE("macos::path_under_network_mount: a network mount at or above the path
     CHECK(macos::path_under_network_mount("/home/dave/Library", real));
     CHECK(macos::path_under_network_mount("/Users/carol/Library/x", real));
     CHECK(macos::path_under_network_mount("/System/Volumes/Data/home/dave", real));
-    CHECK_FALSE(macos::path_under_network_mount("/Users/carolyn/Library", real));
+    CHECK_FALSE(macos::path_under_network_mount("/Users/carolyn/Library", real));  // personal-data-ok: synthetic test path
     CHECK_FALSE(macos::path_under_network_mount("/Users/jsmith/Library", real));
     CHECK_FALSE(macos::path_under_network_mount("/homework", real));
     // A network root covers every path.

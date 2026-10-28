@@ -516,12 +516,12 @@ exec_id = execute("windows.registry.get_value",
                   params={
                       "hive": "HKLM",
                       "key": "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
-                      "value": "CurrentBuildNumber"
+                      "name": "CurrentBuildNumber"
                   })
 wait_for(exec_id)
 responses = get_responses("windows.registry.get_value", exec_id)
 for row in responses:
-    build = row["output"].get("data", "unknown")
+    build = row["output"].get("value", "unknown")
     print(f"{row['agent_id']}: Windows Build {build}")
 ```
 
@@ -530,16 +530,99 @@ for row in responses:
 Policy: Windows build must be 22621 or higher (Windows 11 22H2+):
 
 ```cel
-int(result.data) >= 22621
+int(result.value) >= 22621
 ```
 
 #### Dashboard UI
 
 1. **Instructions > Definitions** > `windows.registry.get_value`
 2. Click **Execute**
-3. Parameters: **Hive** = `HKLM`, **Key** = `SOFTWARE\Microsoft\Windows NT\CurrentVersion`, **Value** = `CurrentBuildNumber`
-4. Scope: leave empty (Windows-only plugin only runs on Windows agents)
+3. Parameters: **Hive** = `HKLM`, **Key** = `SOFTWARE\Microsoft\Windows NT\CurrentVersion`, **Name** = `CurrentBuildNumber`
+4. Scope: `ostype == "windows"` (the plugin also loads on macOS and Linux agents, where every action answers a `registry|unsupported|...` line instead of reading the registry)
 5. Click **Run**
+
+#### Recipe: Preview, Apply and Undo a Registry Plan
+
+`windows.registry.apply` is Destructive, so it takes explicit `agent_ids` (scope and broadcast are refused) and an
+administrator or an approval; it needs registry 2.1.0 on the agent (see [Upgrading](upgrading.md)).
+
+1. **Preview.** Run it with the default `dry_run=true` and this `plan`:
+
+   ```json
+   [{"op":"set_value","key":"SOFTWARE\\Acme","name":"Mode","type":"REG_SZ","value":"new"},
+    {"op":"delete_key","key":"SOFTWARE\\AcmeLegacy"}]
+   ```
+
+   The two items touch unrelated keys: an item on a key and one on its ancestor or descendant would be refused
+   `dependent_items`. Every `item` row should say `would_apply` and the `summary` row `undo_complete` 1. Save the reply.
+2. **Apply.** Run the same plan with `dry_run=false` and save the reply to the change record: its `item` rows
+   (`old_state`, `old_type`, `old_hex`) and `undo` rows are the only copy of the previous values.
+3. **Undo**, in reverse item order, only for items that say `applied` (or `failed` with a change): recreate
+   `SOFTWARE\AcmeLegacy` with `create_key`, then in a second plan one `set_value` per `undo` row of item 1
+   (`name`, `type`, hex as `data_hex`); for item 0, `set_value` with `type` = `old_type` and `data_hex` = `old_hex`
+   when `old_state` is `present`, or `delete_value` when it is `absent`. A row `name` of `-` is the default value:
+   omit `name` for it (a plan refuses `-`). When item 0's `created` is above 0, remove the keys it made with
+   `delete_key` in plans of their own, one call per level, deepest first (a value op and a key op on one key are
+   `dependent_items`). The undo restores values only, not the deleted key's security or volatility (the registry
+   README, "Undoing a plan").
+
+#### Recipe: Change One Value in a User's Hive
+
+`hive=HKCU` is the agent's own hive (LocalSystem's `HKU\.DEFAULT`), not the logged-on user's, so a person's setting
+is changed with `windows.registry.set_user_value`. It needs an administrator or an approval and registry 2.1.0 on the
+agent, and it has no dry run: it writes at once. Its twin `windows.registry.delete_user_value` is Destructive, so it
+also takes explicit `agent_ids`.
+
+1. **Find the profile.** Run `windows.registry.list_profiles` on the device. Each row is
+   `<sid>|<profile_name>|<profile_path>|<hive_state>`; note the `sid`. `hive_state` `loaded` means the user's hive is
+   open and the write goes to it live; otherwise the agent mounts the profile's `NTUSER.DAT` for the one call (the
+   offline hive), behind the hive-file guard, and flushes it before unloading.
+2. **Record the current value.** Run `windows.registry.get_user_value` with `sid`, `key` (relative to the user's hive
+   root, e.g. `Software\Acme`) and `name`. Keep the answer: it is your preview.
+3. **Write.** Run `windows.registry.set_user_value` with the same `sid`, `key` and `name`, plus `type` (default
+   `REG_SZ`) and either `value` or `data_hex`. Save the reply: its `audit|` line (`hive=HKU`, `sid=<SID>`) carries the
+   old value as hex (`old_state`, `old_type`, `old=`, 256 bytes at most), the only record of it.
+4. **Read the answer.** `status|ok` means the value was written and read back (and, offline, flushed). The other
+   lines explain the hive:
+   - `warning|hive_unload_failed: ...`: the write is durable, but the offline hive stayed mounted; run the
+     `reg unload` the warning names once nothing holds it, or the user's next logon can get a temporary profile.
+   - `warning|hive_loaded_after_offline_write`: the user logged on right after the offline write; read the value back
+     in their live hive.
+   - an `error|...` sentence before the audit line, and `error|hive_not_found`, `privilege_missing`,
+     `hive_mount_failed` or a guard token such as `hive_hardlinked` after it: the hive could not be reached or
+     trusted, and nothing was written.
+   - `error|flush_failed:<token>`: the offline write could not be made durable; read the value back and retry.
+5. **Undo.** With `old_state=present`, run `set_user_value` again with `type` = `old_type` and `data_hex` = `old`.
+   That works only when `old` was not cut (no `~<total>` at its end), `old_type` is one of the six types
+   `set_user_value` writes and the bytes fit that type (a string type ends in its NUL, a `REG_DWORD` is 4 bytes);
+   restore any other value with another tool (the registry README, "Undoing a change"). With `old_state=absent`, run
+   `delete_user_value` with the same `key` and `name`. Keys the write created (`created` above 0) can be removed only
+   with `windows.registry.delete_key`, `hive=HKU` and `key=<SID>\...`, while the user's hive is loaded.
+
+#### Recipe: Remove a Registry Branch Safely
+
+`windows.registry.delete_key` is Destructive (explicit `agent_ids`, administrator or approval) and deletes by default.
+Send `dry_run=true` only to agents verified at registry 2.1.0: an older agent ignores it and DELETES a key that has no
+subkeys (see [Upgrading](upgrading.md)).
+
+1. **Preview.** Run it with `hive` = `HKLM`, `key` = `SOFTWARE\AcmeLegacy`, `recursive=true` and `dry_run=true`. The
+   reply ends `status|ok`, `counted_keys|<n>`, `counted_values|<n>`, `dry_run|1` and `capped|0`. Nothing is deleted;
+   the vet has checked every key in the tree for a registry link and for the agent's right to delete it.
+2. **Decide.** There is no undo for a recursive delete: the keys, values and permissions are not recorded. If the
+   values matter, read them first (`enumerate_keys`, `enumerate_values`, `get_value`). `capped|1` means the tree is
+   over 10,000 keys and values or 600 levels: a real run is refused `tree_too_large`, so delete it in parts, deepest
+   subtrees first.
+3. **Delete.** Run the same request with `dry_run=false` and save the reply. Its counts are what was removed, which can
+   exceed the preview if keys were added since.
+4. **Verify.** `windows.registry.key_exists` for the key answers `exists|false`.
+
+What a refusal means: `key_is_link` (a registry link inside the tree; the plugin never deletes through one),
+`access_denied` (a key the agent may not delete) and `unrepresentable_name` (a key whose raw name is malformed)
+delete nothing when the vet finds them, in the preview or in the real run; `tree_too_large` comes only from a real
+run (the preview answers `capped|1` instead) and also deletes nothing. During the real delete, a link or malformed
+name that appeared after the vet, or `concurrent_change` (the tree grew past the bound), stops the run: keys already
+removed stay removed (`result=failed` in the audit line), so run the preview again to see what is left, then delete
+again.
 
 ---
 
@@ -965,9 +1048,12 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `windows.registry.get_value` | get_value | Q | W | hive:enum (req), key:string (req), name:string (req) | value:string, type:string |
 | `windows.registry.get_user_value` | get_user_value | Q | W | username:string, sid:string, key:string (req), name:string | username:string, value:string, type:string |
 | `windows.registry.list_profiles` | list_profiles | Q | W | (none) | sid:string, profile_name:string, profile_path:string, hive_state:string |
-| `windows.registry.set_value` | set_value | A | W | hive:enum (req), key:string (req), name:string (req), value:string (req), type:enum | status:string |
+| `windows.registry.set_value` | set_value | A | W | hive:enum (req), key:string (req), name:string (req), value:string, data_hex:string (send one of the two), type:enum | status:string |
 | `windows.registry.delete_value` | delete_value | A | W | hive:enum (req), key:string (req), name:string (req) | status:string |
-| `windows.registry.delete_key` | delete_key | A | W | hive:enum (req), key:string (req) | status:string |
+| `windows.registry.delete_key` | delete_key | A | W | hive:enum (req), key:string (req), recursive:enum, dry_run:enum | status:string, counted_keys:int32, counted_values:int32, dry_run:bool, capped:bool |
+| `windows.registry.set_user_value` | set_user_value | A | W | username:string, sid:string, key:string (req), name:string (req), value:string, data_hex:string (send one of the two), type:enum | status:string |
+| `windows.registry.delete_user_value` | delete_user_value | A | W | username:string, sid:string, key:string (req), name:string (req) | status:string |
+| `windows.registry.apply` | apply | A | W | plan:string (req, JSON array of up to 256 items), dry_run:enum (default true), continue_on_error:enum | row_kind:string, field_1..field_13:string |
 | `windows.registry.enumerate_keys` | enum_keys | Q | W | hive:enum (req), key:string (req) | subkey:string |
 | `windows.registry.enumerate_values` | enum_values | Q | W | hive:enum (req), key:string (req) | name:string, type:string |
 | `windows.registry.key_exists` | key_exists | Q | W | hive:enum (req), key:string (req) | exists:bool |

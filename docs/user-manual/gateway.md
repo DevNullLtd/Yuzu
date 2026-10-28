@@ -1,7 +1,7 @@
 # Yuzu Gateway
 
 The Yuzu gateway is an Erlang/OTP application that sits between agents and the
-C++ server, enabling the platform to scale beyond the connection limits of a
+C++ server, enabling the platform to scale beyond the capacity of a
 single server process.
 
 ## Table of Contents
@@ -315,6 +315,30 @@ response does not reveal which condition failed; the reason appears only in the
 counters below. A heartbeat that is admitted is acknowledged and buffered exactly as
 before.
 
+**`ReportInventory` is admitted the same way.** An inventory report is forwarded to
+the server only for a session this node holds, on the connection bound to it (the
+`session_id` of the `InventoryReport`, checked by the same rule as a heartbeat). The
+check runs before the call asks for an upstream permit, so a peer that never
+registered cannot hold the inventory permits or their wait queue, and its decoded
+report is dropped at once instead of waiting in that queue. A refused report gets the
+same gRPC `NOT_FOUND` (`unknown session`) and is counted in
+`yuzu_gw_inventory_rejected_total{reason}` (`unknown_session`, `no_connection`,
+`registry_unavailable`, `connection_mismatch`; every series starts at 0). A
+connection mismatch is counted there too, not in the `event="security"` heartbeat
+family. The gateway logs `ReportInventory refused before forwarding: no session held
+on this connection (<reason>)` at warning level, at most once per second with a count
+of the lines it suppressed, never with the session id. No audit row is written: a
+refused caller holds no session on this connection and the agent listener authenticates
+no one, so there is no principal to attribute a row to, and a
+row per call would let any peer flood the audit log; the counter and the log line are
+the record. The agent sends its inventory
+over the same channel as its heartbeats, so a registered agent's reports are admitted.
+When one is refused (for example in the moments before it re-registers), the agent
+does not re-register for it: its daily-sync scheduler treats any failed
+`ReportInventory` as "retry on the next tick" and keeps the report's state, and the
+heartbeat on the same connection is what drives re-registration (read from
+`agents/core/src/agent.cpp` and `sync_scheduler.cpp`, not run on a rig).
+
 A rejected agent re-registers through its `NOT_FOUND` handling where that handling
 works; see below. Where it works, the agent waits an escalating cooldown (2 s on the first
 rejection, doubling to a 300 s cap), drops its `Subscribe` stream and registers
@@ -371,7 +395,7 @@ see "Per-connection session cap" under Configuration). See
 [Security Hardening](security-hardening.md#gateway-tls-if-you-deploy-the-erlang-gateway).
 
 **Multi-node gateways.** The check reads node-local state, so for the life of a session
-the `Register`, `Subscribe` and `Heartbeat` calls of one agent must reach the same
+the `Register`, `Subscribe`, `Heartbeat` and `ReportInventory` calls of one agent must reach the same
 gateway node on one connection: use per-connection sticky L4 and do not balance
 per RPC. An agent that re-registers on a new connection (for example after a failover
 to another node) mints a new session, which is compatible with this rule. Multi-node
@@ -767,8 +791,8 @@ gateway now reads the field: `acknowledged=false` means **not delivered**.
 
 What the server means by `false` (read from `NotifyStreamStatus` in
 `server/core/src/gateway_service_impl.cpp`; each case logs a WARN on the server
-and counts in `yuzu_server_gateway_route_desync_total{op="notify_stream_status"}`
-under the outcome named):
+and counts in `yuzu_server_gateway_route_desync_total` under the outcome named, with
+`op="notify_stream_status"` unless the table names another op):
 
 | Server WARN line (start) | Outcome | Event | Kind |
 |---|---|---|---|
@@ -776,6 +800,7 @@ under the outcome named):
 | `NotifyStreamStatus: unknown session ... for agent ...` | `unknown_session` | both | Definitive for that session: the server lost its state or never saw the registration. For a live session the heartbeat verdict names it and the replay re-registers it |
 | `NotifyStreamStatus: CONNECTED for session ... but the directory names a different session — rejecting`, or `NotifyStreamStatus: CONNECTED for session ... is no longer the currently-installed session` | `stale_connected_session` | CONNECTED | Definitive: a newer registration owns the agent |
 | `NotifyStreamStatus: CONNECTED for agent ... claims cluster_id ..., which differs from this agent's already-bound cluster affinity` | `cluster_affinity_violation` (op `announce_connected`) | CONNECTED | Definitive until the cluster configuration is fixed |
+| `NotifyStreamStatus: CONNECTED for agent ... presents session ... that another agent's route already holds (#5683)` | `session_held_by_other_agent` (op `announce_connected`; audit `gateway.session_held_by_other_agent`; alert `YuzuGatewaySessionHeldByOtherAgent`) | CONNECTED | Definitive while the other agent's route holds the session, but the gateway cannot tell it from the others (the answer carries no reason, #6059), so it keeps resending for as long as it holds the session (at the ordinary retry cadence for the first 15 minutes, then in the slow phase at intervals of up to 10 minutes): the WARN and the audit row repeat with each resend, and the alert stays active, until the presenting agent's session ends at the gateway or the other agent's route releases the session id. See [Forged or colliding session ids](#forged-or-colliding-session-ids) |
 
 A failed directory write is answered `true` by this server (the write is
 fail-open); a server change in review (#5961) answers it `UNAVAILABLE` instead,
@@ -806,9 +831,9 @@ so the gateway treats every `false` the same way:
   minutes.** The answer carries no reason, so a refusal the server will repeat for
   as long as the session lives (`stale_connected_session`,
   `cluster_affinity_violation`) looks the same as one it takes back seconds later.
-  Once a `CONNECTED` has been refused continuously for
-  `notify_unacked_slow_after_ms` (900000, 15 minutes) since its first refusal,
-  each next resend comes 0.8 to 1 times `notify_unacked_slow_max_ms` (600 s)
+  Once `notify_unacked_slow_after_ms` (900000, 15 minutes) has passed since a
+  `CONNECTED`'s first refusal without an acknowledgement (time it spends held
+  while the upstream connection is down counts too), each next resend comes 0.8 to 1 times `notify_unacked_slow_max_ms` (600 s)
   later: a fixed interval jittered down by up to 20%, so no slowed session is
   resent more than once every 8 minutes, and sessions slowed together are spread
   over 2 minutes. (Decorrelated jitter up to 600 s was not used: its floor stays
@@ -817,7 +842,8 @@ so the gateway treats every `false` the same way:
   backoff reaches 10 refusals in as little as 33 s, so a threshold of 10
   refusals in a row, measured behind a server refusing `CONNECTED` for 60 s (a
   degraded route store) at 5,000 agents, slowed 1,512 of the 5,000 sessions and
-  left them unrecorded for up to 10 minutes after the server recovered (#6077). 15 minutes is well past a typical degraded-route-store outage, so a
+  left them unrecorded for up to 10 minutes after the server recovered (#6077).
+  15 minutes is well past a typical degraded-route-store outage, so a
   refusal that ends before then slows no one, and every session is recorded
   within the normal backoff (at most 60 s) of the recovery. The cost: a
   `CONNECTED` the server will never accept is resent at the normal backoff for
@@ -854,7 +880,8 @@ Signals: `yuzu_gw_upstream_notify_unacknowledged_total{event}` counts every
 `false`; `yuzu_gw_upstream_notify_unacked_keys` is the number of sessions waiting
 for a resend, and `yuzu_gw_upstream_notify_unacked_slow_keys` how many of them are
 in the slow phase (usually a definitive refusal: look for
-`stale_connected_session` or `cluster_affinity_violation` in the server log);
+`stale_connected_session`, `cluster_affinity_violation` or `session_held_by_other_agent` in
+the server log);
 `yuzu_gw_upstream_notify_unacked_ended_total{outcome}` says how each wait ended.
 The gateway logs a WARN, at most one a second, `Server did not record the <event>
 stream status notice for <agent> (acknowledged=false; refused <n> time(s) over
@@ -1179,8 +1206,8 @@ This is the production shape, from `gateway/config/sys.config.prod` (comments sh
 | `name` | Any term; names the listener. Mandatory and unique (the old `{grpcbox, [{servers, ...}]}` shape had no names). |
 | `service_protos` | The proto modules (`agent_pb`, `management_pb`) that describe the services the listener serves. |
 | `services` | `#{ServiceName => Module}`: the module that serves each service. |
-| `listen` | `#{port, ip, socket_opts}`. `ip` defaults to `0.0.0.0`. `port => 0` binds any free port (tests). An optional `socket_opts` list is appended to the socket options; it may not carry `ip`, `ifaddr`, `fd`, `port` or `{local, _}`, which would move the bind away from `listen` (boot refuses them on every listener, because an `ifaddr` of `0.0.0.0` on a listener whose `ip` says loopback would publish the plaintext management plane to the network). |
-| `tls` | Keys: `certfile`, `keyfile`, `cacertfile`, `verify`, `fail_if_no_peer_cert`, `ciphers`. Omit the map for plaintext HTTP/2 (an explicit choice: a listener with no `tls` map is plaintext whatever certificates are mounted next to it). When present, `certfile`, `keyfile` **and** `cacertfile` are all required and an incomplete map refuses boot. A listener that still carries certificate settings under a legacy key (`transport_opts`, `ssl`) refuses boot rather than running plaintext, so "certificates configured but plaintext" cannot come from a half-converted entry. `verify` defaults to `verify_peer` and `fail_if_no_peer_cert` to `true` (mutual TLS); `verify => verify_none` is one-way TLS and then `fail_if_no_peer_cert` defaults to `false`. TLS 1.2 only. Cipher suites follow the certificate's key type when `ciphers` is unset: ECDHE-ECDSA AEAD suites for an EC key (the generated default certificates), ECDHE-RSA AES-GCM suites for an RSA key (a bring-your-own certificate); an explicit `ciphers` list always wins. FIPS mode is not claimed. The listener also sets `reuse_sessions => false` (every reconnect is a full TLS handshake, so a reconnect herd costs more CPU than with session resumption) and `honor_cipher_order => true` (the gateway's list decides the suite, not the client's); listeners built from the old `{grpcbox, [{servers, ...}]}` shape took OTP's defaults for both. **Not supported:** the `tls` map is closed, so an encrypted private key (`password`) and the ssl options `depth`, `crl_check`, `partial_chain` and `versions` that a `transport_opts` map could carry refuse boot. Decrypt the key first (`openssl pkey -in encrypted.key -out gateway.key`, with the file readable by the gateway user only) and use the defaults; supporting them is a follow-up, not something to work around. **Decrypting removes the passphrase protection the key had at rest**: if you answer "are private keys encrypted at rest?" for this key, the answer is now "protected by file permissions and the secret store that mounts it". |
+| `listen` | `#{port, ip, socket_opts}`. `ip` defaults to `0.0.0.0`. `port => 0` binds any free port (tests). An optional `socket_opts` list is appended to the socket options; it may not carry `ip`, `ifaddr`, `fd`, `port` or `{local, _}`, which would move the bind away from `listen` (boot refuses them on every listener, because an `ifaddr` of `0.0.0.0` on a listener whose `ip` says loopback would publish the plaintext management plane to the network). It may not carry `client_renegotiation` or `secure_renegotiate` either: the gateway fixes both (see `tls`), and boot refuses them (`listen_socket_opts_set_tls_policy`). |
+| `tls` | Keys: `certfile`, `keyfile`, `cacertfile`, `verify`, `fail_if_no_peer_cert`, `ciphers`. Omit the map for plaintext HTTP/2 (an explicit choice: a listener with no `tls` map is plaintext whatever certificates are mounted next to it). When present, `certfile`, `keyfile` **and** `cacertfile` are all required and an incomplete map refuses boot. A listener that still carries certificate settings under a legacy key (`transport_opts`, `ssl`) refuses boot rather than running plaintext, so "certificates configured but plaintext" cannot come from a half-converted entry. `verify` defaults to `verify_peer` and `fail_if_no_peer_cert` to `true` (mutual TLS); `verify => verify_none` is one-way TLS and then `fail_if_no_peer_cert` defaults to `false`. TLS 1.2 only. Cipher suites follow the certificate's key type when `ciphers` is unset: ECDHE-ECDSA AEAD suites for an EC key (the generated default certificates), ECDHE-RSA AES-GCM suites for an RSA key (a bring-your-own certificate); an explicit `ciphers` list always wins. FIPS mode is not claimed. The listener also sets `reuse_sessions => false` (every reconnect is a full TLS handshake, so a reconnect herd costs more CPU than with session resumption), `honor_cipher_order => true` (the gateway's list decides the suite, not the client's), and `client_renegotiation => false` with `secure_renegotiate => true` on every TLS listener, agent and management (the gateway answers a client's renegotiation request with a `no_renegotiation` warning alert and does not renegotiate, so a peer cannot make the gateway run one full handshake after another on one connection; an OTP client then carries on unchanged, but an OpenSSL-family client, measured with LibreSSL `s_client`, treats the refusal as fatal (`handshake_failure`) and the connection closes; OTP's own server default allows renegotiation; this is not configurable). Yuzu agents and the server do not ask to renegotiate (not measured against them; gRPC's TLS stack does not initiate renegotiation). A TLS-terminating or re-encrypting load balancer or proxy in front of a gateway listener must not renegotiate toward it either (for example a backend TLS profile with periodic renegotiation): its connections close, and the gateway log has a NOTICE `TLS server: In state connection received CLIENT ALERT: Fatal - Handshake Failure` for each one (observed with LibreSSL `s_client` against the gateway's settings). Pass TLS through, or turn renegotiation off on that profile; listeners built from the old `{grpcbox, [{servers, ...}]}` shape took OTP's defaults for both. **Not supported:** the `tls` map is closed, so an encrypted private key (`password`) and the ssl options `depth`, `crl_check`, `partial_chain` and `versions` that a `transport_opts` map could carry refuse boot. Decrypt the key first (`openssl pkey -in encrypted.key -out gateway.key`, with the file readable by the gateway user only) and use the defaults; supporting them is a follow-up, not something to work around. **Decrypting removes the passphrase protection the key had at rest**: if you answer "are private keys encrypted at rest?" for this key, the answer is now "protected by file permissions and the secret store that mounts it". |
 | `auth_fun` | Management listener only: `fun(Der) -> {true, Id} \| true \| false`, run by the stream handler on the peer certificate before a handler exists. Needs `tls`. **Boot refuses an `auth_fun` on any listener that serves the agent service** (`auth_fun_on_agent_listener`), that is, whose `service_protos` include `agent_pb` **or** whose `services` map has `'yuzu.agent.v1.AgentService'` as a key (the management proto embeds the AgentService definition, so `service_protos` alone would miss it), including a combined agent-and-management listener that has one; a combined listener without an `auth_fun` is valid (the integration test uses one). That refusal and the boot and `/readyz` rule are two different tests: the refusal asks whether the entry *serves* the agent service by either route, while boot and `/readyz` require at least one entry that *routes* it (the `services` key). |
 | `origin` | Keys: `mode`, `sources`, `trusted_hops`. How the caller's address is decided; default `#{mode => transport}`. See [Client addresses behind a proxy](#client-addresses-behind-a-proxy). |
 | `acceptors` | Acceptor processes, a positive integer (default 4). `sys.config.prod` and the reference configs give the agent listener 32 for reconnect storms; the plaintext default, demo and UAT configs set nothing and so run 4. |
@@ -2073,7 +2100,7 @@ What this warning does **not** cover:
 | Hop | State | Notes |
 |---|---|---|
 | gateway → server upstream (`:50055`) | **mutual TLS in `sys.config.prod`; the gateway itself enforces only server verification** | `gateway/config/sys.config.prod` `{https,...}` `default_channel`; CA-issued `default-gateway` leaf, TLS 1.2 floor + AEAD/PFS cipher whitelist. The gateway refuses to boot on `https` without `verify_peer` and a CA of its own, and on a channel mixing `http` and `https`; it does **not** require a client certificate, so mutual TLS holds only where the endpoint carries `certfile` and `keyfile` and the server demands them (SPKI pin, see [Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization)). Plaintext `http` boots as the lab/UAT posture. |
-| agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `tls => #{certfile, keyfile, cacertfile, verify => verify_none, fail_if_no_peer_cert => false}` in its `grpc_listeners` entry. Of the shipped composes, only `docker-compose.reference-gateway.yml` enables it (#1314, mounting `reference-gateway-sys.config`). The cluster, demo, full-UAT, viz-UAT and sanitizer-UAT composes, and the repo-root `docker-compose.uat.yml`, run plaintext on the shipped default or a UAT/demo `sys.config` (inline in `docker-compose.uat.yml`, mounted as a file by the others); the remaining composes do not run the gateway. Heartbeats are bound to the connection that opened the session's `Subscribe` stream (see [Heartbeat admission](#heartbeat-admission)); the agent listener itself still does not authenticate agents. |
+| agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `tls => #{certfile, keyfile, cacertfile, verify => verify_none, fail_if_no_peer_cert => false}` in its `grpc_listeners` entry. Of the shipped composes, only `docker-compose.reference-gateway.yml` enables it (#1314, mounting `reference-gateway-sys.config`). The cluster, demo, full-UAT, viz-UAT and sanitizer-UAT composes, and the repo-root `docker-compose.uat.yml`, run plaintext on the shipped default or a UAT/demo `sys.config` (inline in `docker-compose.uat.yml`, mounted as a file by the others); the remaining composes do not run the gateway. Heartbeats and inventory reports are bound to the connection that opened the session's `Subscribe` stream (see [Heartbeat admission](#heartbeat-admission)); the agent listener itself still does not authenticate agents. Client-initiated TLS renegotiation is refused; a proxy or load balancer that renegotiates toward `:50051` loses its connections (see the `tls` key under "gRPC listeners"). |
 | server → gateway mgmt (`:50063`) | **strict mTLS + peer authorization: SPKI pin (#1422) and/or the server identity (#6016)** | The privileged command-fan-out plane. Do NOT one-way-TLS it (would be unauthenticated). The secure shape (in `sys.config.prod` / `reference-gateway-sys.config`) is strict mTLS (omit `verify`/`fail_if_no_peer_cert` from the `tls` map) **plus** `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` with `{yuzu_gw, mgmt_peer_auth_mode}` choosing what admits the server (default and shipped value `pin`; the identity is an explicit opt-in: its SPKI pin from `{yuzu_gw, mgmt_peer_pins}`, the identity URI SAN `yuzu://<install>/server` that the install CA puts on the server's built-in certificate, or either; see [Authorizing the server by its identity](#authorizing-the-server-by-its-identity)) — a CA-issued cert alone (an agent's leaf, the gateway's own leaf) is NOT authorization to command the fleet. The gateway **refuses to boot** with a network-reachable mgmt listener lacking this posture; `{allow_insecure_mgmt, true}` is a lab-rig-only acknowledgement (pair it with an unpublished `:50063`). BYO certs carry no server identity and stay on pins: point `mgmt_peer_pins` at your server cert (`{cert_file, ...}`) or paste its SPKI SHA-256 (`{spki_sha256, "..."}`) — the cert **must carry the `serverAuth` EKU** or the pin rejects it (`missing_server_auth_eku` in the gateway log); list old+new pins to overlap a rotation. Pin-list edits (adding/removing an entry) require a gateway restart; only a `{cert_file, Path}` target's file **content** re-reads live without one — within `mgmt_pin_refresh_ms` (default 5 s, see "Management-pin refresh"): the `yuzu_gw_mgmt_pins` watcher re-reads the file on its own timer (comparing a SHA-256 of its contents, so a new key of the same size with a preserved mtime is still picked up) and the per-stream check reads its published key, never the file, so a rotated server leaf can be refused for up to one interval (fail closed). The server does not retry a refused command: it fails terminally as `gateway_unauthenticated` and must be submitted again (#5988 tracks a server-side retry). |
 
 TLS is configured in two places: the `tls` map of each `grpc_listeners` entry (the
@@ -3169,7 +3196,7 @@ the rig runs under "Observed on a rig" below are the measured evidence).
 - **Breaker closed.** The verdict arrives with the first agent heartbeat after
   the server is back, so the bound is up to one agent heartbeat interval (30 s
   by default), plus one gateway flush (1 s by default,
-  `heartbeat_batch_interval_ms`), plus the agent's position in the replay drip
+  `heartbeat_batch_interval_ms`), plus the agent's turn in the replay
   (see the table below). OBSERVED with 1 agent: after outages of 302 s to 402 s
   the verdict arrived 0.33 s to 0.67 s after the server was healthy, because the
   first flush carried the heartbeats buffered during the outage (rig runs E2b,
@@ -3490,11 +3517,16 @@ failures now count toward the shared breaker (see below).
   `yuzu_server_gateway_route_desync_total{op="notify_stream_status"}` with
   outcome `connected_unverified` (the directory read failed and this replica
   holds no matching local session) or `stale_connected_session` (the directory
-  row or the local registry names a different session). On an older gateway
-  recovery is the same: the agent's next reconnect. On a gateway with #5695 the
-  resend is delivered once the server records it (a `connected_unverified`
-  refusal clears when the directory reads again; a `stale_connected_session`
-  refusal is definitive and is resent until the session ends).
+  row or the local registry names a different session). The same holds for the
+  `op="announce_connected"` refusals `session_held_by_other_agent` and the
+  affinity pre-check `cluster_affinity_violation`, which answer
+  `acknowledged=false`; the post-write `cluster_affinity_violation` arm answers
+  `acknowledged=true` today (#5977), so the server does not count it as a
+  refusal. On an older gateway recovery is the same: the agent's next
+  reconnect. On a gateway with #5695 the resend is delivered once the server
+  records it (a `connected_unverified` refusal clears when the directory reads
+  again; a `stale_connected_session` refusal is definitive and is resent until
+  the session ends).
 - Correctness on several core replicas (see below).
 - Any order beyond first-in, first-out in sorted session-id order. The gateway
   sorts the ids it keeps from one response, so each verdict's agents are queued
@@ -3953,9 +3985,9 @@ replica (see [ADR-2002](../adr/2002-high-availability-architecture.md),
 section 7c, update 2026-10-04, and section 7f). Deferred:
 the surfaces that read only the local registry (`/api/agents`, the dashboard
 device list, `yuzu_agents_connected`, the guardian heartbeat reconcile) on a
-replica that has not been hydrated by the replay, a unique index on the
-directory's `session_id` column (#5683), and the failover and restart validation
-scenarios (WS-9).
+replica that has not been hydrated by the replay, and the failover and restart
+validation scenarios (WS-9). The unique index on the directory's `session_id`
+column (#5683) has shipped (see "Forged or colliding session ids" below).
 
 **Degraded directory reads.** The posture differs per RPC on purpose.
 `BatchHeartbeat` is fail-soft: sessions the replica holds locally are still
@@ -4014,7 +4046,9 @@ The session id on the gateway-to-server hop is asserted by the gateway.
   neither acknowledged nor listed, and counts under
   `yuzu_server_gateway_route_desync_total{op="session_lookup",outcome="ambiguous_session"}`
   (alert `YuzuGatewaySessionAmbiguous`). It means duplicate placement, two
-  concurrent adopts of one id (below), or a forged presented id.
+  concurrent adopts of one id (below), or a forged presented id. Since the
+  unique index (#5683) a duplicate can exist only after that index was dropped
+  by hand (see "Recovering a missing unique session index" below).
 - An unreadable directory is never treated as "unknown" (which would trigger a
   re-register). A session this replica itself registered (a local hint) is
   still acknowledged, lease-renewed and ingested during the degrade, which
@@ -4027,11 +4061,24 @@ The session id on the gateway-to-server hop is asserted by the gateway.
   agent's committed directory row already holds, counted under
   `yuzu_server_gateway_route_desync_total{op="proxy_register",outcome="session_held_by_other_agent"}`
   (alert `YuzuGatewaySessionHeldByOtherAgent`; expected rate zero, so any
-  increase means a forged or colliding id from a pinned gateway). The check is
-  not a lock: two concurrent adopts of one id for different agents can both
-  land (measured against live Postgres), and the ambiguity refusal above then
-  catches the duplicate until a unique index on `session_id` ships (deferred,
-  #5683). Nor can it see another agent's row that was already tombstoned
+  increase means a forged or colliding id from a pinned gateway, except the
+  bounded one-time migration artifact described under "One-time dedup at
+  upgrade" below, which has its own carve-out and limits). A unique
+  index on `session_id` (migration v5, #5683) serialises two concurrent adopts
+  of one id for different agents: the second is refused with the same
+  `FAILED_PRECONDITION` and the same counter, so no duplicate row is created
+  (the ambiguity refusal above remains as defense in depth for a hand-dropped
+  index only). A stream notification (CONNECTED) that presents an id another
+  agent holds is refused the same way when the presenting agent has no directory
+  row (the fallback insert is what the unique index refuses): the placement is
+  not published, the notification is not acknowledged, it is counted under
+  `yuzu_server_gateway_route_desync_total{op="announce_connected",outcome="session_held_by_other_agent"}`
+  (same alert) and a `gateway.session_held_by_other_agent` audit row is written
+  (without the session id). An agent that still has a row, including a
+  tombstone, is not covered: its CONNECTED lands as `session_mismatch` and does
+  not unpublish (the tombstoned-victim residual recorded in ADR-2002 7f "Still
+  open", #6339, unchanged by this change). The index cannot see another
+  agent's row that was already tombstoned
   (after a Postgres outage longer than 270 s): the presented id is then
   reclaimed and resolves to the presenting agent until the original agent's
   stream reconnects. If the original agent was already listed for replay, its
@@ -4045,7 +4092,154 @@ The session id on the gateway-to-server hop is asserted by the gateway.
   refusals apart.
 
 The evidence for these decisions is the metrics above and the server log (ids
-are sanitized and truncated to 64 bytes); there is no per-event audit row.
+are sanitized and truncated); there is no per-event audit row, except the
+`announce_connected` refusal above (the `ProxyRegister` replay refusal writes
+none). Paste a session id from a log line into SQL only if it matches
+`^gw-session-[0-9a-f]{32}$`.
+
+**One-time dedup at upgrade.** Migration v5 tombstones every row of a group of
+rows that already shared a session id (expected: none) and logs
+`migration v5 tombstoned N agent_routes row(s)` once; the count is exported as
+`yuzu_server_gateway_route_session_dedup_total`. A non-zero value means those
+agents re-registered through the normal heartbeat replay (one or two heartbeat
+cycles; up to about 2 minutes if the circuit breaker of a gateway that includes
+#5695 had opened, about 6 minutes on an older gateway); find
+how the duplicate arose. The counter is present when the server runs with
+`--gateway-upstream` and reads the migration of THIS start only: it reads 0 on
+any later restart. The durable record is the `route_meta` row
+(`SELECT value FROM gateway_route_store.route_meta WHERE key = 'v5_session_dedup_tombstoned_rows';`),
+and a later start logs it once at INFO. A tombstoned agent's replay can lose the
+race to another tombstoned agent that presented the same id first; the loser is
+refused (`session_held_by_other_agent`) and re-registers with a fresh session.
+So when `YuzuGatewaySessionHeldByOtherAgent` fires, the refusals can be the
+one-time migration artifact ONLY IF BOTH hold: (a) the number of
+`op="proxy_register"` `session_held_by_other_agent` refusals since that start,
+summed over every server replica, is at most N, the number of rows migration v5
+tombstoned on that start (`yuzu_server_gateway_route_session_dedup_total` on the
+migrating start; the
+`migration v5 tombstoned N` WARN, or the `route_meta` value after a restart),
+because a tombstoned group of k rows can produce at most k-1 refusals (N is a
+safe upper bound; the recovery block's own tombstones produce the same refusals
+but `route_meta` does not count them, so record that `UPDATE`'s row count and
+time and apply the same rule); count the refusal WARN lines rather than the
+counter if any replica restarted since the migrating start (the counter resets
+on restart); any `op="announce_connected"` refusal is NOT the
+artifact; and (b) they all occur within that start's window: one or two agent
+heartbeat cycles (30 s by default, `--heartbeat` changes it), plus the gateway
+circuit breaker's backoff if it opened (up to 30 s on a gateway that includes
+#5695, cap `circuit_breaker_max_reset_timeout_ms` in
+`gateway/config/sys.config`; up to 300 s on an older gateway), plus the replay
+(on a #5695 gateway a random start delay of up to 1 s,
+`registration_replay_start_jitter_ms`, then up to 24 registrations in flight at
+once, `upstream_replay_concurrency`; on an older gateway a drip of about 20 ms
+per agent): allow roughly 2 minutes at the defaults when every gateway includes
+#5695 (plus the replay itself: the gateway's agent count times the server's `ProxyRegister` time, divided by 24; about 10 s for 5,000 agents at 50 ms a call), or roughly 6 minutes
+plus 20 ms per agent if any gateway is older.
+Refusals that continue past that window, or exceed N, are NOT the artifact
+(escalating errs on the safe side): treat them as a forged or colliding id.
+Refusals inside the bound and the window are still NOT proof of benignness: a
+forged presenter acting at
+the same time could hide inside them, and a forger that wins the reclaim of a
+tombstoned id makes the legitimate agents' refusals look identical. The rule
+only lets you stop escalating once refusals have stopped inside the window:
+re-check the refusal count after the window has passed, and do not silence the
+alert beyond the window (it has no `for:` and uses `increase()[1h]`, so a
+silence would hide later refusals). The counter keeps its migrating-start value
+for the whole process lifetime, so it proves nothing about timing; establish
+timing from the WARN timestamps (after any restart the counter reads 0 and the
+`route_meta` value has no timestamp, so use the earlier start's WARN time or the
+deploy time, with the `route_meta` count; while the store is still at version 5,
+`SELECT version, to_timestamp(upgraded_at) FROM public.schema_meta WHERE store = 'gateway_route_store';`
+gives the time v5 was applied, but a later store migration overwrites it, then
+use the logs). If the migrating start's time or log
+cannot be found, escalate.
+See
+[upgrading](upgrading.md#behaviour-change-gateway-sessions-are-unique-per-agent-a-one-time-migration-gateway_route_store-v5-5683).
+
+**Recovering a missing unique session index.** The unique index is named
+`ux_agent_routes_session_id` and the server recognises a lost race only by that
+exact name. If an operator dropped it (the `YuzuGatewaySessionAmbiguous` alert is
+the symptom), restore it in this order. Use the exact name: an index under any
+other name is not recognised, so a racing adopt fails as a generic route-write
+error, `ProxyRegister` answers `UNAVAILABLE` and the gateway counts that against
+its circuit breaker.
+
+0. Check first whether the correct index exists:
+   `SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'gateway_route_store' AND c.relname = 'ux_agent_routes_session_id' AND i.indrelid = 'gateway_route_store.agent_routes'::regclass AND i.indnatts = 1 AND i.indkey[0] = (SELECT attnum FROM pg_attribute WHERE attrelid = i.indrelid AND attname = 'session_id') AND i.indisunique AND i.indisvalid AND pg_get_expr(i.indpred, i.indrelid) = '(session_id IS NOT NULL)';`
+   A row means the index is unique, valid, on `agent_routes(session_id)` and partial
+   with exactly the predicate `session_id IS NOT NULL`: do not run
+   the block below (the duplicate is already gone and the alert clears within
+   the hour; running it anyway is harmless but rebuilds the index under the
+   lock). No row means it is missing, invalid or of another shape: continue.
+1. Find the duplicates (optional; the block below tombstones none if there are
+   none):
+   `SELECT session_id, array_agg(agent_id) FROM gateway_route_store.agent_routes WHERE session_id IS NOT NULL GROUP BY session_id HAVING count(*) > 1;`
+2. Tombstone the duplicates and recreate the index in ONE transaction. The lock
+   stops any writer creating a new duplicate in between, and the tombstone is
+   the statement migration v5 uses (every row of each duplicate group; the
+   affected agents re-register through the replay). Run it as one block: save
+   it to a file and run `psql -v ON_ERROR_STOP=1 -f block.sql`; do not paste it
+   into a session with `ON_ERROR_ROLLBACK` enabled or a client that wraps
+   statements in savepoints (a failed `LOCK` would then leave the `UPDATE`
+   applied and the index unbuilt). Before running it, list who holds or waits
+   for a lock on the table, and avoid `pg_dump` windows (an empty result means
+   nothing is in the way):
+   `SELECT l.pid, a.state, a.application_name, a.xact_start FROM pg_locks l JOIN pg_stat_activity a USING (pid) WHERE l.relation = 'gateway_route_store.agent_routes'::regclass AND l.pid <> pg_backend_pid();`
+   ```sql
+   BEGIN;
+   SET LOCAL lock_timeout = '5s';
+   SET LOCAL statement_timeout = 0;
+   LOCK TABLE gateway_route_store.agent_routes IN ACCESS EXCLUSIVE MODE;
+   UPDATE gateway_route_store.agent_routes
+   SET session_id = NULL, lease_until = NULL, cluster_id = NULL,
+       gateway_node = NULL, stream_home_id = NULL, updated_at = now()
+   WHERE session_id IN (
+       SELECT session_id FROM gateway_route_store.agent_routes
+       WHERE session_id IS NOT NULL GROUP BY session_id HAVING count(*) > 1);
+   -- only reached when the Check-first query returned no row: this clears a
+   -- stray/invalid/wrong-shape object of that name
+   DROP INDEX IF EXISTS gateway_route_store.ux_agent_routes_session_id;
+   CREATE UNIQUE INDEX ux_agent_routes_session_id
+       ON gateway_route_store.agent_routes (session_id) WHERE session_id IS NOT NULL;
+   COMMIT;
+   ```
+   You do not need to stop the server. While the block runs, the live server's
+   statements on `agent_routes` stall: during the lock wait (a pending
+   `ACCESS EXCLUSIVE` request queues new statements) and during the build (about
+   2.4 s per million rows). A stalled statement waits at most the pool's 10 s
+   `lock_timeout` (set on every pooled connection, `pg_pool.hpp`) and then fails
+   as a degrade: fail-closed operations (`ProxyRegister`) return `UNAVAILABLE`
+   and feed the gateway circuit breaker; fail-open writers only count under
+   `yuzu_server_gateway_route_write_failed_total`. The build phase stalls
+   statements that long only above about 4M rows, but a lock wait behind a long
+   holder degrades queued statements at ANY table size. That is why the block
+   waits only 5 s, below the pool's 10 s (the migration's own 30 s wait runs at
+   start-up, before the gateway listener is up). If the lock is not granted
+   within 5 s the block gives up and nothing changed, so it is safe to retry.
+   Record the `UPDATE n` row count, the time and the operator in the change
+   ticket: Yuzu does not audit this manual change (rely on database statement
+   logging or pgaudit if enabled).
+   To get a SQL session: on the single-node composes run
+   `docker compose exec postgres psql -U yuzu -d yuzu` (or
+   `psql "$YUZU_POSTGRES_DSN"`); in `docker-compose.ha-postgres.yml`
+   `postgres` is only a network alias on HAProxy (port 5432 forwards to the
+   current Patroni primary), so connect through that alias or exec into the
+   current Patroni leader (a replica rejects the block with a read-only
+   transaction error, which is safe).
+3. Drop the old non-unique index only if it still exists (a no-op when
+   migration v5 already ran):
+   `DROP INDEX IF EXISTS gateway_route_store.agent_routes_session_id_idx;`
+
+If the server will not start after an upgrade because an object named
+`ux_agent_routes_session_id` already exists with another shape, migration v5
+failed on purpose and rolled back. The server log shows
+`PgMigrationRunner: migration v5 failed for gateway_route_store:` carrying the
+Postgres error `relation "ux_agent_routes_session_id" already exists`, followed
+by `GatewayRouteStore: schema migration failed`. Drop that object
+(`DROP INDEX gateway_route_store.ux_agent_routes_session_id;`, the same clean-up
+the `DROP INDEX IF EXISTS` line in the block above performs) and restart: the
+migration then removes any duplicates and builds the correct index itself, so
+do not also run the recovery block.
 
 **Agent dependency.** The ordinary restart path above does not need the agent
 to do anything. When the gateway does disconnect an agent process (an
@@ -4933,6 +5127,7 @@ that are actually emitted are listed.
 | `yuzu_gw_cluster_address_cap_exceeded_total` | counter | Total times the lifetime distinct-address cap (`cluster_max_lifetime_addrs`) refused a never-before-seen address (`#4555` review round 2). Any non-zero value should be investigated immediately — it means the seed DNS name is returning an unexpectedly large or rotating/hostile answer set. |
 | `yuzu_gw_heartbeat_rejected_total` | counter | Agent `Heartbeat` calls rejected before buffering because no usable session binding exists (label `reason`, closed set: `unknown_session` = the session is not held by this node, `no_connection` = no connection key to compare, `registry_unavailable` = the session index does not exist). Every reason is created at 0 at start. The agent re-registers on the `NOT_FOUND` answer when its build includes the reconnect fix (see the gateway manual); older agents only log it. A held session whose heartbeat arrived on a different connection is counted in the next row instead. See [Heartbeat admission](#heartbeat-admission). |
 | `yuzu_gw_heartbeat_session_mismatch_total` | counter | Agent `Heartbeat` calls rejected because the session is held by this node but the call arrived on a different connection than the one that opened it (label `event`, always `security`, for SIEM routing; created at 0 at start). Also rises when an HTTP/2 proxy between agents and the gateway spreads one agent's calls over several connections. A rise of one per affected agent is expected when an agent's connection is replaced while its session is still held (observed with an injected GOAWAY, a test-only trigger; not observed with an abrupt close or a gateway restart). There is no audit row (the sender of a rejected heartbeat is not a resolved principal): the counter and a rate-limited summary log line are the signal. |
+| `yuzu_gw_inventory_rejected_total` | counter | Agent `ReportInventory` calls refused before forwarding, and before taking an upstream permit, because no session is held on the calling connection (label `reason`, closed set: `unknown_session`, `no_connection`, `registry_unavailable`, and `connection_mismatch`, which is counted here rather than in the `event="security"` family). Every reason is created at 0 at start. The agent retries on its next sync tick. See [Heartbeat admission](#heartbeat-admission). |
 | `yuzu_gw_grpc_origin_ignored_total` | counter | gRPC calls on a listener configured as behind a proxy whose claimed client address was not used (labels `mode` = `proxy_protocol` or `forwarded_for`, `reason` = `untrusted_source`, `no_claim` or `bad_claim`). The call is served either way: for `untrusted_source` it is attributed to the TCP peer, for `no_claim` and `bad_claim` it is sent upstream with no observed address (empty `gateway_observed_peer`; the server records `origin_observed=false`). Created at 0 for every pair at start; no listener label. See [Client addresses behind a proxy](#client-addresses-behind-a-proxy) and [Origin counters](#origin-counters). |
 | `yuzu_gw_grpc_dropped_data_bytes_total` | counter | Request bytes the gRPC layer discarded in a state that must not run a handler (label `reason`, closed set: `extra_request_data` = a second message on a unary call, `stream_ended` = data after the stream's status). |
 | `yuzu_gw_upstream_calls_dropped_total` | counter | Proxied `Register` or inventory calls not sent because the caller's deadline passed while it waited for a permit, or left too little time (250 ms) to make the call (label `rpc_name`, closed set `register` and `inventory`, both created at 0 at start). Nothing is sent for them, so no server session is created. Before #5695 it counted queued calls of callers that had exited. |

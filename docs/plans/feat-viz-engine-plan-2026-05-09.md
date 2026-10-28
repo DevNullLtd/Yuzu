@@ -2,7 +2,7 @@
 
 > **Status note (2026-05-10):** PRs 1–6 + six hardening rounds shipped on `origin/feat/viz-engine`. PR-7+ (interior process nodes / edges / vuln overlay) still ahead. The 11-PR ladder below is unchanged from the original plan; consult `git log origin/dev..HEAD` for current rung progress.
 >
-> **Provenance.** Drafted via the `/plan` skill on 2026-05-09 in worktree `/Users/nathan/Yuzu-viz`. This file is the version-controlled copy; the per-Claude-session original at `~/.claude/plans/we-re-in-a-git-encapsulated-yao.md` is unmaintained.
+> **Provenance.** Drafted via the `/plan` skill on 2026-05-09 in worktree `/Users/<user>/Yuzu-viz`. This file is the version-controlled copy; the per-Claude-session original at `~/.claude/plans/we-re-in-a-git-encapsulated-yao.md` is unmaintained.
 
 ## Context
 
@@ -10,7 +10,7 @@ Yuzu operators today have no spatial view of their fleet. They can list devices,
 
 The new visualization will render each managed machine as a translucent cube, processes inside as positional nodes coloured by category, intra-machine localhost connections as interior lines, and external connections as edges that exit visible socket markers on one cube and enter sockets on another. WASD pans the camera, mouse drag rotates around scene centre, mouse wheel zooms.
 
-The branch (`feat/viz-engine`, worktree `/Users/nathan/Yuzu-viz`) is at `origin/dev` HEAD `3cd5c06` with no diverging work yet. The prior 7-PR ladder (memory `project_viz_engine_branch_2026-05-09.md`) is **superseded by this plan** — the data plane is reorganised around fleet-level network topology rather than per-device process tree.
+The branch (`feat/viz-engine`, worktree `/Users/<user>/Yuzu-viz`) is at `origin/dev` HEAD `3cd5c06` with no diverging work yet. The prior 7-PR ladder (memory `project_viz_engine_branch_2026-05-09.md`) is **superseded by this plan** — the data plane is reorganised around fleet-level network topology rather than per-device process tree.
 
 **Locked decisions (from clarifying questions):**
 1. Process categorization in v1 = hardcoded heuristics (system / browser / database / web / runtime / other)

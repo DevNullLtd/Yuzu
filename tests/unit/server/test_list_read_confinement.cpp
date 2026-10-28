@@ -24,6 +24,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
+#include <yuzu/metrics.hpp>
 
 #include <algorithm>
 #include <filesystem>
@@ -414,6 +415,102 @@ TEST_CASE("authorize_list_read: a degraded mgmt store denies a confined operator
     CHECK_FALSE(r.rbac.check_scoped_permission("alice", "Response", "Read", "a_p", &r.mgmt));
 }
 
+// ── read_failed: a failed read is told apart from "no grant" (CA-S3 / CA-A2 / CH-1) ──────────
+//
+// `DenyAll` alone cannot say whether the caller holds no grant or a read failed; a caller that
+// served a list on the first reading served it on the second. read_failed is set for the failed
+// reads (the global-grant read, the permission-group resolution, the subtree expansion, a store
+// that is not wired) and NEVER for a genuine refusal or an admission.
+
+namespace {
+void break_table(const std::string& dsn, const char* table) {
+    yuzu::server::pg::PgConn c{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult dr{PQexec(c.get(), (std::string("DROP TABLE ") + table + " CASCADE").c_str())};
+    REQUIRE(dr.ok());
+}
+} // namespace
+
+TEST_CASE("authorize_list_read: read_failed is false for a genuine no-grant and for every admission",
+          "[list_read][rbac][read_failed][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    Rig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.assign_role({"user", "glob", "RespReader"}).has_value()); // GLOBAL allow
+    r.group_assign(r.gP, "scoped", "RespReader");
+
+    auto none = r.rbac.authorize_list_read("nobody", "Response", "Read", &r.mgmt);
+    CHECK(none.decision == ListReadDecision::DenyAll);
+    CHECK_FALSE(none.read_failed);
+
+    auto all = r.rbac.authorize_list_read("glob", "Response", "Read", &r.mgmt);
+    CHECK(all.decision == ListReadDecision::AdmitAll);
+    CHECK_FALSE(all.read_failed);
+
+    auto sc = r.rbac.authorize_list_read("scoped", "Response", "Read", &r.mgmt);
+    CHECK(sc.decision == ListReadDecision::AdmitScoped);
+    CHECK_FALSE(sc.read_failed);
+
+    // Removing the LAST scoped allow leaves a genuine no-grant, not a failed read.
+    REQUIRE(r.mgmt.unassign_role(r.gP, "user", "scoped", "RespReader").has_value());
+    auto gone = r.rbac.authorize_list_read("scoped", "Response", "Read", &r.mgmt);
+    CHECK(gone.decision == ListReadDecision::DenyAll);
+    CHECK_FALSE(gone.read_failed);
+}
+
+TEST_CASE("authorize_list_read: read_failed is true for each failed-read arm, and DenyAll holds",
+          "[list_read][rbac][read_failed][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    yuzu::MetricsRegistry metrics; // declared before the Rig so the store never outlives it
+    Rig r{rbac_db_.dsn()};
+    r.group_assign(r.gP, "alice", "RespReader");
+    r.group_assign(r.gP, "bob", "RespReader");
+
+    SECTION("no management-group store wired") {
+        auto d = r.rbac.authorize_list_read("alice", "Response", "Read", nullptr);
+        CHECK(d.decision == ListReadDecision::DenyAll);
+        CHECK(d.read_failed);
+    }
+
+    SECTION("the subtree expansion fails (second arm)") {
+        REQUIRE(r.rbac.authorize_list_read("alice", "Response", "Read", &r.mgmt).decision ==
+                ListReadDecision::AdmitScoped);
+        break_table(r.mgmt_bundle.dsn(), "management_group_store.management_group_members");
+        auto d = r.rbac.authorize_list_read("alice", "Response", "Read", &r.mgmt);
+        CHECK(d.decision == ListReadDecision::DenyAll);
+        CHECK(d.read_failed);
+    }
+
+    SECTION("the group-membership reads fail (the global read and the group-names read both)") {
+        REQUIRE(r.rbac.authorize_list_read("alice", "Response", "Read", &r.mgmt).decision ==
+                ListReadDecision::AdmitScoped);
+        break_table(rbac_db_.dsn(), "rbac_store.group_members"); // user_rbac_group_names
+        // "bob" has no cached verdict, so the global read runs; the group-names read then fails.
+        auto d = r.rbac.authorize_list_read("bob", "Response", "Read", &r.mgmt);
+        CHECK(d.decision == ListReadDecision::DenyAll);
+        CHECK(d.read_failed);
+    }
+
+    SECTION("ONLY the global-grant read fails: not no-grant, and not a narrower scoped view") {
+        // "carol" holds a group-scoped allow and has no cached verdict, so authorize_list_read's
+        // OWN first call is the one that reads (and fails). Nothing may query "carol" before it:
+        // two failed reads open the breaker (threshold 2), and a breaker shed would then deny
+        // the call whether or not authorize_list_read tells a failed read from "no grant".
+        r.group_assign(r.gP, "carol", "RespReader");
+        r.rbac.set_metrics(&metrics);
+        // The role lookup is the global read's alone: group names, assignments and role effects
+        // do not read principal_roles, so with the early return reverted the later reads
+        // would all succeed and carol would be admitted scoped.
+        break_table(rbac_db_.dsn(), "rbac_store.principal_roles");
+        auto d = r.rbac.authorize_list_read("carol", "Response", "Read", &r.mgmt);
+        CHECK(d.decision == ListReadDecision::DenyAll); // not AdmitScoped from the later reads
+        CHECK(d.read_failed);
+        // One failed read: the breaker did not trip, so the result came from the read itself.
+        CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
+        CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+                  .value() == 1.0);
+    }
+}
+
 // Governance re-review, #2703 Gate 7 (G11-SEC-CALLSITE-01 / QA-1): a lexical
 // regression backstop for the class of defect just found and fixed —
 // confinement-relevant closures reading the raw `is_rbac_enabled()` accessor
@@ -459,11 +556,19 @@ TEST_CASE("every live is_rbac_enabled() call site is display-only "
     // keeps the same test-and-branch shape still matches, and any OTHER new
     // call site (different shape, different purpose) does not.
     const std::unordered_map<std::string, std::unordered_set<std::string>> allowlists = {
+        // The fleet-read gate had the raw engine-arm ternary (CDX-1); no live call remains.
+        {"authz_gates.cpp", {}},
         {"server.cpp",
          {
              // The nav-bar/`/api/me`-style session JSON — display-only per
              // rbac_store.hpp's own documented exception.
              "if (rbac_store_ && rbac_store_->is_rbac_enabled()) {",
+             // The Users and roles page's RBAC enforcement panel: it DRAWS the setting (its REST
+             // twin is GET /api/v1/me, which reports the same value to any session) and the
+             // switch it may draw is only a hint; the server re-decides every PUT. The very next
+             // line reads rbac_enabled_view_degraded(), and a degraded view is drawn as
+             // "Unconfirmed", never as this flag.
+             "v.enabled = rbac_store_->is_rbac_enabled();",
          }},
         {"rest_api_v1.cpp",
          {
@@ -488,24 +593,23 @@ TEST_CASE("every live is_rbac_enabled() call site is display-only "
          }},
         {"auth_routes.cpp",
          {
-             // security-guardian (Gate 8, MEDIUM): auth_routes.cpp had 4 of
-             // its own is_rbac_enabled() call sites, entirely unscanned
-             // before this entry. All 4 are single-target require_permission/
-             // require_scoped_permission preconditions ("RBAC must be
-             // enabled for this token/grant kind"), not the list-read/
-             // visible-agents confinement class this test otherwise guards —
-             // same disposition as rest_api_v1.cpp's precondition site above.
-             // Each is a deny-first compound gate (`!is_rbac_enabled() ||
-             // !check_...(...)`), so a stale raw view here can only ever
-             // bias toward wrongly DENYING a request, never toward
-             // over-disclosure. Two distinct trimmed shapes cover all 4
-             // sites (2 occurrences each).
+             // security-guardian (Gate 8, MEDIUM): auth_routes.cpp's remaining raw-flag site
+             // is the ENGINE-principal gate of require_scoped_permission (the shape appears
+             // exactly once; require_list_read's engine gate reads engine_grant_checked). It is a single-target
+             // precondition ("RBAC must be enabled for this grant kind"), not the
+             // list-read/visible-agents confinement class this test otherwise guards, and each
+             // is a deny-first compound gate (`!is_rbac_enabled() || !check_...(...)`), so a
+             // stale raw view here can only ever bias toward wrongly DENYING a request, never
+             // toward over-disclosure. require_permission's engine gate is NOT here: it decides
+             // its definitive refusal with rbac_enforcement_in_effect (the typed unavailable
+             // answer, #4990). The line text alone cannot tell the sites apart, so the exact
+             // count of one is pinned below; a second occurrence is an offender.
              "if (!rbac_store_->is_rbac_enabled() ||",
-             "if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {",
          }},
     };
 
     std::vector<std::string> offenders;
+    int auth_routes_engine_gate_shape = 0;
     for (const auto& [filename, allowlist] : allowlists) {
         const auto path = src_dir / filename;
         std::ifstream in(path);
@@ -528,6 +632,9 @@ TEST_CASE("every live is_rbac_enabled() call site is display-only "
                 continue;
             std::string trimmed =
                 line.substr(first_nonspace == std::string::npos ? 0 : first_nonspace);
+            if (filename == "auth_routes.cpp" &&
+                trimmed == "if (!rbac_store_->is_rbac_enabled() ||")
+                ++auth_routes_engine_gate_shape;
             if (allowlist.count(trimmed))
                 continue;
             offenders.push_back(filename + ":" + std::to_string(lineno) + ": " + trimmed);
@@ -542,4 +649,9 @@ TEST_CASE("every live is_rbac_enabled() call site is display-only "
     for (const auto& o : offenders)
         UNSCOPED_INFO(o);
     CHECK(offenders.empty());
+    // The allowlisted auth_routes.cpp shape is the engine gate of require_scoped_permission. A
+    // second occurrence (for example the require_permission engine gate regressing to the raw
+    // flag, which would answer a stale-false view with a definitive denial before the typed check
+    // runs) matches the same line text, so it is pinned by count.
+    CHECK(auth_routes_engine_gate_shape == 1);
 }

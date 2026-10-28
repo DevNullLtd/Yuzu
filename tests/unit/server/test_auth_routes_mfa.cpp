@@ -128,9 +128,13 @@ struct AuthRoutesHarness {
 
     AuthRoutesHarness() : tmp(yuzu::test::unique_temp_path("auth-routes-mfa-")) {
         cfg.auth_config_path = tmp.path / "auth.cfg";
-        // Tight pending-token TTL so we can assert expiry without
-        // sleeping minutes in tests.
-        cfg.mfa_login_pending_secs = 2;
+        // The pending-token TTL is left at its production default. A tight one used to live
+        // here so the expiry case could avoid sleeping minutes, but it applied to EVERY case:
+        // each one spends real time between "/login" (which mints the token) and the follow-up
+        // POST on Postgres round trips and PBKDF2, and on a sanitizer leg that outlasted the
+        // 2 s TTL, so the token was reaped and the follow-up got a 401 "pending token invalid or
+        // expired" instead of the outcome under test (#5538, the "mfa.enroll.race" case's 401 vs
+        // 409). The one case that tests expiry shortens it itself.
         cfg.https_enabled = false; // no Secure cookie suffix
 
         auth_mgr.load_config(cfg.auth_config_path);
@@ -324,7 +328,8 @@ TEST_CASE("POST /login MFA-enrolled returns 202 + mfa_pending_token, no cookie",
     CHECK(res->status == 202);
     CHECK(res->body.find(R"("status":"mfa_required")") != std::string::npos);
     CHECK(res->body.find(R"("mfa_pending_token")") != std::string::npos);
-    CHECK(res->body.find(R"("expires_in":2)") != std::string::npos);
+    CHECK(nlohmann::json::parse(res->body).at("expires_in").get<int>() ==
+          h.cfg.mfa_login_pending_secs);
     CHECK(res->get_header_value("Set-Cookie").empty());
     CHECK(h.count_audits("mfa.login.required", "admin") >= 1);
     // Crucially, auth.login is NOT emitted yet — only the .required
@@ -721,6 +726,7 @@ TEST_CASE("POST /login/mfa strict shape gate routes non-6-digit to recovery path
 
 TEST_CASE("POST /login/mfa pending token expires after TTL", "[pg][mfa][routes][auth_routes]") {
     AuthRoutesHarness h;
+    h.cfg.mfa_login_pending_secs = 2; // read at /login time, so set before the token is minted
     h.enroll_mfa("admin");
     auto step1 = h.sink.Post("/login",
                              form({{"username", "admin"}, {"password", "adminpassword1"}}),
@@ -729,17 +735,10 @@ TEST_CASE("POST /login/mfa pending token expires after TTL", "[pg][mfa][routes][
     auto p_start = body.find(R"("mfa_pending_token":")") + 21;
     auto pending = body.substr(p_start, body.find('"', p_start) - p_start);
 
-    // Sleep past the TTL (configured to 2 s in the harness). reap_mfa_
-    // pending_locked fires on the next access via /login/mfa.
-    //
-    // 5000 ms = 2.5x the TTL — the conventional multiplier for wall-
-    // clock-gated tests on a nightly sanitizer runner where ASan + UBSan
-    // add 2-3x CPU overhead and scheduler preemption under load is
-    // unbounded. Earlier iterations of this test used 2200 ms (10 %
-    // margin) and 2800 ms (40 % margin); cpp-safety + qe both flagged
-    // anything below 2x as fragile. Test now takes ~3 s extra but is
-    // robust on the slowest runner in the matrix.
-    std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+    // Move the pending challenge's deadline 3000 ms into the past (past the 2 s TTL set
+    // at the top of this case) instead of sleeping. reap_mfa_pending_locked fires on
+    // the next access via /login/mfa.
+    h.auth_routes->expire_mfa_pending_for_test(pending, std::chrono::milliseconds(3000));
 
     auto r = h.sink.Post("/login/mfa",
                          form({{"mfa_pending_token", pending}, {"code", "000000"}}),
@@ -907,6 +906,40 @@ TEST_CASE("POST /login/mfa/stepup with wrong TOTP returns 401 + mfa.step_up.fail
         }
     }
     CHECK(saw_totp_reject);
+}
+
+TEST_CASE("POST /login/mfa/stepup from a SAML session returns the 400 'no step-up this release' "
+          "text and audits mfa.step_up.failed",
+          "[pg][mfa][stepup][routes]") {
+    AuthRoutesHarness h;
+    // A SAML session has no local `users` row and no MFA attestation in this release, so the
+    // route refuses it with its OWN 400 text (not the chokepoint's 403 wording) before any code
+    // is looked at. Pinned because the operator-facing remedy ("re-authenticating does not
+    // help") is the whole point of the message.
+    const auto token = h.auth_mgr.create_saml_session("saml.user@example.com",
+                                                      "https://idp.example.com/metadata");
+    REQUIRE_FALSE(token.empty());
+    const auto session = h.auth_mgr.validate_session(token);
+    REQUIRE(session.has_value());
+    REQUIRE(session->auth_source == "saml");
+
+    auto res = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", "123456"}}),
+                               "application/x-www-form-urlencoded",
+                               {{"Cookie", "yuzu_session=" + token}});
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->body.find("SAML sessions cannot satisfy step-up in this release; "
+                         "re-authenticating does not help") != std::string::npos);
+    CHECK(h.count_audits("mfa.step_up.passed") == 0);
+
+    AuditQuery q;
+    q.action = "mfa.step_up.failed";
+    auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].detail.find("saml session cannot local step up (no mfa this release)") !=
+          std::string::npos);
+    CHECK((*rows)[0].detail.find("(auth_source=saml)") != std::string::npos);
 }
 
 // ── /login/mfa/enroll + enforcement bootstrap tests (PR3) ─────────────────

@@ -215,6 +215,12 @@ only rule governing ordinary `on_success`/`on_failure` chain gating.
 
 ## Two-person approval (D9)
 
+> **Amendment pending: ADR-1009 (proposed).** ADR-1009 amends the Guardian baseline gate of
+> ADR-0021 Decision 9 (symmetric, all-enforce). Its text states that the Reaction clause is
+> unchanged and Reflex is outside that MVP, so this section stands as written. The bound-ticket
+> primitive it adds (`docs/adr/1009-four-eyes-mvp-bound-approval.md`) is what a Reflex Set deploy
+> would redeem through; none of it is wired to Reflex.
+
 Any Reflex Set deploy whose compiled content contains at least one dangerous Reaction (per the
 chokepoint above) requires approval by a principal representing a **distinct human root**, per
 ADR-0033 §7's identity-resolution rule — not merely "a different principal string": an editor
@@ -708,7 +714,7 @@ from starving Guardian, and Guardian's own enforcement evidence, of that shared,
   the default lens, not an automatic copy). **`capture_output` is RAW plugin stdout/stderr — it is
   NOT covered by the "never a SID/username/user path" guarantee above by construction.** A
   `script_exec`-class Reaction can easily emit a diagnostic line containing a user path
-  (`/home/alice/...`) on stderr with no malicious authoring required, which the bullet above's
+  (`/home/jsmith/...`) on stderr with no malicious authoring required, which the bullet above's
   blanket D10(a) rule otherwise contradicts. This must be closed one of two ways, decided at R6
   (executor + outcome mapping) and stated in that slice's own PR text, not left implicit: either a
   **default-deny, per-action typed output projection** is applied before persistence (an action opts

@@ -10,6 +10,7 @@
 #include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "app_shell.hpp"
+#include "forensics_read_audit.hpp" // #4990: response.forensics.read
 #include "authz_model.hpp"          // authz::in_scope
 #include "http_route_sink.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, ensure_correlation_id
@@ -23,6 +24,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <iterator>
 #include <optional>
 #include <string>
@@ -135,30 +137,6 @@ std::optional<HardwareListQuery> query_from_request(const httplib::Request& req)
     if (malformed)
         return std::nullopt;
     return q;
-}
-
-// Assemble the operator-visible roster: the UNFILTERED roster from RosterFn, scope-
-// filtered by the FleetReadGate's own scope (the SOLE filter — never double up with
-// a second scope predicate). Returns the filtered roster + the drop count.
-std::pair<std::vector<InventoryDeviceRow>, std::size_t>
-scoped_roster(const InventoryDevicesResult& all, const authz::VisibleSet& scope) {
-    std::vector<InventoryDeviceRow> out;
-    std::size_t dropped = 0;
-    out.reserve(all.rows.size());
-    for (const auto& row : all.rows) {
-        if (!authz::in_scope(scope, row.agent_id)) { ++dropped; continue; }
-        out.push_back(row);
-    }
-    return {std::move(out), dropped};
-}
-
-// Audit-trail floor for an id taken raw from a URL: a device id reaches `target_id`
-// on every audit row these routes write and on the permission-denial audit, so ids over
-// kMaxAgentIdLength bytes or carrying a byte below 0x20 (CR/LF) are refused before any
-// audit write. Mirrors viz_routes.cpp's agent_id floor.
-bool id_is_audit_safe(const std::string& id) {
-    return id.size() <= auth::kMaxAgentIdLength &&
-           std::none_of(id.begin(), id.end(), [](unsigned char c) { return c < 0x20; });
 }
 
 } // namespace
@@ -400,7 +378,13 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // Early exit on an explicit refusal from the agent (e.g. a release 0.13.0
                 // agent answering "plugin not found", or --inventory-disable).
                 if (!command_id.empty() && deps_.responses_fn) {
-                    for (const auto& r : deps_.responses_fn(command_id, id)) {
+                    // #4990: `command_id` is a client parameter, constrained above to a
+                    // `__sync__-` id: the sync command is a fixed system one that is never
+                    // Forensics-tier. The read excludes the Forensics plugins outright, so that
+                    // does not rest on the id check alone.
+                    const auto tier =
+                        ResponseTierFilter::for_fixed_plugin_poll(deps_.forensics_plugins);
+                    for (const auto& r : deps_.responses_fn(command_id, tier, id)) {
                         if (r.agent_id != id) continue;
                         if (r.status >= 2) {
                             send_html(res, render_hardware_sync_terminal(
@@ -606,8 +590,9 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!deps_.sync_perm_fn(req, res, "Execution", "Execute")) return;
         const auto session = deps_.auth_fn(req, res);
         if (!session) return;
-        // After the permission gate (an unauthorised caller keeps its 403) and before anything
-        // is parsed, resolved, slotted, audited or sent.
+        // This route's own same-site copy, after the permission gate, as defence in depth: the
+        // pre-routing gate answers cookie writes first. Before anything is parsed, resolved,
+        // slotted, audited or sent.
         if (deps_.write_gate.refuse_cross_site(deps_.audit_fn, req, res, "hardware.sync")) return;
 
         const auto parsed = ss::parse_request(nlohmann::json::parse(req.body, nullptr, false));
@@ -754,11 +739,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         const HardwareCiDetail detail = deps_.ci_detail_fn(agent_id);
-        const bool truly_absent = !detail.identity &&
-                                  (!detail.ci.has_value() ? false : !detail.ci->has_value()) &&
-                                  (!detail.software || detail.software->empty()) &&
-                                  (!detail.tags || detail.tags->empty());
-        if (truly_absent && detail.identity_degraded) {
+        const HardwareCiRead read = classify_hardware_ci_read(detail);
+        if (read == HardwareCiRead::RosterUnreadable) {
             // A failed roster read is never a 404 (#5531).
             (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.device.ci", "failure",
                                                 "Agent", agent_id,
@@ -769,7 +751,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                             "application/json");
             return;
         }
-        if (truly_absent) {
+        if (read == HardwareCiRead::NotFound) {
             res.status = 404;
             res.set_content(detail::a4_error(res, "not found"), "application/json");
             return;
@@ -891,7 +873,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                      httplib::Response& res) {
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         const std::string command_id = req.has_param("command_id") ? req.get_param_value("command_id") : "";
-        const std::string plugin = req.has_param("plugin") ? req.get_param_value("plugin") : "";
+        // The client `plugin` parameter is a caption only (#4990). The plugin the poll reads for
+        // is DERIVED from the command id (server-minted ids are `<plugin>-<hex>`), never taken
+        // from the client.
+        const std::string caption_plugin = req.has_param("plugin") ? req.get_param_value("plugin") : "";
         if (id.empty()) { res.status = 400; send_html(res, "bad request"); return; }
         if (!id_is_audit_safe(id)) {
             res.status = 400;
@@ -900,8 +885,19 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         if (!deps_.scoped_perm_fn(req, res, "Inventory", "Read", id)) return;
 
-        if (bad_hw_ident(plugin) || command_id.size() > 64 ||
-            !command_id.starts_with(plugin + "-")) {
+        // This LAST-dash split names the plugin the poll asks about: server-minted ids are
+        // `<plugin>-<hex>`, and the poll validates the name against the catalogue below. It never
+        // decides what a stored row is: the ingest and the tracker label a response with the plugin
+        // the server RECORDED at dispatch, never with the id. The split is exact for a Forensics
+        // plugin only because Forensics plugin names are dash-free, and the boot soundness check
+        // (`forensics_catalogue_defect`) refuses a catalogue that breaks that. A command id the
+        // server never issued is stored as unverified and this poll never finds it (the
+        // fixed-plugin tier excludes that label).
+        const auto id_dash = command_id.rfind('-');
+        const std::string plugin =
+            (id_dash == std::string::npos || id_dash == 0) ? std::string{} : command_id.substr(0, id_dash);
+        if (command_id.size() > 64 || bad_hw_ident(caption_plugin) || bad_hw_ident(plugin) ||
+            plugin != caption_plugin || !deps_.known_plugin_fn || !deps_.known_plugin_fn(plugin)) {
             res.status = 400;
             send_html(res, "bad request");
             return;
@@ -919,7 +915,47 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             send_html(res, "<div class=\"gp-mute\">Result polling unavailable on this server.</div>");
             return;
         }
-        const auto rows = deps_.responses_fn(command_id, id);
+        // Derived after the gates above (it never writes a response): the replies are read only
+        // as far as the caller may read the plugin's tier.
+        // The visibility resolver (one global Forensics:Read authorization probe) runs only for a
+        // poll of a Forensics-tier plugin. The plugin here is derived from the server-minted
+        // command id and validated against the catalogue above (never taken from the client), and
+        // stored rows carry the plugin the server recorded for their command id, so a poll of any
+        // other plugin can only ever meet its own plugin's rows: excluding the Forensics plugins
+        // outright is exact, needs no per-caller answer, and spares up to 40 resolver runs per
+        // action. An unwired plugin set keeps the fail-closed path through `tier_filter_for`.
+        const bool resolve_for_caller =
+            !deps_.forensics_plugins || deps_.forensics_plugins->contains(plugin);
+        const auto tier_resolved =
+            resolve_for_caller
+                ? tier_filter_for(req, deps_.forensics_visibility_fn, deps_.forensics_plugins)
+                : std::expected<ResponseTierFilter, ForensicsUnknown>{
+                      ResponseTierFilter::exclude(*deps_.forensics_plugins, authz::deny_all())};
+        if (!tier_resolved) {
+            // Unknown: end the poll with a notice that points to the execution results. Polling
+            // on would end in a false "timed out" for a device that did answer, and the rows can
+            // never be shown from here.
+            HwActionResultView notice;
+            notice.attempt = attempt;
+            notice.phase = HwActionResultView::Phase::PermissionUnconfirmed;
+            send_html(res, render_hardware_action_result(plugin, "", notice));
+            return;
+        }
+        const ResponseTierFilter& tier = *tier_resolved;
+        // A Forensics-tier plugin's reply this caller may not read for this device: say so on the
+        // first poll (and on any later one, so a grant revoked mid-poll ends the same way) instead
+        // of polling to a false "timed out" for a device that did answer. The dispatch gate is
+        // AdminOrApproval and the read gate is Forensics:Read, which can differ (RBAC enforced, a
+        // legacy-admin role without the RBAC grant); no row ever reaches the page either way.
+        if (deps_.forensics_plugins && deps_.forensics_plugins->contains(plugin) &&
+            !tier.admits(plugin)) {
+            HwActionResultView notice;
+            notice.attempt = attempt;
+            notice.phase = HwActionResultView::Phase::NeedsForensicsRead;
+            send_html(res, render_hardware_action_result(plugin, "", notice));
+            return;
+        }
+        const auto rows = deps_.responses_fn(command_id, tier, id);
         const DexAgentResponse* with_output = nullptr;
         const DexAgentResponse* terminal = nullptr;
         for (const auto& r : rows) {
@@ -949,6 +985,22 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             deps_.audit_fn, req, res, "hardware.action.result", "success", "Agent", id,
             plugin + " command_id=" + command_id + " phase=" +
                 std::to_string(static_cast<int>(view.phase)));
+        // #4990: the row this render serves, if any, is the one whose text reached `view`
+        // (Rendered -> the output row, Failed -> the terminal row; the other phases print none).
+        // A `response.forensics.read` row is written only when that row is a Forensics-tier
+        // plugin's. Set-and-proceed, like the hardware.action.result row above: a failed persist
+        // sets `Sec-Audit-Failed` and the page still renders.
+        {
+            const DexAgentResponse* served_row =
+                view.phase == HwActionResultView::Phase::Rendered ? with_output
+                : view.phase == HwActionResultView::Phase::Failed ? terminal
+                                                                   : nullptr;
+            ForensicsServed served;
+            if (served_row)
+                served.note(served_row->plugin, deps_.forensics_plugins);
+            (void)emit_forensics_read_audit(deps_.audit_fn, req, res, served, command_id,
+                                            ForensicsSurface::kHardware);
+        }
         // action name isn't carried on the wire (only plugin + command_id are, to
         // keep the poll URL short) — the panel only needs it for the RenderedEmpty
         // caption, so an empty string there is a cosmetic-only gap.

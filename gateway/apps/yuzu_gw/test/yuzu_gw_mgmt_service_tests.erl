@@ -258,7 +258,8 @@ wait_dead(Pid, Attempts) ->
 %% through a command_error-derived response, instead of the previous
 %% hardcoded `command_id => <<>>`. Before this fix, a gateway-side "agent
 %% not connected on this cluster" error was invisible to the core server's
-%% execution tracker (resolve_execution_id("") -> nullopt) — see
+%% execution tracker (an empty command id resolved to no execution; the
+%% server now labels it ~unverified) — see
 %% docs/adr/2002-high-availability-architecture.md §7d for the full
 %% end-to-end story. `send_command/2` is exercised directly (not
 %% `stream_responses/3`, which isn't exported) by mocking `yuzu_gw_router`'s
@@ -363,4 +364,55 @@ send_command_router_failures_test() ->
                      yuzu_gw_mgmt_service:send_command(Request, test_stream))
     after
         meck:unload(yuzu_gw_router)
+    end.
+
+%% CommandResponse.action (field 8) must survive the management hop for an ORDINARY (non-Guardian)
+%% response: the server's registry.write audit hook for a gateway-connected agent depends on it.
+%% Drives send_command/2 exactly like the not_connected test above (the router delivers one
+%% command_response and fanout_complete; yuzu_grpc_stream:send/2 is captured), then pushes the
+%% captured message through management_pb, the codec the wire uses, and checks the decoded frame.
+send_command_forwards_the_stamped_action_test() ->
+    catch meck:unload(yuzu_gw_router),
+    catch meck:unload(yuzu_grpc_stream),
+    meck:new(yuzu_gw_router, [non_strict, no_link]),
+    meck:new(yuzu_grpc_stream, [non_strict, no_link]),
+    try
+        FanoutRef = make_ref(),
+        Self = self(),
+        CmdId = <<"registry-0123456789abcdef">>,
+        Frame = #{command_id => CmdId, status => 'RUNNING',
+                  output => <<"audit|op=set_value">>, action => <<"set_value">>},
+        meck:expect(yuzu_gw_router, send_command,
+                    fun(_AgentIds, _CommandReq, _Opts) ->
+                        Self ! {command_response, FanoutRef, <<"agent-1">>, Frame},
+                        Self ! {fanout_complete, FanoutRef, #{}},
+                        {ok, FanoutRef}
+                    end),
+        meck:expect(yuzu_grpc_stream, send,
+                    fun(test_stream, Msg) ->
+                        Self ! {captured_send, Msg},
+                        ok
+                    end),
+
+        Request = #{agent_ids => [<<"agent-1">>],
+                    command => #{command_id => CmdId}},
+        ?assertEqual(ok, yuzu_gw_mgmt_service:send_command(Request, test_stream)),
+
+        receive
+            {captured_send, Msg} ->
+                ?assertEqual(<<"set_value">>,
+                             maps:get(action, maps:get(response, Msg), undefined)),
+                Wire = management_pb:encode_msg(Msg, 'yuzu.server.v1.SendCommandResponse'),
+                %% Field 8, length-delimited (tag 66), 9 bytes: encode and decode share one module,
+                %% so the round trip alone would not notice the field being renumbered.
+                ?assertNotEqual(nomatch, binary:match(Wire, <<66, 9, "set_value">>)),
+                Decoded = management_pb:decode_msg(Wire, 'yuzu.server.v1.SendCommandResponse'),
+                ?assertEqual(<<"set_value">>,
+                             maps:get(action, maps:get(response, Decoded), undefined))
+        after 1000 ->
+            ?assert(false)
+        end
+    after
+        meck:unload(yuzu_gw_router),
+        meck:unload(yuzu_grpc_stream)
     end.

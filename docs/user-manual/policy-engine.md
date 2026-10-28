@@ -219,7 +219,7 @@ The policy engine tracks compliance status per agent per policy. Each
 |---|---|
 | `compliant` | Check passed -- the endpoint is in the desired state |
 | `non_compliant` | Check failed -- the endpoint is not in the desired state |
-| `unknown` | Not yet evaluated, status invalidated, or the agent did not respond to a check within the grace window |
+| `unknown` | Not yet evaluated, status invalidated, the agent did not respond to a check within the grace window, or the check instruction runs a Forensics-tier plugin (see below) |
 | `fixing` | Fix instruction is currently running |
 | `error` | Check or fix instruction failed to execute, **or the policy is misconfigured** (e.g. an empty compliance expression — a policy that checks nothing is reported as `error`, never `compliant`) |
 
@@ -251,6 +251,27 @@ Verdict semantics: a plugin failure / timeout / rejection → `error`; a
 non-responder after the grace window → `unknown`; a successful response that
 fails the CEL → `non_compliant`; one that satisfies it → `compliant`.
 
+**A check that runs a Forensics-tier plugin scores `unknown`.** The evaluator
+reads each check's stored response with every Forensics-tier plugin
+(`app_usage`, `browser_inventory`, `execution_artifacts`,
+`privacy_permissions`, `remote_access_audit`; the set is derived from the
+capability catalogue) excluded, because the verdict and the first bytes of the
+check output are shown to readers who do not hold `Forensics:Read`. Such a
+policy therefore shows `unknown` for every agent with an empty `check_result`,
+and never a verdict from, or a stored copy of, Forensics output. `unknown`
+there says nothing about the device. A Forensics-tier plugin is not a suitable
+policy check. The check instruction is still dispatched to the endpoints and the
+plugin's response row is still stored (it is readable only through the
+`Forensics:Read` tier and kept for the response retention window, 90 days by
+default); only the verdict and `check_result` are withheld. A separate
+follow-up (#6065) tracks the dispatch-side authorization of policy checks.
+
+This release stores no check output for such a policy, so there is nothing to
+clean up for it; deleting a policy (`DELETE /api/policies/{id}`, `Policy:Delete`)
+removes its status rows as before. The deployment assumption behind this is the
+hard-cutover contract in the [upgrade guide](upgrading.md): a fresh database with
+no data imported from earlier builds.
+
 Implementation/lifecycle: the thread is `PolicyEvaluator`
 (`policy_evaluator.{hpp,cpp}`), wired in `server.cpp` against a hoisted shared
 `command_dispatch_fn`; per-agent verdicts are written via
@@ -279,9 +300,9 @@ use-after-free guard any shutdown refactor must preserve.
 > **Scope of the guarantee.** The claim prevents two replicas from independently *claiming* the
 > same `(policy, agent)` target only when both are running the **same schema version**. During a
 > rolling upgrade across the migration boundary, an old binary that predates the durable claim can
-> transiently run alongside a new one; that mixed-version window is gated today by issue #4014
-> (which blocks running a second production replica) pending a durable cluster-capability admission
-> gate. The exposure is one-directional — a row written by an old binary carries claim-generation
+> transiently run alongside a new one; that mixed-version window is covered today only by the safe-to-scale gate
+> (`docs/ha-delivery-matrix.md`, which is procedural and not lifted), pending a durable
+> cluster-capability admission gate (#6528). The exposure is one-directional — a row written by an old binary carries claim-generation
 > `0`, a value a new binary never mints for its own claims. Separately, the guarantee is
 > effectively-once, not exactly-once (consistent with ADR-2002): a replica that pauses for longer
 > than `fixing_stale_seconds` between winning the claim and actually sending a command over gRPC —
@@ -398,6 +419,7 @@ expected schema in the error body.
 
 ```bash
 curl -X POST http://localhost:8080/api/policy-fragments \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -b cookie -d '{
     "yaml_source": "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\nmetadata:\n  name: ssh-disabled\nspec:\n  check:\n    plugin: services\n    action: status\n    parameters: { name: sshd }\n    compliance: \"result.state != \\\"running\\\"\"\n"
@@ -408,6 +430,7 @@ curl -X POST http://localhost:8080/api/policy-fragments \
 
 ```bash
 curl -X POST http://localhost:8080/api/policy-fragments \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/yaml" \
   -b cookie --data-binary @- <<'EOF'
 apiVersion: yuzu.io/v1alpha1

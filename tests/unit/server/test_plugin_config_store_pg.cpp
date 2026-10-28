@@ -551,6 +551,45 @@ TEST_CASE("Wave 8: ServerImpl's boot sequence actually calls "
     CHECK(block.find("Refusing to start") != std::string::npos);
 }
 
+TEST_CASE("Wave 11: ServerImpl's boot sequence actually calls "
+          "seed_kill_switch_default_off(\"remote_access_audit\", ...) and fails the boot "
+          "closed on a seed error — source tripwire against server.cpp, since a full "
+          "ServerImpl construction is not practical at the unit level",
+          "[server][killswitch][source_tripwire]") {
+    std::ifstream input(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(input.is_open());
+    const std::string source{std::istreambuf_iterator<char>(input),
+                             std::istreambuf_iterator<char>()};
+
+    const auto marker = source.find("seed_kill_switch_default_off(\n                    \"remote_access_audit\"");
+    REQUIRE(marker != std::string::npos);
+    const auto block_end = source.find("\n        }\n", marker);
+    REQUIRE(block_end != std::string::npos);
+    const auto block = source.substr(marker, block_end - marker);
+
+    CHECK(block.find("\"remote_access_audit\"") != std::string::npos);
+
+    // The call is gated on the store existing and the boot not already
+    // having failed — never unconditional.
+    const auto guard_start = source.rfind("if (plugin_config_store_ && !startup_failed_)",
+                                          marker);
+    REQUIRE(guard_start != std::string::npos);
+    CHECK(guard_start < marker);
+    // The guard must be this call's own, not an earlier seed's.
+    CHECK(source.substr(guard_start, marker - guard_start).find("seed_kill_switch_default_off") ==
+          std::string::npos);
+
+    CHECK(block.find("startup_failed_ = true;") != std::string::npos);
+    CHECK(block.find("Refusing to start") != std::string::npos);
+
+    // The seed reason is public (it is stored and shown to an operator): the exact text, split
+    // across two source literals, and no roadmap-wave wording.
+    CHECK(block.find("\"default-off: forensics class; enable per PUT \"") != std::string::npos);
+    CHECK(block.find("\"/api/v1/plugin-config/remote_access_audit/kill-switch\"") !=
+          std::string::npos);
+    CHECK(block.find("Wave 11") == std::string::npos);
+}
+
 TEST_CASE("set_kill_switch rejects an invalid reason as InvalidInput",
           "[pg][store][plugin_config][killswitch]") {
     YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
@@ -671,7 +710,7 @@ TEST_CASE("#3265: a stored kill-switch row for __guard__.push_rules is informati
 
 TEST_CASE("A degraded/unopened store makes action_allowed return false, never true",
           "[server][config][killswitch]") {
-    PgPool bad_pool{{.conninfo = "host=127.0.0.1 port=1 dbname=nonexistent",
+    PgPool bad_pool{{.conninfo = "host=127.0.0.1 port=1 dbname=nonexistent connect_timeout=1",
                      .size = 1,
                      .connect_timeout_s = 1}};
     yuzu::test::TempDir keys{"yuzu_test_keys_"};
@@ -706,11 +745,9 @@ TEST_CASE("list_config caps at kListRowCap rows and only flags truncated past th
     YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
     Wired w{db.dsn()};
 
-    // Mirrors plugin_config_store.cpp's anonymous-namespace `kListRowCap`.
-    // Not exposed via the header (deliberately internal/defensive, see the
-    // .cpp's comment) — hardcoded here, so this MUST track that constant if
-    // it ever changes.
-    constexpr int kListRowCap = 5000;
+    // The store's own cap, read from the one shared constant (the Plugins and updates panel's
+    // `row_cap` reads it too), so this test cannot drift from what the store enforces.
+    constexpr int kListRowCap = static_cast<int>(yuzu::server::plugin_config::kListRowCap);
 
     // Bulk-seed exactly kListRowCap rows for one plugin via a single
     // server-side INSERT ... SELECT FROM generate_series, straight through
@@ -944,7 +981,7 @@ TEST_CASE("PluginConfigStore: an invalid os is refused and writes no row",
 
 TEST_CASE("PluginConfigStore: a degraded store yields no kill-switch decision (fail closed)",
           "[server][config][killswitch]") {
-    PgPool bad_pool{{.conninfo = "host=127.0.0.1 port=1 dbname=nonexistent",
+    PgPool bad_pool{{.conninfo = "host=127.0.0.1 port=1 dbname=nonexistent connect_timeout=1",
                      .size = 1,
                      .connect_timeout_s = 1}};
     yuzu::test::TempDir keys{"yuzu_test_keys_"};

@@ -23,7 +23,7 @@ extern const std::string kYuzuTokensJs;
 
 using Catch::Matchers::ContainsSubstring;
 
-TEST_CASE("tokens glue: no HTML-string injection, no storage, no write path",
+TEST_CASE("tokens glue: no HTML-string injection, no storage, no write path (writes live in the actions glue)",
           "[access-tokens][js]") {
     const std::string& js = yuzu::server::kYuzuTokensJs;
     for (const char* bad : {"innerHTML", "outerHTML", "insertAdjacentHTML", "eval(", "new Function",
@@ -100,6 +100,24 @@ TEST_CASE("tokens glue: the strip never prints a clean result it did not read",
     CHECK_THAT(js, ContainsSubstring("No violations found in the roles and grants the server could read."));
     CHECK_THAT(js, ContainsSubstring("typeof d.ok !== 'boolean'"));
     CHECK_THAT(js, ContainsSubstring("Treat it as a security incident."));
+    // The incident sentence is reserved for the two reasons that mean the write-path guard was
+    // bypassed (admin_role, system_role). A wildcard_grant is permitted by design under the
+    // maintainer ruling (2026-10-23, #2485): a run with only wildcard or orphan findings must
+    // not print it, so it sits inside the `if (incident)` branch and nowhere earlier.
+    CHECK_THAT(js, ContainsSubstring("var INCIDENT_REASONS = { admin_role: true, system_role: true };"));
+    CHECK_THAT(js, ContainsSubstring("INCIDENT_REASONS[v.reason] === true"));
+    const auto branch = js.find("if (incident) {");
+    const auto sentence = js.find("Treat it as a security incident.");
+    REQUIRE(branch != std::string::npos);
+    REQUIRE(sentence != std::string::npos);
+    CHECK(branch < sentence);
+    CHECK(js.find("Treat it as a security incident.", sentence + 1) == std::string::npos);
+    // The wildcard and orphan findings each get their own neutral line, and the reason text for a
+    // wildcard says the custom role is permitted.
+    CHECK_THAT(js, ContainsSubstring("wildcard_grant: 'holds every permission (a permitted custom role)'"));
+    CHECK_THAT(js, ContainsSubstring("orphan_grant: 'holds a grant but has no active principal record'"));
+    CHECK_THAT(js, ContainsSubstring("A wildcard custom role is permitted by design under the maintainer ruling."));
+    CHECK_THAT(js, ContainsSubstring("A grant with no active principal record is unexpected."));
     // Not a green pill: the clean state is a neutral note.
     CHECK_THAT(js, !ContainsSubstring("pill ok"));
 }
@@ -121,7 +139,8 @@ TEST_CASE("tokens page: the template is inline-free, single-shell and under the 
     const std::regex script_src(R"RX(<script src="([^"]+)")RX");
     for (std::sregex_iterator it(t.begin(), t.end(), script_src), end; it != end; ++it)
         srcs.push_back((*it)[1].str());
-    CHECK(srcs == std::vector<std::string>{"/static/htmx.js", "/static/yuzu-tokens.js"});
+    CHECK(srcs == std::vector<std::string>{"/static/htmx.js", "/static/yuzu-dialog.js", "/static/yuzu-tokens.js",
+                                           "/static/yuzu-tokens-actions.js"});
 }
 
 TEST_CASE("tokens page: the template's sentences are byte-equal to the renderer's constants",

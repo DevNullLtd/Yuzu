@@ -240,15 +240,59 @@ parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw
     return yuzu::protective::is_protective_action(scope.plugin, scope.action);
 }
 
+/// Reason cap — an operator-entered free-text explanation for a kill-switch
+/// flip. Capped so a pathological submission can't bloat the audit/kill-
+/// switch row indefinitely; control characters other than tab rejected (it renders in an
+/// operator UI and lands in an audit `detail` string verbatim).
+inline constexpr std::size_t kMaxReasonBytes = 512;
+
+/// The most rows `PluginConfigStore::list_config` materialises (the REST and MCP lists truncate
+/// at it, and the System > Plugins panel says "First N shown"). One definition, so the store, the
+/// page and its caption cannot drift apart.
+inline constexpr std::size_t kListRowCap = 5000;
+
 /// The `plugin_config.kill_switch.set` audit detail: `enabled=<bool>`, plus
 /// `, protective_exempt=true` when the row covers a protective action (stored
-/// but never gating dispatch). One definition for the REST and MCP write
-/// surfaces so the documented evidence format cannot drift between them.
-[[nodiscard]] inline std::string kill_switch_set_detail(const KillSwitchScope& scope,
-                                                        bool enabled) {
+/// but never gating dispatch), plus `, reason="<text>"` when the operator gave
+/// one. The reason survives on the live row only until the next flip, so without
+/// it here the audit trail cannot answer "why was this switched off". It is
+/// already validated (<= 512 bytes, no control characters but tab) by
+/// `is_valid_reason`; this re-bounds it anyway so the evidence format never
+/// depends on a caller having validated, flattens tab to a space and backslash-
+/// escapes `\` and `"` so the quoted value cannot be confused with the fields
+/// around it. The cut never lands inside a multi-byte UTF-8 sequence (it backs up
+/// to the previous code point boundary) and a cut reason is flagged with a trailing
+/// `, reason_truncated=true`, so a shortened reason is never read as the whole one.
+/// One definition for the REST and MCP write surfaces so the documented evidence
+/// format cannot drift between them.
+[[nodiscard]] inline std::string kill_switch_set_detail(const KillSwitchScope& scope, bool enabled,
+                                                        std::string_view reason = {}) {
     std::string detail = enabled ? "enabled=true" : "enabled=false";
     if (kill_switch_row_covers_protective(scope))
         detail += ", protective_exempt=true";
+    if (!reason.empty()) {
+        std::size_t keep = reason.size() < kMaxReasonBytes ? reason.size() : kMaxReasonBytes;
+        // A continuation byte (10xxxxxx) at the cut means the cut tears a sequence: back up.
+        while (keep > 0 && keep < reason.size() &&
+               (static_cast<unsigned char>(reason[keep]) & 0xC0) == 0x80)
+            --keep;
+        const bool truncated = keep < reason.size();
+        detail += ", reason=\"";
+        for (const char c : reason.substr(0, keep)) {
+            const auto u = static_cast<unsigned char>(c);
+            if (c == '\\' || c == '"') {
+                detail += '\\';
+                detail += c;
+            } else if (u < 0x20 || u == 0x7F) {
+                detail += ' ';
+            } else {
+                detail += c;
+            }
+        }
+        detail += '"';
+        if (truncated)
+            detail += ", reason_truncated=true";
+    }
     return detail;
 }
 
@@ -287,12 +331,6 @@ resolve_kill_switch(std::string_view action, std::span<const KillSwitchRowView> 
     }
     return off;
 }
-
-/// Reason cap — an operator-entered free-text explanation for a kill-switch
-/// flip. Capped so a pathological submission can't bloat the audit/kill-
-/// switch row indefinitely; control characters rejected (it renders in an
-/// operator UI and lands in an audit `detail` string verbatim).
-inline constexpr std::size_t kMaxReasonBytes = 512;
 
 [[nodiscard]] inline bool is_valid_reason(std::string_view reason) {
     if (reason.size() > kMaxReasonBytes)

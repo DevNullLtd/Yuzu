@@ -1267,9 +1267,10 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
     };
     // Presentation metadata (the agent's schema registry is not linked here).
     // Category follows docs/user-manual/tar.md's five categories. always_on = the
-    // default-enabled core sources (locked here; forensic-pause uses the configure
-    // path). is_new/pii drive the badges.
-    static const std::array<Meta, 10> kSources = {{
+    // default-enabled core sources (the toggle is locked here; pause/resume uses the
+    // configure path, and the State cell still shows the reported <src>_enabled as
+    // "always on" or "paused"). is_new/pii drive the badges.
+    static const std::array<Meta, 11> kSources = {{
         {"process", "$Process", "Processes", true, false, false},
         {"tcp", "$TCP", "Network connections", true, false, false},
         {"service", "$Service", "Services", true, false, false},
@@ -1280,6 +1281,12 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
         {"module", "$Module", "Processes", false, false, false},
         {"arp", "$ARP", "Network connections", false, true, false},
         {"dns", "$DNS", "Network connections", false, true, true},
+        // registry (PR11.8): an older agent never reports registry_enabled, so the row is
+        // simply absent; a current agent reports it on every OS, and the OS cells read
+        // unsupported off Windows. Stored values are unmasked, which the user manual
+        // states. No PII badge: the badge marks usage-class sources like $DNS, and
+        // registry values are machine configuration, not per-user behaviour.
+        {"registry", "$Registry", "System", false, true, false},
     }};
 
     auto os_cell = [&](const std::string& src, const char* os) -> std::string {
@@ -1295,12 +1302,13 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
 
     std::string h = "<div class=\"cat-filter\" id=\"capFilter\"><span class=\"filter-label\">"
                     "Category</span><span class=\"tar-seg\"><a class=\"tar-chip on\" onclick=\"filterCap(this,'all')\">All</a>";
-    static const std::array<std::pair<const char*, const char*>, 5> kChips = {
+    static const std::array<std::pair<const char*, const char*>, 6> kChips = {
         {{"Processes", "Processes"},
          {"Network connections", "Network"},
          {"Services", "Services"},
          {"User sessions", "User sessions"},
-         {"Performance", "Performance"}}};
+         {"Performance", "Performance"},
+         {"System", "System"}}};
     for (const auto& [cat, label] : kChips)
         h += std::string("<a class=\"tar-chip\" onclick=\"filterCap(this,'") + cat + "')\">" + label +
              "</a>";
@@ -1328,9 +1336,12 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
             h += " <span class=\"badge badge-pii\">PII</span>";
         h += "</td><td class=\"cat\">" + std::string(m.category) + "</td><td class=\"src-dollar\">" +
              std::string(m.dollar) + "</td><td><div class=\"state-cell\">";
-        if (m.always_on) {
+        if (m.always_on && enabled) {
             h += "<label class=\"tgl locked\"><input type=\"checkbox\" checked disabled>"
                  "<span class=\"sl\"></span></label><span class=\"state-txt state-on\">always on</span>";
+        } else if (m.always_on) {
+            h += "<label class=\"tgl locked\"><input type=\"checkbox\" disabled>"
+                 "<span class=\"sl\"></span></label><span class=\"state-txt\">paused</span>";
         } else {
             h += "<label class=\"tgl\"><input type=\"checkbox\" data-source=\"" + std::string(m.name) +
                  "\" data-committed=\"" + (enabled ? "true" : "false") + "\"" +

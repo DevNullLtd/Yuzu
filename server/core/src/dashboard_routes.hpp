@@ -27,6 +27,7 @@
 #include "authz_gates.hpp" // yuzu::server::authz::FleetReadGate (#1712 / #3290 Phase 2)
 #include "authz_model.hpp" // yuzu::server::authz::VisibleSet (#1788 / CDX-R7-02)
 #include "command_capability.hpp" // PR6.0b: CommandCapability / ClassificationError — ClassifyFn's return type
+#include "forensics_visibility.hpp" // ForensicsVisibilityFn (#4990)
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
 
 namespace yuzu::server {
@@ -38,6 +39,7 @@ class TagStore;
 class InstructionStore;
 class HttpRouteSink; // http_route_sink.hpp — the in-process-testable seam (#438)
 struct FacetFilter;
+struct ForensicsServed; // forensics_read_audit.hpp - #4990
 struct TarRetentionPausedScan; // tar_tree_routes.hpp — #4027 REST+MCP twin shape
 
 namespace detail {
@@ -179,6 +181,19 @@ public:
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
+    /// #4990 - the Forensics plugin set the stored-response read tier excludes
+    /// (`ServerImpl::forensics_plugin_set_`, borrowed: it outlives this object). Same setter idiom
+    /// as `set_fleet_read_fn`: handlers read the member per request. Unset (nullptr, a test
+    /// harness) fails closed: the results fragments then refuse every row (`tier_filter_for`).
+    void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
+
+    /// #4990 - the resolver behind the results fragments' Forensics tier (see
+    /// `forensics_visibility.hpp`); read live per request like `fleet_read_fn_`. Unset resolves to
+    /// present-empty at the use site.
+    void set_forensics_visibility_fn(ForensicsVisibilityFn fn) {
+        forensics_visibility_fn_ = std::move(fn);
+    }
+
     /// PR6.0b — classifies a `plugin.action` pair for the Destructive
     /// TARGETING gate on `POST /api/dashboard/execute`
     /// (`dispatch_destructive_gate.hpp`). Deliberately the SAME shape and the
@@ -259,9 +274,11 @@ public:
 
 private:
     /// Same-site gate for the cookie-authorised dashboard dispatch routes (execute, tar-execute):
-    /// see `browser_write_is_cross_site`. Runs after the permission gate and BEFORE any parsing,
-    /// audit-before-dispatch row or dispatch, so a refused request does no work. Token callers
-    /// are exempt. Writes the 403 and a `csrf.denied` audit row; returns true when refused.
+    /// see `browser_write_is_cross_site`. Defence in depth: the server-wide pre-routing gate
+    /// answers a cookie-session write first. This copy runs after the permission gate and BEFORE
+    /// any parsing, audit-before-dispatch row or dispatch, so a refused request does no work.
+    /// Token callers are exempt. Writes the 403 and a `csrf.denied` audit row; returns true when
+    /// refused.
     bool refuse_cross_site_write(const httplib::Request& req, httplib::Response& res) const;
 
     std::vector<std::string> csrf_trusted_origins_;
@@ -271,6 +288,8 @@ private:
     FleetReadFn fleet_read_fn_;
     AuditFn audit_fn_;
     ResponseStore* response_store_{nullptr};
+    const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990 - see set_forensics_plugin_set
+    ForensicsVisibilityFn forensics_visibility_fn_;         // #4990 - see set_forensics_visibility_fn
     ManagementGroupStore* mgmt_group_store_{nullptr};
     detail::AgentRegistry* registry_{nullptr};
     TagStore* tag_store_{nullptr};
@@ -331,6 +350,9 @@ private:
     /// the listed plugin column names are rendered (the "Agent" pseudo-
     /// column is always shown). @p template_id is propagated through pager
     /// / sort URLs so that switching pages doesn't drop the chosen template.
+    /// @p tier: #4990, what the caller may read with respect to the Forensics tier
+    /// (`tier_filter_for`, derived by the route after its gate). Required, no default: every
+    /// store read below (rows, counts, byte-cap cuts, facets) is computed over the permitted set.
     /// @p scope — #1712 / #3290 Phase 2: the fleet-read gate's composed
     /// meet(management-group, service-scope) VisibleSet. nullopt (TOP) ⇒
     /// unfiltered — a global grant or RBAC-off, byte-identical to the
@@ -338,7 +360,11 @@ private:
     /// nullopt so the existing DashboardResultsColumnsTestAccess friend
     /// seam (test_dashboard_results_columns.cpp) keeps testing the
     /// unfiltered path unchanged.
-    std::string render_results(const std::string& command_id, const std::string& plugin,
+    /// @p served - #4990: when non-null, filled with the Forensics-tier rows the rendered PAGE
+    /// shows (the stored rows behind the page's lines, not the whole filtered set), so the route can
+    /// write the `response.forensics.read` row. Null = the caller discards it (the test seam).
+    std::string render_results(const std::string& command_id, const ResponseTierFilter& tier,
+                               const std::string& plugin,
                                const std::string& sort_col, const std::string& sort_dir,
                                int page, int per_page,
                                const std::vector<FacetFilter>& filters,
@@ -346,7 +372,8 @@ private:
                                const std::string& definition_id = {},
                                const std::string& template_id = {},
                                const std::vector<std::string>& visible_columns = {},
-                               const authz::VisibleSet& scope = std::nullopt);
+                               const authz::VisibleSet& scope = std::nullopt,
+                               ForensicsServed* served = nullptr);
 
     /// Render filter controls for a plugin schema. When @p definition_id is
     /// non-empty it's emitted as a hidden form input so subsequent
@@ -355,7 +382,8 @@ private:
     /// Issue #254 — also renders a response-template selector dropdown at
     /// the top of the bar listing the synthesised default plus any
     /// operator-defined templates on the definition.
-    std::string render_filter_bar(const std::string& command_id, const std::string& plugin,
+    std::string render_filter_bar(const std::string& command_id, const ResponseTierFilter& tier,
+                                   const std::string& plugin,
                                    const std::string& definition_id = {},
                                    const std::string& template_id = {},
                                    const std::string& username = {},

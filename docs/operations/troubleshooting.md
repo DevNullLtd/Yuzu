@@ -9,6 +9,7 @@
 | Wrong server address | Verify `--server host:port` matches server's `--listen` address |
 | TLS mismatch | Ensure agent has `--ca-cert` pointing to the server's CA |
 | Enrollment not approved | Check Estate > Groups and enrolment (or Settings > Pending Agent Approvals) in the dashboard |
+| Token refused; host appears in Pending Agent Approvals | The agent log shows `Server permanently rejected registration: invalid, expired, or exhausted enrollment token`, then `Removed the enrollment token file ... after the server refused the token`. The server audit row `enrollment.token_consumed` with `result=failure` carries `variant=not_found` (also a token minted on a different server), `revoked`, `expired` or `already_consumed`. Approve the host from the queue, or mint a new token and stage it again |
 | Firewall | Verify port 50051 is open between agent and server |
 | Gateway mode | If using gateway, agent connects to gateway port (50051), not server directly |
 
@@ -61,7 +62,7 @@ Health probes (`/livez`, `/readyz`, `/health`, `/api/health`) are exempt from th
 |-------|-----|
 | SQLite WAL growth | Run `PRAGMA wal_checkpoint(TRUNCATE)` on large .db files |
 | Response retention too long | Reduce `--response-retention-days` (default: 90) |
-| Too many connected agents | Check `--max-agents` limit, consider gateway for distribution |
+| Too many connected agents | The server does not cap the agent count (`--max-agents` is deprecated and has no effect). Spread agents across gateways, and keep `--grpc-max-threads` above the connected-agent count (it is a ceiling, not a limiter) |
 | Agent thread pool | Agent thread pool is bounded (4-32 workers, 1000 max queue) |
 
 ## Gateway Disconnections

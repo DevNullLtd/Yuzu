@@ -16,6 +16,7 @@
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include_lib("yuzu_gw/src/yuzu_grpc.hrl").
 
 %% These cases call the agent service handlers in-process (no real
 %% connection), so the connection key heartbeat admission compares is
@@ -325,15 +326,28 @@ agent_inventory_proxy(_Config) ->
         {ok, #{received => true}}
     end),
 
+    %% An inventory report is admitted like a heartbeat (#5695): only for a
+    %% session this node holds, on its connection (?CONN_KEY).
+    Holder = spawn(fun() -> receive stop -> ok end end),
+    ok = yuzu_gw_registry:register_agent(<<"integration-inv-agent">>, Holder,
+                                         <<"sess-inv-1">>, [], <<>>, #{}, ?CONN_KEY),
+
     Ctx = ctx:background(),
     Report = #{
-        session_id => <<"sess-1">>,
+        session_id => <<"sess-inv-1">>,
         collected_at => #{millis_epoch => erlang:system_time(millisecond)},
         plugin_data => #{<<"svc">> => <<"{}">>}
     },
 
     {ok, Response, _} = yuzu_gw_agent_service:report_inventory(Ctx, Report),
-    ?assertEqual(true, maps:get(received, Response)).
+    ?assertEqual(true, maps:get(received, Response)),
+
+    %% A session nobody holds is refused before the upstream is called.
+    Calls = meck:num_calls(yuzu_gw_upstream, proxy_inventory, '_'),
+    ?assertEqual({grpc_error, {?GRPC_STATUS_NOT_FOUND, <<"unknown session">>}},
+                 yuzu_gw_agent_service:report_inventory(Ctx, Report#{session_id => <<"nobody">>})),
+    ?assertEqual(Calls, meck:num_calls(yuzu_gw_upstream, proxy_inventory, '_')),
+    Holder ! stop.
 
 agent_subscribe_lifecycle(_Config) ->
     SessionId = <<"subscribe-sess-1">>,

@@ -8,7 +8,8 @@
 %%% - Subscribe: terminated locally, one yuzu_gw_agent process spawned
 %%% - Heartbeat: admitted per session and connection, then buffered for
 %%%   batch upstream delivery
-%%% - ReportInventory: proxied upstream
+%%% - ReportInventory: admitted per session and connection (as Heartbeat),
+%%%   then proxied upstream
 %%% - ExecuteCommand: not used (Subscribe is the primary channel)
 %%%
 %%% Calling conventions (yuzu_grpc_runner):
@@ -473,10 +474,30 @@ execute_command(_CommandReq, _Stream) ->
                   <<"Use Subscribe for command delivery">>}}.
 
 %%--------------------------------------------------------------------
-%% ReportInventory — proxy upstream
+%% ReportInventory — admit, then proxy upstream
 %%--------------------------------------------------------------------
 
+%% Admitted like a heartbeat (yuzu_gw_heartbeat_admission:admit_inventory/2):
+%% only for a session this node holds, on the connection bound to it, and
+%% decided before any upstream permit is asked for, so a peer that never
+%% registered cannot hold the inventory permits or their wait queue (nor keep
+%% its decoded report alive in a queued runner). A refusal is the same
+%% NOT_FOUND "unknown session" Heartbeat answers; the agent's daily-sync sender
+%% treats any non-OK status as "retry next tick" without advancing its state,
+%% and its heartbeat, on the same channel, re-registers it.
 report_inventory(Ctx, InventoryReport) ->
+    SessionId = case is_map(InventoryReport) of
+        true  -> maps:get(session_id, InventoryReport, undefined);
+        false -> undefined
+    end,
+    case yuzu_gw_heartbeat_admission:admit_inventory(Ctx, SessionId) of
+        ok ->
+            forward_inventory(Ctx, InventoryReport);
+        rejected ->
+            {grpc_error, {?GRPC_STATUS_NOT_FOUND, <<"unknown session">>}}
+    end.
+
+forward_inventory(Ctx, InventoryReport) ->
     case yuzu_gw_upstream:proxy_inventory(InventoryReport, upstream_opts(Ctx)) of
         {ok, Response} ->
             {ok, Response, Ctx};

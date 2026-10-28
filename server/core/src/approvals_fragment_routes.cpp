@@ -1,13 +1,16 @@
 #include "approvals_fragment_routes.hpp"
 
 #include "approval_manager.hpp"
+#include "approver_assurance.hpp"
 #include "approvals_page_render.hpp"
 #include "http_route_sink.hpp"
+#include "refusal_log_throttle.hpp"
 #include "instruction_store.hpp"
 #include "reserved_definition_id.hpp"
 #include "web_utils.hpp" // html_escape
 
 #include <httplib.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <ctime>
@@ -30,6 +33,41 @@ std::string note(std::string_view attr, std::string_view text) {
     return out;
 }
 
+/// The viewing session is NAMED in `a`'s excluded roots (#6062) and so may not APPROVE it. A
+/// render hint only - the store refuses the approval either way (`ApprovalManager::approve`) -
+/// and it decides through the store's own `reviewer_is_excluded`, so the two cannot drift. It
+/// gates Approve ONLY: the store lets an excluded root REJECT, so an excluded viewer is still
+/// offered Reject (the way a designer withdraws a request). The submitter is different -
+/// barred from both verbs. An UNREADABLE roots list names nobody, so it is not "excluded"
+/// (the hint would give the wrong cause); it is unapprovable, below.
+bool viewer_is_excluded(const Approval& a, const std::string& username) {
+    return !a.excluded_roots_unreadable && !username.empty() &&
+           reviewer_is_excluded(username, a.excluded_roots);
+}
+
+/// The stored state of `a` is one `approve()` would refuse whoever asks (#6062): the frozen
+/// request cannot be read, bounded or verified against its digest, or the excluded roots
+/// cannot be read - decided by the store's own `approval_state_is_approvable`. The page then
+/// withholds Approve and leaves Reject, the only way to clear the row. Logs with the id
+/// prefix only, never the request: the id is a bearer capability (see ApprovalManager's
+/// redact_id) and the request can be anything.
+bool state_unapprovable(const Approval& a) {
+    if (approval_state_is_approvable(a))
+        return false;
+    // A bad row is rendered on every page load and poll, in every status filter, so the line
+    // is throttled per ticket (the repo's RefusalLogThrottle: one warn per id prefix per
+    // minute, the rest demoted to debug). The page itself is unaffected.
+    static RefusalLogThrottle throttle;
+    const std::string prefix = a.id.substr(0, 8);
+    if (throttle.should_warn(prefix))
+        spdlog::warn("Approvals page: the stored request or excluded roots of ticket {}... "
+                     "cannot be read or verified; Approve is withheld",
+                     prefix);
+    else
+        spdlog::debug("Approvals page: ticket {}... is still not approvable", prefix);
+    return true;
+}
+
 } // namespace
 
 void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
@@ -42,8 +80,15 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
             // (#3040): this fragment renders the full approvals population
             // (submitted_by / status / scope_expression) and must not disclose it
             // to any authenticated session, only to Approval:Read holders (seeded
-            // to Viewer). Approvals are workflow rows, not per-agent fleet data, so
-            // a bare require_permission is correct here (not authorize_list_read).
+            // to Viewer). Approvals are workflow rows, not a per-agent fleet read, so
+            // a bare require_permission is the gate here (not authorize_list_read), the
+            // same gate every approval read carries. A BOUND ticket's frozen request
+            // can name devices in its targets, and it is shown to any Approval:Read
+            // holder under that same global gate - the REST v1 list/get and MCP
+            // list_pending_approvals expose the very same request/digest/excluded_roots
+            // through approval_row_json (#6062), so the page and the API twins agree on
+            // who may see it. Confining a bound request by the viewer's management
+            // groups would be a new decision, not an inherited one.
             if (!deps.perm_fn(req, res, "Approval", "Read")) {
                 // The gate already wrote its 403 (and its audit row). htmx drops 4xx
                 // bodies, so the panel would sit on "Loading..." forever: rewrite that
@@ -63,6 +108,13 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
             // but empty = every status. Validated BEFORE the store is read, so a typo
             // answers "unknown filter" and never reads as an empty queue.
             const bool view_page = req.get_param_value("view") == "page";
+            // Buttons are rendered only for a session the decide routes would accept on
+            // class (#6061): an interactive human, non-engine session. A bearer / engine /
+            // non-human viewer would only get a refusal, so the control is not offered.
+            // This mirrors the route's check (the one shared predicate); the route stays
+            // the authority.
+            const bool approver_class_ok =
+                approval::check_approver_class(*session) == approval::ApproverRefusal::kNone;
             std::string status = req.has_param("status") ? req.get_param_value("status")
                                                          : (view_page ? "pending" : "");
             const auto& allowed = ApprovalManager::allowed_status();
@@ -88,21 +140,30 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
 
+            // One probe per render, and only when some pending row is not the caller's own
+            // (self-review is refused server-side whatever the grant). Never per row. Shared
+            // by both views (#6061): the tab used to offer Approve/Reject on the class check
+            // alone, so a Viewer-level approver-class session saw buttons the route would
+            // refuse with a 403 the tab cannot surface.
+            const bool decidable_row = std::any_of(
+                listed->approvals.begin(), listed->approvals.end(), [&](const auto& a) {
+                    // An excluded viewer still has Reject, so the row is decidable.
+                    return a.status == "pending" &&
+                           (session->username.empty() || a.submitted_by != session->username);
+                });
+            const bool can_decide = approver_class_ok && decidable_row && deps.probe_perm_fn &&
+                                    deps.probe_perm_fn(req, "Approval", "Approve");
+
             if (view_page) {
                 operate_pages::NameLookupMemo names(operate_pages::instruction_name_resolver(deps.instruction_store));
                 operate_pages::ApprovalListView view;
                 view.truncated = listed->truncated;
                 view.status_filter = status;
+                // Display only (#6096): the age column subtracts a database-authored
+                // submitted_at from this process's clock, so skew shifts the printed age.
+                // No decision reads it.
                 view.now = static_cast<int64_t>(std::time(nullptr));
-                // One probe per render, and only when some pending row is not the caller's
-                // own (self-review is refused server-side whatever the grant). Never per row.
-                const bool decidable_row = std::any_of(
-                    listed->approvals.begin(), listed->approvals.end(), [&](const auto& a) {
-                        return a.status == "pending" &&
-                               (session->username.empty() || a.submitted_by != session->username);
-                    });
-                view.can_decide = decidable_row && deps.probe_perm_fn &&
-                                  deps.probe_perm_fn(req, "Approval", "Approve");
+                view.can_decide = can_decide;
                 view.rows.reserve(listed->approvals.size());
                 for (const auto& a : listed->approvals) {
                     operate_pages::ApprovalRowView row;
@@ -117,7 +178,11 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                     row.submitted_at = a.submitted_at;
                     row.reviewed_at = a.reviewed_at;
                     row.mine = !session->username.empty() && a.submitted_by == session->username;
-                    row.mcp = is_reserved_definition_id(a.definition_id);
+                    row.mcp = is_mcp_definition_id(a.definition_id);
+                    row.request_json = a.request_json;
+                    row.request_digest = a.request_digest;
+                    row.excluded = viewer_is_excluded(a, session->username);
+                    row.unapprovable = state_unapprovable(a);
                     view.rows.push_back(std::move(row));
                 }
                 res.set_content(operate_pages::render_approvals_page(view),
@@ -145,8 +210,16 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                             "</td>"
                             "<td><code>" +
                             html_escape(a.scope_expression) +
-                            "</code></td>"
-                            "<td class=\"act\">";
+                            "</code>";
+                    if (!a.request_json.empty()) {
+                        // Bound ticket (#6062): the reviewer reads what is being approved.
+                        // Text only, escaped; the raw JSON is never emitted.
+                        html += "<details><summary>Request</summary><pre>" +
+                                html_escape(operate_pages::summarize_bound_request(
+                                    a.request_json, a.request_digest)) +
+                                "</pre></details>";
+                    }
+                    html += "</td><td class=\"act\">";
                     if (a.status == "pending") {
                         if (a.submitted_by == session->username) {
                             // Self-review is denied server-side
@@ -156,12 +229,20 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                             html += "<span class=\"hint\">"
                                     "You submitted this — another reviewer must "
                                     "approve</span>";
-                        } else {
-                            html += "<button class=\"btn btn-primary btn-sm\" "
-                                    "hx-post=\"/api/approvals/" +
-                                    a.id +
-                                    "/approve\" hx-swap=\"none\">Approve</button>"
-                                    " <button class=\"btn btn-danger btn-sm\" "
+                        } else if (can_decide) {
+                            // Approve is withheld when the store would refuse it: the
+                            // viewer is an excluded root, or the stored state cannot be
+                            // approved (state_unapprovable). Reject stays in both cases.
+                            if (viewer_is_excluded(a, session->username))
+                                html += "<span class=\"hint\">You are excluded from approving "
+                                        "this request. You can still reject it.</span> ";
+                            if (!viewer_is_excluded(a, session->username) &&
+                                !state_unapprovable(a))
+                                html += "<button class=\"btn btn-primary btn-sm\" "
+                                        "hx-post=\"/api/approvals/" +
+                                        a.id +
+                                        "/approve\" hx-swap=\"none\">Approve</button> ";
+                            html += "<button class=\"btn btn-danger btn-sm\" "
                                     "hx-post=\"/api/approvals/" +
                                     a.id +
                                     "/reject\" hx-swap=\"none\">Reject</button>";

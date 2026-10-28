@@ -28,6 +28,7 @@
 #include "integrations_render.hpp" // MCP + Gateway panel markup and the MCP form parser
 #include "json_extract.hpp" // #2557: shared extract_json_string (was an anonymous-namespace copy)
 #include "mcp_policy.hpp"
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log (enrol-confirm stamp log)
 #include "oidc_writer_gate.hpp" // writer priority for the OIDC lock (#5692 UP-13)
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
@@ -37,6 +38,7 @@
 #include "plugin_signing_helpers.hpp"
 #include "rest_a4_envelope.hpp"      // #4028 — detail::error_json_a4 for the settings read-twins
 #include "audited_write.hpp"          // detail::audit_attempted — audit-first settings.mcp
+#include "auth_routes.hpp"           // AuthRoutes::extract_session_cookie (enrol-confirm proof stamp)
 #include "rest_a4_envelope_http.hpp" // #4028 — detail::a4_error/ensure_correlation_id
 #include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
 #include "settings_model.hpp"        // #4028 — shared REST/fragment read-twin builders
@@ -140,9 +142,14 @@ std::string url_encode(const std::string& s) {
 
 // A refused MFA step-up on an htmx form: `step_up_fn_` has already written the refusal (a 401/403/503
 // A4 envelope). htmx swaps no 4xx/5xx body, so without a toast the button looks dead. Show the
-// envelope's own `error.message` (never its `remediation`, which for a SAML session points back at
-// a sign-in that cannot help); fall back to a fixed message if the body is not an envelope.
+// envelope's own `error.message` (never its `remediation`, which names API-caller steps such as a
+// token or a POST route, not something the form can do); fall back to a fixed message if the body is not an envelope.
+// An in-handler refusal (require_mfa_step_up) already toasts on an htmx request via
+// render_step_up_refusal; Response::set_header appends to a multimap, so a second HX-Trigger here
+// would put two lines on the wire. Do nothing when one is already set.
 void toast_step_up_refusal(httplib::Response& res) {
+    if (res.has_header("HX-Trigger"))
+        return;
     std::string message = "MFA step-up required";
     try {
         const auto body = nlohmann::json::parse(res.body, nullptr, false);
@@ -154,6 +161,18 @@ void toast_step_up_refusal(httplib::Response& res) {
     }
     const nlohmann::json toast = {{"showToast", {{"message", message}, {"level", "error"}}}};
     res.set_header("HX-Trigger", toast.dump());
+}
+
+// True when a Content-Type header names application/json (any parameters, any case).
+bool is_json_content_type(std::string_view value) {
+    constexpr std::string_view kJson = "application/json";
+    if (value.size() < kJson.size())
+        return false;
+    for (std::size_t i = 0; i < kJson.size(); ++i)
+        if (std::tolower(static_cast<unsigned char>(value[i])) != kJson[i])
+            return false;
+    return value.size() == kJson.size() || value[kJson.size()] == ';' ||
+           value[kJson.size()] == ' ';
 }
 
 // #4966: the ONE dashboard answer to a last-Administrator refusal (delete AND demote): 409 with
@@ -398,7 +417,7 @@ std::string SettingsRoutes::render_server_config_fragment() {
     html += "<tr><td>Console session lifetime</td><td><code>" +
             std::to_string(v.at("session_absolute_lifetime_seconds").get<std::int64_t>()) +
             "s</code></td></tr>";
-    html += "<tr><td>Max Agents</td><td><code>" +
+    html += "<tr><td>Max Agents (deprecated, no effect)</td><td><code>" +
             std::to_string(v.at("max_agents").get<std::int64_t>()) + "</code></td></tr>";
 
     std::string auth_path = v.at("auth_config_path").get<std::string>();
@@ -857,6 +876,18 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
     return html;
 }
 
+namespace {
+// In-page retry for a degraded Engine Principals fragment. A plain inline onclick (the dashboard
+// CSP blocks hx-on) fires the event the section already listens for. The page itself must not be
+// reloaded to retry: a freshly minted or rotated secret is shown outside this section and a
+// reload discards it.
+constexpr const char* kEngineRetryControl =
+    "<button class=\"btn btn-secondary\" type=\"button\" "
+    "onclick=\"htmx.trigger(document.body,'refreshEnginePrincipals')\">Retry</button> "
+    "<span class=\"hint\">Retry here instead of reloading the page, which would discard a "
+    "credential secret shown above.</span>";
+} // namespace
+
 std::string SettingsRoutes::render_engine_principals_fragment() {
     if (!engine_principal_store_ || !engine_principal_store_->is_open()) {
         return "<span class=\"muted\">Engine Principals store unavailable "
@@ -875,7 +906,15 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
     // Admin/auditor list surface — every engine principal, any lifecycle
     // state, so revoked rows stay visible (never quietly dropped from the
     // console — design doc §3.1 / §12 decision 1).
-    auto principals = engine_principal_store_->list_all(/*include_revoked=*/true);
+    // CHECKED roster read: the plain `list_all` returns an empty vector on a pool-lease
+    // timeout or query failure, which would render "No engine principals" during an outage.
+    auto principals_res = engine_principal_store_->list_all_checked(/*include_revoked=*/true);
+    if (!principals_res) {
+        spdlog::warn("settings engine-principals: roster read failed: {}", principals_res.error());
+        return "<div class=\"muted\">Engine principals unavailable: the list could not be "
+               "read. " + std::string(kEngineRetryControl) + "</div>";
+    }
+    const auto& principals = *principals_res;
 
     std::string html = "<table class=\"user-table\">"
                        "  <thead><tr><th>Principal ID</th><th>Display Name</th><th>Owner</th>"
@@ -883,6 +922,10 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                        "  <th>Revocation</th><th></th></tr></thead>"
                        "  <tbody>";
 
+    // True once a credential read has failed, or from the start when no token store was ever
+    // wired: either way no row can show a credential count, the row hint points at the Retry
+    // control, and the revoke-detail lookups below are skipped.
+    bool credentials_unreadable = (api_token_store_ == nullptr);
     if (principals.empty()) {
         html += "<tr><td colspan=\"8\" class=\"muted\">No engine principals</td></tr>";
     } else {
@@ -891,10 +934,29 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
             const std::string status_cls = active ? "role-ok" : "role-user";
             const std::string status_txt = active ? "Active" : "Revoked";
 
+            // CHECKED read: the plain accessor turns a closed store, pool-lease timeout or
+            // query failure into an empty vector, which this cell would show as "0" for a
+            // principal that holds a live credential. A read that cannot answer says so in
+            // the cell and leaves the rest of the row (read from the principal store) intact.
+            // After the first failed read the remaining rows are marked unavailable without
+            // another credential read (and without the revoke-detail audit lookup below, which
+            // waits on the same pool): each failing read waits out its store's lease timeout, so
+            // retrying per row would hold this request for roughly N x that timeout. A store
+            // that was never wired is treated the same way from the first row.
             std::size_t active_creds = 0;
-            if (api_token_store_ && api_token_store_->is_open()) {
-                active_creds = api_token_store_->list_active_for_principal(p.principal_id).size();
+            bool creds_known = false;
+            if (!credentials_unreadable) {
+                auto checked = api_token_store_->list_active_for_principal_checked(p.principal_id);
+                if (checked) {
+                    active_creds = checked->size();
+                    creds_known = true;
+                } else {
+                    credentials_unreadable = true;
+                }
             }
+            const std::string active_creds_cell =
+                creds_known ? std::to_string(active_creds)
+                            : std::string("<span class=\"muted\">unavailable</span>");
 
             // Revoked rows MUST surface the `superseded_by` linkage AND the
             // recorded revoke detail explicitly (design doc §3.1 / §12
@@ -919,7 +981,13 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                         ? "<em class=\"muted\">no successor recorded</em>"
                         : ("superseded by <code>" + html_escape(p.superseded_by) + "</code>");
                 std::string audit_detail = "(not recorded)";
-                if (audit_store_) {
+                if (credentials_unreadable) {
+                    // The pool is already failing reads; do not queue another lease wait per
+                    // revoked row (revoked rows are never pruned, so they only accumulate).
+                    // "(unavailable)" here means "not looked up", not "the audit store failed":
+                    // rows rendered before the first failed read still show their real detail.
+                    audit_detail = "(unavailable)";
+                } else if (audit_store_) {
                     AuditQuery q;
                     q.target_type = "EnginePrincipal";
                     q.target_id = p.principal_id;
@@ -958,7 +1026,7 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                     status_cls + "\">" + status_txt +
                     "</span></td>"
                     "<td>" +
-                    std::to_string(active_creds) +
+                    active_creds_cell +
                     "</td>"
                     "<td>" +
                     revocation_cell +
@@ -994,7 +1062,12 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                 // htmx's own `hx-confirm` (that only fires for htmx-owned
                 // hx-post/hx-get triggers, which these forms deliberately
                 // are not).
-                if (active_creds == 0) {
+                if (!creds_known) {
+                    // The credential store could not answer, so neither "Mint" (no live
+                    // credential) nor "Rotate" (exactly one) can be offered truthfully.
+                    html += "<span class=\"hint\">Credential state unavailable; "
+                            "use Retry below.</span> ";
+                } else if (active_creds == 0) {
                     // No live credential yet — this principal needs an
                     // initial mint (POST .../credentials), not a rotate
                     // (rotate_engine_credential requires exactly one active
@@ -1056,6 +1129,10 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
     }
 
     html += "  </tbody></table>";
+    // Only with rows: an empty roster has no row hint to point at it, and for a store that was
+    // never wired a retry cannot help.
+    if (credentials_unreadable && !principals.empty())
+        html += "<p>" + std::string(kEngineRetryControl) + "</p>";
 
     // NOTE: the one-time-reveal target (#engine-principal-reveal) is
     // DELIBERATELY NOT emitted here — it lives in the static page shell
@@ -1766,6 +1843,14 @@ std::string SettingsRoutes::render_updates_fragment() {
             auto size_str = pkg.file_size < 1024 * 1024
                                 ? std::to_string(pkg.file_size / 1024) + " KB"
                                 : std::to_string(pkg.file_size / (1024 * 1024)) + " MB";
+            // The same decision the Signed column makes, read once and handed to the rollout
+            // confirm (data-signed) so the confirm cannot disagree with the pill.
+            const bool sig_served =
+                signature_sidecar_outcome(update_registry_->signature_path(pkg)) ==
+                SidecarOutcome::kServed;
+            const bool sig_covers =
+                sig_served && signature_sidecar_covers_binary(update_registry_->binary_path(pkg),
+                                                              update_registry_->signature_path(pkg));
 
             // platform/arch/version are operator-uploaded path segments: encode
             // each, and offer no rollout/delete URL when one is empty or only
@@ -1778,21 +1863,27 @@ std::string SettingsRoutes::render_updates_fragment() {
                 const std::string pkg_path = url_path_segment(pkg.platform) + "/" +
                                              url_path_segment(pkg.arch) + "/" +
                                              url_path_segment(pkg.version);
+                // A whole-number text input (digits 0 to 100 only: a number input also
+                // accepts 1e2, which stoi reads as 1), required and prefilled with the row's
+                // current value: a blank or non-numeric rollout_pct is read as 100 by the
+                // handler, so an empty box must never be submittable. data-* feed the page's
+                // confirm listener.
                 rollout_cell =
                     "<form style=\"display:flex;align-items:center;gap:0.4rem\" "
                     "hx-post=\"/api/settings/updates/" +
                     pkg_path +
                     "/rollout\" "
-                    "hx-target=\"#updates-section\" hx-swap=\"innerHTML\">"
-                    "<input type=\"range\" name=\"rollout_pct\" min=\"0\" max=\"100\" "
-                    "value=\"" +
+                    "hx-target=\"#updates-section\" hx-swap=\"innerHTML\" "
+                    "data-confirm=\"rollout\" data-signed=\"" +
+                    std::string(sig_covers ? "yes" : "no") + "\" data-mandatory=\"" +
+                    std::string(pkg.mandatory ? "yes" : "no") +
+                    "\">"
+                    "<input type=\"text\" inputmode=\"numeric\" name=\"rollout_pct\" "
+                    "pattern=\"(100|[1-9]?[0-9])\" required value=\"" +
                     std::to_string(pkg.rollout_pct) +
-                    "\" "
-                    "style=\"width:60px\" "
-                    "onchange=\"this.nextElementSibling.textContent=this.value+'%'\">"
-                    "<span style=\"width:2.5em\">" +
-                    std::to_string(pkg.rollout_pct) +
-                    "%</span>"
+                    "\" style=\"width:72px\" "
+                    "aria-label=\"Offered to this percentage of devices\">"
+                    "<span class=\"hint\">% of devices</span>"
                     "<button class=\"btn btn-secondary\" type=\"submit\">Set</button>"
                     "</form>";
                 delete_cell = "<button class=\"btn btn-danger\" "
@@ -1810,7 +1901,11 @@ std::string SettingsRoutes::render_updates_fragment() {
                     "<span class=\"muted\">identifier not supported for actions</span>";
             }
 
-            html += "<tr>"
+            // data-* feed the page's confirm listener (replace detection on upload, from -> to
+            // on rollout); nothing is read from them on /settings, which has no listener.
+            html += "<tr data-platform=\"" + html_escape(pkg.platform) + "\" data-arch=\"" +
+                    html_escape(pkg.arch) + "\" data-version=\"" + html_escape(pkg.version) +
+                    "\" data-rollout=\"" + std::to_string(pkg.rollout_pct) + "\">"
                     "<td>" +
                     html_escape(pkg.platform) +
                     "</td>"
@@ -1834,17 +1929,13 @@ std::string SettingsRoutes::render_updates_fragment() {
                     // disk but served as UNSIGNED, so exists() alone would tell
                     // the operator "signed" while every agent is told otherwise —
                     // the one thing this column exists to prevent.
-                    (update_registry_ &&
-                     signature_sidecar_outcome(update_registry_->signature_path(pkg)) ==
-                         SidecarOutcome::kServed
+                    (sig_served
                          // A served signature that CANNOT cover the binary beside
                          // it gets its own state. Reporting it as "signed" is the
                          // worst of the three: the docs nominate this column as
                          // the confirmation check, so the operator reads success
                          // while every anchored agent refuses the package.
-                         ? (signature_sidecar_covers_binary(
-                                update_registry_->binary_path(pkg),
-                                update_registry_->signature_path(pkg))
+                         ? (sig_covers
                                 ? std::string("<span class=\"role-badge role-ok\" "
                                               "title=\"A detached signature is stored "
                                               "for this package\">signed</span>")
@@ -1890,6 +1981,7 @@ std::string SettingsRoutes::render_updates_fragment() {
     html += "<form class=\"add-user-form\" hx-post=\"/api/settings/updates/upload\" "
             "hx-target=\"#updates-section\" hx-swap=\"innerHTML\" "
             "hx-encoding=\"multipart/form-data\" "
+            "data-confirm=\"ota-upload\" "
             "style=\"width:100%\">"
             "<div class=\"mini-field\">"
             "<label>Platform</label>"
@@ -1906,7 +1998,10 @@ std::string SettingsRoutes::render_updates_fragment() {
             "</select></div>"
             "<div class=\"mini-field\">"
             "<label>Binary</label>"
-            "<input type=\"file\" name=\"file\" required></div>"
+            "<input type=\"file\" name=\"file\" required>"
+            "<span class=\"hint\">The file name becomes the version. A name ending in .sig is "
+            "not accepted. The name identifies the file across all platforms and "
+            "architectures.</span></div>"
             // Optional detached CMS signature (#416/#3807). Without this input
             // the documented signing workflow is unreachable from the UI and an
             // operator would ship an unsigned package believing it signed.
@@ -1917,10 +2012,14 @@ std::string SettingsRoutes::render_updates_fragment() {
             // No accept filter: ".sig" is only convention — ".p7s" and ".pem" are
             // common names for the same detached CMS blob, and filtering the picker
             // to one suffix hides the operator's actual file.
-            "<input type=\"file\" name=\"signature\"></div>"
+            "<input type=\"file\" name=\"signature\">"
+            "<span class=\"hint\">PEM CMS block, up to 64 KB.</span></div>"
             "<div class=\"mini-field\">"
             "<label>Rollout %</label>"
-            "<input type=\"text\" name=\"rollout_pct\" value=\"100\" style=\"width:64px\"></div>"
+            "<input type=\"text\" inputmode=\"numeric\" name=\"rollout_pct\" "
+            "pattern=\"(100|[1-9]?[0-9])\" required value=\"100\" style=\"width:72px\">"
+            "<span class=\"hint\">0 to 100. Offered to this share of devices, chosen by device "
+            "identity.</span></div>"
             "<div class=\"mini-field\" style=\"display:flex;align-items:center;gap:0.3rem\">"
             "<label>Mandatory</label>"
             "<input type=\"checkbox\" name=\"mandatory\" value=\"true\"></div>"
@@ -2340,8 +2439,6 @@ std::optional<std::expected<TrustBundleStats, std::string>> read_on_disk_bundle(
 } // namespace
 
 std::string SettingsRoutes::render_plugin_signing_fragment() {
-    std::string html;
-
     // #4028 — shared builder (also feeds the hardened
     // GET /api/v2/agent/plugin-policy, plugin-signing's only REST twin —
     // #4144 moved it from /v1/, now deprecated);
@@ -2378,6 +2475,16 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             required = rc->has_value() && rc->value().value == "true";
         }
     }
+    return render_plugin_signing_panel(bundle, required, required_status_unknown);
+}
+
+// Pure renderer: the three inputs are everything the panel depends on, so a unit test can
+// drive every state (bundle present or absent, required on or off, 17+ subjects) without
+// touching the real certs directory.
+std::string render_plugin_signing_panel(
+    const std::optional<std::expected<plugin_signing::TrustBundleStats, std::string>>& bundle,
+    bool required, bool required_status_unknown) {
+    std::string html;
     const auto v = settings_model::build_plugin_signing_settings(required, bundle);
     const bool enabled = v.at("enabled").get<bool>();
 
@@ -2420,8 +2527,17 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
                 v.at("sha256").get<std::string>() + "</code></div>";
         const auto subjects = v.at("subjects").get<std::vector<std::string>>();
         if (!subjects.empty()) {
+            // The helper lists at most 16 subjects but counts every certificate: say so
+            // rather than let "40 certificate(s)" sit beside 16 names.
+            const auto n_certs = static_cast<std::size_t>(v.at("cert_count").get<int>());
+            const std::string subjects_label =
+                n_certs > subjects.size()
+                    ? "Subjects (first " + std::to_string(subjects.size()) + " of " +
+                          std::to_string(n_certs) + ")"
+                    : std::string("Subjects");
             html += "<div class=\"form-row\" style=\"align-items:flex-start\">"
-                    "<label>Subjects</label>"
+                    "<label>" +
+                    subjects_label + "</label>"
                     "<div style=\"flex:1;min-width:0\">";
             for (const auto& s : subjects) {
                 html += "<div class=\"mono\" "
@@ -2456,9 +2572,18 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
     // Upload form (multipart so curl/UI both work)
     html += "<hr style=\"border:none;border-top:1px solid var(--line);"
             "margin:1rem 0\">";
+    // Key-changing: uploading replaces the trust anchor every agent verifies against.
+    // Name what is being replaced; nothing to confirm on a first upload (no bundle).
     html += "<form hx-post=\"/api/settings/plugin-signing/upload\" "
             "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" "
-            "hx-encoding=\"multipart/form-data\">";
+            "hx-encoding=\"multipart/form-data\"";
+    if (enabled) {
+        html += " hx-confirm=\"Replace the trust bundle (" +
+                std::to_string(v.at("cert_count").get<int>()) + " certificate(s), SHA-256 " +
+                html_escape(v.at("sha256").get<std::string>()) +
+                ")? Agents verify against the new bundle on their next start.\"";
+    }
+    html += ">";
     html += "<div class=\"form-row\" style=\"align-items:center\">"
             "<label>PEM trust bundle</label>"
             "<input type=\"file\" name=\"file\" accept=\".pem,.crt,application/x-pem-file\" "
@@ -2480,17 +2605,28 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
     // forcing a retry is strictly safer than presenting a write control
     // whose displayed state the page itself just declared untrustworthy.
     if (enabled && !required_status_unknown) {
+        // The confirm is a static hx-confirm, attached whenever the stored flag is currently
+        // off: the browser cannot tell whether THIS save ticks the box, so the text is
+        // conditional ("If Require signed plugins is ticked ...") and carries the same
+        // Heads-up as the warning above. With the flag already on, no confirm is attached.
         html += "<form hx-post=\"/api/settings/plugin-signing/require\" "
-                "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" "
-                "style=\"margin-top:0.75rem\">";
+                "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" ";
+        if (!required) {
+            html += "hx-confirm=\"Save this setting? If Require signed plugins is ticked: "
+                    "Yuzu-shipped plugins do not yet include CMS signatures, so an agent "
+                    "started with --plugin-require-signature will reject every Yuzu-bundled "
+                    "plugin at its next scan. This server only records the flag; each agent "
+                    "enforces its own flags.\" ";
+        }
+        html += "style=\"margin-top:0.75rem\">";
         html += "<div class=\"form-row\">"
                 "<label>Require signed plugins</label>"
                 "<label style=\"display:flex;align-items:center;gap:0.5rem;flex:1\">"
                 "<input type=\"checkbox\" name=\"required\" value=\"true\"" +
                 std::string(required ? " checked" : "") +
                 "><span class=\"hint\">"
-                "Reject unsigned plugins instead of allowing them through (transitional vs "
-                "enforced).</span>"
+                "Recorded here and served with the trust bundle. Each agent enforces its own "
+                "<code>--plugin-require-signature</code>.</span>"
                 "</label></div>";
         html += "<div class=\"form-row\"><label></label>"
                 "<button type=\"submit\" class=\"btn btn-secondary\">Save</button></div>";
@@ -2536,6 +2672,21 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             "See <a href=\"/docs#plugin-code-signing\">user manual</a> for the full workflow.</p>";
 
     return html;
+}
+
+bool SettingsRoutes::refuse_cross_site(const httplib::Request& req, httplib::Response& res,
+                                       const auth::Session& session,
+                                       const std::string& endpoint) const {
+    if (!browser_write_is_cross_site(session.auth_source, req.get_header_value("Host"),
+                                     req.get_header_value("Origin"), req.get_header_value("Referer"),
+                                     cfg_ ? std::span<const std::string>(cfg_->csrf_trusted_origins)
+                                          : std::span<const std::string>{}))
+        return false;
+    audit_fn_(req, "csrf.denied", "denied", "Endpoint", endpoint,
+              "cross-site or header-less browser write refused");
+    res.status = 403;
+    res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
+    return true;
 }
 
 // ── Route registration ──────────────────────────────────────────────────────
@@ -4144,7 +4295,9 @@ void SettingsRoutes::register_routes(
         auto keys = oidc::OidcProvider::parse_jwks(*jwks_body);
         if (!keys || keys->empty()) {
             fail("Discovery succeeded but the JWKS has no usable signing keys" +
-                 (keys ? std::string{} : ": " + keys.error()));
+                 (keys ? std::string(" (an RSA key under 2048 bits, or with an unusable exponent, is "
+                                 "skipped; the server log names it)")
+                       : ": " + keys.error()));
             return;
         }
         res.set_content("<span class=\"feedback-ok\">"
@@ -4164,6 +4317,10 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        // Same-site gate (audited_write.hpp rule 1): a cookie-authorised create must name this
+        // site, before the body is read.
+        if (refuse_cross_site(req, res, *session, "/api/settings/users"))
+            return;
         if (session->username.empty()) {
             spdlog::error("POST /api/settings/users: session has empty username; "
                           "refusing to upsert (likely upstream auth misconfiguration)");
@@ -4192,8 +4349,11 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        // H1 FIX: Validate username format (alphanumeric + ._- only, no ':')
-        if (!is_valid_username(username)) {
+        // H1 FIX: Validate username format (alphanumeric + ._- only, no ':'). A name made only
+        // of dots is refused too: a browser resolves "." and ".." out of a request path, so such
+        // an account could never be addressed (removed, or have its role changed) by URL.
+        if (!is_valid_username(username) || username.find_first_not_of('.') == std::string::npos) {
+            audit_fn_(req, "user.create", "denied", "User", username, "invalid_username");
             res.status = 400;
             res.set_header(
                 "HX-Trigger",
@@ -4264,7 +4424,29 @@ void SettingsRoutes::register_routes(
             res.set_content(detail::a4_error(res, msg), "application/json");
             return;
         }
+        // Audit-first (ADR-0033 section 9, audited_write.hpp rule 2): no `attempted` row, no
+        // new account. The outcome rows below are written after the change.
+        if (!detail::audit_attempted(audit_read_fn_, req, res, "user.create", "User", username,
+                                     "role=" + auth::role_to_string(role)))
+            return;
         if (!auth_mgr_->upsert_user(username, password, role)) {
+            // upsert_user's `false` is "too short" OR a store refusal. A password that already
+            // passed the policy was refused by the store: the name is still held by a removed
+            // (deactivated) account, or the store failed. Do not call that a weak password.
+            if (auth::check_password_policy(password) == auth::PasswordPolicyVerdict::kOk) {
+                spdlog::warn("POST /api/settings/users: create refused for '{}' "
+                             "(name held by a removed account, or the user store failed)",
+                             username);
+                audit_fn_(req, "user.create", "denied", "User", username, "create_refused");
+                const std::string msg =
+                    "The account could not be created. The name may still belong to a removed "
+                    "account, or the user store did not answer.";
+                res.status = 409;
+                res.set_header("HX-Trigger",
+                               std::format(R"({{"showToast":{{"message":"{}","level":"error"}}}})", msg));
+                res.set_content(detail::a4_error(res, msg), "application/json");
+                return;
+            }
             spdlog::warn("POST /api/settings/users: upsert rejected for '{}' "
                          "(weak_password — minimum {} bytes)",
                          username, auth::kMinPasswordBytes);
@@ -4284,7 +4466,10 @@ void SettingsRoutes::register_routes(
         spdlog::info("User '{}' created (role={})", username, role_str);
         // SOC 2 CC7.2: privileged user lifecycle operations must appear
         // in audit_store, not just spdlog (governance Gate 6 CO-1).
-        audit_fn_(req, "user.create", "success", "User", username, "role=" + role_str);
+        // The change is made: a lost outcome row keeps the 2xx but marks Sec-Audit-Failed
+        // (audited_write.hpp); the `attempted` row stands either way.
+        (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.create", "success",
+                                            "User", username, "role=" + role_str);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"User created","level":"success"}})");
         res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
@@ -4303,6 +4488,11 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        // Same-site gate (audited_write.hpp rule 1): defence in depth behind the central
+        // pre-routing gate, which already answered any cookie-session write before this handler
+        // ran. This copy sits after the permission gate and before any state is read or changed.
+        if (refuse_cross_site(req, res, *session, "/api/settings/users/{username}"))
+            return;
         // PR2 — MFA step-up gate. Deleting a user destroys a principal;
         // require fresh MFA proof. Sits after admin_fn (no point step-
         // upping a non-admin) but before any state mutation.
@@ -4424,6 +4614,11 @@ void SettingsRoutes::register_routes(
                 "Cannot delete: this account is the fleet's last administrator");
             return;
         }
+        // Audit-first (ADR-0033 section 9, audited_write.hpp rule 2): no `attempted` row, no
+        // credential revoke and no removal.
+        if (!detail::audit_attempted(audit_read_fn_, req, res, "user.delete", "User", username,
+                                     "remove account"))
+            return;
         // ADR-2001 §§1,3 — credentials-FIRST revoke across the resolved
         // principal set (the deleted username + every OIDC identity linked
         // to it via SCIM, if any) BEFORE the account is removed. Mirrors
@@ -4433,6 +4628,7 @@ void SettingsRoutes::register_routes(
         // user — never on "not a SCIM user"/"SCIM store unwired", which
         // degrade to the slug-only set (see its doc comment).
         std::string revoke_detail;
+        std::vector<std::string> erase_principals; // the post-commit erasure hook's set
         if (api_token_store_) {
             auto principals = resolve_deprovision_principals_for_username(scim_store_, username);
             if (!principals.has_value()) {
@@ -4496,6 +4692,7 @@ void SettingsRoutes::register_routes(
                     "application/json");
                 return;
             }
+            erase_principals = std::move(*principals);
         } else {
             // Governance Gate 7 BLOCKING fix (UP-7): FAIL CLOSED here —
             // mirror the SCIM seam's `revoke_linked_credentials_or_fail`
@@ -4533,7 +4730,11 @@ void SettingsRoutes::register_routes(
                 spdlog::error("Failed to save config after user removal");
             }
             spdlog::info("User '{}' removed", username);
-            audit_fn_(req, "user.delete", "success", "User", username, revoke_detail);
+            (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.delete", "success",
+                                                "User", username, revoke_detail);
+            // Post-commit personal-data erasure (ADR-0071): best-effort, never changes this
+            // response - see deprovision_erasure.hpp.
+            run_deprovisioned_hook(on_deprovisioned_, erase_principals);
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"User deleted","level":"success"}})");
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
@@ -4575,6 +4776,8 @@ void SettingsRoutes::register_routes(
             }
             audit_fn_(req, "user.delete", "partial", "User", username,
                       "account_deactivated session_wipe_failed=true " + revoke_detail);
+            // The account IS deactivated (committed): erase as on a clean removal.
+            run_deprovisioned_hook(on_deprovisioned_, erase_principals);
             respond_lifecycle_store_unavailable(
                 res, "User deactivated, but session cleanup failed. Repeat the delete to finish");
             return;
@@ -4600,6 +4803,18 @@ void SettingsRoutes::register_routes(
         auto session = auth_fn_(req, res);
         if (!session) {
             res.status = 401;
+            return;
+        }
+        // Same-site gate (audited_write.hpp rule 1), and a JSON-only body: a URL-encoded or
+        // text/plain POST is what a cross-site form can send without a preflight.
+        if (refuse_cross_site(req, res, *session, "/api/settings/users/{username}/role"))
+            return;
+        if (!is_json_content_type(req.get_header_value("Content-Type"))) {
+            audit_fn_(req, "user.role_change", "denied", "User", req.matches[1].str(),
+                      "content_type_not_json");
+            res.status = 415;
+            res.set_content(detail::a4_error(res, "Content-Type must be application/json"),
+                            "application/json");
             return;
         }
         // admin_fn_ admits a JIT-elevated session (effective_role). An elevation is temporary
@@ -4734,6 +4949,14 @@ void SettingsRoutes::register_routes(
             return;
         }
 
+        // Audit-first (ADR-0033 section 9, audited_write.hpp rule 2): no `attempted` row, no
+        // role change.
+        if (!detail::audit_attempted(audit_read_fn_, req, res, "user.role_change", "User",
+                                     target_username,
+                                     "old_role=" + auth::role_to_string(old_role) +
+                                         ",new_role=" + auth::role_to_string(new_role)))
+            return;
+
         // Perform role change (AuthManager::update_role_checked() runs the #4966 guarded write,
         // then handles the cache + session invalidation after the commit). There is no
         // pre-write revoke on this path, so a refusal changed nothing at all.
@@ -4800,8 +5023,9 @@ void SettingsRoutes::register_routes(
         std::string new_role_str = auth::role_to_string(new_role);
         spdlog::info("User role changed: {} {} -> {} by {}", target_username, old_role_str,
                      new_role_str, session->username);
-        audit_fn_(req, "user.role_change", "success", "User", target_username,
-                  "old_role=" + old_role_str + ",new_role=" + new_role_str);
+        (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.role_change", "success",
+                                            "User", target_username,
+                                            "old_role=" + old_role_str + ",new_role=" + new_role_str);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Role updated","level":"success"}})");
         res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
@@ -4816,12 +5040,13 @@ void SettingsRoutes::register_routes(
         auto max_uses_s = extract_form_value(req.body, "max_uses");
         auto ttl_s = extract_form_value(req.body, "ttl_hours");
 
-        int max_uses = 0;
-        int ttl_hours = 0;
+        int max_uses = auth::kDefaultEnrollmentTokenMaxUses;
+        int ttl_hours = auth::kDefaultEnrollmentTokenTtlHours;
         try {
             // Strict: `stoi("0x5")` is 0 and max_uses 0 means UNLIMITED, so a mistyped limit
-            // used to mint an unlimited token. Only an EMPTY field or a literal 0 means
-            // "unlimited" / "no expiry"; anything else must be one base-10 integer.
+            // used to mint an unlimited token. A field left BLANK takes the bounded default
+            // above; only a literal 0 means "unlimited" / "no expiry"; anything else must be
+            // one base-10 integer.
             if (!max_uses_s.empty())
                 max_uses = yuzu::server::strict_stoi(max_uses_s);
             if (!ttl_s.empty())
@@ -4874,7 +5099,7 @@ void SettingsRoutes::register_routes(
         // shown once in the response and must never reach the audit store.
         audit_fn_(req, "enrollment.token_create", "success", "EnrollmentToken", created->token_id,
                   "by=" + session->username + " max_uses=" + std::to_string(max_uses) +
-                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + label);
+                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + audit_token(label));
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Enrollment token created","level":"success"}})");
         no_store_private(res); // the raw token is in this body
@@ -4919,7 +5144,7 @@ void SettingsRoutes::register_routes(
         if (!admin_fn_(req, res))
             return;
         // A blank body keeps every default; any other body must be one JSON object (a truncated
-        // document used to mint the default 10 single-use tokens with no expiry).
+        // document used to mint 10 single-use tokens that never expire).
         nlohmann::json batch_body = nlohmann::json::object();
         const bool body_blank =
             std::all_of(req.body.begin(), req.body.end(),
@@ -4940,8 +5165,9 @@ void SettingsRoutes::register_routes(
         auto label = extract_json_string(batch_body, "label");
 
         int count = 10;
+        // Batch tokens stay single-use by default; only ttl_hours gets the bounded default.
         int max_uses = 1;
-        int ttl_hours = 0;
+        int ttl_hours = auth::kDefaultEnrollmentTokenTtlHours;
         try {
             // Strict (see the single-token route): a malformed limit must never read as 0.
             read_enrollment_int(batch_body, "count", count);
@@ -5015,8 +5241,8 @@ void SettingsRoutes::register_routes(
 
         audit_fn_(req, "enrollment.bulk_token_create", "success", "EnrollmentToken", "",
                   "by=" + session->username + " max_uses=" + std::to_string(max_uses) +
-                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + label + " " +
-                      bulk_audit_detail(token_ids));
+                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + audit_token(label) +
+                      " " + bulk_audit_detail(token_ids));
 
         no_store_private(res); // N raw tokens are in this body
         res.set_content(nlohmann::json({{"count", tokens.size()}, {"tokens", tokens}}).dump(),
@@ -5246,8 +5472,9 @@ void SettingsRoutes::register_routes(
 
         // Owner-scoped revocation (fixes the sibling IDOR to #222 on
         // the HTMX dashboard path). A caller with ApiToken:Delete
-        // may only revoke their own tokens; the global admin role
-        // is the only bypass. We return a generic "not found"
+        // may only revoke their own tokens; the only bypass is an
+        // effective admin (the global admin role, or a session holding
+        // a JIT admin elevation). We return a generic "not found"
         // fragment in both the missing-id and the not-owner cases
         // so the dashboard does not become an enumeration oracle.
         auto existing = api_token_store_->get_token(token_id);
@@ -5572,6 +5799,10 @@ void SettingsRoutes::register_routes(
         }
         return out;
     };
+    // Cookie-session writes require a same-site Origin or Referer; the pre-routing gate
+    // (same_site_write_gate.hpp) decides that, after authentication, before this handler runs.
+    // This copy is defence in depth and serves the TestRouteSink tests, which bypass
+    // pre-routing. It is not a substitute for the central gate.
     auto origin_safe = [this, sanitise](const httplib::Request& req, httplib::Response& res,
                                         const std::string& action_for_audit) -> bool {
         auto host = req.get_header_value("Host");
@@ -5929,24 +6160,14 @@ void SettingsRoutes::register_routes(
     sink.Post("/api/settings/mcp", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
-        // Same-site gate for a cookie-authorised write: unlike origin_safe above, a header-less
-        // cookie request is refused (browsers always send an Origin on a write); token callers
-        // are exempt.
+        // Same-site check for a cookie-authorised write: a cookie request without a same-site
+        // Origin or Referer is refused here too (the pre-routing gate decides it first, so this
+        // copy is defence in depth); token callers are exempt.
         const auto session = auth_fn_(req, res);
         if (!session)
             return;
-        if (browser_write_is_cross_site(session->auth_source, req.get_header_value("Host"),
-                                        req.get_header_value("Origin"),
-                                        req.get_header_value("Referer"),
-                                        cfg_ ? std::span<const std::string>(cfg_->csrf_trusted_origins)
-                                             : std::span<const std::string>{})) {
-            audit_fn_(req, "csrf.denied", "denied", "Endpoint", "/api/settings/mcp",
-                      "cross-site or header-less browser write refused");
-            res.status = 403;
-            res.set_content(detail::a4_error(res, "cross-site request refused"),
-                            "application/json");
+        if (refuse_cross_site(req, res, *session, "/api/settings/mcp"))
             return;
-        }
         const auto form = integrations::parse_mcp_form(req.body);
         if (!form) {
             res.status = 400;
@@ -6495,9 +6716,9 @@ void SettingsRoutes::register_routes(
     // are a different origin, which is what Origin/Referer catches.
     //
     // We require Origin (or Referer as fallback) to carry the
-    // same host as the request's Host header; absence means a non-
-    // browser caller (curl, automation) which is explicitly allowed
-    // because programmatic admin clients post without an Origin header.
+    // same host as the request's Host header. Cookie-session writes require a
+    // same-site Origin or Referer; the pre-routing gate (same_site_write_gate.hpp)
+    // decides that first, and this copy is defence in depth.
     // Mismatched host → 403, audited as csrf.denied for SIEM correlation.
     //
     // Hardenings from the re-review round of the Hermes fixes:
@@ -6512,14 +6733,13 @@ void SettingsRoutes::register_routes(
     //    validate URL shape, so anything containing `@`, `?`, or `#`
     //    is treated as a fail-closed mismatch.
     //
-    // Scoping note (Gate 4 SHOULD S2 — known follow-up): origin_safe is
-    // wired into the 4 mutating MFA POSTs and the 4 auto-approve writes
-    // only. 11 sibling state-changing Settings POSTs (/api/settings/users/*,
-    // plugin-signing, OIDC, cert, enrollment-tokens, tls) remain CSRF-unprotected
-    // pending a follow-up PR that wraps every admin HTMX mutation. The
-    // asymmetric defence is documented in CHANGELOG and is NOT a
-    // regression introduced by this PR — those sites were unprotected
-    // before PR1 too.
+    // Scoping note: cookie-session writes require a same-site Origin or
+    // Referer, enforced centrally in the pre-routing stage after
+    // authentication (same_site_write_gate.hpp). origin_safe is wired into
+    // the routes that carry a per-route copy, as defence in depth; its
+    // audit rows (result=error, sanitised header bytes) are written only
+    // for a request the central gate admitted, or by a TestRouteSink test
+    // that bypasses pre-routing.
 
     sink.Get("/fragments/settings/mfa", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
@@ -6687,7 +6907,65 @@ void SettingsRoutes::register_routes(
                                       "text/html; charset=utf-8");
                       return;
                   }
-                  audit_fn_(req, "mfa.enroll.verified", "ok", "User", session->username, "");
+                  // Enrolment has just committed, and the code that committed it IS a fresh proof
+                  // of the factor: stamp the CURRENT cookie session's step-up proof (the same
+                  // `mark_session_mfa_verified` as POST /login/mfa/stepup, so the DB-clock
+                  // authoring and every replica's cache refresh are that primitive's), so the
+                  // operator can regenerate recovery codes or disable MFA from this very session
+                  // without a separate step-up. Only a local cookie session is stamped, and only
+                  // when the cookie resolves to the SAME user the form was verified for: a bearer
+                  // credential, an OIDC/SAML session or a mismatched cookie never earns it. A
+                  // failed stamp does not undo the enrolment (the codes below are shown once), and
+                  // neither does a throw from the stamp: the stamp block is wrapped, so the stamp
+                  // can never drop the codes reveal or the audit rows below. Those two audit_fn_
+                  // calls and the render follow it unguarded, exactly like every other handler in
+                  // this file (a throw there is not caught here). The Settings
+                  // panel cannot prompt for a step-up, so an operator who is not stamped signs in
+                  // again to earn a proof. Never reached on a failed or rejected verification (all
+                  // return above).
+                  // The audit row below says only `not_stamped`; this line says why. Sampled (1 in
+                  // kStampThrewLogEvery, the first always) so a failing auth store cannot become a log storm.
+                  // `what()` is text an exception chose, so it is sanitised. Guarded: a formatter
+                  // or logger throw must not escape the catch and drop the codes reveal.
+                  const auto note_stamp_threw = [](const char* what) noexcept {
+                      try {
+                          static std::atomic<uint64_t> stamp_threw_hits{0};
+                          if (stamp_threw_hits.fetch_add(1, std::memory_order_relaxed) %
+                                  kStampThrewLogEvery != 0)
+                              return;
+                          if (what)
+                              spdlog::warn("enrol-confirm: step-up proof stamp threw; recording "
+                                           "not_stamped ({})",
+                                           onbehalf::sanitize_for_log(what));
+                          else
+                              spdlog::warn("enrol-confirm: step-up proof stamp threw; recording "
+                                           "not_stamped");
+                      } catch (...) { // NOLINT(bugprone-empty-catch)
+                      }
+                  };
+                  bool proof_stamped = false;
+                  try {
+                      if (auth_mgr_ && session->auth_source == "local") {
+                          const auto cookie_token = AuthRoutes::extract_session_cookie(req);
+                          if (!cookie_token.empty()) {
+                              const auto cookie_session = auth_mgr_->validate_session(cookie_token);
+                              if (cookie_session && cookie_session->auth_source == "local" &&
+                                  cookie_session->username == session->username) {
+                                  if (stamp_fault_hook_) // test seam, empty in production
+                                      stamp_fault_hook_();
+                                  proof_stamped = auth_mgr_->mark_session_mfa_verified(cookie_token);
+                              }
+                          }
+                      }
+                  } catch (const std::exception& ex) {
+                      proof_stamped = false;
+                      note_stamp_threw(ex.what());
+                  } catch (...) {
+                      proof_stamped = false;
+                      note_stamp_threw(nullptr);
+                  }
+                  audit_fn_(req, "mfa.enroll.verified", "ok", "User", session->username,
+                            proof_stamped ? "step_up_proof=stamped" : "step_up_proof=not_stamped");
                   audit_fn_(req, "mfa.recovery_codes.generated", "ok", "User",
                             session->username, "10 codes issued");
                   set_no_store(res);
@@ -6705,6 +6983,14 @@ void SettingsRoutes::register_routes(
                   auto session = auth_fn_(req, res);
                   if (!session || session->username.empty()) {
                       res.status = 401;
+                      return;
+                  }
+                  // MFA step-up gate. Minting a fresh recovery-code set hands the caller a
+                  // credential that satisfies the step-up challenge itself, and disabling MFA removes
+                  // the factor the gate checks; both need a fresh proof first. Before any mutation.
+                  if (step_up_fn_ &&
+                      !step_up_fn_(req, res, *session, "POST /api/settings/mfa/recovery-codes")) {
+                      toast_step_up_refusal(res);
                       return;
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
@@ -6740,6 +7026,13 @@ void SettingsRoutes::register_routes(
                   auto session = auth_fn_(req, res);
                   if (!session || session->username.empty()) {
                       res.status = 401;
+                      return;
+                  }
+                  // MFA step-up gate (see recovery-codes above): stripping the factor the gate
+                  // checks needs a fresh proof. Before the enforcement guard and any mutation.
+                  if (step_up_fn_ &&
+                      !step_up_fn_(req, res, *session, "POST /api/settings/mfa/disable")) {
+                      toast_step_up_refusal(res);
                       return;
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;

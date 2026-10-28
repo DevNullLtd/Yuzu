@@ -139,6 +139,15 @@ holds key material, only metadata; see "Key custody + threat model" below. Table
   future migration backfilling a `ca_issued` column must skip revoked rows (or
   disable the trigger inside that migration's own transaction), and pruning
   expired revoked rows would need a deliberate change to the trigger.
+- Three read-only indexes on `ca_issued` (Postgres migration v5, ADR-0070 D13), additive only:
+  `(sort key, serial_hex)` range indexes on `not_after` (active rows), `revoked_at` (revoked rows)
+  and `issued_at`, each including the columns its counts read. They back the Yuzu-issued
+  certificate counts, which read only the active, recently revoked and recently issued rows
+  rather than every certificate ever issued, and the keyset-paged certificate list behind them.
+  The counts and the list are read-only `CaStore` queries over `ca_issued`, evaluated against the
+  database clock (`now()`), and never write to the CA. The build blocks `ca_issued` writes while
+  it runs, and the HTTP listener (health probes included) stays closed until it finishes (see
+  `docs/user-manual/upgrading.md`).
 
 Invariants: `key_ref` is opaque (pass to `load_key`, never parse). `revoke()` uses `RETURNING` for
 change detection — never `sqlite3_changes()`-style counting (#1033's Postgres analogue: trust
@@ -186,7 +195,8 @@ callback so `ca_routes` links no `x509_ca`/`key_provider`.
 |---|---|---|
 | `GET /api/v1/ca/root` | **public** | CA root certificate (PEM). Public by definition — clients/browsers need it to trust the install. |
 | `GET /api/v1/ca/crl` | **public** | Current CRL (DER, `application/pkix-crl`). Served from the latest *published* CRL (cheap + DoS-safe — not rebuilt/signed per request); built on first access. |
-| `GET /api/v1/ca/issued` | `Security:Read` | Issued-cert inventory (JSON: serial, subject, SAN, purpose, status, expiry, issued_by). `limit`/`offset` query params. |
+| `GET /api/v1/ca/issued` | `Security:Read` | Issued-cert inventory (JSON: serial, subject, SAN, purpose, status, expiry, issued_by; `meta` also carries `crl_version`, `crl_published_at`, `crl_next_update`, `crl_revoked_count`, `crl_stale`, mirrored at the top level of MCP `list_issued_certs`). `limit`/`offset` query params. Fleet-wide per-agent data, so a management-group-**confined** caller is refused `403` (no permission named) and the call is audited `crypto.ca.certificates.view` (`denied` / `success` / `failure`); a caller with no `Inventory:Read` grant at all is refused too (`withheld=refused`), and a read failure inside the access check is a retryable `503 access check unavailable`, never the list. With any of `kind`/`days`/`week`/`bucket`/`as_of`/`cursor` it is the filtered list behind one `/crypto` count. See [crypto.md](user-manual/crypto.md#access). |
+| `GET /settings/pki` (page) with fragments `GET /fragments/settings/ca?view=pki` and `GET /fragments/settings/kek` | admin (page); `Security:Read` (fragments) | **Settings → Certificates and secrets**: CA, revocation (with a *Current* / *Out of date* / *Expired list* / *Not confirmed current* status) and issued-certificate panels, plus a read-only key-encryption-key status panel. Read-only views over the routes above (the issued-certificate list in the CA panel is withheld from a confined caller and from one holding no `Inventory:Read` grant, with a note in its place; the CA details, downloads and import form are still shown); the KEK fragment is the dashboard view of `GET /api/v1/secrets/kek/status` (MCP `get_kek_status`). Revoke and import keep their existing wrappers. |
 | `POST /api/v1/ca/revoke` | `Security:Delete` | Revoke a serial (`{"serial_hex","reason"}`), then republish the CRL. |
 
 **MCP parity (A1).** The inventory + revoke operations are also exposed as MCP
@@ -198,6 +208,10 @@ MCP tier ladder: `list_issued_certs` (a `Read`) runs on every tier including
 where it is approval-gated exactly like every other destructive MCP op (so an
 autonomous worker cannot revoke without the approval workflow — the same
 platform-wide approval-gated-execution boundary, not a CA-specific carve-out).
+`list_issued_certs` applies the same confinement check as the route (both forms): a confined
+caller, or one with no `Inventory:Read` grant, gets permission-denied (-32003), an unavailable
+check (including a read failure inside it) is a retryable internal error, and
+each call writes `crypto.ca.certificates.view` plus `mcp.list_issued_certs`.
 
 Audit actions: `ca.cert.issued` (PR3, at enrollment), `ca.cert.revoked`,
 `ca.crl.published`, plus `ca.cert.reissue_blocked` (PR3 H-2 revoked-identity
@@ -674,7 +688,7 @@ admission verifies by key+DN (`is_yuzu_issued`→`verify_chain`), revocation by 
 root (empty in Builtin → M1 single-cert behaviour unchanged).
 
 **Surfaces:** REST `GET /api/v1/ca/root-csr` (`Security:Read`) + `POST
-/api/v1/ca/import-chain` (`Security:Write`); the **Settings → Internal CA** panel
+/api/v1/ca/import-chain` (`Security:Write`); the **Settings → Certificates and secrets** page (or the **Settings → Internal CA** panel)
 shows a Trust-mode badge + the CSR download + an import form (the dashboard
 wrapper `/api/settings/ca/import-chain` is CSRF-gated like revoke). Audit:
 `ca.root_csr.exported`, `ca.subordinate.imported`.

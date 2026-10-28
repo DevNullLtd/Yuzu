@@ -64,7 +64,7 @@ attempts, all failed:
   step 1 returns true for **every** agent → the per-row filter is a no-op → sees the whole fleet.
   *(UAT: admin saw agent-1 + agent-2.)*
 - **Confined operator** (`Operator@G1`): the global gate is `check_permission`, which consults only
-  `principal_roles` (user) ∪ RBAC `group_members` (`collect_roles_locked`, `rbac_store.cpp:930-952`)
+  `principal_roles` (user) ∪ RBAC `group_members` (`collect_roles_locked`, `rbac_store.cpp:930-952`; since renamed `collect_roles_accounted`, which counts a failed role query as a read degrade, #4990)
   — **never** the management-group `GroupRoleAssignment`s. So the confined operator is **403'd at the
   gate** and never reaches the filter. *(UAT: opA → 403 on `/api/responses/*`, `/api/agents`,
   `/fragments/devices/list`.)*
@@ -164,7 +164,7 @@ RbacStore::authorize_list_read(user, securable, op) -> DenyAll | AdmitAll | Admi
   403 / audit envelope: `AuthRoutes::require_list_read` (REST, sibling to `require_scoped_permission`
   and to the `rest_audit.hpp` #1647 chokepoint precedent), the MCP equivalent, the dashboard
   equivalent.
-- `DenyAll` → 403 (REST) / empty (dashboard). `AdmitAll` → unfiltered read (global holder).
+- `DenyAll` → 403 (REST) / empty (dashboard); since 2026-10-24 a `DenyAll` carrying `read_failed` (a read inside the check failed) is a retryable 503 on the shared gates (see the CA bullet below). `AdmitAll` → unfiltered read (global holder).
   `AdmitScoped(set)` → the route reads **only** `set` (preferably pushed into SQL `WHERE agent_id IN
   (...)`).
 - For **aggregates** (`aggregate_responses`) and **paginated** reads (#1550), the visible set MUST be
@@ -348,6 +348,12 @@ gate.
     `guardian_observations` rows (the per-application and per-version top-N membership) that is
     **not yet confined per-caller**. It publishes only distinct-device COUNTs, never an `agent_id`.
     The per-caller SQL slice is the same work item, tracked as #5090.
+- **CA issued-certificate reads** (`GET /api/v1/ca/issued` both forms, MCP `list_issued_certs`, the
+  `/crypto` drill, the Settings certificate panel's inventory): see the ADR-0070 Update
+  (2026-10-24). These are the exception to the "Out of scope" paragraph below, which lists CA
+  routes as global-gated. A read failure inside the check is answered 503 through
+  `ListReadAuthorization::read_failed`, so INV-1 and INV-5 hold; a caller with no grant is refused.
+  (The 2026-10-23 exception, tracked as #6382, is closed by that Update.)
 
 ### Out of scope (global by design)
 

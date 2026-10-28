@@ -219,6 +219,11 @@ public:
 
     bool is_open() const;
 
+    /// The two rotation constants a UI must mirror to draw the right controls. Exposed so the
+    /// Tokens page reads the store's values instead of keeping copies that could drift.
+    static constexpr int64_t rotation_grace_secs() { return kRotationGraceSecs.count(); }
+    static constexpr int64_t overlap_floor_secs() { return kOverlapFloorSecs; }
+
     /// Create a new API token. Returns the raw token string (shown to user once).
     /// If scope_service is non-empty, the token is scoped to that IT service.
     /// If mcp_tier is non-empty, the token is an MCP token with the given tier.
@@ -292,8 +297,10 @@ public:
     /// Active credentials for one principal: not revoked AND (expires_at==0
     /// OR expires_at>now). `token_hash` is masked ('') same as `list_tokens`.
     /// Used to enforce the design doc §7 "at most two active credentials"
-    /// ceiling and to drive `rotate_engine_credential`'s state machine, and
-    /// by the admin console to show live credential counts.
+    /// ceiling and to drive `rotate_engine_credential`'s state machine. A caller
+    /// that DISPLAYS or DECIDES on the result must use the checked twin below, unless
+    /// it deliberately treats an empty vector as "could not read" (as the two token
+    /// rotate routes do): this accessor reads a store fault as an empty vector.
     [[nodiscard]] std::vector<ApiToken>
     list_active_for_principal(const std::string& principal_id) const;
 
@@ -364,9 +371,13 @@ public:
     ///                per-reveal audit + step-up re-validation that gates a
     ///                replay happen at the ROUTE layer, not here. Once the
     ///                grace window lapses (or the cache entry is gone),
-    ///                rejected — the caller falls back to the compromise
-    ///                runbook (principal-level revoke) or an explicit
-    ///                re-mint, never an indefinite retry.
+    ///                rejected; the caller resolves the stuck pair by
+    ///                revoking the SUCCESSOR credential (the surviving
+    ///                predecessor then becomes a standalone credential via
+    ///                resolve_rotation_pair_after_revoke) and rotating
+    ///                again, never an indefinite retry. Principal-level
+    ///                revoke is terminal: it is the compromise runbook,
+    ///                not the stuck-pair remedy.
     ///   >2 active -> defensive rejection; this function's own 1-active arm
     ///                is the only mint path it drives, so this state means a
     ///                credential was minted outside `rotate_engine_credential`
@@ -1275,8 +1286,9 @@ private:
     // Raw secret cache for the rotation grace window, keyed by
     // `rotation_group`. RAM-only, process-local — the raw value is NEVER
     // persisted (same one-time-reveal contract as `create_token`), and a
-    // process restart forfeits re-serve (acceptable per §7: the caller falls
-    // back to an explicit re-mint or the compromise runbook). `raw` reveal
+    // process restart forfeits re-serve (acceptable per §7: the caller revokes
+    // the successor credential and rotates again; principal-level revoke is
+    // terminal and is the compromise runbook, not the remedy). `raw` reveal
     // is refused (by `try_reserve`, on lookup) once older than
     // `kRotationGraceSecs`, and the plaintext itself is actively scrubbed
     // (`yuzu::secure_zero`, not just left unreachable) by

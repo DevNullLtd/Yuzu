@@ -91,6 +91,7 @@ curl -s -b cookies.txt \
 
 # Validate YAML without saving
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/validate-yaml \
   --data-urlencode "yaml_source@definitions/process-list.yaml"
 ```
@@ -285,7 +286,7 @@ spec:
 
 | Field | Description |
 |---|---|
-| `minAgentVersion` | Agents below this version are skipped during dispatch (error `4003`). |
+| `minAgentVersion` | Declared and exported; not compared at dispatch today, so an older agent is NOT skipped and error `4003` is not raised. |
 | `requiredPlugins` | Agents missing any listed plugin are skipped (error `4001`). |
 
 ---
@@ -601,7 +602,94 @@ When a user (or MCP tool) executes an instruction that requires approval:
 
 The submitter cannot approve their own request. A different user with the appropriate role must review it.
 
+### Who can approve
+
+Approving or rejecting a request is an act of human review, so the server asks for more than the
+`Approval:Approve` permission. The same rules apply to the dashboard Approvals page, which posts to
+the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject`:
+
+- **An interactive browser session.** The reviewer must be signed in through the sign-in page with a
+  local account or OIDC single sign-on, and the request must carry that session cookie. An API token or an MCP
+  token is refused with `403` and an A4 error envelope, however much it is permitted to do
+  elsewhere.
+- **A fresh MFA step-up.** Approve and reject are step-up endpoints, like token creation and role
+  changes. If the session's MFA proof is older than `--mfa-step-up-window-secs` (default 300), the
+  request returns `401` with `meta.mfa_step_up_required: true`; the dashboard prompts for the code
+  inline, and a script posts the code to `/login/mfa/stepup` and retries (see
+  [Step-up on high-risk surfaces](authentication.md#step-up-on-high-risk-surfaces-pr-2)). **Read
+  "fresh MFA step-up" with its limit.** As on every step-up endpoint, the gate cannot demand a factor
+  an account does not have, so it passes without a second factor for: a local account with no
+  enrolled MFA factor (the gate itself passes it in every `--mfa-enforcement` mode; `required`, and
+  `admin-only` for admins, make login force enrolment first, so in practice this is any account under
+  `optional` and a non-admin under `admin-only`); an SSO account whose identity provider did not
+  assert MFA (`amr`), **unless `--mfa-enforcement=required`** (under `admin-only` it still passes for
+  a non-admin role); and any session when `--mfa-step-up-window-secs=0`. To make a fresh factor
+  mandatory for every approver, run with `--mfa-enforcement=required`, and know its prerequisite and
+  cost first: your identity provider must assert an MFA-method `amr` for approvers, and an SSO session
+  without one gets `401` and loops through re-sign-in at EVERY step-up endpoint (token creation, user and
+  role management, Guardian writes, software deploy, JIT elevation), not only approval, so check `amr`
+  before you enable it; the way back is restarting the server in `optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards), not just any non-`required` mode, because an
+  `amr`-less OIDC admin is still gated under `admin-only` (see
+  [MFA on SSO sessions](authentication.md#mfa-on-sso-sessions-pr-3) and the
+  [recovery runbook](../ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)). Every local user must also enrol at
+  login. SAML users are refused at step-up gates in every mode, so `required` does not change that. A requirement that the approver
+  specifically holds an enrolled factor, whatever the enforcement mode, is tracked in #6079.
+- **A human principal.** An engine principal is never admitted.
+- **Not the submitter.** Unchanged: the reviewer cannot be the person who submitted the request
+  (HTTP 400, audited as denied).
+- **Not a SAML session.** MFA step-up is not available for SAML sessions (#4935), so a user who
+  signed in through SAML is refused with `403` while step-up is on. Approvers who use SAML cannot
+  approve until they sign in with a local account or OIDC, or step-up is disabled (next point).
+  **A deployment where every approver signs in through SAML has no working approver path** until
+  they are given an OIDC provider or a local account, or you accept losing step-up fleet-wide with
+  `--mfa-step-up-window-secs=0`. Under `--auth-mode=sso-only` the only local sign-in left is the
+  break-glass account, which is not a substitute. This is a known limitation, tracked in #6098 (the
+  SAML step-up decision is #4935).
+- **If you disable step-up, assurance drops.** `--mfa-step-up-window-secs=0` turns the step-up gate
+  off for approve and reject along with every other step-up endpoint. Approval then requires only an
+  interactive session with the permission. Do not run that way if approvals are a control you rely
+  on; if you must, have a person review every `approval.approve` audit row with `result=success`
+  and check every `attempted` row that has no outcome row, comparing counts per `target_id` (each
+  decision writes a `result=attempted` row first, and a decision whose outcome row failed to write
+  leaves only that `attempted` row; see [Audit Log](audit-log.md)).
+
+**MCP clients cannot approve.** MCP callers authenticate with a bearer token and the MCP transport runs no MFA step-up, so the MCP tools
+`approve_request` and `reject_request` always return a typed refusal, whatever credential the caller used
+(a browser cookie session that reaches `/mcp/v1/` is refused too). This is an exception
+recorded in ADR-1005's exception ledger (entry 2026-10-18): human review is a human-session act. The tools stay registered, and listing
+pending approvals through MCP (`list_pending_approvals`, `get_pending_approval_count`) is
+unchanged. A supervised-tier agentic worker still gets its ticket from the first call and still
+recalls the tool with the `approval_id`; a person approves the ticket in the dashboard or over REST
+with a signed-in session.
+
+**Failure behaviour.**
+
+- If the server cannot resolve the caller's session while recording the decision, the request fails
+  closed with `503` and the request stays pending. It is no longer recorded with the reviewer
+  `unknown`.
+- The approval attempt is written to the audit log before the decision is applied. If that audit row
+  cannot be written, the request returns `503` and nothing changes (#5823).
+- An approved request that has not been used within 7 days of its review is refused when it is
+  consumed, even if no new request has been submitted since to sweep expired tickets. The check
+  uses database time. The submitter must request approval again. The status shown in the Approvals
+  tab and page, and returned by the list routes, is only rewritten to `expired` by the next approval
+  submission, so an aged approved request keeps showing `approved` until then although it can no
+  longer be used (tracked in #6098).
+
+**If the dialog says you do not have permission.** The Approvals dialog shows that one message for
+every `403`. The causes, in the order the server checks them: the request carried no same-site
+`Origin` or `Referer` (for example a reverse proxy rewrites `Host` and the public address is not
+listed in `--csrf-trusted-origin`; the server-wide same-site check answers this first, before any
+step-up); you signed in through SAML while step-up is on (the central step-up check, before the
+route handler); in the handler, you lack `Approval:Approve`. The Approve and Reject buttons are a render hint only: a SAML session is shown them and the
+route still refuses it. The Approvals tab on Instructions has no dialog: it shows the server's message
+in a toast on a `403`, "Your session expired; sign in again." on a plain `401`, and the same code prompt
+as the Approvals page on a step-up `401`, then repeats the decision once after a correct code.
+
 ### Approval API
+
+Approve and reject need a signed-in session cookie (see [Who can approve](#who-can-approve)); a bearer
+token is refused. The examples assume a session that has completed MFA step-up. A cookie-session `POST` must carry an `Origin` (or `Referer`) naming the server, as a browser sends; a request with neither, or naming another site, is refused with `403` (`--csrf-trusted-origin` entries are accepted). The error table is in the [REST API reference](rest-api.md).
 
 ```bash
 # Check pending approval count
@@ -610,13 +698,17 @@ curl -s -b cookies.txt \
 
 # Approve an execution request
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/approvals/REQ-001/approve \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Reviewed — safe to proceed."}'
 
 # Reject an execution request
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/approvals/REQ-001/reject \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Not approved for production during change freeze."}'
 ```
@@ -760,6 +852,7 @@ and `yuzu_schedule_tick_errors_total` counters.
 ```bash
 # Create a schedule — daily service check at 06:00
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/schedules \
   -H "Content-Type: application/json" \
   -d '{
@@ -774,6 +867,7 @@ curl -s -b cookies.txt \
 
 # Create a schedule — every 30 minutes
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/schedules \
   -H "Content-Type: application/json" \
   -d '{
@@ -787,12 +881,14 @@ curl -s -b cookies.txt \
 
 # Enable or disable a schedule
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/schedules/SCHED-001/enable \
   -H "Content-Type: application/json" \
   -d '{"enabled": false}'
 
 # Delete a schedule
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X DELETE http://localhost:8080/api/schedules/SCHED-001
 ```
 
@@ -850,12 +946,14 @@ Rerun creates a new execution linked to the original via `rerun_of`. Two modes:
 ```bash
 # Rerun all agents
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions/EXEC-001/rerun \
   -H "Content-Type: application/json" \
   -d '{"scope": "all"}'
 
 # Rerun only failed agents
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions/EXEC-001/rerun \
   -H "Content-Type: application/json" \
   -d '{"scope": "failed_only"}'
@@ -869,6 +967,7 @@ Cancellation records the requesting user for audit:
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions/EXEC-001/cancel
 ```
 
@@ -1102,6 +1201,7 @@ Returns validation errors without saving.
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/validate-yaml \
   -H "Content-Type: application/x-yaml" \
   --data-binary @my-definition.yaml
@@ -1277,7 +1377,7 @@ DELETE /api/schedules/{id}
 ```
 
 ```bash
-curl -s -b cookies.txt -X DELETE http://localhost:8080/api/schedules/SCHED-001
+curl -s -b cookies.txt -X DELETE http://localhost:8080/api/schedules/SCHED-001 -H "Origin: http://localhost:8080"
 ```
 
 #### Enable/disable a schedule
@@ -1288,6 +1388,7 @@ POST /api/schedules/{id}/enable
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/schedules/SCHED-001/enable \
   -H "Content-Type: application/json" \
   -d '{"enabled": true}'
@@ -1327,6 +1428,11 @@ curl -s -b cookies.txt http://localhost:8080/api/approvals/pending/count
 POST /api/approvals/{id}/approve
 ```
 
+Approve and reject need a signed-in session cookie, a fresh MFA step-up (which an account with no
+enrolled factor passes, #6079) and a same-site `Origin`/`Referer`; an API or MCP token is refused
+with `403`. See
+[Who can approve](#who-can-approve) and the error table in the [REST API reference](rest-api.md).
+
 The reviewer must be a different operator than the submitter — self-approval
 is rejected with HTTP 400 (`"reviewer cannot be the same as the submitter"`),
 and the denied attempt is recorded in the audit log. The `comment` is capped at
@@ -1334,7 +1440,9 @@ and the denied attempt is recorded in the audit log. The `comment` is capped at
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/approvals/REQ-001/approve \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Approved."}'
 ```
@@ -1347,7 +1455,9 @@ POST /api/approvals/{id}/reject
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/approvals/REQ-001/reject \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Denied — change freeze in effect."}'
 ```
@@ -1427,6 +1537,7 @@ POST /api/executions/{id}/rerun
 ```bash
 # Rerun failed agents only
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions/EXEC-001/rerun \
   -H "Content-Type: application/json" \
   -d '{"scope": "failed_only"}'
@@ -1440,6 +1551,7 @@ POST /api/executions/{id}/cancel
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions/EXEC-001/cancel
 ```
 
@@ -1456,7 +1568,7 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 | Tab | Description |
 |---|---|
 | **Definitions** | Browse, search, create, edit, and delete instruction definitions. Supports both form mode and CodeMirror YAML editor. |
-| **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, the wall-clock dispatch time in the operator's local timezone (`HH:MM:SS.mmm <TZ>`, e.g. `12:22:33.251 BST`; full ISO-8601 UTC on hover), and — on failed rows — an 80-character preview of the most recent agent error. The "Fan-out" cell shows succeeded / failed / targeted counts that update in real time as agents respond. Click any row to expand an inline drawer that **live-updates via SSE as responses arrive** — no page reload required. The drawer shows a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a responses table with a **Time** column showing the server-side response arrival time at millisecond precision (same wall-clock format as above). The drawer is keyboard-reachable via Tab and Enter/Space. The Executions page (`/executions`) takes `?definition_id=<id>` and `?status=<s>` to pre-filter the list and `?id=<execution>` to open one. |
+| **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, the wall-clock dispatch time in the operator's local timezone (`HH:MM:SS.mmm <TZ>`, e.g. `12:22:33.251 BST`; full ISO-8601 UTC on hover), and — on failed rows — an 80-character preview of the most recent agent error. The "Fan-out" cell shows succeeded / failed / targeted counts that update in real time as agents respond. Click any row to expand an inline drawer that **live-updates via SSE as responses arrive** — no page reload required. The drawer shows a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a responses table with a **Time** column showing the server-side response arrival time at millisecond precision (same wall-clock format as above). The drawer is keyboard-reachable via Tab and Enter/Space. The Executions page (`/executions`) takes `?definition_id=<id>` and `?status=<s>` to pre-filter the list and `?id=<execution>` to open one. The drawer's responses table, its live updates and the page detail omit the rows of Forensics-tier plugins (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`) for a caller without `Forensics:Read`, with no marker, and the failure preview of such a command is a short machine token; see "Forensics-tier rows" in `rest-api.md`. |
 | **Schedules** | Create, enable/disable, and delete recurring schedules. Shows next and last execution times. |
 | **Approvals** | Review pending approval requests. Approve or reject with comments. The sidebar's Approvals entry shows the pending count. A submitter cannot review their own request — a pending row you submitted shows "You submitted this — another reviewer must approve" instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
 
@@ -1585,4 +1697,4 @@ These will be expressed as additional YAML DSL constructs within an InstructionD
 
 ### Product Packs (Phase 7.9)
 
-Signed distribution bundles containing instruction sets, definitions, policy fragments, and documentation. Product packs will use Ed25519 signatures with a trust chain anchored to an organization root key. Import will support staged review before activation.
+Signed distribution bundles containing instruction sets, definitions, policy fragments, and documentation. Product packs already carry Ed25519 signatures: a pack's signature is verified at install against the key inside the pack, a pack that fails verification is rejected, and an unsigned pack is refused unless the server runs with `--allow-unsigned-packs`. A trust chain anchored to an organization root key, and staged review before activation, are still planned.

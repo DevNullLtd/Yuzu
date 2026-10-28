@@ -15,6 +15,7 @@
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace yuzu::server::rs_matcher;
@@ -263,4 +264,306 @@ TEST_CASE("matcher: a JSON unsigned cell above INT64_MAX is not read as its int6
     const std::string out = R"([{"c":18446744073709551615}])";
     CHECK(response_matches(R"({"column":"c","op":"eq","value":"18446744073709551615"})", kOk, out));
     CHECK_FALSE(response_matches(R"({"column":"c","op":"eq","value":"-1"})", kOk, out));
+}
+
+// ── declared-column matcher over plain pipe rows ─────────────────────────────
+// A plugin that is neither tar nor JSON (security.certificates.list) writes a header row
+// then pipe rows; the column is resolved from the definition's declared names, which admission
+// stores in the matcher (bind_declared_columns).
+namespace {
+const char* kCertSchema =
+    R"([{"name":"subject","type":"string"},{"name":"issuer","type":"string"},)"
+    R"({"name":"thumbprint","type":"string"},{"name":"not_before","type":"string"},)"
+    R"({"name":"not_after","type":"string"},{"name":"serial","type":"string"},)"
+    R"({"name":"store","type":"string"},{"name":"key_usage","type":"string"}])";
+
+const char* kCertHeader = "subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage";
+
+std::string cert_matcher(const std::string& column, const std::string& op,
+                         const std::string& value = {}) {
+    nlohmann::json m{{"column", column}, {"op", op}};
+    if (!value.empty())
+        m["value"] = value;
+    bind_declared_columns(m, kCertSchema, "certificates");
+    return m.dump();
+}
+
+std::string cert_output(const std::string& extra = {}) {
+    return std::string(kCertHeader) +
+           "\nCN=a|CN=DigiCert CA|aa|2020|2030|01|Root|sig"
+           "\nCN=b|CN=eMudhra Sub CA|bb|2020|2030|02|Root|sig"
+           "\nCN=c|CN=Other CA|cc|2020|2030|03|Root|sig" +
+           extra;
+}
+} // namespace
+
+TEST_CASE("matcher: declared columns resolve a plain pipe-row column", "[result_set][matcher]") {
+    const auto m = cert_matcher("issuer", "contains", "eMudhra");
+    const auto j = nlohmann::json::parse(m);
+    REQUIRE(j["declared_columns"].size() == 8);
+    REQUIRE(j["declared_columns"][1] == "issuer");
+    REQUIRE(j["plugin"] == "certificates");
+    REQUIRE(response_matches(m, kOk, cert_output()));
+    REQUIRE_FALSE(response_matches(cert_matcher("issuer", "contains", "Nonexistent"), kOk,
+                                   cert_output()));
+    REQUIRE(response_matches(cert_matcher("issuer", "eq", "CN=Other CA"), kOk, cert_output()));
+    REQUIRE_FALSE(response_matches(m, kFail, cert_output()));
+}
+
+TEST_CASE("matcher: declared columns skip the header and short status rows",
+          "[result_set][matcher]") {
+    // The header's own cells would satisfy exists/contains if it were read as data.
+    const auto exists = cert_matcher("issuer", "exists");
+    REQUIRE_FALSE(response_matches(exists, kOk, kCertHeader));
+    REQUIRE_FALSE(response_matches(exists, kOk, std::string(kCertHeader) + "\nstatus|not_found"));
+    REQUIRE_FALSE(response_matches(cert_matcher("issuer", "contains", "issuer"), kOk,
+                                   std::string(kCertHeader) + "\n"));
+    REQUIRE_FALSE(response_matches(exists, kOk, "not_available|no store reachable"));
+    REQUIRE(response_matches(exists, kOk, cert_output()));
+    // A short status row after real data does not change the verdict either way.
+    REQUIRE(response_matches(cert_matcher("issuer", "contains", "eMudhra"), kOk,
+                             cert_output("\nstatus|not_found")));
+    REQUIRE_FALSE(response_matches(cert_matcher("issuer", "contains", "not_found"), kOk,
+                                   "status|not_found"));
+}
+
+TEST_CASE("matcher: declared columns keep row width across an escaped pipe",
+          "[result_set][matcher]") {
+    const std::string out = std::string(kCertHeader) +
+                            "\nCN=a\\|b|CN=eMudhra CA|aa|2020|2030|01|Root|sig";
+    REQUIRE(response_matches(cert_matcher("issuer", "contains", "eMudhra"), kOk, out));
+    REQUIRE(response_matches(cert_matcher("subject", "eq", "CN=a|b"), kOk, out));
+    // An UNescaped extra pipe makes the row 9 wide: dropped, not shifted.
+    REQUIRE_FALSE(response_matches(
+        cert_matcher("issuer", "contains", "eMudhra"), kOk,
+        std::string(kCertHeader) + "\nCN=a|b|CN=eMudhra CA|aa|2020|2030|01|Root|sig"));
+}
+
+TEST_CASE("matcher: a column outside the declared list binds nothing", "[result_set][matcher]") {
+    nlohmann::json m{{"column", "nope"}, {"op", "exists"}};
+    bind_declared_columns(m, kCertSchema, "certificates");
+    REQUIRE_FALSE(m.contains("declared_columns"));
+    REQUIRE_FALSE(m.contains("plugin"));
+    nlohmann::json empty{{"column", "issuer"}, {"op", "exists"}};
+    bind_declared_columns(empty, "", "certificates");
+    REQUIRE_FALSE(empty.contains("declared_columns"));
+    nlohmann::json kind{{"kind", "any_response"}, {"column", "issuer"}};
+    bind_declared_columns(kind, kCertSchema, "certificates");
+    REQUIRE_FALSE(kind.contains("declared_columns"));
+}
+
+TEST_CASE("matcher: wrong-typed declared_columns / plugin match nobody", "[result_set][matcher]") {
+    const auto good = nlohmann::json::parse(cert_matcher("issuer", "exists"));
+    for (const auto& bad : {nlohmann::json("issuer"), nlohmann::json::array({1, 2}),
+                            nlohmann::json::object()}) {
+        auto m = good;
+        m["declared_columns"] = bad;
+        REQUIRE_FALSE(response_matches(m.dump(), kOk, cert_output()));
+    }
+    auto m = good;
+    m["plugin"] = 5;
+    REQUIRE_FALSE(response_matches(m.dump(), kOk, cert_output()));
+}
+
+TEST_CASE("matcher: admission refuses caller-supplied server-authored keys",
+          "[result_set][matcher]") {
+    const auto dc = validate_matcher(R"({"column":"issuer","op":"exists","declared_columns":["issuer"]})");
+    REQUIRE(dc);
+    CHECK(dc->find("declared_columns") != std::string::npos);
+    const auto pl = validate_matcher(R"({"column":"issuer","op":"exists","plugin":"x"})");
+    REQUIRE(pl);
+    CHECK(pl->find("plugin") != std::string::npos);
+    REQUIRE_FALSE(validate_matcher(R"({"column":"issuer","op":"exists"})"));
+}
+
+TEST_CASE("matcher: declared columns leave tar and json matching unchanged",
+          "[result_set][matcher]") {
+    nlohmann::json m{{"column", "pid"}, {"op", "eq"}, {"value", "1000"}};
+    bind_declared_columns(m, kCertSchema, "certificates"); // pid not declared: unchanged
+    REQUIRE(response_matches(m.dump(), kOk, tar_rows(2)));
+    REQUIRE(response_matches(R"({"column":"sha256","op":"eq","value":"x"})", kOk,
+                             R"([{"sha256":"x"}])"));
+}
+
+// ── declared columns wider than a key/value plugin's key + remainder schema (#5624) ──
+// find_by_hash declares row_kind/path/size on the key/value `filesystem` plugin and OPTS IN to an
+// every-pipe split with `discriminator: true` on its first column. The matcher then takes a row
+// as a data row only when its field count equals the declared width, so the 9-field
+// `truncated|...` trailer and the 2-field `matches_found|N` summary are never data rows. A
+// definition without the key (search, search_dir, a stored 0.3.0 find_by_hash) keeps the
+// key + remainder split and never matches a wider declaration.
+// The schemas are literal copies (this binary has no YAML loader), in the object form
+// embed_content.py stores; the shipped find_by_hash definition is pinned to the same names, types,
+// row_kind values and `discriminator` by tests/test_filesystem_definition.py.
+namespace {
+const char* kFindByHashSchema =
+    R"({"columns":[{"name":"row_kind","type":"string","discriminator":true},)"
+    R"({"name":"path","type":"string"},{"name":"size","type":"int64"}]})";
+
+// find_by_hash 0.3.0 as an upgraded server still stores it: no discriminator.
+const char* kFindByHash030Schema =
+    R"({"columns":[{"name":"path","type":"string"},{"name":"size","type":"int64"},)"
+    R"({"name":"matches_found","type":"int32"}]})";
+
+// content/definitions/t2_capabilities.yaml: three declared columns, wire rows `match|<line>|<text>`
+// and `result|<path>|<type>` (a three-field row whose leading tag is not a declared column).
+const char* kSearchSchema =
+    R"({"columns":[{"name":"line_number","type":"int32"},{"name":"content","type":"string"},)"
+    R"({"name":"total_matches","type":"int32"}]})";
+const char* kSearchDirSchema =
+    R"({"columns":[{"name":"path","type":"string"},{"name":"entry_type","type":"string"},)"
+    R"({"name":"total_matches","type":"int32"}]})";
+
+// The verbatim trailer filesystem_find_by_hash.hpp writes (nine fields).
+const char* kTrailer = "truncated|deadline|visited=5|hashed=9|skipped_unreadable=1|"
+                       "skipped_symlink=0|skipped_not_regular=0|skipped_oversize=0|"
+                       "skipped_network_mount=0";
+
+const char* kHitOutput = "match|/etc/hosts|413\n"
+                         "truncated|deadline|visited=5|hashed=9|skipped_unreadable=1|"
+                         "skipped_symlink=0|skipped_not_regular=0|skipped_oversize=0|"
+                         "skipped_network_mount=0\n"
+                         "matches_found|1";
+
+// A device with no hit that skipped one entry: only the trailer and the zero count.
+const char* kZeroHitOutput = "truncated|none|visited=5|hashed=0|skipped_unreadable=0|"
+                             "skipped_symlink=1|skipped_not_regular=0|skipped_oversize=0|"
+                             "skipped_network_mount=0\n"
+                             "matches_found|0";
+
+// One column matcher through the production bind + evaluate path.
+bool matches(const char* schema, const std::string& column, const std::string& op,
+             const std::string& value, std::string_view output) {
+    nlohmann::json m{{"column", column}, {"op", op}};
+    if (!value.empty())
+        m["value"] = value;
+    bind_declared_columns(m, schema, "filesystem");
+    return response_matches(m.dump(), kOk, output);
+}
+
+bool find_by_hash_matches(const std::string& column, const std::string& op,
+                          const std::string& value = {}, const char* output = kHitOutput) {
+    return matches(kFindByHashSchema, column, op, value, output);
+}
+} // namespace
+
+TEST_CASE("matcher: a definition that declares a row discriminator matches match rows by "
+          "declared position",
+          "[result_set][matcher]") {
+    CHECK(find_by_hash_matches("row_kind", "eq", "match"));
+    CHECK(find_by_hash_matches("path", "contains", "/etc/hosts"));
+    CHECK(find_by_hash_matches("path", "exists"));
+    CHECK(find_by_hash_matches("size", "eq", "413"));
+    CHECK_FALSE(find_by_hash_matches("path", "contains", "/etc/passwd"));
+    CHECK_FALSE(find_by_hash_matches("size", "eq", "414"));
+}
+
+TEST_CASE("matcher: the trailer and the matches_found summary are not data rows (strict width)",
+          "[result_set][matcher]") {
+    // Neither row has three fields, so neither can satisfy a column matcher.
+    CHECK_FALSE(find_by_hash_matches("row_kind", "eq", "truncated"));
+    CHECK_FALSE(find_by_hash_matches("row_kind", "eq", "matches_found"));
+    CHECK_FALSE(find_by_hash_matches("size", "contains", "skipped_unreadable=1"));
+
+    // A zero-hit device that skipped an entry is NOT selected by an `exists` matcher: the trailer
+    // must not read as a match row.
+    CHECK_FALSE(find_by_hash_matches("path", "exists", {}, kZeroHitOutput));
+    CHECK_FALSE(find_by_hash_matches("size", "exists", {}, kZeroHitOutput));
+    CHECK_FALSE(find_by_hash_matches("row_kind", "exists", {}, kZeroHitOutput));
+    CHECK_FALSE(find_by_hash_matches("path", "contains", "none", kZeroHitOutput));
+    CHECK_FALSE(find_by_hash_matches("row_kind", "eq", "match", kTrailer));
+
+    // The unreadable-mount-table signal row has one value, so it is not a data row either.
+    CHECK_FALSE(find_by_hash_matches("row_kind", "exists", {},
+                                     "network_mount_guard|unavailable\nmatches_found|0"));
+}
+
+TEST_CASE("matcher: the discriminator is stored only from the definition and only when true",
+          "[result_set][matcher]") {
+    nlohmann::json opted{{"column", "path"}, {"op", "exists"}};
+    bind_declared_columns(opted, kFindByHashSchema, "filesystem");
+    CHECK(opted["row_discriminator"] == true);
+
+    // The array form of result_schema binds the same way.
+    nlohmann::json array_form{{"column", "path"}, {"op", "exists"}};
+    bind_declared_columns(array_form,
+                          R"([{"name":"row_kind","type":"string","discriminator":true},)"
+                          R"({"name":"path","type":"string"},{"name":"size","type":"int64"}])",
+                          "filesystem");
+    CHECK(array_form["row_discriminator"] == true);
+
+    // Absent, false, non-boolean, or on a later column: not opted in.
+    for (const char* schema :
+         {kSearchSchema,
+          R"({"columns":[{"name":"line_number","type":"int32","discriminator":false}]})",
+          R"({"columns":[{"name":"line_number","type":"int32","discriminator":"true"}]})",
+          R"({"columns":[{"name":"x","type":"string"},)"
+          R"({"name":"line_number","type":"int32","discriminator":true}]})"}) {
+        CAPTURE(schema);
+        nlohmann::json m{{"column", "line_number"}, {"op", "exists"}};
+        bind_declared_columns(m, schema, "filesystem");
+        REQUIRE(m.contains("declared_columns"));
+        CHECK_FALSE(m.contains("row_discriminator"));
+    }
+
+    // A caller may not supply it, and a wrong-typed stored value matches nobody.
+    const auto refused =
+        validate_matcher(R"({"column":"path","op":"exists","row_discriminator":true})");
+    REQUIRE(refused.has_value());
+    CHECK(refused->find("row_discriminator") != std::string::npos);
+    nlohmann::json bad = nlohmann::json::parse(opted.dump());
+    bad["row_discriminator"] = "yes";
+    CHECK_FALSE(response_matches(bad.dump(), kOk, "match|/etc/hosts|413"));
+}
+
+TEST_CASE("matcher: real search and search_dir rows never bind one position off without the "
+          "opt-in (#5624 review)",
+          "[result_set][matcher]") {
+    // `search` emits `match|<line>|<content>` against declared line_number/content/total_matches;
+    // `search_dir` emits `result|<path>|<type>` against path/entry_type/total_matches. The leading
+    // tag is not a declared column, so a three-cell split would read every cell one position
+    // early. Without the opt-in these rows split to key + remainder and never match.
+    const std::string search =
+        "match|19|# localhost name resolution is handled within DNS itself.\ntotal_matches|1";
+    CHECK_FALSE(matches(kSearchSchema, "content", "eq", "19", search));
+    CHECK_FALSE(matches(kSearchSchema, "content", "eq", "benign", search));
+    CHECK_FALSE(matches(kSearchSchema, "line_number", "eq", "match", search));
+    CHECK_FALSE(matches(kSearchSchema, "line_number", "eq", "19", search));
+    CHECK_FALSE(matches(kSearchSchema, "content", "contains", "localhost", search));
+
+    const std::string search_dir = "result|/tmp/foo|directory\ntotal_matches|1";
+    CHECK_FALSE(matches(kSearchDirSchema, "path", "eq", "result", search_dir));
+    CHECK_FALSE(matches(kSearchDirSchema, "path", "eq", "/tmp/foo", search_dir));
+    CHECK_FALSE(matches(kSearchDirSchema, "entry_type", "eq", "/tmp/foo", search_dir));
+    CHECK_FALSE(matches(kSearchDirSchema, "entry_type", "eq", "directory", search_dir));
+}
+
+TEST_CASE("matcher: a stored find_by_hash 0.3.0 definition keeps the old never-match behaviour",
+          "[result_set][matcher]") {
+    // 0.3.0 declares path/size/matches_found and carries no discriminator, so `path eq match`
+    // must not read the leading tag of a 0.4.0-agent match row as the path.
+    CHECK_FALSE(matches(kFindByHash030Schema, "path", "eq", "match", kHitOutput));
+    CHECK_FALSE(matches(kFindByHash030Schema, "path", "contains", "/etc/hosts", kHitOutput));
+    CHECK_FALSE(matches(kFindByHash030Schema, "size", "eq", "413", kHitOutput));
+}
+
+TEST_CASE("matcher: list_dir's four-field wire row is not a row of its three declared columns",
+          "[result_set][matcher]") {
+    // list_dir does not opt in, so its `entry|name|type|size` row splits to key + remainder.
+    nlohmann::json m{{"column", "entry_name"}, {"op", "eq"}, {"value", "entry"}};
+    bind_declared_columns(m,
+                          R"([{"name":"entry_name","type":"string"},)"
+                          R"({"name":"entry_type","type":"string"},)"
+                          R"({"name":"entry_size","type":"int64"}])",
+                          "filesystem");
+    CHECK_FALSE(response_matches(m.dump(), kOk, "entry|foo.txt|file|12"));
+}
+
+TEST_CASE("matcher: a two-column definition over a key/value plugin is unchanged",
+          "[result_set][matcher]") {
+    nlohmann::json m{{"column", "value"}, {"op", "eq"}, {"value", "ok"}};
+    bind_declared_columns(m, R"([{"name":"key","type":"string"},{"name":"value","type":"string"}])",
+                          "filesystem");
+    CHECK(response_matches(m.dump(), kOk, "status|ok"));
+    CHECK_FALSE(response_matches(m.dump(), kOk, "status|no"));
 }

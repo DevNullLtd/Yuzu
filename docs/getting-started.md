@@ -30,6 +30,8 @@ Here are the key concepts you will use in this tutorial:
 
 - **InstructionSet** -- A permission boundary that groups related definitions together and declares which roles can author, execute, and approve the definitions it contains.
 
+The `/api/v1` REST routes are described in the API reference at `http://localhost:8080/swagger`, which lists each operation with its parameters, bodies and responses and opens each group with a guide. It needs the `Infrastructure:Read` permission (with RBAC switched off, any signed-in account passes), has no menu entry, and is linked from Settings > Developer and API, which only administrators can open. The `/api/...` dashboard-session routes used in this tutorial (such as `/api/command` and `/api/instructions/yaml`) are not in that reference; see the [REST API reference](user-manual/rest-api.md) for them.
+
 Let's build all of this up, one step at a time.
 
 ---
@@ -114,6 +116,7 @@ Now dispatch the command to all connected agents:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/command \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -229,6 +232,7 @@ Expected response:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/command \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -522,9 +526,13 @@ Expected response:
 
 **4. Approve it.**
 
+Approving needs a signed-in session cookie from a different user than the submitter (an API token is refused with `403`) and a fresh MFA step-up (an account with no enrolled MFA factor passes the step-up, so enrol your approvers; see #6079). If the server answers `401` with `meta.mfa_step_up_required`, post your code to `/login/mfa/stepup` on the same cookie and retry. A cookie-session `POST` must also carry an `Origin` (or `Referer`) naming the server, as a browser sends; a request with neither is refused with `403`. See [Who can approve](user-manual/instructions.md#who-can-approve).
+
 ```bash
 curl -s -X POST http://localhost:8080/api/approvals/d4e5f6a7-.../approve \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Approved for maintenance window"}'
 ```
@@ -543,7 +551,9 @@ If the action should not proceed, reject it instead:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/approvals/d4e5f6a7-.../reject \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Not approved -- outside maintenance window"}'
 ```
@@ -689,6 +699,7 @@ Before using a scope expression in a command, you can validate its syntax:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/scope/validate \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"expression": "ostype == \"windows\""}'
@@ -712,6 +723,7 @@ Before dispatching to a large fleet, check how many agents the scope expression 
 
 ```bash
 curl -s -X POST http://localhost:8080/api/scope/estimate \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"expression": "ostype == \"windows\""}'
@@ -731,6 +743,7 @@ Use the `scope` field in the command request to target specific agents:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/command \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -780,6 +793,7 @@ Schedule the service inspect instruction to run every 15 minutes:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/schedules \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -828,6 +842,7 @@ Expected response:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/schedules/f6a7b8c9-.../enable \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"enabled": false}'
@@ -845,6 +860,7 @@ Expected response:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/schedules/f6a7b8c9-.../enable \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"enabled": true}'
@@ -854,6 +870,7 @@ curl -s -X POST http://localhost:8080/api/schedules/f6a7b8c9-.../enable \
 
 ```bash
 curl -s -X DELETE http://localhost:8080/api/schedules/f6a7b8c9-... \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
@@ -990,6 +1007,7 @@ Rerun an execution (optionally targeting only failed agents):
 
 ```bash
 curl -s -X POST http://localhost:8080/api/executions/EXECUTION_ID/rerun \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"scope": "failed_only"}'

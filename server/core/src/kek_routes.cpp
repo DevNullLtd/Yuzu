@@ -1,5 +1,6 @@
 #include "kek_routes.hpp"
 
+#include "kek_panel_render.hpp"
 #include "rest_a4_envelope.hpp"
 
 #include <nlohmann/json.hpp>
@@ -39,6 +40,22 @@ std::string iso8601_utc(std::chrono::system_clock::time_point tp) {
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
     return std::string(buf);
 }
+// "HH:MM:SS UTC" for the lock-holder capture instant shown in the status panel.
+std::string hms_utc(std::chrono::system_clock::time_point tp) {
+    std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm tm{};
+#if defined(_WIN32)
+    if (gmtime_s(&tm, &t) != 0)
+        return {};
+#else
+    if (gmtime_r(&t, &tm) == nullptr)
+        return {};
+#endif
+    char buf[32] = {};
+    std::strftime(buf, sizeof(buf), "%H:%M:%S UTC", &tm);
+    return std::string(buf);
+}
+
 // All three operations take zero parameters; the body must be absent or
 // `{}`. Cap it defensively before parsing (mirrors ca_routes.cpp's
 // kMaxRevokeBody) — a multi-GB POST must not reach nlohmann::json::parse on
@@ -337,9 +354,10 @@ void KekRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, AuditFn aud
              });
 
     // ── GET /api/v1/secrets/kek/status ── Security:Read. ──────────────────────
-    // Read-only; not audited (matches the CA read routes — GET /ca/issued
-    // etc. don't audit either). `oldest_in_use` is null when no secret rows
-    // exist at all (nothing to rewrap, trivially "complete"). #2530 B2/C1:
+    // Read-only; not audited (the CA metadata routes, /ca/root and /ca/crl, don't
+    // audit either; GET /ca/issued does, as crypto.ca.certificates.view).
+    // `oldest_in_use` is null when no secret rows exist at all (nothing to rewrap, trivially
+    // "complete"). #2530 B2/C1:
     // `live_versions`/`lock_held`/`lock_holder_pid` are diagnostic snapshots
     // taken lock-free — see the KekOpResult doc comment — and this route
     // still deliberately never takes the `secrets_kek_op` lock itself; the
@@ -397,6 +415,47 @@ void KekRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, AuditFn aud
                     {"meta", {{"api_version", "v1"}}}};
                 res.set_content(out.dump(), kJson);
             });
+
+    // ── GET /fragments/settings/kek ── System > Certificates and secrets panel ──
+    // Server-rendered status panel over the SAME `ops.status()` the REST twin above
+    // reads (twin: GET /api/v1/secrets/kek/status, MCP get_kek_status), same
+    // Security:Read gate. Never takes the KEK operation lock (status never does).
+    // A degraded read is answered 200 with a fixed sentence, not the twin's 503: htmx
+    // drops 4xx/5xx bodies, so a 503 would leave the panel on "Loading..." forever.
+    // The gate's own 403 is the only non-200.
+    sink.Get("/fragments/settings/kek",
+             [perm_fn, ops](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "Security", "Read"))
+                     return;
+                 res.set_header("Cache-Control", "no-store");
+                 kek_panel::Model m;
+                 if (ops.status) {
+                     const KekOpResult r = ops.status();
+                     switch (r.failure) {
+                     case KekOpResult::Failure::None:
+                         m.availability = kek_panel::Availability::Ready;
+                         m.active_version = r.active_version;
+                         m.oldest_in_use = r.oldest_in_use;
+                         m.rotation_complete = r.rotation_complete;
+                         m.live_versions = r.live_versions;
+                         m.lock_held = r.lock_held;
+                         m.lock_holder_pid = r.lock_holder_pid;
+                         if (r.lock_holder_captured_at)
+                             m.lock_captured_at = hms_utc(*r.lock_holder_captured_at);
+                         break;
+                     case KekOpResult::Failure::QueryCanceled:
+                         m.availability = kek_panel::Availability::QueryCanceled;
+                         break;
+                     case KekOpResult::Failure::Unavailable:
+                         m.availability = kek_panel::Availability::Unavailable;
+                         break;
+                     default:
+                         m.availability = kek_panel::Availability::Internal;
+                         break;
+                     }
+                 }
+                 res.set_content(kek_panel::render(m), "text/html; charset=utf-8");
+             });
 }
 
 } // namespace yuzu::server

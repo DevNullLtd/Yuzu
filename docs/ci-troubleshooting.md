@@ -28,8 +28,12 @@ Companion docs:
 
 **Symptom:**
 
-- `Preflight (runner health)` fails with `auth_error`, `rate_limit`,
+- `Preflight (gate)` fails with `auth_error`, `rate_limit`,
   `api_error`, or `malformed_response`.
+- `Preflight (runner health)` fails with `preflight-gate did not succeed
+  (skipped)`: `trusted_inputs` failed, so the gate never ran. Open the
+  `Preflight (gate)` job; `Re-run failed jobs` re-runs the gate and its
+  dependents.
 - Nightly preflight reports `Required runner pool unavailable: bigtam` or
   `weetam`.
 - The nightly workflow opens or updates a `nightly-broken` issue.
@@ -577,11 +581,11 @@ Full set of candidate corruption paths under `clean: false`:
 - `C:\Windows\System32\config\systemprofile\AppData\Local\vcpkg\` — LOCAL SYSTEM profile cache (mostly registry clone, not archives, but check anyway)
 
 **Fix:** `scripts/ci/recovery/probe-and-nuke-vcpkg-windows.ps1`. Run over
-SSH on the runner as the `natha` interactive user with output redirected
+SSH on the runner as the `<user>` interactive user with output redirected
 to a `.out` file:
 
 ```powershell
-pwsh C:\path\to\Yuzu\scripts\ci\recovery\probe-and-nuke-vcpkg-windows.ps1 >> C:\Users\natha\Nuke-File.out 2>&1
+pwsh C:\path\to\Yuzu\scripts\ci\recovery\probe-and-nuke-vcpkg-windows.ps1 >> $HOME\Nuke-File.out 2>&1
 ```
 
 Outputs structured `KEY: value` inventory before + nuke + after. Preserves

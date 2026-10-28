@@ -64,7 +64,7 @@ name-normalized guess. Attribution of repository/install/service signals to the
 originating app is a follow-on slice; the Apps tab today scopes to crash and
 hang signals only. The Apps API (`GET /api/v1/dex/apps`) now also carries per-version
 figures, the Windows devices online now as the population, exact intervals and the stability score with its
-decomposition (the share and rate count only affected devices that are online now, so one population on both sides, while the crash and device counts cover the whole window; the score is withheld as `offline_affected` when any affected device is offline, which on a fleet with laptops or off-hours devices will be the common case for applications with several affected devices; the figures vary with the time of day, so read the share and rate against `distinct_devices_online` / `distinct_devices`, see #5894 for an offline-aware score); the tab itself follows in a later change. The API names the score policy in force on every response (`policy`: source, revision, the four tier edges and names, and a `fault` when a stored policy document was refused), and marks each application whose tiers or weights a per-application override changed (`profile`). An invalid stored policy scores under the shipped defaults and says so, never half-applied. When the stored policy cannot be read, the last good one is used for up to 60 seconds; once it is older than that (at once when there is none) the read fails instead of scoring under a guess. The route that writes the policy ships in a later change; until then every response reports the shipped defaults, unless the `dex_score_policy` row was written directly in the database. Tab counts are all platforms; the API counts Windows devices only and keeps the 100 applications affecting the most devices (`apps_total` and `apps_truncated` report the cut), so the same application can show different crashes and devices on the two surfaces until the tab is rewired. Per-version crash/hang *counts* on the performance trend
+decomposition (the share and rate count only affected devices that are online now, so one population on both sides, while the crash and device counts cover the whole window; the score is withheld as `offline_affected` when any affected device is offline, which on a fleet with laptops or off-hours devices will be the common case for applications with several affected devices; the figures vary with the time of day, so read the share and rate against `distinct_devices_online` / `distinct_devices`, see #5894 for an offline-aware score); the tab itself follows in a later change. The API names the score policy in force on every response (`policy`: source, revision, the four tier edges and names, and a `fault` when a stored policy document was refused), and marks each application whose tiers or weights a per-application override changed (`profile`). An invalid stored policy scores under the shipped defaults and says so, never half-applied. When the stored policy cannot be read, the last good one is used for up to 60 seconds; once it is older than that (at once when there is none) the read fails instead of scoring under a guess. Write the policy with [`PUT /api/v1/dex/score-policy`](rest-api.md#get--put--delete-apiv1dexscore-policy) (and remove it with `DELETE`); there is no Settings page for it yet, and no MCP tool either (#6087). Until one is written every response reports the shipped defaults, unless the `dex_score_policy` row was written directly in the database. Tab counts are all platforms; the API counts Windows devices only and keeps the 100 applications affecting the most devices (`apps_total` and `apps_truncated` report the cut), so the same application can show different crashes and devices on the two surfaces until the tab is rewired. Per-version crash/hang *counts* on the performance trend
 (as opposed to the per-app crash/hang totals already shown here) are not
 rendered on the Apps tab; `GET /api/v1/dex/perf/app` carries them per version
 — see "Fleet-wide application performance" under Drill-downs.
@@ -276,7 +276,7 @@ numbers match.
   working set. This is a **top-N sample, not a census**: it lists devices
   where the exact app-version was among that device's own top resource
   consumers that day, not every device that has it installed (per-application
-  sampling is opt-in and only retains the top-N heaviest processes per
+  sampling only retains the top-N heaviest processes per
   device) — use the [software inventory](inventory.md) for a full install
   census instead. It also reads a **shorter retention window** than the trend
   above: per-device data (B1) keeps 31 days, the fleet trend (B2) keeps 180,
@@ -336,14 +336,15 @@ numbers match.
   the cohort comparison is withheld only when the cohort has no reporting
   devices (the floor is one device), with an honest caption.
 
-  A separate **Top applications** panel queries the device's opt-in per-app
+  A separate **Top applications** panel queries the device's per-app
   tier (`$ProcPerf_Hourly`, process **names only** — never command lines)
   behind its **own** "Load applications" click. Per-app data is usage-class
   telemetry — it observes what people run, not just how the machine behaves —
   so it carries its **own audit action (`dex.device.procperf.query`)**,
   keeping usage reads separately countable from machine-health reads. An
-  empty result states plainly that per-app sampling is **off by default** on
-  every device (or that no hourly rollup has completed yet) — the device's
+  empty result states plainly that per-app sampling (`procperf_enabled`) is
+  **on by default**, so either it has been disabled on the device or no hourly
+  rollup has completed yet — the device's
   read-only query surface deliberately hides plugin config, so the server
   does not guess which. App rows cross-link to the per-application
   reliability drill.
@@ -446,6 +447,41 @@ does (agentic-first parity):
   value.
 - **`GET /api/v1/dex/devices/{id}/app-perf?app=`** — one device's retained per-app
   history (behavioral PII; scoped + audited fail-closed, `dex.device.app_perf.view`).
+- **`GET /api/v1/dex/perf/compare?group=&app=&baseline=&candidate=&window=`**, the
+  before/after comparison for an upgrade: the shift is computed per machine for
+  the machines in one management group that ran both versions, then aggregated
+  (`window` is days each side, default 7). Evidential only, with no verdict and no
+  device floor; audited as `dex.app_perf.compare` and denied to a service-scoped
+  API token.
+- **`GET /api/v1/dex/app?name=&window=`**, one application's blast radius (crash
+  and hang summary, faulting modules, exceptions, affected devices). Audited
+  fail-closed (`dex.app.view`) and denied to a service-scoped API token, because it
+  names devices fleet-wide.
+- **`GET /api/v1/dex/apps?window=`**, the application stability list (a distinct
+  device count per application, no `agent_id`; not audited).
+- **`GET /api/v1/dex/catalogue?os=&window=`**, the Catalogue family cards, fleet
+  coverage and the uncatalogued list, and **`GET /api/v1/dex/catalogue/group?name=&os=&window=`**,
+  one signal family's member signals (404 for an unknown family). Aggregates, not
+  audited.
+- **`GET /api/v1/dex/health?weighting=&window=`**, the derived composite health
+  score, and **`GET /api/v1/dex/trends?window=`**, the cross-OS comparison and
+  per-family trend source data. Aggregates, not audited.
+- **`GET /api/v1/dex/overview?window=`**, the landing-page fleet summary including
+  the top-devices list. Audited fail-closed (`dex.overview.view`) and denied to a
+  service-scoped API token.
+- **`GET /api/v1/dex/devices/{id}`**, one device's score and signal summary
+  (`window`; scoped to the device, audited fail-closed as `dex.device.view`), and
+  **`GET /api/v1/dex/devices/{id}/history?window=`**, that device's raw signal
+  history (same scope and audit verb).
+- **`GET /api/v1/dex/devices/{id}/observations/{event_id}`**, one observation's
+  detail (scoped, audited fail-closed as `dex.observation.view`; an unknown or
+  foreign event id is a 404).
+- **`POST /api/v1/dex/devices/{id}/live?kind=uptime|processes`**, the "Get live
+  info" read: it dispatches a read-only instruction to the device and waits up to
+  about 20 seconds for the result (hence POST, not GET). Needs scoped `Read` and
+  `Execute`, audited before dispatch (`device.live.uptime` or
+  `device.live.processes`), and answers 429, 502, 503 or 504 when the device
+  cannot answer in time.
 
 The signal endpoints take a `window` of `24h`/`7d`/`30d`/`all` (and the
 catalogue rollup + per-signal drill-down additionally take the optional `os`
@@ -481,10 +517,10 @@ MCP tools (`list_dex_signals`,
 `get_dex_tag_app_perf`); the
 version-row devices drill has its own MCP twin `list_dex_app_perf_devices`
 (same `dex.app_perf.devices.view` audit, set-and-proceed on MCP); the
-per-device app-perf drill is exposed via REST **and** the dashboard device drill
-(the "Application performance over time" panel, same `dex.device.app_perf.view`
-audit) but has **no MCP twin** (MCP's set-and-proceed posture can't express the
-REST fail-closed contract). Full request/response
+per-device app-perf drill is exposed via REST, the dashboard device drill
+(the "Application performance over time" panel) and the MCP tool
+`get_dex_device_app_perf` (all three write the same `dex.device.app_perf.view`
+audit). Full request/response
 shapes are in [`rest-api.md`](rest-api.md#dex-digital-employee-experience) and
 `GET /api/v1/openapi.json`.
 

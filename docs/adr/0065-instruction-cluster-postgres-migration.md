@@ -240,6 +240,49 @@ compound cap-check + sweep + insert sequence — `consume_ticket`'s CAS and ever
 longer take it at all, since a single Postgres statement is already atomic under the target row's
 own lock.
 
+**Amendment (2026-10-18, #6061):** the paragraph above describes the sweep as written at migration
+time: two statements with app-clock cutoffs. It is no longer exact. The cutoffs are now Postgres
+`now()` evaluated in-SQL; `reviewed_at` and `consumed_at` are stamped by the database; and the
+approved-unconsumed sweep and `consume_ticket` share one liveness predicate (`ticket_live_sql()`) with
+a lower bound of 7 days and an upper bound of 300 s ahead of the database clock, so the sweep is no
+longer "the same statement" and the same predicate is also what `ticket_is_live()` evaluates. `submitted_at` is still
+stamped from the submitting process's clock (`ScheduleRunner`'s occurrence anchor compares it with
+process-clock schedule stamps), so the stale-pending sweep still compares an app-clock value with a
+database cutoff; that residual is tracked in #6096. The conclusion above (a state transition to
+`'expired'`, never a `DELETE`, so the seven-part apparatus's trigger is not met) stands. Current
+reasoning and residuals: `docs/clock-guarded-retention.md`, "`ApprovalManager` ticket liveness".
+
+**Amendment (2026-10-21, #6096):** the 2026-10-18 amendment's `submitted_at` residual is closed.
+`submit()` now authors `submitted_at` in-SQL from the same `now()` expression as every other stamp
+(`submit_stamp_epoch()` is deleted), so `approval_manager.cpp` reads no process clock and the
+stale-pending sweep compares database time with database time. The reason it had stayed
+process-stamped, `ScheduleRunner::ticket_is_current` comparing it with `ScheduleEngine`'s
+process-clock `last_executed_at`, is removed rather than worked around: one approval == at most one
+scheduled run is now a guarded state transition plus a clock-free ledger. `ApprovalManager::
+retire_schedule_tickets(schedule_id, occurrence_key, ids)` is one UPDATE keyed on `consumed_at = 0`
+and scoped to the ticket ids the runner observed in its own snapshot (database-time `consumed_at`,
+`consumed_by = 'schedule:<occurrence key>'`, or `schedule:ledger-spent:<occurrence key>` for tickets
+the outbox ledger shows an earlier occurrence used); the runner calls it after the occurrence is durably
+enqueued and before the schedule advances, and a ticket is eligible only while `consumed_at = 0`. A
+retire failure or exception holds the occurrence; the idempotent occurrence key makes the retry safe.
+The command outbox is the spent-ticket ledger: before firing, the runner reads which occurrences
+already used the ticket (`CommandOutboxStore::occurrences_for_approval`, new `outbox_approval_idx`,
+outbox schema v2) and refuses one used by an earlier occurrence, which closes mixed-version and
+skip-advance re-fires; if the current occurrence is already in the outbox and no ticket is eligible, the
+schedule advances without a fresh ask. Any future outbox reaper must retain rows for at least the 7-day
+ticket life. The retire is deliberately not epoch-fenced (the only fenced write is the outbox INSERT) and
+is safe because, on the enqueue paths, it runs only after the outbox row exists, and on the
+rejected-skip path it is an observed-ids-only CAS from unsettled, so a stale leader can only settle
+tickets it saw (the deny direction). Every retire site settles only observed ids by a CAS from
+unsettled: the enqueue and already-ran sites run after the outbox row exists, the ledger-spent site settles
+tickets whose row belongs to an earlier occurrence, and the rejected-skip site has no outbox row. Retire-ok
+with a failed advance burns one approval, accepted. `consume_ticket` still refuses `kSchedule` origins.
+`ScheduleEngine`'s own stamps stay process clock (due-ness bookkeeping, informational for approvals).
+The approvals ladder gains **v2**, a clock-free data migration that retires every pre-upgrade
+unsettled schedule ticket (`consumed_by = 'schedule:legacy-6096'`). The paragraph above
+supersedes the 2026-10-18 amendment's `submitted_at` sentence. Reasoning and accepted LOW items:
+`docs/clock-guarded-retention.md`, "`ApprovalManager` ticket liveness".
+
 **Correction (adversarial review, 2026-08-31):** "ports shape-preserved" above was true of the two
 `UPDATE` statements themselves but not of their ORDER relative to the pending-count cap check.
 Both Kimi and Codex independently found — and cross-examination confirmed unanimously — that

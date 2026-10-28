@@ -253,6 +253,18 @@ yuzu_tokens_js_embed = custom_target(
     'YuzuTokensJs',
   ],
 )
+yuzu_tokens_actions_js_embed = custom_target(
+  'yuzu_tokens_actions_js_bundle',
+  input: 'static/yuzu-tokens-actions.js',
+  output: 'yuzu_tokens_actions_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuTokensActionsJs',
+  ],
+)
 
 # Audit and reviews page (Phase 2): client glue. Symbol: kYuzuAuditJs (std::string).
 yuzu_audit_js_embed = custom_target(
@@ -309,6 +321,35 @@ yuzu_estate_js_embed = custom_target(
     '@INPUT@',
     '@OUTPUT@',
     'YuzuEstateJs',
+  ],
+)
+
+# TAR retention tier defaults (checked-in mirror of the agent's schema registry,
+# drift-tested in the tar suite). Symbol: kTarRetentionTiersTsv.
+tar_retention_tiers_tsv_embed = custom_target(
+  'tar_retention_tiers_tsv',
+  input: files('../../docs/capability-registries/tar_retention_tiers.tsv'),
+  output: 'tar_retention_tiers_tsv.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'TarRetentionTiersTsv',
+  ],
+)
+
+# TAR timeline page (hidden; /static/yuzu-tar-timeline.js). Symbol: kYuzuTarTimelineJs.
+yuzu_tar_timeline_js_embed = custom_target(
+  'yuzu_tar_timeline_js_bundle',
+  input: 'static/yuzu-tar-timeline.js',
+  output: 'yuzu_tar_timeline_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuTarTimelineJs',
   ],
 )
 
@@ -563,13 +604,16 @@ yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
    yuzu_viz_host_js_embed, yuzu_access_js_embed, yuzu_tokens_js_embed,
-   yuzu_audit_js_embed, cytoscape_js_embed, yuzu_operate_js_embed,
+   yuzu_tokens_actions_js_embed, yuzu_audit_js_embed,
+   cytoscape_js_embed, yuzu_operate_js_embed,
    yuzu_dialog_js_embed, yuzu_integrations_js_embed,
    yuzu_integrations_sync_js_embed, yuzu_operate_extras_js_embed,
    yuzu_estate_js_embed, yuzu_device_data_js_embed,
    yuzu_groups_js_embed,
    yuzu_system_js_embed,
    yuzu_developer_js_embed,
+   yuzu_tar_timeline_js_embed,
+   tar_retention_tiers_tsv_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
@@ -589,6 +633,8 @@ yuzu_server_core_lib = static_library(
     'src/auth_routes.cpp',
     'src/authz_gates.cpp',
     'src/mfa_step_up.cpp',
+    'src/route_inventory.cpp', # process-wide record of HttplibRouteSink registrations (boot-time step-up sweep)
+    'src/step_up_gate.cpp', # MFA step-up decide/render split + request chokepoint (policy table: src/step_up_policy.hpp)
     'src/mfa_qr.cpp',
     'src/totp.cpp',
     'src/auto_approve.cpp',
@@ -610,6 +656,8 @@ yuzu_server_core_lib = static_library(
     'src/access_audit_render.cpp', # Audit and reviews page: pure renderers (log, sample, retention)
     'src/access_audit_ui.cpp', # Audit and reviews page: template
     'src/access_audit_routes.cpp', # Audit and reviews page: /access/audit + fragments + glue
+    'src/access_reviews_render.cpp', # Audit and reviews page: Access reviews renderers
+    'src/access_reviews_routes.cpp', # Audit and reviews page: Access reviews fragments
     'src/login_ui.cpp',
     'src/settings_ui.cpp',
     'src/settings_security_ui.cpp',  # Security and sign-in page (System group)
@@ -627,6 +675,7 @@ yuzu_server_core_lib = static_library(
     'src/ota_signature_sidecar.cpp',
     'src/update_registry.cpp',
     'src/response_store.cpp',
+    'src/forensics_visibility.cpp', # #4990: ForensicsVisibilityFn + the production resolver
     'src/response_routes.cpp',
     'src/response_query_model.cpp', # #2146 A2-R2: shared REST v1 + MCP builder for the
                                      # instruction/command-ID-keyed response query/aggregate/export surface
@@ -672,11 +721,13 @@ yuzu_server_core_lib = static_library(
     'src/schedule_model.cpp', # ADR-0031 WS-A4: seventh per-family seam, pure JSON row builder
     'src/schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam
     'src/help_ui.cpp',
+    'src/swagger_page_ui.cpp',
     'src/home_ui.cpp',     # Home (/home): the sign-in landing page, rendered per request
     'src/home_render.cpp', # Dashboard panels: pure value structs + renderers
     'src/home_routes.cpp', # Dashboard: GET /fragments/dashboard/summary over injected seams
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
+    'src/tar_timeline_page_ui.cpp', # hidden TAR timeline page shell (flag-gated route)
     'src/result_sets_ui.cpp',
     'src/result_set_extras_render.cpp',
     'src/approvals_page_render.cpp', # Operate O1: the Approvals page's pure list renderer
@@ -701,6 +752,7 @@ yuzu_server_core_lib = static_library(
     'src/access_review_store.cpp',
     'src/session_store.cpp',
     'src/plugin_config_store.cpp',
+    'src/enablement_store.cpp', # ADR-3006: durable enablement store + continuity anchor
     'src/plugin_config_routes.cpp',
     'src/upload_grant_store.cpp',
     'src/file_retrieval_routes.cpp',
@@ -742,6 +794,9 @@ yuzu_server_core_lib = static_library(
     'src/mcp_session.cpp',
     'src/mcp_stream.cpp',
     'src/mcp_stream_bridge.cpp',
+    'src/mcp_tools_discovery.cpp',
+    'src/mcp_tools_hardware.cpp',
+    'src/mcp_tools_containment.cpp',
     'src/mcp_transport.cpp',
     'src/rest_api_v1.cpp',
     'src/compliance_model.cpp',
@@ -788,6 +843,13 @@ yuzu_server_core_lib = static_library(
     'src/sle_routes.cpp',
     'src/software_catalog_rollup.cpp',
     'src/software_catalogue_model.cpp',
+    'src/crypto_cbom.cpp',    # /crypto CBOM export: pure CycloneDX 1.7 shaper
+    'src/crypto_library_model.cpp', # /crypto slice 1: pure curated table + shared REST/MCP model
+    'src/crypto_api.cpp',     # /crypto slice 1: store-backed CryptoApi seam impl
+    'src/crypto_routes.cpp',  # /crypto slice 1: page + fragments + REST v1 route owner
+    'src/crypto_ui.cpp',      # /crypto slice 1: pure HTML renderers
+    'src/crypto_widget_catalogue.cpp', # /crypto widgets: pure catalogue + D13 windows + JSON shapers
+    'src/crypto_dashboard_layout_store.cpp', # /crypto widgets: per-operator layout (born-on-PG)
     'src/preflight_routes.cpp',
     'src/preflight_ui.cpp',
     'src/preflight_eval.cpp',
@@ -804,6 +866,7 @@ yuzu_server_core_lib = static_library(
     'src/deployment_run_store.cpp',
     'src/deployment_engine.cpp',
     'src/tar_process_tree.cpp',
+    'src/tar_timeline_render.cpp',
     'src/tar_tree_routes.cpp',
     'src/dashboard_routes.cpp',
     'src/workflow_routes.cpp',
@@ -813,6 +876,7 @@ yuzu_server_core_lib = static_library(
     'src/dashboard_api_routes.cpp',
     'src/nvd_routes.cpp',
     'src/approval_routes.cpp',
+    'src/config_write.cpp', # the transport-free core shared by the config routes (legacy + v1) and the MCP get/set_runtime_config tools
     'src/config_routes.cpp', # #2542 PR-12: the 2-route Runtime Configuration API (7.3), extracted onto the HttpRouteSink seam
     'src/diagnostics_routes.cpp', # #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API, extracted onto the HttpRouteSink seam
     'src/legacy_events_routes.cpp', # #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
@@ -915,7 +979,14 @@ yuzu_server_core_lib = static_library(
     'src/crl_publisher.cpp',
     'src/default_certs.cpp',
     'src/ca_routes.cpp',
+    'src/ca_panel_render.cpp',
     'src/kek_routes.cpp',
+    'src/settings_plugins_routes.cpp',
+    'src/settings_plugins_ui.cpp',
+    'src/plugin_page_model.cpp',
+    'src/kek_panel_render.cpp',
+    'src/pki_routes.cpp',
+    'src/settings_pki_ui.cpp',
     'src/security_headers.cpp',
   )],
   include_directories: ['include', '../../common/include'],

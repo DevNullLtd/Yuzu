@@ -228,6 +228,10 @@ public:
     /// provenance (e.g. `created_by`, audit event annotation) on a code path
     /// that has already cleared its authorization gate via require_auth or
     /// require_permission and just needs to know who's calling.
+    ///
+    /// One principal per request: once the step-up chokepoint has passed a gated request, a
+    /// resolution that lands on any other principal returns nullopt (the caller's ordinary
+    /// "no session" answer), on every credential path (`detail::step_up_binding_admits`).
     std::optional<auth::Session> resolve_session(const httplib::Request& req);
 
     /// Re-validate the credential on a HELD-OPEN stream (MCP `GET /mcp/v1/`),
@@ -266,11 +270,13 @@ public:
     /// Whether the caller holds `securable_type:operation`, for deciding what to DRAW. It runs
     /// `require_permission`'s own decision path (elevation, engine principals, MCP tier,
     /// service scope, RBAC, legacy role), so the answer cannot drift from the gate's, but it
-    /// writes no response and no `auth.permission_required` denial row: nobody attempted
-    /// anything, and a page that refreshes every few seconds would otherwise fill the audit
-    /// log with denials. NEVER a gate: an action must still pass `require_permission` (or a
-    /// scoped variant) on the request that performs it. (#5792 asks for this on the shared
-    /// auth seam; callers that still probe with the loud gate are listed there and in #5830.)
+    /// writes no response, and no `auth.permission_required` denial row for an interactive cookie
+    /// session (`denial_row_may_be_withheld`): nobody attempted anything, and a page that
+    /// refreshes every few seconds would otherwise fill the audit log with denials. A token or
+    /// engine caller keeps its row (it is `probe_permission` with the response discarded). NEVER
+    /// a gate: an action must still pass `require_permission` (or a scoped variant) on the
+    /// request that performs it. (#5792 asks for this on the shared auth seam; callers that
+    /// still probe with the loud gate are listed there and in #5830.)
     [[nodiscard]] bool has_permission(const httplib::Request& req,
                                       const std::string& securable_type,
                                       const std::string& operation);
@@ -292,6 +298,47 @@ public:
     [[nodiscard]] bool probe_permission(const httplib::Request& req, httplib::Response& res,
                                         const std::string& securable_type,
                                         const std::string& operation);
+
+    /// `probe_permission` with ONE difference: an RBAC read that could not be completed (store not
+    /// open, circuit breaker open, pool acquire timeout, a failed role or permission query) is
+    /// answered with a retryable 503 (`retry_after_ms`, no `permission` field) instead of the
+    /// fail-closed 403 that `require_permission` gives every route (ADR-0041). Same decision path
+    /// otherwise (elevation, engine principals, MCP tier, service scope, RBAC, legacy floor), same
+    /// `AuditProbeScope`. NOT a parallel evaluator and NOT a gate: it exists for the one consumer
+    /// whose correctness depends on telling "could not determine" from "definitively denied", the
+    /// Forensics-tier resolver (`resolve_forensics_visible`), where a collapsed answer would
+    /// silently serve a 200 with the Forensics rows missing. A new caller needs the same
+    /// justification; do not switch `require_permission` itself (about a hundred routes document
+    /// the 403).
+    [[nodiscard]] bool probe_permission_unavailable_aware(const httplib::Request& req,
+                                                          httplib::Response& res,
+                                                          const std::string& securable_type,
+                                                          const std::string& operation);
+
+    /// `require_list_read` for a resource that is NOT agent-scoped (plugin configuration): the same
+    /// decision (ADR-0017 admit-then-filter, elevation, engine principals, MCP tier, service
+    /// scope, RBAC, legacy), except that a management-group-CONFINED admission is refused here as
+    /// a denial: 403, `auth.permission_required` row, `admitted=false`. Such a grant has no
+    /// per-agent filter to apply, and serving the list unfiltered would widen a device-scoped
+    /// grant to fleet-wide platform configuration. The refusal is audited HERE, at the one place
+    /// that knows it is a denial: `require_list_read` rightly writes nothing for an admission,
+    /// so a route that refused the scope itself would leave the denial off the record. Sole gate
+    /// for its route; never stack it with `require_permission` or `probe_permission` for the same
+    /// securable.
+    [[nodiscard]] ListReadGate require_global_list_read(const httplib::Request& req,
+                                                        httplib::Response& res,
+                                                        const std::string& securable_type,
+                                                        const std::string& operation);
+
+    /// `require_global_list_read` with the `auth.permission_required` denial row withheld for an
+    /// interactive cookie session only (`denial_row_may_be_withheld`); a token or engine caller
+    /// keeps it. For a page fragment that loads by itself and decides what to DRAW from the same
+    /// list authority its REST and MCP twins use. `res` is meant to be a scratch response: a 503
+    /// there is an unavailable authorization store (engine principals), any other refusal a denial.
+    [[nodiscard]] ListReadGate probe_global_list_read(const httplib::Request& req,
+                                                      httplib::Response& res,
+                                                      const std::string& securable_type,
+                                                      const std::string& operation);
 
     /// `has_permission`'s twin for the fleet-read gate: `require_fleet_read`'s own decision path
     /// (so the verdict and the scope cannot drift from the gate's), with its
@@ -351,8 +398,9 @@ public:
 
     /// The SOLE production factory for a gate-less-route `TierPolicyFn` (#5047
     /// governance fix round). Returns a callable that invokes
-    /// `require_tier_policy(..., /*actionable_permission=*/false)` — both
-    /// `server.cpp` wiring sites (REST + dashboard fragments) call this
+    /// `require_tier_policy(..., /*actionable_permission=*/false)` — every
+    /// `server.cpp` wiring site (result-set REST + dashboard fragments, and the
+    /// /crypto dashboard layout routes) calls this
     /// SAME function rather than each writing its own near-identical
     /// lambda, so there is exactly one place a future reviewer needs to
     /// check for clause-5 compliance, and a unit test can exercise the
@@ -455,10 +503,10 @@ public:
     /// each axis's own infrastructure-unavailable case landing on
     /// `GateFailure::Degraded` (503, retryable): a null/not-open RBAC store
     /// on the management axis, and a null or query-failed tag store on the
-    /// service axis. Only a genuine `ListReadDecision::DenyAll` — real "no
-    /// grant," or an in-query store error surfacing through it, the one
-    /// residual weakening of `authorize_list_read`'s own promise this gate
-    /// does not add a discriminator for (implementation plan §2c) — lands on
+    /// service axis. A read that fails INSIDE `authorize_list_read` (the
+    /// global-grant, permission-group or subtree read: `read_failed`) is
+    /// `GateFailure::Degraded` (503) too. Only a genuine
+    /// `ListReadDecision::DenyAll` (real "no grant") lands on
     /// `GateFailure::Forbidden` (403).
     ///
     /// SELF-SUFFICIENT for the RBAC/management-group authority decision — do
@@ -512,10 +560,11 @@ public:
     /// here: `rbac_enforcement_in_effect()` (`rbac_store.cpp:1608`) returns
     /// `true` for a non-null-but-not-open store, routing both siblings INTO
     /// their RBAC-enforced branch, where `check_permission`/`authorize_list_
-    /// read` fail on the dead handle and 403 (fail CLOSED, matching this
-    /// gate's posture) — the only divergence here is STATUS-CODE
-    /// GRANULARITY: a permanent-looking 403 indistinguishable from "no
-    /// grant" in the siblings vs this gate's correct retryable 503. (c) a
+    /// read` fail on the dead handle (fail CLOSED, matching this gate's
+    /// posture) — the only divergence here is STATUS-CODE GRANULARITY: the
+    /// siblings that do not read `read_failed` answer a permanent-looking 403
+    /// indistinguishable from "no grant", this gate and `require_list_read`
+    /// the correct retryable 503. (c) a
     /// null OR not-open `mgmt_group_store_` — NEITHER sibling distinguishes
     /// null from not-open for this store the way (a)/(b) do for
     /// `rbac_store_`; both already fail CLOSED via `RbacStore::resolve_perm_
@@ -730,6 +779,29 @@ public:
                                  const std::string& detail = {},
                                  const std::string& principal_class_override = {});
 
+    /// `audit_log_for_principal` for a SESSION the caller already resolved (#6065 PR-Q,
+    /// `RestApiV1::AuditAsSessionFn`): stamps the session's username, the `principal_role`
+    /// the caller passes (it captures `effective_role` once per request), and the engine
+    /// class when `session.principal_kind == "engine"`, so a row carries the fields
+    /// `make_audit_event` would have stamped for that session without re-resolving the
+    /// request (cookie first, then bearer), which can name a different actor.
+    bool audit_log_for_session(const httplib::Request& req, const auth::Session& session,
+                               const std::string& principal_role, const std::string& action,
+                               const std::string& result, const std::string& target_type = {},
+                               const std::string& target_id = {}, const std::string& detail = {});
+
+    /// The ONE production `RestApiV1::AuditAsSessionFn` (same `std::function` type): a closure
+    /// over `this` that forwards every argument, in order, to `audit_log_for_session`. A
+    /// factory, like `gateless_tier_policy_fn()`, so server.cpp wires this and never a
+    /// hand-rolled lambda whose eight same-typed parameters could be transposed unseen; a
+    /// test drives this very closure through a real `AuditStore`. The `AuthRoutes` must
+    /// outlive every call (it is owned by `ServerImpl`, as for the other `[ar = ...]` writers).
+    using AuditAsSessionFn = std::function<bool(
+        const httplib::Request&, const auth::Session&, const std::string& principal_role,
+        const std::string& action, const std::string& result, const std::string& target_type,
+        const std::string& target_id, const std::string& detail)>;
+    [[nodiscard]] AuditAsSessionFn audit_as_session_fn();
+
     /// The `AuditEvent` `audit_log_for_principal` would write, built WITHOUT
     /// writing it (#5342 Gate 8): the identity/request fields (principal,
     /// role, class, source IP, user agent, session correlator, target) for a
@@ -847,6 +919,18 @@ public:
     static std::string extract_form_value(const std::string& body, const std::string& key);
 
 private:
+    /// The credential walk behind `resolve_session`, before the per-request binding is applied.
+    /// Only `resolve_session` calls it, so no return path can skip the binding.
+    std::optional<auth::Session> resolve_session_unbound(const httplib::Request& req);
+
+    /// SHA-256 hex of the `yuzu_session` cookie when the request carries one; empty
+    /// when it does not, so cookie-less rows never share the digest of "". Hashed
+    /// whether or not the cookie authenticated the request (`resolve_session` falls
+    /// through to Bearer / X-Yuzu-Token). A digest failure logs at debug and yields
+    /// empty. The value equals the session store key (`AuthManager::hash_token` is
+    /// `sha256_hex` today); if that ever changes, route this helper through `hash_token`.
+    static std::string session_correlator(const httplib::Request& req);
+
     /// The gates `synthesize_token_session` applies AFTER the api_tokens row itself
     /// validates: the `principal_kind` allowlist, and — for an engine token — that the
     /// backing engine principal is still Active. `revalidate_stream` must apply them
@@ -950,6 +1034,15 @@ public:
     /// qe-B: the load-shed branch must be exercised.
     void set_mfa_pending_cap_for_test(std::size_t cap) { mfa_pending_cap_ = cap; }
 
+    /// Test hook: push the pending MFA challenge `pending_token`'s steady
+    /// `expires_at` backward by `elapsed`, so the TTL reaper
+    /// (`reap_mfa_pending_locked`) sees it as lapsed after `elapsed` more time
+    /// without sleeping. The map is keyed by the raw pending token. A no-op for an
+    /// unknown token. Production code MUST NOT call this — no caller in
+    /// `server/core/src/**` references it.
+    void expire_mfa_pending_for_test(const std::string& pending_token,
+                                     std::chrono::milliseconds elapsed);
+
     /// Override the service-scope global-safe allow-list for a test
     /// (`kServiceScopeGlobalSafe` is seeded EMPTY in production, #2298 PR 3 —
     /// see `service_scope_policy.hpp` — so `require_permission`'s
@@ -978,6 +1071,24 @@ public:
     }
 
 private:
+    /// How `require_permission_impl` answers an RBAC read that could not be completed.
+    enum class RbacDegradeMapping : std::uint8_t {
+        DenyAs403,       ///< ADR-0041 default: fail closed with the 403 every route documents
+        UnavailableAs503 ///< opt-in (`probe_permission_unavailable_aware`): retryable 503
+    };
+
+    /// The body of `require_permission`. `degrade` only changes the answer for an RBAC read that
+    /// could not be completed (the engine branch and the ordinary RBAC branch); the service-scoped
+    /// branch, the legacy fallback and every definitive outcome are identical in both modes.
+    bool require_permission_impl(const httplib::Request& req, httplib::Response& res,
+                                 const std::string& securable_type, const std::string& operation,
+                                 RbacDegradeMapping degrade);
+
+    /// Write the audit row and the retryable 503 for an unavailable RBAC read (opt-in mode only).
+    void respond_rbac_unavailable(const httplib::Request& req, httplib::Response& res,
+                                  const std::string& securable_type, const std::string& operation,
+                                  const char* who);
+
     std::function<void()> after_first_provider_check_for_test_;
 
     /// Whether `(securable_type, operation)` clears the service-scope

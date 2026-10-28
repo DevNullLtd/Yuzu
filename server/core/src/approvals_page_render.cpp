@@ -1,13 +1,96 @@
 #include "approvals_page_render.hpp"
 
+#include "approval_manager.hpp" // bound_request_is_readable
 #include "reserved_definition_id.hpp"
 #include "web_utils.hpp" // html_escape, format_relative_time, format_iso_utc, truncate_utf8
 
+#include <nlohmann/json.hpp>
+
 #include <cstddef>
+#include <exception>
+#include <string>
+#include <vector>
 
 namespace yuzu::server::operate_pages {
 
 namespace {
+
+// Bounds on summarize_bound_request. The stored request is already capped at 16 KiB, so
+// these exist to keep the rendered text (and the 100-row fragment that carries it in
+// data-request) small and a hostile value from dominating the reviewer's screen.
+constexpr std::size_t kSummaryValueBytes = 512;
+constexpr std::size_t kSummaryMaxEntries = 40; // per section
+constexpr std::size_t kSummaryTotalBytes = 6000;
+// Each optional section has its OWN byte budget, so a huge section can never push another
+// out of the summary (a submitter padding the definition fields, say, must not be able to hide
+// the device list or the parameters). The Definition line and, when `definition` is an object,
+// the Hash line are never budgeted away (two values of at most 512 bytes each); the budgets plus headings, omission notes and the footer sum to under
+// kSummaryTotalBytes, so the total cut below is a safety net that the sections never reach.
+constexpr std::size_t kTargetsBudget = 1700;
+constexpr std::size_t kParamsBudget = 1400;
+constexpr std::size_t kDefinitionFieldsBudget = 600;
+constexpr std::size_t kOtherFieldsBudget = 600;
+
+// A JSON string/number/etc as a reviewer reads it, made DISPLAY-SAFE. Output is ASCII
+// (`ensure_ascii`; the one exception is the U+2026 ellipsis `truncate_utf8` appends to a value it
+// cut, which can also land inside a `\uXXXX` escape): every non-ASCII character, including bidirectional overrides (U+202E,
+// U+2066), line and paragraph separators (U+2028/2029), NEL (U+0085) and every control
+// character, appears as its visible `\uXXXX` escape and can never reorder, hide or break the
+// text around it. Strings lose the surrounding quotes but KEEP their escapes (`\n`, `\"`,
+// `\u0007`): the output is single-line per value, and every value is rendered on a line that
+// begins with a fixed label, so a value cannot start a line of its own or stand in for another
+// field's line. Non-strings print as compact JSON. Invalid UTF-8 cannot occur (the document
+// parsed), but replace anyway so dump() never throws. The cost is that non-Latin names read as
+// escapes; the digest, not the text, is the identity of the request.
+std::string value_text(const nlohmann::json& v, bool& shortened) {
+    std::string d = v.dump(-1, ' ', /*ensure_ascii=*/true, nlohmann::json::error_handler_t::replace);
+    if (v.is_string() && d.size() >= 2)
+        d = d.substr(1, d.size() - 2);
+    if (d.size() > kSummaryValueBytes)
+        shortened = true;
+    return truncate_utf8(d, kSummaryValueBytes);
+}
+
+// One section: `heading`, then as many of `lines` (each already "  ...\n") as fit the section's
+// own byte budget and entry cap, then an explicit omission note for the rest. The heading is
+// emitted whatever the content, and a section that shows nothing says so, so a reviewer never
+// has to guess whether a section was empty, trimmed or never rendered.
+void append_section(std::string& out, const std::string& heading,
+                    const std::vector<std::string>& lines, std::size_t budget, bool& shortened) {
+    out += heading;
+    std::size_t used = 0;
+    std::size_t shown = 0;
+    for (const auto& line : lines) {
+        if (shown >= kSummaryMaxEntries || used + line.size() > budget)
+            break;
+        out += line;
+        used += line.size();
+        ++shown;
+    }
+    if (shown < lines.size()) {
+        out += shown == 0 ? "  ... " + std::to_string(lines.size()) +
+                                " entries, none shown (section limit)\n"
+                          : "  ... and " + std::to_string(lines.size() - shown) +
+                                " more not shown (section limit)\n";
+        shortened = true;
+    }
+}
+
+void append_entries(std::string& out, const nlohmann::json& obj, const char* heading,
+                    const char* skip_a, const char* skip_b, const char* skip_c,
+                    std::size_t budget, bool& shortened) {
+    std::vector<std::string> lines;
+    for (auto it = obj.begin(); it != obj.end(); ++it) {
+        if ((skip_a && it.key() == skip_a) || (skip_b && it.key() == skip_b) ||
+            (skip_c && it.key() == skip_c))
+            continue;
+        lines.push_back("  " + value_text(nlohmann::json(it.key()), shortened) + ": " +
+                        value_text(it.value(), shortened) + "\n");
+    }
+    if (lines.empty())
+        return;
+    append_section(out, std::string(heading) + "\n", lines, budget, shortened);
+}
 
 // The visible scope cell is a clipped copy; the full text lives once, in `data-scope`.
 constexpr std::size_t kScopeCellBytes = 120;
@@ -63,6 +146,21 @@ void append_row(std::string& out, const ApprovalRowView& r, int64_t now) {
     attr_num(out, "data-rev-at", r.reviewed_at);
     attr(out, "data-rev-age", rev_age);
     attr(out, "data-comment", r.review_comment);
+    // Bound ticket (#6062): the reviewer reads the frozen request, not a bare digest.
+    // Both go through attr() = html_escape; the raw JSON never reaches the markup.
+    if (!r.request_json.empty()) {
+        const auto summary = summarize_bound_request_detail(r.request_json, r.request_digest);
+        attr(out, "data-request", summary.text);
+        attr(out, "data-digest", r.request_digest);
+        // The summary was cut: the decision dialog must not claim the reviewer saw all.
+        if (summary.shortened)
+            out += R"( data-shortened="1")";
+    }
+    // A request that cannot be read or bounded is not approvable (the store refuses it
+    // too): the controller hides Approve and leaves Reject, the way to clear the row.
+    if (r.unapprovable || (!r.request_json.empty() && !bound_request_is_readable(r.request_json)))
+        out += R"( data-unreadable="1")";
+    out += r.excluded ? R"( data-excluded="1")" : R"( data-excluded="0")";
     out += r.mine ? R"( data-mine="1")" : R"( data-mine="0")";
     out += r.mcp ? R"( data-mcp="1">)" : R"( data-mcp="0">)";
 
@@ -71,6 +169,8 @@ void append_row(std::string& out, const ApprovalRowView& r, int64_t now) {
            html_escape(r.name);
     if (r.mcp)
         out += R"(<span class="tag">MCP</span>)";
+    if (!r.request_json.empty())
+        out += R"(<span class="tag">Bound</span>)";
     out += "</span>";
     if (r.name != r.definition_id)
         out += R"(<span class="sub mono">)" + html_escape(r.definition_id) + "</span>";
@@ -103,9 +203,113 @@ void append_row(std::string& out, const ApprovalRowView& r, int64_t now) {
 } // namespace
 
 std::string approval_display_name(const std::string& definition_id, NameLookupMemo& names) {
-    if (is_reserved_definition_id(definition_id))
+    if (is_mcp_definition_id(definition_id))
         return definition_id.substr(kMcpDefinitionPrefix.size());
     return names.label(definition_id);
+}
+
+BoundRequestSummary summarize_bound_request_detail(const std::string& request_json,
+                                                  const std::string& request_digest) {
+    static const std::string kUnreadable =
+        "The stored request could not be read. Do not approve this request.";
+    // Size and nesting are bounded BEFORE the document is built or dumped: a stored row
+    // is data, not a promise, and a hostile or corrupt one must take the notice path
+    // rather than reach a recursive serializer.
+    if (!bound_request_is_readable(request_json))
+        return {kUnreadable, false, false};
+    const auto doc = nlohmann::json::parse(request_json, nullptr, /*allow_exceptions=*/false);
+    if (!doc.is_object())
+        return {kUnreadable, false, false};
+
+    std::string out;
+    bool shortened = false;
+    try {
+        // Definition: name and hash, each on its OWN line - the identity of what will run. A
+        // name that merely looks like "x (hash 1234)" can therefore never pose as the hash.
+        const nlohmann::json* definition_object = nullptr;
+        if (const auto d = doc.find("definition"); d != doc.end() && d->is_object()) {
+            definition_object = &*d;
+            const auto name = d->find("name");
+            const auto hash = d->find("hash");
+            out += "Definition: ";
+            out += name != d->end() ? value_text(*name, shortened) : "(no name stated)";
+            out += "\nHash: ";
+            out += hash != d->end() ? value_text(*hash, shortened) : "not stated";
+        } else if (d != doc.end()) {
+            out += "Definition: " + value_text(*d, shortened);
+        } else {
+            out += "Definition: (not stated in the request)";
+        }
+        out += '\n';
+        // ORDER matters as much as the budgets: the sections a reviewer most needs (what runs,
+        // on which devices, with which parameters) come first, the optional ones after them.
+
+        // Targets: an array (one per line) or one scope-expression string.
+        if (const auto t = doc.find("targets"); t != doc.end()) {
+            if (t->is_array()) {
+                std::vector<std::string> lines;
+                for (const auto& e : *t)
+                    lines.push_back("  " + value_text(e, shortened) + "\n");
+                append_section(out, "Targets (" + std::to_string(t->size()) + "):\n", lines,
+                               kTargetsBudget, shortened);
+            } else {
+                out += "Targets: " + value_text(*t, shortened) + "\n";
+            }
+        } else {
+            out += "Targets: (not stated in the request)\n";
+        }
+
+        // Parameters: key/value pairs when an object, else the value as-is.
+        if (const auto p = doc.find("params"); p != doc.end()) {
+            if (p->is_object() && !p->empty())
+                append_entries(out, *p, "Parameters:", nullptr, nullptr, nullptr, kParamsBudget,
+                               shortened);
+            else if (p->is_object())
+                out += "Parameters: none\n";
+            else
+                out += "Parameters: " + value_text(*p, shortened) + "\n";
+        } else {
+            out += "Parameters: none stated\n";
+        }
+
+        // Any other key inside `definition` is part of what the ticket binds too.
+        if (definition_object != nullptr)
+            append_entries(out, *definition_object, "Definition fields:", "name", "hash", nullptr,
+                           kDefinitionFieldsBudget, shortened);
+
+        // Everything else the ticket binds, so no key is hidden from the reviewer.
+        append_entries(out, doc, "Other fields:", "definition", "targets", "params",
+                       kOtherFieldsBudget, shortened);
+    } catch (const std::exception&) {
+        return {kUnreadable, false, false};
+    }
+
+    // The footer is built AFTER the body so a total-size cut can never remove it: when
+    // anything above is cut, the summary says so and names the digest as the identity of
+    // the WHOLE request (the dialog copy relies on this being true).
+    const auto footer_for = [&](bool cut) {
+        std::string f;
+        if (cut)
+            f += "Shortened: some values or entries above are cut. The digest below identifies "
+                 "the whole request.\n";
+        if (!request_digest.empty())
+            f += "Digest: sha256:" + request_digest + "\n";
+        return f;
+    };
+    std::string footer = footer_for(shortened);
+    if (out.size() + footer.size() > kSummaryTotalBytes) {
+        shortened = true;
+        footer = footer_for(true);
+        out = truncate_utf8(out, kSummaryTotalBytes > footer.size() ? kSummaryTotalBytes - footer.size() : 0);
+        out += '\n';
+    }
+    out += footer;
+    return {std::move(out), shortened, true};
+}
+
+std::string summarize_bound_request(const std::string& request_json,
+                                    const std::string& request_digest) {
+    return summarize_bound_request_detail(request_json, request_digest).text;
 }
 
 std::string render_approvals_page(const ApprovalListView& v) {

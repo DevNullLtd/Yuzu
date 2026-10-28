@@ -407,7 +407,28 @@ heartbeat_admission_series_test_() ->
            %% connection_mismatch is its own family, so it is not a `reason'.
            ?assertEqual(lists:usort([connection_mismatch |
                                      yuzu_gw_telemetry:heartbeat_reject_reasons()]),
-                        Returned)
+                        Returned),
+           %% The inventory family has no separate security family: every
+           %% reason, connection_mismatch included, is a `reason' there.
+           ?assertEqual(Returned,
+                        lists:usort(yuzu_gw_telemetry:inventory_reject_reasons()))
+       end},
+      {"every inventory rejection reason has a series from startup (#5695)",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           [?assertNotEqual(nomatch,
+                            binary:match(Out, iolist_to_binary(
+                              ["yuzu_gw_inventory_rejected_total{reason=\"",
+                               atom_to_binary(R, utf8), "\"} 0"])))
+            || R <- yuzu_gw_telemetry:inventory_reject_reasons()]
+       end},
+      {"an inventory rejection event increments its reason's series",
+       fun() ->
+           Read = fun(R) -> prometheus_counter:value(yuzu_gw_inventory_rejected_total, [R]) end,
+           B = Read(<<"connection_mismatch">>),
+           telemetry:execute([yuzu, gw, inventory, rejected], #{count => 1},
+                             #{reason => connection_mismatch}),
+           ?assertEqual(B + 1, Read(<<"connection_mismatch">>))
        end}
      ]}.
 

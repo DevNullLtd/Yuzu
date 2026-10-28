@@ -8,6 +8,7 @@
 #include <yuzu/server/auth.hpp>
 
 #include "api_token_store.hpp"
+#include "agent_registry.hpp" // #6065 PR-Q: DispatchDenial -- AuthorizeDispatchFn's error type (as mcp_server.hpp)
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "auth_routes.hpp" // ListReadGate — ADR-0017 list-read gate result type
@@ -18,6 +19,7 @@
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4: the public in-process VERIFY API seam
 #include "dex_api.hpp"    // ADR-0031 WS-A4: the public in-process DEX signals API seam
+#include "dex_score_policy_writer.hpp" // DexScorePolicyWriteDeps: PUT/DELETE /dex/score-policy
 #include "dex_perf_api.hpp" // ADR-0031 WS-A4: the public in-process DEX app-perf-over-time API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
@@ -31,6 +33,7 @@
 #include "product_pack_store.hpp"
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
+#include "forensics_visibility.hpp" // ForensicsVisibilityFn (#4990)
 #include "response_store.hpp"
 #include "result_set_store.hpp"
 #include "schedule_engine.hpp"
@@ -137,6 +140,21 @@ public:
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation,
                            const std::string& agent_id)>;
+    /// #6065 PR-Q: the shared dispatch chokepoint's PRE-DISPATCH dry run
+    /// (`classify_and_authorize_dispatch`): given the caller and a
+    /// (plugin, action) pair it answers the capability row or a typed
+    /// `DispatchDenial`. The identical type to `McpServer::AuthorizeDispatchFn`
+    /// (server.cpp static_asserts it), and server.cpp hands BOTH a copy of the
+    /// SAME closure -- a route-local binder here would be a drift between the
+    /// two surfaces. FAIL-CLOSED
+    /// contract: a route that requires it answers 500 when it is unwired,
+    /// never "no gate". The empty/default `{}` exists ONLY for source-stability
+    /// of the other (unrelated) call sites. Consumers: POST and DELETE
+    /// /api/v1/quarantine.
+    using AuthorizeDispatchFn = std::function<std::expected<yuzu::server::CommandCapability,
+                                                             yuzu::server::detail::DispatchDenial>(
+        const yuzu::server::DispatchCaller& caller, std::string_view plugin,
+        std::string_view action)>;
     /// ADR-0017 admit-then-filter list-read gate for a list/fan-out route
     /// over per-agent data (`AuthRoutes::require_list_read`). Unlike PermFn/
     /// ScopedPermFn (bool: caller re-derives the session separately if
@@ -575,21 +593,30 @@ public:
         // TierPolicyFn's doc comment in auth_routes.hpp). Trailing optional
         // dep; `{}` fails closed (503) for a TIERED caller and passes
         // through for an untiered one — see TierPolicyFn's own contract.
-        TierPolicyFn tier_policy_fn = {});
+        TierPolicyFn tier_policy_fn = {},
+        // #6065 PR-Q: see AuthorizeDispatchFn's doc comment above. Trailing optional
+        // dep; `{}` makes POST and DELETE /api/v1/quarantine FAIL CLOSED (500) -- an unwired
+        // chokepoint is misconfiguration, not "no gate".
+        AuthorizeDispatchFn authorize_dispatch_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
     /// TSan-hostile acceptor thread (#438).
     ///
-    /// `step_up_fn` (PR2, optional) — when present, the high-risk REST /
-    /// Settings handlers (token create/revoke, session revoke, Guardian rule
-    /// create/update/push, software package create, software deploy start,
-    /// file retrieval upload, user delete/role-change, and the two
-    /// engine-principal role assign/unassign routes) gate behind it after
-    /// permissions pass — the canonical enumerated list lives in
+    /// `step_up_fn` (PR2, optional) - the in-handler MFA step-up check on the
+    /// high-risk REST / Settings handlers (token create/revoke, session revoke,
+    /// Guardian rule create/update/delete/push, software package create,
+    /// software deploy start, user delete/role-change, and the engine-principal
+    /// and RBAC assignment routes). The routes that need step-up are classified
+    /// in step_up_policy.hpp; for those, the central check in server.cpp's
+    /// pre-request handler (step_up_gate.hpp) evaluates the same decision
+    /// BEFORE the handler runs, ahead of the handler's own permission and
+    /// its own cross-site copy (a cookie write has already met the server-wide
+    /// same-site gate in pre-routing), and this functor repeats it from that
+    /// same verdict within the request. The canonical enumerated list lives in
     /// docs/user-manual/rest-api.md "Step-up envelope on high-risk endpoints".
-    /// Empty functor disables the gate entirely (default — preserves
-    /// pre-PR2 behaviour for any caller that hasn't wired it).
+    /// An empty functor disables only this in-handler repeat; it does not
+    /// affect the central check.
     void register_routes(
         class HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
         RbacStore* rbac_store, ManagementGroupStore* mgmt_store, ApiTokenStore* token_store,
@@ -670,7 +697,11 @@ public:
         // #5047: see the production overload's doc comment above; identical
         // trailing-optional-dep, fail-closed-for-a-tiered-caller-when-unwired
         // contract (TierPolicyFn's own doc comment, auth_routes.hpp).
-        TierPolicyFn tier_policy_fn = {});
+        TierPolicyFn tier_policy_fn = {},
+        // #6065 PR-Q: see AuthorizeDispatchFn's doc comment above. Trailing optional
+        // dep; `{}` makes POST and DELETE /api/v1/quarantine FAIL CLOSED (500) -- an unwired
+        // chokepoint is misconfiguration, not "no gate".
+        AuthorizeDispatchFn authorize_dispatch_fn = {});
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the
@@ -685,6 +716,20 @@ public:
     /// BEFORE `register_routes()`, same timing contract as
     /// `set_engine_principal_store`.
     void set_user_exists_fn(UserExistsFn fn) { user_exists_fn_ = std::move(fn); }
+
+    /// #4990 - the Forensics plugin set the stored-response read tier excludes
+    /// (`ServerImpl::forensics_plugin_set_`, borrowed: it outlives this object). MUST be called
+    /// BEFORE `register_routes()`, same timing contract as `set_engine_principal_store`.
+    /// Unset (nullptr, a test harness) fails closed: the response routes refuse every row
+    /// (`tier_filter_for`), so a harness that reads responses must wire it.
+    void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
+
+    /// #4990 - the resolver behind the response routes' Forensics tier (see
+    /// `forensics_visibility.hpp`). Same timing contract as `set_forensics_plugin_set`: BEFORE
+    /// `register_routes()`. Unset resolves to present-empty at the use site.
+    void set_forensics_visibility_fn(ForensicsVisibilityFn fn) {
+        forensics_visibility_fn_ = std::move(fn);
+    }
 
     /// #4981 PR-2 — see `ScopeEvaluateFn`'s doc comment above. MUST be called
     /// BEFORE `register_routes()`, same timing contract as
@@ -768,9 +813,45 @@ public:
         csrf_trusted_origins_ = std::move(origins);
     }
 
+    /// #6065 PR-Q: an audit writer that stamps a row from a SESSION the caller already
+    /// holds instead of re-resolving one from the request. `audit_fn` re-resolves
+    /// (`AuthRoutes::make_audit_event` tries the cookie, then the bearer token), so a
+    /// credential that lapsed or was revoked between the route's own resolution and the
+    /// audit write, or a second credential on the same request, made a row name a
+    /// different actor than the record it describes (`rest-audit-principal-reresolution`).
+    /// Wired from `AuthRoutes::audit_as_session_fn()` (which stamps the principal, the
+    /// `principal_role` passed in, the engine class and the session correlator).
+    /// `principal_role` is the session's effective role, captured once per binding: the
+    /// route binds at its first look-up and again at its second, so a row written between
+    /// the two (a 503, a 400) carries the first look-up's role and every row after carries
+    /// the second's, the session the dispatch check authorizes. Returns true iff the row
+    /// persisted (true in audit-off mode). Used by `POST` and `DELETE /api/v1/quarantine`:
+    /// an unwired writer makes both answer 500, and neither uses the re-resolving `audit_fn`
+    /// for the request; the single `failure` row that records the unwired writer is the only
+    /// row written through it. MUST be called BEFORE `register_routes()` (captured by
+    /// value).
+    using AuditAsSessionFn = std::function<bool(
+        const httplib::Request& req, const auth::Session& session,
+        const std::string& principal_role, const std::string& action, const std::string& result,
+        const std::string& target_type, const std::string& target_id, const std::string& detail)>;
+    void set_audit_as_session_fn(AuditAsSessionFn fn) { audit_as_session_fn_ = std::move(fn); }
+
+    /// The score policy writer behind GET/PUT/DELETE /api/v1/dex/score-policy: the observed
+    /// store read, the store conditional writes and the provider (`audit` is bound per request
+    /// by the handler). Unset = the three routes answer 503 "runtime config store
+    /// unavailable". MUST be called BEFORE `register_routes()` (captured by value), like
+    /// `set_audit_as_session_fn`, whose session-bound audit writer the write routes require.
+    void set_dex_score_policy_writer(DexScorePolicyWriteDeps deps) {
+        dex_score_policy_writer_ = std::move(deps);
+    }
+
 private:
+    std::optional<DexScorePolicyWriteDeps> dex_score_policy_writer_;
+    AuditAsSessionFn audit_as_session_fn_;
     EnginePrincipalStore* engine_principal_store_{nullptr};
     UserExistsFn user_exists_fn_;
+    const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990 - see set_forensics_plugin_set
+    ForensicsVisibilityFn forensics_visibility_fn_;         // #4990 - see set_forensics_visibility_fn
     PasswordChangeDeps password_deps_;
     std::vector<std::string> csrf_trusted_origins_;
     ScopeEvaluateFn scope_evaluate_fn_;

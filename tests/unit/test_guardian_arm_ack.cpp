@@ -22,9 +22,11 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <variant>
 
 using namespace yuzu::agent;
@@ -225,6 +227,10 @@ gpb::GuaranteedStatePush one_rule_push(const std::string& rule_id, const std::st
 
 using RD = GuardianArmAckLedger::RetryDecision;
 using RT = GuardianSparkRuntime;
+using OB = GuardianArmAckLedger::ObligationForTest;
+using BFS = GuardianArmAckLedger::BeginFaultSite;
+using DFS = GuardianArmAckLedger::DrainFaultSite;
+using NamedRules = std::set<std::string, std::less<>>;
 
 /// #5459 (option D) rig: a real GuardianSparkRuntime + real GuardianArmAckLedger over the
 /// file's FakeBackend, with deterministic, sleep-free wedge creation. The runtime's
@@ -326,8 +332,42 @@ struct Rig5459 {
         REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key_of(path)) == 0; },
                                        std::chrono::seconds(10)));
     }
-    void open_app(std::size_t applied = 1) { ledger.begin_application(1, digest, false, applied); }
+    void open_app(std::size_t applied = 1) { ledger.begin_delta_application(1, digest, applied, {"r1"}); }
     [[nodiscard]] RD retry() { return ledger.decide_retry(1, digest, false, *rt); }
+    /// #5547: a delta application (full_sync == false, so retry() matches it) naming `named`.
+    void open_delta(const NamedRules& named = {}, std::size_t applied = 1) {
+        ledger.begin_delta_application(1, digest, applied, named);
+    }
+    /// #5547: a full-sync application (Application::full_sync == true, so it matches
+    /// retry_full(), not retry()).
+    void open_full(std::size_t applied = 1) { ledger.begin_full_application(1, digest, applied); }
+    [[nodiscard]] RD retry_full() { return ledger.decide_retry(1, digest, true, *rt); }
+    /// arm_stats().failed, i.e. resolved_failed.
+    [[nodiscard]] std::size_t failed_gauge() const {
+        const auto s = ledger.arm_stats();
+        REQUIRE(s.has_value());
+        return static_cast<std::size_t>(s->failed);
+    }
+    /// Invariant: resolved_failed == failed_receipts.size() + failed_ids.size().
+    [[nodiscard]] bool counts_consistent() const {
+        return failed_gauge() ==
+               ledger.failed_receipt_count_for_test() + ledger.failed_id_count_for_test();
+    }
+    /// The late success of a Pending arm: released, adopted/committed, receipt terminal.
+    void commit(const RT::ArmReceipt& receipt, const std::string& path) {
+        b->release_path(path);
+        REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(receipt); },
+                                       std::chrono::seconds(10)));
+    }
+    /// Everything exact about the current application, for before/after equality.
+    [[nodiscard]] auto snapshot() const {
+        return std::make_tuple(
+            ledger.pending_generation(), ledger.applied_count(), ledger.pending_count_for_test(),
+            ledger.failed_receipt_count_for_test(), ledger.failed_id_count_for_test(),
+            ledger.sync_failed_count_for_test(), ledger.boot_origin_count_for_test(),
+            ledger.boot_claim_count_for_test(), failed_gauge(), ledger.latched_failure_for_test(),
+            ledger.inherited_latch_for_test(), ledger.wedge_suppress_count_for_test());
+    }
 };
 
 } // namespace
@@ -382,14 +422,14 @@ TEST_CASE("GuardianArmAckLedger: a superseded application's stale receipt cannot
     auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(/*generation=*/1, "content-a", /*full_sync=*/false, /*applied=*/1);
+    ledger.begin_delta_application(/*generation=*/1, "content-a", /*applied=*/1, {"r1"});
     auto r1 = accept(*rt, "r1", "/a");
     ledger.add_pending("r1", r1);
     CHECK_FALSE(ledger.can_advance()); // r1 still pending
 
     // A higher-generation application supersedes it before r1 ever resolves - r1's own
     // claim is NOT re-added to generation 2; generation 2 gets its own, different rule.
-    ledger.begin_application(/*generation=*/2, "content-b", /*full_sync=*/false, /*applied=*/1);
+    ledger.begin_delta_application(/*generation=*/2, "content-b", /*applied=*/1, {"r1"});
     auto r2 = accept(*rt, "r2", "/b");
     ledger.add_pending("r2", r2);
     CHECK_FALSE(ledger.can_advance()); // r2 still pending - not vacuously true
@@ -427,7 +467,7 @@ TEST_CASE("GuardianArmAckLedger: can_advance() is false with zero pending, zero 
     REQUIRE(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Failed);
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 0);
+    ledger.begin_delta_application(1, "content", 0, {"r1"});
     ledger.add_pending("r1", receipt);
     ledger.drain_locked(*rt, 10);
     CHECK(ledger.can_advance() == false);
@@ -442,7 +482,7 @@ TEST_CASE("GuardianArmAckLedger: a latched teardown failure holds the generation
     auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 0);
+    ledger.begin_delta_application(1, "content", 0, {"r1"});
     ledger.latch_failure(); // e.g. this generation's full_sync kv sweep failed
     auto receipt = accept(*rt, "r1");
     ledger.add_pending("r1", receipt);
@@ -475,7 +515,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): identical (generation, content,
     const std::string content_y(64, 'b');
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(5, content_x, false, 3);
+    ledger.begin_delta_application(5, content_x, 3, {"r1"});
     ledger.add_pending("r1", accept(*rt, "r1"));
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
 
@@ -510,7 +550,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): once a pending receipt resolves
     const std::string content_x(64, 'a'); // see the sibling Suppress test above for why
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(5, content_x, false, 1);
+    ledger.begin_delta_application(5, content_x, 1, {"r1"});
     auto receipt = accept(*rt, "r1");
     ledger.add_pending("r1", receipt);
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
@@ -532,7 +572,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): bounded per call - 3 pending "
     auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 3);
+    ledger.begin_delta_application(1, "content", 3, {"r1"});
     // 3 DISTINCT keys (paths) - same-key siblings would queue behind one shared
     // arm instead of each dispatching (and parking) their own, per R5.2.
     auto r1 = accept(*rt, "r1", "/a");
@@ -566,7 +606,7 @@ TEST_CASE("GuardianArmAckLedger::retire(): drops the current application without
     auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 1);
+    ledger.begin_delta_application(1, "content", 1, {"r1"});
     ledger.add_pending("r1", accept(*rt, "r1"));
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
 
@@ -602,7 +642,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): no pending receipts and no reta
     GuardianArmAckLedger ledger;
     // Nothing was ever Accepted this application (the ordinary case at
     // prefer_spark_=false) - pending stays empty for its whole lifetime.
-    ledger.begin_application(5, content, false, 3);
+    ledger.begin_delta_application(5, content, 3, {"r1"});
     CHECK(ledger.can_advance()); // trivially true - nothing to hold the generation
 
     // TARGET (sec-1/arch-1): before the fix, an identical (generation, content,
@@ -631,7 +671,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): default-path pin - with nothing
     Rig5459 f;
     CHECK(f.retry() == RD::Reapply); // no current application at all
 
-    f.ledger.begin_application(5, f.digest, false, 3); // nothing is ever add_pending()ed
+    f.ledger.begin_delta_application(5, f.digest, 3, {"r1"}); // nothing is ever add_pending()ed
     CHECK(f.ledger.decide_retry(5, f.digest, false, *f.rt) == RD::Reapply); // identical retry
     CHECK(f.ledger.decide_retry(6, f.digest, false, *f.rt) == RD::Reapply);
     CHECK(f.ledger.decide_retry(5, std::string(64, 'b'), false, *f.rt) == RD::Reapply);
@@ -646,7 +686,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): default-path pin - with nothing
     // A sentinel content_id on the OPEN application never matches either, even against
     // itself, and even with an outstanding wedge in it.
     auto w = f.wedge("r1", "/a");
-    f.ledger.begin_application(5, "", false, 1);
+    f.ledger.begin_delta_application(5, "", 1, {"r1"});
     f.ledger.add_pending("r1", w);
     CHECK(f.ledger.drain_locked(*f.rt, 10) == 1);
     CHECK(f.ledger.decide_retry(5, "", false, *f.rt) == RD::Reapply);
@@ -654,7 +694,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): default-path pin - with nothing
     // An EMPTY application (nothing add_pending()ed) is Reapply even while the runtime
     // itself holds a live outstanding wedge: the ledger only reasons about receipts ITS
     // application accepted, so a wedge it never saw can never turn a decision into Suppress.
-    f.ledger.begin_application(7, f.digest, false, 1);
+    f.ledger.begin_delta_application(7, f.digest, 1, {"r1"});
     CHECK(f.rt->receipt_recovery_status(w) == RT::RecoveryStatus::WedgeEligible);
     CHECK(f.ledger.decide_retry(7, f.digest, false, *f.rt) == RD::Reapply);
     CHECK(f.ledger.drain_locked(*f.rt, 10) == 0);
@@ -675,7 +715,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): failed_out feeds an async arm "
     auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, std::string(64, 'd'), false, 1);
+    ledger.begin_delta_application(1, std::string(64, 'd'), 1, {"r1"});
     auto receipt = accept(*rt, "r1");
     ledger.add_pending("r1", receipt);
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
@@ -715,7 +755,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): failed_out feeds an async arm "
     b->hang_next_arm.store(true);
     yuzu::test::ScopeExit release_guard{[&] { b->release_hang(); }};
     GuardianArmAckLedger ledger2;
-    ledger2.begin_application(2, std::string(64, 'e'), false, 1);
+    ledger2.begin_delta_application(2, std::string(64, 'e'), 1, {"r1"});
     auto receipt2 = accept(*rt, "r2");
     ledger2.add_pending("r2", receipt2);
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
@@ -787,7 +827,7 @@ TEST_CASE("GuardianArmAckLedger::arm_stats(): a live empty application reads a "
           "PRESENT {0, 0} - the common case, not the same as no application at all",
           "[spark][ack][arm_stats]") {
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 0);
+    ledger.begin_delta_application(1, "content", 0, {"r1"});
     const auto s = ledger.arm_stats();
     REQUIRE(s.has_value());
     CHECK(s->pending == 0);
@@ -806,7 +846,7 @@ TEST_CASE("GuardianArmAckLedger::arm_stats(): an accepted receipt increases pend
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 1);
+    ledger.begin_delta_application(1, "content", 1, {"r1"});
     ledger.add_pending("r1", receipt);
     {
         const auto s = ledger.arm_stats();
@@ -826,7 +866,7 @@ TEST_CASE("GuardianArmAckLedger::arm_stats(): an accepted receipt increases pend
 }
 
 TEST_CASE("GuardianArmAckLedger::arm_stats(): a Failed drain increases failed; "
-          "RED-FIRST - replacing the application via begin_application() (the "
+          "RED-FIRST - replacing the application via begin_delta_application() (the "
           "same path decide_retry()'s Reapply takes on an ordinary retry) "
           "brings a PRESENT failed back to 0",
           "[spark][ack][arm_stats]") {
@@ -851,7 +891,7 @@ TEST_CASE("GuardianArmAckLedger::arm_stats(): a Failed drain increases failed; "
     REQUIRE(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Failed);
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 1);
+    ledger.begin_delta_application(1, "content", 1, {"r1"});
     ledger.add_pending("r1", receipt);
     ledger.drain_locked(*rt, 10);
 
@@ -866,7 +906,7 @@ TEST_CASE("GuardianArmAckLedger::arm_stats(): a Failed drain increases failed; "
     // NEXT push for a generation decide_retry() sent to Reapply because
     // resolved_failed > 0 (see the "identical (generation, content, full_sync) is
     // Suppress" test above, which pins that Reapply trigger).
-    ledger.begin_application(2, "content-2", false, 0);
+    ledger.begin_delta_application(2, "content-2", 0, {"r1"});
     const auto s = ledger.arm_stats();
     REQUIRE(s.has_value()); // PRESENT zero, not merely "no longer 1", and not absent
     CHECK(s->pending == 0);
@@ -903,7 +943,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a Wedged receipt (timed out whi
     REQUIRE(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 1);
+    ledger.begin_delta_application(1, "content", 1, {"r1"});
     ledger.add_pending("r1", receipt);
 
     std::size_t failed_out = 0;
@@ -951,7 +991,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): concern 2 (rung 9c PR-5d) - a W
     // #5459: a real SHA-256-shaped content_id (decide_retry() never trusts a sentinel).
     const std::string digest(64, 'a');
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, digest, false, 1);
+    ledger.begin_delta_application(1, digest, 1, {"r1"});
     ledger.add_pending("r1", receipt);
 
     // First drain: resolves Wedged as an ordinary failure, exactly like the sibling
@@ -1030,7 +1070,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): concern 2 - a Wedged receipt th
 
     const std::string digest(64, 'a');
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, digest, false, 1);
+    ledger.begin_delta_application(1, digest, 1, {"r1"});
     ledger.add_pending("r1", receipt);
     std::size_t failed_out = 0;
     CHECK(ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out) == 1);
@@ -1124,7 +1164,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a CongestionExpired receipt (ti
     REQUIRE(rt->receipt_status(r2_receipt) == GuardianSparkRuntime::ReceiptStatus::CongestionExpired);
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 2);
+    ledger.begin_delta_application(1, "content", 2, {"r1"});
     ledger.add_pending("r1", r1_receipt);
     ledger.add_pending("r2", r2_receipt);
 
@@ -1178,8 +1218,9 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): never acknowledges an outstandin
 
     // The old waiver acknowledged after 3 identical re-applies. There is none now: six
     // identical re-applications, each re-observing the same retained claim, never
-    // acknowledge. (Each begin_application() replaces the application wholesale, so each
-    // starts with fresh accounting and a fresh suppression budget.)
+    // acknowledge. (Each open_app() names r1, the only rule in play, so the delta drops r1's
+    // old entry and each application starts with fresh accounting and a fresh suppression
+    // budget.)
     for (int i = 1; i <= 6; ++i) {
         f.open_app();
         f.ledger.add_pending("r1", accept(*f.rt, "r1", "/a")); // Reobserved: same underlying claim
@@ -1196,7 +1237,7 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): never acknowledges an outstandin
     }
 
     // A DISTINCT push (different content) is a fresh application with clean accounting.
-    f.ledger.begin_application(1, std::string(64, 'b'), false, 1);
+    f.ledger.begin_delta_application(1, std::string(64, 'b'), 1, {"r1"});
     CHECK(f.ledger.failed_receipt_count_for_test() == 0); // no leak
     CHECK(f.ledger.can_advance()); // trivially true - nothing pending or failed YET
 }
@@ -1356,7 +1397,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): a wedge plus an UNDRAINED ordin
 
 TEST_CASE("GuardianArmAckLedger::decide_retry(): safety valve - kWedgeSuppressMaxDecisions "
           "wedge Suppresses, then Reapply; Pending-only suppression never spends the "
-          "budget; only begin_application()/retire() reset it (#5459)",
+          "budget; only begin_*_application()/retire() reset it (#5459)",
           "[spark][ack][5459]") {
     Rig5459 f;
     auto w = f.wedge("r1", "/a");
@@ -1412,7 +1453,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): the safety valve bounds EVERY w
           "[spark][ack][5459]") {
     // Exhausts the budget through whatever branch the rig set up: exactly
     // kWedgeSuppressMaxDecisions Suppresses, then Reapply, and the budget does not come
-    // back (a Reapply decision is not a reset, only begin_application()/retire() are).
+    // back (a Reapply decision is not a reset, only begin_*_application()/retire() are).
     auto exhaust = [](Rig5459& f) {
         for (std::size_t i = 0; i < kWedgeSuppressMaxDecisions; ++i)
             REQUIRE(f.retry() == RD::Suppress);
@@ -1619,7 +1660,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): identity is checked BEFORE any 
     SECTION("a sentinel on the OPEN application never matches, even against a sentinel") {
         Rig5459 f;
         auto w = f.wedge("r1", "/a");
-        f.ledger.begin_application(1, not_hex, false, 1);
+        f.ledger.begin_delta_application(1, not_hex, 1, {"r1"});
         f.ledger.add_pending("r1", w);
         REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
         CHECK(f.ledger.decide_retry(1, not_hex, false, *f.rt) == RD::Reapply);
@@ -1774,7 +1815,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): a Blocking failed_receipts entr
     CHECK(f.retry() == RD::Reapply);
 }
 
-TEST_CASE("GuardianArmAckLedger::begin_application(): a fresh application starts with clean "
+TEST_CASE("GuardianArmAckLedger::begin_*_application(): a fresh application starts with clean "
           "failure accounting and a fresh suppression budget; retire() likewise (#5459)",
           "[spark][ack][5459]") {
     Rig5459 f;
@@ -1795,7 +1836,7 @@ TEST_CASE("GuardianArmAckLedger::begin_application(): a fresh application starts
     establish(false);
     exhaust_budget();
 
-    // An identical begin_application() (what the forced Reapply does): no stale failure
+    // An identical begin_delta_application() (what the forced Reapply does): no stale failure
     // state leaks, and an application with nothing outstanding is a Reapply.
     f.open_app();
     CHECK(f.ledger.failed_receipt_count_for_test() == 0);
@@ -1851,7 +1892,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a genuinely dispatched claim th
     REQUIRE(rt->receipt_wedge_k_eligible(receipt)); // genuinely outstanding right now
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, std::string(64, '2'), false, 1);
+    ledger.begin_delta_application(1, std::string(64, '2'), 1, {"r1"});
     ledger.add_pending("r1", receipt);
     CHECK(ledger.drain_locked(*rt, 10) == 1);
     CHECK(ledger.failed_receipt_count_for_test() == 1); // retained - genuinely eligible right now
@@ -2122,4 +2163,883 @@ TEST_CASE("GuardianSparkRuntime::receipt_status_wedge_aware(): a real concurrent
     CHECK_FALSE(saw_both_wedge_flags.load(std::memory_order_relaxed));
     CHECK(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged); // still sticky
     CHECK_FALSE(rt->receipt_wedge_k_eligible(receipt));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #5547: a delta push that omits an unresolved rule must not drop its retry
+// obligation. begin_delta_application() carries each unresolved per-rule outcome of the
+// open application for a rule the delta does not name; begin_full_application() carries
+// only the unattributed legacy latch. Every test below asserts the EXACT carried state
+// (which set holds which rule, the failed gauge, the counts) and not only can_advance(),
+// which alone would stay green for the wrong reason.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("GuardianArmAckLedger::begin_delta_application(): a still-PENDING receipt of an "
+          "omitted rule is carried and is later resolved by a drain (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    auto p = f.pending_sibling("r1", "/a");
+    f.open_delta({"r1"});
+    f.ledger.add_pending("r1", p);
+    REQUIRE(f.ledger.obligation_for_test("r1") == OB::Pending);
+
+    f.open_delta({"r2"}, 5); // names only r2: r1 is omitted
+    CHECK(f.ledger.obligation_for_test("r1") == OB::Pending);
+    CHECK(f.ledger.pending_count_for_test() == 1);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 0);
+    CHECK(f.ledger.failed_id_count_for_test() == 0);
+    CHECK(f.failed_gauge() == 0);
+    CHECK(f.ledger.applied_count() == 5); // per-push, never carried
+    CHECK_FALSE(f.ledger.can_advance());
+    CHECK(f.retry() == RD::Suppress); // still genuinely in flight: nothing to re-arm
+    {
+        const auto s = f.ledger.arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->pending == 1);
+    }
+
+    // Its late success resolves the carried receipt and only then does the generation advance.
+    f.commit(p, "/a");
+    CHECK(f.ledger.drain_locked(*f.rt, 10) == 1);
+    CHECK(f.ledger.obligation_for_test("r1") == OB::None);
+    CHECK(f.ledger.can_advance());
+}
+
+TEST_CASE("GuardianArmAckLedger::begin_delta_application(): a retained eligible wedge of an "
+          "omitted rule is carried with its failure count and is still Suppressed (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    auto w = f.wedge("r1", "/a");
+    f.open_delta({"r1"});
+    f.ledger.add_pending("r1", w);
+    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
+    REQUIRE(f.ledger.obligation_for_test("r1") == OB::FailedReceipt);
+
+    f.open_delta({"r2"});
+    CHECK(f.ledger.obligation_for_test("r1") == OB::FailedReceipt);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 1);
+    CHECK(f.ledger.failed_id_count_for_test() == 0);
+    CHECK(f.ledger.pending_count_for_test() == 0);
+    CHECK(f.failed_gauge() == 1);
+    CHECK(f.counts_consistent());
+    CHECK_FALSE(f.ledger.can_advance()); // the old application's hold survives the replacement
+    CHECK(f.retry() == RD::Suppress);    // counts equal and the wedge is live: suppress, not re-arm
+    CHECK_FALSE(f.ledger.can_advance());
+
+    // The hung arm finally succeeds: the carried handle sees the recovery.
+    f.b->release_path("/a");
+    REQUIRE(
+        yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; }, std::chrono::seconds(10)));
+    CHECK(f.ledger.drain_locked(*f.rt, 10) == 0);
+    CHECK(f.ledger.obligation_for_test("r1") == OB::None);
+    CHECK(f.failed_gauge() == 0);
+    CHECK(f.ledger.can_advance());
+}
+
+TEST_CASE("GuardianArmAckLedger::begin_delta_application(): a compensation-pending wedge of an "
+          "omitted rule is carried, Suppressed, then becomes a Reapply-forcing failed id (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    auto w = f.wedge("r1", "/a");
+    f.start_compensation("/a");
+    f.open_delta({"r1"});
+    f.ledger.add_pending("r1", w);
+    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
+    REQUIRE(f.ledger.obligation_for_test("r1") == OB::FailedReceipt);
+
+    f.open_delta({"r2"});
+    CHECK(f.ledger.obligation_for_test("r1") == OB::FailedReceipt);
+    CHECK(f.failed_gauge() == 1);
+    CHECK(f.counts_consistent());
+    CHECK(f.retry() == RD::Suppress);
+    CHECK_FALSE(f.ledger.can_advance());
+
+    f.finish_compensation("/a"); // the claim pops; nothing re-armed the rule
+    CHECK(f.retry() == RD::Reapply);
+    CHECK(f.ledger.drain_locked(*f.rt, 10) == 0);
+    // The recovery scan's Blocking arm moves the entry; it is NOT erased and not uncounted.
+    CHECK(f.ledger.obligation_for_test("r1") == OB::FailedId);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 0);
+    CHECK(f.failed_gauge() == 1);
+    CHECK(f.counts_consistent());
+    CHECK(f.retry() == RD::Reapply);
+    CHECK_FALSE(f.ledger.can_advance());
+}
+
+TEST_CASE("GuardianArmAckLedger::begin_delta_application(): a Recovered wedge of an omitted "
+          "rule is carried and acknowledged by the next recovery scan (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    auto w = f.wedge("r1", "/a");
+    f.open_delta({"r1"});
+    f.ledger.add_pending("r1", w);
+    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
+    f.b->release_path("/a"); // nobody withdrew r1: the late success is adopted
+    REQUIRE(
+        yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; }, std::chrono::seconds(10)));
+    REQUIRE(f.rt->receipt_recovery_status(w) == RT::RecoveryStatus::Recovered);
+
+    f.open_delta({"r2"}); // before any drain has recorded the recovery
+    CHECK(f.ledger.obligation_for_test("r1") == OB::FailedReceipt);
+    CHECK(f.failed_gauge() == 1);
+    CHECK_FALSE(f.ledger.can_advance());
+    CHECK(f.retry() == RD::Suppress); // tearing it down would undo the recovery
+    CHECK(f.rt->rule_active_for_test("r1") == std::optional<bool>{true});
+
+    CHECK(f.ledger.drain_locked(*f.rt, 10) == 0); // the recovery scan on the carried handle
+    CHECK(f.ledger.obligation_for_test("r1") == OB::None);
+    CHECK(f.failed_gauge() == 0);
+    CHECK(f.ledger.can_advance());
+}
+
+TEST_CASE("GuardianArmAckLedger::begin_delta_application(): an ordinary async failure of an "
+          "omitted rule is carried by id, holds the generation and forces Reapply (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    auto bad = f.failed_sibling("r1", "/a");
+    f.open_delta({"r1"});
+    f.ledger.add_pending("r1", bad);
+    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
+    REQUIRE(f.ledger.obligation_for_test("r1") == OB::FailedId);
+
+    f.open_delta({"r2"});
+    CHECK(f.ledger.obligation_for_test("r1") == OB::FailedId);
+    CHECK(f.ledger.failed_id_count_for_test() == 1);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 0); // the receipt itself is not kept
+    CHECK(f.ledger.pending_count_for_test() == 0);
+    CHECK(f.failed_gauge() == 1);
+    CHECK(f.counts_consistent());
+    CHECK_FALSE(f.ledger.can_advance());
+    CHECK(f.retry() == RD::Reapply);
+    // A repeat delta that still omits it keeps carrying it.
+    f.open_delta({"r3"});
+    CHECK(f.ledger.obligation_for_test("r1") == OB::FailedId);
+    CHECK(f.failed_gauge() == 1);
+    CHECK_FALSE(f.ledger.can_advance());
+}
+
+TEST_CASE("GuardianArmAckLedger::note_sync_failure(): a synchronous per-rule failure holds the "
+          "generation, is carried past an omitting delta, and is outside the failed gauge "
+          "(#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    f.open_delta({"r1"});
+    f.ledger.note_sync_failure("r1", false);
+    CHECK(f.ledger.obligation_for_test("r1") == OB::SyncFailed);
+    CHECK(f.ledger.sync_failed_count_for_test() == 1);
+    CHECK_FALSE(f.ledger.latched_failure_for_test()); // per-rule, not the application-wide latch
+    CHECK_FALSE(f.ledger.can_advance());
+
+    f.open_delta({"r2"});
+    CHECK(f.ledger.obligation_for_test("r1") == OB::SyncFailed);
+    CHECK(f.ledger.sync_failed_count_for_test() == 1);
+    CHECK(f.failed_gauge() == 0); // arm_stats().failed counts accepted-receipt failures only
+    CHECK_FALSE(f.ledger.boot_origin_for_test("r1"));
+    CHECK_FALSE(f.ledger.can_advance());
+    CHECK(f.retry() == RD::Reapply);
+
+    // A delta that NAMES the rule supersedes the entry.
+    f.open_delta({"r1"});
+    CHECK(f.ledger.obligation_for_test("r1") == OB::None);
+    CHECK(f.ledger.can_advance());
+}
+
+TEST_CASE("GuardianArmAckLedger::note_sync_failure(): with no current application it is a no-op, "
+          "and the boot tag rides with the carried entry (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    f.ledger.note_sync_failure("r1", true); // no application yet
+    CHECK(f.ledger.sync_failed_count_for_test() == 0);
+    CHECK(f.ledger.boot_origin_count_for_test() == 0);
+
+    f.open_delta({"r1"});
+    f.ledger.note_sync_failure("r1", true);
+    CHECK(f.ledger.boot_origin_for_test("r1"));
+    f.open_delta({"r2"});
+    CHECK(f.ledger.obligation_for_test("r1") == OB::SyncFailed);
+    CHECK(f.ledger.boot_origin_for_test("r1"));
+    CHECK(f.ledger.boot_origin_count_for_test() == 1);
+}
+
+TEST_CASE("GuardianArmAckLedger: the application-wide latch is inherited by a replacing delta "
+          "as a debt distinct from the new application's own latch (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    f.open_delta({"r1"});
+    f.ledger.latch_failure();
+    REQUIRE(f.ledger.latched_failure_for_test());
+
+    f.open_delta({"r2"});
+    CHECK(f.ledger.inherited_latch_for_test());
+    CHECK_FALSE(f.ledger.latched_failure_for_test()); // this application has raised nothing
+    CHECK_FALSE(f.ledger.can_advance());
+    CHECK(f.retry() == RD::Reapply);
+
+    f.open_delta({"r3"}); // a second replacement keeps the debt
+    CHECK(f.ledger.inherited_latch_for_test());
+    CHECK_FALSE(f.ledger.can_advance());
+
+    // A failure raised by THIS application is separate: discharging the inherited debt
+    // leaves it in force, and a clean application's discharge opens the gate.
+    f.ledger.latch_failure();
+    f.ledger.discharge_inherited_latch();
+    CHECK_FALSE(f.ledger.inherited_latch_for_test());
+    CHECK(f.ledger.latched_failure_for_test());
+    CHECK_FALSE(f.ledger.can_advance());
+    CHECK(f.retry() == RD::Reapply);
+
+    f.open_delta({"r4"}); // the own latch becomes inherited in turn
+    CHECK(f.ledger.inherited_latch_for_test());
+    f.ledger.discharge_inherited_latch();
+    CHECK_FALSE(f.ledger.inherited_latch_for_test());
+    CHECK_FALSE(f.ledger.latched_failure_for_test());
+    CHECK(f.ledger.can_advance());
+}
+
+TEST_CASE("GuardianArmAckLedger::discharge_inherited_latch(): a no-op with no current "
+          "application; never touches per-rule outcomes (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    f.ledger.discharge_inherited_latch(); // must not crash with no application
+    CHECK_FALSE(f.ledger.can_advance());
+
+    f.open_delta({"r1"});
+    f.ledger.note_sync_failure("r1", false);
+    f.ledger.latch_failure();
+    f.open_delta({"r2"});
+    f.ledger.discharge_inherited_latch();
+    CHECK_FALSE(f.ledger.inherited_latch_for_test());
+    CHECK(f.ledger.obligation_for_test("r1") == OB::SyncFailed); // untouched
+    CHECK_FALSE(f.ledger.can_advance());
+}
+
+// ── Drop rules ────────────────────────────────────────────────────────────
+
+namespace {
+/// Builds, in one application naming r1..r4, every carried kind: r1 retained wedge,
+/// r2 still pending, r3 ordinary failure (failed id), r4 synchronous failure; plus the
+/// application-wide latch. Returns the receipts so the runtime objects outlive the test.
+struct AllKinds {
+    RT::ArmReceipt wedge, pend, bad;
+};
+AllKinds build_all_kinds(Rig5459& f) {
+    AllKinds k;
+    k.wedge = f.wedge("r1", "/a");
+    k.bad = f.failed_sibling("r3", "/c");
+    k.pend = f.pending_sibling("r2", "/b");
+    f.open_delta({"r1", "r2", "r3", "r4"}, 4);
+    f.ledger.add_pending("r1", k.wedge);
+    f.ledger.add_pending("r2", k.pend);
+    f.ledger.add_pending("r3", k.bad);
+    f.ledger.note_sync_failure("r4", false);
+    f.ledger.latch_failure();
+    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 2); // r1 (wedge) + r3 (failed); r2 stays Pending
+    REQUIRE(f.ledger.obligation_for_test("r1") == OB::FailedReceipt);
+    REQUIRE(f.ledger.obligation_for_test("r2") == OB::Pending);
+    REQUIRE(f.ledger.obligation_for_test("r3") == OB::FailedId);
+    REQUIRE(f.ledger.obligation_for_test("r4") == OB::SyncFailed);
+    return k;
+}
+} // namespace
+
+TEST_CASE("GuardianArmAckLedger::begin_delta_application(): every kind is carried together, "
+          "one source per id, with exact counts (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    const auto keep_alive = build_all_kinds(f);
+    (void)keep_alive;
+    f.open_delta({"r9"}, 7);
+    CHECK(f.ledger.obligation_for_test("r1") == OB::FailedReceipt);
+    CHECK(f.ledger.obligation_for_test("r2") == OB::Pending);
+    CHECK(f.ledger.obligation_for_test("r3") == OB::FailedId);
+    CHECK(f.ledger.obligation_for_test("r4") == OB::SyncFailed);
+    CHECK(f.ledger.pending_count_for_test() == 1);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 1);
+    CHECK(f.ledger.failed_id_count_for_test() == 1);
+    CHECK(f.ledger.sync_failed_count_for_test() == 1);
+    CHECK(f.failed_gauge() == 2);
+    CHECK(f.counts_consistent());
+    CHECK(f.ledger.applied_count() == 7);
+    CHECK(f.ledger.inherited_latch_for_test()); // the latch of the old application
+    CHECK_FALSE(f.ledger.latched_failure_for_test());
+    CHECK_FALSE(f.ledger.can_advance());
+    CHECK(f.ledger.drain_locked(*f.rt, 10) ==
+          0); // r2 is still Pending; the carried r1 stays retained
+    CHECK(f.counts_consistent());
+}
+
+TEST_CASE("GuardianArmAckLedger::begin_delta_application(): drop rules - a rule the delta "
+          "NAMES (enabled or disabled alike) is covered by the new application and not "
+          "carried; unnamed rules still are (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    const auto keep_alive = build_all_kinds(f);
+    (void)keep_alive;
+
+    // Names r1 (wedge) and r3 (failed id) only. A disabled rule is named in the push but
+    // gets no add_pending(): at this seam "named" and "named and disabled" are the same
+    // thing, so there is nothing further to distinguish.
+    f.open_delta({"r1", "r3"});
+    CHECK(f.ledger.obligation_for_test("r1") == OB::None);
+    CHECK(f.ledger.obligation_for_test("r3") == OB::None);
+    CHECK(f.ledger.obligation_for_test("r2") == OB::Pending);
+    CHECK(f.ledger.obligation_for_test("r4") == OB::SyncFailed);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 0);
+    CHECK(f.ledger.failed_id_count_for_test() == 0);
+    CHECK(f.failed_gauge() == 0);
+    CHECK(f.counts_consistent());
+    CHECK_FALSE(f.ledger.can_advance()); // r2, r4 and the inherited latch remain
+
+    // Naming everything drops every per-rule obligation; only the inherited latch is left.
+    f.open_delta({"r2", "r4"});
+    CHECK(f.ledger.obligation_for_test("r2") == OB::None);
+    CHECK(f.ledger.obligation_for_test("r4") == OB::None);
+    CHECK(f.ledger.pending_count_for_test() == 0);
+    CHECK(f.ledger.sync_failed_count_for_test() == 0);
+    CHECK(f.ledger.inherited_latch_for_test());
+    CHECK_FALSE(f.ledger.can_advance());
+    f.ledger.discharge_inherited_latch();
+    CHECK(f.ledger.can_advance());
+}
+
+TEST_CASE("GuardianArmAckLedger::begin_delta_application(): a disabled rule that is named but "
+          "never add_pending()ed leaves no obligation behind (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    auto bad = f.failed_sibling("r1", "/a");
+    f.open_delta({"r1"});
+    f.ledger.add_pending("r1", bad);
+    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
+    REQUIRE_FALSE(f.ledger.can_advance());
+    f.open_delta({"r1"}); // re-pushed, now disabled: reconcile adds nothing for it
+    CHECK(f.ledger.obligation_for_test("r1") == OB::None);
+    CHECK(f.ledger.can_advance());
+}
+
+TEST_CASE("GuardianArmAckLedger::begin_full_application(): carries no per-rule obligation, "
+          "only the inherited latch (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    const auto keep_alive = build_all_kinds(f);
+    (void)keep_alive;
+    f.open_full(3);
+    for (const char* id : {"r1", "r2", "r3", "r4"})
+        CHECK(f.ledger.obligation_for_test(id) == OB::None);
+    CHECK(f.ledger.pending_count_for_test() == 0);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 0);
+    CHECK(f.ledger.failed_id_count_for_test() == 0);
+    CHECK(f.ledger.sync_failed_count_for_test() == 0);
+    CHECK(f.ledger.boot_origin_count_for_test() == 0);
+    CHECK(f.failed_gauge() == 0);
+    CHECK(f.ledger.applied_count() == 3);
+    CHECK(f.ledger.inherited_latch_for_test()); // the one thing a full sync carries
+    CHECK_FALSE(f.ledger.latched_failure_for_test());
+    CHECK_FALSE(f.ledger.can_advance());  // until the full sync completes cleanly
+    CHECK(f.retry_full() == RD::Reapply); // full_sync identity matches; the debt forces it
+    f.ledger.discharge_inherited_latch();
+    CHECK(f.ledger.can_advance());
+}
+
+TEST_CASE("GuardianArmAckLedger::begin_full_application(): a wedge omitted by a full sync is not "
+          "carried - the full sync detaches it (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    auto w = f.wedge("r1", "/a");
+    f.open_delta({"r1"});
+    f.ledger.add_pending("r1", w);
+    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
+    REQUIRE_FALSE(f.ledger.can_advance());
+    f.open_full();
+    CHECK(f.ledger.failed_receipt_count_for_test() == 0);
+    CHECK(f.failed_gauge() == 0);
+    CHECK(f.ledger.can_advance()); // no latch was set, so nothing is inherited
+}
+
+TEST_CASE("GuardianArmAckLedger: a recovery drops the carried obligation and its boot tag; "
+          "retire() drops everything and nothing is inherited afterwards (#5547)",
+          "[spark][ack][5547]") {
+    SECTION("recovery") {
+        Rig5459 f;
+        auto w = f.wedge("r1", "/a");
+        f.open_delta({"r1"});
+        f.ledger.add_pending("r1", w, /*boot_origin=*/true);
+        REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
+        f.open_delta({"r2"});
+        REQUIRE(f.ledger.boot_origin_for_test("r1"));
+        f.b->release_path("/a");
+        REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; },
+                                       std::chrono::seconds(10)));
+        CHECK(f.ledger.drain_locked(*f.rt, 10) == 0);
+        CHECK(f.ledger.obligation_for_test("r1") == OB::None);
+        CHECK_FALSE(f.ledger.boot_origin_for_test("r1")); // tag subset of the live obligations
+        CHECK(f.ledger.boot_origin_count_for_test() == 0);
+        CHECK(f.failed_gauge() == 0);
+        CHECK(f.ledger.can_advance());
+    }
+    SECTION("retire") {
+        Rig5459 f;
+        const auto keep_alive = build_all_kinds(f);
+        (void)keep_alive;
+        f.ledger.retire();
+        CHECK(f.ledger.failed_id_count_for_test() == 0);
+        CHECK(f.ledger.sync_failed_count_for_test() == 0);
+        CHECK(f.ledger.obligation_for_test("r1") == OB::None);
+        CHECK_FALSE(f.ledger.can_advance());
+        f.open_delta({"r9"}); // nothing is inherited from a retired application
+        CHECK_FALSE(f.ledger.inherited_latch_for_test());
+        CHECK(f.ledger.failed_receipt_count_for_test() == 0);
+        CHECK(f.ledger.pending_count_for_test() == 0);
+        CHECK(f.ledger.can_advance());
+    }
+}
+
+// ── decide_retry arithmetic ───────────────────────────────────────────────
+
+TEST_CASE("GuardianArmAckLedger::decide_retry(): a carried failed id or sync failure beside a "
+          "live wedge forces Reapply instead of letting the wedge Suppress (#5547)",
+          "[spark][ack][5547]") {
+    SECTION("sync failure beside a retained wedge (counts alone are equal)") {
+        Rig5459 f;
+        auto w = f.wedge("r1", "/a");
+        f.open_delta({"r1", "r2"});
+        f.ledger.add_pending("r1", w);
+        f.ledger.note_sync_failure("r2", false);
+        REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
+        REQUIRE(f.failed_gauge() == f.ledger.failed_receipt_count_for_test()); // 1 == 1
+        CHECK(f.retry() == RD::Reapply);
+        f.open_delta({"r3"});
+        CHECK(f.retry() == RD::Reapply);                      // and again after the carry
+        CHECK(f.ledger.wedge_suppress_count_for_test() == 0); // the budget was never spent
+    }
+    SECTION("failed id beside a retained wedge") {
+        Rig5459 f;
+        auto w = f.wedge("r1", "/a");
+        auto bad = f.failed_sibling("r2", "/b");
+        f.open_delta({"r1", "r2"});
+        f.ledger.add_pending("r1", w);
+        f.ledger.add_pending("r2", bad);
+        REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 2);
+        f.open_delta({"r3"});
+        CHECK(f.ledger.obligation_for_test("r1") == OB::FailedReceipt);
+        CHECK(f.ledger.obligation_for_test("r2") == OB::FailedId);
+        CHECK(f.retry() == RD::Reapply);
+        CHECK(f.ledger.wedge_suppress_count_for_test() == 0);
+    }
+    SECTION("inherited latch beside a retained wedge") {
+        Rig5459 f;
+        auto w = f.wedge("r1", "/a");
+        f.open_delta({"r1"});
+        f.ledger.add_pending("r1", w);
+        REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
+        REQUIRE(f.retry() == RD::Suppress);
+        f.ledger.latch_failure();
+        f.open_delta({"r2"});
+        CHECK(f.ledger.inherited_latch_for_test());
+        CHECK(f.retry() == RD::Reapply); // would be Suppress without the inherited-latch test
+    }
+}
+
+TEST_CASE("GuardianArmAckLedger::begin_delta_application(): the suppress budget restarts at "
+          "zero on replacement (AC-11 (4)) (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    auto w = f.wedge("r1", "/a");
+    f.open_delta({"r1"});
+    f.ledger.add_pending("r1", w);
+    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
+    for (std::size_t i = 0; i < kWedgeSuppressMaxDecisions; ++i)
+        REQUIRE(f.retry() == RD::Suppress);
+    REQUIRE(f.retry() == RD::Reapply);
+    REQUIRE(f.ledger.wedge_suppress_count_for_test() == kWedgeSuppressMaxDecisions);
+
+    f.open_delta({"r2"}); // carries the still-hung wedge
+    CHECK(f.ledger.obligation_for_test("r1") == OB::FailedReceipt);
+    CHECK(f.ledger.wedge_suppress_count_for_test() == 0);
+    for (std::size_t i = 0; i < kWedgeSuppressMaxDecisions; ++i)
+        CHECK(f.retry() == RD::Suppress); // a full fresh budget
+    CHECK(f.retry() == RD::Reapply);
+}
+
+// ── Build before replace ──────────────────────────────────────────────────
+
+TEST_CASE("GuardianArmAckLedger: a throw while building a replacement leaves the open "
+          "application, every obligation and the suppress budget untouched (#5547)",
+          "[spark][ack][5547]") {
+    SECTION("every kind of obligation, at each fault site, delta and full") {
+        Rig5459 f;
+        const auto keep_alive = build_all_kinds(f);
+        (void)keep_alive;
+        f.ledger.note_sync_failure("r4", true); // boot-tagged
+        const auto before = f.snapshot();
+        REQUIRE(f.ledger.boot_origin_count_for_test() == 1);
+
+        for (const auto site : {BFS::MidCarry, BFS::BeforePublish}) {
+            f.ledger.set_begin_fault_hook_for_test([site](BFS reached) {
+                if (reached == site)
+                    throw std::runtime_error("injected");
+            });
+            CHECK_THROWS_AS(f.ledger.begin_delta_application(2, std::string(64, 'b'), 9, {"r9"}),
+                            std::runtime_error);
+            CHECK(f.snapshot() == before);
+            CHECK(f.ledger.obligation_for_test("r1") == OB::FailedReceipt);
+            CHECK(f.ledger.obligation_for_test("r2") == OB::Pending);
+            CHECK(f.ledger.obligation_for_test("r3") == OB::FailedId);
+            CHECK(f.ledger.obligation_for_test("r4") == OB::SyncFailed);
+            CHECK(f.ledger.latched_failure_for_test()); // still the OLD application's own latch
+            CHECK_FALSE(f.ledger.inherited_latch_for_test());
+        }
+        // The full entry point has no carry loop, so only BeforePublish applies to it.
+        f.ledger.set_begin_fault_hook_for_test([](BFS reached) {
+            if (reached == BFS::BeforePublish)
+                throw std::runtime_error("injected");
+        });
+        CHECK_THROWS_AS(f.ledger.begin_full_application(2, std::string(64, 'b'), 9),
+                        std::runtime_error);
+        CHECK(f.snapshot() == before);
+
+        // With the fault removed the same call succeeds and carries.
+        f.ledger.set_begin_fault_hook_for_test({});
+        f.ledger.begin_delta_application(2, std::string(64, 'b'), 9, {"r9"});
+        CHECK(f.ledger.pending_generation() == 2);
+        CHECK(f.ledger.obligation_for_test("r1") == OB::FailedReceipt);
+        CHECK(f.ledger.obligation_for_test("r4") == OB::SyncFailed);
+        CHECK(f.ledger.boot_origin_for_test("r4"));
+    }
+    SECTION("the identity and the remaining suppress budget survive") {
+        Rig5459 f;
+        auto w = f.wedge("r1", "/a");
+        f.open_delta({"r1"});
+        f.ledger.add_pending("r1", w);
+        REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
+        for (int i = 0; i < 3; ++i)
+            REQUIRE(f.retry() == RD::Suppress);
+        REQUIRE(f.ledger.wedge_suppress_count_for_test() == 3);
+
+        f.ledger.set_begin_fault_hook_for_test([](BFS) { throw std::runtime_error("injected"); });
+        CHECK_THROWS_AS(f.ledger.begin_delta_application(2, std::string(64, 'b'), 1, {"r2"}),
+                        std::runtime_error);
+        CHECK(f.ledger.pending_generation() == 1);
+        CHECK(f.ledger.wedge_suppress_count_for_test() == 3);
+        CHECK(f.ledger.obligation_for_test("r1") == OB::FailedReceipt);
+        f.ledger.set_begin_fault_hook_for_test({});
+        // Exactly the remaining seven Suppress decisions are left, then the valve opens.
+        for (std::size_t i = 3; i < kWedgeSuppressMaxDecisions; ++i)
+            CHECK(f.retry() == RD::Suppress);
+        CHECK(f.retry() == RD::Reapply);
+    }
+}
+
+// ── Transactional drain ───────────────────────────────────────────────────
+
+TEST_CASE("GuardianArmAckLedger::drain_locked(): a throw after a receipt's accounting leaves it "
+          "in `pending`, and the re-drain does not count it a second time (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    auto ra = f.failed_sibling("r1", "/a");
+    auto rb = f.failed_sibling("r2", "/b");
+    f.open_delta({"r1", "r2"}, 2);
+    f.ledger.add_pending("r1", ra);
+    f.ledger.add_pending("r2", rb);
+    f.ledger.set_drain_fault_hook_for_test([](DFS site, std::string_view id) {
+        if (site == DFS::AfterAccounting && id == "r1")
+            throw std::runtime_error("injected");
+    });
+
+    std::size_t failed_out = 0;
+    bool boot_failed = false;
+    CHECK_THROWS_AS(f.ledger.drain_locked(*f.rt, 10, &failed_out, &boot_failed),
+                    std::runtime_error);
+    // r1's accounting committed before the throw and is visible to the caller...
+    CHECK(failed_out == 1);
+    CHECK(f.failed_gauge() == 1);
+    CHECK(f.ledger.failed_id_count_for_test() == 1);
+    CHECK_FALSE(boot_failed);
+    // ...but the receipt was not erased, and r2 was never reached.
+    CHECK(f.ledger.pending_count_for_test() == 2);
+
+    f.ledger.set_drain_fault_hook_for_test({});
+    CHECK(f.ledger.drain_locked(*f.rt, 10, &failed_out, &boot_failed) == 2);
+    CHECK(failed_out == 2);       // r1 NOT counted again
+    CHECK(f.failed_gauge() == 2); // resolved_failed matches the two ids
+    CHECK(f.ledger.failed_id_count_for_test() == 2);
+    CHECK(f.ledger.pending_count_for_test() == 0);
+    CHECK(f.counts_consistent());
+    CHECK(f.ledger.resolved_statuses_for_test().size() == 2); // one diagnostic per distinct failure
+}
+
+TEST_CASE("GuardianArmAckLedger::drain_locked(): a boot-origin failure committed before a "
+          "sibling's throw is still reported through the out-param (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    auto ra = f.failed_sibling("r1", "/a");
+    auto rb = f.failed_sibling("r2", "/b");
+    f.open_delta({"r1", "r2"}, 2);
+    f.ledger.add_pending("r1", ra, /*boot_origin=*/true);
+    f.ledger.add_pending("r2", rb, /*boot_origin=*/false);
+    f.ledger.set_drain_fault_hook_for_test([](DFS site, std::string_view id) {
+        if (site == DFS::AfterAccounting && id == "r2")
+            throw std::runtime_error("injected");
+    });
+    std::size_t failed_out = 0;
+    bool boot_failed = false;
+    CHECK_THROWS_AS(f.ledger.drain_locked(*f.rt, 10, &failed_out, &boot_failed),
+                    std::runtime_error);
+    CHECK(boot_failed); // r1 is no longer pending: this is the only chance to learn of it
+    CHECK(failed_out == 2);
+    CHECK(f.failed_gauge() == 2);
+    CHECK(f.ledger.obligation_for_test("r1") == OB::FailedId);
+    CHECK(f.ledger.boot_origin_for_test("r1"));
+    CHECK_FALSE(f.ledger.boot_origin_for_test("r2"));
+
+    // The re-drain neither double-counts nor loses the tag.
+    f.ledger.set_drain_fault_hook_for_test({});
+    bool boot_again = false;
+    CHECK(f.ledger.drain_locked(*f.rt, 10, &failed_out, &boot_again) == 1);
+    CHECK_FALSE(boot_again); // r2 is not boot-origin; r1 was already reported
+    CHECK(failed_out == 2);
+    CHECK(f.failed_gauge() == 2);
+}
+
+TEST_CASE("GuardianArmAckLedger::drain_locked(): the boot out-param follows the tag only, and a "
+          "committed boot rule drops its tag (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    auto bad = f.failed_sibling("r1", "/a");
+    auto ok = f.committed_sibling("r2", "/b");
+    f.open_delta({"r1", "r2"}, 2);
+    f.ledger.add_pending("r1", bad, false);
+    f.ledger.add_pending("r2", ok, true);
+    REQUIRE(f.ledger.boot_origin_for_test("r2"));
+    bool boot_failed = false;
+    CHECK(f.ledger.drain_locked(*f.rt, 10, nullptr, &boot_failed) == 2);
+    CHECK_FALSE(boot_failed);                         // the only failure is not boot-origin
+    CHECK_FALSE(f.ledger.boot_origin_for_test("r2")); // committed: no longer an obligation
+    CHECK(f.ledger.boot_origin_count_for_test() == 0);
+}
+
+TEST_CASE("GuardianArmAckLedger::drain_locked(): the recovery scan's Blocking arm inserts into "
+          "failed_ids BEFORE erasing from failed_receipts, so a throwing insert loses nothing "
+          "(#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    auto w = f.wedge("r1", "/a");
+    f.open_delta({"r1"});
+    f.ledger.add_pending("r1", w);
+    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
+    REQUIRE(f.ledger.obligation_for_test("r1") == OB::FailedReceipt);
+    f.late_failure("/a"); // popped without adoption: the entry now reads Blocking
+
+    f.ledger.set_drain_fault_hook_for_test([](DFS site, std::string_view id) {
+        if (site == DFS::BeforeBlockingInsert && id == "r1")
+            throw std::runtime_error("injected");
+    });
+    CHECK_THROWS_AS(f.ledger.drain_locked(*f.rt, 10), std::runtime_error);
+    CHECK(f.ledger.obligation_for_test("r1") == OB::FailedReceipt); // not lost
+    CHECK(f.ledger.failed_receipt_count_for_test() == 1);
+    CHECK(f.ledger.failed_id_count_for_test() == 0);
+    CHECK(f.failed_gauge() == 1);
+    CHECK(f.counts_consistent());
+    CHECK_FALSE(f.ledger.can_advance());
+
+    f.ledger.set_drain_fault_hook_for_test({});
+    CHECK(f.ledger.drain_locked(*f.rt, 10) == 0);
+    CHECK(f.ledger.obligation_for_test("r1") == OB::FailedId);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 0);
+    CHECK(f.failed_gauge() == 1); // moved, not recounted and not dropped
+    CHECK(f.counts_consistent());
+    CHECK_FALSE(f.ledger.can_advance());
+}
+
+TEST_CASE("GuardianArmAckLedger::drain_locked(): a Wedged receipt that is neither wedge-eligible "
+          "nor compensation-pending (popped before its first drain) is a counted failed id, "
+          "not retained (#5547; the AC-15 shape stays as documented)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    auto w = f.wedge("r1", "/a");
+    f.start_compensation("/a");
+    f.finish_compensation("/a"); // popped, nothing adopted it, before the ledger ever drained it
+    f.open_delta({"r1"});
+    f.ledger.add_pending("r1", w);
+    CHECK(f.ledger.drain_locked(*f.rt, 10) == 1);
+    CHECK(f.ledger.obligation_for_test("r1") == OB::FailedId);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 0);
+    CHECK(f.failed_gauge() == 1);
+    CHECK(f.counts_consistent());
+    f.open_delta(
+        {"r2"}); // carried like any ordinary failure: repaired by a full sync or a naming push
+    CHECK(f.ledger.obligation_for_test("r1") == OB::FailedId);
+    CHECK(f.retry() == RD::Reapply);
+    f.open_full();
+    CHECK(f.ledger.obligation_for_test("r1") == OB::None);
+}
+
+TEST_CASE("GuardianArmAckLedger::begin_delta_application(): an id left in two sets by a throwing "
+          "drain is carried from exactly one, by a stated priority (#5547)",
+          "[spark][ack][5547]") {
+    SECTION("failed id over pending") {
+        Rig5459 f;
+        auto bad = f.failed_sibling("r1", "/a");
+        auto other = f.failed_sibling("r2", "/b");
+        f.open_delta({"r1", "r2"});
+        f.ledger.add_pending("r1", bad);
+        f.ledger.add_pending("r2", other);
+        f.ledger.set_drain_fault_hook_for_test([](DFS site, std::string_view id) {
+            if (site == DFS::AfterAccounting && id == "r1")
+                throw std::runtime_error("injected");
+        });
+        CHECK_THROWS_AS(f.ledger.drain_locked(*f.rt, 10), std::runtime_error);
+        REQUIRE(f.ledger.pending_count_for_test() == 2); // r1 is in failed_ids AND pending
+
+        f.open_delta({"r9"});
+        CHECK(f.ledger.obligation_for_test("r1") == OB::FailedId);
+        CHECK(f.ledger.failed_id_count_for_test() == 1);
+        CHECK(f.ledger.pending_count_for_test() == 1); // r2 only
+        CHECK(f.ledger.obligation_for_test("r2") == OB::Pending);
+        CHECK(f.failed_gauge() == 1);
+        CHECK(f.counts_consistent());
+    }
+    SECTION("retained wedge over pending") {
+        Rig5459 f;
+        auto w = f.wedge("r1", "/a");
+        f.open_delta({"r1"});
+        f.ledger.add_pending("r1", w);
+        f.ledger.set_drain_fault_hook_for_test([](DFS site, std::string_view id) {
+            if (site == DFS::AfterAccounting && id == "r1")
+                throw std::runtime_error("injected");
+        });
+        CHECK_THROWS_AS(f.ledger.drain_locked(*f.rt, 10), std::runtime_error);
+        REQUIRE(f.ledger.pending_count_for_test() == 1);
+        REQUIRE(f.ledger.failed_receipt_count_for_test() == 1);
+
+        f.open_delta({"r9"});
+        CHECK(f.ledger.obligation_for_test("r1") == OB::FailedReceipt);
+        CHECK(f.ledger.pending_count_for_test() == 0);
+        CHECK(f.ledger.failed_receipt_count_for_test() == 1);
+        CHECK(f.failed_gauge() == 1);
+        CHECK(f.counts_consistent());
+        CHECK(f.retry() == RD::Suppress);
+    }
+}
+
+// ── boot_claims: boot provenance across re-observation ────────────────────
+
+TEST_CASE("GuardianArmAckLedger::add_pending(): a named re-observation of the SAME boot claim "
+          "keeps its boot tag, so its later failure is reported as boot-origin (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    auto p = f.pending_sibling("r1", "/a");
+    f.open_delta({"r1"});
+    f.ledger.add_pending("r1", p, /*boot_origin=*/true);
+    REQUIRE(f.ledger.boot_origin_for_test("r1"));
+
+    f.open_delta({"r1"}); // names r1: the obligation is dropped, the claim identity is not
+    CHECK(f.ledger.obligation_for_test("r1") == OB::None);
+    CHECK(f.ledger.boot_origin_count_for_test() == 0);
+    CHECK(f.ledger.boot_claim_count_for_test() == 1);
+    auto again = accept(*f.rt, "r1", "/a");
+    REQUIRE(again.claim == p.claim); // PR-A: an identical pending arm re-observes the same claim
+    f.ledger.add_pending("r1", again, /*boot_origin=*/false);
+    CHECK(f.ledger.boot_origin_for_test("r1"));
+    CHECK(f.ledger.obligation_for_test("r1") == OB::Pending);
+
+    f.b->fail_arm.store(true);
+    f.b->release_path("/a");
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->is_terminal(p); }, std::chrono::seconds(10)));
+    bool boot_failed = false;
+    CHECK(f.ledger.drain_locked(*f.rt, 10, nullptr, &boot_failed) == 1);
+    CHECK(boot_failed);
+    CHECK(f.ledger.obligation_for_test("r1") == OB::FailedId);
+    CHECK(f.ledger.boot_origin_for_test("r1"));
+}
+
+TEST_CASE("GuardianArmAckLedger::add_pending(): a genuinely NEW attempt for a boot rule is not "
+          "tagged merely because the rule id matches, and its stale claim entry is dropped "
+          "(#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    auto w = f.wedge("r1", "/a");
+    f.open_delta({"r1"});
+    f.ledger.add_pending("r1", w, /*boot_origin=*/true);
+    REQUIRE(f.ledger.boot_claim_count_for_test() == 1);
+    f.late_failure("/a"); // the boot claim pops; the next arm is a different claim
+
+    f.open_delta({"r1"});
+    auto fresh = f.hang("r1", "/a");
+    REQUIRE_FALSE(fresh.claim == w.claim);
+    f.ledger.add_pending("r1", fresh, /*boot_origin=*/false);
+    CHECK_FALSE(f.ledger.boot_origin_for_test("r1"));
+    CHECK(f.ledger.boot_origin_count_for_test() == 0);
+    CHECK(f.ledger.boot_claim_count_for_test() == 0); // pruned
+    CHECK(f.ledger.obligation_for_test("r1") == OB::Pending);
+}
+
+TEST_CASE("GuardianArmAckLedger: boot tags ride with carried obligations; boot_claims is copied "
+          "by BOTH entry points as identity only (#5547)",
+          "[spark][ack][5547]") {
+    Rig5459 f;
+    auto w = f.wedge("r1", "/a");
+    auto bad = f.failed_sibling("r2", "/b");
+    f.open_delta({"r1", "r2"});
+    f.ledger.add_pending("r1", w, true);
+    f.ledger.add_pending("r2", bad, false);
+    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 2);
+
+    f.open_delta({"r3"}); // omits both
+    CHECK(f.ledger.boot_origin_for_test("r1"));
+    CHECK_FALSE(f.ledger.boot_origin_for_test("r2"));
+    CHECK(f.ledger.boot_origin_count_for_test() == 1);
+    CHECK(f.ledger.boot_claim_count_for_test() == 1);
+
+    f.open_delta({"r1"}); // names the boot rule: tag dropped with the obligation, identity kept
+    CHECK(f.ledger.boot_origin_count_for_test() == 0);
+    CHECK(f.ledger.boot_claim_count_for_test() == 1);
+    CHECK(f.ledger.obligation_for_test("r2") == OB::FailedId);
+
+    f.open_full(); // a full sync carries no obligation and no tag, but keeps the identity
+    CHECK(f.ledger.boot_origin_count_for_test() == 0);
+    CHECK(f.ledger.obligation_for_test("r2") == OB::None);
+    CHECK(f.ledger.boot_claim_count_for_test() == 1);
+
+    f.ledger.retire();
+    f.open_delta({"r1"});
+    CHECK(f.ledger.boot_claim_count_for_test() == 0); // retire() drops everything
+}
+
+TEST_CASE("GuardianArmAckLedger::drain_locked(): a Withdrawn or a Stopped receipt is an ordinary "
+          "failure kept in failed_ids, its receipt discarded (#5547)",
+          "[spark][ack][5547]") {
+    // Both statuses share the ordinary-failure arm of drain_locked() with Failed: only the rule id
+    // is kept, in failed_ids. Mutation: either status removed from that case label (the receipt is
+    // dropped from pending without being counted: drain_locked() still returns 1, failed_ids stays
+    // empty and resolved_failed stays 0).
+    {
+        Rig5459 f;
+        f.open_delta({"r1"});
+        auto p = f.pending_sibling("r1", "/a");
+        f.ledger.add_pending("r1", p);
+        f.rt->detach_rule("r1"); // the rule is detached while its arm is in flight
+        REQUIRE(f.rt->receipt_status(p) == RT::ReceiptStatus::Withdrawn);
+        CHECK(f.ledger.drain_locked(*f.rt, 10) == 1);
+        CHECK(f.ledger.obligation_for_test("r1") == OB::FailedId);
+        CHECK(f.ledger.failed_id_count_for_test() == 1);
+        CHECK(f.ledger.failed_receipt_count_for_test() == 0);
+        CHECK(f.ledger.pending_count_for_test() == 0);
+        CHECK_FALSE(f.ledger.can_advance());
+    }
+    {
+        Rig5459 f;
+        f.open_delta({"r1"});
+        auto p = f.pending_sibling("r1", "/a");
+        f.ledger.add_pending("r1", p);
+        f.rt->begin_stop(); // the runtime stops while the arm is in flight
+        f.b->release_path("/a");
+        REQUIRE(yuzu::test::spin_until([&] { return f.rt->is_terminal(p); }, std::chrono::seconds(10)));
+        REQUIRE(f.rt->receipt_status(p) == RT::ReceiptStatus::Stopped);
+        CHECK(f.ledger.drain_locked(*f.rt, 10) == 1);
+        CHECK(f.ledger.obligation_for_test("r1") == OB::FailedId);
+        CHECK(f.ledger.failed_id_count_for_test() == 1);
+        CHECK(f.ledger.failed_receipt_count_for_test() == 0);
+        CHECK(f.ledger.pending_count_for_test() == 0);
+        CHECK_FALSE(f.ledger.can_advance());
+    }
 }

@@ -27,6 +27,7 @@
 // Full-page templates (defined at global scope in the *_ui.cpp translation units).
 extern const char* const kDashboardIndexHtml;
 extern const char* const kHelpHtml;
+extern const char* const kSwaggerPageHtml;
 extern const char* const kInstructionPageHtml;
 extern const char* const kApprovalsPageHtml;
 extern const char* const kExecutionsPageHtml;
@@ -88,9 +89,9 @@ TEST_CASE("app shell: nav is exactly the pages that exist, in design order", "[n
         for (const auto& it : g.items)
             labels.push_back(it.label);
     CHECK(labels == std::vector<std::string_view>{"Console", "Instructions", "Result sets",
-                                                  "Compliance", "Guardian", "DEX", "TAR",
+                                                  "Compliance", "Guardian", "DEX", "TAR", "Crypto",
                                                   "Groups and enrolment", "Hardware", "Software",
-                                                  "Fleet", "Users", "Tokens and principals", "Audit and reviews",
+                                                  "Fleet", "Users and roles", "Tokens and principals", "Audit and reviews",
                                                   "Settings"});
 }
 
@@ -169,6 +170,14 @@ TEST_CASE("app shell: Settings sub-items are System pages in artboard order, non
         CHECK(c.href != settings.href);
         CHECK(c.href.starts_with("/settings/"));
     }
+}
+
+TEST_CASE("app shell: a System child shows Settings / <page> and lights its own entry",
+          "[nav][shell]") {
+    CHECK(breadcrumb_trail({.active_key = "settings-plugins", .breadcrumb = "Settings"}) ==
+          std::vector<std::string>{"Settings", "Plugins and updates"});
+    CHECK(breadcrumb_trail({.active_key = "settings-pki", .breadcrumb = "Settings"}) ==
+          std::vector<std::string>{"Settings", "Certificates and secrets"});
 }
 
 // ── Breadcrumb ──────────────────────────────────────────────────────────────
@@ -599,6 +608,7 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         {"fleet map", kVizFleetPageHtml, {"/viz/fleet"}},
         {"host map", kVizHostPageHtml, {"/viz/fleet"}},
         {"help", kHelpHtml, {}},
+        {"swagger", kSwaggerPageHtml, {}},
         // Not listed on purpose: /home is the landing and sign-in page and carries no
         // shell at all (test_home_ui.cpp pins that). The logo reaches it (below).
     };
@@ -678,6 +688,7 @@ TEST_CASE("the shared detail shell re-targets to every route that reuses it", "[
         {"dex", {"/dex"}},
         {"hardware", {"/hardware"}},
         {"software", {"/software"}},
+        {"crypto", {"/crypto"}},
         {"auto", {"/software", "/auto"}},
         {"network", {"/viz/fleet", "/network"}},
     };

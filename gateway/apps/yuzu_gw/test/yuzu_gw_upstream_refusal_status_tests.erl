@@ -53,8 +53,11 @@ register_circuit_open_is_unavailable() ->
 
 inventory_circuit_open_is_unavailable() ->
     trip(),
-    ?assertMatch({grpc_error, {?GRPC_STATUS_UNAVAILABLE, _}},
-                 yuzu_gw_agent_service:report_inventory(ctx(#{}), #{agent_id => <<"a1">>})).
+    with_held_session(<<"a1">>, fun(Session) ->
+        ?assertMatch({grpc_error, {?GRPC_STATUS_UNAVAILABLE, _}},
+                     yuzu_gw_agent_service:report_inventory(ctx(#{}),
+                                                            #{session_id => Session}))
+    end).
 
 register_overloaded_is_unavailable() ->
     application:set_env(yuzu_gw, upstream_register_concurrency, 1),
@@ -97,8 +100,11 @@ upstream_not_running_is_unavailable() ->
     ?assertMatch({error, upstream_unavailable}, yuzu_gw_upstream:proxy_register(req(<<"a4">>))),
     ?assertMatch({grpc_error, {?GRPC_STATUS_UNAVAILABLE, _}},
                  yuzu_gw_agent_service:register(ctx(#{}), req(<<"a4">>))),
-    ?assertMatch({grpc_error, {?GRPC_STATUS_UNAVAILABLE, _}},
-                 yuzu_gw_agent_service:report_inventory(ctx(#{}), #{agent_id => <<"a4">>})),
+    with_held_session(<<"a4">>, fun(Session) ->
+        ?assertMatch({grpc_error, {?GRPC_STATUS_UNAVAILABLE, _}},
+                     yuzu_gw_agent_service:report_inventory(ctx(#{}),
+                                                            #{session_id => Session}))
+    end),
     ?assertEqual(0, meck:num_calls(yuzu_grpc_client, unary, '_')).
 
 %%--------------------------------------------------------------------
@@ -110,6 +116,16 @@ trip() ->
     yuzu_gw_test_upstream:trip_breaker(req(<<"trip">>), 1).
 
 req(Id) -> #{info => #{agent_id => Id}}.
+
+%% An inventory report is forwarded only for a session held on the calling
+%% connection (#5695): hold one, pending, on this process (the conn pid ctx/1
+%% puts in the call), for the duration of Fun.
+with_held_session(AgentId, Fun) ->
+    Session = <<"inv-", AgentId/binary>>,
+    ok = yuzu_gw_registry:store_pending(Session, #{agent_id => AgentId, conn_key => self()}),
+    try Fun(Session)
+    after _ = yuzu_gw_registry:take_pending(Session)
+    end.
 
 ctx(Headers) ->
     yuzu_grpc:new_ctx(Headers, self(), {{127, 0, 0, 1}, 1}, {{127, 0, 0, 1}, transport}, undefined).

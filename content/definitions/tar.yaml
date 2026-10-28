@@ -146,10 +146,9 @@ spec:
         displayName: Event Type Filter
         description: >
           Filter results by event type. Valid values: process, network,
-          service, user, software, arp, dns, mapdrive. software joins the default
-          feed once enabled (its collection is off by default — see
-          software_enabled); arp/dns/mapdrive are opt-in device-state / PII sources
-          reached only by an explicit filter — they are excluded from the default
+          service, user, software, arp, dns, mapdrive. software is part of the
+          default feed (see software_enabled); arp/dns/mapdrive are device-state
+          sources reached only by an explicit filter — they are excluded from the default
           (empty-filter) feed. mapdrive (§3.8) returns network-share mappings in
           both directions, including historical (action='historical') rows. Leave
           empty to return the core process/network/service/user/software types.
@@ -243,7 +242,7 @@ spec:
       - name: status
         type: string
         description: >-
-          Outcome token for the forced snapshot. The actual response line is `tar|snapshot|complete` when every enabled source collected cleanly, or `tar|snapshot|partial|<comma-joined source names>` when one or more sources threw an incomplete-capture error and retained their previous baseline instead of collecting. Values: complete, partial.
+          Outcome token for the forced snapshot. The actual response line is `tar|snapshot|complete` when every enabled source collected cleanly, or `tar|snapshot|partial|<comma-joined source names>` when one or more sources threw an incomplete-capture error and retained their previous baseline instead of collecting, or whose `<source>_enabled` flag could not be read (that source's leg was skipped and its rows are kept). Values: complete, partial.
         example: "-"
         platforms: [windows, linux, darwin]
       - name: events_recorded
@@ -462,16 +461,15 @@ spec:
         displayName: Per-Application Performance Collector Enabled
         description: >
           Enable or disable the per-application top-N CPU/working-set sampler
-          (procperf source → $ProcPerf_*). **Off by default** — per-application
-          resource usage reveals which applications run on a device, which is
-          usage-class telemetry under the works-council posture; independent of
-          perf_enabled. Image names only — never command lines. **Enabling this
-          also sends per-app names + versions OFF-DEVICE**: the top-N is synced
+          (procperf source → $ProcPerf_*). **On by default**; independent of
+          perf_enabled. Image names only — never command lines. **This also
+          sends per-app names + versions OFF-DEVICE**: the top-N is synced
           daily to the central app_perf store (the B1 per-device and B2 fleet
           views), so it is not local-triage-only. To keep the device fully
-          local, leave this off, or suppress the upload with --inventory-disable
-          / YUZU_AGENT_INVENTORY_DISABLE. Set to "true" to opt in. Requires
-          agent v0.12.0+; older agents silently ignore. Valid: "true" | "false".
+          local, set this to "false", or suppress the upload with
+          --inventory-disable / YUZU_AGENT_INVENTORY_DISABLE. Set to "false" to
+          opt out. Requires agent v0.12.0+; older agents silently ignore.
+          Valid: "true" | "false".
         validation:
           pattern: "^(true|false)$"
       netqual_enabled:
@@ -480,16 +478,15 @@ spec:
         description: >
           Enable or disable the per-connection TCP-quality sampler (netqual
           source → $NetQual_Live, plus the per-boot retrospective baseline
-          $NetQual_Boot). **Off by default** — per-connection quality is
-          usage-class telemetry under the works-council posture; only a coarse
-          destination class (loopback/private/public) is stored, raw remote
-          addresses are dropped at the edge. Linux (netlink INET_DIAG) and
+          $NetQual_Boot). **On by default**; only a coarse destination class
+          (loopback/private/public) is stored, raw remote addresses are
+          dropped at the edge. Linux (netlink INET_DIAG) and
           Windows (TCP ESTATS — ADR-0020); **Windows requires an elevated
           agent** (non-elevated records nothing and tar.status reports
           netqual_capture_method=none). macOS is planned. Independent of
           tcp_enabled. Queried via tar.sql only ($NetQual_Live / $NetQual_Boot);
           the legacy tar.query / tar.export actions do not surface netqual. Set
-          to "true" to opt in. Requires agent v0.12.0+; older agents silently
+          to "false" to opt out. Requires agent v0.12.0+; older agents silently
           ignore. Valid: "true" | "false".
         validation:
           pattern: "^(true|false)$"
@@ -498,8 +495,7 @@ spec:
         displayName: Connectivity-Transition Collector Enabled
         description: >
           Enable or disable the connectivity-transition source (netconn →
-          $NetConn_Live, ADR-0020). **Off by default** — opt-in usage-class
-          telemetry. Windows reads the OS-retained NetworkProfile / NCSI /
+          $NetConn_Live, ADR-0020). **On by default**. Windows reads the OS-retained NetworkProfile / NCSI /
           WLAN-AutoConfig event logs, so the FIRST read backfills connectivity
           history from BEFORE the source was enabled (bounded by
           netconn_lookback_seconds; set that to 0 for forward-only). Only closed
@@ -534,13 +530,13 @@ spec:
         displayName: Module-Load Collector Enabled
         description: >
           Enable or disable the image-load / module-stream capture source (module
-          source → $Module_*). **Off by default** — module-load capture is
-          high-volume usage-class telemetry (every library and driver load per
-          process, with a code-signing verdict) under the works-council posture;
-          no command line is ever captured. No data is recorded until a collector
-          for the host's OS ships ($Module_* tables are queryable-empty until
-          then). Set to "true" to opt in. Requires agent v0.12.0+; older agents
-          silently ignore. Valid: "true" | "false".
+          source → $Module_*). **On by default** — module-load capture is
+          high-volume (every library and driver load per process, with a
+          code-signing verdict); no command line is ever captured. Windows
+          records image loads today (ETW); the Linux and macOS collectors are
+          planned, and there the $Module_* tables are queryable-empty. Set to
+          "false" to opt out. Requires
+          agent v0.12.0+; older agents silently ignore. Valid: "true" | "false".
         validation:
           pattern: "^(true|false)$"
       software_enabled:
@@ -548,8 +544,8 @@ spec:
         displayName: Software Inventory Collector Enabled
         description: >
           Enable or disable the software install/uninstall source (software →
-          $Software_*) on this agent. **Off by default** — turn it on per host to
-          record machine-wide installed-software inventory (HKLM Uninstall), which
+          $Software_*) on this agent. **On by default** — records machine-wide
+          installed-software inventory (HKLM Uninstall), which
           is device asset-management and vulnerability-relevance data and carries
           NO user identity (machine scope only — no per-user / profile-name data).
           Names, versions, and publisher only. See process_enabled for the disable
@@ -574,7 +570,7 @@ spec:
         displayName: ARP Collector Enabled
         description: >
           Enable or disable the ARP / neighbour-table capture source (ADR-0015).
-          Opt-in: "false" by default. See process_enabled for semantics.
+          **On by default.** See process_enabled for semantics.
           Native on every OS today: GetIpNetTable2 on Windows, /proc/net/arp
           on Linux, and a route_sysctl dump on macOS (constrained there --
           entry_type always reports "unknown"). Requires agent v0.12.0+;
@@ -586,9 +582,7 @@ spec:
         displayName: DNS Cache Collector Enabled
         description: >
           Enable or disable the DNS resolver-cache capture source (ADR-0015).
-          Opt-in: "false" by default — the DNS cache reveals visited domains
-          (usage-class telemetry under the works-council posture; enabling is
-          audited). Windows-only collector today (Linux/macOS planned). Requires
+          **On by default** — the DNS cache reveals visited domains. Windows-only collector today (Linux/macOS planned). Requires
           agent v0.12.0+; older agents silently ignore. Valid: "true" | "false".
         validation:
           pattern: "^(true|false)$"
@@ -600,15 +594,24 @@ spec:
           mapdrive → $MapDrive_*). Records network-share mappings in BOTH
           directions — outbound (drives this host maps to remote shares) and
           inbound (remote hosts mapping this host's shares, the lateral-movement
-          signal). Opt-in: "false" by default — rows expose usernames and remote
-          share paths (identity/usage-class telemetry under the works-council
-          posture; enabling is audited). Windows + Linux (macOS planned); inbound
+          signal). **On by default** — rows expose usernames and remote share
+          paths. Windows + Linux (macOS planned); inbound
           needs local-admin / Server-Operator on Windows and Samba on Linux and
           degrades to empty otherwise. NOTE: the one-time HISTORICAL backfill (all
           PREVIOUSLY mapped drives, from the registry / fstab / event logs) is
           seeded at agent init, so it materializes on the first agent restart
-          AFTER you enable this. See software_enabled for disable semantics (same
-          opt-in posture; disabling leaves existing rows queryable).
+          AFTER you enable this (or after upgrade, where it is now on by
+          default). See software_enabled for disable semantics (disabling leaves
+          existing rows queryable).
+          degrades to empty otherwise. NOTE: the HISTORICAL backfill (all
+          PREVIOUSLY mapped drives, from the registry / fstab / event logs) runs
+          its first pass at agent init, so it materializes on the first agent
+          restart AFTER you enable this; any profile whose hive could not be read
+          on that first pass (including a logged-out profile the offline
+          hive-file guard refuses) is retried individually, bounded at 7 attempts
+          per profile 24 hours apart, until it resolves or is abandoned. See
+          software_enabled for disable semantics (same opt-in posture; disabling
+          leaves existing rows queryable).
           Requires agent v0.12.0+; older agents silently ignore. Valid:
           "true" | "false".
         validation:
@@ -618,16 +621,8 @@ spec:
         displayName: Power Transition Capture Enabled
         description: >
           Enable or disable the sleep/wake/AC-power transition source (power →
-          $Power_Live, cursor-model seam). **ON by default ("true")** — the
-          first works-council-class source to ship enabled. Note this is NOT
-          the product's first default-on source: process, tcp, service, user
-          and perf have always been on as machine-scope operational telemetry.
-          Of the eight sources added since 1.5 under the works-council opt-in
-          posture (procperf, netqual, module, software, arp, dns, netconn,
-          mapdrive) every one defaults OFF, and power is the first of THAT
-          class to diverge.
-          The divergence is deliberate, but it does NOT mean the data is
-          low-sensitivity: the SOC 2 data inventory classifies $Power_Live as
+          $Power_Live, cursor-model seam). **ON by default ("true")**, like every
+          other capture source. The SOC 2 data inventory classifies $Power_Live as
           usage-class / behavioral-adjacent, because the TIMING of sleep/wake
           and AC events is a presence and working-hours proxy. Treat it as
           co-determination-relevant and use power_lookback_seconds=0 where a
@@ -664,15 +659,8 @@ spec:
           Enable or disable the removable-media attach/detach source
           (removable → $Removable_Live, cursor-model seam), including
           exec_from_removable correlation (a process observed running from a
-          removable volume). **ON by default ("true")** — the first
-          works-council-class source to ship enabled, alongside power. This is
-          NOT the product's first default-on source: process, tcp, service,
-          user and perf have always been on as machine-scope operational
-          telemetry. Of the eight sources added since 1.5 under the
-          works-council opt-in posture every one defaults OFF, and removable is
-          one of the first two of THAT class to diverge.
-          The divergence is deliberate and it does NOT mean the data is
-          low-sensitivity — this is the MORE sensitive of the two. The SOC 2
+          removable volume). **ON by default ("true")**, like every other
+          capture source. This is the MORE sensitive of power and removable. The SOC 2
           data inventory classifies $Removable_Live as usage/identity-class:
           it records device vendor, product and SERIAL, plus the executed
           binary path and pid of any process running from a removable volume.
@@ -702,6 +690,36 @@ spec:
           Requires agent v0.12.0+.
         validation:
           pattern: "^[0-9]+$"
+      registry_enabled:
+        type: string
+        displayName: Registry Change Capture Enabled
+        description: >
+          Enable or disable the Windows registry change source (registry →
+          $Registry_Live, cursor-model seam). **ON by default ("true")**, like
+          every other capture source. Windows only; on Linux and macOS the source
+          is listed as unsupported and records nothing. A curated watch list (Run and RunOnce, Services,
+          Image File Execution Options, AppInit_DLLs, Winlogon, LSA, Policies and
+          Defender under HKLM, plus Run, RunOnce, Policies and Winlogon under every
+          loaded user hive) is watched for changes; each added, changed or removed
+          value is recorded with its old and new data.
+          VALUES ARE STORED UNMASKED: any value under a watched key, changed or
+          not, is readable through tar.sql - the per-key baseline in tar_state
+          stores every current value (for example a Winlogon autologon
+          DefaultPassword) and $Registry_Live holds the old and new data of every
+          change. Treat both accordingly, or set "false" to opt out. Rows carry no acting process yet (actor_pid
+          is 0); naming it follows in a later release. Rows land at the slow
+          tick that observes the change (every slow_interval, 300 s by default);
+          a full re-read of every watched key runs every 12 slow ticks (hourly at
+          the default). A value written and reverted between two reads is not
+          recorded. A key is baselined silently at its first read, so for a user
+          hive that loads at logon (or a user who logs off and back on) anything
+          written to its watched keys before that first read is not a row.
+          Retention is a row count (500000 rows). Setting "false" pauses capture
+          and a later "true" re-baselines every watched key (no row is invented
+          for what changed while paused). Requires an agent newer than v0.14.1;
+          older agents silently ignore. Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
       usage_enabled:
         type: string
         displayName: Application Usage Capture Enabled
@@ -710,9 +728,7 @@ spec:
           $Usage_Daily), a checked_transaction-based pairing of the process
           source's started/stopped events into per-executable run/duration
           aggregates plus a per-day distinct-user count. **ON by default
-          ("true")** — joining power/removable as a works-council-class
-          source shipping enabled; process, tcp, service, user and perf are
-          already default-on as machine-scope operational telemetry.
+          ("true")**, like every other capture source.
           The SOC 2 data inventory classifies $Usage_Live/$Usage_Daily as
           usage-class / behavioral-adjacent: $Usage_Live persists the owning
           pid and user for each open run, and the per-day username
@@ -829,7 +845,7 @@ spec:
       - name: events_recorded
         type: int32
         description: >-
-          Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `tar|collect_fast|<events_recorded>|<token>`, where <token> is one of source_disabled / unsupported_platform / baseline / sample_recorded / cursor_advanced / cursor_lost / capture_incomplete / counters_unavailable. Values: non-negative integer.
+          Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `tar|collect_fast|<events_recorded>|<token>`, where <token> is one of source_disabled / unsupported_platform / baseline / sample_recorded / cursor_advanced / cursor_lost / capture_incomplete / counters_unavailable / state_unreadable. Values: non-negative integer.
         example: "-"
         platforms: [windows, linux, darwin]
 

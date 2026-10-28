@@ -2,7 +2,7 @@
  * test_web_utils.cpp — Unit tests for server web utility functions
  *
  * Covers: base64_decode, html_escape, url_decode, extract_form_value,
- *         form_value_supplied, extract_plugin
+ *         form_value_supplied
  */
 
 #include "mcp_jsonrpc.hpp"
@@ -434,6 +434,72 @@ TEST_CASE("origin_is_same_site: `Origin: null` is never admitted", "[web_utils][
     CHECK_FALSE(origin_is_same_site("yuzu-server:8080", "null", "", {}));
 }
 
+TEST_CASE("origin_is_same_site: a raw `null` allowlist entry is still refused", "[web_utils][csrf]") {
+    // The gate must not depend on `normalise_trusted_origins` having dropped the entry.
+    const std::vector<std::string> raw{"null"};
+    CHECK_FALSE(origin_is_same_site("yuzu-server:8080", "null", "", raw));
+    CHECK_FALSE(origin_is_same_site("yuzu-server:8080", "NULL", "", raw));
+    CHECK_FALSE(origin_is_same_site("yuzu-server:8080", "", "null", raw));
+    CHECK_FALSE(origin_is_same_site("yuzu-server:8080", "null", "", raw, /*listener_is_tls=*/true));
+}
+
+TEST_CASE("origin_is_same_site: a TLS listener requires an https source", "[web_utils][csrf]") {
+    constexpr bool tls = true;
+    const std::vector<std::string> none;
+    CHECK(origin_is_same_site("h", "https://h", "", none, tls));
+    CHECK(origin_is_same_site("h:443", "https://h", "", none, tls));
+    CHECK(origin_is_same_site("h", "https://h:443", "", none, tls));
+    CHECK(origin_is_same_site("h:8443", "https://h:8443", "", none, tls));
+    CHECK(origin_is_same_site("h", "HTTPS://h", "", none, tls)); // case-insensitive scheme
+    CHECK(origin_is_same_site("h:443", "", "https://h/page", none, tls));
+    // The loose compare would admit all of these; a TLS listener does not.
+    CHECK_FALSE(origin_is_same_site("h:443", "http://h", "", none, tls));
+    CHECK_FALSE(origin_is_same_site("h", "http://h", "", none, tls));
+    CHECK_FALSE(origin_is_same_site("h:443", "https://h:80", "", none, tls));
+    CHECK_FALSE(origin_is_same_site("h:8443", "http://h:8443", "", none, tls));
+    CHECK_FALSE(origin_is_same_site("h:443", "", "http://h/page", none, tls));
+    CHECK_FALSE(origin_is_same_site("h", "h", "", none, tls)); // no scheme at all
+    CHECK_FALSE(origin_is_same_site("h", "ftp://h", "", none, tls));
+    // No headers is still the non-browser case; userinfo still fails closed.
+    CHECK(origin_is_same_site("h", "", "", none, tls));
+    CHECK_FALSE(origin_is_same_site("h", "https://u@h", "", none, tls));
+    // A malformed authority with two port-like suffixes is never same-host.
+    CHECK_FALSE(origin_is_same_site("h:80:443", "https://h:80", "", none, tls));
+    CHECK_FALSE(origin_is_same_site("h:443", "https://h:80:443", "", none, tls));
+    CHECK(origin_is_same_site("[::1]:443", "https://[::1]", "", none, tls));
+    CHECK(origin_is_same_site("[::1]:8443", "https://[::1]:8443", "", none, tls));
+    CHECK_FALSE(origin_is_same_site("[::1]:80:443", "https://[::1]:80", "", none, tls));
+    // The legacy default is unchanged.
+    CHECK(origin_is_same_site("h:443", "http://h", "", none));
+}
+
+TEST_CASE("origin_is_same_site: a TLS listener still admits scheme-qualified trusted entries",
+          "[web_utils][csrf]") {
+    const auto trusted =
+        normalise_trusted_origins(std::vector<std::string>{"https://console.example"});
+    CHECK(origin_is_same_site("proxy:8443", "https://console.example", "", trusted, true));
+    CHECK_FALSE(origin_is_same_site("proxy:8443", "http://console.example", "", trusted, true));
+}
+
+TEST_CASE("origin_is_same_site: a declared https entry pins the scheme on a plain listener",
+          "[web_utils][csrf]") {
+    const auto pin = normalise_trusted_origins(std::vector<std::string>{"https://h"});
+    // Legacy loose behaviour without a declaration.
+    CHECK(origin_is_same_site("h", "http://h", "", {}));
+    // With the declaration, plain http for that host is refused; https is admitted.
+    CHECK_FALSE(origin_is_same_site("h", "http://h", "", pin));
+    CHECK_FALSE(origin_is_same_site("h:443", "http://h", "", pin));
+    CHECK_FALSE(origin_is_same_site("h", "", "http://h/page", pin));
+    CHECK(origin_is_same_site("h", "https://h", "", pin));
+    // Unrelated host unaffected.
+    CHECK(origin_is_same_site("other", "http://other", "", pin));
+    // A port-qualified entry pins that port only.
+    const auto pin_port = normalise_trusted_origins(std::vector<std::string>{"https://h:8443"});
+    CHECK_FALSE(origin_is_same_site("h:8443", "http://h:8443", "", pin_port));
+    CHECK(origin_is_same_site("h:9090", "http://h:9090", "", pin_port));
+    CHECK(origin_is_same_site("h", "http://h", "", pin_port));
+}
+
 TEST_CASE("origin_is_same_site: allowlist admits a proxied Origin", "[web_utils][csrf]") {
     // The #2537 shape: proxy rewrote Host, so Host and Origin legitimately differ.
     const auto trusted = normalise_trusted_origins(
@@ -610,36 +676,6 @@ TEST_CASE("form_value_supplied: the real key after a decoy suffix key IS a match
     // `scope=` key also appears, it must be found even though the unanchored
     // decoy occurs first in the string.
     CHECK(form_value_supplied("myscope=x&scope=", "scope"));
-}
-
-// ── extract_plugin ──────────────────────────────────────────────────────────
-
-TEST_CASE("extract_plugin: standard command_id with timestamp", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("chargen-12345") == "chargen");
-    REQUIRE(extract_plugin("netstat-98765") == "netstat");
-    REQUIRE(extract_plugin("hardware-1234567890") == "hardware");
-}
-
-TEST_CASE("extract_plugin: no dash returns whole string", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("chargen") == "chargen");
-    REQUIRE(extract_plugin("netstat") == "netstat");
-}
-
-TEST_CASE("extract_plugin: empty string", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("") == "");
-}
-
-TEST_CASE("extract_plugin: multiple dashes uses first", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("my-plugin-12345") == "my");
-}
-
-TEST_CASE("extract_plugin: dash at start", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("-12345") == "");
-}
-
-TEST_CASE("extract_plugin: underscore plugin name", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("vuln_scan-12345") == "vuln_scan");
-    REQUIRE(extract_plugin("script_exec-12345") == "script_exec");
 }
 
 // ── Time formatters ─────────────────────────────────────────────────────────
@@ -1156,6 +1192,18 @@ TEST_CASE("is_login_exempt_path: unrelated API paths are NOT exempt",
     // pre-routing chokepoint must resolve a session for it like every other
     // /api/v1/* route rather than skip straight to the handler.
     CHECK_FALSE(is_login_exempt_path("/api/v1/openapi.json"));
+    // Near-misses of the exempt literals: each needs a session, so each is gated.
+    CHECK_FALSE(is_login_exempt_path("/logout"));
+    CHECK_FALSE(is_login_exempt_path("/mcp/v1/"));
+    CHECK_FALSE(is_login_exempt_path("/static")); // the prefix needs its trailing slash
+    CHECK_FALSE(is_login_exempt_path("/login/"));
+    CHECK_FALSE(is_login_exempt_path("/login/mfa/"));
+    CHECK_FALSE(is_login_exempt_path("/saml/acs/"));
+    CHECK_FALSE(is_login_exempt_path("/auth/saml"));
+    // Probe and metrics paths are bypassed by their own earlier branches, not by this predicate.
+    CHECK_FALSE(is_login_exempt_path("/livez"));
+    CHECK_FALSE(is_login_exempt_path("/readyz"));
+    CHECK_FALSE(is_login_exempt_path("/metrics"));
 }
 
 TEST_CASE("is_login_exempt_path: every pre-existing exempt path is unchanged",

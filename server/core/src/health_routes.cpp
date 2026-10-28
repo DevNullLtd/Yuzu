@@ -13,6 +13,7 @@
 #include "audit_store.hpp"
 #include "baseline_store.hpp"
 #include "ca_store.hpp"
+#include "crypto_dashboard_layout_store.hpp"
 #include "custom_properties_store.hpp"
 #include "default_certs.hpp"
 #include "deployment_store.hpp"
@@ -26,6 +27,8 @@
 #include "guaranteed_state_store.hpp"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+#include "leader_elector.hpp" // HA WS-11: LeaderElector::Stats (stats() only)
+#include "leader_metrics.hpp" // HA WS-11
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
 #include "nvd_db.hpp"
@@ -35,6 +38,7 @@
 #include "patch_manager.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg_reachability_probe.hpp" // HA WS-8
+#include "enablement_store.hpp"
 #include "plugin_config_store.hpp"
 #include "policy_store.hpp"
 #include "process_health.hpp"
@@ -103,7 +107,10 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
     // (see this file's header comment). The `ServerImpl` member declaration
     // is deleted by this extraction.
     auto scrape_mu = std::make_shared<std::mutex>();
-    sink.Get("/metrics", [deps, scrape_mu](const httplib::Request&, httplib::Response& res) {
+    // HA WS-11: serializes the leader counter delta-sync across concurrent scrapes.
+    auto leader_publisher = std::make_shared<yuzu::server::LeaderMetricsPublisher>();
+    sink.Get("/metrics", [deps, scrape_mu, leader_publisher](const httplib::Request&,
+                                                             httplib::Response& res) {
         // WS-3 3.3 (sre-F2/WS-11): refresh the command-outbox delivery-backlog
         // gauge on scrape (regardless of leadership — a stuck loop that never
         // acquires leadership shows flat event counters, so this gauge is the
@@ -128,6 +135,17 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             if (snap.last_success_ns != yuzu::server::pg_reachability::kNever)
                 deps.metrics->gauge("yuzu_server_pg_reachability_last_success_age_seconds")
                     .set(static_cast<double>(now - snap.last_success_ns) / 1e9);
+        }
+        // HA WS-11 (#4014): leader-election observability. A lock-free Stats copy
+        // (never an elector reference), so a scrape cannot stall behind the
+        // election loop's blocking libpq calls; counters/age are computed here so
+        // they keep moving if that loop wedges.
+        if (deps.leader_elector) {
+            leader_publisher->publish(
+                *deps.metrics, deps.leader_elector->stats(),
+                deps.leader_loop_errors ? deps.leader_loop_errors->load(std::memory_order_relaxed)
+                                        : 0,
+                yuzu::server::LeaderMetricsPublisher::steady_now_ns());
         }
         // Refresh management group gauges before serializing
         if (deps.mgmt_group_store && deps.mgmt_group_store->is_open()) {
@@ -173,22 +191,21 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
     // /api/ keep working — a side-effect of #401's move from /api/health → /health.
     //
     // `health_body` is the ONE body behind every /health alias; its callers
-    // decide `is_authenticated` (main sink: a non-blocking session resolve;
-    // plaintext sink: hard false, #5906).
+    // decide `is_authenticated` (main sink: a session resolve, which is a store
+    // lookup and runs only when the request carries a credential; plaintext sink: hard
+    // false, #5906).
     auto health_body = [deps](const httplib::Request&, httplib::Response& res,
                               bool is_authenticated) {
-        // `is_authenticated` gates the expensive work below.
-        // Governance Gate 7 round 2 (security MEDIUM): /health and
-        // /api/health are rate-limit-exempt for monitoring stability;
-        // the bounded but non-trivial work below (a pending-agents scan
-        // and bounded execution_tracker reads — two PG pool leases,
-        // ADR-0065) must only run for authenticated callers, otherwise
-        // an unauth flood becomes a DoS amplification primitive. Unauth
-        // callers get the cheap
-        // probe response — status, uptime, agent count from in-memory
-        // registry, store ok flags from is_open() (constant-time member
-        // checks), and version. Authed callers additionally get
-        // pending-agent count, execution stats, and process sampler.
+        // `is_authenticated` gates the expensive work below. The bounded but
+        // non-trivial work (a pending-agents scan and bounded execution_tracker
+        // reads: two PG pool leases, ADR-0065) runs only for authenticated
+        // callers. Unauthenticated callers get the probe response: status,
+        // uptime, agent count from the in-memory registry, store ok flags from
+        // is_open() (constant-time member checks), and version. Authenticated
+        // callers additionally get pending-agent count, execution stats, and
+        // process sampler. /health and /api/health are rate limited per source
+        // in server.cpp's pre-routing handler (`health::admit_probe_request`),
+        // so even the authenticated shape is bounded per source.
 
         auto now = std::chrono::steady_clock::now();
         auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(
@@ -353,6 +370,12 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         // WS-3 3.3 (arch-F1/sre-F1): born-on-PG command outbox on the live
         // scheduled-dispatch path — mirrors its /readyz row.
         bool command_outbox_ok = deps.command_outbox_store && deps.command_outbox_store->is_open();
+        // ADR-3006: the enablement tables live in the plugin-config schema, and
+        // both stores are latched at boot like the rows above. The plugin-config store
+        // was /readyz-only until now (the same readyz-vs-healthz drift class), so its
+        // row joins here with the new one.
+        bool plugin_config_store_ok = deps.plugin_config_store && deps.plugin_config_store->is_open();
+        bool enablement_store_ok = deps.enablement_store && deps.enablement_store->is_open();
 
         // Determine overall status
         bool all_stores_ok =
@@ -364,7 +387,7 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             discovery_ok && deployment_ok && quarantine_ok && notification_ok && upload_grant_ok &&
             tag_ok && runtime_config_ok && patch_manager_ok && session_store_ok &&
             directory_sync_ok && workflow_engine_ok && schedule_engine_ok && execution_tracker_ok &&
-            command_outbox_ok;
+            command_outbox_ok && plugin_config_store_ok && enablement_store_ok;
         std::string status = all_stores_ok ? "healthy" : "degraded";
 
         nlohmann::json health = {
@@ -416,11 +439,16 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
               {"workflow_engine", workflow_engine_ok ? "ok" : "error"},
               {"schedule_engine", schedule_engine_ok ? "ok" : "error"},
               {"execution_tracker", execution_tracker_ok ? "ok" : "error"},
-              {"command_outbox_store", command_outbox_ok ? "ok" : "error"}}},
+              {"command_outbox_store", command_outbox_ok ? "ok" : "error"},
+              {"plugin_config_store", plugin_config_store_ok ? "ok" : "error"},
+              {"enablement_store", enablement_store_ok ? "ok" : "error"}}},
             // #401: was hardcoded "0.1.0" — now derived from the
             // meson-generated yuzu/version.hpp so the health endpoint
             // tracks the actual build instead of a stale literal.
             {"version", std::string(yuzu::kVersionString)}};
+        // I/O-free (a cached read): true while the enablement store is declared regressed.
+        health["enablement_regressed"] =
+            deps.enablement_store ? deps.enablement_store->regression().regressed : false;
 
         // TLS posture — intentionally UNAUTHENTICATED: operators and
         // monitoring MUST be able to see when the install is on built-in
@@ -513,7 +541,12 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         res.set_content(health.dump(), "application/json");
     };
     auto health_handler = [deps, health_body](const httplib::Request& req, httplib::Response& res) {
-        health_body(req, res, static_cast<bool>(deps.resolve_session_fn(req)));
+        // A request with no Cookie, Authorization or X-Yuzu-Token header cannot resolve to a
+        // session, so it is answered as unauthenticated without a session-store lookup. A
+        // request that carries any of them resolves exactly as before.
+        const bool authenticated = health::request_carries_credential(req) &&
+                                   static_cast<bool>(deps.resolve_session_fn(req));
+        health_body(req, res, authenticated);
     };
     // Every /health alias — main-sink /health and /api/health via health_handler,
     // plaintext-sink via plain_health — MUST route through the ONE health_body
@@ -567,6 +600,13 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         //
         // LEADERSHIP IS NOT READINESS (#4014 decision): a follower serves every
         // operator-synchronous path, so the LeaderElector is deliberately absent.
+        // That includes "the elector is not open": a replica that cannot lead is a
+        // ready follower (it still serves every operator-synchronous path), and
+        // gating it out would evict a working replica from the LB -- on a single
+        // replica, take the whole API down over an HA-substrate fault. The pause
+        // of the FencedLeaderOnly loops is surfaced by the yuzu_server_leader_*
+        // series and the YuzuLeaderNoLeader alert instead. The elector is read on
+        // /metrics only, through the lock-free stats() snapshot.
         struct StoreCheck {
             const char* name;
             bool ok;
@@ -828,6 +868,9 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             // yuzu::protective). Same readyz-vs-healthz drift class
             // the rows above document; boot state only (latched, #3061).
             {"plugin_config_store", deps.plugin_config_store && deps.plugin_config_store->is_open()},
+            // ADR-3006 — the enablement tables ride the plugin-config schema; boot
+            // state only (latched), like the row above.
+            {"enablement_store", deps.enablement_store && deps.enablement_store->is_open()},
         };
 
         // Non-gating (governance Gate 2, 2026-08-16): ADR-0049's own construction
@@ -843,11 +886,20 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         // is always constructed, so a null pointer or a not-open handle is
         // genuinely "broken", not "feature off". Without this row a dead CVE
         // cache showed only as the yuzu_nvd_* gauges going absent.
+        // crypto_dashboard_layout_store is the third (ADR-0071, owner decision
+        // 2026-10-19): a layout is a loss-tolerant UI preference, so a store that
+        // did not open DEGRADES the boot (server.cpp resets the pointer; operators
+        // see the default layout and cannot save) instead of refusing it. Gating
+        // here would pull a node that serves everything else out of rotation for
+        // a dashboard preference; the notice keeps the boot failure visible. The
+        // store is always constructed when Postgres is up, so null = did not open.
         std::vector<StoreCheck> notices = {
             {"analytics_event_store",
              !deps.cfg->analytics_enabled ||
                  (deps.analytics_store && deps.analytics_store->is_open())},
             {"nvd_db", deps.nvd_db && deps.nvd_db->is_open()},
+            {"crypto_dashboard_layout_store",
+             deps.crypto_dashboard_layout_store && deps.crypto_dashboard_layout_store->is_open()},
         };
 
         std::string failed_list;
@@ -871,11 +923,27 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             }
         }
 
+        // ONE non-gating `enablement` object (never two members with the same key), from
+        // the I/O-free cache, present in both the ready and the not-ready body whenever
+        // the store is wired. A pending regression, an unwitnessed anchor and report-ahead
+        // endpoints are all visible at once; none of them changes the verdict.
+        std::string enablement_member;
+        if (deps.enablement_store) {
+            const auto st = deps.enablement_store->regression();
+            enablement_member = std::string(",\"enablement\":{\"regression_pending\":") +
+                                (st.regressed ? "true" : "false") +
+                                ",\"anchor_unwitnessed_at_boot\":" +
+                                (st.anchor_unwitnessed ? "true" : "false") +
+                                ",\"report_ahead\":" +
+                                (st.report_ahead_endpoints > 0 ? "true" : "false") + "}";
+        }
+
         if (failed_list.empty()) {
-            res.set_content(degraded_list.empty()
-                                ? R"({"status":"ready"})"
-                                : "{\"status\":\"ready\",\"degraded\":[" + degraded_list + "]}",
-                            "application/json");
+            std::string body = "{\"status\":\"ready\"";
+            if (!degraded_list.empty())
+                body += ",\"degraded\":[" + degraded_list + "]";
+            body += enablement_member + "}";
+            res.set_content(body, "application/json");
         } else {
             res.status = 503;
             std::string body = "{\"status\":\"not ready\",\"failed_stores\":[" + failed_list + "]";
@@ -886,7 +954,7 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
                         yuzu::server::pg_reachability::reason(pg_verdict) + "\"";
             if (!degraded_list.empty())
                 body += ",\"degraded\":[" + degraded_list + "]";
-            body += "}";
+            body += enablement_member + "}";
             res.set_content(body, "application/json");
         }
     };

@@ -18,6 +18,7 @@
 #include "analytics_event_store.hpp"
 #include "audit_store.hpp"
 #include "cidr_match.hpp"
+#include "dispatch_record_policy.hpp"
 #include "enrollment_token_rejection.hpp"
 #include "execution_tracker.hpp"
 #include "fleet_topology_store.hpp"
@@ -43,7 +44,11 @@
 #include "notification_store.hpp"
 #include "offload_target_store.hpp"
 #include "peer_ip.hpp"
+#include "plugin_result_audit.hpp"
+#include "refusal_log_throttle.hpp"
 #include "response_store.hpp"
+#include "forensics_error_detail.hpp" // #4990: sanitize_forensics_error_detail
+#include "response_tier_filter.hpp"  // #4990: ForensicsPluginSet::contains
 #include "result_parsing.hpp"
 #include "tag_store.hpp"
 #include "update_registry.hpp"
@@ -60,6 +65,170 @@ namespace yuzu::server::detail {
 // Bring html_escape into scope for the HTML rendering methods.
 using yuzu::server::html_escape;
 
+namespace {
+// The `__timing__|` intercept runs before the Forensics tier and the provenance label, and the
+// agent core emits the sentinel itself with a millisecond count. The stat bar is shared by every
+// dashboard session, so only a plain count (1 to 12 ASCII digits) is relayed; any other text a
+// frame puts after the sentinel is swallowed without being published (#4990).
+[[nodiscard]] bool is_timing_millis(std::string_view v) noexcept {
+    if (v.empty() || v.size() > 12)
+        return false;
+    return std::all_of(v.begin(), v.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+} // namespace
+
+// The registry audit budget keys on a whole agent id (the budget treats keys that share its key
+// bound as one agent, plugin_result_audit.hpp).
+static_assert(kRegistryAuditBudgetKeyBytes >= auth::kMaxAgentIdLength,
+              "the registry audit budget must key on a whole agent id");
+
+// Persists the `registry.write` audit rows one stored output frame owes (see
+// plugin_result_audit.hpp for the binding: a minted registry command id AND an agent-stamped
+// mutating action, any of the kRegistryMutatingActions: the hook is action-generic). Called at every
+// site that stores an output-carrying frame, immediately before `notify_exec_tracker` so the row
+// exists before the execution advances (tests/
+// test_audit_action_stamp_wiring_lexical.py pins the four sites and their order). The agent flushes
+// plugin output in RUNNING frames and its terminal frame carries none, so the terminal sites are
+// defence in depth for an agent that returns output there.
+//
+// The PURE verdict runs first and the store is touched only when the frame owes rows or a flag, so
+// no other frame ever reaches it. process_gateway_response runs on the detached forwarder threads
+// of #3279, which outlive the gRPC drain and are never joined, so two things keep this reach safe.
+// The store is held weakly and locked here: a forwarder that locks it keeps the OBJECT alive for
+// exactly this call (set_registry_audit_store). The POOL it borrows is the other half: every
+// `store->log()` leases it and the strong reference spans up to kMaxRegistryAuditLinesPerFrame of
+// them, so a forwarder BETWEEN two rows would lease a pool that stop() is destroying. The hook
+// therefore runs inside a rundown gate (rundown_gate.hpp): it enters before it locks the store
+// (`in_flight` is declared first, so it dies last), checks the gate before every row, and
+// stop() closes the gate and waits for the hooks inside before it resets the store and the pool.
+// What stays #3279's is the detached thread itself, `this` and `metrics_`. Only the weak member is
+// read here (the lexical gate pins it): the raw `audit_store_` of the other sites is unwired
+// earlier in stop().
+//
+// Every row is charged to a per-agent budget (kRegistryAuditBudget*): a bound per frame is not a
+// bound on frames, and one enrolled agent looping 300-line frames would otherwise write
+// unbounded 365-day evidence. A refused row is counted, never queued; the first failure to persist
+// ends the frame. The hook must not throw into a stream handler or a detached thread: everything
+// below, the verdict and the store lock included, runs inside one try, and an exception is
+// reported as a failed write: logged, returned as false, and counted as `persist_failed` for the
+// rows already known to be owed. That is every row of the frame once the verdict is taken, so a
+// throw out of the gate entry or the store lock books them all; an exception out of the verdict
+// itself (an allocation failure) leaves none known, and only the error line says so. An
+// allocation failure while REPORTING one is not caught; no other code around the hook guards
+// that either.
+bool AgentServiceImpl::audit_registry_frame(const std::string& agent_id,
+                                            const pb::CommandResponse& resp,
+                                            const std::string& plugin) {
+    if (resp.output().empty() || resp.action().empty())
+        return true;
+    // Once the verdict is taken, every row the frame owes ends up written, refused by the budget
+    // (`refused`) or lost (the row at `done` and the rows after it), even when something throws.
+    std::size_t owed = 0;
+    std::size_t done = 0;
+    std::size_t refused = 0;
+    // The metric counts what the server sees go unrecorded; the log lines below are for a human.
+    // Rows for `suppressed` and `persist_failed`, frames for `unmintable_id` and `truncated`.
+    const auto dropped = [this](const char* reason, std::size_t n) {
+        metrics_.counter("yuzu_server_registry_audit_dropped_total", {{"reason", reason}})
+            .increment(static_cast<double>(n));
+    };
+    // Idempotent: a throw after a booking (the next statement may allocate) must not book the same
+    // rows again from a catch arm.
+    const auto book_rows = [&] {
+        if (refused != 0) {
+            dropped("suppressed", refused); // a refusal of the ROWS, never a failure of the write
+            refused = 0;
+        }
+        if (done != owed) {
+            dropped("persist_failed", owed - done);
+            owed = done;
+        }
+    };
+    try {
+        const auto frame = registry_audit_events_for_frame(
+            agent_id, resp.command_id(), plugin, resp.action(),
+            resp.output(), yuzu::server::now_epoch_seconds());
+        if (frame.events.empty() && !frame.truncated && !frame.unmintable_id)
+            return true;
+        owed = frame.events.size(); // known before anything below can throw (see the catch arms)
+        // Declared BEFORE `store`: locals die in reverse order, so the strong reference is
+        // released first and the count falls after it, on every exit including a throw.
+        const auto in_flight = registry_audit_gate_.try_enter();
+        if (!in_flight)
+            return true; // shutdown has closed the hook: silent, like a store its owner released
+        const auto store = registry_audit_store_.lock();
+        if (!store || !store->is_open())
+            return true; // no store (released at shutdown): silent, like the other audit sites
+        if (frame.unmintable_id) {
+            dropped("unmintable_id", 1);
+            spdlog::warn("[audit] registry.write frame ignored: command_id is not a server-minted "
+                         "shape (agent={}, {} bytes)",
+                         yuzu::log_id_token(agent_id), resp.command_id().size());
+        }
+        if (frame.truncated) {
+            dropped("truncated", 1);
+            // The id is a minted shape here, so it is safe to log.
+            spdlog::warn("[audit] registry.write frame exceeded the audit bounds (more than {} "
+                         "lines, or a line over {} bytes); the excess was not recorded "
+                         "(agent={}, command={})",
+                         kMaxRegistryAuditLinesPerFrame, kMaxRegistryAuditLineBytes,
+                         yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()));
+        }
+        // Every row is charged, so the budget's window report counts refused ROWS exactly. Once an
+        // agent is over budget every later row of the window is refused too, and none is queued.
+        const std::string overflow = registry_audit_overflow_key(agent_id);
+        for (; done < owed; ++done) {
+            const auto admit = registry_audit_budget_->try_admit(agent_id, overflow);
+            if (admit.closed_window_suppressed != 0)
+                spdlog::warn("[audit] registry.write rows refused by the per-agent budget in the "
+                             "last window: {}",
+                             admit.closed_window_suppressed);
+            if (!admit.admitted) {
+                ++refused;
+                continue;
+            }
+            // Immediately before the only call that leases the pool. A row that passed this
+            // check may still start its lease after stop() closes the gate; that is safe because
+            // this call's entry is still counted and stop() waits for it before it resets the
+            // store and the pool. What the close does guarantee is that no row that has not yet
+            // passed this check starts a lease, so the drain is bounded by one row per hook
+            // inside the gate. The rows from this one on are lost, and counted as such. A row
+            // the budget refused above never gets here: it never leases, so the close changes
+            // nothing for it (it stays `suppressed`).
+            if (registry_audit_gate_.closed()) {
+                const std::size_t not_attempted = owed - done;
+                book_rows();
+                spdlog::warn("[audit] registry.write frame cut short by shutdown (agent={}, "
+                             "command={}); {} row(s) not recorded",
+                             yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()),
+                             not_attempted);
+                return false;
+            }
+            if (!store->log(frame.events[done])) {
+                const std::size_t not_attempted = owed - done - 1;
+                book_rows();
+                spdlog::error("[audit] registry.write row failed to persist (agent={}, "
+                              "command={}); {} further row(s) of this frame not attempted",
+                              yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()),
+                              not_attempted);
+                return false;
+            }
+        }
+        book_rows();
+        return true;
+    } catch (const std::exception& e) {
+        book_rows();
+        spdlog::error("[audit] registry.write hook threw: {} (agent={}, command={})", e.what(),
+                      yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()));
+        return false;
+    } catch (...) {
+        book_rows();
+        spdlog::error("[audit] registry.write hook threw (agent={}, command={})",
+                      yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()));
+        return false;
+    }
+}
+
 
 // -- Constructor --------------------------------------------------------------
 
@@ -75,6 +244,7 @@ AgentServiceImpl::AgentServiceImpl(AgentRegistry& registry, EventBus& bus,
     // bounded even when no operator config is applied and in every test that
     // constructs this service directly. set_ota_bound_config() replaces it.
     set_ota_bound_config(ota_cfg_);
+    registry_audit_budget_ = make_registry_audit_budget();
 }
 
 // -- Register -----------------------------------------------------------------
@@ -1339,6 +1509,9 @@ grpc::Status AgentServiceImpl::Subscribe(
 
     // Read loop -- process responses from the agent
     pb::CommandResponse resp;
+    // The audit-failed trailer is added once per stream: AddTrailingMetadata appends to a multimap
+    // for the life of the call, and the trailer is delivered only when the stream closes.
+    bool audit_failed_signalled = false;
     while (stream->Read(&resp)) {
         registry_.touch_activity(agent_id);
 
@@ -1381,8 +1554,9 @@ grpc::Status AgentServiceImpl::Subscribe(
                 auto payload = resp.output().substr(11);
                 auto eq = payload.find('=');
                 auto ms = (eq != std::string::npos) ? payload.substr(eq + 1) : payload;
-                bus_.publish("timing", "<strong id=\"stat-agent\" hx-swap-oob=\"true\">" +
-                                           html_escape(ms) + " ms</strong>");
+                if (is_timing_millis(ms)) // #4990: never relay arbitrary frame text to the shared bus
+                    bus_.publish("timing", "<strong id=\"stat-agent\" hx-swap-oob=\"true\">" +
+                                               html_escape(ms) + " ms</strong>");
                 continue;
             }
             // CHAOS-TTL-1 (PR #3784 fix round, ADR-1007): the agent's
@@ -1394,8 +1568,13 @@ grpc::Status AgentServiceImpl::Subscribe(
             // output for the executions drawer/SSE to show) and must not be
             // stored, published as output, or counted as an analytics event,
             // same reasoning as the __timing__ intercept above.
+            // #4990: provenance is decided ONCE for this frame, from the server's dispatch
+            // record. It is resolved before the keepalive branch because the keepalive needs
+            // the recorded execution id to renew its claim.
+            const ResponseProvenance prov =
+                resolve_response_provenance(resp.command_id(), resp.output() == "__keepalive__");
             if (resp.output() == "__keepalive__") {
-                notify_exec_tracker(resp.command_id(), agent_id, resp);
+                notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
                 continue;
             }
 
@@ -1415,8 +1594,9 @@ grpc::Status AgentServiceImpl::Subscribe(
                 }
             }
 
-            // Determine the plugin from command_id prefix (format: plugin-timestamp)
-            std::string plugin = extract_plugin(resp.command_id());
+            // The plugin is the one the SERVER recorded at dispatch (or the unverified label),
+            // never one parsed from the command id the agent echoes (#4990).
+            const std::string& plugin = prov.plugin;
 
             // Publish each row as its own SSE event
             publish_output_rows(agent_id, plugin, resp.output());
@@ -1431,17 +1611,22 @@ grpc::Status AgentServiceImpl::Subscribe(
                 sr.output = resp.output();
                 sr.plugin = plugin;
                 // PR 2 / HA WS-1(1b): stamp execution_id from the PG-backed
-                // command_execution table so the executions detail drawer
+                // command_execution record so the executions detail drawer
                 // can correlate exactly, on any replica.
-                if (auto eid = resolve_execution_id(resp.command_id()))
-                    sr.execution_id = *eid;
+                sr.execution_id = prov.execution_id;
                 response_store_->store(sr);
+            }
+
+            // registry.write audit rows (RUNNING frames carry the plugin output).
+            if (!audit_registry_frame(agent_id, resp, plugin) && !audit_failed_signalled) {
+                signal_grpc_audit_failed(context);
+                audit_failed_signalled = true;
             }
 
             // UAT 2026-05-06 #8: notify the executions tracker so the
             // drawer's per-agent KPI table populates and the SSE
             // `agent-transition` event fires for live updates.
-            notify_exec_tracker(resp.command_id(), agent_id, resp);
+            notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
 
             if (auto analytics_store = analytics_store_.lock()) {
                 AnalyticsEvent ae;
@@ -1458,23 +1643,29 @@ grpc::Status AgentServiceImpl::Subscribe(
                          ::yuzu::log_id_token(resp.command_id()), static_cast<int>(resp.status()),
                          resp.exit_code());
 
+            // #4990: the failure text every derived sink below (analytics event, notification,
+            // webhook / offload payload) may carry; computed once. The stored response row keeps
+            // the raw message: it is a row of the plugin itself and is read through the tier filter.
+            // #4990: the frame's provenance is decided once, here, from the server's dispatch record
+            // (see the RUNNING branch above); everything below takes it from `prov`.
+            const ResponseProvenance prov = resolve_response_provenance(resp.command_id());
+            const std::string sink_error = failure_text_for_sinks(prov.plugin, resp);
+
             // Store completion response
             if (response_store_) {
-                auto plugin_name = extract_plugin(resp.command_id());
+                const std::string& plugin_name = prov.plugin;
                 std::string err_detail;
                 if (resp.has_error()) {
                     err_detail = resp.error().message();
                 }
-                // PR 2 / HA WS-1(1b): resolve execution_id from the
-                // PG-backed command_execution table. Do NOT delete on
+                // PR 2 / HA WS-1(1b): the execution_id comes from the
+                // PG-backed command_execution record. Do NOT delete on
                 // terminal status — a single command_id can produce N
                 // terminal responses (one per agent in fan-out); deleting on
                 // the first agent's terminal would leave agents 2..N with no
                 // execution_id to stamp (HF-1). The row ages out via
                 // ExecutionTracker::reap_command_execution_mappings instead.
-                std::string current_exec;
-                if (auto eid = resolve_execution_id(resp.command_id()))
-                    current_exec = *eid;
+                const std::string& current_exec = prov.execution_id;
                 // Terminal frame with no output: update the existing
                 // RUNNING rows in place — the data is already there.
                 // Persisting an empty-output row whose status enum reads
@@ -1511,10 +1702,18 @@ grpc::Status AgentServiceImpl::Subscribe(
                 //             insert — would re-create the sentinel.
             }
 
+            // A terminal frame that carries output AND the agent-stamped action owes its audit
+            // rows too (defence in depth: this agent's terminal frame carries no output); a frame
+            // without the stamp owes none.
+            if (!audit_registry_frame(agent_id, resp, prov.plugin) && !audit_failed_signalled) {
+                signal_grpc_audit_failed(context);
+                audit_failed_signalled = true;
+            }
+
             // UAT 2026-05-06 #8: notify the executions tracker on terminal
             // status so the drawer's per-agent KPI flips to its terminal
             // state and the SSE `agent-transition` event fires.
-            notify_exec_tracker(resp.command_id(), agent_id, resp);
+            notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
 
             std::string status_str =
                 (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
@@ -1531,13 +1730,13 @@ grpc::Status AgentServiceImpl::Subscribe(
                 AnalyticsEvent ae;
                 ae.event_type = "command.completed";
                 ae.agent_id = agent_id;
-                ae.plugin = extract_plugin(resp.command_id());
+                ae.plugin = prov.plugin;
                 ae.correlation_id = resp.command_id();
                 ae.severity = (resp.status() == pb::CommandResponse::SUCCESS) ? Severity::kInfo
                                                                               : Severity::kError;
                 ae.payload = {{"status", status_str}, {"exit_code", resp.exit_code()}};
                 if (resp.has_error()) {
-                    ae.payload["error_message"] = resp.error().message();
+                    ae.payload["error_message"] = sink_error;
                 }
                 analytics_store->emit(std::move(ae));
             }
@@ -1545,7 +1744,7 @@ grpc::Status AgentServiceImpl::Subscribe(
             // Create notification on execution failure
             if (resp.status() != pb::CommandResponse::SUCCESS && notification_store_ &&
                 notification_store_->is_open()) {
-                std::string err_msg = resp.has_error() ? resp.error().message() : "unknown";
+                std::string err_msg = resp.has_error() ? sink_error : "unknown";
                 notification_store_->create("error", "Execution Failed",
                                             "Command " + resp.command_id() + " on agent " +
                                                 agent_id + " failed: " + err_msg);
@@ -1562,7 +1761,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                                              {"status", status_str},
                                              {"exit_code", resp.exit_code()}};
                 if (resp.has_error()) {
-                    wh_payload["error"] = resp.error().message();
+                    wh_payload["error"] = sink_error;
                 }
                 const auto body = wh_payload.dump();
                 if (webhook_store_ && webhook_store_->is_open()) {
@@ -1658,49 +1857,95 @@ bool AgentServiceImpl::discard_send_time(const std::string& command_id) {
     return true;
 }
 
-// -- resolve_execution_id (HA WS-1(1b), ADR-2002 section 5) ------------------
+// -- resolve_response_provenance (#4990 UP-7; HA WS-1(1b), ADR-2002 section 5) ---
 
-std::optional<std::string>
-AgentServiceImpl::resolve_execution_id(const std::string& command_id) const {
+ResponseProvenance AgentServiceImpl::resolve_response_provenance(const std::string& command_id,
+                                                                 bool keepalive) const {
     // Atomic snapshot — see notify_exec_tracker's identical load for the
     // detached gateway-forward-thread rationale (governance UAT 2026-05-06
     // Gate 7 re-review HIGH).
     auto* tracker = execution_tracker_.load(std::memory_order_acquire);
-    if (!tracker)
-        return std::nullopt;
-    // Distinguish a STORE DEGRADE from an ordinary miss (adversarial
-    // review Should-fix, PR #3780): this is the hot path, hit on every
-    // CommandResponse, and a nullopt here was previously indistinguishable
-    // from the common "out-of-band dispatch" case. A sustained degrade now
-    // counts, mirroring the write path's yuzu_exec_correlation_write_degrade_total.
-    std::string degrade_reason;
-    auto result = tracker->lookup_execution_id(command_id, &degrade_reason);
-    if (!degrade_reason.empty())
-        metrics_.counter("yuzu_exec_correlation_read_degrade_total", {{"reason", degrade_reason}})
+    CommandRecordLookupFn tracker_lookup;
+    if (!command_record_lookup_override_ && tracker) {
+        tracker_lookup = [tracker](const std::string& id, std::string* degrade) {
+            return tracker->lookup_command_record(id, degrade);
+        };
+    }
+    const CommandRecordLookupFn& lookup =
+        command_record_lookup_override_ ? command_record_lookup_override_ : tracker_lookup;
+
+    // THE decision, shared by both ingest paths (response_provenance.hpp). Everything below is
+    // observability about it.
+    ResponseProvenance prov = ::yuzu::server::resolve_response_provenance(command_id, lookup);
+
+    // Distinguish a STORE DEGRADE from an ordinary miss (adversarial review Should-fix, PR #3780):
+    // this is the hot path, hit on every CommandResponse. A sustained degrade now counts,
+    // mirroring the write path's yuzu_exec_correlation_write_degrade_total.
+    for (const auto& reason : prov.degrade_reasons)
+        metrics_.counter("yuzu_exec_correlation_read_degrade_total", {{"reason", reason}})
             .increment();
-    return result;
+    // A `__keepalive__` frame is a claim-renewal heartbeat the agent repeats on a fixed interval
+    // for a long-running command: it is never stored, published or audited, so it labels no
+    // response. It still needs the recorded execution id (resolved above, and any store degrade it
+    // hit is counted above), but it must not move the per-response outcome counter or raise the
+    // "response stored as unverified" line, or a heartbeat rate would swamp both.
+    if (keepalive)
+        return prov;
+    const char* outcome = prov.outcome == ProvenanceOutcome::kVerified     ? "verified"
+                          : prov.outcome == ProvenanceOutcome::kUnrecorded ? "unrecorded"
+                                                                           : "lookup_degraded";
+    metrics_.counter("yuzu_server_response_provenance_total", {{"outcome", outcome}}).increment();
+    if (!prov.verified()) {
+        // One line a minute per outcome: the counter above is the evidence, the line is for a
+        // human. A frame whose id the server never issued is expected to be rare; a sustained
+        // rate means failed dispatch-record writes or a misbehaving endpoint.
+        static RefusalLogThrottle throttle;
+        if (throttle.should_warn(outcome))
+            spdlog::warn("response provenance unresolved (outcome={}, command {}): the response is "
+                         "stored and treated as unverified, i.e. Forensics-tier (at most one log "
+                         "per 60 s per outcome)",
+                         outcome, ::yuzu::log_id_token(command_id));
+    }
+    return prov;
 }
 
-// -- record_execution_id (PR 2; HA WS-1(1b) — PG-backed, ADR-2002 section 5) --
+// -- record_command_dispatch (#4990 UP-7; PR 2; HA WS-1(1b) — PG-backed, ADR-2002 section 5) --
 
-void AgentServiceImpl::record_execution_id(const std::string& command_id,
-                                           const std::string& execution_id) {
+void AgentServiceImpl::record_command_dispatch(const std::string& command_id,
+                                               const std::string& plugin,
+                                               const std::string& execution_id,
+                                               DispatchRecordLatch* latch) {
     // Atomic snapshot — see notify_exec_tracker's identical load for the
     // detached gateway-forward-thread rationale (governance UAT 2026-05-06
-    // Gate 7 re-review HIGH). A null tracker (not wired, or mid-shutdown)
-    // means the correlation is simply not recorded — same no-op posture the
-    // former in-process map had before this dispatch's first write.
-    auto* tracker = execution_tracker_.load(std::memory_order_acquire);
-    if (!tracker)
-        return;
-    // Best-effort: a false return degrades observability for this one
-    // command (see record_command_execution's doc comment) and is
-    // deliberately not propagated to the dispatch caller — it is counted
-    // here so a sustained write-side degrade is visible in Prometheus
-    // (governance Gate 4/6 finding: previously log-only, asymmetric with
-    // the reap path's yuzu_exec_correlation_store_degrade_total).
-    if (!tracker->record_command_execution(command_id, execution_id))
+    // Gate 7 re-review HIGH). A null tracker (not wired, or mid-shutdown) records nothing, which
+    // the response side reads as unverified: counted below like any other failed record.
+    //
+    // Best-effort: a false return degrades this one command (its responses are labelled
+    // unverified and carry no execution id; see record_command_dispatch's doc comment) and is
+    // deliberately not propagated to the dispatch caller — it is counted here so a sustained
+    // write-side degrade is visible in Prometheus (governance Gate 4/6 finding: previously
+    // log-only, asymmetric with the reap path's yuzu_exec_correlation_store_degrade_total).
+    //
+    // `latch` (dispatch_record_policy.hpp) is non-null only for a loop that writes one record per
+    // target. Such a write uses the short fan-out lease budget, and once one write in the loop
+    // has failed the rest are SKIPPED: counted as a degrade exactly like a failed write (the
+    // command is still dispatched; its responses are labelled unverified), so an outage costs the
+    // loop one short wait, not N. A null latch is every other caller: the ordinary budget, no skip.
+    if (latch && latch->tripped()) {
+        latch->note_skipped();
         metrics_.counter("yuzu_exec_correlation_write_degrade_total").increment();
+        return;
+    }
+    auto* tracker = execution_tracker_.load(std::memory_order_acquire);
+    const bool recorded =
+        tracker && (latch ? tracker->record_command_dispatch(command_id, plugin, execution_id,
+                                                             latch->lease_timeout())
+                          : tracker->record_command_dispatch(command_id, plugin, execution_id));
+    if (!recorded) {
+        if (latch)
+            latch->trip();
+        metrics_.counter("yuzu_exec_correlation_write_degrade_total").increment();
+    }
 }
 
 // -- process_gateway_response -------------------------------------------------
@@ -1713,15 +1958,19 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             auto payload = resp.output().substr(11);
             auto eq = payload.find('=');
             auto ms = (eq != std::string::npos) ? payload.substr(eq + 1) : payload;
-            bus_.publish("timing", "<strong id=\"stat-agent\" hx-swap-oob=\"true\">" +
-                                       html_escape(ms) + " ms</strong>");
+            if (is_timing_millis(ms)) // #4990: never relay arbitrary frame text to the shared bus
+                bus_.publish("timing", "<strong id=\"stat-agent\" hx-swap-oob=\"true\">" +
+                                           html_escape(ms) + " ms</strong>");
             return;
         }
         // CHAOS-TTL-1 — see the direct-Subscribe twin of this intercept above
         // (this function's own doc comment names it "the gateway-streamed
         // RUNNING" path); same sentinel, same reasoning.
+        // #4990: provenance is decided ONCE for this frame (see the direct-Subscribe twin).
+        const ResponseProvenance prov =
+            resolve_response_provenance(resp.command_id(), resp.output() == "__keepalive__");
         if (resp.output() == "__keepalive__") {
-            notify_exec_tracker(resp.command_id(), agent_id, resp);
+            notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
             return;
         }
 
@@ -1741,7 +1990,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             }
         }
 
-        std::string plugin = extract_plugin(resp.command_id());
+        const std::string& plugin = prov.plugin;
         publish_output_rows(agent_id, plugin, resp.output());
 
         if (response_store_) {
@@ -1754,13 +2003,17 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             sr.plugin = plugin;
             // PR 2 / HA WS-1(1b): streaming response — keep the mapping
             // until completion (PG-backed, shared across replicas).
-            if (auto eid = resolve_execution_id(resp.command_id()))
-                sr.execution_id = *eid;
+            sr.execution_id = prov.execution_id;
             response_store_->store(sr);
         }
 
+        // registry.write audit rows. No gRPC context on the gateway path to carry an
+        // audit-failed trailer: the hook has logged any failure (and counted the rows it
+        // knows) itself.
+        (void)audit_registry_frame(agent_id, resp, plugin);
+
         // UAT 2026-05-06 #8: gateway-streamed RUNNING — notify tracker.
-        notify_exec_tracker(resp.command_id(), agent_id, resp);
+        notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
 
         if (auto analytics_store = analytics_store_.lock()) {
             AnalyticsEvent ae;
@@ -1776,20 +2029,22 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                      ::yuzu::log_id_token(resp.command_id()), static_cast<int>(resp.status()),
                      resp.exit_code());
 
+        // #4990: see the Subscribe twin; one value for every derived sink below.
+        const ResponseProvenance prov = resolve_response_provenance(resp.command_id());
+        const std::string sink_error = failure_text_for_sinks(prov.plugin, resp);
+
         if (response_store_) {
-            auto gw_plugin = extract_plugin(resp.command_id());
+            const std::string& gw_plugin = prov.plugin;
             std::string err_detail;
             if (resp.has_error()) {
                 err_detail = resp.error().message();
             }
-            // PR 2 / HA WS-1(1b): resolve execution_id from the
-            // PG-backed command_execution table. Do NOT delete on
+            // PR 2 / HA WS-1(1b): the execution_id comes from the
+            // PG-backed command_execution record. Do NOT delete on
             // terminal status (HF-1) — multi-agent fan-out produces N
             // terminal responses; the row ages out via
             // ExecutionTracker::reap_command_execution_mappings instead.
-            std::string current_exec;
-            if (auto eid = resolve_execution_id(resp.command_id()))
-                current_exec = *eid;
+            const std::string& current_exec = prov.execution_id;
             // Terminal frame with no output: update existing RUNNING row(s)
             // instead of inserting a separate empty-output sentinel that
             // operators misread as a failure (UAT 2026-05-06). Tri-state
@@ -1816,8 +2071,12 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             // FR::Updated → in-place; FR::Error → already logged, do NOT insert.
         }
 
+        // A terminal frame that carries output owes its audit rows too (see the Subscribe twin;
+        // the hook has logged any failure (and counted the rows it knows) itself).
+        (void)audit_registry_frame(agent_id, resp, prov.plugin);
+
         // UAT 2026-05-06 #8: gateway-streamed terminal — notify tracker.
-        notify_exec_tracker(resp.command_id(), agent_id, resp);
+        notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
 
         std::string status_str = (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
         metrics_.counter("yuzu_commands_completed_total", {{"status", status_str}}).increment();
@@ -1833,20 +2092,20 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             AnalyticsEvent ae;
             ae.event_type = "command.completed";
             ae.agent_id = agent_id;
-            ae.plugin = extract_plugin(resp.command_id());
+            ae.plugin = prov.plugin;
             ae.correlation_id = resp.command_id();
             ae.severity = (resp.status() == pb::CommandResponse::SUCCESS) ? Severity::kInfo
                                                                           : Severity::kError;
             ae.payload = {{"status", status_str}, {"exit_code", resp.exit_code()}};
             if (resp.has_error()) {
-                ae.payload["error_message"] = resp.error().message();
+                ae.payload["error_message"] = sink_error;
             }
             analytics_store->emit(std::move(ae));
         }
 
         if (resp.status() != pb::CommandResponse::SUCCESS && notification_store_ &&
             notification_store_->is_open()) {
-            std::string err_msg = resp.has_error() ? resp.error().message() : "unknown";
+            std::string err_msg = resp.has_error() ? sink_error : "unknown";
             notification_store_->create("error", "Execution Failed",
                                         "Command " + resp.command_id() + " on agent " + agent_id +
                                             " failed: " + err_msg);
@@ -1860,7 +2119,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                                          {"status", status_str},
                                          {"exit_code", resp.exit_code()}};
             if (resp.has_error()) {
-                wh_payload["error"] = resp.error().message();
+                wh_payload["error"] = sink_error;
             }
             const auto body = wh_payload.dump();
             if (webhook_store_ && webhook_store_->is_open()) {
@@ -1943,9 +2202,20 @@ std::string AgentServiceImpl::render_row(const std::string& agent_name, const st
     return html;
 }
 
+std::string AgentServiceImpl::failure_text_for_sinks(const std::string& plugin,
+                                                     const pb::CommandResponse& resp) const {
+    if (!resp.has_error())
+        return {};
+    std::string text = resp.error().message();
+    if (!forensics_plugins_ || forensics_plugins_->contains(plugin))
+        text = sanitize_forensics_error_detail(text);
+    return text;
+}
+
 void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
                                            const std::string& agent_id,
-                                           const pb::CommandResponse& resp) {
+                                           const pb::CommandResponse& resp,
+                                           const ResponseProvenance& prov) {
     // Atomic snapshot — detached gateway-forward worker threads spawned
     // by ServerImpl::forward_gateway_pending outlive gRPC's Shutdown
     // drain (those threads are *clients* of the gateway, not server-side
@@ -1961,12 +2231,11 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     auto* tracker = execution_tracker_.load(std::memory_order_acquire);
     if (!tracker)
         return;
-    // HA WS-1(1b): resolved from the PG-backed command_execution table
-    // (shared across replicas), not an in-process map — a response landing
-    // on a different server instance than the one that dispatched it now
-    // still resolves.
-    auto execution_id_opt = resolve_execution_id(command_id);
-    if (!execution_id_opt || execution_id_opt->empty()) {
+    // HA WS-1(1b): the execution id was resolved ONCE for this frame from the PG-backed
+    // command_execution record (shared across replicas), not an in-process map — a response
+    // landing on a different server instance than the one that dispatched it still resolves. An
+    // untracked dispatch (and an unverified frame) carries the empty string.
+    if (prov.execution_id.empty()) {
         // ADR-1007 by-command concurrency-claim fallback (originally UP-1,
         // unhappy-path Gate 4 finding, PR #3784 fix round — reconciled onto
         // HA WS-1(1b) above; the fallback's ORIGINAL trigger, a server
@@ -1975,8 +2244,8 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
         // this fallback's help). What still reaches here, genuinely: (1)
         // every workflow-step dispatch (`workflow_routes.cpp`), which
         // always passes an empty `execution_id` (CONSIST-2/sec-M2), so
-        // `record_execution_id` never records a mapping for it and
-        // `resolve_execution_id` correctly returns nullopt — this is the
+        // the dispatch record carries an empty execution id for it and
+        // `resolve_response_provenance` correctly returns an empty one — this is the
         // ONLY release path a workflow-step per-device claim ever reaches;
         // (2) a genuine degrade on `command_execution`'s own write or
         // read side (pool exhaustion, a query failure), which this fallback
@@ -2030,7 +2299,7 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
         }
         return; // out-of-band dispatch, nothing to publish
     }
-    const std::string& execution_id = *execution_id_opt;
+    const std::string& execution_id = prov.execution_id;
 
     // Compliance-check correlation ids ("polchk-…", minted by PolicyEvaluator)
     // are NOT operator executions: the evaluator tags responses with this id only
@@ -2084,9 +2353,9 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     // sdk/include/yuzu/plugin.h's YuzuResultStatus), so no separate mapping
     // table is needed to avoid drift; 0 in both is PLUGIN_RESULT_UNDECLARED.
     s.plugin_result_status = static_cast<int>(resp.plugin_result_status());
-    if (resp.has_error()) {
-        s.error_detail = resp.error().message();
-    }
+    // #4990: shown at the Execution:Read tier (drawer, execution status, event stream and outbox),
+    // below the Forensics tier of the plugin's own rows; see failure_text_for_sinks.
+    s.error_detail = failure_text_for_sinks(prov.plugin, resp);
     switch (resp.status()) {
     case pb::CommandResponse::RUNNING:
         s.status = "running";
@@ -2122,6 +2391,14 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
 void AgentServiceImpl::publish_output_rows(const std::string& agent_id, const std::string& plugin,
                                            const std::string& raw_output) {
     if (raw_output.empty())
+        return;
+    // #4990: the "output" stream is shared by every dashboard session, with no per-subscriber
+    // read tier. A Forensics-tier plugin's frame therefore publishes NOTHING to it: no row, and no
+    // notice either (a notice would be an event the stream's subscribers could see even though
+    // they hold no Forensics read). Its rows are served only by the tier-filtered stored-response
+    // reads. An unwired set publishes nothing for the same reason: without it a Forensics row
+    // cannot be told apart from an ordinary one.
+    if (!forensics_plugins_ || forensics_plugins_->contains(plugin))
         return;
     auto agent_name = registry_.display_name(agent_id);
     auto& col_names = yuzu::server::columns_for_plugin(plugin);
@@ -2907,14 +3184,6 @@ void AgentServiceImpl::prune_expired_pending_locked() {
             ++it;
         }
     }
-}
-
-std::string AgentServiceImpl::extract_plugin(const std::string& command_id) {
-    auto dash = command_id.find('-');
-    if (dash != std::string::npos) {
-        return command_id.substr(0, dash);
-    }
-    return command_id;
 }
 
 } // namespace yuzu::server::detail

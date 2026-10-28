@@ -93,7 +93,8 @@
 %%% listen_opts, grpc_opts, pool_opts, ssl) never starts a listener that is not the one
 %%% configured. The `tls' map takes certfile, keyfile, cacertfile, verify,
 %%% fail_if_no_peer_cert and ciphers; `listen' takes port, ip and socket_opts
-%%% (which may not set the bind address or port).
+%%% (which may not set the bind address or port, nor the renegotiation options
+%%% ssl_opts/1 fixes: client renegotiation is refused on every TLS listener).
 %%%
 %%% A listener that goes away is restarted by its supervisor, and a graceful stop
 %%% or a single death of the Ranch listener supervisor recovers that way. A brutal
@@ -208,6 +209,9 @@
 %% Socket options that would move the bind address or port, which `listen' alone
 %% decides (and the management-plane posture guard reads).
 -define(BIND_SOCKET_OPTS, [ip, ifaddr, fd, port, local]).
+%% TLS options ssl_opts/1 fixes for every listener, which `listen.socket_opts'
+%% may not set: renegotiation is not configurable.
+-define(TLS_POLICY_SOCKET_OPTS, [client_renegotiation, secure_renegotiate]).
 
 %%--------------------------------------------------------------------
 %% API
@@ -265,6 +269,16 @@ validate(_) ->
 %% unless the map sets `ciphers': ECDSA suites for an EC certificate, RSA suites
 %% for an RSA one. A certificate that cannot be read here (it fails when the
 %% listener starts, with the reason) gets the EC list.
+%%
+%% Client-initiated renegotiation is refused (`client_renegotiation' false; OTP's
+%% server default is true), so a peer, authenticated or not, cannot make the
+%% gateway run one full ECDHE handshake after another on one connection. The
+%% peer gets a no_renegotiation warning alert: an OTP client carries on, but an
+%% OpenSSL-family client treats the refusal as fatal and closes. Secure
+%% renegotiation (RFC 5746) stays required, explicitly. Neither is a key of the
+%% `tls' map, and `listen.socket_opts' may not set them (check_socket_opts/1);
+%% these options also come after the socket options in the list, and a later
+%% option wins.
 -spec ssl_opts(map()) -> [ssl:tls_server_option()].
 ssl_opts(#{certfile := Cert, keyfile := Key, cacertfile := CaCert} = Tls) ->
     Verify = maps:get(verify, Tls, verify_peer),
@@ -275,7 +289,9 @@ ssl_opts(#{certfile := Cert, keyfile := Key, cacertfile := CaCert} = Tls) ->
      {ciphers, maps:get(ciphers, Tls, default_ciphers(Cert))},
      {alpn_preferred_protocols, [<<"h2">>]},
      {honor_cipher_order, true},
-     {reuse_sessions, false}].
+     {reuse_sessions, false},
+     {client_renegotiation, false},
+     {secure_renegotiate, true}].
 
 %% The suites for the key of the first certificate in the file.
 default_ciphers(CertFile) ->
@@ -531,10 +547,12 @@ check_ip(Ip) ->
 check_socket_opts(Opts) ->
     case proper_list(Opts) of
         true ->
-            case [Name || Opt <- Opts, Name <- [socket_opt_name(Opt)],
-                          lists:member(Name, ?BIND_SOCKET_OPTS)] of
-                [] -> ok;
-                Refused -> {error, {listen_socket_opts_set_the_bind, lists:usort(Refused)}}
+            Names = [socket_opt_name(Opt) || Opt <- Opts],
+            case {[N || N <- Names, lists:member(N, ?BIND_SOCKET_OPTS)],
+                  [N || N <- Names, lists:member(N, ?TLS_POLICY_SOCKET_OPTS)]} of
+                {[], []} -> ok;
+                {[], Tls} -> {error, {listen_socket_opts_set_tls_policy, lists:usort(Tls)}};
+                {Refused, _} -> {error, {listen_socket_opts_set_the_bind, lists:usort(Refused)}}
             end;
         false ->
             {error, bad_listen_socket_opts}

@@ -29,7 +29,7 @@ Scope expressions appear in three contexts:
 | Context | Where | Purpose |
 |---|---|---|
 | **Instruction execution** | `scope_expression` field on an execution | Determines which agents receive the command at dispatch time. |
-| **Management group membership** | `scope_expression` on a dynamic management group | Devices matching the expression are automatically added to the group. |
+| **Management group membership** | `scope_expression` on a dynamic management group | Stored with the group. Yuzu computes members from it only for the `Service: {name}` groups it creates itself, once, when the group is created. For other dynamic groups created through the API, members are not computed from the expression. |
 | **Instruction scheduling** | `scope_expression` on a schedule | Evaluated at each scheduled dispatch to determine the target set. New devices enrolled since the schedule was created are automatically included. |
 
 Because scope expressions are evaluated at dispatch time (not at authoring time), the target set is always current.
@@ -384,6 +384,7 @@ tag:environment == "Production" AND agent_version >= "0.9.0"
 ```bash
 # Execute a service inspection on production Windows servers
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions \
   -H "Content-Type: application/json" \
   -d '{
@@ -397,6 +398,7 @@ curl -s -b cookies.txt \
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/schedules \
   -H "Content-Type: application/json" \
   -d '{
@@ -423,6 +425,7 @@ Parses the expression and returns success or a descriptive parse error. Does not
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/scope/validate \
   -H "Content-Type: application/json" \
   -d '{"expression": "ostype == \"windows\" AND tag:environment == \"Production\""}'
@@ -455,6 +458,7 @@ Evaluates the expression against all enrolled agents and returns the count of ma
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/scope/estimate \
   -H "Content-Type: application/json" \
   -d '{"expression": "ostype == \"windows\" AND tag:environment == \"Production\""}'

@@ -63,6 +63,8 @@ agent_test_() ->
       {"streaming tracks pending commands", fun streaming_tracks_pending/0},
       {"streaming removes pending on terminal response", fun streaming_clears_pending/0},
       {"streaming keeps pending on RUNNING response", fun streaming_keeps_running/0},
+      {"streaming forwards CommandResponse.action unchanged (registry.write audit)",
+       fun streaming_forwards_action/0},
       {"streaming handles orphaned response", fun streaming_orphaned_response/0},
       {"completed duration carries the dispatched plugin, not the response's",
        fun completed_carries_dispatched_plugin/0},
@@ -264,6 +266,34 @@ code_change_upgrades_legacy_pending() ->
     ?assertMatch([#{plugin := <<"unknown">>}],
                  [Meta || {_, {telemetry, execute, [[yuzu, gw, command, completed], _, Meta]}, _}
                               <- meck:history(telemetry)]),
+    stop_agent(Pid).
+
+%% CommandResponse.action (field 8) is what the server's registry.write audit hook keys on for a
+%% gateway-connected agent, so an ordinary response frame must reach the waiting caller with it
+%% intact, on a RUNNING frame and on the terminal one. The Guardian-shaped wire test does not cover
+%% this hop (unsolicited "__guard__" frames carry no command_id and are intercepted before it).
+streaming_forwards_action() ->
+    {Pid, _} = start_agent(<<"sfa-1">>, self()),
+    FanoutRef = make_ref(),
+    CmdId = <<"registry-0123456789abcdef">>,
+    yuzu_gw_agent:dispatch(Pid, #{command_id => CmdId, plugin => <<"registry">>},
+                           {self(), FanoutRef}),
+    receive {send_command, _} -> ok after 1000 -> ok end,
+    Pid ! {stream_data, #{command_id => CmdId, status => 'RUNNING',
+                          output => <<"audit|op=set_value">>, action => <<"set_value">>}},
+    receive
+        {command_response, FanoutRef, _, Running} ->
+            ?assertEqual(<<"set_value">>, maps:get(action, Running, undefined))
+    after 1000 ->
+        ?assert(false, "Expected the RUNNING command_response")
+    end,
+    Pid ! {stream_data, #{command_id => CmdId, status => 'SUCCESS', action => <<"set_value">>}},
+    receive
+        {command_response, FanoutRef, _, Terminal} ->
+            ?assertEqual(<<"set_value">>, maps:get(action, Terminal, undefined))
+    after 1000 ->
+        ?assert(false, "Expected the terminal command_response")
+    end,
     stop_agent(Pid).
 
 streaming_orphaned_response() ->

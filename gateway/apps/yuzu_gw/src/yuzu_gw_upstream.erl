@@ -186,6 +186,14 @@
 %%%       cluster_id ..., which differs from this agent's already-bound cluster
 %%%       affinity -- REFUSING ...", cluster_affinity_violation): DEFINITIVE
 %%%       until the configuration changes.
+%%%     - CONNECTED, the presenting agent has no directory row and another
+%%%       agent's row holds the session ("... presents session ... that another
+%%%       agent's route already holds (#5683)", session_held_by_other_agent,
+%%%       op announce_connected, plus a gateway.session_held_by_other_agent
+%%%       audit row): DEFINITIVE while that row holds it. The ack carries no
+%%%       reason (#6059), so this gateway resends it for as long as it holds
+%%%       the session (the slow phase after 15 minutes), and the server logs
+%%%       and audits each one.
 %%%     - an event that is neither (never sent by this gateway).
 %%%   A failed directory WRITE (announce_connected) is answered true today
 %%%   (fail-open); a server change in review (#5961) answers it UNAVAILABLE,
@@ -219,10 +227,12 @@
 %%%     for, and the alert names it.
 %%%   - Slow phase (a stopgap until the answer carries a refusal reason, #6059):
 %%%     a refusal the server will repeat for as long as the session lives
-%%%     (stale_connected_session, cluster_affinity_violation) looks the same as
-%%%     a transient one. So once a CONNECTED has been refused continuously
-%%%     for notify_unacked_slow_after_ms (900000, 15 min) since its first
-%%%     refusal, each next resend comes 0.8 to 1 x notify_unacked_slow_max_ms
+%%%     (stale_connected_session, cluster_affinity_violation,
+%%%     session_held_by_other_agent) looks the same as
+%%%     a transient one. So once notify_unacked_slow_after_ms (900000, 15 min)
+%%%     has passed since a CONNECTED's first refusal without an
+%%%     acknowledgement (time it spends held during an upstream outage counts
+%%%     too), each next resend comes 0.8 to 1 x notify_unacked_slow_max_ms
 %%%     (600000) later: a fixed interval jittered down by up to 20%, not
 %%%     decorrelated jitter: its floor stays the base (1 s), so even with a
 %%%     600 s cap a third of its draws fall below the cap, anywhere down to
@@ -377,9 +387,9 @@
 %%%                                          100..3600000, raised to the base)
 %%%   notify_unacked_disconnected_window_ms - how long a refused DISCONNECTED is
 %%%                                          resent (default 120000, valid 0..3600000)
-%%%   notify_unacked_slow_after_ms        - how long a CONNECTED has been
-%%%                                          refused continuously (since its first
-%%%                                          refusal) before it is resent at the
+%%%   notify_unacked_slow_after_ms        - how long after its first refusal,
+%%%                                          without an acknowledgement, a
+%%%                                          CONNECTED starts being resent at the
 %%%                                          slow interval (default 900000, valid
 %%%                                          0..86400000; 0 slows it from its
 %%%                                          first refusal). notify_unacked_slow_after
@@ -556,9 +566,9 @@
 %% changes nothing. 0 (never resent) to 1 h.
 -define(DEFAULT_UNACKED_DISC_WINDOW_MS, 120000).
 -define(MAX_UNACKED_DISC_WINDOW_MS, 3600000).
-%% The slow phase (stopgap until the refusal carries a reason, #6059): once a
-%% CONNECTED has been refused continuously for this long since its first
-%% refusal, it is resent every 0.8 to 1 x the slow max. Time, not a refusal
+%% The slow phase (stopgap until the refusal carries a reason, #6059): once
+%% this long has passed since a CONNECTED's first refusal without an
+%% acknowledgement (held time during an upstream outage included), it is resent every 0.8 to 1 x the slow max. Time, not a refusal
 %% count (#6077): 10 refusals came in as little as 33 s at the default backoff,
 %% so a server refusing CONNECTED for 60 s (a degraded route store, measured at
 %% 5,000 agents) slowed 1,512 of 5,000 sessions, which then sat unrecorded for
@@ -1356,8 +1366,8 @@ warn_retired_slow_after() ->
     case application:get_env(yuzu_gw, notify_unacked_slow_after) of
         {ok, Value} ->
             logger:warning("notify_unacked_slow_after (~p) is no longer read: a refused "
-                           "CONNECTED is slowed after notify_unacked_slow_after_ms of "
-                           "continuous refusal (default ~b)",
+                           "CONNECTED is slowed once notify_unacked_slow_after_ms has passed "
+                           "since its first refusal (default ~b)",
                            [Value, ?DEFAULT_UNACKED_SLOW_AFTER_MS]);
         undefined ->
             ok
@@ -2884,8 +2894,8 @@ slow_unacked_delay(SlowMax) ->
     Lo + rand:uniform(SlowMax - Lo + 1) - 1.
 
 %% @doc Whether a refusal settled at Now puts its entry in the slow phase: a
-%% CONNECTED refused continuously for SlowAfterMs or more since its first
-%% refusal (First). A DISCONNECTED never is (its window bounds it).
+%% CONNECTED whose first refusal (First) was SlowAfterMs or more ago, with no
+%% acknowledgement since (that removes the entry). A DISCONNECTED never is (its window bounds it).
 -spec slow_now(connected | disconnected, integer(), integer(), non_neg_integer()) ->
           boolean().
 slow_now(connected, First, Now, SlowAfterMs) ->

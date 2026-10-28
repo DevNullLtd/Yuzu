@@ -19,6 +19,7 @@
  */
 
 #include "tar_db.hpp"
+#include "tar_mapdrive_backfill.hpp" // ProfileHiveOutcome (MapDriveHistory below)
 #include "tar_schema_registry.hpp" // OsSupportStatus (read_failure_token)
 #include "tar_netqual.hpp" // TcpQualitySample (returned by collect_tcp_quality)
 
@@ -183,6 +184,20 @@ struct MapDriveEntry {
 struct MapDriveHistoryRow {
     MapDriveEntry entry;
     int64_t ts{0};
+};
+
+// Result of one historical-mapdrive walk (the init-time first pass, or a bounded per-profile
+// retry): the rows gathered, each WALKED profile's per-profile hive-read outcome (empty on
+// Linux/macOS/stub, where there is no per-profile hive walk at all), and whether the ProfileList
+// walk itself was complete (yuzu::tar::profile_list_complete, tar_mapdrive_backfill.hpp) --
+// `false` means some profiles were never reached this run, so their absence from `profiles`
+// proves nothing (never a "vanished" signal). A profile outside the requested filter (for_profiles)
+// that the list no longer contains gets NO entry, which is exactly how apply_outcomes tells
+// "no longer present" (complete=true) from "not reached this run" (complete=false).
+struct MapDriveHistory {
+    std::vector<MapDriveHistoryRow> rows;
+    std::vector<ProfileHiveOutcome> profiles;
+    bool complete = true;
 };
 
 // ── Platform enumeration functions ────────────────────────────────────────────
@@ -361,15 +376,27 @@ std::vector<DnsEntry> enumerate_dns();
 std::vector<MapDriveEntry> enumerate_mapdrive();
 
 /**
- * Enumerate PREVIOUS (historical) mapped drives for the one-time init backfill
- * (capability-map §3.8). Windows: outbound from HKCU\Network + Map Network Drive
- * MRU + MountPoints2 across offline profiles (ts = subkey last-write), inbound
- * from Security event log 4624 (logon_type=3 network) logons (ts = event time).
- * Linux: outbound from /etc/fstab (ts=0), inbound from Samba logs (ts = log time).
- * Returns `{}` on macOS. Deduplicated by mapping identity, capped at
- * kMapDriveHistoryCap.
+ * Enumerate PREVIOUS (historical) mapped drives for the init-time first pass AND the bounded
+ * per-profile retry that follows it (capability-map §3.8; related issue #5291). Windows: outbound
+ * from HKCU\Network + Map Network Drive MRU + MountPoints2 across offline profiles (ts = subkey
+ * last-write), inbound from Security event log 4624 (logon_type=3 network) logons (ts = event
+ * time). Linux: outbound from /etc/fstab (ts=0), inbound from Samba logs (ts = log time).
+ * Returns rows only (profiles empty, complete true) on macOS/Linux/stub, where there is no
+ * per-profile hive walk. Rows deduplicated by mapping identity and capped at
+ * kMapDriveHistoryCap; `profiles` carries one yuzu::tar::ProfileHiveOutcome per WALKED Windows
+ * profile (the default offline hive-file guard's outcome, read-completeness included) and
+ * `complete` whether the ProfileList walk itself reached every profile
+ * (yuzu::tar::profile_list_complete).
  */
-std::vector<MapDriveHistoryRow> enumerate_mapdrive_history();
+MapDriveHistory enumerate_mapdrive_history();
+
+/**
+ * Same walk as enumerate_mapdrive_history(), restricted to the given SIDs -- the bounded retry's
+ * own call, so a profile that already resolved is never re-mounted. Never runs the wevtutil
+ * inbound-history leg (that is a one-time, not per-profile, artifact). Windows only in effect;
+ * other platforms return `{}` (the retry never calls it there -- there is nothing to retry).
+ */
+MapDriveHistory enumerate_mapdrive_history_for_profiles(const std::vector<std::string>& sids);
 
 /**
  * Collapse duplicate historical rows by mapping identity (direction, local_mount,

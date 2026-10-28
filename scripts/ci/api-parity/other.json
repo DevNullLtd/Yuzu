@@ -3,9 +3,12 @@
     "method": "GET",
     "path": "/api/agents",
     "capability_id": "get.api-agents",
-    "rest_v1_twin": null,
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/devices"
+    },
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#4041 revisit:2027-01-31 MCP list_agents is unconfined (known gap, #4041) while GET /api/v1/devices is confined through require_fleet_read; not a twin until list_agents is confined (ADR-1005 2026-10-23 entry)"
   },
   {
     "method": "GET",
@@ -75,7 +78,7 @@
     "capability_id": "post.api-approvals-param-approve",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#6061 revisit:2027-01-18 deciding an approval is a human-session act (interactive cookie session that passes the MFA step-up gate: an un-enrolled local user passes it and an enrolled-factor requirement is tracked in #6079); the MCP twin approve_request/reject_request is permanently refused with approver_assurance_required:* and no machine twin is intended (ADR-1005 exception, #6061)"
   },
   {
     "method": "POST",
@@ -83,7 +86,7 @@
     "capability_id": "post.api-approvals-param-reject",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#6061 revisit:2027-01-18 deciding an approval is a human-session act (interactive cookie session that passes the MFA step-up gate: an un-enrolled local user passes it and an enrolled-factor requirement is tracked in #6079); the MCP twin approve_request/reject_request is permanently refused with approver_assurance_required:* and no machine twin is intended (ADR-1005 exception, #6061)"
   },
   {
     "method": "GET",
@@ -123,7 +126,7 @@
     "capability_id": "post.api-chargen-start",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:post.api-command"
   },
   {
     "method": "GET",
@@ -131,7 +134,7 @@
     "capability_id": "get.api-chargen-status",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#5955 revisit:2026-11-30 One boolean (registry has_any) for the chargen test page; derivable from GET /api/v1/devices count. UI-only exception recorded by the ADR-1005 2026-10-22 entry (extends #5955)."
   },
   {
     "method": "POST",
@@ -139,7 +142,7 @@
     "capability_id": "post.api-chargen-stop",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:post.api-command"
   },
   {
     "method": "POST",
@@ -153,41 +156,56 @@
     "method": "GET",
     "path": "/api/config",
     "capability_id": "get.api-config",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/config"
+    },
+    "mcp_twin": "get_runtime_config",
+    "status": "twinned"
   },
   {
     "method": "PUT",
     "path": "/api/config/{param}",
     "capability_id": "put.api-config-param",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "PUT",
+      "path": "/api/v1/config/{key}"
+    },
+    "mcp_twin": "set_runtime_config",
+    "status": "twinned"
   },
   {
     "method": "GET",
     "path": "/api/executions",
     "capability_id": "get.api-executions",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/executions"
+    },
+    "mcp_twin": "list_executions",
+    "status": "twinned"
   },
   {
     "method": "GET",
     "path": "/api/executions/{param}",
     "capability_id": "get.api-executions-param",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/executions/{param}"
+    },
+    "mcp_twin": "get_execution_status",
+    "status": "twinned"
   },
   {
     "method": "GET",
     "path": "/api/executions/{param}/agents",
     "capability_id": "get.api-executions-param-agents",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/executions/{param}"
+    },
+    "mcp_twin": "get_execution_status",
+    "status": "twinned"
   },
   {
     "method": "POST",
@@ -230,7 +248,7 @@
     "capability_id": "post.api-export-json-to-csv",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#5955 revisit:2026-11-30 Stateless transform of caller-supplied JSON; reads no server data. UI-only exception recorded by the ADR-1005 2026-10-22 entry (extends #5955)."
   },
   {
     "method": "GET",
@@ -244,9 +262,12 @@
     "method": "GET",
     "path": "/api/help",
     "capability_id": "get.api-help",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/discover/plugins"
+    },
+    "mcp_twin": "discover_plugins",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -254,7 +275,7 @@
     "capability_id": "get.api-help-autocomplete",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#5955 revisit:2026-11-30 Pure HTMX HTML fragment over the same help data as get.api-help. UI-only exception recorded by the ADR-1005 2026-10-22 entry (extends #5955)."
   },
   {
     "method": "GET",
@@ -262,7 +283,7 @@
     "capability_id": "get.api-help-html",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:get.api-help"
   },
   {
     "method": "GET",
@@ -270,7 +291,7 @@
     "capability_id": "get.api-help-palette",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#5955 revisit:2026-11-30 Pure HTMX search fragment over the same registry data as get.api-help. UI-only exception recorded by the ADR-1005 2026-10-22 entry (extends #5955)."
   },
   {
     "method": "GET",
@@ -358,7 +379,7 @@
     "capability_id": "post.api-nvd-match",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#4099 revisit:2027-03-31 ADR-1005 grandfathered surface 2: the re-home to a use-case engine is tracked by #4099 (Phase 7, not started); no twin is built for the legacy route (ADR-1005 2026-10-22 entry)."
   },
   {
     "method": "GET",
@@ -366,7 +387,7 @@
     "capability_id": "get.api-nvd-status",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#4099 revisit:2027-03-31 ADR-1005 grandfathered surface 2: the re-home to a use-case engine is tracked by #4099 (Phase 7, not started); no twin is built for the legacy route (ADR-1005 2026-10-22 entry)."
   },
   {
     "method": "POST",
@@ -374,7 +395,7 @@
     "capability_id": "post.api-nvd-sync",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#4099 revisit:2027-03-31 ADR-1005 grandfathered surface 2: the re-home to a use-case engine is tracked by #4099 (Phase 7, not started); no twin is built for the legacy route (ADR-1005 2026-10-22 entry)."
   },
   {
     "method": "POST",
@@ -382,7 +403,7 @@
     "capability_id": "post.api-procfetch-fetch",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:post.api-instructions-param-execute"
   },
   {
     "method": "GET",
@@ -390,7 +411,7 @@
     "capability_id": "get.api-procfetch-status",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#5955 revisit:2026-11-30 One boolean (registry has_any) for the procfetch test page, the same shape as get.api-chargen-status; derivable from GET /api/v1/devices count. UI-only exception recorded by the ADR-1005 2026-10-22 entry (extends #5955)."
   },
   {
     "method": "GET",
@@ -445,9 +466,12 @@
     "method": "GET",
     "path": "/api/schedules",
     "capability_id": "get.api-schedules",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/schedules"
+    },
+    "mcp_twin": "list_schedules",
+    "status": "twinned"
   },
   {
     "method": "POST",
@@ -496,9 +520,12 @@
     "method": "POST",
     "path": "/api/tags/delete",
     "capability_id": "post.api-tags-delete",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "DELETE",
+      "path": "/api/v1/tags/{param}/{param}"
+    },
+    "mcp_twin": "delete_tag",
+    "status": "twinned"
   },
   {
     "method": "POST",
@@ -512,9 +539,12 @@
     "method": "POST",
     "path": "/api/tags/set",
     "capability_id": "post.api-tags-set",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "PUT",
+      "path": "/api/v1/tags"
+    },
+    "mcp_twin": "set_tag",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -554,7 +584,7 @@
     "capability_id": "get.fragments-approvals",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:get.api-approvals,post.api-approvals-param-approve,post.api-approvals-param-reject"
   },
   {
     "method": "GET",
@@ -562,7 +592,7 @@
     "capability_id": "get.fragments-health-summary",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:get.api-health"
   },
   {
     "method": "GET",
@@ -586,7 +616,7 @@
     "capability_id": "get.fragments-instructions",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:get.api-instructions,get.api-instruction-sets"
   },
   {
     "method": "GET",
@@ -594,7 +624,7 @@
     "capability_id": "get.fragments-instructions-editor",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:get.api-instructions-param"
   },
   {
     "method": "GET",
@@ -613,7 +643,7 @@
     "capability_id": "post.fragments-instructions-yaml-preview",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#5955 revisit:2026-11-30 Pure presentation: highlight_yaml output is HTML only; the validation half is validate_yaml_source, whose JSON capability is the planned post.api-instructions-validate-yaml row. UI-only exception recorded by the ADR-1005 2026-10-22 entry (extends #5955)."
   },
   {
     "method": "POST",

@@ -1,6 +1,6 @@
 # Management Groups
 
-Management groups organize devices into a hierarchy for scoped access control and targeted operations. They support both static membership (manually assigned) and dynamic membership (auto-populated by a scope expression).
+Management groups organize devices into a hierarchy for scoped access control and targeted operations. They support both static membership (manually assigned) and dynamic membership (a group that stores a scope expression; Yuzu fills only some dynamic groups from it, see the concepts table below).
 
 ## Concepts
 
@@ -9,9 +9,9 @@ Management groups organize devices into a hierarchy for scoped access control an
 | **Management group** | A named container for devices, with optional parent/child relationships. |
 | **Root group** | The built-in "All Devices" group (ID `000000000000`) is auto-created on server startup. It cannot be deleted or re-parented. Every newly enrolled agent is automatically added to this group. |
 | **Static membership** | Agents are explicitly added to or removed from the group by an operator. |
-| **Dynamic membership** | A scope expression (e.g., `ostype == "Windows" AND tag:department == "Finance"`) determines membership. Matching agents are included automatically. |
+| **Dynamic membership** | A scope expression (e.g., `ostype == "Windows" AND tag:department == "Finance"`) is stored with the group. Yuzu computes members from it only for the auto-created `Service: {name}` groups, and only once: the members are the agents carrying that `service` tag at the moment the group is created, and later tag writes do not add or remove members; the root group is filled at enrollment. For any other dynamic group created through the API the expression is stored but members are not computed, so add them with `POST /api/v1/management-groups/{id}/members`. |
 | **Hierarchy** | Groups form a tree with a maximum depth of 5 levels below the root (root + 5 child levels). Role assignments on a parent group cascade to all children. |
-| **Service groups** | When a `service` tag is set on an agent, Yuzu auto-creates a `Service: {name}` management group containing all agents with that tag. |
+| **Service groups** | When a `service` tag is set on an agent and no group of that name exists, Yuzu auto-creates a `Service: {name}` management group containing the agents that carry that tag at that moment. Membership is a snapshot taken at creation and is not refreshed afterwards. |
 | **Visibility filtering** | Non-admin users only see agents that belong to management groups where they hold a role assignment. Global administrators see all agents regardless of group membership. |
 
 ## Root Group
@@ -108,6 +108,7 @@ All list endpoints return a paginated envelope:
 
 ```bash
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/management-groups \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "London Servers",
@@ -132,17 +133,18 @@ Returns `201 Created`:
 
 ```bash
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/management-groups \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "All Windows Endpoints",
-    "description": "Auto-populated with all Windows agents",
+    "description": "Windows endpoints (members added by hand)",
     "parent_id": "mg_all_devices",
     "membership_type": "dynamic",
     "scope_expression": "ostype == \"Windows\""
   }'
 ```
 
-The `scope_expression` uses the same syntax as the scope engine. Common operators:
+The `scope_expression` is stored with the group and written back by reads. Yuzu does **not** evaluate it to fill a group created this way: the new group has no members until you add them with `POST /api/v1/management-groups/{id}/members`. The expression is written in scope engine syntax, shown here for reference. Examples of that syntax:
 
 | Expression | Matches |
 |---|---|
@@ -199,6 +201,7 @@ Use `PUT` to rename a group, change its description, re-parent it, or switch bet
 
 ```bash
 curl -s -b cookies.txt -X PUT \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6 \
   -H "Content-Type: application/json" \
   -d '{
@@ -213,6 +216,7 @@ Move a group under a different parent:
 
 ```bash
 curl -s -b cookies.txt -X PUT \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6 \
   -H "Content-Type: application/json" \
   -d '{
@@ -230,6 +234,7 @@ curl -s -b cookies.txt -X PUT \
 
 ```bash
 curl -s -b cookies.txt -X PUT \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6 \
   -H "Content-Type: application/json" \
   -d '{
@@ -247,10 +252,13 @@ Returns `200 OK`:
 }
 ```
 
+Switching to `dynamic` stores the expression but does not compute members. The existing members stay as they are and nothing adds or removes members from the expression afterwards.
+
 ### Delete a Group
 
 ```bash
 curl -s -b cookies.txt -X DELETE \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6
 ```
 
@@ -278,6 +286,7 @@ The root "All Devices" group (ID `000000000000`) cannot be deleted. Attempting t
 
 ```bash
 curl -s -b cookies.txt -X POST \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6/members \
   -H "Content-Type: application/json" \
   -d '{
@@ -294,12 +303,13 @@ Returns `201 Created`:
 }
 ```
 
-This endpoint is intended for static membership groups. For dynamic groups, membership is controlled by the scope expression and refreshed via `refresh_dynamic_membership`.
+This endpoint is intended for static membership groups. For a dynamic group the server computes members only for the root group (filled at enrollment) and, as a one-time snapshot at creation, for the `Service: {name}` groups it creates itself when a `service` tag is first written; for any other dynamic group created through the API, members are not computed from the scope expression.
 
 ### Remove a Member
 
 ```bash
 curl -s -b cookies.txt -X DELETE \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6/members/agent_lon_srv_03
 ```
 
@@ -312,7 +322,7 @@ Returns `200 OK`:
 }
 ```
 
-Only removes static membership records. Dynamic membership entries (added by scope expression evaluation) are not removed by this endpoint.
+Only removes static membership records. Dynamic membership entries (the root group's enrollment members and the one-time snapshot of a `Service: {name}` group) are not removed by this endpoint.
 
 ## Role Delegation
 
@@ -351,6 +361,7 @@ Only `Operator` and `Viewer` roles can be delegated via this endpoint. Assigning
 
 ```bash
 curl -s -b cookies.txt -X POST \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/mg_london/roles \
   -H "Content-Type: application/json" \
   -d '{
@@ -375,6 +386,7 @@ Jane now has Operator permissions for all devices in "London Office" and its chi
 
 ```bash
 curl -s -b cookies.txt -X DELETE \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/mg_london/roles \
   -H "Content-Type: application/json" \
   -d '{
@@ -397,11 +409,12 @@ The caller must be a global Administrator or hold `ITServiceOwner` on the target
 
 ## Service Groups
 
-When an agent's `service` tag is set (e.g., via the asset tagging API), Yuzu auto-creates a management group named `Service: {value}`. All agents sharing that service tag are automatically included.
+When an agent's `service` tag is set (e.g., via the asset tagging API), Yuzu auto-creates a management group named `Service: {value}` if none exists. The group starts with the agents that carry that service tag at the moment it is created. Membership is a snapshot: a group that already exists is left unchanged, so tagging or untagging an agent later does not add it to or remove it from the group. To add an agent to the group, use `POST /api/v1/management-groups/{id}/members`.
 
 ```bash
 # Tag an agent with a service
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tags \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{
     "agent_id": "agent_lon_srv_01",
@@ -410,7 +423,7 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tags \
   }'
 ```
 
-This creates (or updates) the group `Service: SAP` with `agent_lon_srv_01` as a member. The group uses dynamic membership internally with scope expression `tag:service == "SAP"` -- any agent tagged with `service = "SAP"` is included.
+If the group `Service: SAP` does not exist yet, this creates it with the agents tagged `service = "SAP"` (here `agent_lon_srv_01`) as members. If it already exists, the call leaves its membership unchanged. The group is stored as dynamic with scope expression `tag:service == "SAP"`, but Yuzu does not re-evaluate that expression after the group is created.
 
 ## Practical Example: Regional Delegation
 
@@ -419,27 +432,32 @@ Set up a structure where each regional team manages their own devices:
 ```bash
 # 1. Create regional groups (created_by is set from the authenticated session)
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/management-groups \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"name": "EMEA", "description": "Europe, Middle East, Africa", "membership_type": "static"}'
 
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/management-groups \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"name": "APAC", "description": "Asia-Pacific", "membership_type": "static"}'
 
 # 2. Add agents to EMEA (use the id returned by the create call)
 curl -s -b cookies.txt -X POST \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/<emea_group_id>/members \
   -H "Content-Type: application/json" \
   -d '{"agent_id": "agent_london_01"}'
 
 # 3. Delegate Operator to the EMEA team lead
 curl -s -b cookies.txt -X POST \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/<emea_group_id>/roles \
   -H "Content-Type: application/json" \
   -d '{"principal_type": "user", "principal_id": "emea.lead", "role_name": "Operator"}'
 
 # 4. Delegate Viewer to the EMEA helpdesk group
 curl -s -b cookies.txt -X POST \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/<emea_group_id>/roles \
   -H "Content-Type: application/json" \
   -d '{"principal_type": "group", "principal_id": "emea-helpdesk", "role_name": "Viewer"}'

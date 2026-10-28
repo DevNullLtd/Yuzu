@@ -4,9 +4,9 @@ Engine principals are the durable identities behind autonomous use-case-engine
 modules (ADR-1005 item 2b) — a third principal class alongside human users and
 human-created API tokens. Each engine principal has a named responsible human
 owner, a grant justification captured at creation, and a required
-`internal`/`external` classification, and it can never be granted the
-admin/wildcard role: least privilege is enforced structurally, not merely
-asserted by policy.
+`internal`/`external` classification, and it cannot be granted the admin
+role or any other built-in role. A custom role that grants every permission is
+not refused when it is assigned; the no-admin audit reports it afterwards.
 
 This page is an operator walkthrough. Full API reference:
 [REST API — Engine Principals](rest-api.md#engine-principals);
@@ -24,6 +24,10 @@ automation pipeline; engine credentials are hard-locked to MCP tier
 `readonly` and structurally barred from the admin role, which is the wrong
 shape for anything that needs to execute or approve on a human's behalf.
 
+While RBAC is off, the permission checks and the shared per-agent reads refuse an engine credential or
+return it no agents; enable RBAC and grant it a role to give it access. See
+[Upgrading](upgrading.md#behaviour-change-engine-principals-are-default-deny-when-rbac-is-off).
+
 ## Before you start
 
 Every mutating operation on this surface requires:
@@ -35,10 +39,9 @@ Every mutating operation on this surface requires:
   exist as a real Yuzu user — creation and transfer both fail closed
   (`400`) against an unknown username.
 
-**A structural rule with no exception:** a caller whose *own* session is
-itself engine-classed can never touch this surface at all, on either
-transport — not even to read. REST and all 9 MCP tools carry the same
-denial belt.
+**An engine-classed session is refused on the lifecycle and credential surface.** A caller whose *own* session is engine-classed is refused, even to read, on every engine-principal lifecycle and credential route on REST (create, list, get, revoke, mint, rotate, confirm, transfer and the no-admin audit) and on the engine lifecycle MCP tools; for the MCP tools, see the [MCP tool list](mcp.md#available-tools). `GET /api/v1/engine-principals/{id}/roles` (list) is the one REST exception: it carries no engine-session check and relies on its `EnginePrincipal:Read` gate alone. `POST` and `DELETE` on the roles routes (assign, unassign) are step-up gated like every other mutating route, so they refuse an engine-classed session before the handler runs.
+
+**What an engine principal can never be given.** Assignment refuses the roles named `admin` and `Administrator`, and refuses every built-in (system) role. Assignment does not inspect the permissions of a custom role, so a custom role that grants broad permissions can still be assigned. `GET /api/v1/engine-principals/audit/no-admin` reports an admin grant, a system role, or an effective grant that covers every securable and operation, so run it after assigning a custom role.
 
 ## Walkthrough: create, mint, rotate, confirm, transfer, revoke
 
@@ -47,10 +50,18 @@ denial belt.
 Dashboard: Settings → **Engine Principals** → fill in Slug, Display Name,
 Owner, Classification, Justification → Create.
 
+If the list or an engine principal's credentials cannot be read (for example
+while the database connection pool is exhausted), the panel says so: an
+"unavailable" notice replaces the table, or the Active Creds cell shows
+"unavailable" and the row offers neither Mint nor Rotate. Use the panel's
+**Retry** button rather than reloading the page; a reload discards a credential
+secret that is still shown above the panel.
+
 REST:
 
 ```bash
 curl -sk -X POST https://localhost:8080/api/v1/engine-principals \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
   -d '{
     "slug": "vuln-uce",
@@ -72,13 +83,29 @@ REST: `POST .../credentials`):
 
 ```bash
 curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce/credentials \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
   -d '{ "ttl_days": 90 }'
 ```
 
 The response carries the raw secret **exactly once**, under
 `Cache-Control: no-store` — copy it immediately into the consuming module's
-secret store. It cannot be retrieved again; only rotated or revoked.
+secret store. It cannot be retrieved again; only rotated or revoked. If the
+server cannot read the token store to check that the principal has no
+credential yet, it answers `503` with `Retry-After: 2` and mints nothing, so
+retrying after that `503` is safe. The MCP tool `mint_engine_credential` does the
+same (a retryable error with a `retry_after_ms` hint, nothing minted). If the
+credential is minted but the server then cannot read it back, it answers `503`
+with the secret withheld and the audit row `engine_principal.credential.mint`
+with `result=partial`; the credential exists but its secret was never shown, so
+do **not** retry the mint (that is a `409`): rotate it to obtain a secret.
+The same `503` and `partial` row apply when the read-back **answers but finds no
+active credential** (the new credential was revoked out of band between the
+insert and the read-back): the secret is withheld rather than delivered with an
+empty `token_id`. Check the principal's credentials, and rotate only if one is
+listed. Mint does not take a lock between the check and the insert, so two mint
+requests in flight at the same moment can both pass the check. Send them one at
+a time.
 
 ### 3. Rotate the credential (overlap-pair model)
 
@@ -89,6 +116,7 @@ the consuming module has time to pick up the new secret without a hard cutover:
 
 ```bash
 curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce/credentials/rotate \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
   -d '{ "overlap_secs": 604800 }'
 ```
@@ -101,6 +129,51 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
   or minting a second successor — safe to retry a dropped response. Every
   successful return, original or replay, is independently audited under
   `engine_principal.credential.reveal`.
+- If the rotation commits but the server then cannot read the new credential
+  back to build the response, it answers `503` with `Retry-After: 2` and
+  **withholds the secret**; the audit row is
+  `engine_principal.credential.rotate` with `result=partial`, with no reveal
+  row. Retry inside the same ~120-second grace window, as the same operator
+  and against the same server replica, to receive the same successor secret.
+  The grace window is held in that replica's memory: after a restart, on a
+  different replica, or once the window has ended, the retry is a `409`. The
+  MCP tool `rotate_engine_credential` behaves the same way (a retryable error,
+  secret withheld, `result=partial`). A `result=partial` row is the operator
+  signal that a successor exists whose secret was never delivered.
+- If the rotation committed and the read-back **answered but found no linked
+  successor** (the successor was revoked or confirmed out of band in between),
+  the response is also `503` with the secret withheld and `result=partial`, but
+  with **no retry hint**: there is no pending pair to re-serve, and an automatic
+  retry would perform a *new* rotation you did not ask for. The message says
+  "A successor may exist; inspect the principal's credentials
+  (`GET /api/v1/engine-principals/{id}`), then rotate again if needed." Do that,
+  then rotate again only if the principal needs a new credential. The MCP tool
+  `rotate_engine_credential` answers the same way, also without a retry hint.
+- **If the secret is lost** (the grace window passed, or the replica changed),
+  the pair is stuck with a successor nobody holds. Recover in three steps:
+  1. Find the successor with `GET /api/v1/engine-principals/{id}`. In its
+     `active_credentials` list a stuck pair is two credentials sharing a
+     `rotation_group`; the successor is the one whose `overlap_expires_at` is
+     `0` while the predecessor's is non-zero. That read fails closed: when the
+     token store cannot answer, the route returns `503` with `Retry-After: 2`
+     instead of an empty `active_credentials` list, so repeat it after the `503`
+     clears.
+     (`GET /api/v1/tokens` does not list it: that route is scoped to the
+     caller's own tokens, and an engine credential is owned by the engine
+     principal.)
+  2. Revoke the successor with `DELETE /api/v1/tokens/{token_id}`. This is a
+     REST call only (the MCP tools have no per-credential revoke). It needs
+     `ApiToken:Delete`, a fresh MFA step-up, and an **effective administrator**,
+     because only the token's owner or an administrator may revoke it and the
+     owner here is the engine principal, not a person. Any other caller gets
+     `404 token not found`.
+  3. Rotate again. After the successor is revoked the predecessor is the sole
+     credential, and rotating it starts a fresh pair.
+
+  Do **not** revoke only the predecessor: that leaves the principal holding a
+  single credential whose secret no one has. Do **not** revoke the principal
+  itself (`DELETE /api/v1/engine-principals/{id}`) as a recovery step: that is
+  terminal and destroys the identity and every credential.
 - If the consuming module updates the secret and you never call `confirm`
   (next step), a **60-second background sweep** enforces predecessor
   auto-revoke on your behalf, with this SLA: **a predecessor is revoked
@@ -147,10 +220,14 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
   that warning has fired for the elapsed state, do not assume the sweep will
   eventually clean it up (it will not — see the "never presented" case
   above) — either confirm once the successor genuinely is in use, or revoke
-  the *specific* credential you no longer trust via
+  the *specific* credential you no longer trust (the successor, if its secret
+  was never picked up) via
   `DELETE /api/v1/tokens/{token_id}` (never
   `DELETE /api/v1/engine-principals/{id}` — see step 4's callout below for
-  why).
+  why). That call needs the administrator role (or a JIT-elevated session, which
+  counts for this route): a caller without either gets
+  `404 token not found`, the same answer as for an unknown id, and only the
+  audit log records the denial.
 
 ### 4. Confirm the rotation (optional but recommended)
 
@@ -159,6 +236,7 @@ loop explicitly instead of waiting for the sweep:
 
 ```bash
 curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce/credentials/confirm \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"token_id": "<token_id from the rotate response>", "secret": "<the raw successor secret from the rotate response>"}'
@@ -207,6 +285,19 @@ admin caller may revoke any token, not just one they created — see
 `docs/user-manual/rest-api.md` "`DELETE /api/v1/tokens/{token_id}`") works
 on it, then rotate again once you're down to one active credential.
 
+**Recovering when the successor secret was lost.** If the rotate response was
+lost and the ~120-second re-serve window has passed, the secret cannot be shown
+again and `confirm` cannot be used (it needs the raw secret). The way out is an
+administrator call, and nothing else will do it: sign in as a user who holds the
+`admin` role or has an active JIT elevation (the same MFA step-up as other token revokes applies), read
+`GET /api/v1/engine-principals/{id}`, and pick the entry in `active_credentials`
+with `last_used_at` of `0` and `overlap_expires_at` of `0` (the successor; the
+predecessor carries the non-zero `overlap_expires_at`). Then call
+`DELETE /api/v1/tokens/{token_id}` with that `token_id`. A user who holds neither
+the admin role nor an active elevation gets `404` for a token it does not own. Rotate again afterwards.
+Until then the predecessor keeps working, and the sweep will not retire it
+because the successor was never used.
+
 If you replay a `confirm` **after it already succeeded** — a dropped `200`, a
 double-submit, or a client racing the auto-revoke sweep — you get a *terminal*
 `409` (`rotation already confirmed` / `no rotation in flight ... already the
@@ -224,6 +315,7 @@ engine-principal ownership as a lever to stall its own deprovisioning:
 
 ```bash
 curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce/transfer-owner \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
   -d '{ "new_owner": "bob" }'
 ```
@@ -236,6 +328,7 @@ reference the old one via `superseded_by`:
 
 ```bash
 curl -sk -X DELETE https://localhost:8080/api/v1/engine-principals/engine:vuln-uce \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
   -d '{ "superseded_by": "engine:vuln-uce-2" }'
 ```
@@ -277,14 +370,38 @@ is enforced in two modes, chosen by whether an operator is in the loop:
 ## The no-admin auditor
 
 `GET /api/v1/engine-principals/audit/no-admin` (REST) and `audit_engine_no_admin`
-(MCP, available on every MCP tier) are an independently-runnable proof that
-"no admin, ever" actually holds across every engine principal — not just a
-claim about the write-path guard that creates and grants them. It resolves
-each engine principal's real role assignments and effective permissions
-against the live RBAC tables and reports three kinds of violation: a literal
-`admin`/`Administrator` role grant, any role flagged `is_system`, or a granted
-`securable × operation` set large enough to be functionally admin-equivalent
-even under an innocuous custom role name.
+(MCP, available on every MCP tier) are an independently-runnable **check** of
+the "no admin" rule across every engine principal, rather than a claim about the
+write-path guard that creates and grants them. They read every grant held by an
+`engine:` id from the grant table, with each role's permissions, and report
+three kinds of detected grant: a literal `admin`/`Administrator` role
+(`admin_role`), a role flagged `is_system` (`system_role`), and a
+`wildcard_grant`, meaning a role (or, with an empty `role`, the union of a
+principal's roles) that allows every `securable x operation` pair of the grid as
+it is at run time. Grants are read by principal id, whatever their principal
+type, so a grant of type `user` on an `engine:` id is reported too, and `role`
+carries the role's name. Only `admin_role` and `system_role` mean the
+assignment check was bypassed; a `wildcard_grant` is permitted by design and is
+reported for review (the Tokens page words the two differently).
+
+The MCP tool also takes `include_revoked` (default `true`, MCP only). `false`
+is a different report, not a subset of the default run. It skips principals the
+engine-principal roster lists as **revoked**, and it also reports
+`orphan_grant` for every `engine:` grant whose principal has no roster row at
+all (a stale or out-of-band grant that a walk over the roster would hide). The
+default run and the REST route never report `orphan_grant`, so a grant of a
+harmless role to a principal with no roster row is `ok:true` there and a
+finding on the narrowed run. Use the default run for the full-population
+answer. The success audit row records `scope=active` for a narrowed run and
+`scope=all` otherwise, so a narrowed `violations=0` is not mistaken for a
+full-population result.
+
+**What assignment refuses, and what it does not.** Assigning a role to an engine
+principal refuses the `admin` and `Administrator` role names and every built-in
+(`is_system`) role. It does **not** refuse a custom role that covers the whole
+grid: that is permitted by design (maintainer ruling 2026-10-23, #2485) and is
+**detected afterwards** by this auditor. Role permissions can also be edited
+after the role was assigned, which is why the check is run against live data.
 
 ```bash
 curl -sk https://localhost:8080/api/v1/engine-principals/audit/no-admin \
@@ -295,14 +412,39 @@ curl -sk https://localhost:8080/api/v1/engine-principals/audit/no-admin \
 { "data": { "ok": true, "violations": [] } }
 ```
 
-An empty `violations` array is the positive evidence, not the absence of a
-check. If the RBAC reference data needed to compute the wildcard bound can't
-be resolved, the route returns `503` ("cannot verify") rather than a false
-`ok:true` — treat that response as "run again," never as "clean." This
-auditor is gated on `AuditLog:Read`, not `Security`, deliberately (with RBAC
-enabled; admin-only while RBAC is off, #5771): a
-read-only auditor role can run it without holding engine-principal write
-access.
+What `ok:true` means, and what it does not:
+
+- It means no role held by an engine principal, and no engine principal's union
+  of roles, allows every pair of the current grid **at the moment of the run**.
+  A role that grants every pair but one is **not** reported, and a role that
+  covered the grid before an upgrade added a new securable stops being reported
+  until it is granted the new pair. `deny` rows are ignored (over-reporting is
+  the safe direction).
+- It is a point-in-time, pull-only check. Nothing runs it on a schedule and
+  nothing alerts on a `wildcard_grant`; the cadence is the operator's. Each run
+  writes an `engine_principal.audit.no_admin` audit row
+  (`violations=N scope=all|active`, then up to ten detected
+  `principal_id:reason` pairs), and those rows are the evidence the control
+  operated. The Tokens page also runs the check incidentally, in the browser,
+  whenever a viewer who holds `AuditLog:Read` loads the principals panel; that
+  is not a schedule and not a control (other viewers see a note that the check
+  needs `AuditLog:Read`, and a deployment nobody opens in a browser never
+  triggers it). A success row whose write was dropped is signalled only by
+  `Sec-Audit-Failed` on REST (the MCP tool gives no signal). A period with no
+  rows is therefore not evidence that the check ran or that it passed; absence
+  of rows shows at most that no recorded run exists. The grants, the roles and the role permissions are three separate
+  reads, not one snapshot: a role granted or edited between them is picked up by
+  the next run. Run it after every role assignment to an engine principal
+  and periodically as part of a machine-identity access review.
+- It fails closed. If any read it depends on cannot be answered (the grants,
+  the roles, the role permissions, or the RBAC reference data), the route returns
+  `503` ("rbac resolution unavailable - cannot verify", `Retry-After: 2`; the MCP
+  tool returns a retryable error with `retry_after_ms`), with no partial list and
+  an `engine_principal.audit.no_admin` row with `result=failure`. Treat that as
+  "run again," never as "clean." This auditor is gated on `AuditLog:Read`, not
+  `Security`, deliberately (with RBAC enabled; admin-only while RBAC is off,
+  #5771): a read-only auditor role can run it without holding engine-principal
+  write access.
 
 ## Per-principal quota cap (PR 4.4)
 
@@ -315,20 +457,26 @@ principal may be enabled in production until it exists.
 
 ### Layered limits for engine principals
 
-An engine-principal request on `/mcp/` can be rejected by up to four
-independent caps, evaluated in this order:
+An engine-principal request can be rejected by up to four independent caps,
+evaluated in the order (a), (c), (d), (b): (a), (c) and (d) run in the server's
+pre-routing step, while (b) runs later, in the MCP `initialize` handler, and
+applies only there (the others apply to REST routes and `/mcp/` alike). The
+letters name the rows, not the order:
 
 | # | Cap | Scope | Error / code | Notes |
 |---|---|---|---|---|
 | a | Per-IP rate limiter (existing) | Source IP | HTTP `429` | Applies to every caller, not just engine principals; checked before any principal is resolved. |
 | b | MCP session cap (8 concurrent sessions) | MCP session lifecycle, checked on `initialize` | JSON-RPC `-32010` / HTTP `429` | Rejects a **new session**, never evicts a live one. |
-| c | Per-principal in-flight concurrency (16, PR 4.4) | Per engine principal, every `/mcp/` request | JSON-RPC `-32010` / HTTP `429` | This page's quota cap, concurrency dimension. |
-| d | Per-principal rate (20 rps, PR 4.4) | Per engine principal, every `/mcp/` request | JSON-RPC `-32010` / HTTP `429` | This page's quota cap, rate dimension. |
+| c | Per-principal in-flight concurrency (16, PR 4.4) | Per engine principal, every REST and `/mcp/` request | HTTP `429` with the A4 envelope on REST; JSON-RPC `-32010` / HTTP `429` on MCP | This page's quota cap, concurrency dimension. |
+| d | Per-principal rate (20 rps, PR 4.4) | Per engine principal, every REST and `/mcp/` request | HTTP `429` with the A4 envelope on REST; JSON-RPC `-32010` / HTTP `429` on MCP | This page's quota cap, rate dimension. |
 
-(a) is the only dimension that also applies to REST and non-engine traffic.
+(a) is the only dimension that also applies to non-engine traffic.
 (b) is distinct from (c)/(d): it gates `initialize` only, on the *number of
-open sessions*, while (c)/(d) gate *every* `/mcp/` request on in-flight count
-and request rate regardless of session state. **(b) and (c)/(d) share the
+open sessions*, while (c)/(d) gate *every* REST and `/mcp/` request on
+in-flight count and request rate regardless of session state. The quota runs
+once the engine's credential has resolved: while the database cannot answer, the
+pre-routing authentication resolves no credential and the request is refused
+`401` `unauthorized` before the quota is consulted. **(b) and (c)/(d) share the
 same JSON-RPC error code `-32010`** — disambiguate by `error.message`
 ("session limit" vs "per-principal rate/concurrency cap exceeded") and by
 `retry_after_ms` (always `null` for (b); non-null for (c)/(d) — see

@@ -14,18 +14,80 @@
 
 ## How it works
 
-`list`/`query` read the OS's native application registry: Windows enumerates the Uninstall keys (64-bit HKLM, WoW64 HKLM, and the agent's own HKCU) natively via `Reg*W`; Linux auto-detects dpkg/rpm/pacman; macOS shells out to `system_profiler SPApplicationsDataType`, and `list` additionally reads each listed bundle's `CFBundleIdentifier` for its `bundle_id` column in ONE bounded, abandonable pass inside agent-core (`read_bundle_ids_bounded`, 30 s deadline, one pass in flight per agent process (one per device), at most 5000 apps submitted) -- a cut-short or capped pass is reported by a leading `warning|bundle_id_*` row and a `CONSTRAINED / PARTIAL` status; on Windows the shared Uninstall-key enumerator reads `InstallLocation` for every action and only `list` emits it. `query` never re-acquires — it filters the same collection with a case-insensitive substring match and emits a `found|true`/`found|false` discriminator. `list_per_user` is the real per-user surface: on Windows it walks every local profile's registry hive via the shared `win_profiles.hpp` ladder, mounting `NTUSER.DAT` offline when a profile isn't already loaded; Linux/macOS instead report the same system-wide set tagged `username=system`, and macOS additionally runs `brew list --versions` under the calling account. `list_inventory` is a separate acquisition — the ADR-0016 daily-sync collector — emitting an extended 13-token `inv|` row where a field an ecosystem doesn't store stays honestly empty (never a `-` placeholder), and on macOS it additionally performs a native, budget-capped CFBundle/SecStaticCode enrichment per app for publisher and signature *presence*. The plugin is read-only throughout: it never installs, removes, or verifies a package's cryptographic validity.
+`installed_apps` answers "what software is on this device" from the operating system's own records and never installs, removes or verifies anything. Four actions share one set of OS readers. `list` returns one `app|` row per application: Windows reads the Uninstall registry keys (64-bit and 32-bit machine keys, plus the agent account's own user key); Linux uses the first package manager it finds (`dpkg-query`, else `rpm`, else `pacman`); macOS runs `system_profiler SPApplicationsDataType` for GUI applications and then reads each bundle's identifier in one bounded pass. `query` takes the same collection and returns the rows whose name contains the given text (case-insensitive), preceded by `found|true` or followed by only `found|false`. `list_per_user` is the per-person view: on Windows it walks every local profile's registry hive; on Linux and macOS it returns the same system-wide set tagged `system` (plus Homebrew formulae tagged `brew` on macOS). `list_inventory` is a separate, richer collector for the daily sync: it has no instruction definition, so it is not offered to operators; the agent's daily sync runs it.
+
+If the OS reader fails part-way (a tool is killed, times out, exits non-zero or is truncated, or a Windows Uninstall key cannot be read to the end), `list`, `query` and `list_inventory` return an `error|` row (or nothing, for `list_inventory`) and rc 1 instead of a short list, so a partial result is never mistaken for a complete one. A genuinely empty `list` is a single `app|No applications found` row.
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow<br/>dispatches definition] --> SRV[Server<br/>authz: Inventory.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host]
-  HOST --> EX[installed_apps.execute]
-  EX --> WIN[Windows leg<br/>Reg*W Uninstall key enumeration]
-  EX --> MAC[macOS leg<br/>system_profiler + pkgutil + native CFBundle/SecStaticCode]
-  EX --> LIN[Linux leg<br/>dpkg-query / rpm / pacman / apk]
-  WIN & MAC & LIN --> ROWS[rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/v1/responses/{id}]
+  OP["Operator, workflow or daily sync"] --> EX["installed_apps action"]
+  EX --> WIN["Windows: Uninstall registry keys"]
+  EX --> MAC["macOS: system_profiler, pkgutil, bundle reads"]
+  EX --> LIN["Linux: dpkg-query, rpm, pacman, apk"]
+  WIN --> OUT["app, user_app or inv rows"]
+  MAC --> OUT
+  LIN --> OUT
+  OUT --> RS["ResponseStore, for list, query and list_per_user"]
+  OUT --> SYNC["Typed inventory store, for list_inventory"]
 ```
+
+### What you can decide with it
+
+| Question | Action | Notes |
+|---|---|---|
+| Is product X installed, and which version? | `query name=X` | Substring match on the display name. `found\|false` is trustworthy only when there is no `error|` row, because a failed read withholds the result instead of answering false. |
+| What is installed on this device? | `list` | Windows: machine-wide installs (plus the agent account's own). Linux: every package of the detected manager; publisher is the maintainer (dpkg) or vendor (rpm), and `-` on pacman. macOS: GUI applications only, no installer receipts or Homebrew formulae. |
+| What has each user installed for themselves? | `list_per_user` | Windows only gives real per-profile data (apps registered in each user's own hive, which `list` does not show). On Linux and macOS it repeats the system set, so do not read the `system` rows as per-user. |
+| What feeds the central software inventory? | `list_inventory` | Not run by hand. The agent runs it every 24 hours and the server serves it fleet-wide at `GET /api/v1/inventory/software`. It adds package ecosystem, architecture, a signed or unsigned flag and (Linux) distribution identity, and on macOS also installer receipts. |
+
+What a result does and does not prove:
+
+- **Machine scope only, except `list_per_user`.** On Windows an app installed just for one user is not in `list`, `query` or `list_inventory`; it appears only in `list_per_user`, and only if that profile's hive could be read.
+- **Names and versions are what the installer registered.** They are not verified against the files on disk, and a signature flag in `list_inventory` means a signature is present, not that it is valid.
+- **Not a vulnerability or licence verdict.** Use `vuln_scan` for CVE matching and `license_scan` for licence state.
+
+### Diagrams
+
+#### macOS `list`
+
+```mermaid
+sequenceDiagram
+  participant Op as Operator
+  participant Pl as installed_apps
+  participant SP as system_profiler
+  participant Core as agent-core bundle pass
+  Op->>Pl: list
+  Pl->>SP: SPApplicationsDataType, 20 s deadline
+  SP-->>Pl: application list
+  alt tool failed or listed nothing
+    Pl-->>Op: error row, rc 1, CONSTRAINED acquisition_degraded
+  else healthy
+    Pl->>Core: read bundle ids, at most 5000 apps, 30 s
+    Core-->>Pl: ids, or timeout, busy, rejected, capped
+    Pl-->>Op: optional warning bundle_id row first, then app rows
+  end
+```
+
+The application list comes from one `system_profiler` call. The bundle-identifier read runs once, with its own 30-second deadline and a 5,000-app limit, and any shortfall is reported by a leading `warning|bundle_id_*` row and a `CONSTRAINED` status while the rows it could not read carry `-`.
+
+#### Windows `list_per_user` hive ladder
+
+```mermaid
+flowchart TD
+  P["For each local profile"] --> L{"Hive already loaded under HKU?"}
+  L -- "yes" --> R["Read its Uninstall key"]
+  L -- "no" --> PR{"Backup and restore privileges enabled?"}
+  PR -- "no" --> PM["Counted for the privilege_missing warning"]
+  PR -- "yes" --> G{"Hive file passes the guard?"}
+  G -- "no" --> HF["warning hive_file_refused for that profile"]
+  G -- "yes" --> M["Mount the hive file, read, unload"]
+  M --> R
+  R --> RD{"Uninstall key readable?"}
+  RD -- "no" --> HR["Counted for the hive_read_failed warning"]
+  RD -- "yes" --> OK["user_app rows for that profile"]
+```
+
+A logged-in user's loaded hive is read with no privilege. A logged-out profile needs an offline mount, which needs the backup and restore privileges and a hive file that passes the ownership and path guard. A profile that cannot be read adds a warning row and the others still return their rows.
 
 ## OS capability
 
@@ -42,11 +104,11 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account — LocalSystem today, not the intended virtual service account (`docs/agent-privilege-model.md` Correction, #1442) | **None** for `list`/`query`/`list_inventory` — `Reg*W` reads only. `list_per_user`'s offline `NTUSER.DAT` mount fallback rides `SeBackupPrivilege` + `SeRestorePrivilege`, already held by the agent account (`docs/agent-privilege-model.md:87`) — no new privilege is introduced. | 2026-09-21, bare-metal, as `LocalSystem` (`windows.txt:1`) | `warning\|privilege_missing: SeBackupPrivilege/SeRestorePrivilege could not be enabled for N logged-out profile(s); their per-user apps are not listed` (`do_list_per_user`); machine-scope actions still report |
-| macOS | agent daemon — root today (LaunchDaemon carries no `UserName` key; not yet narrowed to the unprivileged `_yuzu` account, #1455) | **None** — `docs/agent-privilege-model.md:86` lists `list`/`query`/`list_inventory` as `default`; no keychain/TCC/Location Services grant is touched | 2026-09-21, bare-metal, euid 501 (account redacted to jsmith; user-profile paths redacted) (`macos.txt:1`) — captured unprivileged, not the daemon's real root identity | n/a — no privilege is required; a Security framework absent at build time silently no-ops the `#2273` enrichment (empty `publisher`/`signature_status`) rather than refusing (`meson.build:15-23`) |
-| Linux | agent daemon, intended dedicated unprivileged account (`_yuzu`/`yuzu`) | **None** — `docs/agent-privilege-model.md:86` lists all four actions as `default`; the dpkg/rpm/pacman/apk databases are world-readable | 2026-09-21, container, euid 0 (`linux.txt:1`) — captured as root, not the intended unprivileged account | n/a — no privilege is required; a missing package-manager binary falls through the ladder and `probe_tool_path` returns empty, yielding an empty (not degraded) collection (`get_installed_apps_linux`) |
+| Windows | Agent service account, LocalSystem today, not the intended virtual service account (`docs/agent-privilege-model.md` Correction). | **None** for `list`, `query` and `list_inventory`: `Reg*W` reads only. `list_per_user`'s offline `NTUSER.DAT` mount for a logged-out profile uses `SeBackupPrivilege` and `SeRestorePrivilege`, which the agent account already holds. | Bare-metal Windows (10.0.26200) as `LocalSystem`, 2026-09-21. The capture predates the typed hive-read status and the default-on hive-file guard, so neither shows in it. | `list_per_user` writes `warning\|privilege_missing: ...` naming how many logged-out profiles could not be read, `warning\|hive_file_refused` per refused hive and `warning\|hive_read_failed` for unreadable Uninstall keys; machine-scope actions are unaffected. An unreadable profile list is `error\|profile_list_unreadable` with rc 1. |
+| macOS | Agent daemon, **root** today (the LaunchDaemon has no `UserName` key, `docs/agent-privilege-model.md`). | **None.** No keychain, TCC or Location Services grant is touched. A missing Security framework at build time turns the signature enrichment into a no-op (empty `publisher` and `signature_status`) rather than an error. | Bare-metal macOS 26.6.2 as an ordinary user (euid 501), 2026-09-21, not the daemon's root identity. In that capture `list_per_user` ended with rc 1 because `brew list --versions` exited non-zero for that account. | No privilege is required, so there is no refusal path; a failed tool is reported as a degraded acquisition (`error\|` row, rc 1). |
+| Linux | Agent daemon, an unprivileged account by design. | **None.** The dpkg, rpm, pacman and apk databases are expected to be world-readable (inferred, not measured as the unprivileged account). | Debian 13 container, euid 0, 2026-09-21; not the intended unprivileged account. | No privilege is required. If no package manager binary is found at its fixed path the collection is empty (not degraded); a found tool that fails is a degraded acquisition. |
 
-Binaries/subprocesses: Linux — `dpkg-query`, `rpm`, `pacman`, `apk` (`list_inventory` only), probed by fixed absolute path (`get_installed_apps_linux`, `get_inventory_linux`) and exec'd directly via `yuzu::agent::run_bounded_subprocess` (no shell, ADR-3002 rung 2). macOS — `system_profiler`, `pkgutil`, `brew` (`list_per_user` only), same bounded runner. Windows — no subprocess; native `Reg*W` calls only. No network access on any OS.
+Subprocesses: Linux runs `dpkg-query`, `rpm`, `pacman` and (`list_inventory` only) `apk`, found at fixed absolute paths and run without a shell through the bounded runner (20 s deadline each). macOS runs `system_profiler`, `pkgutil` (`list_inventory`) and `brew` (`list_per_user` only) the same way. Windows spawns nothing. No network use on any OS.
 
 ## Data contract
 
@@ -60,9 +122,9 @@ Binaries/subprocesses: Linux — `dpkg-query`, `rpm`, `pacman`, `apk` (`list_inv
 
 ### Outputs
 
-Pipe-delimited rows, one per application, written via `write_output()`. `list`/`query`/`list_per_user` emit the stable `app`/`app`/`user_app`-tagged wire format `content/definitions/installed_apps.yaml` documents; `-` marks a field the OS reported empty or one that does not apply on that OS (`install_location`/`bundle_id` on Linux, `bundle_id` on Windows). `list_inventory` emits a separate, extended `inv`-tagged 13-token row (blob contract v2, ADR-0016) where a field an ecosystem does not store stays *honestly empty* — never a `-` placeholder (`installed_apps_inventory.hpp:6-11`). Every `list` field is escape-aware (`format_app_row`): `\` folds to `/`, `|` becomes `\|`, CR/LF become a space, an interior NUL cuts the field, a field over 4 KiB is cut; `query`/`list_per_user` rows are raw, as before, but bounded: every registry-sourced field is cut at 4 KiB at read (Windows), so a hostile registry string cannot inflate them.
+Pipe-delimited rows, one per application, written via `write_output()`. `list`/`query`/`list_per_user` emit the stable `app`/`app`/`user_app`-tagged wire format `content/definitions/installed_apps.yaml` documents; `-` marks a field the OS reported empty or one that does not apply on that OS (`install_location`/`bundle_id` on Linux, `bundle_id` on Windows). `list_inventory` emits a separate, extended `inv`-tagged 13-token row (blob contract v2, ADR-0016) where a field an ecosystem does not store stays *honestly empty* — never a `-` placeholder. Every `list` field is escape-aware (`format_app_row`): `\` folds to `/`, `|` becomes `\|`, CR/LF become a space, an interior NUL cuts the field, a field over 4 KiB is cut; `query`/`list_per_user` rows are raw but bounded: every registry-sourced field is cut at 4 KiB at read (Windows), so a hostile registry string cannot inflate them.
 
-**Server rendering (pre-existing).** `installed_apps` is one of the server's key/value plugins (`kKeyValuePlugins`, `server/core/src/result_parsing.hpp`), so the dashboard results table, its detail drawer, sort and facets split every row at the first pipe only — `app` plus one remainder cell — whatever columns the definition declares; `install_location` and `bundle_id`, like `version`/`publisher`/`install_date` before them, are not separately rendered, sortable or filterable there. `GET /api/v1/responses/{id}` (and its export) and MCP `query_responses` return the raw seven-token row in `output`, which is where automation should read the columns. A definition-aware server splitter is tracked as a separate server-side follow-up, not part of this plugin.
+**Server rendering.** `installed_apps` is one of the server's key/value plugins (`kKeyValuePlugins`, `server/core/src/result_parsing.hpp`), so the dashboard results table, its detail drawer, sort and facets split every row at the first pipe only — `app` plus one remainder cell — whatever columns the definition declares; `install_location` and `bundle_id`, like `version`/`publisher`/`install_date` before them, are not separately rendered, sortable or filterable there. `GET /api/v1/responses/{id}` (and its export) and MCP `query_responses` return the raw seven-token row in `output`, which is where automation should read the columns. The server splits these rows at the first pipe only; a definition-aware splitter does not exist yet.
 
 **Parsing `list` rows.** `app|name|version|publisher|install_date|install_location|bundle_id` — seven escape-aware tokens. Split `output` on newlines first (one response can carry many rows); split each line on `|` not preceded by `\`, then decode `\|` to `|`; `\` never otherwise appears (folded to `/`, which makes a UNC path `//srv/share` and is not reversible), CR/LF are folded to a space, and the raw value is cut at 4 KiB before escaping, so an emitted field can be up to 8 KiB. `-` means empty or not applicable. A macOS `list` may lead with a `warning|bundle_id_*` row; ignore lines whose first token is not `app`. Agents older than plugin 1.2.0 emit five tokens and do not escape `|`, so a row from one can split into any count: accept a row only when it has exactly 5 or exactly 7 tokens under the escape-aware split, reject any other count, and read the sixth/seventh columns only for agents known to be on plugin >= 1.2.0. REST and MCP return this text verbatim; only the dashboard decodes `\|`, inside its merged cell.
 
@@ -98,30 +160,30 @@ Pipe-delimited rows, one per application, written via `write_output()`. `list`/`
 | `publisher` | string | - | Windows, Linux | `Microsoft Corporation` | The vendor or maintainer name; always "-" on macOS, since system_profiler's mini detail carries no publisher field. Values: free text or "-". |
 <!-- END GENERATED -->
 
-**Empty-result convention.** `list_inventory` drops a row outright if `name` is empty (`do_list_inventory`); there is no sentinel row, so an empty collection is empty output at rc 0. A *degraded* collection instead returns rc 1 (`report_if_degraded`) and the daily sync skips the whole cycle rather than committing a partial inventory as authoritative.
+**Empty-result convention.** `list` with nothing to report returns a single `app` row named `No applications found`. `list_inventory` drops a row outright if `name` is empty and has no sentinel row, so an empty collection is empty output at rc 0. A *degraded* collection instead returns rc 1 and the daily sync skips the whole cycle rather than committing a partial inventory as authoritative.
 
 ### Result status
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
-| `CONSTRAINED` | PARTIAL | `installed_apps:acquisition_degraded` | a degraded acquisition (Linux/macOS: a subprocess that failed to start, exited nonzero, was killed, timed out or was truncated; Windows: an Uninstall root that could not be opened or enumerated to the end, or an application subkey whose open failed): `list`/`query`/`list_inventory` return rc 1, and so does `list_per_user` on Linux/macOS |
-| `CONSTRAINED` | PARTIAL | `installed_apps:acquisition_degraded` | Windows `list_per_user`: one or more profiles' Uninstall key could not be read; the rows already read stay, a trailing `warning\|hive_read_failed` row counts the profiles, rc 0 |
+| `CONSTRAINED` | PARTIAL | `installed_apps:acquisition_degraded` | a degraded acquisition (Linux/macOS: a subprocess that failed to start, exited nonzero, was killed, timed out or was truncated; Windows: an Uninstall root that could not be opened or enumerated to the end, or an application subkey whose open failed): `list`, `query` and `list_inventory` return rc 1, and so does `list_per_user` on Linux and macOS |
+| `CONSTRAINED` | PARTIAL | `installed_apps:acquisition_degraded` | Windows `list_per_user`: one or more profiles' Uninstall key could not be read (a trailing `warning\|hive_read_failed` row counts the profiles), or a profile's hive file was refused by the offline guard (a trailing `warning\|hive_file_refused` row names the SID and the guard's token); the rows already read stay, rc 0 |
 | `CONSTRAINED` | PARTIAL | `installed_apps:bundle_id_timeout` | macOS `list`: the 30 s bundle-id pass deadline hit; a leading `warning\|bundle_id_timeout` row, unread rows carry `-`, rc 0 |
 | `CONSTRAINED` | PARTIAL | `installed_apps:bundle_id_busy` | macOS `list`: another bundle-id pass is in flight on this device (a concurrent `list` or an earlier abandoned pass); all rows carry `-`, rc 0 |
 | `CONSTRAINED` | PARTIAL | `installed_apps:bundle_id_rejected` | macOS `list`: the bounded-call ceiling refused the pass or its admission allocation failed; all rows carry `-`, rc 0 |
-| `CONSTRAINED` | PARTIAL | `installed_apps:bundle_id_capped` | macOS `list`: more than 5000 located apps, only the first 5000 submitted; the rest carry `-`, rc 0; a TimedOut/Busy/Rejected pass outranks this warning and status |
-| `OK` | FULL | — | a complete macOS `list` |
-| `UNDECLARED` | — | — | every other healthy run: the wire stays `UNDECLARED`; only the agent log derives `OK` from rc 0 |
+| `CONSTRAINED` | PARTIAL | `installed_apps:bundle_id_capped` | macOS `list`: more than 5000 located apps, only the first 5000 submitted; the rest carry `-`, rc 0; a timed-out, busy or rejected pass outranks this warning and status |
+| `OK` | FULL | - | a complete macOS `list` |
+| `UNDECLARED` | - | - | every other run, healthy or not: the wire stays `UNDECLARED` and the agent log derives `OK` from rc 0. This includes Windows `list_per_user` runs that end with only a `warning\|privilege_missing`, a profile-list truncation warning or a hive-unload warning (row text only, rc 0), and the `error\|profile_list_unreadable` failure (rc 1) |
 
-Provenance and completeness are agent-log only (the wire carries the status enum, `agent.proto` `plugin_result_status`); the durable signals are the status and the in-band `warning|`/`error|` row text.
+Provenance and completeness are agent-log only (the wire carries the status enum, `agent.proto` `plugin_result_status`); the durable signals are the status and the in-band `warning|` and `error|` row text.
 
 ### Where the data goes
 
-- **Instruction result.** `list`/`query`/`list_per_user` rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (operator-configurable retention, 90-day default — `server.hpp:222`), queryable at `/api/v1/responses/{id}`.
-- **Daily-sync typed store.** `list_inventory` is never dispatched through `execute_instruction` — it has no definition. The agent's own `SyncSource` (`make_installed_software_source` in `sync_source_installed_software.cpp`) runs it every 24 hours, canonicalizes the parsed rows into a hash-skip blob, and pushes it to the server's typed `SoftwareInventoryStore` (ADR-0016), served fleet-wide at `GET /api/v1/inventory/software` (`rest_api_v1.cpp`), gated on `Inventory:Read`.
+- **Instruction result.** `list`/`query`/`list_per_user` rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (operator-configurable retention, 90-day default), queryable at `/api/v1/responses/{id}`.
+- **Daily-sync typed store.** `list_inventory` is never dispatched through `execute_instruction` — it has no definition. The agent's own `SyncSource` (`make_installed_software_source` in `sync_source_installed_software.cpp`) runs it every 24 hours, canonicalizes the parsed rows into a hash-skip blob, and pushes it to the server's typed `SoftwareInventoryStore` (ADR-0016), served fleet-wide at `GET /api/v1/inventory/software` gated on `Inventory:Read`.
 - **Not consumed by** TAR, DEX, or metrics — no reference to `installed_apps`/`crossplatform.software.*` was found in the TAR or DEX collector sources.
 - **Sensitivity.** `list_per_user`/`list_inventory` rows carry per-account software names/versions/publishers, and `list_per_user`'s `username` field is a resolved local account name (not a raw SID) — a per-person installed-software inventory; `list`/`query`/`list_inventory` alone already name specific installed software (`name`/`version`/`publisher`) even at machine scope. `list`'s `install_location` names a user's home directory when an application is installed under it (`/Users/<account>/Applications/…`, `/Users/<account>/Library/…` — 4 of 323 rows in the macOS capture), or `C:/Users/<name>/...` on Windows; the macOS count is from an unprivileged capture — the root daemon may list every account's `~/Applications`; the committed sample redacts the account to `jsmith`.
-- **Siblings:** `msi_packages.*` (Windows-only MSI package detail) and `license_scan.list` (software-licence/entitlement detection) — grouped alongside `installed_apps` in the privilege matrix's read-only row (`docs/agent-privilege-model.md:86`).
+- **Siblings:** `msi_packages.*` (Windows-only MSI package detail) and `license_scan.list` (software-licence/entitlement detection) — grouped alongside `installed_apps` in the privilege model's read-only row (`docs/agent-privilege-model.md`).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("crossplatform.software.inventory")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/v1/responses/{id}` for `list`/`query`/`list_per_user`; `list_inventory`'s daily-sync output instead lands at `GET /api/v1/inventory/software`, since it carries no definition and is never dispatched through `execute_instruction`.
 
 ## Sample output
@@ -309,11 +371,11 @@ inv|bsdutils|2.41.5|Chris Hofstaedtler <zeha@debian.org>||package|deb|1|0+deb13u
 
 ## Caveats and known gaps
 
-1. **Windows hive reads degrade loudly, with one benign exception.** `enumerate_uninstall_key` (`installed_apps_registry_walk.hpp`) reports `ok`/`absent`/`failed`: a missing HKCU or WoW6432Node Uninstall key is `absent` (normal: LocalSystem's own hive has none, a host without WoW64 has none); any other open failure, an enumeration error, a >255-WCHAR subkey name, or an app key whose open fails (e.g. `ERROR_ACCESS_DENIED`) marks the walk degraded while keeping the apps already read. A subkey that vanishes between enumerate and open is skipped; one deleted during enumeration shifts the remaining indices and can skip a sibling (not detected). A DisplayName value that is not REG_SZ or exceeds the reader's 64 KiB bound reads as empty and that entry is skipped without a degraded mark (value-level read failures are not distinguished from an absent value; 511 characters before #4714). Degraded makes `list`/`query` emit the `error|` row and `list_inventory` return rc 1 (the daily sync skips the cycle, `sync_source_installed_software.cpp`), all with `installed_apps:acquisition_degraded` provenance. The registry walk was verified against a real DACL denial (a Deny-SYSTEM entry on one subkey of a scratch key, run as SYSTEM on a Windows host): the denied subkey degraded the result, the other applications were kept, and the result recovered once the ACL was restored. That run covers the walk code only, not the full plugin `list` action under an ACL denial or per-user hive loading.
-2. **macOS `signature_status` is presence, not validity.** The `#2273` enrichment calls `SecCodeCopySigningInformation` only, never `SecStaticCodeCheckValidity` — a bundle with `Contents/_CodeSignature` deleted, or with bytes appended to its Mach-O, both still read `signed` (`installed_apps_macos_enrich.hpp:13-30`). Deep verification was deliberately left an open decision, not shipped.
-3. **`list`/`query` degrade loudly on every OS; `list_per_user` does so on Linux/macOS.** A subprocess that is killed, times out, is truncated, or exits nonzero (outside the tolerated per-ID `pkgutil` lookup) makes these three emit `error|installed_apps: acquisition degraded (...)` and return rc 1 rather than a false-empty/partial list (`report_if_degraded`). On Windows `list`/`query` report the same way for the registry walk — see caveat 1; Windows `list_per_user` instead keeps the rows it read, emits `warning|hive_read_failed: ...`, sets the same typed status, and returns rc 0. Separately, macOS `list_inventory` memoizes its `system_profiler` scan for 10 minutes (`ProfilerCache`/`kProfilerCacheTtl`), keyed on an `lstat` signature covering both the Applications-type directories and the two `pkgutil`-receipt directories (`installed_apps_macos_receipts.hpp`'s `kReceiptDirs`) — a degraded/empty scan is never cached, and most per-package version/install-date lookups now resolve in-process from the receipt plist rather than spawning `pkgutil --pkg-info <id>` (that spawn is a fallback for the rare miss; see the spawn-sink manifest's `get_inventory_macos#3` row).
-4. **`list` carries two trailing columns for ADR-0028; `query`'s row stays four fields.** `list` emits `app|name|version|publisher|install_date|install_location|bundle_id` (`format_app_row`, `installed_apps_parsers.hpp`); the two trailing columns partially satisfy the `installed_apps`/`InstallLocation` sequencing dependency ADR-0028 names as a binding condition (`docs/adr/0028-agent-component-inventory-collection.md:1458-1466`) for the operator `list` action only — the hashed daily-sync blob addition (blob v3) remains open, and the ADR-0016 daily-sync row is unchanged. ADR-0028 (`:57-63`) records why: "a large, modern CVE surface is invisible to today's collection model: dependencies **bundled inside an installed application** (Electron/Chromium embedded in Slack/Teams/Discord/VS Code, vendored `OpenSSL.dll`/`libcrypto.so`, embedded JARs — the Log4Shell distribution vector, statically-linked libraries) and **filesystem-resident language dependencies** (`node_modules`, Python venvs/site-packages, on-disk JARs, Go/Rust module graphs) that no package manager or OS registry enumerates." `install_location` and `bundle_id` give a later component-inventory walk a per-application path to start from; on their own they enumerate nothing beyond where each application lives. Every field of the row is escape-aware (see *Parsing `list` rows*). On Windows a product registered in more than one hive keeps the base survivor's fields, and its `InstallLocation` becomes the lexicographically smallest populated one among its duplicates (`dedupe_uninstall_records`) — deterministic per registry state. On macOS, same-named applications sort by (name, `install_location`). `install_location` is as reported by the OS: untrusted, non-canonical, and under a user's home writable by that user. `bundle_id` is likewise untrusted, as reported by the local bundle: a local user can plant a bundle whose identifier is any string. On macOS, `list`'s `bundle_id` pass is bounded (30 s, at most 5000 apps submitted, one pass in flight per agent process (one per device)): a timed-out, busy, rejected or capped pass is surfaced as a leading `warning|bundle_id_*` row plus `CONSTRAINED / PARTIAL` (see *Result status*), never silently — rows not read carry `-`. A bundle identifier is cut at 4 KiB at read (on a UTF-8 character boundary). `do_query` still emits `app|name|version|publisher` (raw) — intentional per the YAML contract, not a truncation.
-5. **The `list_inventory`/`list_per_user` samples were captured under the wrong identity on two of three OSes, and the macOS `list_per_user` `[rc] 1` traces to that.** macOS ran unprivileged (`euid 501`) and Linux ran as root inside a container (`euid 0`); neither matches the agent's actual production identity (root today on macOS, the intended `_yuzu` account on Linux) — see *Privileges and prerequisites*. On macOS, `do_list_per_user` first lists system apps via `system_profiler` (succeeds), then probes for Homebrew and, if found, runs `brew list --versions`; under the euid-501 capture identity that `brew` invocation exits nonzero, `run_tool` marks it `degraded` on any nonzero exit, and `report_if_degraded` then emits the `error|...` row and returns rc 1 — the traced cause of the sample's `[rc] 1`, not an unrelated fault.
+1. **Per-user installs on Windows appear only in `list_per_user`.** `list`, `query` and `list_inventory` read the machine keys and the agent account's own user key, so an application installed for one user is not in them. In `list_per_user`, a missing privilege, a truncated profile list or a hive that fails to unload is reported by a warning row only, with the typed status still `UNDECLARED`, so check the rows and not just the status.
+2. **Windows hive reads degrade loudly, with one benign exception.** A missing user or 32-bit Uninstall key is normal and ignored; any other open or enumeration failure, an over-long subkey name or an application key whose open fails marks the walk degraded while the apps already read are kept. A `DisplayName` that is not a string, or is over 64 KiB, is read as empty and that entry is skipped without a degraded mark, and a subkey deleted during enumeration can hide a sibling.
+3. **macOS `signature_status` is presence, not validity.** The enrichment reads the code-signing information only and never checks the signature, so a bundle with its `_CodeSignature` removed or with bytes appended still reads `signed`, and `publisher` is then unverified attribution. Deep verification is deliberately not performed.
+4. **A failed read is withheld, and macOS `list_inventory` is cached.** A killed, timed-out, truncated or non-zero-exit tool makes the action emit an `error|` row and return rc 1 rather than a partial list, and the daily sync then skips that cycle. macOS `list_inventory` reuses its `system_profiler` scan for 10 minutes unless the Applications or receipt directories change, and a degraded or empty scan is never cached.
+5. **`install_location` and `bundle_id` are untrusted.** Both are as the local bundle or installer reports them, so a local user can plant a bundle whose identifier is any string, and `install_location` can sit under a user's home. On Windows a product registered in more than one hive keeps the first record's fields and the smallest populated `InstallLocation`; on Linux both columns are always `-`.
 
 ## Source and tests
 

@@ -45,12 +45,15 @@
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_shares.hpp"
+#include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
 #include "command_capability.hpp"
+#include "forensics_plugin_set.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <span>
 #include <string>
 #include <string_view>
@@ -166,6 +169,7 @@ struct LabeledSpan {
         {"pkg_inventory", capdecls::plugin_action_catalogue_pkg_inventory(), false},
         {"mgmt_posture", capdecls::plugin_action_catalogue_mgmt_posture(), false},
         {"shares", capdecls::plugin_action_catalogue_shares(), false},
+        {"remote_access_audit", capdecls::plugin_action_catalogue_remote_access_audit(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -174,7 +178,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, twenty-eight sources exactly as a live composition site would use.
+    // literally, twenty-nine sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -203,6 +207,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_pkg_inventory(),
         capdecls::plugin_action_catalogue_mgmt_posture(),
         capdecls::plugin_action_catalogue_shares(),
+        capdecls::plugin_action_catalogue_remote_access_audit(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -413,6 +418,32 @@ TEST_CASE("capability catalogue: shares.list pins its exact classification",
     CHECK(row.risk_tier == authz::RiskTier::Low);
     CHECK(row.system_reserved == false);
     CHECK(row.execute_gate == ExecuteGate::None);
+}
+
+/// Exact-row pin for `remote_access_audit.list` (Wave 11, Forensics-class): per-account SSH key
+/// fingerprints on one named machine, the same Forensics/AdminOrApproval boundary as
+/// privacy_permissions, checked on the fragment AND as the composed registry classifies it, so
+/// neither a fragment edit nor a composition change can drift it silently.
+TEST_CASE("capability catalogue: remote_access_audit.list pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_remote_access_audit();
+    REQUIRE(rows.size() == 1);
+    const auto check_row = [](const CommandCapability& r) {
+        CHECK(r.plugin == "remote_access_audit");
+        CHECK(r.action == "list");
+        CHECK(r.dispatch_class == DispatchClass::ReadOnly);
+        CHECK(r.mutability == Mutability::None);
+        CHECK(r.securable == "Forensics");
+        CHECK(r.operation == authz::Operation::Read);
+        CHECK(r.risk_tier == authz::RiskTier::High);
+        CHECK(r.execute_gate == ExecuteGate::AdminOrApproval);
+        CHECK_FALSE(r.system_reserved);
+    };
+    check_row(rows.front());
+    auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("remote_access_audit", "list");
+    REQUIRE(classified.has_value());
+    check_row(*classified);
 }
 
 TEST_CASE("capability catalogue: classify() resolves every declared plugin.action across every "
@@ -680,4 +711,63 @@ TEST_CASE("capability catalogue: privacy_permissions.permissions pins its exact 
     const auto classified = registry.classify("privacy_permissions", "permissions");
     REQUIRE(classified.has_value());
     check_row(*classified);
+}
+
+// #4990: the stored-response read tier excludes exactly the plugins this derivation returns, so a
+// Forensics row the derivation misses would leave that plugin's stored output readable at the
+// lower Response:Read tier. The derivation reads the composed registry; this case proves it
+// covers every catalogue row on the Forensics securable and pins the resulting set.
+TEST_CASE("capability catalogue: every Forensics-securable plugin is in the response-tier plugin "
+          "set",
+          "[server][dispatch][capability][responses][forensics]") {
+    const auto registry = build_registry(all_labeled_sources());
+    const auto set = derive_forensics_plugin_set(registry);
+    REQUIRE(set.has_value());
+
+    std::size_t forensics_rows = 0;
+    for (const auto& source : all_labeled_sources()) {
+        for (const auto& row : source.rows) {
+            if (row.securable != kForensicsSecurable)
+                continue;
+            ++forensics_rows;
+            INFO("source=" << source.label << " plugin=" << row.plugin << " action=" << row.action);
+            std::string lower(row.plugin);
+            for (auto& c : lower)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            CHECK(std::ranges::binary_search(set->names(), lower));
+        }
+    }
+    CHECK(forensics_rows > 0);
+    // The row count is pinned too: a new Forensics ACTION on an existing plugin changes no plugin
+    // name, so the set below would not notice it, but it widens what the tier's audit and error
+    // handling must cover. Update this number in the same change that adds the row.
+    CHECK(forensics_rows == 10);
+
+    // A NEW Forensics plugin must be acknowledged HERE (and in test_response_tier_filter.cpp):
+    // its stored rows become Forensics-tier on every operator read, which is a user-visible
+    // change for anyone who holds Response:Read but not Forensics:Read.
+    // Plus the unresolved-provenance sentinel (#4990): a response whose command id has no server
+    // dispatch record is stored under it and is Forensics-tier everywhere.
+    CHECK(set->names() == std::vector<std::string>{"app_usage", "browser_inventory",
+                                                   "execution_artifacts", "privacy_permissions",
+                                                   "remote_access_audit", "~unverified"});
+    CHECK(set->contains(kUnverifiedProvenanceLabel));
+}
+
+// #4990: the unresolved-provenance sentinel "~unverified" is safe as a stored plugin label only
+// because no real plugin can carry that name. Nothing else enforces it (the boot soundness check
+// reads only the Forensics-securable rows), so every catalogue plugin name is pinned here to the
+// tilde-free alphabet, over all rows of all sources.
+TEST_CASE("capability catalogue: no plugin name can collide with the unverified provenance label",
+          "[server][dispatch][capability][responses][forensics]") {
+    std::size_t rows = 0;
+    for (const auto& source : all_labeled_sources()) {
+        for (const auto& row : source.rows) {
+            ++rows;
+            INFO("source=" << source.label << " plugin=" << row.plugin);
+            CHECK(std::string_view{row.plugin}.find('~') == std::string_view::npos);
+        }
+    }
+    CHECK(rows > 0);
+    CHECK(kUnverifiedProvenanceLabel.front() == '~');
 }

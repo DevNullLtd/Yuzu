@@ -154,7 +154,7 @@ std::string render_verify_config(const std::vector<std::pair<std::string, std::s
     h += "<div class=\"af-note\">Tip: the app name "
          "must match what the devices report (e.g. <span class=\"vf-mono\">AcmeVPN.exe</span>). "
          "Discover apps with retained data via <span class=\"vf-mono\">GET "
-         "/api/v1/dex/perf/apps</span>. Performance collection is opt-in (off by default).</div>";
+         "/api/v1/dex/perf/apps</span>. Performance collection is on by default (<span class=\"vf-mono\">procperf_enabled</span>).</div>";
 
     h += "<div id=\"verify-results\"><div class=\"gp-placeholder\">"
          "Pick a cohort, app, and two versions, then Compare.</div></div>";

@@ -595,9 +595,10 @@ groups:
       # counter is expected at a low background rate (see its own doc
       # comment) and alerting on it needs real fleet data to set a threshold
       # that doesn't page on a routine post-restart/failover baseline rise;
-      # it remains unalerted EXCEPT two expected-zero pairs:
+      # it remains unalerted EXCEPT three expected-zero pairs:
       # (op="session_lookup", outcome="ambiguous_session") and
-      # (op="proxy_register", outcome="session_held_by_other_agent"), see
+      # (op="proxy_register", outcome="session_held_by_other_agent") and
+      # (op="announce_connected", outcome="session_held_by_other_agent"), see
       # YuzuGatewaySessionAmbiguous and YuzuGatewaySessionHeldByOtherAgent
       # below. `route_unreadable` fires the
       # command outbox's retry-with-backoff path (the SAME reschedule
@@ -653,8 +654,29 @@ groups:
             gateway_route_store.agent_routes, so the server refused to resolve
             it (never acked, never listed, never ingested). Causes: a
             duplicate placement, two concurrent ProxyRegister adopts of one id
-            for different agents (the cross-agent adopt guard is not a lock),
-            or a forged / colliding presented id.
+            for different agents (before the unique index), or a forged /
+            colliding presented id. Since the unique session index (#5683,
+            migration v5, which also removes existing duplicates) a NEW
+            duplicate cannot be created: this fires only after the index
+            `ux_agent_routes_session_id` was dropped by hand. Check first:
+            SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname =
+            'gateway_route_store' AND c.relname = 'ux_agent_routes_session_id'
+            AND i.indrelid = 'gateway_route_store.agent_routes'::regclass AND
+            i.indnatts = 1 AND i.indkey[0] = (SELECT attnum FROM pg_attribute
+            WHERE attrelid = i.indrelid AND attname = 'session_id') AND
+            i.indisunique AND i.indisvalid AND pg_get_expr(i.indpred,
+            i.indrelid) = '(session_id IS NOT NULL)';
+            (a row means the index is unique, valid, on
+            agent_routes(session_id) and partial with exactly that predicate;
+            a same-named index of another shape, column, table or predicate,
+            or an invalid one, returns no row). If it returns
+            a row the duplicate is already gone and this alert clears within
+            the hour. If it returns no row, follow the
+            recovery procedure in
+            docs/user-manual/gateway.md "Recovering a missing unique session
+            index" (tombstone the duplicates, then recreate the index under
+            that exact name).
             FIRST REMEDIATION: the id is not a metric label, so list every
             shared id from the directory: SELECT session_id,
             array_agg(agent_id) FROM gateway_route_store.agent_routes WHERE
@@ -670,36 +692,90 @@ groups:
       # HA WS-5 (ADR-2002 §7f Security notes) — ProxyRegister's replay-ADOPT
       # decision refused a presented session_id because a DIFFERENT agent's
       # committed directory row already holds it (the reclaim statement's
-      # NOT EXISTS guard). Kept separate from YuzuGatewaySessionAmbiguous:
-      # nothing became ambiguous (the adopt was refused), so that alert's
+      # NOT EXISTS guard, or the unique session index for a concurrent adopt,
+      # #5683). Also covers op="announce_connected": a CONNECTED whose session
+      # id another agent's row holds, refused by the same index (#5683) - but
+      # ONLY when the presenting agent has NO directory row (the fallback
+      # insert is what the index refuses). A presenter that still has a row,
+      # including a tombstone, lands as session_mismatch and is not alerted
+      # (the tombstoned-victim residual, ADR-2002 7f "Still open", #6339).
+      # Kept separate from YuzuGatewaySessionAmbiguous:
+      # nothing became ambiguous (the write was refused), so that alert's
       # duplicate-row query finds nothing and the remediation differs. No
-      # `for:`: expected rate zero, every occurrence is actionable. The pair
-      # is pre-seeded at zero in gateway_service_impl.cpp.
+      # `for:`: expected rate zero, every occurrence is actionable. Both pairs
+      # are pre-seeded at zero in gateway_service_impl.cpp.
       - alert: YuzuGatewaySessionHeldByOtherAgent
         expr: |
-          increase(yuzu_server_gateway_route_desync_total{op="proxy_register",outcome="session_held_by_other_agent"}[1h]) > 0
+          increase(yuzu_server_gateway_route_desync_total{op=~"proxy_register|announce_connected",outcome="session_held_by_other_agent"}[1h]) > 0
         labels:
           severity: warning
         annotations:
-          summary: "A ProxyRegister replay presented a session_id another agent holds"
+          summary: "A gateway presented a session_id another agent holds"
           description: >-
-            A gateway replayed ProxyRegister for one agent presenting a
-            session_id that a different agent's directory row already holds,
-            and the server refused the adopt (FAILED_PRECONDITION; the gateway
-            disconnects that agent so it registers fresh). The expected rate
-            is zero: this means a forged or colliding presented id from a
-            pinned gateway peer, a CC6.6 signal.
-            FIRST REMEDIATION: find the server WARN "ProxyRegister: presented
-            session <id> for agent <agent> is already held by a different
-            agent's directory row" (the id is sanitized and truncated to 64
-            bytes), look up the holder with SELECT agent_id, gateway_node FROM
-            gateway_route_store.agent_routes WHERE session_id = '<id>', identify the
-            presenting gateway from its peer certificate, and escalate to
-            security. The guard only sees committed rows: two concurrent
-            adopts can both land, which YuzuGatewaySessionAmbiguous then
-            catches. Evidence is metrics and logs only (no audit row). See
-            ADR-2002 §7f and docs/user-manual/gateway.md "Forged or colliding
-            session ids".
+            Possible forged or colliding gateway session id, a CC6.6 signal;
+            expected rate zero. Likely benign only if a server upgrade to this
+            version started within about the last 2 minutes (6 minutes plus 20
+            ms per agent if any gateway predates #5695) and the count is
+            at most the tombstoned-row count; otherwise treat it as a security
+            event and escalate to security.
+            A gateway presented one agent a session_id that a different
+            agent's directory row already holds, and the server refused it:
+            either a ProxyRegister replay adopt (FAILED_PRECONDITION; the
+            gateway disconnects that agent so it registers fresh; op label
+            proxy_register) or a NotifyStreamStatus CONNECTED (placement
+            unpublished, op label announce_connected; also audit action
+            gateway.session_held_by_other_agent). The CONNECTED refusal covers
+            a presenting agent that has NO directory row; an agent that still
+            has a row, including a tombstone, is not covered (its CONNECTED is
+            a session_mismatch and does not unpublish: the tombstoned-victim
+            residual, ADR-2002 7f). The gateway resends a refused CONNECTED
+            for as long as it holds that session (#6059), so an
+            announce_connected refusal keeps this alert active until the
+            presenting agent's session ends.
+            FIRST REMEDIATION: rule out the migration artifact. The refusals
+            can be the one-time v5 dedup artifact ONLY IF BOTH hold: (a) the
+            number of op="proxy_register" refusals since that start, summed
+            over every server replica, is at most N, the number of rows
+            migration v5 tombstoned on that start
+            (yuzu_server_gateway_route_session_dedup_total on the migrating
+            start; the "migration v5 tombstoned N" WARN, or the route_meta
+            value after a restart); count the refusal WARN lines rather than
+            the counter if any replica restarted since (the counter resets on
+            restart); any op="announce_connected" refusal is NOT the
+            artifact; and (b) they all occur within that start's window: one
+            or two agent heartbeat cycles (30 s by default, --heartbeat
+            changes it), plus the breaker backoff if it opened (up to 30 s on
+            a gateway that includes #5695, cap
+            circuit_breaker_max_reset_timeout_ms; 300 s on an older gateway),
+            plus the replay (up to 1 s start jitter, then up to 24 at once on
+            a #5695 gateway; about 20 ms per agent on an older one): roughly
+            2 minutes at the defaults when every gateway includes #5695,
+            roughly 6 minutes plus 20 ms per agent if any is older. Refusals
+            past that window, or more than N, are NOT the artifact. Refusals
+            inside the bound and window are NOT proof of benignness (a forged
+            presenter could hide inside them): the rule only lets you stop
+            escalating once refusals have stopped inside the window, so
+            re-check the count after the window and do not silence this alert
+            beyond it (it has no for: and uses increase()[1h]). The counter
+            keeps its migrating-start value for the process lifetime, so
+            establish timing from the WARN timestamps, or, while the store is
+            still at version 5, SELECT version, to_timestamp(upgraded_at) FROM
+            public.schema_meta WHERE store = 'gateway_route_store' (a later
+            store migration overwrites it); if the migrating start's time
+            cannot be found, escalate (details: docs/user-manual/gateway.md
+            "One-time dedup at upgrade"). Find the server WARN, one of two
+            texts: "ProxyRegister: presented session <id> for agent <agent> is
+            already held by a different agent's directory row" (op
+            proxy_register) or "NotifyStreamStatus: CONNECTED for agent
+            <agent> presents session <id> that another agent's route already
+            holds (#5683)" (op announce_connected); ids are sanitized and
+            truncated. Paste an id into SQL only if it matches
+            ^gw-session-[0-9a-f]{32}$. Look up the holder with SELECT
+            agent_id, gateway_node FROM gateway_route_store.agent_routes
+            WHERE session_id = '<id>' and identify the presenting gateway from
+            its peer certificate. Evidence is metrics and logs (plus the audit
+            row for op announce_connected). See ADR-2002 §7f and docs/user-manual/gateway.md "Forged or
+            colliding session ids".
 
       # HA WS-4 rest-of-4.3 (ADR-2002 §7d) — cross-cluster gateway fan-out.
       # No `for:`, matching YuzuGatewayMgmtAuthRejected's own reasoning
@@ -1139,9 +1215,9 @@ groups:
       # it above 0 for seconds; a server that keeps refusing keeps it above 0,
       # and the agents behind it are connected to the gateway but not recorded
       # (not dispatchable) at the server. `for: 10m` is ten times the normal
-      # 60 s backoff cap and once the slow-phase interval (a CONNECTED refused
-      # continuously for notify_unacked_slow_after_ms, 15 minutes by default,
-      # is then resent every 8 to 10 minutes; it waits in the set the whole
+      # 60 s backoff cap and once the slow-phase interval (a CONNECTED still
+      # unacknowledged notify_unacked_slow_after_ms, 15 minutes by default,
+      # after its first refusal is then resent every 8 to 10 minutes; it waits in the set the whole
       # time, so the gauge does not dip), so a refusal the server stops within
       # a few minutes never fires, and a dip to 0 starts the ten minutes again.
       # The alert fires before any session is slowed: a refusal that lasts 10
@@ -2962,6 +3038,45 @@ groups:
             consumers render a degrade banner / 503 rather than a false-empty.
             Usually PostgreSQL pool saturation; correlate with pool metrics.
 
+      # #4990: stored-response reads withhold Forensics-tier rows from a caller without
+      # Forensics:Read. When the caller's authority itself cannot be determined (the
+      # authorization read answered unavailable, or a dependency was never wired) the read is
+      # refused with a retryable 503 or shows a notice (sessions, API tokens, MCP tokens and engine
+      # principals; a service-scoped token is default-denied instead, and a whole-store outage
+      # that fails the surface's earlier admission gate first is answered by that gate and does
+      # not move this counter); it is not served
+      # as a 200 with the Forensics rows silently missing. Only a global Forensics:Read admits
+      # rows (there is no scoped read tier). A definitive
+      # refusal is correct behavior and is not counted, so the series is flat on a healthy
+      # server whatever the callers' roles. The series is pre-seeded to 0 for every reason at
+      # boot, so the first event is a rate. `for: 10m` over a 5m rate window (the shape of
+      # YuzuResponseReadDegrade): one refusal keeps the expression true for under 5 minutes, so
+      # it never fires, and neither does a burst shorter than about 5 minutes; a failure that
+      # keeps recurring (an event every few minutes) fires after about 10 minutes. BOUNDARY, by
+      # design: with the 5m rate window, a refusal that recurs only every 5 minutes or longer
+      # leaves the rate false between events, never holds for 10 consecutive minutes, and does not
+      # fire (measured with promtool: an event every 285 seconds still fires at minute 12, every
+      # 300 seconds does not).
+      - alert: YuzuForensicsTierUnresolved
+        expr: |
+          sum by (instance, reason) (rate(yuzu_server_forensics_tier_withheld_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Forensics-tier reads are being refused because caller authority cannot be determined on {{ $labels.instance }} (reason={{ $labels.reason }})"
+          description: >-
+            Reads of stored responses could not determine whether the caller may see
+            Forensics-tier rows (reason={{ $labels.reason }}) repeatedly over at least 10
+            minutes on {{ $labels.instance }}. Those reads are refused with a retryable error (a 503 on the
+            REST and legacy routes, a JSON-RPC internal error carrying retry_after_ms on MCP)
+            or show a notice (dashboard); no Forensics row is served and no partial result is
+            returned. rbac_unavailable: the authorization store answered
+            unavailable. unwired: a dependency of the resolver was never wired, which a running
+            server should not show. Usually PostgreSQL pool saturation or a store outage:
+            correlate with yuzu_server_rbac_read_degrade_total, the pool metrics and the
+            server log line "Forensics-tier visibility could not be resolved".
+
       - alert: YuzuResponseReapBacklog
         expr: |
           rate(yuzu_server_response_reap_passes_total{result="capped"}[1h]) > 0
@@ -3543,6 +3658,227 @@ groups:
         annotations:
           summary: "Yuzu PostgreSQL pool acquire p99 > 200ms"
 
+  # HA WS-11 (#4014, ADR-2002 §3/§6/§10/§11): the fenced LeaderElector, as each
+  # replica reports it on its own /metrics. READ BEFORE EDITING OR COPYING:
+  #
+  #  - Every threshold below (2m / 5m / 6-per-30m / 120s) is a CLAIM with no
+  #    fleet data behind it: no multi-replica deployment exists yet. They are
+  #    WS-9 calibration targets, not measured values -- do not copy a number.
+  #  - Aggregation is `sum by (job)` over `max by (job, instance)`. The inner
+  #    max collapses a duplicated series for ONE replica (two scrape paths, a
+  #    relabelled copy) so it cannot count as two leaders. This REQUIRES that
+  #    Prometheus scrapes EACH replica individually (never through the load
+  #    balancer) and that unrelated Yuzu deployments sharing one Prometheus use
+  #    separate `job`s (the shipped scrape configs all use `yuzu-server`, so a
+  #    second stack must be given another name); otherwise their leaders are
+  #    summed together.
+  #  - `yuzu_server_leader_is_leader` is the replica's BELIEF (the attempt gate),
+  #    not proof. Correctness for a leader-driven claim is the epoch fence in
+  #    its WRITE (leader_elector.hpp), never this gauge. The fence is PER
+  #    DATABASE (see YuzuLeaderSplitBrain) and assumes no committed transaction
+  #    is lost on a promotion (synchronous replication, the shipped quorum
+  #    default): under asynchronous replication, or a degraded non-strict quorum,
+  #    a lagging promotion could re-mint an epoch, and "fenced claims remain
+  #    safe" below is NOT claimed for that case.
+  #  - Single replica (the supported default): SplitBrain cannot fire (one
+  #    series), NoLeader fires only if the elector never leads (loops paused),
+  #    Flapping usually does NOT see a single replica's restart loop (see that
+  #    rule; YuzuServerRestartLoop is the rule for it). A server with no
+  #    elector exports no series, so every expression is empty -- no false page,
+  #    and deliberately NO absent() rule (a Prometheus that does not scrape Yuzu
+  #    would page forever).
+  #  - /readyz does NOT consult the elector (leadership is not readiness, #4014):
+  #    a replica that cannot lead is a ready follower. These alerts are therefore
+  #    the ONLY signal that the five FencedLeaderOnly passes (schedule tick,
+  #    policy dispatch, quarantine reconcile, command-outbox delivery and the
+  #    CRL re-publish) are paused or running on a stale belief.
+  #  - EVERY rule here needs a successful scrape. In a WHOLE-PRIMARY stall (the
+  #    primary freezes while its kernel keeps ACKing) the /metrics handler's own
+  #    pool queries hang too, the scrape fails, and every yuzu_server_leader_*
+  #    series goes stale at once, so every rule below evaluates EMPTY. The
+  #    backstop is an `up == 0` alert on the server job (substitute YOUR scrape
+  #    job name) plus /readyz: NO such rule ships (no rule in this file is a
+  #    dead-man's-switch for the server process; #2956 tracked it and was closed
+  #    without building it), so configure one.
+  - name: yuzu-ha-leader
+    rules:
+      - alert: YuzuLeaderSplitBrain
+        # More than one replica currently believes it leads, for 2m. WHAT THIS
+        # CATCHES: against the real elector the reachable >2m overlap is (a) two
+        # replicas on DIFFERENT databases (a split DSN, or a Patroni double-primary
+        # / forked database): each holds a valid lock and a valid epoch in ITS OWN
+        # database, so each believes it leads; or (b) an elector regression within
+        # one database. WHAT IT DOES NOT CATCH: a PAUSED ex-leader (the case the
+        # epoch fence exists for) -- its process is frozen, so its series goes
+        # STALE, not 1 (a failed scrape writes a staleness marker at once).
+        # THE EPOCH FENCE IS PER DATABASE: epoch_fence_sql() is a subselect on
+        # leader_elector.leader_state in the SAME database as the claim and the
+        # epoch comes from a per-database sequence, so it protects a leader-driven
+        # claim only against another replica of the same database. In cause (a)
+        # BOTH replicas pass their own fence and BOTH run every leader-only pass;
+        # on a forked database the same occurrence can be sent twice, absorbed only
+        # by the agent's command_id dedup (WS-0, effectively-once). In cause (b)
+        # the fence still holds for fenced claims and only the unfenced passes
+        # (schedule tick, policy dispatch, quarantine reconcile, CRL re-publish)
+        # run on both. `for: 2m` rides out a graceful handover (a resign sets 0
+        # before the successor acquires; heartbeat/poll cadence is 5s + up to 3s
+        # jitter). VERIFIED BY PROMTOOL UNIT CASES ONLY: a genuine two-leader state
+        # cannot be constructed against one database (the advisory lock prevents
+        # it), so there is no live end-to-end proof.
+        expr: |
+          sum by (job) (max by (job, instance) (yuzu_server_leader_is_leader)) > 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "More than one Yuzu server replica believes it is the leader ({{ $labels.job }})"
+          description: >-
+            Two or more replicas have reported yuzu_server_leader_is_leader = 1
+            for over 2 minutes. FIRST compare each replica's coordination
+            host/dbname (its startup log line). Replicas on different databases
+            (a split DSN, or a Patroni double-primary) each hold a valid lock and
+            epoch in their own database, so the epoch fence does NOT span them and
+            both replicas run every leader-only pass: first establish which
+            database is authoritative (patronictl list, and compare
+            SELECT system_identifier FROM pg_control_system() on each side; do
+            not demote on a log-line comparison alone), then fix the DSN, or
+            fence or demote the wrong primary, BEFORE restarting any replica. Only when all
+            replicas share one database is the stale one the replica whose
+            yuzu_server_leader_epoch differs from
+            leader_elector.leader_state.current_leader_epoch; restart it. Within
+            one database (with synchronous replication) fenced claims remain
+            safe and the unfenced background passes may be running twice.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#leader-election-metrics-and-alerts-ha-ws-11"
+
+      - alert: YuzuLeaderNoLeader
+        # No replica believes it leads, for 5m. The five FencedLeaderOnly passes
+        # are PAUSED (fail-closed: nothing double-dispatches, but scheduled
+        # dispatch, policy dispatch, quarantine re-application, the command
+        # outbox and the CRL re-publish are not running), while /readyz stays
+        # green and every replica keeps serving operators. This is the ONLY signal
+        # for that state, and also the case where a replica's elector never opened
+        # (acquire_failures_total{cause="connect"} rising), or a ZOMBIE lock
+        # holder: a backend still holding the advisory lock until Postgres notices
+        # its client is gone, so nobody can acquire. On a SINGLE replica the
+        # zombie is often the replica's OWN previous connection after a network
+        # blip. `for: 5m` >> the ~5-8s first acquire at boot and an ordinary
+        # failover. A restart removes the series (target down), so the expression
+        # is EMPTY, not 0, during it. FALSE-PAGE CASE: if only the LEADER's scrape
+        # target is down, the followers' zeros keep the sum at 0 although a leader
+        # is healthy; the description tells the operator to scrape each replica
+        # directly first. No `up`-based guard is added: it would also suppress the
+        # genuine case of a dead or partitioned leader host whose backend still
+        # holds the lock. A planned Postgres maintenance window longer than 5m
+        # fires this rule: silence it.
+        expr: |
+          sum by (job) (max by (job, instance) (yuzu_server_leader_is_leader)) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No Yuzu server replica is the leader ({{ $labels.job }}): fenced background loops are paused"
+          description: >-
+            No replica has believed it leads for over 5 minutes. The schedule
+            tick, policy dispatch, quarantine reconciler, command-outbox
+            delivery and CRL re-publish are paused on every replica. FIRST scrape
+            each replica's /metrics directly: if any replica reads
+            yuzu_server_leader_is_leader = 1 this is a scrape problem, not a
+            leader problem. Otherwise check the server log for "[HA]
+            leader_elector could not open its coordination connection", the
+            acquire_failures_total{cause} series, and pg_locks WHERE locktype =
+            'advisory' (select client_addr, backend_start and state_change too)
+            for a lock held by a backend that no live replica owns; on a single
+            replica that is often its own previous connection after a network
+            blip. Terminate only that backend (pg_terminate_backend; read the
+            runbook first; terminating a live leader's backend forces a failover
+            with up to about 8 seconds of unfenced overlap, absorbed only by the agent's
+            command_id dedup). Silence this alert, scoped
+            to the job, for planned Postgres maintenance of 5 minutes or more,
+            with an end time at the window plus about 10 minutes, and confirm
+            afterwards that a replica reads yuzu_server_leader_is_leader = 1.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#leader-election-metrics-and-alerts-ha-ws-11"
+
+      - alert: YuzuLeaderFlapping
+        # Leadership was acquired 6 or more times across the deployment in 30m.
+        # Each acquisition needs a prior loss or a process start, so repeated
+        # acquisitions across a MULTI-replica deployment mean a network flap, a
+        # Postgres failover loop or a handover loop. A SINGLE replica's restart
+        # loop is USUALLY not visible here: the counter is synced at scrape time,
+        # so a boot whose leadership is acquired before its first scrape reads 1
+        # with no rise. A boot whose acquire is delayed (slow or unreachable
+        # Postgres, a lock still held by the previous process) IS counted, so do
+        # not rely on this rule for that failure: YuzuServerRestartLoop is the
+        # rule for it (with its own documented limits). THRESHOLD IS A WS-9
+        # CALIBRATION CLAIM, not a measured value: increase() extrapolates to the
+        # window edges, and each boot of a rolling restart contributes one
+        # acquisition for whichever replica wins, so a single N-replica rolling
+        # upgrade can add up to N. 6 clears a rolling restart of up to 4 replicas
+        # with margin. `for: 0m` is deliberate: the 30m window already is the
+        # persistence; a counter reset (process restart) is handled by increase().
+        expr: |
+          sum by (job) (increase(yuzu_server_leader_acquired_total[30m])) >= 6
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu server leadership is flapping ({{ $labels.job }})"
+          description: >-
+            Leadership was acquired 6 or more times in 30 minutes. Compare with
+            YuzuServerPostgresUnreachable and the lost_total{cause} series: a
+            network or Postgres failover flap, or a handover loop between
+            replicas. (A single replica in a restart loop is usually not visible
+            to this rule; YuzuServerRestartLoop is the rule for that.)
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#leader-election-metrics-and-alerts-ha-ws-11"
+
+      - alert: YuzuLeaderCoordinationStale
+        # A replica that still BELIEVES it leads, but whose dedicated coordination
+        # connection has not answered a query for over 120s, for 2m. This is the
+        # only series that moves when the DEDICATED coordination connection wedges
+        # while /metrics still answers (a partition where the peer kernel keeps
+        # ACKing): heartbeat() blocks under the elector's mutex inside a libpq call
+        # that has NO client-side bound against a frozen-but-ACKing backend (~101s
+        # is the length of the pause measured in pg_reachability_probe.hpp, not a
+        # ceiling), the lock-free published epoch stays > 0, so sum(is_leader)
+        # stays 1 and BOTH SplitBrain and NoLeader are silent -- while the five
+        # FencedLeaderOnly passes keep ATTEMPTING on a replica that cannot commit.
+        # Fenced claims still cannot double-dispatch (the epoch predicate is
+        # evaluated in the claim's write on an ordinary pooled connection); the
+        # unfenced passes are what run blind. A healthy leader's age is bounded by
+        # the 5s + 3s-jitter heartbeat cadence plus one query, so well under 10s;
+        # 120s is more than 10x that. DETECTION TIME is age > 120s plus `for: 2m`
+        # plus a scrape interval, i.e. about 4-5 minutes into a freeze: a shorter
+        # freeze never alerts. last_ok_age is computed at SCRAPE time, so it keeps
+        # growing even when the election loop is wedged. BLIND SPOT: in a
+        # WHOLE-PRIMARY stall the scrape itself fails (see the group header), so
+        # this rule cannot evaluate; the `up == 0` backstop must catch that. Both
+        # series carry the same job/instance labels, so default all-label matching
+        # applies (no on()).
+        expr: |
+          yuzu_server_leader_last_ok_age_seconds > 120
+            and
+          yuzu_server_leader_is_leader == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Yuzu server {{ $labels.instance }} believes it leads but its coordination connection is stale"
+          description: >-
+            {{ $labels.instance }} still reports leadership, but its dedicated
+            coordination connection has not answered a query for over 2 minutes
+            (a wedged or partitioned Postgres connection). Its background passes
+            keep attempting, and its fenced claims cannot commit; the unfenced
+            passes may still succeed. Fenced claims remain safe.
+            Check connectivity from this replica to the Postgres primary. If the
+            primary is reachable, terminate this replica's stuck backend
+            (pg_stat_activity, pg_terminate_backend): that ends the lock and
+            unblocks the stale replica, which then drops its belief, though its
+            unfenced passes can briefly overlap the successor's (any duplicate
+            dispatch is absorbed only by the agent's command_id dedup);
+            otherwise restart the replica (it may need the supervisor's stop
+            timeout or a second signal while its coordination call is wedged),
+            then terminate the old backend if its advisory lock persists.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#leader-election-metrics-and-alerts-ha-ws-11"
+
   - name: yuzu-guardian
     rules:
       # yuzu_server_guardian_events_dropped_total is a cumulative-but-published-
@@ -3680,6 +4016,111 @@ groups:
             See #2659 for the deferred-widening posture behind this metric.
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-read-degraded"
 
+      # The heartbeat reconcile aborts, sending nothing, when a store it depends on
+      # cannot be read, and counts every such abort as
+      # yuzu_server_guardian_reconciles_total{result="degraded"}. The causes are the
+      # policy generation read (the first read before admission and the fresh read
+      # after it), the rule store, the Baseline deployed-set read, a rule bundle load
+      # that timed out waiting for another load or threw, and the tag or property
+      # store during per-agent scope evaluation. YuzuGuardianReadDegraded counts only
+      # the rule store reads of those, and the policy generation read and the Baseline
+      # deployed-set read bump no read-degrade counter at all, so without this rule a
+      # generation or Baseline store outage leaves every behind agent unreconciled with
+      # nothing paging. Overlap with YuzuGuardianReadDegraded (rule store),
+      # YuzuTagStoreReadDegraded and YuzuCustomPropertiesReadDegraded (scope reads) is
+      # deliberate: this one answers "is the reconcile itself failing", the others name
+      # the store. A reconcile that throws out of the hook into the heartbeat handler is
+      # caught there and counted by yuzu_server_guardian_reconcile_exceptions_total, not
+      # by the degraded result, so the rule also fires on that counter: a reconcile that
+      # keeps throwing would otherwise be invisible here. Both counters are pre-seeded to
+      # 0 at boot (see docs/observability-conventions.md), so the first abort or throw
+      # after boot is an increase. sum() makes a multi-replica fleet one signal, and the
+      # two sums carry no labels, so a rise in both is one alert.
+      - alert: YuzuGuardianReconcileDegraded
+        expr: |
+          (sum(increase(yuzu_server_guardian_reconciles_total{result="degraded"}[10m])) > 0)
+          or
+          (sum(increase(yuzu_server_guardian_reconcile_exceptions_total[10m])) > 0)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Guardian heartbeat reconcile is aborting on an unreadable store or throwing"
+          description: >-
+            yuzu_server_guardian_reconciles_total{result="degraded"} or
+            yuzu_server_guardian_reconcile_exceptions_total increased over the last
+            10 minutes: heartbeat reconciles aborted on an unreadable store, or the
+            reconcile hook threw. Either way nothing is sent to the agents concerned
+            (the abort is fail-closed, so a narrowed or empty rule set is never
+            pushed). Agents
+            that are behind the server's policy generation stay behind until the read
+            recovers, and an agent with nothing armed yet receives no rules, unscoped
+            rules included. The counter covers the policy generation read, the rule
+            store, the Baseline deployed-set read, a rule bundle load failure, and the
+            tag or property store read during scope evaluation. Find which: the
+            guaranteed_state.reconcile audit rows with result=degraded and a detail
+            beginning "heartbeat reconcile ABORTED" name the cause ("policy generation
+            unreadable", "rule store degraded", "baseline store degraded", "rule
+            bundle load failed", "scope store degraded"), and the server warn log
+            carries the same. The first policy generation read, before admission,
+            writes no audit row, so a rising counter with no such rows points at that
+            read. A rule store cause also fires YuzuGuardianReadDegraded and a scope
+            cause also fires YuzuTagStoreReadDegraded or
+            YuzuCustomPropertiesReadDegraded; the other causes fire only this alert.
+            When only yuzu_server_guardian_reconcile_exceptions_total rose, the cause
+            is a throw, not a store abort: the server warn line "Heartbeat guardian
+            reconcile threw for agent=..." carries the exception text.
+            Check Postgres reachability and yuzu_pg_* pool saturation first. The
+            agents are retried on later heartbeats, so no operator action is needed
+            once the store recovers.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/guaranteed-state.md#4-push-to-agents"
+
+      # yuzu_server_guardian_agent_generation_ahead_total flags an agent that reports a
+      # policy generation ABOVE the server's, usually because the Guardian state store
+      # was restored to an earlier state or rebuilt while the agents kept the
+      # generation they persisted. Such an agent refuses every full push labelled below
+      # the generation it holds, so rule and Baseline edits stop reaching it, and the
+      # server cannot otherwise see that: the reconcile counts the agent as converged
+      # and sends nothing. The counter is a throttled flag, not a count: at most one
+      # increment per minute per replica, and only after a fresh store read confirms the
+      # agent is ahead. The window must stay well above one minute plus the agent
+      # heartbeat interval (30 s by default) so a sample is not missed; 15m clears about
+      # 15 minutes after the fix. Do not read rate() of this counter as a magnitude.
+      # Blind spot: an agent whose boot re-arm is unresolved reports generation 0 while
+      # it still refuses a lower-labelled push, so it is never counted here (see
+      # guaranteed-state.md, Restoring the policy generation, Detection limits).
+      - alert: YuzuGuardianAgentGenerationAhead
+        expr: |
+          sum(increase(yuzu_server_guardian_agent_generation_ahead_total[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "An agent holds a Guardian policy generation above the server's"
+          description: >-
+            yuzu_server_guardian_agent_generation_ahead_total increased over the last
+            15 minutes: at least one agent reports a Guardian policy generation above
+            the server's. That agent refuses every full push labelled below the
+            generation it holds, so rule and Baseline edits are not delivered to it
+            until the server's generation reaches its own. The usual cause is a
+            Guardian state store restored to an earlier state or rebuilt while agents
+            kept their persisted generation. The counter is sampled at most once a
+            minute per replica and does not count agents. The server warn line
+            "Guardian heartbeat reconcile: agent_id=... reports policy generation N
+            above the server's M" names one sampled agent with both numbers; take the
+            highest held generation from several agents' refusal log lines, not one
+            sampled value. Before raising, check that the rule store and the deployed
+            Baselines hold the policy you want enforced fleet-wide, because the raise
+            converges every behind agent to exactly that rule set. Then use the
+            supported raise (POST /api/v1/guaranteed-state/policy-generation/raise or
+            the MCP tool raise_guardian_policy_generation) with a target of the highest
+            held generation plus one. The alert stays firing for about 15 minutes after
+            the fix; confirm with
+            changes(yuzu_server_guardian_agent_generation_ahead_total[3m]) being 0 on
+            every replica rather than by waiting for it to clear. An agent whose boot
+            re-arm is unresolved reports generation 0 and is not counted by this alert.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/guaranteed-state.md#restoring-the-policy-generation"
+
   - name: yuzu-audit
     # Behavioural-data routes (guardian.device.view, dex.device.view, dex.signal.view,
     # dex.perf.device.view, network.device.view, and response.read on the v1 query,
@@ -3700,16 +4141,42 @@ groups:
           description: >-
             yuzu_server_audit_emit_failed_total is rising. Every REST route that uses
             fail-closed audit-on-open (guardian.device.view, dex.device.view,
-            dex.signal.view, dex.perf.device.view, network.device.view, plus
+            dex.signal.view, dex.perf.device.view, network.device.view, inventory.devices,
+            inventory.device.ci, plus
             response.read on the v1 query, aggregate and export routes and on the
-            legacy get, aggregate and export routes) is returning 503 and withholding PII or response
-            data, so a ServiceNow / CMDB poll blackouts fleet-wide. Check audit_store health (/healthz
+            legacy get, aggregate and export routes, plus response.forensics.read (written
+            only when the rows served include a Forensics-tier plugin's) on the v1
+            execution-scoped response, response get, export and visualization routes, on
+            bundle collation (GET /api/v1/bundles/{id}) and on the legacy get and export
+            routes) is returning 503 and withholding PII or response
+            data, so a ServiceNow / CMDB poll blackouts fleet-wide. Set-and-proceed reads, including
+            crypto.libraries.* and response.forensics.read on the dashboard results fragment, the
+            executions drawer, the hardware result poll, the MCP query_responses tool and
+            the MCP get_bundle_result tool, keep
+            serving data and do not 503: their REST routes and dashboard
+            fragments set the Sec-Audit-Failed header, their MCP tools set audit_persisted:false
+            (the hardware CI tools list_hardware_ci and get_hardware_ci, which audit as
+            inventory.devices and inventory.device.ci, fail closed instead: they withhold the
+            data and answer a retryable -32603), and only the /crypto (crypto.libraries.*) pages
+            also show an on-page "Audit not recorded" notice.
+            Check audit_store health (/healthz
             stores.audit) and free disk / connection saturation on the PostgreSQL
             server (ADR-0040 — audit is Postgres-backed, not a local file). Note: a bad_alloc-class
             throw in the audit pipeline fails closed the same way but does NOT bump this
             counter (it is catch-logged only) — correlate with a spike in 503s on the
             behavioural routes. The audit-first admin writes (webhooks, offload targets,
-            directory sync, group mappings, MCP settings) 503 the same way.
+            directory sync, group mappings, MCP settings) 503 the same way. Upload-grant revoke
+            refuses on both REST (503) and MCP (retryable -32603), so a leaked grant stays
+            redeemable until the outage ends or its TTL expires, whichever is first (#6169).
+            Approval approve and reject (approval.approve, approval.reject) 503 with
+            Sec-Audit-Failed when the "attempted" row fails; then the decision is not applied
+            and the request stays pending. Their outcome rows (success or denied) are best
+            effort: a failed outcome row also moves this counter and the response carries no
+            Sec-Audit-Failed. A lost success row means the decision was applied; a lost denied
+            row means the store refused it, so this request applied nothing and the ticket keeps
+            its prior state (usually pending, but read its status). Check the status of any
+            request that has more "attempted" rows than outcome rows (compare counts per
+            target_id; the example query is in the runbook).
           runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
 
       # #2360 retention clock guard. The guard declines a cleanup pass that would
@@ -4497,7 +4964,15 @@ groups:
         # failure, to avoid false LB evictions), so this is otherwise
         # dashboard-invisible: the store-agnostic yuzu_pg_acquire_timeout_total
         # moves but nothing inventory-specific does (#1675).
-        # reason = store_not_open | pool_acquire_timeout | query_error.
+        # reason = store_not_open | pool_acquire_timeout | query_error, plus
+        # admission_full (source=installed_software or ca_issued): a /crypto read
+        # refused by its per-process in-flight bound BEFORE any store call. The
+        # /crypto Yuzu-issued (source=ca_issued) and layout (source=crypto_layout)
+        # reads count here too; ca_issued has its own longer-held alert below. Sustained for 5m
+        # that is saturation of the bound (a poll storm or slow summary reads), which
+        # is worth the same warning. The rule is rate([5m]) > 0 held for 5m, so
+        # refusals recurring within every 5m window keep it firing; a single
+        # isolated burst clears once it leaves the 5m window.
         expr: |
           sum(rate(yuzu_inventory_read_degrade_total[5m])) by (reason, source) > 0
         for: 5m
@@ -4511,10 +4986,83 @@ groups:
             read for the labelled authoritative inventory source returned a
             degrade (no data) rather than a result. pool_acquire_timeout/query_error correlate
             with yuzu_pg_* saturation or outage; store_not_open means the store
-            failed to open at boot. A fleet vulnerability query ("which devices run
-            <CVE>") reads as degraded, NOT "installed nowhere" — do not trust a
-            zero-result inventory answer while this fires.
+            failed to open at boot; admission_full means /crypto reads are being
+            refused because its in-flight bound (two reads) stayed full - check for
+            a poll storm or slow summary reads, not for a database fault. For the
+            store-side reasons (pool_acquire_timeout, query_error, store_not_open) a
+            fleet vulnerability query ("which devices run <CVE>") reads as degraded,
+            NOT "installed nowhere" - do not trust a zero-result inventory answer while
+            one of those fires. admission_full is a shed: a refused /crypto read is an
+            error response, never a zero-result answer. A source=installed_software
+            query_error that fires together with YuzuInventoryCatalogRollupStale or
+            YuzuInventoryCatalogRollupFailing is the /crypto live name scan exceeding
+            its 5s bound (too many distinct package names): retrying will not help, fix
+            the catalogue refresh (see docs/user-manual/crypto.md, "Diagnosing a degrade").
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuCryptoCaReadDegraded
+        # The /crypto Yuzu-issued certificate reads (the CA counts behind GET
+        # /api/v1/crypto/ca/stats, get_crypto_ca_stats and the dashboard cards, and
+        # the filtered GET /api/v1/ca/issued drill) refused or failed for 15
+        # minutes. One series, summed across reasons: the shorter, per-reason
+        # YuzuInventoryReadDegraded above already names the reason; this one says
+        # the CA widgets have been unanswerable long enough to page a human.
+        # Reasons: admission_full (the per-process crypto read bound stayed full,
+        # including a pool of 3 or fewer connections, where CA reads are always
+        # refused as busy), pool_acquire_timeout, query_error (incl. the 5s
+        # statement bound), store_not_open.
+        expr: |
+          sum(rate(yuzu_inventory_read_degrade_total{source="ca_issued"}[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "/crypto Yuzu-issued certificate reads degraded for 15 minutes"
+          description: >-
+            yuzu_inventory_read_degrade_total{source="ca_issued"} has been rising for
+            15 minutes: the Yuzu-issued certificate counts and drill answer 503 instead
+            of data. Split it by reason. admission_full is a SHED, not a database fault:
+            too many concurrent /crypto reads (a poll storm, slow stats reads) or a
+            Postgres pool of 3 connections or fewer, where CA reads are refused by
+            design - raise the pool size or find the caller, the database is fine.
+            pool_acquire_timeout and query_error are DATABASE faults: check
+            yuzu_pg_pool_* saturation, the server's CaStore warnings (they carry the
+            libpq error) and, for query_error alone, a stats read exceeding its 5s
+            statement bound on a large ca_issued table (the indexes are created at
+            upgrade). store_not_open means the CA store did not open at boot.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/crypto.md#failure-behavior"
+      - alert: YuzuCryptoLayoutEraseFailed
+        # ADR-0071: a deprovision (SCIM active:false / delete, dashboard user
+        # delete) committed, but the best-effort erasure of the operator's
+        # /crypto dashboard layout row did not complete. The deprovision itself
+        # succeeded; the row (keyed by the username - personal data) may remain
+        # and must be removed by hand. Any increase in the last hour fires; the
+        # counter is pre-seeded at boot per reason, so a healthy server shows
+        # flat zeros. One series per reason (store_not_open,
+        # pool_acquire_timeout, outcome_unknown, query_error, link_read_failed).
+        expr: |
+          sum by (reason) (increase(yuzu_server_crypto_layout_erase_failures_total[1h])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "/crypto dashboard layout erasure on deprovision failed ({{ $labels.reason }})"
+          description: >-
+            yuzu_server_crypto_layout_erase_failures_total{reason="{{ $labels.reason }}"}
+            rose in the last hour: a deprovisioned operator's saved /crypto dashboard
+            layout may still be stored. The deprovision itself completed (credentials
+            revoked, account deactivated); only this personal-data row is left behind.
+            The log line carries the reason only, never the principal. Remedy: compare
+            the usernames in crypto_dashboard_layout_store.layouts with your active
+            operator list (local users and SCIM users) and delete the rows of
+            deprovisioned principals - the exact statements are in
+            docs/user-manual/crypto.md, "Deprovision erasure". store_not_open means the
+            layout store did not open at boot (layouts are unavailable until a restart
+            with it fixed); pool_acquire_timeout and query_error correlate with
+            yuzu_pg_* saturation or outage; outcome_unknown means the connection was
+            lost after the DELETE was sent (the row may or may not be gone - check);
+            link_read_failed means an already-inactive SCIM user's linked oidc:/saml:
+            identities could not be read, so only the user name's row was erased (a
+            linked principal's row may remain - check).
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/crypto.md#deprovision-erasure"
       - alert: YuzuMgmtGroupReadDegraded
         # A CONFINEMENT-feeding management-group read (ancestors / descendants /
         # agent-groups / row/member resolution, ADR-0042 + #1762) degraded.
@@ -4910,7 +5458,12 @@ groups:
         # seeded to 0 (epoch 1970, the "building" sentinel) at thread start, so a naive
         # `now - ts` fires immediately on every cold boot; the guard skips the building
         # window. The never-succeeded / ongoing-failure case is covered by the error-rate
-        # alert below, NOT this rule.
+        # alert below, NOT this rule. The 7200 literal is twice the hourly refresh
+        # cadence and equals kCatalogueFreshSeconds (software_inventory_store.hpp,
+        # static_assert-ed against kCatalogueRefreshIntervalSeconds): /crypto reads its
+        # package names live once the catalogue is older than this, so keep them in step.
+        # The alert measures end-of-refresh success while /crypto measures the refresh START
+        # stamp, so the two differ by up to the refresh duration.
         expr: |
           (time() - yuzu_inventory_catalog_rollup_last_success_timestamp) > 7200
           and yuzu_inventory_catalog_rollup_last_success_timestamp > 0
@@ -4925,6 +5478,8 @@ groups:
             installs. Check yuzu_inventory_catalog_rollup_total{outcome="error"} and the
             SoftwareCatalogRollup thread log (Postgres outage or the 60s recompute budget
             exceeded at scale — raise kRollupStatementTimeout or shard the rollup).
+            While it fires, /crypto reads its package names live (slower) if the shared
+            catalogue is also older than two hours; alerts are per replica, the catalogue is shared.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryCatalogRollupFailing
         # Catches the case the staleness alert's `> 0` guard deliberately skips: a server
@@ -4944,6 +5499,8 @@ groups:
             the catalogue has never populated ("building"); otherwise it is frozen at the
             last good rollup. Investigate Postgres availability / the recompute duration
             (yuzu_inventory_catalog_rollup_duration_seconds vs the 60s budget).
+            While it fires, /crypto reads its package names live (slower) if the shared
+            catalogue is also older than two hours; alerts are per replica, the catalogue is shared.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       # YuzuInventoryStaleAgents — SHIPPED DISABLED. The freshness gauge
       # (yuzu_inventory_stale_agents{source}) is exported and graphable, but there
@@ -5544,6 +6101,61 @@ groups:
             is `no_store`/`pool_acquire_timeout`/`query_error`, never a bad-input
             case). Usually PostgreSQL pool saturation / failover — correlate
             with the pool metrics.
+      # MFA step-up chokepoint (docs/auth-architecture.md "MFA step-up
+      # chokepoint"). `unavailable` is a 503 on a step-up route: the auth store
+      # could not be read, an enrolled account's second factor could not be
+      # decrypted, the server has no usable auth store, or the check itself threw
+      # or could not fingerprint the session (chokepoint_exception). The counter is
+      # zero-seeded over its closed label set, so increase() is meaningful from the
+      # first scrape. The >= 3 debounce
+      # keeps one stray 503 (a single failed read, one request that raced a
+      # restart) from paging; it also means the first two refusals of an outage
+      # never alert. The rule only sees REFUSED-as-503: a read failure that the
+      # store does not classify as unavailable answers 401 and is counted as
+      # `refused`, which no alert here covers.
+      - alert: YuzuStepUpGateUnavailable
+        expr: |
+          sum by (job, instance, surface) (increase(yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}[10m])) >= 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MFA step-up check answering 503 on {{ $labels.instance }} ({{ $labels.surface }} surface)"
+          description: >-
+            The central MFA step-up check refused at least three requests in
+            ten minutes with 503 because it could not establish the caller's MFA
+            state (auth store unreadable, stored second factor undecryptable,
+            no usable auth store, or an unexpected exception inside the check).
+            The gated routes stay closed until the cause is fixed; re-entering a
+            TOTP code does not help. Each refusal has a best-effort
+            `mfa.step_up.required` audit row (lost when the audit store is also
+            down) whose `reason=` token in `detail` names the cause. Usually
+            PostgreSQL or KEK trouble: correlate with
+            yuzu_auth_session_store_degrade_total and
+            yuzu_server_secret_decrypt_failures_total, and see
+            docs/ops-runbooks/auth-db-recovery.md "Step-up returns 503".
+      # The window gauge is the configured --mfa-step-up-window-secs. 0 or less
+      # is the documented recovery lever (it disables the stale-proof requirement
+      # on every step-up route except JIT elevation, and also lets SAML sessions
+      # through and skips the store read; engine denials and the unwired-store 503
+      # still apply); it must not be left on.
+      - alert: YuzuStepUpWindowDisabled
+        expr: |
+          yuzu_auth_mfa_step_up_window_seconds <= 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MFA step-up stale-proof requirement is disabled (--mfa-step-up-window-secs <= 0)"
+          description: >-
+            The server was started with --mfa-step-up-window-secs 0 (or less),
+            so the stale-proof requirement is disabled on every step-up route
+            except the JIT-elevation routes: no stale proof is refused (so none
+            is recorded), and SAML sessions and the authentication-store read
+            are skipped too, while engine denials and unwired-store refusals
+            still apply and are recorded. This is a recovery lever, not a
+            steady state: restore the window (default 300) and restart once
+            the reason it was set is resolved.
 
   - name: yuzu-ota
     # Agent OTA pull bounds (#913 per-peer admission, #911 deadlines, #416
@@ -5820,13 +6432,26 @@ groups:
     # in-process cmd_execution_ids_ map). Mirrors yuzu-auth-sessions'
     # YuzuSessionReapClockAnomaly shape: a reap pass declines when its
     # DB-primary now() read is implausibly ahead of, or behind, the
-    # persisted anchor. Lower stakes than the session case (this table is a
-    # regenerable observability aid, not compliance evidence — see
-    # docs/executions-history-ladder.md), so a single reap-clock-anomaly
-    # alert is the whole ask here; the write/store-degrade counters are
-    # deferred (no comparable existing shape to adapt, best-effort
-    # observability rather than an integrity signal). Zero-seeded at boot,
-    # so increase() > 0 is meaningful.
+    # persisted anchor. A decline here un-expires nothing (rows only age past
+    # the window), so a single reap-clock-anomaly alert is the whole ask for
+    # the reap; see docs/executions-history-ladder.md. Since #4990 the table
+    # is also the server's dispatch record, the source of a stored response's
+    # plugin label: a missing record means the response is stored
+    # `~unverified` (Forensics-tier, withheld from callers without
+    # Forensics:Read). The write/store-degrade counters and the
+    # yuzu_server_response_provenance_total outcomes `unrecorded` and
+    # `lookup_degraded` are therefore signals of responses being stored
+    # unverified. Rules exist for: failed record writes
+    # (YuzuDispatchRecordWriteFailing), the `lookup_degraded` outcome
+    # (YuzuResponseProvenanceLookupDegraded) and a saturated reap
+    # (YuzuExecCorrelationReapSaturated). DELIBERATELY no rule on `unrecorded`
+    # (it is non-zero on a healthy fleet: an id the server never issued, a
+    # record reaped after 24 hours, an empty id; a failed write that causes it is
+    # already covered by the write rule), on read_degrade_total (a first-attempt
+    # failure that the retry recovers also counts there and unverifies nothing;
+    # the double failure that does is the `lookup_degraded` outcome), or on
+    # store_degrade_total (a failed hourly reap pass: no response is affected).
+    # Zero-seeded at boot, so increase() > 0 is meaningful.
     rules:
       - alert: YuzuExecCorrelationReapClockAnomaly
         expr: |
@@ -5848,3 +6473,313 @@ groups:
             the DATABASE primary's NTP / clock health; correlate with
             yuzu_exec_correlation_store_degrade_total /
             yuzu_exec_correlation_write_degrade_total.
+
+      # #4990: every dispatch writes one command_execution record, and a response is
+      # labelled from it. A dispatch whose record write fails (pool lease not acquired
+      # within 2 s, lock or statement timeout, query error, tracker not open) still goes
+      # out, but every response to it is stored `~unverified`: Forensics-tier, so it is
+      # withheld from callers without Forensics:Read (an HTTP 200 with no marker) and
+      # hidden from fixed-plugin polls such as DEX, TAR and hardware. One failed write
+      # unverifies one command, which a blip can cause, so only a failure that keeps
+      # recurring pages. Shape of YuzuForensicsTierUnresolved: `for: 10m` over a 5m rate
+      # window; one failure keeps the expression true for under 5 minutes and a burst
+      # shorter than about 5 minutes never reaches 10. BOUNDARY, by design: dispatch is
+      # operator or automation driven, so a store outage with fewer than one dispatch
+      # every ~5 minutes leaves the rate false between failures and does not fire,
+      # although each of those commands is still unverified (the promtool case pins an
+      # event every 6 minutes as quiet). The counter is the complete evidence. The pool
+      # rules (YuzuPgPoolSaturated, YuzuPgAcquireWaitHigh) do not cover a statement-level
+      # failure (lock timeout, query error) with a healthy pool. COUNTING NOTE: in the one
+      # loop that writes a record per target (the operator Guardian rule push), the first
+      # failed write skips the rest, and each skipped write is counted too. An outage push to
+      # N agents therefore adds N to the counter from ONE real write attempt, so the size of
+      # a jump measures affected commands, not store attempts. The expression only tests
+      # for a non-zero rate, so it is unchanged by this.
+      - alert: YuzuDispatchRecordWriteFailing
+        expr: |
+          sum by (instance) (rate(yuzu_exec_correlation_write_degrade_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dispatch records are failing to write on {{ $labels.instance }}, so responses are being stored unverified"
+          description: >-
+            Writing the per-dispatch command_execution record has failed repeatedly over at
+            least 10 minutes on {{ $labels.instance }}. Dispatch itself is unaffected, but
+            every response to a command whose record was not written is stored
+            `~unverified`, which is Forensics-tier: legitimate responses of any plugin are
+            withheld from callers without Forensics:Read (a normal 200 with the rows
+            missing) and hidden from fixed-plugin polls such as DEX, TAR and hardware, and
+            the executions drawer misses those commands' agent events. First check
+            PostgreSQL health and the yuzu_pg_* pool and lock metrics (the write fails on a
+            pool lease timeout, a lock or statement timeout or a query error), then
+            yuzu_exec_correlation_write_degrade_total and the server log line "pool
+            exhausted for command_id" (at most one per minute per cause). The responses
+            already stored unverified are not repaired when the store recovers; re-run the
+            affected commands.
+
+      # #4990: the READ side of the same record. A response frame whose record lookup
+      # fails twice (one retry) is stored `~unverified` with the same consequences. Only
+      # outcome="lookup_degraded" is a fault signal. Do NOT widen this to `unrecorded`:
+      # that outcome also counts an id the server never issued (a forged or echoed id), a
+      # record reaped after its 24 hour window and an empty id, none of which is a store
+      # fault, so it is non-zero on a healthy fleet. Do not use
+      # yuzu_exec_correlation_read_degrade_total either: it also counts a first-attempt
+      # failure that the retry recovers, which unverifies nothing. Keepalive frames are
+      # never counted in the provenance family, which is intended. Same shape and
+      # boundary as the write rule above (`for: 10m` over a 5m rate window), but the
+      # trigger is response traffic, which is usually denser than dispatch traffic, so the
+      # sparse-failure boundary is rarely the limiting case here.
+      - alert: YuzuResponseProvenanceLookupDegraded
+        expr: |
+          sum by (instance) (rate(yuzu_server_response_provenance_total{outcome="lookup_degraded"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dispatch-record lookups are failing on {{ $labels.instance }}, so responses are being stored unverified"
+          description: >-
+            Looking up the dispatch record of an incoming command response has failed twice
+            for responses repeatedly over at least 10 minutes on {{ $labels.instance }}.
+            Each such response is stored `~unverified`, which is Forensics-tier:
+            legitimate responses of any plugin are withheld from callers without
+            Forensics:Read (a normal 200 with the rows missing) and hidden from fixed-plugin
+            polls such as DEX, TAR and hardware. First check PostgreSQL health and the
+            yuzu_pg_* pool and lock metrics, then
+            yuzu_server_response_provenance_total{outcome="lookup_degraded"} and
+            yuzu_exec_correlation_read_degrade_total{reason} (pool_exhausted or
+            query_failed), and the server log line "response provenance unresolved" (at most
+            one per minute per outcome). Responses already stored unverified are not
+            repaired when the store recovers; re-run the affected commands. A rise in
+            outcome="unrecorded" alone is not this alert (see the group comment).
+
+      # #4990: the dispatch-record reap deletes at most 50,000 rows per pass
+      # (kCmdExecutionReapCap) and runs about hourly, so it can reclaim about 1.2 million
+      # rows a day. A pass that finds more than that deletes exactly the cap, so the counter
+      # moves by the cap every hour while a backlog exists, and the table grows by the
+      # difference between inflow and reclaim. Expression: the counter moved by at least
+      # 200,000 (four caps) over 6 hours. The window holds 5 or 6 hourly passes depending on
+      # its phase, so the expression is true in EVERY phase only when each pass deletes
+      # about 39,500 rows or more (79 percent of the cap, which includes full saturation);
+      # between about 33,400 and 39,400 it is true in some phases only, so it flaps, which
+      # restarts the 24h pending and keeps the rule quiet. Four caps rather than five is so
+      # that a slightly slower pass cadence, which leaves 4 passes in some windows, still
+      # holds a saturated reap true. `increase` is used instead of an average over
+      # productive passes because it stays correct across a server restart (a reset), which
+      # an average built on `changes()` does not. The threshold is the cap times 4 and must
+      # be revisited if kCmdExecutionReapCap changes. `for: 24h` is sized to one day of the
+      # ceiling, recorded reasoning rather than a copied number: a one-off burst is drained
+      # at the cap, so it saturates exactly as long as it takes to drain, and the cap is
+      # designed to absorb two fleet-wide per-agent events a day (about one million rows,
+      # 20 saturated passes) without paging. The expression is true from the fourth
+      # saturated pass until about three passes after the last one, so a drain of up to 24
+      # saturated passes (1.2 million rows) stays quiet and a longer backlog pages, as does
+      # any sustained saturation after about 28 hours. BOUNDARIES: a replica restart that
+      # skips passes keeps the rule quiet while fewer than 4 passes are in the window; the
+      # rule is per replica (each replica's own reap pass), so a pass that finds nothing
+      # left on a second replica does not mask the first; and passes more than 1.5 times
+      # slower than the nominal hour would leave 4 passes or fewer in most windows and the
+      # rule unreliable. See execution_tracker.cpp kCmdExecutionReapCap.
+      - alert: YuzuExecCorrelationReapSaturated
+        expr: |
+          increase(yuzu_exec_correlation_reap_total[6h]) >= 200000
+        for: 24h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dispatch-record reap on {{ $labels.instance }} has been running at its per-pass cap for a day"
+          description: >-
+            The hourly sweep of the command_execution dispatch-record table has deleted
+            at or near its 50,000 rows per pass cap on {{ $labels.instance }} (at least
+            200,000 rows over the last 6 hours) continuously for 24 hours, so records are
+            being created faster than the sweep can reclaim them and the table is growing
+            (about 210 bytes a row before the execution_id index, a little more with it).
+            This is a capacity signal, not a response failure: nothing is unverified by it. A burst of per-agent dispatches
+            is drained at the cap and resolves on its own after the backlog clears. If it
+            persists, the sustained dispatch rate is about 11 records a second or more (the
+            rule fires from about 79 percent of the cap; the cap itself is about 14 a
+            second): find the source (a fleet-wide per-agent push, an API client or a runner dispatching
+            in a loop). The cap is a compile-time constant today, so a persistent excess
+            needs an engineering escalation, not a configuration change. Correlate with
+            yuzu_exec_correlation_reap_total and yuzu_exec_correlation_store_degrade_total.
+
+  - name: yuzu-enablement
+    # ADR-3006 — the durable plugin-enablement store (EnablementStore). Every closed-label
+    # series and every gauge is zero-seeded at boot, so increase() > 0 is
+    # meaningful and absent() stays a real signal. All series are server-side.
+    #
+    # Most of these arm with the later change that issues desired state: until then only
+    # YuzuEnablementRegressed and YuzuEnablementAnchorWriteFailing can fire, and the rest
+    # read as flat zero ("inactive") without being armed. The loader, the registration and
+    # report writers and the unit resolver have no production caller yet.
+    #
+    # Deliberately NOT alerted: yuzu_server_enablement_write_degrade_total and
+    # yuzu_server_enablement_read_degrade_total on their own. A best-effort
+    # registration or read fault is retried by the next event; the
+    # signals that matter operationally are a regression, a rule the
+    # loader refused and a continuity anchor that cannot be written. Also not alerted:
+    # yuzu_server_enablement_anchor_unwitnessed_total, which is expected once on every
+    # fresh install (the manual defines it).
+    rules:
+      # A refused rule is a standing condition (it stays unapplied until it is fixed or
+      # deactivated), so this alerts on the per-load gauge. The counter
+      # yuzu_server_enablement_rules_rejected_total{reason} keeps the rate and the reason.
+      - alert: YuzuEnablementRulesRejected
+        expr: |
+          yuzu_server_enablement_rules_quarantined > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A persisted enablement rule was refused at load and quarantined"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/adr/3005-plugin-config-store.md"
+          description: >-
+            The enablement loader re-reads every stored rule through
+            make_persisted_rule and refused at least one at its last load
+            (the reason is on yuzu_server_enablement_rules_rejected_total:
+            refused = selector, attribute or unit-name shape, provenance = an
+            unknown provenance spelling, caps = an over-cap or malformed row).
+            A refused rule is NOT applied, so the units it names are not
+            switched off by it. The server log carries one line per refused
+            rule naming its (neutralised) id and the reason.
+
+      - alert: YuzuEnablementUnresolvedUnits
+        expr: |
+          yuzu_server_enablement_unresolved_units > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Enablement rules reference units this release does not know"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/adr/3005-plugin-config-store.md"
+          description: >-
+            One or more persisted rules name a unit that this release's
+            capability catalogue knows neither as a unit nor as a recorded
+            non-unit (a unit removed or renamed since the rule was authored).
+            Such a name switches nothing off; the rule's other units still
+            apply. Review the rule or restore the unit. The loader's warn line
+            lists up to 20 of the names.
+
+      - alert: YuzuEnablementRegressed
+        expr: |
+          yuzu_server_enablement_regressed == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The enablement store is declared regressed - issuing desired state is frozen"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#enablement-continuity-anchor"
+          description: >-
+            The continuity anchor (enablement-anchor beside the server data)
+            disagrees with the enablement store. Three causes, named by the
+            reason in the boot log (grep for "declared REGRESSED"):
+            store_id_mismatch (the anchor names a different store while the
+            anchor's counter or the store's counter is above 0: a database
+            replaced, or a cloned image, after desired state was issued;
+            at counter 0 on both sides nothing was ever issued and the
+            server rewrites the anchor instead), store_behind
+            (the store's counter is below the anchor's: a dump older than the
+            anchor) or anchor_unparseable (the file is readable but is not an
+            anchor). While regressed the store issues no desired state and
+            nothing already issued is changed. The declaration is permanent in
+            the product; the runbook gives the exit for this release.
+            /readyz reports enablement.regression_pending.
+
+      - alert: YuzuEnablementReportAhead
+        expr: |
+          yuzu_server_enablement_report_ahead_endpoints > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Endpoints reported an enablement state newer than the store's"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#enablement-continuity-anchor"
+          description: >-
+            One or more endpoints reported an (epoch, counter) above the
+            enablement store's highest. That is the second witness that the
+            database was restored from an older dump (or replaced) while
+            endpoints kept their state. It is surfaced here and on /readyz
+            (enablement.report_ahead); the later change that issues desired
+            state declares the regression from it. Compare with
+            yuzu_server_enablement_regressed.
+
+      # State-shaped on purpose: the anchor is written at boot, so a counter of failures goes
+      # 0 -> 1 before the first scrape and would never show a rise. The gauge is seeded 1 and set
+      # to 0 by a failed write or an anchor that cannot be read, so it is visible from the first
+      # scrape and clears once a later boot writes the anchor.
+      - alert: YuzuEnablementAnchorWriteFailing
+        expr: |
+          yuzu_server_enablement_anchor_writable == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The enablement continuity anchor could not be written"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#enablement-continuity-anchor"
+          description: >-
+            The server could not write the continuity anchor (enablement-anchor
+            in --data-dir): the directory is read-only, full or missing, or
+            the file exists but cannot be read. Until it is fixed this host
+            cannot witness the enablement store, so every boot reads as
+            unwitnessed and a restored older dump would go unnoticed here. The
+            boot log line says which. Make the data directory writable
+            (one persistent data directory per replica; an ephemeral one makes
+            the mechanism inert).
+
+  - name: yuzu-web-writes
+    # Cookie-session requests refused by the pre-routing same-site gate
+    # (yuzu_server_csrf_denied_total{path_class,reason}). Every path_class x
+    # reason series is zero-seeded at boot, so increase() sees the first
+    # refusal and an absent() would stay a real signal.
+    #
+    # Deliberately NOT alerted: reason="no_origin_no_referer". A header-less
+    # cookie write is what a curl script reusing a cookie jar sends, and the
+    # reason is common and benign at low volume; the two mismatch reasons are
+    # the ones that mean a browser sent a request from another site (or a proxy
+    # rewrote Host without --csrf-trusted-origin). A refused Sec-Fetch-Site
+    # value also counts as origin_mismatch.
+    #
+    # The rule name YuzuCookieWritesRefusedSameSite is kept from when only
+    # writes were refused; renaming it would break existing consumers.
+    rules:
+      - alert: YuzuCookieWritesRefusedSameSite
+        expr: |
+          sum(
+            increase(yuzu_server_csrf_denied_total{reason=~"origin_mismatch|referer_mismatch"}[15m])
+          ) >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cookie-session requests are being refused for a cross-site Origin, Referer or fetch metadata"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#vnext--behind-a-reverse-proxy-declare-your-external-origin-or-csrf-gated-dashboard-actions-keep-failing-2537"
+          description: >-
+            Three or more cookie-session requests were refused in 15 minutes because
+            the Origin or Referer did not name this site (or a --csrf-trusted-origin
+            entry), or because the request's fetch metadata (Sec-Fetch-Site) was not
+            same-origin or none. Three causes: a browser sent a request from another
+            site, a reverse proxy rewrites the Host header and the server was started
+            without --csrf-trusted-origin (or YUZU_CSRF_TRUSTED_ORIGIN), in which case
+            every dashboard write fails, or a client sent a Sec-Fetch-Site value other
+            than same-origin or none. Each refusal is audited as csrf.denied with the
+            closed reason; this alert sums over path_class, so query
+            yuzu_server_csrf_denied_total by path_class to see which kind of route was
+            targeted. Check the Host and Origin the proxy forwards first.
+
+      - alert: YuzuSameSiteGateInternalError
+        expr: |
+          sum(
+            increase(yuzu_server_csrf_denied_total{reason="gate_error"}[15m])
+          ) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The same-site gate failed internally and refused requests"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#vnext--behind-a-reverse-proxy-declare-your-external-origin-or-csrf-gated-dashboard-actions-keep-failing-2537"
+          description: >-
+            The same-site check for cookie-session requests hit an internal
+            error and refused the request (it fails closed). A refusal that
+            fails inside the gate may have no audit row, so the metric and the
+            server log (at most one warning per minute) may be the only
+            evidence. Look for
+            the gate warning in the server log; a persistent error means
+            cookie-session requests are failing for every operator.

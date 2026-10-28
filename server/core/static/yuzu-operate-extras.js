@@ -494,6 +494,48 @@
   doc.addEventListener('input', function (ev) {
     if (ev.target && ev.target.id === 'ox-expr') { previewed = null; }
   });
+
+  /* ---- #6061: the Approvals tab's Approve/Reject buttons post with hx-swap="none", so
+     htmx drops a 401/403 body and the click did nothing. A 403 or an expired session says
+     so in a toast. A 401 step-up goes through YuzuDialog.request, the Approvals page's own
+     code prompt, which replays the decision once the code is accepted. ---- */
+  function stepUpEnvelope(env) {
+    return !!(env && env.meta && env.meta.mfa_step_up_required === true);
+  }
+  doc.body.addEventListener('htmx:responseError', function (evt) {
+    var d = evt.detail;
+    var x = d && d.xhr;
+    if (!x || (x.status !== 401 && x.status !== 403)) return;
+    var path = (d.pathInfo && d.pathInfo.requestPath) ||
+               (d.requestConfig && d.requestConfig.path) || '';
+    var m = /^\/api\/approvals\/[^\/]+\/(approve|reject)$/.exec(path);
+    if (!m) return;
+    var env = null;
+    try { env = JSON.parse(x.responseText); } catch (e) { env = null; }
+    var msg = env && env.error && typeof env.error.message === 'string' ? env.error.message : '';
+    if (x.status === 403) {
+      toast(msg || 'You do not have permission to decide approvals.', 'error');
+      return;
+    }
+    if (!stepUpEnvelope(env)) {
+      toast('Your session expired; sign in again.', 'error');
+      return;
+    }
+    D.request('POST', path, { json: {} }).then(function (r) {
+      if (r.ok) {
+        toast(m[1] === 'approve' ? 'Approved' : 'Rejected', 'success');
+        doc.body.dispatchEvent(new CustomEvent('refreshApprovals'));
+      } else if (r.status === 401) {
+        if (!stepUpEnvelope(r.data)) toast('Your session expired; sign in again.', 'error');
+      } else if (r.status === 403) {
+        toast(r.message || 'You do not have permission to decide approvals.', 'error');
+      } else if (r.status === 400) {
+        toast(r.message || 'The request was refused.', 'error');
+      } else {
+        toast('Could not confirm the decision. Refresh to see the current state.', 'error');
+      }
+    }, function () { /* another dialog is open: nothing to do */ });
+  });
 })();
 
 /* Dashboard and Result sets controllers, keyed on document.body.dataset.page.

@@ -302,7 +302,7 @@ struct ModuleRow {
 /// PRIVACY — only `remote_bucket` (a coarse destination CLASS: loopback /
 /// private / public / unknown — see remote_bucket() in tar_netqual.hpp) leaves
 /// the connection's destination on the row; the raw remote address / hostname is
-/// NOT stored in this tier. Collection is gated by its own opt-in toggle and a
+/// NOT stored in this tier. Collection is gated by its own toggle and a
 /// per-tick top-N cap (collector slice).
 struct NetQualRow {
     int64_t ts{0};
@@ -333,7 +333,7 @@ struct NetQualRow {
 /// current-loss verdict from their ratio (see NetQualRow above — the
 /// device-aggregate live signal was empirically disproven). Host-wide, no
 /// per-connection or per-process attribution, no addresses: nothing usage-class
-/// on the row, but it ships under netqual's opt-in toggle regardless.
+/// on the row, but it ships under netqual's own toggle regardless.
 struct NetQualBootRow {
     int64_t ts{0};              // t_live: when TAR started observing this boot
     int64_t snapshot_id{0};
@@ -411,6 +411,36 @@ struct RemovableEvent {
     std::string record_key; // UNIQUE — replay idempotence (INSERT OR IGNORE)
 };
 
+/// One registry_live row (cursor-model seam, tar_cursor.hpp) -- a value or key
+/// change the key watch observed (tar_registry_parsers.hpp). The actor columns
+/// exist for a later change that attributes writers: until then actor_pid is 0
+/// and actor_image is ''. `data`/`prev_data` are UNMASKED rendered values.
+/// Warehouse columns are NOT NULL DEFAULT '' / 0, so "not applicable" (removals,
+/// key removals, gaps; the old value of an addition) is '' / 0, and `data_type`
+/// /`prev_data_type` == '' is what tells an absent value from an empty one.
+struct RegistryEvent {
+    int64_t ts{0}; // unix seconds
+    int64_t snapshot_id{0};
+    std::string hive;     // HKLM | HKU
+    std::string key_path; // below the hive (HKU rows lead with the SID)
+    std::string value_name;
+    std::string action; // added, changed, removed, key_removed, capture_gap
+    std::string data_type;
+    std::string data;
+    int64_t data_size{0};
+    int data_truncated{0};
+    std::string prev_data_type;
+    std::string prev_data;
+    int64_t prev_data_size{0};
+    int prev_data_truncated{0};
+    int64_t actor_pid{0}; // 0 = unattributed
+    std::string actor_image;
+    std::string source;     // notify | reconcile
+    int64_t observed_at{0}; // unix ms
+    std::string detail;     // the gap description; '' on a change row
+    std::string record_key; // UNIQUE -- replay idempotence (INSERT OR IGNORE)
+};
+
 /// Row from an arbitrary SQL query (used by tar.sql action).
 using QueryRow = std::vector<std::string>;
 
@@ -439,6 +469,13 @@ public:
      * Open (or create) the TAR database at the given path.
      * Creates tables if they don't exist. Sets WAL mode, busy_timeout,
      * and secure_delete pragmas.
+     *
+     * On failure the error text says WHY and, where there is one, the remedy: the directory
+     * cannot be created, SQLite cannot open the file, a corrupt tar.db could not be moved aside
+     * (#559, refused rather than trusted), a schema transaction wedged, or -- on Windows only --
+     * a planted tar.db (refused) or a planted -wal, -shm or -journal that could not be replaced
+     * (foreign owner or extra hard link). The plugin ABI carries only an error CODE, so the
+     * caller must log this text.
      */
     static std::expected<TarDatabase, std::string> open(const std::filesystem::path& path);
 
@@ -473,6 +510,17 @@ public:
      */
     /// The bool is load-bearing: callers must treat false as "baseline not saved".
     bool set_state(const std::string& collector, const std::string& json);
+
+    /**
+     * Tri-state state read, for callers where "unreadable" and "absent" must not
+     * mean the same thing. `get_state` returns an empty string for BOTH, so a
+     * source that treated that as "no baseline" would turn a transient SQLite
+     * failure into a silent re-baseline (every change since the last good tick
+     * lost without a gap). nullopt = the query SUCCEEDED and matched no row; an
+     * error = the read failed. Same shape as try_get_config / get_cursor.
+     */
+    std::expected<std::optional<std::string>, std::string> try_get_state(
+        const std::string& collector);
 
     // ── Cursor-model persistence (tar_cursor.hpp) ────────────────────────────
 
@@ -539,6 +587,18 @@ public:
     /** Same contract as insert_power_events_and_cursor, for "removable". */
     std::expected<void, CursorInsertError> insert_removable_events_and_cursor(
         const std::vector<RemovableEvent>& events, const std::string& cursor_json);
+
+    /**
+     * Same contract as insert_power_events_and_cursor, for "registry", plus the
+     * per-root baselines (`registry:<root>` tar_state rows) in the SAME
+     * transaction: a baseline can never advance without the rows it explains, nor
+     * the rows without the baseline (a failed commit rolls all three back).
+     * The collision check compares IDENTITY columns only (what changed), never
+     * the actor/detail columns.
+     */
+    std::expected<void, CursorInsertError> insert_registry_events_and_cursor(
+        const std::vector<RegistryEvent>& events, const std::string& cursor_json,
+        const std::vector<StateWrite>& baseline_writes);
 
     // ── Config management ────────────────────────────────────────────────────
 
@@ -625,8 +685,22 @@ public:
                              const std::optional<StateWrite>& state = std::nullopt);
     bool insert_dns_events(const std::vector<DnsEvent>& events,
                              const std::optional<StateWrite>& state = std::nullopt);
+    /**
+     * `skip_known_historical` (default false): when set, the insert is
+     * `INSERT ... SELECT ... WHERE NOT EXISTS` against every row already recorded with
+     * `origin='historical'` and the same mapping identity (direction, local_mount, remote_path,
+     * remote_host, username) -- the bounded per-profile retry's own call (tar_plugin.cpp), so a
+     * SID retried after already being recorded once adds no duplicate. `mapdrive_live` is
+     * append-only (the only statement touching it is the INSERT this function issues; nothing
+     * ever UPDATEs a row), so a row already recorded keeps its FIRST-recorded timestamp forever
+     * -- a later insert attempt with the same identity, whatever ts it carries, is simply
+     * skipped. The only merge of timestamps across duplicate identities is dedup_history's own
+     * earliest-sighting rule, and that applies ONLY within one enumeration's own row set, never
+     * across runs or against what is already on disk.
+     */
     bool insert_mapdrive_events(const std::vector<MapDriveEvent>& events,
-                             const std::optional<StateWrite>& state = std::nullopt);
+                             const std::optional<StateWrite>& state = std::nullopt,
+                             bool skip_known_historical = false);
     bool insert_perf_sample(const PerfRow& row);
     bool insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows);
     bool insert_netqual_samples(const std::vector<NetQualRow>& rows);

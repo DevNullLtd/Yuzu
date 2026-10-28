@@ -24,6 +24,7 @@
 #include "dex_app_perf_model.hpp" // the app-perf read types (slice-2)
 #include "guaranteed_state_store.hpp"
 #include "management_group_store.hpp"
+#include "mfa_step_up.hpp"
 #include "oidc_provider.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -34,10 +35,12 @@
 #include "guardian_api_local.hpp" // ADR-0031 WS-A4 (ninth family): wire the real GuardianApi seam
 #include "rest_api_v1.hpp"
 #include "test_dex_perf_api_double.hpp"
+#include "test_forensics_tier_fixture.hpp" // #4990
 #include "test_guardian_api_double.hpp" // ADR-0031 WS-A4 (ninth family): FnGuardianApi
 #include "test_network_api_double.hpp"
 #include "test_route_sink.hpp"
 #include "test_verify_api_double.hpp"
+#include "web_utils.hpp" // normalise_trusted_origins
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -201,6 +204,21 @@ struct RestGsHarness {
     // before the fleet /status route migrated to real tokens via
     // service_scoped_token_headers() — its own service-token-denial test).
     std::string session_token_scope_service;
+    // The resolved session's auth_source. "local" is a cookie session, which the same-site
+    // gate on POST /push applies to; "api_token" is a bearer caller, which it exempts.
+    std::string session_auth_source{"local"};
+    // Calls the wired guardian_push_fn received (POST /push's fan-out), so a test can prove a
+    // refused request never reached it.
+    int guardian_push_calls{0};
+    // What the wired guardian_push_fn returns: an agent count, -1 for an unparseable scope or
+    // -2 for a degraded store the fan-out reads.
+    int guardian_push_result{0};
+    // MFA step-up seam, wired into every route that takes one. Unset = permissive. A test sets
+    // it to stand in for a failed or stale step-up: a gate returning false has already written
+    // its own response and the route stops. `step_up_actions` records every action label the
+    // routes passed.
+    yuzu::server::StepUpFn step_up;
+    std::vector<std::string> step_up_actions;
 
     // When false, perm_fn denies (403) — lets a test prove the permission gate
     // runs BEFORE any audit emission on the DEX read surface (default grants,
@@ -386,7 +404,11 @@ struct RestGsHarness {
                            // ADR-0031 WS-A4 PR-1: false -> dex_api_local stays null even
                            // with a live store, exercising every DEX REST route's own
                            // "!dex_api -> 503" guard (see wire_dex_api_'s doc comment).
-                           bool wire_dex_api = true)
+                           bool wire_dex_api = true,
+                           // handed to RestApiV1::set_csrf_trusted_origins BEFORE the routes
+                           // register (a route captures the list by value); empty keeps the
+                           // same-host-only behaviour every other test here relies on.
+                           std::vector<std::string> csrf_trusted_origins = {})
         : wire_live_deps(live_deps), wire_exec_visible(with_exec_visible),
           wire_list_read_fn_(wire_list_read_fn), wire_dex_api_(wire_dex_api) {
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
@@ -458,6 +480,7 @@ struct RestGsHarness {
             s.username = session_user;
             s.role = session_role;
             s.token_scope_service = session_token_scope_service;
+            s.auth_source = session_auth_source;
             return s;
         };
 
@@ -643,6 +666,15 @@ struct RestGsHarness {
                                   : yuzu::server::make_local_guardian_api(store.get(),
                                                                            baseline_store.get());
 
+        // A cookie session's write must name this site in Origin or Referer (POST /push
+        // enforces it), so every request carries a same-site Host and Origin as a browser's
+        // does. A test varies the cross-site cases by assigning `sink.default_headers`.
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+
+        api.set_csrf_trusted_origins(std::move(csrf_trusted_origins));
+        // #4990: the live-snapshot polls read back with a fixed-plugin tier filter, and an unwired
+        // plugin set refuses every row.
+        api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/&rbac_,
                             /*mgmt_store=*/&mgmt_,
@@ -667,8 +699,17 @@ struct RestGsHarness {
                             /*execution_event_bus=*/nullptr,
                             /*result_set_store=*/nullptr,
                             dispatch_arg,
-                            /*step_up_fn=*/{},
-                            /*guardian_push_fn=*/{},
+                            /*step_up_fn=*/
+                            [this](const httplib::Request& req, httplib::Response& res,
+                                   const auth::Session& session, const std::string& action) -> bool {
+                                step_up_actions.push_back(action);
+                                return !step_up || step_up(req, res, session, action);
+                            },
+                            /*guardian_push_fn=*/
+                            [this](const std::string&, bool) {
+                                ++guardian_push_calls;
+                                return guardian_push_result;
+                            },
                             dex_perf_fn_,
                             net_perf_fn_,
                             /*lockout_clear_fn=*/{},
@@ -1699,6 +1740,198 @@ TEST_CASE("REST gs.push: service-scoped token → 403, .permission names Push (t
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].action == "guaranteed_state.push");
     CHECK(h.audit_log[0].result == "denied");
+}
+
+namespace {
+std::size_t push_csrf_denied_rows(const RestGsHarness& h) {
+    std::size_t n = 0;
+    for (const auto& a : h.audit_log)
+        if (a.action == "csrf.denied" && a.result == "denied" && a.target_type == "Endpoint" &&
+            a.target_id == "guaranteed_state_push")
+            ++n;
+    return n;
+}
+std::size_t push_rows(const RestGsHarness& h) {
+    std::size_t n = 0;
+    for (const auto& a : h.audit_log)
+        if (a.action == "guaranteed_state.push")
+            ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("REST gs.push: a cookie session with a cross-site Origin is refused 403 with a "
+          "csrf.denied row and no fan-out",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({"full_sync":true})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "cross-site request refused");
+    CHECK(push_csrf_denied_rows(h) == 1);
+    CHECK(push_rows(h) == 0);
+    CHECK(h.guardian_push_calls == 0);
+}
+
+TEST_CASE("REST gs.push: a cookie session with no Origin and no Referer is refused, a same-site "
+          "Origin or Referer alone proceeds",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+
+    SECTION("neither header") {
+        h.sink.default_headers = {{"Host", "yuzu.test"}};
+        auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(push_csrf_denied_rows(h) == 1);
+        CHECK(h.guardian_push_calls == 0);
+    }
+    SECTION("same-site Origin only") {
+        h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+        auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(push_csrf_denied_rows(h) == 0);
+        CHECK(h.guardian_push_calls == 1);
+    }
+    SECTION("same-site Referer only") {
+        h.sink.default_headers = {{"Host", "yuzu.test"},
+                                  {"Referer", "https://yuzu.test/guardian"}};
+        auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(push_csrf_denied_rows(h) == 0);
+        CHECK(h.guardian_push_calls == 1);
+    }
+}
+
+TEST_CASE("REST gs.push: an api_token session is exempt from the same-site gate even with a "
+          "foreign Origin",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+    h.session_auth_source = "api_token";
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(push_csrf_denied_rows(h) == 0);
+    CHECK(h.guardian_push_calls == 1);
+}
+
+TEST_CASE("REST gs.push: the degraded-store sentinel is a retryable 503 whose message names every "
+          "store the push depends on, and the audit row keeps its fixed prefix",
+          "[pg][rest][guaranteed_state][push]") {
+    RestGsHarness h;
+    h.guardian_push_result = -2;
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({"scope":"tag:role=printer"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    const auto j = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(j.is_discarded());
+    REQUIRE(j.contains("error"));
+    REQUIRE(j["error"].contains("message"));
+    const auto message = j["error"]["message"].get<std::string>();
+    CHECK(message.rfind("guaranteed-state store degraded", 0) == 0);
+    for (const char* cause : {"Baseline", "tag", "custom-property", "management-group"})
+        CHECK(message.find(cause) != std::string::npos);
+    CHECK(j["error"]["retry_after_ms"] == 5000);
+    REQUIRE(push_rows(h) == 1);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].detail.rfind("store degraded scope=", 0) == 0);
+}
+
+TEST_CASE("REST gs.push: the same-site gate runs before the body is read, so a cross-site request "
+          "with a malformed body is 403, not 400",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", "not json");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(push_csrf_denied_rows(h) == 1);
+    CHECK(push_rows(h) == 0);
+}
+
+TEST_CASE("REST gs.push: a caller without GuaranteedState:Push with a cross-site Origin learns "
+          "only the permission denial",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+    h.grant_perms = false;
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("cross-site request refused") == std::string::npos);
+    CHECK(push_csrf_denied_rows(h) == 0);
+    CHECK(h.guardian_push_calls == 0);
+}
+
+TEST_CASE("REST gs.push: a foreign Origin proceeds only when it is a configured trusted origin",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    const std::vector<std::string> configured =
+        normalise_trusted_origins(std::vector<std::string>{"https://proxy.example"});
+    const std::unordered_map<std::string, std::string> proxied = {
+        {"Host", "internal.test:8080"}, {"Origin", "https://proxy.example"}};
+
+    SECTION("a configured trusted origin behind a Host-rewriting proxy proceeds") {
+        // The trailing argument is the trusted-origins list; the rest are the defaults.
+        RestGsHarness h(true, true, true, true, nullptr, true, nullptr, true, configured);
+        h.sink.default_headers = proxied;
+        auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(push_csrf_denied_rows(h) == 0);
+        CHECK(h.guardian_push_calls == 1);
+    }
+    SECTION("the same origin is refused when no trusted origin is configured") {
+        RestGsHarness h;
+        h.sink.default_headers = proxied;
+        auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(push_csrf_denied_rows(h) == 1);
+        CHECK(h.guardian_push_calls == 0);
+    }
+}
+
+TEST_CASE("REST gs.push: a cross-site refusal whose csrf.denied row cannot persist is still 403 "
+          "with Sec-Audit-Failed and no fan-out",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+    h.audit_succeeds = false;
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({"full_sync":true})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "cross-site request refused");
+    CHECK(push_csrf_denied_rows(h) == 1); // attempted, not persisted
+    CHECK(push_rows(h) == 0);
+    CHECK(h.guardian_push_calls == 0);
+}
+
+TEST_CASE("REST gs.push: a failing step-up with a cross-site Origin is the step-up's own "
+          "response and writes no csrf.denied row",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+    h.step_up = [](const httplib::Request&, httplib::Response& res, const auth::Session&,
+                   const std::string&) {
+        res.status = 401;
+        res.set_content(R"({"error":{"code":401,"message":"step-up required"}})",
+                        "application/json");
+        return false;
+    };
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "step-up required");
+    CHECK(push_csrf_denied_rows(h) == 0);
+    REQUIRE(h.step_up_actions.size() == 1);
+    CHECK(h.step_up_actions[0] == "POST /api/v1/guaranteed-state/push");
+    CHECK(h.guardian_push_calls == 0);
 }
 
 TEST_CASE("REST gs.status: returns store rule_count rollup", "[pg][rest][guaranteed_state][status]") {

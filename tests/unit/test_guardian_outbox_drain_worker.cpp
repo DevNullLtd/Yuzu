@@ -424,9 +424,8 @@ TEST_CASE("a running worker pages AND ships a durable batch in one wake (no seco
     rig.persist("r1");
 
     CollectingSink sink;
-    // A long periodic bound: if the paged entry needed a SECOND wake to ship, this test
-    // would time out. try_page_batch does not fire the enqueue waker, so shipping within
-    // one wake is exactly the post-page re-drain C0 adds.
+    // A long periodic bound. try_page_batch does not fire the enqueue waker; running
+    // maintenance ahead of the drain (C0) is what ships a paged entry within the same wake.
     GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/60'000,
                                      {.journal = rig.journal});
     worker.start();
@@ -434,9 +433,22 @@ TEST_CASE("a running worker pages AND ships a durable batch in one wake (no seco
     // 30 s, not the 5 s default: this waits on a real journal scan plus a send, and under a
     // sanitizer build sharing a box with the rest of the suite that overran 5 s in one full
     // TSan run out of two (isolated, it passes 5/5). The deadline is only there to stop a
-    // never-shipping worker hanging the suite - what the test asserts is that ONE wake
-    // suffices, which a longer deadline does not weaken.
-    CHECK(spin_until([&] { return sink.count() == 1; }, 30s));
+    // never-shipping worker hanging the suite; a longer one does not weaken what is asserted.
+    //
+    // `>= 1`, NOT `== 1` (#5644). The worker can legitimately ship this entry TWICE: the
+    // boot cycle (force_page_ is seeded true) pages and ships it, and when notify() lands
+    // after that cycle consumed the seed, the second cycle runs a forced page and re-offers
+    // the entry (redelivery is at-least-once by design; the server dedupes by event_id).
+    // Both passes can complete between two 1 ms polls, so a poll delayed on a loaded box
+    // saw 2 and never saw 1 again: the old `== 1` timed out after 30 s with sink.count() ==
+    // 2, about 1 failed run in 640 under heavy parallel load, in a bimodal fast / 30 s
+    // pattern (a starved scheduler would show a long tail, not a cliff).
+    //
+    // This asserts only that the entry ships. It does not by itself discriminate "one wake"
+    // from "two": notify() always supplies a second cycle, so a regression that shipped only
+    // on that cycle would also pass. That gap is pre-existing and tracked as a follow-up (a
+    // no-notify test with a long periodic bound).
+    CHECK(spin_until([&] { return sink.count() >= 1; }, 30s));
     worker.stop();
 }
 
@@ -1837,6 +1849,19 @@ TEST_CASE("#3980: an orphan stalled on an emptied compliance lane is counted and
     // (notify() enqueues NOTHING): the probe reaps the finished slot on the emptied lane.
     CHECK(f.compliance().in_flight_snapshot().running);
     f.sink.open();
+    // Let the released send actually FINISH before waking the loop. notify() wakes the loop at
+    // once, and its tail probe can only reclaim a slot whose send is already done: if the
+    // detached send thread has not run yet (a starved box), the probe reclaims nothing, a
+    // counted stall contributes no clamp, and the next cycle is the 1 h periodic bound - so the
+    // 5 s wait below would time out (#6041: 40 of 240 runs on two pinned cores). `running` is
+    // `in_flight && !done`, so !running with in_flight still true is exactly "finished, not yet
+    // reaped": the state the probe is documented to reclaim.
+    REQUIRE(spin_until(
+        [&] {
+            const auto snap = f.compliance().in_flight_snapshot();
+            return snap.in_flight && !snap.running;
+        },
+        5s));
     f.worker.notify();
     REQUIRE(spin_until([&] { return !f.compliance().in_flight_snapshot().in_flight; }, 5s));
     CHECK(f.compliance().offer_calls_for_test() == 1); // reaped by the probe, not by an offer()

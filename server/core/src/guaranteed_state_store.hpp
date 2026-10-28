@@ -193,6 +193,17 @@ struct EventInsertResult {
 // error surface for `get_rule`) was relocated to "guardian_types.hpp" too —
 // see that header's comment.
 
+/// Result of GuaranteedStateStore::raise_policy_generation(): the stored generation before and
+/// after, and whether the raise increased it.
+struct PolicyGenerationRaise {
+    uint64_t previous{0};
+    uint64_t resulting{0};
+    bool raised{false};
+};
+/// `kOutOfRange`: the target is outside 1..guardian::kMaxPolicyGenerationTarget.
+/// `kStoreUnavailable`: the store could not read or write the counter (never reported as 0).
+enum class PolicyGenerationRaiseError { kOutOfRange, kStoreUnavailable };
+
 class GuaranteedStateStore {
 public:
     /// Borrows the shared pool and runs the `guaranteed_state_store` schema
@@ -290,9 +301,10 @@ public:
     DexCrashSummary dex_crash_summary(const std::string& since = "",
                                       const std::string& platform = "") const;
     std::vector<DexAppCrashCount> dex_top_apps(const std::string& since = "", int limit = 20) const;
-    /// Windows-scoped (`platform`) application AND per-version stability rows in
-    /// ONE statement (one snapshot): for the `app_limit` applications affecting
-    /// the most devices (then events, then name; Windows rows only) -- the
+    /// Platform-scoped application AND per-version stability rows in ONE
+    /// statement (one snapshot); an empty `platform` means every platform. For
+    /// the `app_limit` applications affecting the most devices (then events,
+    /// then name; rows of `platform` only) -- the
     /// published activity order is the assembler's -- one total row (`version`
     /// nullopt, plus `version_count` and `apps_total`, the count of every
     /// qualifying application before the cut) and up to `version_limit`
@@ -414,11 +426,17 @@ public:
     errored_rule_count(const std::optional<std::vector<std::string>>& agent_scope) const;
 
     std::size_t rule_count() const;
+    /// Type-distinguishable twin of `rule_count()`: an error string on a store that is not open,
+    /// a pool timeout or a failed query, never 0 (the degrade-collapsing `rule_count()` would
+    /// read as an empty rule set).
+    std::expected<std::size_t, std::string> rule_count_checked() const;
     std::size_t event_count() const;
 
     // Monotonic policy generation — the version stamp of the rule SET, bumped
     // atomically on every create/update/delete. Persisted (survives restart)
-    // and strictly increasing.
+    // and strictly increasing. std::nullopt is a degraded read (store not open, lease
+    // timeout, query error) and ALSO a stored value below zero, which only out-of-band SQL
+    // can produce; raise_policy_generation() repairs that row.
     std::optional<uint64_t> current_policy_generation() const;
 
     // Bump the persisted policy generation WITHOUT mutating any rule (the
@@ -426,8 +444,25 @@ public:
     // original SQLite contract — callers do not currently consume a result).
     void bump_policy_generation();
 
+    /// Raise the persisted policy generation to `target`, never lowering it: the stored value
+    /// becomes max(stored, target) in one transaction that holds the `guardian_meta` row lock
+    /// from the read of `previous` through the write, so concurrent raises and the ordinary
+    /// `value + 1` bumps serialise on that row and `previous` is the value this raise actually
+    /// replaced. `raised` is true iff the stored value increased.
+    ///
+    /// The store re-enforces 1 <= target <= guardian::kMaxPolicyGenerationTarget
+    /// (`kOutOfRange`); a store that is not open, a pool timeout, a failed statement and a
+    /// missing `policy_generation` row are all `kStoreUnavailable` and never read as a
+    /// generation of 0. When `raised`, `on_rule_mutation_` runs after the commit with no lease
+    /// held, so this replica drops the caches keyed by the old generation; when not raised
+    /// nothing changed and it does not run. This never pushes anything to agents: the
+    /// heartbeat reconcile converges them to the new generation.
+    std::expected<PolicyGenerationRaise, PolicyGenerationRaiseError>
+    raise_policy_generation(int64_t target);
+
     /// Optional post-mutation hook (#5513 chaos-F1). Invoked once per successful rule
-    /// create_rule / update_rule / delete_rule, AFTER the mutation committed and AFTER
+    /// create_rule / update_rule / delete_rule, and once per raise_policy_generation() that
+    /// raised the stored value, AFTER the mutation committed and AFTER
     /// the best-effort policy-generation bump was attempted, whether or not that bump
     /// succeeded (a failed bump leaves the generation unchanged, so a cache keyed by
     /// generation cannot notice the edit on its own). Contract: called on the MUTATING
@@ -435,11 +470,12 @@ public:
     /// (it sits on the REST/MCP write path); an exception is caught and logged at warn,
     /// never propagated (the mutation is already durable); may be empty (the default).
     /// Set once during single-threaded wiring, before the store is shared; it is not
-    /// synchronised against concurrent mutation. NOT invoked by bump_policy_generation().
+    /// synchronised against concurrent mutation. NOT invoked by bump_policy_generation(), nor by
+    /// a raise_policy_generation() that left the value unchanged.
     /// Baseline deploy, delete and a deployed create commit in BaselineStore, which has its own
-    /// hook of the same shape (BaselineStore::set_on_baseline_mutation, to be wired by the
-    /// reconcile wire-up to the same invalidations through one ServerImpl wrapper), so they
-    /// are covered before the caller's own bump and fan-out run.
+    /// hook of the same shape (BaselineStore::set_on_baseline_mutation, wired to the same
+    /// invalidations through one ServerImpl wrapper), so they are covered before the caller's
+    /// own bump and fan-out run.
     void set_on_rule_mutation(std::function<void()> hook);
 
     // Observability — lock-free cumulative counters for Prometheus scraping.

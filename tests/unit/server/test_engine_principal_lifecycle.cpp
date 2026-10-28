@@ -33,10 +33,12 @@
 #include "rbac_store.hpp"
 #include "rest_api_v1.hpp"
 #include "settings_routes.hpp"
+#include "test_principal_lock_gate.hpp" // SqlFault: a REAL table moved aside in the throwaway DB
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
 
+#include <algorithm>
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
@@ -233,7 +235,14 @@ struct RestEngineHarness {
     std::optional<yuzu::server::pg::PgPool> rbac_pool;
 
     EnginePrincipalStorePg engine_store;
-    yuzu::test::ApiTokenStorePgShared token_store;
+    // The token store is the process-wide shared clone by default (CRUD-only cases). A case that
+    // runs DDL against it (a saboteur trigger or a column rename) asks for its OWN clone with
+    // `RestEngineHarness h{true}`: DDL on the shared clone poisons every later case
+    // (test_api_token_pg_helper.hpp), and a hard abort between arming and undoing would leave it
+    // poisoned. `token_store` points at whichever store is in use.
+    std::optional<yuzu::test::ApiTokenStorePgShared> shared_token_;
+    std::optional<yuzu::test::ApiTokenStorePg> dedicated_token_;
+    yuzu::server::ApiTokenStore* token_store = nullptr;
     std::unique_ptr<RbacStore> rbac_store;
 
     yuzu::server::test::TestRouteSink sink;
@@ -258,10 +267,19 @@ struct RestEngineHarness {
 
     std::vector<AuditCall> audit_log;
 
-    RestEngineHarness() {
-        // By this point every member above (engine_store, in particular) has
-        // already constructed, so the "PG DSN unset -> SKIP" gate has already
-        // fired if needed — no separate guard required here.
+    /// Connection string of the DEDICATED token clone (only valid when constructed with true).
+    [[nodiscard]] std::string token_dsn() const { return dedicated_token_->dsn(); }
+
+    explicit RestEngineHarness(bool dedicated_token_db = false) {
+        // engine_store has already constructed, so the "PG DSN unset -> SKIP" gate has already
+        // fired if needed; the token store below SKIPs the same way.
+        if (dedicated_token_db) {
+            dedicated_token_.emplace();
+            token_store = dedicated_token_->get();
+        } else {
+            shared_token_.emplace();
+            token_store = shared_token_->get();
+        }
         rbac_db.emplace(rbac_store_lifecycle_template);
         INFO("[RestEngineHarness] rbac db status (blank == database came up OK): "
              << rbac_db->error());
@@ -328,7 +346,7 @@ struct RestEngineHarness {
         // Every other store is nullptr — every engine-principal handler
         // null-checks its own dependencies and 503s cleanly if hit.
         api.register_routes(sink, auth_fn, perm_fn, audit_fn, rbac_store.get(),
-                            /*mgmt_store=*/nullptr, token_store.get(),
+                            /*mgmt_store=*/nullptr, token_store,
                             /*quarantine_store=*/nullptr,
                             /*response_store=*/nullptr,
                             /*instruction_store=*/nullptr,
@@ -814,6 +832,425 @@ TEST_CASE("Engine-principal REST: rotate reads overlap_secs strictly and rejects
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Degraded token-store reads on the credential mint and rotate routes.
+//
+// The degraded read is produced by holding every lease of the shared token
+// pool, so the store's bounded read gives up (a pool-lease timeout) while every
+// other store keeps working. No schema is touched, so the shared clone stays
+// clean. Each held-pool read waits one read timeout (1.5 s).
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+using TokenPoolLease = decltype(yuzu::test::detail::api_token_shared_bundle().pool->acquire());
+
+/// Takes every lease of the shared token pool; they return on destruction.
+std::vector<TokenPoolLease> hold_all_token_pool_leases() {
+    auto& pool = *yuzu::test::detail::api_token_shared_bundle().pool;
+    std::vector<TokenPoolLease> held;
+    for (std::size_t i = 0; i < pool.size(); ++i) {
+        held.push_back(pool.acquire());
+        REQUIRE(held.back());
+    }
+    return held;
+}
+
+/// Takes every lease of the engine-principal store's pool, so its roster read cannot answer. In
+/// production that pool IS the token store's pool; holding both here reproduces its exhaustion.
+std::vector<TokenPoolLease> hold_all_engine_pool_leases() {
+    auto& pool = *ep_lc_shared().pool;
+    std::vector<TokenPoolLease> held;
+    for (std::size_t i = 0; i < pool.size(); ++i) {
+        held.push_back(pool.acquire());
+        REQUIRE(held.back());
+    }
+    return held;
+}
+} // namespace
+
+TEST_CASE("Engine-principal REST: mint fails closed with 503 when the active-credential guard "
+          "cannot read and a retry after recovery mints exactly one credential",
+          "[pg][rest][engine_principal][mint][degraded]") {
+    RestEngineHarness h;
+    auto cres = h.create("mint-degraded");
+    REQUIRE(cres);
+    REQUIRE(cres->status == 201);
+    auto pid = nlohmann::json::parse(cres->body)["data"]["principal_id"].get<std::string>();
+
+    {
+        auto held = hold_all_token_pool_leases();
+        auto res = h.mint(pid);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "2");
+        CHECK(res->body.find("\"token\"") == std::string::npos);
+        REQUIRE(!h.audit_log.empty());
+        CHECK(h.audit_log.back().action == "engine_principal.credential.mint");
+        CHECK(h.audit_log.back().result == "failure");
+        // The checked read's own string, not the generic create_token one ("database
+        // unavailable - try again"): this pins that the 503 came from the guard read.
+        CHECK(h.audit_log.back().detail == "pool lease timed out");
+        // A4: the retry hint is machine metadata in the body, not only a header.
+        CHECK(nlohmann::json::parse(res->body)["error"]["retry_after_ms"].get<int>() == 2000);
+    }
+
+    // Nothing was minted while the read could not answer ...
+    CHECK(h.token_store->list_active_for_principal(pid).empty());
+    // ... and the retry now succeeds, creating the one credential.
+    auto retry = h.mint(pid);
+    REQUIRE(retry);
+    CHECK(retry->status == 201);
+    CHECK(h.token_store->list_active_for_principal(pid).size() == 1);
+    // A further mint is the ordinary 409, not a second secret.
+    auto again = h.mint(pid);
+    REQUIRE(again);
+    CHECK(again->status == 409);
+}
+
+TEST_CASE("Engine-principal REST: GET list and GET one answer 503, not zero credentials, when "
+          "the credential read cannot answer",
+          "[pg][rest][engine_principal][read][degraded]") {
+    RestEngineHarness h;
+    auto [pid, raw] = h.create_and_mint("read-degraded");
+    (void)raw;
+
+    {
+        auto held = hold_all_token_pool_leases();
+
+        auto list = h.list();
+        REQUIRE(list);
+        CHECK(list->status == 503);
+        CHECK(list->get_header_value("Retry-After") == "2");
+        // No principal row, so no "0" count, was served.
+        CHECK(list->body.find("active_credential_count") == std::string::npos);
+        CHECK(nlohmann::json::parse(list->body)["error"]["retry_after_ms"].get<int>() == 2000);
+        REQUIRE(!h.audit_log.empty());
+        CHECK(h.audit_log.back().action == "engine_principal.list");
+        CHECK(h.audit_log.back().result == "failure");
+        CHECK(h.audit_log.back().detail == "pool lease timed out");
+
+        auto one = h.get(pid);
+        REQUIRE(one);
+        CHECK(one->status == 503);
+        CHECK(one->get_header_value("Retry-After") == "2");
+        CHECK(one->body.find("active_credentials") == std::string::npos);
+        CHECK(nlohmann::json::parse(one->body)["error"]["retry_after_ms"].get<int>() == 2000);
+        CHECK(h.audit_log.back().action == "engine_principal.get");
+        CHECK(h.audit_log.back().result == "failure");
+        CHECK(h.audit_log.back().detail == "pool lease timed out");
+
+        // A failure row whose own write drops still sets the header on the data-less 503.
+        h.audit_allow = false;
+        auto list_dropped = h.list();
+        REQUIRE(list_dropped);
+        CHECK(list_dropped->status == 503);
+        CHECK(list_dropped->get_header_value("Sec-Audit-Failed") == "true");
+        auto one_dropped = h.get(pid);
+        REQUIRE(one_dropped);
+        CHECK(one_dropped->status == 503);
+        CHECK(one_dropped->get_header_value("Sec-Audit-Failed") == "true");
+        h.audit_allow = true;
+    }
+
+    // The leases are back: the same reads now report the credential that was there all along.
+    auto list = h.list();
+    REQUIRE(list);
+    REQUIRE(list->status == 200);
+    bool found = false;
+    for (const auto& row : nlohmann::json::parse(list->body)["data"]) {
+        if (row["principal_id"] == pid) {
+            found = true;
+            CHECK(row["active_credential_count"].get<int>() == 1);
+        }
+    }
+    CHECK(found);
+    auto one = h.get(pid);
+    REQUIRE(one);
+    REQUIRE(one->status == 200);
+    CHECK(nlohmann::json::parse(one->body)["data"]["active_credentials"].size() == 1);
+}
+
+TEST_CASE("Engine-principal REST: GET list answers 503, not an empty 200, when the principal "
+          "roster cannot be read (the shared-pool exhaustion case)",
+          "[pg][rest][engine_principal][read][degraded]") {
+    RestEngineHarness h;
+    auto [pid, raw] = h.create_and_mint("roster-degraded");
+    (void)raw;
+
+    {
+        // In production both stores draw from ONE pool, so exhaustion denies the roster read
+        // first. The harness gives them separate pools, so holding the engine store's pool is the
+        // equivalent: the roster read is the one that fails, before any credential read.
+        auto held_engine = hold_all_engine_pool_leases();
+        auto list = h.list();
+        REQUIRE(list);
+        CHECK(list->status == 503);
+        CHECK(list->get_header_value("Retry-After") == "2");
+        CHECK(list->body.find("\"data\"") == std::string::npos);
+        CHECK(nlohmann::json::parse(list->body)["error"]["retry_after_ms"].get<int>() == 2000);
+        // The store's own error text (driver text) never reaches the response.
+        CHECK(list->body.find("database unavailable") == std::string::npos);
+        CHECK(list->body.find("pool lease") == std::string::npos);
+        REQUIRE(!h.audit_log.empty());
+        CHECK(h.audit_log.back().action == "engine_principal.list");
+        CHECK(h.audit_log.back().result == "failure");
+        // A fixed string: the store's own error can carry database driver text.
+        CHECK(h.audit_log.back().detail == "engine principal roster could not be read");
+        // No success row was written for the failed read.
+        for (const auto& a : h.audit_log)
+            CHECK_FALSE((a.action == "engine_principal.list" && a.result == "success"));
+    }
+
+    // A failure row whose own write drops still sets the header on the (data-less) 503.
+    {
+        auto held_engine = hold_all_engine_pool_leases();
+        h.audit_allow = false;
+        auto list = h.list();
+        REQUIRE(list);
+        CHECK(list->status == 503);
+        CHECK(list->get_header_value("Sec-Audit-Failed") == "true");
+        h.audit_allow = true;
+    }
+
+    auto list = h.list();
+    REQUIRE(list);
+    CHECK(list->status == 200);
+    CHECK(nlohmann::json::parse(list->body)["data"].size() == 1);
+}
+
+TEST_CASE("Engine-principal REST: rotate withholds the secret with 503 and a partial audit when "
+          "the successor read-back cannot answer and a retry re-serves the same secret",
+          "[pg][rest][engine_principal][rotation][degraded]") {
+    RestEngineHarness h;
+    auto [pid, raw1] = h.create_and_mint("rotate-degraded");
+    (void)raw1;
+
+    std::vector<TokenPoolLease> held;
+    // Fires after the rotate commits and before the store caches the secret,
+    // so the successor exists when the route's own read-back runs dry.
+    h.token_store->test_hook_before_store_rotation_raw_ = [&held] {
+        held = hold_all_token_pool_leases();
+    };
+    auto res = h.rotate(pid);
+    h.token_store->test_hook_before_store_rotation_raw_ = nullptr;
+    held.clear();
+
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(res->body.find("\"token\"") == std::string::npos);
+    CHECK(res->body.find("token_id") == std::string::npos); // nothing to pin was disclosed
+    CHECK(nlohmann::json::parse(res->body)["error"]["retry_after_ms"].get<int>() == 2000);
+
+    // The audit row matches the database: a successor exists, so the outcome
+    // is partial and no reveal was recorded.
+    REQUIRE(!h.audit_log.empty());
+    CHECK(h.audit_log.back().action == "engine_principal.credential.rotate");
+    CHECK(h.audit_log.back().result == "partial");
+    for (const auto& row : h.audit_log)
+        CHECK(row.action != "engine_principal.credential.reveal");
+    CHECK(h.token_store->list_active_for_principal(pid).size() == 2);
+
+    // The same operator's retry inside the grace window re-serves the same
+    // successor with a usable token_id, and records its own reveal. This rests on
+    // the store caching the secret even though its own pending check could not
+    // read: that check fails open by contract (successor_rotation_still_pending).
+    auto retry = h.rotate(pid);
+    REQUIRE(retry);
+    REQUIRE(retry->status == 200);
+    auto data = nlohmann::json::parse(retry->body)["data"];
+    CHECK(!data["token"].get<std::string>().empty());
+    CHECK(!data["token_id"].get<std::string>().empty());
+    CHECK(h.audit_log.back().action == "engine_principal.credential.reveal");
+    CHECK(h.audit_log.back().result == "success");
+
+    // The re-served token_id is the NEWER active row (the one that links back to the
+    // predecessor), and the retry minted nothing: the pair is still exactly two.
+    const auto active = h.token_store->list_active_for_principal(pid);
+    REQUIRE(active.size() == 2);
+    std::string linked;
+    for (const auto& t : active)
+        if (!t.supersedes_token_id.empty())
+            linked = t.token_id;
+    CHECK(data["token_id"].get<std::string>() == linked);
+}
+
+namespace {
+// DDL / DML on a DEDICATED token clone (RestEngineHarness h{true}); never the shared one.
+void token_clone_exec(const std::string& dsn, const char* sql) {
+    pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    auto r = pg::exec_params(conn.get(), sql, std::vector<std::string>{});
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+} // namespace
+
+TEST_CASE("Engine-principal REST: mint withholds the secret with 503 and a partial audit when "
+          "the read-back after the insert cannot answer, and rotate recovers a usable secret",
+          "[pg][rest][engine_principal][mint][degraded]") {
+    RestEngineHarness h{/*dedicated_token_db=*/true};
+    auto cres = h.create("mint-readback-degraded");
+    REQUIRE(cres);
+    REQUIRE(cres->status == 201);
+    auto pid = nlohmann::json::parse(cres->body)["data"]["principal_id"].get<std::string>();
+
+    // create_token has no post-insert test seam, so a DEFERRED constraint trigger renames a
+    // column at COMMIT of the mint's own INSERT: the credential commits and the read-back's
+    // SELECT then fails. The clone is this case's own, so nothing needs putting back.
+    token_clone_exec(h.token_dsn().c_str(),
+                     "CREATE FUNCTION api_token_store.mint_readback_sabotage() RETURNS trigger "
+                     "LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'ALTER TABLE api_token_store.api_tokens "
+                     "RENAME COLUMN name TO mint_readback_gone'; RETURN NULL; END $$");
+    token_clone_exec(h.token_dsn().c_str(),
+                     "CREATE CONSTRAINT TRIGGER mint_readback_sabotage AFTER INSERT ON "
+                     "api_token_store.api_tokens DEFERRABLE INITIALLY DEFERRED FOR EACH ROW "
+                     "EXECUTE FUNCTION api_token_store.mint_readback_sabotage()");
+    auto res = h.mint(pid);
+    token_clone_exec(h.token_dsn().c_str(),
+                     "DROP TRIGGER mint_readback_sabotage ON api_token_store.api_tokens");
+
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("\"token\"") == std::string::npos);
+    CHECK(res->get_header_value("Retry-After").empty()); // retrying the mint cannot help
+    REQUIRE(!h.audit_log.empty());
+    CHECK(h.audit_log.back().action == "engine_principal.credential.mint");
+    CHECK(h.audit_log.back().result == "partial");
+    for (const auto& a : h.audit_log)
+        CHECK_FALSE((a.action == "engine_principal.credential.mint" && a.result == "success"));
+
+    // Put the column back, then check the database agrees with the audit row: the credential
+    // exists, a second mint is refused, and rotating the sole credential yields a secret.
+    token_clone_exec(h.token_dsn().c_str(),
+                     "ALTER TABLE api_token_store.api_tokens RENAME COLUMN mint_readback_gone "
+                     "TO name");
+    CHECK(h.token_store->list_active_for_principal(pid).size() == 1);
+    auto again = h.mint(pid);
+    REQUIRE(again);
+    CHECK(again->status == 409);
+    auto rot = h.rotate(pid);
+    REQUIRE(rot);
+    REQUIRE(rot->status == 200);
+    CHECK(!nlohmann::json::parse(rot->body)["data"]["token"].get<std::string>().empty());
+}
+
+TEST_CASE("Engine-principal REST: mint withholds the secret with 503 and a partial audit when "
+          "the read-back ANSWERS but the new credential is no longer active",
+          "[pg][rest][engine_principal][mint][degraded]") {
+    RestEngineHarness h{/*dedicated_token_db=*/true};
+    auto cres = h.create("mint-readback-gone");
+    REQUIRE(cres);
+    REQUIRE(cres->status == 201);
+    auto pid = nlohmann::json::parse(cres->body)["data"]["principal_id"].get<std::string>();
+
+    // A DEFERRED constraint trigger revokes the new row at COMMIT of the mint's own INSERT, as if
+    // the credential were revoked out of band between create_token and the read-back. The read
+    // answers with no active row: it used to deliver the secret with token_id "" under a success
+    // row for an already-dead credential.
+    token_clone_exec(h.token_dsn().c_str(),
+                     "CREATE FUNCTION api_token_store.mint_revoke_sabotage() RETURNS trigger "
+                     "LANGUAGE plpgsql AS $$ BEGIN UPDATE api_token_store.api_tokens SET revoked = "
+                     "TRUE WHERE token_id = NEW.token_id; RETURN NULL; END $$");
+    token_clone_exec(h.token_dsn().c_str(),
+                     "CREATE CONSTRAINT TRIGGER mint_revoke_sabotage AFTER INSERT ON "
+                     "api_token_store.api_tokens DEFERRABLE INITIALLY DEFERRED FOR EACH ROW "
+                     "EXECUTE FUNCTION api_token_store.mint_revoke_sabotage()");
+    auto res = h.mint(pid);
+
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("\"token\"") == std::string::npos);
+    CHECK(res->get_header_value("Retry-After").empty());
+    CHECK(res->body.find("no active credential was found on read-back") != std::string::npos);
+    REQUIRE(!h.audit_log.empty());
+    CHECK(h.audit_log.back().action == "engine_principal.credential.mint");
+    CHECK(h.audit_log.back().result == "partial");
+    CHECK(h.audit_log.back().detail.find("no active credential row was found") !=
+          std::string::npos);
+    for (const auto& a : h.audit_log)
+        CHECK_FALSE((a.action == "engine_principal.credential.mint" && a.result == "success"));
+    CHECK(h.token_store->list_active_for_principal(pid).empty());
+
+    // The same arm with the audit store degraded as well: still withheld, and the lost audit
+    // write is signalled to the caller.
+    h.audit_allow = false;
+    auto dropped = h.mint(pid);
+    h.audit_allow = true;
+    REQUIRE(dropped);
+    CHECK(dropped->status == 503);
+    CHECK(dropped->has_header("Sec-Audit-Failed"));
+    CHECK(dropped->body.find("\"token\"") == std::string::npos);
+
+    // With the saboteur gone a retry mints exactly one usable credential.
+    token_clone_exec(h.token_dsn().c_str(),
+                     "DROP TRIGGER mint_revoke_sabotage ON api_token_store.api_tokens");
+    auto retry = h.mint(pid);
+    REQUIRE(retry);
+    CHECK(retry->status == 201);
+    CHECK(!nlohmann::json::parse(retry->body)["data"]["token_id"].get<std::string>().empty());
+}
+
+TEST_CASE("Engine-principal REST: rotate withholds the secret with 503 and a partial audit when "
+          "the successor was revoked between the commit and the read-back",
+          "[pg][rest][engine_principal][rotation][degraded]") {
+    RestEngineHarness h;
+    auto [pid, raw1] = h.create_and_mint("rotate-successor-gone");
+    (void)raw1;
+
+    // The read ANSWERS, but no active credential links to a predecessor any more: it used
+    // to hand the secret out with token_id "" and a reveal row for a revoked credential.
+    h.token_store->test_hook_before_store_rotation_raw_ = [&] {
+        for (const auto& t : h.token_store->list_active_for_principal(pid))
+            if (!t.supersedes_token_id.empty())
+                REQUIRE(h.token_store->revoke_token(t.token_id).has_value());
+    };
+    auto res = h.rotate(pid);
+    h.token_store->test_hook_before_store_rotation_raw_ = nullptr;
+
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    // No retry hint: the pair is gone, so a retry would not re-serve anything, it would perform
+    // a NEW rotation the caller did not ask for. The message says to look first.
+    CHECK(res->get_header_value("Retry-After").empty());
+    {
+        const auto err = nlohmann::json::parse(res->body)["error"];
+        CHECK((!err.contains("retry_after_ms") || err["retry_after_ms"].is_null()));
+    }
+    CHECK(res->body.find("re-serve") == std::string::npos);
+    CHECK(res->body.find("A successor may exist; inspect the principal's credentials") !=
+          std::string::npos);
+    CHECK(res->body.find("\"token\"") == std::string::npos);
+    REQUIRE(!h.audit_log.empty());
+    CHECK(h.audit_log.back().action == "engine_principal.credential.rotate");
+    CHECK(h.audit_log.back().result == "partial");
+    for (const auto& a : h.audit_log)
+        CHECK(a.action != "engine_principal.credential.reveal");
+}
+
+TEST_CASE("Engine-principal REST: a partial rotate whose audit write also drops still withholds the "
+          "secret and signals Sec-Audit-Failed",
+          "[pg][rest][engine_principal][rotation][degraded]") {
+    RestEngineHarness h;
+    auto [pid, raw1] = h.create_and_mint("rotate-partial-audit-drop");
+    (void)raw1;
+    h.token_store->test_hook_before_store_rotation_raw_ = [&] {
+        for (const auto& t : h.token_store->list_active_for_principal(pid))
+            if (!t.supersedes_token_id.empty())
+                REQUIRE(h.token_store->revoke_token(t.token_id).has_value());
+    };
+    h.audit_allow = false; // the audit store is degraded as well
+    auto res = h.rotate(pid);
+    h.token_store->test_hook_before_store_rotation_raw_ = nullptr;
+
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->has_header("Sec-Audit-Failed"));
+    CHECK(res->body.find("\"token\"") == std::string::npos);
+    REQUIRE(!h.audit_log.empty());
+    CHECK(h.audit_log.back().result == "partial"); // the attempt to record it was made
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // No-admin auditor query (§4.2).
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -929,6 +1366,10 @@ TEST_CASE("Engine-principal REST: no-admin auditor fails CLOSED (503) when the "
     // {"data":{"ok":true,...}} success envelope.
     CHECK(res->body.find("\"ok\":true") == std::string::npos);
     CHECK(res->body.find("cannot verify") != std::string::npos);
+    // Same retry hint as the checked-read arm (header and A4 body), so a client can treat the
+    // two 503s alike.
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(nlohmann::json::parse(res->body)["error"]["retry_after_ms"].get<int>() == 2000);
 
     bool found_failure = false;
     for (const auto& a : h.audit_log) {
@@ -937,6 +1378,296 @@ TEST_CASE("Engine-principal REST: no-admin auditor fails CLOSED (503) when the "
             found_failure = true;
     }
     CHECK(found_failure);
+}
+
+namespace {
+
+/// Grant `role` every (securable, operation) pair of the CURRENT grid, as a custom (non-system)
+/// role. Returns the number of pairs granted.
+std::size_t grant_full_grid(RbacStore& store, const std::string& role) {
+    std::size_t n = 0;
+    for (const auto& s : store.list_securable_types())
+        for (const auto& o : store.list_operations()) {
+            REQUIRE(store.set_permission({role, s, o, "allow"}).has_value());
+            ++n;
+        }
+    return n;
+}
+
+bool has_audit(const std::vector<AuditCall>& log, const std::string& action,
+               const std::string& result) {
+    for (const auto& a : log)
+        if (a.action == action && a.result == result)
+            return true;
+    return false;
+}
+
+/// The three tables the shared auditor reads through CHECKED accessors, with the SQL that moves
+/// each one aside and back. (securable_types/operations are the fail-soft reference reads,
+/// covered by the empty-table case above.)
+struct AuditReadTable {
+    const char* label;
+    const char* apply;
+    const char* undo;
+};
+const AuditReadTable kAuditReadTables[] = {
+    {"principal_roles", "ALTER TABLE rbac_store.principal_roles RENAME TO principal_roles_gone",
+     "ALTER TABLE rbac_store.principal_roles_gone RENAME TO principal_roles"},
+    {"roles", "ALTER TABLE rbac_store.roles RENAME TO roles_gone",
+     "ALTER TABLE rbac_store.roles_gone RENAME TO roles"},
+    {"role_permissions", "ALTER TABLE rbac_store.role_permissions RENAME TO role_permissions_gone",
+     "ALTER TABLE rbac_store.role_permissions_gone RENAME TO role_permissions"},
+};
+
+} // namespace
+
+TEST_CASE("Engine-principal REST: no-admin auditor fails CLOSED (503, no ok:true, no success "
+          "audit row) when ANY checked read degrades",
+          "[pg][rest][engine_principal][no_admin][fail_closed][degraded]") {
+    // The auditor is the only control over a wildcard custom role (ruling 2026-10-23, #2485).
+    // A degraded read used to collapse to an empty vector and certify {"ok":true} over a
+    // deployment that DID hold a violation. Seed a real violation (a custom role covering the
+    // whole grid) so the unfixed route answers 200 here, then break each read in turn.
+    RestEngineHarness h;
+    REQUIRE(h.rbac_store->create_role({.name = "WildRole", .description = "d"}).has_value());
+    grant_full_grid(*h.rbac_store, "WildRole");
+    auto [principal_id, raw] = h.create_and_mint("audit-degraded");
+    (void)raw;
+    REQUIRE(h.rbac_store->assign_role({"engine", principal_id, "WildRole"}).has_value());
+
+    // Control: healthy, the violation is reported.
+    {
+        auto ok = h.no_admin_audit();
+        REQUIRE(ok);
+        REQUIRE(ok->status == 200);
+        REQUIRE(nlohmann::json::parse(ok->body)["data"]["violations"].size() == 1);
+    }
+
+    for (const auto& t : kAuditReadTables) {
+        INFO("read broken: " << t.label);
+        h.audit_log.clear();
+        yuzu::test::SqlFault fault(*h.rbac_pool, t.apply, t.undo);
+        fault.arm();
+
+        auto res = h.no_admin_audit();
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "2");
+        CHECK(res->body.find("\"ok\":true") == std::string::npos);
+        CHECK(res->body.find("\"violations\"") == std::string::npos); // no partial list
+        CHECK(res->body.find("rbac resolution unavailable - cannot verify") != std::string::npos);
+        CHECK(has_audit(h.audit_log, "engine_principal.audit.no_admin", "failure"));
+        // The fixed detail only: never the store's own error text.
+        for (const auto& a : h.audit_log)
+            if (a.action == "engine_principal.audit.no_admin" && a.result == "failure")
+                CHECK(a.detail == "rbac_resolution_failed");
+        // A run that could not verify leaves NO evidence-shaped success row.
+        CHECK_FALSE(has_audit(h.audit_log, "engine_principal.audit.no_admin", "success"));
+
+        fault.repair();
+        auto healed = h.no_admin_audit();
+        REQUIRE(healed);
+        CHECK(healed->status == 200);
+    }
+}
+
+TEST_CASE("Engine-principal REST: no-admin auditor success row names the detected principals",
+          "[pg][rest][engine_principal][no_admin]") {
+    RestEngineHarness h;
+    REQUIRE(h.rbac_store->create_role({.name = "WildRole", .description = "d"}).has_value());
+    grant_full_grid(*h.rbac_store, "WildRole");
+    auto [principal_id, raw] = h.create_and_mint("audit-detail");
+    (void)raw;
+    REQUIRE(h.rbac_store->assign_role({"engine", principal_id, "WildRole"}).has_value());
+
+    auto res = h.no_admin_audit();
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    std::string detail;
+    for (const auto& a : h.audit_log)
+        if (a.action == "engine_principal.audit.no_admin" && a.result == "success")
+            detail = a.detail;
+    CHECK(detail == "violations=1 scope=all sample=" + principal_id + ":wildcard_grant");
+}
+
+// ── The wildcard ruling (maintainer, 2026-10-23, #2485): a custom role covering the whole grid
+// is PERMITTED at assignment and DETECTED afterwards. Administrator and built-ins stay refused.
+
+TEST_CASE("Engine-principal REST: a custom full-grid role is assignable and the auditor lists it "
+          "as wildcard_grant under its role NAME",
+          "[pg][rest][engine_principal][no_admin][wildcard]") {
+    RestEngineHarness h;
+    REQUIRE(h.rbac_store->create_role({.name = "WildRole", .description = "d"}).has_value());
+    grant_full_grid(*h.rbac_store, "WildRole");
+    auto [principal_id, raw] = h.create_and_mint("wildcard-named");
+    (void)raw;
+    REQUIRE(h.rbac_store->assign_role({"engine", principal_id, "WildRole"}).has_value());
+
+    auto res = h.no_admin_audit();
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["data"]["ok"].get<bool>() == false);
+    REQUIRE(body["data"]["violations"].size() == 1);
+    CHECK(body["data"]["violations"][0]["principal_id"].get<std::string>() == principal_id);
+    CHECK(body["data"]["violations"][0]["role"].get<std::string>() == "WildRole");
+    CHECK(body["data"]["violations"][0]["reason"].get<std::string>() == "wildcard_grant");
+}
+
+TEST_CASE("Engine-principal REST: a role edited to the full grid AFTER assignment is still "
+          "caught on the next run",
+          "[pg][rest][engine_principal][no_admin][wildcard]") {
+    RestEngineHarness h;
+    REQUIRE(h.rbac_store->create_role({.name = "LaterWild", .description = "d"}).has_value());
+    REQUIRE(h.rbac_store->set_permission({"LaterWild", "Inventory", "Read", "allow"}).has_value());
+    auto [principal_id, raw] = h.create_and_mint("wildcard-later");
+    (void)raw;
+    REQUIRE(h.rbac_store->assign_role({"engine", principal_id, "LaterWild"}).has_value());
+
+    {
+        auto before = h.no_admin_audit();
+        REQUIRE(before);
+        CHECK(nlohmann::json::parse(before->body)["data"]["ok"].get<bool>() == true);
+    }
+    grant_full_grid(*h.rbac_store, "LaterWild"); // edited after the assignment succeeded
+    auto after = h.no_admin_audit();
+    REQUIRE(after);
+    auto body = nlohmann::json::parse(after->body);
+    CHECK(body["data"]["ok"].get<bool>() == false);
+    REQUIRE(body["data"]["violations"].size() == 1);
+    CHECK(body["data"]["violations"][0]["role"].get<std::string>() == "LaterWild");
+}
+
+TEST_CASE("Engine-principal REST: a role granting every pair but one is not reported, and "
+          "Administrator plus built-in roles are still refused at assignment",
+          "[pg][rest][engine_principal][no_admin][wildcard]") {
+    RestEngineHarness h;
+    REQUIRE(h.rbac_store->create_role({.name = "AlmostAll", .description = "d"}).has_value());
+    const auto securables = h.rbac_store->list_securable_types();
+    const auto operations = h.rbac_store->list_operations();
+    REQUIRE(!securables.empty());
+    REQUIRE(!operations.empty());
+    bool skipped = false;
+    for (const auto& s : securables)
+        for (const auto& o : operations) {
+            if (!skipped) {
+                skipped = true; // withhold exactly one pair
+                continue;
+            }
+            REQUIRE(h.rbac_store->set_permission({"AlmostAll", s, o, "allow"}).has_value());
+        }
+    auto [principal_id, raw] = h.create_and_mint("almost-all");
+    (void)raw;
+    REQUIRE(h.rbac_store->assign_role({"engine", principal_id, "AlmostAll"}).has_value());
+
+    auto res = h.no_admin_audit();
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["data"]["ok"].get<bool>() == true); // the documented limit of the check
+
+    // The name-based and built-in bars are unchanged by the ruling.
+    CHECK_FALSE(h.rbac_store->assign_role({"engine", principal_id, "Administrator"}).has_value());
+    CHECK_FALSE(h.rbac_store->assign_role({"engine", principal_id, "admin"}).has_value());
+    for (const auto& role : h.rbac_store->list_roles()) {
+        if (!role.is_system)
+            continue;
+        INFO("built-in role " << role.name);
+        CHECK_FALSE(h.rbac_store->assign_role({"engine", principal_id, role.name}).has_value());
+    }
+}
+
+TEST_CASE("Engine-principal REST: a stuck rotation pair is recovered by revoking the SUCCESSOR "
+          "through DELETE /api/v1/tokens/{id}, then rotating from the sole credential",
+          "[pg][rest][engine_principal][rotation][recovery]") {
+    // The documented recovery (docs/user-manual/engine-principals.md, "If the secret is lost"):
+    // the successor's secret is gone, so the pair cannot be confirmed. Revoke the SUCCESSOR with
+    // the per-credential route (never the principal, which is terminal), after which the
+    // predecessor must survive as a standalone credential and rotate again from there.
+    RestEngineHarness h;
+    auto [pid, raw1] = h.create_and_mint("rotation-recovery");
+    (void)raw1;
+
+    auto r1 = h.rotate(pid);
+    REQUIRE(r1);
+    REQUIRE(r1->status == 200);
+    const auto successor_id = nlohmann::json::parse(r1->body)["data"]["token_id"].get<std::string>();
+    REQUIRE(!successor_id.empty());
+
+    // Stuck: once the grace window lapses the pair cannot be re-served (same advanced-`now`
+    // technique as the lapsed-grace case above), and both credentials are still active.
+    auto lapsed =
+        h.token_store->rotate_engine_credential(pid, 86400, now_epoch() + 10 * 60, "alice");
+    REQUIRE_FALSE(lapsed.has_value());
+    CHECK(lapsed.error().find("grace window elapsed") != std::string::npos);
+
+    std::string predecessor_id;
+    {
+        const auto active = h.token_store->list_active_for_principal(pid);
+        REQUIRE(active.size() == 2);
+        for (const auto& t : active) {
+            CHECK(!t.rotation_group.empty());
+            if (t.token_id != successor_id)
+                predecessor_id = t.token_id;
+        }
+        REQUIRE(!predecessor_id.empty());
+    }
+
+    // The per-credential route is owner-or-admin: a non-admin caller who does not own the
+    // engine credential is refused with the same 404 as an unknown id, and the successor stays
+    // active (the recovery is not reachable by anyone who merely holds ApiToken:Delete).
+    h.session_role = auth::Role::user;
+    {
+        auto refused = h.sink.dispatch("DELETE", "/api/v1/tokens/" + successor_id, "");
+        REQUIRE(refused);
+        CHECK(refused->status == 404);
+        CHECK(refused->body.find("token not found") != std::string::npos);
+        const auto active = h.token_store->list_active_for_principal(pid);
+        CHECK(active.size() == 2);
+        CHECK(std::any_of(active.begin(), active.end(),
+                          [&](const auto& t) { return t.token_id == successor_id; }));
+    }
+
+    // Recovery step 2: revoke the successor as an effective administrator.
+    h.session_role = auth::Role::admin;
+    auto del = h.sink.dispatch("DELETE", "/api/v1/tokens/" + successor_id, "");
+    REQUIRE(del);
+    CHECK(del->status == 200);
+    CHECK(nlohmann::json::parse(del->body)["data"]["revoked"].get<bool>() == true);
+
+    // The predecessor survives as the SOLE credential, resolved to a standalone row (no
+    // rotation stamp left for the sweep to act on), and was not revoked to zero credentials.
+    {
+        const auto active = h.token_store->list_active_for_principal(pid);
+        REQUIRE(active.size() == 1);
+        CHECK(active[0].token_id == predecessor_id);
+        CHECK(active[0].rotation_group.empty());
+        CHECK(active[0].supersedes_token_id.empty());
+        CHECK(active[0].overlap_expires_at == 0);
+    }
+
+    // The maintenance sweep must not touch the survivor either: it is a standalone credential
+    // with no rotation stamp, so a sweep leaves it active. The sweep decides eligibility from
+    // PostgreSQL's own now(); the `now` passed here is only a plausibility check, so it does NOT
+    // advance the sweep clock. This guards the predicate (a stamped survivor would be a
+    // candidate), not the timing.
+    {
+        const auto swept = h.token_store->sweep_expired_rotations(now_epoch() + 3 * 86400);
+        CHECK(swept.outcome == ApiTokenStore::SweepOutcome::Ok);
+        CHECK(swept.revoked.empty());
+        const auto active = h.token_store->list_active_for_principal(pid);
+        REQUIRE(active.size() == 1);
+        CHECK(active[0].token_id == predecessor_id);
+    }
+
+    // Recovery step 3: rotating from the sole credential succeeds with a fresh secret.
+    auto r2 = h.rotate(pid);
+    REQUIRE(r2);
+    REQUIRE(r2->status == 200);
+    const auto data = nlohmann::json::parse(r2->body)["data"];
+    CHECK(!data["token"].get<std::string>().empty());
+    CHECK(data["token_id"].get<std::string>() != successor_id);
+    CHECK(data["token_id"].get<std::string>() != predecessor_id);
+    CHECK(h.token_store->list_active_for_principal(pid).size() == 2);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1558,7 +2289,8 @@ struct SettingsOwnerDeleteHarness {
 
     std::vector<AuditCall> audit_calls;
 
-    explicit SettingsOwnerDeleteHarness(EnginePrincipalStore* engine_store) {
+    explicit SettingsOwnerDeleteHarness(EnginePrincipalStore* engine_store,
+                                        bool wire_token_store = true) {
         cfg.auth_config_path = tmp.path / "auth.cfg";
         auth_mgr.load_config(cfg.auth_config_path);
         REQUIRE(auth_mgr.upsert_user("admin", "adminpassword1", auth::Role::admin));
@@ -1574,6 +2306,7 @@ struct SettingsOwnerDeleteHarness {
             auth::Session s;
             s.username = session_user;
             s.role = session_role;
+            s.auth_source = "api_token"; // a token caller is exempt from the same-site gate
             return s;
         };
         auto admin_fn = [this](const httplib::Request&, httplib::Response& res) {
@@ -1595,7 +2328,7 @@ struct SettingsOwnerDeleteHarness {
         auto agents_json_fn = []() -> std::string { return "[]"; };
 
         routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
-                               auto_approve, token_store.get(),
+                               auto_approve, wire_token_store ? token_store.get() : nullptr,
                                /*mgmt_group_store=*/nullptr,
                                /*tag_store=*/nullptr,
                                /*update_registry=*/nullptr,
@@ -1611,6 +2344,122 @@ struct SettingsOwnerDeleteHarness {
 };
 
 } // namespace
+
+TEST_CASE("SettingsRoutes engine-principals fragment: a credential read that cannot answer "
+          "says unavailable and offers neither Mint nor Rotate",
+          "[pg][settings][engine_principal][read][degraded]") {
+    EnginePrincipalStorePg engine_store;
+    REQUIRE(engine_store->create("Vuln Sync", "bob", "j", "internal", "admin", "engine:panel-deg")
+                .has_value());
+    // A second principal with NO credential, so the recovery phase pins the Mint form too.
+    REQUIRE(engine_store->create("Idle", "bob", "j", "internal", "admin", "engine:panel-none")
+                .has_value());
+    // A revoked principal: its "Detail:" cell is the revoke-detail audit lookup, which is
+    // skipped once a credential read has failed. (No audit store is wired in this harness, so a
+    // healthy render says "(not recorded)" and a skipped one says "(unavailable)".)
+    REQUIRE(engine_store->create("Gone", "bob", "j", "internal", "admin", "engine:panel-gone")
+                .has_value());
+    REQUIRE(engine_store->revoke("engine:panel-gone").value_or(false));
+    SettingsOwnerDeleteHarness h(engine_store.get());
+    // One live credential on the first principal, so a "0" with a Mint button would be false.
+    h.token_store->set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(h.token_store
+                ->create_token("Vuln Sync", "engine:panel-deg", now + 90 * 24 * 3600, "",
+                               "readonly", "engine")
+                .has_value());
+
+    SECTION("a credential read that cannot answer") {
+        {
+            auto held = hold_all_token_pool_leases();
+            auto res = h.sink.Get("/fragments/settings/engine-principals");
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            // Both the cell and the row hint, asserted as their own markup.
+            // All three principals' cells (the revoked one too) are marked after one failed read.
+            std::size_t cells = 0;
+            for (auto pos = res->body.find("<span class=\"muted\">unavailable</span>");
+                 pos != std::string::npos;
+                 pos = res->body.find("<span class=\"muted\">unavailable</span>", pos + 1))
+                ++cells;
+            CHECK(cells == 3);
+            CHECK(res->body.find("Credential state unavailable") != std::string::npos);
+            // The in-page retry, not a page reload that would discard a displayed secret.
+            CHECK(res->body.find(
+                      "onclick=\"htmx.trigger(document.body,'refreshEnginePrincipals')\"") !=
+                  std::string::npos);
+            CHECK(res->body.find("use Retry below") != std::string::npos);
+            CHECK(res->body.find("data-engine-action=\"mint\"") == std::string::npos);
+            CHECK(res->body.find("data-engine-action=\"rotate\"") == std::string::npos);
+            // The principal rows, read from the principal store, are still shown.
+            CHECK(res->body.find("engine:panel-deg") != std::string::npos);
+            CHECK(res->body.find("engine:panel-none") != std::string::npos);
+            // The revoked row's detail cell carries the not-looked-up label (this harness wires\n            // no audit store, so the label, not the absence of the query, is what is pinned).
+            CHECK(res->body.find("Detail: (unavailable)") != std::string::npos);
+            CHECK(res->body.find("Detail: (not recorded)") == std::string::npos);
+        }
+        auto res = h.sink.Get("/fragments/settings/engine-principals");
+        REQUIRE(res);
+        CHECK(res->body.find("Detail: (not recorded)") != std::string::npos);
+        CHECK(res->body.find("unavailable") == std::string::npos);
+        CHECK(res->body.find("data-engine-action=\"rotate\"") != std::string::npos);
+        CHECK(res->body.find("data-engine-action=\"mint\"") != std::string::npos);
+    }
+
+    SECTION("a roster that cannot be read") {
+        {
+            auto held = hold_all_engine_pool_leases();
+            auto res = h.sink.Get("/fragments/settings/engine-principals");
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(res->body.find("Engine principals unavailable") != std::string::npos);
+            CHECK(res->body.find("refreshEnginePrincipals") != std::string::npos);
+            // The store's own error text never reaches the HTML.
+            CHECK(res->body.find("database unavailable") == std::string::npos);
+            // Not the empty-table text that reads as "no engine principals exist".
+            CHECK(res->body.find("No engine principals") == std::string::npos);
+            CHECK(res->body.find("<table") == std::string::npos);
+        }
+        auto res = h.sink.Get("/fragments/settings/engine-principals");
+        REQUIRE(res);
+        CHECK(res->body.find("Engine principals unavailable") == std::string::npos);
+        CHECK(res->body.find("engine:panel-deg") != std::string::npos);
+    }
+}
+
+TEST_CASE("SettingsRoutes engine-principals fragment: a token store that was never wired reads "
+          "as unavailable, not as 0 credentials with a Mint button",
+          "[pg][settings][engine_principal][read][degraded]") {
+    EnginePrincipalStorePg engine_store;
+    REQUIRE(engine_store->create("Vuln Sync", "bob", "j", "internal", "admin", "engine:panel-null")
+                .has_value());
+    SettingsOwnerDeleteHarness h(engine_store.get(), /*wire_token_store=*/false);
+
+    auto res = h.sink.Get("/fragments/settings/engine-principals");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("engine:panel-null") != std::string::npos);
+    CHECK(res->body.find("<span class=\"muted\">unavailable</span>") != std::string::npos);
+    CHECK(res->body.find("data-engine-action=\"mint\"") == std::string::npos);
+    CHECK(res->body.find("data-engine-action=\"rotate\"") == std::string::npos);
+    // The row hint points at a Retry control, so the control must exist.
+    CHECK(res->body.find("use Retry below") != std::string::npos);
+    CHECK(res->body.find("refreshEnginePrincipals") != std::string::npos);
+}
+
+TEST_CASE("SettingsRoutes engine-principals fragment: no engine principals and no token store "
+          "says so without a Retry control that cannot help",
+          "[pg][settings][engine_principal][read][degraded]") {
+    EnginePrincipalStorePg engine_store;
+    SettingsOwnerDeleteHarness h(engine_store.get(), /*wire_token_store=*/false);
+
+    auto res = h.sink.Get("/fragments/settings/engine-principals");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("No engine principals") != std::string::npos);
+    CHECK(res->body.find("refreshEnginePrincipals") == std::string::npos);
+}
 
 TEST_CASE("SettingsRoutes owner-delete guard: blocks deleting a user who owns an "
           "active engine principal (409)",

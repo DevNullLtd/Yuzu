@@ -27,6 +27,7 @@
 
 #include "dashboard_routes.hpp"
 #include "test_export_cap_guard.hpp"
+#include "test_forensics_tier_fixture.hpp" // #4990
 #include "management_group_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
@@ -66,6 +67,8 @@ struct DashboardTarRetentionTestAccess {
     void set_stores(ResponseStore* rs, ManagementGroupStore* mg) {
         routes.response_store_ = rs;
         routes.mgmt_group_store_ = mg;
+        // #4990: the scan read is a fixed-plugin poll; an unwired plugin set refuses every row.
+        routes.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
     }
     void set_metrics(yuzu::MetricsRegistry* m) { routes.metrics_ = m; }
     void set_scan(const std::string& user, const std::string& cmd_id, int count, int64_t at) {

@@ -39,6 +39,8 @@ constexpr NavItem kSettingsSub[] = {
     {.key = "settings-general", .label = "General", .href = "/settings/general"},
     {.key = "settings-security", .label = "Security and sign-in", .href = "/settings/security"},
     {.key = "settings-integrations", .label = "Integrations", .href = "/settings/integrations"},
+    {.key = "settings-pki", .label = "Certificates and secrets", .href = "/settings/pki"},
+    {.key = "settings-plugins", .label = "Plugins and updates", .href = "/settings/plugins"},
     {.key = "settings-data", .label = "Data and retention", .href = "/settings/data"},
     {.key = "settings-developer", .label = "Developer and API", .href = "/settings/developer"},
 };
@@ -69,6 +71,10 @@ constexpr NavItem kPosture[] = {
      .label = "TAR",
      .href = "/tar",
      .icon = "M3 12a9 9 0 109-9 M3 4v5h5 M12 7v5l3 2"},
+    {.key = "crypto",
+     .label = "Crypto",
+     .href = "/crypto",
+     .icon = "M7 11V8a5 5 0 0110 0v3 M5 11h14v10H5z M12 15v2"},
 };
 constexpr NavItem kEstate[] = {
     {.key = "groups",
@@ -94,7 +100,7 @@ constexpr NavItem kEstate[] = {
 };
 constexpr NavItem kAccess[] = {
     {.key = "users",
-     .label = "Users",
+     .label = "Users and roles",
      .href = "/access/users",
      .icon = "M12 12a4 4 0 100-8 4 4 0 000 8z M4 21c0-4 3.6-7 8-7s8 3 8 7"},
     {.key = "tokens",

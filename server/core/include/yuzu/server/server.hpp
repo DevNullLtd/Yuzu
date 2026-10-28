@@ -40,6 +40,29 @@ private:
     static_assert(std::atomic<std::int64_t>::is_always_lock_free);
 };
 
+/// An `int` the runtime-configuration write can change while request threads read it: the three
+/// retention windows (`PUT /api/config/{key}`, `PUT /api/v1/config/{key}` and `set_runtime_config`
+/// assign them, `GET` and the data-retention page read them). `Config` is copied by value and
+/// `std::atomic` is not copyable, so, like `LiveSeconds`, this wraps one: copies take a relaxed
+/// snapshot, which is enough because the value is independent of any other state. The stores do
+/// not read these after construction (#483); this only makes the live copy safe to show.
+class LiveInt {
+public:
+    LiveInt(int v = 0) noexcept : v_(v) {}
+    LiveInt(const LiveInt& o) noexcept : v_(o.get()) {}
+    LiveInt& operator=(const LiveInt& o) noexcept { return *this = o.get(); }
+    LiveInt& operator=(int v) noexcept {
+        v_.store(v, std::memory_order_relaxed);
+        return *this;
+    }
+    [[nodiscard]] int get() const noexcept { return v_.load(std::memory_order_relaxed); }
+    operator int() const noexcept { return get(); }
+
+private:
+    std::atomic<int> v_;
+    static_assert(std::atomic<int>::is_always_lock_free);
+};
+
 struct Config {
     std::string listen_address{"0.0.0.0:50051"};     // Agent-facing gRPC
     std::string management_address{"0.0.0.0:50052"}; // Operator-facing gRPC
@@ -287,14 +310,14 @@ struct Config {
     std::string saml_email_attribute; // <Attribute Name="..."> carrying the email (display fallback)
 
     // Response persistence
-    int response_retention_days{90};
+    LiveInt response_retention_days{90};
 
     // Audit trail
-    int audit_retention_days{365};
+    LiveInt audit_retention_days{365};
 
     // Guardian (Guaranteed State) event retention. Default 30d matches
     // kDefaultEventRetentionDays + the workstream-E data inventory.
-    int guardian_event_retention_days{30};
+    LiveInt guardian_event_retention_days{30};
 
     // Analytics
     bool analytics_enabled{true};
@@ -384,6 +407,17 @@ struct Config {
     // scales with the caller's address space (a /24 buys 256 buckets). This is the
     // bound that does not.
     int ota_max_concurrent_total{64};
+
+    // Guardian heartbeat-reconcile admission budget (#5513), per server replica. A leaky bucket
+    // in milliseconds of reconcile wall time (see guardian_reconcile_budget.hpp): an admitted
+    // re-push is charged its measured duration, and a reconcile that finds the bucket empty is
+    // shed (the agent re-reports a stale generation on its next heartbeat). The count ceiling
+    // bounds the burst before any push has finished. Raw operator input, validated by
+    // guardian_reconcile_options_error (server_guardian_reconcile_options.hpp); the defaults
+    // are provisional starting values, not derived from fleet measurement.
+    double guardian_reconcile_budget_ms_per_s{500.0};  // --guardian-reconcile-budget-ms-per-s
+    double guardian_reconcile_burst_ms{1000.0};        // --guardian-reconcile-burst-ms
+    std::uint32_t guardian_reconcile_max_per_s{1000};  // --guardian-reconcile-max-per-s
 
     // Account lockout — `/auth-and-authz` skill gap matrix P0 #2, SOC 2
     // CC6.3. After `auth_lockout_threshold` consecutive failed local-password

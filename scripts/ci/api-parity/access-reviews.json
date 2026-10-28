@@ -5,7 +5,7 @@
     "capability_id": "get.fragments-settings-access-reviews",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:get.fragments-access-reviews-campaigns"
   },
   {
     "method": "GET",
@@ -13,6 +13,39 @@
     "capability_id": "get.fragments-settings-access-reviews-campaign",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:get.fragments-access-reviews-campaign"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/access/reviews/campaigns",
+    "capability_id": "get.fragments-access-reviews-campaigns",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/access-reviews"
+    },
+    "mcp_twin": "list_access_reviews",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/access/reviews/campaign",
+    "capability_id": "get.fragments-access-reviews-campaign",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/access-reviews/{id}"
+    },
+    "mcp_twin": "get_access_review",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/access/reviews/grants",
+    "capability_id": "get.fragments-access-reviews-grants",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/access-reviews/export"
+    },
+    "mcp_twin": "export_access_review",
+    "status": "twinned"
   }
 ]

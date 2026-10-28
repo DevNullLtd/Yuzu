@@ -27,12 +27,11 @@
 
 #include "authz_model.hpp"
 #include "execution_scope_rules.hpp"
+#include "source_scan.hpp"
 #include "test_response_execution_authz_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <filesystem>
-#include <fstream>
 #include <regex>
 #include <string>
 #include <vector>
@@ -47,17 +46,14 @@ httplib::Request bearer_request(const std::string& token) {
     return req;
 }
 
-#ifndef YUZU_SERVER_SRC_DIR
-#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
-#endif
-
-// #2542 PR-7: reads execution_routes.cpp (the extracted owner file), not
-// server.cpp — see this file's header comment.
-std::string read_execution_routes_cpp() {
-    std::ifstream input(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "execution_routes.cpp");
-    REQUIRE(input.is_open());
-    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-}
+// #2542 PR-7: the source under scan is execution_routes.cpp (the extracted owner
+// file), not server.cpp -- see this file's header comment. stripped_source() reads it
+// once per process with every `//` comment cut (source_scan.hpp), so a bare needle
+// name inside a comment cannot satisfy a substring find without the code actually
+// calling it (quality-engineer, #3789 Gate 8 F2: a `find("get_agent_statuses_checked")`
+// check alone can't tell "called unconditionally" from "called only inside
+// `if (exec_opt)`" -- both contain the identical literal).
+using yuzu::test::source_scan::stripped_source;
 
 std::string route_block(const std::string& source, const std::string& marker) {
     const auto begin = source.find(marker);
@@ -66,17 +62,6 @@ std::string route_block(const std::string& source, const std::string& marker) {
     // `web_server_->` receiver to execution_routes.cpp's `sink.` receiver.
     const auto end = source.find("sink.", begin + marker.size());
     return source.substr(begin, (end == std::string::npos ? source.size() : end) - begin);
-}
-
-// A bare needle name inside a `//` comment can satisfy a substring find
-// without the code actually calling it (quality-engineer, #3789 Gate 8 F2:
-// a `find("get_agent_statuses_checked")` check alone can't tell "called
-// unconditionally" from "called only inside `if (exec_opt)`" — both
-// contain the identical literal). Precedent: test_store_wiring_order.cpp /
-// test_shutdown_join_order.cpp both strip comments before scanning.
-std::string strip_line_comments(const std::string& text) {
-    static const std::regex re(R"(//[^\n]*)");
-    return std::regex_replace(text, re, "");
 }
 
 // The substring of `block` starting at the FIRST occurrence of `from` and
@@ -331,7 +316,7 @@ TEST_CASE("legacy executions: Bob's global Execute grant admits a complete, "
 TEST_CASE("legacy executions routes: every route retains the fleet gate, not the "
           "bare flat permission gate",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_execution_routes_cpp();
+    const std::string& source = stripped_source("execution_routes.cpp");
     const auto list_route = route_block(source, R"(sink.Get("/api/executions",)");
     const auto detail = route_block(source, R"(/api/executions/([^/]+))");
     const auto summary = route_block(source, R"(/api/executions/([^/]+)/summary)");
@@ -361,7 +346,7 @@ TEST_CASE("legacy executions routes: every route retains the fleet gate, not the
 TEST_CASE("legacy executions detail route: redaction literal and checked reads "
           "are present, unchecked get_execution/get_agent_statuses are not",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_execution_routes_cpp();
+    const std::string& source = stripped_source("execution_routes.cpp");
     const auto detail = route_block(source, R"(/api/executions/([^/]+))");
     CHECK(detail.find("(redacted - confined view)") != std::string::npos);
     CHECK(detail.find("get_execution_checked") != std::string::npos);
@@ -376,7 +361,7 @@ TEST_CASE("legacy executions detail route: redaction literal and checked reads "
 TEST_CASE("legacy executions agents route: filters to in-scope agents via the "
           "checked status read",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_execution_routes_cpp();
+    const std::string& source = stripped_source("execution_routes.cpp");
     const auto agents = route_block(source, R"(/api/executions/([^/]+)/agents)");
     CHECK(agents.find("get_agent_statuses_checked") != std::string::npos);
     CHECK(agents.find("authz::in_scope") != std::string::npos);
@@ -386,7 +371,7 @@ TEST_CASE("legacy executions agents route: filters to in-scope agents via the "
 TEST_CASE("legacy executions list route: SQL scope pushdown precedes the "
           "checked query, and the limit is capped",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_execution_routes_cpp();
+    const std::string& source = stripped_source("execution_routes.cpp");
     const auto list_route = route_block(source, R"(sink.Get("/api/executions",)");
     CHECK(list_route.find("query_executions_checked") != std::string::npos);
     CHECK(list_route.find("ExecutionListScope") != std::string::npos);
@@ -402,7 +387,7 @@ TEST_CASE("legacy executions list route: SQL scope pushdown precedes the "
 TEST_CASE("legacy executions summary route: unknown-id collapses to 404 for every "
           "caller, not the old zero-filled 200",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_execution_routes_cpp();
+    const std::string& source = stripped_source("execution_routes.cpp");
     const auto summary = route_block(source, R"(/api/executions/([^/]+)/summary)");
     CHECK(summary.find("get_execution_checked") != std::string::npos);
     CHECK(summary.find(R"("not found")") != std::string::npos);
@@ -413,7 +398,7 @@ TEST_CASE("legacy executions summary route: unknown-id collapses to 404 for ever
 TEST_CASE("legacy executions children route: each child is checked against the "
           "same visibility predicate as its parent, not truthfully passed through",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_execution_routes_cpp();
+    const std::string& source = stripped_source("execution_routes.cpp");
     const auto children = route_block(source, R"(/api/executions/([^/]+)/children)");
     CHECK(children.find("get_children_checked") != std::string::npos);
     CHECK(children.find("get_agent_statuses_for_executions_checked") != std::string::npos);
@@ -423,7 +408,7 @@ TEST_CASE("legacy executions children route: each child is checked against the "
 TEST_CASE("legacy executions rerun/cancel routes: mutation admission uses the "
           "complete-cohort rule, not a bare visibility check",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_execution_routes_cpp();
+    const std::string& source = stripped_source("execution_routes.cpp");
     const auto rerun = route_block(source, R"(/api/executions/([^/]+)/rerun)");
     const auto cancel = route_block(source, R"(/api/executions/([^/]+)/cancel)");
     for (const auto* block : {&rerun, &cancel}) {
@@ -440,10 +425,10 @@ TEST_CASE("legacy executions rerun/cancel routes: mutation admission uses the "
         // Gate 8 F2 — verified false-green by mutation-testing the prior
         // version of this assertion). This pins the actual SHAPE: no
         // `exec_opt`-conditional appears in the span between fetching the
-        // execution and fetching its statuses, on comment-stripped source.
-        const auto stripped = strip_line_comments(*block);
+        // execution and fetching its statuses, on comment-stripped source
+        // (stripped_source above).
         const auto span =
-            span_between(stripped, "get_execution_checked", "get_agent_statuses_checked");
+            span_between(*block, "get_execution_checked", "get_agent_statuses_checked");
         static const std::regex exec_opt_conditional(R"(if\s*\([^)]*exec_opt)");
         CHECK_FALSE(std::regex_search(span, exec_opt_conditional));
     }
@@ -456,14 +441,11 @@ TEST_CASE("legacy executions GET routes: the 'denied' audit row fires only "
           "under an engaged scope, never for an unconfined caller's "
           "genuinely-nonexistent id (#3789 Gate 8 compliance-officer F2)",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_execution_routes_cpp();
-    const auto detail = strip_line_comments(route_block(source, R"(/api/executions/([^/]+))"));
-    const auto summary =
-        strip_line_comments(route_block(source, R"(/api/executions/([^/]+)/summary)"));
-    const auto agents =
-        strip_line_comments(route_block(source, R"(/api/executions/([^/]+)/agents)"));
-    const auto children =
-        strip_line_comments(route_block(source, R"(/api/executions/([^/]+)/children)"));
+    const std::string& source = stripped_source("execution_routes.cpp");
+    const auto detail = route_block(source, R"(/api/executions/([^/]+))");
+    const auto summary = route_block(source, R"(/api/executions/([^/]+)/summary)");
+    const auto agents = route_block(source, R"(/api/executions/([^/]+)/agents)");
+    const auto children = route_block(source, R"(/api/executions/([^/]+)/children)");
     // The audit call must be nested directly inside `if (gate.scope) { ... }`
     // — a caller with no engaged scope always has `!scope` visibility true
     // (execution_scope_rules.hpp), so this branch's audit is reachable ONLY
@@ -479,7 +461,7 @@ TEST_CASE("legacy executions confined routes: an empty resolved username "
           "fails closed with 503 rather than falling through to agent-only "
           "visibility (#3789 Gate 8, security-guardian LOW / unhappy-path UP-6)",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_execution_routes_cpp();
+    const std::string& source = stripped_source("execution_routes.cpp");
     const auto list_route = route_block(source, R"(sink.Get("/api/executions",)");
     const auto detail = route_block(source, R"(/api/executions/([^/]+))");
     const auto summary = route_block(source, R"(/api/executions/([^/]+)/summary)");

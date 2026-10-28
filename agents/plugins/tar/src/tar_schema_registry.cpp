@@ -369,14 +369,10 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // top-10 by CPU ∪ top-10 by working set per tick (<= 20 rows/30 s).
         // NAMES ONLY — no command lines (privacy default); operator redaction
         // patterns apply to the name; own `procperf_enabled` toggle so per-app
-        // visibility can be disabled while device-level sampling stays on
-        // (works-council posture).
+        // visibility can be disabled while device-level sampling stays on.
         {
             .name = "procperf",
             .dollar_name = "ProcPerf",
-            // Opt-in (works-council posture): a fresh agent reports it disabled
-            // on tar.status, matching the explicit "false" collection gate.
-            .default_enabled = false,
             .os_support = {
                 {"windows", OsSupportStatus::kSupported,  "ntsysinfo",
                  "One NtQuerySystemInformation(SystemProcessInformation) "
@@ -434,15 +430,12 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // joined to the owning process. Co-sampled with the `tcp` source so it
         // shares the snapshot_id (joins to process/perf on ts). Only a coarse
         // destination CLASS (`remote_bucket`) is stored — never the raw remote
-        // address — and collection carries its own opt-in toggle + per-tick
+        // address — and collection carries its own toggle + per-tick
         // top-N cap (collector slice). Row-count retention bounds storage
         // deterministically regardless of connection churn.
         {
             .name = "netqual",
             .dollar_name = "NetQual",
-            // Opt-in (usage-class per-connection telemetry): disabled on a fresh
-            // agent, matching the explicit "false" collection gate.
-            .default_enabled = false,
             .os_support = {
                 {"linux",   OsSupportStatus::kSupported, "inetdiag",
                  "netlink SOCK_DIAG / INET_DIAG TCP_INFO dump (the interface "
@@ -533,26 +526,22 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // injection, and BYOVD surface $Process cannot answer. `module_dir` IS
         // captured (the hijack signal is the path, not a command line — a narrow,
         // deliberate divergence from the names-only process posture; no cmdline).
-        // M1 registers the schema queryable-empty; collectors are kPlanned until
-        // M2 (Windows ETW), M4/M5 (macOS ES), M6 (Linux auditd kmod). The high-
+        // M1 registered the schema queryable-empty; the Windows collector (M2, ETW)
+        // has shipped, macOS ES (M4/M5) and Linux auditd kmod (M6) are kPlanned. The high-
         // volume edge risk-filter that really bounds module_live ships with the
-        // first collector; opt-in (module_enabled, default off) like procperf.
+        // first collector; own `module_enabled` toggle, on by default.
         {
             .name = "module",
             .dollar_name = "Module",
-            // Opt-in (~100× process volume; ships disabled until an operator
-            // turns it on). default_enabled=false is what discharges the M1 §13
-            // condition that module_enabled must NOT read as true before a
-            // collector exists — it makes tar.status, retention, and the
-            // paused_at transition all agree the source starts disabled.
-            .default_enabled = false,
             .os_support = {
                 {"windows", OsSupportStatus::kSupported, "etw",
                  "Microsoft-Windows-Kernel-Process image-load events (IMAGE "
                  "keyword 0x40, events 5/6) on a dedicated ETW session; driver "
                  "loads surface as kernel image-loads (System pid). Signing is "
-                 "verified out-of-band at drain (WinVerifyTrust + CryptQueryObject "
-                 "signer, cached); module_dir is scrubbed of user-profile prefixes "
+                 "verified out-of-band at drain on a no-reparse handle (WinVerifyTrust "
+                 "+ the verification-chain signer, cached); an image on a network path "
+                 "or behind a symlink/junction is never verified and reads unknown. "
+                 "module_dir is scrubbed of user-profile prefixes "
                  "before storage. CodeIntegrity/Operational (3033/3034) blocked-load "
                  "overlay is M3."},
                 {"linux", OsSupportStatus::kPlanned, "auditd",
@@ -636,9 +625,8 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // point-in-time installed_apps inventory cannot answer. MACHINE SCOPE ONLY
         // (HKLM Uninstall): an event is the host's software, never attributed to a
         // Windows profile, so the capture carries no user identity / personal data
-        // (#1620). Opt-in (default_enabled=false): shipped disabled as the cautious
-        // posture for a new capture source — an operator turns it on per host via
-        // tar.configure software_enabled=true.
+        // (#1620). Ships enabled; an operator can turn it off per host via
+        // tar.configure software_enabled=false.
         //
         // Windows captures machine-wide (HKLM Uninstall 64-bit + WOW6432Node 32-bit).
         // Linux (dpkg/rpm) and macOS (pkgutil) are kPlanned (queryable-empty) until a
@@ -646,9 +634,6 @@ const std::vector<CaptureSourceDef>& build_sources() {
         {
             .name = "software",
             .dollar_name = "Software",
-            // Opt-in (cautious new-source posture): a fresh agent reports it disabled
-            // on tar.status, matching the explicit "false" collection gate.
-            .default_enabled = false,
             .os_support = {
                 {"windows", OsSupportStatus::kSupported, "registry",
                  "Registry Uninstall keys, polled-and-diffed on the tar.software "
@@ -711,15 +696,13 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // Host L2 adjacency: IP<->MAC bindings per interface. Snapshot-diff
         // appeared/removed keyed on the (interface, ip_address, mac_address)
         // binding — a changing entry_type on the same binding is a value update,
-        // not churn. Opt-in (default_enabled=false): low-PII infrastructure data
-        // but shipped disabled per the standing capture-source posture. Windows
+        // not churn. Ships enabled. Windows
         // (GetIpNetTable2), Linux (/proc/net/arp) and macOS (NET_RT_FLAGS
         // sysctl, constrained) are all wired (see docs/tar-implementer.md
         // "Adding a capture source").
         {
             .name = "arp",
             .dollar_name = "ARP",
-            .default_enabled = false,
             .os_support = {
                 {"windows", OsSupportStatus::kSupported,           "iphlpapi",
                  "GetIpNetTable2(AF_UNSPEC) — the kernel ARP / IPv6 neighbour "
@@ -780,12 +763,10 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // never join dns_live to a process by pid). Snapshot-diff appeared/removed
         // keyed on the (name, record_type, data) resolution; ttl_remaining_s is a
         // value field and is NOT part of the diff key (it decrements every tick
-        // and must not churn). Opt-in (usage-class PII — reveals visited domains).
-        // Windows only here; Linux/macOS kPlanned.
+        // and must not churn). Windows only here; Linux/macOS kPlanned.
         {
             .name = "dns",
             .dollar_name = "DNS",
-            .default_enabled = false,
             .os_support = {
                 {"windows", OsSupportStatus::kSupported,           "dnsapi",
                  "DnsGetCacheDataTable — the DNS client resolver cache. Full "
@@ -843,12 +824,10 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // PRIVACY: an allow-list parser extracts ONLY the enum/numeric fields
         // below; SSID, BSSID, profile names, interface GUIDs and MACs are
         // never extracted and the raw event XML is never persisted (stricter
-        // than the wifi plugin — this table ships fleet-wide). Opt-in like
-        // every usage-class source.
+        // than the wifi plugin — this table ships fleet-wide).
         {
             .name = "netconn",
             .dollar_name = "NetConn",
-            .default_enabled = false,
             .os_support = {
                 {"windows", OsSupportStatus::kSupported, "wevtapi",
                  "EvtQuery over the NetworkProfile / NCSI / WLAN-AutoConfig "
@@ -896,15 +875,12 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // event log; Linux fstab + Samba logs) as `origin='historical'` rows
         // — the `origin` column separates historically-inferred from
         // live-observed, and `historical` rows bypass the live diff entirely.
-        // Opt-in (default_enabled=false): rows expose usernames + share paths
-        // (identity/usage-class PII), shipped disabled per the standing
-        // capture-source posture (like arp/dns). macOS is outbound-live only
+        // Ships enabled. macOS is outbound-live only
         // via getfsstat — no inbound, no history (honestly out of reach for
         // an unprivileged agent; see the macOS os_support row below).
         {
             .name = "mapdrive",
             .dollar_name = "MapDrive",
-            .default_enabled = false,
             .os_support = {
                 {"windows", OsSupportStatus::kSupported,            "wnet",
                  "Outbound live: WNetOpenEnumW/WNetEnumResourceW + WNetGetUserW "
@@ -975,23 +951,12 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // the UNIQUE record_key index below (tar_cursor.hpp rule 3), not
         // cursor arithmetic.
         //
-        // ALEX RULING 2026-09-04 (overrides peer finding P-005 and the
-        // Architect's prior adoption of it): power AND removable ship
-        // default_enabled = TRUE. NOT the first default-on sources in the
-        // product -- process/tcp/service/user/perf have always been on, as
-        // machine-scope operational telemetry, and this file's own test
-        // (test_tar_schema_registry.cpp) asserts it. These are the first
-        // WORKS-COUNCIL-CLASS sources to ship enabled: of the eight added
-        // since 1.5 under the opt-in posture (procperf, netqual, module,
-        // software, arp, dns, netconn, mapdrive) every one defaults OFF, and
-        // power/removable are the first of THAT class to diverge. That divergence from the
-        // standing works-council opt-in posture is DELIBERATE and must be
-        // documented plainly in the user-manual pages and changelog, not
-        // quietly. The retrospective-reach control is retained:
-        // power_lookback_seconds (default 604800s / 7 days, 0 = forward-only)
-        // still lets an operator suppress historical backfill without
-        // disabling the source outright — same shape as netconn_lookback_
-        // seconds (ADR-0020).
+        // Every capture source ships default_enabled = TRUE (registry-wide
+        // invariant, test_tar_schema_registry.cpp). The retrospective-reach
+        // control is power_lookback_seconds (default 604800s / 7 days,
+        // 0 = forward-only): it lets an operator suppress historical backfill
+        // without disabling the source outright — same shape as
+        // netconn_lookback_seconds (ADR-0020).
         //
         // os_support: mechanisms are the 2026-09-04 measured bindings
         // (hardware-probe measurement, Wave 6); the collector ships in this
@@ -1040,8 +1005,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // `record_key` are forensic/value fields only, never identity
         // carriers. Replay idempotence via the UNIQUE record_key index below.
         //
-        // Ships default_enabled = TRUE — see the ALEX RULING note on `power`
-        // above; same divergence, same documentation obligation.
+        // Ships default_enabled = TRUE like every capture source.
         // removable_lookback_seconds (default 604800s, 0 = forward-only)
         // governs historical backfill the same way.
         //
@@ -1094,6 +1058,63 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 },
             },
         },
+        // ── registry (cursor-model seam, tar_cursor.hpp) — registry value and key
+        // changes under a curated persistence/policy watch list (HKLM and each
+        // loaded HKU hive): what changed, with its old and new value. LIVE TIER
+        // ONLY, no rollups (P-008, same rationale as power above). Mechanism: a
+        // RegNotifyChangeKeyValue subtree watch + a per-root baseline diff
+        // (tar_state `registry:<root>`). The actor columns are in the schema for
+        // writer attribution, which follows in a later change; until then they
+        // hold 0 / ''.
+        // Values are stored UNMASKED: `data`/`prev_data` are readable through
+        // tar.sql. Retention is a row count.
+        // Replay idempotence via the UNIQUE record_key index below.
+        {
+            .name = "registry",
+            .dollar_name = "Registry",
+            .default_enabled = true,
+            .unique_key_column = "record_key",
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported, "regnotify",
+                 "RegNotifyChangeKeyValue subtree watch + baseline diff (what changed, old/new "
+                 "value); cursor-model (tar_cursor.hpp). Rows carry no actor yet."},
+                {"linux",   OsSupportStatus::kUnsupported, "",
+                 "The Windows registry does not exist on this platform."},
+                {"macos",   OsSupportStatus::kUnsupported, "",
+                 "The Windows registry does not exist on this platform."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    .retention_default = 500000,
+                    .columns = {
+                        {"ts",                  "INTEGER"},
+                        {"snapshot_id",         "INTEGER"},
+                        {"hive",                "TEXT"},    // HKLM | HKU
+                        {"key_path",            "TEXT"},
+                        {"value_name",          "TEXT"},    // "" for key_removed / capture_gap
+                        {"action",              "TEXT"},    // added, changed, removed,
+                                                            // key_removed, capture_gap
+                        {"data_type",           "TEXT"},
+                        {"data",                "TEXT"},    // UNMASKED; '' when n/a (data_type '' = no value)
+                        {"data_size",           "INTEGER"},
+                        {"data_truncated",      "INTEGER"},
+                        {"prev_data_type",      "TEXT"},
+                        {"prev_data",           "TEXT"},
+                        {"prev_data_size",      "INTEGER"},
+                        {"prev_data_truncated", "INTEGER"},
+                        {"actor_pid",           "INTEGER"}, // 0 = unattributed
+                        {"actor_image",         "TEXT"},    // '' until a writer is attributed
+                        {"source",              "TEXT"},    // notify | reconcile
+                        {"observed_at",         "INTEGER"}, // unix ms the read saw it
+                        {"detail",              "TEXT"},    // the gap text; '' on a change row
+                        {"record_key",          "TEXT"},    // UNIQUE — replay idempotence
+                    },
+                },
+            },
+        },
+
         // ── Usage (Wave 7 PR7.2b) — DERIVED from `process`: a checked_
         // transaction fold (tar_usage.cpp run_usage_fold) pairs started/
         // stopped by (pid, exe_key) into runs; usage_live holds OPEN runs
@@ -1444,6 +1465,10 @@ bool is_queryable_table(std::string_view real_table_name) {
         // deleting tar.db, which destroys every OTHER source's history too.
         // Reading it exposes a source name, a position and updated_at; the
         // cursor payload is the source's own bookkeeping, not captured content.
+        // tar_state carries the registry baselines (`registry:<root>`, rendered
+        // values), readable here consistently with registry_live's own unmasked
+        // values; purge_source("registry") erases the table, the cursor row and
+        // every `registry:%` state row in one transaction.
         std::unordered_set<std::string> s{"tar_state", "tar_config", "tar_cursor"};
         for (const auto& [real, ref] : table_ref_map())
             s.insert(real);

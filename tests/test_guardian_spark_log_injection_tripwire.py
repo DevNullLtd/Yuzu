@@ -2,8 +2,8 @@
 """#4665 / #5513 tripwire: no NEW spdlog:: call prints a rule-id/Spark-key-shaped value, a claimed
 agent id, agent-supplied free text or store error text unwrapped.
 
-Seven checks, numbered in the order they appear below. Check 1 is the #4665 rule-id / Spark-key
-check; checks 2 to 7 are the #5513 agent-id, free-text and store-error checks.
+Eight checks, numbered in the order they appear below. Check 1 is the #4665 rule-id / Spark-key
+check; checks 2 to 8 are the #5513 agent-id, free-text and store-error checks.
 
 CHECK 1 (#4665). #4665 closed CWE-117 log-injection on operator-authored Guardian `rule_id` /
 Spark `key` (and the path/hive/service/unit-name values a Spark mechanism embeds
@@ -138,14 +138,14 @@ the wrap happens INSIDE the formatter:
 CHECK 2 (#5513): claimed agent ids in seven named files outside the
 Guardian/Spark basename family -- server/core/src/agent_service_impl.cpp,
 gateway_service_impl.cpp, agent_registry.cpp, custom_properties_store.cpp,
-custom_properties_routes.cpp, tag_store.cpp and config_routes.cpp (AGENT_ID_FILES). It flags a
+custom_properties_routes.cpp, tag_store.cpp and config_write.cpp (AGENT_ID_FILES). It flags a
 spdlog:: argument that is a request-derived agent id
 (`info.agent_id()`, `request->agent_id()`, `req->agent_id()`, a local alias bound from
 one of those in the same function, or the bare `agent_id` in the custom-properties
 files and tag_store.cpp, where the bare caller-supplied tag `key` is also matched; the bare `key`
 and `validation_regex` in custom_properties_store.cpp, the bare path parameter `key` in
 custom_properties_routes.cpp (the PUT 503 line) and the bare path parameter `key` in
-config_routes.cpp are matched the same way) and is
+config_write.cpp are matched the same way) and is
 not wholly a log_id_token / log_key_token / audit_token /
 onbehalf::sanitize_for_log call or the local `safe_agent_id`. It is LEXICAL: it reads
 argument text, not data flow, so an id reaching the log through a variable it cannot
@@ -179,7 +179,7 @@ reads argument text only: a value copied into a local under another name first i
 request-metadata session ids printed before their lookup, `sync.error()`-style fixed-text
 errors and member-form session reads other than `.gateway_node` are not tracked (lexical limit).
 
-CHECK 5 (UNSCANNED_LOGGING_FILES, the check 2 files except config_routes.cpp, which
+CHECK 5 (UNSCANNED_LOGGING_FILES, the check 2 files except config_write.cpp, which
 reads the default logger's level without logging through it, plus server/core/src/pg/pg_pool.cpp)
 fails on any
 logging FORM the scanner does not parse: an `SPDLOG_TRACE|DEBUG|INFO|WARN|ERROR|CRITICAL(`
@@ -198,7 +198,7 @@ pool's connection-failure text, which can carry libpq text) in custom_properties
 tag_store.cpp. It matches the call name only, with no data flow: a value copied into a local first
 is not seen, which is why pg_pool.cpp's connect-failure line (it prints a local `err` copied from
 PQerrorMessage) is wrapped by hand but not covered here. The same rule keyed on a store `.error()`
-argument covers config_routes.cpp and custom_properties_routes.cpp (STORE_ERROR_FILES), and the
+argument covers config_write.cpp and custom_properties_routes.cpp (STORE_ERROR_FILES), and the
 store result's `error` MEMBER (`res.error`, not a call) is covered in guardian_ingest.cpp
 (STORE_ERROR_MEMBER_FILES): an spdlog argument containing it must be wrapped.
 
@@ -216,6 +216,22 @@ whose format literal starts with "Gateway SendCommand" must wrap a response fram
 `.command_id()` accessor and any `.cluster_id` member or accessor; the expected target
 `expected_agent_id` comes from the session table and is not matched, and neither is the local
 `cmd_id` (a copy of the command id made before the print).
+
+CHECK 8 (GUARDIAN_RECONCILE_LOG_FILES, server/core/src/server.cpp and
+server/core/src/guardian_reconcile_flow.hpp) covers the Guardian push fan-out and the heartbeat
+reconcile flow. An spdlog:: statement whose format literal starts with "Guardian push:" (the fan-out
+in server.cpp) or "Guardian heartbeat reconcile:" or "Guardian: reconciled" (the flow header) must
+wrap, as a whole log_id_token / log_key_token call, any argument that is a bare `agent_id` (only
+`.size()`, `.empty()` and `.length()` on it are exempt), the bare push `scope` (the operator-supplied
+scope expression), `scope_degraded_detail`, a `.detail` member (a bundle load error), a store
+`.error()` result or a `.what()` message. It is lexical, like check 7: a literal that does not start
+with one of those prefixes, or a value copied into another local first, is not seen. The bare-name
+rules for `agent_id` and `scope` are scoped to those literals, so they do not apply to the rest of
+server.cpp.
+Each file must also still hold the statements the prefixes name (GUARDIAN_RECONCILE_ANCHORS: at
+least 6 "Guardian push:" in server.cpp; at least 1 each of "Guardian heartbeat reconcile:" and
+"Guardian: reconciled" in the flow header), else an ANCHOR hit is reported: a reworded literal
+would otherwise leave the rule matching nothing.
 
 WHAT CHECKS 2 TO 7 DELIBERATELY DO NOT COVER (session-resolved ids). Log lines that print an
 agent id read back from the session table or the enrollment store print it as stored: the
@@ -1074,7 +1090,7 @@ AGENT_ID_FILES: dict[str, tuple[str, ...]] = {
     "server/core/src/custom_properties_routes.cpp": ("agent_id", "key"),
     # `key` is the URL path parameter of PUT /api/config/{key}. The store `.error()` text this
     # file also logs is covered by STORE_ERROR_FILES below, not by this entry.
-    "server/core/src/config_routes.cpp": ("key",),
+    "server/core/src/config_write.cpp": ("key",),
 }
 
 # Any receiver, including a chained one such as `request->info().agent_id()`: the match starts at
@@ -1200,12 +1216,12 @@ PQ_ERROR_FILES: tuple[str, ...] = (
     "server/core/src/pg/pg_pool.cpp",
 )
 
-# Same rule, different marker: in config_routes.cpp the store's `.error()` text (which on the
+# Same rule, different marker: in config_write.cpp the store's `.error()` text (which on the
 # database-failure path carries a kRuntimeConfigDbErrorPrefix plus libpq text) must be wrapped
 # wherever it is an spdlog argument. custom_properties_routes.cpp is listed for the same reason:
 # its PUT 503 line and its POST property-schemas line print the store's `.error()` text.
 STORE_ERROR_FILES: tuple[str, ...] = (
-    "server/core/src/config_routes.cpp",
+    "server/core/src/config_write.cpp",
     "server/core/src/custom_properties_routes.cpp",
 )
 
@@ -1438,18 +1454,98 @@ def find_pki_signer_violations_in_text(text: str) -> list[tuple[int, str]]:
     return out
 
 
+# Check 8: the Guardian push fan-out (server.cpp) and the heartbeat reconcile flow
+# (guardian_reconcile_flow.hpp). Both print store error text, a bundle-load error detail and the
+# agent id; the fan-out also prints the operator-supplied push `scope`. Each must be wholly one
+# wrap call. The match is by the literal's prefix, so the bare-name rules do not reach the rest of
+# server.cpp (where `agent_id` and `scope` are common names).
+GUARDIAN_RECONCILE_LOG_FILES: tuple[str, ...] = (
+    "server/core/src/server.cpp",
+    "server/core/src/guardian_reconcile_flow.hpp",
+)
+_GUARDIAN_RECONCILE_LITERAL_PREFIXES = (
+    "Guardian push:",
+    "Guardian heartbeat reconcile:",
+    "Guardian: reconciled",
+)
+# Per file, the least number of spdlog statements whose literal starts with each prefix. The rule
+# matches by prefix, so rewording a literal (or moving the statements out of these files) would
+# leave it matching nothing and the group would pass silently; the minimums are the counts today.
+GUARDIAN_RECONCILE_ANCHORS: dict[str, tuple[tuple[str, int], ...]] = {
+    "server/core/src/server.cpp": (("Guardian push:", 6),),
+    "server/core/src/guardian_reconcile_flow.hpp": (
+        ("Guardian heartbeat reconcile:", 1),
+        ("Guardian: reconciled", 1),
+    ),
+}
+_GUARDIAN_RECONCILE_RAW_RE = re.compile(
+    r"(?<![\w.>:])(?:agent_id|scope)\b(?!\s*\.\s*(?:size|empty|length)\s*\()"
+    r"|\bscope_degraded_detail\b"
+    r"|(?:\.|->)\s*detail\b"
+    r"|(?:\.|->)\s*error\s*\(\s*\)"
+    r"|(?:\.|->)\s*what\s*\(\s*\)"
+)
+
+
+def find_guardian_reconcile_log_violations_in_text(text: str) -> list[tuple[int, str]]:
+    out: list[tuple[int, str]] = []
+    for pos, stmt in find_spdlog_statements_with_pos(text):
+        parsed = parse_call(stmt)
+        if parsed is None:
+            continue
+        if not parsed[0].lstrip().startswith(_GUARDIAN_RECONCILE_LITERAL_PREFIXES):
+            continue
+        for arg in split_top_level_args(parsed[1]):
+            if _GUARDIAN_RECONCILE_RAW_RE.search(arg) is not None and not argument_is_wrapped(arg):
+                out.append((text.count("\n", 0, pos) + 1, stmt))
+                break
+    return out
+
+
+def _guardian_reconcile_hits(
+    text: str,
+    rel: str,
+    anchors: "dict[str, tuple[tuple[str, int], ...]] | None" = None,
+) -> list[str]:
+    """Hits for check 8, plus an anchor check per file.
+
+    The anchor reports a file that no longer holds the minimum number of spdlog statements for a
+    listed literal prefix, so the rule gets re-pointed at the new wording instead of going quiet
+    (this is not a wrap violation). The count is lexical, like the rule: spdlog-shaped text inside
+    a comment or a string literal counts too.
+    """
+    hits = _fmt_stmt_hits(rel, find_guardian_reconcile_log_violations_in_text(text))
+    counts: dict[str, int] = {}
+    for _pos, stmt in find_spdlog_statements_with_pos(text):
+        parsed = parse_call(stmt)
+        if parsed is None:
+            continue
+        literal = parsed[0].lstrip()
+        for prefix in _GUARDIAN_RECONCILE_LITERAL_PREFIXES:
+            if literal.startswith(prefix):
+                counts[prefix] = counts.get(prefix, 0) + 1
+    for prefix, least in (GUARDIAN_RECONCILE_ANCHORS if anchors is None else anchors).get(rel, ()):
+        if counts.get(prefix, 0) < least:
+            hits.append(
+                f"{rel}: ANCHOR: fewer than {least} spdlog statement(s) start with \"{prefix}\" "
+                f"(found {counts.get(prefix, 0)}); re-point _GUARDIAN_RECONCILE_LITERAL_PREFIXES "
+                "(this is not a wrap violation)"
+            )
+    return hits
+
+
 # Check 5: logging forms the scanner above does not parse. find_spdlog_statements only
 # understands `spdlog::<level>(`, `spdlog::get(<name>)-><level>(` and `<logger>-><level>(`; any other form in the files of
 # the second check would print its arguments unexamined. They are absent today, so the guard
 # fails on any occurrence (a mention in a comment too: reword it) rather than trying to scan them.
-# config_routes.cpp is the one AGENT_ID_FILES member left out: it reads the default logger's LEVEL
+# config_write.cpp is the one AGENT_ID_FILES member left out: it reads the default logger's LEVEL
 # (`spdlog::default_logger()->level()`, line 38) to report the effective log level and never logs
 # through it, so the guard would fail on a non-logging use. Its spdlog:: calls are all the
 # `spdlog::<level>(` form the other rules parse.
 # server.cpp (PKI_SIGNER_FILES) is left out for the same reason: its one `default_logger` use is the
 # same kind of level read, not a log call.
 UNSCANNED_LOGGING_FILES: tuple[str, ...] = tuple(
-    f for f in AGENT_ID_FILES if f != "server/core/src/config_routes.cpp"
+    f for f in AGENT_ID_FILES if f != "server/core/src/config_write.cpp"
 ) + ("server/core/src/pg/pg_pool.cpp",)
 
 _UNSCANNED_LOGGING_FORM_RE = re.compile(
@@ -1927,7 +2023,7 @@ def _selfcheck() -> None:
         if find_pq_error_violations_in_text(src, markers):
             raise SystemExit(f"selfcheck: unexpected spaced-marker violation: {src!r}")
 
-    # 9b. The same rule keyed on a store `.error()` (config_routes.cpp).
+    # 9b. The same rule keyed on a store `.error()` (config_write.cpp).
     store_must_match = 'spdlog::error("write failed: {}", result.error());'
     if not find_pq_error_violations_in_text(store_must_match, (".error()",)):
         raise SystemExit(f"selfcheck: expected a store .error() violation: {store_must_match!r}")
@@ -2192,6 +2288,58 @@ def _selfcheck() -> None:
         if find_pki_signer_violations_in_text(src):
             raise SystemExit(f"selfcheck: unexpected PKI signer violation: {src!r}")
 
+    # 14. The Guardian push fan-out and reconcile flow rule (find_guardian_reconcile_log_violations_in_text).
+    reconcile_must_match = [
+        'spdlog::warn("Guardian push: list_rules degraded ({}) - aborting push (scope={})",'
+        " rules_result.error(), ::yuzu::log_key_token(scope));",
+        'spdlog::warn("Guardian push: list_rules degraded ({}) - aborting push (scope={})",'
+        " ::yuzu::log_key_token(rules_result.error()), scope);",
+        'spdlog::warn("Guardian push: target scope read degraded ({}) - aborting (scope={})",'
+        " resolved.error().detail, ::yuzu::log_key_token(scope));",
+        'spdlog::warn("Guardian heartbeat reconcile: policy generation unreadable ({}) - aborting'
+        ' re-push for agent_id={}", fresh_res.error(), ::yuzu::log_id_token(agent_id));',
+        'spdlog::warn("Guardian heartbeat reconcile: list_rules degraded ({}) - aborting re-push for'
+        ' agent_id={}", err.detail, ::yuzu::log_id_token(agent_id));',
+        'spdlog::warn("Guardian heartbeat reconcile: scope evaluation store degraded ({}) - aborting'
+        ' re-push for agent_id={}", scope_degraded_detail, ::yuzu::log_id_token(agent_id));',
+        'spdlog::info("Guardian heartbeat reconcile: agent_id={} re-registered", agent_id);',
+        'spdlog::info("Guardian: reconciled agent {} (generation {} -> {})", agent_id, agent_gen, g);',
+        'spdlog::warn("Guardian heartbeat reconcile: x {}", e.what());',
+        'spdlog::warn("Guardian heartbeat reconcile: x {}", err . detail);',
+    ]
+    for src in reconcile_must_match:
+        if not find_guardian_reconcile_log_violations_in_text(src):
+            raise SystemExit(f"selfcheck: expected a Guardian reconcile log violation: {src!r}")
+    reconcile_must_not = [
+        'spdlog::warn("Guardian push: list_rules degraded ({}) - aborting push (scope={})",'
+        " ::yuzu::log_key_token(rules_result.error()), ::yuzu::log_key_token(scope));",
+        'spdlog::warn("Guardian heartbeat reconcile: policy generation unreadable ({}) - aborting'
+        ' re-push for agent_id={}", ::yuzu::log_key_token(fresh_res.error()),'
+        " ::yuzu::log_id_token(agent_id));",
+        'spdlog::warn("Guardian heartbeat reconcile: list_rules degraded ({}) - aborting re-push for'
+        ' agent_id={}", ::yuzu::log_key_token(err.detail), ::yuzu::log_id_token(agent_id));',
+        'spdlog::warn("Guardian heartbeat reconcile: x {}", ::yuzu::log_key_token(scope_degraded_detail));',
+        'spdlog::info("Guardian: reconciled agent {} (generation {} -> {})",'
+        " ::yuzu::log_id_token(agent_id), agent_gen, fresh_generation);",
+        'spdlog::warn("Guardian heartbeat reconcile: n {}", agent_id.size());',
+        'spdlog::warn("Guardian heartbeat reconcile: shed {} so far", shed_so_far);',
+        # Not a Guardian reconcile line: the bare-name rules are deliberately not applied elsewhere.
+        'spdlog::warn("Agent {} did a thing ({})", agent_id, scope);',
+    ]
+    for src in reconcile_must_not:
+        if find_guardian_reconcile_log_violations_in_text(src):
+            raise SystemExit(f"selfcheck: unexpected Guardian reconcile log violation: {src!r}")
+    anchor_probe = {"anchor.cpp": (("Guardian push:", 2),)}
+    two = 'spdlog::info("Guardian push: a {}", 1); spdlog::info("Guardian push: b {}", 2);'
+    if not _guardian_reconcile_hits('spdlog::info("Reworded push: a {}", 1);', "anchor.cpp", anchor_probe):
+        raise SystemExit("selfcheck: a file with no Guardian push statement must be reported")
+    if not _guardian_reconcile_hits('spdlog::info("Guardian push: a {}", 1);', "anchor.cpp", anchor_probe):
+        raise SystemExit("selfcheck: a file below the minimum statement count must be reported")
+    if _guardian_reconcile_hits(two, "anchor.cpp", anchor_probe):
+        raise SystemExit("selfcheck: a file at the minimum statement count must not be reported")
+    if _guardian_reconcile_hits('spdlog::info("Reworded push: a {}", 1);', "other.cpp", anchor_probe):
+        raise SystemExit("selfcheck: a file with no anchor entry must not be reported")
+
 
 # ---------------------------------------------------------------------------
 # main
@@ -2345,6 +2493,13 @@ RULE_GROUPS: tuple[RuleGroup, ...] = (
         'spdlog::warn("PKI: sign_csr failed for agent {}", agent_id);',
     ),
     RuleGroup(
+        "GUARDIAN_RECONCILE_LOG_FILES",
+        lambda: GUARDIAN_RECONCILE_LOG_FILES,
+        lambda text, rel: _guardian_reconcile_hits(text, rel),
+        "agent",
+        'spdlog::warn("Guardian push: list_rules degraded ({}) - aborting push", r.error());',
+    ),
+    RuleGroup(
         "UNSCANNED_LOGGING_FILES",
         lambda: UNSCANNED_LOGGING_FILES,
         _find_unscanned,
@@ -2365,6 +2520,7 @@ REQUIRED_RULE_GROUPS: tuple[str, ...] = (
     "REGISTRY_FREE_TEXT_FILES",
     "COMMAND_TEXT_FILES",
     "PKI_SIGNER_FILES",
+    "GUARDIAN_RECONCILE_LOG_FILES",
     "UNSCANNED_LOGGING_FILES",
 )
 
