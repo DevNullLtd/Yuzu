@@ -3611,6 +3611,50 @@ TEST_CASE("AuthDB trigger validation is sticky once it observes tampering",
     CHECK(fresh.mfa_status("t1")->binding_enforced);
 }
 
+// cpps-3 / up-2 (#6079 Gate 3/4): an inconclusive validation must not be visible as "enforced" to
+// ANY caller. Only the compare-exchange winner runs the catalog query; before the latch the
+// losers (and every caller until the memo lapsed) read the stale "enforced". The forced-Unknown
+// seam stands in for a catalog query that cannot run.
+TEST_CASE("AuthDB inconclusive trigger validation reads not-enforced for every concurrent caller",
+          "[pg][auth_db][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    h.db.set_binding_validation_memo_for_test(std::chrono::milliseconds(60'000));
+    REQUIRE(h.db.upsert_user("u1", "h", "s", yuzu::server::auth::Role::user).has_value());
+    CHECK(h.db.mfa_status("u1")->binding_enforced); // memo armed, check Valid
+
+    h.db.set_binding_check_unknown_for_test(true); // memo due now; the next check is inconclusive
+    // The first read runs the (inconclusive) check and latches; only then do the racers start,
+    // so the assertion below is about the LATCH, not about who wins the very first exchange.
+    CHECK_FALSE(h.db.mfa_status("u1")->binding_enforced);
+    constexpr int kThreads = 16;
+    std::atomic<int> enforced{0};
+    std::atomic<int> failed{0};
+    {
+        std::vector<std::jthread> workers;
+        workers.reserve(kThreads);
+        for (int i = 0; i < kThreads; ++i) {
+            workers.emplace_back([&] {
+                for (int round = 0; round < 20; ++round) {
+                    auto s = h.db.mfa_status("u1");
+                    if (!s) {
+                        ++failed;
+                    } else if (s->binding_enforced) {
+                        ++enforced;
+                    }
+                }
+            });
+        }
+    } // jthreads join here, before any assertion
+    CHECK(failed.load() == 0);
+    CHECK(enforced.load() == 0); // a loser must not read "enforced" while the check cannot run
+
+    // Recovery: the latch clears on the next Valid check (the process was never poisoned).
+    h.db.set_binding_check_unknown_for_test(false);
+    CHECK(h.db.mfa_status("u1")->binding_enforced);
+    CHECK(h.db.mfa_binding_enforced());
+}
+
 TEST_CASE("AuthDB trigger validation latches (Invalid, sticky) on an AFTER or statement-level "
           "recreation",
           "[pg][auth_db][mfa_binding]") {

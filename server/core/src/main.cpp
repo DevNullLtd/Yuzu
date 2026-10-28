@@ -546,14 +546,13 @@ int main(int argc, char* argv[]) {
                    "Seconds after a TOTP proof that high-risk endpoints accept the session as "
                    "stepped-up (default: 300). A value <= 0 disables the stale-proof "
                    "requirement on the 35 ordinary step-up routes only: a stale or absent proof "
-                   "is neither refused nor recorded, SAML sessions and token principals pass "
-                   "those 35, and the auth store is not read; engine denials and unwired-store "
-                   "refusals still apply and are recorded. The two factor-credential routes "
-                   "(regenerate recovery codes, disable MFA) ignore a value <= 0 and always "
-                   "require a local session with a proof inside the approver window. "
-                   "Approval approve/reject always use that window too: an enrolled factor and "
-                   "a proof within min(this value, 300) seconds, or 300 seconds when this value "
-                   "is <= 0")
+                   "is neither refused nor recorded, SAML sessions pass, and the auth store is "
+                   "not read; engine denials and unwired-store refusals still apply and are "
+                   "recorded. Two route classes are NOT switched off by <= 0: approval "
+                   "approve/reject always need an enrolled factor and a proof within "
+                   "min(this value, 300) seconds, and the two factor-credential routes "
+                   "(regenerate recovery codes, disable MFA) always need a local session with a "
+                   "proof inside min(this value, 300) seconds")
         ->default_val(300)
         ->envname("YUZU_MFA_STEP_UP_WINDOW_SECS");
     app.add_option("--mfa-login-pending-secs", cfg.mfa_login_pending_secs,
@@ -1926,8 +1925,8 @@ int main(int argc, char* argv[]) {
         }
         // Audit is MANDATORY for break-glass: the whole point of #1226 is to
         // replace the manual-SQL path that left no evidence (SOC 2 CC6.6). The
-        // fail-closed gate is the INTENT row written below, before anything is
-        // mutated: if the audit store will not accept it, nothing is cleared. This
+        // fail-closed gate is the owner's audit INSERT inside the clear's transaction:
+        // if the audit store will not accept it, the whole clear rolls back. This
         // open-and-verify step only avoids a pointless attempt and gives the
         // operator an actionable error instead of a buried warning during a
         // stressful recovery.

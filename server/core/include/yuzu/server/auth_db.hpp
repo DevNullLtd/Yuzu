@@ -935,6 +935,10 @@ public:
     /// would. The write itself persists (counter advanced / code consumed / account enrolled).
     void set_commit_ack_lost_for_test(bool lost) noexcept;
 
+    /// Makes the next trigger validation in `mfa_status` come back inconclusive (as if the
+    /// catalog query could not run), until cleared. Production never sets it.
+    void set_binding_check_unknown_for_test(bool unknown) noexcept;
+
     /// Runs between `mfa_verify_enrollment`'s cryptographic check and its transaction, so a test
     /// can pause there and read the database clock or rotate the provisional secret.
     void set_enrolment_pre_txn_hook_for_test(std::function<void()> hook);

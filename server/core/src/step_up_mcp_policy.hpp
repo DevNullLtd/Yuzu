@@ -330,8 +330,13 @@ template <std::size_t Begin, std::size_t End>
         if (found < 0)
             return false;
         const StepUpPolicyEntry& twin = kStepUpPolicy[static_cast<std::size_t>(found)];
-        const bool twin_gates_or_pending =
-            twin.cls == StepUpClass::kRequired || twin.cls == StepUpClass::kPendingRuling;
+        // kFactorCredential twins gate too (local session only, #6079): an MCP tool that twins
+        // one of those two REST rows may not be declared exempt. The MCP table has no
+        // factor-credential class of its own, so such a twin stays kPendingRuling (refused as
+        // ungated) until that class is designed; see the ADR-1005 exception ledger.
+        const bool twin_gates_or_pending = twin.cls == StepUpClass::kRequired ||
+                                           twin.cls == StepUpClass::kFactorCredential ||
+                                           twin.cls == StepUpClass::kPendingRuling;
         if (twin_gates_or_pending && a.cls == StepUpClass::kExempt)
             return false;
     }

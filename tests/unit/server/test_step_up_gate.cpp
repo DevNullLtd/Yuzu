@@ -17,6 +17,7 @@
  */
 
 #include "../../../server/core/src/step_up_gate.hpp"
+#include "../../../server/core/src/step_up_wiring.hpp"
 #include "../../../server/core/src/step_up_policy.hpp"
 #include "../../../server/core/src/totp.hpp"
 
@@ -3310,6 +3311,25 @@ struct ChainFixture {
         return *codes;
     }
 
+    // What the production in-handler wrapper does for a kFactorCredential route after the
+    // chokepoint armed a pass: `run_in_handler_step_up` must consume that pass AND hand the
+    // admission back. A wrapper that forwards `nullptr` instead of the caller's `admitted`
+    // leaves the handler without the admitted generation, so both factor-credential routes
+    // answer 403 "not local" in production while every other test stays green (qe-Q1).
+    bool run_in_handler_admits(const std::string& token, StepUpAdmission& admitted) {
+        httplib::Response res;
+        const auto result = gate(token, "/api/settings/mfa/recovery-codes", res);
+        if (result != StepUpChokepointResult::kPassed)
+            return false;
+        const auto session = mgr.validate_session(token);
+        REQUIRE(session.has_value());
+        httplib::Response in_handler_res;
+        const DurableProofFn durable = durable_fn();
+        return detail::run_in_handler_step_up(
+            *pass_req, in_handler_res, *session, "POST /api/settings/mfa/recovery-codes", db.get(),
+            /*window_secs=*/300, audit_fn, "optional", &metrics, &durable, &admitted);
+    }
+
     // The ids of alice's stored recovery codes, in order: unchanged iff nothing was regenerated.
     std::string code_ids(const std::string& user = "alice") {
         auto lease = db.pool().acquire();
@@ -3420,6 +3440,18 @@ TEST_CASE("the chain: a survivor of a factor replacement cannot regenerate the r
     std::string ticket;
     CHECK(approve_or_reject(fx, "approve", legit, status, ticket) == "approved");
     CHECK(status == 200);
+}
+
+TEST_CASE("run_in_handler_step_up hands the armed pass's admission back to a factor-credential "
+          "handler (qe-Q1)",
+          "[pg][stepup][gate][binding][chain]") {
+    ChainFixture f; // alice is enrolled by the fixture
+    const auto token = f.session_bound();
+    StepUpAdmission admitted;
+    REQUIRE(f.run_in_handler_admits(token, admitted));
+    CHECK(admitted.local);
+    CHECK(admitted.factor_gen == f.gen_of("alice"));
+    CHECK(admitted.factor_gen > 0);
 }
 
 TEST_CASE("the legacy interleaving: a proof written by a replica that cannot bind is refused by "

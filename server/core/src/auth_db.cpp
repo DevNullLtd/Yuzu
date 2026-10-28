@@ -670,9 +670,15 @@ struct AuthDB::Impl {
     std::atomic<std::int64_t> binding_next_check_ns{0}; // steady_clock ns; 0 = due now
     std::atomic<std::int64_t> binding_memo_ns{
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::seconds(60)).count()};
+    // Set while the last validation could not run (BindingCheck::Unknown); cleared by the next
+    // Valid result. Every `mfa_status` reports "not enforced" while it is set, so a concurrent
+    // reader that lost the compare-exchange cannot read "enforced" in the window where the
+    // winner's check is inconclusive (mirrors SessionStore::last_validation_inconclusive_).
+    std::atomic<bool> binding_inconclusive{false};
 
     // Test seams (never set in production).
     std::atomic<bool> commit_ack_lost{false};
+    std::atomic<bool> force_binding_unknown{false}; // forces BindingCheck::Unknown in mfa_status
     std::mutex hook_mu;
     std::function<void()> enrolment_pre_txn_hook;
 
@@ -845,6 +851,13 @@ bool AuthDB::is_open() const noexcept { return is_ready(); }
 void AuthDB::set_commit_ack_lost_for_test(bool lost) noexcept {
     if (impl_)
         impl_->commit_ack_lost.store(lost, std::memory_order_release);
+}
+
+void AuthDB::set_binding_check_unknown_for_test(bool unknown) noexcept {
+    if (!impl_)
+        return;
+    impl_->force_binding_unknown.store(unknown, std::memory_order_release);
+    impl_->binding_next_check_ns.store(0); // due now
 }
 
 void AuthDB::set_enrolment_pre_txn_hook_for_test(std::function<void()> hook) {
@@ -1741,8 +1754,9 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
     // #6079: re-validate the generation trigger behind a steady-clock memo, on the lease already
     // held (never a second one, see above). Request-driven only: the cleanup cadence plays no
     // part. A query that RAN and found the trigger not in force flips the STICKY flag; a query
-    // that could not run reports "not enforced" for this read only and leaves the memo lapsed, so
-    // a transient blip neither poisons the process nor reads as enforced.
+    // that could not run latches `binding_inconclusive` (every read reports "not enforced" until a
+    // later check returns Valid) and leaves the memo lapsed, so a transient blip neither poisons
+    // the process nor reads as enforced.
     if (impl_->binding_ok.load(std::memory_order_acquire)) {
         const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch())
@@ -1752,8 +1766,12 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
         if (now_ns >= due &&
             impl_->binding_next_check_ns.compare_exchange_strong(
                 due, now_ns + impl_->binding_memo_ns.load(std::memory_order_relaxed))) {
-            switch (check_factor_trigger(lease.get())) {
+            const BindingCheck checked = impl_->force_binding_unknown.load(std::memory_order_acquire)
+                                             ? BindingCheck::Unknown
+                                             : check_factor_trigger(lease.get());
+            switch (checked) {
             case BindingCheck::Valid:
+                impl_->binding_inconclusive.store(false, std::memory_order_release);
                 break;
             case BindingCheck::Invalid:
                 impl_->binding_ok.store(false, std::memory_order_release);
@@ -1762,13 +1780,14 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
                               "decisions fail closed until the server restarts");
                 break;
             case BindingCheck::Unknown:
+                impl_->binding_inconclusive.store(true, std::memory_order_release);
                 impl_->binding_next_check_ns.store(0, std::memory_order_release); // retry next read
-                status.binding_enforced = false;
                 break;
             }
         }
     }
-    if (!impl_->binding_ok.load(std::memory_order_acquire))
+    if (!impl_->binding_ok.load(std::memory_order_acquire) ||
+        impl_->binding_inconclusive.load(std::memory_order_acquire))
         status.binding_enforced = false;
     return status;
 }
