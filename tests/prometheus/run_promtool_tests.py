@@ -62,6 +62,9 @@ synthetic docs with known answers - with no promtool, no docker and no network, 
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import os
 import re
 import shutil
@@ -183,11 +186,49 @@ def run(argv: list[str], timeout: int = 300, quiet: bool = False) -> tuple[int, 
 
 # `promtool test rules` runs its cases one after another in ONE process and is
 # CPU-bound (it builds a TSDB per case and evaluates every rule over each
-# window). Measured on 3.13.1, 273 cases / 181 rules: 54s as one process, 15.5s
-# as 4 parallel processes over a round-robin split - against a hard 120s ceiling
-# that the unsharded run was already brushing on dev (118s and 120.0s on green
-# runs). Capped at 4, the vCPU count of a public-repo GHA runner.
+# window). Measured with promtool 3.13.1 (the pinned image) on a local docker,
+# 289 cases / 181 rules: 69 s as one process, 23 s as 4 parallel processes over
+# a round-robin split. In CI the unsplit call ran 118 s and 120 s between its
+# logged command line and its result on two green docs-lint runs (40663221423,
+# 40688324438), against the 120 s per-call timeout below, and timed out on
+# others. Capped at min(4, os.cpu_count()): a public-repo ubuntu-24.04 runner
+# has 4 vCPUs (cflite-pr.yml). cpu_count ignores CPU affinity and cgroup quotas,
+# which only over-counts on a pinned box; the cap bounds that.
 TEST_SHARDS = max(1, min(4, os.cpu_count() or 1))
+
+
+def load_strict_yaml(text: str) -> dict | None:
+    """Parse `text`, or return None when it cannot be split SAFELY.
+
+    None means "let promtool read the original": PyYAML is missing, the text
+    does not parse, or a mapping repeats a key. The last one is why this is not
+    `yaml.safe_load`. promtool unmarshals strictly and REJECTS a repeated key
+    (`field interval already set in type main.testGroup`, rc 1, measured on
+    3.13.1), but `safe_load` silently keeps the last value, so re-serialising
+    such a file into shards turned a rejected test file into a green run and
+    dropped the earlier assertion. Sharding must never be a weaker parser than
+    the tool it feeds.
+    """
+    try:
+        import yaml
+    except ImportError:
+        return None
+
+    class Strict(yaml.SafeLoader):
+        def construct_mapping(self, node, deep=False):
+            if isinstance(node, yaml.MappingNode):
+                self.flatten_mapping(node)
+                keys = [self.construct_object(k, deep=True) for k, _ in node.value]
+                if len(set(keys)) != len(keys):
+                    raise yaml.constructor.ConstructorError(
+                        None, None, "duplicate mapping key", node.start_mark)
+            return super().construct_mapping(node, deep)
+
+    try:
+        doc = yaml.load(text, Loader=Strict)  # noqa: S506 - SafeLoader subclass
+    except (yaml.YAMLError, TypeError):
+        return None
+    return doc if isinstance(doc, dict) else None
 
 
 def run_test_rules(promtool_argv: list[str], tests_argv: str, tests_host: Path, *,
@@ -203,25 +244,25 @@ def run_test_rules(promtool_argv: list[str], tests_argv: str, tests_host: Path, 
 
     Returns `(rc, combined output)` like `run()`: rc is the first non-zero shard
     rc, and the output is every shard's, so `check_gate_output`'s "no file match
-    pattern" scan covers all of them. If PyYAML is missing, or there is one case
-    or fewer, it runs the file unsplit - `gate()`'s strict `inspect_test_file`
-    is what fails a run without PyYAML.
+    pattern" scan covers all of them. It runs the ORIGINAL file unsplit, so
+    promtool gives the verdict, when there is one case or fewer or
+    `load_strict_yaml` returns None (PyYAML missing, unparseable, a repeated
+    key). Without PyYAML `gate()`'s strict `inspect_test_file` then fails the
+    run.
     """
+    doc = None
     try:
-        import yaml
-        doc = yaml.safe_load(tests_host.read_text(encoding="utf-8"))
-    except ImportError:
-        doc = None
-    cases = doc.get("tests") if isinstance(doc, dict) else None
+        doc = load_strict_yaml(tests_host.read_text(encoding="utf-8"))
+    except OSError:
+        pass
+    cases = doc.get("tests") if doc is not None else None
     n = min(TEST_SHARDS, len(cases)) if isinstance(cases, list) else 1
     if n <= 1:
         return run(promtool_argv + ["test", "rules", tests_argv],
                    timeout=timeout, quiet=quiet)
 
+    import yaml
     shards = [cases[k::n] for k in range(n)]
-    if sum(len(sh) for sh in shards) != len(cases):
-        sys.exit("FAIL: test sharding dropped or duplicated cases; refusing to "
-                 "report a partial suite as the whole one.")
     argv_dir = tests_argv[:len(tests_argv) - len(Path(tests_argv).name)]
     paths: list[Path] = []
     try:
@@ -242,7 +283,10 @@ def run_test_rules(promtool_argv: list[str], tests_argv: str, tests_host: Path, 
                 paths))
     finally:
         for path in paths:
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass  # a transient hold (AV/indexer); .gitignore covers a leftover
     out = "".join(o if o.endswith("\n") or not o else o + "\n" for _, o in results)
     if out and not quiet:
         print(out, end="", flush=True)
@@ -856,6 +900,131 @@ def docker_argv(root: Path = REPO_ROOT) -> list[str]:
     ]
 
 
+# Fake promtool for `sharding_selftest`: argv[-1] is the file it was handed. It
+# logs that file's basename, case names and top-level keys, exits 1 if a case is
+# named FAIL*, and prints the no-match warning if one is named NOMATCH*.
+_FAKE_PROMTOOL = r'''
+import json, pathlib, sys, yaml
+p = pathlib.Path(sys.argv[-1]); d = yaml.safe_load(p.read_text())
+names = [c["name"] for c in d["tests"]]
+with open(LOG, "a") as fh:
+    fh.write(json.dumps({"file": p.name, "names": names,
+                         "top": {k: v for k, v in d.items() if k != "tests"}}) + "\n")
+if any(n.startswith("NOMATCH") for n in names):
+    print("WARNING: no file match pattern /w/gone.yml")
+if any(n.startswith("FAIL") for n in names):
+    print("  FAILED: boom"); sys.exit(1)
+print("  SUCCESS")
+'''
+
+
+def sharding_selftest(failures: list[str]) -> None:
+    """Drive `run_test_rules` against a fake promtool: no docker, no promtool.
+
+    Skipped when PyYAML is absent (the unsplit path is then all there is, and
+    `gate()` fails that case itself). Forces TEST_SHARDS so a 1-vCPU box still
+    exercises the sharded path.
+    """
+    global TEST_SHARDS, run
+    try:
+        import yaml
+    except ImportError:
+        print("note: sharding selftest skipped (PyYAML unavailable)", flush=True)
+        return
+    saved_shards, saved_run = TEST_SHARDS, run
+    top = {"rule_files": ["../../docs/x.yml"], "evaluation_interval": "1m"}
+
+    def fail(msg: str) -> None:
+        failures.append("run_test_rules: " + msg)
+
+    def go(tmp: Path, text: str, *, shards: int = 3):
+        global TEST_SHARDS
+        f = tmp / "t.test.yml"
+        f.write_text(text, encoding="utf-8")
+        log = tmp / "log.jsonl"
+        log.write_text("")
+        argv = [sys.executable, "-c", f"LOG={str(log)!r}\n" + _FAKE_PROMTOOL]
+        TEST_SHARDS = shards
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                res = run_test_rules(argv, str(f), f, timeout=60, quiet=True)
+            except BaseException as ex:  # noqa: BLE001 - reported as a failure
+                res = ex
+        recs = [json.loads(line) for line in log.read_text().splitlines()]
+        left = [q.name for q in tmp.iterdir() if q.name.startswith(".promtool-shard-")]
+        return res, recs, left, f
+
+    def doc(names: list[str]) -> str:
+        return yaml.safe_dump({**top, "tests": [{"name": n, "interval": "1m"}
+                                                for n in names]}, sort_keys=False)
+
+    names = [f"c{i}" for i in range(10)]
+    try:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_promtool_shard_") as td:
+            tmp = Path(td)
+            # Union of the shards == the original, no duplicate, none empty, the
+            # original never run, top-level keys verbatim, nothing left behind.
+            res, recs, left, f = go(tmp, doc(names))
+            seen = [n for r in recs for n in r["names"]]
+            if (isinstance(res, BaseException) or res[0] != 0 or sorted(seen) != sorted(names)
+                    or len(recs) != 3 or any(not r["names"] for r in recs)):
+                fail(f"partition wrong: {res!r} {recs!r}")
+            if any(r["file"] == f.name for r in recs):
+                fail("ran the unsplit file")
+            if any(r["top"] != top for r in recs):
+                fail("top-level keys not preserved in every shard")
+            if left:
+                fail(f"shard files left after success: {left}")
+            # A failing case in EVERY shard position reddens the run.
+            for pos in range(3):
+                nm = list(names)
+                nm[pos] = "FAIL"
+                res, _, left, _ = go(tmp, doc(nm))
+                if isinstance(res, BaseException) or res[0] == 0 or "FAILED" not in res[1]:
+                    fail(f"failing case in shard {pos} did not redden: {res!r}")
+                if left:
+                    fail("shard files left after a failing shard")
+            # The no-match warning from a NON-first shard survives into the output.
+            nm = list(names)
+            nm[2] = "NOMATCH"
+            res, *_ = go(tmp, doc(nm))
+            if isinstance(res, BaseException) or "no file match pattern" not in res[1]:
+                fail("no-match warning from a later shard was lost")
+            # An exception while running still removes the shard files.
+            def boom(argv, timeout=300, quiet=False):
+                raise RuntimeError("x")
+            run = boom
+            try:
+                res, _, left, _ = go(tmp, doc(names))
+            finally:
+                run = saved_run
+            if not isinstance(res, RuntimeError):
+                fail("an exception was not propagated")
+            if left:
+                fail(f"shard files left after an exception: {left}")
+            # Runs the ORIGINAL file unsplit: one case; a repeated key (promtool
+            # rejects it, a PyYAML round-trip would silently drop one value);
+            # unparseable text; PyYAML unavailable.
+            for label, text in (
+                    ("one case", doc(["only"])),
+                    ("a repeated key", "rule_files: []\ntests:\n- name: a\n"
+                     "  alert_rule_test: [1]\n  alert_rule_test: [2]\n- name: b\n"),
+                    ("unparseable", "tests: [\n")):
+                res, recs, _, f = go(tmp, text)
+                if [r["file"] for r in recs if "file" in r] not in ([f.name], []):
+                    fail(f"{label}: file was re-serialised into shards")
+            saved_yaml = sys.modules.get("yaml")
+            sys.modules["yaml"] = None  # makes `import yaml` raise ImportError
+            try:
+                res, recs, _, f = go(tmp, doc(names))
+            finally:
+                sys.modules["yaml"] = saved_yaml
+            if isinstance(res, BaseException) or [r["file"] for r in recs] != [f.name]:
+                fail("PyYAML unavailable did not run the unsplit file")
+    finally:
+        TEST_SHARDS, run = saved_shards, saved_run
+
+
 def selftest() -> int:
     """No promtool, no docker, no network. It DOES read the repo tree:
     `inspect_test_file()` opens the shipped test file and can exit on a broken
@@ -1029,6 +1198,8 @@ def selftest() -> int:
     good = extract_marked_block(f"  {B}\n  # - name: x\n  #   rules: []\n  #\n  {E}\n",
                                 B, E)
     check("clean extraction", good, "- name: x\n  rules: []\n")
+
+    sharding_selftest(failures)
 
     for f in failures:
         print(f"SELFTEST FAIL: {f}", flush=True)
