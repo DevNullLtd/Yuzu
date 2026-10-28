@@ -2239,6 +2239,19 @@ and the boot warning for a channel with more than one connection (`docs/user-man
 per-endpoint signals once item 2 lands; a fleet-wide simultaneous breaker open is the signature of a shared
 cause (the database pair), not of one bad server, and the runbook should say so.
 
+### 7h. Transport security and topology (ADR-0074, 2026-10-28)
+
+**Status: proposed with ADR-0074; to be ratified at the end of its wave 0.** Added by Nathan Dornbrook. This section records what ADR-0074 settles in this ADR's terms; the decisions themselves and their reasons are in ADR-0074.
+
+- **Section 2 stands.** In HA every agent terminates on a gateway. ADR-0074 adds mutual TLS at that edge: a separate enrollment port, and a main port that requires a client certificate (ADR-0074 D2).
+- **Section 7g, item 3 (#5649), direction chosen:** each agent's stream goes to one server chosen by consistent hashing on `agent_id`, so the reconcile is sticky on the gateway side (ADR-0074 D12). It must still be shown correct when an agent's owning server changes (server loss or drain).
+- **Section 7g, gateways find servers by DNS,** and agents find their first gateway by DNS (ADR-0074 D9, D12).
+- **Agent-to-cluster affinity (#4669, the sticky `home_cluster_id`) is to be relaxed, not removed yet.** Draining moves agents across gateways and possibly clusters (ADR-0074 D11). The proposal: once the server can verify an agent's own proof end to end (ADR-0074 D5), it admits the agent through any gateway, and affinity becomes a placement preference. Until then affinity stays an admission rule.
+- **Section 8, PKI:** the CA issues SPIFFE-form identities, 24-hour agent certificates and 7-day gateway and server certificates, from the Yuzu root or a customer-signed intermediate. Gateways pull the CRL that `CaStore::publish_next_crl` publishes. A daily certificate instead of a yearly one raises issuance about 365-fold, so the signing path and CRL size must be measured before the agent edge changes (ADR-0074 D3, D4, D6, D7).
+- **Sections 10 and 13, Postgres:** ratified as one synchronous standby plus asynchronous ones, never degrading to the primary alone; RPO zero for acknowledged writes; write downtime under 60 seconds; no standby reads in the first version; one DNS name or a multi-host DSN with `target_session_attrs=read-write`. Patroni is the on-premises reference (ADR-0074 D13).
+- **Gateway drain** is a new operator action through the server: weight zero, GOAWAY in staggered batches over a window, and results accepted through a different gateway than the one that carried the command (ADR-0074 D11). It relies on WS-0's durable command idempotency.
+- **Gateway-to-gateway:** an Erlang cluster only inside a corporate network, over TLS distribution; coordination through the server everywhere else (ADR-0074 D10).
+
 ### 8. PKI / CA high availability (Q8)
 Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced *(the
 "collapse into the KEK problem" framing and the first two bullets are superseded — see the Update
