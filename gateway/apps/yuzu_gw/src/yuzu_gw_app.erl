@@ -26,12 +26,14 @@
 -export([check_upstream_tls_posture/0, check_upstream_channel_mix/0, warn_replaced_options/0,
          check_upstream_tls_files/0]).
 -export([evaluate_upstream_posture/2, evaluate_listeners/1]).             %% for testing
--export([evaluate_mgmt_posture/3, apply_listener_port_overrides/0]).      %% for testing
+-export([evaluate_mgmt_posture/3, evaluate_mgmt_posture/4,
+         apply_listener_port_overrides/0]).                                %% for testing
 -export([check_legacy_grpcbox_servers/0, check_legacy_grpcbox_client/0,
          legacy_grpcbox_in_files/2, check_grpc_listeners/0,
          check_upstream_client_config/0,
          check_mgmt_listener_posture/0, check_memory_shedding/0,
-         check_mgmt_pin_refresh/0]).                                      %% for testing
+         check_mgmt_pin_refresh/0, check_mgmt_auth_config/0,
+         startup_guards/0]).                                               %% for testing
 -export([evaluate_cluster_id/2, evaluate_cluster_id/3]).                  %% for testing
 -export([apply_env_overrides/1]).                                          %% for testing
 
@@ -89,15 +91,22 @@ do_start_guarded() ->
     %% cookie guard, rather than booting with only a log warning. PLAINTEXT upstream
     %% is still allowed (the legitimate UAT/dev posture); only the "TLS but
     %% unauthenticated" footgun is refused.
-    run_guards([fun check_grpc_listeners/0,
-                fun check_upstream_client_config/0,
-                fun check_upstream_channel_mix/0,
-                fun check_upstream_tls_posture/0,
-                fun check_upstream_tls_files/0,
-                fun check_mgmt_listener_posture/0,
-                fun check_mgmt_pin_refresh/0,
-                fun check_memory_shedding/0],
-               fun do_start_services/0).
+    run_guards(startup_guards(), fun do_start_services/0).
+
+%% The boot guards, in order. check_mgmt_auth_config/0 publishes the management
+%% peer authorization that check_mgmt_listener_posture/0 then judges, so it must
+%% come first; exported so a test can pin both facts.
+-spec startup_guards() -> [fun(() -> ok | {error, term()})].
+startup_guards() ->
+    [fun ?MODULE:check_grpc_listeners/0,
+     fun ?MODULE:check_upstream_client_config/0,
+     fun ?MODULE:check_upstream_channel_mix/0,
+     fun ?MODULE:check_upstream_tls_posture/0,
+     fun ?MODULE:check_upstream_tls_files/0,
+     fun ?MODULE:check_mgmt_auth_config/0,
+     fun ?MODULE:check_mgmt_listener_posture/0,
+     fun ?MODULE:check_mgmt_pin_refresh/0,
+     fun ?MODULE:check_memory_shedding/0].
 
 run_guards([], Next) ->
     Next();
@@ -309,6 +318,9 @@ stop(_State) ->
     %% reports are redacted too.
     ok = yuzu_gw_crash_redact:remove(),
     ok = yuzu_gw_conn_watch:remove(),
+    %% The management peer authorization published at boot describes the listeners
+    %% that just went down; a later start resolves and publishes its own.
+    ok = yuzu_gw_mgmt_identity:reset(),
     logger:info("Gateway shutdown complete"),
     ok.
 
@@ -1234,6 +1246,126 @@ check_mgmt_pin_refresh() ->
             {error, bad_mgmt_pin_refresh_ms}
     end.
 
+%% @doc Fail-closed guard (#6016): resolve the management peer authorization
+%% (`mgmt_peer_auth_mode', `mgmt_peer_identity', `mgmt_peer_denied') and publish
+%% it for yuzu_gw_authz, whose per-stream check does no I/O. A mode that is not
+%% one of the three, an explicit identity that is not `yuzu://<install>/server',
+%% a deny entry that is not a hex serial, and two management listeners that
+%% derive different identities each refuse the boot. An identity that merely
+%% cannot be derived (a CA bundle, an unreadable file) is not refused here: the
+%% posture guard decides whether the listener may run without it, and the check
+%% rejects every peer that needs it (`identity_unresolved').
+-spec check_mgmt_auth_config() -> ok | {error, bad_mgmt_peer_auth}.
+check_mgmt_auth_config() ->
+    case yuzu_gw_mgmt_identity:resolve() of
+        {ok, #{mode := Mode, identity := Identity, denied := Denied} = State} ->
+            ok = yuzu_gw_mgmt_identity:publish(State),
+            Pins = application:get_env(yuzu_gw, mgmt_peer_pins, []),
+            %% Only a management listener that runs the auth_fun needs the identity;
+            %% a plaintext lab-rig listener has none to resolve and nothing to warn of.
+            Guarded = lists:any(fun(S) -> maps:get(auth_fun, S, undefined) =/= undefined end,
+                                mgmt_listener_entries()),
+            case Mode =:= pin andalso
+                 application:get_env(yuzu_gw, mgmt_peer_identity, undefined) =/= undefined of
+                true ->
+                    logger:warning(
+                      "{yuzu_gw, mgmt_peer_identity} is set but mgmt_peer_auth_mode is "
+                      "pin (the default), so the identity is ignored and only a pin "
+                      "admits the server. Set mgmt_peer_auth_mode to identity_or_pin or "
+                      "identity to use the identity.");
+                false ->
+                    ok
+            end,
+            case Guarded andalso Mode =/= pin andalso Identity =:= undefined of
+                true ->
+                    logger:warning(
+                      "Management peer authorization mode ~p could not resolve the "
+                      "server identity (no management listener whose cacertfile holds "
+                      "exactly one certificate, and no {yuzu_gw, mgmt_peer_identity}): "
+                      "~s. Set {yuzu_gw, mgmt_peer_identity} to "
+                      "yuzu://<install>/server.",
+                      [Mode, case Mode of
+                                 identity -> "every management peer is refused "
+                                             "(identity_unresolved)";
+                                 identity_or_pin -> "only a pinned key is admitted"
+                             end]);
+                false ->
+                    ok
+            end,
+            warn_identity_differs(Mode, Identity),
+            log_denied(Denied),
+            logger:info("Management peer authorization: mode=~p identity=~s pins=~p "
+                        "denied_serials=~p",
+                        [Mode,
+                         case {Mode, Identity} of
+                             {pin, _}       -> "not used (mode pin)";
+                             {_, undefined} -> "unresolved";
+                             _              -> "resolved"
+                         end,
+                         try length(Pins) catch _:_ -> invalid end,
+                         length(Denied)]),
+            ok;
+        {error, Defects} ->
+            logger:critical(
+              "Refusing to start: invalid management peer authorization "
+              "configuration: ~p. mgmt_peer_auth_mode must be pin, identity_or_pin or "
+              "identity; mgmt_peer_identity must be yuzu://<install>/server; "
+              "mgmt_peer_denied must be a list of {serial, Hex} (1 to 40 hex digits, at most 4096 entries); "
+              "management listeners must not derive different identities; an "
+              "identity over a CA bundle needs mode identity AND a configured pin "
+              "(identity_over_ca_bundle). See docs/user-manual/gateway.md.", [Defects]),
+            {error, bad_mgmt_peer_auth}
+    end.
+
+%% An explicit mgmt_peer_identity that is not the identity the management
+%% listener's own cacertfile derives is almost always a typo, a lower-case copy
+%% of the fingerprint (the server mints UPPER-case hex) or a value left over from
+%% before a CA re-root: no peer can match it, so say so at boot rather than at
+%% the first refused command. Not a refusal: a deliberate value is possible.
+warn_identity_differs(pin, _Identity) ->
+    ok;
+warn_identity_differs(_Mode, undefined) ->
+    ok;
+warn_identity_differs(_Mode, Identity) ->
+    case yuzu_gw_mgmt_identity:derive_for_listeners(application:get_env(yuzu_gw, grpc_listeners, [])) of
+        {ok, Derived} when is_binary(Derived), Derived =/= Identity ->
+            Hint = case string:lowercase(Derived) =:= string:lowercase(Identity) of
+                       true  -> " (they differ only in letter case: the install id is UPPER-case hex)";
+                       false -> ""
+                   end,
+            logger:warning("{yuzu_gw, mgmt_peer_identity} (~s) is not the identity derived from "
+                           "the management listener's cacertfile (~s)~s: no peer certificate "
+                           "of this install will match it. Correct it, or remove it to use "
+                           "the derived one.", [Identity, Derived, Hint]);
+        _ ->
+            ok
+    end.
+
+%% The deny-list as parsed: the canonical upper-case hex of each serial, so an
+%% operator who wrote a DECIMAL serial (read as hex) sees what is actually denied.
+%% Serials are public certificate fields, not secrets; bounded to 20 on the line.
+log_denied([]) ->
+    ok;
+log_denied(Denied) ->
+    Shown = lists:sublist(Denied, 20),
+    %% Each entry in hex, with the decimal it equals: an operator who wrote a decimal
+    %% serial (read as hex) sees at once that it is not the number they meant.
+    logger:info("Management peer deny-list (serials, upper-case hex as parsed): ~s~s",
+                [lists:join(", ", [[integer_to_list(N, 16), " (decimal ", integer_to_list(N), ")"]
+                                   || N <- Shown]),
+                 case length(Denied) > 20 of true -> ", ..."; false -> "" end]).
+
+%% The configured management_pb listener entries ([] for an unusable listeners value).
+mgmt_listener_entries() ->
+    case application:get_env(yuzu_gw, grpc_listeners, []) of
+        L when is_list(L) ->
+            case yuzu_grpc_listener:proper_list(L) of
+                true -> [S || S <- L, is_map(S), is_mgmt_listener(S)];
+                false -> []
+            end;
+        _ -> []
+    end.
+
 %% @doc Pure listener-configuration decision -- exported for testing. A defect
 %% is `{Name, Reason}' (Name is `unknown' for an entry that has none): the
 %% entry's own validation (yuzu_grpc_listener:validate/1), the route table it
@@ -1289,7 +1421,8 @@ listeners_have_tls(_) ->
 
 %% @private Fail-closed guard for the PRIVILEGED command plane: refuse to boot
 %% when a management_pb listener is network-reachable without the full #1422
-%% posture (strict mTLS + the SPKI-pin auth_fun + configured pins). A
+%% posture (strict mTLS + the approved auth_fun + a way to admit the server:
+%% pins and/or a resolved identity, per `mgmt_peer_auth_mode'). A
 %% mgmt listener without it hands fleet-wide command execution to any peer
 %% that can reach the port -- the finding this guard makes non-recurring.
 %%
@@ -1305,7 +1438,7 @@ check_mgmt_listener_posture() ->
     Listeners = application:get_env(yuzu_gw, grpc_listeners, []),
     Pins = application:get_env(yuzu_gw, mgmt_peer_pins, []),
     Allow = application:get_env(yuzu_gw, allow_insecure_mgmt, false) =:= true,
-    case evaluate_mgmt_posture(Listeners, Pins, Allow) of
+    case evaluate_mgmt_posture(Listeners, Pins, Allow, yuzu_gw_mgmt_identity:current()) of
         ok ->
             ok;
         {ok_insecure, Details} ->
@@ -1321,7 +1454,9 @@ check_mgmt_listener_posture() ->
                 "reachable without the required posture (a `tls' map with "
                 "certfile+keyfile+cacertfile, verify_peer, fail_if_no_peer_cert, "
                 "auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1, no proxied "
-                "origin, and non-empty {yuzu_gw, mgmt_peer_pins}). Anyone reaching "
+                "origin, and a way to admit the server: non-empty "
+                "{yuzu_gw, mgmt_peer_pins} (mode pin), a resolvable server identity "
+                "(mode identity), or either (mode identity_or_pin)). Anyone reaching "
                 "this port could otherwise command the entire fleet (#1422). Fix "
                 "the grpc_listeners entry (see config/sys.config.prod), bind it to "
                 "loopback, or -- isolated lab/UAT rigs ONLY -- set "
@@ -1334,24 +1469,33 @@ check_mgmt_listener_posture() ->
 %% refusal into {ok_insecure, Details} (boot + warn), never a silent pass.
 -spec evaluate_mgmt_posture(term(), term(), boolean()) ->
           ok | {ok_insecure, [term()]} | {error, {insecure_mgmt_listener, [term()]}}.
-evaluate_mgmt_posture([_ | _] = Listeners, Pins, Allow) ->
+evaluate_mgmt_posture(Listeners, Pins, Allow) ->
+    evaluate_mgmt_posture(Listeners, Pins, Allow,
+                          #{mode => pin, identity => undefined, denied => []}).
+
+%% @doc As evaluate_mgmt_posture/3, with the resolved peer authorization
+%% (yuzu_gw_mgmt_identity): what must be configured to admit the server depends
+%% on the mode. Exported for testing.
+-spec evaluate_mgmt_posture(term(), term(), boolean(), yuzu_gw_mgmt_identity:state()) ->
+          ok | {ok_insecure, [term()]} | {error, {insecure_mgmt_listener, [term()]}}.
+evaluate_mgmt_posture([_ | _] = Listeners, Pins, Allow, Auth) ->
     case yuzu_grpc_listener:proper_list(Listeners) of
-        true -> mgmt_posture(Listeners, Pins, Allow);
+        true -> mgmt_posture(Listeners, Pins, Allow, Auth);
         %% An improper list cannot be walked, so no listener can be shown NOT to
         %% be a management one: refused, whatever the escape hatch says.
         false -> {error, {insecure_mgmt_listener, [{unknown, improper_list}]}}
     end;
-evaluate_mgmt_posture(_Listeners, _Pins, _Allow) ->
+evaluate_mgmt_posture(_Listeners, _Pins, _Allow, _Auth) ->
     %% No listeners, or an unrecognisable listeners config: nothing provably
     %% exposes management_pb (evaluate_listeners/1 refuses an unusable one
     %% separately).
     ok.
 
-mgmt_posture(Listeners, Pins, Allow) ->
+mgmt_posture(Listeners, Pins, Allow, Auth) ->
     Details = [{listener_port(S), D}
                || S <- Listeners, is_mgmt_listener(S),
                   not loopback_bound(S),
-                  D <- [mgmt_defects(S, Pins)],
+                  D <- [mgmt_defects(S, Pins, Auth)],
                   D =/= []],
     case {Details, Allow} of
         {[], _}     -> ok;
@@ -1405,12 +1549,13 @@ loopback_bound_listen(Listen) ->
 %% (yuzu_grpc_listener:validate/1), so there is no "cert material but plaintext"
 %% state to catch. TLS with verify_none would let a self-signed cert reach the
 %% auth_fun, and without fail_if_no_peer_cert a certless peer skips it entirely
-%% -- both count as defects. The auth_fun must be exactly the approved pin
-%% callback, the pin set non-empty, and the origin the TCP peer: this plane takes
+%% -- both count as defects. The auth_fun must be exactly the approved callback,
+%% there must be a way to admit the server (no_admission_path/3), and the origin
+%% must be the TCP peer: this plane takes
 %% its authority from the certificate, and a proxied listener would not be
 %% reachable by the server's own client.
--spec mgmt_defects(map(), term()) -> [atom()].
-mgmt_defects(S, Pins) ->
+-spec mgmt_defects(map(), term(), yuzu_gw_mgmt_identity:state()) -> [atom()].
+mgmt_defects(S, Pins, Auth) ->
     Tls = maps:get(tls, S, undefined),
     IsTls = is_map(Tls),
     HasMaterial = IsTls andalso lists:all(fun(K) -> has_material(K, Tls) end,
@@ -1424,6 +1569,8 @@ mgmt_defects(S, Pins) ->
         false -> undefined
     end,
     Origin = maps:get(origin, S, #{mode => transport}),
+    Mode = maps:get(mode, Auth, pin),
+    Identity = maps:get(identity, Auth, undefined),
     Checks =
         [{plaintext, not IsTls},
          {missing_cert_material, IsTls andalso not HasMaterial},
@@ -1431,9 +1578,25 @@ mgmt_defects(S, Pins) ->
          {peer_cert_not_required, IsTls andalso FailNoPeer =/= true},
          {missing_or_wrong_auth_fun,
           maps:get(auth_fun, S, undefined) =/= fun yuzu_gw_authz:check_mgmt_peer/1},
-         {no_mgmt_peer_pins, not (is_list(Pins) andalso Pins =/= [])},
+         {auth_defect_name(Mode), no_admission_path(Mode, Pins, Identity)},
          {proxied_origin, not (is_map(Origin) andalso maps:get(mode, Origin, undefined) =:= transport)}],
     [Defect || {Defect, true} <- Checks].
+
+%% Nothing could admit the server in this mode: no pin in `pin'; no resolved
+%% identity in `identity' (a configured pin is an extra constraint there, never a
+%% way in); neither in `identity_or_pin'.
+no_admission_path(Mode, Pins, Identity) ->
+    HasPins = is_list(Pins) andalso Pins =/= [],
+    HasIdentity = is_binary(Identity),
+    case Mode of
+        identity_or_pin -> not (HasPins orelse HasIdentity);
+        identity -> not HasIdentity;
+        _ -> not HasPins
+    end.
+
+auth_defect_name(identity)        -> no_mgmt_peer_identity;
+auth_defect_name(identity_or_pin) -> no_mgmt_peer_pins_or_identity;
+auth_defect_name(_)               -> no_mgmt_peer_pins.
 
 %% "mutual-TLS" is said only when the gateway also PRESENTS a certificate on
 %% every endpoint (certfile + keyfile); a verified channel without one
