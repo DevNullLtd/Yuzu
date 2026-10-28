@@ -68,6 +68,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import NamedTuple
 
@@ -178,6 +179,74 @@ def run(argv: list[str], timeout: int = 300, quiet: bool = False) -> tuple[int, 
     if out and not quiet:
         print(out, end="" if out.endswith("\n") else "\n", flush=True)
     return proc.returncode, out
+
+
+# `promtool test rules` runs its cases one after another in ONE process and is
+# CPU-bound (it builds a TSDB per case and evaluates every rule over each
+# window). Measured on 3.13.1, 273 cases / 181 rules: 54s as one process, 15.5s
+# as 4 parallel processes over a round-robin split - against a hard 120s ceiling
+# that the unsharded run was already brushing on dev (118s and 120.0s on green
+# runs). Capped at 4, the vCPU count of a public-repo GHA runner.
+TEST_SHARDS = max(1, min(4, os.cpu_count() or 1))
+
+
+def run_test_rules(promtool_argv: list[str], tests_argv: str, tests_host: Path, *,
+                   timeout: int, quiet: bool = False) -> tuple[int, str]:
+    """`promtool test rules` over `tests_host`, split across parallel processes.
+
+    `tests_argv` is the same file as promtool sees it (a /w/... path under
+    docker, the host path natively); `tests_host` is where THIS process can read
+    it. Each shard is a copy holding a subset of the cases and every other
+    top-level key verbatim, written BESIDE the original so its `rule_files:`
+    resolves to the same rules file - promtool resolves it relative to the test
+    file. A shard is deleted when the run ends.
+
+    Returns `(rc, combined output)` like `run()`: rc is the first non-zero shard
+    rc, and the output is every shard's, so `check_gate_output`'s "no file match
+    pattern" scan covers all of them. If PyYAML is missing, or there is one case
+    or fewer, it runs the file unsplit - `gate()`'s strict `inspect_test_file`
+    is what fails a run without PyYAML.
+    """
+    try:
+        import yaml
+        doc = yaml.safe_load(tests_host.read_text(encoding="utf-8"))
+    except ImportError:
+        doc = None
+    cases = doc.get("tests") if isinstance(doc, dict) else None
+    n = min(TEST_SHARDS, len(cases)) if isinstance(cases, list) else 1
+    if n <= 1:
+        return run(promtool_argv + ["test", "rules", tests_argv],
+                   timeout=timeout, quiet=quiet)
+
+    shards = [cases[k::n] for k in range(n)]
+    if sum(len(sh) for sh in shards) != len(cases):
+        sys.exit("FAIL: test sharding dropped or duplicated cases; refusing to "
+                 "report a partial suite as the whole one.")
+    argv_dir = tests_argv[:len(tests_argv) - len(Path(tests_argv).name)]
+    paths: list[Path] = []
+    try:
+        for sh in shards:
+            fd, name = tempfile.mkstemp(dir=tests_host.parent, prefix=".promtool-shard-",
+                                        suffix=".test.yml")
+            path = Path(name)
+            paths.append(path)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                yaml.safe_dump({**doc, "tests": sh}, fh, sort_keys=False)
+            # Same umask hazard as build_canary_tree: uid 65534 must be able to
+            # read it through the read-only mount.
+            path.chmod(0o644)
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            results = list(pool.map(
+                lambda path: run(promtool_argv + ["test", "rules", argv_dir + path.name],
+                                 timeout=timeout, quiet=True),
+                paths))
+    finally:
+        for path in paths:
+            path.unlink(missing_ok=True)
+    out = "".join(o if o.endswith("\n") or not o else o + "\n" for _, o in results)
+    if out and not quiet:
+        print(out, end="", flush=True)
+    return next((rc for rc, _ in results if rc), 0), out
 
 
 def check_gate_output(check_out: str, test_out: str,
@@ -577,7 +646,8 @@ def gate(promtool_argv: list[str], rules: str, tests: str, *,
     rc, check_out = run(promtool_argv + ["check", "rules", rules], timeout=120)
     if rc:
         return rc
-    rc, test_out = run(promtool_argv + ["test", "rules", tests], timeout=120)
+    rc, test_out = run_test_rules(promtool_argv, tests, REPO_ROOT / tests_rel,
+                                  timeout=120)
     if rc:
         return rc
     reason = check_gate_output(check_out, test_out,
@@ -603,8 +673,9 @@ def gate(promtool_argv: list[str], rules: str, tests: str, *,
         # `FAILED:` detail, which above the reassuring line reads as a broken
         # build. The output is still captured and is printed on every failure
         # arm below.
-        canary_rc, canary_out = run(canary_argv + ["test", "rules", canary_tests],
-                                    timeout=120, quiet=True)
+        canary_rc, canary_out = run_test_rules(canary_argv, canary_tests,
+                                               tmp / tests_rel,
+                                               timeout=120, quiet=True)
         canary_check_rc, canary_check_out = run(
             canary_argv + ["check", "rules", canary_rules], timeout=120, quiet=True)
     finally:
