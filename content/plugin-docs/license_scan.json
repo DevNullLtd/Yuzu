@@ -90,9 +90,6 @@
       "runs_as": "Agent LaunchDaemon, which runs as **root** today (no `UserName` key, `docs/agent-privilege-model.md`)."
     },
     {
-      "grant": "**None for `pkg_metadata` and FlexLM `.lic` files** (rpm/dpkg-query and the conventional `.lic` directories are world-readable). **RHEL entitlement certificates under `/etc/pki/entitlement/` are not assumed readable:** subscription-manager creates them root-owned and the unprivileged account's access is **UNMEASURED** on a real RHEL host (none has been measured).",
-      "if_refused": "`entitlement_certs` reports `cert_permission_denied` (result status `PERMISSION_DENIED`) when the directory cannot be listed or a certificate cannot be read — never `ok|0`; an unlistable directory for another reason, an oversized or unparseable certificate reports `cert_parse_failed`/`cert_parse_partial`; a truncated listing, more than 64 certificate files or more than 16 certificates in one file reports `cert_scan_budget_exhausted`; `pkg_metadata` reports `dpkg_query_failed`/`output_truncated` on a query failure",
-      "measured": "2026-09-06, container, at euid 0 (root) — not representative of the unprivileged production account, and the entitlement directory was absent there, so the RHEL grant is unmeasured",
       "grant": "**None.** Package databases, FlexLM `.lic` files and the RHEL certificates under `/etc/pki/entitlement` are expected to be world-readable on a standard install (not measured as the unprivileged account); the `-key.pem` files are skipped.",
       "if_refused": "`entitlement_certs` reports `openssl_unavailable` when certificates exist but `openssl` is missing, and `cert_parse_failed`, `cert_parse_partial` or `cert_scan_budget_exhausted` when parsing falls short. `pkg_metadata` reports `dpkg_query_failed` or `output_truncated`.",
       "measured": "Debian 13 container, euid 0, 2026-09-06. Not representative of the unprivileged account, but no privilege is needed either way.",
@@ -110,15 +107,8 @@
     },
     {
       "completeness": "PARTIAL",
-      "provenance": "`license_scan:permission_denied`",
-      "status": "`PERMISSION_DENIED`",
-      "when": "the `entitlement_certs` outcome is `cert_permission_denied` (the agent may not list `/etc/pki/entitlement` or read a certificate in it); takes precedence over `CONSTRAINED`, set identically after both `list` and `surfaces`; rows already collected are kept"
-    },
-    {
-      "completeness": "PARTIAL",
       "provenance": "`license_scan:surface_error`",
       "status": "`CONSTRAINED`",
-      "when": "at least one probe surface outcome has `ok=false` and none is a permission refusal, set identically after both `list` and `surfaces`"
       "when": "at least one `probe_status` line is an `error`, for either action. The return code stays 0. Any surface counts here, including the per-user ones, so this status is wider than the set of errors that block the daily sync."
     }
   ],
@@ -322,7 +312,6 @@
   },
   "version": "1.0.0",
   "where_the_data_goes": [
-    "**Daily-sync (`software_licensing` source).** `list` output feeds a 24 h scheduled sync: the empty-vs-error structural guard skips a cycle (keeps last good state) if a primary/authoritative surface (`slp_wmi`, `entitlement_certs`, `flexlm_lic`) errored — `cert_permission_denied` included — and caps at 10,000 records / 1 MiB blob / 2 MiB raw capture — an over-cap or over-budget cycle is skipped rather than sent truncated.",
     "**Instruction result.** When dispatched directly (no instruction definition ships for this plugin, so use the generic command or MCP execute path), the rows travel over the agent's mTLS gRPC channel as the command response and land in the standard `ResponseStore`, kept 90 days by default and read through `GET /api/v1/responses/{id}`.",
     "**Daily sync (`software_licensing` source).** `list` output feeds a 24 h scheduled sync. An `error` on `slp_wmi`, `pkg_metadata`, `mas_receipt`, `entitlement_certs` or `flexlm_lic` makes it skip the cycle and keep the last good state; errors on any other surface do not. A cycle with 10,000 or more records, a blob over 1 MiB, or a raw capture over 2 MiB is skipped rather than sent truncated.",
     "**Server store.** The blob is parsed and ingested into `SoftwareLicensingStore`.",
