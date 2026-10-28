@@ -334,6 +334,48 @@ implementation is.
 | disk_space | free | linux | supported | 1 | statvfs(2) | - |
 | disk_space | free | macos | supported | 1 | statfs(2) | - |
 | disk_space | free | windows | supported | 1 | GetDiskFreeSpaceExW | - |
+| echo | status | linux | supported | 1 | sqlite | - |
+| echo | status | macos | supported | 1 | sqlite | - |
+| echo | status | windows | supported | 1 | sqlite | - |
+| echo | query | linux | supported | 1 | sqlite | - |
+| echo | query | macos | supported | 1 | sqlite | - |
+| echo | query | windows | supported | 1 | sqlite | - |
+| echo | snapshot | linux | constrained | 2 | procfs+systemctl+dpkg_rpm(planned) | software inventory collection is PLANNED (dpkg/rpm not yet wired) on Linux; service enumeration runs bounded argv (rung 2) via the shared subprocess runner |
+| echo | snapshot | macos | constrained | 2 | endpoint_security+nstat+launchctl+getfsstat+pkgutil(planned) | software collection is PLANNED on macOS; mapdrive is wired but outbound-live-only (getfsstat, no username, no inbound, no history); service enumeration runs bounded argv (rung 2) via the shared subprocess runner; process/tcp fall back to a poll without the Endpoint Security entitlement or nstat root privilege |
+| echo | snapshot | windows | supported | 1 | etw+iphlpapi+scm+wts+wnet+wevtapi+registry | - |
+| echo | export | linux | supported | 1 | sqlite | - |
+| echo | export | macos | supported | 1 | sqlite | - |
+| echo | export | windows | supported | 1 | sqlite | - |
+| echo | configure | linux | supported | 1 | sqlite | - |
+| echo | configure | macos | supported | 1 | sqlite | - |
+| echo | configure | windows | supported | 1 | sqlite | - |
+| echo | collect_fast | linux | constrained | 1 | procfs | dns sub-source is PLANNED (no-op) on Linux; arp sub-source is native (procfs, /proc/net/arp); core process/network/netqual collection is native |
+| echo | collect_fast | macos | constrained | 1 | endpoint_security+nstat+route_sysctl | process/tcp fall back to a KERN_PROC_ALL/proc_pidfdinfo poll without the Endpoint Security entitlement or nstat root privilege; dns sub-source is PLANNED (no-op) on macOS; arp sub-source is native but constrained (route_sysctl, entry_type always 'unknown') |
+| echo | collect_fast | windows | supported | 1 | etw+iphlpapi | - |
+| echo | collect_slow | linux | constrained | 2 | systemctl+utmp | service enumeration runs bounded argv (rung 2) via the shared subprocess runner; startup_type reads 'unknown'; netconn source is PLANNED (no-op) on Linux |
+| echo | collect_slow | macos | constrained | 2 | launchctl+utmpx+getfsstat | service enumeration runs bounded argv (rung 2) via the shared subprocess runner; no startup_type; mapdrive source is wired but outbound-live-only (getfsstat, no username, no inbound, no history); netconn source is PLANNED (no-op) on macOS |
+| echo | collect_slow | windows | supported | 1 | scm+wts+wnet+wevtapi | - |
+| echo | collect_perf | linux | supported | 1 | procfs | - |
+| echo | collect_perf | macos | planned | 1 | host_statistics | - |
+| echo | collect_perf | windows | supported | 1 | ntcounters | - |
+| echo | collect_software | linux | planned | 2 | dpkg_rpm | - |
+| echo | collect_software | macos | planned | 2 | pkgutil | - |
+| echo | collect_software | windows | supported | 1 | registry | - |
+| echo | rollup | linux | supported | 1 | sqlite | - |
+| echo | rollup | macos | supported | 1 | sqlite | - |
+| echo | rollup | windows | supported | 1 | sqlite | - |
+| echo | sql | linux | supported | 1 | sqlite | - |
+| echo | sql | macos | supported | 1 | sqlite | - |
+| echo | sql | windows | supported | 1 | sqlite | - |
+| echo | compatibility | linux | supported | 1 | sqlite | - |
+| echo | compatibility | macos | supported | 1 | sqlite | - |
+| echo | compatibility | windows | supported | 1 | sqlite | - |
+| echo | fleet_snapshot | linux | supported | 1 | procfs | - |
+| echo | fleet_snapshot | macos | constrained | 1 | libproc(proc_pidfdinfo) | inherent TOCTOU between pid enumeration and per-fd query; short-lived sockets may be missed |
+| echo | fleet_snapshot | windows | supported | 1 | iphlpapi+win32_process_enum | - |
+| echo | purge_source | linux | supported | 1 | sqlite | - |
+| echo | purge_source | macos | supported | 1 | sqlite | - |
+| echo | purge_source | windows | supported | 1 | sqlite | - |
 | event_logs | errors | linux | supported | 1 | sd_journal (bounded local read, PRIORITY<=err) | falls back to a bounded journalctl argv invocation (rung 2) when libsystemd is compiled out (-Dsystemd_guard) or the journal is unreachable |
 | event_logs | errors | macos | supported | 2 | log_show | requires root or a real login session to open the local unified-log data store -- a non-root headless process gets EX_NOPERM/77 regardless of Full Disk Access (docs/darwin-compat.md); no gap in production, which runs as a root LaunchDaemon |
 | event_logs | errors | windows | supported | 1 | wevtapi (EvtQuery/EvtRender, Level=2, bounded EvtNext) | - |
@@ -799,48 +841,6 @@ implementation is.
 | tags | count | linux | supported | 1 | local_json_store | - |
 | tags | count | macos | supported | 1 | local_json_store | - |
 | tags | count | windows | supported | 1 | local_json_store | - |
-| echo | status | linux | supported | 1 | sqlite | - |
-| echo | status | macos | supported | 1 | sqlite | - |
-| echo | status | windows | supported | 1 | sqlite | - |
-| echo | query | linux | supported | 1 | sqlite | - |
-| echo | query | macos | supported | 1 | sqlite | - |
-| echo | query | windows | supported | 1 | sqlite | - |
-| echo | snapshot | linux | constrained | 2 | procfs+systemctl+dpkg_rpm(planned) | software inventory collection is PLANNED (dpkg/rpm not yet wired) on Linux; service enumeration runs bounded argv (rung 2) via the shared subprocess runner |
-| echo | snapshot | macos | constrained | 2 | endpoint_security+nstat+launchctl+getfsstat+pkgutil(planned) | software collection is PLANNED on macOS; mapdrive is wired but outbound-live-only (getfsstat, no username, no inbound, no history); service enumeration runs bounded argv (rung 2) via the shared subprocess runner; process/tcp fall back to a poll without the Endpoint Security entitlement or nstat root privilege |
-| echo | snapshot | windows | supported | 1 | etw+iphlpapi+scm+wts+wnet+wevtapi+registry | - |
-| echo | export | linux | supported | 1 | sqlite | - |
-| echo | export | macos | supported | 1 | sqlite | - |
-| echo | export | windows | supported | 1 | sqlite | - |
-| echo | configure | linux | supported | 1 | sqlite | - |
-| echo | configure | macos | supported | 1 | sqlite | - |
-| echo | configure | windows | supported | 1 | sqlite | - |
-| echo | collect_fast | linux | constrained | 1 | procfs | dns sub-source is PLANNED (no-op) on Linux; arp sub-source is native (procfs, /proc/net/arp); core process/network/netqual collection is native |
-| echo | collect_fast | macos | constrained | 1 | endpoint_security+nstat+route_sysctl | process/tcp fall back to a KERN_PROC_ALL/proc_pidfdinfo poll without the Endpoint Security entitlement or nstat root privilege; dns sub-source is PLANNED (no-op) on macOS; arp sub-source is native but constrained (route_sysctl, entry_type always 'unknown') |
-| echo | collect_fast | windows | supported | 1 | etw+iphlpapi | - |
-| echo | collect_slow | linux | constrained | 2 | systemctl+utmp | service enumeration runs bounded argv (rung 2) via the shared subprocess runner; startup_type reads 'unknown'; netconn source is PLANNED (no-op) on Linux |
-| echo | collect_slow | macos | constrained | 2 | launchctl+utmpx+getfsstat | service enumeration runs bounded argv (rung 2) via the shared subprocess runner; no startup_type; mapdrive source is wired but outbound-live-only (getfsstat, no username, no inbound, no history); netconn source is PLANNED (no-op) on macOS |
-| echo | collect_slow | windows | supported | 1 | scm+wts+wnet+wevtapi | - |
-| echo | collect_perf | linux | supported | 1 | procfs | - |
-| echo | collect_perf | macos | planned | 1 | host_statistics | - |
-| echo | collect_perf | windows | supported | 1 | ntcounters | - |
-| echo | collect_software | linux | planned | 2 | dpkg_rpm | - |
-| echo | collect_software | macos | planned | 2 | pkgutil | - |
-| echo | collect_software | windows | supported | 1 | registry | - |
-| echo | rollup | linux | supported | 1 | sqlite | - |
-| echo | rollup | macos | supported | 1 | sqlite | - |
-| echo | rollup | windows | supported | 1 | sqlite | - |
-| echo | sql | linux | supported | 1 | sqlite | - |
-| echo | sql | macos | supported | 1 | sqlite | - |
-| echo | sql | windows | supported | 1 | sqlite | - |
-| echo | compatibility | linux | supported | 1 | sqlite | - |
-| echo | compatibility | macos | supported | 1 | sqlite | - |
-| echo | compatibility | windows | supported | 1 | sqlite | - |
-| echo | fleet_snapshot | linux | supported | 1 | procfs | - |
-| echo | fleet_snapshot | macos | constrained | 1 | libproc(proc_pidfdinfo) | inherent TOCTOU between pid enumeration and per-fd query; short-lived sockets may be missed |
-| echo | fleet_snapshot | windows | supported | 1 | iphlpapi+win32_process_enum | - |
-| echo | purge_source | linux | supported | 1 | sqlite | - |
-| echo | purge_source | macos | supported | 1 | sqlite | - |
-| echo | purge_source | windows | supported | 1 | sqlite | - |
 | update_source_trust | sources | linux | supported | 1 | /etc/apt/sources.list{,.d/*} (one-line + deb822), /etc/apt/trusted.gpg{,.d/*} and /etc/apt/keyrings/* config file reads | rpm/dnf .repo files under /etc/yum.repos.d are not read yet (a host whose /etc/yum.repos.d has entries reports constrained linux:rpm_repo:planned); zypper, pacman and apk sources are not read, so zero rows there is not evidence of none |
 | update_source_trust | sources | macos | planned | 1 | CFPropertyListCreateWithData over /Library/Preferences and /Library/Managed Preferences com.apple.SoftwareUpdate.plist | not read yet: one unsupported status row, macos:planned |
 | update_source_trust | sources | windows | planned | 1 | HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate{,\\AU} registry values | not read yet: one unsupported status row, windows:planned |

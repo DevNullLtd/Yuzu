@@ -1418,7 +1418,7 @@
     "gathered": true,
     "mutating": true
   },
-  "leg_hash": "3094b2651318",
+  "leg_hash": "20eab902257c",
   "manifest_version": 1,
   "name": "echo",
   "outputs": [
@@ -2236,7 +2236,7 @@
       "stamp": {
         "date": "2026-09-06",
         "host_class": "container",
-        "leg_hash": "3094b2651318",
+        "leg_hash": "20eab902257c",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -2454,7 +2454,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "3094b2651318",
+        "leg_hash": "20eab902257c",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501 (jsmith)"
@@ -2672,7 +2672,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "3094b2651318",
+        "leg_hash": "20eab902257c",
         "os": "windows",
         "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
         "privilege": "SYSTEM"
@@ -2813,17 +2813,7 @@
       "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
     ],
     "changelog": [
-      "changelog.d/2026-10-14-dex-tar-titles.changed.md",
-      "changelog.d/2026-10-21-tar-all-sources-default-on.changed.md",
-      "changelog.d/2026-10-21-tar-mapdrive-history-backfill.fixed.md",
-      "changelog.d/2026-10-21-tar-timeline-render.added.md",
-      "changelog.d/2026-10-21-tar-windows-image-db-hardening.security.md",
-      "changelog.d/2026-10-23-tar-timeline-page.added.md",
-      "changelog.d/2026-10-25-tar-regchange-source.added.md",
-      "changelog.d/2026-10-25-tar-retention-tiers-api.added.md",
-      "changelog.d/2026-10-26-tar-tiers-data-page.added.md",
-      "changelog.d/20261014-tar-adhoc-sql-moved.changed.md",
-      "changelog.d/20261021-tar-capture-sources-paused-core.fixed.md"
+      "changelog.d/2026-10-28-echo-rename.changed.md"
     ],
     "definitions": [
       "content/definitions/echo.yaml",
@@ -2901,6 +2891,7 @@
       "tests/test_echo_mapdrive_pin_lexical.py",
       "tests/test_echo_timeline_script_behaviour.py",
       "tests/unit/server/test_echo_process_tree.cpp",
+      "tests/unit/server/test_echo_rename_migration_pg.cpp",
       "tests/unit/server/test_echo_retention_tiers.cpp",
       "tests/unit/server/test_echo_timeline_page.cpp",
       "tests/unit/server/test_echo_timeline_render.cpp",

@@ -29,6 +29,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `discovery` | ✅ ✅ 🟡 | Network device discovery — ARP scan and ping sweep | [README](../../agents/plugins/discovery/README.md) |
 | `disk_actions` | ✅ 🟡 ⛔ | Reports physical drive health and the mapping between drives and the logical volumes they back | [README](../../agents/plugins/disk_actions/README.md) |
 | `disk_space` | ✅ ✅ ✅ | Reports free / total disk space for a single volume | [README](../../agents/plugins/disk_space/README.md) |
+| `echo` | ✅ ✅ ✅ | Echo activity record -- continuous system state change tracking | [README](../../agents/plugins/echo/README.md) |
 | `event_logs` | ✅ ✅ ✅ | Queries system event logs for errors and filtered events | [README](../../agents/plugins/event_logs/README.md) |
 | `example` | ✅ ✅ ✅ | Reference example plugin — responds to 'ping' | [README](../../agents/plugins/example/README.md) |
 | `execution_artifacts` | ✅ ⛔ ⛔ | Windows execution-evidence sources: ShimCache, Amcache InventoryApplicationFile, and Prefetch. Forensics-gated, single-target, default-off | [README](../../agents/plugins/execution_artifacts/README.md) |
@@ -73,7 +74,6 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `storage` | ✅ ✅ ✅ | Persistent key-value storage — set, get, delete, list, clear | [README](../../agents/plugins/storage/README.md) |
 | `system_hardening` | ✅ ✅ ✅ | Exploit-mitigation and kernel-hardening posture (read-only) | [README](../../agents/plugins/system_hardening/README.md) |
 | `tags` | ✅ ✅ ✅ | Device tagging — set, get, delete, list tags for scope evaluation | [README](../../agents/plugins/tags/README.md) |
-| `echo` | ✅ ✅ ✅ | Echo activity record -- continuous system state change tracking | [README](../../agents/plugins/echo/README.md) |
 | `update_source_trust` | 🟡 🟡 ✅ | Package and update-source trust posture (facts only) | [README](../../agents/plugins/update_source_trust/README.md) |
 | `users` | ✅ ✅ ✅ | Reports logged-on users, sessions, local accounts, admin group members, group membership, primary user, and session history | [README](../../agents/plugins/users/README.md) |
 | `vuln_scan` | ✅ ✅ ✅ | Host vulnerability scanning — CVE matching and configuration compliance checks | [README](../../agents/plugins/vuln_scan/README.md) |

@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-15 · euid 501 · leg-hash 21254047acbd
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-15 · euid 501 · leg-hash abdc9bc615f2
 == action=summary
 constrained|echo_db_unavailable|/var/lib/yuzu/agent/echo.db|unable to open database file
 [result_status] UNAVAILABLE / PARTIAL / unable to open database file

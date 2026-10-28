@@ -215,7 +215,7 @@ constrained|foreground_not_captured|user-context-bridge roadmap (session-scope a
 [result_status] CONSTRAINED / PARTIAL / foreground/focus attribution not captured by this source
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-15 · euid 501 · leg-hash 21254047acbd
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-15 · euid 501 · leg-hash abdc9bc615f2
 
 ```
 == action=summary
