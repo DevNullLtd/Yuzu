@@ -3919,6 +3919,17 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   timeout: 30,
 )
 
+# Echo rename upgrade window: static lexical gate pinning that agent.cpp still CALLS the tested
+# tar.db adoption helper and the KV re-key after KvStore::open( and before the first plugin
+# init (no Agent::run() seam exists to test that, #1492). Carries its own in-memory mutation
+# self-test. No build required.
+test('Echo adoption boot wiring lexical gate',
+  _python3_test,
+  args: [files('test_echo_adoption_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # Access Users page: pins the production wiring in server.cpp (the real require_admin gate and the
 # AuthDB::list_users() account source), which every route test stubs. Source-text only, so Python.
 # Suite 'docs': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a

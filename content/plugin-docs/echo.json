@@ -2888,6 +2888,7 @@
     ],
     "privilege_row": true,
     "tests": [
+      "tests/test_echo_adoption_wiring_lexical.py",
       "tests/test_echo_mapdrive_pin_lexical.py",
       "tests/test_echo_timeline_script_behaviour.py",
       "tests/unit/server/test_echo_process_tree.cpp",

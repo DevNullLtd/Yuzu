@@ -8,9 +8,10 @@
 #include "echo_db.hpp"
 #include "echo_netqual.hpp"
 #include "echo_netqual_boot.hpp"
-#include "echo_db_legacy_rename.hpp" // agents/shared: tar.db -> echo.db adoption
 #include "echo_sql_executor.hpp"
 #include "test_helpers.hpp"
+
+#include <yuzu/agent/echo_db_legacy_rename.hpp> // tar.db -> echo.db adoption
 
 #include <sqlite3.h> // raw handle for the reopen-after-DROP upgrade simulation
 
@@ -3313,9 +3314,9 @@ std::vector<std::string> table_names(const fs::path& db_file) {
     sqlite3_stmt* raw = nullptr;
     REQUIRE(sqlite3_prepare_v2(o.db, "SELECT name FROM sqlite_master WHERE type = 'table'", -1,
                                &raw, nullptr) == SQLITE_OK);
-    while (sqlite3_step(raw) == SQLITE_ROW)
-        out.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(raw, 0)));
-    sqlite3_finalize(raw);
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> stmt{raw, &sqlite3_finalize};
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW)
+        out.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)));
     return out;
 }
 
@@ -3378,7 +3379,7 @@ TEST_CASE("adopt_legacy_echo_db: a crash-shaped tar.db + un-checkpointed WAL ope
     make_legacy_tar_db_with_wal(d.path());
     const auto echo_db = d.path() / "echo.db";
 
-    REQUIRE(yuzu::shared::adopt_legacy_echo_db(echo_db).has_value());
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(echo_db).has_value());
     CHECK_FALSE(fs::exists(d.path() / "tar.db"));
     CHECK_FALSE(fs::exists(d.path() / "tar.db-wal"));
     CHECK(fs::exists(echo_db));
@@ -3404,7 +3405,7 @@ TEST_CASE("adopt_legacy_echo_db: an interrupted adoption resumes", "[echo][store
         ScratchDir d;
         make_legacy_tar_db_with_wal(d.path());
         fs::rename(d.path() / "tar.db-wal", d.path() / "echo.db-wal");
-        REQUIRE(yuzu::shared::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+        REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
         CHECK_FALSE(fs::exists(d.path() / "tar.db"));
         auto db = EchoDatabase::open(d.path() / "echo.db");
         REQUIRE(db.has_value());
@@ -3413,10 +3414,10 @@ TEST_CASE("adopt_legacy_echo_db: an interrupted adoption resumes", "[echo][store
     SECTION("everything already at the echo names: a no-op") {
         ScratchDir d;
         make_legacy_tar_db_with_wal(d.path());
-        REQUIRE(yuzu::shared::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+        REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
         const auto before = slurp_file(d.path() / "echo.db");
         const auto wal_before = slurp_file(d.path() / "echo.db-wal");
-        REQUIRE(yuzu::shared::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+        REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
         CHECK(slurp_file(d.path() / "echo.db") == before);
         CHECK(slurp_file(d.path() / "echo.db-wal") == wal_before);
     }
@@ -3429,7 +3430,7 @@ TEST_CASE("adopt_legacy_echo_db: an interrupted adoption resumes", "[echo][store
         std::error_code ec;
         fs::remove(d.path() / "echo.db-shm", ec);
         spit_file(d.path() / "tar.db-shm", "stale");
-        REQUIRE(yuzu::shared::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+        REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
         CHECK_FALSE(fs::exists(d.path() / "tar.db-shm"));
         auto db = EchoDatabase::open(d.path() / "echo.db");
         CHECK(db.has_value());
@@ -3452,7 +3453,7 @@ TEST_CASE("adopt_legacy_echo_db: both main files present is two databases and no
     for (const char* f : files)
         before.push_back(slurp_file(d.path() / f));
 
-    REQUIRE(yuzu::shared::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
     for (std::size_t i = 0; i < files.size(); ++i) {
         INFO(files[i]);
         REQUIRE(fs::exists(d.path() / files[i]));
@@ -3461,6 +3462,34 @@ TEST_CASE("adopt_legacy_echo_db: both main files present is two databases and no
     auto db = EchoDatabase::open(d.path() / "echo.db");
     REQUIRE(db.has_value());
     CHECK(db->get_config("which", "") == "echo");
+}
+
+TEST_CASE("adopt_legacy_echo_db: a WAL at both names fails closed and moves nothing",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path()); // tar.db + tar.db-wal holding the row wal_marker=x
+    spit_file(d.path() / "echo.db-wal", "a foreign WAL with distinct bytes");
+
+    const std::array<const char*, 3> files = {"tar.db", "tar.db-wal", "echo.db-wal"};
+    std::vector<std::string> before;
+    for (const char* f : files)
+        before.push_back(slurp_file(d.path() / f));
+
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db");
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(adopted.error().find("tar.db-wal") != std::string::npos);
+    CHECK(adopted.error().find("echo.db-wal") != std::string::npos);
+    CHECK_FALSE(fs::exists(d.path() / "echo.db"));
+    for (std::size_t i = 0; i < files.size(); ++i) {
+        INFO(files[i]);
+        REQUIRE(fs::exists(d.path() / files[i]));
+        CHECK(slurp_file(d.path() / files[i]) == before[i]); // the committed WAL-only row is intact
+    }
+
+    // The state is the same fail-closed one an interrupted adoption leaves: open() refuses.
+    auto refused = EchoDatabase::open(d.path() / "echo.db");
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("tar.db") != std::string::npos);
 }
 
 TEST_CASE("EchoDatabase::open refuses to create a fresh echo.db beside an unadopted tar.db",
@@ -3474,7 +3503,7 @@ TEST_CASE("EchoDatabase::open refuses to create a fresh echo.db beside an unadop
     CHECK(refused.error().find("tar.db") != std::string::npos);
     CHECK_FALSE(fs::exists(echo_db));
 
-    REQUIRE(yuzu::shared::adopt_legacy_echo_db(echo_db).has_value());
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(echo_db).has_value());
     auto db = EchoDatabase::open(echo_db);
     REQUIRE(db.has_value());
     CHECK(db->schema_version() == 9);
@@ -3484,7 +3513,7 @@ TEST_CASE("adopt_legacy_echo_db: a fresh directory is a no-op and opens at schem
           "[echo][store][adopt]") {
     ScratchDir d;
     const auto echo_db = d.path() / "echo.db";
-    REQUIRE(yuzu::shared::adopt_legacy_echo_db(echo_db).has_value());
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(echo_db).has_value());
     CHECK_FALSE(fs::exists(echo_db));
     {
         auto db = EchoDatabase::open(echo_db);
@@ -3552,7 +3581,7 @@ TEST_CASE("adopt_legacy_echo_db: a rename that cannot complete fails closed and 
 #endif
 
     const auto echo_db = d.path() / "echo.db";
-    auto adopted = yuzu::shared::adopt_legacy_echo_db(echo_db);
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(echo_db);
     REQUIRE_FALSE(adopted.has_value());
     CHECK(adopted.error().find("tar.db") != std::string::npos);
     CHECK_FALSE(fs::exists(echo_db));

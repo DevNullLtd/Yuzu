@@ -1304,8 +1304,9 @@ gw_enrolled:
         session_id =
             "gw-session-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16));
         if (gateway_route_store_) {
-            // Upgrade-window shim (removed in PR 7): carry the agent's legacy plugin-name flag
-            // onto the directory row, so a replica without this session can still dispatch.
+            // Upgrade-window shim (removed with the other legacy-name shims): carry the agent's
+            // legacy plugin-name flag onto the directory row, so a replica without this session
+            // can still dispatch.
             if (auto res = gateway_route_store_->register_fresh(info.agent_id(), session_id,
                                                                 installed->legacy_echo_wire_name);
                 !res) {

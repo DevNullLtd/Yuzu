@@ -207,6 +207,11 @@ std::string echo_rename_text_chain(const std::string& col) {
 }
 
 std::string echo_rename_definitions_sql() {
+    // 1. The builtin Echo definitions (plugin `tar`, id `crossplatform.tar.*`): every free-text
+    //    column gets the whole token chain, because their prose names the feature. Any other row
+    //    of the renamed plugin (an operator-authored definition) only has its plugin column
+    //    moved: its description or a SQL literal may legitimately say "tar" for the archive
+    //    tool, so the bare-word chain must not touch it. Its YAML identity forms follow in 2.
     std::string sql = "UPDATE instruction_definitions SET ";
     bool first = true;
     for (const char* col : {"name", "description", "yaml_source", "parameter_schema",
@@ -215,8 +220,9 @@ std::string echo_rename_definitions_sql() {
         sql += std::format("{}{} = {}", first ? "" : ", ", col, echo_rename_text_chain(col));
         first = false;
     }
-    sql += ", plugin = 'echo' WHERE plugin = 'tar';";
-    // 2. Every other row: operator-authored definitions may still name the renamed plugin in
+    sql += ", plugin = 'echo' WHERE plugin = 'tar' AND id LIKE 'crossplatform.tar.%';"
+           "UPDATE instruction_definitions SET plugin = 'echo' WHERE plugin = 'tar';";
+    // 2. Every row: operator-authored definitions may still name the renamed plugin in
     //    their YAML (a quoted `plugin: "tar"`, `requiredPlugins: [..tar..]`, a block-list `- tar`,
     //    or a `crossplatform.tar.` id reference). Only those anchored forms change, so a shell step
     //    that runs the archive tool is left alone.
@@ -312,9 +318,7 @@ const std::vector<pg::PgMigration>& migrations() {
         // (insert_definition_row), so nothing would ever refresh a stored row: every column the
         // renamed content touches is rewritten here, or an upgraded deployment keeps the old ids,
         // plugin and prose forever. Idempotent: each statement is guarded by its own predicate.
-        //
-        // 1. Rows of the renamed plugin (the builtin Echo definitions and operator copies of them):
-        //    every free-text column gets the whole token chain. Their prose names the feature.
+        // The numbered steps are in echo_rename_definitions_sql().
         {3, echo_rename_definitions_sql()},
     };
     return kMigrations;

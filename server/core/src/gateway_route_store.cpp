@@ -279,9 +279,9 @@ DROP INDEX IF EXISTS agent_routes_session_id_idx;
 )"},
         // v6 (Echo rename, upgrade window): whether the agent registered with the pre-rename
         // plugin name `tar`, so the HA directory dispatch path (which has no session to consult)
-        // can still put the legacy name on the wire. Written by register_fresh only. PR 7 of the
-        // Echo programme removes the write and the read; the column stays (DEFAULT FALSE is
-        // harmless), the same posture as stream_home_id (v3).
+        // can still put the legacy name on the wire. Written by register_fresh only. Removing the
+        // other legacy-name shims drops the write and the read; the column stays (DEFAULT FALSE
+        // is harmless), the same posture as stream_home_id (v3).
         {6, R"(
 ALTER TABLE agent_routes ADD COLUMN legacy_echo_wire_name BOOLEAN NOT NULL DEFAULT FALSE;
 )"},
@@ -399,8 +399,8 @@ GatewayRouteStore::register_fresh(std::string_view agent_id, std::string_view se
         "ON CONFLICT (agent_id) DO UPDATE SET "
         "  connection_epoch = EXCLUDED.connection_epoch, "
         "  session_id = EXCLUDED.session_id, "
-        // Upgrade-window shim, removed in PR 7: a new connection re-states whether this agent
-        // still speaks the pre-rename plugin name.
+        // Upgrade-window shim, removed with the other legacy-name shims: a new connection
+        // re-states whether this agent still speaks the pre-rename plugin name.
         "  legacy_echo_wire_name = EXCLUDED.legacy_echo_wire_name, "
         "  cluster_id = NULL, "
         "  gateway_node = NULL, "

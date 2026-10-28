@@ -70,7 +70,7 @@ public:
         for (auto& rr : *res)
             if (rr.routable && rr.route.cluster_id) {
                 routable_[rr.route.agent_id] = *rr.route.cluster_id;
-                // Upgrade-window shim, removed in PR 7 of the Echo programme.
+                // Upgrade-window shim, removed with the other legacy-name shims.
                 if (rr.route.legacy_echo_wire_name)
                     legacy_wire_.insert(rr.route.agent_id);
             }
@@ -89,8 +89,9 @@ public:
         return it == routable_.end() ? std::nullopt : std::optional<std::string>(it->second);
     }
 
-    /// Upgrade-window shim (removed in PR 7): whether the directory row says this agent still
-    /// speaks the pre-rename plugin name `tar`. Pass to `send_via_directory`'s `legacy_wire`.
+    /// Upgrade-window shim (removed with the other legacy-name shims): whether the directory row
+    /// says this agent still speaks the pre-rename plugin name `tar`. Pass to
+    /// `send_via_directory`'s `legacy_wire`.
     [[nodiscard]] bool legacy_wire_for(const std::string& agent_id) const {
         return legacy_wire_.contains(agent_id);
     }

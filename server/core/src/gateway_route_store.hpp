@@ -564,10 +564,11 @@ struct RouteRow {
     /// operator re-home) — the NEXT `announce_connected` binds it (TOFU). See
     /// the file header "AGENT<->CLUSTER AFFINITY" note.
     std::optional<std::string> home_cluster_id;
-    /// Echo rename, upgrade window (removed in PR 7; the column stays): the agent registered
-    /// with the pre-rename plugin name `tar`. `lookup_route`/`lookup_routes` fill it; it exists
-    /// so the HA directory dispatch path, which has no AgentSession, can still write the
-    /// legacy plugin name on the wire. Written only by `register_fresh`.
+    /// Echo rename, upgrade window (removed with the other legacy-name shims; the column
+    /// stays): the agent registered with the pre-rename plugin name `tar`.
+    /// `lookup_route`/`lookup_routes` fill it; it exists so the HA directory dispatch path,
+    /// which has no AgentSession, can still write the legacy plugin name on the wire. Written
+    /// only by `register_fresh`.
     bool legacy_echo_wire_name{false};
 };
 

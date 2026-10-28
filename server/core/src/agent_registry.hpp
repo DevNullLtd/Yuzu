@@ -375,10 +375,11 @@ private:
     std::unordered_set<std::string> kill_switched_os_;
 };
 
-/// Upgrade-window shim, removed in PR 7 of the Echo programme. The wire command for a session
-/// that registered the pre-rename plugin name `tar` must carry `tar`, not `echo`, or the agent
-/// reports plugin-not-found. Returns the command unchanged (a copy) for every other session and
-/// every other plugin. dispatch_tag is deliberately left as computed: the agent never reads it.
+/// Upgrade-window shim, removed with the other legacy-name shims. The wire command for a
+/// session that registered the pre-rename plugin name `tar` must carry `tar`, not `echo`, or the
+/// agent reports plugin-not-found. Returns the command unchanged (a copy) for every other
+/// session and every other plugin. dispatch_tag is deliberately left as computed: the agent
+/// never reads it.
 [[nodiscard]] inline pb::CommandRequest wire_for(bool legacy_echo_wire_name,
                                                  const ClassifiedCommand& cmd) {
     pb::CommandRequest out = cmd.wire();
@@ -564,7 +565,7 @@ struct AgentSession {
     std::string agent_version;
     std::vector<std::string> plugin_names;
     std::vector<PluginMeta> plugin_meta;
-    /// Upgrade-window shim, removed in PR 7 of the Echo programme: the agent registered the
+    /// Upgrade-window shim, removed with the other legacy-name shims: the agent registered the
     /// pre-rename plugin name `tar` (normalised to `echo` in plugin_names/plugin_meta). Commands
     /// for `echo` are written to it as `tar` (see wire_for). Set only by register_agent.
     bool legacy_echo_wire_name = false;
@@ -962,8 +963,9 @@ public:
     // `send_to` is the sole path for that (this method has no capability
     // advertisement to check, because there is no session to have
     // advertised one).
-    /// `legacy_wire` (Echo-rename upgrade window, removed in PR 7) is the directory row's
-    /// `legacy_echo_wire_name`: the target agent registered the pre-rename plugin name `tar`.
+    /// `legacy_wire` (Echo-rename upgrade window, removed with the other legacy-name shims) is
+    /// the directory row's `legacy_echo_wire_name`: the target agent registered the pre-rename
+    /// plugin name `tar`.
     bool send_via_directory(const std::string& agent_id, const ClassifiedCommand& cmd,
                             const std::string& cluster_id, bool legacy_wire);
 

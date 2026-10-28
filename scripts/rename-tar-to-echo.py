@@ -15,8 +15,9 @@ Usage (from anywhere inside the checkout):
 Stdlib only. A second apply is a no-op ("0 edits, 0 renames").
 
 Run it once, on the pre-rename tree. The hand-written upgrade-window shims that land after it
-(agents/shared/echo_db_legacy_rename.hpp, the registry wire shim, the Postgres migrations, the
-audit both-spellings filter) deliberately spell the legacy names, and the map would rewrite them.
+(agents/core/include/yuzu/agent/echo_db_legacy_rename.hpp, the registry wire shim, the Postgres
+migrations, the audit both-spellings filter) deliberately spell the legacy names, and the map would
+rewrite them.
 Once that header exists the script reports "0 edits, 0 renames" and changes nothing.
 """
 from __future__ import annotations
@@ -118,6 +119,7 @@ PROTECT = [
     r"(?<![\w.-])tar(?= takes SIGPIPE)",
     r"(?<![\w.-])tar(?= unpacks)",
     r"(?<=filesystem-level `)tar(?=`)",
+    r"(?<=by `)tar(?=`-ing)",
     r"(?<=and )tar(?= takes)",
 ]
 PROTECT_RES = [re.compile(p) for p in PROTECT]
@@ -203,7 +205,7 @@ def transform_text(text: str, ext: str) -> tuple[str, list[tuple[int, str, str]]
 
 
 def repo_root() -> Path:
-    return Path(subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip())
+    return Path(subprocess.check_output(["git", "rev-parse", "--show-toplevel"], encoding="utf-8").strip())
 
 
 def tracked_files(root: Path) -> list[str]:
@@ -211,7 +213,7 @@ def tracked_files(root: Path) -> list[str]:
     return [p for p in raw.decode("utf-8", "surrogateescape").split("\0") if p]
 
 
-APPLIED_MARKER = "agents/shared/echo_db_legacy_rename.hpp"
+APPLIED_MARKER = "agents/core/include/yuzu/agent/echo_db_legacy_rename.hpp"
 
 
 def run(dry_run: bool) -> int:
@@ -322,6 +324,7 @@ NEVER_CHANGE = [
     "tar.exe",
     "apt-get install -y curl zip unzip tar git",
     "tar | grep -q needle",
+    "back up Postgres by `tar`-ing the postgres-data volume",
     'echo "x"',
     "icmp echo reply",
     "journal",

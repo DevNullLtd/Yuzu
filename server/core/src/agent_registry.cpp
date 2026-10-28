@@ -101,9 +101,10 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         session->scopable_tags[k] = v;
     }
     for (const auto& p : info.plugins()) {
-        // Upgrade-window shim, removed in PR 7: an agent that has not upgraded still reports the
-        // pre-rename plugin name `tar`. Normalise it so every inventory consumer (presence gate,
-        // help catalogue) sees `echo`, and remember to write `tar` back on the wire (wire_for).
+        // Upgrade-window shim, removed with the other legacy-name shims: an agent that has not
+        // upgraded still reports the pre-rename plugin name `tar`. Normalise it so every
+        // inventory consumer (presence gate, help catalogue) sees `echo`, and remember to write
+        // `tar` back on the wire (wire_for).
         const bool legacy_name = p.name() == "tar";
         if (legacy_name)
             session->legacy_echo_wire_name = true;
@@ -2278,9 +2279,10 @@ void AgentHealthStore::upsert(const std::string& agent_id,
         snap.agent_id = agent_id;
         snap.status_tags.clear();
         for (const auto& [k, v] : tags) {
-            // Upgrade-window shim, removed in PR 7: an agent that has not upgraded still
-            // publishes its Echo heartbeat tags under the pre-rename `yuzu.plugin.tar.` prefix.
-            // Normalise at ingest so the corruption gate and every tag reader see one spelling.
+            // Upgrade-window shim, removed with the other legacy-name shims: an agent that has
+            // not upgraded still publishes its Echo heartbeat tags under the pre-rename
+            // `yuzu.plugin.tar.` prefix. Normalise at ingest so the corruption gate and every tag
+            // reader see one spelling.
             constexpr std::string_view kLegacyPrefix = "yuzu.plugin.tar.";
             if (std::string_view{k}.starts_with(kLegacyPrefix))
                 snap.status_tags["yuzu.plugin.echo." + k.substr(kLegacyPrefix.size())] = v;

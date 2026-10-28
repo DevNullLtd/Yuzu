@@ -5,10 +5,11 @@
 // file keeps its DACL / mode and content, so adoption is a rename, nothing else.
 //
 // ONE caller: agent core at boot (agents/core/src/agent.cpp), after the KV store opens and
-// before any plugin is loaded or initialised. That placement is the exclusion: no process-wide
-// lock exists across plugin dylibs, so no plugin ever adopts, and nothing can have the database
-// open while it is moved. EchoDatabase::open() refuses to create a fresh echo.db beside an
-// unadopted tar.db, so a failed adoption fails closed instead of booting with default config.
+// before any plugin init or dispatch (the plugin scan only registers descriptors; no plugin
+// opens a database before init). That placement is the exclusion: no process-wide lock exists
+// across plugin dylibs, so no plugin ever adopts, and nothing can have the database open while
+// it is moved. EchoDatabase::open() refuses to create a fresh echo.db beside an unadopted
+// tar.db, so a failed adoption fails closed instead of booting with default config.
 //
 // Order is load-bearing: sidecars (-journal, -wal, -shm) move BEFORE the main file. An
 // interrupted adoption therefore always looks like "tar.db present, echo.db absent" and resumes
@@ -18,6 +19,13 @@
 // rename, then upgraded again). Nothing is touched: echo.db wins, tar.db and its sidecars are
 // left for the operator, and one warning names them. Old tar.db.corrupt-* quarantine files are
 // never touched.
+//
+// A sidecar present at BOTH names while tar.db is being adopted (for example a downgrade wrote a
+// fresh tar.db-wal beside an already-moved echo.db-wal) cannot be paired safely: moving tar.db
+// anyway would open it with a foreign WAL and strand the legacy WAL's committed rows. Adoption
+// fails closed there and moves nothing further; tar.db stays, echo.db stays absent, and
+// EchoDatabase::open() refuses until the operator resolves the two files. Without a legacy main
+// file nothing can be mispaired, so a stray legacy sidecar is only warned about and left.
 #pragma once
 
 #include <spdlog/spdlog.h>
@@ -28,7 +36,7 @@
 #include <string>
 #include <system_error>
 
-namespace yuzu::shared {
+namespace yuzu::agent {
 
 [[nodiscard]] inline std::expected<void, std::string>
 adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
@@ -61,9 +69,18 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
                     std::format("cannot stat {}: {}", from.string(), ec.message()));
             continue;
         }
-        // Never overwrite: a sidecar already at the echo name belongs to a live echo.db (an
-        // overwritten -wal would lose committed rows). Leave the stale one for the operator.
-        if (fs::exists(to, ec)) {
+        // Never overwrite: an overwritten -wal would lose committed rows. With a legacy main
+        // file to adopt, a collision cannot be resolved here (the main file would be paired with
+        // the wrong WAL), so fail closed and move nothing further; without one, leave the stray
+        // legacy sidecar for the operator.
+        const bool to_present = fs::exists(to, ec);
+        if (ec)
+            return std::unexpected(std::format("cannot stat {}: {}", to.string(), ec.message()));
+        if (to_present) {
+            if (legacy_present)
+                return std::unexpected(std::format(
+                    "cannot adopt {}: {} and {} both exist; resolve them by hand", legacy.string(),
+                    from.string(), to.string()));
             spdlog::warn("Legacy {} left in place: {} already exists", from.string(), to.string());
             continue;
         }
@@ -84,4 +101,4 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
     return {};
 }
 
-} // namespace yuzu::shared
+} // namespace yuzu::agent

@@ -66,6 +66,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 using yuzu::server::detail::AgentRegistry;
@@ -382,6 +383,40 @@ TEST_CASE("ProxyRegister: fresh register mints a route row; a second fresh regis
     REQUIRE(row2->has_value());
     CHECK((*row2)->session_id == session2);
     CHECK((*row2)->connection_epoch > epoch1); // strictly greater: new connection wins
+}
+
+// ── ProxyRegister: the upgrade-window legacy plugin-name flag reaches the directory row ───
+
+TEST_CASE("ProxyRegister: an inventory reporting the pre-rename plugin tar writes "
+          "legacy_echo_wire_name=true on the route row; a current echo inventory writes false",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    PgAuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    for (const auto& [agent_id, plugin, want_legacy] :
+         {std::tuple{"agent-legacy-tar", "tar", true}, std::tuple{"agent-current-echo", "echo", false}}) {
+        INFO(agent_id);
+        auto req = make_gw_register(auth_mgr, agent_id);
+        req.mutable_info()->add_plugins()->set_name(plugin);
+        apb::RegisterResponse resp;
+        REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+        REQUIRE(resp.accepted());
+
+        auto row = store.lookup_route(agent_id);
+        REQUIRE(row.has_value());
+        REQUIRE(row->has_value());
+        CHECK((*row)->legacy_echo_wire_name == want_legacy);
+    }
 }
 
 // ── ProxyRegister: the NEW re-announce-vs-fresh decision branch ─────────────

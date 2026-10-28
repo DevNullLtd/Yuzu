@@ -23,6 +23,7 @@
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <memory>
@@ -611,15 +612,35 @@ EchoDatabase& EchoDatabase::operator=(EchoDatabase&& other) noexcept {
 
 namespace {
 
-bool table_exists(sqlite3* db, const char* name) {
+// A failed lookup is an error, never "absent": reading a prepare/step failure as "no such table"
+// would let open() create empty echo_* tables beside populated tar_* ones (the #559 class).
+std::expected<bool, std::string> table_exists(sqlite3* db, const char* name) {
     sqlite3_stmt* raw = nullptr;
     if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", -1,
                            &raw, nullptr) != SQLITE_OK) {
-        return false;
+        return std::unexpected(std::format("table lookup {}: {}", name, sqlite3_errmsg(db)));
     }
     StmtPtr stmt(raw);
     sqlite3_bind_text(stmt.get(), 1, name, -1, SQLITE_STATIC);
-    return sqlite3_step(stmt.get()) == SQLITE_ROW;
+    const int rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_ROW)
+        return true;
+    if (rc == SQLITE_DONE)
+        return false;
+    return std::unexpected(std::format("table lookup {}: {}", name, sqlite3_errmsg(db)));
+}
+
+// True when `from` exists and `to` does not; an error when either lookup fails.
+std::expected<bool, std::string> rename_pending(sqlite3* db, const char* from, const char* to) {
+    auto have_from = table_exists(db, from);
+    if (!have_from)
+        return std::unexpected(std::move(have_from.error()));
+    if (!*have_from)
+        return false;
+    auto have_to = table_exists(db, to);
+    if (!have_to)
+        return std::unexpected(std::move(have_to.error()));
+    return !*have_to;
 }
 
 // Schema v9 (upgrade window, removed with the legacy-name shims): a database written before the
@@ -627,7 +648,10 @@ bool table_exists(sqlite3* db, const char* name) {
 // one transaction. Skipped when echo_config already exists (a fresh or already-renamed file).
 // Returns an error message on failure; the caller then refuses the open.
 std::optional<std::string> rename_legacy_tables(sqlite3* db) {
-    if (!table_exists(db, "tar_config") || table_exists(db, "echo_config"))
+    auto legacy = rename_pending(db, "tar_config", "echo_config");
+    if (!legacy)
+        return std::move(legacy.error());
+    if (!*legacy)
         return std::nullopt;
     static constexpr std::array<std::pair<const char*, const char*>, 3> kPairs = {{
         {"tar_state", "echo_state"},
@@ -641,7 +665,12 @@ std::optional<std::string> rename_legacy_tables(sqlite3* db) {
         return std::format("BEGIN: {}", sqlite3_errmsg(db));
     std::optional<std::string> failure;
     for (const auto& [from, to] : kPairs) {
-        if (!table_exists(db, from) || table_exists(db, to))
+        auto pending = rename_pending(db, from, to);
+        if (!pending) {
+            failure = std::move(pending.error());
+            break;
+        }
+        if (!*pending)
             continue;
         const std::string sql = std::format("ALTER TABLE {} RENAME TO {}", from, to);
         if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK) {

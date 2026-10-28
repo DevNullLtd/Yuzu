@@ -262,6 +262,45 @@ TEST_CASE("Echo rename: instruction_store v3 rewrites ids, plugin, requiredPlugi
     CHECK(snapshot() == before);
 }
 
+TEST_CASE("Echo rename: instruction_store v3 moves an operator Echo definition's plugin and "
+          "YAML identity but leaves its prose and SQL literals alone",
+          "[pg][echo][migration][instruction_store]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        yuzu::server::InstructionStore store{pool};
+        REQUIRE(store.is_open());
+    }
+    const std::string& dsn = db.dsn();
+
+    // Not a builtin (its id lacks the crossplatform.tar. prefix), but it runs the renamed plugin
+    // and its prose and SQL name the archive tool `tar` as a process, which must stay as written.
+    exec_sql(dsn, R"SQL(INSERT INTO instruction_store.instruction_definitions
+        (id, name, type, plugin, description, required_plugins, yaml_source) VALUES
+        ('ops.tar-hunt', 'Hunt', 'question', 'tar', 'Find tar processes', 'tar',
+         E'spec:\n  plugin: tar\n  sql: SELECT pid FROM procs WHERE name = ''tar''\n'))SQL");
+
+    roll_back(dsn, "instruction_store", 2);
+    {
+        PgPool pool{{.conninfo = dsn, .size = 2}};
+        yuzu::server::InstructionStore store{pool};
+        REQUIRE(store.is_open());
+    }
+    CHECK(version_of(dsn, "instruction_store") == "3");
+
+    const auto col = [&](const char* column) {
+        return one(dsn, std::string("SELECT ") + column +
+                            " FROM instruction_store.instruction_definitions WHERE id = "
+                            "'ops.tar-hunt'");
+    };
+    CHECK(col("plugin") == "echo");
+    CHECK(col("required_plugins") == "echo");
+    CHECK(col("yaml_source") ==
+          "spec:\n  plugin: echo\n  sql: SELECT pid FROM procs WHERE name = 'tar'\n");
+    CHECK(col("description") == "Find tar processes");
+    CHECK(col("name") == "Hunt");
+}
+
 TEST_CASE("Echo rename: the migrated crossplatform.tar.query row equals the freshly seeded "
           "crossplatform.echo.query row on every column",
           "[pg][echo][migration][instruction_store]") {

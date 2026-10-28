@@ -17,6 +17,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/cloud_identity.hpp>
 #include <yuzu/agent/command_dedup_store.hpp>
 #include <yuzu/agent/dex_observer.hpp>
+#include <yuzu/agent/echo_db_legacy_rename.hpp> // tar.db -> echo.db adoption (boot, upgrade window)
 #include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
@@ -39,7 +40,6 @@ __declspec(allocate(".CRT$XCB"))
 #include "guaranteed_state.pb.h"
 
 // Local-only helper, exposed for unit testing.
-#include "echo_db_legacy_rename.hpp" // agents/shared: tar.db -> echo.db adoption (boot)
 #include "plugin_config_sync.hpp"
 #include "plugin_heartbeat_tags.hpp" // #1567 plugin heartbeat.* KV -> status tags
 #include "local_dispatcher.hpp"
@@ -852,11 +852,12 @@ public:
 
         // 1b''. Upgrade-window step (removed with the other legacy-name shims): the activity-record
         // feature was renamed from TAR to Echo. Adopt a pre-rename tar.db as echo.db and re-key its
-        // KV namespace, BEFORE any plugin loads or initialises. This is the ONLY adopter - the
-        // plugins never rename - so nothing can have the database open while it moves, and
+        // KV namespace, BEFORE any plugin init or dispatch (the plugin scan above only registers
+        // descriptors and opens no database). This is the ONLY adopter - the plugins never
+        // rename - so nothing can have the database open while it moves, and
         // EchoDatabase::open refuses to create a fresh echo.db beside an unadopted tar.db.
         // Neither step is fatal: a failed adoption leaves the echo plugin refusing to open.
-        if (auto adopted = yuzu::shared::adopt_legacy_echo_db(cfg_.data_dir / "echo.db"); !adopted) {
+        if (auto adopted = adopt_legacy_echo_db(cfg_.data_dir / "echo.db"); !adopted) {
             spdlog::error("Legacy tar.db adoption failed: {}", adopted.error());
         }
         if (kv_store_ && !kv_store_->rename_plugin("tar", "echo")) {
