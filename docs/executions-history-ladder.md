@@ -113,7 +113,9 @@ Regression pin: `tests/unit/server/test_agent_service_impl.cpp` (9 cases /
 47 assertions) drives `process_gateway_response` end-to-end into a real
 `ResponseStore` and pins the no-erase rule (HF-1 fan-out across 4 agents
 with mixed terminal statuses), the RUNNING/terminal stamping branches,
-and the `__timing__|...` sentinel early-return. The
+and the `__timing__|...` sentinel early-return. That intercept runs before the Forensics tier and the
+provenance label, so it relays only a 1 to 12 digit millisecond count to the shared stat bar
+(`is_timing_millis`); any other text after the sentinel is swallowed, neither published nor stored. The
 `test_workflow_routes.cpp:814` sibling case covers the response-store
 level only.
 
@@ -343,7 +345,7 @@ status, exit code and a failure text (`error_detail`). For a command of a Forens
 text is reduced, when it is stored and again when the tracker reads it, to a bounded machine token
 (`^[a-z0-9_]{1,32}(:[a-z0-9_.-]{1,48}){1,3}$`, at most 96 bytes) or to the fixed `forensics_error`
 (`forensics_error_detail.hpp`); status and exit code are unchanged, and other plugins' text is not
-touched when it is stored or published. The tracker's reads decide per execution, not per command: in an
+touched when it is stored or published (the transition event of a mixed execution is built from the persisted text and can carry the reduced form). The tracker's reads decide per execution, not per command: in an
 execution that ran at least one Forensics-tier command, every agent's failure text is reduced on read,
 including the text of an ordinary plugin's command in the same execution (an over-reduction that
 exposes nothing). The same pure function (`AgentServiceImpl::failure_text_for_sinks`), evaluated once per frame on each ingest path
