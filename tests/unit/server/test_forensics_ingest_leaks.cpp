@@ -130,6 +130,12 @@ TEST_CASE("timing stat: only a plain millisecond count is relayed to the shared 
         REQUIRE(ev.size() == 1);
         CHECK(ev[0].data.find("42 ms") != std::string::npos);
     }
+    SECTION("the 12-digit boundary is accepted, 13 digits are not") {
+        h.svc.process_gateway_response("agent-1", running_frame("echo-0t", "__timing__|exec_ms=999999999999"));
+        CHECK(timing_events().size() == 1);
+        h.svc.process_gateway_response("agent-1", running_frame("echo-0t", "__timing__|exec_ms=1000000000000"));
+        CHECK(timing_events().size() == 1); // the 13-digit frame was swallowed
+    }
     SECTION("any other text after the sentinel is swallowed, not published") {
         for (const char* payload :
              {"__timing__|exec_ms=", "__timing__|exec_ms=12 ms plus text", "__timing__|exec_ms=-1",
@@ -1208,6 +1214,43 @@ constexpr const char* kContentMatcher =
     R"({"column":"hostname","op":"eq","value":"marker-4990-member"})";
 
 } // namespace
+
+TEST_CASE("timing stat: the direct Subscribe path relays only a plain millisecond count",
+          "[pg][server][forensics_tier][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(ndb, leaks_notif_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(adb, yuzu::test::analytics_pg_template);
+    SinkHarness h(ndb.dsn(), adb.dsn(), /*wire_set=*/true);
+    std::mutex mu;
+    std::vector<SseEvent> seen;
+    const auto sub = h.bus.subscribe([&](const SseEvent& e) {
+        std::lock_guard lock(mu);
+        seen.push_back(e);
+    });
+    h.ingest_direct_frames({running_frame("echo-0d1", "__timing__|exec_ms=42"),
+                            running_frame("echo-0d2", "__timing__|exec_ms=999999999999"),
+                            running_frame("echo-0d3", "__timing__|exec_ms=1000000000000"),
+                            running_frame("echo-0d4", "__timing__|exec_ms=12 ms plus text"),
+                            running_frame("echo-0d5", std::string{"__timing__|"} + kMarker)});
+    h.bus.unsubscribe(sub);
+    std::size_t timing = 0, marker = 0;
+    bool saw_42 = false, saw_max = false;
+    {
+        std::lock_guard lock(mu);
+        for (const auto& e : seen) {
+            if (e.event_type == "timing") {
+                ++timing;
+                saw_42 = saw_42 || e.data.find(">42 ms<") != std::string::npos;
+                saw_max = saw_max || e.data.find(">999999999999 ms<") != std::string::npos;
+            }
+            if (e.data.find(kMarker) != std::string::npos)
+                ++marker;
+        }
+    }
+    CHECK(timing == 2); // the two plain counts only
+    CHECK(saw_42);
+    CHECK(saw_max);
+    CHECK(marker == 0); // free text after the sentinel never reaches the shared bus
+}
 
 TEST_CASE("result-set materializer: membership is never derived from a Forensics plugin's rows",
           "[pg][server][forensics_tier][security]") {
