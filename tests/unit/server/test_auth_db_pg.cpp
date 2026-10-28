@@ -38,13 +38,13 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
-#include <condition_variable>
-#include <mutex>
 #include <atomic>
 #include <barrier>
 #include <chrono>
+#include <condition_variable>
 #include <expected>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -3652,6 +3652,20 @@ TEST_CASE("AuthDB inconclusive trigger validation reads not-enforced for a reade
             if (s)
                 winner_enforced = s->binding_enforced;
         });
+        // Declared AFTER the winner so it is destroyed BEFORE the jthread joins: it releases the
+        // winner even if a REQUIRE below throws, so the join can never hang (Gate 8b S1).
+        struct ReleaseGuard {
+            std::mutex& mu;
+            std::condition_variable& cv;
+            bool& release;
+            ~ReleaseGuard() {
+                {
+                    std::lock_guard lk(mu);
+                    release = true;
+                }
+                cv.notify_all();
+            }
+        } guard{mu, cv, release};
         {
             std::unique_lock lk(mu);
             REQUIRE(cv.wait_for(lk, std::chrono::seconds(10), [&] { return in_check; }));
@@ -3660,12 +3674,7 @@ TEST_CASE("AuthDB inconclusive trigger validation reads not-enforced for a reade
         auto s = h.db.mfa_status("u1");
         if (s)
             loser_enforced = s->binding_enforced;
-        {
-            std::lock_guard lk(mu);
-            release = true;
-        }
-        cv.notify_all();
-    } // the winner joins here, before any assertion about it
+    } // the guard releases the winner, then the winner joins, before any assertion about it
     h.db.set_binding_check_hook_for_test({});
     REQUIRE(winner_enforced.has_value());
     REQUIRE(loser_enforced.has_value());
