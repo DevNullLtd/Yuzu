@@ -47,11 +47,14 @@ Invariants (the numbered rules below; each failure message starts with its rule 
   R3b agents/core/src/agent.cpp: `guardian_instance_lock_` is assigned from
       `GuardianInstanceLock::acquire(cfg_.data_dir / "<name>", <wait>)` exactly once, where the
       path starts exactly at `cfg_.data_dir /` and the wait is a positive integer literal
-      duration (`std::chrono::seconds{5}`); the acquire precedes the claim in the SAME block
-      (the text between them never closes a block opened before the acquire); no local of the
-      same name shadows the member; and the member is declared after `kv_store_` and before
-      `guardian_` (destroyed after the engine, before the store). Without the assignment every
-      boot loses the lock and the whole fleet runs unordered (0/0) with every other test green.
+      duration of at least one second (`std::chrono::seconds{5}`); the acquire is a statement of
+      its own (not the body of a braceless if/for/while) and precedes the claim in the SAME
+      block (the text between them never closes a block opened before the acquire and never
+      mentions the member); no local of the same name shadows the member; and the member is
+      declared after `kv_store_` and before `guardian_` (destroyed after the engine, before the
+      store). Without the assignment every boot loses the lock and the whole fleet runs
+      unordered (0/0) with every other test green.
+  R3d The lock file name `guardian_boot_epoch.lock` is pinned on the raw source of the acquire.
   R3c The test seam `acquire_for_test` is named only in guardian_boot_epoch.{hpp,cpp}: no other
       production source under agents/core may call it (it can alter lock semantics).
   R4  agents/core/src/guardian_engine.cpp: every legacy executor is built through
@@ -376,7 +379,9 @@ def _rule2(srcs, norm, out):
 # The only accepted wait: a positive integer literal in a chrono duration, e.g.
 # std::chrono::seconds{5}. A positive pin: every other spelling (zero in any form, a variable, an
 # expression) is rejected, so there is no list of zero spellings to keep complete.
-_POSITIVE_WAIT = re.compile(r"^std::chrono::(?:milliseconds|seconds|minutes)\{[1-9][0-9]*\}$")
+_POSITIVE_WAIT = re.compile(r"^std::chrono::(milliseconds|seconds|minutes)\{([1-9][0-9]*)\}$")
+_WAIT_MS = {"milliseconds": 1, "seconds": 1000, "minutes": 60000}
+_MIN_WAIT_MS = 1000  # a restart overlaps the old process's shutdown by seconds, not milliseconds
 # The lock path: exactly `cfg_.data_dir / "<name>"` (the literal is blanked by the normaliser).
 _LOCK_PATH = 'cfg_.data_dir / ""'
 
@@ -401,14 +406,24 @@ def _rule3(t, out):
     else:
         asites = call_sites(t[acquires[0].start():], r"GuardianInstanceLock::acquire")
         aargs = split_args(t[acquires[0].start():][asites[0][1]:asites[0][2]]) if asites else []
-        if len(aargs) != 2 or not _POSITIVE_WAIT.match(aargs[1]):
-            out.append(f"R3b: GuardianInstanceLock::acquire( in {AGENT} must pass a path and a non-zero "
-                       f"wait written as a positive integer literal duration, e.g. "
+        wm = _POSITIVE_WAIT.match(aargs[1]) if len(aargs) == 2 else None
+        if wm is None or int(wm.group(2)) * _WAIT_MS[wm.group(1)] < _MIN_WAIT_MS:
+            out.append(f"R3b: GuardianInstanceLock::acquire( in {AGENT} must pass a path and a wait of "
+                       f"at least one second written as a positive integer literal duration, e.g. "
                        f"std::chrono::seconds{{5}} (a service restart overlaps the old process's "
                        f"shutdown), got {aargs}")
         if aargs and aargs[0] != _LOCK_PATH:
             out.append(f"R3b: the lock path in {AGENT} must be exactly `cfg_.data_dir / \"<name>\"` "
                        f"(the lock guards that data directory's epoch), got {aargs[0]}")
+        before = t[:acquires[0].start()].rstrip()
+        if before and before[-1] not in ";{}":
+            out.append(f"R3b: the lock acquire in {AGENT} is not a statement of its own (it follows "
+                       f"`{before[-12:]}`: a braceless if/for/while can skip it)")
+        if asites and len(claims) == 1 and acquires[0].start() < claims[0].start():
+            stmt_end = acquires[0].start() + asites[0][2]
+            if "guardian_instance_lock_" in t[stmt_end:claims[0].start()]:
+                out.append(f"R3b: guardian_instance_lock_ is used or reassigned between the acquire and "
+                           f"the claim in {AGENT}")
         if len(claims) == 1 and acquires[0].start() > claims[0].start():
             out.append(f"R3b: guardian_instance_lock_ is assigned after the claim in {AGENT}")
         if len(claims) == 1 and acquires[0].start() < claims[0].start():
@@ -467,6 +482,16 @@ def _rule3(t, out):
                    f"emit_guardian_event( callers in {AGENT} are expected to be exactly the "
                    f"set_event_sink lambda and the DEX observer; found sink={sink_n}, dex={dex_n}, "
                    f"unrecognised={other}. A new wire writer must be reviewed for the emit-pair stamp")
+
+
+def _rule3d(raw_agent, out):
+    # The normaliser blanks string literals, so the lock FILE NAME is pinned on the raw text: the
+    # one acquire call must name guardian_boot_epoch.lock (the header, manual, upgrade note and
+    # SOC 2 row all name that file).
+    if not re.search(r"GuardianInstanceLock::acquire\(\s*cfg_\.data_dir\s*/\s*\"guardian_boot_epoch\.lock\"\s*,",
+                     raw_agent):
+        out.append(f"R3d: the GuardianInstanceLock::acquire( call in {AGENT} must name "
+                   '`cfg_.data_dir / "guardian_boot_epoch.lock"` (the documented file name)')
 
 
 def _rule3c(srcs, out):
@@ -534,6 +559,7 @@ def problems(srcs):
     _rule2(srcs, norm, out)
     _rule3(norm(AGENT), out)
     _rule3c(srcs, out)
+    _rule3d(srcs[AGENT], out)
     _rule4(norm(ENGINE), out)
     return out
 
@@ -677,16 +703,16 @@ MUTATIONS = [
      "", 1, 0, "R3b: expected exactly one `guardian_instance_lock_ = GuardianInstanceLock::acquire(`"),
     ("R3b lock acquired with no wait", AGENT,
      r"\"guardian_boot_epoch\.lock\", std::chrono::seconds\{5\}\)", "\"guardian_boot_epoch.lock\", std::chrono::seconds{0})",
-     1, 0, "must pass a path and a non-zero wait"),
+     1, 0, "positive integer literal duration"),
     ("R3b lock acquired after the claim", AGENT,
      r"(guardian_instance_lock_ = GuardianInstanceLock::acquire\([^;]*\);)(.*?)(const auto boot_epoch_claim =\s*claim_guardian_boot_epoch\([^;]*\);)",
      r"\2\3\n        \1", 1, 0, "assigned after the claim"),
     ("R3b zero wait via ::zero()", AGENT,
      r"std::chrono::seconds\{5\}\);", "std::chrono::seconds::zero());", 1, 0,
-     "must pass a path and a non-zero wait"),
+     "positive integer literal duration"),
     ("R3b zero wait via parentheses", AGENT,
      r"std::chrono::seconds\{5\}\);", "std::chrono::seconds(0));", 1, 0,
-     "must pass a path and a non-zero wait"),
+     "positive integer literal duration"),
     ("R3b lock path outside the data dir", AGENT,
      r"cfg_\.data_dir / \"guardian_boot_epoch\.lock\"", "std::filesystem::temp_directory_path() / \"guardian_boot_epoch.lock\"",
      1, 0, "must be exactly `cfg_.data_dir /"),
@@ -713,6 +739,18 @@ MUTATIONS = [
     ("R3c test seam named in production", AGENT,
      r"guardian_instance_lock_ = GuardianInstanceLock::acquire\(", "guardian_instance_lock_ = GuardianInstanceLock::acquire_for_test(",
      1, 0, "R3c: src/agent.cpp names acquire_for_test"),
+    ("R3b braceless conditional acquire", AGENT,
+     r"(\n\s*)(guardian_instance_lock_ = GuardianInstanceLock::acquire\()", r"\1if (cfg_.data_dir.empty()) \2", 1, 0,
+     "is not a statement of its own"),
+    ("R3b wait of one millisecond", AGENT,
+     r"std::chrono::seconds\{5\}\);", "std::chrono::milliseconds{1});", 1, 0,
+     "at least one second"),
+    ("R3b member reassigned between acquire and claim", AGENT,
+     r"(const auto boot_epoch_claim =)", r"guardian_instance_lock_ = GuardianInstanceLock{}; \1", 1, 0,
+     "used or reassigned between the acquire and the claim"),
+    ("R3d lock file renamed", AGENT,
+     r"cfg_\.data_dir / \"guardian_boot_epoch\.lock\"", "cfg_.data_dir / \"epoch.lock\"", 1, 0,
+     "R3d: the GuardianInstanceLock::acquire( call"),
     ("R3b member declared before kv_store_", AGENT,
      r"(std::unique_ptr<KvStore> kv_store_;)(.*?)(GuardianInstanceLock guardian_instance_lock_;)",
      r"\3\n    \1\2", 1, 0, "member order"),

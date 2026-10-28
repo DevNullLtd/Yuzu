@@ -1004,20 +1004,28 @@ Known limits of the boot epoch:
   the new epoch equals the previous one and `emit_seq` restarts at 1 (accepted by the UP-14
   residual-acceptance ruling; the equal epoch is pinned by a test).
 - A single writer is enforced for processes that run this code (UP-9): the agent holds an
-  exclusive lock on `<data-dir>/guardian_boot_epoch.lock` (advisory `flock` on POSIX, an open with share mode 0 on Windows) for the life of the process
-  (waiting up to 5 s for a previous process to exit), and a process that cannot take it claims
-  no epoch (`instance_lock_not_held`, with `instance_lock=contended` or `failed`) and emits
-  unordered 0/0 events instead of colliding with the holder. The lock guards only the epoch
-  claim, not the rest of the data directory. Limits: an agent build that predates the lock does
-  not take it; it is a same-host guard; the 5 s wait is shorter than the agent's worst-case
-  shutdown, so a restart that overlaps a slow teardown runs unordered until its next restart; on
-  Linux and macOS a lock file removed or replaced after the claim is not detected (it needs write
-  access to the data directory; a file replaced before the lock is detected and re-locked); on
-  Windows share mode 0 forbids removing the held file, and any other program holding it open (a
-  backup or security product) is reported as `contended` with `native_error=32`; a local principal able to open the file can hold it and force an
-  agent to 0/0 for that process lifetime (accepted: the result is the pre-feature timestamp
-  ordering, and the agent logs `contended`); and a file system that does not support the
-  lock, or a lock file the agent's account cannot open, is `failed`. The recovery is a restart with the cause fixed; the process does not retry.
+  exclusive lock on `<data-dir>/guardian_boot_epoch.lock` (advisory `flock` on POSIX, an open
+  with share mode 0 on Windows) for the life of the process, waiting up to 5 s for a previous
+  process to exit. A process that cannot take it claims no epoch (`instance_lock_not_held`,
+  with `instance_lock=contended` or `failed`) and emits unordered 0/0 events instead of
+  colliding with the holder. The lock guards only the epoch claim, not the rest of the data
+  directory. Limits:
+  - an agent build that predates the lock does not take it, and it is a same-host guard;
+  - the 5 s wait is shorter than the agent's worst-case shutdown, so a restart that overlaps a
+    slow teardown runs unordered until its next restart;
+  - on Linux and macOS a lock file removed or replaced after the claim is not detected (it
+    needs write access to the data directory; a file replaced before the lock is detected and
+    re-locked); on Windows share mode 0 forbids removing the held file;
+  - on Windows any other program holding the file open (a backup or security product) is
+    reported as `contended` with `native_error=32`;
+  - a local principal that can open the file before the agent starts can hold it and leave the
+    agent at 0/0 for that process lifetime (accepted: the result is the pre-feature timestamp
+    ordering, and the agent logs `contended`; on POSIX the requested mode 0600 limits this to
+    the agent's account and root);
+  - a file system that does not support the lock, or a lock file the agent's account cannot
+    open, is `failed`.
+
+  The recovery is a restart with the cause fixed; the process does not retry.
 - A clock wrongly ahead at boot pins the epoch ahead, and it does not self-heal because the
   claim tracks the persisted value rather than the clock. A burst of restarts or a crash loop
   within the same second also pushes the epoch ahead of a correct clock until the clock catches

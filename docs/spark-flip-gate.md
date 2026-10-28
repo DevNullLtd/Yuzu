@@ -2900,7 +2900,8 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
      verdict at timestamp 90), in both arrival orders and with subsequent live events; and two
      live senders sharing one agent_id, a lock holder stamping a pair while a process that
      was refused the data-directory lock (`instance_lock_not_held`) or an older build sends
-     0/0: the mixture must not make the comparator non-transitive (a verdict ranked above
+     0/0, and two stamping senders on separate data directories under one fixed agent id
+     (independent epochs): the mixture must not make the comparator non-transitive (a verdict ranked above
      one that is in turn ranked above it), the outcome is stated, and a test covers it. The
      server also counts accepted events that carry no pair, per agent, and exposes the count
      (a metric or an API field), so an agent that runs unordered is visible fleet-wide; the

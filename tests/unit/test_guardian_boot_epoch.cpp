@@ -943,7 +943,9 @@ TEST_CASE("boot-epoch: a parent that stops being a directory reports its own err
     // Root-proof sibling of the EACCES case: no permission bits are involved, so it also runs
     // as root. The hook swaps the lock file's parent directory for a regular file, and the
     // re-resolve of "<parent>/guardian_boot_epoch.lock" then fails with ENOTDIR, which says
-    // nothing about the file having been replaced and must not be retried or relabelled ESTALE.
+    // nothing about the file having been replaced and must not be relabelled ESTALE. (calls == 1
+    // does not by itself prove "not retried": a retry would fail at open() with the same ENOTDIR
+    // without running the hook again; the pinned facts are the error code and the single hook run.)
     yuzu::test::TempDir dir{"yuzu_test_boot_epoch_lock-"};
     std::filesystem::create_directories(dir.path);
     const auto sub = dir.path / "sub";
@@ -957,7 +959,7 @@ TEST_CASE("boot-epoch: a parent that stops being a directory reports its own err
             std::filesystem::remove_all(sub);
             std::ofstream out{sub}; // "sub" is now a regular file
         });
-    CHECK(calls == 1); // not retried
+    CHECK(calls == 1); // the hook ran once
     CHECK_FALSE(lock.held());
     CHECK(lock.state() == GuardianInstanceLock::State::Failed);
     CHECK(lock.native_error() == ENOTDIR);

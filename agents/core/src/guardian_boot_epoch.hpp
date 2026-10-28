@@ -93,13 +93,14 @@
 //     file the service account cannot open (EACCES, for example one created earlier by
 //     another account), is Failed. Either way the claim is unordered (epoch 0) rather than a
 //     guess.
-//   * a local principal that can open the lock file can hold it and force an agent to claim no
-//     epoch (0/0 for that process lifetime): on Windows with a sharing-allowed open across an
-//     agent start, if the file is readable by that principal (not measured here); on POSIX the
-//     file is requested at mode 0600 by the agent's account, which closes it for other users.
-//     Accepted:
-//     the result is the timestamp ordering the agent used before it stamped the pair, and the
-//     claim fails loudly (instance_lock=contended).
+//   * a local principal that can open the lock file before the agent starts can hold it open
+//     and leave that agent unordered (epoch 0, 0/0) for its process lifetime: the agent's own
+//     open or flock is then refused (a sharing violation on Windows, EWOULDBLOCK on POSIX). On
+//     POSIX the file is requested at mode 0600, which limits this to the agent's account and
+//     root unless the mode was changed or the file already existed with a looser one; on
+//     Windows who can open it depends on the data directory's ACL, which was not measured.
+//     Accepted: the result is the timestamp ordering the agent used before it stamped the pair,
+//     and the claim fails loudly (instance_lock=contended).
 //   * the lock guards the epoch claim only, not the rest of the data directory (the identity
 //     and command-dedup stores have never been exclusive).
 //   * there is no in-process recovery: a process that lost the lock stays at epoch 0 until it
