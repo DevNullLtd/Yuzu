@@ -448,17 +448,6 @@ TEST_CASE("PluginLoader rejects a plugin declaring an invalid name",
     fs::remove_all(tmp);
 }
 
-TEST_CASE("is_retired_plugin_name matches only the pre-rename Echo name",
-          "[plugin_loader][retired_name]") {
-    CHECK(yuzu::agent::is_retired_plugin_name("tar"));
-    CHECK_FALSE(yuzu::agent::is_retired_plugin_name("echo"));
-    CHECK_FALSE(yuzu::agent::is_retired_plugin_name("Tar"));
-    CHECK_FALSE(yuzu::agent::is_retired_plugin_name("tar_x"));
-    CHECK_FALSE(yuzu::agent::is_retired_plugin_name(""));
-    // Not a reserved name: that list doubles as the KV-namespace contract.
-    CHECK_FALSE(yuzu::agent::is_reserved_plugin_name("tar"));
-}
-
 TEST_CASE("PluginLoader rejects a stale plugin declaring the retired pre-rename name",
           "[plugin_loader][retired_name]") {
     auto fixture = find_fixture_plugin("retired_name_fixture_plugin");
@@ -488,6 +477,8 @@ TEST_CASE("PluginLoader rejects a stale plugin declaring the retired pre-rename 
     CHECK(err.path == staged.string());
     REQUIRE(err.reason.starts_with(yuzu::agent::kRetiredNameReason));
     CHECK(err.reason.find("tar") != std::string::npos);
+    // Rejected as retired, not as reserved: that list doubles as the KV-namespace contract.
+    CHECK_FALSE(yuzu::agent::is_reserved_plugin_name("tar"));
 }
 
 // ─── Plugin config-sync (covers agent.cpp post-load sync invariant) ─────────

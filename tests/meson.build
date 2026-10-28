@@ -1187,7 +1187,7 @@ if get_option('b_sanitize') != 'none'
     suite: 'agent',
     timeout: 600,
     is_parallel: tsan_heavy_checkpoints_is_parallel,
-    depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, retired_name_fixture_plugin, abi3_fixture_plugin],
+    depends: agent_shard_deps,
   )
 endif
 
