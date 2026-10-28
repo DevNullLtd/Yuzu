@@ -956,7 +956,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      First, `get.api-me` flips from `planned:#2146` to `twinned` (untwinned 215
      to 214, generic `planned:#2146` 86 to 85; these are the figures at the time
      of this ruling, and the runtime configuration twins that merged later moved
-     them, so the live pins are the ones in `scripts/ci/check-api-parity.py`). Second, the gate-parity check
+     them, so the live pins are the ones in
+     `scripts/ci/check-api-parity.py`). Second, the gate-parity check
      reads `GET /api/v1/me` as a route with no gate call it can read: the
      handler calls `auth_fn` alone, because the route is session-only
      self-description with no per-resource authority, so there is nothing to
