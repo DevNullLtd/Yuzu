@@ -1,10 +1,23 @@
 # Slice 2: fleet certificate inventory and registered-CRL revocation
 
-**Status:** design, not built. This is the slice-2 design that ADR-0070 (PR #6125) requires
-before any slice-2 code is written ("Slice 2 is unblocked to design. Its design doc must cite this
-ADR and satisfy D4, D5, D6, D7 and D12"). It is a design, not an ADR. The owner's decisions for
-slice 2, all decided as of 2026-10-23, are under [Decisions](#decisions). Where possible it states
-outcomes and leaves mechanisms to the implementation PRs, which get their own governance.
+**Status:** design, not built. This is the slice-2 design that ADR-0070 (PR #6125, merged
+2026-10-21) requires before any slice-2 code is written ("Slice 2 is unblocked to design. Its design
+doc must cite this ADR and satisfy D4, D5, D6, D7 and D12"). It is a design, not an ADR. The
+owner's decisions for slice 2 are under [Decisions](#decisions), each with the date it was made
+(2026-10-19 to 2026-10-28). Where possible it states outcomes and leaves mechanisms to the
+implementation PRs, which get their own governance.
+
+**Nothing from slice 2 is on `dev` yet** (checked 2026-10-28: `RegisterResponse` in
+`proto/yuzu/agent/v1/agent.proto` ends at field 8, and no `certificate_inventory` or
+`server_capabilities` code is on `dev`). Where this doc says a PR "does" something, it describes
+that PR's plan. Where it says "on the 2a-2a branch" (or another PR's branch), it describes that
+PR's unmerged implementation, recorded so this design matches it; it becomes fact only when that PR
+merges. 2a-1 is PR #6563 and 2b-1a is PR #6583, both open. Other work so far is on local branches
+that are not pushed: 2a-2a `feat/cert-inventory-store`, 2a-1b `feat/typed-source-background-purge`,
+2a-2b `feat/cert-inventory-read`, 2a-2c `feat/cert-inventory-tombstones`, 2a-2d
+`feat/cert-inventory-prune`, 2a-2e `feat/cert-inventory-agent-linux`, 2a-2f
+`feat/cert-inventory-agent-windows`, 2a-2g `feat/cert-inventory-agent-macos`, 2a-3
+`feat/cert-inventory-counts`, 2a-4 `feat/cert-inventory-cbom` and 2b-1b `feat/revocation-fetcher`.
 
 It supersedes the "Slice 2: certificate inventory" section of `docs/crypto-asset-design.md` where
 the two differ. One difference matters: that section proposes computing days-to-expiry on the
@@ -18,11 +31,10 @@ server. ADR-0070 rules that out as a field (D4, and D13 condition 3: "no stored
 
 **How to read the citations.**
 - A bare `path:line` is a code fact, checked against `origin/dev` at `820afe501` on 2026-10-19.
-- `0070:N` is a line in `docs/adr/0070-cryptographic-asset-inventory-placement.md` at commit
-  **`430e67b7d`** of the `docs/adr-0070-crypto-asset-placement` branch (PR #6125, open, in review),
-  which carries owner rulings R1–R14. Every `0070:N` citation in this doc is pinned to that commit
-  and was re-checked by script against it. If #6125 changes before merge, the clause names govern,
-  not the line numbers.
+- ADR-0070 is cited by section, never by line: "ADR-0070 §D12 "Lifecycle"" means the
+  "Lifecycle" paragraph of D12 in `docs/adr/0070-cryptographic-asset-inventory-placement.md`, and
+  "R16" means the owner ruling of that number in the ADR. Section names do not move when the ADR
+  grows, so these citations do not need re-pinning.
 - `widgets:` marks work proposed in the unmerged, unpublished `feat/crypto-dashboard-widgets`
   branch. Its commits are not on `origin`, so this doc relies on nothing in it: where it is
   mentioned, it is "proposed in unmerged work", and every binding rule here comes from ADR-0070 or
@@ -63,12 +75,12 @@ server. ADR-0070 rules that out as a field (D4, and D13 condition 3: "no stored
 - per-user certificate stores (decided by the owner, 2026-10-19; see [Decisions](#decisions));
 - any live dispatch of the full-field collector. It runs only inside the daily sync (owner
   decision OD-1, [Decisions](#decisions)). Ad-hoc look-ups keep using today's `certificates.list`;
-- the device-local chain-to-trust-store result. D5 makes it "optional, not committed" (`0070:498-501`),
+- the device-local chain-to-trust-store result. D5 makes it "optional, not committed" (ADR-0070 §D5 "Device-local trust"),
   and this design does not build it;
-- OCSP, and any fetch of a URL taken from a certificate (Decided, ADR-0070 D5, `0070:518`,
-  `:565-568`);
-- any certificate mutation, such as renewal, re-issue or deletion (Decided, ADR-0070 D6,
-  `0070:607-620`);
+- OCSP, and any fetch of a URL taken from a certificate (Decided, ADR-0070 §D5, "OCSP is not
+  included");
+- any certificate mutation, such as renewal, re-issue or deletion (Decided, ADR-0070 §D6,
+  "Read-only by construction");
 - the Yuzu-CA issued and revoked widgets. They read `CaStore`, not fleet rows (R2), and the separate
   widgets work builds them.
 
@@ -113,7 +125,9 @@ says which PR carries each item. "2b-1" likewise means 2b-1a and 2b-1b.
 
 **Deploy order** is server before agents, as for blob v2 of `installed_software`
 (`docs/adr/0016-agent-daily-sync-framework.md`, "Deploy order: server before agents"), but this
-design does not rely on it. The window is closed in code (ADR-0070 R17, decision 8):
+design does not rely on it. The window is to be closed in code (ADR-0070 R17, decision 8). That
+closure depends on 2a-1 (PR #6563) and 2a-2a merging, and on 2a-2e for the agent side; none has
+merged yet:
 - From 2a-1 on, `certificate_inventory` is in the typed set before any agent sends it. A server at
   2a-1 or later never stores the blob in the generic store on the gateway path, and its read filter
   hides any stray row.
@@ -133,12 +147,12 @@ design does not rely on it. The window is closed in code (ADR-0070 R17, decision
 |---|---|
 | 2a-1 | `upgrading.md`: the `app_usage`/`device_ci` behaviour change (stray generic rows stop being readable). The app-usage read-surface routed-concern row: its accepted mixed-version window becomes closed. A changelog fragment. |
 | 2a-1b | The purge metric where inventory metrics are documented, and `upgrading.md` (boot no longer waits on the purge). |
-| 2a-2a | `rest-api.md`/`server-admin.md` for the ingest metric and `/readyz` membership; `inventory.md` for the server side of the new daily-sync source and the `certificate_inventory_v1` capability; the SOC 2 data-inventory row (`docs/enterprise-readiness-soc2-first-customer.md`) for `certificate_inventory_store`; the SOC 2 risk-register entry for the L7 balancer residual (review-by 2027-01-31; 2a-2a is the PR that carries it); and the L7 operator note (no L7 per-call balancer in front of a mixed set; never roll a backend back below 2a-1), already shipped on the 2a-2a branch in `gateway.md`, `inventory.md` and `upgrading.md` (cite them; do not re-author). |
+| 2a-2a | `rest-api.md`/`server-admin.md` for the ingest metric and `/readyz` membership; `inventory.md` for the server side of the new daily-sync source and the `certificate_inventory_v1` capability; the SOC 2 data-inventory row (`docs/enterprise-readiness-soc2-first-customer.md`) for `certificate_inventory_store`; the SOC 2 risk-register entry for the L7 balancer residual (review-by 2027-01-31; 2a-2a is the PR that carries it); and the L7 operator note (no L7 per-call balancer in front of a mixed set; never roll a backend back below 2a-1), already written on the unmerged 2a-2a branch in `gateway.md`, `inventory.md` and `upgrading.md` (cite them; do not re-author). |
 | 2a-2b | `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (the read verbs), `rbac.md` and the SOC 2 access-control inventory (`CertificateInventory`); the SOC 2 data-inventory row for `dn_dict`; `crypto.md` states the pool bound for the per-certificate read (pool under 4 refuses, 4 to 7 gives one slot); `crypto.md` states that every certificate fact is agent-reported and unverified by the server until the revocation statements (2b-2). |
 | 2a-2c | `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (`crypto.certificates.tombstones.view`, `crypto.certificates.tombstone_purge`), plus the decision 12 sweep and its audit verb `crypto.certificates.decommission_sweep` (`crypto.md`, `audit-log.md`, `upgrading.md`; the operator text, including the never-erased classes, is on `feat/cert-inventory-tombstones`). The A2/A1 RBAC-administration routed-concern row (`.claude/routed-concerns-access-control.md`), amended for the new `is_rbac_administrator()` call sites, as that row requires. |
 | 2a-2d | `crypto.md` (retention) and the clock-guarded-retention adoption register, with a separate decision for the location grain, whose cutoff compares two stored receipt times (`status_at`, `last_seen`) rather than the pass's own `now()`. |
-| 2a-2e, 2a-2f, 2a-2g | The generated plugin README and the OS capability matrix, per OS; 2a-2e also owes the supported-kernel statement (Linux 5.8+ supported; below 6.8 the mount-id-reuse residual applies; FUSE or autofs hosts run 6.8+) in the OS capability matrix row and the manual, `upgrading.md` for the `certificate_inventory_v1` gate (the note must state the L7 exception: every backend at 2a-1 or later and never rolled back below it while certificate-collecting agents report, not "no remaining window"; the 2a-2e branch's own `upgrading.md` lines 5 and 14 still say otherwise and are owed that fix on that branch), and the `walk_stalled` heartbeat tag and log line (no fleet gauge or alert)|
-| #6125 (owed request, not an edit) | Ask that D6's "never opens ... key blocks in PEM files" (`0070:630`) be worded as the exact property in [Linux link and file rules](#stores-read-per-os): key-block lines discarded unretained, never base64-decoded, buffer cleansed. Tracked until #6125 answers; this design does not edit D6 (it amends D12 only through R15). |
+| 2a-2e, 2a-2f, 2a-2g | The generated plugin README and the OS capability matrix, per OS; 2a-2e also owes the supported-kernel statement (Linux 5.8+ supported; below 6.8 the mount-id-reuse residual applies; FUSE or autofs hosts run 6.8+) in the OS capability matrix row and the manual, `upgrading.md` for the `certificate_inventory_v1` gate (the note must state the L7 exception: every backend at 2a-1 or later and never rolled back below it while certificate-collecting agents report, not "no remaining window"; the 2a-2e branch's `upgrading.md` now states it), and the `walk_stalled` heartbeat tag and log line (no fleet gauge or alert)|
+| #6125 (owed request, not an edit) | Ask that D6's "never opens ... key blocks in PEM files" (ADR-0070 §D6, "No private keys") be worded as the exact property in [Linux link and file rules](#stores-read-per-os): key-block lines discarded unretained, never base64-decoded, buffer cleansed. Tracked until #6125 answers; this design does not edit D6 (it amends D12 only through R15 to R18). |
 | 2a-3 | `crypto.md`, `rest-api.md`, `mcp.md` and `audit-log.md` for the snapshot export (`GET /api/v1/crypto/certificates/snapshot`, `export_crypto_certificate_snapshot`, verb `crypto.certificates.snapshot`), including that paged reads make no cross-page consistency promise. `crypto.md` and `server-admin.md` carry the counts limit (about 1.3M certificates in scope, then non-retryable `scale_limit`) and the Postgres pool floor of 8 for the default long-read bound of two (decision 9). `crypto.md` (each count's rule, window and boundary), the D10 lint's allow-list entries. |
 | 2a-4 | `crypto.md` and `rest-api.md`/`mcp.md` (the certificate half of the CBOM, its securable and its `halves_omitted` metadata). |
 | 2b-1a, 2b-1b | The A2/A1 RBAC-administration routed-concern row (`.claude/routed-concerns-access-control.md`), amended for 2b-1a's new `is_rbac_administrator()`-style call sites. `server-admin.md` and `security-hardening.md`: CRL egress, the address rules, and firewall guidance for the server's outbound CRL fetches. `rbac.md`, `audit-log.md` and the SOC 2 inventory (`RevocationSource`). The fetcher's security review record. |
@@ -148,7 +162,7 @@ design does not rely on it. The window is closed in code (ADR-0070 R17, decision
 
 ### The collector
 
-**Decided (ADR-0070 D6, `0070:607-620`):** the sync source runs plugin actions in-process
+**Decided (ADR-0070 §D6, "Read-only by construction"):** the sync source runs plugin actions in-process
 through the agent's local dispatcher, so the server-side `ExecuteGate` never sees it. It must be a
 dedicated read-only collector, or a fixed list of read-only actions, never `delete`. A
 compile-time assertion or a test checks the list against the catalogue's `ReadOnly` /
@@ -162,9 +176,11 @@ compile-time assertion or a test checks the list against the catalogue's `ReadOn
   `content/definitions/`, and the sync source calls it through `LocalDispatcher`
   (`agents/core/src/sync_source_installed_software.cpp:218`, `:473-491`).
 - **Daily sync only (owner decision OD-1).** A live dispatch would put the full field set, UPN
-  and e-mail SANs included, into the ResponseStore, readable under `Response:Read`: every user under
-  RBAC off and the Viewer role under RBAC on. That is the breadth D12 forbids the synced copy to
-  inherit (`0070:880-888`), and gating who may dispatch does not limit who may read the result. So
+  and e-mail SANs included, into the ResponseStore, readable under `Response:Read`: any
+  authenticated session under RBAC off (the default), and under RBAC on the Operator,
+  PlatformEngineer, ITServiceOwner, Viewer and ForensicsAnalyst roles as well as administrators
+  (`rbac_store.cpp` seeding on `dev`). That is the breadth D12 forbids the synced copy to
+  inherit (ADR-0070 §D12 "Read surface"), and gating who may dispatch does not limit who may read the result. So
   every dispatch path refuses `list_inventory`.
   - **How every path refuses it.** `ExecuteGate` has no "never" value
     (`command_capability.hpp:76-81`). Instead, `certificates.list_inventory` gets **no**
@@ -215,7 +231,7 @@ compile-time assertion or a test checks the list against the catalogue's `ReadOn
 
 ### Stores read, per OS
 
-**Decided (ADR-0070 D12 "Identity", `0070:1017-1018`):** a fallback read never stands in for
+**Decided (ADR-0070 §D12 "Identity"):** a fallback read never stands in for
 LocalMachine, and a service account's own store is labelled as such, never as a person's.
 
 **Proposed: machine scope only. Per-user stores are not read in slice 2.**
@@ -269,7 +285,7 @@ has been opened, so a parent that cannot be read is `unreadable`, not `absent`. 
   are discarded as they are framed: never copied out of the read buffer, never base64-decoded,
   never parsed, never logged, and counted only as `non_certificate_block`. The read buffer that
   held them is cleansed before release. This is the exact property. D6's wording, "the collector
-  never opens ... key blocks in PEM files" (`0070:630`), cannot hold literally for a mixed file,
+  never opens ... key blocks in PEM files" (ADR-0070 §D6, "No private keys"), cannot hold literally for a mixed file,
   whose bytes are read as one file; so this design asks #6125 to word D6 as the property above (see
   the owed items under [Phasing and PR order](#phasing-and-pr-order)). The design does not edit
   the ADR.
@@ -281,11 +297,11 @@ has been opened, so a parent that cannot be read is `unreadable`, not `absent`. 
 
 ### Fields collected
 
-**Decided:** raw X.509 facts only (ADR-0070 placement table, `0070:253`). Validity is stored in
-UTC to the second, unclamped, with RFC 5280's `99991231235959Z` sentinel kept (D4, `0070:410-413`).
+**Decided:** raw X.509 facts only (ADR-0070 "Placement under ADR-1005", placement table). Validity is stored in
+UTC to the second, unclamped, with RFC 5280's `99991231235959Z` sentinel kept (ADR-0070 §D4, "What core stores").
 For RSASSA-PSS the PSS hash parameter is recorded. For EC keys the named curve is recorded, so the
-bit length of the curve's group order n is known (D12, `0070:915-922`). SHA-1 is display only
-(D12, `0070:1004-1006`).
+bit length of the curve's group order n is known (ADR-0070 §D12, "Raw fields D13 depends on"). SHA-1 is display only
+(ADR-0070 §D12 "Identity").
 
 **Proposed field list.** Unknown is a distinct value from empty, everywhere (see
 [blob contract](#blob-contract)).
@@ -298,7 +314,7 @@ bit length of the curve's group order n is known (D12, `0070:915-922`). SHA-1 is
 | `version` | int | X.509 version. |
 | `serial` | hex | Canonical: the unsigned big-endian magnitude, uppercase, no leading zero bytes. A negative (non-conforming) serial is flagged `serial_negative`. Equal canonical text means equal integers, which is how D5 compares serials. Today's Windows leg reverses bytes for display (`certificates_plugin.cpp:283-292`); the new field does not. |
 | `subject_dn`, `issuer_dn` | UTF-8 text | The full DN in RFC 4514 order, from the DER on every OS. Today's Windows leg reads a simple display name (D6 gap). |
-| `subject_name_sha256`, `issuer_name_sha256` | 64 hex | SHA-256 of the Name DER exactly as encoded. Equality of these is DER Name equality, which D5's matching rule needs (`0070:525`). |
+| `subject_name_sha256`, `issuer_name_sha256` | 64 hex | SHA-256 of the Name DER exactly as encoded. Equality of these is DER Name equality, which D5's matching rule needs (ADR-0070 §D5, "Revocation statements"). |
 | `not_before`, `not_after` | RFC 3339 UTC, seconds | `YYYY-MM-DDTHH:MM:SSZ`. UTCTime years are mapped per RFC 5280 (50–99 → 19xx). Pre-1970 and year-9999 values are kept. |
 | `key_alg_oid` | OID | `subjectPublicKeyInfo` algorithm. |
 | `rsa_modulus_bits` | int | RSA keys only. |
@@ -312,22 +328,22 @@ bit length of the curve's group order n is known (D12, `0070:915-922`). SHA-1 is
 | `key_usage` | bit names | As today. |
 | `eku_oids` | OID list | Capped (below). |
 | `sans` | list of (type, value) | Types `dns`, `ip`, `rfc822`, `uri`, `upn` (otherName `1.3.6.1.4.1.311.20.2.3`), `dirname`, `other` (OID only, no value). Capped (below). |
-| `crl_dp_uris` | URI list | From the CRL distribution points extension. Collected only so the server can test a partitioned CRL's scope (D5 condition 2). **Never fetched** by anything (D5, `0070:579-582`). Capped. |
-| `self_signed` | bool | Subject DER equals issuer DER **and** the signature verifies under the certificate's own key, computed by the agent (ADR-0070 field table, `0070:220`). |
-| `der` | base64, optional | Shipped so the server can verify signatures itself (D5, `0070:545-546`). See the DER budget below. |
+| `crl_dp_uris` | URI list | From the CRL distribution points extension. Collected only so the server can test a partitioned CRL's scope (D5 condition 2). **Never fetched** by anything (ADR-0070 §D5). Capped. |
+| `self_signed` | bool | Subject DER equals issuer DER **and** the signature verifies under the certificate's own key, computed by the agent (ADR-0070's derived-field table, under "The test applied"). |
+| `der` | base64, optional | Shipped so the server can verify signatures itself (ADR-0070 §D5, "Revocation statements"). See the DER budget below. |
 | key association | see next section | |
 | `locations` | list | Each location is (`store_id`, `path` or empty). A path is a machine path such as `/etc/ssl/certs/ca-certificates.crt`. |
 
 Today's plugin collects none of key algorithm, size, signature algorithm, SANs, EKU, basic
 constraints or a SHA-256 fingerprint, and keeps dates as `YYYY-MM-DD`
-(`certificates_x509.hpp:140-148`). That is the D6 field gap (`0070:668-669`).
+(`certificates_x509.hpp:140-148`). That is the D6 field gap (ADR-0070 §D6, "Fields").
 
 **The DER budget (Proposed).** DER is shipped for a certificate that is not self-signed and whose
 DER is at most 16 KiB, up to 1 MiB of DER per blob. A self-signed root is not shipped, because no
 other CA's CRL can revoke it, and D5's statement does not apply to it. A certificate with no
 shipped DER carries `der_omitted` = `self_signed`, `oversize` or `budget`. The server cannot verify
 its signature, so its revocation statement uses the "matched by issuer and serial" basis
-(`0070:539-546`). Where DER is present, the server re-parses it and uses the server-parsed facts. A
+(ADR-0070 §D5, "Revocation statements"). Where DER is present, the server re-parses it and uses the server-parsed facts. A
 disagreement with the agent's claimed fields is counted
 (`yuzu_server_cert_inventory_claim_mismatch_total`), and the server's values are stored. The
 re-parse ships in 2b-2, beside the signature check that already reads stored DER; until then
@@ -338,7 +354,7 @@ from server-parsed ones. This design adds no field for it.
 
 ### Private-key metadata
 
-**Decided (ADR-0070 D6, `0070:622-630`; placement table, `0070:254`):** metadata only. Never read
+**Decided (ADR-0070 §D6, "No private keys"; placement table):** metadata only. Never read
 key material. Never acquire or open a key to find these things out. On Windows, never call
 `CryptAcquireCertificatePrivateKey` or open a key-storage-provider handle. On Linux, never open
 private-key directories or PEM key blocks. Windows export policy is not collected unless the design
@@ -360,7 +376,7 @@ shows a way that opens no key.
 
 ### Deadlines and caps
 
-**Decided (ADR-0070 D12 "Untrusted input", `0070:969-975`):** the source inherits ADR-0016's ingest
+**Decided (ADR-0070 §D12 "Untrusted input"):** the source inherits ADR-0016's ingest
 caps and adds per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
 
 **Proposed:**
@@ -385,7 +401,7 @@ one-sided cap makes the agent send and the server drop in a tight loop.
 
 ### The D6 collection gaps, closed or disclosed
 
-**Decided (ADR-0070 D6, `0070:663-682`):** the design covers the gaps the ADR found.
+**Decided (ADR-0070 §D6, its list of collection gaps):** the design covers the gaps the ADR found.
 
 | Gap (ADR-0070 D6) | Slice 2 |
 |---|---|
@@ -407,7 +423,7 @@ need_full jitter and weekly full floor (`docs/adr/0016-agent-daily-sync-framewor
 
 ### Blob contract
 
-**Decided (ADR-0070 D12 "Honest capture", `0070:996-1001`):** a capped or timed-out capture is
+**Decided (ADR-0070 §D12 "Honest capture"):** a capped or timed-out capture is
 `constrained` and never an empty success. An empty blob is never sent for a failed or constrained
 capture. A field an older agent did not send reads as unknown, never as empty, and the blob is
 versioned.
@@ -471,7 +487,7 @@ der|<sha256>|<base64>
   fields as unknown.
 - **Unknown versus empty.** A field an older agent's record does not have reads as NULL (unknown)
   on the server. A field the agent could not determine is sent as the literal `?` and also stored
-  NULL. **As built in 2a-2a:** a `?` in `is_ca`, `path_len` or `self_signed` is stored NULL and adds an
+  NULL. **On the 2a-2a branch (not merged):** a `?` in `is_ca`, `path_len` or `self_signed` is stored NULL and adds an
   `unknown:<field>` token to `constrained_fields`; a `?` in the `flags` field adds `flags_unknown`;
   an empty field stays not-applicable NULL, with no token. An empty field is a real empty value: for example, an empty SAN list is sent as no `san|`
   records together with `cert|...|sans=0`. A count of zero is an explicit 0; it never means "not
@@ -494,9 +510,13 @@ der|<sha256>|<base64>
   records. That is not an empty blob, because it carries each failure and its reason, and ingest
   records every store as `unreadable` while keeping its rows. It meets ADR-0016's `app_usage`
   clause 4 ("never send an empty blob for a constrained capture") in substance. Skipping the cycle
-  instead would leave the last `ok` status standing on the server. The source skips the cycle only
-  when the action fails before it can name any store (for example, the plugin fails to load); the
-  read then shows each store's `status_at` ageing. A device whose stores are all genuinely `absent`
+  instead would leave the last `ok` status standing on the server, so the source skips a cycle in
+  three named cases only: the server has not advertised `certificate_inventory_v1` (R17; nothing is
+  walked); the action fails before it can name any store (for example, the plugin fails to load);
+  or the walk stalls (`walk_stalled`, or `walk_unavailable` when its worker cannot start). The
+  stall skip is an owner-accepted exception to D12 (ADR-0070 R18, decision 11). In each case the
+  read shows each store's `status_at` ageing. A walk cancelled by a disconnect or shutdown is not a
+  skip; it is collected again on reconnect. A device whose stores are all genuinely `absent`
   sends the `store|` records and no `cert|` records, and the read says "none found at the listed
   stores", never "no certificates".
 - **No clock in the blob.** The blob carries no agent timestamp. Freshness is server receipt time
@@ -521,7 +541,7 @@ unreported locations therefore still age, and the location-grain prune can fire.
 
 ### Per-user scope
 
-**Decided (ADR-0070 D12 "Identity", `0070:1019-1036`):** per-user rows have their own replace scope,
+**Decided (ADR-0070 §D12 "Identity"):** per-user rows have their own replace scope,
 keyed by device and a per-agent keyed pseudonym (`user_ref`, ADR-0024 D11,
 `HMAC-SHA256(k_agent, profile)`), never a raw SID, uid or username. A per-user location is relative
 to the profile. A user not read this run is `not_observed`, never an empty store.
@@ -539,11 +559,12 @@ A test asserts that a slice-2 report never produces a row with a non-empty `user
 **Decided:** a typed store, Postgres-born (ADR-0006), under the ADR-0012 author contract
 (`docs/postgres-store-playbook.md`). Rows are keyed by (device, store/location/path, SHA-256), plus
 the per-user identifier for per-user rows. Every count is of distinct (device, SHA-256). Every row
-carries the server-receipt `last_seen`. Each store has its own `observed_at` (ADR-0070 D12,
-`0070:977-1038`).
+carries the server-receipt `last_seen`. Each store has its own `observed_at` (ADR-0070 §D12
+"Honest capture" and "Identity").
 
-**Proposed (as built in 2a-2a):** `CertificateInventoryStore`, schema `certificate_inventory_store`, with seven tables in 2a-2a (the
-`decommission_tombstone` row below arrives in 2a-2c). All `*_at` and `*_seen`
+**Proposed (and implemented this way on the unmerged 2a-2a branch):** `CertificateInventoryStore`,
+schema `certificate_inventory_store`, with seven tables in 2a-2a. The `decommission_tombstone` row
+below arrives in 2a-2c, and `dn_dict` and `dn_dict_state` arrive in 2a-2b. All `*_at` and `*_seen`
 columns are `TIMESTAMPTZ` set from the database clock in SQL (`now()`, or for a report's own time T the plain `clock_timestamp()`). Certificate validity columns are `TIMESTAMPTZ`
 from the certificate. Postgres covers 4713 BC to 294276 AD, so pre-1970 and year-9999 dates fit
 unclamped.
@@ -552,12 +573,14 @@ unclamped.
 |---|---|---|
 | `agent_state` | `agent_id` | `content_hash`, `blob_version`, `first_seen`, `last_seen` (receipt of any report, full or skip), `last_full_at` (receipt of the last full report), `sample_key` (server-assigned random 64-bit from the CSPRNG at first ingest; never taken from the wire, never exposed, never changed) |
 | `store_state` | (`agent_id`, `store_id`, `user_ref`) | `scope`, `status`, `reason`, `observed_at` (receipt of the last report in which the store read `ok` or `absent`), `status_at` (receipt of the last report that carried this store), `cert_count` |
-| `cert_location` | (`agent_id`, `store_id`, `user_ref`, `path_md5`, `sha256`); `path_md5` is a generated column, `md5(path)`, and the full `path` is stored beside it (as built in 2a-2a; keeps the key short for long paths) | `first_seen`, `last_seen`, `full_report_at` (the `last_full_at` of the full report that last carried it) |
+| `cert_location` | (`agent_id`, `store_id`, `user_ref`, `path_md5`, `sha256`); `path_md5` is a generated column, `md5(path)`, and the full `path` is stored beside it (as on the 2a-2a branch; keeps the key short for long paths) | `first_seen`, `last_seen`, `full_report_at` (the `last_full_at` of the full report that last carried it) |
 | `decommission_tombstone` | `agent_id` | `decommissioned_at` |
 | `cert_fact` | (`agent_id`, `sha256`) | every field in the field table, `der` (nullable), `server_parsed` (bool), `constrained_fields`, `sample_key` (copy of the agent's, `NOT NULL`) |
 | `cert_san` | (`agent_id`, `sha256`, `ord`) | `san_type`, `value` |
 | `cert_eku` | (`agent_id`, `sha256`, `ord`) | `oid` |
 | `cert_cdp` | (`agent_id`, `sha256`, `ord`) | `uri` |
+| `dn_dict` (2a-2b) | `dn` | `is_issuer`, `is_ca_subject`. Each distinct issuer DN, and each distinct CA subject DN, held once fleet-wide and not tied to a device, so the DN substring filters scan this table rather than `cert_fact`. 2a-2b's migration creates it empty; a background, leader-gated pass builds its indexes and backfill, and prunes names no certificate row references. See [Personal data](#personal-data). |
+| `dn_dict_state` (2a-2b) | `k` | `v`: the background pass's scheduling state (database-clock milliseconds). |
 
 **Indexes:** `cert_fact (not_after)`, `(not_before)`, `(issuer_name_sha256, serial)`,
 `(sig_alg_oid, pss_hash_oid)`, `(key_alg_oid, rsa_modulus_bits)`, `(ec_order_bits)`,
@@ -569,9 +592,9 @@ decommission and confinement.
 A `cert_fact` row exists while at least one `cert_location` row references it. The ingest
 transaction deletes orphaned facts. Engine-facing reads join `cert_fact` to its locations, so every
 response presents one entry per (device, certificate), with its locations as a list, as D12
-requires (`0070:1013-1016`).
+requires (ADR-0070 §D12 "Identity").
 
-**Schema lint (Decided, ADR-0070 D13 "Mechanical checks", `0070:1324-1325`):** no column is named
+**Schema lint (Decided, ADR-0070 §D13 "Mechanical checks"):** no column is named
 after a D13 rule id or window field, or `days_remaining`. 2a-2a adds the lint over every migration
 in this store's migration array.
 
@@ -579,7 +602,7 @@ in this store's migration array.
 
 **Proposed:** one shared ingest seam, `certificate_inventory_ingestion.cpp`, for the direct
 `ReportInventory` and gateway `ProxyInventory` paths (ADR-0016 §5). It runs in one transaction per
-report. **As built in 2a-2a:** the transaction takes a per-agent lock with
+report. **On the 2a-2a branch (not merged):** the transaction takes a per-agent lock with
 `pg_try_advisory_xact_lock`, so it never queues behind another report for the same agent. A report
 that finds the agent busy is **deferred**, not stored: it is counted `result="deferred"`,
 `reason="agent_busy"`; a full report is answered `need_full` (the agent resends), and a hash-only
@@ -598,7 +621,7 @@ relative to their fact (a child digest is being added to prove it). Per store:
 | `absent` | All the store's locations removed. | Set to `now()` |
 | `constrained` | Reported locations upserted. Unreported locations **kept**, since a partial read cannot prove a removal. | Unchanged |
 | `unreadable` | Untouched. | Unchanged |
-| missing from the report (stored, not reported) | Untouched; status becomes `not_observed` from this first omission (D12, `0070:989-991`). | Unchanged |
+| missing from the report (stored, not reported) | Untouched; status becomes `not_observed` from this first omission (ADR-0070 §D12 "Honest capture"). | Unchanged |
 
 **No rows for a decommissioned agent (Proposed; ships in 2a-2c, with the clear below, so no tombstone is ever written before something can clear it).** Ingest writes nothing for an agent that has
 been decommissioned: the check runs inside the ingest transaction, against a decommission tombstone
@@ -607,7 +630,7 @@ the PR chooses). A report from such an agent is acknowledged, writes no row, and
 (`reason=decommissioned`).
 - **No race.** Ingest (`pg_try_advisory_xact_lock`, deferring when busy) and `delete_agent` (the same lock, waited for under a bounded `lock_timeout`) both take the same per-agent lock first, on a hash of the agent id, so a decommission cannot commit between the
   ingest's tombstone read and its commit.
-- **What decommission does today (verified).** The decommission cascade erases seven data stores before 2a-2a and **eight as built in 2a-2a** (the certificate inventory is the eighth, `agent_decommission.cpp`)
+- **What decommission does today (verified).** The decommission cascade erases seven data stores on `dev` today, and **eight once 2a-2a merges** (the certificate inventory is the eighth; `agent_decommission.cpp` on the 2a-2a branch)
   and no auth store (`server.cpp:10019-10029`, `agent_decommission.hpp:117-125`); the only
   `pending_agents` delete is pending-only (`auth_db.cpp:2765`). So an approved agent's enrolment
   record survives decommission. If that agent is still running, it re-registers through the
@@ -659,7 +682,7 @@ the PR chooses). A report from such an agent is acknowledged, writes no row, and
 UTF-8 is validated at the seam. Invalid bytes are replaced, with `sanitize_utf8`
 (`sdk/include/yuzu/string_utils.hpp:32`), and the field is marked. A record over a cap is refused,
 never truncated silently. Refusals are counted on
-`yuzu_server_cert_inventory_ingest_total{result,reason}`. **As built in 2a-2a** the closed
+`yuzu_server_cert_inventory_ingest_total{result,reason}`. **On the 2a-2a branch** the closed
 (result, reason) set is: `stored` {`none`, `parse_error`, `over_cap`, `der_hash_mismatch`,
 `utf8_replaced`}; `touched` {`none`}; `need_full` {`cold`, `hash_mismatch`, `bad_claim`};
 `rejected` {`blob_too_large`, `unknown_version`, `bad_header`, `over_cap`, `too_many_sources`};
@@ -675,7 +698,7 @@ major version, so the agent never loops on bytes the server will always refuse.
 
 ### Typed set, purge and read filter
 
-**Decided (ADR-0070 D12 "Lifecycle", `0070:1043-1052`):** the source joins the typed set, with a
+**Decided (ADR-0070 §D12 "Lifecycle"):** the source joins the typed set, with a
 test. Stray rows in the generic store must never be readable, which needs both a read-time filter
 that excludes typed sources and membership of the boot-time purge, tested against the typed set.
 App-usage's accepted mixed-version window is not acceptable for this source.
@@ -701,7 +724,7 @@ What exists today:
 - **The purge starts at boot but no longer blocks it (PR 2a-1b).** 2a-1 keeps the existing
   synchronous boot purge, iterating the one array; 2a-1b replaces it. The batched background pass (bounded rows
   per batch, classified in `background_jobs.hpp`) is started at every boot, so typed sources stay
-  members of the boot-time purge ADR-0070 D12 requires (`0070:1049`). What changes is that the
+  members of the boot-time purge ADR-0070 §D12 "Lifecycle" requires. What changes is that the
   server does not wait for it to finish before serving, instead of one unbounded `delete_source`
   per name during boot (`server.cpp:7612-7621`). The read filter makes that deferral safe: a row
   the pass has not reached yet is already unreadable.
@@ -714,7 +737,7 @@ mixed-version window becomes closed), and ships a changelog fragment and the `up
 
 ### Decommission and readiness
 
-**Decided (ADR-0070 D12 "Lifecycle", `0070:1041-1042`, `:1053`):** the store joins
+**Decided (ADR-0070 §D12 "Lifecycle"):** the store joins
 `AgentDecommissionStores` and its drift guard in the same change, and `/readyz` covers it.
 
 **Proposed:**
@@ -733,12 +756,15 @@ mixed-version window becomes closed), and ships a changelog fragment and the `up
 
 ### Retention and the prune
 
-**Decided (ADR-0070 D12 "Honest capture", `0070:986-995`, and its R15 amendment):** kept rows are pruned only when both
-hold: the store's latest report says `unreadable` or `not_observed`, and its `observed_at` is older
-than a stated bound. Age alone never prunes. The prune follows the clock-guarded-retention routed
-concern. The design states how a pruned store's rows are re-sent despite hash-skip.
+**Decided (ADR-0070 §D12 "Honest capture", as amended by R15 and R16):** D12's bounded-retention
+rule pruned kept rows only when the store's latest report said `unreadable` or `not_observed` and
+its `observed_at` was older than a stated bound. R15 (decision 6) added a location grain inside a
+`constrained` store. R16 (decision 7) supersedes both R15's predicate and D12's store-grain
+condition with the one location-grain rule below. What stands from D12: age alone never prunes, the
+prune follows the clock-guarded-retention routed concern, and the design states how a pruned
+store's rows are re-sent despite hash-skip.
 
-**Proposed (prune rule ruled by the owner 2026-10-26, decision 7; see [Decisions](#decisions)):**
+**Decided (owner, 2026-10-26: ADR-0070 R16, decision 7; see [Decisions](#decisions)):**
 - **Bound:** 30 days.
 - **One rule, at location grain.** A `cert_location` row is pruned when all three hold:
   its store's latest status is `unreadable`, `not_observed` or `constrained` (an `ok` or `absent`
@@ -748,9 +774,10 @@ concern. The design states how a pruned store's rows are re-sent despite hash-sk
   the bound is never pruned even if its store later reads `unreadable`. A store whose first read
   was `constrained` (so its `observed_at` is NULL) is covered the same way. This replaces the
   store-grain predicate on `observed_at < now()`, which governance showed pruned an offline
-  device's rows once a store had read `unreadable` before it went offline. It is at least as strict
-  as D12's store-grain condition wherever that condition applies, and extends R15's location grain
-  to `unreadable` and `not_observed` stores; the extension is ruling R16 (accepted 2026-10-26).
+  device's rows once a store had read `unreadable` before it went offline. It is not stricter than
+  D12's condition in every case (for a location last seen 20 days ago, in a store unreadable for
+  40, D12's condition prunes it and R16 keeps it); it is a different rule, and R16 supersedes D12's
+  store-grain condition and R15's predicate rather than narrowing them.
 - **Accepted residual (R16, accepted 2026-10-26):** a forward step of the database clock that is in force when
   an agent next reports is added to that agent's `last_seen`, so its kept locations can age out
   that much early. `last_seen <= now()` stops a stored future value, not a step that `now()`
@@ -777,7 +804,8 @@ concern. The design states how a pruned store's rows are re-sent despite hash-sk
 
 ### Background jobs
 
-**Decided (ADR-0070 D12, `0070:945-946`, `:1054-1055`):** any new job is classified in
+**Decided (ADR-0070 §D12, "Registered-CRL revocation
+(R1)" and "Lifecycle"):** any new job is classified in
 `background_jobs.hpp`, and the CRL refresh job is leader-gated.
 
 **Proposed:**
@@ -802,7 +830,7 @@ egress. The test count tripwire in `test_background_jobs.cpp` is bumped by each 
 
 ### The securable
 
-**Decided (ADR-0070 D12 "Read surface", `0070:875-900`):** a dedicated certificate securable that no
+**Decided (ADR-0070 §D12 "Read surface"):** a dedicated certificate securable that no
 other surface uses. RBAC on: seeded only to Administrator plus any role the design names and
 justifies, never granted through `Security:Read`, `Inventory:Read` or a seeded read-only role. RBAC
 off: admin-only, by extending `authz_topology_floor.hpp`, never forking it. The entry fits that
@@ -841,7 +869,7 @@ header's class for preserving an existing admin-only posture.
 
 ### Gates, confinement, denial text and errors
 
-**Decided (ADR-0070 D12, `0070:901-905`):** the gate and the denial text take the securable as a
+**Decided (ADR-0070 §D12 "Read surface"):** the gate and the denial text take the securable as a
 parameter. A denial names the permission actually required. On a page that shows both halves, a
 denied certificate half says it was denied, never "no certificates".
 
@@ -861,7 +889,7 @@ denied certificate half says it was denied, never "no certificates".
 
 ### Audit and degrade
 
-**Decided (ADR-0070 D12, `0070:906-907`):** each read is audited with its own verb, recording
+**Decided (ADR-0070 §D12 "Read surface"):** each read is audited with its own verb, recording
 fleet-wide or confined scope. A degraded read is a 503 with a retry hint, never an empty 200.
 
 **Proposed audit verbs:**
@@ -905,7 +933,7 @@ fleet-wide or confined scope. A degraded read is a 503 with a retry hint, never 
 
 ### Admission
 
-**Decided (ADR-0070 D12, `0070:909-910`):** reads, including read-time CRL matching, are admitted
+**Decided (ADR-0070 §D12 "Read surface"):** reads, including read-time CRL matching, are admitted
 through the existing `/crypto` read gate and degrade metric. Extend them; never fork them.
 
 **Proposed:** every certificate store read leases from the one `CryptoReadGate` that
@@ -917,7 +945,7 @@ the dashboard's polling, and any change to the bound is its own reviewed change.
 
 ### Truncation
 
-**Decided (ADR-0070 D12, `0070:911-913`):** every capped read carries a named truncation flag. It
+**Decided (ADR-0070 §D12 "Read surface"):** every capped read carries a named truncation flag. It
 never looks complete, and never looks empty.
 
 **Proposed, decided once for every certificate surface and the certificate CBOM.** This answers
@@ -929,7 +957,7 @@ FortitudeEtc's #6123 finding that `result_truncated` could be false on a truncat
   `locations_cap`, `sans_cap`, `constrained_store`, `constrained_certificate`.
 - A response that is paged and complete across pages carries `next_cursor` and
   `result_truncated: false` on the last page. An engine-grain read either completes across pages or
-  fails with a 503 (ADR-0070 D9, `0070:819-820`).
+  fails with a 503 (ADR-0070 §D9).
 
 **Paged reads make no cross-page consistency promise (disclosed).** Each page of the
 per-certificate read is its own statement. An ingest, prune or decommission that commits between
@@ -939,7 +967,7 @@ and drilling, not for recomputing a count exactly.
 
 **The snapshot export carries D13 condition 2's recompute promise (senior ruling R-gen).** D13
 condition 2 requires each fleet count to be recomputable from the raw per-certificate facts
-(`0070:1288-1295`). That promise is scoped to one read:
+(ADR-0070 §D13, "Conditions that keep the exception closed"). That promise is scoped to one read:
 - `GET /api/v1/crypto/certificates/snapshot`, MCP twin `export_crypto_certificate_snapshot`.
 - It runs in **one** `REPEATABLE READ` transaction: it selects `date_trunc('second', now()) AS
   as_of`, the D13 counts and every raw row behind them (the per-certificate fields, with locations
@@ -996,7 +1024,7 @@ typed output schema and per-error recovery metadata, with the values in
 
 Every certificate and revocation-source REST and MCP description carries D10's sentence: "facts
 only; the only built-in checks are D13's named rules and windows, each shown with its criterion"
-(`0070:831-832`).
+(ADR-0070 §D10).
 
 #### MCP annotations and errors
 
@@ -1059,7 +1087,7 @@ in OpenAPI beside "not refused" on the server is the #6122 item 2 defect.
 | `sha256` | 64 hex | Refused if malformed. |
 | `spki_sha256` | 64 hex | Exact. Every certificate over one key. Refused if malformed. |
 | `aki_key_id` | hex, 2..128 | Exact. Every certificate whose authority key identifier names one CA key. Refused if malformed. |
-| `not_after_edges` (summary histogram) | list of RFC 3339, 1..32, ascending | The caller's bucket edges (ADR-0070's derived-field table, `0070:225`). Refused if unsorted or too many. |
+| `not_after_edges` (summary histogram) | list of RFC 3339, 1..32, ascending | The caller's bucket edges (ADR-0070's derived-field table, under "The test applied"). Refused if unsorted or too many. |
 | `cursor`, `limit` | opaque / int 1..500 (default 100) | REST and MCP both refuse a value out of range. |
 
 #### Finding one CA's certificates
@@ -1146,26 +1174,25 @@ per-certificate read. The snapshot accepts them too, because it takes the same f
   description says revocation is not checked by this version.
 - `stores` lists the status of every store on every device in the page, so a kept row is never
   shown without the status that explains it.
-- `not_read` is D10's honesty list (`0070:835-836`).
+- `not_read` is D10's honesty list (ADR-0070 §D10).
 - `coverage.tombstoned_agents_registered` is added to `coverage` only for an administrator (see
   [Ingest](#ingest)); the example above is a confined caller's response, so it has none.
 
 **Summary** (`/summary`): distinct-device and distinct-certificate counts grouped by raw value
 (`key_alg_oid` + `rsa_modulus_bits` or `ec_order_bits`, `sig_alg_oid` + `pss_hash_oid`,
 `ec_curve_oid`, `issuer_dn` top 50, `store_id`), plus a `not_after` histogram over the caller's
-edges. These are raw-value rollups at a grain an engine can consume (ADR-0070 D9, `0070:821-823`).
+edges. These are raw-value rollups at a grain an engine can consume (ADR-0070 §D9).
 No bucket edge is chosen by Yuzu. Subject DNs and SANs are never a grouping key (see
 [Personal data](#personal-data)).
 
 ### D13 counts
 
-**Decided (ADR-0070 D13 at `430e67b7d`, `0070:1079-1140`, `:1186-1270`, `:1283-1338`):** the four
+**Decided (ADR-0070 §D13):** the four
 rules, the windows and their edges (R5, R7, R10, R14), the `active` count, R13's partial-reasons
 figure, conditions 1–5, the mechanical checks and the closed allow-list. This design adopts R5,
 R7, R10, R12, R13 and R14 verbatim and does not restate them differently anywhere. `as_of` is
-`date_trunc('second', now())` (R5, `0070:1188-1189`): R4's Postgres `now()` in whole seconds, read
-in the same SQL statement as every comparison it governs, and returned exactly as compared (R4,
-`0070:1176-1177`).
+`date_trunc('second', now())` (R5): R4's Postgres `now()` in whole seconds, read
+in the same SQL statement as every comparison it governs, and returned exactly as compared (R4).
 
 **Proposed rule definitions** (`rule_set_version: "crypto_weak_rules_v1"`). They are a closed OID
 set, compiled in, and changed only by a reviewed code change (condition 4):
@@ -1181,12 +1208,11 @@ A certificate with an unknown field (NULL) does not match a rule. It is counted 
 `not_evaluable`, so an older agent's rows never read as "no weak keys".
 
 **The expiry boundary (owner decision OD-3, per RFC 5280; restated by R5).** OD-3 rules the
-`not_after` boundary only: a certificate is valid through its `notAfter`, inclusive (R5,
-`0070:1187`). So a certificate whose `not_after` equals `as_of` is still valid: it is active and
+`not_after` boundary only: a certificate is valid through its `notAfter`, inclusive (R5). So a certificate whose `not_after` equals `as_of` is still valid: it is active and
 expiring, not expired. Because `as_of` is truncated to the second and certificate times are whole
 seconds, that equality is exact. Every other edge below is R5's, R10's and R14's, not OD-3's.
 
-**Window definitions (Decided, R5/R10/R14, `0070:1186-1202`, `:1237-1242`, `:1267-1270`).** Windows
+**Window definitions (Decided, ADR-0070 §D13, R5/R10/R14).** Windows
 are cumulative, not banded. Every bound is stated; none is implied:
 
 | Window | Predicate (UTC, against `as_of`) | Values |
@@ -1200,10 +1226,10 @@ are cumulative, not banded. Every bound is stated; none is implied:
 | `revoked_per_iso_week` (2b-2) | `week_start <= revocation_date < week_start + 7 days`, and `revocation_date <= as_of` | 52 weeks, current week included and `partial` (R7) |
 | `crl_past_next_update` (2b-1) | registered CRL scopes whose `next_update < as_of` (strictly before); a CRL with no `nextUpdate` is counted under `no_next_update`, never as past. Served on the `RevocationSource:Read` source list, not the certificate counts read (below). | — |
 
-The window values, edges and 52-week span are ADR-0070's (`0070:1095-1134`, `:1212-1214`), and
+The window values, edges and 52-week span are ADR-0070's (§D13 "What is admitted, and nothing else", and R7), and
 `rule_set_version` `crypto_weak_rules_v1` names exactly the rules and windows as ADR-0070 states
-them at `430e67b7d`. Retuning any rule, window, edge or the span bumps it, because condition 4
-makes that a change to the rule set (`0070:1311-1314`). The constants are defined once, with one
+them. Retuning any rule, window, edge or the span bumps it, because condition 4
+makes that a change to the rule set (ADR-0070 §D13, "Conditions that keep the exception closed"). The constants are defined once, with one
 shared predicate per edge, and every count surface (the certificate counts here and any Yuzu-CA
 count) imports them rather than copying them.
 
@@ -1244,13 +1270,13 @@ The `active` count is the same object with `"rule_id": "active"`, no `threshold`
 - A revoked-window count adds `matched_by_issuer_and_serial`, `signature_verified`,
   `revocation_not_checked` with a per-cause breakdown, and beside it
   `checked_some_reasons_only`: how many certificates in scope were checked against a CRL covering
-  only some reasons (R13, `0070:1105-1111`, `:1262-1266`).
+  only some reasons (ADR-0070 §D13, R13).
 
 The response's top-level keys are `weak_key_rules`, `active`, `expiring_within_days`,
 `expired_within_days`, `issued_within_days`, `issued_per_iso_week` and, from 2b-2,
 `revoked_within_days` and `revoked_per_iso_week`. Of these only `weak_key_rules`,
 `expiring_within_days` and `expired_within_days` are verdict-shaped names under the D10 lint, and
-they are exactly D13's closed allow-list (`0070:1332-1338`). 2a-3 adds three allow-list entries
+they are exactly D13's closed allow-list (ADR-0070 §D13, "The D10 allow-list is closed"). 2a-3 adds three allow-list entries
 keyed by (`/api/v1/crypto/certificates/counts`, field), the same three for
 `get_crypto_certificate_counts`, the counts fragment, the snapshot route and
 `export_crypto_certificate_snapshot` (the snapshot embeds the same counts object), each citing D13:
@@ -1266,7 +1292,7 @@ timeout is a 503 with a retry hint, never a partial count.
 
 ### CBOM certificate components
 
-**Decided (ADR-0070 D7, `0070:684-713`):** facts only. Verdict fields stay empty or omitted. Each
+**Decided (ADR-0070 §D7):** facts only. Verdict fields stay empty or omitted. Each
 half is gated by its own securable, and an omitted half never reads as "no certificates". Coverage,
 confinement and truncation are carried.
 
@@ -1280,7 +1306,7 @@ certificate (`sha256`), with `assetType: certificate`:
   (with its size), never the deprecated `signatureAlgorithmRef` / `subjectPublicKeyRef`;
 - `yuzu:` properties: device count, store ids, `key_association`.
 
-**Agreement sample (as built in 2a-4; the key itself is created by 2a-2a).** Agent-claimed facts are
+**Agreement sample (as on the unmerged 2a-4 branch; the key itself is created by 2a-2a).** Agent-claimed facts are
 published as agreed only when the devices examined agree and every emitted value matches them.
 Under 64 reporters every reporter is examined; at 64 or more the first 64 in `(sample_key,
 agent_id)` order are examined and the component says `reporters_sampled`. Because the key is
@@ -1294,15 +1320,15 @@ certificate's claimed facts are withheld. The exact bounds are stated in `crypto
 (lifecycle state is derived against "now"). `revocationDate` is also left empty in 2a-4. Filling it
 from an R1 statement is a fact, but it would need D5's basis wording, which the field cannot carry.
 It is revisited after 2b-2 (decision 4, [Decisions](#decisions)). The exact field
-list is checked against `bom-1.7.schema.json` when 2a-4 is built (D7, `0070:694-695`).
+list is checked against `bom-1.7.schema.json` when 2a-4 is built (ADR-0070 §D7, "Verdict fields stay empty").
 
 A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the library half, plus
 `yuzu:crypto:halves_omitted: ["certificates"]` and the reason in the coverage metadata.
 
 ## R1: registered-CRL revocation (slice 2b)
 
-**Decided (ADR-0070 D5 as amended by R1, `0070:507-570`; D12 "Registered-CRL revocation",
-`0070:924-951`):** everything R1 requires is binding. This section designs it.
+**Decided (ADR-0070 §D5 as amended by R1; §D12 "Registered-CRL revocation
+(R1)"):** everything R1 requires is binding. This section designs it.
 
 ### Registration
 
@@ -1315,7 +1341,7 @@ A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the l
 - The URL list is admin-only, because it reveals internal hosts.
 - Registered URLs are logged through `log_token`.
 - A registered CA certificate is supplied by an administrator, never imported from fleet rows, and
-  never a trust anchor for any PKI decision path (D6, `0070:650-652`).
+  never a trust anchor for any PKI decision path (ADR-0070 §D6, "Separate from `CaStore` and every trust anchor").
 
 **Proposed:**
 - **Securable:** `RevocationSource`, with two operations only: `Read` (the source list and detail)
@@ -1342,7 +1368,7 @@ A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the l
   store keeps each key's DER, the CA's subject Name DER hash, each key's SKI and its SPKI hash.
 - **Each URL** must be `http` or `https`, with a host, and with no userinfo, no fragment and at
   most 2,048 bytes. The host must be ASCII (IDNs are given as punycode). `file:`, LDAP, UNC and
-  everything else are refused (D12, `0070:940`). At registration the host is resolved and its
+  everything else are refused (ADR-0070 §D12, "The fetcher's own security review"). At registration the host is resolved and its
   address class shown to the administrator, who confirms it. Refused outright, at registration and
   on every fetch, with no override: the always-refused tier that `oidc_egress_policy.hpp:12-22`
   defines (unspecified, link-local, cloud metadata, multicast, reserved), **loopback**, and **every
@@ -1375,7 +1401,8 @@ A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the l
 
 ### The fetcher
 
-**Decided (ADR-0070 D5 and D12, `0070:511-518`, `:936-944`):** exactly the registered URLs;
+**Decided (ADR-0070 §D5 "Registration" and §D12 "The fetcher's own
+security review"):** exactly the registered URLs;
 redirects only to registered URLs; no credentials; bounded timeouts and sizes; `http`/`https` only;
 the resolved address checked against the registered host on every fetch, so DNS rebinding cannot
 redirect it; the revocation-statement rule applied before any entry is used. Internal addresses are
@@ -1420,7 +1447,7 @@ review, as a new egress surface.
 
 ### Verifying and accepting a CRL
 
-**Decided (ADR-0070 D5 "Revocation statements", `0070:520-530`):**
+**Decided (ADR-0070 §D5 "Revocation statements"):**
 1. It verifies against a CA key registered for that CA.
 2. It is in scope for the certificate: issuer by DER Name equality, AKI where present, serial as an
    integer; a partitioned CRL only within its distribution point and reasons; a delta CRL only with
@@ -1529,11 +1556,11 @@ review, as a new egress surface.
 
 ### The store
 
-**Decided (ADR-0070 D12, `0070:947-948`):** a Postgres store for registered CAs and CRL entries,
+**Decided (ADR-0070 §D12 "Registered-CRL revocation (R1)"):** a Postgres store for registered CAs and CRL entries,
 separate from `ca_store`, in the readiness conjunction.
 
 **Proposed:** `RevocationSourceStore`, schema `revocation_source_store`. It never touches `ca_store`
-(D6, `0070:632-639`).
+(ADR-0070 §D6, "Separate from `CaStore` and every trust anchor").
 
 | Table | Key | Columns |
 |---|---|---|
@@ -1571,7 +1598,7 @@ also covers.
 
 ### Matching and statements
 
-**Decided, quoted verbatim from ADR-0070 D5 at `430e67b7d` (`0070:532-555`):**
+**Decided, quoted verbatim from ADR-0070 §D5 "Revocation statements":**
 
 > From such a CRL it states one of:
 > - "revoked on <revocationDate> (reason <r>)". A `certificateHold` entry reads "on hold",
@@ -1635,7 +1662,7 @@ Then `serial` equality against `crl_entry` decides "listed" or "not listed".
 
 ### Metrics and alerts
 
-**Decided (ADR-0070 D12, `0070:949-953`):** an alert on fetch failure and on `crl_past_next_update`,
+**Decided (ADR-0070 §D12 "Registered-CRL revocation (R1)"):** an alert on fetch failure and on `crl_past_next_update`,
 following `docs/observability-conventions.md`. Each rule ships with a test proving it can fire.
 
 **Proposed:** server metrics use the `yuzu_server_` prefix (`docs/observability-conventions.md:7-9`).
@@ -1651,7 +1678,7 @@ caps (64 sources × 8 URLs). Closed label sets are pre-seeded to 0.
 | `yuzu_server_crl_refresh_last_run_timestamp_seconds` | gauge, set at the end of every refresh tick | none | the leader |
 | `yuzu_server_crl_sources` | gauge | none | every replica (a store count) |
 | `yuzu_server_crl_refresh_leader` | gauge, 1 on the replica running the refresh, else 0 | none | every replica |
-| `yuzu_server_cert_inventory_ingest_total` | counter | `result`, `reason` (closed set, see [Ingest](#ingest); as built in 2a-2a, plus the generic `yuzu_inventory_ingest_total` / `yuzu_inventory_ingest_duration_seconds` with `source=certificate_inventory`) | every replica |
+| `yuzu_server_cert_inventory_ingest_total` | counter | `result`, `reason` (closed set, see [Ingest](#ingest); as on the 2a-2a branch, plus the generic `yuzu_inventory_ingest_total` / `yuzu_inventory_ingest_duration_seconds` with `source=certificate_inventory`) | every replica |
 | `yuzu_server_cert_inventory_claim_mismatch_total` | counter | none | every replica |
 | `yuzu_server_cert_inventory_pruned_total`, `..._prune_capped_total` | counter | `grain` | every replica |
 | `yuzu_fleet_cert_store_status` | gauge, fleet rollup | `os`, `status` | every replica; absent-not-zero |
@@ -1661,7 +1688,7 @@ non-leader exports none of them.
 
 Alerts in `docs/prometheus/yuzu-alerts.yml`, each with a `promtool` test that fires it:
 - `YuzuCrlFetchFailing`: per `url_id`, failures increasing with no success for 6 hours;
-- `YuzuCrlPastNextUpdate` (R12, `0070:1251-1260`) is **two rules with the same alert name**, so each
+- `YuzuCrlPastNextUpdate` (ADR-0070 §D13, R12) is **two rules with the same alert name**, so each
   has its own `for`:
   - *past next update*: `max(yuzu_server_crl_scopes_past_next_update) > 0`, `for: 1h`. It takes
     the `max` across replicas, so a former leader's stale value cannot hide a CRL past its
@@ -1687,7 +1714,7 @@ Alerts in `docs/prometheus/yuzu-alerts.yml`, each with a `promtool` test that fi
 
 ## Personal data
 
-**Decided (ADR-0070 D12 "Personal data", `0070:955-967`):** subjects and SANs can carry e-mail
+**Decided (ADR-0070 §D12 "Personal data"):** subjects and SANs can carry e-mail
 addresses, UPNs and names. Per-user stores are per-user data, and including them is this design's
 privacy decision. The design records the DPIA, works-council and retention position, the RBAC-off
 posture, and the data-processor obligations an engine takes on.
@@ -1700,7 +1727,10 @@ posture, and the data-processor obligations an engine takes on.
   the CBOM certificate half, the snapshot export (`GET /api/v1/crypto/certificates/snapshot` and
   MCP `export_crypto_certificate_snapshot`, up to 50k rows) and the `/fragments/crypto/certificates`
   dashboard fragments. The certificate inventory's own reads are behind
-  `CertificateInventory:Read`, which is admin-only under RBAC off. An issuer DN is a personal name when the issuer is a personal CA or a self-issued
+  `CertificateInventory:Read`. That securable is not on `dev`; 2a-2b adds it (on the
+  `feat/cert-inventory-read` branch). It is admin-only under RBAC off. With RBAC on it is seeded
+  only to Administrator, no other built-in role holds it, and any other holder needs an explicit
+  grant, which the access-review export lists. An issuer DN is a personal name when the issuer is a personal CA or a self-issued
   certificate, and the `/summary` read groups by issuer DN (top 50), so the grouping can show such
   a name (self-signed end-entity certificates are excluded; a personal CA, or a self-issued
   certificate whose `self_signed` flag is false or NULL, is not). Distinguished names are also
@@ -1712,8 +1742,8 @@ posture, and the data-processor obligations an engine takes on.
   key, never a metric label, and never in audit details (only counts and filter names are audited).
   The pre-existing `certificates.list` and `certificates.details` plugin results, stored as
   ordinary responses, are outside this table and follow `Response:Read`: with RBAC on it is held
-  by Operator, PlatformEngineer, ITServiceOwner and Viewer as well as administrators, and under
-  RBAC off (the default) any authenticated session can read them; they are kept
+  by Operator, PlatformEngineer, ITServiceOwner, Viewer and ForensicsAnalyst as well as
+  administrators, and under RBAC off (the default) any authenticated session can read them; they are kept
   90 days and are not erased on decommission. A further exposure is the L7 generic-store residual
   (decision 8, ADR R17): a blob that a pre-2a-1 backend stored in the generic inventory store is
   readable to `Inventory:Read` and `Infrastructure:Read` holders (under RBAC off, the default, any
@@ -1763,7 +1793,7 @@ This section defines only the data each widget reads. The widget UI, layout and 
 proposed in unmerged work (`feat/crypto-dashboard-widgets`) and are not specified here. Every
 certificate widget reads under `CertificateInventory:Read`, except the registered-CRL widget,
 which reads under `RevocationSource:Read`. A caller without the permission sees "not available to
-this account (<permission> is required)", never zeros (D12, `0070:901-905`).
+this account (<permission> is required)", never zeros (ADR-0070 §D12 "Read surface").
 
 | Widget (data, not UI) | Reads | Slice |
 |---|---|---|
@@ -1786,7 +1816,7 @@ gates them on `Inventory:Read`, with the confined-caller note, and they are neve
 
 ## Tests and chaos
 
-**Decided (ADR-0070 D12 "Chaos", `0070:1057-1067`):** CH-1..CH-6 run before slice 2 is complete,
+**Decided (ADR-0070 §D12 "Chaos"):** CH-1..CH-6 run before slice 2 is complete,
 each in the PR that first makes it runnable: CH-1's store-ingest half in 2a-2a and its Windows
 half in 2a-2f; CH-2's caps in 2a-2e and its fragment and audit half in 2a-2b; CH-3 on each OS in
 2a-2e, 2a-2f and 2a-2g, and its registered-URL half in 2b-1b; CH-4's offline and prune half in
@@ -1834,7 +1864,7 @@ Each is defined by the property it must prove.
 - **D13:** the condition-1 lint over OpenAPI, MCP schemas and fragments; the closed allow-list; a
   recompute test that takes one snapshot export and rebuilds every count it returns, `active` and
   `checked_some_reasons_only` included, from the rows it returns at the `as_of` it returns, with an
-  independent predicate per R5/R10/R14 edge, failing on any difference (`0070:1326-1330`). Edge
+  independent predicate per R5/R10/R14 edge, failing on any difference (ADR-0070 §D13 "Mechanical checks"). Edge
   cases it pins: `not_after == as_of` (active and expiring, not expired); a not-yet-valid
   certificate (in neither `active` nor any expiring window); `not_before` exactly
   `as_of - 7 days` (not issued, lower bound exclusive) and one second later (issued); the same two
@@ -1945,20 +1975,25 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
 6. **Retention of locations in a store that stays `constrained`.** A location missing from every
    report the server received over 30 days is treated as not observed at location grain and pruned
    by the same pass. The owner confirmed this reading of D12's store-grain condition over a
-   per-store ceiling ([Retention and the prune](#retention-and-the-prune)).
+   per-store ceiling ([Retention and the prune](#retention-and-the-prune)). This is ADR-0070 R15.
+   R16 (decision 7) later superseded its predicate.
 
-**Decided by the owner, 2026-10-26** (items raised by governance on 2a-2d, 2a-2e, 2a-3 and 2a-4; the owner took the recommendations on all):
+**Decided by the owner, 2026-10-26 and 2026-10-27** (items raised by governance on 2a-2d, 2a-2e, 2a-3 and 2a-4; the owner took the recommendations on all; each item carries its own date):
 
 7. **R16, one location-grain prune rule** (ADR-0070 D12). Ruled 2026-10-26: accepted as written
-   (see ADR R16), points (i)-(iv) accepted as residuals. See
+   (see ADR R16), points (i)-(iv) accepted as residuals. R16 supersedes R15's predicate (decision
+   6) and D12's store-grain condition. See
    [Retention and the prune](#retention-and-the-prune).
-8. **R17, the agents-before-servers window** (ADR-0070 D12). Ruled 2026-10-26: closed in code
-   by a capability gate, superseding the earlier option (a). The agent sends
+8. **R17, the agents-before-servers window** (ADR-0070 D12; ruled 2026-10-26, L7 residual
+   accepted 2026-10-27). R17 amends D12's "Lifecycle" sentence that the mixed-version window "is
+   **not** acceptable for this source". Ruled: to be closed in code by a capability gate,
+   superseding the earlier option (a). The agent sends
    `certificate_inventory` only when the server's `RegisterResponse` advertises
    `certificate_inventory_v1` (new field `repeated string server_capabilities = 9`); the server
    advertises it only while its certificate store opened. Absent means never sent, so the gate
-   fails closed. The server capability ships in 2a-2a and the agent gate in 2a-2e. D12's "the
-   mixed-version window is not acceptable" stands, with one exception: the owner-accepted L7
+   fails closed. The server capability is planned for 2a-2a and the agent gate for 2a-2e; neither
+   is on `dev`, so the closure depends on 2a-1 (PR #6563) and 2a-2a merging, and on 2a-2e for the
+   agent side. D12's "the mixed-version window is not acceptable" stands, with one exception: the owner-accepted L7
    balancer residual below and in ADR R17 (every backend at 2a-1 or later; never roll a backend
    back below 2a-1 while certificate-collecting agents report). Not adopted: (a)
    accepting the window and closing it by deploy order (servers first, never roll back, a
@@ -1969,7 +2004,8 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
    on deploy order, except for the L7 balancer residual below, which does rely on one
    condition: no backend is rolled back below 2a-1 while certificate-collecting agents report.
 
-    **As built, the gateway layer (2a-2a; owner acceptance 2026-10-27).** The gateway enforces
+    **The gateway layer (planned for 2a-2a and implemented on its unmerged branch; owner
+    acceptance 2026-10-27).** The gateway enforces
     the capability itself, per upstream connection. It records each connection's
     `server_capabilities` from the latest accepted `ProxyRegister` answer, live or replayed, and
     drops the record when the connection closes. It strips the `certificate_inventory` source from
@@ -2009,20 +2045,21 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
     certificate half writes its own `crypto.certificates.view` row (`via=cbom`) and is omitted,
     named in `halves_omitted`, when that row cannot be stored, on REST and on MCP alike (stricter
     than OD-2's MCP set-and-proceed); the export's own row stays set-and-proceed for the library
-    half. The code is kept and this design follows it.
-    **Ruled 2026-10-26:** acknowledged as built; the certificate half fails closed on its own
-    audit row on REST and MCP.
+    half. The 2a-4 branch (`feat/cert-inventory-cbom`, not merged) implements this, and this
+    design follows it. **Ruled 2026-10-26:** accepted as implemented on that branch; the
+    certificate half fails closed on its own audit row on REST and MCP.
 
 11. **The Linux walk's residual** (raised by 2a-2e's governance and measured by its chaos runs;
     an owner decision). **Ruled 2026-10-26:** accepted as disclosed, including clause (4)'s Linux
     5.8-6.7 mount-id-reuse gap. Operators running FUSE or autofs on certificate-collecting hosts
     are advised to run Linux 6.8 or later; the agent PR's (2a-2e) README and manual must carry
-    that advice. Source: `sync_cancel.hpp` header (2a-2e), copied verbatim.
+    that advice. Source: the `sync_cancel.hpp` header on the unmerged 2a-2e branch
+    (`feat/cert-inventory-agent-linux`), copied verbatim.
 
     **Restated 2026-10-26 (owner), superseding the consequence the ruling above was given on:**
     the walk no longer blocks the agent. 2a-2e runs it on a dedicated worker; the sync thread waits
     at most 75 s, then the source is SKIPPED with reason `walk_stalled` (corrected 2026-10-27 to
-    the as-built behaviour, below); a stuck
+    the 2a-2e branch's behaviour, below); a stuck
     worker blocks only itself, and no second worker starts while one is stuck; shutdown uses the
     existing `hard_exit` grace path, so a stuck worker cannot hold a reconnect or a stop. The
     residual below is therefore bounded to the certificate source on that device. The sync
@@ -2034,16 +2071,27 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
     on hosts with FUSE or autofs run 6.8 or later.
 
     **Disclosed limits (governance, 2026-10-27).** (a) `walk_stalled` has no fleet gauge or alert
-    as built: it is a heartbeat tag the server does not store plus an agent log line, so nothing durable detects agents that stay dark
+    on the 2a-2e branch: it is a heartbeat tag the server does not store plus an agent log line, so nothing durable detects agents that stay dark
     after it; fleet-drop alerts self-clear. (b) "A stuck worker cannot hold a stop" holds for the
     sync thread and the `hard_exit` grace path, but a worker left in uninterruptible kernel wait
     (for example by a silent FUSE daemon that has read the request) cannot be killed, so
     `_exit` may not complete promptly and a restart can meet the same wedge again.
 
-    **Corrected 2026-10-27 to the as-built 2a-2e behaviour (owner).** The sync thread waits at
+    **Corrected 2026-10-27 to the 2a-2e branch's behaviour (owner).** The sync thread waits at
     most 75 s. On a stall the source is SKIPPED with reason `walk_stalled`: no status-only blob is
     sent, so `observed_at` ages visibly and R16 never prunes on a stall. When the worker cannot
-    start, the source is skipped with `walk_unavailable`. The bounded-residual ruling applies on
+    start, the source is skipped with `walk_unavailable`.
+
+    **D12 exception (ADR-0070 R18; owner, kept 2026-10-27, stated as an exception
+    2026-10-28).** D12 says a capped or timed-out capture is reported `constrained` and an empty
+    blob is never sent; that stands, with one exception: a stalled walk (`walk_stalled`, or
+    `walk_unavailable`) sends no daily-sync blob for that cycle, not even a status-only one. The
+    store keeps its last good state, so the prune, the decommission sweep (decision 12) and the
+    counts never act on a partial walk, and `observed_at` ages visibly. A walk that returns, even
+    one cut short by its 60 s action deadline, is still reported: each store it did not finish
+    reads `constrained` with reason `deadline`, which meets D12 on that path. The stall itself is
+    signalled by the heartbeat tag and log line above. The [blob contract](#blob-contract) names
+    this skip. The bounded-residual ruling applies on
     every OS, not only Linux: on Windows a wedged CryptoAPI or provider call, on macOS a wedged
     keychain read, blocks only the worker, never the agent.
 
@@ -2055,7 +2103,8 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
     (5) The 60 s action deadline and cooperative cancellation cannot interrupt a syscall already blocked in the kernel.
     (Restated outside the verbatim header: the deadline bounds the sync thread's wait, not the syscall; the worker absorbs the block.)
 
-12. **The decommission sweep, as built in 2a-2c** (r11-design; owner, 2026-10-27, "go with your
+12. **The decommission sweep, planned for 2a-2c and implemented on its unmerged branch
+    (`feat/cert-inventory-tombstones`)** (r11-design; owner, 2026-10-27, "go with your
     recommendations"). A background sweep, on the leader only, erases certificate rows for devices
     decommissioned while the server ran a version older than the certificate store. It erases rows
     and writes **no tombstone**, and only on positive evidence: the latest `sle.agent.decommission`
@@ -2164,7 +2213,9 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
 | D12: lifecycle | [Typed set](#typed-set-purge-and-read-filter); [Decommission and readiness](#decommission-and-readiness); [Background jobs](#background-jobs) |
 | D12: R1 registration, fetcher, job, store, alerts | [Registration](#registration); [The fetcher](#the-fetcher); [Background jobs](#background-jobs); [The store](#the-store); [Metrics and alerts](#metrics-and-alerts) |
 | D12: chaos CH-1..CH-6 | [Chaos mapping](#chaos-mapping) |
-| D12: R15 (location-grain prune) | [Retention and the prune](#retention-and-the-prune); [Decisions](#decisions) (decision 6) |
+| D12: R15 and R16 (location-grain prune) | [Retention and the prune](#retention-and-the-prune); [Decisions](#decisions) (decisions 6 and 7) |
+| D12: R17 (the mixed-version window and its L7 exception) | [Phasing and PR order](#phasing-and-pr-order) (deploy order); [Decisions](#decisions) (decision 8) |
+| D12: R18 (a stalled walk skips the daily-sync blob) | [Blob contract](#blob-contract); [Decisions](#decisions) (decision 11) |
 | D13: four rules, windows, `crl_past_next_update` | [D13 counts](#d13-counts) |
 | D13: conditions 1–5 and mechanical checks | [D13 counts](#d13-counts) (count object, one statement, lint); [Store](#store-and-schema) (schema lint); [Tests](#unit-and-integration-tests-proposed) (recompute test) |
 | D13: R2 | Not slice 2's surface; [Dashboard widgets](#dashboard-widgets-the-data-they-read) keeps the Yuzu-CA widgets separate |
