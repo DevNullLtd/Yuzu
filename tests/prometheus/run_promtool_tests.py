@@ -228,10 +228,10 @@ def plan_shards(text: str, max_shards: int) -> tuple[list[str] | None, str]:
 
     A SHARD IS THE ORIGINAL TEXT WITH THE OTHER CASES CUT OUT. Nothing is
     parsed into Python values and written back, and nothing is re-emitted.
-    Reviews found, each measured against the pinned promtool as a shard run
-    that passes where the unsplit file fails (rc 0 vs rc 1), that every form of
-    re-emission launders something promtool's reader (Go yaml v2) would have
-    rejected or typed differently from PyYAML's:
+    Reviews found five ways a re-emitted shard passes (rc 0) where the unsplit
+    file fails (rc 1) on the pinned promtool. In each, re-emission launders
+    something promtool's reader (Go yaml v2) rejects or types differently from
+    PyYAML:
       - a repeated mapping key (PyYAML keeps the last value);
       - YAML 1.1 coercion (`on`, `0755`, `1.10`, `2026-01-01T00:00:00Z`);
       - a quoted string written back plain (`'0.1e1'` becomes a float);
@@ -250,7 +250,8 @@ def plan_shards(text: str, max_shards: int) -> tuple[list[str] | None, str]:
     shard's text is parsed and its (kind, tag, style, text) signature must equal
     the original node tree with only that shard's cases, else None. Also
     refused, so promtool gives the verdict on the file as written: a repeated
-    key (`Strict`; PyYAML would silently keep the last), an anchor or alias, a
+    key (PyYAML's loader keeps the last; the `Strict` loader subclass rejects
+    it), an anchor or alias, a
     merge key, a duplicate or non-sequence `tests`, unparseable text, no
     PyYAML, fewer than two cases, and any unexpected error in this function.
     """
@@ -302,7 +303,8 @@ def plan_shards(text: str, max_shards: int) -> tuple[list[str] | None, str]:
             line_start = text.rfind("\n", 0, at_idx) + 1
             prefix = text[line_start:at_idx]
             if not re.fullmatch(r" *- +", prefix):
-                raise _Refuse("a case does not begin on the line holding its '- '")
+                raise _Refuse("a case is not a '- ' entry starting its own line (a null item, "
+                          "an empty entry, or a line ending other than LF)")
             starts.append(line_start)
             dash_cols.add(prefix.index("-"))
         if len(dash_cols) != 1 or starts != sorted(set(starts)):
@@ -330,7 +332,7 @@ def plan_shards(text: str, max_shards: int) -> tuple[list[str] | None, str]:
     except _Refuse as why:
         return None, str(why)
     except Exception as ex:  # noqa: BLE001 - any planner failure means: let promtool read the original
-        return None, f"the planner failed ({type(ex).__name__}: {ex})"
+        return None, f"the planner failed ({type(ex).__name__})"
     return shards, ""
 
 
@@ -1050,8 +1052,8 @@ def sharding_selftest(failures: list[str]) -> None:
     exercises the sharded path. Every "runs the original unsplit" row asserts
     the fake was invoked EXACTLY ONCE, on the original file: a run that crashed
     before invoking anything must not read as a fallback. Every "must shard" row
-    compares what the fake READ OUT OF THE SHARD (style and spelled text), so
-    it is not blind to a round trip that re-types a scalar.
+    compares each case's name as (style, value, raw source text) read out of the
+    shard, so any byte change shows.
     """
     global TEST_SHARDS, run
     try:
@@ -1069,7 +1071,7 @@ def sharding_selftest(failures: list[str]) -> None:
         global TEST_SHARDS
         f = tmp / name
         if text is not None:
-            f.write_text(text, encoding="utf-8")
+            f.write_bytes(text.encode("utf-8"))
         for old in tmp.glob("log.*"):
             old.unlink()
         argv = [sys.executable, "-c", f"LOG={str(tmp / 'log')!r}\n" + _FAKE_PROMTOOL]
@@ -1200,6 +1202,9 @@ def sharding_selftest(failures: list[str]) -> None:
                 ("a flow-style tests", "tests: [{name: a}, {name: b}, {name: c}]\n", 3),
                 ("a dash on its own line", "tests:\n-\n  name: a\n-\n  name: b\n"
                  "- name: c\n", 3),
+                ("null items", "tests:\n-\n- \n- name: c\n", 3),
+                ("an anchor inside one item", "tests:\n- name: &a x\n  other: 1\n"
+                 "- name: y\n- name: z\n", 3),
                 ("a bad bool tag", "tests:\n- name: !!bool '\\\\'\n- name: y\n- name: z\n", 3),
             )
             for label, text, shards in unsplit:
@@ -1212,6 +1217,11 @@ def sharding_selftest(failures: list[str]) -> None:
             res, _, calls, _, f = go(tmp, None, name="d.test.yml")
             if not ok(res) or calls != [f.name]:
                 fail(f"unreadable file: expected one unsplit run, got {calls!r} / {res!r}")
+            # Not UTF-8: promtool reports it, not this planner.
+            (tmp / "b.test.yml").write_bytes(b"tests:\n- name: \xff\n- name: b\n")
+            res, _, calls, _, f = go(tmp, None, name="b.test.yml")
+            if not ok(res) or calls != [f.name]:
+                fail(f"invalid UTF-8: expected one unsplit run, got {calls!r} / {res!r}")
             saved_yaml = sys.modules.get("yaml")
             sys.modules["yaml"] = None  # makes `import yaml` raise ImportError
             try:

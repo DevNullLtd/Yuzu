@@ -6045,10 +6045,9 @@ tests:
   # YuzuExecCorrelationReapSaturated. ONE run, seven instances, because the rule needs a 24 hour `for:`
   # and promtool evaluates every rule in the file each minute of simulated time (a case costs about
   # 0.17 s per simulated hour, and each parallel shard of the file runs under a 120 s harness
-  # timeout). Hourly passes
-  # are modelled as a step of the counter every 12 samples at a 5m input interval; instance =
-  # case. The window is 6h, so it holds 5 or 6 passes depending on phase, and the threshold is
-  # 200,000 (four caps).
+  # timeout). Hourly passes are modelled as a step of the counter every 12 samples at a 5m
+  # input interval; instance = case. The window is 6h, so it holds 5 or 6 passes depending on
+  # phase, and the threshold is 200,000 (four caps).
   #   s1 CASE A  sustained saturation (50,000 every hour from hour 1): the window first holds 4
   #              passes at hour 4, so `for: 24h` fires at hour 28. Not true at 3h (3 passes),
   #              pending at 5h and 27h (true, not vacuous), firing at exactly 28h. RED if `for:` is
