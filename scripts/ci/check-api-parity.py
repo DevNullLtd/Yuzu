@@ -476,8 +476,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # `exception:#520` (its REST twin is MCP-free by decision); both count untwinned: +2 on the 225 of dev, 227.
 #
 # 227 (origin/dev) -> 228 (Users and roles page): GET /fragments/access/enforcement has only the REST twin
-# GET /api/v1/me, which omits the unconfirmed (degraded) bit, and no MCP twin
-# (`twinned-rest-only`); the missing REST/MCP read is tracked in #6033.
+# GET /api/v1/me, which omits the unconfirmed (degraded) bit (`twinned-rest-only`). The MCP tool
+# get_me is the twin of the raw flag only, so this row still needs the degraded-bit read tracked in
+# #6033.
 #
 # 228 -> 225 (Seam PR2): the three hardware rows (get.fragments-hardware-list, -hardware-ci,
 # -hardware-quarantine) gained MCP twins (list_hardware_ci, get_hardware_ci, list_quarantined_devices).
@@ -492,7 +493,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # to the #4041 exception, because its MCP tool list_agents is unconfined; see get.api-agents.
 # 215 -> 213 (runtime configuration twins): get.api-config and put.api-config-param flipped to `twinned`
 # (GET/PUT /api/v1/config and the MCP tools get_runtime_config / set_runtime_config).
-BASELINE_UNTWINNED = 213
+# 213 -> 212 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me flipped from planned to twinned
+# (GET /api/v1/me + the get_me MCP tool).
+BASELINE_UNTWINNED = 212
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
@@ -502,7 +505,8 @@ BASELINE_UNTWINNED = 213
 # 86 -> 84 (runtime configuration twins): get.api-config and put.api-config-param became twinned.
 GENERIC_PLANNED_STATUS = "planned:#2146"
 GENERIC_PLANNED_ISSUE = 2146
-BASELINE_GENERIC_PLANNED = 84
+# 84 -> 83 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me became twinned.
+BASELINE_GENERIC_PLANNED = 83
 
 # A revisit date outside this window is a typo (9999-12-31), a shape error. A date at or before
 # today + REVISIT_WARN_DAYS only produces ONE aggregated warning, never a failure.
@@ -2359,7 +2363,7 @@ GATE_PARITY_KNOWN_MISMATCHES = {
 # holds no gate call this script recognises (owner-only reads that call auth_fn alone, helper
 # gates such as sw_admit, member-function gates) cannot be compared, so it fails closed unless it
 # is named here.
-GATE_PARITY_NO_GATE_MAX = 12
+GATE_PARITY_NO_GATE_MAX = 13
 GATE_PARITY_NO_GATE_ALLOWED = {
     ("DELETE", "/api/v1/result-sets/{param}", "delete_result_set"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
@@ -2375,6 +2379,13 @@ GATE_PARITY_NO_GATE_ALLOWED = {
     ("GET", "/api/v1/inventory/software/catalogue/versions", "get_software_versions"): (
         "gated by the sw_admit helper closure (Inventory:Read confined read), not a recognised "
         "gate call"),
+    ("GET", "/api/v1/me", "get_me"): (
+        "session-only self-description: the route calls auth_fn alone and reads no per-resource "
+        "authority; the tool is gated at Infrastructure:Read for the MCP tier ladder only. REST "
+        "permits a service-scoped token to describe itself while get_me is service-scope class "
+        "`denied`, a documented asymmetry; an explicit self-only service-scope policy is a "
+        "follow-up recorded as exception:#6432 revisit:2026-11-30, confirmed "
+        "by the ADR owner (ADR-1005 2026-10-24 entry)"),
     ("GET", "/api/v1/result-sets", "list_result_sets"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
         "call (result-set precedent)"),

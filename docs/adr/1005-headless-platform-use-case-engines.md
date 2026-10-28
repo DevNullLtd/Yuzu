@@ -993,6 +993,38 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        conditions for revisiting it: an agentic worker shown to need guide
        text the default document lacks, or the first release that ships the
        `/swagger` page. The date is not machine-checked.
+   - **2026-10-24 - `get_me` as the MCP twin of `GET /api/v1/me`, and one
+     `GATE_PARITY_NO_GATE_ALLOWED` entry. Confirmed 2026-10-24 by the ADR owner,
+     as written.** Three parts.
+     First, `get.api-me` flips from `planned:#2146` to `twinned` (untwinned 215
+     to 214, generic `planned:#2146` 86 to 85; these are the figures at the time
+     of this ruling, and the runtime configuration twins that merged later moved
+     them, so the live pins are the ones in
+     `scripts/ci/check-api-parity.py`). Second, the gate-parity check
+     reads `GET /api/v1/me` as a route with no gate call it can read: the
+     handler calls `auth_fn` alone, because the route is session-only
+     self-description with no per-resource authority, so there is nothing to
+     gate on. The tool's `Infrastructure:Read` row drives MCP tier
+     classification only. Reason: adding an artificial REST gate would invent
+     an authority the route does not have. The legacy `GET /api/me` was already
+     reviewed as a document-only disposition (it returns only the caller's own
+     identity metadata; `service-scope-flip-route-inventory-2026-08.md`, the
+     "Document-only dispositions" table); `GET /api/v1/me` shares the same
+     builder (`me_response.hpp`) but the inventory does not list it. One entry,
+     `("GET", "/api/v1/me", "get_me")`, is added to
+     `GATE_PARITY_NO_GATE_ALLOWED` and `GATE_PARITY_NO_GATE_MAX` rises from 12
+     to 13. Third, the one asymmetry this leaves: REST lets a service-scoped
+     token describe itself, while `get_me` has service-scope class `denied` and
+     refuses it. That is the conservative default for a new tool, and it is a
+     documented difference rather than a defect; a self-only service-scope
+     policy that would let both transports agree is the follow-up, recorded as
+     `exception:#6432 revisit:2026-11-30` (revisit date confirmed by the owner;
+     issue filed as #6432). Scope of the twin: `rbac_enabled` is the server's
+     cached view of the RBAC switch and does not report the degraded state in
+     which enforcement fails closed; that bit is owned by #6033, not by this twin.
+     The owner gave the confirmation in the authoring session and this entry
+     records it; like the entries above it is not a separately signed
+     decision.
 
     - **2026-10-28 - mixed-version admission during a rolling upgrade (scope
       exception recorded by the maintainer, #6079).** The approver gate
