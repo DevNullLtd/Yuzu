@@ -1331,7 +1331,7 @@ TEST_CASE("openapi documents: no text cites an issue, an ADR, a build wave or th
     // decision, design section, build wave, SOC 2 control, review gate or C++ symbol that shaped
     // it. Every string value in the document is checked, in both forms (keys are not text).
     static const std::regex kInternal(
-        R"((^|[^A-Za-z0-9])#[0-9]{2,5}\b|\bADR-?[0-9]{4}|\bSOC ?2 ?CC[0-9]|\bCC-?[0-9]|\bPhase [0-9]|\bWave [0-9]|)"
+        R"((^|[^A-Za-z0-9])#[0-9]+\b|\bADR-?[0-9]{4}|\bSOC ?2\b|\b[Ii]ssues? [0-9]|\b[Pp]ull request [0-9]|github\.com|\bmanifest_by_name\b|\bCC-?[0-9]|\bPhase [0-9]|\bWave [0-9]|)"
         R"(\bPRs? ?[0-9]|\bWS-[A-Z][0-9]|\bA2-R[0-9]|\bINV-[0-9]|\bUP-[0-9]+|\bCDX-|[Gg]overnance|)"
         R"(\bGate [0-9]|fix round|re-review|[Aa]pi-parity|API-parity|\bBatch [A-Z]\b|\bsprint\b|§|)"
         R"(decision log|docs/adr/|\badr/[0-9]{4}|[A-Za-z_]+::[A-Za-z_]|\.(hpp|cpp)\b|\b[a-z]+_fn\b|)"
@@ -1339,9 +1339,9 @@ TEST_CASE("openapi documents: no text cites an issue, an ADR, a build wave or th
         R"(\b[a-z][a-z_]+\(\)|routed-concerns|parity ledger|\bHermes\b|\bAstra\b|\b(SOLE|sole) (gate|authorization)|)"
         R"([a-z0-9]_fn\b|_(row|detail)_json\b|\bagent_ids_json\b|\bspec_json\b|)"
         R"(\brequire_(fleet_read|scoped_permission)\b|\bis_rbac_administrator\b|\bdispatch_confined|)"
-        R"((^|[^/A-Za-z0-9])A[1-5]([^A-Za-z0-9]|$)|(^|[^/])A4Error|)"
+        R"((^|[^/A-Za-z0-9])A[1-5]([^A-Za-z0-9]|$)|A4Error|)"
         R"(\b(ExecutionTracker|WorkflowEngine|SessionStore|TagStore|AuthFn|ExecutionEventBus|MachineNode|ClientValidation)\b|)"
-        R"(\(M[0-9]\b|capability [0-9]+\.[0-9]|UAT non-functional|tracked open|\b(shared|same|one|row) builder\b|)"
+        R"(\(M[0-9]\b|capability [0-9]+\.[0-9]|UAT non-functional|tracked open|\b(shared|same|one|row)( [A-Za-z_]+)? builder\b|)"
         R"(authorization-topology floor|\b(ledger|ladder)\b|docs/[a-z-]*(ladder|invariants)\.md)");
     // The line an operator reads first is held to more: no control number, gate word or label.
     static const std::regex kSummary(R"(SOC ?2|\bCC-?[0-9]|\bGate\b|\bADR\b|\([A-B][0-9]\)|(^|[^A-Za-z0-9])#[0-9]|\bA[1-5]\b|capability [0-9])");
@@ -1354,7 +1354,11 @@ TEST_CASE("openapi documents: no text cites an issue, an ADR, a build wave or th
                 if (node.is_string()) {
                     ++strings;
                     INFO(where);
-                    CHECK_FALSE(std::regex_search(node.get<std::string>(), kInternal));
+                    const std::string text = node.get<std::string>();
+                    // The one retained schema reference names A4ErrorEnvelope (renaming it would
+                    // change generated clients); no prose may.
+                    if (text != "#/components/schemas/A4ErrorEnvelope")
+                        CHECK_FALSE(std::regex_search(text, kInternal));
                 } else if (node.is_array()) {
                     for (std::size_t i = 0; i < node.size(); ++i)
                         walk(node[i], where + "/" + std::to_string(i));
