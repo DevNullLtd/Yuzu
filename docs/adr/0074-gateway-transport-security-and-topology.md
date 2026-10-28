@@ -129,7 +129,7 @@ Certificate checking moves into the NIF: `SSL_VERIFY_PEER` with the CA store, th
 - **Choosing:** weighted random choice, with the weight from measured round-trip time, so the nearest gateway in time weighs most and agents do not all pile onto one. Jittered back-off between attempts. Failover down the list.
 - **Draining gateways** have weight zero.
 - No region or site field in the first version: latency weighting covers it. The weight function stays pluggable, because round-trip time does not see a LAN boundary (a per-campus site gateway, for example).
-- **When every cached entry fails** (all drained or dead), the agent goes back to DNS. The cached list carries an expiry; to be set in wave 3.
+- **When every cached entry fails** (all drained or dead), the agent goes back to DNS. The cached list carries an expiry; to be set in wave 4.
 
 ### D10. How gateways know about one another
 
@@ -194,8 +194,8 @@ The memory measures in this ADR's companion change apply to both TLS paths: a ga
 
 A review of the decisions record and ADR-0073 against BigColin's measurements (`yuzu-test-results/REVIEW-NATHAN-MTLS-TOPOLOGY-ADR-0073-2026-10-28.md`, private share; RR7 at merged `dev@73369c123`, 5,000 agents) was folded in above: the auth_fun row (D2), renewal rates and expired certificates (D6), the revocation window and the two 15-minute clocks (D7), the nginx and HAProxy correction and the TLS version (D8), the DNS fallback and pluggable weight (D9), the new server code in D12, response storage in D13, the baseline before the budget gates (D14), and conflicts 5 to 7.
 
-Three proposals change the plan, and wait for the owners' decision:
-1. **A server wave before wave 3**, fixing what makes moves between gateways and servers lossy today. With an agent on two gateways at once, about 50 agents' routes were lost in 8 of 8 RR7 runs. Response storage drops under pool pressure. The in-memory registry lags Postgres for up to two seconds after a restart.
+Three proposals change the plan. The first was accepted on 2026-10-28; the other two wait for the owners' decision:
+1. **Accepted by Nathan on 2026-10-28; now wave 3 of the plan.** A server wave before topology work, fixing what makes moves between gateways and servers lossy today. With an agent on two gateways at once, about 50 agents' routes were lost in 8 of 8 RR7 runs. Response storage drops under pool pressure. The in-memory registry lags Postgres for up to two seconds after a restart.
 2. **Measure the Register rate and certificate issuance against the real server in waves 1 and 2,** plain and with mutual TLS, with the pool at 16 and 64. RR7 registered 5,000 agents in 17.0 s (about 290 per second); D14 needs about 1,700 per second.
 3. **The common memory baseline first** (D14).
 
@@ -204,13 +204,14 @@ Each wave ends with the owner's guidance before the next starts. Pull requests t
 
 | Wave | Content | Done when |
 |---|---|---|
-| 0 | This ADR and ADR-2002 section 7h ratified; the four conflicts above decided; ADR-0073 to PR. A survey of what comparable products and projects do (SPIRE, Teleport, Tailscale, nginx/HAProxy with OpenSSL, 1E Tachyon, Tanium, ConfigMgr, Intune), recorded with the ADR. The memory-measures PR (split from the kTLS branch). | Owner sign-off. |
+| 0 | This ADR and ADR-2002 section 7h ratified; the conflicts above decided; ADR-0073 to PR. A survey of what comparable products and projects do (SPIRE, Teleport, Tailscale, nginx/HAProxy with OpenSSL, 1E Tachyon, Tanium, ConfigMgr, Intune), recorded with the ADR. The memory-measures PR (split from the kTLS branch). | Owner sign-off. |
 | 1 | The CA: SPIFFE-form identities; 24-hour agent and 7-day gateway and server certificates with renewal; importing a customer intermediate; the CRL served to gateways. Gateway and server move from pins to CA trust plus identity plus revocation, in both directions. | Both directions refuse a revoked, expired, wrong-role or wrong-CA peer, proven by test. |
 | 2 | The agent edge: the enrollment port (token, or a machine certificate through CNG, Keychain or file); the strict main port; certificate and CRL checks in kTLS; the per-session agent signature checked by the server, plus whatever D5 settles. CI fuzzing, ASan, and the shared accept/refuse suite. | The shared suite passes on both TLS paths; 100 real Windows agents (rig100) enroll and connect with mutual TLS. |
-| 3 | Topology: DNS discovery; the server-pushed gateway list; latency weighting; gateway drain (GOAWAY batches, enrollment port closed at the start); Erlang clustering on or off by deployment. | A drain moves every agent to other gateways within the window, with no lost command result. |
-| 4 | Several servers: consistent hashing of agents to servers; the agent-to-gateway table; results through a different gateway; server drain; the ADR-2002 leader election wired in. | Two or more servers serve one fleet; one is killed and one is drained without losing an acknowledged result. |
-| 5 | Postgres: a streaming-replication test rig with Patroni; failover tests. | Failover meets RPO zero and under 60 seconds of write downtime, under load. |
-| 6 | The 100,000-agent run: the gateway on an 8-core, 16 GB allocation, load from Ngai-Syoon and the other test machines. | The D14 budget is met, or the gap is measured and explained. |
+| 3 | The server, before agents move: an agent seen on two gateways at once must not lose its route (RR7: about 50 of 5,000 lost in 8 of 8 forced-move runs); response storage must not drop under pool pressure; the in-memory registry must not lag the Postgres routes after a restart. Accepted by Nathan on 2026-10-28 from the BigColin review. | The RR7 forced-move, pool-pressure and post-restart cells pass with no loss, on BigColin's rig and ours. |
+| 4 | Topology: DNS discovery; the server-pushed gateway list; latency weighting; gateway drain (GOAWAY batches, enrollment port closed at the start); Erlang clustering on or off by deployment. | A drain moves every agent to other gateways within the window, with no lost command result. |
+| 5 | Several servers: consistent hashing of agents to servers; the agent-to-gateway table; results through a different gateway; server drain; the ADR-2002 leader election wired in. | Two or more servers serve one fleet; one is killed and one is drained without losing an acknowledged result. |
+| 6 | Postgres: a streaming-replication test rig with Patroni; failover tests. | Failover meets RPO zero and under 60 seconds of write downtime, under load. |
+| 7 | The 100,000-agent run: the gateway on an 8-core, 16 GB allocation, load from Ngai-Syoon and the other test machines. | The D14 budget is met, or the gap is measured and explained. |
 
 ## Alternatives considered
 
@@ -225,7 +226,7 @@ Each wave ends with the owner's guidance before the next starts. Pull requests t
 - The release that ships wave 2 breaks every existing agent-to-gateway deployment: new port, new certificates, agents re-enroll. This is acceptable only because there are no customers yet.
 - The CA signs far more often: each agent renews every 12 hours instead of about every eight months. At 1.2 million agents that is about 28 signatures per second, around the clock, before any mass re-enrolment. Its signing path, its `ca_issued` table and its CRL size must be measured before wave 2, not after.
 - The gateway gains C code that faces the internet. The fuzzing, ASan and advisory-tracking requirements in D8 are permanent.
-- `docs/pki-architecture.md`, `docs/user-manual/gateway.md`, the reference composes, the compose wizard and the agent installer all change with waves 1 to 3.
+- `docs/pki-architecture.md`, `docs/user-manual/gateway.md`, the reference composes, the compose wizard and the agent installer all change with waves 1, 2 and 4.
 
 ## Open questions
 
@@ -233,4 +234,4 @@ Each wave ends with the owner's guidance before the next starts. Pull requests t
 - D5's final scope (see Conflicts).
 - Whether to move kTLS handshakes out of the Erlang VM, into a separate OS process, so a memory-safety bug costs one handshake process rather than the gateway.
 - Whether the CRL must become a delta or a bloom-filtered form at 1.2 million agents with 24-hour certificates.
-- The ephemeral-port limit on load generators for wave 6: one source address to one gateway port gives about 16,000 connections on macOS defaults.
+- The ephemeral-port limit on load generators for wave 7: one source address to one gateway port gives about 16,000 connections on macOS defaults.
