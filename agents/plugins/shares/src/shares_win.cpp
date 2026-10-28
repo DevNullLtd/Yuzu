@@ -63,6 +63,13 @@ struct NetApiBuf {
 /// on.
 constexpr DWORD kWinPageBytes = 64 * 1024;
 
+// KNOWN OPERATIONAL HAZARD -- NO DEADLINE ON NetShareEnum.
+// The call is synchronous local RPC to the Server service, run on a dispatch-pool worker with
+// no timeout. A wedged (not stopped) service parks that worker and each repeated fire parks
+// another. Same class as NetUserEnum (users), NetSessionEnum (tar mapdrive) and the VSS calls
+// (filesystem_posture); tracked in #3925. Do not bound it locally with bounded_wait.hpp: that
+// abandons a DETACHED thread, and this plugin can be unloaded out from under it.
+
 /// One NetShareEnum call at the level `Info` names (SHARE_INFO_1 or SHARE_INFO_2). `path` is
 /// null for level 1 (no path in SHARE_INFO_1). `resume` is the API's resume handle: NetShareEnum
 /// advances it on ERROR_MORE_DATA.

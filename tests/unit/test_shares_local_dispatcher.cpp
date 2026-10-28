@@ -303,10 +303,9 @@ TEST_CASE("shares plugin: status row first, source rows next, then well-formed s
                std::string::npos) {
         // The level-1 fallback (a non-admin runner identity). The token only says the fallback
         // was ATTEMPTED: a level-1 drain that then fails (status_<n>, no_progress) reports one
-        // failed source row and no shares. When the drain succeeded, a running Server service
-        // publishes IPC$ (as on the supported arm above); SHARE_INFO_1 has no path, so every
-        // share row's path is the placeholder.
-        // read|0 is an honest empty drain the leg permits; only a non-empty read must show rows.
+        // failed source row and no shares. This arm asserts only the placeholder path and, for
+        // a non-empty read, that share rows exist (SHARE_INFO_1 has no path, so every share
+        // row's path is the placeholder). read|0 is an honest empty drain the leg permits.
         if (starts_with(rows[1], "source|netshareenum|read|") && wire_fields(rows[1])[3] != "0")
             CHECK(rows.size() >= 3);
         for (std::size_t i = 2; i < rows.size(); ++i) {

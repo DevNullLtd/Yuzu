@@ -375,7 +375,7 @@ std::vector<WinShareRec> disks(const std::string& prefix, std::size_t n) {
 
 } // namespace
 
-TEST_CASE("shares windows: one page of every kind is typed, special flagged not hidden",
+TEST_CASE("shares windows: one page of every kind is typed and special is flagged not hidden",
           "[shares]") {
     FakeWinPages f;
     // NetShareEnum returns backslash paths; the row grammar folds them to '/'. 3 is STYPE_IPC.
@@ -400,7 +400,8 @@ TEST_CASE("shares windows: one page of every kind is typed, special flagged not 
     CHECK(f.calls == std::vector<int>{2});
 }
 
-TEST_CASE("shares windows: an unknown kind is other; the temporary bit alone is disk,temporary",
+TEST_CASE("shares windows: an unknown kind is other and the temporary bit alone is disk then "
+          "temporary",
           "[shares]") {
     FakeWinPages f;
     f.pages[2] = {page_of(0, {rec("x", "C:/x", 7), rec("t", "C:/t", kStypeTemporary),
@@ -408,7 +409,7 @@ TEST_CASE("shares windows: an unknown kind is other; the temporary bit alone is 
     const auto l = f.run();
     CHECK(has(l, "share|smb|x|C:/x|-|-|other|netshareenum"));
     CHECK(has(l, "share|smb|t|C:/t|-|-|disk,temporary|netshareenum"));
-    // kind, then hidden, then temporary; a special share is never hidden whatever its name ends in
+    // kind, then hidden, then temporary
     CHECK(has(l, "share|smb|h$|C:/h|-|-|device,hidden,temporary|netshareenum"));
 }
 
@@ -475,7 +476,7 @@ TEST_CASE("shares windows: a share returned twice is kept once and costs no budg
 }
 
 TEST_CASE("shares windows: a multi-page drain whose count differs from the first page's total is "
-          "inconsistent_drain, rows kept",
+          "inconsistent_drain with the rows kept",
           "[shares]") {
     // A share created while paging: 4 read, 3 announced.
     FakeWinPages f;
@@ -521,7 +522,7 @@ TEST_CASE("shares windows: one budget spans every page and refusal stops fetchin
     CHECK(o.rows[1].size() < 4200);
 }
 
-TEST_CASE("shares windows: the byte budget cuts the listing before the row cap, at the first "
+TEST_CASE("shares windows: the byte budget cuts the listing before the row cap at the first "
           "refusal",
           "[shares]") {
     // Large entries exhaust 1 MiB long before 512 rows. Name, path, flags and the fixed per-row
@@ -596,7 +597,7 @@ TEST_CASE("shares windows: level 2 refused falls back to level 1 names without p
     CHECK(has(l, "share|smb|IPC$|-|-|-|ipc,special|netshareenum"));
 }
 
-TEST_CASE("shares windows: the level-1 fallback that then fails reports no shares, both tokens",
+TEST_CASE("shares windows: the level-1 fallback that then fails reports no shares and both tokens",
           "[shares]") {
     // The fallback token says the retry was attempted, not that it succeeded: a level-1 drain
     // that fails leaves ONE failed source row (two wire rows with the status row) and no share.
@@ -615,7 +616,7 @@ TEST_CASE("shares windows: the level-1 fallback that then fails reports no share
     }
 }
 
-TEST_CASE("shares windows: the level-1 fallback that answers empty is read|0, still constrained",
+TEST_CASE("shares windows: the level-1 fallback that answers empty is read|0 and still constrained",
           "[shares]") {
     FakeWinPages f;
     f.pages[2] = {page_of(kWinAccessDenied)};
@@ -649,7 +650,7 @@ TEST_CASE("shares windows: refused at both levels is permission_denied", "[share
     CHECK(l.rows == std::vector<std::string>{"source|netshareenum|refused|-"});
 }
 
-TEST_CASE("shares windows: a stopped Server service is typed unsupported, level 1 not tried",
+TEST_CASE("shares windows: a stopped Server service is typed unsupported and level 1 is not tried",
           "[shares]") {
     for (const std::uint32_t st : {kNerrServerNotStarted, kRpcServerUnavailable, kRpcUnknownIf}) {
         FakeWinPages f;

@@ -93,8 +93,10 @@ inline bool is_ws(char c) { return c == ' ' || c == '\t' || c == '\v' || c == '\
 
 inline std::string lower(std::string_view s) {
     std::string out(s);
-    std::ranges::transform(out, out.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    // ASCII only, whatever the process locale (std::tolower follows setlocale).
+    std::ranges::transform(out, out.begin(), [](unsigned char c) {
+        return static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c);
+    });
     return out;
 }
 

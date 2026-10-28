@@ -11,7 +11,8 @@
 ##            not read and are reported as constrained tokens.
 ##   macOS:   PLANNED, not read yet; one `unsupported` status row, macos:planned.
 ##   Windows: NetShareEnum level 2 (netapi32), the live shares of the Server service, read
-##            in bounded pages; level 1 (names, no paths) when level 2 is refused. The
+##            in pages (64 KiB requested per call: a memory bound, not a time bound); level 1
+##            (names, no paths) when level 2 is refused. The
 ##            administrative ADMIN$, C$ and IPC$ shares are flagged `special`, never
 ##            `hidden`; any other share whose name ends in `$` is flagged `hidden`. A stopped
 ##            Server service is `unsupported` with a named token, never an empty list. The
@@ -42,8 +43,9 @@ metadata:
     any other share whose name ends in $ is flagged hidden, and a stopped Server service is
     reported as unavailable, never as an empty list. Under a service identity that is not an
     administrator (the intended NT SERVICE\YuzuAgent) the Windows leg answers names and kind
-    only, constrained with windows:shares:netshareenum:level2_permission_denied; membership of
-    Server Operators for that identity restores paths. The macOS leg is planned and not yet
+    only, constrained with windows:shares:netshareenum:level2_permission_denied; per the
+    NetShareEnum contract, membership of Server Operators for that identity would restore
+    paths. The macOS leg is planned and not yet
     read. A refused or failed read is permission_denied or constrained with a reason token,
     never an empty result; one source row per source says whether it was read. Share names and
     paths can embed account names, so the result is sensitive. A leading status row states
